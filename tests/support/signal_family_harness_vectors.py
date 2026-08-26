@@ -13,8 +13,12 @@ only on the policy side, never inside the child.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import shutil
+import sys
+import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -92,7 +96,7 @@ def _fixture_source(relative: str) -> Path:
 
 
 def generation_fixture_declarations() -> tuple[SignalFamilyGenerationFileV1, ...]:
-    """The sorted `generation_files` tuple the immutable test manifest carries."""
+    """The checked-in half of the `generation_files` tuple: the `strategy-router` fixture."""
 
     return tuple(
         SignalFamilyGenerationFileV1(
@@ -105,16 +109,104 @@ def generation_fixture_declarations() -> tuple[SignalFamilyGenerationFileV1, ...
     )
 
 
-def install_generation_fixtures(generation_path: Path) -> tuple[SignalFamilyGenerationFileV1, ...]:
-    """Copy the checked-in fixture set into a generation tree, read-only, and declare it."""
+def shadow_fixture_supported() -> bool:
+    """Whether the `strategy-shadow` producer fixture can exist on this host.
 
-    declarations = generation_fixture_declarations()
+    `shadow_session_builder` reaches its three readers only through
+    `FilesystemShadowSessionInputLoader` under
+    `LegacyShadowFilesystemPolicy(mode="linux-production")`, and
+    `legacy_shadow_export._validate_mount_policy` refuses that mode unless
+    `sys.platform == "linux"`. The fixture is published by the production export publishers,
+    which run the same predicate, so both halves are Linux-only for the same reason.
+    """
+
+    return sys.platform == "linux"
+
+
+@dataclass(frozen=True)
+class InstalledGenerationFixtures:
+    """One generation tree's fixture set, as the policy author sees it."""
+
+    generation_root: Path
+    declarations: tuple[SignalFamilyGenerationFileV1, ...]
+    shadow_descriptor: dict[str, Any] | None
+
+    def authorized(self) -> dict[str, Any]:
+        from rquant.signal_family_verifier_harness import AuthorizedGenerationFile
+
+        return {
+            declared.relative_path: AuthorizedGenerationFile(
+                relative_path=declared.relative_path,
+                sha256=declared.sha256,
+                size=declared.size,
+                mode=declared.mode,
+            )
+            for declared in self.declarations
+        }
+
+
+def _shadow_builder() -> Any:
+    script = (
+        Path(__file__).resolve().parent.parent.parent
+        / "scripts"
+        / "build-signal-family-shadow-fixture.py"
+    )
+    spec = importlib.util.spec_from_file_location("_signal_family_shadow_builder", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_signal_family_shadow_builder"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def install_generation_fixtures(generation_path: Path) -> InstalledGenerationFixtures:
+    """Put every producer fixture into a generation tree and declare what it now holds.
+
+    The `strategy-router` fixture is checked in and copied. The `strategy-shadow` fixture is
+    *published in place* by the production export publishers, because its Ed25519 recovery
+    marker binds the session directory's inode and a copy would therefore be a different
+    directory (see `scripts/build-signal-family-shadow-fixture.py`). On a host where the
+    production reader path cannot be entered at all, the shadow half is simply absent and
+    the vector set is the ten surfaces that remain reachable.
+    """
+
+    declarations = list(generation_fixture_declarations())
     for declared in declarations:
         target = generation_path / declared.relative_path
         target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         shutil.copyfile(_fixture_source(declared.relative_path), target)
         target.chmod(declared.mode)
-    return declarations
+    shadow_descriptor: dict[str, Any] | None = None
+    if shadow_fixture_supported():
+        builder = _shadow_builder()
+        scratch = Path(tempfile.mkdtemp(prefix="rquant-shadow-build-", dir=Path.home()))
+        scratch.chmod(0o700)
+        try:
+            result = builder.build_shadow_fixture(
+                generation_path.resolve(),
+                relative_prefix=GENERATION_FIXTURE_PREFIX,
+                scratch_root=scratch,
+            )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        shadow_descriptor = result.descriptor
+        for relative in result.relative_paths:
+            published = generation_path / relative
+            declarations.append(
+                SignalFamilyGenerationFileV1(
+                    relative_path=relative,
+                    sha256=hashlib.sha256(published.read_bytes()).hexdigest(),
+                    size=published.stat().st_size,
+                    mode=FIXTURE_MODE,
+                )
+            )
+    return InstalledGenerationFixtures(
+        generation_root=generation_path.resolve(),
+        declarations=tuple(
+            sorted(declarations, key=lambda declared: declared.relative_path)
+        ),
+        shadow_descriptor=shadow_descriptor,
+    )
 
 
 def _generation_file_state(relative: str, workspace_path: str) -> dict[str, Any]:
@@ -367,6 +459,109 @@ def _paper_state(*, actions: tuple[SignalAction, ...]) -> dict[str, Any]:
     }
 
 
+_SHADOW_SIGNER_COMMAND = (
+    "/usr/bin/sudo",
+    "-n",
+    "/usr/local/libexec/rquant-shadow-report-signer",
+)
+
+
+def _shadow_service(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """The Shadow session manifest, pointed at the export published in the generation."""
+
+    prefix = "@generation/"
+    return {
+        "interval_seconds": 300.0,
+        "plane": "research",
+        "producer_commit": descriptor["producer_commit"],
+        "service_id": "shadow-session",
+        "service_kind": "shadow_session",
+        "settings": {
+            "calendar_content_sha256": descriptor["calendar_content_sha256"],
+            "calendar_expected_commit": descriptor["calendar_producer_commit"],
+            "calendar_path": prefix + descriptor["calendar_relative_path"],
+            "completion_active_key_id": descriptor["completion_active_key_id"],
+            "completion_active_public_key_pem": descriptor[
+                "completion_active_public_key_pem"
+            ],
+            "isolated_runner_root": prefix + descriptor["isolated_runner_relative_root"],
+            "legacy_monitor_root": prefix + descriptor["monitor_relative_root"],
+            "legacy_surge_root": prefix + descriptor["surge_relative_root"],
+            "match_tolerance_microseconds": 60_000_000,
+            "mode": "shadow",
+            "producer_version": descriptor["producer_version"],
+            "report_active_key_id": descriptor["report_active_key_id"],
+            "report_active_public_key_pem": descriptor["report_active_public_key_pem"],
+            "report_producer_instance_id": "shadow-primary",
+            "report_producer_service_id": "shadow-session",
+            "report_root": "@runtime/shadow-reports",
+            "runner_manifest_bindings": descriptor["runner_manifest_bindings"],
+            "signer_command": list(_SHADOW_SIGNER_COMMAND),
+            "signer_timeout_seconds": 1.0,
+            "strategy_bindings": descriptor["strategy_bindings"],
+        },
+        "stale_after_seconds": 172_800.0,
+    }
+
+
+def _shadow_state() -> dict[str, Any]:
+    """The Shadow readers materialize nothing: the export is read where it was published."""
+
+    return {"directories": [], "files": []}
+
+
+def _shadow_vector_specifications(
+    descriptor: dict[str, Any],
+) -> tuple[tuple[str, SurfaceId, str], ...]:
+    service = _shadow_service(descriptor)
+    state = _shadow_state()
+    trade_date = descriptor["trade_date"]
+    return (
+        (
+            "strategy-shadow",
+            SurfaceId.FILESYSTEM_RUNNER_SOURCE_READ_COMPLETED_BATCH,
+            _envelope(
+                call={
+                    "after_sequence": 0,
+                    "limit": 10,
+                    "strategy_id": "n_shape",
+                    "trade_date": trade_date,
+                },
+                service=service,
+                state=state,
+            ),
+        ),
+        (
+            "strategy-shadow",
+            SurfaceId.READ_ISOLATED_RUNNER_SHADOW_SNAPSHOT,
+            _envelope(
+                call={
+                    "calendar_authority_id": descriptor["calendar_content_sha256"],
+                    "strategy_id": "n_shape",
+                    "trade_date": trade_date,
+                },
+                service=service,
+                state=state,
+            ),
+        ),
+        (
+            "strategy-shadow",
+            SurfaceId.ISOLATED_SIGNAL_OBSERVATIONS,
+            _envelope(
+                call={
+                    "after_sequence": 0,
+                    "limit": 10,
+                    "producer_commit": descriptor["producer_commit"],
+                    "strategy_id": "growth_board_surge",
+                    "trade_date": trade_date,
+                },
+                service=service,
+                state=state,
+            ),
+        ),
+    )
+
+
 def _envelope(
     *,
     call: dict[str, Any],
@@ -387,8 +582,10 @@ def _envelope(
 _READ_BOUNDS: dict[str, Any] = {"after_sequence": 0, "limit": 10, "through_sequence": 1}
 
 
-def vector_specifications() -> tuple[tuple[str, SurfaceId, str], ...]:
-    """`(pair_id, surface_id, input_json)` for every surface the harness exercises."""
+def vector_specifications(
+    shadow_descriptor: dict[str, Any] | None = None,
+) -> tuple[tuple[str, SurfaceId, str], ...]:
+    """`(pair_id, surface_id, input_json)` for every surface reachable on this host."""
 
     paper_state = _paper_state(actions=(SignalAction.B_INTENT,))
     notifier_state = {
@@ -491,6 +688,11 @@ def vector_specifications() -> tuple[tuple[str, SurfaceId, str], ...]:
                 state=paper_state,
             ),
         ),
+        *(
+            ()
+            if shadow_descriptor is None
+            else _shadow_vector_specifications(shadow_descriptor)
+        ),
     )
 
 
@@ -516,7 +718,9 @@ def blocked_surface_vector(surface_id: SurfaceId) -> tuple[SignalFamilyVectorV1,
     return vector, canonical_json_bytes({"unreachable": True}).decode("utf-8")
 
 
-def harness_vectors() -> tuple[SignalFamilyVectorV1, ...]:
+def harness_vectors(
+    shadow_descriptor: dict[str, Any] | None = None,
+) -> tuple[SignalFamilyVectorV1, ...]:
     """The sorted duplicate-free vector tuple the policy hashes."""
 
     built = [
@@ -526,13 +730,13 @@ def harness_vectors() -> tuple[SignalFamilyVectorV1, ...]:
             surface_id=surface_id,
             input_json=input_json,
         )
-        for pair_id, surface_id, input_json in vector_specifications()
+        for pair_id, surface_id, input_json in vector_specifications(shadow_descriptor)
     ]
     return tuple(sorted(built, key=lambda vector: vector.vector_id))
 
 
 def authorized_fixtures() -> dict[str, Any]:
-    """The root-authorized fixture map, in the shape the child receives it in the request."""
+    """The root-authorized map for the checked-in `strategy-router` fixture alone."""
 
     from rquant.signal_family_verifier_harness import AuthorizedGenerationFile
 
@@ -552,19 +756,25 @@ def expected_results_for(
     root: Path,
     *,
     generation_root: Path | None = None,
+    installed: InstalledGenerationFixtures | None = None,
 ) -> dict[str, str]:
     """Policy-side derivation: run the same exercise the child runs and keep the bytes.
 
     This never runs inside the child. It exists because whoever signs the external policy
-    has to know the expected result before the child is ever launched. When no generation
-    tree is supplied the fixtures are read out of the repository copy, which is the same
-    bytes the world installs; the results carry no absolute path either way.
+    has to know the expected result before the child is ever launched. When no installed
+    fixture set is supplied the checked-in `strategy-router` half is staged into a scratch
+    generation, which is the same bytes the world installs; the results carry no absolute
+    path either way.
     """
 
     from rquant.signal_family_verifier_harness import RequestVector, exercise_vector
 
-    fixture_root = _fixture_generation_root(generation_root, root)
-    fixtures = authorized_fixtures()
+    fixture_root = (
+        installed.generation_root
+        if installed is not None
+        else _fixture_generation_root(generation_root, root)
+    )
+    fixtures = installed.authorized() if installed is not None else authorized_fixtures()
     results: dict[str, str] = {}
     for index, vector in enumerate(vectors):
         request_vector = RequestVector(
@@ -601,6 +811,8 @@ def _fixture_generation_root(generation_root: Path | None, scratch: Path) -> Pat
 
 __all__ = [
     "FAMILY_ID",
+    "InstalledGenerationFixtures",
+    "shadow_fixture_supported",
     "FIXTURE_MODE",
     "FIXTURE_MODIFIED_AT",
     "GENERATION_FIXTURE_PREFIX",

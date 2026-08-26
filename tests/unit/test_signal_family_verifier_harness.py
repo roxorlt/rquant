@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import re
 import stat
@@ -45,7 +46,36 @@ from tests.support.signal_family_harness_vectors import (
     generation_fixture_declarations,
     harness_vectors,
     install_generation_fixtures,
+    shadow_fixture_supported,
 )
+
+#: The three `strategy-shadow` readers are reachable only where the production reader path
+#: is: `shadow_session_builder` enters them through `FilesystemShadowSessionInputLoader`
+#: under `LegacyShadowFilesystemPolicy(mode="linux-production")`, and
+#: `legacy_shadow_export._validate_mount_policy` refuses that mode off Linux. The harness
+#: implements all thirteen; these cases are the ones that need the fixture to exist.
+SHADOW_SURFACE_IDS = frozenset(
+    surface.value for surface in READER_SURFACES["strategy-shadow"]
+)
+linux_only = pytest.mark.skipif(
+    not shadow_fixture_supported(),
+    reason=(
+        "the strategy-shadow production reader path runs under "
+        "LegacyShadowFilesystemPolicy(mode='linux-production'), which "
+        "legacy_shadow_export._validate_mount_policy refuses off Linux"
+    ),
+)
+
+
+def _surface_params() -> list[Any]:
+    return [
+        pytest.param(
+            surface_id,
+            marks=[linux_only] if surface_id in SHADOW_SURFACE_IDS else [],
+            id=surface_id,
+        )
+        for surface_id in harness.IMPLEMENTED_SURFACE_IDS
+    ]
 
 # The Phase C ancestry walks refuse a group- or world-writable ancestor, and pytest's own
 # `tmp_path` is rooted at `TMPDIR`, which defaults to a sticky `/tmp` on Linux. Rebinding both
@@ -56,6 +86,14 @@ tmp_path = _private_root.tmp_path
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build-signal-family-verifier-harness.py"
 
+_MATERIALIZING_STATE_KEYS = (
+    "directories",
+    "files",
+    "generation_files",
+    "serving_authorities",
+    "spool",
+    "sqlite_sources",
+)
 RUN_ID = "a" * 64
 TEST_MANIFEST_HASH = "c" * 64
 POLICY_DIGEST_PATTERN = re.compile(r"policy_digest[= ][0-9a-f]{8}")
@@ -194,6 +232,13 @@ class TestSurfaceCoverageBookkeeping:
         for surface_id, reason in harness.BLOCKED_SURFACE_REASONS.items():
             assert surface_id in self._all_reader_surfaces()
             assert len(reason) > 40
+
+    def test_every_reader_surface_is_implemented(self) -> None:
+        """P1-6: thirteen of thirteen, with nothing standing in for a missing exercise."""
+
+        assert set(harness.IMPLEMENTED_SURFACE_IDS) == self._all_reader_surfaces()
+        assert len(harness.IMPLEMENTED_SURFACE_IDS) == 13
+        assert harness.BLOCKED_SURFACE_REASONS == {}
 
     def test_no_producer_surface_has_an_exercise(self) -> None:
         producers = {
@@ -670,38 +715,93 @@ class TestServingAuthorityAncestryRule:
 # ---------------------------------------------------------------------------------------
 
 
-def _generation_root(root: Path) -> Path:
-    """A generation-shaped tree carrying the checked-in fixture set, beside the workspace."""
+_FIXTURE_CACHE: dict[Path, Any] = {}
 
-    staged = root.parent / f"{root.name}-generation"
-    if not staged.exists():
-        staged.mkdir(mode=0o700, parents=True)
-        install_generation_fixtures(staged)
-    return staged
+
+def _session_root(root: Path) -> Path:
+    """The private session root `tmp_path` was carved out of."""
+
+    candidate = root.resolve()
+    home = Path.home().resolve()
+    while candidate.parent != home and candidate.parent != candidate:
+        candidate = candidate.parent
+    return candidate
+
+
+def _installed_fixtures(root: Path) -> Any:
+    """One generation tree per session, shared by every exercise in this module.
+
+    The `strategy-shadow` half is published in place by the production export publishers,
+    which is neither cheap nor repeatable inside one directory, so it is built once.
+    """
+
+    session = _session_root(root)
+    cached = _FIXTURE_CACHE.get(session)
+    if cached is None:
+        generation = session / "harness-generation"
+        generation.mkdir(mode=0o700, exist_ok=True)
+        cached = install_generation_fixtures(generation)
+        _FIXTURE_CACHE[session] = cached
+    return cached
+
+
+def _generation_root(root: Path) -> Path:
+    return _installed_fixtures(root).generation_root
+
+
+def _harness_vectors(root: Path) -> tuple[Any, ...]:
+    from tests.support.signal_family_harness_vectors import harness_vectors
+
+    return harness_vectors(_installed_fixtures(root).shadow_descriptor)
+
+
+def _workspace_reading_vectors(root: Path) -> tuple[Any, ...]:
+    """The vectors that materialize something into the workspace before their surface runs."""
+
+    selected = []
+    for vector in _harness_vectors(root):
+        state = json.loads(vector.input_json)["state"]
+        if any(state.get(key) for key in _MATERIALIZING_STATE_KEYS):
+            selected.append(vector)
+    return tuple(selected)
+
+
+def _reachable_surface_ids() -> tuple[str, ...]:
+    """The surfaces whose production path can be entered on this host."""
+
+    if shadow_fixture_supported():
+        return harness.IMPLEMENTED_SURFACE_IDS
+    return tuple(
+        surface_id
+        for surface_id in harness.IMPLEMENTED_SURFACE_IDS
+        if surface_id not in SHADOW_SURFACE_IDS
+    )
+
+
+def _vector_for(surface_id: str, root: Path) -> Any:
+    return next(
+        item for item in _harness_vectors(root) if item.surface_id.value == surface_id
+    )
 
 
 def _exercise(vector: Any, root: Path) -> dict[str, Any]:
+    installed = _installed_fixtures(root)
     return _surfaces.exercise_vector(
         _request_vector(vector),
         root,
-        generation_root=_generation_root(root),
-        authorized_fixtures=authorized_fixtures(),
+        generation_root=installed.generation_root,
+        authorized_fixtures=installed.authorized(),
     )
 
 
 class TestSurfaceExercises:
-    @pytest.mark.parametrize(
-        "surface_id",
-        list(harness.IMPLEMENTED_SURFACE_IDS),
-    )
+    @pytest.mark.parametrize("surface_id", _surface_params())
     def test_each_surface_runs_through_its_production_builder(
         self,
         tmp_path: Path,
         surface_id: str,
     ) -> None:
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         result = _exercise(vector, tmp_path)
 
@@ -710,18 +810,13 @@ class TestSurfaceExercises:
         assert result["schema_version"] == 1
         assert result["observation"]
 
-    @pytest.mark.parametrize(
-        "surface_id",
-        list(harness.IMPLEMENTED_SURFACE_IDS),
-    )
+    @pytest.mark.parametrize("surface_id", _surface_params())
     def test_each_surface_is_byte_identical_on_a_second_run(
         self,
         tmp_path: Path,
         surface_id: str,
     ) -> None:
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
         first = (tmp_path / "first").resolve()
         second = (tmp_path / "second").resolve()
         first.mkdir()
@@ -733,9 +828,7 @@ class TestSurfaceExercises:
 
     def test_a_read_only_surface_leaves_the_builder_runtime_alone(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         result = _exercise(vector, tmp_path)
 
@@ -745,9 +838,7 @@ class TestSurfaceExercises:
         """The verdict is enforced, not reported, so this is how it has to be observed."""
 
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
         real_tree_digest = _surfaces.tree_digest
         seen: list[str] = []
 
@@ -773,9 +864,7 @@ class TestSurfaceExercises:
         """
 
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_ROUTED_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
         real_tree_digest = _surfaces.tree_digest
         seen = 0
 
@@ -807,10 +896,8 @@ class TestSurfaceExercises:
             "schema_version",
             "surface_id",
         }
-        for surface_id in harness.IMPLEMENTED_SURFACE_IDS:
-            vector = next(
-                item for item in harness_vectors() if item.surface_id.value == surface_id
-            )
+        for surface_id in _reachable_surface_ids():
+            vector = _vector_for(surface_id, tmp_path)
             root = tmp_path / f"state-{surface_id.rsplit('.', 1)[1]}"
             root.mkdir()
 
@@ -822,10 +909,8 @@ class TestSurfaceExercises:
     def test_no_result_field_depends_on_sqlite_checkpoint_timing(self, tmp_path: Path) -> None:
         """A writer's runtime tree is not byte-stable across processes; nothing may report it."""
 
-        for surface_id in harness.IMPLEMENTED_SURFACE_IDS:
-            vector = next(
-                item for item in harness_vectors() if item.surface_id.value == surface_id
-            )
+        for surface_id in _reachable_surface_ids():
+            vector = _vector_for(surface_id, tmp_path)
             root = tmp_path / surface_id.rsplit(".", 1)[1]
             root.mkdir()
 
@@ -833,9 +918,7 @@ class TestSurfaceExercises:
 
     def test_a_writer_surface_is_declared_as_one(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.CONSUME_SIGNAL_BUS_TO_PAPER.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         result = _exercise(vector, tmp_path)
 
@@ -844,9 +927,7 @@ class TestSurfaceExercises:
 
     def test_the_spool_reader_reports_the_published_prefix(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         observation = _exercise(vector, tmp_path)["observation"]
 
@@ -854,16 +935,30 @@ class TestSurfaceExercises:
         assert observation["global_sequences"] == [1]
         assert observation["source_descriptor"]["high_watermark"] == 1
 
-    @pytest.mark.parametrize("surface_id", sorted(harness.BLOCKED_SURFACE_REASONS))
-    def test_a_blocked_surface_refuses_instead_of_substituting(
+    def test_the_blocked_surface_map_is_empty_and_still_fails_closed(
         self,
         tmp_path: Path,
-        surface_id: str,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """All thirteen are exercised, and the refusal mechanism is still wired.
+
+        `BLOCKED_SURFACE_REASONS` is empty, so there is no real surface to parametrize over.
+        The property it protects has not gone away though: a surface that reaches the frozen
+        allowlist without a working exercise must be refused, not answered with a substitute.
+        Declaring one here proves the branch still rejects.
+        """
+
+        assert harness.BLOCKED_SURFACE_REASONS == {}
+        surface_id = SurfaceId.ISOLATED_SIGNAL_OBSERVATIONS.value
         pair_id = next(
             pair
             for pair, surfaces in READER_SURFACES.items()
             if surface_id in {surface.value for surface in surfaces}
+        )
+        monkeypatch.setitem(
+            _surfaces.BLOCKED_SURFACE_REASONS,
+            surface_id,
+            "a delivery gap declared by this case, to prove the branch still refuses",
         )
         vector = harness.RequestVector(
             vector_id="0" * 64,
@@ -919,11 +1014,10 @@ class TestGenerationFixtureChannel:
     """
 
     @staticmethod
-    def _router_vector() -> Any:
-        return next(
-            item
-            for item in harness_vectors()
-            if item.surface_id is SurfaceId.READONLY_STRATEGY_RUNNER_SIGNAL_SOURCE_READ_BATCH
+    def _router_vector(root: Path) -> Any:
+        return _vector_for(
+            SurfaceId.READONLY_STRATEGY_RUNNER_SIGNAL_SOURCE_READ_BATCH.value,
+            root,
         )
 
     @staticmethod
@@ -941,7 +1035,7 @@ class TestGenerationFixtureChannel:
     def test_the_router_reader_runs_over_the_copied_fixture(self, tmp_path: Path) -> None:
         """The happy path, and the proof that the copy is what the builder actually opened."""
 
-        result = _exercise(self._router_vector(), tmp_path)
+        result = _exercise(self._router_vector(tmp_path), tmp_path)
         workspace = next(tmp_path.glob("vector-*"))
 
         assert result["builder"] == "rquant.runtime_builder_signal.signal_router_builder"
@@ -957,7 +1051,7 @@ class TestGenerationFixtureChannel:
                 f"{GENERATION_FIXTURE_PREFIX}/strategy-router/not-authorized.json"
             )
 
-        broken = self._rebuild(self._router_vector(), mutate)
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="did not authorize"):
             _surfaces.exercise_vector(
@@ -973,7 +1067,7 @@ class TestGenerationFixtureChannel:
         def mutate(payload: dict[str, Any]) -> None:
             payload["state"]["generation_files"][0]["sha256"] = "0" * 64
 
-        broken = self._rebuild(self._router_vector(), mutate)
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="disagrees"):
             _surfaces.exercise_vector(
@@ -987,9 +1081,15 @@ class TestGenerationFixtureChannel:
         self,
         tmp_path: Path,
     ) -> None:
-        """The child re-hashes what it read, so a substituted generation file cannot pass."""
+        """The child re-hashes what it read, so a substituted generation file cannot pass.
 
-        generation = _generation_root(tmp_path)
+        The substitution needs its own generation: the shared one is what every other case
+        in this module reads, and poisoning it would make this case's failure everyone's.
+        """
+
+        generation = tmp_path / "substituted-generation"
+        generation.mkdir(mode=0o700)
+        install_generation_fixtures(generation)
         target = generation / generation_fixture_declarations()[0].relative_path
         target.chmod(0o644)
         target.write_bytes(b'{"default_no_target_reason":"substituted","rules":[]}')
@@ -997,7 +1097,7 @@ class TestGenerationFixtureChannel:
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="authorized value"):
             _surfaces.exercise_vector(
-                _request_vector(self._router_vector()),
+                _request_vector(self._router_vector(tmp_path)),
                 tmp_path,
                 generation_root=generation,
                 authorized_fixtures=authorized_fixtures(),
@@ -1010,7 +1110,7 @@ class TestGenerationFixtureChannel:
         """No root-side authorization means no fixture, not a fixture read from somewhere else."""
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="authorized generation root"):
-            _surfaces.exercise_vector(_request_vector(self._router_vector()), tmp_path)
+            _surfaces.exercise_vector(_request_vector(self._router_vector(tmp_path)), tmp_path)
 
     @pytest.mark.parametrize(
         ("relative", "expected"),
@@ -1049,7 +1149,7 @@ class TestGenerationFixtureChannel:
                 {"content": "this is not SQL;", "path": "@workspace/runner-state-v1.sql"}
             ]
 
-        broken = self._rebuild(self._router_vector(), mutate)
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="not replayable"):
             _surfaces.exercise_vector(
@@ -1318,7 +1418,15 @@ class TestWorkspaceAccessClass:
 
     @staticmethod
     def _exercise_all(gate: Path, visitor_bits: int) -> tuple[int, int]:
-        """Run every surface beneath a gate carrying `visitor_bits`; return (ok, failed)."""
+        """Run every workspace-reading surface beneath a gate; return (ok, failed).
+
+        The experiment measures what the *workspace* access class does to a surface, so it
+        only covers surfaces that read the workspace. The three `strategy-shadow` readers
+        read an in-generation export in place and materialize nothing, so the gate has
+        nothing to deny them and including them would measure nothing. Membership is derived
+        from each vector's declared state rather than named, so a future vector that starts
+        materializing state is covered automatically.
+        """
 
         gate.mkdir(mode=0o700, parents=True, exist_ok=True)
         workspace = gate / "workspace"
@@ -1327,7 +1435,7 @@ class TestWorkspaceAccessClass:
         succeeded = 0
         failed = 0
         try:
-            for index, vector in enumerate(harness_vectors()):
+            for index, vector in enumerate(_workspace_reading_vectors(gate)):
                 root = workspace / f"run-{index:02d}"
                 try:
                     root.mkdir(mode=0o700)
@@ -1346,7 +1454,7 @@ class TestWorkspaceAccessClass:
         succeeded, failed = self._exercise_all(tmp_path / "gate-x", 0o100)
 
         assert succeeded == 0
-        assert failed == len(harness.IMPLEMENTED_SURFACE_IDS) == 10
+        assert failed == len(_workspace_reading_vectors(tmp_path / "gate-x"))
 
     def test_read_and_execute_passes_every_surface(self, tmp_path: Path) -> None:
         """`r-x` for the visitor, i.e. the `0715` this round ships."""
@@ -1354,7 +1462,7 @@ class TestWorkspaceAccessClass:
         succeeded, failed = self._exercise_all(tmp_path / "gate-rx", 0o500)
 
         assert failed == 0
-        assert succeeded == len(harness.IMPLEMENTED_SURFACE_IDS) == 10
+        assert succeeded == len(_workspace_reading_vectors(tmp_path / "gate-rx"))
 
     def test_the_frozen_mode_carries_the_bits_the_experiment_selected(self) -> None:
         from rquant.signal_family_root_verifier import CHILD_WORKSPACE_MODE
@@ -1369,10 +1477,14 @@ class TestWorkspaceAccessClass:
 
 class TestChildEntryPoint:
     def test_run_child_answers_every_vector_exactly_once(self, tmp_path: Path) -> None:
-        vectors = harness_vectors()
+        installed = _installed_fixtures(tmp_path)
+        vectors = _harness_vectors(tmp_path)
         request = _request_payload(
             vectors,
-            generation_root=str(_generation_root(tmp_path)),
+            generation_root=str(installed.generation_root),
+            generation_files=tuple(
+                declared.model_dump(mode="json") for declared in installed.declarations
+            ),
         )
 
         payload = harness_main.run_child(request, workspace_root=tmp_path)
@@ -1386,9 +1498,16 @@ class TestChildEntryPoint:
     def test_the_response_satisfies_the_frozen_child_result_model(self, tmp_path: Path) -> None:
         from rquant.signal_family_verification import SignalFamilyChildResultV1
 
-        vectors = harness_vectors()
+        installed = _installed_fixtures(tmp_path)
+        vectors = _harness_vectors(tmp_path)
         payload = harness_main.run_child(
-            _request_payload(vectors, generation_root=str(_generation_root(tmp_path))),
+            _request_payload(
+                vectors,
+                generation_root=str(installed.generation_root),
+                generation_files=tuple(
+                    declared.model_dump(mode="json") for declared in installed.declarations
+                ),
+            ),
             workspace_root=tmp_path,
         )
 

@@ -35,6 +35,14 @@ from ._request import AuthorizedGenerationFile
 #: builder is allowed to create and own.
 WORKSPACE_PREFIX: Final[str] = "@workspace/"
 RUNTIME_PREFIX: Final[str] = "@runtime/"
+#: `@generation/` names an in-generation producer fixture the surface reads *in place*.
+#: Most fixtures are copied into the vector's own tree instead; this prefix exists for the
+#: one kind that cannot be. An accepted legacy shadow export binds its Ed25519 recovery
+#: marker and finalization receipt to the session directory's `st_dev`/`st_ino`
+#: (`legacy_shadow_export._verify_recovery_marker_batch_at`), so a byte-perfect copy is a
+#: different directory and is refused. Reading in place is therefore not a shortcut around
+#: the copy: it is the only form the production reader accepts.
+GENERATION_PREFIX: Final[str] = "@generation/"
 
 #: One vector may not materialize an unbounded fixture tree.
 MAX_MATERIALIZED_FILES: Final[int] = 512
@@ -139,6 +147,32 @@ class VectorWorkspace:
             shutil.copytree(self.state, self.scratch)
         return self.scratch
 
+    def generation_path(self, value: str) -> Path:
+        """Resolve one `@generation/` path, bounded by what the root actually authorized.
+
+        The root checks individual files, not directories, so a bare prefix would let a
+        vector point a production builder at any generation path at all. The rule here is
+        the tightest one the declaration set supports: the target must either *be* an
+        authorized fixture or be a directory that contains one. Everything a surface reads
+        through this prefix is therefore inside the tuple the root verified before the child
+        started and re-digests after it exits.
+        """
+
+        if self.generation_root is None:
+            raise WorkspaceError("this harness run carries no authorized generation root")
+        relative = value[len(GENERATION_PREFIX) :]
+        parts = relative.split("/")
+        if not relative or relative.startswith("/"):
+            raise WorkspaceError("generation paths must name something inside the generation")
+        if any(part in {"", ".", ".."} for part in parts):
+            raise WorkspaceError("generation paths must not contain dot components")
+        authorized = tuple(self.authorized_fixtures)
+        if relative not in authorized and not any(
+            candidate.startswith(f"{relative}/") for candidate in authorized
+        ):
+            raise WorkspaceError("vector names a generation path the root did not authorize")
+        return self.generation_root.joinpath(*parts)
+
     def _resolve_declared(self, value: str, *, base: Path) -> Path:
         prefix = RUNTIME_PREFIX if value.startswith(RUNTIME_PREFIX) else WORKSPACE_PREFIX
         if not value.startswith(prefix):
@@ -155,6 +189,8 @@ class VectorWorkspace:
         return candidate
 
     def declared_path(self, value: str, *, live: Path) -> Path:
+        if value.startswith(GENERATION_PREFIX):
+            return self.generation_path(value)
         base = self.runtime if value.startswith(RUNTIME_PREFIX) else live
         return self._resolve_declared(value, base=base)
 
@@ -162,7 +198,9 @@ class VectorWorkspace:
         """Rewrite every declared path string into an absolute path in this workspace."""
 
         if type(value) is str:
-            if value.startswith(WORKSPACE_PREFIX) or value.startswith(RUNTIME_PREFIX):
+            if value.startswith(
+                (WORKSPACE_PREFIX, RUNTIME_PREFIX, GENERATION_PREFIX)
+            ):
                 return str(self.declared_path(value, live=live))
             return value
         if type(value) is list:
@@ -378,6 +416,7 @@ def require_declared_sequence(value: Any, *, field: str) -> Sequence[Any]:
 
 
 __all__ = [
+    "GENERATION_PREFIX",
     "MAX_GENERATION_FIXTURE_BYTES",
     "MAX_MATERIALIZED_FILES",
     "VOLATILE_SUFFIXES",

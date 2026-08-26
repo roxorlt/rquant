@@ -776,11 +776,15 @@ def build_world(
             install_generation_fixtures,
         )
 
-        # The ruling E-1 fixture set is generation content like any other: it is copied in
+        # The ruling E-1 fixture set is generation content like any other: it is installed
         # before the full manifest is built, so `full-manifest.json` covers it and the
-        # generation identity — the SHA-256 of that manifest — depends on its bytes.
-        generation_files = install_generation_fixtures(generation_path)
-        vectors = harness_vectors()
+        # generation identity — the SHA-256 of that manifest — depends on its bytes. The
+        # `strategy-shadow` half is published in place by the production export publishers
+        # and only exists where their filesystem policy can run; where it does not, the
+        # vector set is the ten surfaces that remain reachable and the coverage gate says so.
+        installed = install_generation_fixtures(generation_path)
+        generation_files = installed.declarations
+        vectors = harness_vectors(installed.shadow_descriptor)
         if vector_pair_ids is not None:
             vectors = tuple(
                 vector for vector in vectors if vector.pair_id in vector_pair_ids
@@ -791,11 +795,7 @@ def build_world(
         policy_scratch = tmp_path / "policy-expected"
         policy_scratch.mkdir(mode=0o700, parents=True)
         derived = dict(
-            expected_results_for(
-                vectors,
-                policy_scratch,
-                generation_root=generation_path,
-            )
+            expected_results_for(vectors, policy_scratch, installed=installed)
         )
         if blocked_surface_id is not None:
             blocked_vector, placeholder = blocked_surface_vector(blocked_surface_id)

@@ -16,22 +16,25 @@ and `serving_publisher_builder` build their readers during `build(manifest)` and
 them, so reading the cell by name is how the child gets *the builder's* object rather than
 one of its own.
 
-Ten of the thirteen reader surfaces are exercised. Two of those ten — the `strategy-router`
-pair — need producer-side state no bounded vector can carry, and they get it through the
-ruling E-1 fixture channel: the immutable test manifest names an in-generation, full-manifest
-covered, policy-hashed runner-state SQL dump and routing policy, the root checks both before
-and after this child runs, and `VectorWorkspace` copies them into the vector's own tree and
-rebuilds the database there. The fixture is producer output — `scripts/build-signal-family-
-producer-fixtures.py` drives the real `StrategyRunnerStore.process_batch` — never a
-hand-written table.
+All thirteen reader surfaces are exercised. Five of them need producer-side state no bounded
+vector can carry, and they get it through the ruling E-1 fixture channel: the immutable test
+manifest names in-generation, full-manifest covered, policy-hashed producer artifacts, and
+the root checks every one of them before this child starts and again after it exits.
 
-`BLOCKED_SURFACE_REASONS` names the remaining three and says exactly what stops each of them;
-a vector that asks for one is refused rather than answered with a substitute. All three are
-`strategy-shadow` readers whose only production path runs through
-`FilesystemShadowSessionInputLoader` under `LegacyShadowFilesystemPolicy(mode="linux-production")`,
-which `legacy_shadow_export._validate_mount_policy` refuses on any non-Linux host — so on a
-Darwin build host the production path cannot be entered at all, and no fixture makes it
-reachable.
+The two `strategy-router` readers take the copying form — a canonical runner-state SQL dump
+and a frozen routing policy are copied into the vector's own tree and the database is rebuilt
+there. The three `strategy-shadow` readers take the in-place form: an accepted legacy shadow
+export binds its Ed25519 recovery marker to the session directory's `st_dev`/`st_ino`, so a
+copy is a different directory and the production reader refuses it. Those vectors name
+`@generation/…` paths and the surfaces read the export where it was published.
+
+Both fixture sets are producer output. `scripts/build-signal-family-producer-fixtures.py`
+drives the real `StrategyRunnerStore.process_batch`;
+`scripts/build-signal-family-shadow-fixture.py` drives that plus `route_runner_signals`,
+`ReadonlySignalRouteAuthority.read_drain_evidence`, and
+`StrategyRunnerStore.publish_session_close_receipt` before publishing through the real
+export publishers. Neither writes a table by hand, and neither puts a signing key anywhere
+this child can reach.
 """
 
 from __future__ import annotations
@@ -64,29 +67,12 @@ _SERVICE_KEYS: Final[tuple[str, ...]] = (
     "stale_after_seconds",
 )
 
-#: The five reader surfaces this harness version refuses to answer, and why. Each reason is a
-#: delivery gap recorded in `wp4c-report.md`, not a silent omission: the child rejects the
-#: whole run rather than returning a substitute observation.
-BLOCKED_SURFACE_REASONS: Final[dict[str, str]] = {
-    "rquant.runtime_builder_shadow._FilesystemRunnerSource.read_completed_batch": (
-        "shadow_session_builder constructs this source only through "
-        "FilesystemShadowSessionInputLoader.load with the production LegacyShadowFilesystemPolicy "
-        "mode linux-production, and legacy_shadow_export._validate_mount_policy refuses that "
-        "mode outright unless sys.platform == 'linux', so the production reader path cannot be "
-        "entered at all on a Darwin build host and a fixture published for it would need the "
-        "equally Linux-gated production publisher"
-    ),
-    "rquant.runtime_shadow_sources.read_isolated_runner_shadow_snapshot": (
-        "reached in production only through the same shadow_session_builder input loader as "
-        "_FilesystemRunnerSource.read_completed_batch, so the linux-production mount predicate "
-        "blocks it identically"
-    ),
-    "rquant.runtime_shadow_sources.isolated_signal_observations": (
-        "reached in production only through the same shadow_session_builder input loader as "
-        "_FilesystemRunnerSource.read_completed_batch, so the linux-production mount predicate "
-        "blocks it identically"
-    ),
-}
+#: Reader surfaces this harness version refuses to answer, and why. The map is empty: all
+#: thirteen are exercised. It stays as the fail-closed mechanism — a surface added to the
+#: frozen allowlist without an exercise here is refused rather than answered with a
+#: substitute — and `tests/unit/test_signal_family_verifier_harness.py` pins it at empty.
+BLOCKED_SURFACE_REASONS: Final[dict[str, str]] = {}
+
 
 
 class SurfaceExerciseError(ValueError):
@@ -158,6 +144,12 @@ def _service_manifest(context: ExerciseContext, spec: SurfaceSpec) -> Any:
     if type(service["settings"]) is not dict:
         raise SurfaceExerciseError("vector service settings must be a JSON object")
     try:
+        settings = context.workspace.rebase(service["settings"], live=context.live_root)
+    except WorkspaceError as exc:
+        # A path the workspace refuses is a bounded, specific refusal; folding it into the
+        # generic "not a valid runtime manifest" below would hide which path and why.
+        raise SurfaceExerciseError(str(exc)) from exc
+    try:
         return RuntimeServiceManifest(
             service_id=service["service_id"],
             service_kind=RuntimeServiceKind(service["service_kind"]),
@@ -165,7 +157,7 @@ def _service_manifest(context: ExerciseContext, spec: SurfaceSpec) -> Any:
             interval_seconds=service["interval_seconds"],
             stale_after_seconds=service["stale_after_seconds"],
             producer_commit=service["producer_commit"],
-            settings=context.workspace.rebase(service["settings"], live=context.live_root),
+            settings=settings,
         )
     except (TypeError, ValueError) as exc:
         raise SurfaceExerciseError("vector service block is not a valid runtime manifest") from exc
@@ -569,6 +561,183 @@ def _exercise_route_runner_signals(context: ExerciseContext) -> ExerciseOutcome:
 
 
 # ---------------------------------------------------------------------------------------
+# strategy-shadow
+# ---------------------------------------------------------------------------------------
+
+
+def _shadow_session_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
+    """Build the Shadow session with nothing injected, so the loader is the real one."""
+
+    from rquant.runtime_builder_shadow import shadow_session_builder
+
+    manifest = _service_manifest(context, spec)
+    try:
+        return shadow_session_builder(clock=lambda: context.observed_at)(manifest)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceExerciseError(
+            "the shadow session production builder refused the vector"
+        ) from exc
+
+
+def _shadow_runner_source(context: ExerciseContext, step: Any) -> tuple[Any, Any]:
+    """The `(binding, source)` pair the builder's own input loader constructed.
+
+    `FilesystemShadowSessionInputLoader.load` is the only production path to
+    `_FilesystemRunnerSource`, and it only returns one after every accepted legacy shadow
+    export — monitor, surge, and both isolated runners — has passed
+    `load_accepted_legacy_shadow_export` under the production filesystem policy.
+    """
+
+    from rquant.runtime_builder_shadow import (
+        FilesystemShadowSessionInputLoader,
+        _FilesystemRunnerSource,
+    )
+
+    loader = _closure_value(step, "resolved_input_loader", FilesystemShadowSessionInputLoader)
+    settings = _closure_callable_free(step, "settings")
+    manifest = _closure_callable_free(step, "manifest")
+    strategy_id = context.text("strategy_id")
+    try:
+        inputs = loader.load(
+            settings=settings,
+            trade_date=_parse_trade_date(context.text("trade_date")),
+            expected_export_commit=manifest.producer_commit,
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure here is a refused vector
+        raise SurfaceExerciseError(
+            "the shadow input loader refused the in-generation export"
+        ) from exc
+    for binding, source in inputs.runner_sources:
+        if binding.strategy_id == strategy_id:
+            if type(source) is not _FilesystemRunnerSource:
+                raise SurfaceExerciseError(
+                    "the shadow input loader did not wire a _FilesystemRunnerSource"
+                )
+            return binding, source
+    raise SurfaceExerciseError("vector call.strategy_id names no shadow runner source")
+
+
+def _closure_callable_free(step: Any, name: str) -> Any:
+    """One free variable of the builder's step, whatever its type."""
+
+    code = getattr(step, "__code__", None)
+    cells = getattr(step, "__closure__", None)
+    if code is None or cells is None:  # pragma: no cover - builders return closures
+        raise SurfaceExerciseError("the production builder did not return a closure step")
+    names = tuple(code.co_freevars)
+    if name not in names:
+        raise SurfaceExerciseError(f"the production builder step does not capture {name}")
+    return cells[names.index(name)].cell_contents
+
+
+def _parse_trade_date(value: str) -> Any:
+    from datetime import date as date_type
+
+    try:
+        return date_type.fromisoformat(value)
+    except ValueError as exc:
+        raise SurfaceExerciseError("vector call.trade_date is not an ISO date") from exc
+
+
+def _runner_batch_identity(batch: Any) -> dict[str, Any]:
+    return {
+        "count": len(batch.records),
+        "descriptor": batch.snapshot.descriptor.model_dump(mode="json"),
+        "records_sha256": canonical_sha256(
+            [record.model_dump(mode="json") for record in batch.records]
+        ),
+        "sequences": [record.sequence for record in batch.records],
+    }
+
+
+def _exercise_shadow_completed_batch(context: ExerciseContext) -> ExerciseOutcome:
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _shadow_session_step(context, spec)
+    binding, source = _shadow_runner_source(context, step)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    bounds = {
+        "after_sequence": context.integer("after_sequence"),
+        "limit": context.integer("limit"),
+    }
+    surface = bound_surface(source, context.vector.surface_id)
+    batch = surface(trade_date=_parse_trade_date(context.text("trade_date")), **bounds)
+    return ExerciseOutcome(
+        observation={
+            "batch": _runner_batch_identity(batch),
+            "bounds": bounds,
+            "source_id": source.source_id,
+            "strategy_id": binding.strategy_id,
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+def _exercise_isolated_runner_shadow_snapshot(context: ExerciseContext) -> ExerciseOutcome:
+    from rquant.runtime_shadow_validation import Ed25519CompletionAttestationKeyring
+
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _shadow_session_step(context, spec)
+    binding, source = _shadow_runner_source(context, step)
+    keyring = _closure_value(step, "completion_keyring", Ed25519CompletionAttestationKeyring)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    surface = resolve_surface(context.vector.surface_id)
+    snapshot = surface(
+        source,
+        trade_date=_parse_trade_date(context.text("trade_date")),
+        observed_at=context.observed_at,
+        binding=binding,
+        expected_calendar_authority_id=context.text("calendar_authority_id"),
+        attestation_verifier=keyring,
+    )
+    return ExerciseOutcome(
+        observation={
+            "observation_count": len(snapshot.observations),
+            "observation_ids": [
+                str(observation.observation_id) for observation in snapshot.observations
+            ],
+            "raw_input_id": snapshot.raw_input_id,
+            "snapshot_sha256": canonical_sha256(snapshot.model_dump(mode="json")),
+            "source_id": snapshot.source_id,
+            "upstream_snapshot_id": snapshot.upstream_snapshot_id,
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+def _exercise_isolated_signal_observations(context: ExerciseContext) -> ExerciseOutcome:
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _shadow_session_step(context, spec)
+    binding, source = _shadow_runner_source(context, step)
+    trade_date = _parse_trade_date(context.text("trade_date"))
+    batch = source.read_completed_batch(
+        trade_date=trade_date,
+        after_sequence=context.integer("after_sequence"),
+        limit=context.integer("limit"),
+    )
+    runtime_digest = tree_digest(context.workspace.runtime)
+    surface = resolve_surface(context.vector.surface_id)
+    observations = surface(
+        [record.signal for record in batch.records],
+        trade_date=trade_date,
+        binding=binding,
+        current_producer_commit=context.text("producer_commit"),
+    )
+    return ExerciseOutcome(
+        observation={
+            "count": len(observations),
+            "observation_ids": [
+                str(observation.observation_id) for observation in observations
+            ],
+            "observations_sha256": canonical_sha256(
+                [observation.model_dump(mode="json") for observation in observations]
+            ),
+            "strategy_id": binding.strategy_id,
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+# ---------------------------------------------------------------------------------------
 # router-paper
 # ---------------------------------------------------------------------------------------
 
@@ -720,6 +889,24 @@ SURFACE_SPECS: Final[dict[str, SurfaceSpec]] = {
         service_kind="signal_router",
         writes=True,
         exercise=_exercise_route_runner_signals,
+    ),
+    "rquant.runtime_builder_shadow._FilesystemRunnerSource.read_completed_batch": SurfaceSpec(
+        builder="rquant.runtime_builder_shadow.shadow_session_builder",
+        service_kind="shadow_session",
+        writes=False,
+        exercise=_exercise_shadow_completed_batch,
+    ),
+    "rquant.runtime_shadow_sources.read_isolated_runner_shadow_snapshot": SurfaceSpec(
+        builder="rquant.runtime_builder_shadow.shadow_session_builder",
+        service_kind="shadow_session",
+        writes=False,
+        exercise=_exercise_isolated_runner_shadow_snapshot,
+    ),
+    "rquant.runtime_shadow_sources.isolated_signal_observations": SurfaceSpec(
+        builder="rquant.runtime_builder_shadow.shadow_session_builder",
+        service_kind="shadow_session",
+        writes=False,
+        exercise=_exercise_isolated_signal_observations,
     ),
 }
 
