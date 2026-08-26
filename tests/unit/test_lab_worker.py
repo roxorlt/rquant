@@ -2720,6 +2720,26 @@ class BlockingSecondSourceQuotaLeaseProvider:
         )
 
 
+def _recorded_pid(path: Path, *, timeout_seconds: float = 2.0) -> int | None:
+    """Read a pid a child writes, tolerating the gap between create and write.
+
+    The child creates the file and writes into it as two steps, so `exists()`
+    can be true while the content is still empty. Return None only when the
+    child never got as far as recording a pid.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            recorded = path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            recorded = ""
+        if recorded:
+            return int(recorded)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
+
+
 def _assert_process_gone(pid: int, *, timeout_seconds: float = 2.0) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -5938,8 +5958,9 @@ def test_stop_and_start_ack_commit_share_one_atomic_gate(
     assert not runner.is_alive()
     assert controls[0].stop_reason is not None
     assert "stop requested" in controls[0].stop_reason
-    if adapter_pid_path.exists():
-        _assert_process_gone(int(adapter_pid_path.read_text(encoding="ascii")))
+    adapter_pid = _recorded_pid(adapter_pid_path)
+    if adapter_pid is not None:
+        _assert_process_gone(adapter_pid)
 
 
 def test_stop_before_start_commit_never_sends_ack_or_executes_adapter(
