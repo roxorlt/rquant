@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import re
 import stat
 import sys
 import zipfile
@@ -57,6 +58,7 @@ BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build-signal-family-verifier-harne
 
 RUN_ID = "a" * 64
 TEST_MANIFEST_HASH = "c" * 64
+POLICY_DIGEST_PATTERN = re.compile(r"policy_digest[= ][0-9a-f]{8}")
 
 
 def _load_build_script() -> Any:
@@ -1123,6 +1125,64 @@ class TestProducerFixtureBuild:
             assert b"PRIVATE KEY" not in payload
             assert b"BEGIN PGP" not in payload
             assert b"ssh-ed25519" not in payload
+
+
+class TestRecomputeExpectations:
+    """Ruling E-7: one command, and running it twice changes nothing."""
+
+    @staticmethod
+    def _module() -> Any:
+        import importlib.util
+
+        script = REPOSITORY_ROOT / "scripts" / "signal_family_recompute_expectations.py"
+        spec = importlib.util.spec_from_file_location("_wpe_recompute", script)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        # `dataclasses` resolves its owner through `sys.modules`, so the module has to be
+        # registered before it executes or the first decorated class raises.
+        sys.modules["_wpe_recompute"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_policy_recomputation_is_idempotent(self) -> None:
+        module = self._module()
+
+        first = module.recompute_policy(write=False)
+        second = module.recompute_policy(write=False)
+
+        assert first == second
+        assert POLICY_DIGEST_PATTERN.search(first.detail) is not None
+
+    @pytest.mark.parametrize(
+        ("path", "category"),
+        [
+            ("src/rquant/signal_family_verification.py", "production"),
+            ("tests/fixtures/signal_family_producer/x.sql", "fixture"),
+            ("tests/manifests/full-suite-v1/index.json", "fixture"),
+            ("tests/unit/test_signal_family_verifier_harness.py", "test"),
+            ("tests/support/signal_family_harness_vectors.py", "test"),
+            ("deploy/systemd/rquant-runtime-router.service", "architecture"),
+            ("scripts/signal_family_recompute_expectations.py", "architecture"),
+            ("docs/architecture/production-interpreter-authority.md", "architecture"),
+        ],
+    )
+    def test_the_category_rule_reproduces_the_frozen_assignments(
+        self,
+        path: str,
+        category: str,
+    ) -> None:
+        """Ruling B-3 fixed `deploy/` at architecture; the rest follows the existing policy."""
+
+        assert self._module()._category(path) == category
+
+    def test_the_recomputation_never_writes_without_being_asked(self) -> None:
+        module = self._module()
+        before = module.POLICY_PATH.read_bytes()
+
+        module.recompute_policy(write=False)
+        module.recompute_producer_fixtures(write=False)
+
+        assert module.POLICY_PATH.read_bytes() == before
 
 
 class TestServingLoaderProvenance:
