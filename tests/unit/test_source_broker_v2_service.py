@@ -66,6 +66,12 @@ HASHES = {
 NOW = datetime(2026, 8, 9, 4, tzinfo=UTC)
 
 
+# A watchdog for "the provider thread got in at all", not a subject: the
+# bounded rejections these cases assert afterwards are what is under test. One
+# or two seconds is a developer machine's budget and the x64 runner missed it.
+_PROVIDER_ENTRY_WATCHDOG_SECONDS = 30
+
+
 def _openssl() -> str:
     executable = shutil.which("openssl")
     if executable is None:
@@ -1713,7 +1719,7 @@ def test_live_claim_and_replay_do_not_poison_inflight_provider_completion(
 
     thread = threading.Thread(target=invoke)
     thread.start()
-    assert provider.entered.wait(timeout=2)
+    assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
     live_claim_request = _claim_once_request(request, challenge="b" * 64)
     live_claim = _claim(service, live_claim_request)
@@ -1775,7 +1781,7 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
 
     thread = threading.Thread(target=invoke)
     thread.start()
-    assert provider.entered.wait(timeout=2)
+    assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
@@ -1856,7 +1862,7 @@ def test_global_provider_gate_bounds_blocked_sources_before_authority_reserve(
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
             service.dispatch(first_envelope, deadline=time.monotonic() + 0.05)
-        assert provider.entered.wait(timeout=1)
+        assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
         started = time.monotonic()
         with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
@@ -1919,7 +1925,7 @@ def test_provider_service_stop_prevents_new_threads_and_reservations(tmp_path: P
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
             service.dispatch(first_envelope, deadline=time.monotonic() + 0.05)
-        assert provider.entered.wait(timeout=1)
+        assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
         service.stop()
         service.stop()
