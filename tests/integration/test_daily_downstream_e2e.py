@@ -574,9 +574,22 @@ def test_screen_crash_after_business_commit_restarts_without_duplicate_write(
         now=recovered_at,
         lease_for=timedelta(minutes=15),
     )
-    assert ledger.recover(recovered_lease, now=recovered_at).retried_stage_ids == ("screen",)
-    retry = ledger.claim_next(recovered_lease, now=recovered_at)
-    assert retry is not None and retry.stage_id == "screen" and retry.attempt_number == 2
+    # Recovery deliberately adopts nothing here: DailyPipelineLedger.recover
+    # leaves a nonterminal attempt for the replacement writer instead of
+    # turning another owner's lease loss into a terminal or retry mutation.
+    # The replay below is what proves the stage runs exactly once more.
+    recovered = ledger.recover(recovered_lease, now=recovered_at)
+    assert recovered.retried_stage_ids == ()
+    assert recovered.finalized_receipt_ids == ()
+    assert recovered.failed_stage_ids == ()
+    # As above: the replacement writer adopts the running attempt.
+    retry = ledger.adopt_effect_attempt(
+        recovered_lease,
+        run_id=run.run_id,
+        stage_id="screen",
+        now=recovered_at,
+    )
+    assert retry is not None and retry.stage_id == "screen" and retry.attempt_number == 1
     monkeypatch.setattr(artifacts, "persist_screen", original_persist)
     result = _screen_stage(
         db_path=db_path,
@@ -699,9 +712,24 @@ def test_summary_outbox_crash_replays_to_a_single_signal(
         now=recovered_at,
         lease_for=timedelta(minutes=15),
     )
-    assert ledger.recover(recovered_lease, now=recovered_at).retried_stage_ids == ("summary",)
-    retry = ledger.claim_next(recovered_lease, now=recovered_at)
-    assert retry is not None and retry.stage_id == "summary" and retry.attempt_number == 2
+    # Recovery deliberately adopts nothing here: DailyPipelineLedger.recover
+    # leaves a nonterminal attempt for the replacement writer instead of
+    # turning another owner's lease loss into a terminal or retry mutation.
+    # The replay below is what proves the stage runs exactly once more.
+    recovered = ledger.recover(recovered_lease, now=recovered_at)
+    assert recovered.retried_stage_ids == ()
+    assert recovered.finalized_receipt_ids == ()
+    assert recovered.failed_stage_ids == ()
+    # The new owner adopts the running attempt instead of claiming a new one:
+    # adoption keeps the attempt number, so the effect's idempotency key is
+    # unchanged and the replay below can only produce the same single signal.
+    retry = ledger.adopt_effect_attempt(
+        recovered_lease,
+        run_id=run.run_id,
+        stage_id="summary",
+        now=recovered_at,
+    )
+    assert retry is not None and retry.stage_id == "summary" and retry.attempt_number == 1
     replay = DailySummaryStage.from_ledger(
         signal_bus=bus,
         strategy_version="daily-close-dag/v1",
