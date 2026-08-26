@@ -325,7 +325,7 @@ orchestrator = DailyPipelineOrchestrator(
     adapters=(manifest.adapter_for("capture"),),
     source_resolver=Source(),
     clock=lambda: datetime.now(UTC),
-    lease_for=timedelta(milliseconds=250),
+    lease_for=timedelta(milliseconds=int(os.environ["RQUANT_TEST_LEASE_MS"])),
 )
 action = sys.argv[1]
 if action == "start":
@@ -358,11 +358,26 @@ else:
 def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -> None:
     driver = tmp_path / "expiring_fence_driver.py"
     _write_expiring_fence_driver(driver)
+    # The parent has to reach its external effect while still holding the lease;
+    # the expiry is what the recovery half of the case is about. A fixed 250ms
+    # made one constant do both jobs, and on a shared runner the parent lost its
+    # own lease mid-advance and died with LeaseLost before writing the marker.
+    # Size the lease from what a process start costs here instead.
+    started = time.monotonic()
+    subprocess.run(
+        (sys.executable, "-I", "-S", "-c", "pass"),
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    process_start_seconds = time.monotonic() - started
+    lease_seconds = max(0.25, 25 * process_start_seconds)
     environment = {
         **os.environ,
         "PYTHONPATH": _pythonpath(),
         "RQUANT_DAILY_EXTERNAL_RECEIPT_KEY_ID": "daily-stage-1",
         "RQUANT_DAILY_EXTERNAL_RECEIPT_SECRET": "s" * 32,
+        "RQUANT_TEST_LEASE_MS": str(int(lease_seconds * 1000)),
     }
     parent = subprocess.Popen(
         (sys.executable, str(driver), "start", str(tmp_path)),
@@ -374,13 +389,15 @@ def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -
         text=True,
     )
     marker = tmp_path / "external-effect"
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 60
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
     assert marker.exists(), parent.communicate(timeout=2)[1]
     parent.kill()
-    parent.wait(timeout=5)
-    time.sleep(1.0)
+    parent.wait(timeout=30)
+    # Wait out the lease the parent was holding, plus a margin, so the fence is
+    # provably expired before asserting that nothing was committed.
+    time.sleep(lease_seconds + 0.5)
     storage_profile = _storage_profile(tmp_path)
     assert not list(storage_profile.receipt_root.glob("*.json"))
 
@@ -392,7 +409,7 @@ def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -
         capture_output=True,
         text=True,
         check=False,
-        timeout=15,
+        timeout=120,
     )
     assert recovered.returncode == 0, recovered.stderr
     result = __import__("json").loads(recovered.stdout)
