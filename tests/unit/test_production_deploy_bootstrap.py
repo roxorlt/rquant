@@ -420,7 +420,16 @@ def _checkout(
             "def main(argv=None):\n"
             "    if os.environ.get('RUN_MARKER'):\n"
             "        Path(os.environ['RUN_MARKER']).write_text('ran', encoding='utf-8')\n"
-            "    time.sleep(float(os.environ.get('DEPLOY_HOLD_SECONDS', '0')))\n"
+            # Holding the generation open is a handshake, not a sleep: the test
+            # releases us once it has proved a second deployer is refused. The
+            # deadline is only a watchdog so a broken test cannot hang the job.
+            "    release = os.environ.get('RELEASE_MARKER')\n"
+            "    if release:\n"
+            "        watchdog = time.monotonic() + float(\n"
+            "            os.environ.get('RELEASE_WATCHDOG_SECONDS', '120')\n"
+            "        )\n"
+            "        while not Path(release).exists() and time.monotonic() < watchdog:\n"
+            "            time.sleep(0.01)\n"
             "    return int(os.environ.get('DEPLOY_EXIT', '0'))\n",
             encoding="utf-8",
         )
@@ -5166,12 +5175,13 @@ def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     first_run = tmp_path / "first-run"
     second_import = tmp_path / "second-import"
     second_run = tmp_path / "second-run"
+    release_marker = tmp_path / "release-first"
     first_env = {
         **os.environ,
         "DEPLOY_LOCK": str(lock_path),
         "IMPORT_MARKER": str(first_import),
         "RUN_MARKER": str(first_run),
-        "DEPLOY_HOLD_SECONDS": "1.0",
+        "RELEASE_MARKER": str(release_marker),
     }
     first = subprocess.Popen(
         _command(checkout, python, lock_path),
@@ -5181,10 +5191,18 @@ def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
         stderr=subprocess.PIPE,
         text=True,
     )
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while not first_import.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert first_import.read_text(encoding="utf-8") == "locked"
+    # IMPORT_MARKER is written at import time, before main() runs. Wait for the
+    # run marker too: that is the point at which the first deployer is provably
+    # inside the held generation, and it is what the second deployer has to
+    # collide with. Without it the overlap depended on a second process
+    # starting a fresh CPython faster than a fixed sleep.
+    while not first_run.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert first_run.read_text(encoding="utf-8") == "ran"
     second = subprocess.run(
         _command(checkout, python, lock_path),
         cwd=checkout,
@@ -5197,9 +5215,10 @@ def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
         capture_output=True,
         text=True,
         check=False,
-        timeout=5,
+        timeout=60,
     )
-    first_stdout, first_stderr = first.communicate(timeout=5)
+    release_marker.write_text("release", encoding="utf-8")
+    first_stdout, first_stderr = first.communicate(timeout=30)
 
     assert first.returncode == 0, first_stdout + first_stderr
     assert first_run.read_text(encoding="utf-8") == "ran"
