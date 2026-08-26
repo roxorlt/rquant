@@ -329,6 +329,31 @@ producer_commit
 
 runner 先把事件原子写入自己的 spool。`signal-router` 是 `signal_bus.sqlite3` 的唯一写入者，负责全局排序、schema 校验、幂等和隔离坏事件。
 
+#### signal_high_watermark 三条不变量（冻结）
+
+Amended per Codex round-2 order 2026-08-25, ruling 5。`signal_envelope` 是 append-only 表，
+`signal_bus_metadata` 里的 `signal_high_watermark` 必须精确等于表内最大 `global_sequence`：
+
+1. **单调**：ingest 路径只在新序号更大时抬高水位（SQL 里带
+   `CAST(metadata_value AS INTEGER) < ?` 守卫），任何路径都不得降低它。
+2. **不自动纠正**：发现水位与实际行不一致时，代码**不回写**修正值——一次静默纠正会把一次可
+   审计的事故变成一次无痕的数据改写。唯一的例外是水位键**整个缺失**时的一次性 bootstrap
+   seeding（老库迁移路径），它不修改任何已存在的值。
+3. **fail closed**：`SignalBusStore` 在**打开时**和 `source_descriptor()` **读出时**都校验这条
+   等式，不一致就抛 `SignalBusWatermarkError`，既不打开也不交出水位。
+
+修复只能显式做：
+
+```bash
+uv run rquant signal-bus-recover --database <signal_bus.sqlite3 绝对路径> \
+  --acknowledge "<为什么要修，会被原样写进审计>"
+```
+
+它只把水位**抬高**到实际最大序号，并向 append-only 的 `signal_bus_watermark_recovery` 表写一
+行审计（acknowledge 原文、修复前水位、观察到的最大序号、修复后水位、时间）。水位**高于**实际
+行时它拒绝执行：append-only 的表不会缩短，那意味着真实数据丢失，要走备份恢复而不是改元数据。
+没有任何环境变量或开关可以绕过 `--acknowledge`。
+
 ### 9.2 通知服务
 
 通知服务只关心：

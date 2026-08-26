@@ -1300,6 +1300,35 @@ def cmd_legacy_shadow_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_signal_bus_recover(args: argparse.Namespace) -> int:
+    """Explicitly repair a lagging signal-bus high watermark, with a durable audit row.
+
+    Codex round-2 order 2026-08-25, ruling 5. `signal_high_watermark` is monotonic and is
+    never self-corrected, so a store whose watermark disagrees with its rows refuses to
+    open. This is the only repair path: the operator states a reason, it is recorded
+    verbatim, and the watermark only ever moves up to the observed maximum sequence.
+    """
+
+    from rquant.signal_bus import recover_signal_bus_high_watermark
+
+    recovery = recover_signal_bus_high_watermark(
+        Path(args.database),
+        acknowledgement=args.acknowledge,
+    )
+    _print_json(
+        {
+            "command": "signal-bus-recover",
+            "database": str(Path(args.database).resolve()),
+            "acknowledgement": recovery.acknowledgement,
+            "previous_watermark": recovery.previous_watermark,
+            "observed_max_sequence": recovery.observed_max_sequence,
+            "recovered_watermark": recovery.recovered_watermark,
+            "recovered_at": recovery.recovered_at.isoformat(),
+        }
+    )
+    return 0
+
+
 def _split_ts_codes(values: list[str]) -> list[str]:
     codes: list[str] = []
     for value in values:
@@ -6635,6 +6664,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     legacy_shadow_recover_p.add_argument("--date", required=True)
 
+    signal_bus_recover_p = sub.add_parser(
+        "signal-bus-recover",
+        help="显式修复 signal bus 高水位（只抬高，写审计，无环境变量旁路）",
+    )
+    signal_bus_recover_p.add_argument(
+        "--database",
+        required=True,
+        help="signal_bus.sqlite3 的绝对路径",
+    )
+    signal_bus_recover_p.add_argument(
+        "--acknowledge",
+        required=True,
+        help="修复理由，原样写入 signal_bus_watermark_recovery 审计表",
+    )
+
     rt_min_p = sub.add_parser(
         "rt-minute-fetch",
         help="拉取 Tushare 实时分钟最新 K 线并写入 minute_bar",
@@ -8625,6 +8669,7 @@ def main() -> int:
         "runtime-recovery-production": cmd_runtime_recovery_production,
         "runtime-recovery": cmd_runtime_recovery,
         "legacy-shadow-recover": cmd_legacy_shadow_recover,
+        "signal-bus-recover": cmd_signal_bus_recover,
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
         "lab-integrity-audit": cmd_lab_integrity_audit,

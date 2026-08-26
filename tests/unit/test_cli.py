@@ -126,6 +126,112 @@ def test_legacy_shadow_recovery_cli_is_recovery_only() -> None:
     assert not hasattr(args, "exported_at")
 
 
+class TestSignalBusRecoverCli:
+    """Codex round-2 ruling 5: the only watermark repair path, and it is explicit."""
+
+    def test_the_acknowledgement_and_database_are_both_required(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "signal-bus-recover",
+                "--database",
+                "/tmp/rquant-signal-bus.sqlite3",
+                "--acknowledge",
+                "restored from the 08-25 backup",
+            ]
+        )
+
+        assert args.command == "signal-bus-recover"
+        assert args.database == "/tmp/rquant-signal-bus.sqlite3"
+        assert args.acknowledge == "restored from the 08-25 backup"
+        for missing in (
+            ["signal-bus-recover"],
+            ["signal-bus-recover", "--database", "/tmp/x.sqlite3"],
+            ["signal-bus-recover", "--acknowledge", "why"],
+        ):
+            with pytest.raises(SystemExit):
+                parser.parse_args(missing)
+
+    def test_the_parser_exposes_no_force_or_environment_bypass(self) -> None:
+        parser = build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        options = {
+            option
+            for action in subparsers.choices["signal-bus-recover"]._actions
+            for option in action.option_strings
+        }
+
+        assert options == {"-h", "--help", "--database", "--acknowledge"}
+
+    def test_the_command_repairs_a_lagging_watermark_and_prints_its_audit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import sqlite3
+
+        from rquant.cli import cmd_signal_bus_recover
+        from rquant.signal_bus import SignalBusStore, SignalBusWatermarkError
+        from rquant.signal_contracts import SignalAction, SignalEnvelope
+
+        path = tmp_path / "signal-bus.sqlite3"
+        store = SignalBusStore(path)
+        moment = datetime(2026, 8, 25, 1, 30, tzinfo=UTC)
+        store.ingest(
+            SignalEnvelope(
+                schema_version=1,
+                strategy_id="n-shape",
+                strategy_version="2.0.0",
+                parameter_fingerprint="a" * 64,
+                dataset_snapshot_id="b" * 64,
+                feature_snapshot_id="c" * 64,
+                event_time=moment - timedelta(seconds=2),
+                available_at=moment,
+                candidate_id="600000.SH",
+                action=SignalAction.B_INTENT,
+                reason_codes=("same-minute-volume",),
+                evidence={"ratio": 1.25},
+                expires_at=moment + timedelta(minutes=5),
+                producer_commit="d" * 40,
+            ),
+            received_at=moment,
+        )
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "UPDATE signal_bus_metadata SET metadata_value = '0' "
+                "WHERE metadata_key = 'signal_high_watermark'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with pytest.raises(SignalBusWatermarkError):
+            SignalBusStore(path)
+
+        args = build_parser().parse_args(
+            [
+                "signal-bus-recover",
+                "--database",
+                str(path),
+                "--acknowledge",
+                "restored from the 08-25 backup",
+            ]
+        )
+        assert cmd_signal_bus_recover(args) == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["command"] == "signal-bus-recover"
+        assert payload["acknowledgement"] == "restored from the 08-25 backup"
+        assert payload["previous_watermark"] == 0
+        assert payload["observed_max_sequence"] == 1
+        assert payload["recovered_watermark"] == 1
+        assert SignalBusStore(path).source_descriptor().high_watermark == 1
+
+
 def test_lab_startup_deadline_binding_rejects_missing_or_expired_value() -> None:
     from rquant.cli import _lab_startup_deadline_binding
 
