@@ -982,10 +982,11 @@ now, verifies it in full, and atomically replaces the entry. A cache entry older
 history is unverifiable and therefore blocks: a rollback that far back re-runs the channel
 instead of trusting retained bytes. The entry and every ancestor from the trusted root
 — `/` under `linux-production`, which never exempts a sticky directory — are walked without
-following symlinks and must be a directory or regular file owned by the expected deployment
-identity, with no group or other write bit, exactly one link, and at most 64 KiB. The entry
-itself stays unsigned: this replaces an assumed server-permission boundary with an enforced one
-and does not restore the removed signer, Ed25519, or attestation findings.
+following symlinks. Every ancestor must be a directory owned by root or by the deployment
+identity with no group or other write bit; the entry itself must be a regular file owned by the
+deployment identity, with no group or other write bit, exactly one link, and at most 64 KiB.
+The entry itself stays unsigned: this replaces an assumed server-permission boundary with an
+enforced one and does not restore the removed signer, Ed25519, or attestation findings.
 
 Merge review and branch protection are the approval boundary. The artifact is evidence for that
 trusted boundary, not a signature, URI chain, or separate authorization service.
