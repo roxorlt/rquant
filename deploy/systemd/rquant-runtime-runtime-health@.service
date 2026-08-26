@@ -11,7 +11,7 @@ Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
 Slice=rquant-serving.slice
-ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role runtime_health_publisher
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role runtime_health_publisher --instance %i
 
 Restart=on-failure
 RestartSec=20s

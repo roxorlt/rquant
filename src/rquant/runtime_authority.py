@@ -60,7 +60,67 @@ GENERATION_MANIFEST_NAME = "full-manifest.json"
 GENERATION_DIRECTORY_MODE = 0o555
 GENERATION_MANIFEST_MODE = 0o444
 PRODUCTION_ALLOWED_OPERATIONS = ("publish", "rollback")
-PRODUCTION_ROLE_POLICY = (("daily", "rquant.runtime_service_main", ("LANG", "LC_ALL", "TZ")),)
+#: The environment names every runtime role is allowed to receive. The wrapper builds the
+#: child environment from an empty dictionary and copies only these, so the set is the
+#: complete answer to "what can a unit's own `Environment=` line reach".
+_RUNTIME_ROLE_ENVIRONMENT = ("LANG", "LC_ALL", "TZ")
+_RUNTIME_SERVICE_MODULE = "rquant.runtime_service_main"
+
+#: Every role `/usr/local/libexec/rquant-runtime-exec.pyz` will execute, as
+#: `(name, module, environment_allowlist, instanced)`.
+#:
+#: Amended per Codex round-2 order 2026-08-25, item P1-3: before this, the policy froze the
+#: single `daily` role, so all 25 protected units failed closed at role selection and none
+#: could start. Extending it changes `profile_id`, which is a deliberate profile version
+#: step for Release A rather than a side effect — `profile_id` is bound into `current.json`,
+#: every generation's full manifest and the R07 policy, so the new profile must be published
+#: as its own authorized infrastructure transaction.
+#:
+#: `instanced` says whether the role is served by a systemd template. The concrete instance
+#: labels are *not* frozen here: `runtime_deployment_bundle` derives them from each service
+#: manifest as `svc-<sha256>` at deployment time, so they cannot be known at code-freeze.
+#: What is frozen is the shape — an instanced role must carry at least one label, a
+#: non-instanced role none — and the labels themselves live in the root-owned profile
+#: document, where a caller cannot reach them. The wrapper then accepts `%i` only if it is
+#: already in that list, which keeps the template label a lookup key rather than an
+#: authority value (ruling D-2).
+PRODUCTION_ROLE_POLICY = (
+    ("artifact_retention", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("auction_match_source", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("auction_universe_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("candidate_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("daily", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, False),
+    ("daily_close_source", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("daily_pipeline_orchestrator", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("feature_live", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("lab_artifact_catalog", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("lab_jobs_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("market_minute_source", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("notifier", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("page_control", "rquant.page_control_service", _RUNTIME_ROLE_ENVIRONMENT, False),
+    ("paper_broker", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("paper_constraint_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("promotions_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("reference_slow_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("reference_slow_source", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("runtime_health_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("runtime_recovery", "rquant.runtime_recovery_service", _RUNTIME_ROLE_ENVIRONMENT, True),
+    (
+        "runtime_recovery_rehearsal",
+        "rquant.runtime_recovery_service",
+        _RUNTIME_ROLE_ENVIRONMENT,
+        True,
+    ),
+    ("serving_publisher", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("shadow_session", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("signal_router", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("strategy_live", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+    ("watchlist_quote_source", _RUNTIME_SERVICE_MODULE, _RUNTIME_ROLE_ENVIRONMENT, True),
+)
+#: The frozen grammar of a systemd template label. `runtime_deployment_bundle` already
+#: derives exactly this shape from each service manifest.
+_ROLE_INSTANCE = re.compile(r"svc-[0-9a-f]{64}")
+MAX_ROLE_INSTANCES = 64
 PRODUCTION_MANIFEST_SCHEMA = MappingProxyType(
     {
         "schema_id": "rquant-full-manifest/v1",
@@ -280,6 +340,9 @@ class RuntimeFilePolicy:
 class RuntimeProfileRole:
     module: str
     environment_allowlist: tuple[str, ...]
+    #: The systemd template labels this role may be started as. Empty for a role served by
+    #: a non-template unit. A caller may only choose among these; it can never introduce one.
+    instances: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -315,11 +378,23 @@ class RuntimeProfileRole:
             or names != tuple(sorted(set(names)))
         ):
             raise ProductionRuntimeProfileError("runtime profile environment allowlist is invalid")
+        instances = self.instances
+        if (
+            not isinstance(instances, tuple)
+            or len(instances) > MAX_ROLE_INSTANCES
+            or any(
+                type(instance) is not str or _ROLE_INSTANCE.fullmatch(instance) is None
+                for instance in instances
+            )
+            or instances != tuple(sorted(set(instances)))
+        ):
+            raise ProductionRuntimeProfileError("runtime profile role instances are invalid")
 
     def payload(self) -> dict[str, object]:
         return {
             "module": self.module,
             "environment_allowlist": list(self.environment_allowlist),
+            "instances": list(self.instances),
         }
 
 
@@ -452,12 +527,26 @@ class RuntimeClosureProfile:
             raise ProductionRuntimeProfileError("runtime allowed operations are not fixed")
         if not isinstance(self.roles, Mapping) or len(self.roles) > MAX_ROLES:
             raise ProductionRuntimeProfileError("runtime profile roles are invalid")
-        expected_roles = {
-            name: RuntimeProfileRole(module, environment)
-            for name, module, environment in PRODUCTION_ROLE_POLICY
+        # The frozen policy fixes the role set, each role's module and environment
+        # allowlist, and whether the role is instanced. It deliberately does not fix the
+        # instance labels: those are derived per deployment from the service manifests, so
+        # the policy pins their shape and the root-owned profile document carries the list.
+        expected = {
+            name: (module, environment, instanced)
+            for name, module, environment, instanced in PRODUCTION_ROLE_POLICY
         }
-        if dict(self.roles) != expected_roles:
+        if set(self.roles) != set(expected):
             raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+        for name, role in self.roles.items():
+            module, environment, instanced = expected[name]
+            if not isinstance(role, RuntimeProfileRole):
+                raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+            if role.module != module or role.environment_allowlist != environment:
+                raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+            if bool(role.instances) is not instanced:
+                raise ProductionRuntimeProfileError(
+                    "runtime profile role instance policy is not fixed"
+                )
         object.__setattr__(
             self,
             "roles",
@@ -747,7 +836,7 @@ _ROLE_FIELDS = {
     "app_source",
     "site_packages",
 }
-_PROFILE_ROLE_FIELDS = {"module", "environment_allowlist"}
+_PROFILE_ROLE_FIELDS = {"module", "environment_allowlist", "instances"}
 _MANIFEST_FIELDS = set(PRODUCTION_MANIFEST_SCHEMA)
 _GENERATION_MANIFEST_FIELDS = {"schema_id", "profile_id", "roles", "entries"}
 _GENERATION_MANIFEST_ENTRY_FIELDS = {
@@ -1138,7 +1227,11 @@ def _parse_profile_role(payload: object) -> RuntimeProfileRole:
     environment = payload["environment_allowlist"]
     if type(environment) is not list:
         raise ProductionRuntimeProfileError("runtime profile environment allowlist is invalid")
+    instances = payload["instances"]
+    if type(instances) is not list:
+        raise ProductionRuntimeProfileError("runtime profile role instances are invalid")
     return RuntimeProfileRole(
+        instances=tuple(instances),
         module=payload["module"],
         environment_allowlist=tuple(environment),
     )

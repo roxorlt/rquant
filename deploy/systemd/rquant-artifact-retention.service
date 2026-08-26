@@ -14,7 +14,7 @@ WorkingDirectory=/home/lighthouse/rquant
 Environment=RQUANT_DISABLE_DOTENV=1
 LoadCredentialEncrypted=capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349/current.cred
 Slice=rquant-research.slice
-ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role artifact_retention
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role artifact_retention --instance svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349
 SuccessExitStatus=0 75
 Restart=no
 TimeoutStartSec=120s

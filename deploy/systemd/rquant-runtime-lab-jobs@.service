@@ -11,7 +11,7 @@ Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
 Slice=rquant-research.slice
-ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role lab_jobs_publisher
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role lab_jobs_publisher --instance %i
 
 Restart=on-failure
 RestartSec=30s

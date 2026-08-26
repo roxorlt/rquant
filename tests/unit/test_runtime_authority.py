@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.machinery
 import inspect
@@ -78,12 +79,7 @@ def _profile_payload() -> dict[str, object]:
         "quarantine_root": str(authority_module.PRODUCTION_QUARANTINE_ROOT),
         "generation_root": str(authority_module.PRODUCTION_GENERATION_ROOT),
         "allowed_operations": ["publish", "rollback"],
-        "roles": {
-            "daily": {
-                "module": "rquant.runtime_service_main",
-                "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
-            }
-        },
+        "roles": _policy_profile_roles(),
         "manifest_schema": {
             key: list(value) if isinstance(value, tuple) else value
             for key, value in authority_module.PRODUCTION_MANIFEST_SCHEMA.items()
@@ -129,6 +125,60 @@ def _directory_policy(*directories: Path) -> dict[Path, tuple[int, int]]:
     return policy
 
 
+#: Codex round-2 P1-3 expanded `PRODUCTION_ROLE_POLICY` from the single `daily` role to
+#: every role the runtime wrapper executes, so a valid profile now has to declare all of
+#: them and a valid slot has to match. All roles of one generation share the same venv,
+#: cwd and source tree, so one spec fanned out across the policy's names is both the
+#: shortest fixture and the shape a real deployment publishes.
+def _policy_role_names() -> tuple[str, ...]:
+    return tuple(name for name, _, _, _ in authority_module.PRODUCTION_ROLE_POLICY)
+
+
+def _instances_for(name: str) -> list[str]:
+    for role, _, _, instanced in authority_module.PRODUCTION_ROLE_POLICY:
+        if role == name:
+            return [f"svc-{hashlib.sha256(name.encode()).hexdigest()}"] if instanced else []
+    raise AssertionError(name)
+
+
+def _policy_profile_roles() -> dict[str, object]:
+    return {
+        name: {
+            "module": module,
+            "environment_allowlist": list(environment),
+            "instances": _instances_for(name),
+        }
+        for name, module, environment, _ in authority_module.PRODUCTION_ROLE_POLICY
+    }
+
+
+def _policy_module(name: str) -> str:
+    for role, module, _, _ in authority_module.PRODUCTION_ROLE_POLICY:
+        if role == name:
+            return module
+    raise AssertionError(name)
+
+
+def _fan_out(value: object) -> dict[str, object]:
+    """One spec across every policy role, with each role's own module substituted in.
+
+    `_validate_slot_against_profile` compares the slot's module to the profile's, so the
+    fan-out cannot use a single module for roles the policy maps elsewhere.
+    """
+
+    result: dict[str, object] = {}
+    given = value["module"] if isinstance(value, dict) else value.module
+    for name in _policy_role_names():
+        # A caller that deliberately supplied another module is injecting a fault; leave it
+        # alone so the fault still fires. Only the default fans out to each role's own.
+        module = _policy_module(name) if given == "rquant.runtime_service_main" else given
+        if isinstance(value, dict):
+            result[name] = {**value, "module": module}
+        else:
+            result[name] = dataclasses.replace(value, module=module)
+    return result
+
+
 def _role_payload(generation: Path) -> dict[str, object]:
     return {
         "python_path": str(generation / "venv" / "bin" / "python"),
@@ -154,7 +204,7 @@ def _slot_payload(
         "commit": f"untrusted-{marker}",
         "full_manifest_hash": generation_id,
         "profile_id": _profile_payload()["profile_id"],
-        "roles": {"daily": _role_payload(generation)},
+        "roles": _fan_out(_role_payload(generation)),
     }
 
 
@@ -291,6 +341,10 @@ def _materialize_generation_slot(
         "pyvenv.cfg": pyvenv_payload,
         "release/src/rquant/__init__.py": b"",
         "release/src/rquant/runtime_service_main.py": b"def main():\n    return 0\n",
+        # The expanded role policy maps two roles onto other modules, and publication
+        # requires every allowlisted module to have a unique regular source in the tree.
+        "release/src/rquant/page_control_service.py": b"def main():\n    return 0\n",
+        "release/src/rquant/runtime_recovery_service.py": b"def main():\n    return 0\n",
         "venv/bin/python": marker.encode("utf-8"),
     }
     files.update(extra_files or {})
@@ -372,7 +426,7 @@ def _materialize_generation_slot(
         {
             "schema_id": "rquant-full-manifest/v1",
             "profile_id": manifest_profile_id or _profile_payload()["profile_id"],
-            "roles": {"daily": manifest_role},
+            "roles": _fan_out(manifest_role),
             "entries": sorted(entries, key=lambda entry: entry["path"]),
         },
         trailing_newline=True,
@@ -395,8 +449,8 @@ def _materialize_generation_slot(
         commit=f"untrusted-{marker}",
         full_manifest_hash=generation_id,
         profile_id=_profile_payload()["profile_id"],
-        roles={
-            "daily": authority_module._parse_role(
+        roles=_fan_out(
+            authority_module._parse_role(
                 relative_role
                 | {
                     "python_path": str(generation / relative_role["python_path"]),
@@ -407,7 +461,7 @@ def _materialize_generation_slot(
                     ],
                 }
             )
-        },
+        ),
     )
 
 
@@ -840,7 +894,7 @@ def test_record_v1_parses_complete_current_and_nullable_prior(
     assert record.state is RuntimeAuthorityState.ACTIVE
     assert record.prior is None
     assert record.current.generation_id == record.current.full_manifest_hash
-    assert tuple(record.current.roles) == ("daily",)
+    assert tuple(record.current.roles) == tuple(sorted(_policy_role_names()))
 
     with_prior = parse_runtime_authority_record(
         canonical_json_bytes(_record_payload(generation_root, prior_marker="prior"))
@@ -1111,12 +1165,7 @@ def test_hyb1_p1_01_profile_binds_roots_operations_roles_and_manifest() -> None:
         quarantine_root="/var/lib/rquant/runtime-authority/quarantine",
         generation_root="/var/lib/rquant/runtime-authority/generations",
         allowed_operations=["publish", "rollback"],
-        roles={
-            "daily": {
-                "module": "rquant.runtime_service_main",
-                "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
-            }
-        },
+        roles=_policy_profile_roles(),
         manifest_schema={
             "schema_id": "rquant-full-manifest/v1",
             "entry_types": ["directory", "file"],

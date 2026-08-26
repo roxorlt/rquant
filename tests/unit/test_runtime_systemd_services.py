@@ -106,7 +106,9 @@ def test_artifact_retention_oneshot_and_timer_are_static_production_contracts() 
         "capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/"
         f"{RETENTION_INSTANCE}/current.cred"
     )
-    assert unit["ExecStart"] == f"{ARBITER_PREFIX}{WRAPPER_COMMAND} artifact_retention"
+    assert unit["ExecStart"] == (
+        f"{ARBITER_PREFIX}{WRAPPER_COMMAND} artifact_retention --instance {RETENTION_INSTANCE}"
+    )
     assert f"manifests/{RETENTION_INSTANCE}.json" not in unit["ExecStart"]
     assert "EnvironmentFile" not in unit
     assert set(unit["ReadWritePaths"].split()) == {
@@ -151,7 +153,7 @@ def test_daily_close_source_is_a_dedicated_least_privilege_live_unit() -> None:
     service = parser["Service"]
     assert service["Type"] == "simple"
     assert service["Slice"] == "rquant-live.slice"
-    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_close_source")
+    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_close_source --instance %i")
     assert set(service["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/daily-close-sources/%i",
         f"{RUNTIME_ROOT}/live/daily-close",
@@ -170,7 +172,7 @@ def test_watchlist_quote_has_an_independent_least_privilege_live_unit() -> None:
     service = parser["Service"]
 
     assert service["Slice"] == "rquant-live.slice"
-    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} watchlist_quote_source")
+    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} watchlist_quote_source --instance %i")
     assert "LoadCredentialEncrypted" not in service
     assert set(service["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
@@ -193,7 +195,7 @@ def test_shadow_session_is_a_readonly_legacy_consumer_with_its_own_report_root()
     service = parser["Service"]
     assert service["Type"] == "simple"
     assert service["Slice"] == "rquant-research.slice"
-    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} shadow_session")
+    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} shadow_session --instance %i")
     assert set(service["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/shadow-sessions/%i",
         f"{RUNTIME_ROOT}/research/shadow-reports",
@@ -221,7 +223,9 @@ def test_daily_orchestrator_is_an_unenabled_shadow_fan_in_oneshot() -> None:
     unit = service["Service"]
     assert unit["Type"] == "oneshot"
     assert unit["Slice"] == "rquant-research.slice"
-    assert unit["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_pipeline_orchestrator")
+    assert unit["ExecStart"].endswith(
+        f"{WRAPPER_COMMAND} daily_pipeline_orchestrator --instance %i"
+    )
     assert unit["Restart"] == "no"
     assert unit["NoNewPrivileges"] == "true"
     assert unit["PrivateTmp"] == "true"
@@ -392,7 +396,7 @@ def test_runtime_template_runs_the_fixed_root_owned_wrapper(plane: str) -> None:
     if plane in DEDICATED_RESEARCH_TEMPLATES:
         assert command.startswith(ARBITER_PREFIX)
         command = command.removeprefix(ARBITER_PREFIX)
-    assert command == f"{WRAPPER_COMMAND} {TEMPLATE_ROLES[plane]}"
+    assert command == f"{WRAPPER_COMMAND} {TEMPLATE_ROLES[plane]} --instance %i"
 
 
 @pytest.mark.parametrize("plane", TEMPLATES)
@@ -404,10 +408,13 @@ def test_runtime_template_carries_no_retired_authority_input(plane: str) -> None
     assert FORBIDDEN_EXECUTABLE not in command
     assert RETIRED_MODULE not in command
     assert CURRENT_ROOT not in command
-    assert "%i" not in command
     assert "${" not in command
     for retired in ("--manifest", "--control-root", "--expected-commit", "--expected-generation"):
         assert retired not in command
+    # `%i` survives only as the instance label, and the wrapper accepts it only if the
+    # root-owned profile already lists it (ruling D-2: a lookup key, not an authority value).
+    assert command.count("%i") == 1
+    assert command.endswith("--instance %i")
 
 
 def test_every_protected_unit_names_a_wrapper_allowlisted_role() -> None:
@@ -422,7 +429,9 @@ def test_every_protected_unit_names_a_wrapper_allowlisted_role() -> None:
         command = parser["Service"]["ExecStart"]
 
         assert role in PROTECTED_ROLES, role
-        assert command.endswith(f"{WRAPPER_COMMAND} {role}"), name
+        expected = f"{WRAPPER_COMMAND} {role}"
+        assert command.startswith(ARBITER_PREFIX) or command.startswith(expected), name
+        assert expected in command, name
 
 
 def test_no_new_unit_still_reads_the_application_written_runtime_environment() -> None:
@@ -727,7 +736,7 @@ def test_recovery_oneshot_is_isolated_bounded_and_does_not_control_live(
     # P1-3 / ruling D-2: the generation is no longer a `%i` argument the caller chooses.
     # The wrapper reads it out of the root-owned `current.json` and refuses anything else.
     role = "runtime_recovery" if action == "execute" else "runtime_recovery_rehearsal"
-    assert command.removeprefix(ARBITER_PREFIX) == f"{WRAPPER_COMMAND} {role}"
+    assert command.removeprefix(ARBITER_PREFIX) == f"{WRAPPER_COMMAND} {role} --instance %i"
     assert "--expected-profile-generation" not in command
     assert set(service["SuccessExitStatus"].split()) == {"0", "75"}
     for duplicated in (

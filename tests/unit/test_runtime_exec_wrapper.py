@@ -81,7 +81,14 @@ def _canonical(value: Any, *, newline: bool = False) -> bytes:
 class World:
     """A complete root-owned runtime world, rooted at `tmp_path`."""
 
-    def __init__(self, root: Path, *, profile_role_overrides: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        profile_role_overrides: dict[str, Any] | None = None,
+        whole_policy: bool = False,
+    ) -> None:
+        self.whole_policy = whole_policy
         self.profile_role_overrides = dict(profile_role_overrides or {})
         self.root = root
         self.trusted_root = root
@@ -212,15 +219,46 @@ class World:
             "quarantine_root": "/var/lib/rquant/runtime-authority/quarantine",
             "generation_root": str(self.generation_root),
             "allowed_operations": ["publish", "rollback"],
-            "roles": {
+            "roles": self._profile_roles(),
+            "manifest_schema": {"schema_id": "rquant-full-manifest/v1"},
+        }
+
+    def _profile_roles(self) -> dict[str, Any]:
+        if not self.whole_policy:
+            return {
                 ROLE: {
                     "module": MODULE,
                     "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
                     "instances": list(INSTANCES),
                     **self.profile_role_overrides,
                 }
-            },
-            "manifest_schema": {"schema_id": "rquant-full-manifest/v1"},
+            }
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        return {
+            name: {
+                "module": module,
+                "environment_allowlist": list(environment),
+                "instances": (
+                    sorted(
+                        "svc-" + hashlib.sha256(f"{name}-{index}".encode()).hexdigest()
+                        for index in range(2)
+                    )
+                    if instanced
+                    else []
+                ),
+            }
+            for name, module, environment, instanced in PRODUCTION_ROLE_POLICY
+        }
+
+    def _slot_roles(self, generation: Path) -> dict[str, Any]:
+        if not self.whole_policy:
+            return {ROLE: self._role_spec(generation)}
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        return {
+            name: {**self._role_spec(generation), "module": module}
+            for name, module, _, _ in PRODUCTION_ROLE_POLICY
         }
 
     def _write_profile(self) -> None:
@@ -234,7 +272,12 @@ class World:
         manifest_document = {
             "schema_id": "rquant-full-manifest/v1",
             "profile_id": self.profile_id,
-            "roles": {ROLE: {"module": MODULE}},
+            "roles": {
+                name: {"module": spec["module"]}
+                for name, spec in self._slot_roles(
+                    self.generation_root / "placeholder"
+                ).items()
+            },
             "entries": self._entries,
         }
         manifest_bytes = _canonical(manifest_document, newline=True)
@@ -257,7 +300,7 @@ class World:
             "commit": "0" * 40,
             "full_manifest_hash": generation_id,
             "profile_id": self.profile_id,
-            "roles": {ROLE: self._role_spec(generation)},
+            "roles": self._slot_roles(generation),
         }
         record: dict[str, Any] = {
             "schema_version": 1,
@@ -282,7 +325,11 @@ class World:
 
     def resolve(self, role: str = ROLE, **overrides: Any) -> dict[str, Any]:
         arguments: dict[str, Any] = {
-            "instance": INSTANCES[0],
+            "instance": (
+                self._profile_roles()[role]["instances"][0]
+                if self._profile_roles().get(role, {}).get("instances")
+                else None
+            ),
             "profile_path": str(self.profile_path),
             "authority_path": str(self.authority_path),
             "generation_root": str(self.generation_root),
@@ -931,3 +978,74 @@ class TestDeterministicBuild:
         # On a host where `/etc` is not a canonical root-owned directory the anchored walk
         # refuses even earlier than the profile read; both are the same fail-closed outcome.
         assert "runtime profile" in completed.stderr or "ancestor" in completed.stderr
+
+
+# ---------------------------------------------------------------------------------------
+# Every protected unit, every instance: one distinct, correct launch
+# ---------------------------------------------------------------------------------------
+
+
+class TestEveryProtectedUnitResolves:
+    """Codex round-2 P1-2 acceptance: 25 units must be startable, not 0.
+
+    Before the role policy was expanded, `PRODUCTION_ROLE_POLICY` froze the single `daily`
+    role, so every one of the 25 protected units died in `select_role` with "the runtime
+    profile does not declare the requested role" — a fail-closed refusal, but a production
+    entry point that could never start. This builds one world declaring the whole policy and
+    resolves a launch for each unit's role and each of its authorised instances.
+    """
+
+    @staticmethod
+    def _instances(world: World, role: str) -> tuple[str, ...]:
+        return tuple(world._profile_roles()[role]["instances"])
+
+    def test_every_protected_role_resolves_for_every_authorised_instance(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        world = _build_world(tmp_path, whole_policy=True)
+        resolved: dict[tuple[str, str | None], dict[str, Any]] = {}
+
+        for role, module, _, _ in PRODUCTION_ROLE_POLICY:
+            labels: tuple[str | None, ...] = self._instances(world, role) or (None,)
+            for label in labels:
+                launch = world.resolve(role, instance=label)
+                assert launch["role"] == role
+                assert launch["module"] == module
+                assert launch["instance"] == label
+                assert Path(launch["python_path"]).is_relative_to(world.generation_path)
+                assert Path(launch["app_source"]).is_relative_to(world.generation_path)
+                resolved[(role, label)] = launch
+
+        assert len(resolved) == 2 * 24 + 2  # 24 instanced roles x 2 labels, 2 plain roles
+        signatures = {
+            (launch["role"], launch["instance"]) for launch in resolved.values()
+        }
+        assert len(signatures) == len(resolved), "each unit instance must be distinguishable"
+
+    def test_every_unit_role_is_declared_by_the_expanded_policy(self) -> None:
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        declared = {name for name, _, _, _ in PRODUCTION_ROLE_POLICY}
+
+        assert set(_verify.PROTECTED_ROLES) == declared
+        assert len(declared) == 26
+
+    def test_an_unauthorised_instance_is_refused_for_every_instanced_role(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        world = _build_world(tmp_path, whole_policy=True)
+
+        for role, _, _, instanced in PRODUCTION_ROLE_POLICY:
+            if not instanced:
+                continue
+            with pytest.raises(
+                _verify.RuntimeExecError,
+                match="not in the root-owned allowlist",
+            ):
+                world.resolve(role, instance="svc-" + "f" * 64)

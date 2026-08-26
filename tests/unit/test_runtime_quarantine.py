@@ -92,10 +92,14 @@ def _profile_payload(
         "generation_root": str(generations),
         "allowed_operations": ["publish", "rollback"],
         "roles": {
-            "daily": {
-                "module": "rquant.runtime_service_main",
-                "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
+            name: {
+                "module": module,
+                "environment_allowlist": list(environment),
+                "instances": (
+                    [f"svc-{hashlib.sha256(name.encode()).hexdigest()}"] if instanced else []
+                ),
             }
+            for name, module, environment, instanced in authority_module.PRODUCTION_ROLE_POLICY
         },
         "manifest_schema": {
             key: list(value) if isinstance(value, tuple) else value
@@ -159,6 +163,10 @@ def _make_candidate(
         "pyvenv.cfg": b"include-system-site-packages = false\n",
         "release/src/rquant/__init__.py": b"",
         "release/src/rquant/runtime_service_main.py": b"def main():\n    return 0\n",
+        # The expanded role policy maps two roles onto other modules, and publication
+        # requires every allowlisted module to have a unique regular source in the tree.
+        "release/src/rquant/page_control_service.py": b"def main():\n    return 0\n",
+        "release/src/rquant/runtime_recovery_service.py": b"def main():\n    return 0\n",
         "venv/bin/python": b"python executable bytes\n",
     }
     files.update(extra_files or {})
