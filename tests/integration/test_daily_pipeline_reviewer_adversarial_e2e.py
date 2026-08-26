@@ -325,7 +325,15 @@ orchestrator = DailyPipelineOrchestrator(
     adapters=(manifest.adapter_for("capture"),),
     source_resolver=Source(),
     clock=lambda: datetime.now(UTC),
-    lease_for=timedelta(milliseconds=int(os.environ["RQUANT_TEST_LEASE_MS"])),
+    lease_for=timedelta(
+        milliseconds=int(
+            os.environ[
+                "RQUANT_TEST_RECOVER_LEASE_MS"
+                if sys.argv[1] == "recover"
+                else "RQUANT_TEST_LEASE_MS"
+            ]
+        )
+    ),
 )
 action = sys.argv[1]
 if action == "start":
@@ -358,26 +366,41 @@ else:
 def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -> None:
     driver = tmp_path / "expiring_fence_driver.py"
     _write_expiring_fence_driver(driver)
-    # The parent has to reach its external effect while still holding the lease;
-    # the expiry is what the recovery half of the case is about. A fixed 250ms
-    # made one constant do both jobs, and on a shared runner the parent lost its
-    # own lease mid-advance and died with LeaseLost before writing the marker.
-    # Size the lease from what a process start costs here instead.
+    # One constant used to serve two leases with opposite requirements, which is
+    # why sizing it either way broke the other half of the case.
+    #
+    # The parent's lease has to be *short*. The stage child writes the external
+    # effect, sleeps 0.8s and only then tries to publish its receipt; the parent
+    # is killed in between, and what makes that publication fail is the fence
+    # having expired by the time the orphan gets there. Anything approaching
+    # 0.8s lets the orphan commit and the "nothing was committed" assertion
+    # fails. It does not need to cover the parent reaching the marker: if the
+    # parent loses its own lease after the child has written it, the case is in
+    # exactly the state it wants to be in.
+    parent_lease_seconds = 0.25
+    # The recovery's lease has to be *long*: it re-runs the whole stage, which
+    # is a fresh interpreter importing this surface, and it heartbeats while it
+    # does. Sized against a bare `python -I -S -c pass` it was half a second on
+    # a CI runner - a runner starts one about as fast as this laptop, so that
+    # measurement carried no signal - and `advance()` died with
+    # `LeaseLost: writer lease is stale`. The cost that actually varies is an
+    # interpreter start plus the import, so that is what gets measured.
     started = time.monotonic()
     subprocess.run(
-        (sys.executable, "-I", "-S", "-c", "pass"),
+        (sys.executable, "-c", "import rquant.daily_pipeline_orchestrator"),
         check=True,
         capture_output=True,
-        timeout=60,
+        timeout=120,
     )
-    process_start_seconds = time.monotonic() - started
-    lease_seconds = max(0.25, 25 * process_start_seconds)
+    stage_start_seconds = time.monotonic() - started
+    recover_lease_seconds = max(1.0, 4 * stage_start_seconds)
     environment = {
         **os.environ,
         "PYTHONPATH": _pythonpath(),
         "RQUANT_DAILY_EXTERNAL_RECEIPT_KEY_ID": "daily-stage-1",
         "RQUANT_DAILY_EXTERNAL_RECEIPT_SECRET": "s" * 32,
-        "RQUANT_TEST_LEASE_MS": str(int(lease_seconds * 1000)),
+        "RQUANT_TEST_LEASE_MS": str(int(parent_lease_seconds * 1000)),
+        "RQUANT_TEST_RECOVER_LEASE_MS": str(int(recover_lease_seconds * 1000)),
     }
     parent = subprocess.Popen(
         (sys.executable, str(driver), "start", str(tmp_path)),
@@ -396,8 +419,10 @@ def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -
     parent.kill()
     parent.wait(timeout=30)
     # Wait out the lease the parent was holding, plus a margin, so the fence is
-    # provably expired before asserting that nothing was committed.
-    time.sleep(lease_seconds + 0.5)
+    # provably expired - and past the orphaned stage child's 0.8s sleep, so its
+    # refused publication has provably already been attempted - before asserting
+    # that nothing was committed.
+    time.sleep(parent_lease_seconds + 1.3)
     storage_profile = _storage_profile(tmp_path)
     assert not list(storage_profile.receipt_root.glob("*.json"))
 

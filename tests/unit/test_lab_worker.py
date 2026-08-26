@@ -138,6 +138,24 @@ def _child_startups(count: float) -> float:
     return _observe(_CHILD_STARTUP_SECONDS * count)
 
 
+def _await_markers(*paths: Path, budget: float) -> None:
+    """Wait for every marker a spawned child writes before acting on it.
+
+    These cases used to synchronise on the blocked callback's marker alone and
+    then assert, afterwards, that the shard child had recorded its session pid.
+    Both children exist by then on a fast host, so the second fact looked
+    implied by the first; on a slower one the shard child was still starting
+    when the case requested a stop, and it was reaped before it ever wrote.
+    The precondition the later assertions need is that *both* children are
+    observable, so both are waited for.
+    """
+    deadline = time.monotonic() + budget
+    for path in paths:
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert path.exists(), f"child marker never appeared: {path}"
+
+
 def _probe_ceiling(timeout_seconds: float) -> float:
     """The ceiling a standalone probe declares: its timeout plus one child.
 
@@ -4557,10 +4575,11 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + _child_startups(2)
-        while not callback_entered_path.exists() and time.monotonic() < entered_deadline:
-            time.sleep(0.01)
-        assert callback_entered_path.exists()
+        _await_markers(
+            callback_entered_path,
+            child_pid_path,
+            budget=_child_startups(3),
+        )
         started = time.monotonic()
         if termination == "stop":
             worker.request_stop()
@@ -4649,10 +4668,12 @@ def test_blocked_initial_quota_gate_stop_reaps_authority_child_and_lease(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + _child_startups(2)
-        while not callback_entered_path.exists() and time.monotonic() < entered_deadline:
-            time.sleep(0.01)
-        assert callback_entered_path.exists()
+        _await_markers(
+            callback_entered_path,
+            child_pid_path,
+            authority_pid_path,
+            budget=_child_startups(3),
+        )
         started = time.monotonic()
         worker.request_stop()
         runner.join(timeout=_observe(1.1))
@@ -12542,6 +12563,13 @@ def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Pa
         tmp_path,
         claims=claims,
         reports=reports,
+        # The receipts this case waits for are produced by the scheduler it
+        # drives by hand below, for _observe(2). The default 0.2s receipt wait
+        # is ten times shorter than that loop, so on a host where one
+        # `scheduler.run_once()` costs more than a few milliseconds the worker
+        # gave up first and reported 'awaiting_receipt'. The wait has to
+        # outlast the window the case is willing to feed it.
+        receipt_timeout_seconds=_observe(2),
         receipt_waiter=None,
     )
     outcomes = []
@@ -12707,6 +12735,10 @@ def test_hard_crash_after_rename_is_reclaimed_before_generation_two_runs(
         tmp_path,
         claims=claims,
         reports=reports,
+        # Same reason as the sibling case above: the receipts come from the
+        # scheduler this case drives for _observe(3), so the worker's own
+        # receipt wait cannot be the 0.2s default.
+        receipt_timeout_seconds=_observe(3),
         receipt_waiter=None,
         clock=lambda: clock[0],
     )
