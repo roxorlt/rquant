@@ -211,27 +211,55 @@ def _regenerated_production_declarations(
     return declarations
 
 
+def _entrypoint_node(tree: ast.Module, entrypoint: str, *, module: str) -> ast.AST:
+    """Resolve one boundary probe's declared entrypoint to its exact definition node.
+
+    ``source_span`` is only a line anchor, and a line anchor silently re-aims at whatever
+    definition happens to occupy that line after an unrelated edit above it. ``entrypoint``
+    is the reviewed name, so the span is derived from it rather than trusted as input.
+    """
+
+    prefix = f"rquant.{module}."
+    if not entrypoint.startswith(prefix):
+        raise ValueError(f"boundary entrypoint does not name its own module: {entrypoint}")
+    body: list[ast.stmt] = list(tree.body)
+    node: ast.AST | None = None
+    for part in entrypoint[len(prefix) :].split("."):
+        node = next(
+            (
+                item
+                for item in body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and item.name == part
+            ),
+            None,
+        )
+        if node is None:
+            raise ValueError(f"boundary entrypoint is missing: {entrypoint}")
+        body = list(node.body)  # type: ignore[attr-defined]
+    if node is None:
+        raise ValueError(f"boundary entrypoint is empty: {entrypoint}")
+    return node
+
+
 def _regenerated_boundary_probes(
     payload: list[dict[str, Any]],
     read: Callable[[str], bytes],
 ) -> list[dict[str, Any]]:
     probes: list[dict[str, Any]] = []
     for probe in payload:
-        filename, line_text = probe["source_span"].rsplit(":", 1)
+        filename = probe["source_span"].rsplit(":", 1)[0]
         module_path = f"src/rquant/{filename}"
         source = read(module_path).decode("utf-8")
         tree = ast.parse(source, filename=module_path)
-        line = int(line_text)
-        candidates = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and node.lineno <= line <= (node.end_lineno or node.lineno)
-        ]
-        if not candidates:
-            raise ValueError(f"boundary source anchor is missing: {probe['inventory_id']}")
-        node = min(candidates, key=lambda item: (item.end_lineno or item.lineno) - item.lineno)
-        probes.append({**probe, "boundary_ast_sha256": normalized_ast_sha256(node)})
+        node = _entrypoint_node(tree, probe["entrypoint"], module=filename.removesuffix(".py"))
+        probes.append(
+            {
+                **probe,
+                "source_span": f"{filename}:{node.lineno}",  # type: ignore[attr-defined]
+                "boundary_ast_sha256": normalized_ast_sha256(node),
+            }
+        )
     return probes
 
 
