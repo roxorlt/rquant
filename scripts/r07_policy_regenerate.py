@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -211,28 +213,124 @@ def _regenerated_production_declarations(
     return declarations
 
 
+def _entrypoint_node(tree: ast.Module, entrypoint: str, *, module: str) -> ast.AST:
+    """Resolve one boundary probe's declared entrypoint to its exact definition node.
+
+    ``source_span`` is only a line anchor, and a line anchor silently re-aims at whatever
+    definition happens to occupy that line after an unrelated edit above it. ``entrypoint``
+    is the reviewed name, so the span is derived from it rather than trusted as input.
+    """
+
+    prefix = f"rquant.{module}."
+    if not entrypoint.startswith(prefix):
+        raise ValueError(f"boundary entrypoint does not name its own module: {entrypoint}")
+    body: list[ast.stmt] = list(tree.body)
+    node: ast.AST | None = None
+    for part in entrypoint[len(prefix) :].split("."):
+        node = next(
+            (
+                item
+                for item in body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and item.name == part
+            ),
+            None,
+        )
+        if node is None:
+            raise ValueError(f"boundary entrypoint is missing: {entrypoint}")
+        body = list(node.body)  # type: ignore[attr-defined]
+    if node is None:
+        raise ValueError(f"boundary entrypoint is empty: {entrypoint}")
+    return node
+
+
 def _regenerated_boundary_probes(
     payload: list[dict[str, Any]],
     read: Callable[[str], bytes],
 ) -> list[dict[str, Any]]:
     probes: list[dict[str, Any]] = []
     for probe in payload:
-        filename, line_text = probe["source_span"].rsplit(":", 1)
+        filename = probe["source_span"].rsplit(":", 1)[0]
         module_path = f"src/rquant/{filename}"
         source = read(module_path).decode("utf-8")
         tree = ast.parse(source, filename=module_path)
-        line = int(line_text)
-        candidates = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and node.lineno <= line <= (node.end_lineno or node.lineno)
-        ]
-        if not candidates:
-            raise ValueError(f"boundary source anchor is missing: {probe['inventory_id']}")
-        node = min(candidates, key=lambda item: (item.end_lineno or item.lineno) - item.lineno)
-        probes.append({**probe, "boundary_ast_sha256": normalized_ast_sha256(node)})
+        node = _entrypoint_node(tree, probe["entrypoint"], module=filename.removesuffix(".py"))
+        probes.append(
+            {
+                **probe,
+                "source_span": f"{filename}:{node.lineno}",  # type: ignore[attr-defined]
+                "boundary_ast_sha256": normalized_ast_sha256(node),
+            }
+        )
     return probes
+
+
+def _refreshed_boundary_snapshots(
+    repo: Path,
+    payload: list[dict[str, Any]],
+    *,
+    policy_path: Path,
+) -> list[dict[str, Any]]:
+    """Re-observe every boundary probe's no-mutation snapshot digest by running the probe.
+
+    These two digests are a property of the production store the probe touches, so any
+    schema change to a probed database moves them. They cannot be derived statically: the
+    only honest source is an actual probe run, and the run must still show the boundary
+    rejecting before it mutates anything, which is exactly what is asserted here before a
+    refreshed digest is accepted.
+
+    Off by default because it spawns one subprocess per probe. Pass
+    ``--refresh-boundary-snapshots`` after changing a probed store's schema.
+    """
+
+    sys.path.insert(0, str(repo))
+    from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
+
+    refreshed: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="rquant-r07-refresh-") as directory:
+        root = Path(directory)
+        for index, probe in enumerate(payload):
+            inventory_id = probe["inventory_id"]
+            if probe["variant"] == "static_only":
+                # `static_only` rows have no dynamic runner: their evidence is the static
+                # snapshot universe, and their digests do not observe any store.
+                refreshed.append(dict(probe))
+                continue
+            try:
+                observed = run_boundary_probe_subprocess(
+                    policy_path=policy_path,
+                    candidate_root=repo,
+                    inventory_id=inventory_id,
+                    tmp_path=root / f"probe-{index:02d}",
+                )
+            except AssertionError as exc:
+                # The child exits nonzero whenever `passed` is false, and a stale snapshot
+                # digest is exactly that case, so the run this refresh exists for always
+                # lands here. Its own result JSON is still the payload; anything that is
+                # not that JSON is a real failure and propagates.
+                try:
+                    observed = json.loads(str(exc))
+                except ValueError:
+                    raise exc from None
+                if not isinstance(observed, dict) or observed.get("inventory_id") != inventory_id:
+                    raise exc from None
+            before = observed["before_snapshot_digest"]
+            after = observed["after_snapshot_digest"]
+            if before != after:
+                raise ValueError(f"boundary probe mutated observable state: {inventory_id}")
+            if observed["reached_count"] != 1:
+                raise ValueError(f"boundary probe did not reach its sentinel once: {inventory_id}")
+            guards = observed["mutation_guard_counts"]
+            if not isinstance(guards, dict) or any(guards.values()):
+                raise ValueError(f"boundary probe tripped a mutation guard: {inventory_id}")
+            refreshed.append(
+                {
+                    **probe,
+                    "before_snapshot_digest": before,
+                    "after_snapshot_digest": after,
+                }
+            )
+    return refreshed
 
 
 def regenerate_policy_bytes(
@@ -241,6 +339,8 @@ def regenerate_policy_bytes(
     *,
     baseline_ref: str = DEFAULT_BASELINE_REF,
     candidate: str | None = "HEAD",
+    refresh_boundary_snapshots: bool = False,
+    policy_path: Path | None = None,
 ) -> bytes:
     """Re-derive every baseline-, diff-, and source-derived policy field, then re-digest."""
 
@@ -268,6 +368,14 @@ def regenerate_policy_bytes(
         read,
     )
     payload["boundary_probes"] = _regenerated_boundary_probes(payload["boundary_probes"], read)
+    if refresh_boundary_snapshots:
+        if policy_path is None:
+            raise ValueError("refreshing boundary snapshots needs the on-disk policy path")
+        payload["boundary_probes"] = _refreshed_boundary_snapshots(
+            repo,
+            payload["boundary_probes"],
+            policy_path=policy_path,
+        )
     payload["fixtures_digest"] = fixture_manifest_digest(
         tuple(_validated(differential_gate.FixtureValueV1, value) for value in payload["fixtures"]),
         tuple(
@@ -311,6 +419,11 @@ def _parse_args(arguments: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="derive the policy from the Git index so one commit stays self-consistent",
     )
+    parser.add_argument(
+        "--refresh-boundary-snapshots",
+        action="store_true",
+        help="re-observe each boundary probe's no-mutation snapshot digest by running it",
+    )
     parser.add_argument("--check", action="store_true")
     return parser.parse_args(arguments)
 
@@ -325,6 +438,8 @@ def main(arguments: list[str] | None = None) -> int:
         policy_path.read_bytes(),
         baseline_ref=args.baseline_ref,
         candidate=None if args.staged else args.candidate,
+        refresh_boundary_snapshots=args.refresh_boundary_snapshots,
+        policy_path=policy_path,
     )
     if args.check:
         current = policy_path.read_bytes()

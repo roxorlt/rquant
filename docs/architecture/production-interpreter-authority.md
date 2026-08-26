@@ -630,6 +630,15 @@ The same directory-fsync obligation applies whether retry observed a freshly cre
 identical pre-existing target.
 
 This is a frozen later-writer contract and crash red test, not a Phase A implementation grant.
+Amended per Codex round-2 order 2026-08-25, ruling 5: the two obligations above —
+re-fsyncing the records directory after an identical post-link retry, and appending conflict
+audit evidence before rejecting differing bytes — are **v3-only**. The untouched v2
+`_immutable_write_at` does neither, and that is its frozen *observed* semantics, not a v2
+compliance claim; v2 keeps only the frozen observation semantics and its bytes do not move.
+The Phase A evidence for the v3 obligations is a **synthetic in-memory state machine**
+(`tests/support/signal_route_spool_crash_matrix.py`, dialects `frozen-v2-observed` and
+`v3-spec`). It is evidence about the frozen contract only and MUST NOT be reported as
+evidence about a real durable current-family writer, because Phase A has none.
 Phase A synthetic fixture construction remains read-only/in-memory and cannot import, call, expose,
 or make this primitive reachable through `rquant.runtime_service_main.build_builtin_registry`, its
 builtin factory, any production builder, or any runtime capability. No production v3 writer exists
@@ -1217,8 +1226,9 @@ channel_hash
 ```
 
 `producer_service_ids` and `consumer_service_ids` are independently sorted unique tuples of exact
-service IDs. `payload_model` is the authoritative qualified model string and MUST resolve inside the
-generation source closure to the actual class before this declaration can exist. Its exact model
+service IDs, frozen as specified in *Frozen Declaration Domain* below. `payload_model` is the
+authoritative qualified model string and MUST resolve inside the generation source closure to the
+actual class before this declaration can exist. Its exact model
 descriptor preimage and hash are:
 
 ```text
@@ -1354,6 +1364,47 @@ files, noncallable objects, omitted surfaces, and additional surfaces reject. Ch
 starts through the actual manifest-backed production builders above; direct unit construction
 cannot substitute for that path.
 
+#### Frozen Declaration Domain
+
+Amended per Codex round-2 order 2026-08-25, ruling 2. The four schemas above previously accepted
+any nonempty string as a participant service ID, and their channel, family, and identity sets were
+described only in prose. The following sets are now frozen, and all of them live in the leaf module
+`rquant.signal_family_constants` so they can be named by `Literal` annotations without an import
+cycle. Widening any of them requires a new ADR.
+
+**Channels.** The closed set is exactly `signal-envelope/current`,
+`signal-bus-routed-record/current`, and `signal-route-spool-record/current`, each bound to the one
+class it already names. `channel_id` is that closed set at the type layer on both
+`SuccessorChannelV1` and `OverlayDeclarationV1`, and the binding map is immutable.
+
+**Family.** `accepted_family_ids` is frozen to the single current family
+`rquant.signal-envelope/v1`. Legacy envelopes carry no such discriminant and can never appear.
+
+**Bundle identity.** A successor bundle's identity is its namespace
+`rquant.signal-family.successor` and nothing else: exactly one successor base may be registered, so
+a second bundle with different bytes is a conflict on that one identity.
+
+**Overlay identity.** An overlay's identity is the pair
+`(overlay_namespace, base_bundle_content_hash)`. One overlay may be staged per successor base, so
+the same namespace over a different base is a *different* identity rather than a conflict, and the
+conflict audit record spells the identity as `overlay_namespace:base_bundle_content_hash`.
+
+**Participant service IDs.** Every entry of `producer_service_ids` and `consumer_service_ids` MUST
+match the grammar `^[a-z][a-z0-9]*(-[a-z0-9]+)*$` and be at most 64 characters, and MUST name a role
+in the frozen domain: the five exact Phase C role IDs `signal-router`, `shadow-session`, `notifier`,
+`paper-broker`, `serving-publisher`, or the dynamic strategy domain `strategy-live-<segment>`. The
+role domain is per channel and per direction, derived from the frozen five pair rows: strategy
+services produce envelopes; the router and the shadow session consume them; the router produces
+routed and spool records; the notifier and the paper broker consume them. A consumer-only role in a
+producer tuple, a producer-only role in a consumer tuple, a legal role on the wrong channel, an
+unknown role, a case or underscore variant, and an over-length ID all reject.
+
+This domain governs the Phase B declaration schemas only. It is deliberately not propagated to
+`RuntimeServiceManifest.service_id` or `PairBindingV1`: the live production profile issues IDs such
+as `signal-router.all-strategies.v1` and `strategy.n_shape.v1`, which contain dots and underscores
+and do not satisfy the grammar above. Aligning the live topology with this grammar would be a
+production change and requires its own authorization.
+
 #### Exact Verification Service Bindings
 
 `RESET-REG-P1-02` freezes `VerificationServiceBindingV1` in the immutable, root-policy-approved,
@@ -1402,6 +1453,38 @@ selected generation without traversal or symlink escape; matches its relative pa
 the full generation manifest; and resolves every `surface_id` to the exact callable-object allowlist
 entry. Missing, duplicate, cross-role, wrong-kind, wrong-module, wrong-path, wrong-source-hash,
 unmanifested, omitted-surface, or extra-surface bindings reject before any child starts.
+
+#### Alternate Root Authority Identity For The Service-Manifest Document
+
+Amended per Codex round-2 order 2026-08-25, ruling 3. The specification never froze how the
+validated production profile's `RuntimeServiceManifest` tuple reaches a root process that may not
+import a builder. The root reads it from one canonical in-generation document, and that document's
+authority identity is normatively **full manifest membership plus policy-anchored
+`service_manifest_fingerprint`**, not a raw SHA equality against any single pre-existing field:
+
+1. **Membership.** The document is an entry of the full generation manifest, and the manifest's own
+   raw bytes MUST hash to `RuntimeGenerationSlot.full_manifest_hash` before any entry inside it is
+   believed. `full_manifest_hash` is the slot identity and an input to the authority epoch key, so
+   the closure authenticates itself first and repairing an entry row no longer launders a swapped
+   file. A failure is `FULL_MANIFEST_HASH_MISMATCH`.
+2. **Fingerprint anchoring.** Every `manifest_fingerprint` in the document MUST equal the
+   `service_manifest_fingerprint` of the matching `VerificationServiceBindingV1`, and that binding
+   tuple is anchored outside the generation by the root policy through
+   `five_pair_service_binding_set_hash`. Forging a service manifest therefore requires a
+   `manifest_fingerprint` preimage.
+
+An equality against `RuntimeGenerationSlot.profile_id` MUST NOT be required: `RuntimeClosureProfile`
+fixes `profile_id` as the hash of the runtime closure body, which carries no service manifests at
+all, so that equation could only hold on a SHA-256 collision. Requiring it would be an impossible
+condition, not a stronger one.
+
+Both halves are components of the reopened authority identity compared at step 7, together with
+`full_manifest_sha256`, the complete `full_manifest_entries` table, `profile_document_sha256`, and
+every reopened `manifest_fingerprint`; any one of them moving between child exit and append is
+`AUTHORITY_EPOCH_CHANGED` and appends nothing. A document that is self-consistent but absent from
+the full manifest is `BINDING_UNMANIFESTED`, checked independently by both the gateway and the
+verifier, because a gateway is an injected component whose word about closure membership is not
+taken.
 
 #### Fixed Root-Owned Release Verification Policy
 
@@ -1721,8 +1804,8 @@ The planned red-test matrix is exact:
 | IDs | Planned test file/evidence | Required assertions |
 |---|---|---|
 | `RESET-R07-P1` | `tests/fixtures/signal_route_spool_v2_differential/manifest.json`; `tests/unit/test_signal_route_spool_v2_differential.py` | frozen valid and invalid corpus proves untouched v2 bytes, `ensure_ascii=True`, hashes, models, and public error category/sequence before and after dispatcher introduction |
-| `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
-| `RESET-R07-P2-01` | future `tests/unit/test_current_signal_route_spool_v3_publication_contract.py` in the separately authorized writer tranche | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
+| `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_signal_route_spool_r07_v3.py`; `tests/unit/test_signal_route_spool_r07_v3_fixtures.py` (Amended per Codex round-2 order 2026-08-25, ruling 5: the planned name `test_current_signal_route_spool_record_v3.py` was never the delivered file name) | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
+| `RESET-R07-P2-01` | Amended per Codex round-2 order 2026-08-25, ruling 5: no file of that name exists or may be created in Phase A. The frozen v3-only contract is asserted today as the `v3-spec` dialect of the synthetic model in `tests/support/signal_route_spool_crash_matrix.py`, exercised from `tests/unit/test_signal_route_spool_r07_v3.py`; the real publication-contract test belongs to the separately authorized writer tranche and its file name is not fixed here | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
 | `R07-DR-P1-01` | `tests/unit/test_signal_family_differential_gate.py::TestCompleteRepoDiff`; `tests/fixtures/r07_differential_gate/policy-v1.json` | full raw Git diff covers every path, add/modify/delete, mode change, and rename-as-delete-plus-add; unlisted docs/tests/workflows/dependencies/scripts/deploy changes and declaration AST drift block |
 | `R07-DR-P1-02` | `tests/unit/test_signal_family_differential_boundaries.py` | every inventory row's declared direct/stored-byte/batch form uses exact scalar/bytes/composite fixtures, exact args/kwargs, expected failure, guards, and unchanged database/filesystem/outbox/pointer snapshots; cyclic/malformed/composite drift and early rejection block |
 | `R07-DR-P1-03` | `tests/unit/test_signal_family_differential_gate.py::TestRootSnapshots`; `tests/unit/test_signal_family_differential_gate.py::TestForbiddenDefinitions` | all ten root signatures/exports/source ASTs and the static forbidden-definition universe pass without import, construction, closure traversal, or bytecode analysis; every forbidden definition/alias/export/key blocks |
@@ -1730,7 +1813,7 @@ The planned red-test matrix is exact:
 | `R07-DR-SPEC-P1-01` | `tests/unit/test_signal_family_differential_boundaries.py::TestProbeSetup`; `::TestCallShape`; `::TestBoundaryReachedSentinel`; `::TestCompleteInventoryMatrix` | B01 identity fence observes the exact replacement once and never claims construction; B03 rejects only during one `consume_tuple`; B09 and B16 receive current inputs only through exact source-result calls; all receiver/source-result bindings and B01..B19 matrix rows match source anchors; every row reaches one sentinel, every mutation guard is zero, and all post-setup before/after snapshots are equal; wrong phase/receiver/result/action, setup exception, early rejection, missing/duplicate sentinel, and drift block |
 | `R07-DR-SPEC-P1-02` | `tests/unit/test_signal_family_differential_evidence.py`; `tests/unit/test_production_deploy.py::TestR07Bootstrap` | PR/tag/manual/non-main, failed/partial/skipped, wrong SHA/tree/run/artifact/path/cache, duplicate/extra JSON, and disabled post-bootstrap evidence block; Release A audits bootstrap-disabled once, Release B verifies enforced evidence before checkout, pre-checkout failure leaves services untouched, and post-checkout failure rolls back exactly |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
-| `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
+| `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts; Amended per Codex round-2 order 2026-08-25, ruling 3: the alternate authority identity is covered end to end — self-authenticating full manifest, repaired-entry rejection, unmanifested document rejection at both the gateway and the verifier, a forged manifest the bindings do not fingerprint, the absence of any `profile_id` equation, and step 7 rejection when `full_manifest_sha256`, `full_manifest_entries`, `profile_document_sha256`, or a `manifest_fingerprint` moves under the run |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_policy_anchor.py` | policy is loaded before generation files/child and requires anchored no-follow root ownership, mode `0444`, `nlink == 1`, canonical bytes/content hash, exact harness identity/hash, and one exact entry; self-consistent replacement of generation code, manifest, vectors, and expected results rejects without a separate matching policy update; policy whitespace, duplicate/extra keys, entry reorder, hash tampering, missing/stale/multiple/conflicting entries, release/quarantine update attempts, and policy/harness replacement during child execution reject with no receipt/readiness; an approved exact policy passes only through the isolated root-verifier flow |
 | `RESET-REG-P0`, `RESET-REG-P2`, `RESET-REG-P2-01` | `tests/unit/test_signal_family_readiness_reset.py` | exact five-set equality and pair-derived participating-service union, atomic receipt/decision/CAS, byte-identical concurrency, divergent conflict, profile-derived expiry, lower shadow or serving stale bound controls `fresh_until`, optional policy cap, authority advance/return to same generation, rollback, revoke, and no `ATTESTING`/`ACTIVATED` state |

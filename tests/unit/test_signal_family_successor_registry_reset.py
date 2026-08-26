@@ -13,12 +13,15 @@ reason with `match=`, so two different rules can never satisfy one another's ass
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import inspect
 import json
+import re
 import subprocess
 import sys
+import typing
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -27,6 +30,7 @@ import pytest
 from pydantic import BaseModel
 
 from rquant import runtime_contracts
+from rquant import signal_family_constants as constants
 from rquant import signal_family_successor_registry as successor
 from rquant.runtime_schema_registry import _CHANNEL_SPEC_BY_ID, RuntimeSchemaContractBundle
 from rquant.signal_contracts import CURRENT_ENVELOPE_SCHEMA
@@ -44,9 +48,13 @@ CLOSURE_FILES = frozenset(
 PRODUCER_COMMIT = "a" * 40
 OTHER_PRODUCER_COMMIT = "b" * 40
 
+# The frozen role domain of `rquant.signal_family_constants`: strategy services produce
+# envelopes, the router produces routed and spool records, and the notifier, paper broker
+# and shadow session only ever consume. `signal-router-shadow` used to sit in two producer
+# tuples; it names no role at all, so it is not a legal participant.
 _CHANNEL_SERVICES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "signal-bus-routed-record/current": (
-        ("signal-router", "signal-router-shadow"),
+        ("signal-router",),
         ("notifier", "paper-broker"),
     ),
     "signal-envelope/current": (
@@ -54,7 +62,7 @@ _CHANNEL_SERVICES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("shadow-session", "signal-router"),
     ),
     "signal-route-spool-record/current": (
-        ("signal-router", "signal-router-shadow"),
+        ("signal-router",),
         ("notifier", "paper-broker"),
     ),
 }
@@ -211,8 +219,13 @@ def _raw_forms() -> dict[str, tuple[bytes, Any]]:
     bundle = _bundle()
     overlay = _overlay(bundle)
     return {
+        # The envelope channel is the raw "channel" form because it is the only one whose
+        # producer and consumer tuples both have two members, which the sort/duplicate
+        # mutators need in order to fail their own rule rather than pass vacuously.
         "channel": (
-            successor.successor_channel_canonical_json_bytes(bundle.channels[0]),
+            successor.successor_channel_canonical_json_bytes(
+                bundle.channel("signal-envelope/current")
+            ),
             lambda payload: successor.SuccessorChannelV1.from_canonical_json(
                 payload, closure=_closure()
             ),
@@ -476,7 +489,9 @@ def test_non_object_payloads_reject(form: str, payload: bytes) -> None:
 @pytest.mark.parametrize(
     ("form", "field", "value", "reason"),
     (
-        ("channel", "channel_id", 1, "Input should be a valid string"),
+        # `channel_id` is a `Literal` closed set, so a non-member of any type fails the
+        # frozen membership rule at the type layer rather than a generic string check.
+        ("channel", "channel_id", 1, "Input should be 'signal-bus-routed-record/current'"),
         ("channel", "declaration_schema_fingerprint", 0, "Input should be a valid string"),
         ("channel", "producer_service_ids", "signal-router", "must be a JSON array"),
         ("bundle", "schema_version", "1", "Input should be a valid integer"),
@@ -701,7 +716,7 @@ def test_unknown_channel_rejects(form: str) -> None:
 def test_channel_payload_model_must_match_its_frozen_binding() -> None:
     payload, decode = _raw_forms()["channel"]
     decoded = _decoded(payload)
-    decoded["payload_model"] = "rquant.signal_contracts.CurrentSignalEnvelope"
+    decoded["payload_model"] = "rquant.signal_route_spool.CurrentSignalBusRoutedRecord"
     with pytest.raises(
         REJECTIONS,
         match="successor channel payload model is not its frozen binding",
@@ -1341,3 +1356,276 @@ def test_public_surface_exposes_no_writer_or_activation_callable() -> None:
     assert not {name for name in exported if "ready" in name.lower()}
     assert successor.SuccessorRegistry.__mro__[1:] == (object,)
     assert issubclass(successor.SuccessorChannelV1, BaseModel)
+
+
+# --------------------------------------------------------------------------------------
+# Ruling 2: the frozen channel set, family, identities and participant service-ID domain
+# --------------------------------------------------------------------------------------
+
+
+def test_the_constants_module_is_a_leaf_and_imports_nothing_from_rquant() -> None:
+    """The whole reason the module exists: `Literal` needs module-level constants.
+
+    The registry used to defer `from rquant.signal_contracts import ...` into a function
+    body to dodge an import cycle. A leaf module removes the cycle instead of dodging it,
+    so it must stay import-free of `rquant`.
+    """
+
+    source = Path(inspect.getsourcefile(constants) or "").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.append(node.module)
+    assert imported
+    assert not [name for name in imported if name == "rquant" or name.startswith("rquant.")]
+
+
+def test_the_registry_re_exports_every_lowered_constant_under_its_historical_name() -> None:
+    """Downstream modules import these names from the registry and must keep working."""
+
+    for name in (
+        "ACCEPTED_FAMILY_IDS",
+        "OVERLAY_NAMESPACE",
+        "PAIR_IDS",
+        "SUCCESSOR_BUNDLE_NAMESPACE",
+        "SUCCESSOR_CHANNEL_BINDINGS",
+    ):
+        assert getattr(successor, name) is getattr(constants, name), name
+        assert name in successor.__all__
+
+
+def test_the_accepted_family_is_exactly_the_one_current_family() -> None:
+    assert constants.ACCEPTED_FAMILY_IDS == (CURRENT_ENVELOPE_SCHEMA,)
+    assert len(constants.ACCEPTED_FAMILY_IDS) == 1
+    assert constants.CURRENT_ENVELOPE_FAMILY_ID == CURRENT_ENVELOPE_SCHEMA
+    assert typing.get_args(constants.AcceptedFamilyId) == (CURRENT_ENVELOPE_SCHEMA,)
+
+
+def test_a_declaration_accepting_a_second_family_rejects() -> None:
+    bundle = _bundle()
+    with pytest.raises(
+        REJECTIONS,
+        match="overlay declaration accepts a family absent from the current family",
+    ):
+        _declaration(
+            bundle,
+            "signal-envelope/current",
+            accepted_family_ids=tuple(sorted((*constants.ACCEPTED_FAMILY_IDS, "other/v1"))),
+        )
+
+
+def test_the_channel_set_is_a_frozen_closed_set_at_the_type_layer() -> None:
+    assert isinstance(constants.SUCCESSOR_CHANNEL_BINDINGS, MappingProxyType)
+    assert tuple(sorted(constants.SUCCESSOR_CHANNEL_BINDINGS)) == (
+        "signal-bus-routed-record/current",
+        "signal-envelope/current",
+        "signal-route-spool-record/current",
+    )
+    assert typing.get_args(constants.SuccessorChannelId) == tuple(
+        sorted(constants.SUCCESSOR_CHANNEL_BINDINGS)
+    )
+    assert (
+        successor.SuccessorChannelV1.model_fields["channel_id"].annotation
+        is constants.SuccessorChannelId
+    )
+    assert (
+        successor.OverlayDeclarationV1.model_fields["channel_id"].annotation
+        is constants.SuccessorChannelId
+    )
+    with pytest.raises(TypeError):
+        constants.SUCCESSOR_CHANNEL_BINDINGS["forged/current"] = "rquant.forged.Model"  # type: ignore[index]
+
+
+def test_the_bundle_identity_is_its_namespace_and_nothing_else() -> None:
+    """One successor base per process, so the namespace alone names the slot."""
+
+    bundle = _bundle()
+    other = successor.SuccessorBundleV1.create(
+        channels=(_channel("signal-envelope/current"),)
+    )
+    assert bundle.identity == constants.SUCCESSOR_BUNDLE_NAMESPACE
+    assert other.identity == bundle.identity
+    assert other.content_hash != bundle.content_hash
+    assert "identity" not in successor.SuccessorBundleV1.model_fields
+
+    registry, records = _registry()
+    registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(bundle))
+    with pytest.raises(successor.SuccessorConflictError):
+        registry.register_successor_bundle(
+            successor.successor_bundle_canonical_json_bytes(other)
+        )
+    assert records[0].identity_kind == "bundle"
+    assert records[0].identity == constants.SUCCESSOR_BUNDLE_NAMESPACE
+
+
+def test_the_overlay_identity_is_its_namespace_and_its_base_bundle_hash() -> None:
+    bundle = _bundle()
+    other_bundle = successor.SuccessorBundleV1.create(
+        channels=(_channel("signal-envelope/current"),)
+    )
+    overlay = _overlay(bundle)
+    other_overlay = _overlay(other_bundle, channel_ids=("signal-envelope/current",))
+
+    assert overlay.identity == (constants.OVERLAY_NAMESPACE, bundle.content_hash)
+    assert other_overlay.identity == (constants.OVERLAY_NAMESPACE, other_bundle.content_hash)
+    assert overlay.identity != other_overlay.identity
+    assert "identity" not in successor.OverlayBundleV1.model_fields
+
+    registry, records = _registry()
+    registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(bundle))
+    registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(overlay))
+    conflicting = _overlay(bundle, channel_ids=("signal-envelope/current",))
+    with pytest.raises(successor.SuccessorConflictError):
+        registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(conflicting))
+    assert records[0].identity_kind == "overlay"
+    assert records[0].identity == f"{constants.OVERLAY_NAMESPACE}:{bundle.content_hash}"
+
+
+def test_an_overlay_naming_another_base_is_not_the_same_identity_and_rejects() -> None:
+    bundle = _bundle()
+    other_bundle = successor.SuccessorBundleV1.create(
+        channels=(_channel("signal-envelope/current"),)
+    )
+    registry, _records = _registry()
+    registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(bundle))
+    foreign = _overlay(other_bundle, channel_ids=("signal-envelope/current",))
+    with pytest.raises(
+        successor.SuccessorRegistryError,
+        match="the staged overlay does not name the registered successor bundle",
+    ):
+        registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(foreign))
+
+
+_LEGAL_STRATEGY_ID_AT_LIMIT = constants.STRATEGY_SERVICE_ID_PREFIX + "a" * (
+    constants.SERVICE_ID_MAX_LENGTH - len(constants.STRATEGY_SERVICE_ID_PREFIX)
+)
+
+
+@pytest.mark.parametrize(
+    ("service_id", "reason"),
+    (
+        ("Signal-Router", "outside the frozen grammar"),
+        ("signal_router", "outside the frozen grammar"),
+        ("signal-router.v1", "outside the frozen grammar"),
+        ("1signal-router", "outside the frozen grammar"),
+        ("signal-router-", "outside the frozen grammar"),
+        ("signal--router", "outside the frozen grammar"),
+        ("-signal-router", "outside the frozen grammar"),
+        ("strategy-live-", "outside the frozen grammar"),
+        (_LEGAL_STRATEGY_ID_AT_LIMIT + "a", "exceeds 64 characters"),
+    ),
+)
+def test_a_participant_service_id_outside_the_frozen_grammar_rejects(
+    service_id: str,
+    reason: str,
+) -> None:
+    """`producer_service_ids` used to accept any nonempty string."""
+
+    with pytest.raises(REJECTIONS, match=reason):
+        _channel("signal-envelope/current", producers=(service_id,))
+
+
+def test_a_strategy_service_id_at_the_exact_length_bound_is_accepted() -> None:
+    assert len(_LEGAL_STRATEGY_ID_AT_LIMIT) == constants.SERVICE_ID_MAX_LENGTH
+    channel = _channel("signal-envelope/current", producers=(_LEGAL_STRATEGY_ID_AT_LIMIT,))
+    assert channel.producer_service_ids == (_LEGAL_STRATEGY_ID_AT_LIMIT,)
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "producers", "consumers", "reason"),
+    (
+        # A consumer-only role standing in the producer tuple.
+        (
+            "signal-envelope/current",
+            ("notifier",),
+            None,
+            "producer_service_ids role notifier cannot produce signal-envelope/current",
+        ),
+        (
+            "signal-bus-routed-record/current",
+            ("paper-broker",),
+            None,
+            "producer_service_ids role paper_broker cannot produce",
+        ),
+        # A producer-only role standing in the consumer tuple.
+        (
+            "signal-envelope/current",
+            None,
+            ("strategy-live-a",),
+            "consumer_service_ids role strategy_live cannot consume signal-envelope/current",
+        ),
+        # A legal role on the wrong channel.
+        (
+            "signal-bus-routed-record/current",
+            ("strategy-live-a",),
+            None,
+            "producer_service_ids role strategy_live cannot produce",
+        ),
+        (
+            "signal-envelope/current",
+            ("signal-router",),
+            None,
+            "producer_service_ids role signal_router cannot produce",
+        ),
+        (
+            "signal-route-spool-record/current",
+            None,
+            ("shadow-session",),
+            "consumer_service_ids role shadow_session cannot consume",
+        ),
+        # A grammar-legal identifier that names no role at all.
+        (
+            "signal-bus-routed-record/current",
+            ("signal-router-shadow",),
+            None,
+            "producer_service_ids service id is outside the frozen role domain",
+        ),
+        (
+            "signal-envelope/current",
+            None,
+            ("serving-publisher",),
+            "consumer_service_ids role serving_publisher cannot consume",
+        ),
+    ),
+)
+def test_a_cross_domain_participant_rejects(
+    channel_id: str,
+    producers: tuple[str, ...] | None,
+    consumers: tuple[str, ...] | None,
+    reason: str,
+) -> None:
+    with pytest.raises(REJECTIONS, match=re.escape(reason)):
+        _channel(channel_id, producers=producers, consumers=consumers)
+
+
+def test_the_role_domain_is_exactly_the_five_phase_c_roles_plus_the_strategy_prefix() -> None:
+    assert tuple(sorted(constants.PHASE_C_ROLE_SERVICE_IDS)) == (
+        "notifier",
+        "paper_broker",
+        "serving_publisher",
+        "shadow_session",
+        "signal_router",
+    )
+    for role, service_id in constants.PHASE_C_ROLE_SERVICE_IDS.items():
+        assert constants.service_id_role(service_id) == role
+    assert constants.service_id_role("strategy-live-a") == constants.STRATEGY_LIVE_ROLE
+    assert constants.service_id_role("strategy-live-") is None
+    assert constants.service_id_role("strategy-live") is None
+    assert constants.service_id_role("signal-router-shadow") is None
+    assert constants.service_id_role("Signal-Router") is None
+    assert constants.service_id_role("a" * (constants.SERVICE_ID_MAX_LENGTH + 1)) is None
+
+
+def test_every_channel_role_domain_is_a_subset_of_the_frozen_role_names() -> None:
+    """No channel may name a role that is not one of the six frozen roles."""
+
+    known = {*constants.PHASE_C_ROLE_SERVICE_IDS, constants.STRATEGY_LIVE_ROLE}
+    for mapping in (constants.CHANNEL_PRODUCER_ROLES, constants.CHANNEL_CONSUMER_ROLES):
+        assert tuple(sorted(mapping)) == tuple(sorted(constants.SUCCESSOR_CHANNEL_BINDINGS))
+        for channel_id, roles in mapping.items():
+            assert roles, channel_id
+            assert tuple(sorted(set(roles))) == tuple(sorted(roles)), channel_id
+            assert set(roles) <= known, channel_id

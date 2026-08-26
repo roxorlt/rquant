@@ -17,6 +17,8 @@ from rquant.signal_bus import (
     SignalBusLeaseError,
     SignalBusSourceSequenceError,
     SignalBusStore,
+    SignalBusWatermarkError,
+    recover_signal_bus_high_watermark,
 )
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
@@ -678,3 +680,384 @@ def test_missing_signal_and_outbox_are_explicit(tmp_path: Path) -> None:
     assert store.outbox_record("f" * 64) is None
     with pytest.raises(KeyError, match="signal"):
         store.route("f" * 64, (_target(),), now=NOW)
+
+
+# ---------------------------------------------------------------------------------------
+# Codex round-2 ruling 5: `signal_high_watermark` is monotonic, never self-corrected, and
+# fails closed when it disagrees with the durable rows. Only an explicit audited recovery
+# may move it, and only upwards.
+# ---------------------------------------------------------------------------------------
+
+
+def _watermark(path: Path) -> int:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT metadata_value FROM signal_bus_metadata "
+            "WHERE metadata_key = 'signal_high_watermark'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return int(row[0])
+
+
+def _set_watermark(path: Path, value: int) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE signal_bus_metadata SET metadata_value = ? "
+            "WHERE metadata_key = 'signal_high_watermark'",
+            (str(value),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_the_high_watermark_never_regresses_through_the_ingest_path(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+
+    assert _watermark(path) == 2
+    store.ingest(_signal("a"), received_at=NOW + timedelta(seconds=2))
+    store.ingest(_signal("f"), received_at=NOW + timedelta(seconds=3))
+
+    assert _watermark(path) == 3
+    assert store.source_descriptor().high_watermark == 3
+
+
+def test_a_watermark_behind_the_durable_rows_fails_closed_on_open(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    _set_watermark(path, 1)
+
+    with pytest.raises(SignalBusWatermarkError, match="signal bus high watermark"):
+        _store(path)
+
+    assert _watermark(path) == 1
+
+
+def test_a_watermark_ahead_of_the_durable_rows_fails_closed_on_open(tmp_path: Path) -> None:
+    """The append-only sequence cannot shrink, so a higher watermark means lost rows."""
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    _set_watermark(path, 9)
+
+    with pytest.raises(SignalBusWatermarkError, match="signal bus high watermark"):
+        _store(path)
+
+
+def test_an_inconsistent_watermark_is_never_silently_corrected(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    _set_watermark(path, 1)
+
+    for _attempt in range(3):
+        with pytest.raises(SignalBusWatermarkError):
+            _store(path)
+        assert _watermark(path) == 1
+
+
+def test_a_readback_of_an_inconsistent_watermark_fails_closed(tmp_path: Path) -> None:
+    """A store that was already open when the metadata drifted must not serve it."""
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    _set_watermark(path, 1)
+
+    with pytest.raises(SignalBusWatermarkError):
+        store.source_descriptor()
+
+
+def test_explicit_audited_recovery_repairs_a_lagging_watermark(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    _set_watermark(path, 1)
+
+    recovery = recover_signal_bus_high_watermark(
+        path,
+        acknowledgement="operator reconciled the ledger after a restore",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert recovery.previous_watermark == 1
+    assert recovery.observed_max_sequence == 2
+    assert recovery.recovered_watermark == 2
+    assert recovery.acknowledgement == "operator reconciled the ledger after a restore"
+    assert recovery.recovered_at == NOW + timedelta(minutes=1)
+    assert _watermark(path) == 2
+    assert _store(path).source_descriptor().high_watermark == 2
+
+
+def test_recovery_appends_an_audit_row_for_every_repair(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    _set_watermark(path, 0)
+    recover_signal_bus_high_watermark(
+        path,
+        acknowledgement="first repair",
+        now=NOW + timedelta(minutes=1),
+    )
+
+    connection = sqlite3.connect(path)
+    try:
+        rows = connection.execute(
+            "SELECT acknowledgement, previous_watermark, observed_max_sequence, "
+            "recovered_watermark FROM signal_bus_watermark_recovery ORDER BY recovery_id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert rows == [("first repair", 0, 1, 1)]
+
+
+def test_recovery_refuses_to_lower_the_watermark(tmp_path: Path) -> None:
+    """Rows are append-only, so a watermark above them is data loss, not a metadata bug."""
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    _set_watermark(path, 9)
+
+    with pytest.raises(SignalBusWatermarkError, match="never lowers"):
+        recover_signal_bus_high_watermark(path, acknowledgement="try to lower it", now=NOW)
+
+    assert _watermark(path) == 9
+
+
+def test_recovery_refuses_a_consistent_watermark(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+
+    with pytest.raises(SignalBusWatermarkError, match="already consistent"):
+        recover_signal_bus_high_watermark(path, acknowledgement="nothing to do", now=NOW)
+
+
+@pytest.mark.parametrize("acknowledgement", ("", "   ", "\t\n"))
+def test_recovery_requires_a_nonempty_acknowledgement(
+    tmp_path: Path,
+    acknowledgement: str,
+) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    _set_watermark(path, 0)
+
+    with pytest.raises(ValueError, match="acknowledgement"):
+        recover_signal_bus_high_watermark(path, acknowledgement=acknowledgement, now=NOW)
+
+    assert _watermark(path) == 0
+
+
+def test_recovery_reads_no_environment_override(tmp_path: Path) -> None:
+    """There is no env bypass: the reason is an argument, never a variable.
+
+    The check walks the executable body only, so prose in the docstring cannot satisfy or
+    break it.
+    """
+
+    import ast
+    import inspect
+
+    import rquant.signal_bus as signal_bus_module
+
+    source = inspect.getsource(signal_bus_module.recover_signal_bus_high_watermark)
+    tree = ast.parse(inspect.cleandoc(source))
+    function = tree.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    body = function.body[1:] if ast.get_docstring(function) else function.body
+    names = {
+        node.attr if isinstance(node, ast.Attribute) else node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, (ast.Attribute, ast.Name))
+    }
+    assert names.isdisjoint({"environ", "getenv", "os"})
+
+
+# ---------------------------------------------------------------------------------------
+# R2F-SPEC-01: deleting the watermark row must not be a cheaper way past the fail-closed
+# check than leaving it in place. Only a genuinely empty store may seed its own watermark.
+# ---------------------------------------------------------------------------------------
+
+
+def _watermark_row(path: Path) -> str | None:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT metadata_value FROM signal_bus_metadata "
+            "WHERE metadata_key = 'signal_high_watermark'"
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else str(row[0])
+
+
+def _delete_watermark_row(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "DELETE FROM signal_bus_metadata WHERE metadata_key = 'signal_high_watermark'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _truncate_signals_above(path: Path, sequence: int) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DELETE FROM signal_envelope WHERE global_sequence > ?", (sequence,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_deleted_watermark_row_is_not_reseeded_from_truncated_rows(tmp_path: Path) -> None:
+    """The exact bypass: deleting the row used to be cheaper than tampering with it.
+
+    Reseeding from `MAX(global_sequence)` after a truncation moves the watermark *down*,
+    with no exception and no audit row, which breaks both monotonicity and fail-closed.
+    """
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    assert _watermark_row(path) == "2"
+
+    _truncate_signals_above(path, 1)
+    _delete_watermark_row(path)
+
+    with pytest.raises(SignalBusWatermarkError, match="missing from a store that already"):
+        _store(path)
+
+    # Nothing was written: no reseeded metadata row and no audit row either.
+    assert _watermark_row(path) is None
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM signal_bus_watermark_recovery"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_a_deleted_watermark_row_fails_closed_even_without_truncation(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    _delete_watermark_row(path)
+
+    with pytest.raises(SignalBusWatermarkError, match="missing from a store that already"):
+        _store(path)
+
+    assert _watermark_row(path) is None
+
+
+def test_a_genuinely_empty_store_still_seeds_its_own_watermark(tmp_path: Path) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+
+    assert _store(path).source_descriptor().high_watermark == 0
+    assert _watermark_row(path) == "0"
+
+    # Reopening an empty store is still fine, and so is one whose row was deleted while it
+    # held no signal rows at all: there is no committed watermark to contradict.
+    _delete_watermark_row(path)
+    assert _store(path).source_descriptor().high_watermark == 0
+    assert _watermark_row(path) == "0"
+
+
+def test_explicit_recovery_rebuilds_a_deleted_watermark_row_with_an_audit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    _delete_watermark_row(path)
+
+    recovery = recover_signal_bus_high_watermark(
+        path,
+        acknowledgement="metadata row lost to a bad restore",
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert recovery.previous_watermark is None
+    assert recovery.observed_max_sequence == 2
+    assert recovery.recovered_watermark == 2
+    assert _watermark_row(path) == "2"
+    assert _store(path).source_descriptor().high_watermark == 2
+
+    connection = sqlite3.connect(path)
+    try:
+        rows = connection.execute(
+            "SELECT acknowledgement, previous_watermark, observed_max_sequence, "
+            "recovered_watermark FROM signal_bus_watermark_recovery ORDER BY recovery_id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert rows == [("metadata row lost to a bad restore", None, 2, 2)]
+
+
+def test_rebuilding_a_deleted_row_after_truncation_records_the_truncated_maximum(
+    tmp_path: Path,
+) -> None:
+    """Recovery cannot invent the lost value, so the operator's reason is the record.
+
+    The rebuilt watermark is the observed maximum, and the audit row is what says a human
+    accepted that number — which is exactly what the silent reseed never produced.
+    """
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW + timedelta(seconds=1))
+    _truncate_signals_above(path, 1)
+    _delete_watermark_row(path)
+
+    recovery = recover_signal_bus_high_watermark(
+        path,
+        acknowledgement="restored from the 08-25 snapshot, ledger reconciled",
+        now=NOW + timedelta(minutes=3),
+    )
+
+    assert (recovery.previous_watermark, recovery.recovered_watermark) == (None, 1)
+    assert _store(path).source_descriptor().high_watermark == 1
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM signal_bus_watermark_recovery"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_recovery_still_refuses_an_empty_acknowledgement_when_the_row_is_missing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    _delete_watermark_row(path)
+
+    with pytest.raises(ValueError, match="acknowledgement"):
+        recover_signal_bus_high_watermark(path, acknowledgement="  ", now=NOW)
+
+    assert _watermark_row(path) is None

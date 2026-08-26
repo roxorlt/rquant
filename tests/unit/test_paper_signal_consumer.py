@@ -217,7 +217,12 @@ def test_consumer_rejects_generation_drift_and_high_watermark_rollback(
         observed_at=NOW,
         limit=10,
     )
+    # A rolled-back source is modelled as a *consistent* restore from an older snapshot:
+    # the rows above the restore point are gone and the watermark matches them again.
+    # Codex round-2 ruling 5 makes the bus itself fail closed on a watermark that
+    # disagrees with its rows, so metadata-only tampering never reaches this consumer.
     with sqlite3.connect(rollback_bus_path) as connection:
+        connection.execute("DELETE FROM signal_envelope WHERE global_sequence > 1")
         connection.execute(
             """
             UPDATE signal_bus_metadata

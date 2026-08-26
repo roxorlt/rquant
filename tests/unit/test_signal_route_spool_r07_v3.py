@@ -21,6 +21,7 @@ from rquant.signal_bus import (
     SignalBusRoutedRecord,
     SignalBusSourceDescriptor,
     SignalBusStore,
+    SignalBusWatermarkError,
     SignalRouteReceipt,
 )
 from rquant.signal_contracts import (
@@ -1170,6 +1171,17 @@ def test_signal_bus_generation_and_high_watermark_stay_continuous(tmp_path: Path
     assert descriptor.high_watermark == 2
     assert SignalBusStore(path).source_descriptor() == descriptor
 
+    # The ingest path never lowers the watermark, and a third append advances it by one.
+    bus.ingest(_legacy_envelope("3"), received_at=NOW)
+    advanced = bus.source_descriptor()
+
+    assert advanced.high_watermark == 3
+    assert advanced.generation_id == descriptor.generation_id
+
+    # Amended per Codex round-2 order 2026-08-25, ruling 5. This used to assert that a
+    # watermark tampered *ahead* of the durable rows was served as-is and merely never
+    # regressed. The bus now fails closed on that disagreement instead of reporting it, and
+    # it does not quietly correct the metadata either.
     connection = sqlite3.connect(path)
     try:
         connection.execute(
@@ -1179,11 +1191,19 @@ def test_signal_bus_generation_and_high_watermark_stay_continuous(tmp_path: Path
         connection.commit()
     finally:
         connection.close()
-    bus.ingest(_legacy_envelope("3"), received_at=NOW)
-    ahead = bus.source_descriptor()
-
-    assert ahead.high_watermark == 9
-    assert ahead.generation_id == descriptor.generation_id
+    with pytest.raises(SignalBusWatermarkError, match="disagrees with the durable signal rows"):
+        bus.source_descriptor()
+    with pytest.raises(SignalBusWatermarkError):
+        SignalBusStore(path)
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT metadata_value FROM signal_bus_metadata "
+            "WHERE metadata_key = 'signal_high_watermark'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row[0] == "9"
 
     path.unlink()
     rebuilt = SignalBusStore(path).source_descriptor()

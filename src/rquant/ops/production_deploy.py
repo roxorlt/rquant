@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time as monotonic_time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time
@@ -985,12 +985,33 @@ def _audit_path(config: DeployConfig) -> Path:
     return config.audit_path or config.repo / "logs" / "production-deploy.jsonl"
 
 
+def _recovery_provenance(intent: DeploymentIntent, *, action: str) -> dict[str, str]:
+    """Name the exact persisted intent an automatic recovery replayed.
+
+    Codex round-2 order 2026-08-25, ruling 8: recovery never re-runs the Release A/B
+    table, so ``r07_gate=recorded_intent`` is the only gate label it can carry. These
+    fields are what make that label auditable after the fact — they identify which
+    recorded intent was replayed and in which direction, so no reader has to assume a
+    pair was not silently chosen.
+    """
+
+    return {
+        "recovery_action": action,
+        "recovery_intent_operation_id": intent.operation_id,
+        "recovery_intent_stage": intent.stage,
+        "recovery_intent_target_ref": intent.target_ref,
+        "recovery_intent_previous_sha": intent.previous_sha,
+        "recovery_intent_target_sha": intent.target_sha,
+    }
+
+
 def _append_audit(
     config: DeployConfig,
     result: DeployResult,
     *,
     error: str = "",
     r07_decision: R07GateDecision | None = None,
+    recovery_provenance: Mapping[str, str] | None = None,
 ) -> None:
     path = _audit_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1001,6 +1022,7 @@ def _append_audit(
         "restart_services": list(result.restart_services),
         "error": error,
         **({} if r07_decision is None else r07_decision.audit_fields()),
+        **({} if recovery_provenance is None else dict(recovery_provenance)),
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
@@ -1315,6 +1337,11 @@ def _recover_locked(
     specification assigns to "the existing deployer's rollback to the exact previous commit and
     tree". Re-running the Release A/B table here would make a crashed rollout unrecoverable
     while Release A is current, so the audit records the recorded-intent provenance instead.
+
+    Amended per Codex round-2 order 2026-08-25, ruling 8: the Release A/B decision table is
+    deliberately not consulted on this path, and `_recovery_provenance` writes the replayed
+    intent's identity into the audit row so the skipped table is accounted for. Any explicit
+    ``--target`` deployment still runs the full table.
     """
 
     action = config.recovery_action
@@ -1397,7 +1424,11 @@ def _recover_locked(
         plan.handoff_daemons,
         "recorded_intent",
     )
-    _append_audit(config, result)
+    _append_audit(
+        config,
+        result,
+        recovery_provenance=_recovery_provenance(intent, action=action),
+    )
     return result
 
 

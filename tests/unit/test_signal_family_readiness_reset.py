@@ -1948,3 +1948,99 @@ def test_snapshot_rejects_a_test_manifest_whose_pairs_are_not_profile_derived() 
     assert alien_pairs != _pairs()
     with pytest.raises(REJECTIONS, match="pairs are not derived from the validated profile"):
         _snapshot(profile_manifests=_profile_manifests(), declared_profile_manifests=alien)
+
+
+# --------------------------------------------------------------------------------------
+# R2F-SPEC-05: the Phase B declaration grammar is deliberately NOT propagated upward.
+# --------------------------------------------------------------------------------------
+
+
+_PRODUCTION_PAIR_KINDS: tuple[tuple[RuntimeServiceKind, str], ...] = (
+    (RuntimeServiceKind.SIGNAL_ROUTER, "signal-router.all-strategies.v1"),
+    (RuntimeServiceKind.SHADOW_SESSION, "shadow.session.production.v1"),
+    (RuntimeServiceKind.NOTIFIER, "notifier.admin.shadow.v1"),
+    (RuntimeServiceKind.PAPER_BROKER, "paper-broker.shadow-main.v1"),
+    (RuntimeServiceKind.SERVING_PUBLISHER, "serving.publisher.v1"),
+)
+_PRODUCTION_STRATEGY_SERVICE_IDS: tuple[str, ...] = (
+    "strategy.auction_gap.v1",
+    "strategy.growth_board_surge.v1",
+    "strategy.n_shape.v1",
+)
+
+
+def test_the_production_service_ids_are_exactly_what_the_profile_issues() -> None:
+    """Pin the literals below to the real generator, so this test cannot go stale."""
+
+    from rquant.runtime_production_profile import (  # noqa: PLC0415
+        _SINGLETON_SERVICE_IDS,
+        _strategy_service_id,
+    )
+
+    for kind, service_id in _PRODUCTION_PAIR_KINDS:
+        assert _SINGLETON_SERVICE_IDS[kind] == service_id
+    assert tuple(
+        sorted(
+            _strategy_service_id(strategy_id)
+            for strategy_id in ("n_shape", "growth_board_surge", "auction_gap")
+        )
+    ) == _PRODUCTION_STRATEGY_SERVICE_IDS
+
+
+def test_the_phase_b_declaration_grammar_is_not_propagated_to_production_ids() -> None:
+    """Codex round-2 ruling 2 freezes the declaration domain, not the live topology.
+
+    The production profile issues dotted, underscored service IDs that the Phase B grammar
+    rejects on purpose. Pushing `SERVICE_ID_PATTERN` up into `RuntimeServiceManifest` or
+    `PairBindingV1` would only fail when a real profile is parsed, so both sides of that
+    boundary are asserted here: the declaration domain knows no such role, and the
+    production models keep accepting the ID unchanged.
+    """
+
+    from rquant import signal_family_constants as constants  # noqa: PLC0415
+
+    production_ids = (
+        *(service_id for _kind, service_id in _PRODUCTION_PAIR_KINDS),
+        *_PRODUCTION_STRATEGY_SERVICE_IDS,
+    )
+    for service_id in production_ids:
+        assert constants.service_id_role(service_id) is None, service_id
+        manifest = _manifest(service_id, RuntimeServiceKind.SIGNAL_ROUTER, 60.0)
+        assert manifest.service_id == service_id
+
+    binding = verification.PairBindingV1(
+        pair_id="router-paper",
+        producer_service_ids=("signal-router.all-strategies.v1",),
+        consumer_service_ids=("paper-broker.shadow-main.v1",),
+    )
+    assert binding.producer_service_ids == ("signal-router.all-strategies.v1",)
+    assert binding.consumer_service_ids == ("paper-broker.shadow-main.v1",)
+
+
+def test_pair_resolution_accepts_a_profile_built_from_the_real_production_ids() -> None:
+    """The five frozen rows still resolve when every ID is the one production issues."""
+
+    participants = tuple(
+        (service_id, kind, 60.0) for kind, service_id in _PRODUCTION_PAIR_KINDS
+    ) + tuple(
+        (service_id, RuntimeServiceKind.STRATEGY_LIVE, 90.0)
+        for service_id in _PRODUCTION_STRATEGY_SERVICE_IDS
+    )
+    manifests = _profile_manifests(participants=participants, with_bystanders=False)
+
+    pairs = verification.resolve_pair_bindings(manifests)
+
+    assert tuple(pair.pair_id for pair in pairs) == verification.PAIR_IDS
+    by_id = {pair.pair_id: pair for pair in pairs}
+    assert by_id["strategy-router"].producer_service_ids == _PRODUCTION_STRATEGY_SERVICE_IDS
+    assert by_id["strategy-router"].consumer_service_ids == ("signal-router.all-strategies.v1",)
+    assert by_id["notifier-serving"].producer_service_ids == ("notifier.admin.shadow.v1",)
+    assert by_id["notifier-serving"].consumer_service_ids == ("serving.publisher.v1",)
+    assert verification.participating_service_ids(manifests) == tuple(
+        sorted(
+            (
+                *(service_id for _kind, service_id in _PRODUCTION_PAIR_KINDS),
+                *_PRODUCTION_STRATEGY_SERVICE_IDS,
+            )
+        )
+    )

@@ -189,6 +189,8 @@ class CurrentSignalRouteSpoolRecord(RuntimeContractModel):
         return self
 
 
+# Frozen v2 primitive: `ensure_ascii=True` is part of the frozen v2 byte contract and is not
+# the current-family `rquant.strict_json.canonical_json_bytes` definition. Do not "unify" them.
 def _canonical_object_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -465,6 +467,23 @@ def _atomic_replace_at(
             os.unlink(temporary, dir_fd=directory_descriptor)
 
 
+# Frozen v2 primitive. `docs/architecture/production-interpreter-authority.md` freezes the
+# behavior and the bytes of this function, and `RESET-R07-P2-01` freezes a *separate* future
+# v3-only primitive for the later writer tranche. The two v3-only obligations below are NOT
+# obligations of this function and must never be retrofitted into it:
+#
+#   * observing an existing byte-identical immutable target withdraws durability evidence
+#     until the records directory is fsynced again (v3-only); this function accepts the
+#     existing link and returns without a second directory fsync, and
+#   * a byte conflict appends conflict audit evidence before rejecting (v3-only); this
+#     function raises `SignalRouteSpoolIntegrityError` and records nothing.
+#
+# Those two gaps are the frozen *observed* v2 semantics, not a v2 compliance claim. They are
+# pinned side by side with the v3 contract as the `frozen-v2-observed` and `v3-spec` dialects
+# of `tests/support/signal_route_spool_crash_matrix.py`, exercised from
+# `tests/unit/test_signal_route_spool_r07_v3.py`. That model is a synthetic in-memory state
+# machine: it is Phase A evidence about the frozen contract, never evidence about a real
+# durable current-family writer, because Phase A has none.
 def _immutable_write_at(
     directory_descriptor: int,
     name: str,

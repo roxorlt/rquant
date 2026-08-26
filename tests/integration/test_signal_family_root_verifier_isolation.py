@@ -677,10 +677,11 @@ class TestChildLaunchWiring:
 
 class TestRootImportClosure:
     #: Everything `import rquant.signal_family_root_verifier` is permitted to pull in.
-    #: `rquant.signal_contracts` is present because WP4-a's `ACCEPTED_FAMILY_IDS` reads
-    #: `CURRENT_ENVELOPE_SCHEMA` from the contract module at import time rather than
-    #: restating the literal. It is the root's own installed package, never a module
-    #: under the selected generation, and no pair-to-surface entry names it.
+    #: Amended per Codex round-2 order 2026-08-25, ruling 2: `rquant.signal_contracts` used
+    #: to appear here because `ACCEPTED_FAMILY_IDS` read `CURRENT_ENVELOPE_SCHEMA` from the
+    #: contract module at import time. Those constants now live in the leaf module
+    #: `rquant.signal_family_constants`, which imports nothing from `rquant`, so the
+    #: contract module leaves the root's closure and the leaf module takes its place.
     ALLOWED_MODULES = (
         "rquant",
         "rquant.authority_path_security",
@@ -689,7 +690,7 @@ class TestRootImportClosure:
         "rquant.runtime_contracts",
         "rquant.runtime_service_control",
         "rquant.runtime_service_entrypoint",
-        "rquant.signal_contracts",
+        "rquant.signal_family_constants",
         "rquant.signal_family_root_verifier",
         "rquant.signal_family_successor_registry",
         "rquant.signal_family_verification",

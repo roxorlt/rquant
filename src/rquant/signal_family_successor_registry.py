@@ -31,44 +31,52 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.signal_family_constants import (
+    ACCEPTED_FAMILY_IDS,
+    OVERLAY_NAMESPACE,
+    PAIR_IDS,
+    SUCCESSOR_BUNDLE_NAMESPACE,
+    SUCCESSOR_CHANNEL_BINDINGS,
+    SuccessorChannelId,
+    require_channel_role_domain,
+)
 from rquant.strict_json import StrictJsonError, canonical_json_bytes, strict_canonical_json_loads
 
 _SHA256 = r"^[0-9a-f]{64}$"
 _SHA1 = r"^[0-9a-f]{40}$"
 
-SUCCESSOR_BUNDLE_NAMESPACE = "rquant.signal-family.successor"
-OVERLAY_NAMESPACE = "rquant.signal-family.overlay"
-
-# Distinct current-family transport channel IDs. They deliberately share no identifier
-# with the v2 `runtime.*` catalog, and each one names a class that already exists.
-SUCCESSOR_CHANNEL_BINDINGS: Mapping[str, str] = {
-    "signal-bus-routed-record/current": "rquant.signal_route_spool.CurrentSignalBusRoutedRecord",
-    "signal-envelope/current": "rquant.signal_contracts.CurrentSignalEnvelope",
-    "signal-route-spool-record/current": (
-        "rquant.signal_route_spool.CurrentSignalRouteSpoolRecord"
-    ),
-}
-
-# The exact receipt pair IDs of the later verification phase. A declaration may bind a
-# sorted, duplicate-free, nonempty subset of them and nothing outside them.
-PAIR_IDS: tuple[str, ...] = (
-    "notifier-serving",
-    "router-notifier",
-    "router-paper",
-    "strategy-router",
-    "strategy-shadow",
-)
-
-
-def _accepted_family_ids() -> tuple[str, ...]:
-    from rquant.signal_contracts import CURRENT_ENVELOPE_SCHEMA
-
-    return (CURRENT_ENVELOPE_SCHEMA,)
-
-
-# The current-family discriminant literal, read from the contract module rather than
-# restated here. Legacy envelopes carry no such discriminant and can never appear.
-ACCEPTED_FAMILY_IDS: tuple[str, ...] = _accepted_family_ids()
+# Amended per Codex round-2 order 2026-08-25, ruling 2. The channel closed set, the single
+# accepted family, both namespaces, the pair IDs, and the participant service-ID domain now
+# live in the leaf module `rquant.signal_family_constants` so `Literal` annotations can name
+# them at module scope without the import cycle the old deferred import worked around. These
+# re-exports are the historical spelling and stay part of this module's public surface.
+__all__ = [
+    "ACCEPTED_FAMILY_IDS",
+    "OVERLAY_NAMESPACE",
+    "PAIR_IDS",
+    "SUCCESSOR_BUNDLE_NAMESPACE",
+    "SUCCESSOR_CHANNEL_BINDINGS",
+    "ConflictAuditSink",
+    "OverlayBundleV1",
+    "OverlayDeclarationV1",
+    "StagedOverlayStateV1",
+    "SuccessorBundleV1",
+    "SuccessorChannelV1",
+    "SuccessorConflictAuditRecordV1",
+    "SuccessorConflictError",
+    "SuccessorGenerationSourceClosureV1",
+    "SuccessorModelDescriptorV1",
+    "SuccessorRegistry",
+    "SuccessorRegistryError",
+    "model_descriptor_hash",
+    "overlay_bundle_canonical_json_bytes",
+    "overlay_declaration_canonical_json_bytes",
+    "resolve_payload_model",
+    "resolve_successor_channel_descriptor",
+    "successor_bundle_canonical_json_bytes",
+    "successor_channel_canonical_json_bytes",
+    "verify_successor_channel_binding",
+]
 
 
 class SuccessorRegistryError(ValueError):
@@ -106,6 +114,21 @@ def _require_exact_items(value: object, expected: type, *, field: str) -> None:
         raise TypeError(f"{field} requires an exact tuple of {expected.__name__} objects")
     for item in value:
         _require_exact_instance(item, expected, field=field)
+
+
+def _require_known_channel(value: object) -> None:
+    """Reject an out-of-set `channel_id` with its own message, ahead of `Literal`.
+
+    The `Literal` annotation is the frozen closed set at the type layer; this keeps the
+    rejection reason naming the offending channel instead of listing the members.
+    """
+
+    if isinstance(value, Mapping):
+        channel_id = value.get("channel_id")
+    else:
+        channel_id = getattr(value, "channel_id", None)
+    if isinstance(channel_id, str) and channel_id not in SUCCESSOR_CHANNEL_BINDINGS:
+        raise ValueError(f"unknown successor transport channel: {channel_id}")
 
 
 def _require_sorted_unique(values: tuple[str, ...], *, field: str) -> tuple[str, ...]:
@@ -307,7 +330,7 @@ def resolve_successor_channel_descriptor(
 
 
 class SuccessorChannelV1(_SuccessorStrictModel):
-    channel_id: StrictStr = Field(min_length=1)
+    channel_id: SuccessorChannelId
     payload_model: StrictStr = Field(min_length=1)
     declaration_schema_fingerprint: StrictStr = Field(pattern=_SHA256)
     physical_schema_fingerprint: StrictStr = Field(pattern=_SHA256)
@@ -315,6 +338,14 @@ class SuccessorChannelV1(_SuccessorStrictModel):
     producer_service_ids: tuple[StrictStr, ...]
     consumer_service_ids: tuple[StrictStr, ...]
     channel_hash: StrictStr = Field(pattern=_SHA256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unknown_channel(cls, value: object) -> object:
+        """Name an out-of-set channel before the `Literal` reports a bare type error."""
+
+        _require_known_channel(value)
+        return value
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -325,6 +356,18 @@ class SuccessorChannelV1(_SuccessorStrictModel):
             raise ValueError("successor channel payload model is not its frozen binding")
         _require_sorted_unique(self.producer_service_ids, field="producer_service_ids")
         _require_sorted_unique(self.consumer_service_ids, field="consumer_service_ids")
+        require_channel_role_domain(
+            self.channel_id,
+            self.producer_service_ids,
+            field="producer_service_ids",
+            direction="produce",
+        )
+        require_channel_role_domain(
+            self.channel_id,
+            self.consumer_service_ids,
+            field="consumer_service_ids",
+            direction="consume",
+        )
         if self.model_descriptor_hash != model_descriptor_hash(
             payload_model=self.payload_model,
             declaration_schema_fingerprint=self.declaration_schema_fingerprint,
@@ -441,6 +484,17 @@ class SuccessorBundleV1(_SuccessorStrictModel):
             raise ValueError("successor bundle content hash does not match its canonical content")
         return self
 
+    @property
+    def identity(self) -> str:
+        """The bundle identity is its namespace, and nothing else.
+
+        Amended per Codex round-2 order 2026-08-25, ruling 2. Exactly one successor base may
+        be registered, so the namespace alone names the slot a second bundle would collide
+        with; neither the content hash nor the channel set participates.
+        """
+
+        return self.bundle_namespace
+
     def channel(self, channel_id: str) -> SuccessorChannelV1:
         for channel in self.channels:
             if channel.channel_id == channel_id:
@@ -486,7 +540,7 @@ class SuccessorBundleV1(_SuccessorStrictModel):
 
 
 class OverlayDeclarationV1(_SuccessorStrictModel):
-    channel_id: StrictStr = Field(min_length=1)
+    channel_id: SuccessorChannelId
     base_bundle_content_hash: StrictStr = Field(pattern=_SHA256)
     base_declaration_fingerprint: StrictStr = Field(pattern=_SHA256)
     base_physical_fingerprint: StrictStr = Field(pattern=_SHA256)
@@ -494,6 +548,14 @@ class OverlayDeclarationV1(_SuccessorStrictModel):
     accepted_family_ids: tuple[StrictStr, ...]
     pair_ids: tuple[StrictStr, ...]
     declaration_hash: StrictStr = Field(pattern=_SHA256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unknown_channel(cls, value: object) -> object:
+        """Name an out-of-set channel before the `Literal` reports a bare type error."""
+
+        _require_known_channel(value)
+        return value
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -582,11 +644,24 @@ class OverlayBundleV1(_SuccessorStrictModel):
         for declaration in self.declarations:
             if declaration.base_bundle_content_hash != self.base_bundle_content_hash:
                 raise ValueError("overlay declaration names a different successor base bundle")
+        if self.identity != (OVERLAY_NAMESPACE, self.base_bundle_content_hash):
+            raise ValueError("overlay identity is not its namespace and base bundle hash")
         if self.content_hash != _canonical_sha256(
             self.model_dump(mode="json", exclude={"content_hash"})
         ):
             raise ValueError("overlay bundle content hash does not match its canonical content")
         return self
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        """The overlay identity is `(overlay_namespace, base_bundle_content_hash)`.
+
+        Amended per Codex round-2 order 2026-08-25, ruling 2. One overlay may be staged per
+        successor base, so the same namespace over a different base is a *different*
+        identity, not a conflict, and the registry's conflict decision uses this tuple.
+        """
+
+        return (self.overlay_namespace, self.base_bundle_content_hash)
 
     @classmethod
     def create(
@@ -725,7 +800,7 @@ class SuccessorRegistry:
             self._audit_sink.append(
                 SuccessorConflictAuditRecordV1(
                     identity_kind="bundle",
-                    identity=SUCCESSOR_BUNDLE_NAMESPACE,
+                    identity=existing.identity,
                     existing_hash=existing.content_hash,
                     attempted_hash=candidate.content_hash,
                 )
@@ -774,6 +849,13 @@ class SuccessorRegistry:
                     f"overlay declaration does not bind its base channel: {channel.channel_id}"
                 )
         existing = self._overlay
+        if existing is not None and existing.identity != candidate.identity:
+            # A different successor base is a different overlay identity, so it can never be
+            # the same slot. The base equality above already rejects that case, and this
+            # keeps the conflict decision spelled in terms of the frozen identity tuple.
+            raise SuccessorRegistryError(
+                "the staged overlay does not name the registered successor bundle"
+            )
         if existing is not None:
             if raw == self._overlay_bytes:
                 state = self._overlay_state
@@ -783,7 +865,7 @@ class SuccessorRegistry:
             self._audit_sink.append(
                 SuccessorConflictAuditRecordV1(
                     identity_kind="overlay",
-                    identity=f"{OVERLAY_NAMESPACE}:{base.content_hash}",
+                    identity=":".join(candidate.identity),
                     existing_hash=existing.content_hash,
                     attempted_hash=candidate.content_hash,
                 )

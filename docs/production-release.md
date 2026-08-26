@@ -140,7 +140,13 @@ release 解释器执行，因为部署器自己在 `-I -S` 下无法 import poli
 | `enforced` | `enforced` 且 evidence 通过（前滚与回滚同此） | 允许 |
 | `enforced` | `disabled_for_bootstrap` 或 absent | 拒绝 |
 
-`_recover_locked` 的 rollback target 走同一张表。
+`_recover_locked` **不重跑上表**（Amended per Codex round-2 order 2026-08-25, ruling 8）。
+自动 recovery 从不挑选 target：它只重放此前已被 R07 门接受并持久化的那一对精确 intent
+（`resume` 走记录的 target、`rollback` 走记录的 previous），因此 audit 记
+`r07_gate=recorded_intent`，并额外写入 recovery provenance——`recovery_action`、
+`recovery_intent_operation_id`、`recovery_intent_stage`、`recovery_intent_target_ref`
+以及该 intent 记录的 `previous_sha` / `target_sha`——让「跳过了决策表」这件事本身可审计。
+任何不在记录里的 pair 一律拒绝。任何显式 `--target`（含回滚之后的 retry）仍走完整决策表。
 
 **Release A（本阶段）**：policy 的 `deployment_mode=disabled_for_bootstrap`、
 `bootstrap_predecessor=null`。它只把 R07 决策链路装进生产，不消费任何 CI 证据，因此
