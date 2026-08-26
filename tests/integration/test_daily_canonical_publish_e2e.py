@@ -353,14 +353,6 @@ def _chain(tmp_path: Path):
     return verified, candidate, db_path, publisher, ledger, lease, run, attempt
 
 
-@pytest.mark.xfail(
-    reason=(
-        "daily ledger recovery adopts running attempts (4c583e2) while the "
-        "canonical publisher still requires a fresh attempt number and an equal "
-        "fencing token; owning package must reconcile the two"
-    ),
-    strict=True,
-)
 def test_spool_validate_candidate_ledger_duckdb_receipt_recovers_fenced_attempt(
     tmp_path: Path,
 ) -> None:
@@ -456,17 +448,24 @@ def test_spool_validate_candidate_ledger_duckdb_receipt_recovers_fenced_attempt(
             first_db_receipt.stage_result,
             now=COMMITTED_AT + timedelta(seconds=2),
         )
+    # Recovery deliberately adopts nothing here: DailyPipelineLedger.recover
+    # leaves a nonterminal attempt for the replacement writer instead of turning
+    # another owner's lease loss into a terminal or retry mutation. The
+    # replacement writer adopts the running attempt, which keeps the attempt
+    # number and therefore the effect's idempotency key.
     recovered = ledger.recover(
         lease_two,
         now=COMMITTED_AT + timedelta(seconds=2),
     )
-    assert recovered.retried_stage_ids == ("canonical_publish",)
-    second_attempt = ledger.claim_next(
+    assert recovered.retried_stage_ids == ()
+    second_attempt = ledger.adopt_effect_attempt(
         lease_two,
+        run_id=run.run_id,
+        stage_id="canonical_publish",
         now=COMMITTED_AT + timedelta(seconds=2),
     )
     assert second_attempt is not None
-    assert second_attempt.attempt_number == 2
+    assert second_attempt.attempt_number == 1
     publisher._ledger_fence_verifier = DailyLedgerFenceGuard(ledger=ledger, lease=lease_two)
     second_db_receipt = publisher.publish(
         candidate.generation_id,
@@ -474,8 +473,12 @@ def test_spool_validate_candidate_ledger_duckdb_receipt_recovers_fenced_attempt(
         ledger_input_identity=run.input_identity,
         committed_at=COMMITTED_AT + timedelta(seconds=3),
     )
-    assert second_db_receipt.publication_mode == "recovered"
-    assert second_db_receipt.recovery_of_receipt_id == first_db_receipt.receipt_id
+    # Adoption keeps the attempt number, so the replacement writer lands on the
+    # attempt that already published and gets its receipt back unchanged. There
+    # is nothing to "recover": the recovery mode existed only because a fresh
+    # attempt number used to force a second receipt for the same publication.
+    assert second_db_receipt.publication_mode == "committed"
+    assert second_db_receipt.receipt_id == first_db_receipt.receipt_id
     prepared = ledger.prepare_success(
         lease_two,
         second_attempt,
@@ -497,11 +500,12 @@ def test_spool_validate_candidate_ledger_duckdb_receipt_recovers_fenced_attempt(
             reader._conn.execute("SELECT count(*) FROM daily_canonical_publication").fetchone()[0]
             == 1
         )
+        # One receipt, not two: the adopted attempt reuses the stored one.
         assert (
             reader._conn.execute("SELECT count(*) FROM daily_canonical_publish_receipt").fetchone()[
                 0
             ]
-            == 2
+            == 1
         )
 
 
@@ -681,14 +685,6 @@ def test_fence_guard_blocks_a_new_lease_until_the_canonical_transaction_finishes
     assert lease_two.fencing_token > lease_one.fencing_token
 
 
-@pytest.mark.xfail(
-    reason=(
-        "daily ledger recovery adopts running attempts (4c583e2) while the "
-        "canonical publisher still requires a fresh attempt number and an equal "
-        "fencing token; owning package must reconcile the two"
-    ),
-    strict=True,
-)
 def test_two_processes_publish_one_canonical_candidate_once(tmp_path: Path) -> None:
     verified, candidate, db_path, publisher, *_unused = _chain(tmp_path)
     storage_profile = _storage_profile(tmp_path / "daily-profile")
@@ -754,7 +750,15 @@ def test_two_processes_publish_one_canonical_candidate_once(tmp_path: Path) -> N
     assert [process.exitcode for process in processes] == [0, 0]
     successes = [item for item in observed if item.startswith("success:")]
     assert len(successes) == 1, observed
-    assert sum(item.startswith("DailyPipelineLedgerError:") for item in observed) == 1
+    # The loser is rejected as a stale writer, not by a generic ledger error:
+    # recovery adopts the running attempt rather than handing out a fresh one,
+    # so the second process finds its lease already superseded. LeaseLost is a
+    # DailyPipelineLedgerError, and naming it here keeps the case honest about
+    # which rejection proves the "exactly once" property.
+    rejections = [
+        item for item in observed if item.startswith(("DailyPipelineLedgerError:", "LeaseLost:"))
+    ]
+    assert len(rejections) == 1, observed
     with DuckDBStore(db_path, read_only=True) as reader:
         assert reader._conn.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 1
         assert (

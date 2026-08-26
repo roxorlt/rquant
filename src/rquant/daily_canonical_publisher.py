@@ -858,7 +858,7 @@ class DailyCanonicalPublisher:
             and receipt.expected_ledger_receipt.attempt_number
             == int(row[4])
             == attempt.attempt_number
-            and receipt.ledger_fencing_token == int(row[5]) == attempt.fencing_token
+            and receipt.ledger_fencing_token == int(row[5])
             and receipt.expected_ledger_receipt.receipt_id == row[6]
             and receipt.expected_ledger_receipt.input_identity == row[7] == ledger_input_identity
             and receipt.db_content_sha256 == row[8]
@@ -880,6 +880,16 @@ class DailyCanonicalPublisher:
             and receipt.calendar_as_of == candidate.manifest.calendar_as_of
         ):
             raise DailyCanonicalPublishError("stored canonical receipt binding changed")
+        # The fence is an ordering check, not an equality one. A replacement
+        # writer adopts the running attempt (DailyPipelineLedger.recover leaves
+        # it in place) and therefore reaches this receipt under the same attempt
+        # number with a strictly newer token; that is the newer owner and it is
+        # entitled to the stored receipt. A stored token newer than the caller's
+        # means the caller is the stale writer and must not publish.
+        if receipt.ledger_fencing_token > attempt.fencing_token:
+            raise DailyCanonicalPublishError(
+                "stored canonical receipt was written by a newer fencing token"
+            )
         return receipt
 
     @staticmethod
