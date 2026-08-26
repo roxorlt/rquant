@@ -2095,6 +2095,7 @@ def test_load_rejects_non_direct_lexical_path_alias(tmp_path: Path) -> None:
 
 
 @pytest.mark.xfail(
+    sys.platform != "darwin",
     reason=(
         "LabSpoolFileIdentity identifies a spool file by (device, inode) only, and "
         "ext4 reuses a just-freed inode, so an unlink-and-recreate replacement can "
