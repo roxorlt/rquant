@@ -11,7 +11,7 @@ User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 Environment="APP_ENV=prod" "RQUANT_DISABLE_DOTENV=1" "RQUANT_PAGE_CONTROL_HOST=127.0.0.1" "RQUANT_PAGE_CONTROL_PORT=8767"
-ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role page_control
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role page_control --instance svc-981cb38218dd899500ee1592a504790a57d459c946bbc53c8e210f299cf1980b
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s

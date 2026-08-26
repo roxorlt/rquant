@@ -92,14 +92,19 @@ def _profile_payload(
         "generation_root": str(generations),
         "allowed_operations": ["publish", "rollback"],
         "roles": {
-            name: {
-                "module": module,
-                "environment_allowlist": list(environment),
+            entry.name: {
+                "module": entry.module,
+                "environment_allowlist": list(entry.environment_allowlist),
                 "instances": (
-                    [f"svc-{hashlib.sha256(name.encode()).hexdigest()}"] if instanced else []
+                    [f"svc-{hashlib.sha256(entry.name.encode()).hexdigest()}"]
+                    if entry.instanced
+                    else []
                 ),
+                "service_kind": entry.service_kind,
+                "control_root": entry.control_root,
+                "once": entry.once,
             }
-            for name, module, environment, instanced in authority_module.PRODUCTION_ROLE_POLICY
+            for entry in authority_module.PRODUCTION_ROLE_POLICY
         },
         "manifest_schema": {
             key: list(value) if isinstance(value, tuple) else value

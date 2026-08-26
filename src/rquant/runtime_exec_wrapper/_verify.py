@@ -131,6 +131,13 @@ _MANIFEST_ENTRY_FIELDS = frozenset(
     {"path", "type", "owner_uid", "mode", "nlink", "size", "sha256"}
 )
 
+#: Where a generation keeps its per-instance service manifests. The path is derived, never
+#: taken from a unit: the old units interpolated `%i` into
+#: `data/runtime/current/manifests/%i.json`, reached through a `lighthouse`-owned symlink.
+GENERATION_MANIFEST_DIRECTORY = "manifests"
+_COMMIT_SHA_LENGTH = 40
+_HEX = "0123456789abcdef"
+
 _FORBIDDEN_BASENAMES = ("sitecustomize.py", "usercustomize.py")
 _REQUIRED_PYVENV_LINE = "include-system-site-packages = false"
 
@@ -600,6 +607,84 @@ def build_child_environment(
     return environment
 
 
+def derive_module_argv(
+    *,
+    profile_role: dict[str, Any],
+    slot: dict[str, Any],
+    instance: str | None,
+    generation_path: str,
+    manifest_entries: tuple[dict[str, Any], ...],
+) -> tuple[str, ...]:
+    """Build the module's argv out of the two root-owned documents, and nothing else.
+
+    The units used to carry these values themselves: `--manifest` interpolated `%i` into a
+    path under the `current` symlink, and `--expected-commit` / `--expected-generation` came
+    from `runtime.env`, a file the application it configures writes. Both are now derived
+    here — the manifest from the selected generation and the authorised instance label, the
+    generation id from the slot — and the manifest must be a file the generation's own full
+    manifest covers, so it is hash-verified along with the rest of the code.
+
+    A role whose policy declares no control root receives no argv at all. That is the
+    `daily` HYBRID adapter of `authority.md` L200, whose mapping is "caller argv count 0".
+    """
+
+    control_root = profile_role.get("control_root")
+    if type(control_root) is not str:
+        raise _reject("the runtime profile role control root is invalid")
+    if not control_root:
+        return ()
+    if not control_root.startswith("/") or ".." in control_root.split("/"):
+        raise _reject("the runtime profile role control root is not one absolute path")
+    if instance is None:
+        raise _reject("a role with a control root requires an instance label")
+
+    relative = f"{GENERATION_MANIFEST_DIRECTORY}/{instance}.json"
+    covered = {
+        entry["path"]: entry for entry in manifest_entries if entry["type"] == "file"
+    }
+    if relative not in covered:
+        raise _reject(
+            "the derived service manifest is not covered by the generation full manifest"
+        )
+    manifest_path = os.path.join(generation_path, relative)
+    if manifest_path != os.path.abspath(manifest_path):
+        raise _reject("the derived service manifest path is not canonical")
+
+    commit = slot["commit"]
+    if (
+        type(commit) is not str
+        or len(commit) != _COMMIT_SHA_LENGTH
+        or any(character not in _HEX for character in commit)
+    ):
+        # The wrapper still branches on nothing here: the value is forwarded verbatim to the
+        # legacy module, which is the one that compares it. But the module's parser rejects
+        # anything that is not a commit sha, so a record carrying audit prose fails closed
+        # in the wrapper rather than after the exec.
+        raise _reject("the authority record commit is not a forwardable commit sha")
+
+    argv = [
+        "--manifest",
+        manifest_path,
+        "--control-root",
+        os.path.join(control_root, instance),
+        "--expected-commit",
+        commit,
+        "--expected-generation",
+        slot["generation_id"],
+    ]
+    service_kind = profile_role.get("service_kind")
+    if type(service_kind) is not str:
+        raise _reject("the runtime profile role service kind is invalid")
+    if service_kind:
+        argv.extend(("--expected-kind", service_kind))
+    once = profile_role.get("once")
+    if type(once) is not bool:
+        raise _reject("the runtime profile role once flag is invalid")
+    if once:
+        argv.append("--once")
+    return tuple(argv)
+
+
 def resolve_launch(
     role: str,
     *,
@@ -673,10 +758,22 @@ def resolve_launch(
         spec=spec,
         source_environment=dict(source_environment or {}),
     )
+    module_argv = derive_module_argv(
+        profile_role=profile["roles"][role],
+        slot=slot,
+        instance=instance,
+        generation_path=generation_path,
+        manifest_entries=entries,
+    )
     return {
         "role": role,
         "instance": instance,
-        "module_argv": () if instance is None else ("--instance", instance),
+        "module_argv": module_argv,
+        "service_manifest": (
+            module_argv[module_argv.index("--manifest") + 1]
+            if "--manifest" in module_argv
+            else None
+        ),
         "generation_id": slot["generation_id"],
         "generation_path": generation_path,
         "profile_id": profile["profile_id"],

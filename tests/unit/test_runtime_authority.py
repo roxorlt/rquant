@@ -131,31 +131,36 @@ def _directory_policy(*directories: Path) -> dict[Path, tuple[int, int]]:
 #: cwd and source tree, so one spec fanned out across the policy's names is both the
 #: shortest fixture and the shape a real deployment publishes.
 def _policy_role_names() -> tuple[str, ...]:
-    return tuple(name for name, _, _, _ in authority_module.PRODUCTION_ROLE_POLICY)
+    return tuple(entry.name for entry in authority_module.PRODUCTION_ROLE_POLICY)
 
 
 def _instances_for(name: str) -> list[str]:
-    for role, _, _, instanced in authority_module.PRODUCTION_ROLE_POLICY:
-        if role == name:
-            return [f"svc-{hashlib.sha256(name.encode()).hexdigest()}"] if instanced else []
+    for entry in authority_module.PRODUCTION_ROLE_POLICY:
+        if entry.name == name:
+            return (
+                [f"svc-{hashlib.sha256(name.encode()).hexdigest()}"] if entry.instanced else []
+            )
     raise AssertionError(name)
 
 
 def _policy_profile_roles() -> dict[str, object]:
     return {
-        name: {
-            "module": module,
-            "environment_allowlist": list(environment),
-            "instances": _instances_for(name),
+        entry.name: {
+            "module": entry.module,
+            "environment_allowlist": list(entry.environment_allowlist),
+            "instances": _instances_for(entry.name),
+            "service_kind": entry.service_kind,
+            "control_root": entry.control_root,
+            "once": entry.once,
         }
-        for name, module, environment, _ in authority_module.PRODUCTION_ROLE_POLICY
+        for entry in authority_module.PRODUCTION_ROLE_POLICY
     }
 
 
 def _policy_module(name: str) -> str:
-    for role, module, _, _ in authority_module.PRODUCTION_ROLE_POLICY:
-        if role == name:
-            return module
+    for entry in authority_module.PRODUCTION_ROLE_POLICY:
+        if entry.name == name:
+            return entry.module
     raise AssertionError(name)
 
 

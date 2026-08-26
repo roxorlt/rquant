@@ -94,9 +94,22 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    profile 版本变更本身是单独授权的基础设施事务；`profile_id` 同时被 slot、generation
    full-manifest 与 R07 policy 冻结，三者必须一起换代。
 
-10. **`rquant-runtime-recovery@` / `rquant-runtime-recovery-rehearsal@` 语义变更**：
-   `--expected-profile-generation %i` 已移除，generation 改由 root-owned `current.json`
-   决定。安装前确认对应 role 的 module 能从权威记录读取 generation，而不是从 argv。
+10. **每个实例的 service manifest 必须落在 generation 里**。wrapper 不再从 unit 接收
+   `--manifest`，而是从权威记录派生：`<generation>/manifests/<instance>.json`，并要求这条
+   相对路径是该 generation full-manifest 里的一个 `file` 条目——于是它和其余代码一样被逐字节
+   校验。`--control-root` 由 profile 的 per-role `control_root` 前缀拼上已授权的实例标签，
+   `--expected-commit` / `--expected-generation` 来自 `current.json` 的 current slot；
+   `--expected-kind` / `--once` 由 profile role 策略决定。既有的
+   `rquant.runtime_service_main` **不需要任何改动**，它收到的正是原来由 unit 传的那组参数，
+   只是来源换成了 root-owned 记录。
+
+   发布 generation 时必须把 service manifest 写进 `<generation>/manifests/` 并纳入
+   full-manifest（旧位置 `data/runtime/current/manifests/` 由应用自己可写，已不再被读取）。
+   `current.json` 的 `current_commit` 必须是 40 位十六进制 commit sha，否则 wrapper 退 78——
+   该值只是转发给既有模块的 `--expected-commit`，wrapper 自身仍不据它做任何判定。
+
+   `rquant-runtime-recovery@` / `rquant-runtime-recovery-rehearsal@` 的
+   `--expected-profile-generation %i` 已移除，generation 同样来自 `current.json`。
 
 11. **`deploy/libexec/rquant-workload-arbiter` 的 pdeathsig 竞态**：`setpriv --pdeathsig`
    在 fork 与 exec 之间设置 `PR_SET_PDEATHSIG`，与旧实现一样存在「父进程恰在此窗口内死亡」

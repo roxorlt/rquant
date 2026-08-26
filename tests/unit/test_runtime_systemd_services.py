@@ -79,6 +79,9 @@ PROTECTED_UNIT_ROLES = {
     "rquant-runtime-recovery-rehearsal@.service": "runtime_recovery_rehearsal",
     "rquant-page-control.service": "page_control",
 }
+#: `rquant-page-control.service` is not a template, so its authorised instance label is a
+#: unit-owned literal rather than `%i` — the same shape `rquant-artifact-retention` uses.
+PAGE_CONTROL_INSTANCE = "svc-981cb38218dd899500ee1592a504790a57d459c946bbc53c8e210f299cf1980b"
 RETENTION_INSTANCE = "svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349"
 REQUIRED_INACCESSIBLE_PATHS = {
     "lab-jobs": frozenset({"/etc/rquant/lab-claim-finalizer-runtime"}),
@@ -136,7 +139,9 @@ def test_page_control_has_a_loopback_production_unit() -> None:
     assert "APP_ENV=prod" in service["Environment"]
     assert "RQUANT_DISABLE_DOTENV=1" in service["Environment"]
     assert "EnvironmentFile" not in service
-    assert service["ExecStart"] == f"{WRAPPER_COMMAND} page_control"
+    assert service["ExecStart"] == (
+        f"{WRAPPER_COMMAND} page_control --instance {PAGE_CONTROL_INSTANCE}"
+    )
     assert "RQUANT_PAGE_CONTROL_HOST=127.0.0.1" in service["Environment"]
     assert "RQUANT_PAGE_CONTROL_PORT=8767" in service["Environment"]
     assert service["Restart"] == "on-failure"

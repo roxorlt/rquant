@@ -45,6 +45,7 @@ BUILD_SCRIPT = ROOT / "scripts" / "build-runtime-exec-pyz.py"
 ROLE = "strategy_live"
 MODULE = "rquant.runtime_service_main"
 INSTANCES = ("svc-" + "a" * 64, "svc-" + "b" * 64)
+CONTROL_ROOT = "/home/lighthouse/rquant/data/runtime/control/strategies"
 
 #: What the generation's own module prints when the frozen bootstrap actually reaches it.
 #: `textwrap` is a pure-stdlib module the wrapper itself never imports, so it is only
@@ -87,7 +88,9 @@ class World:
         *,
         profile_role_overrides: dict[str, Any] | None = None,
         whole_policy: bool = False,
+        omit_manifest_for: frozenset[str] = frozenset(),
     ) -> None:
+        self.omit_manifest_for = omit_manifest_for
         self.whole_policy = whole_policy
         self.profile_role_overrides = dict(profile_role_overrides or {})
         self.root = root
@@ -131,6 +134,14 @@ class World:
         (package / "__init__.py").write_text('ORIGIN = "generation"\n', encoding="utf-8")
         (package / "runtime_service_main.py").write_text(CHILD_PROBE, encoding="utf-8")
         (staging / "app" / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
+        # Per-instance service manifests live inside the generation, so they are covered by
+        # its full manifest and hash-verified with the rest of the code.
+        manifests = staging / "manifests"
+        manifests.mkdir()
+        for label in sorted(self._all_instances() - self.omit_manifest_for):
+            (manifests / f"{label}.json").write_text(
+                f'{{"service_id": "{label}"}}\n', encoding="utf-8"
+            )
         (staging / "pyvenv.cfg").write_text(
             "home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.15\n",
             encoding="utf-8",
@@ -223,6 +234,12 @@ class World:
             "manifest_schema": {"schema_id": "rquant-full-manifest/v1"},
         }
 
+    def _all_instances(self) -> set[str]:
+        labels: set[str] = set()
+        for role in self._profile_roles().values():
+            labels.update(role["instances"])
+        return labels
+
     def _profile_roles(self) -> dict[str, Any]:
         if not self.whole_policy:
             return {
@@ -230,25 +247,31 @@ class World:
                     "module": MODULE,
                     "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
                     "instances": list(INSTANCES),
+                    "service_kind": ROLE,
+                    "control_root": CONTROL_ROOT,
+                    "once": False,
                     **self.profile_role_overrides,
                 }
             }
         from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 
         return {
-            name: {
-                "module": module,
-                "environment_allowlist": list(environment),
+            entry.name: {
+                "module": entry.module,
+                "environment_allowlist": list(entry.environment_allowlist),
                 "instances": (
                     sorted(
-                        "svc-" + hashlib.sha256(f"{name}-{index}".encode()).hexdigest()
+                        "svc-" + hashlib.sha256(f"{entry.name}-{index}".encode()).hexdigest()
                         for index in range(2)
                     )
-                    if instanced
+                    if entry.instanced
                     else []
                 ),
+                "service_kind": entry.service_kind,
+                "control_root": entry.control_root,
+                "once": entry.once,
             }
-            for name, module, environment, instanced in PRODUCTION_ROLE_POLICY
+            for entry in PRODUCTION_ROLE_POLICY
         }
 
     def _slot_roles(self, generation: Path) -> dict[str, Any]:
@@ -257,8 +280,8 @@ class World:
         from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 
         return {
-            name: {**self._role_spec(generation), "module": module}
-            for name, module, _, _ in PRODUCTION_ROLE_POLICY
+            entry.name: {**self._role_spec(generation), "module": entry.module}
+            for entry in PRODUCTION_ROLE_POLICY
         }
 
     def _write_profile(self) -> None:
@@ -297,7 +320,7 @@ class World:
             "lifecycle": "active",
             "generation_id": generation_id,
             "generation_path": str(generation),
-            "commit": "0" * 40,
+            "commit": "a1b2c3d4" * 5,
             "full_manifest_hash": generation_id,
             "profile_id": self.profile_id,
             "roles": self._slot_roles(generation),
@@ -563,8 +586,10 @@ class TestResolveLaunch:
 
         assert first["instance"] == INSTANCES[0]
         assert second["instance"] == INSTANCES[1]
-        assert first["module_argv"] == ("--instance", INSTANCES[0])
-        assert second["module_argv"] == ("--instance", INSTANCES[1])
+        assert first["module_argv"][:2] == ("--manifest", first["service_manifest"])
+        assert INSTANCES[0] in first["service_manifest"]
+        assert INSTANCES[1] in second["service_manifest"]
+        assert first["module_argv"] != second["module_argv"]
         assert first != second
         for shared in ("role", "module", "python_path", "generation_id", "working_directory"):
             assert first[shared] == second[shared]
@@ -825,7 +850,9 @@ class TestFrozenBootstrap:
         # `runpy(alter_sys=True)` rewrites argv[0] to the module's own file, which is
         # itself proof the module came out of the generation.
         assert observed["argv"][0].startswith(str(world.generation_path / "app") + "/")
-        assert observed["argv"][1:] == ["--instance", INSTANCES[0]]
+        assert observed["argv"][1] == "--manifest"
+        assert observed["argv"][2].endswith(f"/manifests/{INSTANCES[0]}.json")
+        assert "--control-root" in observed["argv"]
 
     def test_the_child_imports_rquant_from_the_generation_not_the_checkout(
         self,
@@ -1008,18 +1035,20 @@ class TestEveryProtectedUnitResolves:
         world = _build_world(tmp_path, whole_policy=True)
         resolved: dict[tuple[str, str | None], dict[str, Any]] = {}
 
-        for role, module, _, _ in PRODUCTION_ROLE_POLICY:
+        for entry in PRODUCTION_ROLE_POLICY:
+            role = entry.name
             labels: tuple[str | None, ...] = self._instances(world, role) or (None,)
             for label in labels:
                 launch = world.resolve(role, instance=label)
                 assert launch["role"] == role
-                assert launch["module"] == module
+                assert launch["module"] == entry.module
                 assert launch["instance"] == label
                 assert Path(launch["python_path"]).is_relative_to(world.generation_path)
                 assert Path(launch["app_source"]).is_relative_to(world.generation_path)
                 resolved[(role, label)] = launch
 
-        assert len(resolved) == 2 * 24 + 2  # 24 instanced roles x 2 labels, 2 plain roles
+        instanced = sum(1 for entry in PRODUCTION_ROLE_POLICY if entry.instanced)
+        assert len(resolved) == 2 * instanced + (len(PRODUCTION_ROLE_POLICY) - instanced)
         signatures = {
             (launch["role"], launch["instance"]) for launch in resolved.values()
         }
@@ -1028,7 +1057,7 @@ class TestEveryProtectedUnitResolves:
     def test_every_unit_role_is_declared_by_the_expanded_policy(self) -> None:
         from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 
-        declared = {name for name, _, _, _ in PRODUCTION_ROLE_POLICY}
+        declared = {entry.name for entry in PRODUCTION_ROLE_POLICY}
 
         assert set(_verify.PROTECTED_ROLES) == declared
         assert len(declared) == 26
@@ -1041,11 +1070,195 @@ class TestEveryProtectedUnitResolves:
 
         world = _build_world(tmp_path, whole_policy=True)
 
-        for role, _, _, instanced in PRODUCTION_ROLE_POLICY:
-            if not instanced:
+        for entry in PRODUCTION_ROLE_POLICY:
+            if not entry.instanced:
                 continue
             with pytest.raises(
                 _verify.RuntimeExecError,
                 match="not in the root-owned allowlist",
             ):
-                world.resolve(role, instance="svc-" + "f" * 64)
+                world.resolve(entry.name, instance="svc-" + "f" * 64)
+
+
+# ---------------------------------------------------------------------------------------
+# The derived argv is the one the existing module actually accepts
+# ---------------------------------------------------------------------------------------
+
+
+class TestDerivedModuleArgv:
+    """R2D-SPEC-02(b): the wrapper execs, and the module has to accept what it is handed.
+
+    The units used to carry `--manifest`, `--control-root`, `--expected-commit` and
+    `--expected-generation` themselves — the first through a `%i`-interpolated path under
+    the `current` symlink, the last two out of `runtime.env`, a file the application it
+    configures writes. All four are now derived from the two root-owned documents, and the
+    instance label only picks *which* authorised manifest, never where it lives.
+    """
+
+    @staticmethod
+    def _parser() -> Any:
+        from rquant.runtime_service_main import build_parser
+
+        return build_parser()
+
+    def test_every_service_role_argv_is_accepted_by_the_real_module_parser(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        world = _build_world(tmp_path, whole_policy=True)
+        accepted = 0
+        skipped: list[str] = []
+
+        for entry in PRODUCTION_ROLE_POLICY:
+            labels: tuple[str | None, ...] = (
+                tuple(world._profile_roles()[entry.name]["instances"]) or (None,)
+            )
+            for label in labels:
+                argv = world.resolve(entry.name, instance=label)["module_argv"]
+                if not argv:
+                    # `daily` is the HYBRID adapter of authority.md L200: "caller argv
+                    # count 0". It is the one role with no unit in this package.
+                    skipped.append(entry.name)
+                    continue
+                parsed = self._parser().parse_args(list(argv))
+                assert str(parsed.manifest).endswith(f"/manifests/{label}.json")
+                assert str(parsed.control_root).endswith(f"/{label}")
+                assert parsed.expected_generation == world.generation_path.name
+                assert parsed.once is entry.once
+                if entry.service_kind:
+                    assert [kind.value for kind in parsed.expected_kind] == [
+                        entry.service_kind
+                    ]
+                else:
+                    assert parsed.expected_kind is None
+                accepted += 1
+
+        assert skipped == ["daily"]
+        assert accepted == 2 * sum(1 for e in PRODUCTION_ROLE_POLICY if e.instanced)
+
+    def test_the_derived_paths_are_verbatim_from_the_authority_records(
+        self,
+        world: World,
+    ) -> None:
+        launch = world.resolve(instance=INSTANCES[1])
+        argv = list(launch["module_argv"])
+
+        assert argv[argv.index("--manifest") + 1] == str(
+            world.generation_path / "manifests" / f"{INSTANCES[1]}.json"
+        )
+        assert argv[argv.index("--control-root") + 1] == f"{CONTROL_ROOT}/{INSTANCES[1]}"
+        assert argv[argv.index("--expected-generation") + 1] == world.generation_path.name
+        assert argv[argv.index("--expected-commit") + 1] == "a1b2c3d4" * 5
+
+    def test_no_derived_argument_carries_a_template_or_environment_expansion(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        world = _build_world(tmp_path, whole_policy=True)
+
+        for entry in PRODUCTION_ROLE_POLICY:
+            for label in world._profile_roles()[entry.name]["instances"] or [None]:
+                for argument in world.resolve(entry.name, instance=label)["module_argv"]:
+                    assert "%i" not in argument
+                    assert "${" not in argument
+                    assert "$" not in argument
+
+    def test_the_manifest_lives_under_the_root_owned_generation(self, world: World) -> None:
+        launch = world.resolve()
+
+        assert Path(launch["service_manifest"]).is_relative_to(world.generation_path)
+        assert Path(launch["service_manifest"]).is_file()
+
+    def test_a_manifest_outside_the_generation_full_manifest_refuses(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The label is authorised, but no manifested file answers to it."""
+
+        stray = "svc-" + "e" * 64
+        starved = _build_world(
+            tmp_path,
+            profile_role_overrides={"instances": sorted([*INSTANCES, stray])},
+            omit_manifest_for=frozenset({stray}),
+        )
+
+        with pytest.raises(
+            _verify.RuntimeExecError,
+            match="not covered by the generation full manifest",
+        ):
+            starved.resolve(instance=stray)
+
+    def test_a_symlinked_service_manifest_refuses(self, world: World) -> None:
+        target = world.generation_path / "manifests" / f"{INSTANCES[0]}.json"
+        elsewhere = world.root / "escaped.json"
+        elsewhere.write_text('{"service_id": "escaped"}\n', encoding="utf-8")
+        parent = stat.S_IMODE(target.parent.stat().st_mode)
+        target.parent.chmod(0o755)
+        target.unlink()
+        target.symlink_to(elsewhere)
+        target.parent.chmod(parent)
+
+        with pytest.raises(_verify.RuntimeExecError, match="symlink"):
+            world.resolve(instance=INSTANCES[0])
+
+    def test_a_record_commit_that_is_not_a_sha_refuses(self, world: World) -> None:
+        record = json.loads(world.authority_path.read_bytes())
+        record["current_commit"] = "untrusted-audit-prose"
+        world.rewrite(world.authority_path, _canonical(record))
+
+        with pytest.raises(_verify.RuntimeExecError, match="forwardable commit sha"):
+            world.resolve()
+
+    def test_a_role_without_a_control_root_receives_no_argv(self, tmp_path: Path) -> None:
+        world = _build_world(tmp_path, whole_policy=True)
+
+        assert world.resolve("daily", instance=None)["module_argv"] == ()
+
+    def test_the_child_execs_into_the_module_with_the_derived_argv(
+        self,
+        world: World,
+    ) -> None:
+        """A real exec through the frozen bootstrap into a stub module's entry point."""
+
+        program = _verify.frozen_bootstrap()
+        body = program[: -len(_verify.CHILD_TRAILER)]
+        call = (
+            "raise SystemExit(child_main(\n"
+            "    _sys.argv[1], _sys.argv[2],\n"
+            "    profile_path=_sys.argv[3], authority_path=_sys.argv[4],\n"
+            "    generation_root=_sys.argv[5], trusted_root=_sys.argv[6],\n"
+            "    expected_owner_uid=int(_sys.argv[7]),\n"
+            "))\n"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                f"{body}\n\nimport sys as _sys\n\n{call}",
+                ROLE,
+                INSTANCES[0],
+                str(world.profile_path),
+                str(world.authority_path),
+                str(world.generation_root),
+                str(world.trusted_root),
+                str(world.owner_uid),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert completed.returncode == 0, completed.stderr
+        observed = json.loads(completed.stdout)
+
+        assert observed["outcome"] == "ran"
+        argv = observed["argv"]
+        assert argv[argv.index("--manifest") + 1].endswith(f"/manifests/{INSTANCES[0]}.json")
+        assert argv[argv.index("--control-root") + 1] == f"{CONTROL_ROOT}/{INSTANCES[0]}"
+        assert argv[argv.index("--expected-kind") + 1] == ROLE
