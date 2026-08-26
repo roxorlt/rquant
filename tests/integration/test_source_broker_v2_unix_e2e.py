@@ -38,6 +38,7 @@ from rquant.source_broker_v2 import (
     SourceBrokerV2SagaUnavailableError,
     SourceBrokerV2UnixClient,
     SourceBrokerV2WireRequest,
+    source_effect_operation_id,
 )
 from rquant.strict_json import (
     canonical_json_bytes,
@@ -243,11 +244,19 @@ def _payload_hash(payload: bytes) -> str:
     return canonical_sha256(strict_canonical_json_loads(payload))
 
 
-def _dispatch_request(operation_id: str = "a" * 64) -> SourceBrokerV2DispatchRequest:
+def _dispatch_request(operation_id: str | None = None) -> SourceBrokerV2DispatchRequest:
     payload = canonical_json_bytes({"symbol": "000001.SZ", "trade_date": "2026-08-07"})
+    saga_id = "saga-source-v2-e2e"
     return SourceBrokerV2DispatchRequest(
-        saga_id="saga-source-v2-e2e",
-        operation_id=operation_id,
+        saga_id=saga_id,
+        # The service requires the operation id to be the deterministic effect
+        # identity for (saga, phase); a literal placeholder is rejected before
+        # any claim work happens.
+        operation_id=operation_id
+        or source_effect_operation_id(
+            saga_id=saga_id,
+            phase=SourceBrokerV2OutboxPhase.DISPATCH,
+        ),
         call_id="daily-bars",
         attempt_identity_hash="1" * 64,
         claim_plan_hash="2" * 64,

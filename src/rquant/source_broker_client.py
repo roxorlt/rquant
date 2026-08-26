@@ -73,7 +73,18 @@ class SourceBrokerUnixClient:
                         self._endpoint,
                         expected_identity=endpoint_identity,
                     )
-                    write_frame(connection, payload)
+                    try:
+                        write_frame(connection, payload)
+                    except (OSError, SourceBrokerTransportError) as write_error:
+                        # The service answers a rejected peer with a failure
+                        # frame and closes at once, so a client that is still
+                        # verifying the listener can lose the write race and
+                        # see only EPIPE. The rejection is already queued on
+                        # this socket: report it instead of a generic failure.
+                        rejected = _pending_remote_failure(connection)
+                        if rejected is not None:
+                            raise SourceBrokerTransportRemoteError(rejected) from write_error
+                        raise
                     wire_response = decode_response(read_frame(connection))
                 if isinstance(wire_response, SourceBrokerTransportFailure):
                     raise SourceBrokerTransportRemoteError(wire_response.error)
@@ -86,6 +97,17 @@ class SourceBrokerUnixClient:
                 if attempt + 1 < self._max_attempts:
                     time.sleep(min(0.05 * (2**attempt), 0.25))
         raise SourceBrokerTransportError("source broker Unix transport failed") from last_error
+
+
+def _pending_remote_failure(connection: socket.socket) -> str | None:
+    """Return the error of a failure frame the peer already sent, if any."""
+    try:
+        decoded = decode_response(read_frame(connection))
+    except (OSError, TimeoutError, ValueError, SourceBrokerTransportError):
+        return None
+    if isinstance(decoded, SourceBrokerTransportFailure):
+        return decoded.error
+    return None
 
 
 class SourceBrokerClient:
