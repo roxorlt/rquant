@@ -1877,21 +1877,38 @@ def _python_facts(
     return version, abi
 
 
+def _interpreter_identity_failures(observed: os.stat_result) -> tuple[str, ...]:
+    """Name every interpreter identity predicate the observed metadata violates.
+
+    The predicate set is exactly the one `_verified_interpreter` enforces; this
+    helper only makes the rejection reason observable (a failing CI leg reports
+    which predicate broke instead of a bare "unsafe identity").
+    """
+    failures: list[str] = []
+    if not stat.S_ISREG(observed.st_mode):
+        failures.append("regular-file")
+    if stat.S_ISLNK(observed.st_mode):
+        failures.append("not-a-symlink")
+    if observed.st_uid != os.getuid():
+        failures.append("owned-by-caller")
+    if observed.st_nlink != 1:
+        failures.append("single-link")
+    if observed.st_mode & 0o022:
+        failures.append("no-group-or-other-write")
+    if not observed.st_mode & stat.S_IXUSR:
+        failures.append("owner-executable")
+    return tuple(failures)
+
+
 def _verified_interpreter(path: Path, *, label: str) -> tuple[Path, PathIdentity, str]:
     try:
         resolved = path.resolve(strict=True)
         observed = resolved.lstat()
     except OSError as exc:
         raise ReleaseGenerationError(f"{label} cannot be resolved") from exc
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or stat.S_ISLNK(observed.st_mode)
-        or observed.st_uid != os.getuid()
-        or observed.st_nlink != 1
-        or observed.st_mode & 0o022
-        or not observed.st_mode & stat.S_IXUSR
-    ):
-        raise ReleaseGenerationError(f"{label} has unsafe identity")
+    failures = _interpreter_identity_failures(observed)
+    if failures:
+        raise ReleaseGenerationError(f"{label} has unsafe identity: failed {', '.join(failures)}")
     return resolved, PathIdentity.capture(observed), _hash_file(resolved, label=label)
 
 

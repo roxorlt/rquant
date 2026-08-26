@@ -27,6 +27,7 @@ from rquant.release_generation import (
     ReleaseGenerationError,
     ReleaseGenerationMarker,
     _read_private_json,
+    _verified_interpreter,
     _write_private_json,
     commit_path_for_lock,
     environment_manifest_path_for_lock,
@@ -793,6 +794,39 @@ def _publish_initialized(
         transaction_kind="initialization",
     )
     return marker
+
+
+def test_verified_interpreter_rejection_names_every_failed_predicate(tmp_path: Path) -> None:
+    candidate = tmp_path / "python"
+    shutil.copy2(sys.executable, candidate)
+    candidate.chmod(0o646)
+
+    with pytest.raises(ReleaseGenerationError) as group_writable:
+        _verified_interpreter(candidate, label="deployment system Python")
+
+    assert str(group_writable.value) == (
+        "deployment system Python has unsafe identity: "
+        "failed no-group-or-other-write, owner-executable"
+    )
+
+    candidate.chmod(0o700)
+    linked = tmp_path / "python-hardlink"
+    os.link(candidate, linked)
+    with pytest.raises(ReleaseGenerationError) as multi_linked:
+        _verified_interpreter(candidate, label="deployment system Python")
+
+    assert str(multi_linked.value) == (
+        "deployment system Python has unsafe identity: failed single-link"
+    )
+
+    linked.unlink()
+    resolved, identity, digest = _verified_interpreter(
+        candidate,
+        label="deployment system Python",
+    )
+    assert resolved == candidate.resolve(strict=True)
+    assert identity.owner == os.getuid()
+    assert len(digest) == 64
 
 
 def test_release_generation_marker_binds_checkout_lock_python_and_venv(
