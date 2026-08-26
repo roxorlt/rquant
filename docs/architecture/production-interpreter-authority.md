@@ -664,17 +664,27 @@ cursor, drain, or cutover is outside Phase A and blocks.
 
 ##### Frozen Inputs And Policy
 
-The frozen baseline is commit `45d0b57c4c5cbab1700fa5e3c386c6756892a7d6` and Git tree
-`4f67e67192855874e82baa13dc343a1d6939bd67`. CI receives the candidate commit and tree from its
-checked-out ref, requires both IDs to be lowercase 40-hex, requires the candidate to descend from
-the baseline, and records the exact pair. The deployment target must later equal that pair.
+Amended per Codex round-2 order 2026-08-25, item P1-1. The frozen baseline is the exact
+merge base of `origin/main` and the candidate, currently commit
+`9699827be09ca22479f6741e820722399fe40244` and Git tree
+`56bf300f296815acca414a1c7f5c2769ee5d466a`, so `baseline..candidate` is the complete pull
+request merge face rather than a branch-local subset. The superseded baseline
+`45d0b57c4c5cbab1700fa5e3c386c6756892a7d6` remains a separately checked candidate ancestor. CI
+receives the candidate commit and tree from its checked-out ref, requires both IDs to be
+lowercase 40-hex, requires the candidate to descend from both the merge base and that historical
+baseline, and records the exact pair. The deployment target must later equal that pair. The merge
+base is frozen: if `origin/main` advances before the merge, the recorded pair, allowlist, and
+merge-tree equality no longer hold and the policy must be regenerated.
 
 The repository-controlled, reviewed fixture
 `tests/fixtures/r07_differential_gate/policy-v1.json` is canonical JSON with a SHA-256 policy
 digest. It contains:
 
-1. the exact baseline commit/tree;
-2. the complete repository diff allowlist: paths, allowed add/modify/delete kinds, and categories;
+1. the exact baseline commit/tree, which is the frozen merge base;
+2. the complete repository diff allowlist: paths, allowed add/modify/delete kinds, and categories.
+   Amended per Codex round-2 order 2026-08-25, item P1-1: it covers every path in the complete
+   `merge_base..candidate` raw diff, and `scripts/r07_policy_regenerate.py` is the one repeatable
+   way to produce it, with frozen category rules and a `--check` mode;
 3. for every allowed production declaration, its qualified name, source span, normalized AST
    digest, and allowed role (`read_only_v3_model`, `read_only_v3_decoder`, or
    `legacy_boundary_reject_guard`);
@@ -809,7 +819,13 @@ rquant.runtime_builder_daily_orchestrator.daily_pipeline_orchestrator_builder
 Each snapshot fixes module path, exported name, function signature, exact source digest, and
 normalized AST digest. A second static manifest fixes the source-file universe and the forbidden
 writer/activation definitions, aliases, exports, and literal registry keys, including the existing
-`signal_route_spool.py` boundary. The resolver parses source only; it never imports a module,
+`signal_route_spool.py` boundary. Amended per Codex round-2 order 2026-08-25, item P1-1: a fourth
+fixed static check, `diff-scope-forbidden-definitions`, additionally parses every `src/rquant`
+source file the reviewed diff adds or modifies and blocks when one *defines* a forbidden symbol,
+exports one, or registers one under a literal key, so the source files outside the frozen
+nine-file snapshot universe are no longer outside the static gate. Mentioning a forbidden name is
+not a definition. The fixed static checks are therefore exactly `policy-completeness`,
+`top-level-source-closure`, `forbidden-definitions`, and `diff-scope-forbidden-definitions`. The resolver parses source only; it never imports a module,
 constructs a registry, executes a descriptor, traverses an object graph or closure, or analyzes
 bytecode. Unknown executable top-level behavior, dynamic import/registration/export, unresolved
 alias, or snapshot drift blocks.
@@ -819,9 +835,17 @@ alias, or snapshot drift blocks.
 The only accepted evidence producer is GitHub Actions workflow `.github/workflows/ci.yml`, test jobs
 `r07-differential-gate-py311` and `r07-differential-gate-py312`, and aggregation job
 `r07-differential-gate-evidence`, triggered by `push` to exact ref `refs/heads/main` after merge.
-Branch protection forbids direct pushes, so the trusted `push main` event identifies a reviewed
-merge. Pull request, workflow-dispatch, tag, branch, rerun at another SHA, or pre-merge evidence is
-never deployment evidence. The checkout commit must equal the event `after` SHA, its resolved tree is
+Amended per Codex round-2 order 2026-08-25, ruling 9: this repository has no branch protection, so
+the `push main` event alone is not an approval boundary and must not be described as one. The
+equivalent enforcement is structural. A `push main` produces evidence only when the pushed commit
+is the merge commit a reviewed pull request merge writes: exactly two parents, the first parent
+equal to the frozen merge base that was the pre-merge `main` tip, the merge base an ancestor of the
+second parent, and a tree exactly equal to `git merge-tree --write-tree <parent1> <parent2>`. A
+squash, rebase, or direct push has one parent and produces no evidence at all. Unlike a GitHub API
+answer, every part of this is replayable offline from Git objects by each later consumer; a pull
+request number may be recorded as a CI-time audit note but is never authority. Pull request,
+workflow-dispatch, tag, branch, rerun at another SHA, or pre-merge evidence is never deployment
+evidence. The checkout commit must equal the event `after` SHA, its resolved tree is
 recorded, and both Python 3.11 and 3.12 jobs run against that same pair.
 
 `R07DrGateEvidenceWireV1` is strict canonical JSON with exactly:
@@ -839,6 +863,10 @@ candidate_commit_sha: lowercase 40-hex
 candidate_tree_sha: lowercase 40-hex
 baseline_commit_sha: exact frozen commit
 baseline_tree_sha: exact frozen tree
+merge_base_commit_sha: lowercase 40-hex, exactly baseline_commit_sha
+merge_base_tree_sha: lowercase 40-hex, exactly baseline_tree_sha
+candidate_parent_commits: exact ordered distinct pair, first exactly merge_base_commit_sha
+merge_tree_sha: lowercase 40-hex, exactly candidate_tree_sha
 policy_digest: lowercase 64-hex
 complete_diff_digest: lowercase 64-hex
 candidate_binding_digest: lowercase 64-hex over baseline/candidate commit+tree and complete diff
@@ -854,9 +882,19 @@ outcome: passed
 evidence_digest: lowercase 64-hex over canonical JSON without this field
 ```
 
+Amended per Codex round-2 order 2026-08-25, item P1-1 and ruling 9: `merge_base_commit_sha`,
+`merge_base_tree_sha`, `candidate_parent_commits`, and `merge_tree_sha` bind the final merge tree
+to the exact two parents it was produced from.
+
 Each `python_runs` entry has exactly `python_minor`, `job_id`, `job_run_id`, `workflow_run_id`, `run_attempt`,
 `candidate_commit_sha`, `candidate_tree_sha`, `collected`, `passed`, `skipped`, `deselected`,
-`result_digest`, and `outcome`. Both entries must bind the top-level run and candidate pair;
+`candidate_gate_digest`, `static_result_digest`, `boundary_result_digest`,
+`check_inventory_digest`, `result_digest`, and `outcome`. Amended per Codex round-2 order
+2026-08-25, ruling 6: the four gate digests carry the exact candidate-gate outcome, the exact
+named static check outcomes, the ordered boundary results, and the ordered executed check
+inventory each interpreter observed. Both entries must carry identical values for all four, the
+top-level `boundary_result_digest` must equal theirs, and a 3.11/3.12 divergence in any of them
+produces no evidence. Both entries must bind the top-level run and candidate pair;
 the 3.11 and 3.12 `job_id` values are exactly `r07-differential-gate-py311` and
 `r07-differential-gate-py312`, and each `job_run_id` is a positive integer.
 `outcome=passed` requires `collected == passed > 0`, `skipped == 0`, and `deselected == 0`. Unknown,
@@ -878,7 +916,14 @@ these steps in order:
 1. Strictly revalidate the wire and policy, resolve the wire's baseline/candidate commit and tree
    IDs as exact Git objects, require the declared trees to match those commits, require candidate
    ancestry from the frozen baseline, and read all source and policy inputs from those Git objects,
-   never from the caller's working tree.
+   never from the caller's working tree. Amended per Codex round-2 order 2026-08-25, item P1-1: the
+   frozen baseline is the merge base, so this ancestry requirement is exactly the requirement that
+   `merge_base(origin/main, candidate)` still be that commit, and the superseded baseline
+   `45d0b57c…` is checked as a candidate ancestor independently. Also resolve the candidate's
+   parents and require the merge provenance the `push main` channel above defines: exactly two
+   distinct parents, the first equal to `merge_base_commit_sha`, the merge base an ancestor of the
+   second, and `git merge-tree --write-tree` over the pair equal to both `merge_tree_sha` and the
+   candidate tree. A Git older than 2.38 cannot write that tree and is a refusal, never a warning.
 2. Materialize the exact candidate tree into a fresh read-only temporary root and re-run the full
    candidate diff/allowlist gate, every static root/declaration/forbidden-definition gate, and the
    ordered B01..B17 boundary probes against that root. A missing, skipped, deselected, partial, or
@@ -886,7 +931,10 @@ these steps in order:
 3. Recompute the canonical `policy_digest`, `complete_diff_digest`, `candidate_binding_digest`,
    `boundary_manifest_digest`, ordered `boundary_result_digest`, `root_snapshot_digest`,
    `forbidden_definition_digest`, every deterministic `python_runs.result_digest`, the derived
-   `artifact_name`, and the final `evidence_digest`. Revalidate all fixed channel metadata and all
+   `artifact_name`, and the final `evidence_digest`. Amended per Codex round-2 order 2026-08-25,
+   ruling 6: also recompute each entry's `candidate_gate_digest`, `static_result_digest`,
+   `boundary_result_digest`, and `check_inventory_digest` from this replay, so a value either
+   interpreter reported that the verifier cannot reproduce rejects. Revalidate all fixed channel metadata and all
    run/candidate cross-bindings.
 4. Compare every recomputed scalar, ordered collection, ID, count, outcome observation, and digest
    field-for-field with the wire. Any mismatch rejects; only after all comparisons pass may the
@@ -970,8 +1018,12 @@ JSON/digest mismatch, or channel metadata mismatch. A cache entry for any deploy
 rollback-eligible commit is retained after GitHub's 90-day artifact expiry. This is a fixed input
 inside the trusted CI and server-permission boundary; it is intentionally unsigned.
 
-Merge review and branch protection are the approval boundary. The artifact is evidence for that
-trusted boundary, not a signature, URI chain, or separate authorization service.
+Amended per Codex round-2 order 2026-08-25, ruling 9. Merge review is the approval boundary, and
+this repository has no branch protection enforcing it; the technically enforced part is the
+merge-provenance requirement above, which admits only the two-parent merge commit a pull request
+merge writes and is replayable offline. Enabling GitHub branch protection would add the missing
+push-side enforcement; until then no document may claim it exists. The artifact is evidence for
+that boundary, not a signature, URI chain, or separate authorization service.
 
 Release deployment continues to use only:
 
