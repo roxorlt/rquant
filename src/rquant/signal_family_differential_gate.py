@@ -2279,28 +2279,55 @@ def diff_scope_source_paths(policy: R07PolicyV1) -> tuple[str, ...]:
     )
 
 
+def _bound_value_names(value: ast.AST | None) -> tuple[str, ...]:
+    """Names an assignment's right-hand side rebinds, so an alias cannot launder a symbol."""
+
+    if isinstance(value, ast.Name):
+        return (value.id,)
+    if isinstance(value, ast.Attribute):
+        return (value.attr,)
+    if isinstance(value, (ast.Tuple, ast.List)):
+        return tuple(name for item in value.elts for name in _bound_value_names(item))
+    return ()
+
+
+def _string_constants(value: ast.AST | None) -> tuple[str, ...]:
+    if isinstance(value, (ast.Tuple, ast.List)):
+        return tuple(
+            item.value
+            for item in value.elts
+            if isinstance(item, ast.Constant) and type(item.value) is str
+        )
+    return ()
+
+
 def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
     definitions: set[str] = set()
     exports: set[str] = set()
     registry_keys: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # ast.walk reaches nested definitions, so a method or a closure-local class
+            # is bound exactly like a module-level one.
             definitions.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            definitions.update(
-                alias.asname or alias.name.rsplit(".", 1)[-1] for alias in node.names
-            )
+            for alias in node.names:
+                # Both halves bind: renaming on import does not unbind the original name.
+                definitions.add(alias.name.rsplit(".", 1)[-1])
+                if alias.asname is not None:
+                    definitions.add(alias.asname)
         elif isinstance(node, ast.Assign):
             names = tuple(name for target in node.targets for name in _target_names(target))
             definitions.update(names)
-            if "__all__" in names and isinstance(node.value, (ast.Tuple, ast.List)):
-                exports.update(
-                    item.value
-                    for item in node.value.elts
-                    if isinstance(item, ast.Constant) and type(item.value) is str
-                )
+            definitions.update(_bound_value_names(node.value))
+            if "__all__" in names:
+                exports.update(_string_constants(node.value))
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            definitions.update(_target_names(node.target))
+            names = _target_names(node.target)
+            definitions.update(names)
+            definitions.update(_bound_value_names(node.value))
+            if "__all__" in names:
+                exports.update(_string_constants(node.value))
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.ctx, ast.Store)

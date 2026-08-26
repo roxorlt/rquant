@@ -821,10 +821,16 @@ normalized AST digest. A second static manifest fixes the source-file universe a
 writer/activation definitions, aliases, exports, and literal registry keys, including the existing
 `signal_route_spool.py` boundary. Amended per Codex round-2 order 2026-08-25, item P1-1: a fourth
 fixed static check, `diff-scope-forbidden-definitions`, additionally parses every `src/rquant`
-source file the reviewed diff adds or modifies and blocks when one *defines* a forbidden symbol,
+source file the reviewed diff adds or modifies and blocks when one *binds* a forbidden symbol,
 exports one, or registers one under a literal key, so the source files outside the frozen
-nine-file snapshot universe are no longer outside the static gate. Mentioning a forbidden name is
-not a definition. The fixed static checks are therefore exactly `policy-completeness`,
+nine-file snapshot universe are no longer outside the static gate. Binding means a definition at
+any nesting depth, an import of the name under either its original or its renamed form, an
+assignment target or an alias assignment that rebinds the name, a string entry of `__all__`
+including its annotated and augmented forms, a literal registry subscript key, or a literal
+argument to a `register*` call. Mentioning a forbidden name in a comment, docstring, string
+constant, or literal name list binds nothing and does not block; a dynamic `setattr`,
+`globals()` write, or plain dict literal key is likewise outside this check, and remains covered
+for the nine snapshot files by their mention-level universe. The fixed static checks are therefore exactly `policy-completeness`,
 `top-level-source-closure`, `forbidden-definitions`, and `diff-scope-forbidden-definitions`. The resolver parses source only; it never imports a module,
 constructs a registry, executes a descriptor, traverses an object graph or closure, or analyzes
 bytecode. Unknown executable top-level behavior, dynamic import/registration/export, unresolved
