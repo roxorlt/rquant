@@ -52,9 +52,14 @@ _TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _ZIP_STREAM_CHUNK_SIZE = 1024 * 1024
 _LEGACY_GENESIS_HASH = "0" * 64
-_LEGACY_PROCESS_LOCKS_GUARD = threading.Lock()
-_ARTIFACT_PROCESS_LOCKS_GUARD = threading.Lock()
-_FINALIZATION_PROCESS_LOCKS_GUARD = threading.Lock()
+# Reentrant on purpose. These guard the per-inode lock registries, and an index's
+# __del__ closes it - so a garbage collection triggered by an allocation *inside*
+# one of these critical sections re-enters the same guard on the same thread. A
+# plain Lock deadlocks the interpreter there with no way out; CPython 3.12's
+# collector made that ordering common enough to hang a whole CI shard.
+_LEGACY_PROCESS_LOCKS_GUARD = threading.RLock()
+_ARTIFACT_PROCESS_LOCKS_GUARD = threading.RLock()
+_FINALIZATION_PROCESS_LOCKS_GUARD = threading.RLock()
 
 
 @dataclass
