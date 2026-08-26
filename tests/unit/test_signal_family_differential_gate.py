@@ -390,13 +390,9 @@ def test_wire_rejects_divergent_dual_python_gate_digests(
 ) -> None:
     wire = evidence_bundle.evidence.wire
     diverged = wire.python_runs[1].model_copy(update={"boundary_result_digest": "9" * 64})
-    diverged = diverged.model_copy(
-        update={"result_digest": python_run_result_digest(diverged)}
-    )
+    diverged = diverged.model_copy(update={"result_digest": python_run_result_digest(diverged)})
     values = wire.model_dump(mode="python")
-    values.update(
-        {"python_runs": (wire.python_runs[0], diverged), "evidence_digest": "0" * 64}
-    )
+    values.update({"python_runs": (wire.python_runs[0], diverged), "evidence_digest": "0" * 64})
     provisional = R07DrGateEvidenceWireV1.model_construct(**values)
     values["evidence_digest"] = differential_gate._digest_without_field(
         provisional,
@@ -705,10 +701,19 @@ def _merge_fixture_repo(root: Path) -> dict[str, str]:
         check=True,
     )
     merge = _head(root)
-    subprocess.run(["git", "-C", str(root), "checkout", "--quiet", "-B", "squash", main_tip], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "checkout", "--quiet", "-B", "squash", main_tip],
+        check=True,
+    )
     subprocess.run(["git", "-C", str(root), "merge", "--squash", feature], check=True)
     squash = _commit(root, "squashed feature")
-    return {"base": base, "main_tip": main_tip, "feature": feature, "merge": merge, "squash": squash}
+    return {
+        "base": base,
+        "main_tip": main_tip,
+        "feature": feature,
+        "merge": merge,
+        "squash": squash,
+    }
 
 
 def test_merge_provenance_accepts_a_real_merge_and_rejects_a_squash(tmp_path: Path) -> None:
@@ -810,9 +815,7 @@ def test_diff_scope_forbidden_definition_scan_covers_every_diffed_source_file(
 
     assert len(scanned) > len(policy.forbidden_definition_universe.source_files)
     assert set(policy.forbidden_definition_universe.source_files) <= set(scanned)
-    assert all(
-        path.startswith("src/rquant/") and path.endswith(".py") for path in scanned
-    )
+    assert all(path.startswith("src/rquant/") and path.endswith(".py") for path in scanned)
     assert verify_diff_scope_forbidden_definitions(ROOT, _head(), policy).passed
 
     repo = tmp_path / "scope-repo"
@@ -820,7 +823,10 @@ def test_diff_scope_forbidden_definition_scan_covers_every_diffed_source_file(
     module_path = "src/rquant/runtime_builder_signal.py"
     source_path = repo / module_path
     source_path.parent.mkdir(parents=True)
-    source_path.write_text("def current_signal_writer() -> None:\n    return None\n", encoding="utf-8")
+    source_path.write_text(
+        "def current_signal_writer() -> None:\n    return None\n",
+        encoding="utf-8",
+    )
     candidate = _commit(repo, "forbidden definition outside the frozen nine")
     narrowed = policy.model_copy(
         update={

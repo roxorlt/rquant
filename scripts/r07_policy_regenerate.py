@@ -269,9 +269,7 @@ def regenerate_policy_bytes(
     )
     payload["boundary_probes"] = _regenerated_boundary_probes(payload["boundary_probes"], read)
     payload["fixtures_digest"] = fixture_manifest_digest(
-        tuple(
-            _validated(differential_gate.FixtureValueV1, value) for value in payload["fixtures"]
-        ),
+        tuple(_validated(differential_gate.FixtureValueV1, value) for value in payload["fixtures"]),
         tuple(
             _validated(differential_gate.CurrentFixtureV1, value)
             for value in payload["current_fixtures"]
@@ -279,8 +277,7 @@ def regenerate_policy_bytes(
     )
     payload["boundary_manifest_digest"] = boundary_manifest_digest(
         tuple(
-            _validated(differential_gate.ProbeSetupV1, value)
-            for value in payload["probe_setups"]
+            _validated(differential_gate.ProbeSetupV1, value) for value in payload["probe_setups"]
         ),
         tuple(
             _validated(differential_gate.BoundaryProbeV1, value)

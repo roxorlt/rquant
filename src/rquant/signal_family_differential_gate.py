@@ -368,18 +368,14 @@ class R07DrGateEvidenceWireV1(_StrictModelMixin, BaseModel):
         first, second = self.python_runs
         for field in PYTHON_RUN_GATE_DIGEST_FIELDS:
             if getattr(first, field) != getattr(second, field):
-                raise ValueError(
-                    "R07 gate outputs diverge between Python 3.11 and 3.12: " + field
-                )
+                raise ValueError("R07 gate outputs diverge between Python 3.11 and 3.12: " + field)
         if self.boundary_result_digest != first.boundary_result_digest:
             raise ValueError("boundary result digest is not the digest both Python runs observed")
         if self.merge_base_commit_sha != self.baseline_commit_sha:
             raise ValueError("merge base commit is not the frozen baseline commit")
         if self.merge_base_tree_sha != self.baseline_tree_sha:
             raise ValueError("merge base tree is not the frozen baseline tree")
-        if any(
-            not _is_lower_hex(parent, length=40) for parent in self.candidate_parent_commits
-        ):
+        if any(not _is_lower_hex(parent, length=40) for parent in self.candidate_parent_commits):
             raise ValueError("candidate parents must be lowercase 40-hex commits")
         if self.candidate_parent_commits[0] != self.merge_base_commit_sha:
             raise ValueError("first candidate parent is not the recorded merge base")
@@ -1316,8 +1312,7 @@ def resolve_merge_provenance(
     parents = tuple(listed[1:])
     if len(parents) != 2:
         raise ValueError(
-            "R07 candidate must be a two-parent merge commit; "
-            f"observed {len(parents)} parent(s)"
+            f"R07 candidate must be a two-parent merge commit; observed {len(parents)} parent(s)"
         )
     if parents[0] == parents[1]:
         raise ValueError("R07 candidate parents must be two distinct commits")
@@ -1662,9 +1657,7 @@ def _wire_with_recomputed_digests(
         "boundary_result_digest": boundary_result_digest,
         "check_inventory_digest": check_inventory_digest(check_inventory),
     }
-    python_runs = tuple(
-        run.model_copy(update=recomputed_run_digests) for run in wire.python_runs
-    )
+    python_runs = tuple(run.model_copy(update=recomputed_run_digests) for run in wire.python_runs)
     python_runs = tuple(
         run.model_copy(update={"result_digest": python_run_result_digest(run)})
         for run in python_runs
@@ -2328,8 +2321,7 @@ def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
                 registry_keys.update(
                     keyword.value.value
                     for keyword in node.keywords
-                    if isinstance(keyword.value, ast.Constant)
-                    and type(keyword.value.value) is str
+                    if isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is str
                 )
     return definitions, exports, registry_keys
 

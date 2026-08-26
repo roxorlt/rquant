@@ -414,9 +414,7 @@ def validate_python_run_pair(
     validated: list[PythonRunEvidenceV1] = []
     for field in PYTHON_RUN_GATE_DIGEST_FIELDS:
         if getattr(runs[0], field, None) != getattr(runs[1], field, None):
-            raise ValueError(
-                "R07 gate outputs diverge between Python 3.11 and 3.12: " + field
-            )
+            raise ValueError("R07 gate outputs diverge between Python 3.11 and 3.12: " + field)
     for run, (minor, job_id) in zip(runs, expected, strict=True):
         if type(run) is not PythonRunEvidenceV1:
             raise ValueError("R07 aggregate requires exact PythonRunEvidenceV1 values")

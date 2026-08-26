@@ -63,7 +63,8 @@ def test_generation_is_idempotent_and_reproduces_the_checked_in_bytes(tmp_path: 
     second = tmp_path / "second.json"
 
     assert regenerate.main(["--repo", str(ROOT), "--output", str(first)]) == 0
-    assert regenerate.main(["--repo", str(ROOT), "--policy", str(first), "--output", str(second)]) == 0
+    arguments = ["--repo", str(ROOT), "--policy", str(first), "--output", str(second)]
+    assert regenerate.main(arguments) == 0
 
     assert first.read_bytes() == second.read_bytes()
     assert first.read_bytes() == POLICY_PATH.read_bytes()
@@ -82,9 +83,7 @@ def test_check_mode_fails_when_the_allowlist_or_digest_drifts(tmp_path: Path) ->
 
     restored = tmp_path / "restored.json"
     assert (
-        regenerate.main(
-            ["--repo", str(ROOT), "--policy", str(tampered), "--output", str(restored)]
-        )
+        regenerate.main(["--repo", str(ROOT), "--policy", str(tampered), "--output", str(restored)])
         == 0
     )
     assert restored.read_bytes() == POLICY_PATH.read_bytes()
