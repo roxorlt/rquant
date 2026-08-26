@@ -113,6 +113,22 @@ def _shared_clone(destination: Path) -> Path:
     return destination
 
 
+def _newest_non_merge_commit() -> str:
+    """The newest single-parent commit reachable from the checkout.
+
+    Work packages are merged back into the integration branch with real merge commits, so the
+    tip itself is a two-parent object most of the time. Tests that need the shape a squash or
+    a direct push leaves behind have to name a non-merge commit explicitly.
+    """
+
+    return subprocess.run(
+        ["git", "-C", str(ROOT), "rev-list", "--no-merges", "-n", "1", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _synthetic_merge_candidate(repo: Path) -> str:
     """Write the exact object GitHub's "Create a merge commit" would create for this branch.
 
@@ -428,19 +444,23 @@ def test_verified_evidence_binds_the_final_merge_tree_and_its_exact_parents(
 
 
 def test_private_verifier_refuses_a_candidate_that_is_not_a_merge_commit() -> None:
+    # The branch tip stops being single-parent as soon as a work package is merged back into
+    # it, so the direct-push shape under test is taken from the newest non-merge commit rather
+    # than from HEAD.
+    non_merge = _newest_non_merge_commit()
     parents = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", "HEAD"],
+        ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", non_merge],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.split()
 
-    assert len(parents) == 2  # the branch tip itself has exactly one parent
+    assert len(parents) == 2  # that commit has exactly one parent
 
     with pytest.raises(ValueError, match="two-parent merge commit"):
         resolve_merge_provenance(
             ROOT,
-            candidate_commit=_head(),
+            candidate_commit=non_merge,
             merge_base_commit=BASELINE_COMMIT_SHA,
         )
 

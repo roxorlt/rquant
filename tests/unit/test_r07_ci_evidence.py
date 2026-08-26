@@ -16,6 +16,8 @@ from rquant.signal_family_differential_gate import R07_CI_EVIDENCE_PRODUCER_IMPL
 from scripts import r07_ci_evidence as ci_evidence
 from tests.unit.test_signal_family_differential_gate import (
     _EvidenceBundle,
+    _newest_non_merge_commit,
+    _shared_clone,
 )
 from tests.unit.test_signal_family_differential_gate import (
     evidence_bundle as _evidence_bundle_fixture,
@@ -443,15 +445,26 @@ def test_aggregate_rejects_dual_python_gate_digest_divergence(tmp_path: Path) ->
 
 
 def test_push_main_without_a_merge_commit_produces_no_summary(tmp_path: Path) -> None:
-    """Ruling 9 equivalent enforcement: a squashed or direct push to main yields no evidence."""
+    """Ruling 9 equivalent enforcement: a squashed or direct push to main yields no evidence.
 
-    commit, _tree = _actual_identity()
+    The checkout tip is a merge commit once a work package has been merged back, so the
+    single-parent shape a squash or a direct push leaves behind is materialized on purpose:
+    a throwaway ``--shared`` clone whose detached HEAD is the newest non-merge commit.
+    """
+
+    repo = _shared_clone(tmp_path / "direct-push")
+    commit = _newest_non_merge_commit()
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "--no-deref", "HEAD", commit],
+        check=True,
+        capture_output=True,
+    )
     output = tmp_path / "summary.json"
     minor = f"{sys.version_info.major}.{sys.version_info.minor}"
     arguments = [
         "run-python",
         "--repo",
-        str(ROOT),
+        str(repo),
         "--python-minor",
         minor,
         "--output",
