@@ -35,8 +35,15 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    root-owned 制品对，由 `scripts/build-signal-family-verifier-artifact.py` 构建：
 
    ```bash
-   python scripts/build-signal-family-verifier-artifact.py --output-root <staging>
+   # --source-venv 必须显式指向**目标解释器**的 venv：制品树里带原生扩展
+   # （pydantic_core 的 .so），用别的 ABI/平台构建出来的树在生产 python3.11 上 import 不了，
+   # 而 content-id 是这棵树的哈希，所以构建主机不同 → TCB 锚点不同。
+   python scripts/build-signal-family-verifier-artifact.py \
+     --output-root <staging> \
+     --source-venv /home/lighthouse/rquant/.venv \
+     --python-version "$(/usr/bin/python3.11 -c 'import platform;print(platform.python_version())')"
    # 打印 content_id / entry_sha256 / manifest_entries 及安装位置
+   find <staging>/<content-id> -name '*.so'   # 必须是 linux 的 ABI tag
    ```
 
    安装是**单独授权的 root 事务**，不能借受控发布器绕过。逐条核对：
@@ -78,9 +85,14 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    done
    ```
 
-   **生产 profile 当前只冻结了 `daily` 一个 role**；25 个 unit 用到的 role 必须在新版
-   profile 里逐个声明（module / cwd / app_source / site-packages / 环境白名单），否则对应
-   unit 会 fail closed 退 78。profile 版本变更本身是单独授权的基础设施事务。
+   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 26 个 role**（Codex round-2 P1-2），`profile_id`
+   随之改变——这是刻意的 profile 版本演进，不是副作用。新版 profile 必须逐个 role 声明
+   module / 环境白名单 / **instance 白名单**；instanced role 的 `instances` 至少一项且形如
+   `svc-<64 hex>`，非 instanced role 必须为空。concrete 标签由
+   `runtime_deployment_bundle` 从各 service manifest 派生，不冻结在代码里。
+   `current.json` 的 slot 也必须声明同一组 role（`_validate_slot_against_profile` 要求相等）。
+   profile 版本变更本身是单独授权的基础设施事务；`profile_id` 同时被 slot、generation
+   full-manifest 与 R07 policy 冻结，三者必须一起换代。
 
 10. **`rquant-runtime-recovery@` / `rquant-runtime-recovery-rehearsal@` 语义变更**：
    `--expected-profile-generation %i` 已移除，generation 改由 root-owned `current.json`
