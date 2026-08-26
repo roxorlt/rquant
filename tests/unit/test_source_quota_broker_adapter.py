@@ -738,11 +738,14 @@ def test_committed_v2_response_still_requires_the_native_signed_journal_on_repla
 @pytest.mark.parametrize(
     "payload",
     (
-        pytest.param(b'{"schema_version":2,"schema_version":2}', id="duplicate-key"),
-        pytest.param(b'{"schema_version":2}\n', id="trailing-newline"),
-        pytest.param(b'{"schema_version":NaN}', id="nan"),
-        pytest.param(b'{"schema_version":"2"}', id="string-version"),
+        b'{"schema_version":2,"schema_version":2}',
+        b'{"schema_version":2}\n',
+        b'{"schema_version":NaN}',
+        b'{"schema_version":"2"}',
         # An explicit id keeps a quarter megabyte of padding out of the nodeid.
+        # The four cases above keep pytest's derived ids: this module is frozen
+        # by tests/manifests/source_broker_v2_frozen.json, so every renamed id
+        # moves that manifest's digest and only this one earns the move.
         pytest.param(b"{" + b"x" * (256 * 1024) + b"}", id="oversize"),
     ),
 )
