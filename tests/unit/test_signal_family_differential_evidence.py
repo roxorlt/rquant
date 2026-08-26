@@ -2175,3 +2175,81 @@ def test_the_cache_write_leaves_no_group_writable_ancestor_behind(tmp_path: Path
 
     for created in (tmp_path / "nested", tmp_path / "nested" / "deeper", directory):
         assert stat.S_IMODE(created.lstat().st_mode) == 0o755
+
+
+# ---------------------------------------------------------------------------------------
+# The other half of the degradation boundary: only staleness may become a cache miss
+# ---------------------------------------------------------------------------------------
+
+
+def _plant_cache_bytes(tmp_path: Path, commit_sha: str, payload: bytes) -> Path:
+    """Write arbitrary bytes through the real writer, so modes and atomicity are the real ones."""
+
+    return r07_deploy_evidence.write_cached_evidence(
+        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        commit_sha=commit_sha,
+        payload=payload,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("candidate_tree_sha", "0" * 40, id="tree"),
+        pytest.param("policy_digest", "1" * 64, id="policy-digest"),
+    ],
+)
+def test_a_wrongly_bound_cache_entry_blocks_and_is_never_redownloaded(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    """Everything the channel *can* answer is available here, and it still must not be asked.
+
+    A retained entry that is not bound to this target says the deployment host is not what it
+    should be. Unlike a superseded attempt, that is not staleness, so it blocks where it stands
+    instead of being quietly repaired by a download.
+    """
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    tree_sha = _git(repo, "rev-parse", "--verify", f"{release_b}^{{tree}}")
+    payload = json.loads(
+        _valid_wire_bytes(release_b, tree_sha, policy=_target_policy_of(repo, release_b))
+    )
+    payload[field] = value
+    entry = _plant_cache_bytes(
+        tmp_path,
+        release_b,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    planted = entry.read_bytes()
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert entry.read_bytes() == planted
+    assert verifier.calls == []
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
+
+
+def test_a_filesystem_noncompliant_cache_entry_blocks_even_when_the_channel_could_supply(
+    tmp_path: Path,
+) -> None:
+    """A group-writable entry is refused before the channel is asked anything at all."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    entry.chmod(0o664)
+    planted = entry.read_bytes()
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert entry.read_bytes() == planted
+    assert stat.S_IMODE(entry.lstat().st_mode) == 0o664
+    assert verifier.calls == []
+    assert transport.requests == []

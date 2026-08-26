@@ -3424,6 +3424,89 @@ class TestR07Bootstrap:
         assert not any(call[0] in {"systemctl", "sudo"} for call in runner.calls)
         assert _audit_records(config)[-1]["r07_gate"] == "rejected"
 
+    def test_a_wrongly_bound_cache_entry_never_falls_back_to_the_download_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Only a superseded attempt degrades to a miss; a mis-bound entry blocks the deploy.
+
+        The whole channel is reachable here, so a wider fallback would silently repair the entry
+        and deploy. It must not: an entry bound to another tree says the deployment host is not
+        what it should be.
+        """
+
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        planted = _seed_r07_cache(
+            tmp_path,
+            commit_sha=_sha("b"),
+            tree_sha=R07_INSTALLED_TREE,
+            policy=enforced,
+        )
+        before = planted.read_bytes()
+        verifier = _RecordingVerifier()
+        transport = _r07_channel_transport(
+            commit_sha=_sha("b"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        runner = FakeRunner(responses)
+        config = _config(tmp_path)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(
+                config,
+                runner=runner,
+                r07_evidence_gate=_r07_gate(tmp_path, verifier=verifier, transport=transport),
+            )
+
+        assert planted.read_bytes() == before
+        assert verifier.calls == []
+        assert transport.requests == [r07_deploy_evidence.workflow_runs_url(_sha("b"))]
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+
+    def test_a_group_writable_cache_entry_never_falls_back_to_the_download_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A filesystem-noncompliant entry blocks before the channel is asked anything."""
+
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        planted = _seed_r07_cache(
+            tmp_path,
+            commit_sha=_sha("b"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        planted.chmod(0o664)
+        before = planted.read_bytes()
+        verifier = _RecordingVerifier()
+        transport = _r07_channel_transport(
+            commit_sha=_sha("b"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        runner = FakeRunner(responses)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(
+                _config(tmp_path),
+                runner=runner,
+                r07_evidence_gate=_r07_gate(tmp_path, verifier=verifier, transport=transport),
+            )
+
+        assert planted.read_bytes() == before
+        assert verifier.calls == []
+        assert transport.requests == []
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+
     def test_already_current_bootstrap_target_is_rejected(self, tmp_path: Path) -> None:
         responses = _base_responses()
         responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
