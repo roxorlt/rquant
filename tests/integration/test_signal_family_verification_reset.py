@@ -1117,6 +1117,11 @@ class TestAuthorityRevalidation:
             ({"sequence": 4}, "AUTHORITY_EPOCH_CHANGED"),
             ({"operation_id": OTHER_OPERATION_ID}, "AUTHORITY_EPOCH_CHANGED"),
             ({"profile_id": "e" * 64}, "AUTHORITY_EPOCH_CHANGED"),
+            # Codex round-2 ruling 3: the alternate authority identity is exactly
+            # "full manifest membership + policy-anchored service_manifest_fingerprint",
+            # so every component of that binding has to be inside the step 7 comparison.
+            ({"full_manifest_sha256": "f" * 64}, "AUTHORITY_EPOCH_CHANGED"),
+            ({"profile_document_sha256": "a" * 64}, "AUTHORITY_EPOCH_CHANGED"),
         ),
     )
     def test_an_authority_change_between_child_exit_and_append_rejects(
@@ -1131,6 +1136,55 @@ class TestAuthorityRevalidation:
             snapshot_with(world, **changes),
         ]
         with pytest.raises(root_verifier.SignalFamilyRootVerifierError, match=reason):
+            _verifier(world).run()
+        _assert_no_evidence(world)
+
+    def test_a_full_manifest_entry_change_between_child_exit_and_append_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """One rewritten membership row is enough to move the authority identity.
+
+        Codex round-2 ruling 3 accepts full-manifest membership as half of the alternate
+        authority identity, so a single entry that moves under the run must be as fatal
+        as a moved slot or sequence.
+        """
+
+        world = build_world(tmp_path)
+        entries = dict(world.gateway.snapshots[0].full_manifest_entries)
+        entries[verification.TEST_MANIFEST_RELATIVE_PATH] = digest("regrafted-declaration")
+        world.gateway.snapshots = [
+            world.gateway.snapshots[0],
+            snapshot_with(world, full_manifest_entries=entries),
+        ]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="AUTHORITY_EPOCH_CHANGED",
+        ):
+            _verifier(world).run()
+        _assert_no_evidence(world)
+
+    def test_a_service_manifest_fingerprint_change_between_child_exit_and_append_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The other half of the identity: the policy-anchored manifest fingerprints.
+
+        `identity()` carries every `manifest_fingerprint` of the reopened profile, so a
+        profile whose manifests were re-signed after the child exited cannot be appended.
+        """
+
+        world = build_world(tmp_path)
+        first = world.gateway.snapshots[0]
+        drifted = profile_manifests({"notifier": 37.5})
+        assert tuple(manifest.manifest_fingerprint for manifest in drifted) != tuple(
+            manifest.manifest_fingerprint for manifest in first.profile_manifests
+        )
+        world.gateway.snapshots = [first, snapshot_with(world, profile_manifests=drifted)]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="AUTHORITY_EPOCH_CHANGED",
+        ):
             _verifier(world).run()
         _assert_no_evidence(world)
 

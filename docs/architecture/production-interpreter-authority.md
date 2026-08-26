@@ -1342,6 +1342,38 @@ the full generation manifest; and resolves every `surface_id` to the exact calla
 entry. Missing, duplicate, cross-role, wrong-kind, wrong-module, wrong-path, wrong-source-hash,
 unmanifested, omitted-surface, or extra-surface bindings reject before any child starts.
 
+#### Alternate Root Authority Identity For The Service-Manifest Document
+
+Amended per Codex round-2 order 2026-08-25, ruling 3. The specification never froze how the
+validated production profile's `RuntimeServiceManifest` tuple reaches a root process that may not
+import a builder. The root reads it from one canonical in-generation document, and that document's
+authority identity is normatively **full manifest membership plus policy-anchored
+`service_manifest_fingerprint`**, not a raw SHA equality against any single pre-existing field:
+
+1. **Membership.** The document is an entry of the full generation manifest, and the manifest's own
+   raw bytes MUST hash to `RuntimeGenerationSlot.full_manifest_hash` before any entry inside it is
+   believed. `full_manifest_hash` is the slot identity and an input to the authority epoch key, so
+   the closure authenticates itself first and repairing an entry row no longer launders a swapped
+   file. A failure is `FULL_MANIFEST_HASH_MISMATCH`.
+2. **Fingerprint anchoring.** Every `manifest_fingerprint` in the document MUST equal the
+   `service_manifest_fingerprint` of the matching `VerificationServiceBindingV1`, and that binding
+   tuple is anchored outside the generation by the root policy through
+   `five_pair_service_binding_set_hash`. Forging a service manifest therefore requires a
+   `manifest_fingerprint` preimage.
+
+An equality against `RuntimeGenerationSlot.profile_id` MUST NOT be required: `RuntimeClosureProfile`
+fixes `profile_id` as the hash of the runtime closure body, which carries no service manifests at
+all, so that equation could only hold on a SHA-256 collision. Requiring it would be an impossible
+condition, not a stronger one.
+
+Both halves are components of the reopened authority identity compared at step 7, together with
+`full_manifest_sha256`, the complete `full_manifest_entries` table, `profile_document_sha256`, and
+every reopened `manifest_fingerprint`; any one of them moving between child exit and append is
+`AUTHORITY_EPOCH_CHANGED` and appends nothing. A document that is self-consistent but absent from
+the full manifest is `BINDING_UNMANIFESTED`, checked independently by both the gateway and the
+verifier, because a gateway is an injected component whose word about closure membership is not
+taken.
+
 #### Fixed Root-Owned Release Verification Policy
 
 `RESET-REG-P0-01` is anchored by the separate fixed policy file
@@ -1669,7 +1701,7 @@ The planned red-test matrix is exact:
 | `R07-DR-SPEC-P1-01` | `tests/unit/test_signal_family_differential_boundaries.py::TestProbeSetup`; `::TestCallShape`; `::TestBoundaryReachedSentinel`; `::TestCompleteInventoryMatrix` | B01 identity fence observes the exact replacement once and never claims construction; B03 rejects only during one `consume_tuple`; B09 and B16 receive current inputs only through exact source-result calls; all receiver/source-result bindings and B01..B19 matrix rows match source anchors; every row reaches one sentinel, every mutation guard is zero, and all post-setup before/after snapshots are equal; wrong phase/receiver/result/action, setup exception, early rejection, missing/duplicate sentinel, and drift block |
 | `R07-DR-SPEC-P1-02` | `tests/unit/test_signal_family_differential_evidence.py`; `tests/unit/test_production_deploy.py::TestR07Bootstrap` | PR/tag/manual/non-main, failed/partial/skipped, wrong SHA/tree/run/artifact/path/cache, duplicate/extra JSON, and disabled post-bootstrap evidence block; Release A audits bootstrap-disabled once, Release B verifies enforced evidence before checkout, pre-checkout failure leaves services untouched, and post-checkout failure rolls back exactly |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
-| `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
+| `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts; Amended per Codex round-2 order 2026-08-25, ruling 3: the alternate authority identity is covered end to end — self-authenticating full manifest, repaired-entry rejection, unmanifested document rejection at both the gateway and the verifier, a forged manifest the bindings do not fingerprint, the absence of any `profile_id` equation, and step 7 rejection when `full_manifest_sha256`, `full_manifest_entries`, `profile_document_sha256`, or a `manifest_fingerprint` moves under the run |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_policy_anchor.py` | policy is loaded before generation files/child and requires anchored no-follow root ownership, mode `0444`, `nlink == 1`, canonical bytes/content hash, exact harness identity/hash, and one exact entry; self-consistent replacement of generation code, manifest, vectors, and expected results rejects without a separate matching policy update; policy whitespace, duplicate/extra keys, entry reorder, hash tampering, missing/stale/multiple/conflicting entries, release/quarantine update attempts, and policy/harness replacement during child execution reject with no receipt/readiness; an approved exact policy passes only through the isolated root-verifier flow |
 | `RESET-REG-P0`, `RESET-REG-P2`, `RESET-REG-P2-01` | `tests/unit/test_signal_family_readiness_reset.py` | exact five-set equality and pair-derived participating-service union, atomic receipt/decision/CAS, byte-identical concurrency, divergent conflict, profile-derived expiry, lower shadow or serving stale bound controls `fresh_until`, optional policy cap, authority advance/return to same generation, rollback, revoke, and no `ATTESTING`/`ACTIVATED` state |
