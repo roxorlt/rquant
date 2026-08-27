@@ -85,6 +85,26 @@ from .test_source_operation_contracts import (
 
 NOW = datetime(2026, 8, 5, 4, tzinfo=UTC)
 
+# `now=` is the saga's logical clock and drives its timestamps. The source
+# attempt's `max_external_deadline` is not on it: `_ensure_source_attempt` sets
+# it to `datetime.now(UTC) + source_request_deadline_seconds` and
+# `_mark_invoke_started` refuses the invocation once the real clock is past it,
+# with `reconcile_reason='source invocation did not start before its persisted
+# deadline'`. Both ends read the real clock, so the budget is a genuine
+# real-time one - it just has to cover whatever the saga does in between: the
+# transport call, the lineage publish and the ledger writes.
+#
+# `for_nonproduction` defaults it to 0.25s, which is a convenience for the cases
+# whose subject *is* that budget; they set it smaller still (0.05-0.08) to make
+# a takeover or a cooldown happen quickly. A case that is about something else
+# inherits the default silently and is then gated on how fast the host runs the
+# saga's internals: 49ms of the 250ms on this laptop, over 250ms inside a
+# 33-minute shard on a 2 vCPU runner, where it turned a COMPLETE into a
+# RECONCILE_REQUIRED. This value is for those cases - large enough that no host
+# can outrun it, so the budget stops being a participant.
+_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS = 30.0
+_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS = 5.0
+
 
 class _MutableUtcClock:
     def __init__(self, current: datetime) -> None:
@@ -2429,11 +2449,19 @@ def test_v2_saga_lookup_unavailable_never_dispatches_and_requires_reconcile(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
 
     blocked = saga.advance(request, now=NOW + timedelta(seconds=1))
 
+    # Named, not just counted: a RECONCILE_REQUIRED whose reason is the source
+    # deadline would satisfy the state assertion while proving nothing about the
+    # unavailable lookup this case is here for.
     assert blocked.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert blocked.reconcile_reason == (
+        "source claim_once authority is unavailable; dispatch is forbidden"
+    )
     assert transport.dispatch_calls == 0
     transport.claim_once_unavailable = False
     recovered = saga.reconcile(request, now=NOW + timedelta(seconds=2))
@@ -2474,6 +2502,8 @@ def test_v2_saga_lookup_unavailable_never_dispatches_and_requires_reconcile(
         quota_adapter=unknown_quota,
         transport=unknown_transport,
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
 
     first_unknown = unknown_saga.advance(
@@ -2485,8 +2515,13 @@ def test_v2_saga_lookup_unavailable_never_dispatches_and_requires_reconcile(
         now=NOW + timedelta(seconds=2),
     )
 
+    # Same reasoning as above, and it bites harder here: this half expects
+    # RECONCILE_REQUIRED, so a deadline expiry would have passed silently.
+    unknown_reason = "source authority cannot determine the dispatch outcome"
     assert first_unknown.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert first_unknown.reconcile_reason == unknown_reason
     assert second_unknown.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert second_unknown.reconcile_reason == unknown_reason
     assert unknown_replay_calls == 2
     assert unknown_transport.claim_once_calls == 0
     assert unknown_transport.dispatch_calls == 0
