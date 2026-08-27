@@ -4399,7 +4399,6 @@ class LabWorker:
         snapshot: ResourceSnapshot | None = None,
         timeout_microseconds: int,
         not_after_monotonic_microseconds: int | None = None,
-        include_spawn_allowance: bool = True,
         cancellation_requested: Callable[[], bool] | None = None,
     ) -> _AuthorityWireResult:
         manifest = self.resource_authority_manifest
@@ -4407,9 +4406,7 @@ class LabWorker:
             raise LabDaemonConfigurationError("resource authority manifest is unavailable")
         if timeout_microseconds <= 0:
             raise TimeoutError(f"{operation} authority timed out")
-        total_budget = timeout_microseconds + (
-            _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS if include_spawn_allowance else 0
-        )
+        total_budget = timeout_microseconds + _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS
         deadline_microseconds = _monotonic_microseconds() + total_budget
         if not_after_monotonic_microseconds is not None:
             deadline_microseconds = min(
@@ -5117,19 +5114,17 @@ class LabWorker:
         *,
         timeout_microseconds: int,
         not_after_monotonic_microseconds: int | None = None,
-        # A standalone probe has not paid for the child yet, so `timeout` means
-        # here what it means everywhere else in this module: the provider's own
-        # budget, with the interpreter start on top.  Defaulting it off made
-        # `resource_probe_timeout_seconds` mean two different things at two
-        # call sites, and the narrower one could not cover a child start.
-        include_spawn_allowance: bool = True,
     ) -> ResourceSnapshot:
+        # `timeout_microseconds` is the provider's own budget here, exactly as
+        # it is at every other authority call site; the interpreter start goes
+        # on top.  This used to be switchable, and the one caller that switched
+        # it off made `resource_probe_timeout_seconds` mean two different
+        # things - the narrower of which could not cover a child start.
         result = self._run_authority_stage(
             operation="snapshot",
             spec=None,
             timeout_microseconds=timeout_microseconds,
             not_after_monotonic_microseconds=not_after_monotonic_microseconds,
-            include_spawn_allowance=include_spawn_allowance,
         )
         if result.snapshot is None:
             raise LabDaemonConfigurationError(

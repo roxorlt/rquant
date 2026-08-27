@@ -104,13 +104,23 @@ _PROLOGUE_REFERENCE_SECONDS = 0.0125
 # provider's sleep - which is the same invariant with margin on both sides
 # rather than none on one.
 _PROVIDER_RACE_DEADLINE_SECONDS = 0.04
-# The one budget in this file that must NOT track the host: two cases hand the
-# service a deadline deliberately too short for the authority signing step and
-# require it to refuse. Scaling that up is scaling the subject - on a host
-# where the scale rose, the signing simply finished inside the larger deadline
-# and both cases reported DID NOT RAISE. The elapsed guards around them stay
-# scaled, because how long the refusal takes to come back *is* a host property.
+# Two cases starve the authority signing step of deadline and require the
+# service to refuse *at that step*. Three quantities decide whether they do,
+# and they only work as a set:
+#
+#   prologue  <  deadline  <  signing cost
+#
+# The left inequality keeps the three `_require_deadline` checkpoints ahead of
+# signing from firing first - if one of them does, the refusal is real but its
+# message is not "authority signing" and the case does not recognise it. The
+# right one is what starves the signer. Scaling the deadline alone broke the
+# right inequality (the signing finished inside the enlarged deadline: DID NOT
+# RAISE); pinning the deadline to a literal while the prologue grows with the
+# host breaks the left one instead, and a full shard's prologue sits right on
+# top of 30ms. Scaling all three by the same factor keeps both inequalities
+# true at every host speed, which is the only form that is not a race.
 _SIGNING_STARVED_DEADLINE_SECONDS = 0.03
+_SIGNING_COST_SECONDS = 0.1
 # The calibration dispatch is not under test and must not be the thing that
 # fails when the host is slow, so it gets a watchdog rather than a budget.
 _PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
@@ -2309,7 +2319,7 @@ def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
 
 
 def test_claim_signing_uses_remaining_single_request_deadline(tmp_path: Path) -> None:
-    signer = _DeadlineAwareTestSigner(required_seconds=0.1)
+    signer = _DeadlineAwareTestSigner(required_seconds=_host(_SIGNING_COST_SECONDS))
     service, _keyring = _service(tmp_path, signer=signer)
     request = _claim_once_request(_dispatch_request())
 
@@ -2317,7 +2327,7 @@ def test_claim_signing_uses_remaining_single_request_deadline(tmp_path: Path) ->
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="authority signing"):
         service.claim_once(
             canonical_model_json_bytes(request),
-            deadline=time.monotonic() + _SIGNING_STARVED_DEADLINE_SECONDS,
+            deadline=time.monotonic() + _host(_SIGNING_STARVED_DEADLINE_SECONDS),
         )
 
     assert time.monotonic() - started < _host(0.08)
@@ -2326,7 +2336,7 @@ def test_claim_signing_uses_remaining_single_request_deadline(tmp_path: Path) ->
 
 
 def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -> None:
-    signer = _DeadlineAwareTestSigner(required_seconds=0.1)
+    signer = _DeadlineAwareTestSigner(required_seconds=_host(_SIGNING_COST_SECONDS))
     provider = _CountingProvider()
     service, _keyring = _service(tmp_path, provider=provider, signer=signer)
     request = SourceBrokerV2ReplayRequest(
@@ -2344,7 +2354,7 @@ def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="authority signing"):
         service.replay(
             canonical_model_json_bytes(request),
-            deadline=time.monotonic() + _SIGNING_STARVED_DEADLINE_SECONDS,
+            deadline=time.monotonic() + _host(_SIGNING_STARVED_DEADLINE_SECONDS),
         )
 
     assert time.monotonic() - started < _host(0.08)
