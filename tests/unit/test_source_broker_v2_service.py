@@ -121,6 +121,23 @@ _PROVIDER_RACE_DEADLINE_SECONDS = 0.04
 # true at every host speed, which is the only form that is not a race.
 _SIGNING_STARVED_DEADLINE_SECONDS = 0.03
 _SIGNING_COST_SECONDS = 0.1
+# One case does *not* need a window, and paying for one is what broke it. Its
+# two siblings need `prologue < deadline < prologue + provider sleep`: squeezed
+# from both sides, so their deadline has to be measured. This one gets its
+# upper bound from the test instead - the provider blocks until the case
+# releases it, so the deadline expires while the provider is still inside it no
+# matter how large the deadline is. That leaves a single ordering to secure,
+# `prologue < deadline`, and a one-sided ordering is secured by margin rather
+# than by measurement.
+#
+# The old form was a 50ms deadline that had to beat the prologue, and inside a
+# full shard on a 2 vCPU runner it lost: `dispatch_calls == 0`, the provider
+# never reached, so the exactly-once invariant the case exists for was not
+# exercised at all - the case failed on the one thing it was not testing. Here
+# the prologue is tens of milliseconds and the ledger writes behind it are
+# bounded by the 500ms busy timeout, so a budget in seconds is not a race with
+# anything. The calibrated scale still applies on top of it.
+_BLOCKED_PROVIDER_DEADLINE_SECONDS = 1.5
 # The calibration dispatch is not under test and must not be the thing that
 # fails when the host is slow, so it gets a watchdog rather than a budget.
 _PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
@@ -1937,7 +1954,11 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
 def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
     tmp_path: Path,
 ) -> None:
-    provider = _ShortBlockingProvider(block_seconds=_host(0.35))
+    deadline_seconds = _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS)
+    # The provider has to still be inside its call when the deadline expires, so
+    # its block outlives the whole budget. It never waits that long in practice:
+    # the case releases it as soon as the refusal has been observed.
+    provider = _ShortBlockingProvider(block_seconds=deadline_seconds * 4)
     service, _keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
@@ -1945,13 +1966,19 @@ def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
         SourceBrokerV2DispatchEnvelope(request=request, claim_receipt=claim)
     )
 
-    started = time.monotonic()
+    deadline = time.monotonic() + deadline_seconds
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-            service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
+            service.dispatch(envelope, deadline=deadline)
     finally:
         provider.release.set()
-    assert time.monotonic() - started < _host(0.2)
+    returned_at = time.monotonic()
+    # Where the refusal came from, stated rather than inferred: a prologue
+    # checkpoint firing first would leave the provider unentered, and that used
+    # to surface three assertions later as `dispatch_calls == 0`.
+    assert provider.entered.is_set()
+    # Returned at the deadline, not when the provider's block would have ended.
+    assert returned_at - deadline < _host(0.2)
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=request.saga_id,
@@ -1965,8 +1992,11 @@ def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
     )
     assert replay.status is SourceBrokerV2ReplayStatus.UNKNOWN
 
+    # Generous here too, and deliberately: the provider is released by now, so a
+    # service that auto-repeated the call would reach it and succeed. A short
+    # deadline could hide that behind a second expiry.
     with pytest.raises((SourceBrokerTransportError, SourceBrokerV2TransportDeadlineError)):
-        service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
+        service.dispatch(envelope, deadline=time.monotonic() + deadline_seconds)
     assert provider.dispatch_calls == 1
 
 
