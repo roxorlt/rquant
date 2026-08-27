@@ -1500,7 +1500,13 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
     # milliseconds this used to carry is shorter than one child start-up on a
     # slow host, so the child was killed mid-import and never wrote the entry
     # marker the case waits for.
-    spec_deadline = _deadline_reachable_in(1)
+    #
+    # Reaching that marker is not one child start but three - the admission
+    # authority round trip, the shard child, and the recheck that finally
+    # blocks - which is why it is the same budget `_await_markers` is given for
+    # the same event below. One start-up was enough on this laptop and still
+    # cut the run short on the runner.
+    spec_deadline = _deadline_reachable_in(3)
     if termination == "deadline":
         spec = spec.model_copy(update={"deadline": NOW + spec_deadline})
     claim = _claim(spec)
@@ -4531,8 +4537,15 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
     spec = _nshape_compare_spec(hold_days=(1,))
+    # Reaching the blocked policy callback costs three child start-ups - the
+    # admission authority round trip, the shard child, and the recheck that
+    # finally blocks - so the deadline mode has to leave room for all three
+    # before it can bound anything. Two flat seconds was enough here and cut
+    # the run short on a slower host, where the callback marker this case waits
+    # for never appeared at all.
+    spec_deadline = _deadline_reachable_in(3)
     if termination == "deadline":
-        spec = spec.model_copy(update={"deadline": NOW + timedelta(milliseconds=2000)})
+        spec = spec.model_copy(update={"deadline": NOW + spec_deadline})
     claim = _short_claim_for_spec(spec)
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -4583,7 +4596,10 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
         started = time.monotonic()
         if termination == "stop":
             worker.request_stop()
-        runner.join(timeout=_observe(2.3))
+        termination_budget = _observe(2.3) + (
+            0.0 if termination == "stop" else spec_deadline.total_seconds()
+        )
+        runner.join(timeout=termination_budget)
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
@@ -4592,7 +4608,7 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
         runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < _observe(2.3)
+    assert elapsed < termination_budget
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
