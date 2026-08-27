@@ -420,11 +420,11 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
             encoding="utf-8"
         )
     )["full_suite"]
-    assert full_suite["cases"] == 13066
+    assert full_suite["cases"] == 13067
     # The skip count is the Linux approved-skip map's size, and the manifest
     # loader already refuses any other value; this pins the number a reviewer
     # sees in the index.
-    assert full_suite["skips"] == 57
+    assert full_suite["skips"] == 56
 
 
 def test_validator_rejects_an_unapproved_skip(
@@ -437,6 +437,22 @@ def test_validator_rejects_an_unapproved_skip(
     _write_artifacts(artifacts, index, shard_with_skip=1)
 
     with pytest.raises(validator.ContractError, match="not approved"):
+        _validate(manifest_root, artifacts, monkeypatch)
+
+
+def test_validator_rejects_an_approved_skip_that_actually_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two directions of map rot are symmetric: an unregistered skip is
+    rejected above, and a registered nodeid that ran green is rejected here."""
+
+    manifest_root = tmp_path / "manifest"
+    index = _write_bundle(manifest_root)
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts, index, shard_with_skip=None)
+
+    with pytest.raises(validator.ContractError, match="registered as an approved skip"):
         _validate(manifest_root, artifacts, monkeypatch)
 
 

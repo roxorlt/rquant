@@ -125,6 +125,16 @@ def _check_shard_outcomes(
             raise ContractError(f"shard {shard_id} never reported {nodeid}")
         status, message = reported
         if status == "passed":
+            # A registered entry that runs green is a stale entry: the map is an
+            # allowlist of skips that are known to be unavoidable on this
+            # platform, not a list of skips that are merely tolerated when they
+            # happen.  Letting it pass silently is how the map rots - the
+            # entry outlives the condition it was written for and then keeps
+            # covering for whatever skip lands on that nodeid next.
+            if nodeid in approved:
+                raise ContractError(
+                    f"shard {shard_id} passed {nodeid}, which is registered as an approved skip"
+                )
             passed += 1
             continue
         if status != "skipped":
