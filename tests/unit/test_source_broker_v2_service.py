@@ -104,6 +104,13 @@ _PROLOGUE_REFERENCE_SECONDS = 0.0125
 # provider's sleep - which is the same invariant with margin on both sides
 # rather than none on one.
 _PROVIDER_RACE_DEADLINE_SECONDS = 0.04
+# The one budget in this file that must NOT track the host: two cases hand the
+# service a deadline deliberately too short for the authority signing step and
+# require it to refuse. Scaling that up is scaling the subject - on a host
+# where the scale rose, the signing simply finished inside the larger deadline
+# and both cases reported DID NOT RAISE. The elapsed guards around them stay
+# scaled, because how long the refusal takes to come back *is* a host property.
+_SIGNING_STARVED_DEADLINE_SECONDS = 0.03
 # The calibration dispatch is not under test and must not be the thing that
 # fails when the host is slow, so it gets a watchdog rather than a budget.
 _PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
@@ -2310,7 +2317,7 @@ def test_claim_signing_uses_remaining_single_request_deadline(tmp_path: Path) ->
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="authority signing"):
         service.claim_once(
             canonical_model_json_bytes(request),
-            deadline=time.monotonic() + _host(0.03),
+            deadline=time.monotonic() + _SIGNING_STARVED_DEADLINE_SECONDS,
         )
 
     assert time.monotonic() - started < _host(0.08)
@@ -2335,7 +2342,10 @@ def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="authority signing"):
-        service.replay(canonical_model_json_bytes(request), deadline=time.monotonic() + _host(0.03))
+        service.replay(
+            canonical_model_json_bytes(request),
+            deadline=time.monotonic() + _SIGNING_STARVED_DEADLINE_SECONDS,
+        )
 
     assert time.monotonic() - started < _host(0.08)
     assert len(signer.seen_deadlines) == 1
