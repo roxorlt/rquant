@@ -66,6 +66,73 @@ HASHES = {
 NOW = datetime(2026, 8, 9, 4, tzinfo=UTC)
 
 
+# A watchdog for "the provider thread got in at all", not a subject: the
+# bounded rejections these cases assert afterwards are what is under test. One
+# or two seconds is a developer machine's budget and the x64 runner missed it.
+_PROVIDER_ENTRY_WATCHDOG_SECONDS = 30
+
+# Every deadline in this file that has to expire *while the provider is
+# running* must first survive the dispatch prologue: envelope parsing, the
+# Ed25519 verification of the claim receipt, and the four or five
+# `synchronous = FULL` ledger transactions that precede
+# `_require_deadline(stage="before provider dispatch")`.
+#
+# Sized against a measurement rather than a literal, because the literals were
+# wrong in a way isolation could not show. A CI diagnostic job (017d808)
+# timed that prologue at 11ms on an idle ubuntu-24.04 x64 runner - the same as
+# this laptop - and running these three cases alone on that runner is green.
+# Inside a full shard, after ~2500 other cases have run, the same prologue
+# overruns the 50ms deadline outright: three cases failed with
+# `dispatch_calls == 0`, which is "the provider was never reached", not
+# "the wait was too short". A larger literal would only move that cliff, so the
+# prologue is measured once per module - in the same process, at the point in
+# the shard where these cases actually run, so the measurement carries the
+# degradation with it - and the budgets are read as multiples of it.
+#
+# The scale is floored at 1.0, so on an unloaded host every budget below is
+# exactly the literal it has always been. Deadlines, the provider sleeps they
+# must fire inside, and the elapsed guards all take the same scale: the
+# orderings between them (prologue < deadline < prologue + provider sleep) hold
+# at every scale precisely because none of the three is scaled alone.
+_PROLOGUE_REFERENCE_SECONDS = 0.0125
+# Two cases need a deadline that lands *after* the prologue and *before* the
+# provider returns from an 80ms sleep - an admissible window of one to about
+# seven measured prologues. Twenty milliseconds sat at the very bottom of it:
+# 1.6 prologues, which is inside the spread between a warm sample (7ms) and a
+# cold one (12ms) on the machine that wrote it, so the lower bound held by
+# luck. Forty puts the deadline at the middle of the window - half the
+# provider's sleep - which is the same invariant with margin on both sides
+# rather than none on one.
+_PROVIDER_RACE_DEADLINE_SECONDS = 0.04
+# Two cases starve the authority signing step of deadline and require the
+# service to refuse *at that step*. Three quantities decide whether they do,
+# and they only work as a set:
+#
+#   prologue  <  deadline  <  signing cost
+#
+# The left inequality keeps the three `_require_deadline` checkpoints ahead of
+# signing from firing first - if one of them does, the refusal is real but its
+# message is not "authority signing" and the case does not recognise it. The
+# right one is what starves the signer. Scaling the deadline alone broke the
+# right inequality (the signing finished inside the enlarged deadline: DID NOT
+# RAISE); pinning the deadline to a literal while the prologue grows with the
+# host breaks the left one instead, and a full shard's prologue sits right on
+# top of 30ms. Scaling all three by the same factor keeps both inequalities
+# true at every host speed, which is the only form that is not a race.
+_SIGNING_STARVED_DEADLINE_SECONDS = 0.03
+_SIGNING_COST_SECONDS = 0.1
+# The calibration dispatch is not under test and must not be the thing that
+# fails when the host is slow, so it gets a watchdog rather than a budget.
+_PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
+_prologue_scale = 1.0
+
+
+def _host(seconds: float) -> float:
+    """Read a budget as wall clock on a quiet host, scaled by a loaded one."""
+
+    return seconds * _prologue_scale
+
+
 def _openssl() -> str:
     executable = shutil.which("openssl")
     if executable is None:
@@ -697,6 +764,84 @@ def _claim(service: object, request: SourceBrokerV2ClaimOnceRequest):
     return response
 
 
+class _EntryStampProvider(_CountingProvider):
+    """Records when the service actually handed the call to the provider."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dispatch_entered_at: float | None = None
+        self.finalize_entered_at: float | None = None
+
+    def dispatch(self, request: SourceBrokerV2DispatchRequest):
+        self.dispatch_entered_at = time.monotonic()
+        return super().dispatch(request)
+
+    def finalize(self, request: SourceBrokerV2FinalizeRequest):
+        self.finalize_entered_at = time.monotonic()
+        return super().finalize(request)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _calibrate_provider_prologue(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Time what a call spends before the provider, once, in this process.
+
+    Both phases are measured and the larger wins: finalize verifies a second
+    claim receipt and writes more ledger rows than dispatch, and it is the
+    finalize case that went red. The measurement has to happen at module scope
+    rather than inside each case - it is a full signed round trip, and the
+    cases that need it are holding blocking providers by the time they would
+    ask. Taking the slowest of three keeps the scale on the conservative side
+    of a host that is still degrading.
+    """
+    global _prologue_scale
+
+    root = tmp_path_factory.mktemp("provider-prologue-calibration")
+    samples: list[float] = []
+    for index in range(3):
+        provider = _EntryStampProvider()
+        service, _keyring = _service(root / f"calibration-{index}", provider=provider)
+        request = _dispatch_request()
+        claim = _claim(service, _claim_once_request(request))
+        envelope = canonical_model_json_bytes(
+            SourceBrokerV2DispatchEnvelope(request=request, claim_receipt=claim)
+        )
+        started = time.monotonic()
+        raw = service.dispatch(
+            envelope,
+            deadline=started + _PROLOGUE_CALIBRATION_DEADLINE_SECONDS,
+        )
+        entered = provider.dispatch_entered_at
+        assert entered is not None, "calibration dispatch never reached the provider"
+        samples.append(entered - started)
+
+        dispatch = SourceBrokerV2DispatchResponse.model_validate_json(raw)
+        finalize_request = _finalize_request(dispatch)
+        finalize_claim = _claim(
+            service,
+            _claim_once_request(
+                _dispatch_request(operation_id=finalize_request.operation_id),
+                challenge=HASHES["final_challenge"],
+                phase=SourceBrokerV2OutboxPhase.SOURCE_FINALIZE,
+                operation_request_hash=finalize_request.request_hash,
+            ),
+        )
+        finalize_envelope = canonical_model_json_bytes(
+            SourceBrokerV2FinalizeEnvelope(
+                request=finalize_request,
+                claim_receipt=finalize_claim,
+            )
+        )
+        started = time.monotonic()
+        service.finalize(
+            finalize_envelope,
+            deadline=started + _PROLOGUE_CALIBRATION_DEADLINE_SECONDS,
+        )
+        entered = provider.finalize_entered_at
+        assert entered is not None, "calibration finalize never reached the provider"
+        samples.append(entered - started)
+    _prologue_scale = max(1.0, max(samples) / _PROLOGUE_REFERENCE_SECONDS)
+
+
 def _ledger_row(tmp_path: Path, operation_id: str) -> sqlite3.Row:
     connection = sqlite3.connect(tmp_path / "source-provider-ledger.sqlite3")
     connection.row_factory = sqlite3.Row
@@ -1068,7 +1213,7 @@ def test_exact_external_authority_client_enforces_one_total_deadline(
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
         client.lookup(_external_reserve_request())
 
-    assert time.monotonic() - started < 0.2
+    assert time.monotonic() - started < _host(0.2)
 
 
 def test_complete_committed_response_loss_recovers_through_signed_lookup(
@@ -1713,7 +1858,7 @@ def test_live_claim_and_replay_do_not_poison_inflight_provider_completion(
 
     thread = threading.Thread(target=invoke)
     thread.start()
-    assert provider.entered.wait(timeout=2)
+    assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
     live_claim_request = _claim_once_request(request, challenge="b" * 64)
     live_claim = _claim(service, live_claim_request)
@@ -1775,12 +1920,12 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
 
     thread = threading.Thread(target=invoke)
     thread.start()
-    assert provider.entered.wait(timeout=2)
+    assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.dispatch(envelope, deadline=time.monotonic() + 0.05)
-    assert time.monotonic() - started < 0.25
+        service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
+    assert time.monotonic() - started < _host(0.25)
 
     provider.release.set()
     thread.join(timeout=2)
@@ -1792,7 +1937,7 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
 def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
     tmp_path: Path,
 ) -> None:
-    provider = _ShortBlockingProvider(block_seconds=0.35)
+    provider = _ShortBlockingProvider(block_seconds=_host(0.35))
     service, _keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
@@ -1803,10 +1948,10 @@ def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
     started = time.monotonic()
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-            service.dispatch(envelope, deadline=time.monotonic() + 0.05)
+            service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
     finally:
         provider.release.set()
-    assert time.monotonic() - started < 0.2
+    assert time.monotonic() - started < _host(0.2)
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=request.saga_id,
@@ -1821,7 +1966,7 @@ def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
     assert replay.status is SourceBrokerV2ReplayStatus.UNKNOWN
 
     with pytest.raises((SourceBrokerTransportError, SourceBrokerV2TransportDeadlineError)):
-        service.dispatch(envelope, deadline=time.monotonic() + 0.05)
+        service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
     assert provider.dispatch_calls == 1
 
 
@@ -1855,13 +2000,13 @@ def test_global_provider_gate_bounds_blocked_sources_before_authority_reserve(
     second_envelope = envelope_for(second_request)
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-            service.dispatch(first_envelope, deadline=time.monotonic() + 0.05)
-        assert provider.entered.wait(timeout=1)
+            service.dispatch(first_envelope, deadline=time.monotonic() + _host(0.05))
+        assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
         started = time.monotonic()
         with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
-            service.dispatch(second_envelope, deadline=time.monotonic() + 0.5)
-        assert time.monotonic() - started < 0.2
+            service.dispatch(second_envelope, deadline=time.monotonic() + _host(0.5))
+        assert time.monotonic() - started < _host(0.2)
         assert provider.dispatch_calls == 1
         assert authority.reserve_calls == 1
         assert (
@@ -1918,8 +2063,8 @@ def test_provider_service_stop_prevents_new_threads_and_reservations(tmp_path: P
 
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-            service.dispatch(first_envelope, deadline=time.monotonic() + 0.05)
-        assert provider.entered.wait(timeout=1)
+            service.dispatch(first_envelope, deadline=time.monotonic() + _host(0.05))
+        assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
         service.stop()
         service.stop()
@@ -1927,7 +2072,7 @@ def test_provider_service_stop_prevents_new_threads_and_reservations(tmp_path: P
             SourceBrokerTransportError,
             match="reconcile|required|unknown|stopped",
         ):
-            service.dispatch(second_envelope, deadline=time.monotonic() + 0.5)
+            service.dispatch(second_envelope, deadline=time.monotonic() + _host(0.5))
 
         assert provider.dispatch_calls == 1
         assert authority.reserve_calls == 1
@@ -1992,7 +2137,7 @@ def test_security_events_are_structured_and_never_include_provider_secrets(
 def test_blocked_provider_finalize_returns_at_deadline_without_auto_repeat(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingProvider(sleep_finalize_seconds=0.08)
+    provider = _CountingProvider(sleep_finalize_seconds=_host(0.08))
     service, _keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
@@ -2020,8 +2165,11 @@ def test_blocked_provider_finalize_returns_at_deadline_without_auto_repeat(
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.finalize(envelope, deadline=time.monotonic() + 0.02)
-    assert time.monotonic() - started < 0.2
+        service.finalize(
+            envelope,
+            deadline=time.monotonic() + _host(_PROVIDER_RACE_DEADLINE_SECONDS),
+        )
+    assert time.monotonic() - started < _host(0.2)
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=finalize_request.saga_id,
@@ -2113,8 +2261,8 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
     started = time.monotonic()
     try:
         with pytest.raises((SourceBrokerTransportError, SourceBrokerV2TransportDeadlineError)):
-            service.dispatch(envelope, deadline=time.monotonic() + 0.05)
-        assert time.monotonic() - started < 0.2
+            service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
+        assert time.monotonic() - started < _host(0.2)
         assert provider.dispatch_calls == 1
 
         replay = SourceBrokerV2ReplayResponse.model_validate_json(
@@ -2126,7 +2274,7 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
         duplicate_started = time.monotonic()
         with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
             service.dispatch(envelope, deadline=time.monotonic() + 1.0)
-        assert time.monotonic() - duplicate_started < 0.2
+        assert time.monotonic() - duplicate_started < _host(0.2)
         assert provider.dispatch_calls == 1
     finally:
         provider.close()
@@ -2140,7 +2288,7 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
 def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingProvider(sleep_dispatch_seconds=0.08)
+    provider = _CountingProvider(sleep_dispatch_seconds=_host(0.08))
     service, _keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
@@ -2149,7 +2297,10 @@ def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
     )
 
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.dispatch(envelope, deadline=time.monotonic() + 0.02)
+        service.dispatch(
+            envelope,
+            deadline=time.monotonic() + _host(_PROVIDER_RACE_DEADLINE_SECONDS),
+        )
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=request.saga_id,
@@ -2168,21 +2319,24 @@ def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
 
 
 def test_claim_signing_uses_remaining_single_request_deadline(tmp_path: Path) -> None:
-    signer = _DeadlineAwareTestSigner(required_seconds=0.1)
+    signer = _DeadlineAwareTestSigner(required_seconds=_host(_SIGNING_COST_SECONDS))
     service, _keyring = _service(tmp_path, signer=signer)
     request = _claim_once_request(_dispatch_request())
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="authority signing"):
-        service.claim_once(canonical_model_json_bytes(request), deadline=time.monotonic() + 0.03)
+        service.claim_once(
+            canonical_model_json_bytes(request),
+            deadline=time.monotonic() + _host(_SIGNING_STARVED_DEADLINE_SECONDS),
+        )
 
-    assert time.monotonic() - started < 0.08
+    assert time.monotonic() - started < _host(0.08)
     assert len(signer.seen_deadlines) == 1
     assert signer.seen_deadlines[0] is not None
 
 
 def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -> None:
-    signer = _DeadlineAwareTestSigner(required_seconds=0.1)
+    signer = _DeadlineAwareTestSigner(required_seconds=_host(_SIGNING_COST_SECONDS))
     provider = _CountingProvider()
     service, _keyring = _service(tmp_path, provider=provider, signer=signer)
     request = SourceBrokerV2ReplayRequest(
@@ -2198,9 +2352,12 @@ def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="authority signing"):
-        service.replay(canonical_model_json_bytes(request), deadline=time.monotonic() + 0.03)
+        service.replay(
+            canonical_model_json_bytes(request),
+            deadline=time.monotonic() + _host(_SIGNING_STARVED_DEADLINE_SECONDS),
+        )
 
-    assert time.monotonic() - started < 0.08
+    assert time.monotonic() - started < _host(0.08)
     assert len(signer.seen_deadlines) == 1
     assert signer.seen_deadlines[0] is not None
     assert provider.dispatch_calls == 0
@@ -2208,7 +2365,7 @@ def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -
 
 
 def test_concurrent_duplicate_dispatches_share_one_durable_result(tmp_path: Path) -> None:
-    provider = _CountingProvider(sleep_dispatch_seconds=0.05)
+    provider = _CountingProvider(sleep_dispatch_seconds=_host(0.05))
     service, _keyring = _service(tmp_path, provider=provider)
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))

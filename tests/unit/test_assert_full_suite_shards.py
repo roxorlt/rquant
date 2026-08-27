@@ -22,6 +22,9 @@ NODEIDS = (
     "tests/d.py::test_d",
 )
 
+APPROVED_SKIP_NODEID = NODEIDS[3]
+APPROVED_SKIP_REASON = "Darwin-only capability gate"
+
 CLEAN_ENV_NODEIDS = (
     "tests/test_a.py::test_a",
     "tests/test_b.py::test_b",
@@ -38,19 +41,17 @@ SENTINEL_ENVIRONMENT = {
     "RUNNER_TEMP": "runner-temp-sentinel",
 }
 
+# Darwin tests that drive their subject through injected fakes and therefore
+# behave identically whatever sys.platform claims. The kqueue registration
+# cases are deliberately absent: they need the real select.kqueue, so they
+# carry a Darwin skipif and run in the macOS lane instead.
 LINUX_DARWIN_CONTRACT_NODEIDS = (
     "tests/unit/test_contained_subprocess.py::test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects",
     "tests/unit/test_contained_subprocess.py::test_darwin_register_root_rechecks_hooks_after_registration_handoffs",
     "tests/unit/test_contained_subprocess.py::test_darwin_register_root_rejects_non_pristine_tracker_without_side_effects",
-    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_serializes_concurrent_callers",
-    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry",
-    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_retains_live_failed_start_and_first_error",
     "tests/unit/test_contained_subprocess.py::test_darwin_close_reports_join_error_after_safe_queue_cleanup",
     "tests/unit/test_contained_subprocess.py::test_darwin_close_retains_owner_until_thread_stop_is_verified",
-    "tests/unit/test_contained_subprocess.py::test_darwin_failed_preinitialized_queue_close_blocks_registration_until_retry",
-    "tests/unit/test_contained_subprocess.py::test_darwin_registration_reentrant_close_fails_and_rolls_back",
     "tests/unit/test_contained_subprocess.py::test_darwin_poll_rejects_hooks_at_every_state_handoff",
-    "tests/unit/test_contained_subprocess.py::test_darwin_registration_rechecks_deadline_after_every_handoff",
     "tests/unit/test_contained_subprocess.py::test_darwin_track_direct_call_rejects_hooks_before_state_changes",
     "tests/unit/test_contained_subprocess.py::test_darwin_register_root_reports_startup_thread_hooks",
     "tests/unit/test_contained_subprocess.py::test_darwin_track_stops_before_next_control_when_hook_activates",
@@ -64,17 +65,37 @@ def _repository_for_manifest(root: Path) -> Path:
     return root.parent / "repository"
 
 
-def _write_bundle(root: Path) -> dict[str, object]:
+def _write_approved_skips(
+    root: Path,
+    *,
+    linux: dict[str, str] | None = None,
+    darwin: dict[str, str] | None = None,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    document = {
+        "platforms": {
+            "darwin": dict(darwin or {}),
+            "linux": {APPROVED_SKIP_NODEID: APPROVED_SKIP_REASON} if linux is None else linux,
+        },
+        "schema_version": 1,
+    }
+    shards.approved_skips_path(root).write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_bundle(root: Path, *, nodeids: tuple[str, ...] = NODEIDS) -> dict[str, object]:
     repository_root = _repository_for_manifest(root)
-    for nodeid in NODEIDS:
+    for nodeid in nodeids:
         path = repository_root / nodeid.partition("::")[0]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("def test_case():\n    assert True\n", encoding="utf-8")
+    _write_approved_skips(root)
     return shards.write_manifest_bundle(
         root,
         selector=(),
-        shard_nodeids=tuple((nodeid,) for nodeid in NODEIDS),
-        expected_skips=1,
+        shard_nodeids=tuple((nodeid,) for nodeid in nodeids),
         repository_root=repository_root,
     )
 
@@ -83,18 +104,22 @@ def _validate(
     manifest_root: Path,
     artifacts: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> dict[str, int]:
+    *,
+    platform: str = "linux",
+    nodeids: tuple[str, ...] = NODEIDS,
+) -> dict[str, object]:
     repository_root = _repository_for_manifest(manifest_root)
 
     def collect(_selector: tuple[str, ...], *, repository_root: Path) -> tuple[str, ...]:
         assert repository_root == _repository_for_manifest(manifest_root)
-        return NODEIDS
+        return nodeids
 
     monkeypatch.setattr(shards, "collect_nodeids", collect)
     return validator.validate_artifacts(
         manifest_root,
         artifacts,
         expected_python="3.12",
+        platform=platform,
         repository_root=repository_root,
     )
 
@@ -106,12 +131,16 @@ def _write_artifacts(
     python_version: str = "3.12",
     shard_with_skip: int | None = 3,
     outcome: str = "pass",
+    skip_reason: str = APPROVED_SKIP_REASON,
+    nodeids: tuple[str, ...] = NODEIDS,
+    rename_case: tuple[int, str] | None = None,
 ) -> None:
+    """Write one JUnit report per shard, keyed by the manifest's own identities."""
     full = index["full_suite"]
     for shard in index["shards"]:
         shard_id = shard["id"]
         artifact = root / f"full-suite-evidence-py{python_version}-shard{shard_id}"
-        artifact.mkdir(parents=True)
+        artifact.mkdir(parents=True, exist_ok=True)
         evidence = {
             "schema_version": 1,
             "python_version": python_version,
@@ -125,19 +154,17 @@ def _write_artifacts(
         child = ""
         skipped = 0
         if shard_id == shard_with_skip:
-            child = "<skipped/>"
+            child = f'<skipped type="pytest.skip" message="{skip_reason}"/>'
             skipped = 1
         if shard_id == 0 and outcome in {"failure", "error"}:
             child = f"<{outcome}/>"
         failures = int(outcome == "failure" and shard_id == 0)
         errors = int(outcome == "error" and shard_id == 0)
-        cases = "".join(
-            (
-                f'<testcase classname="tests.shard{shard_id}" name="case{case_id}">'
-                f"{child if case_id == 0 else ''}</testcase>"
-            )
-            for case_id in range(shard["count"])
-        )
+        identity = shards.junit_identity(nodeids[shard_id])
+        name = identity["name"]
+        if rename_case is not None and rename_case[0] == shard_id:
+            name = rename_case[1]
+        cases = f'<testcase classname="{identity["classname"]}" name="{name}">{child}</testcase>'
         xml = (
             f'<testsuite tests="{shard["count"]}" failures="{failures}" '
             f'errors="{errors}" skipped="{skipped}">' + cases + "</testsuite>"
@@ -227,7 +254,7 @@ def _assert_linux_darwin_contract(repository_root: Path) -> None:
         )
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
-    assert "57 passed" in output
+    assert "43 passed" in output
     assert "skipped" not in output
 
 
@@ -242,7 +269,13 @@ def test_validator_aggregates_real_testcases_and_skips(
 
     summary = _validate(manifest_root, artifacts, monkeypatch)
 
-    assert summary == {"cases": 4, "skipped": 1, "failures": 0, "errors": 0}
+    assert summary == {
+        "cases": 4,
+        "passed": 3,
+        "approved_skips": 1,
+        "platform": "linux",
+        "python_version": "3.12",
+    }
 
 
 def test_clean_environment_aggregate_uses_shared_private_collect_setup(
@@ -252,15 +285,18 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
     repository_root = (tmp_path / "clean-repository").resolve()
     _write_clean_environment_repository(repository_root)
     manifest_root = tmp_path / "manifest"
+    _write_approved_skips(
+        manifest_root,
+        linux={CLEAN_ENV_NODEIDS[3]: APPROVED_SKIP_REASON},
+    )
     index = shards.write_manifest_bundle(
         manifest_root,
         selector=(),
         shard_nodeids=tuple((nodeid,) for nodeid in CLEAN_ENV_NODEIDS),
-        expected_skips=1,
         repository_root=repository_root,
     )
     artifacts = tmp_path / "artifacts"
-    _write_artifacts(artifacts, index)
+    _write_artifacts(artifacts, index, nodeids=CLEAN_ENV_NODEIDS)
     project_environment = {
         "DATA_DIR",
         "DEEPSEEK_API_KEY",
@@ -290,17 +326,34 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
         manifest_root,
         artifacts,
         expected_python="3.12",
+        platform="linux",
         repository_root=repository_root,
     )
 
-    assert summary == {"cases": 4, "skipped": 1, "failures": 0, "errors": 0}
+    assert summary == {
+        "cases": 4,
+        "passed": 3,
+        "approved_skips": 1,
+        "platform": "linux",
+        "python_version": "3.12",
+    }
     workflow = (Path(__file__).parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     setup_command = "python scripts/full_suite_shards.py prepare-environment"
-    assert workflow.count(setup_command) == 2
+    # Three lanes prepare a private root: the Linux shards, the Linux contract
+    # aggregation, and the macOS Darwin lane.
+    assert workflow.count(setup_command) == 3
     shard_job, contract_job = workflow.split("  full-suite-contract:\n", maxsplit=1)
     assert setup_command in shard_job.split("  full-suite-shard:\n", maxsplit=1)[1]
-    assert setup_command in contract_job.split("  runtime-fd-exec-linux:\n", maxsplit=1)[0]
-    assert workflow.count('--basetemp "${RQUANT_CI_PYTEST_BASETEMP}"') == 1
+    assert setup_command in contract_job.split("  full-suite-darwin-lane:\n", maxsplit=1)[0]
+    lane_job = contract_job.split("  full-suite-darwin-lane:\n", maxsplit=1)[1]
+    lane_job = lane_job.split("  r07-differential-gate-py311:\n", maxsplit=1)[0]
+    assert setup_command in lane_job
+    assert "runs-on: macos-14" in lane_job
+    assert "timeout-minutes: 30" in lane_job
+    assert "--profile darwin-lane" in lane_job
+    assert "--platform darwin" in lane_job
+    assert "--platform linux" in contract_job
+    assert workflow.count('--basetemp "${RQUANT_CI_PYTEST_BASETEMP}"') == 2
     assert "${RQUANT_CI_ROOT}/pt-full-shard-" not in workflow
 
     workflow_base = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")
@@ -358,14 +411,93 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
         for line in second_environment.read_text(encoding="utf-8").splitlines()
     )
     assert second["RQUANT_CI_ROOT"] != prepared["RQUANT_CI_ROOT"]
-    _assert_linux_darwin_contract(Path(__file__).parents[2])
+    if sys.platform == "darwin":
+        # The subject tests fake sys.platform, but they still call the real
+        # kqueue and plutil, so only a Darwin host can run this contract.
+        _assert_linux_darwin_contract(Path(__file__).parents[2])
     full_suite = json.loads(
         (Path(__file__).parents[1] / "manifests/full-suite-v1/index.json").read_text(
             encoding="utf-8"
         )
     )["full_suite"]
-    assert full_suite["cases"] == 13051
-    assert full_suite["skips"] == 49
+    assert full_suite["cases"] == 13066
+    # The skip count is the Linux approved-skip map's size, and the manifest
+    # loader already refuses any other value; this pins the number a reviewer
+    # sees in the index.
+    assert full_suite["skips"] == 57
+
+
+def test_validator_rejects_an_unapproved_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_root = tmp_path / "manifest"
+    index = _write_bundle(manifest_root)
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts, index, shard_with_skip=1)
+
+    with pytest.raises(validator.ContractError, match="not approved"):
+        _validate(manifest_root, artifacts, monkeypatch)
+
+
+def test_validator_rejects_an_approved_skip_with_a_different_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_root = tmp_path / "manifest"
+    index = _write_bundle(manifest_root)
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts, index, skip_reason="some other reason")
+
+    with pytest.raises(validator.ContractError, match="unapproved reason"):
+        _validate(manifest_root, artifacts, monkeypatch)
+
+
+def test_validator_rejects_a_missing_or_unexpected_nodeid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_root = tmp_path / "manifest"
+    index = _write_bundle(manifest_root)
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts, index, rename_case=(2, "test_renamed"))
+
+    with pytest.raises(validator.ContractError, match="not in the manifest"):
+        _validate(manifest_root, artifacts, monkeypatch)
+
+
+def test_validator_rejects_a_platform_the_skip_map_does_not_cover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_root = tmp_path / "manifest"
+    index = _write_bundle(manifest_root)
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts, index)
+
+    with pytest.raises(validator.ContractError, match="unsupported contract platform"):
+        _validate(manifest_root, artifacts, monkeypatch, platform="windows")
+
+    # The same evidence is not approved on the other supported platform either:
+    # the Darwin side of the map does not list the skipped nodeid.
+    with pytest.raises(validator.ContractError, match="not approved"):
+        _validate(manifest_root, artifacts, monkeypatch, platform="darwin")
+
+
+def test_manifest_rejects_a_skip_map_that_drifted_from_the_index(
+    tmp_path: Path,
+) -> None:
+    manifest_root = tmp_path / "manifest"
+    _write_bundle(manifest_root)
+    repository_root = _repository_for_manifest(manifest_root)
+
+    _write_approved_skips(manifest_root, linux={NODEIDS[0]: "another reason"})
+    with pytest.raises(shards.ContractError, match="digest differs"):
+        shards.load_manifest(manifest_root, repository_root=repository_root)
+
+    _write_approved_skips(manifest_root, linux={"tests/z.py::test_unknown": "unknown"})
+    with pytest.raises(shards.ContractError, match="digest differs|unknown linux nodeids"):
+        shards.load_manifest(manifest_root, repository_root=repository_root)
 
 
 @pytest.mark.parametrize("outcome", ("failure", "error"))
@@ -379,7 +511,7 @@ def test_validator_rejects_a_failed_or_errored_testcase(
     artifacts = tmp_path / "artifacts"
     _write_artifacts(artifacts, index, outcome=outcome)
 
-    with pytest.raises(validator.ContractError, match="failure|error"):
+    with pytest.raises(validator.ContractError, match="reported .* as (failed|error)"):
         _validate(manifest_root, artifacts, monkeypatch)
 
 
@@ -424,12 +556,19 @@ def test_validator_rejects_malformed_junit_and_python_version_mismatch(
 def test_checked_in_manifest_matches_exact_collection_without_missing_or_duplicate_cases() -> None:
     manifest_root = Path(__file__).parents[1] / "manifests/full-suite-v1"
     with shards._isolated_pytest_environment() as environment:
-        index, groups = shards.validate_manifest(
+        loaded = shards.validate_manifest(
             manifest_root,
             repository_root=Path(__file__).parents[2],
             environment=environment,
         )
-    nodeids = tuple(nodeid for group in groups for nodeid in group)
-    assert len(nodeids) == index["full_suite"]["cases"]
+    nodeids = tuple(nodeid for group in loaded.groups for nodeid in group)
+    assert len(nodeids) == loaded.index["full_suite"]["cases"]
     assert len(nodeids) == len(set(nodeids))
-    assert shards.nodeid_digest(nodeids) == index["full_suite"]["sha256"]
+    assert shards.nodeid_digest(nodeids) == loaded.index["full_suite"]["sha256"]
+    assert set(loaded.junit) == set(nodeids)
+    for nodeid, identity in loaded.junit.items():
+        assert identity == shards.junit_identity(nodeid)
+    linux_skips = loaded.approved_skips["linux"]
+    assert len(linux_skips) == loaded.index["full_suite"]["skips"]
+    assert set(linux_skips) <= set(nodeids)
+    assert set(loaded.approved_skips["darwin"]) <= set(nodeids)

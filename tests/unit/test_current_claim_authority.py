@@ -2019,7 +2019,12 @@ def test_hot_path_uses_incremental_checks_and_full_audit_stays_explicit(
 
     assert authority_audits == 0
     assert root_audits == 0
-    assert hot_elapsed < 5.0
+    # The subject of this case is the two audit counters above: the hot path
+    # must not audit. This bound only has to catch an algorithmic regression -
+    # a quadratic hot path would be orders of magnitude slower, not 20% - and a
+    # five-second wall clock on a shared runner reports load as a defect (6.1s
+    # observed on x64 CI while the audit counters were still correct).
+    assert hot_elapsed < 20.0
 
     authority.preflight()
     assert authority_audits == 1

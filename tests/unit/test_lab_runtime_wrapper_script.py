@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from rquant.release_generation import ReleaseGenerationAuthority, marker_path_for_lock
+from tests.support.verified_system_interpreter import materialize_system_interpreter
 
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "scripts" / "run-lab-daemon.py"
@@ -194,14 +195,19 @@ def _tiny_test_venv(checkout: Path, *, symlink_python: bool = False) -> Path:
     venv_root = checkout / ".venv"
     python = venv_root / "bin" / "python"
     python.parent.mkdir(parents=True)
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    system_home = materialize_system_interpreter(checkout.parent / "system-python")
     if symlink_python:
-        python.symlink_to(Path(sys.executable).resolve(strict=True))
+        # A uv-style venv symlinks bin/python at the base interpreter, and
+        # CPython then reports the resolved target as sys._base_executable
+        # instead of the pyvenv.cfg home entry - so the symlink must point at
+        # the private copy too, not at the host interpreter.
+        python.symlink_to(system_home / f"python{version}")
     else:
         shutil.copy2(sys.executable, python)
         python.chmod(0o700)
-    version = f"{sys.version_info.major}.{sys.version_info.minor}"
     (venv_root / "pyvenv.cfg").write_text(
-        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
+        f"home = {system_home}\nversion = {version}\n",
         encoding="utf-8",
     )
     (venv_root / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)

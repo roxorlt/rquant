@@ -5833,13 +5833,16 @@ class TestLabWorkerCli:
             artifact_root=artifact_root,
             resource_authority_manifest=authority_manifest,
             require_resource_admission=bindings.require_resource_admission,
-            resource_probe_timeout_seconds=3,
+            # The probe spawns a real subprocess; three seconds is a fast
+            # developer machine's budget, not a shared runner's. The bound is
+            # what matters here, not its exact size.
+            resource_probe_timeout_seconds=30,
             verified_code_sha_provider=lambda: commit,
         )
 
-        snapshot = worker._bounded_resource_snapshot(timeout_seconds=3)
+        snapshot = worker._bounded_resource_snapshot(timeout_seconds=30)
 
-        assert abs((snapshot.observed_at - observed_at).total_seconds()) < 3
+        assert abs((snapshot.observed_at - observed_at).total_seconds()) < 30
         assert snapshot.live_healthy is True
         watermark = worker.snapshot_authority_watermark
         if snapshot.live_slo_applicable:

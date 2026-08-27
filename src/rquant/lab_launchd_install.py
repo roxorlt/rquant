@@ -35,6 +35,14 @@ LAB_LAUNCHD_LABELS = (
     "com.roxor.rquant-lab-worker",
     "com.roxor.rquant-lab-finalizer",
 )
+# The launchd control binary this installer drives. It is a module constant so
+# tests can substitute a hermetic fake executable (launchd only exists on
+# Darwin, and even there these tests must not reach the developer's real user
+# domain); nothing reads it from the environment or from any deployed file.
+LAUNCHCTL_PATH = "/bin/launchctl"
+# Apple's plist linter, used as a second opinion after plistlib parses the file.
+# Module constant for the same reason as LAUNCHCTL_PATH.
+PLUTIL_PATH = "/usr/bin/plutil"
 _STATE_SCHEMA_VERSION = 2
 _TRANSACTION_SCHEMA_VERSION = 1
 _MAX_BOUND_FILE_BYTES = 4 * 1024 * 1024
@@ -282,7 +290,7 @@ class LabLaunchdInstaller:
     def _launchctl_loaded(self, label: str) -> bool:
         try:
             result = self._runner(
-                ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                [LAUNCHCTL_PATH, "print", f"gui/{os.getuid()}/{label}"],
                 timeout=self._remaining(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -304,7 +312,7 @@ class LabLaunchdInstaller:
         if not self._launchctl_loaded(label):
             return
         self._run(
-            ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+            [LAUNCHCTL_PATH, "bootout", f"gui/{os.getuid()}/{label}"],
             label="launchctl bootout",
         )
 
@@ -312,7 +320,7 @@ class LabLaunchdInstaller:
         domain = f"gui/{os.getuid()}"
         self._run(
             [
-                "/bin/launchctl",
+                LAUNCHCTL_PATH,
                 "bootstrap",
                 domain,
                 str(self.launch_agents_dir / f"{label}.plist"),
@@ -320,7 +328,7 @@ class LabLaunchdInstaller:
             label="launchctl bootstrap",
         )
         self._run(
-            ["/bin/launchctl", "kickstart", f"{domain}/{label}"],
+            [LAUNCHCTL_PATH, "kickstart", f"{domain}/{label}"],
             label="launchctl kickstart",
         )
 
@@ -541,7 +549,7 @@ class LabLaunchdInstaller:
             temporary_path = self.launch_agents_dir / temporary
             with temporary_path.open("rb") as stream:
                 plistlib.load(stream)
-            self._run(["/usr/bin/plutil", "-lint", str(temporary_path)], label="plutil lint")
+            self._run([PLUTIL_PATH, "-lint", str(temporary_path)], label="plutil lint")
             temporary_stat = os.stat(temporary, dir_fd=root_fd, follow_symlinks=False)
             self._arm_transaction_replacement(
                 transaction,

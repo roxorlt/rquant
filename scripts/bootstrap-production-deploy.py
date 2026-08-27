@@ -335,6 +335,17 @@ def _validate_profile_controls(
         raise DeployBootstrapError("Linux deployment cannot enable Lab lifecycle")
 
 
+def _host_platform() -> str:
+    """Return the platform this bootstrap is deploying on.
+
+    Indirected through one function so a test can pin the deploy host to the
+    macOS Lab profile without writing to `sys.platform`, which would also
+    redirect every other module (contained_subprocess picks its Darwin kqueue
+    tracker from it) and break on a Linux runner.
+    """
+    return sys.platform
+
+
 def _deploy_timeout(raw: str, *, default: float, label: str) -> float:
     try:
         value = float(raw) if raw else default
@@ -2072,7 +2083,7 @@ class _LabLaunchdHandoff:
         }
         if release_profile not in {"linux-production", "macos-lab"}:
             raise DeployBootstrapError("release profile is unsupported")
-        if (release_profile == "macos-lab") != (sys.platform == "darwin"):
+        if (release_profile == "macos-lab") != (_host_platform() == "darwin"):
             raise DeployBootstrapError("release profile does not match host platform")
         if lifecycle_mode not in {"uninstalled", "installed"}:
             raise DeployBootstrapError("Lab lifecycle mode is invalid")
@@ -3883,9 +3894,10 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(overall_deadline_monotonic):
             raise DeployBootstrapError("deployment overall deadline is invalid")
         dry_run = "--dry-run" in _normalized_deploy_argv(deploy_argv)
-        if sys.platform == "darwin":
+        host = _host_platform()
+        if host == "darwin":
             actual_platform = "darwin"
-        elif sys.platform.startswith("linux"):
+        elif host.startswith("linux"):
             actual_platform = "linux"
         else:
             actual_platform = ""

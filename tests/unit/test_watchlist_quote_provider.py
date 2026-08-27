@@ -426,10 +426,15 @@ def test_timeout_kills_provider_descendants_and_reaps_root(
         termination_grace_seconds=0.05,
     )
 
+    # The worker is spawned and then forks a descendant; both have to register
+    # before the provider's deadline kills the group, or the pid file only ever
+    # gets one entry. Half a second is a fast developer machine's budget for two
+    # CPython start-ups; the case is about reaping the group, not about how small
+    # the deadline that trips it is.
     with pytest.raises(TimeoutError, match="exceeded"):
-        provider(("600000.SH",), timeout_seconds=0.5)
+        provider(("600000.SH",), timeout_seconds=10)
 
-    _assert_pids_reaped(_wait_for_pids(pid_path, count=2))
+    _assert_pids_reaped(_wait_for_pids(pid_path, count=2, timeout=15))
 
 
 def test_delayed_ready_consumption_then_go_still_reaps_worker_descendants(
@@ -460,10 +465,15 @@ def test_delayed_ready_consumption_then_go_still_reaps_worker_descendants(
 
     monkeypatch.setattr(provider, "_receive", delay_ready_consumption)
 
+    # The worker is spawned and then forks a descendant; both have to register
+    # before the provider's deadline kills the group, or the pid file only ever
+    # gets one entry. Half a second is a fast developer machine's budget for two
+    # CPython start-ups; the case is about reaping the group, not about how small
+    # the deadline that trips it is.
     with pytest.raises(TimeoutError, match="exceeded"):
-        provider(("600000.SH",), timeout_seconds=0.5)
+        provider(("600000.SH",), timeout_seconds=10)
 
-    _assert_pids_reaped(_wait_for_pids(pid_path, count=2))
+    _assert_pids_reaped(_wait_for_pids(pid_path, count=2, timeout=15))
 
 
 def test_sigterm_interrupts_blocked_provider_and_leaves_no_descendants(tmp_path: Path) -> None:

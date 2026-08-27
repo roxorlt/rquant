@@ -33,6 +33,7 @@ from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
 from tests.formal_smoke_real_generation_support import real_promotion_authority
 from tests.runtime_code_e2e_support import build_test_package, install_test_package
+from tests.support.verified_system_interpreter import materialize_system_interpreter
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUSTED_GIT = Path("/usr/bin/git")
@@ -77,7 +78,8 @@ def _physical_test_venv(checkout: Path) -> Path:
     python.chmod(0o700)
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     (root / "pyvenv.cfg").write_text(
-        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
+        f"home = {materialize_system_interpreter(checkout.parent / 'system-python')}\n"
+        f"version = {version}\n",
         encoding="utf-8",
     )
     target_site = root / "lib" / f"python{version}" / "site-packages"
@@ -109,6 +111,13 @@ def _physical_test_venv(checkout: Path) -> Path:
     )
     dependency_names.update(
         entry.name for entry in source_site.iterdir() if entry.name.endswith(".dist-info")
+    )
+    # manylinux wheels put their bundled shared objects in a sibling
+    # "<project>.libs" directory (numpy.libs holds libscipy_openblas*.so) that
+    # the extension modules reach through $ORIGIN/../../<project>.libs; macOS
+    # wheels keep them inside the package, which is why only Linux noticed.
+    dependency_names.update(
+        entry.name for entry in source_site.iterdir() if entry.name.endswith(".libs")
     )
     for name in dependency_names:
         entry = source_site / name

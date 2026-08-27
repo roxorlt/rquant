@@ -1804,12 +1804,22 @@ def test_list_jobs_keyword_fails_closed_before_filtering_corrupt_specs(
 def test_list_jobs_keyword_rejects_corrupt_row_beyond_first_page_and_cursor(
     tmp_path: Path,
 ) -> None:
-    store, job_ids = _seed_jobs(tmp_path, 4)
+    store, _job_ids = _seed_jobs(tmp_path, 4)
     reader = LabJobReader(store.path)
     filters = LabJobListFilters(keyword="strategy")
     first = reader.list_jobs(filters=filters, limit=1)
     assert first.next_cursor is not None
-    valid = reader.get_job(job_ids[0])
+
+    # Corrupt the row the second page has to return, learned from the page
+    # itself. Corrupting a row that merely sits somewhere after the cursor only
+    # fails when the planner happens to evaluate the keyword function past the
+    # page: with an ordered index scan SQLite stops at limit + 1 matches and
+    # never reads it, which is exactly what x64 CI does and this machine does
+    # not. The row a page must return is evaluated under every plan.
+    second_page = reader.list_jobs(filters=filters, limit=1, cursor=first.next_cursor)
+    assert len(second_page.items) == 1
+    corrupt_job_id = second_page.items[0].job_id
+    valid = reader.get_job(corrupt_job_id)
     assert valid is not None
     noncanonical = json.dumps(valid.spec.model_dump(mode="json"), indent=2, default=str)
     with sqlite3.connect(store.path) as connection:
@@ -1817,7 +1827,7 @@ def test_list_jobs_keyword_rejects_corrupt_row_beyond_first_page_and_cursor(
         connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(
             "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
-            (noncanonical, str(job_ids[0])),
+            (noncanonical, str(corrupt_job_id)),
         )
 
     with pytest.raises(InvalidStoredJobError, match="stored lab job"):

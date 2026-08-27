@@ -7,6 +7,7 @@ import hmac
 import inspect
 import json
 import multiprocessing
+import multiprocessing.connection
 import os
 import random
 import re
@@ -71,6 +72,130 @@ from tests.unit.test_strategy_job_adapters import (
 )
 
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
+# Almost every budget in this file waits for a spawned child to become
+# observable, and that child is a fresh CPython. How long one costs is a
+# property of the host, not of the assertion, so the literals below are read as
+# multiples of a measured interpreter start rather than as wall-clock constants:
+# on a shared x64 CI runner 44 of these cases went red at once because the
+# literals were a fast developer machine's, and raising the literals only moves
+# the cliff.
+#
+# The measurement has to be the cost that actually varies. A bare interpreter
+# start does not: GitHub's x64 runner starts one as fast as this laptop, and
+# calibrating on it left the scale at exactly 1.0 while 30 cases stayed red.
+# What a spawned child really pays is starting an interpreter *and re-importing
+# this module* - pandas, pyarrow and the whole rquant surface - so that is what
+# gets measured. _OBSERVE_REFERENCE_SECONDS is the cost the literals were sized
+# against - half of what this module's import costs on the development machine
+# today, because the module has roughly doubled since those numbers were
+# written and they are marginal even here. Every observation window is that
+# many child start-ups; a slower host gets proportionally more.
+_OBSERVE_REFERENCE_SECONDS = 0.35
+_observe_scale = 1.0
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _calibrate_observation_budgets() -> None:
+    """Measure one child's start-up-and-import once, before any case runs.
+
+    Measuring lazily inside whichever case happens to call `_observe` first is
+    not safe here: these cases install signal handlers, patch multiprocessing
+    and hold containment state, and a probe fired inside one of them can block.
+    A module fixture pays the cost once, in pytest's own context.
+    """
+    global _observe_scale
+    root = Path(__file__).parents[2]
+    environment = {**os.environ, "PYTHONPATH": str(root)}
+    samples: list[float] = []
+    for _ in range(2):
+        started = time.monotonic()
+        subprocess.run(
+            [sys.executable, "-c", "import tests.unit.test_lab_worker"],
+            cwd=root,
+            env=environment,
+            check=True,
+            capture_output=True,
+            timeout=600,
+        )
+        samples.append(time.monotonic() - started)
+    _observe_scale = max(1.0, min(samples) / _OBSERVE_REFERENCE_SECONDS)
+
+
+def _observe(seconds: float) -> float:
+    """Scale a budget for observing a spawned child by this host's spawn cost."""
+    return seconds * _observe_scale
+
+
+# The markers those windows wait for are written by a spawned CPython that
+# re-imports this module first; on the machine these cases were written that is
+# roughly a second and a half, so a flat two seconds left almost no margin even
+# before the host scale applies.
+_CHILD_STARTUP_SECONDS = 1.5
+
+
+def _child_startups(count: float) -> float:
+    """Budget for a marker a spawned child writes `count` start-ups from now."""
+    return _observe(_CHILD_STARTUP_SECONDS * count)
+
+
+def _await_markers(*paths: Path, budget: float) -> None:
+    """Wait for every marker a spawned child writes before acting on it.
+
+    These cases used to synchronise on the blocked callback's marker alone and
+    then assert, afterwards, that the shard child had recorded its session pid.
+    Both children exist by then on a fast host, so the second fact looked
+    implied by the first; on a slower one the shard child was still starting
+    when the case requested a stop, and it was reaped before it ever wrote.
+    The precondition the later assertions need is that *both* children are
+    observable, so both are waited for.
+    """
+    deadline = time.monotonic() + budget
+    for path in paths:
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert path.exists(), f"child marker never appeared: {path}"
+
+
+def _probe_ceiling(timeout_seconds: float) -> float:
+    """The ceiling a standalone probe declares: its timeout plus one child.
+
+    Read from the worker's own budget rather than copied as a literal. The
+    subject of the cases that use it is "the probe is bounded and reaps what it
+    started", and the bound they are entitled to assert is exactly the one the
+    module publishes - a copied number goes stale the moment the published one
+    is resized, which is what just happened to it.
+    """
+    from rquant.lab_worker import _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS
+
+    return timeout_seconds + _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS / 1_000_000
+
+
+def _deadline_reachable_in(count: float) -> timedelta:
+    """A ResearchRunSpec deadline a run can actually *reach* on this host.
+
+    For the cases that force the deadline with an injected clock at an exact
+    point - after execute, mid bundle write, at the atomic rename - the literal
+    is not the subject; the injection is. All the literal has to do is leave
+    enough real time to get there, and getting there costs a shard child
+    start-up. Written as one flat second it was a fast machine's number, and on
+    a slower host the run hit the real deadline while the child was still
+    importing, so the tick came back 'stopped' instead of producing the failure
+    the injection exists to produce.
+    """
+    return timedelta(seconds=_child_startups(count))
+
+
+# The shared temporary root the wire-session tests bind AF_UNIX sockets under.
+# "/tmp" resolves to the macOS spelling of that directory and stays "/tmp" on
+# Linux; the tests used to hard-code the macOS path, which Linux does not have.
+SHARED_TMP_ROOT = Path("/tmp").resolve(strict=True)
+# CPython's multiprocessing client only offers the SHA-256 challenge from 3.12
+# on; on 3.11 it answers the legacy MD5 challenge, which the wire listener still
+# accepts and reports as "legacy-md5". The negotiated mode is therefore a
+# property of the running stdlib, not a constant.
+STDLIB_WIRE_DIGEST_MODE = (
+    "sha256" if hasattr(multiprocessing.connection, "_ALLOWED_DIGESTS") else "legacy-md5"
+)
 
 
 def test_stop_signal_wakes_an_active_waiter_immediately() -> None:
@@ -87,12 +212,12 @@ def test_stop_signal_wakes_an_active_waiter_immediately() -> None:
 
     waiter = threading.Thread(target=wait_for_stop, daemon=True)
     waiter.start()
-    assert waiting.wait(timeout=1)
+    assert waiting.wait(timeout=_observe(1))
 
     stop.request()
 
-    assert returned.wait(timeout=0.2)
-    waiter.join(timeout=0.2)
+    assert returned.wait(timeout=_observe(0.2))
+    waiter.join(timeout=_observe(0.2))
     assert not waiter.is_alive()
 
 
@@ -1308,7 +1433,7 @@ class AdversarialSnapshotHooksProvider:
             descendant.start()
             if not ready.wait(2):
                 raise TimeoutError("snapshot hook descendant did not start")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _observe(10)
         while not self.release_path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not self.release_path.exists():
@@ -1361,7 +1486,7 @@ def test_rejected_resource_authority_state_cannot_admit_worker_execution(
 
 
 @pytest.mark.parametrize("hook", ("spawn_probe_provider", "accept_probe_state"))
-@pytest.mark.parametrize("termination", ("stop", "deadline-800ms"))
+@pytest.mark.parametrize("termination", ("stop", "deadline"))
 def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
     tmp_path: Path,
     hook: Literal["spawn_probe_provider", "accept_probe_state"],
@@ -1370,8 +1495,20 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
     spec = _nshape_compare_spec(hold_days=(1,))
-    if termination == "deadline-800ms":
-        spec = spec.model_copy(update={"deadline": NOW + timedelta(milliseconds=800)})
+    # A deadline can only bound the blocked hook once the hook is running, and
+    # the hook runs in a spawned probe child. The literal eight hundred
+    # milliseconds this used to carry is shorter than one child start-up on a
+    # slow host, so the child was killed mid-import and never wrote the entry
+    # marker the case waits for.
+    #
+    # Reaching that marker is not one child start but three - the admission
+    # authority round trip, the shard child, and the recheck that finally
+    # blocks - which is why it is the same budget `_await_markers` is given for
+    # the same event below. One start-up was enough on this laptop and still
+    # cut the run short on the runner.
+    spec_deadline = _deadline_reachable_in(3)
+    if termination == "deadline":
+        spec = spec.model_copy(update={"deadline": NOW + spec_deadline})
     claim = _claim(spec)
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
@@ -1413,23 +1550,26 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 1.2
+        entered_deadline = time.monotonic() + _observe(1.2)
         while not entered_path.exists() and time.monotonic() < entered_deadline:
             time.sleep(0.01)
         assert entered_path.exists()
         assert int(hook_pid_path.read_text(encoding="ascii")) != os.getpid()
         if termination == "stop":
             worker.request_stop()
-        runner.join(timeout=1.6)
+        termination_budget = _observe(1.6) + (
+            0.0 if termination == "stop" else spec_deadline.total_seconds()
+        )
+        runner.join(timeout=termination_budget)
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         release_path.write_text("release", encoding="ascii")
         worker.request_stop()
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.6
+    assert elapsed < termination_budget
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -1529,7 +1669,7 @@ def test_snapshot_hook_recursive_child_ignoring_term_is_killed_and_reaped(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 3
+        entered_deadline = time.monotonic() + _child_startups(2)
         while (
             not entered_path.exists() or not descendant_pid_path.exists()
         ) and time.monotonic() < entered_deadline:
@@ -1538,16 +1678,16 @@ def test_snapshot_hook_recursive_child_ignoring_term_is_killed_and_reaped(
         assert descendant_pid_path.exists()
         started = time.monotonic()
         worker.request_stop()
-        runner.join(timeout=1.2)
+        runner.join(timeout=_observe(1.2))
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         release_path.write_text("release", encoding="ascii")
         worker.request_stop()
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.2
+    assert elapsed < _observe(1.2)
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -1633,17 +1773,17 @@ def test_process_boundaries_use_bytes_transport_and_primitive_start_args() -> No
     assert "Pipe(" not in source
     lab_worker._assert_primitive_process_start(
         lab_worker._authority_wire_child,
-        (b"{}", "/private/tmp/test.sock", b"key", 1024),
+        (b"{}", f"{SHARED_TMP_ROOT}/test.sock", b"key", 1024),
     )
     with pytest.raises(LabDaemonConfigurationError, match="target is not registered"):
         lab_worker._assert_primitive_process_start(
             lambda: None,
-            (b"{}", "/private/tmp/test.sock", b"key", 1024),
+            (b"{}", f"{SHARED_TMP_ROOT}/test.sock", b"key", 1024),
         )
     with pytest.raises(LabDaemonConfigurationError, match="primitive wire values"):
         lab_worker._assert_primitive_process_start(
             lab_worker._shard_wire_child,
-            (b"{}", "/private/tmp/test.sock", object(), 1024),
+            (b"{}", f"{SHARED_TMP_ROOT}/test.sock", object(), 1024),
         )
 
 
@@ -1692,10 +1832,13 @@ def test_parent_rejects_unregistered_adapter_registry_without_truthiness_call(
 @pytest.mark.parametrize(
     "payload",
     (
-        b"{",
-        b'{"message_type":"readiness", "ready":true}',
-        b'{"message_type":"unknown"}',
-        b"x" * (1024 * 1024 + 1),
+        pytest.param(b"{", id="truncated"),
+        pytest.param(b'{"message_type":"readiness", "ready":true}', id="noncanonical"),
+        pytest.param(b'{"message_type":"unknown"}', id="unknown-type"),
+        # Without an explicit id pytest names the case after the payload, which
+        # puts a megabyte of "x" in the nodeid, the shard manifest and the JUnit
+        # report.
+        pytest.param(b"x" * (1024 * 1024 + 1), id="oversize"),
     ),
 )
 def test_wire_decoder_rejects_malformed_noncanonical_and_oversize_bytes(
@@ -1714,7 +1857,10 @@ def test_wire_decoder_rejects_malformed_noncanonical_and_oversize_bytes(
         )
 
 
-@pytest.mark.parametrize("payload", (b"{", b"x" * 1025))
+@pytest.mark.parametrize(
+    "payload",
+    (pytest.param(b"{", id="truncated"), pytest.param(b"x" * 1025, id="oversize")),
+)
 def test_recv_wire_rejects_malformed_and_oversize_send_bytes(payload: bytes) -> None:
     import rquant.lab_worker as lab_worker
 
@@ -1824,8 +1970,8 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
                 label="test outbound",
             )
     assert not connection.sent
-    first = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
-    second = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    first = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
+    second = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     accepted: dict[str, bytes] = {}
     responses: dict[str, bytes] = {}
     digest_modes: dict[str, str | None] = {}
@@ -1867,12 +2013,15 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     for thread in accept_threads + client_threads:
         thread.start()
     for thread in client_threads + accept_threads:
-        thread.join(timeout=1)
+        thread.join(timeout=_observe(1))
     try:
         assert not any(thread.is_alive() for thread in accept_threads + client_threads)
         assert accepted == {"first": b"first", "second": b"second"}
         assert responses == {"first": b"ack:first", "second": b"ack:second"}
-        assert digest_modes == {"first": "sha256", "second": "sha256"}
+        assert digest_modes == {
+            "first": STDLIB_WIRE_DIGEST_MODE,
+            "second": STDLIB_WIRE_DIGEST_MODE,
+        }
         assert first.address != second.address
         assert first.path != second.path
         assert first.endpoint != second.endpoint
@@ -1913,7 +2062,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
 
     active_child_pids = {child.pid for child in multiprocessing.active_children()}
     for partial_auth in (b"", b"\x00\x00", struct.pack("!i", 40) + b"{s"):
-        partial_session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+        partial_session = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
         raw_peer = connect_raw(partial_session)
         try:
             if partial_auth:
@@ -1924,12 +2073,12 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
                     deadline_microseconds=time.monotonic_ns() // 1_000 + 50_000,
                     cancel_requested=lambda: False,
                 )
-            assert time.monotonic() - started < 0.5
+            assert time.monotonic() - started < _observe(0.5)
         finally:
             raw_peer.close()
             partial_session.cleanup()
 
-    stopped_auth = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    stopped_auth = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     stopped_peer = connect_raw(stopped_auth)
     try:
         with pytest.raises(InterruptedError, match="cancel|stop"):
@@ -1942,7 +2091,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         stopped_auth.cleanup()
 
     def authenticated_pair() -> tuple[object, object, threading.Thread]:
-        session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+        session = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
         holder: dict[str, object] = {}
 
         def connect() -> None:
@@ -1958,7 +2107,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
             deadline_microseconds=time.monotonic_ns() // 1_000 + 1_000_000,
             cancel_requested=lambda: False,
         )
-        client_thread.join(timeout=1)
+        client_thread.join(timeout=_observe(1))
         assert not client_thread.is_alive()
         return session, endpoint, holder["client"]
 
@@ -2018,7 +2167,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     def send_frame(peer: socket.socket, payload: bytes) -> None:
         peer.sendall(struct.pack("!i", len(payload)) + payload)
 
-    legacy_session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    legacy_session = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     legacy_peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     legacy_peer.settimeout(1)
     accepted_legacy: dict[str, object] = {}
@@ -2062,7 +2211,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
             ).digest()
         )
         send_frame(legacy_peer, b"#WELCOME#")
-        legacy_acceptor.join(timeout=1)
+        legacy_acceptor.join(timeout=_observe(1))
         assert not legacy_acceptor.is_alive()
         assert legacy_errors == []
         legacy_endpoint = accepted_legacy["endpoint"]
@@ -2100,9 +2249,9 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         if legacy_endpoint is not None:
             legacy_endpoint.close()
         legacy_session.cleanup()
-        legacy_acceptor.join(timeout=1)
+        legacy_acceptor.join(timeout=_observe(1))
 
-    post_bind_root = Path("/private/tmp") / f"lwl-post-bind-{uuid4().hex[:8]}"
+    post_bind_root = SHARED_TMP_ROOT / f"lwl-post-bind-{uuid4().hex[:8]}"
     post_bind_root.mkdir(mode=0o700)
     original_chown = os.chown
     original_chmod = os.chmod
@@ -2157,7 +2306,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
                 shutil.rmtree(residue)
     post_bind_root.rmdir()
 
-    replacement_root = Path("/private/tmp") / f"lwl-replace-{uuid4().hex[:8]}"
+    replacement_root = SHARED_TMP_ROOT / f"lwl-replace-{uuid4().hex[:8]}"
     replacement_root.mkdir(mode=0o700)
     replacement_bytes = b"replacement endpoint"
 
@@ -2179,7 +2328,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     shutil.rmtree(replacement_directories[0])
     replacement_root.rmdir()
 
-    renamed_root = Path("/private/tmp") / f"lwl-rename-{uuid4().hex[:8]}"
+    renamed_root = SHARED_TMP_ROOT / f"lwl-rename-{uuid4().hex[:8]}"
     renamed_root.mkdir(mode=0o700)
     moved_session = renamed_root / "moved-session"
 
@@ -2206,18 +2355,18 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     shutil.rmtree(moved_session)
     renamed_root.rmdir()
 
-    long_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
+    long_root = SHARED_TMP_ROOT / f"long-{uuid4().hex}{'x' * 96}"
     long_root.mkdir(mode=0o700)
     fallback_session = None
     try:
-        fallback_session = lab_worker._new_wire_session(roots=(long_root, Path("/private/tmp")))
-        assert fallback_session.root_path == Path("/private/tmp")
+        fallback_session = lab_worker._new_wire_session(roots=(long_root, SHARED_TMP_ROOT))
+        assert fallback_session.root_path == SHARED_TMP_ROOT
     finally:
         if fallback_session is not None:
             fallback_session.cleanup()
         long_root.rmdir()
 
-    all_bad_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
+    all_bad_root = SHARED_TMP_ROOT / f"long-{uuid4().hex}{'x' * 96}"
     all_bad_root.mkdir(mode=0o700)
     try:
         with pytest.raises(lab_worker.LabWireSessionStartupError):
@@ -2266,7 +2415,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     finally:
         all_bad_root.rmdir()
 
-    replaced_socket = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    replaced_socket = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         os.unlink(replaced_socket.endpoint)
@@ -2281,7 +2430,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         if replaced_socket.path.exists():
             replaced_socket.path.rmdir()
 
-    replaced_directory = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    replaced_directory = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     original = replaced_directory.path
     moved = replaced_directory.root_path / f"moved-session-{uuid4().hex}"
     os.rename(original, moved)
@@ -2295,7 +2444,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         moved.rmdir()
         original.rmdir()
 
-    unknown_child = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    unknown_child = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     unknown = unknown_child.path / "unknown"
     unknown.write_text("keep", encoding="ascii")
     unknown_child.cleanup()
@@ -2306,7 +2455,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     unknown.unlink()
     unknown_child.path.rmdir()
 
-    normal_cleanup = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    normal_cleanup = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     normal_path = normal_cleanup.path
     normal_cleanup.cleanup()
     normal_cleanup.cleanup()
@@ -2481,7 +2630,7 @@ class BlockingRecordingSessionInitializer(RecordingSessionInitializer):
 
     def __call__(self) -> None:
         super().__call__()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _observe(5)
         while not self.release_path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not self.release_path.exists():
@@ -2547,7 +2696,7 @@ class BlockingInitialAdmissionPolicyProvider:
     def __call__(self, _spec: ResearchRunSpec) -> object:
         self.pid_path.write_text(str(os.getpid()), encoding="ascii")
         self.entered_path.write_text("entered", encoding="ascii")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _observe(10)
         while not self.release_path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not self.release_path.exists():
@@ -2573,7 +2722,7 @@ class BlockingInitialSourceQuotaLeaseProvider:
         validated_request = AdmissionRequest.model_validate(request)
         self.pid_path.write_text(str(os.getpid()), encoding="ascii")
         self.entered_path.write_text("entered", encoding="ascii")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _observe(10)
         while not self.release_path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not self.release_path.exists():
@@ -2614,7 +2763,7 @@ class SpawnDescendantBlockingAdmissionPolicyProvider:
         self.authority_pid_path.write_text(str(os.getpid()), encoding="ascii")
         if not ready.wait(2):
             raise TimeoutError("authority callback descendant did not start")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _observe(10)
         while not self.release_path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not self.release_path.exists():
@@ -2654,7 +2803,7 @@ class BlockingSecondAdmissionPolicyProvider:
             call_number = self._calls.value
         if call_number > 1:
             self.entered_path.write_text("entered", encoding="ascii")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + _observe(10)
             while not self.release_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             if not self.release_path.exists():
@@ -2684,7 +2833,7 @@ class BlockingSecondSourceQuotaLeaseProvider:
             call_number = self._calls.value
         if call_number > 1:
             self.entered_path.write_text("entered", encoding="ascii")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + _observe(10)
             while not self.release_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             if not self.release_path.exists():
@@ -2697,6 +2846,26 @@ class BlockingSecondSourceQuotaLeaseProvider:
             expires_at=NOW + timedelta(minutes=1),
             quota_reset_at=NOW + timedelta(minutes=2),
         )
+
+
+def _recorded_pid(path: Path, *, timeout_seconds: float = 2.0) -> int | None:
+    """Read a pid a child writes, tolerating the gap between create and write.
+
+    The child creates the file and writes into it as two steps, so `exists()`
+    can be true while the content is still empty. Return None only when the
+    child never got as far as recording a pid.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            recorded = path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            recorded = ""
+        if recorded:
+            return int(recorded)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
 
 
 def _assert_process_gone(pid: int, *, timeout_seconds: float = 2.0) -> None:
@@ -3005,7 +3174,7 @@ def _spawn_fixture_descendant(path_value: object) -> int:
         path.write_text(str(os.getpid()), encoding="ascii")
         threading.Event().wait()
         os._exit(1)
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + _observe(2)
     while not path.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     if not path.exists():
@@ -3461,10 +3630,15 @@ def _worker(
     v2_claim_publication_enabled: bool = False,
     heartbeat_interval_seconds: float = 60.0,
     resource_recheck_interval_seconds: float = 1.0,
-    resource_probe_timeout_seconds: float = 1.0,
+    # Back to the original values. Raising them to 10.0 / 5.0 fixed one CI case
+    # and broke four whose subject is the timeout they inherited, and scaling
+    # them by the host has the same failure mode: a longer budget means the
+    # recheck or timeout under test never fires inside the run. Only budgets
+    # that *observe* are scaled; budgets that *gate behaviour* are not.
+    resource_probe_timeout_seconds: float | None = None,
     lease_extension_seconds: int = 30,
     quarantine_reconcile_interval_seconds: float = 300.0,
-    receipt_timeout_seconds: float = 0.2,
+    receipt_timeout_seconds: float | None = None,
     exploratory_store_factory=_store_factory,
     metadata_store_factory=None,
     lake_root: Path | None = None,
@@ -3522,11 +3696,15 @@ def _worker(
         adapter_registry=default_strategy_job_adapter_registry(),
         heartbeat_interval_seconds=heartbeat_interval_seconds,
         resource_recheck_interval_seconds=resource_recheck_interval_seconds,
-        resource_probe_timeout_seconds=resource_probe_timeout_seconds,
+        resource_probe_timeout_seconds=(
+            1.0 if resource_probe_timeout_seconds is None else resource_probe_timeout_seconds
+        ),
         lease_extension_seconds=lease_extension_seconds,
         quarantine_reconcile_interval_seconds=quarantine_reconcile_interval_seconds,
         poll_interval_ms=5,
-        receipt_timeout_seconds=receipt_timeout_seconds,
+        receipt_timeout_seconds=(
+            0.2 if receipt_timeout_seconds is None else receipt_timeout_seconds
+        ),
         receipt_waiter=receipt_waiter,
         verified_code_sha_provider=verified_code_sha_provider,
         resource_authority_manifest=closed_authority_manifest,
@@ -3938,10 +4116,10 @@ def test_parent_never_reduces_unregistered_authority_or_adapter_objects(
             worker.run_once()
     finally:
         if stopper is not None:
-            stopper.join(timeout=1)
+            stopper.join(timeout=_observe(1))
     elapsed = time.monotonic() - started
 
-    assert elapsed < 1.5
+    assert elapsed < _observe(1.5)
     assert not reduce_marker.exists()
     assert not execution_marker.exists()
     assert registry.executions == 0
@@ -3953,9 +4131,13 @@ def test_child_result_with_blocking_reduce_is_never_pickled_and_remains_bounded(
 ) -> None:
     reduce_marker = tmp_path / "malicious-result.reduce"
     registry = MaliciousResultRegistry(reduce_marker=reduce_marker)
-    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(milliseconds=800)}
-    )
+    # The deadline is what bounds the blocking __reduce__, so the shard child
+    # has to be up and executing before it fires; eight hundred milliseconds is
+    # less than one child start-up on a slow host and the tick came back
+    # 'stopped' from the deadline instead of 'failed' from the adversarial
+    # result.
+    spec_deadline = _deadline_reachable_in(1)
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(update={"deadline": NOW + spec_deadline})
     claims = LabClaimSpool(tmp_path / "claims")
     claims.publish(_claim(spec))
     worker = _worker(tmp_path, claims=claims, registry=registry)
@@ -3965,7 +4147,7 @@ def test_child_result_with_blocking_reduce_is_never_pickled_and_remains_bounded(
     elapsed = time.monotonic() - started
 
     assert result.status == "failed"
-    assert elapsed < 1.5
+    assert elapsed < spec_deadline.total_seconds() + _observe(0.7)
     assert registry.executions == 1
     assert not reduce_marker.exists()
 
@@ -4013,23 +4195,23 @@ def test_first_policy_callback_stop_is_bounded_before_reservation(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 2
+        entered_deadline = time.monotonic() + _child_startups(2)
         while not entered_path.exists() and time.monotonic() < entered_deadline:
             time.sleep(0.01)
         assert entered_path.exists()
         assert int(authority_pid_path.read_text(encoding="ascii")) != os.getpid()
         started = time.monotonic()
         worker.request_stop()
-        runner.join(timeout=1.1)
+        runner.join(timeout=_observe(1.1))
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         release_path.write_text("release", encoding="ascii")
         worker.request_stop()
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.1
+    assert elapsed < _observe(1.1)
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -4081,15 +4263,15 @@ def test_first_policy_callback_obeys_100ms_deadline_before_reservation(
     started = time.monotonic()
     runner = threading.Thread(target=run_worker)
     runner.start()
-    runner.join(timeout=1.2)
+    runner.join(timeout=_observe(1.2))
     bounded = not runner.is_alive()
     elapsed = time.monotonic() - started
     release_path.write_text("release", encoding="ascii")
     worker.request_stop()
-    runner.join(timeout=2)
+    runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.2
+    assert elapsed < _observe(1.2)
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -4156,7 +4338,7 @@ def test_first_quota_callback_does_not_hold_sqlite_write_lock_and_stop_is_bounde
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 3
+        entered_deadline = time.monotonic() + _child_startups(2)
         while not entered_path.exists() and time.monotonic() < entered_deadline:
             time.sleep(0.01)
         assert entered_path.exists()
@@ -4173,16 +4355,16 @@ def test_first_quota_callback_does_not_hold_sqlite_write_lock_and_stop_is_bounde
             connection.execute("ROLLBACK")
         started = time.monotonic()
         worker.request_stop()
-        runner.join(timeout=1.1)
+        runner.join(timeout=_observe(1.1))
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         release_path.write_text("release", encoding="ascii")
         worker.request_stop()
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.1
+    assert elapsed < _observe(1.1)
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -4233,7 +4415,7 @@ def test_first_policy_callback_recursive_child_is_killed_and_reaped_on_stop(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 3
+        entered_deadline = time.monotonic() + _child_startups(2)
         while (
             not authority_pid_path.exists() or not descendant_pid_path.exists()
         ) and time.monotonic() < entered_deadline:
@@ -4242,16 +4424,16 @@ def test_first_policy_callback_recursive_child_is_killed_and_reaped_on_stop(
         assert descendant_pid_path.exists()
         started = time.monotonic()
         worker.request_stop()
-        runner.join(timeout=1.2)
+        runner.join(timeout=_observe(1.2))
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         release_path.write_text("release", encoding="ascii")
         worker.request_stop()
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.2
+    assert elapsed < _observe(1.2)
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -4355,8 +4537,15 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
     spec = _nshape_compare_spec(hold_days=(1,))
+    # Reaching the blocked policy callback costs three child start-ups - the
+    # admission authority round trip, the shard child, and the recheck that
+    # finally blocks - so the deadline mode has to leave room for all three
+    # before it can bound anything. Two flat seconds was enough here and cut
+    # the run short on a slower host, where the callback marker this case waits
+    # for never appeared at all.
+    spec_deadline = _deadline_reachable_in(3)
     if termination == "deadline":
-        spec = spec.model_copy(update={"deadline": NOW + timedelta(seconds=2)})
+        spec = spec.model_copy(update={"deadline": NOW + spec_deadline})
     claim = _short_claim_for_spec(spec)
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -4399,23 +4588,27 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 2
-        while not callback_entered_path.exists() and time.monotonic() < entered_deadline:
-            time.sleep(0.01)
-        assert callback_entered_path.exists()
+        _await_markers(
+            callback_entered_path,
+            child_pid_path,
+            budget=_child_startups(3),
+        )
         started = time.monotonic()
         if termination == "stop":
             worker.request_stop()
-        runner.join(timeout=2.3)
+        termination_budget = _observe(2.3) + (
+            0.0 if termination == "stop" else spec_deadline.total_seconds()
+        )
+        runner.join(timeout=termination_budget)
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         worker.request_stop()
         callback_release_path.write_text("release", encoding="ascii")
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 2.3
+    assert elapsed < termination_budget
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -4491,22 +4684,24 @@ def test_blocked_initial_quota_gate_stop_reaps_authority_child_and_lease(
     runner = threading.Thread(target=run_worker)
     runner.start()
     try:
-        entered_deadline = time.monotonic() + 3
-        while not callback_entered_path.exists() and time.monotonic() < entered_deadline:
-            time.sleep(0.01)
-        assert callback_entered_path.exists()
+        _await_markers(
+            callback_entered_path,
+            child_pid_path,
+            authority_pid_path,
+            budget=_child_startups(3),
+        )
         started = time.monotonic()
         worker.request_stop()
-        runner.join(timeout=1.1)
+        runner.join(timeout=_observe(1.1))
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
         worker.request_stop()
         callback_release_path.write_text("release", encoding="ascii")
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < 1.1
+    assert elapsed < _observe(1.1)
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert not adapter_pid_path.exists()
@@ -4581,29 +4776,29 @@ def test_stop_cancels_locked_recheck_and_reaps_child_before_releasing_lease(
     holder: sqlite3.Connection | None = None
     runner.start()
     try:
-        pid_deadline = time.monotonic() + 2
+        pid_deadline = time.monotonic() + _child_startups(2)
         while not child_pid_path.exists() and time.monotonic() < pid_deadline:
             time.sleep(0.01)
         assert child_pid_path.exists()
         holder = sqlite3.connect(database_path, isolation_level=None)
         holder.execute("BEGIN IMMEDIATE")
         child_release_path.write_text("release", encoding="ascii")
-        assert recheck_entered.wait(timeout=2)
+        assert recheck_entered.wait(timeout=_observe(2))
 
         time.sleep(0.01)
         worker.request_stop()
-        assert recheck_finished.wait(timeout=1)
+        assert recheck_finished.wait(timeout=_observe(1))
         holder.rollback()
         holder.close()
         holder = None
-        runner.join(timeout=3)
+        runner.join(timeout=_observe(3))
     finally:
         worker.request_stop()
         child_release_path.write_text("release", encoding="ascii")
         if holder is not None:
             holder.rollback()
             holder.close()
-        runner.join(timeout=1)
+        runner.join(timeout=_observe(1))
 
     assert not runner.is_alive()
     assert failures == []
@@ -5306,7 +5501,7 @@ def test_live_hung_adapter_is_hard_preempted_without_leaking_child(
     elapsed = time.monotonic() - started
 
     assert result.status == "stopped"
-    assert elapsed < 2
+    assert elapsed < _observe(2)
     assert pid_path.is_file()
     child_pid = int(pid_path.read_text(encoding="ascii"))
     with pytest.raises(ProcessLookupError):
@@ -5364,7 +5559,7 @@ def test_post_market_preemptible_shard_crossing_into_live_is_hard_preempted(
     elapsed = time.monotonic() - started
 
     assert result.status == "stopped"
-    assert elapsed < 1.5
+    assert elapsed < _observe(1.5)
     child_pid = int(pid_path.read_text(encoding="ascii"))
     assert child_pid != os.getpid()
     _assert_process_gone(child_pid)
@@ -5469,17 +5664,17 @@ def test_slow_authority_reservation_and_pre_ack_recheck_preserve_live_budget(
 
     started = time.monotonic()
     runner.start()
-    entered_deadline = time.monotonic() + 2
+    entered_deadline = time.monotonic() + _child_startups(2)
     while not second_recheck_path.exists() and time.monotonic() < entered_deadline:
         time.sleep(0.01)
     assert second_recheck_path.exists()
     assert not adapter_pid_path.exists()
-    runner.join(timeout=3)
+    runner.join(timeout=_observe(3))
     elapsed = time.monotonic() - started
 
     assert not runner.is_alive()
     assert elapsed > 0.42
-    assert elapsed < 3
+    assert elapsed < _observe(3)
     assert outcomes[0].status == "succeeded"
     assert adapter_pid_path.exists()
     _assert_process_gone(int(adapter_pid_path.read_text(encoding="ascii")))
@@ -5561,6 +5756,9 @@ def test_receipt_phase_does_not_consume_prepublication_budget(
         ),
         require_resource_admission=True,
         monotonic_clock=lambda: clock_microseconds[0] / 1_000_000,
+        # This case is about the receipt budget itself, so it pins the value
+        # instead of inheriting the helper's CI-sized default.
+        receipt_timeout_seconds=0.2,
     )
     assert worker._receipt_wait_timeout_seconds() == pytest.approx(0.2)
 
@@ -5631,7 +5829,7 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
     authority_pid: int | None = None
     descendant_pid: int | None = None
     try:
-        deadline = time.monotonic() + 4
+        deadline = time.monotonic() + _observe(4)
         while (
             not authority_pid_path.exists() or not descendant_pid_path.exists()
         ) and time.monotonic() < deadline:
@@ -5641,7 +5839,7 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
         authority_pid = int(authority_pid_path.read_text(encoding="ascii"))
         descendant_pid = int(descendant_pid_path.read_text(encoding="ascii"))
         worker.request_stop()
-        runner.join(timeout=2)
+        runner.join(timeout=_observe(2))
         assert not runner.is_alive()
         assert errors == []
         assert len(outcomes) == 1
@@ -5655,7 +5853,7 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
         _assert_process_gone(descendant_pid)
     finally:
         release_authority_path.touch()
-        runner.join(timeout=3)
+        runner.join(timeout=_observe(3))
         if authority_pid is not None:
             _kill_process_if_alive(authority_pid)
         if descendant_pid is not None:
@@ -5675,7 +5873,7 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
 
     def blocking_recheck(**kwargs: object):
         entered_recheck.set()
-        assert release_recheck.wait(timeout=3)
+        assert release_recheck.wait(timeout=_observe(3))
         return original_recheck(**kwargs)
 
     monkeypatch.setattr(store, "recheck", blocking_recheck)
@@ -5705,9 +5903,9 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
     callback_runner = threading.Thread(target=run_blocked_callback)
     callback_runner.start()
     try:
-        assert entered_recheck.wait(timeout=3)
+        assert entered_recheck.wait(timeout=_observe(3))
         callback_worker.request_stop()
-        callback_runner.join(timeout=2)
+        callback_runner.join(timeout=_observe(2))
         assert not callback_runner.is_alive()
         assert callback_outcomes == []
         assert len(callback_errors) == 1
@@ -5718,7 +5916,7 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
         assert callback_worker._pre_ack_admission_diagnostics
     finally:
         release_recheck.set()
-        callback_runner.join(timeout=3)
+        callback_runner.join(timeout=_observe(3))
 
     assert store.active_leases() == ()
     assert reports.pending() == ()
@@ -5870,7 +6068,7 @@ def test_stop_and_start_ack_commit_share_one_atomic_gate(
 
     def block_inside_commit() -> None:
         inside_commit.set()
-        assert release_commit.wait(timeout=2)
+        assert release_commit.wait(timeout=_observe(2))
 
     def record_send(connection: object, value: object, **kwargs: object) -> None:
         original_send(connection, value, **kwargs)
@@ -5892,7 +6090,7 @@ def test_stop_and_start_ack_commit_share_one_atomic_gate(
         )
     )
     runner.start()
-    assert inside_commit.wait(timeout=2)
+    assert inside_commit.wait(timeout=_observe(2))
 
     stopper = threading.Thread(
         target=lambda: (worker.request_stop(), stop_returned.set()),
@@ -5900,17 +6098,18 @@ def test_stop_and_start_ack_commit_share_one_atomic_gate(
     stopper.start()
     assert not stop_returned.wait(timeout=0.05)
     release_commit.set()
-    assert ack_sent.wait(timeout=2)
-    assert stop_returned.wait(timeout=2)
-    stopper.join(timeout=2)
-    runner.join(timeout=3)
+    assert ack_sent.wait(timeout=_observe(2))
+    assert stop_returned.wait(timeout=_observe(2))
+    stopper.join(timeout=_observe(2))
+    runner.join(timeout=_observe(3))
 
     assert not stopper.is_alive()
     assert not runner.is_alive()
     assert controls[0].stop_reason is not None
     assert "stop requested" in controls[0].stop_reason
-    if adapter_pid_path.exists():
-        _assert_process_gone(int(adapter_pid_path.read_text(encoding="ascii")))
+    adapter_pid = _recorded_pid(adapter_pid_path)
+    if adapter_pid is not None:
+        _assert_process_gone(adapter_pid)
 
 
 def test_stop_before_start_commit_never_sends_ack_or_executes_adapter(
@@ -5934,7 +6133,7 @@ def test_stop_before_start_commit_never_sends_ack_or_executes_adapter(
 
     def block_before_commit() -> None:
         before_commit.set()
-        assert release_commit.wait(timeout=2)
+        assert release_commit.wait(timeout=_observe(2))
 
     def record_send(connection: object, value: object, **kwargs: object) -> None:
         if isinstance(value, lab_worker._IsolationStartAck):
@@ -5956,10 +6155,10 @@ def test_stop_before_start_commit_never_sends_ack_or_executes_adapter(
         )
     )
     runner.start()
-    assert before_commit.wait(timeout=2)
+    assert before_commit.wait(timeout=_observe(2))
     worker.request_stop()
     release_commit.set()
-    runner.join(timeout=3)
+    runner.join(timeout=_observe(3))
 
     assert not runner.is_alive()
     assert controls[0].stop_reason == "worker stop requested before isolated shard start"
@@ -6226,7 +6425,7 @@ def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
     process.start()
     assert process.pid is not None
     group_id = process.pid
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + _observe(2)
     while (
         not child_pid_path.is_file() or not grandchild_pid_path.is_file()
     ) and time.monotonic() < deadline:
@@ -6243,7 +6442,7 @@ def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
         )
         elapsed = time.monotonic() - started
 
-        assert elapsed < 0.2
+        assert elapsed < _observe(0.2)
         assert process.exitcode == -signal.SIGKILL
         _assert_process_gone(group_id)
         _assert_process_gone(grandchild_pid)
@@ -6310,7 +6509,7 @@ def test_heavy_shard_is_prestarted_but_never_acked_when_session_turns_live(
     elapsed = time.monotonic() - started
 
     assert result.status == "stopped"
-    assert elapsed < 1.5
+    assert elapsed < _observe(1.5)
     assert not adapter_pid_path.exists()
     child_pid = int(child_pid_path.read_text(encoding="ascii"))
     assert child_pid != os.getpid()
@@ -6614,17 +6813,17 @@ def test_blocked_resource_probe_cannot_delay_hard_deadline_cleanup(tmp_path: Pat
     outcomes: list[object] = []
     runner = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
     runner.start()
-    started_deadline = time.monotonic() + 3
+    started_deadline = time.monotonic() + _child_startups(2)
     while not child_pid_path.exists() and time.monotonic() < started_deadline:
         time.sleep(0.01)
     assert child_pid_path.exists()
     live_started = time.monotonic()
-    runner.join(timeout=1)
+    runner.join(timeout=_observe(1))
     elapsed = time.monotonic() - live_started
 
     assert not runner.is_alive()
     assert outcomes[0].status == "stopped"
-    assert elapsed < 0.6
+    assert elapsed < _observe(0.6)
     _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
     assert all(child.name != "lab-resource-probe" for child in multiprocessing.active_children())
 
@@ -6648,7 +6847,7 @@ def test_resource_probe_timeout_kills_spawned_descendant_process_group(tmp_path:
             worker._bounded_resource_snapshot(timeout_seconds=1.5)
         elapsed = time.monotonic() - started
 
-        assert elapsed < 2.2
+        assert elapsed < _probe_ceiling(1.5) + _observe(0.7)
         assert probe_pid_path.is_file()
         assert descendant_pid_path.is_file()
         _assert_process_gone(int(probe_pid_path.read_text(encoding="ascii")))
@@ -7495,7 +7694,7 @@ def test_prestarted_authority_cancel_during_handoff_reaps_owned_child(
         )
         process.start()
         assert process.pid is not None
-        assert child_ready.wait(timeout=2)
+        assert child_ready.wait(timeout=_observe(2))
         receiver, sender = multiprocessing.Pipe(duplex=False)
         sender.close()
         child_pid.append(process.pid)
@@ -7508,7 +7707,7 @@ def test_prestarted_authority_cancel_during_handoff_reaps_owned_child(
 
     def pause_before_handoff(_stage: object, _child: object) -> None:
         handoff_entered.set()
-        assert release_handoff.wait(timeout=2)
+        assert release_handoff.wait(timeout=_observe(2))
 
     monkeypatch.setattr(worker, "_start_wire_child", start_child)
     monkeypatch.setattr(
@@ -7529,12 +7728,12 @@ def test_prestarted_authority_cancel_during_handoff_reaps_owned_child(
         )
     )
     try:
-        assert handoff_entered.wait(timeout=2)
+        assert handoff_entered.wait(timeout=_observe(2))
         canceller.start()
-        assert stage.cancelled.wait(timeout=2)
+        assert stage.cancelled.wait(timeout=_observe(2))
         release_handoff.set()
-        assert cancel_finished.wait(timeout=2)
-        canceller.join(timeout=2)
+        assert cancel_finished.wait(timeout=_observe(2))
+        canceller.join(timeout=_observe(2))
 
         assert stage.handoff.is_set()
         assert stage.cleanup_complete.is_set()
@@ -7552,7 +7751,7 @@ def test_prestarted_authority_cancel_during_handoff_reaps_owned_child(
     finally:
         release_handoff.set()
         worker._cancel_prestarted_authority_stage(stage, operation="admission")
-        canceller.join(timeout=2)
+        canceller.join(timeout=_observe(2))
         if child_pid:
             _kill_process_if_alive(child_pid[0])
 
@@ -7576,7 +7775,7 @@ def test_prestarted_authority_cancel_before_child_start_is_terminal(
 
     def pause_before_start(_stage: object) -> None:
         startup_entered.set()
-        assert release_startup.wait(timeout=2)
+        assert release_startup.wait(timeout=_observe(2))
 
     monkeypatch.setattr(
         worker,
@@ -7601,12 +7800,12 @@ def test_prestarted_authority_cancel_before_child_start_is_terminal(
         )
     )
     try:
-        assert startup_entered.wait(timeout=2)
+        assert startup_entered.wait(timeout=_observe(2))
         canceller.start()
-        assert stage.cancelled.wait(timeout=2)
+        assert stage.cancelled.wait(timeout=_observe(2))
         release_startup.set()
-        assert cancel_finished.wait(timeout=2)
-        canceller.join(timeout=2)
+        assert cancel_finished.wait(timeout=_observe(2))
+        canceller.join(timeout=_observe(2))
 
         assert start_calls == []
         assert stage.handoff.is_set()
@@ -7619,7 +7818,7 @@ def test_prestarted_authority_cancel_before_child_start_is_terminal(
     finally:
         release_startup.set()
         worker._cancel_prestarted_authority_stage(stage, operation="admission")
-        canceller.join(timeout=2)
+        canceller.join(timeout=_observe(2))
 
 
 def test_prestarted_authority_start_failure_completes_terminal_events(
@@ -7646,7 +7845,7 @@ def test_prestarted_authority_start_failure_completes_terminal_events(
         deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
     )
 
-    assert stage.handoff.wait(timeout=2)
+    assert stage.handoff.wait(timeout=_observe(2))
     worker._cancel_prestarted_authority_stage(stage, operation="admission")
     worker._cancel_prestarted_authority_stage(stage, operation="admission")
 
@@ -7686,7 +7885,7 @@ def test_prestarted_authority_cancel_after_handoff_is_idempotent(
         )
         process.start()
         assert process.pid is not None
-        assert child_ready.wait(timeout=2)
+        assert child_ready.wait(timeout=_observe(2))
         receiver, sender = multiprocessing.Pipe(duplex=False)
         sender.close()
         child_pid.append(process.pid)
@@ -7710,7 +7909,7 @@ def test_prestarted_authority_cancel_after_handoff_is_idempotent(
         deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
     )
     try:
-        assert stage.handoff.wait(timeout=2)
+        assert stage.handoff.wait(timeout=_observe(2))
         worker._cancel_prestarted_authority_stage(stage, operation="admission")
         worker._cancel_prestarted_authority_stage(stage, operation="admission")
 
@@ -7883,7 +8082,7 @@ def test_managed_authority_reaper_converges_after_ipc_close_error(
     process.start()
     assert process.pid is not None
     process_id = process.pid
-    assert ready.wait(timeout=2)
+    assert ready.wait(timeout=_observe(2))
     receiver, sender = multiprocessing.Pipe(duplex=False)
     sender.close()
     managed = worker._register_authority_child(
@@ -7938,7 +8137,7 @@ def test_managed_authority_reaper_marks_closed_handle_before_post_close_interrup
     process.start()
     assert process.pid is not None
     process_id = process.pid
-    assert ready.wait(timeout=2)
+    assert ready.wait(timeout=_observe(2))
     receiver, sender = multiprocessing.Pipe(duplex=False)
     sender.close()
     managed = worker._register_authority_child(
@@ -10462,7 +10661,7 @@ def test_worker_rechecks_admission_after_consume_before_open_or_execute(
 
     claims.revoke(claim, reason="scheduler terminalized consumed claim")
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=_observe(2))
 
     assert not thread.is_alive()
     assert results[0].status == "stopped"
@@ -10505,7 +10704,7 @@ def test_worker_admission_then_revoke_allows_compute_but_never_success(
 
     claims.revoke(claim, reason="scheduler revoked admitted execution")
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=_observe(2))
 
     assert not thread.is_alive()
     assert results[0].status == "failed"
@@ -10538,14 +10737,14 @@ def test_revoke_during_execute_is_fenced_before_seal_and_success(
     results: list[object] = []
     thread = threading.Thread(target=lambda: results.append(worker.run_once()))
     thread.start()
-    entered_deadline = time.monotonic() + 2
+    entered_deadline = time.monotonic() + _child_startups(2)
     while not registry._closed_entered_path.exists() and time.monotonic() < entered_deadline:
         time.sleep(0.01)
     assert registry._closed_entered_path.exists()
 
     claims.revoke(claim, reason="scheduler revoked running attempt")
     registry._closed_release_path.write_text("release", encoding="ascii")
-    thread.join(timeout=2)
+    thread.join(timeout=_observe(2))
 
     assert not thread.is_alive()
     assert results[0].status == "failed"
@@ -10683,14 +10882,14 @@ def test_slow_candidate_loses_one_second_lease_to_new_generation(
 
     def slow_write(*args: object, **kwargs: object):
         write_started.set()
-        assert release_write.wait(timeout=3)
+        assert release_write.wait(timeout=_observe(3))
         return original_write(*args, **kwargs)
 
     monkeypatch.setattr(worker, "_write_bundle", slow_write)
     outcomes = []
     thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
     thread.start()
-    write_timeout = time.monotonic() + 3
+    write_timeout = time.monotonic() + _observe(3)
     while not write_started.is_set() and time.monotonic() < write_timeout:
         scheduler.run_once()
         time.sleep(0.01)
@@ -10703,11 +10902,11 @@ def test_slow_candidate_loses_one_second_lease_to_new_generation(
     recovery = scheduler.run_once()
     replacement = claims.pending()[0].claim
     release_write.set()
-    timeout_at = time.monotonic() + 2
+    timeout_at = time.monotonic() + _observe(2)
     while thread.is_alive() and time.monotonic() < timeout_at:
         scheduler.run_once()
         time.sleep(0.01)
-    thread.join(timeout=0.2)
+    thread.join(timeout=_observe(0.2))
     scheduler.release()
 
     assert not thread.is_alive()
@@ -10866,7 +11065,7 @@ def test_worker_deadline_before_execute_fails_without_running_shard(tmp_path: Pa
 def test_worker_deadline_after_execute_prevents_fence_and_seal(tmp_path: Path) -> None:
     deadline_reached = multiprocessing.get_context("spawn").Value("b", False)
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=1)}
+        update={"deadline": NOW + _deadline_reachable_in(2)}
     )
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -10899,7 +11098,7 @@ def test_worker_deadline_during_bundle_write_prevents_atomic_seal(
 ) -> None:
     clock = [NOW]
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=1)}
+        update={"deadline": NOW + _deadline_reachable_in(2)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -10966,7 +11165,7 @@ def test_deadline_triggered_at_atomic_rename_rolls_back_before_success(
 
     clock = [NOW]
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=1)}
+        update={"deadline": NOW + _deadline_reachable_in(2)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -11099,7 +11298,7 @@ def test_stop_during_execution_reports_stopped_without_sealing(tmp_path: Path) -
     thread.start()
     time.sleep(0.02)
     worker.request_stop()
-    thread.join(timeout=2)
+    thread.join(timeout=_observe(2))
 
     assert outcomes[0].status == "stopped"
     assert isinstance(_reports(reports)[-1].body, LabWorkerStopped)
@@ -11134,7 +11333,7 @@ def test_stop_during_execution_releases_resource_reservation(tmp_path: Path) -> 
     outcomes: list[object] = []
     thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
     thread.start()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + _observe(2)
     active = ()
     while not active and time.monotonic() < deadline:
         try:
@@ -11145,7 +11344,7 @@ def test_stop_during_execution_releases_resource_reservation(tmp_path: Path) -> 
     assert len(active) == 1
 
     worker.request_stop()
-    thread.join(timeout=3)
+    thread.join(timeout=_observe(3))
 
     assert not thread.is_alive()
     assert outcomes[0].status == "stopped"
@@ -11361,7 +11560,7 @@ def test_concurrent_same_attempt_conflicting_results_have_one_atomic_winner(
 
     def synchronized_rename(source: object, target: object) -> None:
         if Path(target) == sealed:
-            rename_barrier.wait(timeout=1)
+            rename_barrier.wait(timeout=_observe(1))
         original_rename(source, target)
 
     monkeypatch.setattr(lab_worker.os, "rename", synchronized_rename)
@@ -11384,7 +11583,7 @@ def test_concurrent_same_attempt_conflicting_results_have_one_atomic_winner(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=2)
+        thread.join(timeout=_observe(2))
 
     assert all(not thread.is_alive() for thread in threads)
     assert sum(isinstance(outcome, Exception) for outcome in outcomes) == 1
@@ -12380,17 +12579,24 @@ def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Pa
         tmp_path,
         claims=claims,
         reports=reports,
+        # The receipts this case waits for are produced by the scheduler it
+        # drives by hand below, for _observe(2). The default 0.2s receipt wait
+        # is ten times shorter than that loop, so on a host where one
+        # `scheduler.run_once()` costs more than a few milliseconds the worker
+        # gave up first and reported 'awaiting_receipt'. The wait has to
+        # outlast the window the case is willing to feed it.
+        receipt_timeout_seconds=_observe(2),
         receipt_waiter=None,
     )
     outcomes = []
     thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
 
     thread.start()
-    timeout_at = time.monotonic() + 2
+    timeout_at = time.monotonic() + _observe(2)
     while thread.is_alive() and time.monotonic() < timeout_at:
         scheduler.run_once()
         time.sleep(0.01)
-    thread.join(timeout=0.2)
+    thread.join(timeout=_observe(0.2))
     scheduler.release()
 
     assert not thread.is_alive()
@@ -12545,17 +12751,21 @@ def test_hard_crash_after_rename_is_reclaimed_before_generation_two_runs(
         tmp_path,
         claims=claims,
         reports=reports,
+        # Same reason as the sibling case above: the receipts come from the
+        # scheduler this case drives for _observe(3), so the worker's own
+        # receipt wait cannot be the 0.2s default.
+        receipt_timeout_seconds=_observe(3),
         receipt_waiter=None,
         clock=lambda: clock[0],
     )
     outcomes = []
     thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
     thread.start()
-    timeout_at = time.monotonic() + 3
+    timeout_at = time.monotonic() + _observe(3)
     while thread.is_alive() and time.monotonic() < timeout_at:
         scheduler.run_once()
         time.sleep(0.01)
-    thread.join(timeout=0.2)
+    thread.join(timeout=_observe(0.2))
     job = LabJobReader(store.path).get_job(job_id)
     scheduler.release()
 
@@ -12844,7 +13054,7 @@ def test_pending_success_published_after_preflight_scan_is_stale_and_reclaimed(
     )
     reports.publish(success)
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=_observe(2))
 
     assert not thread.is_alive()
     assert errors == []
@@ -12903,7 +13113,7 @@ def test_accepted_receipt_published_after_preflight_scan_preserves_attempt(
         ),
     )
     release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=_observe(2))
 
     assert not thread.is_alive()
     assert len(errors) == 1
@@ -13006,7 +13216,7 @@ def test_two_reclaimers_are_idempotent_for_same_obsolete_attempt(
             scan=original_scan,
         ) -> None:
             scan(claim, manifest, durable_claim)
-            barrier.wait(timeout=2)
+            barrier.wait(timeout=_observe(2))
 
         reclaimer._assert_no_terminal_success_evidence = synchronized_scan  # type: ignore[method-assign]
     errors: list[BaseException] = []
@@ -13020,7 +13230,7 @@ def test_two_reclaimers_are_idempotent_for_same_obsolete_attempt(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=3)
+        thread.join(timeout=_observe(3))
 
     assert all(not thread.is_alive() for thread in threads)
     assert errors == []

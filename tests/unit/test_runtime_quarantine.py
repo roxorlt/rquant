@@ -8,7 +8,6 @@ import os
 import shutil
 import socket
 import stat
-import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -272,7 +271,14 @@ def quarantine_fixture(
     monkeypatch.setattr(authority_module, "PRODUCTION_QUARANTINE_ROOT", quarantine)
     monkeypatch.setattr(authority_module, "PRODUCTION_GENERATION_ROOT", generations)
     monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", os.getuid())
-    if sys.platform == "darwin":
+    if os.getuid() != 0:
+        # Publication renames the sealed quarantine directory across parents,
+        # and an unprivileged process cannot move a directory it has no write
+        # bit on: the kernel has to rewrite the moved directory's "..", so both
+        # Linux and macOS answer EACCES for the production 0555 mode. Root
+        # (which is what publishes in production) bypasses that check. Give the
+        # unprivileged test the same transaction with a mode it can move; the
+        # published mode is still asserted against this value.
         monkeypatch.setattr(authority_module, "GENERATION_DIRECTORY_MODE", 0o755)
     profile = parse_runtime_closure_profile(
         canonical_json_bytes(

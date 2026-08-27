@@ -513,6 +513,38 @@ class SQLiteResourceReservationStore:
             ) from exc
 
     def _initialize(self) -> None:
+        # Opening the store is the one operation that runs before any lock
+        # discipline is in force.  `_connect` and the `synchronous` pragma both
+        # have to read the schema, which needs a SHARED lock, and the only
+        # thing protecting them is the 5ms `busy_timeout` poll value chosen so
+        # `_begin_immediate` can do its own cancellable waiting.  A second
+        # process opening the same database while the first one is committing
+        # the schema - EXCLUSIVE, and with `synchronous = FULL` that means real
+        # fsyncs - therefore fails outright instead of waiting, which is how
+        # two contenders both died with "database is locked" on a CI runner
+        # where the commit costs more than 5ms.  Initialisation gets the same
+        # bounded wait the rest of the store already uses.
+        deadline = system_time.monotonic() + _MAX_RESOURCE_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                self._initialize_once()
+                return
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise RuntimeResourceAdmissionError(
+                        "resource reservation store initialization failed"
+                    ) from exc
+                remaining = deadline - system_time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeResourceAdmissionError(
+                        "resource reservation store initialization failed"
+                    ) from exc
+                system_time.sleep(
+                    min(_RESOURCE_LOCK_POLL_MILLISECONDS / 1_000, max(0.0, remaining))
+                )
+
+    def _initialize_once(self) -> None:
         try:
             with self._connect() as connection:
                 connection.execute("PRAGMA synchronous = FULL")
@@ -547,6 +579,10 @@ class SQLiteResourceReservationStore:
                 self._attest_schema(connection)
                 connection.commit()
         except RuntimeResourceAdmissionError:
+            raise
+        except sqlite3.OperationalError:
+            # `_initialize` decides whether a busy database is worth another
+            # attempt; every other operational error is terminal there too.
             raise
         except (OSError, sqlite3.Error) as exc:
             raise RuntimeResourceAdmissionError(

@@ -1461,6 +1461,10 @@ def test_schema_v5_has_first_class_v3_cost_receipts_and_indexed_lookup_plans(
                 (ACCOUNT_ID, "600000.SH", "a" * 64),
             ).fetchall()
         )
+        # The index is partial (WHERE signal_id IS NOT NULL). SQLite only matches a
+        # partial index when the query's WHERE clause states that predicate; the
+        # older library bundled with some CPython builds does not infer it from
+        # "signal_id = ?" and answers "no query solution" instead.
         forced_intent_plan = tuple(
             str(row[3])
             for row in connection.execute(
@@ -1468,7 +1472,7 @@ def test_schema_v5_has_first_class_v3_cost_receipts_and_indexed_lookup_plans(
                 EXPLAIN QUERY PLAN
                 SELECT intent_id FROM paper_intent
                 INDEXED BY idx_paper_intent_account_signal
-                WHERE account_id = ? AND signal_id = ?
+                WHERE account_id = ? AND signal_id = ? AND signal_id IS NOT NULL
                 """,
                 (ACCOUNT_ID, "a" * 64),
             ).fetchall()

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from rquant.config import Settings
 from rquant.release_generation import ReleaseGenerationAuthority
+from tests.support.verified_system_interpreter import materialize_system_interpreter
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "preflight-lab-runtime.py"
@@ -73,7 +74,8 @@ def _tiny_test_venv(checkout: Path) -> None:
     python.chmod(0o700)
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     (venv_root / "pyvenv.cfg").write_text(
-        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
+        f"home = {materialize_system_interpreter(checkout.parent / 'system-python')}\n"
+        f"version = {version}\n",
         encoding="utf-8",
     )
     (venv_root / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)

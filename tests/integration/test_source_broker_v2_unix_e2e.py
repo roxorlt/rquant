@@ -38,6 +38,7 @@ from rquant.source_broker_v2 import (
     SourceBrokerV2SagaUnavailableError,
     SourceBrokerV2UnixClient,
     SourceBrokerV2WireRequest,
+    source_effect_operation_id,
 )
 from rquant.strict_json import (
     canonical_json_bytes,
@@ -243,11 +244,19 @@ def _payload_hash(payload: bytes) -> str:
     return canonical_sha256(strict_canonical_json_loads(payload))
 
 
-def _dispatch_request(operation_id: str = "a" * 64) -> SourceBrokerV2DispatchRequest:
+def _dispatch_request(operation_id: str | None = None) -> SourceBrokerV2DispatchRequest:
     payload = canonical_json_bytes({"symbol": "000001.SZ", "trade_date": "2026-08-07"})
+    saga_id = "saga-source-v2-e2e"
     return SourceBrokerV2DispatchRequest(
-        saga_id="saga-source-v2-e2e",
-        operation_id=operation_id,
+        saga_id=saga_id,
+        # The service requires the operation id to be the deterministic effect
+        # identity for (saga, phase); a literal placeholder is rejected before
+        # any claim work happens.
+        operation_id=operation_id
+        or source_effect_operation_id(
+            saga_id=saga_id,
+            phase=SourceBrokerV2OutboxPhase.DISPATCH,
+        ),
         call_id="daily-bars",
         attempt_identity_hash="1" * 64,
         claim_plan_hash="2" * 64,
@@ -413,6 +422,22 @@ def _start_server(script: Path, endpoint: SocketEndpointPolicy) -> subprocess.Po
     process.kill()
     stdout, stderr = process.communicate(timeout=1)
     raise AssertionError(f"SourceBroker v2 server did not start\n{stdout!r}\n{stderr!r}")
+
+
+def _assert_only_probe_audit_on_stderr(raw: bytes) -> None:
+    """Fail on anything the daemon printed except its own security audit lines.
+
+    `_start_server`'s readiness probe opens a connection and closes it without
+    sending a frame, and the service audits every unframed connection as a
+    transport event. Those lines are expected output; a traceback or any other
+    chatter is not.
+    """
+    residual = [
+        line
+        for line in raw.decode("utf-8", "replace").splitlines()
+        if "source_broker_v2_security_event" not in line
+    ]
+    assert residual == [], residual
 
 
 def _endpoint_accepts_probe_connection(endpoint: SocketEndpointPolicy) -> bool:
@@ -921,7 +946,7 @@ def test_linux_kill_restart_after_provider_start_requires_reconcile_not_second_d
     first_stdout, first_stderr = first.communicate(timeout=3)
     assert first.returncode == -signal.SIGKILL
     assert first_stdout == b""
-    assert first_stderr == b""
+    _assert_only_probe_audit_on_stderr(first_stderr)
     blocked_stdout, blocked_stderr = blocked.communicate(timeout=3)
     assert blocked.returncode == 7, (blocked_stdout, blocked_stderr)
     assert blocked_stdout == b""

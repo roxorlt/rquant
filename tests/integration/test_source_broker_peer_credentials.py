@@ -222,13 +222,17 @@ def test_linux_service_rejects_incoming_peer_outside_uid_or_gid_policy(
         endpoint=endpoint,
         allowed_uid=os.geteuid() + 1 if forged == "uid" else os.geteuid(),
         allowed_gid=os.getegid() + 1 if forged == "gid" else os.getegid(),
-        max_connections=1,
+        # The client verifies that the connected process still owns the
+        # listener, so the service has to outlive the rejected connection the
+        # way the real long-lived service does; with a budget of one the
+        # listener is gone before the client can check it.
+        max_connections=2,
         calls_path=tmp_path / "calls.log",
     )
 
     with pytest.raises(SourceBrokerTransportRemoteError, match="peer credentials are not allowed"):
         _client(endpoint, process).execute(_request())
-    _finish(process)
+    _stop(process)
 
 
 @pytest.mark.parametrize("forged", ("uid", "gid"))

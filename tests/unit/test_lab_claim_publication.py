@@ -109,6 +109,14 @@ _FINALIZER_TRUST_BY_STORE: dict[
 ] = {}
 
 
+# These joins are watchdogs, not subjects: the property under test is that a
+# finalizer thread terminates, not that it terminates within five seconds. A
+# tight cap turns a slow runner into a false "left a finalizer thread alive",
+# which is exactly what happened on x64 CI; a generous one still fails a thread
+# that never finishes.
+_FINALIZER_JOIN_WATCHDOG_SECONDS = 60
+
+
 def _finalizer_root_key() -> LabClaimPublicationFinalizerRootKey:
     return LabClaimPublicationFinalizerRootKey(
         secret=b"test-lab-claim-finalizer-root-key-0001",
@@ -2234,7 +2242,7 @@ def test_finalizer_current_guard_blocks_replacement_until_ledger_commit(
     monkeypatch.setattr(store, target, barrier)
     result = finalizer.finalize(held.identity)
     assert replacement_thread is not None
-    replacement_thread.join(timeout=5)
+    replacement_thread.join(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS)
     assert not replacement_thread.is_alive()
     assert failures == []
     record = store.get_claim_publication(held.identity.attempt_id)
@@ -2391,7 +2399,7 @@ def test_two_finalizers_race_for_one_durable_fence_and_stale_owner_cannot_write(
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5)
+        thread.join(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS)
         assert not thread.is_alive()
 
     assert failures == []
@@ -2458,7 +2466,7 @@ def test_two_finalizers_sharing_one_valid_capability_transition_once_then_replay
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5)
+        thread.join(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS)
         assert not thread.is_alive()
 
     assert failures == []
@@ -2525,7 +2533,7 @@ def test_shared_capability_finalizer_concurrency_replays_after_cas_race_stress(
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=5)
+            thread.join(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS)
             assert not thread.is_alive(), f"race {iteration} left a finalizer thread alive"
 
         assert failures == [], f"race {iteration} raised {failures!r}"

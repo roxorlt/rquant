@@ -756,9 +756,14 @@ def test_signal_source_rejects_canvas_publication_receipt_symlink(
 @pytest.mark.parametrize(
     "name,content",
     [
-        ("bad.json", "[]"),
-        ("wrong-name.json", '{"name":"other","pool_refs":[]}'),
-        ("too-large.json", '{"name":"too-large","description":"' + "x" * 70000 + '"}'),
+        pytest.param("bad.json", "[]", id="not-an-object"),
+        pytest.param("wrong-name.json", '{"name":"other","pool_refs":[]}', id="name-mismatch"),
+        # An explicit id keeps the 70 KB padding out of the nodeid.
+        pytest.param(
+            "too-large.json",
+            '{"name":"too-large","description":"' + "x" * 70000 + '"}',
+            id="oversize",
+        ),
     ],
 )
 def test_signal_source_rejects_malformed_or_oversized_canvas_catalog_records(

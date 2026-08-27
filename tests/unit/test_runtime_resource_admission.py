@@ -1268,6 +1268,51 @@ def test_cross_process_resource_reservation_admits_exactly_one_last_capacity_con
         outcomes.join_thread()
 
 
+def test_resource_reservation_store_opens_behind_an_exclusive_writer(
+    tmp_path: Path,
+) -> None:
+    """Opening the store must wait out a concurrent writer, not die on it.
+
+    The connection preamble reads the schema (`PRAGMA synchronous` needs it),
+    and the only thing guarding that read is the 5ms poll `busy_timeout` the
+    store uses so its own lock waits stay cancellable.  Two CI processes that
+    opened the same database while one of them was committing the schema both
+    died with `database is locked`.
+    """
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    database_path = tmp_path / "resource-reservations.sqlite3"
+    SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+
+    blocker = sqlite3.connect(database_path, isolation_level=None, check_same_thread=False)
+    released = threading.Event()
+    try:
+        blocker.execute("PRAGMA busy_timeout = 0")
+        blocker.execute("BEGIN EXCLUSIVE")
+
+        def release_the_writer() -> None:
+            # Far longer than the 5ms the preamble used to be limited to, and
+            # far inside the one-second bound initialisation now waits under.
+            time.sleep(0.2)
+            blocker.execute("COMMIT")
+            released.set()
+
+        releaser = threading.Thread(target=release_the_writer)
+        releaser.start()
+        try:
+            store = SQLiteResourceReservationStore(
+                database_path,
+                clock=lambda: _RESERVATION_NOW,
+            )
+        finally:
+            releaser.join(30)
+        assert not releaser.is_alive()
+        assert released.is_set()
+        assert store.path == database_path.resolve()
+    finally:
+        blocker.close()
+
+
 def test_abandoned_resource_reservation_expires_and_is_recovered(
     tmp_path: Path,
 ) -> None:

@@ -124,6 +124,14 @@
   对 `full_manifest_sha256`、`profile_document_sha256`、单条 full-manifest entry 与
   `manifest_fingerprint` 漂移的红测。
 
+- **CI 全集契约逐 nodeid 化**：聚合不再只比较用例总数与 skip 总数，而是要求 manifest 里每个
+  nodeid 恰好出现一次且结果为 passed 或**登记在案的 approved skip**（reason 逐字匹配）；
+  approved-skip map 按平台列表（`tests/manifests/full-suite-v1/approved-skips.json`），其
+  sha256 与 Linux 侧计数写进 manifest index，shard 记录预生成 JUnit classname/name 映射，
+  未登记的 skip、失败、缺失或多余用例一律 fail closed。新增 `full-suite-darwin-lane`
+  （macos-14，30 分钟上限）用同一条 manifest/契约链跑只有 Darwin 能执行的 320 个用例。
+  pytest 加 `faulthandler_timeout = 600`，挂死会打印全线程栈而不是吃满整个 job。
+
 - **题材梯队推送改版**：午间战报将最强题材与连续连板梯队合并为 Top5，并将下午候选池
   调整为适合手机阅读的三行分隔格式；30 分钟脉搏新增题材梯队 Top5，展示涨停数、完整
   连续板位、最高标的，以及相较前一脉搏的 `↑` / `↓` / 持平 / 新晋（每日首槽不显示
@@ -147,6 +155,23 @@
 - **项目版本**：从 `0.29.0` 更新到 `0.30.0`。
 
 ### Fixed
+
+- **Lab artifact 进程锁自锁**：三个 per-inode 锁注册表 guard 改为可重入锁。GC 在临界区里
+  finalize 另一个同路径索引时，它的 `close()` 会在同一线程上重入同一个模块级 Lock，把
+  CPython 3.12 上的整个 CI 分片挂死 39 分钟且不留证据。
+
+- **immutable generation 硬链接**：`uv venv` / `uv sync` 构建 generation 时固定
+  `UV_LINK_MODE=copy`。uv 在 Linux 默认从缓存硬链接，而 generation manifest 拒绝
+  `st_nlink != 1`，生产 Linux 上会在发布阶段直接失败。
+
+- **wire session 清理误判空目录**：判空前把目录 fd 的 readdir 游标复位；tmpfs（RHEL 系默认
+  `/tmp`）会在游标越过条目后返回空列表，导致 cleanup 去 rmdir 一个非空目录。
+
+- **Source Broker 拒绝理由丢失**：客户端写请求撞 EPIPE 时先读取对端已排队的 failure 帧，
+  被拒绝的 peer 现在能拿到服务端明写的原因，而不是通用 transport 失败。
+
+- **盯盘行情 worker 收尸**：最后一次进程组 SIGKILL 之后补一次等待再判定。原来这一级发完
+  信号就直接读 `exitcode`，只会被组信号杀死的 worker 必然被误报成「could not be reaped」。
 
 - **午间空量比**：保留空量比结果的固定 schema，午间链路在空数据场景不再丢失该字段。
 

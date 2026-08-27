@@ -742,7 +742,11 @@ def test_committed_v2_response_still_requires_the_native_signed_journal_on_repla
         b'{"schema_version":2}\n',
         b'{"schema_version":NaN}',
         b'{"schema_version":"2"}',
-        b"{" + b"x" * (256 * 1024) + b"}",
+        # An explicit id keeps a quarter megabyte of padding out of the nodeid.
+        # The four cases above keep pytest's derived ids: this module is frozen
+        # by tests/manifests/source_broker_v2_frozen.json, so every renamed id
+        # moves that manifest's digest and only this one earns the move.
+        pytest.param(b"{" + b"x" * (256 * 1024) + b"}", id="oversize"),
     ),
 )
 def test_v2_receipt_wire_rejects_noncanonical_and_oversized_json(payload: bytes) -> None:

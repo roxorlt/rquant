@@ -16,25 +16,38 @@ from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 SCHEMA_VERSION = 1
 SHARD_COUNT = 4
 INDEX_NAME = "index.json"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MAX_NODEID_BYTES = 1_100_000
-MAX_JSONL_LINE_BYTES = MAX_NODEID_BYTES + 32
+# A shard record carries the nodeid plus the JUnit identity pytest will report
+# for it, which repeats the same characters in the classname/name split.
+MAX_JSONL_LINE_BYTES = 2 * MAX_NODEID_BYTES + 96
 MAX_INDEX_BYTES = 64 * 1024
 MAX_SHARD_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_COLLECTION_BYTES = MAX_MANIFEST_TOTAL_BYTES
 CI_DUMMY_TUSHARE_TOKEN = "0" * 32
 
-_INDEX_FIELDS = frozenset({"schema_version", "selector", "partition", "full_suite", "shards"})
+FULL_SUITE_ALGORITHM = "lpt-file-static-v1"
+DARWIN_LANE_ALGORITHM = "darwin-lane-static-v1"
+APPROVED_SKIPS_NAME = "approved-skips.json"
+APPROVED_SKIP_PLATFORMS = ("darwin", "linux")
+MAX_APPROVED_SKIPS_BYTES = 256 * 1024
+
+_INDEX_FIELDS = frozenset(
+    {"schema_version", "selector", "partition", "full_suite", "shards", "approved_skips"}
+)
 _PARTITION_FIELDS = frozenset({"algorithm", "shard_count"})
 _FULL_SUITE_FIELDS = frozenset({"cases", "skips", "sha256"})
 _SHARD_FIELDS = frozenset({"id", "path", "count", "sha256"})
-_NODEID_FIELDS = frozenset({"nodeid"})
+_APPROVED_SKIPS_INDEX_FIELDS = frozenset({"path", "sha256"})
+_APPROVED_SKIPS_FIELDS = frozenset({"schema_version", "platforms"})
+_NODEID_FIELDS = frozenset({"nodeid", "junit"})
+_JUNIT_FIELDS = frozenset({"classname", "name"})
 _COLLECTION_FIELDS = frozenset({"nodeids"})
 _CI_PRIVATE_DIRECTORIES = ("home", "tmp", "data", "parquet", "logs", "pt")
 MAX_CI_PYTEST_BASETEMP_BYTES = 48
@@ -49,6 +62,45 @@ STATIC_FILE_WEIGHTS = {
     "tests/unit/test_runtime_recovery_backup.py": 1_600,
     "tests/integration/test_production_artifact_terminal_lifecycle.py": 2_200,
 }
+
+
+class ManifestProfile(NamedTuple):
+    """One CI selection lane: how many shards it has and what it must cover."""
+
+    name: str
+    algorithm: str
+    shard_count: int
+    subset: bool
+    skip_platform: str
+
+
+FULL_SUITE_PROFILE = ManifestProfile(
+    name="full-suite",
+    algorithm=FULL_SUITE_ALGORITHM,
+    shard_count=SHARD_COUNT,
+    subset=False,
+    skip_platform="linux",
+)
+DARWIN_LANE_PROFILE = ManifestProfile(
+    name="darwin-lane",
+    algorithm=DARWIN_LANE_ALGORITHM,
+    shard_count=1,
+    subset=True,
+    skip_platform="darwin",
+)
+MANIFEST_PROFILES = {
+    FULL_SUITE_PROFILE.name: FULL_SUITE_PROFILE,
+    DARWIN_LANE_PROFILE.name: DARWIN_LANE_PROFILE,
+}
+
+
+class LoadedManifest(NamedTuple):
+    """A validated manifest bundle: index, per-shard nodeids, and its contracts."""
+
+    index: dict[str, Any]
+    groups: tuple[tuple[str, ...], ...]
+    junit: dict[str, dict[str, str]]
+    approved_skips: dict[str, dict[str, str]]
 
 
 class ContractError(ValueError):
@@ -295,6 +347,56 @@ def nodeid_digest(nodeids: Sequence[str]) -> str:
     return hashlib.sha256("".join(f"{nodeid}\n" for nodeid in unique).encode("utf-8")).hexdigest()
 
 
+def junit_identity(nodeid: str) -> dict[str, str]:
+    """Return the JUnit (classname, name) pytest will report for one nodeid.
+
+    pytest's xunit2 writer joins the module path and any enclosing classes with
+    dots and keeps the parametrized test name verbatim. Deriving it here, at
+    manifest generation time, means the contract never has to guess the mapping
+    from a report it is supposed to be checking.
+    """
+    parts = nodeid.split("::")
+    if len(parts) < 2 or not parts[0].endswith(".py") or not all(parts):
+        raise ContractError(f"nodeid cannot be mapped to a JUnit testcase: {nodeid}")
+    module = parts[0][: -len(".py")].replace("/", ".")
+    classname = ".".join((module, *parts[1:-1]))
+    return {"classname": classname, "name": parts[-1]}
+
+
+def approved_skips_path(root: Path) -> Path:
+    return root / APPROVED_SKIPS_NAME
+
+
+def parse_approved_skips(raw: bytes) -> dict[str, dict[str, str]]:
+    document = _decode_canonical_object(raw, label="approved skip map")
+    _require_exact_fields(document, _APPROVED_SKIPS_FIELDS, label="approved skip map")
+    if document["schema_version"] != SCHEMA_VERSION:
+        raise ContractError("unsupported approved skip map schema")
+    platforms = document["platforms"]
+    if type(platforms) is not dict or set(platforms) != set(APPROVED_SKIP_PLATFORMS):
+        raise ContractError("approved skip map must cover exactly the supported platforms")
+    parsed: dict[str, dict[str, str]] = {}
+    for platform, entries in platforms.items():
+        if type(entries) is not dict:
+            raise ContractError(f"approved skip map for {platform} is invalid")
+        for nodeid, reason in entries.items():
+            if type(nodeid) is not str or type(reason) is not str or not nodeid or not reason:
+                raise ContractError(f"approved skip entry for {platform} is invalid")
+            if len(reason) > 400 or any(_is_line_control(character) for character in reason):
+                raise ContractError(f"approved skip reason for {platform} is invalid")
+        parsed[platform] = dict(entries)
+    return parsed
+
+
+def read_approved_skips(root: Path) -> tuple[dict[str, dict[str, str]], str]:
+    raw = _read_bounded_regular_file(
+        approved_skips_path(root),
+        maximum=MAX_APPROVED_SKIPS_BYTES,
+        label="approved skip map",
+    )
+    return parse_approved_skips(raw), hashlib.sha256(raw).hexdigest()
+
+
 def _valid_digest(value: object) -> bool:
     return (
         type(value) is str
@@ -384,15 +486,18 @@ def write_manifest_bundle(
     *,
     selector: Sequence[str],
     shard_nodeids: Sequence[Sequence[str]],
-    expected_skips: int,
     repository_root: Path = REPOSITORY_ROOT,
+    profile: ManifestProfile = FULL_SUITE_PROFILE,
 ) -> dict[str, Any]:
     if type(selector) not in {list, tuple} or selector:
         raise ContractError("v1 manifest selector must be exactly empty")
-    if len(shard_nodeids) != SHARD_COUNT:
-        raise ContractError(f"expected {SHARD_COUNT} shard nodeid lists")
-    if type(expected_skips) is not int or expected_skips < 0:
-        raise ContractError("expected skips must be nonnegative")
+    if len(shard_nodeids) != profile.shard_count:
+        raise ContractError(f"expected {profile.shard_count} shard nodeid lists")
+    # The approved skip map is authored by hand and is an input to generation:
+    # the manifest records its digest and the Linux lane's approved skip count,
+    # so the contract can never drift from the map it is checked against.
+    approved_skips, approved_skips_digest = read_approved_skips(root)
+    expected_skips = len(approved_skips[profile.skip_platform])
     normalized = tuple(tuple(sorted(group)) for group in shard_nodeids)
     validated_files: set[str] = set()
     for group in normalized:
@@ -408,7 +513,10 @@ def write_manifest_bundle(
     shards: list[dict[str, Any]] = []
     for shard_id, nodeids in enumerate(normalized):
         lines = tuple(
-            (_canonical_json({"nodeid": nodeid}) + "\n").encode("utf-8") for nodeid in nodeids
+            (_canonical_json({"nodeid": nodeid, "junit": junit_identity(nodeid)}) + "\n").encode(
+                "utf-8"
+            )
+            for nodeid in nodeids
         )
         if any(len(line) > MAX_JSONL_LINE_BYTES for line in lines):
             raise ContractError(f"shard {shard_id} JSONL line exceeds size limit")
@@ -424,12 +532,18 @@ def write_manifest_bundle(
                 "sha256": nodeid_digest(nodeids),
             }
         )
+    known = set(full_nodeids)
+    for platform in APPROVED_SKIP_PLATFORMS:
+        unknown = sorted(set(approved_skips[platform]) - known)
+        if unknown:
+            raise ContractError(f"approved skip map lists unknown {platform} nodeids: {unknown[0]}")
     index: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "selector": list(selector),
-        "partition": {"algorithm": "lpt-file-static-v1", "shard_count": SHARD_COUNT},
+        "partition": {"algorithm": profile.algorithm, "shard_count": profile.shard_count},
         "full_suite": {"cases": len(full_nodeids), "skips": expected_skips, "sha256": full_digest},
         "shards": shards,
+        "approved_skips": {"path": APPROVED_SKIPS_NAME, "sha256": approved_skips_digest},
     }
     index_payload = (_canonical_json(index) + "\n").encode("utf-8")
     if len(index_payload) > MAX_INDEX_BYTES:
@@ -448,7 +562,11 @@ def _read_json(path: Path, *, maximum: int, label: str) -> dict[str, Any]:
     return _decode_canonical_object(raw, label=label)
 
 
-def _read_jsonl(path: Path, *, repository_root: Path) -> tuple[str, ...]:
+def _read_jsonl(
+    path: Path,
+    *,
+    repository_root: Path,
+) -> tuple[tuple[str, ...], dict[str, dict[str, str]]]:
     raw = _read_bounded_regular_file(
         path,
         maximum=MAX_SHARD_MANIFEST_BYTES,
@@ -456,6 +574,7 @@ def _read_jsonl(path: Path, *, repository_root: Path) -> tuple[str, ...]:
     )
     lines = raw.splitlines(keepends=True)
     nodeids: list[str] = []
+    junit: dict[str, dict[str, str]] = {}
     validated_files: set[str] = set()
     for line_number, raw_line in enumerate(lines, start=1):
         if len(raw_line) > MAX_JSONL_LINE_BYTES:
@@ -467,25 +586,34 @@ def _read_jsonl(path: Path, *, repository_root: Path) -> tuple[str, ...]:
         _require_exact_fields(entry, _NODEID_FIELDS, label="shard nodeid record")
         if type(entry["nodeid"]) is not str:
             raise ContractError(f"invalid shard nodeid record at {path}:{line_number}")
+        identity = entry["junit"]
+        if type(identity) is not dict:
+            raise ContractError(f"invalid shard JUnit identity at {path}:{line_number}")
+        _require_exact_fields(identity, _JUNIT_FIELDS, label="shard JUnit identity")
+        if identity != junit_identity(entry["nodeid"]):
+            raise ContractError(f"shard JUnit identity differs at {path}:{line_number}")
         _file_for_nodeid(
             entry["nodeid"],
             repository_root=repository_root,
             validated_files=validated_files,
         )
         nodeids.append(entry["nodeid"])
+        junit[entry["nodeid"]] = dict(identity)
     if len(set(nodeids)) != len(nodeids):
         raise ContractError(f"duplicate nodeid inside shard manifest {path}")
-    return tuple(nodeids)
+    return tuple(nodeids), junit
 
 
 def load_manifest(
     root: Path,
     *,
     repository_root: Path = REPOSITORY_ROOT,
-) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
+    profile: ManifestProfile = FULL_SUITE_PROFILE,
+) -> LoadedManifest:
     manifest_paths = (
         root / INDEX_NAME,
-        *(_jsonl_path(root, shard) for shard in range(SHARD_COUNT)),
+        approved_skips_path(root),
+        *(_jsonl_path(root, shard) for shard in range(profile.shard_count)),
     )
     total_size = 0
     for path in manifest_paths:
@@ -506,11 +634,11 @@ def load_manifest(
         raise ContractError("manifest partition is invalid")
     _require_exact_fields(partition, _PARTITION_FIELDS, label="manifest partition")
     if (
-        partition["algorithm"] != "lpt-file-static-v1"
+        partition["algorithm"] != profile.algorithm
         or type(partition["shard_count"]) is not int
-        or partition["shard_count"] != SHARD_COUNT
+        or partition["shard_count"] != profile.shard_count
     ):
-        raise ContractError("manifest does not define four shards")
+        raise ContractError(f"manifest does not define {profile.shard_count} {profile.name} shards")
     full = index["full_suite"]
     if type(full) is not dict:
         raise ContractError("manifest full-suite contract is invalid")
@@ -520,9 +648,10 @@ def load_manifest(
     ) or not _valid_digest(full["sha256"]):
         raise ContractError("manifest full-suite contract is invalid")
     shard_entries = index["shards"]
-    if type(shard_entries) is not list or len(shard_entries) != SHARD_COUNT:
+    if type(shard_entries) is not list or len(shard_entries) != profile.shard_count:
         raise ContractError("manifest shard index is invalid")
     nodeid_groups: list[tuple[str, ...]] = []
+    junit: dict[str, dict[str, str]] = {}
     for shard_id, entry in enumerate(shard_entries):
         if type(entry) is not dict:
             raise ContractError("manifest shard entry is invalid")
@@ -538,16 +667,42 @@ def load_manifest(
             raise ContractError("manifest shard count is invalid")
         if not _valid_digest(entry["sha256"]):
             raise ContractError("manifest shard digest is invalid")
-        nodeids = _read_jsonl(root / entry["path"], repository_root=repository_root)
+        nodeids, shard_junit = _read_jsonl(
+            root / entry["path"],
+            repository_root=repository_root,
+        )
         if len(nodeids) != entry["count"] or nodeid_digest(nodeids) != entry["sha256"]:
             raise ContractError(f"manifest shard {shard_id} digest or count differs")
         nodeid_groups.append(nodeids)
+        junit.update(shard_junit)
     all_nodeids = tuple(nodeid for group in nodeid_groups for nodeid in group)
     if len(set(all_nodeids)) != len(all_nodeids):
         raise ContractError("manifest shards contain duplicate nodeids")
     if len(all_nodeids) != full["cases"] or nodeid_digest(all_nodeids) != full["sha256"]:
         raise ContractError("manifest full-suite digest or count differs")
-    return index, tuple(nodeid_groups)
+    declared_skips = index["approved_skips"]
+    if type(declared_skips) is not dict:
+        raise ContractError("manifest approved skip contract is invalid")
+    _require_exact_fields(
+        declared_skips,
+        _APPROVED_SKIPS_INDEX_FIELDS,
+        label="manifest approved skip contract",
+    )
+    if declared_skips["path"] != APPROVED_SKIPS_NAME or not _valid_digest(declared_skips["sha256"]):
+        raise ContractError("manifest approved skip contract is invalid")
+    approved_skips, approved_digest = read_approved_skips(root)
+    if approved_digest != declared_skips["sha256"]:
+        raise ContractError("approved skip map digest differs from the manifest")
+    known = set(all_nodeids)
+    for platform in APPROVED_SKIP_PLATFORMS:
+        unknown = sorted(set(approved_skips[platform]) - known)
+        if unknown:
+            raise ContractError(f"approved skip map lists unknown {platform} nodeids: {unknown[0]}")
+    if len(approved_skips[profile.skip_platform]) != full["skips"]:
+        raise ContractError(
+            f"manifest skip count differs from the {profile.skip_platform} approved skip map"
+        )
+    return LoadedManifest(index, tuple(nodeid_groups), junit, approved_skips)
 
 
 def validate_manifest(
@@ -555,8 +710,10 @@ def validate_manifest(
     *,
     repository_root: Path = REPOSITORY_ROOT,
     environment: Mapping[str, str] | None = None,
-) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
-    index, groups = load_manifest(root, repository_root=repository_root)
+    profile: ManifestProfile = FULL_SUITE_PROFILE,
+) -> LoadedManifest:
+    loaded = load_manifest(root, repository_root=repository_root, profile=profile)
+    groups = loaded.groups
     if environment is None:
         expected = tuple(sorted(collect_nodeids((), repository_root=repository_root)))
     else:
@@ -572,13 +729,20 @@ def validate_manifest(
     actual = tuple(sorted(nodeid for group in groups for nodeid in group))
     if len(set(expected)) != len(expected):
         raise ContractError("full-suite collection contains duplicate nodeids")
+    if profile.subset:
+        # A lane manifest selects part of the suite; it must still be exactly
+        # the nodeids the suite collects, never a stale or invented one.
+        unknown = sorted(set(actual) - set(expected))
+        if unknown:
+            raise ContractError(f"{profile.name} manifest lists uncollected nodeids: {unknown[0]}")
+        return loaded
     if actual != expected:
         actual_set = set(actual)
         expected_set = set(expected)
         missing = len(expected_set - actual_set)
         extra = len(actual_set - expected_set)
         raise ContractError(f"full-suite collection differs: missing={missing} extra={extra}")
-    return index, groups
+    return loaded
 
 
 def _collection_path() -> Path | None:
@@ -725,15 +889,17 @@ def run_shard(
     selection_evidence: Path | None,
     basetemp: Path | None,
     repository_root: Path = REPOSITORY_ROOT,
+    profile: ManifestProfile = FULL_SUITE_PROFILE,
 ) -> int:
     with _isolated_pytest_environment() as environment:
-        index, groups = validate_manifest(
+        index, groups, _junit, _approved = validate_manifest(
             manifest_root,
             repository_root=repository_root,
             environment=environment,
+            profile=profile,
         )
-        if not 0 <= shard_id < SHARD_COUNT:
-            raise ContractError(f"shard must be between 0 and {SHARD_COUNT - 1}")
+        if not 0 <= shard_id < profile.shard_count:
+            raise ContractError(f"shard must be between 0 and {profile.shard_count - 1}")
         nodeids = groups[shard_id]
         with argsfile_for_nodeids(
             nodeids,
@@ -777,7 +943,16 @@ def _parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     commands = parser.add_subparsers(dest="command", required=True)
     generate = commands.add_parser("generate")
     generate.add_argument("--manifest-dir", type=Path, required=True)
-    generate.add_argument("--expected-skips", type=int, required=True)
+    generate.add_argument(
+        "--profile",
+        choices=sorted(MANIFEST_PROFILES),
+        default=FULL_SUITE_PROFILE.name,
+    )
+    generate.add_argument(
+        "--lane-nodeids",
+        type=Path,
+        help="newline-delimited nodeids for a lane profile",
+    )
     prepare_environment = commands.add_parser("prepare-environment")
     prepare_environment.add_argument("--github-env", type=Path, required=True)
     prepare_environment.add_argument("--base-dir", type=Path, required=True)
@@ -787,6 +962,11 @@ def _parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     for command in (run, check):
         command.add_argument("--manifest-dir", type=Path, required=True)
         command.add_argument("--shard", type=int, required=True)
+        command.add_argument(
+            "--profile",
+            choices=sorted(MANIFEST_PROFILES),
+            default=FULL_SUITE_PROFILE.name,
+        )
     run.add_argument("--junitxml", type=Path, required=True)
     run.add_argument("--selection-evidence", type=Path, required=True)
     run.add_argument("--basetemp", type=Path, required=True)
@@ -799,13 +979,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
         environment = _create_private_ci_environment(args.base_dir, label=args.label)
         _append_github_environment(args.github_env, environment)
         return 0
+    profile = MANIFEST_PROFILES[args.profile]
     if args.command == "generate":
-        nodeids = collect_nodeids(())
+        collected = collect_nodeids(())
+        if profile.subset:
+            if args.lane_nodeids is None:
+                raise ContractError(f"the {profile.name} profile requires --lane-nodeids")
+            requested = tuple(
+                line
+                for line in args.lane_nodeids.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+            unknown = sorted(set(requested) - set(collected))
+            if unknown:
+                raise ContractError(f"{profile.name} selection is uncollected: {unknown[0]}")
+            groups: tuple[tuple[str, ...], ...] = (tuple(sorted(set(requested))),)
+        else:
+            groups = plan_shards(collected)
         write_manifest_bundle(
             args.manifest_dir,
             selector=(),
-            shard_nodeids=plan_shards(nodeids),
-            expected_skips=args.expected_skips,
+            shard_nodeids=groups,
+            profile=profile,
         )
         return 0
     return run_shard(
@@ -815,6 +1010,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         junitxml=getattr(args, "junitxml", None),
         selection_evidence=getattr(args, "selection_evidence", None),
         basetemp=getattr(args, "basetemp", None),
+        profile=profile,
     )
 
 

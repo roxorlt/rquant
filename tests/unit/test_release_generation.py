@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -26,7 +27,9 @@ from rquant.release_generation import (
     ReleaseGenerationCommit,
     ReleaseGenerationError,
     ReleaseGenerationMarker,
+    _interpreter_identity_failures,
     _read_private_json,
+    _verified_interpreter,
     _write_private_json,
     commit_path_for_lock,
     environment_manifest_path_for_lock,
@@ -40,6 +43,7 @@ from rquant.release_generation import (
     validate_lab_handoff_supersede_chain,
 )
 from rquant.strict_json import canonical_json_bytes
+from tests.support.verified_system_interpreter import materialize_system_interpreter
 
 _ORIGINAL_OS_WALK = os.walk
 
@@ -707,8 +711,9 @@ def _generation(tmp_path: Path) -> tuple[Path, Path, str, Path]:
     if library.exists():
         (venv / "lib").mkdir()
         shutil.copy2(library, venv / "lib" / library.name)
+    system_home = materialize_system_interpreter(tmp_path / "system-python")
     (venv / "pyvenv.cfg").write_text(
-        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {python_version}\n",
+        f"home = {system_home}\nversion = {python_version}\n",
         encoding="utf-8",
     )
     site_packages = (
@@ -793,6 +798,108 @@ def _publish_initialized(
         transaction_kind="initialization",
     )
     return marker
+
+
+_OK_MODE = stat.S_IFREG | 0o700
+
+
+def _identity_stat(
+    *,
+    mode: int = _OK_MODE,
+    nlink: int = 1,
+    uid: int | None = None,
+) -> os.stat_result:
+    """Build the exact metadata `_interpreter_identity_failures` inspects."""
+    return os.stat_result(
+        (mode, 1, 1, nlink, os.getuid() if uid is None else uid, 0, 1, 0, 0, 0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("observed", "expected"),
+    (
+        pytest.param(_identity_stat(), (), id="accepted"),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFDIR | 0o700),
+            ("regular-file",),
+            id="regular-file",
+        ),
+        # A symlink is never a regular file, so this predicate cannot fail on
+        # its own; pinning the pair still fails if the clause is deleted.
+        pytest.param(
+            _identity_stat(mode=stat.S_IFLNK | 0o700),
+            ("regular-file", "not-a-symlink"),
+            id="not-a-symlink",
+        ),
+        pytest.param(
+            _identity_stat(uid=os.getuid() + 1),
+            ("owned-by-caller",),
+            id="owned-by-caller",
+        ),
+        pytest.param(_identity_stat(nlink=2), ("single-link",), id="single-link"),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFREG | 0o720),
+            ("no-group-or-other-write",),
+            id="group-write",
+        ),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFREG | 0o702),
+            ("no-group-or-other-write",),
+            id="other-write",
+        ),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFREG | 0o600),
+            ("owner-executable",),
+            id="owner-executable",
+        ),
+    ),
+)
+def test_interpreter_identity_predicates_each_have_a_red_case(
+    observed: os.stat_result,
+    expected: tuple[str, ...],
+) -> None:
+    """Delete any one predicate and exactly one of these cases turns red.
+
+    P1-7's first prohibition is that this identity check must not be relaxed,
+    and this work package refactored it. The end-to-end cases only reach three
+    of the six predicates, so the guarantee lives here: the helper is pure, so
+    every predicate can be pinned from constructed metadata without a second
+    uid and without root.
+    """
+    assert _interpreter_identity_failures(observed) == expected
+
+
+def test_verified_interpreter_rejection_names_every_failed_predicate(tmp_path: Path) -> None:
+    candidate = tmp_path / "python"
+    shutil.copy2(sys.executable, candidate)
+    candidate.chmod(0o646)
+
+    with pytest.raises(ReleaseGenerationError) as group_writable:
+        _verified_interpreter(candidate, label="deployment system Python")
+
+    assert str(group_writable.value) == (
+        "deployment system Python has unsafe identity: "
+        "failed no-group-or-other-write, owner-executable"
+    )
+
+    candidate.chmod(0o700)
+    linked = tmp_path / "python-hardlink"
+    os.link(candidate, linked)
+    with pytest.raises(ReleaseGenerationError) as multi_linked:
+        _verified_interpreter(candidate, label="deployment system Python")
+
+    assert str(multi_linked.value) == (
+        "deployment system Python has unsafe identity: failed single-link"
+    )
+
+    linked.unlink()
+    resolved, identity, digest = _verified_interpreter(
+        candidate,
+        label="deployment system Python",
+    )
+    assert resolved == candidate.resolve(strict=True)
+    assert identity.owner == os.getuid()
+    assert len(digest) == 64
 
 
 def test_release_generation_marker_binds_checkout_lock_python_and_venv(
@@ -1027,8 +1134,12 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
     shutil.rmtree(repo / ".venv")
     cache = tmp_path / "uv-cache"
     monkeypatch.setenv("UV_CACHE_DIR", str(cache))
+    # The venv must be built from an interpreter the test owns: CI's hosted
+    # tool-cache interpreter is root-owned and mode 0777, which
+    # _verified_interpreter rejects.
+    system_python = materialize_system_interpreter(tmp_path / "system-python") / "python"
     subprocess.run(
-        [str(uv_path), "venv", "--python", sys.executable, str(repo / ".venv")],
+        [str(uv_path), "venv", "--python", str(system_python), str(repo / ".venv")],
         cwd=repo,
         check=True,
         env={**os.environ, "UV_CACHE_DIR": str(cache)},
