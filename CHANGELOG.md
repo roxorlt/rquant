@@ -156,6 +156,13 @@
 
 ### Fixed
 
+- **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
+  的 `run_identity` 变成必填，命中路径与下载路径一样比对 `(workflow_run_id, run_attempt)`；
+  缓存目录、条目文件及**全部祖先**校验 owner / mode / no-symlink / `st_nlink == 1`，并加
+  64 KiB 上限。身份对不上时降级为 cache miss 走完整下载路径，而不是永久 blocked——否则
+  一个 commit 在 main 上被「Re-run all jobs」之后，它的缓存条目会因 attempt 号变化而永远
+  匹配不上，紧急回滚到这个已知良好的 commit 会被门禁拒绝。
+
 - **Lab artifact 进程锁自锁**：三个 per-inode 锁注册表 guard 改为可重入锁。GC 在临界区里
   finalize 另一个同路径索引时，它的 `close()` 会在同一线程上重入同一个模块级 Lock，把
   CPython 3.12 上的整个 CI 分片挂死 39 分钟且不留证据。

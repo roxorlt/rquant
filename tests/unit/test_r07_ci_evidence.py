@@ -445,7 +445,7 @@ def test_aggregate_rejects_dual_python_gate_digest_divergence(tmp_path: Path) ->
 
 
 def test_push_main_without_a_merge_commit_produces_no_summary(tmp_path: Path) -> None:
-    """Ruling 9 equivalent enforcement: a squashed or direct push to main yields no evidence.
+    """Ruling 9 stand-in enforcement: a squashed or direct push to main yields no evidence.
 
     The checkout tip is a merge commit once a work package has been merged back, so the
     single-parent shape a squash or a direct push leaves behind is materialized on purpose:

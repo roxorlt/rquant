@@ -898,8 +898,8 @@ The only accepted evidence producer is GitHub Actions workflow `.github/workflow
 `r07-differential-gate-evidence`, triggered by `push` to exact ref `refs/heads/main` after merge.
 Amended per Codex round-2 order 2026-08-25, ruling 9: this repository has no branch protection, so
 the `push main` event alone is not an approval boundary and must not be described as one. The
-equivalent enforcement is structural. A `push main` produces evidence only when the pushed commit
-is the merge commit a reviewed pull request merge writes: exactly two parents, the first parent
+stand-in enforcement is structural. A `push main` produces evidence only when the pushed commit
+has the shape a pull request merge produces: exactly two parents, the first parent
 equal to the frozen merge base that was the pre-merge `main` tip, the merge base an ancestor of the
 second parent, and a tree exactly equal to `git merge-tree --write-tree <parent1> <parent2>`. A
 squash, rebase, or direct push has one parent and produces no evidence at all. What this enforces is

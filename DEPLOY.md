@@ -103,7 +103,7 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    done
    ```
 
-   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 26 个 role**（Codex round-2 P1-2），`profile_id`
+   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 26 个 role**（Codex round-2 P1-3），`profile_id`
    随之改变——这是刻意的 profile 版本演进，不是副作用。新版 profile 必须逐个 role 声明
    module / 环境白名单 / **instance 白名单**；instanced role 的 `instances` 至少一项且形如
    `svc-<64 hex>`，非 instanced role 必须为空。concrete 标签由
