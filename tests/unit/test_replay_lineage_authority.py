@@ -5,9 +5,13 @@ import hashlib
 import json
 import multiprocessing
 import os
+import queue
 import shutil
 import sqlite3
 import subprocess
+import sys
+import traceback
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -28,13 +32,27 @@ from rquant.source_broker import (
 from tests.unit.test_adapter_manifest import OpenSslSigningClient
 
 # Watchdogs for four spawned competitors, not subjects: what the case they
-# guard asserts is that exactly one of them commits the operation. Each is a
-# fresh CPython importing the rquant surface, measured at 1.5s on an *idle*
-# ubuntu-24.04 x64 CI runner against 0.5s on the development machine (CI
-# diagnostic job on 017d808), and four of them start at once on four vCPUs
-# while the parent is still running. Ten and fifteen seconds were a fast
-# machine's numbers and the runner missed them.
+# guard asserts is that exactly one of them commits the operation.
+#
+# The number is now a budget for *silence*, not for the whole phase: every wait
+# below resets it whenever any competitor reports progress, so a run that is
+# merely slow is never cut off and only a genuinely stuck one is bounded. It is
+# left at 120s because there is no measurement of this phase on the 2 vCPU
+# runner to justify a smaller one, and shrinking it on laptop numbers is the
+# mistake the previous values made in the other direction. For scale: four
+# competitors, each a fresh CPython importing this module and opening the
+# authority, all reach `ready` in 0.15-0.17s on the development machine with
+# four CPU busy loops running, and a bare spawn-plus-import is 0.13s.
+#
+# Which is also why a 120s expiry here has never meant "too slow". It means a
+# competitor stopped reporting, and the whole point of the staged reporting
+# below is that the case can now say which one and how far it got.
 _COMPETITOR_WATCHDOG_SECONDS = 120
+
+#: What a competitor reports, in order. `imported` proves the spawn and the
+#: module import completed, `trust_root_opened` that the Ed25519 material
+#: loaded, `ready` that the authority is open and it is waiting on the gate.
+_COMPETITOR_STAGES = ("imported", "trust_root_opened", "ready")
 
 
 class _SQLiteMonotonicCheckpointStore:
@@ -283,16 +301,25 @@ def _open_trust_root(
 
 
 def _competing_advance_process(
+    index: int,
     authority_path: str,
     broker_path: str,
     replay_path: str,
     key_path: str,
+    stderr_path: str,
     ready: Any,
     gate: Any,
     output: Any,
 ) -> None:
+    # Anything the interpreter or a library writes on its own goes to a file the
+    # parent can read back. pytest captures the parent's stderr, not a spawned
+    # child's, which is why a failing competitor used to leave no trace at all.
+    with suppress(OSError):
+        sys.stderr = open(stderr_path, "w", buffering=1)  # noqa: SIM115
     try:
+        ready.put((index, "imported"))
         signer, keyring = _open_trust_root(Path(key_path))
+        ready.put((index, "trust_root_opened"))
         authority = replay_lineage_api.PersistentReplayLineageAuthority(
             Path(authority_path),
             authority_id="persistent-lineage-root",
@@ -309,12 +336,73 @@ def _competing_advance_process(
                 Path(key_path) / "lineage.public.pem",
             ),
         )
-        ready.put("ready")
+        ready.put((index, "ready"))
         if not gate.wait(timeout=_COMPETITOR_WATCHDOG_SECONDS):
             raise RuntimeError("multiprocess start gate timed out")
         output.put(("ok", _advance(authority).model_dump_json()))
     except BaseException as exc:
+        # Both channels, deliberately. A failure before `ready` used to be put on
+        # `output` alone while the parent was blocked on `ready`, so it waited out
+        # the whole watchdog and reported a bare `_queue.Empty` with the real
+        # error sitting unread in the other queue.
+        with suppress(BaseException):
+            ready.put((index, "error", "".join(traceback.format_exception(exc))))
         output.put(("error", repr(exc)))
+
+
+def _competitor_diagnosis(
+    processes: list[Any],
+    stderr_paths: list[Path],
+    reached: dict[int, str],
+) -> str:
+    lines = []
+    for index, (process, stderr_path) in enumerate(zip(processes, stderr_paths, strict=True)):
+        captured = ""
+        with suppress(OSError):
+            captured = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+        lines.append(
+            f"  competitor {index}: reached={reached.get(index, 'nothing')} "
+            f"alive={process.is_alive()} exitcode={process.exitcode}"
+            + (f"\n    stderr: {captured}" if captured else "")
+        )
+    return "\n".join(lines)
+
+
+def _await_competitors_ready(
+    ready: Any,
+    *,
+    processes: list[Any],
+    stderr_paths: list[Path],
+) -> dict[int, str]:
+    """Wait for every competitor to reach `ready`, and say what happened if one does not.
+
+    The budget is per report rather than per process: any competitor making
+    progress refreshes it, so four of them starting at once never share one
+    deadline, and a competitor that stops reporting is bounded on its own.
+    """
+
+    reached: dict[int, str] = {}
+    waiting = set(range(len(processes)))
+    while waiting:
+        try:
+            message = ready.get(timeout=_COMPETITOR_WATCHDOG_SECONDS)
+        except queue.Empty:
+            raise AssertionError(
+                f"no competitor reported for {_COMPETITOR_WATCHDOG_SECONDS}s; "
+                f"still waiting on {sorted(waiting)}\n"
+                + _competitor_diagnosis(processes, stderr_paths, reached)
+            ) from None
+        index, stage = message[0], message[1]
+        if stage == "error":
+            raise AssertionError(
+                f"competitor {index} failed before reaching ready:\n{message[2]}"
+                + _competitor_diagnosis(processes, stderr_paths, reached)
+            )
+        assert stage in _COMPETITOR_STAGES, f"competitor {index} reported unknown stage {stage!r}"
+        reached[index] = stage
+        if stage == "ready":
+            waiting.discard(index)
+    return reached
 
 
 def _database_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -942,25 +1030,44 @@ def test_competing_processes_commit_one_operation_exactly_once(tmp_path: Path) -
     ready = context.Queue()
     gate = context.Event()
     output = context.Queue()
+    stderr_paths = [tmp_path / f"competitor-{index}.stderr" for index in range(4)]
+    # Every competitor gets its own copy of the same key material. The openssl
+    # signing client these cases use derives its scratch payload/signature paths
+    # from the private key path and guards them with a `threading.Lock`, which
+    # serialises threads and not processes - so four competitors sharing one key
+    # directory overwrite each other's scratch files, and one of them reads back a
+    # signature over another's challenge. It surfaces from
+    # `PersistentReplayLineageAuthority.__init__` as
+    # `ValueError: Ed25519 signing client returned an invalid signature`, about
+    # once in twenty runs on this machine under four CPU busy loops. Same bytes,
+    # same trust root, private scratch: what the case contends for is the
+    # authority database, not the test signer's temporary files.
+    key_roots = []
+    for index in range(4):
+        key_root = tmp_path / f"keys-{index}"
+        shutil.copytree(tmp_path / "keys", key_root)
+        key_roots.append(key_root)
     processes = [
         context.Process(
             target=_competing_advance_process,
             args=(
+                index,
                 str(authority_path),
                 str(broker_path),
                 str(replay_path),
-                str(tmp_path / "keys"),
+                str(key_roots[index]),
+                str(stderr_paths[index]),
                 ready,
                 gate,
                 output,
             ),
         )
-        for _ in range(4)
+        for index in range(4)
     ]
     for process in processes:
         process.start()
-    for _ in processes:
-        assert ready.get(timeout=_COMPETITOR_WATCHDOG_SECONDS) == "ready"
+    reached = _await_competitors_ready(ready, processes=processes, stderr_paths=stderr_paths)
+    assert set(reached) == {0, 1, 2, 3}
     gate.set()
     results = [output.get(timeout=_COMPETITOR_WATCHDOG_SECONDS) for _ in processes]
     for process in processes:
