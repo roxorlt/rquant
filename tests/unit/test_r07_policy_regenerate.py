@@ -118,3 +118,163 @@ def test_generated_allowlist_covers_the_complete_merge_base_diff() -> None:
     assert policy.baseline_tree_sha == BASELINE_TREE_SHA
     assert {entry.policy_key for entry in policy.allowed_diff} == observed
     assert len(policy.allowed_diff) == len(observed)
+
+
+_DECOY_MODULE = "\n".join(
+    (
+        "class Decoy:",
+        "    def ingest(self, envelope):",
+        "        return ('decoy', envelope)",
+        "",
+        "",
+        "class Store:",
+        "    def ingest(self, envelope):",
+        "        return ('real', envelope)",
+        "",
+    )
+)
+
+
+def _probe_for(entrypoint: str) -> dict[str, object]:
+    return {
+        "entrypoint": entrypoint,
+        # The stale anchor: line 7 is Store.ingest before the edit above it and
+        # Decoy.ingest after it, which is the whole point of not trusting it.
+        "source_span": "example.py:7",
+        "boundary_ast_sha256": "0" * 64,
+        "variant": "dynamic",
+    }
+
+
+def test_boundary_ast_digest_follows_the_entrypoint_name_not_the_stale_line_anchor() -> None:
+    """An unrelated edit above a probed method must not re-aim the boundary digest.
+
+    ``source_span`` is a line anchor, and a line anchor points at whatever definition
+    occupies that line after the file moves. Here the decoy sits above the real store and
+    a four-line edit slides its ``ingest`` onto the anchored line, so a generator that
+    trusts the anchor freezes the decoy's AST under the real store's name.
+    """
+
+    shifted = "# unrelated edit\n" * 4 + _DECOY_MODULE
+    probe = _probe_for("rquant.example.Store.ingest")
+
+    unshifted_result = regenerate._regenerated_boundary_probes(
+        [probe], lambda _path: _DECOY_MODULE.encode("utf-8")
+    )[0]
+    shifted_result = regenerate._regenerated_boundary_probes(
+        [probe], lambda _path: shifted.encode("utf-8")
+    )[0]
+    decoy_result = regenerate._regenerated_boundary_probes(
+        [_probe_for("rquant.example.Decoy.ingest")],
+        lambda _path: shifted.encode("utf-8"),
+    )[0]
+
+    assert unshifted_result["source_span"] == "example.py:7"
+    assert shifted_result["source_span"] == "example.py:11"
+    assert shifted_result["boundary_ast_sha256"] == unshifted_result["boundary_ast_sha256"]
+    # The negative control: resolution really does tell the two definitions apart, so the
+    # equality above is the name being honoured and not both sides landing on one node.
+    assert decoy_result["source_span"] == "example.py:6"
+    assert decoy_result["boundary_ast_sha256"] != shifted_result["boundary_ast_sha256"]
+
+    with pytest.raises(ValueError, match="does not name its own module"):
+        regenerate._regenerated_boundary_probes(
+            [_probe_for("rquant.other.Store.ingest")],
+            lambda _path: _DECOY_MODULE.encode("utf-8"),
+        )
+    with pytest.raises(ValueError, match="boundary entrypoint is missing"):
+        regenerate._regenerated_boundary_probes(
+            [_probe_for("rquant.example.Store.absent")],
+            lambda _path: _DECOY_MODULE.encode("utf-8"),
+        )
+
+
+_CLEAN_OBSERVATION = {
+    "inventory_id": "R07-B01",
+    "before_snapshot_digest": "a" * 64,
+    "after_snapshot_digest": "a" * 64,
+    "reached_count": 1,
+    "mutation_guard_counts": {"writes": 0},
+}
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    (
+        ({"after_snapshot_digest": "b" * 64}, "mutated observable state"),
+        ({"reached_count": 2}, "did not reach its sentinel once"),
+        ({"mutation_guard_counts": {"writes": 1}}, "tripped a mutation guard"),
+    ),
+)
+def test_boundary_snapshot_refresh_only_accepts_a_clean_no_mutation_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, object],
+    message: str,
+) -> None:
+    """A refreshed digest is an R07 authority value, so the run it came from has to have
+    shown the boundary rejecting before it touched anything."""
+
+    import tests.r07_differential_probe_runner as runner
+
+    def observe(**_kwargs: object) -> dict[str, object]:
+        # The refresh exists for the run whose snapshot digest is stale, and that run
+        # fails, so the payload arrives as the child's result JSON on an AssertionError.
+        raise AssertionError(json.dumps({**_CLEAN_OBSERVATION, **override}))
+
+    monkeypatch.setattr(runner, "run_boundary_probe_subprocess", observe)
+    probes = [{"inventory_id": "R07-B01", "variant": "dynamic"}]
+    with pytest.raises(ValueError, match=message):
+        regenerate._refreshed_boundary_snapshots(ROOT, probes, policy_path=tmp_path / "p.json")
+
+
+def test_boundary_snapshot_refresh_writes_back_only_what_the_probe_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tests.r07_differential_probe_runner as runner
+
+    calls: list[str] = []
+
+    def observe(*, inventory_id: str, **_kwargs: object) -> dict[str, object]:
+        calls.append(inventory_id)
+        raise AssertionError(json.dumps(_CLEAN_OBSERVATION))
+
+    monkeypatch.setattr(runner, "run_boundary_probe_subprocess", observe)
+    probes = [
+        {"inventory_id": "R07-B01", "variant": "dynamic", "before_snapshot_digest": "c" * 64},
+        {"inventory_id": "R07-S01", "variant": "static_only", "before_snapshot_digest": "d" * 64},
+    ]
+
+    refreshed = regenerate._refreshed_boundary_snapshots(
+        ROOT, probes, policy_path=tmp_path / "p.json"
+    )
+
+    assert refreshed[0]["before_snapshot_digest"] == "a" * 64
+    assert refreshed[0]["after_snapshot_digest"] == "a" * 64
+    # `static_only` rows observe no store, so the refresh must not spawn a runner for them
+    # or invent digests they never had.
+    assert refreshed[1] == probes[1]
+    assert calls == ["R07-B01"]
+
+
+def test_boundary_snapshot_refresh_propagates_a_failure_that_is_not_its_own_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tests.r07_differential_probe_runner as runner
+
+    def observe(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("boundary probe rejected for some other reason")
+
+    monkeypatch.setattr(runner, "run_boundary_probe_subprocess", observe)
+    probes = [{"inventory_id": "R07-B01", "variant": "dynamic"}]
+    with pytest.raises(AssertionError, match="some other reason"):
+        regenerate._refreshed_boundary_snapshots(ROOT, probes, policy_path=tmp_path / "p.json")
+
+    def observe_other_probe(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError(json.dumps({**_CLEAN_OBSERVATION, "inventory_id": "R07-B02"}))
+
+    monkeypatch.setattr(runner, "run_boundary_probe_subprocess", observe_other_probe)
+    with pytest.raises(AssertionError, match="R07-B02"):
+        regenerate._refreshed_boundary_snapshots(ROOT, probes, policy_path=tmp_path / "p.json")
