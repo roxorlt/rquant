@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import base64
-import hashlib
+import multiprocessing
+import os
 import shutil
 import subprocess
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -77,31 +81,156 @@ class OpenSslSigningClient:
         if key_purpose != self.key_purpose or namespace not in self.allowed_namespaces:
             raise ValueError("signing client purpose or namespace binding was violated")
         with self._lock:
-            namespace_id = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:12]
-            payload_path = self._private_key.with_suffix(f".{namespace_id}.payload")
-            signature_path = self._private_key.with_suffix(f".{namespace_id}.signature")
-            payload_path.write_bytes(payload)
-            completed = subprocess.run(
-                (
-                    _openssl(),
-                    "pkeyutl",
-                    "-sign",
-                    "-inkey",
-                    str(self._private_key),
-                    "-rawin",
-                    "-in",
-                    str(payload_path),
-                    "-out",
-                    str(signature_path),
-                ),
-                check=False,
-                capture_output=True,
+            # Private to this call, and removed after it. The two paths used to be derived
+            # from the private key, which made them shared by every holder of that key -
+            # and this lock serialises threads, not processes. Consumers that spawn
+            # competitors hand them all the same key, so they overwrote each other's
+            # payload and signature files and one could read back a signature over someone
+            # else's payload. It surfaced as an invalid signature far from here.
+            scratch = self._private_key.parent
+            payload_descriptor, payload_name = tempfile.mkstemp(dir=scratch, suffix=".payload")
+            signature_descriptor, signature_name = tempfile.mkstemp(
+                dir=scratch, suffix=".signature"
             )
-            if completed.returncode != 0:
-                raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
-            import base64
+            payload_path = Path(payload_name)
+            signature_path = Path(signature_name)
+            try:
+                os.close(signature_descriptor)
+                with os.fdopen(payload_descriptor, "wb") as handle:
+                    handle.write(payload)
+                completed = subprocess.run(
+                    (
+                        _openssl(),
+                        "pkeyutl",
+                        "-sign",
+                        "-inkey",
+                        str(self._private_key),
+                        "-rawin",
+                        "-in",
+                        str(payload_path),
+                        "-out",
+                        str(signature_path),
+                    ),
+                    check=False,
+                    capture_output=True,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
+                return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+            finally:
+                for path in (payload_path, signature_path):
+                    with suppress(OSError):
+                        path.unlink()
 
-            return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+
+def _shared_key_signing_worker(
+    private_key: str,
+    public_key: str,
+    namespace: str,
+    key_purpose: Any,
+    marker: str,
+    rounds: int,
+    results: Any,
+) -> None:
+    """Sign a private sequence of payloads and require each signature to be over its own.
+
+    Module level and argument-only so it survives a spawn pickle. Each worker verifies in
+    its own temporary directory, so the only thing two workers can contend for is whatever
+    the signing client itself touches.
+    """
+
+    try:
+        client = OpenSslSigningClient(
+            Path(private_key),
+            key_purpose=key_purpose,
+            allowed_namespaces=frozenset({namespace}),
+            public_key_fingerprint="fingerprint-is-not-read-by-sign",
+        )
+        with tempfile.TemporaryDirectory(prefix=f"verify-{marker}-") as scratch:
+            payload_path = Path(scratch) / "payload"
+            signature_path = Path(scratch) / "signature"
+            for index in range(rounds):
+                payload = f"{marker}-{index}".encode()
+                signature = client.sign(
+                    key_purpose=key_purpose,
+                    namespace=namespace,
+                    payload=payload,
+                )
+                payload_path.write_bytes(payload)
+                signature_path.write_bytes(base64.b64decode(signature))
+                verified = subprocess.run(
+                    (
+                        _openssl(),
+                        "pkeyutl",
+                        "-verify",
+                        "-pubin",
+                        "-inkey",
+                        public_key,
+                        "-rawin",
+                        "-in",
+                        str(payload_path),
+                        "-sigfile",
+                        str(signature_path),
+                    ),
+                    check=False,
+                    capture_output=True,
+                )
+                if verified.returncode != 0:
+                    results.put(("mismatch", marker, index, ""))
+                    return
+        results.put(("ok", marker, rounds, ""))
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent, not swallowed
+        results.put(("error", marker, -1, repr(exc)))
+
+
+def test_signing_double_is_safe_when_processes_share_one_private_key(tmp_path: Path) -> None:
+    """The double derives its scratch paths from the key, so two holders must not collide.
+
+    Its `threading.Lock` serialises threads inside one process and nothing at all between
+    processes, and every consumer that spawns competitors hands them the same key: the
+    replay-lineage case had four of them overwriting each other's payload and signature
+    files, so one read back a signature over another's challenge and
+    `PersistentReplayLineageAuthority.__init__` refused it as invalid.
+    """
+
+    _signer, _record = _key_pair(
+        tmp_path / "keys",
+        key_id="shared",
+        issuer="release-authority",
+        key_purpose="replay_claim",
+        rotation="active",
+    )
+    private_key = tmp_path / "keys" / "shared.private.pem"
+    public_key = tmp_path / "keys" / "shared.public.pem"
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_shared_key_signing_worker,
+            args=(
+                str(private_key),
+                str(public_key),
+                REPLAY_CLAIM_NAMESPACE,
+                "replay_claim",
+                marker,
+                40,
+                results,
+            ),
+        )
+        # Same key, same namespace: the two scratch paths the double derives are identical.
+        for marker in ("alpha", "beta")
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        reported = [results.get(timeout=120) for _ in workers]
+    finally:
+        for worker in workers:
+            worker.join(timeout=120)
+
+    assert [status for status, *_rest in reported] == ["ok", "ok"], reported
+    for worker in workers:
+        assert worker.exitcode == 0
 
 
 @dataclass(frozen=True)
