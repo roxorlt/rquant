@@ -393,6 +393,53 @@ def test_publisher_rejects_a_complete_receipt_from_another_ledger_attempt(
         )
 
 
+def test_publisher_refuses_a_stale_writer_whose_receipt_carries_a_newer_fencing_token(
+    tmp_path: Path,
+) -> None:
+    """The stored receipt's fence is an ordering check, and orderings have two
+    sides. The adopter side - a replacement writer reaching an already-stored
+    receipt under a strictly newer token - is exercised by the recovery e2e.
+    This is the other side: the same attempt seen by an *older* token is a
+    writer that has already been replaced, and it must not publish."""
+
+    gateway, candidate_store, candidate = _candidate(tmp_path)
+    db_path = tmp_path / "canonical.duckdb"
+    _seed_database(db_path)
+    publisher = _publisher(candidate_store, db_path, gateway.spool)
+    committed = publisher.publish(
+        candidate.generation_id,
+        attempt=_attempt(fence=2),
+        ledger_input_identity=LEDGER_INPUT,
+        committed_at=COMMITTED_AT,
+    )
+
+    with pytest.raises(DailyCanonicalPublishError, match="newer fencing token"):
+        publisher.publish(
+            candidate.generation_id,
+            attempt=_attempt(fence=1),
+            ledger_input_identity=LEDGER_INPUT,
+            committed_at=COMMITTED_AT,
+        )
+
+    # The newer owner still adopts the very same receipt, so the rejection
+    # above is the ordering talking and not a restored equality check.
+    adopted = publisher.publish(
+        candidate.generation_id,
+        attempt=_attempt(fence=3),
+        ledger_input_identity=LEDGER_INPUT,
+        committed_at=COMMITTED_AT,
+    )
+    assert adopted.receipt_id == committed.receipt_id
+    assert adopted.ledger_fencing_token == 2
+    with DuckDBStore(db_path, read_only=True) as reader:
+        assert (
+            reader._conn.execute(
+                "SELECT count(*) FROM daily_canonical_publish_receipt"
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_publisher_requires_reader_and_writer_to_open_the_same_database_generation(
     tmp_path: Path,
 ) -> None:
