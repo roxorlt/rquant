@@ -1469,7 +1469,7 @@ class TestRecomputeExpectations:
         [
             ("src/rquant/signal_family_verification.py", "production"),
             ("tests/fixtures/signal_family_producer/x.sql", "fixture"),
-            ("tests/manifests/full-suite-v1/index.json", "fixture"),
+            ("tests/manifests/full-suite-v1/index.json", "test"),
             ("tests/unit/test_signal_family_verifier_harness.py", "test"),
             ("tests/support/signal_family_harness_vectors.py", "test"),
             ("deploy/systemd/rquant-runtime-router.service", "architecture"),
@@ -1485,6 +1485,35 @@ class TestRecomputeExpectations:
         """Ruling B-3 fixed `deploy/` at architecture; the rest follows the existing policy."""
 
         assert self._module()._category(path) == category
+
+    def test_the_category_rule_agrees_with_the_generator_ci_enforces(self) -> None:
+        """Two implementations of one rule is one too many, and the drift is invisible.
+
+        `scripts/r07_policy_regenerate.py` is the authority: CI runs its `--check` and the
+        policy is whatever it produces. This script only reports drift, so a disagreement
+        surfaces as a correct tree reported stale, offering a `--write` the authority then
+        rejects. `tests/manifests/` was such a disagreement.
+        """
+
+        from scripts import r07_policy_regenerate
+
+        module = self._module()
+        policy = json.loads(module.POLICY_PATH.read_bytes())
+        assert policy["allowed_diff"]
+        disagreements = sorted(
+            entry["path"]
+            for entry in policy["allowed_diff"]
+            if module._category(entry["path"])
+            != r07_policy_regenerate.diff_category(entry["path"])
+        )
+
+        assert disagreements == []
+
+    def test_the_recomputation_reports_a_correct_tree_as_current(self) -> None:
+        """The checked-in tree is by definition correct - `r07_policy_regenerate --check`
+        is green on it - so this script must say so rather than ask for a `--write`."""
+
+        assert self._module().recompute_policy(write=False).changed is False
 
     def test_the_recomputation_never_writes_without_being_asked(self) -> None:
         module = self._module()
