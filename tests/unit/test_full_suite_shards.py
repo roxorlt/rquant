@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import pytest
@@ -374,6 +378,206 @@ def test_nodeid_rejects_symlink_escape_but_accepts_parameter_punctuation(tmp_pat
     assert shards._file_for_nodeid(valid, repository_root=repository_root) == (
         "tests/test_params.py"
     )
+
+
+# A parametrized id is opaque: pytest keeps whatever the ids= tuple says, so it can
+# carry the node separator, brackets, and option-looking text. Reporting the wrong
+# JUnit identity for those cases makes the contract fail closed on a healthy shard.
+_JUNIT_PROBE_MODULE = """import pytest
+
+
+@pytest.mark.parametrize(
+    "value",
+    (1, 2, 3, 4, 5, 6),
+    ids=(
+        "--junitxml=other.py::test_case",
+        "a::b::c",
+        "x[y]::z",
+        "plain",
+        "[bracket::inside]",
+        "::leading",
+    ),
+)
+def test_top(value):
+    assert value
+
+
+class TestKlass:
+    @pytest.mark.parametrize(
+        "value",
+        (1, 2),
+        ids=("--opt=a.py::b", "nested::id[with]brackets"),
+    )
+    def test_inner(self, value):
+        assert value
+
+    def test_plain_inner(self):
+        assert True
+
+
+def test_no_param():
+    assert True
+"""
+
+_JUNIT_PROBE_CASES = 10
+
+
+def _real_pytest_junit_identities(tmp_path: Path) -> tuple[tuple[str, str, str], ...]:
+    """Return the (nodeid, classname, name) triples a real pytest run reports."""
+    root = tmp_path / "junit-probe"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_probe.py").write_text(_JUNIT_PROBE_MODULE, encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PYTEST_ADDOPTS"] = ""
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "tests/test_probe.py",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-o",
+        "addopts=",
+        f"--rootdir={root}",
+    ]
+    collected = subprocess.run(
+        [*command, "--collect-only"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    nodeids = tuple(
+        line.strip()
+        for line in collected.stdout.splitlines()
+        if line.startswith("tests/test_probe.py::")
+    )
+    subprocess.run(
+        [*command, f"--junitxml={root / 'junit.xml'}", f"--basetemp={root / 'pt'}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    reported = tuple(
+        (case.attrib["classname"], case.attrib["name"])
+        for case in ElementTree.parse(root / "junit.xml").getroot().iter("testcase")
+    )
+    assert len(nodeids) == _JUNIT_PROBE_CASES
+    assert len(reported) == _JUNIT_PROBE_CASES
+    return tuple(
+        (nodeid, classname, name)
+        for nodeid, (classname, name) in zip(nodeids, reported, strict=True)
+    )
+
+
+def test_junit_identity_matches_what_pytest_actually_reports(tmp_path: Path) -> None:
+    triples = _real_pytest_junit_identities(tmp_path)
+
+    separators = [nodeid for nodeid, _, _ in triples if "::" in nodeid.partition("[")[2]]
+    assert len(separators) == 7
+    assert any("::" not in nodeid.partition("[")[2] for nodeid, _, _ in triples)
+    for nodeid, classname, name in triples:
+        assert shards.junit_identity(nodeid) == {
+            "classname": classname,
+            "name": name,
+        }, nodeid
+
+
+@pytest.mark.parametrize(
+    ("nodeid", "classname", "name"),
+    (
+        (
+            "tests/x/test_y.py::TestK::test_z[--opt=a.py::b]",
+            "tests.x.test_y.TestK",
+            "test_z[--opt=a.py::b]",
+        ),
+        (
+            "tests/x/test_y.py::test_z[a::b::c]",
+            "tests.x.test_y",
+            "test_z[a::b::c]",
+        ),
+        (
+            "tests/x/test_y.py::test_z[[bracket::inside]]",
+            "tests.x.test_y",
+            "test_z[[bracket::inside]]",
+        ),
+        (
+            "tests/x/test_y.py::TestK::test_z[nested::id[with]brackets]",
+            "tests.x.test_y.TestK",
+            "test_z[nested::id[with]brackets]",
+        ),
+        (
+            "tests/x/test_y.py::test_z[::leading]",
+            "tests.x.test_y",
+            "test_z[::leading]",
+        ),
+        (
+            "tests/x/test_y.py::TestK::TestInner::test_z",
+            "tests.x.test_y.TestK.TestInner",
+            "test_z",
+        ),
+        ("tests/x/test_y.py::test_z", "tests.x.test_y", "test_z"),
+        ("tests/x/test_y.py::test_z[plain]", "tests.x.test_y", "test_z[plain]"),
+    ),
+    ids=(
+        "option-and-separator-in-class-parameter",
+        "repeated-separator-in-parameter",
+        "leading-bracket-parameter",
+        "mixed-brackets-and-separator",
+        "parameter-starting-with-separator",
+        "nested-classes-without-parameters",
+        "bare-function",
+        "ordinary-parameter",
+    ),
+)
+def test_junit_identity_keeps_parametrized_ids_intact(
+    nodeid: str,
+    classname: str,
+    name: str,
+) -> None:
+    assert shards.junit_identity(nodeid) == {"classname": classname, "name": name}
+
+
+@pytest.mark.parametrize(
+    "nodeid",
+    (
+        "tests/a.py",
+        "tests/a.py::",
+        "tests/a.py::TestK::",
+        "tests/a.py::::test_case",
+        "tests/a.txt::test_case",
+    ),
+    ids=(
+        "no-separator",
+        "empty-selection",
+        "empty-name-after-class",
+        "empty-class",
+        "not-a-python-module",
+    ),
+)
+def test_junit_identity_rejects_nodeids_it_cannot_map(nodeid: str) -> None:
+    with pytest.raises(shards.ContractError, match="JUnit testcase"):
+        shards.junit_identity(nodeid)
+
+
+def test_nodeid_file_resolution_ignores_separators_inside_parameters(
+    tmp_path: Path,
+) -> None:
+    """The path stops at the first separator, so parameter text cannot move it."""
+    repository_root = _test_repository(tmp_path, "tests/test_params.py")
+
+    for nodeid in (
+        "tests/test_params.py::test_case[a::b::c]",
+        "tests/test_params.py::TestK::test_case[--opt=elsewhere.py::other]",
+        "tests/test_params.py::test_case[[bracket::inside]]",
+    ):
+        assert shards._file_for_nodeid(nodeid, repository_root=repository_root) == (
+            "tests/test_params.py"
+        )
 
 
 def test_nodeid_size_limit_accepts_boundary_and_rejects_one_byte_over(tmp_path: Path) -> None:

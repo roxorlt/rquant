@@ -354,13 +354,21 @@ def junit_identity(nodeid: str) -> dict[str, str]:
     dots and keeps the parametrized test name verbatim. Deriving it here, at
     manifest generation time, means the contract never has to guess the mapping
     from a report it is supposed to be checking.
+
+    The module path ends at the first ``::``, and everything from the first
+    ``[`` onwards is one opaque parametrized id that pytest reports as part of
+    the test name. A parameter may itself contain ``::`` and brackets, so only
+    the class/function prefix in between may be split on the node separator.
     """
-    parts = nodeid.split("::")
-    if len(parts) < 2 or not parts[0].endswith(".py") or not all(parts):
+    path, separator, selection = nodeid.partition("::")
+    prefix, bracket, parameters = selection.partition("[")
+    parts = prefix.split("::")
+    name = parts[-1] + bracket + parameters
+    if not separator or not path.endswith(".py") or not all(parts[:-1]) or not name:
         raise ContractError(f"nodeid cannot be mapped to a JUnit testcase: {nodeid}")
-    module = parts[0][: -len(".py")].replace("/", ".")
-    classname = ".".join((module, *parts[1:-1]))
-    return {"classname": classname, "name": parts[-1]}
+    module = path[: -len(".py")].replace("/", ".")
+    classname = ".".join((module, *parts[:-1]))
+    return {"classname": classname, "name": name}
 
 
 def approved_skips_path(root: Path) -> Path:
