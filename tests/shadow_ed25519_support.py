@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import os
 import shutil
 import subprocess
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,28 +22,44 @@ class OpenSslSigningClient:
         self._private_key_path = private_key_path
 
     def sign(self, *, namespace: str, payload: bytes) -> str:
-        payload_path = self._private_key_path.parent / f"{namespace}.payload"
-        signature_path = self._private_key_path.parent / f"{namespace}.signature"
-        payload_path.write_bytes(payload)
-        completed = subprocess.run(
-            (
-                _openssl(),
-                "pkeyutl",
-                "-sign",
-                "-inkey",
-                str(self._private_key_path),
-                "-rawin",
-                "-in",
-                str(payload_path),
-                "-out",
-                str(signature_path),
-            ),
-            check=False,
-            capture_output=True,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
-        return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+        del namespace  # the scratch files no longer take their name from it
+        # Private to this call, and removed after it. Paths derived from the key are
+        # shared by every holder of that key, and a lock inside one process does not
+        # reach another: two signers then overwrite each other's scratch files and one
+        # reads back a signature over the other's payload. See 064ffe8, where that cost
+        # four spawned competitors an invalid signature about once in twenty runs.
+        scratch = self._private_key_path.parent
+        payload_descriptor, payload_name = tempfile.mkstemp(dir=scratch, suffix=".payload")
+        signature_descriptor, signature_name = tempfile.mkstemp(dir=scratch, suffix=".signature")
+        payload_path = Path(payload_name)
+        signature_path = Path(signature_name)
+        try:
+            os.close(signature_descriptor)
+            with os.fdopen(payload_descriptor, "wb") as handle:
+                handle.write(payload)
+            completed = subprocess.run(
+                (
+                    _openssl(),
+                    "pkeyutl",
+                    "-sign",
+                    "-inkey",
+                    str(self._private_key_path),
+                    "-rawin",
+                    "-in",
+                    str(payload_path),
+                    "-out",
+                    str(signature_path),
+                ),
+                check=False,
+                capture_output=True,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
+            return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+        finally:
+            for path in (payload_path, signature_path):
+                with suppress(OSError):
+                    path.unlink()
 
 
 @dataclass(frozen=True)

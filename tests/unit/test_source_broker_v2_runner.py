@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -179,29 +179,45 @@ class _RunnerSourceAuthoritySecurity:
         self._directory.cleanup()
 
     def sign(self, signing_bytes: bytes) -> str:
-        payload_path = self._private_key.with_suffix(".payload")
-        signature_path = self._private_key.with_suffix(".signature")
         with self._sign_lock:
-            payload_path.write_bytes(source_authority_signature_payload(signing_bytes))
-            completed = subprocess.run(
-                (
-                    self._openssl,
-                    "pkeyutl",
-                    "-sign",
-                    "-inkey",
-                    str(self._private_key),
-                    "-rawin",
-                    "-in",
-                    str(payload_path),
-                    "-out",
-                    str(signature_path),
-                ),
-                check=False,
-                capture_output=True,
+            # Private to this call, and removed after it. Paths derived from the key
+            # are shared by every holder of that key, and this lock reaches only this
+            # process's threads: two signers would overwrite each other's scratch files
+            # and one could read back a signature over the other's payload (064ffe8).
+            scratch = self._private_key.parent
+            payload_descriptor, payload_name = tempfile.mkstemp(dir=scratch, suffix=".payload")
+            signature_descriptor, signature_name = tempfile.mkstemp(
+                dir=scratch, suffix=".signature"
             )
-            if completed.returncode != 0:
-                raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
-            return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+            payload_path = Path(payload_name)
+            signature_path = Path(signature_name)
+            try:
+                os.close(signature_descriptor)
+                with os.fdopen(payload_descriptor, "wb") as handle:
+                    handle.write(source_authority_signature_payload(signing_bytes))
+                completed = subprocess.run(
+                    (
+                        self._openssl,
+                        "pkeyutl",
+                        "-sign",
+                        "-inkey",
+                        str(self._private_key),
+                        "-rawin",
+                        "-in",
+                        str(payload_path),
+                        "-out",
+                        str(signature_path),
+                    ),
+                    check=False,
+                    capture_output=True,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
+                return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+            finally:
+                for path in (payload_path, signature_path):
+                    with suppress(OSError):
+                        path.unlink()
 
 
 @pytest.fixture

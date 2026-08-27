@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -249,27 +252,38 @@ def _write_calendar_generation(root: Path) -> tuple[Path, MarketCalendarAuthorit
 
 
 def _sign_ed25519_payload(private_key: Path, payload: bytes, signature_path: Path) -> str:
-    payload_path = signature_path.with_suffix(".payload")
-    payload_path.write_bytes(payload)
-    completed = subprocess.run(
-        (
-            "openssl",
-            "pkeyutl",
-            "-sign",
-            "-inkey",
-            str(private_key),
-            "-rawin",
-            "-in",
-            str(payload_path),
-            "-out",
-            str(signature_path),
-        ),
-        check=False,
-        capture_output=True,
+    # The payload path used to be derived from the signature path. That one is already
+    # unique per request here, so nothing collided - but a derived scratch path is the
+    # shape that cost 064ffe8 an invalid signature, so this one is private to the call.
+    payload_descriptor, payload_name = tempfile.mkstemp(
+        dir=signature_path.parent, suffix=".payload"
     )
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
-    return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+    payload_path = Path(payload_name)
+    try:
+        with os.fdopen(payload_descriptor, "wb") as handle:
+            handle.write(payload)
+        completed = subprocess.run(
+            (
+                "openssl",
+                "pkeyutl",
+                "-sign",
+                "-inkey",
+                str(private_key),
+                "-rawin",
+                "-in",
+                str(payload_path),
+                "-out",
+                str(signature_path),
+            ),
+            check=False,
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr.decode("utf-8", errors="replace"))
+        return base64.b64encode(signature_path.read_bytes()).decode("ascii")
+    finally:
+        with suppress(OSError):
+            payload_path.unlink()
 
 
 def _patch_fixed_shadow_signer(
