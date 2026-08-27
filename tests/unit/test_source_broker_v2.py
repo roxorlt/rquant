@@ -102,6 +102,17 @@ NOW = datetime(2026, 8, 5, 4, tzinfo=UTC)
 # 33-minute shard on a 2 vCPU runner, where it turned a COMPLETE into a
 # RECONCILE_REQUIRED. This value is for those cases - large enough that no host
 # can outrun it, so the budget stops being a participant.
+#
+# Applied at every `for_nonproduction` site whose case is not about the budget.
+# Two kinds of site are left on the default and must stay there:
+#
+#   - the eight cases that install a `_MutableUtcClock` over the module's
+#     `datetime`. There the budget is already on a clock the case drives, and
+#     the arithmetic between the deadline, the takeover boundary and
+#     `clock.advance()` is the scenario - `..._persists_source_window_grant_...`
+#     asserts `first_finalize_takeover <= clock.now()` outright.
+#   - `_spawn_initialize_same_saga`, which builds a saga in a spawned worker to
+#     inspect its schema and never advances it, so the budget is never read.
 _UNCONSTRAINED_SOURCE_DEADLINE_SECONDS = 30.0
 _UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS = 5.0
 
@@ -1487,6 +1498,8 @@ def test_v2_saga_does_not_compensate_after_dispatch_response_loss(tmp_path: Path
         quota_adapter=quota,
         transport=transport,
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
 
     first = saga.advance(request, now=NOW + timedelta(seconds=1))
@@ -1509,6 +1522,8 @@ def test_v2_saga_replays_claim_after_authority_commit_response_loss(tmp_path: Pa
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     with pytest.raises(SourceBrokerV2SagaUnavailableError):
         first.advance(request, now=NOW + timedelta(seconds=1))
@@ -1520,6 +1535,8 @@ def test_v2_saga_replays_claim_after_authority_commit_response_loss(tmp_path: Pa
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     result = restarted.advance(request, now=NOW + timedelta(seconds=2))
 
@@ -1537,6 +1554,8 @@ def test_v2_saga_compensates_only_with_pre_dispatch_evidence(tmp_path: Path) -> 
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
 
     result = saga.compensate_before_dispatch(request, now=NOW + timedelta(seconds=1))
@@ -1561,6 +1580,8 @@ def test_v2_saga_compensation_recovers_release_after_call_terminal_response_loss
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     lost_release = False
 
@@ -1594,6 +1615,8 @@ def test_v2_saga_compensation_recovers_release_after_call_terminal_response_loss
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     recovered = restarted.compensate_before_dispatch(
         request,
@@ -1618,6 +1641,8 @@ def test_v2_saga_rejects_tampered_applied_outbox_before_replay(tmp_path: Path) -
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     with sqlite3.connect(path) as connection:
@@ -1632,6 +1657,8 @@ def test_v2_saga_rejects_tampered_applied_outbox_before_replay(tmp_path: Path) -
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     with pytest.raises(SourceBrokerV2SagaIntegrityError):
         restarted.advance(request, now=NOW + timedelta(seconds=2))
@@ -2235,6 +2262,8 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     with sqlite3.connect(path) as connection:
@@ -2259,6 +2288,8 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     with pytest.raises(SourceBrokerV2SagaIntegrityError, match="source receipt history"):
         restarted.advance(request, now=NOW + timedelta(seconds=2))
@@ -2278,6 +2309,8 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
         quota_adapter=replay_quota,
         transport=replay_transport,
         lineage_authority=replay_lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     ).advance(replay_request, now=NOW + timedelta(seconds=1))
     original_replay = replay_transport.replay
     security = replay_transport._security
@@ -2312,6 +2345,8 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
                 quota_adapter=replay_quota,
                 transport=replay_transport,
                 lineage_authority=replay_lineage,
+                source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+                source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
             )
             with pytest.raises(SourceBrokerV2SagaIntegrityError):
                 forged_saga.advance(
@@ -2424,6 +2459,8 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
                 quota_adapter=replay_quota,
                 transport=replay_transport,
                 lineage_authority=replay_lineage,
+                source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+                source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
             )
             with pytest.raises(
                 SourceBrokerV2SagaIntegrityError,
@@ -2781,6 +2818,8 @@ def test_v2_saga_complete_reverifies_current_claim_and_rejects_new_generation(
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     old = current.current_claim
@@ -2811,6 +2850,8 @@ def test_v2_saga_deleted_local_db_recovers_authority_effects_without_redispatch(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     ).advance(request, now=NOW + timedelta(seconds=1))
     path.unlink()
 
@@ -2821,6 +2862,8 @@ def test_v2_saga_deleted_local_db_recovers_authority_effects_without_redispatch(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     ).advance(request, now=NOW + timedelta(seconds=2))
 
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
@@ -2873,6 +2916,8 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
         transport=transport,
         lineage_authority=lineage,
         executor_lease_seconds=0.05,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     captured = False
 
@@ -2911,6 +2956,8 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
         transport=transport,
         lineage_authority=lineage,
         executor_lease_seconds=0.05,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     ).advance(request, now=NOW + timedelta(seconds=3))
 
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
@@ -2941,6 +2988,8 @@ def test_v2_saga_rejects_rehashed_forged_claim_receipt_against_authority(
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     with sqlite3.connect(path) as connection:
@@ -2977,6 +3026,8 @@ def test_v2_saga_rejects_rehashed_forged_quota_receipt_against_native_chain(
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     with sqlite3.connect(path) as connection:
@@ -3012,6 +3063,8 @@ def test_v2_saga_rejects_rehashed_forged_lineage_receipt_against_authority(
         quota_adapter=quota,
         transport=_TestTransport(),
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     with sqlite3.connect(path) as connection:
@@ -3047,6 +3100,8 @@ def test_v2_saga_missing_native_source_after_local_complete_requires_repair(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=_TestLineageAuthority(),
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     transport._dispatch_results.clear()
@@ -3085,6 +3140,8 @@ def test_v2_saga_recovers_each_external_effect_after_commit_response_loss(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     target = SourceBrokerV2OutboxPhase(phase)
     fired = False
@@ -3107,6 +3164,8 @@ def test_v2_saga_recovers_each_external_effect_after_commit_response_loss(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
     if (
         first_result is not None
