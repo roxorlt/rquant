@@ -126,6 +126,78 @@ def _observe(seconds: float) -> float:
     return seconds * _observe_scale
 
 
+def _reap_leaked_spawned_child(child: multiprocessing.process.BaseProcess) -> None:
+    """Kill a child that outlived its case, and the session it may lead.
+
+    The children these cases start can be process-group leaders that ignore
+    SIGTERM, and their own descendants are not multiprocessing objects at all,
+    so `Process.kill()` alone would leave the rest of the tree behind. Kill the
+    group first, but only when this child really leads one of its own - passing
+    a non-leader's pid to `killpg` would name some unrelated group, and passing
+    the runner's own would kill pytest.
+    """
+    pid = child.pid
+    if pid is not None:
+        with suppress(BaseException):
+            if os.getpgid(pid) == pid != os.getpgid(0):
+                os.killpg(pid, signal.SIGKILL)
+    with suppress(BaseException):
+        child.kill()
+    with suppress(BaseException):
+        child.join(_observe(2))
+    with suppress(BaseException):
+        child.close()
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_leaked_spawned_child() -> Iterator[None]:
+    """Fail the case that leaks a spawned child instead of hanging the session.
+
+    `multiprocessing.util._exit_function` joins every *non-daemon* child at
+    interpreter shutdown, with no timeout, and `threading._shutdown` does the
+    same for non-daemon threads. Several cases here start children that install
+    SIG_IGN for SIGTERM deliberately, so one that escapes its own cleanup does
+    not just fail the next `active_children()` assertion in this module: it
+    parks the whole session in that atexit join *after* the summary has been
+    printed, which is how one CI shard displayed `5 failed, 3620 passed` and
+    then burned its 75-minute job limit with nothing left to report. Naming the
+    case that leaked - and reaping what it left, so the run still ends - keeps
+    that failure mode inside the case that caused it. The guard reports; it
+    does not excuse: a leak is a red result either way.
+    """
+    yield
+    # A case can return a moment before a child it has already terminated is
+    # reaped. `active_children()` joins whatever has exited, so poll for that
+    # rather than race it; anything still standing afterwards is a real leak.
+    deadline = time.monotonic() + _observe(2)
+    while (
+        multiprocessing.active_children() or _live_non_daemon_threads()
+    ) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    children = multiprocessing.active_children()
+    threads = _live_non_daemon_threads()
+    if not children and not threads:
+        return
+    described = sorted(f"child {child.name}(pid={child.pid})" for child in children)
+    described += sorted(f"thread {thread.name}" for thread in threads)
+    for child in children:
+        _reap_leaked_spawned_child(child)
+    pytest.fail(
+        "case leaked something that blocks interpreter exit: "
+        + ", ".join(described)
+        + " (multiprocessing and threading both join non-daemon survivors at "
+        "shutdown, with no timeout)"
+    )
+
+
+def _live_non_daemon_threads() -> tuple[threading.Thread, ...]:
+    return tuple(
+        thread
+        for thread in threading.enumerate()
+        if thread is not threading.main_thread() and thread.is_alive() and not thread.daemon
+    )
+
+
 # The markers those windows wait for are written by a spawned CPython that
 # re-imports this module first; on the machine these cases were written that is
 # roughly a second and a half, so a flat two seconds left almost no margin even
