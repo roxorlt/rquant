@@ -282,6 +282,8 @@ child = "\n".join((
     "publish_external_stage_receipt_from_environment",
     "from rquant.daily_pipeline_ledger import StageResult",
     f"marker = Path({str(root / 'external-effect')!r})",
+    f"go = Path({str(root / 'publish-go')!r})",
+    f"attempted = Path({str(root / 'publish-attempted')!r})",
     "marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)",
     "try:",
     "    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)",
@@ -290,11 +292,23 @@ child = "\n".join((
     "else:",
     "    first = True",
     "    os.write(fd, b'one'); os.fsync(fd); os.close(fd)",
-    "if first: time.sleep(0.8)",
-    "publish_external_stage_receipt_from_environment(",
-    "    StageResult(content_hash='a' * 64, evidence_hash='b' * 64),",
-    "    issued_at=datetime.now(UTC),",
-    ")",
+    # The orphan holds its receipt until the test has established that the fence
+    # is expired, rather than sleeping a constant and leaving the ordering to
+    # whichever of the two finishes first on the day.
+    "if first:",
+    "    deadline = time.monotonic() + 120",
+    "    while not go.exists() and time.monotonic() < deadline:",
+    "        time.sleep(0.02)",
+    "try:",
+    "    publish_external_stage_receipt_from_environment(",
+    "        StageResult(content_hash='a' * 64, evidence_hash='b' * 64),",
+    "        issued_at=datetime.now(UTC),",
+    "    )",
+    "finally:",
+    "    if first:",
+    # Reporting the attempt is what lets the test assert on a refusal that has
+    # provably already happened.
+    "        attempted.write_text('done')",
 ))
 manifest = DailyPipelineCommandManifest(
     mode=storage_profile.mode,
@@ -325,15 +339,7 @@ orchestrator = DailyPipelineOrchestrator(
     adapters=(manifest.adapter_for("capture"),),
     source_resolver=Source(),
     clock=lambda: datetime.now(UTC),
-    lease_for=timedelta(
-        milliseconds=int(
-            os.environ[
-                "RQUANT_TEST_RECOVER_LEASE_MS"
-                if sys.argv[1] == "recover"
-                else "RQUANT_TEST_LEASE_MS"
-            ]
-        )
-    ),
+    lease_for=timedelta(milliseconds=int(os.environ["RQUANT_TEST_LEASE_MS"])),
 )
 action = sys.argv[1]
 if action == "start":
@@ -366,25 +372,22 @@ else:
 def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -> None:
     driver = tmp_path / "expiring_fence_driver.py"
     _write_expiring_fence_driver(driver)
-    # One constant used to serve two leases with opposite requirements, which is
-    # why sizing it either way broke the other half of the case.
+    # One lease, one requirement: be long enough. It used to be two, pulling in
+    # opposite directions - the parent's had to be short (0.25s) so the fence
+    # expired before the orphan's 0.8s sleep ran out, the recovery's long enough
+    # to re-run the whole stage - and the short one lost. A lease is wall clock,
+    # and before the child is even spawned the parent has to get through a
+    # ledger recover, a claim, an effect prepare and a process-spec build; on
+    # this laptop that window is about 6ms, but on a loaded CI runner one commit
+    # inside it can stall past 250ms, at which point the pre-spawn heartbeat
+    # raises `LeaseLost: writer lease is stale`, no child is ever started, and
+    # the case fails on a marker that could not have appeared. The ordering the
+    # case actually needs - fence expired *before* the orphan publishes - is now
+    # a handshake below rather than a race between two constants, which is what
+    # frees this lease to be sized for the one thing left to get right.
     #
-    # The parent's lease has to be *short*. The stage child writes the external
-    # effect, sleeps 0.8s and only then tries to publish its receipt; the parent
-    # is killed in between, and what makes that publication fail is the fence
-    # having expired by the time the orphan gets there. Anything approaching
-    # 0.8s lets the orphan commit and the "nothing was committed" assertion
-    # fails. It does not need to cover the parent reaching the marker: if the
-    # parent loses its own lease after the child has written it, the case is in
-    # exactly the state it wants to be in.
-    parent_lease_seconds = 0.25
-    # The recovery's lease has to be *long*: it re-runs the whole stage, which
-    # is a fresh interpreter importing this surface, and it heartbeats while it
-    # does. Sized against a bare `python -I -S -c pass` it was half a second on
-    # a CI runner - a runner starts one about as fast as this laptop, so that
-    # measurement carried no signal - and `advance()` died with
-    # `LeaseLost: writer lease is stale`. The cost that actually varies is an
-    # interpreter start plus the import, so that is what gets measured.
+    # The cost that varies between hosts is an interpreter start plus this
+    # import, so that is what gets measured rather than guessed.
     started = time.monotonic()
     subprocess.run(
         (sys.executable, "-c", "import rquant.daily_pipeline_orchestrator"),
@@ -393,14 +396,13 @@ def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -
         timeout=120,
     )
     stage_start_seconds = time.monotonic() - started
-    recover_lease_seconds = max(1.0, 4 * stage_start_seconds)
+    lease_seconds = max(1.5, 6 * stage_start_seconds)
     environment = {
         **os.environ,
         "PYTHONPATH": _pythonpath(),
         "RQUANT_DAILY_EXTERNAL_RECEIPT_KEY_ID": "daily-stage-1",
         "RQUANT_DAILY_EXTERNAL_RECEIPT_SECRET": "s" * 32,
-        "RQUANT_TEST_LEASE_MS": str(int(parent_lease_seconds * 1000)),
-        "RQUANT_TEST_RECOVER_LEASE_MS": str(int(recover_lease_seconds * 1000)),
+        "RQUANT_TEST_LEASE_MS": str(int(lease_seconds * 1000)),
     }
     parent = subprocess.Popen(
         (sys.executable, str(driver), "start", str(tmp_path)),
@@ -418,12 +420,25 @@ def test_killed_parent_and_expired_fence_cannot_commit_receipt(tmp_path: Path) -
     assert marker.exists(), parent.communicate(timeout=2)[1]
     parent.kill()
     parent.wait(timeout=30)
-    # Wait out the lease the parent was holding, plus a margin, so the fence is
-    # provably expired - and past the orphaned stage child's 0.8s sleep, so its
-    # refused publication has provably already been attempted - before asserting
-    # that nothing was committed.
-    time.sleep(parent_lease_seconds + 1.3)
+    killed_at = time.monotonic()
+    # Every heartbeat sets the fence to its own clock plus the lease, and a
+    # reaped process cannot heartbeat again, so once this much wall clock has
+    # passed since the kill the fence is expired whatever the parent got up to
+    # before it died. No estimate of where in its lease it was is needed.
+    while time.monotonic() < killed_at + lease_seconds + 0.5:
+        time.sleep(0.02)
     storage_profile = _storage_profile(tmp_path)
+    assert not list(storage_profile.receipt_root.glob("*.json"))
+
+    # Only now is the orphan allowed to try, and it says when it has, so the
+    # assertion below is about a refusal that happened rather than one inferred
+    # from a sleep being long enough.
+    (tmp_path / "publish-go").write_text("go", encoding="utf-8")
+    attempted = tmp_path / "publish-attempted"
+    deadline = time.monotonic() + 120
+    while not attempted.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert attempted.exists(), "the orphaned stage child never attempted its publication"
     assert not list(storage_profile.receipt_root.glob("*.json"))
 
     recovered = subprocess.run(
