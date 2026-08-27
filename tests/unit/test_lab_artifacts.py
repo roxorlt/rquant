@@ -8,6 +8,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -7088,6 +7089,25 @@ def test_artifact_lifecycle_preserves_caller_and_unlock_failures(
     store.close()
 
 
+def _child_exit_detail(process: subprocess.Popen[bytes], label: str, log: Path) -> str:
+    """Say what a competitor's exit code was and show what it printed.
+
+    Both children inherit the parent's stdout and stderr by default, so a child that
+    dies of a signal contributes one orphan line to pytest's capture of the *parent*
+    with nothing naming it. A `-6` on its own is not a diagnosis.
+    """
+
+    code = process.returncode
+    detail = f"{label} exited with {code}"
+    if code is not None and code < 0:
+        with suppress(ValueError):
+            detail += f" ({signal.Signals(-code).name})"
+    captured = ""
+    with suppress(OSError):
+        captured = log.read_text(encoding="utf-8", errors="replace").strip()
+    return detail + (f"\n{label} output:\n{captured}" if captured else f"\n{label} printed nothing")
+
+
 def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     first_marker = tmp_path / "first-entered"
@@ -7103,6 +7123,10 @@ def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> 
         from tests.unit.test_lab_artifacts import _prepare_arguments
 
         root, marker, release, job_id, should_wait = map(Path, sys.argv[1:6])
+        # Written before the store exists. It is what separates "has not finished
+        # importing yet" from "has booted and the guard is holding it", which is the
+        # claim the assertion after the second spawn wants to make.
+        marker.with_suffix(".booted").write_text("booted", encoding="utf-8")
         store = LabJobArtifactStore(root)
         def guarded(_intent):
             marker.write_text("entered", encoding="utf-8")
@@ -7119,44 +7143,63 @@ def test_namespace_guard_serializes_prepare_across_processes(tmp_path: Path) -> 
         """
     )
     env = os.environ.copy()
-    process_a = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            script,
-            str(root),
-            str(first_marker),
-            str(release),
-            str(uuid4()),
-            "yes",
-        ],
-        cwd=Path(__file__).parents[2],
-        env=env,
-    )
+    # A fatal signal in a child prints a Python traceback rather than dying mute.
+    env["PYTHONFAULTHANDLER"] = "1"
+    first_log = tmp_path / "first.log"
+    second_log = tmp_path / "second.log"
+
+    def spawn(marker: Path, log: Path, should_wait: str) -> subprocess.Popen[bytes]:
+        # Each child's output goes to its own file instead of being inherited, so a
+        # child that dies is reported with what it printed rather than leaving one
+        # unattributed line in the parent's capture.
+        handle = log.open("wb")
+        try:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(root),
+                    str(marker),
+                    str(release),
+                    str(uuid4()),
+                    should_wait,
+                ],
+                cwd=Path(__file__).parents[2],
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+            )
+        finally:
+            handle.close()
+
+    process_a = spawn(first_marker, first_log, "yes")
     deadline = time.monotonic() + 10
     while not first_marker.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert first_marker.exists()
-    process_b = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            script,
-            str(root),
-            str(second_marker),
-            str(release),
-            str(uuid4()),
-            "no",
-        ],
-        cwd=Path(__file__).parents[2],
-        env=env,
-    )
+    assert first_marker.exists(), _child_exit_detail(process_a, "first competitor", first_log)
+
+    process_b = spawn(second_marker, second_log, "no")
+    # Anchor the "it did not get in" claim to the second competitor having booted.
+    # Its spawn and imports take 0.3-0.6s on a developer machine and longer on a
+    # loaded runner, so a bare sleep of 0.3s is thin: it discriminates here, but on
+    # a slow enough host it would be observing an interpreter that has not started
+    # rather than a guard that is holding one.
+    second_booted = second_marker.with_suffix(".booted")
+    deadline = time.monotonic() + 30
+    while not second_booted.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert second_booted.exists(), _child_exit_detail(process_b, "second competitor", second_log)
     time.sleep(0.3)
     assert second_marker.exists() is False
     release.write_text("go", encoding="utf-8")
 
-    assert process_a.wait(timeout=15) == 0
-    assert process_b.wait(timeout=15) == 0
+    assert process_a.wait(timeout=15) == 0, _child_exit_detail(
+        process_a, "first competitor", first_log
+    )
+    assert process_b.wait(timeout=15) == 0, _child_exit_detail(
+        process_b, "second competitor", second_log
+    )
     assert second_marker.exists() is True
 
 
