@@ -6423,18 +6423,31 @@ def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
         daemon=False,
     )
     process.start()
-    assert process.pid is not None
     group_id = process.pid
-    deadline = time.monotonic() + _observe(2)
-    while (
-        not child_pid_path.is_file() or not grandchild_pid_path.is_file()
-    ) and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert child_pid_path.is_file()
-    assert grandchild_pid_path.is_file()
-    grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
-
+    grandchild_pid: int | None = None
     try:
+        assert group_id is not None
+        # Both processes in this tree install SIG_IGN for SIGTERM on purpose,
+        # so the only thing that ever ends them is the group kill in the
+        # finally below - nothing between start() and that block may raise.
+        # This used to: the pids were parsed after waiting on is_file() alone,
+        # and a writer creates its pid file and fills it as two separate steps,
+        # so a loaded host can hand the reader a zero-byte file. A 2-vCPU CI
+        # runner did exactly that, int("") raised past the cleanup that had not
+        # been entered yet, and the escaped tree then failed every later
+        # active_children() assertion in this module and parked the session in
+        # multiprocessing's atexit join. _recorded_pid waits for content rather
+        # than for the directory entry, which is the fact the case needs; the
+        # budget is the module's own spawn scale rather than a flat literal,
+        # because what is being waited for is a spawned CPython re-importing
+        # this module and then forking once more before either write.
+        grandchild_pid = _recorded_pid(
+            grandchild_pid_path, timeout_seconds=_child_startups(2)
+        )
+        child_pid = _recorded_pid(child_pid_path, timeout_seconds=_child_startups(2))
+        assert child_pid is not None
+        assert grandchild_pid is not None
+
         started = time.monotonic()
         LabWorker._terminate_isolated_process(
             process,
@@ -6447,10 +6460,12 @@ def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
         _assert_process_gone(group_id)
         _assert_process_gone(grandchild_pid)
     finally:
-        with suppress(ProcessLookupError):
-            os.killpg(group_id, signal.SIGKILL)
-        _kill_process_if_alive(group_id)
-        _kill_process_if_alive(grandchild_pid)
+        if group_id is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(group_id, signal.SIGKILL)
+            _kill_process_if_alive(group_id)
+        if grandchild_pid is not None:
+            _kill_process_if_alive(grandchild_pid)
         with suppress(BaseException):
             process.join(1)
         with suppress(BaseException):
