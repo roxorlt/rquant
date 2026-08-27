@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -49,7 +50,11 @@ def _decision(*, decided_at: datetime, marker: str) -> PromotionDecision:
 
 
 def _insert(path: Path, decision: PromotionDecision, *, decided_at: datetime | None = None) -> None:
-    with sqlite3.connect(path) as connection:
+    # `with connection:` is a transaction scope, not a close. The connection it leaves open
+    # is only reachable through sqlite3's own statement-cache cycle, so it survives until a
+    # cyclic collection runs - and SQLite unlinks `-wal`/`-shm` when that finally happens.
+    # Which side of a publish that lands on decided whether this file passed.
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             """
             INSERT INTO promotion_decision(
@@ -145,11 +150,16 @@ def test_source_reader_rejects_future_payload_hidden_behind_visible_column(
 def test_authority_publisher_is_atomic_and_idempotent_for_same_observation(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "experiments.sqlite3"
-    ExperimentRegistry(path, managed_trust_root=tmp_path)
+    # A managed trust root is a directory whose identity, ctime included, must not move under
+    # the reader holding it. Publishing into a sibling of the registry inside that same root
+    # moves it on the first publish, which production never does and this test used to.
+    registry_root = tmp_path / "registry"
+    registry_root.mkdir(mode=0o700)
+    path = registry_root / "experiments.sqlite3"
+    ExperimentRegistry(path, managed_trust_root=registry_root)
     _insert(path, _decision(decided_at=NOW - timedelta(minutes=1), marker="6"))
     source = PromotionsSourceReader(
-        registry=ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path),
+        registry=ExperimentRegistryReadonlyReader(path, managed_trust_root=registry_root),
         limit=10,
     )
     authority_root = tmp_path / "authority"
@@ -179,10 +189,12 @@ def test_authority_publisher_is_atomic_and_idempotent_for_same_observation(
 
 
 def test_authority_publisher_rejects_wrong_dataset_owner(tmp_path: Path) -> None:
-    path = tmp_path / "experiments.sqlite3"
-    ExperimentRegistry(path, managed_trust_root=tmp_path)
+    registry_root = tmp_path / "registry"
+    registry_root.mkdir(mode=0o700)
+    path = registry_root / "experiments.sqlite3"
+    ExperimentRegistry(path, managed_trust_root=registry_root)
     source = PromotionsSourceReader(
-        registry=ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path),
+        registry=ExperimentRegistryReadonlyReader(path, managed_trust_root=registry_root),
         limit=10,
     )
 
