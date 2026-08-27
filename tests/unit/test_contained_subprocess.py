@@ -10,9 +10,11 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 
@@ -7416,42 +7418,169 @@ def _contained_run_baseline_seconds(cwd: Path) -> float:
     return time.monotonic() - started
 
 
+#: What one trial of the setsid probe observed, kept so a failure can show all of them.
+class _SetsidTrial(NamedTuple):
+    trial: int
+    started: bool
+    launched: bool
+    escaped: bool
+    raised: str | None
+    elapsed: float
+
+    @property
+    def verdict(self) -> str:
+        """Classify by what escaped, not by whether cleanup happened to get there first.
+
+        `escaped` wins over everything: the descendant writes that marker only after
+        outliving its sleep, so its presence means the property under test was broken
+        no matter what containment reported.
+
+        `launched` only disambiguates the trials containment said nothing about, and
+        deliberately does not outrank a report. Containment routinely kills the
+        descendant inside its own interpreter startup - measured at 10 to 23 of 25
+        trials on a two-CPU container - so an unwritten `launched` next to a raised
+        ContainedProcessError means detection was fast, not that the trial proved
+        nothing.
+        """
+
+        if self.escaped:
+            return "escaped"
+        if self.raised is not None:
+            return "caught"
+        if self.launched:
+            return "missed"
+        return "indeterminate"
+
+
+def _setsid_trial_table(rows: list[_SetsidTrial]) -> str:
+    lines = [
+        f"  {'trial':>5}  {'started':>7}  {'launched':>8}  "
+        f"{'escaped':>7}  {'elapsed':>7}  raised"
+    ]
+    for row in rows:
+        lines.append(
+            f"  {row.trial:>5}  {str(row.started):>7}  {str(row.launched):>8}  "
+            f"{str(row.escaped):>7}  {row.elapsed:>6.3f}s  {row.raised or '-'}  [{row.verdict}]"
+        )
+    return "\n".join(lines)
+
+
 def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
     tmp_path: Path,
 ) -> None:
+    # The descendant announces itself *before* sleeping and leaves the escape marker
+    # *after*, so the two are separable: "it never got going" and "it outlived
+    # containment" stop being the same observation.
+    descendant = (
+        "import pathlib,sys,time;"
+        "pathlib.Path(sys.argv[2]).write_text('x');"
+        "time.sleep(float(sys.argv[3]));"
+        "pathlib.Path(sys.argv[1]).write_text('x')"
+    )
     child = (
         "import os,subprocess,sys;"
         "from pathlib import Path;Path(sys.argv[2]).touch();"
         "os.environ.pop('RQUANT_CONTAINMENT_TOKEN',None);"
-        "subprocess.Popen([sys.executable,'-c',"
-        "\"import pathlib,sys,time;time.sleep(.08);pathlib.Path(sys.argv[1]).write_text('x')\","
-        "sys.argv[1]],start_new_session=True);os._exit(0)"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[5],"
+        "sys.argv[1],sys.argv[3],sys.argv[4]],start_new_session=True);os._exit(0)"
     )
-    markers: list[Path] = []
 
+    baseline = _contained_run_baseline_seconds(tmp_path)
     # The trial starts a CPython that spawns a second one and exits; containment
     # then has to notice the orphan and kill it. Budget that as a multiple of
-    # what one contained run costs here, plus the descendant's own 0.08s sleep,
-    # so the assertion stays "containment caught it" on every machine instead of
-    # decaying into "the deadline expired first".
-    per_trial_budget = max(0.6, 6 * _contained_run_baseline_seconds(tmp_path) + 0.3)
+    # what one contained run costs here, so the assertion stays "containment
+    # caught it" on every machine instead of decaying into "the deadline expired
+    # first".
+    per_trial_budget = max(0.6, 6 * baseline + 0.3)
+    # The descendant's own lifetime, and the one number this case used to get wrong.
+    # It was a flat 0.08s while containment's discovery scan lands a measured
+    # 0.060s (median) to 0.161s (max) after `run_contained` is entered, on an
+    # otherwise idle two-CPU container. Those are the same band: the scan beat the
+    # descendant by tens of milliseconds and no more, and when it lost, the
+    # descendant had by definition finished its sleep and written the escape
+    # marker. Deriving the sleep from the same measured baseline keeps the
+    # descendant alive well past any scan this host is going to do, which is what
+    # makes "containment killed it" the thing being observed.
+    descendant_sleep = max(1.0, 10 * baseline)
 
-    trials = 1 if sys.platform == "darwin" else 25
-    for trial in range(trials):
+    def run_trial(trial: int) -> _SetsidTrial:
         marker = tmp_path / f"escaped-{trial}"
         started = tmp_path / f"started-{trial}"
-        markers.append(marker)
-        with pytest.raises(contained.ContainedProcessError):
+        launched = tmp_path / f"launched-{trial}"
+        raised: str | None = None
+        entered = time.monotonic()
+        try:
             contained.run_contained(
-                [sys.executable, "-c", child, str(marker), str(started)],
+                [
+                    sys.executable,
+                    "-c",
+                    child,
+                    str(marker),
+                    str(started),
+                    str(launched),
+                    str(descendant_sleep),
+                    descendant,
+                ],
                 cwd=tmp_path,
                 deadline_monotonic=time.monotonic() + per_trial_budget,
                 may_spawn_background_descendants=True,
             )
-        assert started.exists() is (sys.platform != "darwin")
+        except contained.ContainedProcessError as error:
+            raised = type(error).__name__
+        elapsed = time.monotonic() - entered
+        # Markers are read after the loop, once every descendant has had its full
+        # sleep to write one; only `started` and `launched` are already settled here.
+        return _SetsidTrial(
+            trial=trial,
+            started=started.exists(),
+            launched=launched.exists(),
+            escaped=False,
+            raised=raised,
+            elapsed=elapsed,
+        )
 
-    time.sleep(0.15)
-    assert not any(marker.exists() for marker in markers)
+    if sys.platform == "darwin":
+        # Darwin refuses before the child body runs at all, so it has no descendant
+        # to classify: the contract here is the refusal itself plus an untouched
+        # `started`. Unchanged.
+        observed = run_trial(0)
+        assert observed.raised is not None
+        assert observed.started is False
+        time.sleep(0.15)
+        assert not (tmp_path / "escaped-0").exists()
+        return
+
+    trials = 25
+    rows = [run_trial(trial) for trial in range(trials)]
+    # One wait, after the last trial, long enough that any descendant still sleeping
+    # has written its marker. Reading the markers before this would report an escape
+    # as a miss.
+    time.sleep(descendant_sleep + 0.5)
+    rows = [row._replace(escaped=(tmp_path / f"escaped-{row.trial}").exists()) for row in rows]
+
+    table = _setsid_trial_table(rows)
+    verdicts = Counter(row.verdict for row in rows)
+    escaped = verdicts["escaped"]
+    missed = verdicts["missed"]
+    indeterminate = verdicts["indeterminate"]
+    caught = verdicts["caught"]
+
+    # The safety property, unchanged and now actually reached: this case used to
+    # abort at the first trial containment did not report, so the one assertion that
+    # says "nothing outlived containment" never ran.
+    assert escaped == 0, f"a setsid descendant outlived containment\n{table}"
+    # Announced itself, left no marker, and containment said nothing: not an escape,
+    # but not an explained trial either.
+    assert missed == 0, f"a descendant ran unreported and unkilled\n{table}"
+    # Nothing reported, nothing announced, nothing escaped: the trial observed no
+    # descendant at all and is evidence of neither containment nor a leak. Measured
+    # at 0 of 25 across the container runs, so two is slack rather than a licence.
+    assert indeterminate <= 2, f"too many trials proved nothing\n{table}"
+    # Implied by the three above today (25 - indeterminate >= 23). Kept explicit so
+    # that loosening the indeterminate bound later cannot quietly hollow the case out
+    # into "at least one trial did something".
+    assert caught >= 20, f"containment caught too few of the descendants\n{table}"
+    assert all(row.started for row in rows), f"a trial's child never ran\n{table}"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin pipe identity contract")
