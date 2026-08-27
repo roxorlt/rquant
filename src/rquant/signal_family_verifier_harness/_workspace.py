@@ -547,15 +547,15 @@ def require_declared_sequence(value: Any, *, field: str) -> Sequence[Any]:
 
 __all__ = [
     "GENERATION_PREFIX",
-    "replay_sql_script",
     "MAX_GENERATION_FIXTURE_BYTES",
     "MAX_MATERIALIZED_FILES",
-    "VOLATILE_SUFFIXES",
     "MAX_MATERIALIZED_FILE_BYTES",
     "RUNTIME_PREFIX",
-    "WORKSPACE_PREFIX",
+    "VOLATILE_SUFFIXES",
     "VectorWorkspace",
+    "WORKSPACE_PREFIX",
     "WorkspaceError",
+    "replay_sql_script",
     "require_declared_sequence",
     "tree_digest",
 ]

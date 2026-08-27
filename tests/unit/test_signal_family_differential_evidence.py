@@ -2085,7 +2085,14 @@ def test_hard_linked_cache_entry_is_refused(tmp_path: Path) -> None:
 
 
 def test_cache_entry_owned_by_another_identity_is_refused(tmp_path: Path) -> None:
-    """The expected owner is configurable so a root-owned cache is a value change, not a fork."""
+    """The expected owner is configurable so a root-owned cache is a value change, not a fork.
+
+    What refuses here is the *ancestor* owner predicate: `expected_uid` also seeds
+    `allowed_ancestor_uids`, and the cache directory's real owner is not in that set once the
+    expected identity moves. The final file's own `allowed_final_uids` is not what this case
+    exercises and has no direct coverage - reaching it needs an entry owned by someone else
+    under an ancestor chain that is still trusted, which cannot be built without root.
+    """
 
     directory = _cache_dir(tmp_path)
     policy = _policy()
@@ -2281,6 +2288,12 @@ def test_a_wrongly_bound_cache_entry_blocks_and_is_never_redownloaded(
     A retained entry that is not bound to this target says the deployment host is not what it
     should be. Unlike a superseded attempt, that is not staleness, so it blocks where it stands
     instead of being quietly repaired by a download.
+
+    Rewriting either field in place leaves `candidate_binding_digest` and `evidence_digest`
+    disagreeing with it, so the refusal comes from the wire model's own validator, one layer
+    ahead of the gate's binding comparison. Both layers are fail-closed and the observable
+    outcome under test - blocked, entry untouched, no artifact fetched - is the same either
+    way; the gate-layer comparison itself is pinned by the run-identity cases.
     """
 
     repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)

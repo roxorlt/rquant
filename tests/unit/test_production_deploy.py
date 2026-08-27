@@ -3406,6 +3406,8 @@ class TestR07Bootstrap:
             tree_sha=R07_TARGET_TREE,
             policy=enforced,
         )
+        planted_bytes = planted.read_bytes()
+        planted_mtime = planted.lstat().st_mtime_ns
         verifier = _RecordingVerifier()
         runner = FakeRunner(responses)
         transport = _EmptyTransport()
@@ -3419,6 +3421,9 @@ class TestR07Bootstrap:
             )
 
         assert planted.is_file()
+        # A refused hit writes nothing: not the entry it refused, not a repaired one over it.
+        assert planted.read_bytes() == planted_bytes
+        assert planted.lstat().st_mtime_ns == planted_mtime
         assert verifier.calls == []
         assert transport.requests == [r07_deploy_evidence.workflow_runs_url(_sha("b"))]
         assert not any(call[:2] == ("git", "merge") for call in runner.calls)
