@@ -687,10 +687,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
-    # Amended per Codex round-2 order 2026-08-25, item P1-1: the frozen baseline is the
-    # actual merge base of origin/main and the candidate, not a branch-local ancestor.
-    assert BASELINE_COMMIT_SHA == "9699827be09ca22479f6741e820722399fe40244"
-    assert BASELINE_TREE_SHA == "56bf300f296815acca414a1c7f5c2769ee5d466a"
+    # Release B freezes the baseline to the merge commit PR #155 left on main. It is the
+    # merge base of the endpoints an R07 run states, not something rediscovered from a ref.
+    assert BASELINE_COMMIT_SHA == "2df97ed6045c4ab7efc676f31c742c97ae2193f4"
+    assert BASELINE_TREE_SHA == "1e145e8a2b84ea43934bdf5a1cdca5b591445cab"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -724,15 +724,23 @@ def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
         )
 
 
-def test_frozen_baseline_is_the_actual_merge_base_of_origin_main_and_the_candidate() -> None:
-    merge_base = subprocess.run(
-        ["git", "-C", str(ROOT), "merge-base", "origin/main", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+def test_the_frozen_baseline_is_the_merge_base_this_checkout_resolves_for_itself() -> None:
+    """Renamed from ``..._of_origin_main_and_the_candidate``: that name described the bug.
 
-    assert merge_base == BASELINE_COMMIT_SHA
+    Asking ``origin/main`` is exactly what broke. Once the pull request that freezes a
+    baseline merges, ``origin/main`` is the candidate, ``merge_base(origin/main, HEAD)`` is
+    HEAD, and the assertion can only ever have held before the merge it existed to protect.
+    The question it was really asking - what does this candidate's reviewed diff start from -
+    is answered here from the candidate's own structure, so it gives the same answer on a
+    branch tip, in a fresh clone, and on main itself right after the merge.
+    """
+
+    resolution = differential_gate.resolve_baseline_context(ROOT, environ={})
+
+    assert resolution.baseline_commit_sha == BASELINE_COMMIT_SHA
+    assert resolution.baseline_tree_sha == BASELINE_TREE_SHA
+    assert resolution.context.candidate_sha == _head()
+    assert resolution.context.base_source in ("git_first_parent", "frozen_baseline_fallback")
     assert (
         subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{BASELINE_COMMIT_SHA}^{{tree}}"],
@@ -752,31 +760,83 @@ def test_frozen_baseline_is_the_actual_merge_base_of_origin_main_and_the_candida
     assert len(diff_paths) == len(load_policy(POLICY_PATH).allowed_diff)
 
 
-def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor() -> None:
+def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Git hard constraint 3: the pre-amendment baseline must stay reachable.
+
+    The construction this test used before is gone, and the reason matters. Under the old
+    baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
+    from the baseline while having lost the historical one, and passing the baseline itself as
+    the candidate reached exactly that state. Release B's baseline ``2df97ed`` does have
+    ``45d0b57c`` behind it, so on this repository the historical check is now implied by the
+    baseline-descent check and cannot be reached through it - asserted below, so nobody reads
+    the change as the constraint having been relaxed.
+
+    The constraint itself still has to hold, and it is the second line of defence against a
+    squash: a squash's tree is byte-identical to the merge's, and only ancestry and parent
+    structure tell them apart. So the check is exercised against a historical baseline the
+    candidate demonstrably lacks - a dangling orphan written into a throwaway clone - which
+    drives the same code path with the same policy and the same real candidate.
+    """
+
     policy = load_policy(POLICY_PATH)
-    assert (
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(ROOT),
-                "merge-base",
-                "--is-ancestor",
-                HISTORICAL_BASELINE_COMMIT_SHA,
-                BASELINE_COMMIT_SHA,
-            ],
-            check=False,
-            capture_output=True,
-        ).returncode
-        != 0
-    )
+    candidate = _head()
+    candidate_tree = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{candidate}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    repo = _shared_clone(tmp_path / "historical-baseline")
+
+    def _is_ancestor(ancestor: str, descendant: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+                check=False,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+
+    assert _is_ancestor(HISTORICAL_BASELINE_COMMIT_SHA, BASELINE_COMMIT_SHA)
+    assert _is_ancestor(BASELINE_COMMIT_SHA, candidate)
+    assert _is_ancestor(HISTORICAL_BASELINE_COMMIT_SHA, candidate)
+
+    orphan = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "commit-tree",
+            BASELINE_TREE_SHA,
+            "-m",
+            "a historical baseline this candidate never contained",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "r07-historical-fixture",
+            "GIT_AUTHOR_EMAIL": "r07@example.invalid",
+            "GIT_COMMITTER_NAME": "r07-historical-fixture",
+            "GIT_COMMITTER_EMAIL": "r07@example.invalid",
+            "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+        },
+    ).stdout.strip()
+    assert not _is_ancestor(orphan, candidate)
+    monkeypatch.setattr(differential_gate, "HISTORICAL_BASELINE_COMMIT_SHA", orphan)
 
     with pytest.raises(ValueError, match="historical baseline"):
         differential_gate.verify_candidate_gate(
-            ROOT,
+            repo,
             policy=policy,
-            candidate_commit=BASELINE_COMMIT_SHA,
-            candidate_tree=BASELINE_TREE_SHA,
+            candidate_commit=candidate,
+            candidate_tree=candidate_tree,
         )
 
 
@@ -899,9 +959,29 @@ def test_diff_scope_forbidden_definition_scan_covers_every_diffed_source_file(
 ) -> None:
     policy = load_policy(POLICY_PATH)
     scanned = differential_gate.diff_scope_source_paths(policy)
+    # Re-aimed for Release B. These two used to read "the scan is broader than the frozen
+    # nine" and "it contains all nine", which were true of the previous baseline's 282-file
+    # diff and are shape facts about that particular change set, not properties of the scan.
+    # Refreezing the baseline shrinks the diff to this release's own edits, and neither
+    # sentence then has a truth value. The property they were protecting - the scan is
+    # derived from the reviewed diff, drops nothing from it and invents nothing - is stated
+    # directly instead, so it holds for any allowlist.
+    expected = {
+        entry.path
+        for entry in policy.allowed_diff
+        if entry.status != "D"
+        and entry.path.startswith("src/rquant/")
+        and entry.path.endswith(".py")
+    }
 
-    assert len(scanned) > len(policy.forbidden_definition_universe.source_files)
-    assert set(policy.forbidden_definition_universe.source_files) <= set(scanned)
+    assert expected
+    assert set(scanned) == expected
+    assert scanned == tuple(sorted(scanned))
+    assert len(scanned) == len(set(scanned))
+    # Whatever part of the frozen nine this diff touches must land inside the scan; the old
+    # unconditional containment was the same claim on a diff that happened to touch all nine.
+    universe = set(policy.forbidden_definition_universe.source_files)
+    assert universe & expected == universe & set(scanned)
     assert all(path.startswith("src/rquant/") and path.endswith(".py") for path in scanned)
     assert verify_diff_scope_forbidden_definitions(ROOT, _head(), policy).passed
 
@@ -1385,9 +1465,37 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     }
     assert "scripts/r07_ci_evidence.py" in architecture_paths
     assert ".github/workflows/ci.yml" in architecture_paths
-    # The deploy-time gate entrypoint runs in the production chain but lives outside the
-    # declaration-scanned universe, so it keeps the same category as the CI producer script.
-    assert "scripts/r07_deploy_gate.py" in architecture_paths
+    # Re-aimed for Release B. This used to name scripts/r07_deploy_gate.py, which was in the
+    # previous baseline's diff because that release created it; a refrozen baseline drops it
+    # from the allowlist and the sentence loses its truth value. The property it stood for -
+    # tooling that runs in the production chain but lives outside the declaration-scanned
+    # universe is categorized architecture, never production - is stated as the invariant it
+    # always was. The frozen category rules themselves are pinned by
+    # tests/unit/test_r07_policy_regenerate.py::test_diff_category_rules_are_frozen.
+    tooling = {
+        entry.path
+        for entry in policy.allowed_diff
+        if entry.path.startswith(("scripts/", ".github/", "deploy/", "docs/"))
+    }
+    assert tooling
+    assert tooling <= architecture_paths
+    assert not {path for path in architecture_paths if path.startswith(("src/", "tests/"))}
+    # The negative control: an allowlist that quietly files one tooling path under a
+    # declaration-scanned category really does break the containment above.
+    relabelled = policy.model_copy(
+        update={
+            "allowed_diff": tuple(
+                entry.model_copy(update={"category": "production"})
+                if entry.path.startswith("scripts/")
+                else entry
+                for entry in policy.allowed_diff
+            )
+        }
+    )
+    relabelled_architecture = {
+        entry.path for entry in relabelled.allowed_diff if entry.category == "architecture"
+    }
+    assert not tooling <= relabelled_architecture
 
 
 class _GitCommandRecorder:
@@ -1850,21 +1958,6 @@ def test_the_branch_tip_fallback_is_labelled_locally_and_refused_inside_github_a
             environ={"GITHUB_ACTIONS": "true"},
             expected_baseline=identities["main_tip"],
         )
-
-
-def test_the_real_checkout_resolves_the_frozen_baseline_from_its_own_head() -> None:
-    """The smoke that has to hold wherever main happens to be sitting.
-
-    It asks HEAD what it descends from rather than asking a ref where main is, so it gives the
-    same answer on a branch tip, on a fresh clone, and on main itself right after the merge.
-    """
-
-    resolution = differential_gate.resolve_baseline_context(ROOT, environ={})
-
-    assert resolution.baseline_commit_sha == BASELINE_COMMIT_SHA
-    assert resolution.baseline_tree_sha == BASELINE_TREE_SHA
-    assert resolution.context.base_source in ("git_first_parent", "frozen_baseline_fallback")
-    assert resolution.context.candidate_sha == _head()
 
 
 def test_the_baseline_context_model_rejects_a_malformed_or_mismatched_declaration() -> None:

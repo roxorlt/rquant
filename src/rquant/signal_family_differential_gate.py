@@ -36,11 +36,15 @@ from pydantic import (
 
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
-# Amended per Codex round-2 order 2026-08-25, item P1-1: the frozen baseline is the exact
-# merge base of origin/main and the candidate, so baseline..candidate is the complete pull
-# request merge face rather than a branch-local subset.
-BASELINE_COMMIT_SHA = "9699827be09ca22479f6741e820722399fe40244"
-BASELINE_TREE_SHA = "56bf300f296815acca414a1c7f5c2769ee5d466a"
+# The frozen baseline is the merge base of the two commits an R07 run states, so
+# baseline..candidate is the complete pull request merge face rather than a branch-local
+# subset. Release B freezes it to the merge commit PR #155 left on main. Which two commits
+# meet here is decided by resolve_baseline_context below, from explicit endpoints; it used to
+# be rediscovered as merge_base(origin/main, candidate), and that stopped having an answer the
+# moment the merge that froze it landed, because origin/main then *was* the candidate.
+# Refreezing this pair and regenerating the policy is the last commit of every pull request.
+BASELINE_COMMIT_SHA = "2df97ed6045c4ab7efc676f31c742c97ae2193f4"
+BASELINE_TREE_SHA = "1e145e8a2b84ea43934bdf5a1cdca5b591445cab"
 # The pre-amendment baseline. It is not an origin/main ancestor, so it can no longer anchor
 # the diff, but the Git hard constraint requires it to stay reachable from every candidate.
 HISTORICAL_BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
