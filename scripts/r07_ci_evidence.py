@@ -26,6 +26,7 @@ from rquant.signal_family_differential_gate import (
     R07PolicyV1,
     R07StaticGateResult,
     VerifiedR07DrGateEvidenceV1,
+    baseline_resolution_summary,
     boundary_probe_results_digest,
     candidate_gate_digest,
     canonical_evidence_json_bytes,
@@ -195,6 +196,7 @@ def require_push_main_merge_provenance(
         candidate_sha=candidate_commit,
         event_before_sha=event_before_sha,
     )
+    print(baseline_resolution_summary(resolution), file=sys.stderr)
     return resolve_merge_provenance(
         repo,
         candidate_commit=resolution.context.candidate_sha,
@@ -584,12 +586,13 @@ def main(arguments: list[str] | None = None) -> int:
         # against it equals the base for any base at all and proves nothing. The diff and
         # tree work stays on the checkout, which is that merge ref: it is what main will
         # look like after the merge, which is the thing the allowlist describes.
-        resolve_baseline_context(
+        resolution = resolve_baseline_context(
             repository,
             event=args.event,
             base_sha=args.base_sha,
             candidate_sha=args.candidate_sha,
         )
+        print(baseline_resolution_summary(resolution), file=sys.stderr)
         _execute_exact_gate(repository, candidate_commit=commit, candidate_tree=tree)
         return 0
     context = _context_from_args(args)

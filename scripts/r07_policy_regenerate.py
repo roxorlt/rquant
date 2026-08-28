@@ -35,6 +35,7 @@ from rquant.signal_family_differential_gate import (
     EXPECTED_FORBIDDEN_SOURCE_FILES,
     POLICY_RELATIVE_PATH,
     R07PolicyV1,
+    baseline_resolution_summary,
     boundary_manifest_digest,
     fixture_manifest_digest,
     normalized_ast_sha256,
@@ -479,6 +480,9 @@ def main(arguments: list[str] | None = None) -> int:
         candidate_sha=args.candidate_sha,
         event_before_sha=args.event_before_sha,
     )
+    # Both the generation and the --check path go through here, so a log always records which
+    # of the four sources answered. They produce identical bytes, and one of them is weaker.
+    print(baseline_resolution_summary(resolution), file=sys.stderr)
     regenerated = regenerate_policy_bytes(
         repo,
         policy_path.read_bytes(),

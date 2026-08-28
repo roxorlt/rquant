@@ -1448,6 +1448,24 @@ class R07BaselineResolutionV1:
     baseline_tree_sha: str
 
 
+def baseline_resolution_summary(resolution: R07BaselineResolutionV1) -> str:
+    """One line naming which of the four sources decided this run's baseline.
+
+    The four sources are not equally strong - ``frozen_baseline_fallback`` degenerates the
+    merge-base equality into ancestry - and they all produce identical policy bytes, so
+    without this line a log cannot tell which one ran. Only SHAs and a fixed enum, so it is
+    safe in a public CI log.
+    """
+
+    if type(resolution) is not R07BaselineResolutionV1:
+        raise TypeError("exact R07BaselineResolutionV1 is required")
+    context = resolution.context
+    return (
+        f"R07 baseline: event={context.event} base={resolution.baseline_commit_sha} "
+        f"candidate={context.candidate_sha} base_source={context.base_source}"
+    )
+
+
 def _optional_argument_sha(value: str | None, *, field: str) -> str | None:
     """A workflow expression that resolves to nothing substitutes an empty string."""
 

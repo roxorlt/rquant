@@ -381,3 +381,80 @@ def test_the_generator_takes_its_baseline_from_the_stated_context_and_refuses_a_
             ]
         )
     assert not (tmp_path / "never.json").exists()
+
+
+def test_the_generator_reports_which_source_decided_the_baseline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The four sources produce identical policy bytes and are not equally strong.
+
+    ``frozen_baseline_fallback`` degenerates the merge-base equality into ancestry, so a run
+    that took it proved less than a run that did not - and nothing in the output said which
+    had happened. A label nobody can read is a label the next refactor deletes as unused.
+    """
+
+    def summary_lines() -> list[str]:
+        return [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if line.startswith("R07 baseline: ")
+        ]
+
+    # What CI passes: both endpoints stated on the command line.
+    assert (
+        regenerate.main(
+            [
+                "--repo",
+                str(ROOT),
+                "--event",
+                "pull_request",
+                "--base-sha",
+                BASELINE_COMMIT_SHA,
+                "--candidate-sha",
+                _head(),
+                "--check",
+            ]
+        )
+        == 0
+    )
+    stated = summary_lines()
+    assert len(stated) == 1
+    assert f"event=pull_request base={BASELINE_COMMIT_SHA} candidate={_head()}" in stated[0]
+    assert "base_source=explicit_cli" in stated[0]
+    assert "frozen_baseline_fallback" not in stated[0]
+
+    # The other CI shape: nothing on the command line, the endpoints read off the event.
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "pull_request": {
+                    "base": {"sha": BASELINE_COMMIT_SHA},
+                    "head": {"sha": _head()},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+
+    assert regenerate.main(["--repo", str(ROOT), "--check"]) == 0
+    from_event = summary_lines()
+    assert len(from_event) == 1
+    assert "base_source=github_event_payload" in from_event[0]
+    assert "frozen_baseline_fallback" not in from_event[0]
+
+    # The contrast that makes the line worth printing: the same command outside CI takes the
+    # weaker branch-tip source and now says so.
+    monkeypatch.delenv("GITHUB_ACTIONS")
+    monkeypatch.delenv("GITHUB_EVENT_NAME")
+    monkeypatch.delenv("GITHUB_EVENT_PATH")
+
+    assert regenerate.main(["--repo", str(ROOT), "--check"]) == 0
+    local = summary_lines()
+    assert len(local) == 1
+    assert "base_source=frozen_baseline_fallback" in local[0]

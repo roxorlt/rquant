@@ -808,3 +808,34 @@ def test_the_pull_request_validation_states_its_base_or_refuses_to_run(tmp_path:
                 tree,
             ]
         )
+
+
+def test_the_push_producer_reports_which_source_decided_the_baseline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same line on the path that actually produces deployable evidence.
+
+    ``run-python`` and ``aggregate`` both reach the resolver through
+    ``require_push_main_merge_provenance``, so the CI log records that the interval start came
+    from the pushed commit's own first parent and not from the branch-tip fallback, which is
+    refused inside GitHub Actions and would be a bug if it ever appeared here.
+    """
+
+    repo = _shared_clone(tmp_path / "push-summary")
+    candidate = _synthetic_merge_candidate(repo)
+
+    ci_evidence.require_push_main_merge_provenance(
+        repo,
+        candidate_commit=candidate,
+        event_before_sha=differential_gate.BASELINE_COMMIT_SHA,
+    )
+
+    lines = [
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("R07 baseline: ")
+    ]
+    assert len(lines) == 1
+    assert f"event=push base={differential_gate.BASELINE_COMMIT_SHA}" in lines[0]
+    assert f"candidate={candidate}" in lines[0]
+    assert "base_source=git_first_parent" in lines[0]
+    assert "frozen_baseline_fallback" not in lines[0]
