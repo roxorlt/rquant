@@ -40,7 +40,14 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    合并产生的 merge commit `M` 的第一 parent 是合并前的 main tip，push-to-main 的 R07 job 要求
    第一 parent 恰等于冻结 baseline；只要 baseline 停在更早的 commit，`M` 的 R07 job 就确定性
    失败，evidence job 因 `needs` 不满足而 skip，**该 commit 永远拿不到 evidence artifact，也就
-   永远不能成为部署目标**。具体操作：
+   永远不能成为部署目标**。
+
+   **不必等到 main push 才发现**：`tests/unit/test_r07_policy_regenerate.py`（`--check` 与幂等
+   生成）和 `tests/unit/test_signal_family_differential_gate.py`（冻结常量、allowlist 等式）都在
+   full-suite 分片的 manifest 里，而 PR 上 checkout 的是 GitHub 合成的合并 ref，它的第一 parent
+   就是当时的 base tip——所以 baseline 一旦过期，**PR 阶段的 full-suite 分片就会先红**。
+   看到这两个文件在 PR 上红，第一件事是查 baseline 是否过期，而不是查测试本身。
+   main push 阶段才轮到 R07 三个 job 与 evidence 确定性失败。具体操作：
 
    ```bash
    # 在 PR 分支上，所有代码改动定稿之后
