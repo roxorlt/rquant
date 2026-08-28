@@ -242,8 +242,9 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    回滚同理：先回滚 arbiter，再回滚 pyz / profile。arbiter 的 `.sha256` 由安装脚本现算，
    代码与文档都不冻结 arbiter 哈希。
 
-   **启动开销（生产口径）**。用户已选定 **A1**（admission 走 wrapper，每次都完整校验；若改选
-   A2 另行通知）。该探针让每次 research unit 启动多做 2 次完整 generation 校验（wrapper 父进程
+   **启动开销（生产口径）**。A1 为默认方案（协调者推荐，已向用户说明生产口径代价：每次研究
+   服务启动约 +7 s、retention timer 折合约 34 min/天；截至本轮回执用户尚未明确答复，若改选
+   A2 将以追加提交处理）。该探针让每次 research unit 启动多做 2 次完整 generation 校验（wrapper 父进程
    1 次 + 冻结 bootstrap 在 generation 解释器里 1 次），每次逐条 SHA-256 约 666 MiB。
    离线 arm64 容器、页缓存热的条件下 p95 = 0.889 s/次，**该数字不适用于生产**：生产机
    `82.156.0.68` 是 Intel Xeon Platinum 8255C（Cascade Lake，2 vCPU），`/proc/cpuinfo` 无

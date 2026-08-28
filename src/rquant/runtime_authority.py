@@ -90,7 +90,8 @@ class RuntimeRolePolicy:
 
     `control_root` is the root-owned prefix the wrapper appends the authorised instance
     label to. An empty one means the role takes no caller argv at all — the `daily` HYBRID
-    adapter of `authority.md` L200, whose mapping is "caller argv count 0".
+    adapter of the "WRAP-P1-07 Daily Role And Application Environment" section in
+    `production-interpreter-authority.md`, whose mapping is "caller argv count 0".
     """
 
     name: str
