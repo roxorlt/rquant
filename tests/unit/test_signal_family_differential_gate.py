@@ -1622,12 +1622,15 @@ def test_baseline_context_resolves_a_pull_request_from_its_two_explicit_endpoint
     assert resolution.context.event == "pull_request"
     assert resolution.context.base_source == "explicit_cli"
     assert resolution.context.candidate_sha == identities["feature"]
-    assert resolution.baseline_tree_sha == subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--verify", f"{identities['main_tip']}^{{tree}}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    assert (
+        resolution.baseline_tree_sha
+        == subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", f"{identities['main_tip']}^{{tree}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
 
 
 def test_a_pull_request_proves_its_merge_base_against_the_head_not_the_synthesized_merge_ref(

@@ -588,17 +588,13 @@ def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
     assert len(set(expected)) == len(expected)
     assert gate_execution.collected == gate_execution.passed == len(expected)
     assert gate_execution.skipped == gate_execution.deselected == 0
-    assert gate_execution.collected == ci_evidence.expected_gate_check_total(
-        gate_execution.policy
-    )
+    assert gate_execution.collected == ci_evidence.expected_gate_check_total(gate_execution.policy)
     assert gate_execution.collected != 20
     assert len(gate_execution.static_result.checks) == len(
         differential_gate.FIXED_STATIC_CHECK_NAMES
-    ) + len(
-        gate_execution.policy.root_snapshots
-    ) + len(gate_execution.policy.production_declarations) + len(
-        gate_execution.policy.boundary_probes
-    )
+    ) + len(gate_execution.policy.root_snapshots) + len(
+        gate_execution.policy.production_declarations
+    ) + len(gate_execution.policy.boundary_probes)
     assert len(gate_execution.boundary_results) == ci_evidence.BOUNDARY_PROBE_COUNT
 
 
@@ -685,14 +681,12 @@ def test_the_workflow_states_both_pull_request_endpoints_and_the_push_interval_s
     for job_id in ("r07-differential-gate-py311", "r07-differential-gate-py312"):
         steps = jobs[job_id]["steps"]
         validate = next(
-            step
-            for step in steps
-            if str(step.get("name", "")).startswith("Validate pull request")
+            step for step in steps if str(step.get("name", "")).startswith("Validate pull request")
         )
         assert "--event 'pull_request'" in validate["run"]
         assert "--base-sha '${{ github.event.pull_request.base.sha }}'" in validate["run"]
         assert "--candidate-sha '${{ github.event.pull_request.head.sha }}'" in validate["run"]
-        assert "--candidate-sha \"${GITHUB_SHA}\"" not in validate["run"]
+        assert '--candidate-sha "${GITHUB_SHA}"' not in validate["run"]
 
         produce = next(
             step for step in steps if str(step.get("name", "")).startswith("Produce bound Python")
