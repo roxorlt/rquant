@@ -20,7 +20,11 @@ _PYTHON_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
 _WRAPPER_EXECUTABLE = "/home/lighthouse/rquant/scripts/run-lab-daemon.py"
 _WORKLOAD_ARBITER = "/usr/local/libexec/rquant-workload-arbiter"
 _RUNTIME_CODE_CONFIG = Path("/etc/rquant/runtime-code-bootstrap.json")
-_RUNTIME_CODE_MIGRATION = Path("/etc/rquant/runtime-code-migration.json")
+#: The migration request the retired `ExecStartPre` dry-run named on the unit line. The
+#: gate now runs inside the verified generation (`rquant.lab_formal_runtime_entry`), so
+#: the path has to be a frozen constant: a protected unit contributes a role literal and
+#: nothing else, and may no longer name a file.
+RUNTIME_CODE_MIGRATION_REQUEST_PATH = Path("/etc/rquant/runtime-code-migration.json")
 _RUNTIME_CODE_TRUSTED_BASE = Path("/etc/rquant")
 _DEPLOYMENT_LOCK_PATH = Path("/run/rquant-lab-claim-finalizer/deployment.lock")
 _ENVIRONMENT_FILE = Path("/etc/rquant/lab-claim-finalizer.env")
@@ -328,7 +332,7 @@ def inspect_formal_systemd_service(
         "--runtime-code-authority-gid",
         "0",
         "--request",
-        str(_RUNTIME_CODE_MIGRATION),
+        str(RUNTIME_CODE_MIGRATION_REQUEST_PATH),
         "--format",
         "json",
     )
@@ -383,6 +387,7 @@ def inspect_formal_systemd_service(
 
 __all__ = [
     "FORMAL_RUNTIME_WRAPPER_CONTRACT",
+    "RUNTIME_CODE_MIGRATION_REQUEST_PATH",
     "FormalRuntimeBootstrapBinding",
     "FormalRuntimeCommandError",
     "FormalRuntimeWrapperBinding",
