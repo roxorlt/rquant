@@ -333,6 +333,68 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         control_root="/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources",
         once=False,
     ),
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01. Not a unit's role:
+    # `deploy/libexec/rquant-workload-arbiter` execs this one itself, in place of the
+    # `.venv/bin/python -m rquant.workload_isolation research-admission` it runs today, so
+    # the probe is verified code rather than whatever the checkout happens to hold. It takes
+    # no instance and no control root, which is why the entry it wants has to be named by
+    # `module_arguments`: the arbiter passes the role literal and nothing else.
+    RuntimeRolePolicy(
+        "workload_admission",
+        "rquant.workload_isolation",
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=False,
+        control_root="",
+        module_arguments=("research-admission",),
+    ),
+)
+
+#: Roles that are settled but not yet registered, because their module has not landed.
+#:
+#: Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. `lab_claim_finalizer`
+#: is the other half of this change: `deploy/systemd/rquant-lab-claim-finalizer.service`
+#: still runs `.venv/bin/rquant` and `scripts/run-lab-daemon.py` out of the checkout, and the
+#: code that validates the deployment is the code being validated. Moving it behind the
+#: wrapper needs `rquant.lab_formal_runtime_entry`, a module that does not exist yet — and a
+#: registered role whose module is missing does not wait quietly, it fails the module-entry
+#: contract. So the entry waits here: nothing reads this tuple, `PROTECTED_ROLES` does not
+#: name the role, and a profile that declared it would be refused. What it buys is that the
+#: two roles touching these same lines are settled once, in one place, instead of colliding
+#: in two branches. The module's own change moves this entry into the policy above and adds
+#: the name to `PROTECTED_ROLES`.
+#:
+#: The environment allowlist is the wrapper's whole answer to "what can this unit's
+#: `Environment=` reach": `build_child_environment` starts from an empty dictionary. The
+#: three names below the shared locale set are the unit's own `Environment=` line. Whatever
+#: `/etc/rquant/lab-claim-finalizer.env` adds is not in this repository and must be read off
+#: the host before the role is registered, or those names are dropped in silence.
+_PENDING_ROLE_POLICIES: tuple[RuntimeRolePolicy, ...] = (
+    RuntimeRolePolicy(
+        "lab_claim_finalizer",
+        "rquant.lab_formal_runtime_entry",
+        (
+            *_RUNTIME_ROLE_ENVIRONMENT,
+            "APP_ENV",
+            "RQUANT_DISABLE_DOTENV",
+            "PYTHONDONTWRITEBYTECODE",
+        ),
+        instanced=False,
+        control_root="",
+        module_arguments=(
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
+            "--deployment-lock-path",
+            "/run/rquant-lab-claim-finalizer/deployment.lock",
+            "--",
+            "lab-claim-finalizer",
+        ),
+    ),
 )
 
 #: The frozen grammar of a systemd template label. `runtime_deployment_bundle` already

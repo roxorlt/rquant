@@ -88,6 +88,11 @@ PROTECTED_ROLES = (
     "signal_router",
     "strategy_live",
     "watchlist_quote_source",
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01: the first role that
+    # no unit names. `deploy/libexec/rquant-workload-arbiter` execs it itself, before the
+    # unit's own child, so the research admission probe stops being checkout code that runs
+    # ahead of any verification.
+    "workload_admission",
 )
 
 _PROFILE_FIELDS = frozenset(
@@ -624,15 +629,22 @@ def derive_module_argv(
     generation id from the slot — and the manifest must be a file the generation's own full
     manifest covers, so it is hash-verified along with the rest of the code.
 
-    A role whose policy declares no control root receives no argv at all. That is the
-    `daily` HYBRID adapter of `authority.md` L200, whose mapping is "caller argv count 0".
+    A role whose policy declares no control root receives no derived argv: there is no
+    instance label to resolve a service manifest against. It still receives its own frozen
+    `module_arguments`, which are literals of the root-owned profile rather than anything
+    derived, and are the only way an arbiter-invoked role such as `workload_admission` names
+    the entry it wants. A role with neither is the `daily` HYBRID adapter of `authority.md`
+    L200, whose mapping is "caller argv count 0".
     """
 
+    extra = profile_role.get("module_arguments")
+    if type(extra) is not list or any(type(item) is not str or not item for item in extra):
+        raise _reject("the runtime profile role module arguments are invalid")
     control_root = profile_role.get("control_root")
     if type(control_root) is not str:
         raise _reject("the runtime profile role control root is invalid")
     if not control_root:
-        return ()
+        return tuple(extra)
     if not control_root.startswith("/") or ".." in control_root.split("/"):
         raise _reject("the runtime profile role control root is not one absolute path")
     if instance is None:
@@ -682,9 +694,6 @@ def derive_module_argv(
         raise _reject("the runtime profile role once flag is invalid")
     if once:
         argv.append("--once")
-    extra = profile_role.get("module_arguments")
-    if type(extra) is not list or any(type(item) is not str or not item for item in extra):
-        raise _reject("the runtime profile role module arguments are invalid")
     argv.extend(extra)
     return tuple(argv)
 
