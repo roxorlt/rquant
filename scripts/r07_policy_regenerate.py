@@ -1,13 +1,20 @@
 """Regenerate the frozen R07 policy from the exact merge base and candidate.
 
-Amended per Codex round-2 order 2026-08-25, item P1-1. The reviewed allowlist is the
-complete ``merge_base(origin/main, candidate)..candidate`` raw Git diff, which is far too
+The reviewed allowlist is the complete ``baseline..candidate`` raw Git diff, which is far too
 large to maintain by hand, and every derived digest has to move with it. This generator is
 the one repeatable way to produce those bytes: it is idempotent, its category rules are
 frozen in code, and ``--check`` re-derives the policy and refuses to differ, so CI and
 review can prove the checked-in fixture is exactly what the rules produce.
 
-Every later work package that adds, removes, or edits a repository file must run it again.
+Amended for Release B: the baseline is no longer rediscovered here by asking a branch where
+it is. It comes from ``resolve_baseline_context``, which reads explicit endpoints, the GitHub
+event, or HEAD's own parents, and never a remote-tracking ref. Rediscovering it from
+``origin/main`` inside the checkout was self-defeating, because the merge that freezes a
+baseline is also what makes ``origin/main`` equal to the candidate.
+
+Every later work package that adds, removes, or edits a repository file must run it again,
+and it must be run on Python 3.11 or 3.12: ``ast.dump`` drops default-valued fields from 3.13
+on, so a 3.13 run produces a self-consistent policy that CI rejects.
 """
 
 from __future__ import annotations
@@ -31,11 +38,12 @@ from rquant.signal_family_differential_gate import (
     boundary_manifest_digest,
     fixture_manifest_digest,
     normalized_ast_sha256,
+    resolve_baseline_context,
     source_file_snapshot_from_source,
 )
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
-DEFAULT_BASELINE_REF = "origin/main"
+SUPPORTED_GENERATOR_PYTHON = ((3, 11), (3, 12))
 _ARCHITECTURE_DIRECTORIES = ("deploy/", "scripts/", "docs/", ".github/")
 _ARCHITECTURE_ROOT_FILES = (
     ".env.example",
@@ -337,22 +345,26 @@ def regenerate_policy_bytes(
     repo: Path,
     policy_bytes: bytes,
     *,
-    baseline_ref: str = DEFAULT_BASELINE_REF,
+    baseline_commit: str,
     candidate: str | None = "HEAD",
     refresh_boundary_snapshots: bool = False,
     policy_path: Path | None = None,
 ) -> bytes:
-    """Re-derive every baseline-, diff-, and source-derived policy field, then re-digest."""
+    """Re-derive every baseline-, diff-, and source-derived policy field, then re-digest.
+
+    ``baseline_commit`` is decided by ``resolve_baseline_context`` and handed in already
+    proven. Re-checking it against the module constant here is defence in depth: it is the
+    difference between a policy nobody can validate and one that refuses to be written.
+    """
 
     payload = strict_canonical_json_loads(policy_bytes)
     if not isinstance(payload, dict):
         raise ValueError("R07 policy must be a JSON object")
-    head = _resolve(repo, "HEAD" if candidate is None else candidate)
-    baseline = _git(repo, "merge-base", _resolve(repo, baseline_ref), head).decode().strip()
+    baseline = _resolve(repo, baseline_commit)
     if baseline != BASELINE_COMMIT_SHA:
         raise ValueError(
-            "the frozen baseline constant is no longer merge_base(origin/main, candidate): "
-            f"{baseline}"
+            "the R07 policy can only be generated against the frozen baseline constant; "
+            f"this run resolved {baseline}"
         )
     read = _source_reader(repo, candidate)
     payload["baseline_commit_sha"] = baseline
@@ -412,8 +424,15 @@ def _parse_args(arguments: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--policy", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--baseline-ref", default=DEFAULT_BASELINE_REF)
-    parser.add_argument("--candidate", default="HEAD")
+    parser.add_argument(
+        "--event",
+        choices=("pull_request", "push"),
+        default=None,
+        help="state the R07 context explicitly instead of deriving it from HEAD's parents",
+    )
+    parser.add_argument("--base-sha", default=None)
+    parser.add_argument("--candidate-sha", default=None)
+    parser.add_argument("--event-before-sha", default=None)
     parser.add_argument(
         "--staged",
         action="store_true",
@@ -428,16 +447,43 @@ def _parse_args(arguments: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(arguments)
 
 
+def require_supported_interpreter(version: tuple[int, int]) -> None:
+    """Refuse to generate policy bytes on an interpreter whose AST dump is not the frozen one.
+
+    ``ast.dump`` omits fields equal to their default from Python 3.13 on, so every normalized
+    AST digest in the policy shifts. A 3.13 run is the dangerous case precisely because it is
+    self-consistent: it regenerates cleanly, ``--check`` passes against its own output, and
+    only the 3.11 and 3.12 jobs in CI ever see the drift.
+    """
+
+    if version not in SUPPORTED_GENERATOR_PYTHON:
+        print(
+            "R07 policy generation requires Python 3.11 or 3.12; this interpreter is "
+            f"{version[0]}.{version[1]}. ast.dump changed which fields it emits, so every "
+            "normalized AST digest in the policy would drift and CI would reject the bytes.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def main(arguments: list[str] | None = None) -> int:
+    require_supported_interpreter(sys.version_info[:2])
     args = _parse_args(arguments)
     repo = Path(args.repo).resolve(strict=True)
     policy_path = Path(args.policy) if args.policy is not None else repo / POLICY_RELATIVE_PATH
     output_path = Path(args.output) if args.output is not None else policy_path
+    resolution = resolve_baseline_context(
+        repo,
+        event=args.event,
+        base_sha=args.base_sha,
+        candidate_sha=args.candidate_sha,
+        event_before_sha=args.event_before_sha,
+    )
     regenerated = regenerate_policy_bytes(
         repo,
         policy_path.read_bytes(),
-        baseline_ref=args.baseline_ref,
-        candidate=None if args.staged else args.candidate,
+        baseline_commit=resolution.baseline_commit_sha,
+        candidate=None if args.staged else resolution.context.candidate_sha,
         refresh_boundary_snapshots=args.refresh_boundary_snapshots,
         policy_path=policy_path,
     )
