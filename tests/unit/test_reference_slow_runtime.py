@@ -1168,7 +1168,11 @@ def test_success_persists_authenticated_final_durable_completion_evidence(
 ) -> None:
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
-    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    # 01:24:51 is the earliest start the captured batch's available_at permits. It
+    # leaves the real monotonic guard armed with a 9 s budget instead of 1 s, which
+    # is what the success path needs: the guard must stay live, but a slow disk must
+    # not be able to trip it.
+    before = datetime(2026, 7, 31, 1, 24, 51, tzinfo=UTC)
 
     result = publish_reference_slow_batches(
         spool=spool,
