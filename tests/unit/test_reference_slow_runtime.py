@@ -22,7 +22,7 @@ from rquant.live_contracts import (
     ConsumerCursor,
     LiveChannel,
 )
-from rquant.live_spool import LiveBatchSpool
+from rquant.live_spool import LiveBatchSpool, LiveSpoolIntegrityError
 from rquant.reference_data_registry import (
     ReferenceDataset,
     ReferenceDataUnavailableError,
@@ -513,17 +513,21 @@ def _exit_after_receipt_intent_fsync(
         source_read_only=True,
     )
     registry = ReferenceRegistry(Path(registry_path))
-    wall_start = datetime(2026, 7, 31, 1, 24, 59, 700_000, tzinfo=UTC)
-    monotonic_start = time.monotonic_ns()
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    crossed = False
     original_clear = spool._clear_completion_receipt_intent
 
-    def realtime_clock() -> datetime:
-        elapsed_microseconds = (time.monotonic_ns() - monotonic_start) // 1_000
-        return wall_start + timedelta(microseconds=elapsed_microseconds)
+    def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint before the completion-intent
+        # cleanup observes `before`, so no amount of fsync or CPU stall can expire
+        # the publication early. Only `crossing_cleanup` moves it past 09:25.
+        return late if crossed else before
 
     def exit_late_after_durable_unlink(publication_id: str) -> None:
+        nonlocal crossed
         original_clear(publication_id)
-        time.sleep(0.35)
+        crossed = True
         os._exit(86)
 
     spool._clear_completion_receipt_intent = exit_late_after_durable_unlink  # type: ignore[method-assign]
@@ -532,9 +536,9 @@ def _exit_after_receipt_intent_fsync(
         registry=registry,
         calendar=_calendar(),
         consumer_id="reference-publisher",
-        observed_at=wall_start,
+        observed_at=before,
         producer_commit=COMMIT,
-        completion_clock=realtime_clock,
+        completion_clock=phase_clock,
     )
     os._exit(87)
 
@@ -944,30 +948,41 @@ def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_rel
 ) -> None:
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
-    wall_start = datetime(2026, 7, 31, 1, 24, 59, 700_000, tzinfo=UTC)
-    monotonic_start = time.monotonic()
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    crossed = False
+    cleared = False
     original_clear = spool._clear_completion_receipt_intent
 
-    def realtime_clock() -> datetime:
-        return wall_start + timedelta(seconds=time.monotonic() - monotonic_start)
+    def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint before the completion-intent
+        # cleanup observes `before`, so no amount of fsync or CPU stall can expire
+        # the publication early. Only `crossing_cleanup` moves it past 09:25.
+        return late if crossed else before
 
-    def delayed_cleanup(publication_id: str) -> None:
+    def crossing_cleanup(publication_id: str) -> None:
+        nonlocal crossed, cleared
         original_clear(publication_id)
-        time.sleep(0.35)
+        cleared = True
+        crossed = True
 
-    monkeypatch.setattr(spool, "_clear_completion_receipt_intent", delayed_cleanup)
+    monkeypatch.setattr(spool, "_clear_completion_receipt_intent", crossing_cleanup)
 
-    with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25"):
+    with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25") as excinfo:
         publish_reference_slow_batches(
             spool=spool,
             registry=registry,
             calendar=_calendar(),
             consumer_id="reference-publisher",
-            observed_at=wall_start,
+            observed_at=before,
             producer_commit=COMMIT,
-            completion_clock=realtime_clock,
+            completion_clock=phase_clock,
         )
 
+    assert cleared, "the deadline expired before the completion-intent cleanup was reached"
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LiveSpoolIntegrityError)
+    assert str(cause) == "completion receipt completed after deadline"
     assert _registry_publication_counts(registry) == (0, 0, 0)
     assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
     evidence_files = tuple(spool.completion_evidence_root.glob("*.json"))
@@ -1014,6 +1029,10 @@ def test_real_exit_after_late_receipt_intent_unlink_recovers_by_rolling_back(
         cursor_root=cursor_root,
         source_read_only=True,
     )
+    # The crash left a durable completion receipt behind but no durable evidence,
+    # so recovery must refuse the receipt and roll the publication back.
+    assert tuple(reopened_spool.completion_receipt_root.glob("*.json")) != ()
+    assert tuple(reopened_spool.completion_evidence_root.glob("*.json")) == ()
     assert _registry_publication_counts(reopened_registry) == (0, 0, 0)
     assert reopened_spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
 
