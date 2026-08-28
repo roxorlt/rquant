@@ -2784,6 +2784,55 @@ def test_ready_attestation_status_advance_is_a_recoverable_concurrency_outcome(
     )
 
 
+def test_identity_mismatch_outranks_status_advance_in_ready_attestation(
+    tmp_path: Path,
+) -> None:
+    """Identity is checked first, so a forged identity never becomes recoverable.
+
+    The two guards in validate_finalizer_publication_attestation are ordered, not
+    interchangeable: only "identity matches but the stage moved on" is a
+    concurrency outcome. Swapping them lets a mismatched identity be reported as
+    a recoverable transition and be handed to the bounded recovery loop, so this
+    case pins the order rather than just the pair of error codes.
+    """
+
+    seed, store, held = _prepared_authority_finalizer(tmp_path)
+    assert seed.finalize(held.identity).status == "published"
+    trust_verifier = seed._authority._trust_verifier  # noqa: SLF001
+    assert trust_verifier is not None
+
+    forged = held.identity.model_copy(
+        update={"claim_generation": held.identity.claim_generation + 1}
+    )
+    assert forged != held.identity
+    assert forged.attempt_id == held.identity.attempt_id
+
+    # Both guards would fire for this identity: the record is PUBLISHED while a
+    # READY_TO_PUBLISH attestation is requested. Identity must win.
+    with pytest.raises(
+        ClaimPublicationConflictError, match="finalizer_publication_signature_invalid"
+    ):
+        store.validate_finalizer_ready_attestation(
+            forged,
+            trust_verifier=trust_verifier,
+            now=NOW + timedelta(seconds=5),
+        )
+    assert not LabClaimFinalizer._is_recoverable_concurrency_error(  # noqa: SLF001
+        ClaimPublicationConflictError("finalizer_publication_signature_invalid")
+    )
+
+    # The same forged identity is equally unrecoverable against the stage the
+    # record actually reached, so the guard is about identity, not about status.
+    with pytest.raises(
+        ClaimPublicationConflictError, match="finalizer_publication_signature_invalid"
+    ):
+        store.validate_finalizer_published_attestation(
+            forged,
+            trust_verifier=trust_verifier,
+            now=NOW + timedelta(seconds=5),
+        )
+
+
 def test_tampered_ready_attestation_stays_fail_closed_under_concurrency(tmp_path: Path) -> None:
     """A forged READY attestation blocks at its own stage and never enters recovery."""
 
