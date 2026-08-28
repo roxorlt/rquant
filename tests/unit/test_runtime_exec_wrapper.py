@@ -1106,6 +1106,35 @@ class TestEveryProtectedUnitResolves:
         }
         assert len(signatures) == len(resolved), "each unit instance must be distinguishable"
 
+    def test_the_whole_policy_world_is_built_from_the_role_table_alone(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Adding a role must be one line in the policy, not a line here as well.
+
+        R3-A and R3-B each add a role to the same table, and this file is where all three
+        packages meet. Everything the world needs — which roles the profile and the slot
+        declare, which module sources the generation carries, which instance labels are
+        authorised and which service manifests answer to them — is derived from the policy,
+        and this holds it that way rather than trusting that nobody hand-lists a role again.
+        """
+
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        world = _build_world(tmp_path, whole_policy=True)
+        package = world.generation_path / "app" / "rquant"
+        names = {entry.name for entry in PRODUCTION_ROLE_POLICY}
+
+        assert set(world._profile_roles()) == names
+        assert set(world._slot_roles(world.generation_path)) == names
+        for entry in PRODUCTION_ROLE_POLICY:
+            source = package / f"{entry.module.rsplit('.', 1)[-1]}.py"
+            assert source.is_file(), entry.module
+            labels = world._profile_roles()[entry.name]["instances"]
+            assert bool(labels) is entry.instanced, entry.name
+            for label in labels:
+                assert (world.generation_path / "manifests" / f"{label}.json").is_file()
+
     def test_every_unit_role_is_declared_by_the_expanded_policy(self) -> None:
         from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 
