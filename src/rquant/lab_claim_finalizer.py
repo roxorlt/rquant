@@ -8,8 +8,9 @@ It has no scheduler, provider, queue, runtime, adapter, or worker authority.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -249,7 +250,106 @@ def _system_clock() -> datetime:
     return datetime.now(UTC)
 
 
-def _redacted_reason(exc: Exception) -> str:
+# Closed stage vocabulary for blocked results. Every value is a compile-time
+# literal: no path, identity, byte, key, or exception message ever reaches it.
+_FinalizerStage = Literal[
+    "record",
+    "issue_ready",
+    "ready_attestation",
+    "ready_claim",
+    "spool_publish",
+    "publish_cas",
+    "recovery",
+    "observe",
+]
+
+
+class _FinalizerStageCursor:
+    """Per-call stage marker. One instance per finalize() frame, never shared."""
+
+    __slots__ = ("stage",)
+
+    def __init__(self, stage: _FinalizerStage = "record") -> None:
+        self.stage: _FinalizerStage = stage
+
+
+# Closed (exception class, error code) -> category allowlist, covering every code
+# LabClaimFinalizer.finalize() can surface. Without it the class-name rule below
+# redacts every ClaimPublicationConflictError into "authority_conflict" and every
+# LabClaimFinalizerError into "finalization_blocked", which made a ledger
+# signature failure, a dispatch-tamper detection and a real fencing failure
+# indistinguishable. Keys are matched on the exact type, so the
+# LabClaimFinalizerObservationDegradedError subclass needs its own entry.
+# test_every_finalize_reachable_error_code_is_classified_by_the_allowlist keeps
+# this table in step with the source.
+_REDACTED_CATEGORIES: Mapping[tuple[type[BaseException], str], str] = MappingProxyType(
+    {
+        # --- ledger CAS / transition outcomes ---
+        (ClaimPublicationConflictError, "publication_cas_conflict"): "cas_conflict",
+        (ClaimPublicationConflictError, "attempt_identity_conflict"): "identity_conflict",
+        (ClaimPublicationConflictError, "ready_content_conflict"): "ready_content_conflict",
+        (ClaimPublicationConflictError, "ready_binding_conflict"): "ready_binding_conflict",
+        (ClaimPublicationConflictError, "published_receipt_conflict"): "receipt_conflict",
+        (InvalidClaimPublicationTransitionError, "transition_not_allowed"): "finalization_blocked",
+        (
+            InvalidClaimPublicationTransitionError,
+            "terminal_status_immutable",
+        ): "finalization_blocked",
+        # --- finalizer capability and trust chain ---
+        (ClaimPublicationConflictError, "finalizer_authority_conflict"): "authority_conflict",
+        (ClaimPublicationConflictError, "finalizer_authority_missing"): "authority_missing",
+        (ClaimPublicationConflictError, "finalizer_external_trust_invalid"): "trust_invalid",
+        (
+            ClaimPublicationConflictError,
+            "finalizer_publication_signature_invalid",
+        ): "signature_invalid",
+        (
+            ClaimPublicationConflictError,
+            "finalizer_publication_signature_missing",
+        ): "signature_missing",
+        # --- current-claim authority guard around the C and D CAS ---
+        (
+            ClaimPublicationConflictError,
+            "current_authority_guard_untrusted",
+        ): "authority_guard_untrusted",
+        (
+            ClaimPublicationConflictError,
+            "current_authority_guard_dispatch_tampered",
+        ): "authority_guard_tampered",
+        # --- source stage evidence consulted while issuing READY ---
+        (
+            ClaimPublicationConflictError,
+            "source_stage_authority_conflict",
+        ): "source_stage_authority_conflict",
+        (
+            ClaimPublicationConflictError,
+            "ready_source_stage_conflict",
+        ): "ready_source_stage_conflict",
+        # --- finalizer-local guards, including the worker D gate ---
+        (LabClaimFinalizerError, "publication_missing"): "publication_missing",
+        (LabClaimFinalizerError, "publication_not_published"): "publication_not_published",
+        (LabClaimFinalizerError, "publication_signature_invalid"): "signature_invalid",
+        (LabClaimFinalizerError, "published_claim_conflict"): "published_claim_conflict",
+        (LabClaimFinalizerError, "published_receipt_invalid"): "receipt_invalid",
+        (LabClaimFinalizerError, "publication_trust_verifier_missing"): "trust_verifier_missing",
+        (LabClaimFinalizerError, "finalizer_trust_verifier_missing"): "trust_verifier_missing",
+        (LabClaimFinalizerError, "concurrent_terminal_invalid"): "concurrent_terminal_invalid",
+        (LabClaimFinalizerError, "claim_preimage_invalid"): "claim_preimage_invalid",
+        (LabClaimFinalizerError, "claim_preimage_conflict"): "claim_preimage_conflict",
+        (LabClaimFinalizerError, "source_stage_binding_invalid"): "source_stage_binding_invalid",
+        (LabClaimFinalizerError, "source_stage_evidence_invalid"): "source_stage_evidence_invalid",
+        (
+            LabClaimFinalizerObservationDegradedError,
+            "observation_persistence_degraded",
+        ): "observation_degraded",
+    }
+)
+
+
+def _redacted_category(exc: Exception) -> str:
+    mapped = _REDACTED_CATEGORIES.get((type(exc), str(exc)))
+    if mapped is not None:
+        return mapped
     if isinstance(exc, SourceOperationContractError):
         return "current_claim_evidence_invalid"
     if isinstance(exc, (ValueError, TypeError, UnicodeDecodeError)):
@@ -258,6 +358,12 @@ def _redacted_reason(exc: Exception) -> str:
     if "conflict" in name or "fenced" in name or "stale" in name:
         return "authority_conflict"
     return "finalization_blocked"
+
+
+def _redacted_reason(exc: Exception, *, stage: _FinalizerStage) -> str:
+    """Stage-tagged redacted reason: closed stage enum x closed category set."""
+
+    return f"{stage}_{_redacted_category(exc)}"
 
 
 class LabClaimPublicationWorkerVerifier:
@@ -360,6 +466,10 @@ class LabClaimFinalizer:
     @staticmethod
     def _after_issue_before_ready(_record: LabClaimPublicationRecord) -> None:
         """Test-only crash boundary after issue_plan_once and before C."""
+
+    @staticmethod
+    def _before_ready_attestation(_record: LabClaimPublicationRecord) -> None:
+        """Test-only crash boundary after C and before the D pre-checks."""
 
     @staticmethod
     def _after_ready_before_spool(_record: LabClaimPublicationRecord) -> None:
@@ -496,8 +606,14 @@ class LabClaimFinalizer:
         )
 
     def _publish_ready(
-        self, record: LabClaimPublicationRecord, *, now: datetime
+        self,
+        record: LabClaimPublicationRecord,
+        *,
+        now: datetime,
+        stage: _FinalizerStageCursor,
     ) -> LabClaimPublicationMutation:
+        stage.stage = "ready_attestation"
+        self._before_ready_attestation(record)
         if self._authority._trust_verifier is None:  # noqa: SLF001
             raise LabClaimFinalizerError("finalizer_trust_verifier_missing")
         self._ledger.validate_finalizer_ready_attestation(
@@ -505,6 +621,7 @@ class LabClaimFinalizer:
             trust_verifier=self._authority._trust_verifier,  # noqa: SLF001
             now=now,
         )
+        stage.stage = "ready_claim"
         final_claim = self._ledger.validate_ready_claim_for_publication(
             record.identity,
             current_claim_authority=self._current_claim_authority,
@@ -512,6 +629,7 @@ class LabClaimFinalizer:
             audience=self._audience,
             now=now,
         )
+        stage.stage = "spool_publish"
         self._after_ready_before_spool(record)
         entry = self._spool.publish(final_claim)
         self._after_spool_before_sidecar(record)
@@ -522,6 +640,7 @@ class LabClaimFinalizer:
             committed_at=now,
         )
         receipt = typed_receipt.to_publish_receipt()
+        stage.stage = "publish_cas"
         self._after_sidecar_before_published(record)
         return self._ledger.finalizer_publish_claim_publication(
             record.identity,
@@ -584,8 +703,15 @@ class LabClaimFinalizer:
         A PUBLISHED reread is accepted only through the complete worker D gate.
         A READY reread may run the existing D saga once; a second race gets one
         final reread. No other state is a recoverable concurrency outcome.
+
+        Failures raised from here are reported under the "recovery" stage: the
+        cursor below is deliberately not the caller's, and nothing ever reads it.
+        It exists only to absorb the sub-stage writes _publish_ready performs, so
+        that recovery failures stay flattened to "recovery" instead of surfacing
+        whichever pre-check they happened to die in.
         """
 
+        discarded_stage = _FinalizerStageCursor("recovery")
         for attempt in range(2):
             now = self._clock()
             record = self._record(identity)
@@ -599,7 +725,7 @@ class LabClaimFinalizer:
             if record.status is not ClaimPublicationStatus.READY_TO_PUBLISH:
                 return None
             try:
-                mutation = self._publish_ready(record, now=now)
+                mutation = self._publish_ready(record, now=now, stage=discarded_stage)
             except (
                 ClaimPublicationConflictError,
                 InvalidClaimPublicationTransitionError,
@@ -634,10 +760,12 @@ class LabClaimFinalizer:
     def finalize(self, identity: LabClaimPublicationIdentity) -> LabClaimFinalizerResult:
         """Drive one attempt to D. A failed check leaves the ledger and spool unchanged."""
 
+        cursor = _FinalizerStageCursor()
         try:
             record = self._record(identity)
             now = self._clock()
             if record.status is ClaimPublicationStatus.SOURCE_QUEUED:
+                cursor.stage = "issue_ready"
                 mutation = self._issue_ready(record, now=now)
                 self._metrics = self._metrics.model_copy(
                     update={
@@ -647,6 +775,7 @@ class LabClaimFinalizer:
                     }
                 )
                 record = mutation.record
+                cursor.stage = "observe"
                 self._observe(
                     identity,
                     event_type="replayed" if mutation.replayed else "ready",
@@ -654,7 +783,7 @@ class LabClaimFinalizer:
                     now=now,
                 )
             if record.status is ClaimPublicationStatus.READY_TO_PUBLISH:
-                mutation = self._publish_ready(record, now=now)
+                mutation = self._publish_ready(record, now=now, stage=cursor)
                 self._metrics = self._metrics.model_copy(
                     update={
                         "publish_transitions": self._metrics.publish_transitions
@@ -662,6 +791,7 @@ class LabClaimFinalizer:
                         "replays": self._metrics.replays + int(mutation.replayed),
                     }
                 )
+                cursor.stage = "observe"
                 self._observe(
                     identity,
                     event_type="replayed" if mutation.replayed else "published",
@@ -676,6 +806,7 @@ class LabClaimFinalizer:
                     record=mutation.record,
                 )
             if record.status is ClaimPublicationStatus.PUBLISHED:
+                cursor.stage = "publish_cas"
                 return self._published_replay(
                     identity,
                     record,
@@ -690,6 +821,8 @@ class LabClaimFinalizer:
             )
         except Exception as exc:
             if self._is_recoverable_concurrency_error(exc):
+                primary_stage = cursor.stage
+                cursor.stage = "recovery"
                 try:
                     recovered = self._concurrent_terminal_recovery(identity)
                 except Exception as recovery_exc:
@@ -697,16 +830,18 @@ class LabClaimFinalizer:
                 else:
                     if recovered is not None:
                         return recovered
+                    cursor.stage = primary_stage
             self._metrics = self._metrics.model_copy(update={"blocked": self._metrics.blocked + 1})
             now = self._clock()
+            reason = _redacted_reason(exc, stage=cursor.stage)
             self._observe(
                 identity,
                 event_type="blocked",
-                reason_code=_redacted_reason(exc),
+                reason_code=reason,
                 now=now,
             )
             return LabClaimFinalizerResult(
                 attempt_id=identity.attempt_id,
                 status="blocked",
-                reason=_redacted_reason(exc),
+                reason=reason,
             )

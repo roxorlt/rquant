@@ -2,28 +2,35 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
+from typing import get_args
 from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+import rquant.lab_claim_finalizer as lab_claim_finalizer
 import rquant.lab_jobs as lab_jobs
 import rquant.lab_source_stage as lab_source_stage
 from rquant.current_claim_authority import PersistentCurrentClaimAuthority
 from rquant.lab_claim_finalizer import (
     LabClaimFinalizer,
+    LabClaimFinalizerError,
+    LabClaimFinalizerObservationDegradedError,
     LabClaimPublicationFinalizerAuthorityIssuer,
     LabClaimPublicationWorkerVerifier,
 )
 from rquant.lab_claim_finalizer_trust import (
+    LabClaimFinalizerPublicationAttestation,
     LabClaimFinalizerTrustCertificate,
+    LabClaimFinalizerTrustError,
     LabClaimFinalizerTrustVerifier,
     sign_lab_claim_finalizer_trust_certificate,
 )
@@ -2078,18 +2085,22 @@ def _prepared_execution_finalizer(
     )
 
 
-@pytest.mark.parametrize(
-    "window",
-    (
-        "ready_before_issue",
-        "issue_before_ready",
-        "ready_before_spool",
-        "spool_before_sidecar",
-        "sidecar_before_published",
-        "published_after_d",
-    ),
-)
-def test_finalizer_six_crash_windows_replay_exactly_once(tmp_path: Path, window: str) -> None:
+# Each crash boundary sits inside exactly one finalizer stage, so a crash there
+# pins both the boundary and the stage tag the redacted reason must carry. Adding
+# a stage without advancing the cursor at its entry turns one of these red.
+_CRASH_WINDOW_STAGE_REASONS = {
+    "ready_before_issue": "issue_ready_finalization_blocked",
+    "issue_before_ready": "issue_ready_finalization_blocked",
+    "before_ready_attestation": "ready_attestation_finalization_blocked",
+    "ready_before_spool": "spool_publish_finalization_blocked",
+    "spool_before_sidecar": "spool_publish_finalization_blocked",
+    "sidecar_before_published": "publish_cas_finalization_blocked",
+    "published_after_d": "observe_finalization_blocked",
+}
+
+
+@pytest.mark.parametrize("window", tuple(_CRASH_WINDOW_STAGE_REASONS))
+def test_finalizer_seven_crash_windows_replay_exactly_once(tmp_path: Path, window: str) -> None:
     class _CrashFinalizer(LabClaimFinalizer):
         @staticmethod
         def _crash(name: str) -> None:
@@ -2105,6 +2116,11 @@ def test_finalizer_six_crash_windows_replay_exactly_once(tmp_path: Path, window:
         def _after_issue_before_ready(record: LabClaimPublicationRecord) -> None:
             del record
             _CrashFinalizer._crash("issue_before_ready")
+
+        @staticmethod
+        def _before_ready_attestation(record: LabClaimPublicationRecord) -> None:
+            del record
+            _CrashFinalizer._crash("before_ready_attestation")
 
         @staticmethod
         def _after_ready_before_spool(record: LabClaimPublicationRecord) -> None:
@@ -2127,7 +2143,9 @@ def test_finalizer_six_crash_windows_replay_exactly_once(tmp_path: Path, window:
             _CrashFinalizer._crash("published_after_d")
 
     crashed, store, held = _prepared_authority_finalizer(tmp_path, finalizer_type=_CrashFinalizer)
-    assert crashed.finalize(held.identity).status == "blocked"
+    crashed_result = crashed.finalize(held.identity)
+    assert crashed_result.status == "blocked"
+    assert crashed_result.reason == _CRASH_WINDOW_STAGE_REASONS[window]
 
     # Reopen every durable authority boundary. Only the injected root key survives
     # process restart; the ledger, stage reader, current authority, spool, and
@@ -2546,10 +2564,632 @@ def test_shared_capability_finalizer_concurrency_replays_after_cas_race_stress(
         assert record.final_claim_bytes is not None and record.spool_receipt_bytes is not None
         audit = store.list_claim_publication_audit(held.identity.attempt_id)
         assert (
-            sum(item.reason_code == "finalizer_source_queued_to_ready_to_publish" for item in audit)
+            sum(
+                item.action is ClaimPublicationAuditAction.TRANSITIONED
+                and item.reason_code == "finalizer_source_queued_to_ready_to_publish"
+                for item in audit
+            )
             == 1
+        ), (iteration, audit)
+        assert (
+            sum(
+                item.action is ClaimPublicationAuditAction.TRANSITIONED
+                and item.reason_code == "finalizer_ready_to_published"
+                for item in audit
+            )
+            == 1
+        ), (iteration, audit)
+        assert sum(item.action is ClaimPublicationAuditAction.CONFLICT for item in audit) == 0, (
+            iteration,
+            audit,
         )
-        assert sum(item.reason_code == "finalizer_ready_to_published" for item in audit) == 1
+
+
+def _tamper_finalizer_attestation(
+    store: LabJobStore,
+    held: HeldDraft,
+    publication_status: ClaimPublicationStatus,
+    *,
+    mode: str = "byte_flip",
+) -> None:
+    """Corrupt a durable finalizer attestation for a fail-closed probe.
+
+    ``byte_flip`` leaves ``attestation_hash`` at its original value, so the row is
+    self-inconsistent and the cheapest integrity gate stops it. ``resigned_field``
+    rewrites a semantic field, re-canonicalises the payload and recomputes the
+    hash, so the row is self-consistent, the binding comparison reads the forged
+    value back against itself, and the only thing left to reject it is the Ed25519
+    finalizer signature.
+    """
+
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        row = connection.execute(
+            """
+            SELECT attestation_bytes, attestation_hash
+            FROM lab_claim_publication_finalizer_attestation
+            WHERE attempt_id = ? AND publication_status = ?
+            """,
+            (str(held.identity.attempt_id), publication_status.value),
+        ).fetchone()
+        assert row is not None
+        original = bytes(row[0])
+        if mode == "byte_flip":
+            tampered = original[:-1] + bytes([original[-1] ^ 0x01])
+            tampered_hash = str(row[1])
+        elif mode == "resigned_field":
+            attestation = strict_model_validate_canonical_json(
+                LabClaimFinalizerPublicationAttestation, original
+            )
+            tampered = canonical_model_json_bytes(
+                attestation.model_copy(
+                    update={"finalizer_fencing_token": attestation.finalizer_fencing_token + 1}
+                )
+            )
+            tampered_hash = _sha256(tampered)
+        else:
+            raise AssertionError(f"unknown tamper mode {mode!r}")
+        assert tampered != original
+        connection.execute(
+            """
+            UPDATE lab_claim_publication_finalizer_attestation
+            SET attestation_bytes = ?, attestation_hash = ?
+            WHERE attempt_id = ? AND publication_status = ?
+            """,
+            (
+                tampered,
+                tampered_hash,
+                str(held.identity.attempt_id),
+                publication_status.value,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "window",
+    ("ready_attestation", "ready_before_spool", "sidecar_before_published"),
+)
+def test_shared_capability_finalizer_replays_when_peer_publishes_before_each_d_window(
+    tmp_path: Path,
+    window: str,
+) -> None:
+    """A peer that commits D first must leave the stalled finalizer a replay.
+
+    The interleaving is deterministic instead of load dependent: the slow
+    finalizer parks on exactly one D-saga boundary and is released only after the
+    peer's D transition is durable. On the pre-fix tree the ``ready_attestation``
+    window returns ``blocked``/``authority_conflict`` on every run.
+    """
+
+    race_root = tmp_path / "race"
+    race_root.mkdir(mode=0o700)
+    seed, store, held = _prepared_authority_finalizer(race_root)
+    parked = Event()
+    published = Event()
+    entered: list[str] = []
+
+    def stall(name: str) -> None:
+        if name != window:
+            return
+        entered.append(name)
+        parked.set()
+        assert published.wait(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS), (
+            f"peer never committed D while the finalizer was parked at {name}"
+        )
+
+    class _PeerFinalizer(LabClaimFinalizer):
+        @staticmethod
+        def _after_published(record: LabClaimPublicationRecord) -> None:
+            del record
+            published.set()
+
+    class _StalledFinalizer(LabClaimFinalizer):
+        @staticmethod
+        def _before_ready_attestation(record: LabClaimPublicationRecord) -> None:
+            del record
+            stall("ready_attestation")
+
+        @staticmethod
+        def _after_ready_before_spool(record: LabClaimPublicationRecord) -> None:
+            del record
+            stall("ready_before_spool")
+
+        @staticmethod
+        def _after_sidecar_before_published(record: LabClaimPublicationRecord) -> None:
+            del record
+            stall("sidecar_before_published")
+
+    outcomes: dict[str, tuple[str, str]] = {}
+    results: dict[str, LabClaimPublicationRecord | None] = {}
+    failures: list[BaseException] = []
+
+    def finalize_from_connection(name: str, finalizer_type: type[LabClaimFinalizer]) -> None:
+        try:
+            local = LabJobStore(store.path, busy_timeout_ms=5_000)
+            local.initialize()
+            finalizer = finalizer_type(
+                ledger=local,
+                stage_reader=seed._stage_reader,  # noqa: SLF001
+                authority=seed._authority,  # noqa: SLF001 - intentional shared capability
+                current_claim_authority=seed._current_claim_authority,  # noqa: SLF001
+                keyring=seed._keyring,  # noqa: SLF001
+                audience="lab-claim-publication",
+                spool=seed._spool,  # noqa: SLF001
+                spool_receipt_verifier=seed._spool_receipt_verifier,  # noqa: SLF001
+                clock=lambda: NOW + timedelta(seconds=5),
+            )
+            result = finalizer.finalize(held.identity)
+            outcomes[name] = (result.status, result.reason)
+            results[name] = result.record
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions below
+            failures.append(exc)
+
+    stalled_thread = Thread(target=finalize_from_connection, args=("stalled", _StalledFinalizer))
+    stalled_thread.start()
+    assert parked.wait(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS), "stall window never reached"
+    peer_thread = Thread(target=finalize_from_connection, args=("peer", _PeerFinalizer))
+    peer_thread.start()
+    for thread in (peer_thread, stalled_thread):
+        thread.join(timeout=_FINALIZER_JOIN_WATCHDOG_SECONDS)
+        assert not thread.is_alive(), f"{window} left a finalizer thread alive"
+
+    assert failures == [], f"{window} raised {failures!r}"
+    assert entered == [window]
+    assert sorted(status for status, _reason in outcomes.values()) == ["published", "replayed"], (
+        window,
+        outcomes,
+    )
+    assert outcomes["peer"] == ("published", "published")
+    assert outcomes["stalled"] == ("replayed", "published_replay")
+    assert all("authority_conflict" not in reason for _status, reason in outcomes.values())
+
+    record = store.get_claim_publication(held.identity.attempt_id)
+    assert record is not None
+    assert record.status is ClaimPublicationStatus.PUBLISHED
+    assert record.version == 3
+    assert record.published_at is not None
+    assert record.final_claim_bytes is not None
+    assert record.spool_receipt_bytes is not None
+
+    peer_record = results["peer"]
+    stalled_record = results["stalled"]
+    assert peer_record is not None and stalled_record is not None
+    assert peer_record.final_claim_bytes == record.final_claim_bytes
+    assert stalled_record.final_claim_bytes == record.final_claim_bytes
+    assert peer_record.spool_receipt_bytes == record.spool_receipt_bytes
+    assert stalled_record.spool_receipt_bytes == record.spool_receipt_bytes
+
+    final_claim = strict_model_validate_canonical_json(LabShardClaimV2, record.final_claim_bytes)
+    LabClaimPublicationWorkerVerifier(
+        ledger=store,
+        current_claim_authority=seed._current_claim_authority,  # noqa: SLF001
+        keyring=seed._keyring,  # noqa: SLF001
+        audience="lab-claim-publication",
+        spool_receipt_verifier=seed._spool_receipt_verifier,  # noqa: SLF001
+        trust_verifier=seed._authority._trust_verifier,  # noqa: SLF001
+    ).require_published_claim(final_claim, now=NOW + timedelta(seconds=5))
+
+    spool = seed._spool  # noqa: SLF001
+    assert len(tuple(spool.pending_dir.glob("*.json"))) == 1
+    sidecars = tuple(
+        path
+        for path in spool.publish_receipt_dir.glob("*.json")
+        if path != spool.publish_receipt_authority_path
+    )
+    assert spool.publish_receipt_authority_path.is_file()
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == record.spool_receipt_bytes
+    assert record.spool_receipt_hash == _sha256(record.spool_receipt_bytes)
+
+    audit = store.list_claim_publication_audit(held.identity.attempt_id)
+    assert (
+        sum(
+            item.action is ClaimPublicationAuditAction.TRANSITIONED
+            and item.reason_code == "finalizer_source_queued_to_ready_to_publish"
+            for item in audit
+        )
+        == 1
+    ), audit
+    assert (
+        sum(
+            item.action is ClaimPublicationAuditAction.TRANSITIONED
+            and item.reason_code == "finalizer_ready_to_published"
+            for item in audit
+        )
+        == 1
+    ), audit
+    assert sum(item.action is ClaimPublicationAuditAction.CONFLICT for item in audit) == 0, audit
+
+
+def test_ready_attestation_status_advance_is_a_recoverable_concurrency_outcome(
+    tmp_path: Path,
+) -> None:
+    """A durable record past READY is a concurrency outcome, not a trust failure."""
+
+    seed, store, held = _prepared_authority_finalizer(tmp_path)
+    assert seed.finalize(held.identity).status == "published"
+    trust_verifier = seed._authority._trust_verifier  # noqa: SLF001
+    assert trust_verifier is not None
+
+    with pytest.raises(InvalidClaimPublicationTransitionError, match="transition_not_allowed"):
+        store.validate_finalizer_ready_attestation(
+            held.identity,
+            trust_verifier=trust_verifier,
+            now=NOW + timedelta(seconds=5),
+        )
+    assert LabClaimFinalizer._is_recoverable_concurrency_error(  # noqa: SLF001
+        InvalidClaimPublicationTransitionError("transition_not_allowed")
+    )
+
+    # The READY attestation row still exists and the PUBLISHED one still verifies:
+    # the pre-check failed on status, not on the trust chain.
+    store.validate_finalizer_published_attestation(
+        held.identity,
+        trust_verifier=trust_verifier,
+        now=NOW + timedelta(seconds=5),
+    )
+
+
+def test_identity_mismatch_outranks_status_advance_in_ready_attestation(
+    tmp_path: Path,
+) -> None:
+    """Identity is checked first, so a forged identity never becomes recoverable.
+
+    The two guards in validate_finalizer_publication_attestation are ordered, not
+    interchangeable: only "identity matches but the stage moved on" is a
+    concurrency outcome. Swapping them lets a mismatched identity be reported as
+    a recoverable transition and be handed to the bounded recovery loop, so this
+    case pins the order rather than just the pair of error codes.
+    """
+
+    seed, store, held = _prepared_authority_finalizer(tmp_path)
+    assert seed.finalize(held.identity).status == "published"
+    trust_verifier = seed._authority._trust_verifier  # noqa: SLF001
+    assert trust_verifier is not None
+
+    forged = held.identity.model_copy(
+        update={"claim_generation": held.identity.claim_generation + 1}
+    )
+    assert forged != held.identity
+    assert forged.attempt_id == held.identity.attempt_id
+
+    # Both guards would fire for this identity: the record is PUBLISHED while a
+    # READY_TO_PUBLISH attestation is requested. Identity must win.
+    with pytest.raises(
+        ClaimPublicationConflictError, match="finalizer_publication_signature_invalid"
+    ):
+        store.validate_finalizer_ready_attestation(
+            forged,
+            trust_verifier=trust_verifier,
+            now=NOW + timedelta(seconds=5),
+        )
+    assert not LabClaimFinalizer._is_recoverable_concurrency_error(  # noqa: SLF001
+        ClaimPublicationConflictError("finalizer_publication_signature_invalid")
+    )
+
+    # The same forged identity is equally unrecoverable against the stage the
+    # record actually reached, so the guard is about identity, not about status.
+    with pytest.raises(
+        ClaimPublicationConflictError, match="finalizer_publication_signature_invalid"
+    ):
+        store.validate_finalizer_published_attestation(
+            forged,
+            trust_verifier=trust_verifier,
+            now=NOW + timedelta(seconds=5),
+        )
+
+
+@pytest.mark.parametrize("mode", ("byte_flip", "resigned_field"))
+def test_tampered_ready_attestation_stays_fail_closed_under_concurrency(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """A forged READY attestation blocks at its own stage and never enters recovery.
+
+    Both gates are exercised: a self-inconsistent row stopped by the sha256
+    integrity check, and a self-consistent row that can only be rejected by the
+    Ed25519 finalizer signature. Both must produce the same redacted outcome.
+    """
+
+    class _StopAfterReady(LabClaimFinalizer):
+        @staticmethod
+        def _after_ready_before_spool(record: LabClaimPublicationRecord) -> None:
+            del record
+            raise RuntimeError("stop after C")
+
+    stopped, store, held = _prepared_authority_finalizer(tmp_path, finalizer_type=_StopAfterReady)
+    assert stopped.finalize(held.identity).status == "blocked"
+    ready = store.get_claim_publication(held.identity.attempt_id)
+    assert ready is not None and ready.status is ClaimPublicationStatus.READY_TO_PUBLISH
+
+    _tamper_finalizer_attestation(store, held, ClaimPublicationStatus.READY_TO_PUBLISH, mode=mode)
+
+    # Pin which gate actually rejected the row. The sha256 gate raises without
+    # chaining; the trust block re-raises `from` the underlying trust error, and
+    # only verify_finalizer_signature uses this particular trust code.
+    trust_verifier = stopped._authority._trust_verifier  # noqa: SLF001
+    with pytest.raises(
+        ClaimPublicationConflictError, match="finalizer_publication_signature_invalid"
+    ) as attestation_exc:
+        store.validate_finalizer_ready_attestation(
+            held.identity,
+            trust_verifier=trust_verifier,
+            now=NOW + timedelta(seconds=5),
+        )
+    cause = attestation_exc.value.__cause__
+    if mode == "byte_flip":
+        assert cause is None
+    else:
+        assert isinstance(cause, LabClaimFinalizerTrustError)
+        assert str(cause) == "finalizer_publication_signature_invalid"
+
+    finalizer = LabClaimFinalizer(
+        ledger=store,
+        stage_reader=stopped._stage_reader,  # noqa: SLF001
+        authority=stopped._authority,  # noqa: SLF001
+        current_claim_authority=stopped._current_claim_authority,  # noqa: SLF001
+        keyring=stopped._keyring,  # noqa: SLF001
+        audience="lab-claim-publication",
+        spool=stopped._spool,  # noqa: SLF001
+        spool_receipt_verifier=stopped._spool_receipt_verifier,  # noqa: SLF001
+        clock=lambda: NOW + timedelta(seconds=5),
+    )
+    result = finalizer.finalize(held.identity)
+
+    assert result.status == "blocked"
+    # The stage tag localizes the failure to the pre-check that raised it and
+    # proves the forged signature was never routed into the recovery loop.
+    assert result.reason == "ready_attestation_signature_invalid"
+    assert finalizer.metrics.replays == 0
+    unchanged = store.get_claim_publication(held.identity.attempt_id)
+    assert unchanged is not None
+    assert unchanged.status is ClaimPublicationStatus.READY_TO_PUBLISH
+
+
+def test_tampered_published_attestation_cannot_replay_through_the_worker_gate(
+    tmp_path: Path,
+) -> None:
+    """The worker D gate is the only door into "replayed"; forging it fails closed."""
+
+    seed, store, held = _prepared_authority_finalizer(tmp_path)
+    assert seed.finalize(held.identity).status == "published"
+
+    _tamper_finalizer_attestation(store, held, ClaimPublicationStatus.PUBLISHED)
+
+    record = store.get_claim_publication(held.identity.attempt_id)
+    assert record is not None and record.status is ClaimPublicationStatus.PUBLISHED
+    with pytest.raises(LabClaimFinalizerError, match="publication_signature_invalid"):
+        seed._published_replay(  # noqa: SLF001
+            held.identity,
+            record,
+            now=NOW + timedelta(seconds=5),
+            observation_reason="published_replay",
+        )
+
+    result = seed.finalize(held.identity)
+
+    assert result.status == "blocked"
+    assert result.reason == "publish_cas_signature_invalid"
+    assert seed.metrics.replays == 0
+
+
+def test_finalizer_recoverable_error_whitelist_is_exactly_three_forms() -> None:
+    """Pin the recovery door: CAS conflict, allowed transitions, SQLite busy only."""
+
+    recoverable = LabClaimFinalizer._is_recoverable_concurrency_error  # noqa: SLF001
+
+    assert recoverable(ClaimPublicationConflictError("publication_cas_conflict"))
+    assert recoverable(InvalidClaimPublicationTransitionError("transition_not_allowed"))
+    assert recoverable(InvalidClaimPublicationTransitionError("terminal_status_immutable"))
+    assert recoverable(sqlite3.OperationalError("database is locked"))
+    assert recoverable(sqlite3.OperationalError("database table is busy"))
+
+    for message in (
+        "finalizer_publication_signature_invalid",
+        "finalizer_publication_signature_missing",
+        "finalizer_authority_conflict",
+        "finalizer_external_trust_invalid",
+        "ready_content_conflict",
+        "published_receipt_conflict",
+        "ready_binding_conflict",
+        "attempt_identity_conflict",
+    ):
+        assert not recoverable(ClaimPublicationConflictError(message)), message
+    assert not recoverable(InvalidClaimPublicationTransitionError("some_other_transition"))
+    assert not recoverable(sqlite3.OperationalError("no such table"))
+    assert not recoverable(SchedulerLeaseFencedError("scheduler_lease_fenced"))
+    assert not recoverable(LabClaimFinalizerError("publication_signature_invalid"))
+    assert not recoverable(RuntimeError("business failure"))
+
+
+# Codes that exist in the two finalizer-facing modules but cannot surface from
+# LabClaimFinalizer.finalize(): the scheduler-lease C/D pair, the queue/hold path,
+# finalizer-authority acquire and renew, the rollout-evidence outbox and the
+# observation-degradation drain. Each is reachable only through an API the
+# finalizer never calls, so leaving them unmapped costs nothing.
+_ERROR_CODES_UNREACHABLE_FROM_FINALIZE = frozenset(
+    {
+        "claim_identity_conflict",
+        "finalizer_authority_root_conflict",
+        "finalizer_authority_unavailable",
+        "finalizer_degradation_binding_invalid",
+        "finalizer_root_conflict",
+        "finalizer_root_unbootstrapped",
+        "queued_source_stage_conflict",
+        "rollout_evidence_ack_conflict",
+        "rollout_evidence_attestation_invalid",
+        "rollout_evidence_attestation_missing",
+        "rollout_evidence_defer_conflict",
+        "rollout_evidence_outbox_binding_invalid",
+        "rollout_evidence_outbox_missing",
+        "rollout_evidence_publication_missing",
+        "rollout_evidence_reconciliation_gap",
+        "source_stage_binding_conflict",
+    }
+)
+
+# Built through _publication_conflict_decision rather than a constructor call, so
+# the source scan below cannot see them.
+_INDIRECT_FINALIZER_ERROR_CODES = (
+    (ClaimPublicationConflictError, "ready_content_conflict"),
+    (ClaimPublicationConflictError, "published_receipt_conflict"),
+    (InvalidClaimPublicationTransitionError, "terminal_status_immutable"),
+)
+
+
+def test_every_finalize_reachable_error_code_is_classified_by_the_allowlist() -> None:
+    """A new error code must be mapped or explicitly excluded, never silently redacted.
+
+    The class-name fallback absorbs anything unmapped: every
+    ClaimPublicationConflictError becomes "authority_conflict" and every
+    LabClaimFinalizerError becomes "finalization_blocked". Scanning the source for
+    constructor literals means adding a code and forgetting the mapping turns this
+    red instead of quietly widening those two buckets.
+    """
+
+    pattern = re.compile(
+        r"\b(ClaimPublicationConflictError|InvalidClaimPublicationTransitionError"
+        r"|LabClaimFinalizerError|LabClaimFinalizerObservationDegradedError)"
+        r'\(\s*"([a-z][a-z0-9_]*)"',
+        re.DOTALL,
+    )
+    classes: dict[str, type[Exception]] = {
+        "ClaimPublicationConflictError": ClaimPublicationConflictError,
+        "InvalidClaimPublicationTransitionError": InvalidClaimPublicationTransitionError,
+        "LabClaimFinalizerError": LabClaimFinalizerError,
+        "LabClaimFinalizerObservationDegradedError": LabClaimFinalizerObservationDegradedError,
+    }
+    allowlist = lab_claim_finalizer._REDACTED_CATEGORIES  # noqa: SLF001
+    source_root = Path(lab_jobs.__file__).parent
+    declared: set[tuple[type[Exception], str]] = set()
+    for module in ("lab_jobs.py", "lab_claim_finalizer.py"):
+        text = (source_root / module).read_text(encoding="utf-8")
+        for match in pattern.finditer(text):
+            declared.add((classes[match.group(1)], match.group(2)))
+    assert len(declared) >= 40, len(declared)
+
+    unclassified = sorted(
+        (exc_class.__name__, code)
+        for exc_class, code in declared
+        if code not in _ERROR_CODES_UNREACHABLE_FROM_FINALIZE and (exc_class, code) not in allowlist
+    )
+    assert unclassified == [], (
+        "these finalize-reachable error codes fall through to the class-name rule; "
+        "map them in _REDACTED_CATEGORIES or list them in "
+        f"_ERROR_CODES_UNREACHABLE_FROM_FINALIZE: {unclassified}"
+    )
+
+    for indirect in _INDIRECT_FINALIZER_ERROR_CODES:
+        assert indirect in allowlist, indirect
+
+    # The allowlist must not rot either: every key is a live source literal.
+    known = declared | set(_INDIRECT_FINALIZER_ERROR_CODES)
+    dead = sorted(
+        (exc_class.__name__, code)
+        for exc_class, code in allowlist
+        if (exc_class, code) not in known
+    )
+    assert dead == [], f"allowlist keys with no matching raise site: {dead}"
+
+    # The mapping is closed at runtime, not merely by convention.
+    with pytest.raises(TypeError):
+        allowlist[(RuntimeError, "injected")] = "nope"  # type: ignore[index]
+
+
+def test_stage_tagged_blocked_reasons_stay_within_the_redaction_grammar() -> None:
+    """Stage x category is a closed product that always satisfies the frozen pattern."""
+
+    stages = get_args(lab_claim_finalizer._FinalizerStage)  # noqa: SLF001
+    assert stages == (
+        "record",
+        "issue_ready",
+        "ready_attestation",
+        "ready_claim",
+        "spool_publish",
+        "publish_cas",
+        "recovery",
+        "observe",
+    )
+    # The four literals below are the fallback categories _redacted_category can
+    # return when the allowlist misses; keep them in step with that function.
+    categories = set(lab_claim_finalizer._REDACTED_CATEGORIES.values()) | {  # noqa: SLF001
+        "current_claim_evidence_invalid",
+        "canonical_evidence_invalid",
+        "authority_conflict",
+        "finalization_blocked",
+    }
+    for stage in stages:
+        for category in categories:
+            assert re.fullmatch(r"[a-z][a-z0-9_]{0,63}", f"{stage}_{category}") is not None
+
+    redacted = lab_claim_finalizer._redacted_reason  # noqa: SLF001
+    assert (
+        redacted(
+            ClaimPublicationConflictError("finalizer_publication_signature_invalid"),
+            stage="ready_attestation",
+        )
+        == "ready_attestation_signature_invalid"
+    )
+    assert (
+        redacted(ClaimPublicationConflictError("finalizer_authority_conflict"), stage="record")
+        == "record_authority_conflict"
+    )
+    assert (
+        redacted(ClaimPublicationConflictError("publication_cas_conflict"), stage="publish_cas")
+        == "publish_cas_cas_conflict"
+    )
+    assert (
+        redacted(RuntimeError("business failure"), stage="issue_ready")
+        == "issue_ready_finalization_blocked"
+    )
+
+
+def test_ready_claim_precheck_failure_blocks_at_the_ready_claim_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second D pre-check carries its own stage tag, distinct from the first."""
+
+    seed, store, held = _prepared_authority_finalizer(tmp_path)
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise ClaimPublicationConflictError("ready_binding_conflict")
+
+    monkeypatch.setattr(store, "validate_ready_claim_for_publication", refuse)
+    result = seed.finalize(held.identity)
+
+    assert result.status == "blocked"
+    assert result.reason == "ready_claim_ready_binding_conflict"
+    assert seed.metrics.replays == 0
+    record = store.get_claim_publication(held.identity.attempt_id)
+    assert record is not None and record.status is ClaimPublicationStatus.READY_TO_PUBLISH
+
+
+def test_failure_inside_bounded_recovery_reports_the_recovery_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery flattens its own sub-stages, so its failures are tagged `recovery`.
+
+    A permanently racing pre-check is recoverable, so the primary attempt hands
+    off to _concurrent_terminal_recovery, which exhausts both attempts and
+    re-raises. The reason must name the recovery loop rather than the pre-check
+    it happened to die in, which is what distinguishes it from the primary-path
+    tag asserted by the tampered-attestation case.
+    """
+
+    seed, store, held = _prepared_authority_finalizer(tmp_path)
+
+    def always_race(*_args: object, **_kwargs: object) -> None:
+        raise ClaimPublicationConflictError("publication_cas_conflict")
+
+    monkeypatch.setattr(store, "validate_finalizer_ready_attestation", always_race)
+    result = seed.finalize(held.identity)
+
+    assert result.status == "blocked"
+    assert result.reason == "recovery_cas_conflict"
+    assert seed.metrics.replays == 0
+    record = store.get_claim_publication(held.identity.attempt_id)
+    assert record is not None and record.status is ClaimPublicationStatus.READY_TO_PUBLISH
 
 
 def test_finalizer_concurrency_recovery_replays_only_exact_published_terminal(

@@ -184,6 +184,15 @@
 
 ### Fixed
 
+- **claim finalizer 并发收敛（WP-B1）**：D 阶段 CAS 之前的 ready-attestation 预检原来把「对端
+  已经把 durable 记录推进到 `PUBLISHED`」和「attestation 签名不可信」合并成同一个不可恢复的
+  `finalizer_publication_signature_invalid`，于是两个合法共享 capability 的 finalizer 并发时
+  落后的那个被判成 `blocked`，脱敏后还被谎报成 `authority_conflict`。现在按 identity 与 status
+  分别判定：identity 不符仍是不可恢复的签名冲突，状态已推进则抛可恢复的
+  `transition_not_allowed`（本来就在恢复白名单里，白名单不放宽），并发结果确定性收敛为
+  `published` + `replayed`。blocked 的 `reason` 同时改为「封闭阶段枚举 + 封闭错误码分类」的
+  `{stage}_{category}`（如 `ready_attestation_signature_invalid`），真实签名失败不再被类名规则
+  塌缩成 `authority_conflict`。
 
 - **09:25 发布截止用例改用相位时钟**：`test_reference_slow_runtime.py` 里两条截止用例原来把虚拟
   墙钟锚在 09:24:59.700 上按真实速度推进，只留 300 ms 预算，再用 `sleep(0.35)` 越线；注入点之前

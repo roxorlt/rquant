@@ -12283,8 +12283,14 @@ class LabJobStore:
             if row is None or attestation_row is None:
                 raise ClaimPublicationConflictError("finalizer_publication_signature_missing")
             record = _claim_publication_record_from_row(row)
-            if record.identity != validated or record.status is not publication_status:
+            if record.identity != validated:
                 raise ClaimPublicationConflictError("finalizer_publication_signature_invalid")
+            if record.status is not publication_status:
+                # The durable record already moved past the stage whose attestation
+                # was requested. That is a concurrency outcome, not a trust failure,
+                # and it is what _validate_ready_claim_for_publication_record raises
+                # for the same situation.
+                raise InvalidClaimPublicationTransitionError("transition_not_allowed")
             certificate_bytes = _strict_sqlite_blob(
                 attestation_row["certificate_bytes"],
                 field="lab_claim_publication_finalizer_attestation.certificate_bytes",
