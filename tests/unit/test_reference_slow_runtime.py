@@ -900,6 +900,9 @@ def test_publisher_fails_closed_when_start_is_one_millisecond_after_cutoff(
 def test_publisher_compensates_registry_current_and_cursor_when_commit_crosses_cutoff(
     tmp_path: Path,
 ) -> None:
+    # Same crossing point as
+    # `test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence`, which
+    # additionally pins the evidence directory as empty; keep the two clocks in step.
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
     before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
@@ -949,21 +952,49 @@ def test_publisher_compensates_registry_when_cursor_write_crosses_cutoff(
 
 def test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pin the no-evidence half of the contract in `LiveBatchSpool.write_completion_receipt`.
 
-    The registry publication stage runs long before a completion receipt exists, so
-    a deadline crossing there must roll everything back and leave no durable
-    evidence behind. The fourth clock reading is the registry's post-commit check,
-    which is the first checkpoint that crosses the line after a publication intent
-    row has actually been committed to disk.
+    The registry publication stage runs long before a completion receipt exists, so a
+    deadline crossing there must roll everything back and leave no durable evidence
+    behind. The fourth clock reading is the registry's post-commit check, the first
+    crossing that happens after a publication intent row is actually committed to
+    disk. The ordinal alone does not say that, so the crossing samples the intent
+    table from a second connection: only a committed row is visible there, which is
+    what separates this checkpoint from the pre-commit one a reading earlier.
+
+    Same crossing point as
+    `test_publisher_compensates_registry_current_and_cursor_when_commit_crosses_cutoff`;
+    this case exists to pin the empty evidence directory on top of the rollback.
     """
 
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
-    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+    registry_path = tmp_path / "reference.sqlite3"
+    registry = ReferenceRegistry(registry_path)
     before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
     late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
-    clock_values = iter((before, before, before, late))
+    readings = 0
+    publish_calls = 0
+    committed_intent_rows_at_crossing: int | None = None
+    original_publish = registry.append_many_and_publish_before
+
+    def witnessed_publish(*args: object, **kwargs: object) -> object:
+        nonlocal publish_calls
+        publish_calls += 1
+        return original_publish(*args, **kwargs)  # type: ignore[arg-type]
+
+    def ordinal_clock() -> datetime:
+        nonlocal readings, committed_intent_rows_at_crossing
+        readings += 1
+        if readings < 4:
+            return before
+        with closing(sqlite3.connect(registry_path)) as connection:
+            row = connection.execute("SELECT COUNT(*) FROM reference_publication_intent").fetchone()
+        committed_intent_rows_at_crossing = int(row[0])
+        return late
+
+    monkeypatch.setattr(registry, "append_many_and_publish_before", witnessed_publish)
 
     with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25"):
         publish_reference_slow_batches(
@@ -973,9 +1004,14 @@ def test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence(
             consumer_id="reference-publisher",
             observed_at=before,
             producer_commit=COMMIT,
-            completion_clock=lambda: next(clock_values),
+            completion_clock=ordinal_clock,
         )
 
+    assert publish_calls == 1
+    assert committed_intent_rows_at_crossing == 1, (
+        "the deadline must cross inside the registry stage, after the publication "
+        "intent row is committed to disk"
+    )
     assert _registry_publication_counts(registry) == (0, 0, 0)
     assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
     assert tuple(spool.completion_evidence_root.glob("*.json")) == ()
