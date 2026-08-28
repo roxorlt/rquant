@@ -26,18 +26,19 @@ _LOCK_NAMES = (
     "research-active.lock",
     "maintenance-active.lock",
 )
-#: Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01. The admission probe used to be
-#: `.venv/bin/python -m rquant.workload_isolation research-admission`, run after the research
-#: locks were taken and before the unit's own child was exec'd. That handed the unit's whole
-#: sandbox — every `EnvironmentFile` value included — to whatever the mutable checkout held,
-#: ahead of any verification. It is now the same fixed root-owned wrapper the units run, with
-#: a role literal and nothing else (ruling D-2): the wrapper verifies the generation file by
-#: file first, then runs the admission module out of the verified generation. The exit-code
-#: contract is unchanged — anything other than 0 is a rejected research plane, which the ten
-#: research units already declare as `SuccessExitStatus=0 75`. The argv is restated here
-#: rather than imported because this helper is installed outside the application tree and
-#: must not depend on it; `tests/unit/test_workload_plane_arbiter.py` pins it to
-#: `rquant.runtime_exec_wrapper._verify.RUNTIME_PYZ_PATH` and the wrapper role allowlist.
+#: Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01. The admission probe used to run an
+#: interpreter out of the mutable application checkout, on that checkout's own copy of the
+#: workload-isolation module, after the research locks were taken and before the unit's own
+#: child was exec'd. That handed the unit's whole sandbox — every `EnvironmentFile` value
+#: included — to unverified code, ahead of any verification. It is now the same fixed
+#: root-owned wrapper the units run, with a role literal and nothing else (ruling D-2): the
+#: wrapper verifies the generation file by file first, then runs the admission module out of
+#: the verified generation. The exit-code contract is unchanged — anything other than 0 is a
+#: rejected research plane, which the ten research units already declare as
+#: `SuccessExitStatus=0 75`. The argv is restated here rather than imported because this
+#: helper is installed outside the application tree and must not depend on it;
+#: `tests/unit/test_workload_plane_arbiter.py` pins it to the wrapper's own
+#: `rquant.runtime_exec_wrapper._verify.RUNTIME_PYZ_PATH` and to the wrapper role allowlist.
 _ADMISSION_COMMAND = (
     "/usr/bin/python3.11",
     "-I",
