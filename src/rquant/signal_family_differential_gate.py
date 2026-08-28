@@ -12,11 +12,12 @@ import copy
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import stat
 import subprocess
 import tarfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1367,6 +1368,369 @@ def verify_merge_provenance(
     return resolved
 
 
+# ---------------------------------------------------------------------------
+# Baseline context resolution
+# ---------------------------------------------------------------------------
+# Amended for Release B. The frozen baseline used to be re-discovered inside the checkout as
+# ``merge_base(origin/main, HEAD)``. Once the pull request that froze it is merged,
+# ``origin/main`` *is* the candidate, that expression collapses to HEAD, and no constant can
+# ever match it again: the old semantics denies itself the moment it lands. Every R07 run now
+# states its two endpoints explicitly instead, and this module is the only place that decides
+# what they are, so the generator, the CI producer, and the tests cannot drift apart.
+
+NULL_COMMIT_SHA = "0" * 40
+BASELINE_CONTEXT_SOURCES = (
+    "explicit_cli",
+    "github_event_payload",
+    "git_first_parent",
+    "frozen_baseline_fallback",
+)
+
+
+class R07BaselineContextV1(_StrictModelMixin, BaseModel):
+    """The exact pair of commits one R07 run compares, plus where the base came from.
+
+    ``pull_request`` states the target branch tip and the pull request head, and the frozen
+    baseline must be their real two-sided merge base. ``push`` states the release interval:
+    the base is the pushed merge commit's first parent, which is the pre-merge ``main`` tip,
+    and ``event_before_sha`` is GitHub's own claim about that same commit, kept only so the
+    two can be cross-checked.
+    """
+
+    event: Literal["pull_request", "push"]
+    base_sha: StrictStr = Field(pattern=_SHA1)
+    candidate_sha: StrictStr = Field(pattern=_SHA1)
+    base_source: Literal[
+        "explicit_cli",
+        "github_event_payload",
+        "git_first_parent",
+        "frozen_baseline_fallback",
+    ]
+    event_before_sha: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_endpoints(self) -> Self:
+        if self.base_sha == self.candidate_sha:
+            raise ValueError("R07 base and candidate must be two distinct commits")
+        if self.event_before_sha is not None:
+            if self.event != "push":
+                raise ValueError("only a push context carries a GitHub before SHA")
+            if not _is_lower_hex(self.event_before_sha, length=40):
+                raise ValueError("R07 push before SHA must be a lowercase 40-hex commit")
+            if self.event_before_sha == NULL_COMMIT_SHA:
+                raise ValueError(
+                    "R07 push before SHA is the null commit, so this push created or reset the "
+                    "branch and has no release interval start"
+                )
+        return self
+
+
+@dataclass(frozen=True)
+class DeclaredBaselineArgumentsV1:
+    """What the caller said, before Git is asked anything."""
+
+    event: str
+    base_sha: str | None
+    candidate_sha: str | None
+    event_before_sha: str | None
+
+
+@dataclass(frozen=True)
+class R07BaselineResolutionV1:
+    """The verified answer: which commit anchors this run's reviewed diff."""
+
+    context: R07BaselineContextV1
+    baseline_commit_sha: str
+    baseline_tree_sha: str
+
+
+def _optional_argument_sha(value: str | None, *, field: str) -> str | None:
+    """A workflow expression that resolves to nothing substitutes an empty string."""
+
+    if value is None or value == "":
+        return None
+    if not _is_lower_hex(value, length=40):
+        raise ValueError(f"R07 {field} is not a lowercase 40-hex commit SHA: {value!r}")
+    return value
+
+
+def parse_baseline_cli_arguments(
+    *,
+    event: str,
+    base_sha: str | None = None,
+    candidate_sha: str | None = None,
+    event_before_sha: str | None = None,
+) -> DeclaredBaselineArgumentsV1:
+    """Validate exactly the strings a GitHub workflow expression can substitute.
+
+    This is deliberately pure: the workflow can only be exercised for real by pushing it, so
+    the part that can be wrong locally — an expression that yields nothing, a null commit on a
+    branch's first push, a symbolic ref smuggled in where a SHA belongs — is decided here and
+    unit tested against the shapes GitHub actually produces.
+    """
+
+    if event not in ("pull_request", "push"):
+        raise ValueError(f"R07 baseline resolution has no semantics for the {event!r} event")
+    base = _optional_argument_sha(base_sha, field="base SHA")
+    candidate = _optional_argument_sha(candidate_sha, field="candidate SHA")
+    before = _optional_argument_sha(event_before_sha, field="push before SHA")
+    if event == "pull_request":
+        if base is None:
+            raise ValueError(
+                "a pull request R07 context must state its base SHA; there is no ref to read it "
+                "back from"
+            )
+        if before is not None:
+            raise ValueError("only a push context carries a GitHub before SHA")
+    elif before == NULL_COMMIT_SHA:
+        raise ValueError(
+            "R07 push before SHA is the null commit, so this push created or reset the branch "
+            "and has no release interval start"
+        )
+    return DeclaredBaselineArgumentsV1(
+        event=event,
+        base_sha=base,
+        candidate_sha=candidate,
+        event_before_sha=before,
+    )
+
+
+def _head_commit(repo: Path) -> str:
+    """Resolve the checkout's own HEAD, the only ref this resolver ever reads."""
+
+    resolved = _git_output(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+    if not _is_lower_hex(resolved, length=40):
+        raise ValueError("checkout HEAD is not a lowercase 40-hex commit")
+    return resolved
+
+
+def _commit_parents(repo: Path, commit: str) -> tuple[str, ...]:
+    listed = _git_output(repo, "rev-list", "--parents", "-n", "1", commit).decode().split()
+    if not listed or listed[0] != commit:
+        raise ValueError("commit does not resolve to itself in the Git object store")
+    return tuple(listed[1:])
+
+
+def _two_sided_merge_base(repo: Path, left: str, right: str) -> str:
+    """The real merge base of two commits, or a refusal. Never a one-sided ancestry answer."""
+
+    completed = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", left, right],
+        check=False,
+        capture_output=True,
+    )
+    resolved = completed.stdout.decode().strip()
+    if completed.returncode != 0 or not _is_lower_hex(resolved, length=40):
+        raise ValueError(
+            "R07 endpoints have no computable merge base; the gate does not degrade to an "
+            "ancestry test"
+        )
+    return resolved
+
+
+def _payload_sha(section: object, *, field: str) -> str:
+    if not isinstance(section, dict):
+        raise ValueError(f"R07 GitHub event payload has no {field}")
+    value = section.get("sha")
+    if not isinstance(value, str) or not _is_lower_hex(value, length=40):
+        raise ValueError(f"R07 GitHub event payload {field} is not a lowercase 40-hex commit")
+    return value
+
+
+def _declared_from_github_event(values: Mapping[str, str]) -> DeclaredBaselineArgumentsV1:
+    event_name = values.get("GITHUB_EVENT_NAME", "")
+    event_path = values.get("GITHUB_EVENT_PATH", "")
+    if not event_path:
+        raise ValueError("R07 baseline resolution needs GITHUB_EVENT_PATH beside GITHUB_EVENT_NAME")
+    try:
+        payload = json.loads(Path(event_path).read_bytes())
+    except (OSError, ValueError) as exc:
+        raise ValueError("R07 GitHub event payload is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("R07 GitHub event payload is not a JSON object")
+    if event_name == "pull_request":
+        section = payload.get("pull_request")
+        if not isinstance(section, dict):
+            raise ValueError("R07 GitHub event payload has no pull_request section")
+        return parse_baseline_cli_arguments(
+            event="pull_request",
+            base_sha=_payload_sha(section.get("base"), field="pull_request.base.sha"),
+            candidate_sha=_payload_sha(section.get("head"), field="pull_request.head.sha"),
+        )
+    if event_name == "push":
+        after = payload.get("after")
+        before = payload.get("before")
+        if not isinstance(after, str) or not _is_lower_hex(after, length=40):
+            raise ValueError("R07 GitHub event payload after is not a lowercase 40-hex commit")
+        if not isinstance(before, str) or not _is_lower_hex(before, length=40):
+            raise ValueError("R07 GitHub event payload before is not a lowercase 40-hex commit")
+        return parse_baseline_cli_arguments(
+            event="push",
+            candidate_sha=after,
+            event_before_sha=before,
+        )
+    raise ValueError(f"R07 baseline resolution has no semantics for the {event_name!r} event")
+
+
+def _declared_from_local_head(
+    repo: Path,
+    values: Mapping[str, str],
+    expected_baseline: str,
+) -> tuple[DeclaredBaselineArgumentsV1, str]:
+    """Derive the context from HEAD's own parent structure, asking no ref anything.
+
+    A two-parent HEAD is exactly the shape a merge into ``main`` leaves behind, so it replays
+    the push semantics offline: the base is the first parent. A single-parent HEAD is a branch
+    tip with nothing to merge-base against, so it falls back to the frozen baseline; that mode
+    is labelled, and it is refused inside GitHub Actions, where the event always states the
+    endpoints.
+    """
+
+    candidate = _head_commit(repo)
+    parents = _commit_parents(repo, candidate)
+    if len(parents) == 2:
+        return (
+            DeclaredBaselineArgumentsV1(
+                event="push",
+                base_sha=parents[0],
+                candidate_sha=candidate,
+                event_before_sha=None,
+            ),
+            "git_first_parent",
+        )
+    if len(parents) > 2:
+        raise ValueError(
+            f"R07 has no semantics for a {len(parents)}-parent octopus merge as the candidate"
+        )
+    if "GITHUB_ACTIONS" in values:
+        raise ValueError(
+            "the R07 branch-tip baseline fallback is refused inside GitHub Actions; CI must "
+            "state the pull request or push endpoints explicitly"
+        )
+    return (
+        DeclaredBaselineArgumentsV1(
+            event="pull_request",
+            base_sha=expected_baseline,
+            candidate_sha=candidate,
+            event_before_sha=None,
+        ),
+        "frozen_baseline_fallback",
+    )
+
+
+def resolve_baseline_context(
+    repo: Path,
+    *,
+    event: str | None = None,
+    base_sha: str | None = None,
+    candidate_sha: str | None = None,
+    event_before_sha: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    expected_baseline: str = BASELINE_COMMIT_SHA,
+) -> R07BaselineResolutionV1:
+    """Decide which commit anchors this run's reviewed diff, and fail closed otherwise.
+
+    The sources are tried in one fixed order, and no later source can rescue an earlier one
+    that was stated badly: explicit arguments, then the GitHub event payload, then HEAD's own
+    parent structure. Nothing here reads ``origin/main``, ``origin/HEAD``, or any other
+    remote-tracking ref, which is the whole point: those move, and a gate anchored to
+    something that moves is not a gate.
+
+    In the ``frozen_baseline_fallback`` mode the base *is* the frozen baseline, so the
+    merge-base equality degenerates into "the baseline is an ancestor of HEAD". That mode is
+    for a local branch tip only. What actually holds the line there is the allowlist equality
+    in ``verify_candidate_gate`` plus the two ancestry constraints and the policy digest, not
+    the merge-base test.
+    """
+
+    values = os.environ if environ is None else environ
+    if not _is_lower_hex(expected_baseline, length=40):
+        raise ValueError("the expected R07 baseline must be a lowercase 40-hex commit SHA")
+    if event is None:
+        if any(value for value in (base_sha, candidate_sha, event_before_sha)):
+            raise ValueError("R07 baseline endpoints were given without an event; state it")
+        if values.get("GITHUB_EVENT_NAME"):
+            declared = _declared_from_github_event(values)
+            source = "github_event_payload" if declared.base_sha is not None else "git_first_parent"
+        else:
+            declared, source = _declared_from_local_head(repo, values, expected_baseline)
+    else:
+        declared = parse_baseline_cli_arguments(
+            event=event,
+            base_sha=base_sha,
+            candidate_sha=candidate_sha,
+            event_before_sha=event_before_sha,
+        )
+        source = "explicit_cli" if declared.base_sha is not None else "git_first_parent"
+
+    candidate = (
+        _head_commit(repo)
+        if declared.candidate_sha is None
+        else _resolved_commit(repo, declared.candidate_sha)
+    )
+    base = declared.base_sha
+    if base is None:
+        parents = _commit_parents(repo, candidate)
+        if len(parents) != 2:
+            raise ValueError(
+                "R07 push candidate must be a two-parent merge commit to have a first parent; "
+                f"observed {len(parents)} parent(s)"
+            )
+        base = parents[0]
+    context = R07BaselineContextV1(
+        event=declared.event,
+        base_sha=_resolved_commit(repo, base),
+        candidate_sha=candidate,
+        base_source=source,
+        event_before_sha=declared.event_before_sha,
+    )
+    return verify_baseline_context(repo, context, expected_baseline=expected_baseline)
+
+
+def verify_baseline_context(
+    repo: Path,
+    context: R07BaselineContextV1,
+    *,
+    expected_baseline: str = BASELINE_COMMIT_SHA,
+) -> R07BaselineResolutionV1:
+    """Prove against Git that the stated endpoints really do meet at the frozen baseline."""
+
+    if type(context) is not R07BaselineContextV1:
+        raise TypeError("exact R07BaselineContextV1 is required")
+    base = _resolved_commit(repo, context.base_sha)
+    candidate = _resolved_commit(repo, context.candidate_sha)
+    if base == candidate:
+        raise ValueError("R07 base and candidate are one commit, so the reviewed diff is empty")
+    if context.event == "push":
+        provenance = resolve_merge_provenance(
+            repo,
+            candidate_commit=candidate,
+            merge_base_commit=base,
+        )
+        first, second = provenance.candidate_parent_commits
+        if _two_sided_merge_base(repo, first, second) != first:
+            raise ValueError(
+                "the pushed merge commit's first parent is not the merge base of its two parents"
+            )
+        if context.event_before_sha is not None and context.event_before_sha != first:
+            raise ValueError(
+                "the GitHub push before SHA is not the first parent of the pushed merge commit"
+            )
+        baseline = first
+    else:
+        baseline = _two_sided_merge_base(repo, base, candidate)
+    if baseline != expected_baseline:
+        raise ValueError(
+            "the frozen R07 baseline is not the merge base of this run's stated endpoints: "
+            f"{baseline}"
+        )
+    return R07BaselineResolutionV1(
+        context=context,
+        baseline_commit_sha=baseline,
+        baseline_tree_sha=_resolved_tree(repo, baseline),
+    )
+
+
 def verify_candidate_gate(
     repo: Path,
     *,
@@ -1384,9 +1748,12 @@ def verify_candidate_gate(
         raise ValueError("candidate tree does not match candidate commit")
     if baseline_tree != policy.baseline_tree_sha:
         raise ValueError("policy baseline tree does not match its commit")
-    # Amended per Codex round-2 order 2026-08-25, item P1-1: the baseline is the merge base,
-    # so requiring it to be a candidate ancestor is the same as requiring
-    # merge_base(origin/main, candidate) to remain exactly this commit.
+    # Amended for Release B. This used to be justified as "the same as requiring
+    # merge_base(origin/main, candidate) to stay this commit", and that equivalence stopped
+    # holding the moment the freezing pull request merged: origin/main became the candidate.
+    # Which two commits meet at the baseline is now decided by resolve_baseline_context from
+    # explicit endpoints. What is left here is the descent constraint the allowlist needs to
+    # mean anything, and the allowlist equality below is what actually holds the line.
     if not _is_ancestor(repo, baseline, candidate):
         raise ValueError("candidate commit does not descend from the policy baseline merge base")
     # Codex Git hard constraint 3: the pre-amendment baseline must stay reachable.

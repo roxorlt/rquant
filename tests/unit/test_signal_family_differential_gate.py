@@ -53,6 +53,7 @@ from rquant.signal_family_differential_gate import (
     verify_wire,
 )
 from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
+from tests.support.r07_git_fixtures import merge_fixture_repo, write_github_event
 
 ROOT = Path(__file__).parents[2]
 POLICY_PATH = ROOT / "tests" / "fixtures" / "r07_differential_gate" / "policy-v1.json"
@@ -802,58 +803,9 @@ def test_candidate_gate_blocks_when_one_allowlist_entry_is_missing() -> None:
     assert result.blocked_entries[0].policy_key == policy.allowed_diff[-1].policy_key
 
 
-def _merge_fixture_repo(root: Path) -> dict[str, str]:
-    """A miniature origin/main plus feature branch with a real merge and a squash commit."""
-
-    subprocess.run(["git", "init", "--quiet", "--initial-branch=main", str(root)], check=True)
-    (root / "base.txt").write_text("base\n", encoding="utf-8")
-    base = _commit(root, "base")
-    (root / "main-only.txt").write_text("main\n", encoding="utf-8")
-    main_tip = _commit(root, "main tip")
-    subprocess.run(
-        ["git", "-C", str(root), "checkout", "--quiet", "-b", "feature", main_tip],
-        check=True,
-    )
-    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
-    feature = _commit(root, "feature")
-    subprocess.run(["git", "-C", str(root), "checkout", "--quiet", "main"], check=True)
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "user.name=test",
-            "merge",
-            "--no-ff",
-            "--quiet",
-            "-m",
-            "merge feature",
-            feature,
-        ],
-        check=True,
-    )
-    merge = _head(root)
-    subprocess.run(
-        ["git", "-C", str(root), "checkout", "--quiet", "-B", "squash", main_tip],
-        check=True,
-    )
-    subprocess.run(["git", "-C", str(root), "merge", "--squash", feature], check=True)
-    squash = _commit(root, "squashed feature")
-    return {
-        "base": base,
-        "main_tip": main_tip,
-        "feature": feature,
-        "merge": merge,
-        "squash": squash,
-    }
-
-
 def test_merge_provenance_accepts_a_real_merge_and_rejects_a_squash(tmp_path: Path) -> None:
     repo = tmp_path / "merge-repo"
-    identities = _merge_fixture_repo(repo)
+    identities = merge_fixture_repo(repo)
 
     provenance = resolve_merge_provenance(
         repo,
@@ -890,7 +842,7 @@ def test_merge_provenance_rejects_a_declared_tree_or_parent_that_git_does_not_pr
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "merge-repo"
-    identities = _merge_fixture_repo(repo)
+    identities = merge_fixture_repo(repo)
     resolved = resolve_merge_provenance(
         repo,
         candidate_commit=identities["merge"],
@@ -1436,3 +1388,522 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # The deploy-time gate entrypoint runs in the production chain but lives outside the
     # declaration-scanned universe, so it keeps the same category as the CI producer script.
     assert "scripts/r07_deploy_gate.py" in architecture_paths
+
+
+class _GitCommandRecorder:
+    """Records every Git argument vector the resolver runs, then delegates to the real one."""
+
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+        self.CalledProcessError = subprocess.CalledProcessError
+
+    def run(self, arguments, **keywords):  # type: ignore[no-untyped-def]
+        self.commands.append([str(part) for part in arguments])
+        return subprocess.run(arguments, **keywords)
+
+
+_GIT_NON_REVISION_TOKENS = frozenset(
+    {"git", "rev-parse", "rev-list", "merge-base", "merge-tree", "cat-file", "diff"}
+)
+
+
+def _revision_arguments(commands: list[list[str]]) -> list[str]:
+    """Every argument a Git invocation could resolve as a revision."""
+
+    tokens: list[str] = []
+    for command in commands:
+        for index, part in enumerate(command):
+            previous = command[index - 1] if index else ""
+            if part in _GIT_NON_REVISION_TOKENS or part.startswith("-") or previous in {"-C", "-n"}:
+                continue
+            tokens.append(part)
+    return tokens
+
+
+def test_parse_baseline_cli_arguments_validates_what_a_workflow_expression_substitutes() -> None:
+    """The workflow can only be exercised by pushing it, so its inputs are decided here.
+
+    A GitHub expression that resolves to nothing substitutes an empty string rather than
+    dropping the argument, and ``github.event.before`` is the null commit the first time a
+    branch is pushed. Both reach the CLI as ordinary strings, so both are rejected here.
+    """
+
+    declared = differential_gate.parse_baseline_cli_arguments(
+        event="pull_request",
+        base_sha="a" * 40,
+        candidate_sha="b" * 40,
+    )
+    assert declared == differential_gate.DeclaredBaselineArgumentsV1(
+        event="pull_request",
+        base_sha="a" * 40,
+        candidate_sha="b" * 40,
+        event_before_sha=None,
+    )
+    push = differential_gate.parse_baseline_cli_arguments(
+        event="push",
+        candidate_sha="c" * 40,
+        event_before_sha="d" * 40,
+    )
+    assert (push.base_sha, push.candidate_sha, push.event_before_sha) == (
+        None,
+        "c" * 40,
+        "d" * 40,
+    )
+    # An expression that yields nothing is absence, not a base.
+    assert (
+        differential_gate.parse_baseline_cli_arguments(
+            event="push",
+            base_sha="",
+            candidate_sha="c" * 40,
+            event_before_sha="",
+        ).base_sha
+        is None
+    )
+
+    with pytest.raises(ValueError, match="must state its base SHA"):
+        differential_gate.parse_baseline_cli_arguments(
+            event="pull_request",
+            base_sha="",
+            candidate_sha="b" * 40,
+        )
+    with pytest.raises(ValueError, match="no semantics for"):
+        differential_gate.parse_baseline_cli_arguments(event="workflow_dispatch")
+    with pytest.raises(ValueError, match="lowercase 40-hex"):
+        differential_gate.parse_baseline_cli_arguments(
+            event="pull_request",
+            base_sha="origin/main",
+            candidate_sha="b" * 40,
+        )
+    with pytest.raises(ValueError, match="lowercase 40-hex"):
+        differential_gate.parse_baseline_cli_arguments(
+            event="pull_request",
+            base_sha=("A" * 40),
+            candidate_sha="b" * 40,
+        )
+    with pytest.raises(ValueError, match="null commit"):
+        differential_gate.parse_baseline_cli_arguments(
+            event="push",
+            candidate_sha="c" * 40,
+            event_before_sha="0" * 40,
+        )
+    with pytest.raises(ValueError, match="only a push context"):
+        differential_gate.parse_baseline_cli_arguments(
+            event="pull_request",
+            base_sha="a" * 40,
+            candidate_sha="b" * 40,
+            event_before_sha="d" * 40,
+        )
+
+
+def test_baseline_context_resolves_a_pull_request_from_its_two_explicit_endpoints(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "pr-repo"
+    identities = merge_fixture_repo(repo)
+
+    resolution = differential_gate.resolve_baseline_context(
+        repo,
+        event="pull_request",
+        base_sha=identities["main_tip"],
+        candidate_sha=identities["feature"],
+        environ={},
+        expected_baseline=identities["main_tip"],
+    )
+
+    assert resolution.baseline_commit_sha == identities["main_tip"]
+    assert resolution.context.event == "pull_request"
+    assert resolution.context.base_source == "explicit_cli"
+    assert resolution.context.candidate_sha == identities["feature"]
+    assert resolution.baseline_tree_sha == subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"{identities['main_tip']}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_a_pull_request_proves_its_merge_base_against_the_head_not_the_synthesized_merge_ref(
+    tmp_path: Path,
+) -> None:
+    """``github.sha`` on a pull request is the merge ref, and its first parent is the base.
+
+    That makes ``merge_base(base, github.sha) == base`` hold for every base whatsoever, so a
+    gate that used it would assert nothing. Here the pull request head forked from an older
+    commit, so the real merge base is ``base`` and the frozen ``main_tip`` is refused, while
+    the same check against the merge ref waves it through.
+    """
+
+    repo = tmp_path / "merge-ref-repo"
+    identities = merge_fixture_repo(repo)
+
+    with pytest.raises(ValueError, match="not the merge base of this run's stated endpoints"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha=identities["main_tip"],
+            candidate_sha=identities["stale_feature"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+
+    vacuous = differential_gate.resolve_baseline_context(
+        repo,
+        event="pull_request",
+        base_sha=identities["main_tip"],
+        candidate_sha=identities["stale_merge"],
+        environ={},
+        expected_baseline=identities["main_tip"],
+    )
+    assert vacuous.baseline_commit_sha == identities["main_tip"]
+
+
+def test_baseline_context_fails_closed_on_a_wrong_absent_or_unresolvable_base(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "bad-base-repo"
+    identities = merge_fixture_repo(repo)
+
+    # F6: an older ancestor is a real commit and a real merge base, just not the frozen one.
+    with pytest.raises(ValueError, match="not the merge base of this run's stated endpoints"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha=identities["base"],
+            candidate_sha=identities["feature"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # F7: no common ancestor at all must refuse, never fall back to an ancestry test.
+    with pytest.raises(ValueError, match="no computable merge base"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha=identities["orphan"],
+            candidate_sha=identities["feature"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # F1: a well-formed SHA that names no object.
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha="0" * 40,
+            candidate_sha=identities["feature"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # F10: an empty reviewed diff is not a passing gate.
+    with pytest.raises(ValueError, match="two distinct commits"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha=identities["main_tip"],
+            candidate_sha=identities["main_tip"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # An endpoint without an event is a caller that has not decided which semantics it wants.
+    with pytest.raises(ValueError, match="without an event"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            base_sha=identities["main_tip"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+
+
+def test_baseline_context_resolves_a_push_from_the_first_parent_and_cross_checks_before(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "push-repo"
+    identities = merge_fixture_repo(repo)
+
+    resolution = differential_gate.resolve_baseline_context(
+        repo,
+        event="push",
+        candidate_sha=identities["merge"],
+        event_before_sha=identities["main_tip"],
+        environ={},
+        expected_baseline=identities["main_tip"],
+    )
+
+    assert resolution.baseline_commit_sha == identities["main_tip"]
+    assert resolution.context.event == "push"
+    assert resolution.context.base_source == "git_first_parent"
+    assert resolution.context.event_before_sha == identities["main_tip"]
+
+    # F2: a squash has one parent, so a push of it produces no release interval.
+    with pytest.raises(ValueError, match="two-parent merge commit"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="push",
+            candidate_sha=identities["squash"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # F3: a stated base that is not the first parent.
+    with pytest.raises(ValueError, match="first parent is not the recorded merge base"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="push",
+            base_sha=identities["base"],
+            candidate_sha=identities["merge"],
+            environ={},
+            expected_baseline=identities["base"],
+        )
+    # F4: GitHub's own claim about the interval start disagrees with the commit's structure.
+    with pytest.raises(ValueError, match="before SHA is not the first parent"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="push",
+            candidate_sha=identities["merge"],
+            event_before_sha=identities["base"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # F5: the null commit means the branch was created or reset, never a release interval.
+    with pytest.raises(ValueError, match="null commit"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="push",
+            candidate_sha=identities["merge"],
+            event_before_sha="0" * 40,
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+
+
+def test_baseline_context_reads_the_github_event_payload_when_no_arguments_are_given(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "payload-repo"
+    identities = merge_fixture_repo(repo)
+    payload_path = tmp_path / "event.json"
+
+    write_github_event(
+        payload_path,
+        {
+            "pull_request": {
+                "base": {"sha": identities["main_tip"]},
+                "head": {"sha": identities["feature"]},
+            },
+            # A decoy: the merge ref GitHub also exposes must not be picked up as the head.
+            "sha": identities["merge"],
+        },
+    )
+    pull_request = differential_gate.resolve_baseline_context(
+        repo,
+        environ={
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_EVENT_PATH": str(payload_path),
+        },
+        expected_baseline=identities["main_tip"],
+    )
+    assert pull_request.context.candidate_sha == identities["feature"]
+    assert pull_request.context.base_source == "github_event_payload"
+
+    write_github_event(
+        payload_path,
+        {"before": identities["main_tip"], "after": identities["merge"]},
+    )
+    push = differential_gate.resolve_baseline_context(
+        repo,
+        environ={
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_EVENT_NAME": "push",
+            "GITHUB_EVENT_PATH": str(payload_path),
+        },
+        expected_baseline=identities["main_tip"],
+    )
+    assert push.context.candidate_sha == identities["merge"]
+    assert push.context.event_before_sha == identities["main_tip"]
+    assert push.baseline_commit_sha == identities["main_tip"]
+
+    for payload, message in (
+        ({"pull_request": {"head": {"sha": identities["feature"]}}}, "base.sha"),
+        ({"pull_request": {"base": {"sha": "not-a-sha"}}}, "base.sha"),
+        ({}, "no pull_request section"),
+    ):
+        write_github_event(payload_path, payload)
+        with pytest.raises(ValueError, match=message):
+            differential_gate.resolve_baseline_context(
+                repo,
+                environ={
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_EVENT_PATH": str(payload_path),
+                },
+                expected_baseline=identities["main_tip"],
+            )
+
+    write_github_event(payload_path, {"before": identities["main_tip"]})
+    with pytest.raises(ValueError, match="after is not a lowercase"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_EVENT_PATH": str(payload_path),
+            },
+            expected_baseline=identities["main_tip"],
+        )
+    with pytest.raises(ValueError, match="GITHUB_EVENT_PATH"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={"GITHUB_EVENT_NAME": "push"},
+            expected_baseline=identities["main_tip"],
+        )
+    write_github_event(payload_path, {})
+    with pytest.raises(ValueError, match="no semantics for"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={
+                "GITHUB_EVENT_NAME": "schedule",
+                "GITHUB_EVENT_PATH": str(payload_path),
+            },
+            expected_baseline=identities["main_tip"],
+        )
+
+
+def test_a_two_parent_head_resolves_itself_without_naming_origin_main_or_any_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case the old semantics could not survive: HEAD is the merge that is also main.
+
+    ``merge_base(origin/main, HEAD)`` collapses to HEAD here and denies every frozen constant.
+    Reading HEAD's own parents instead answers the same question — what did this release
+    interval start from — from the candidate's structure alone, so nothing has to be read back
+    off a ref that has already moved.
+    """
+
+    repo = tmp_path / "head-is-main-repo"
+    identities = merge_fixture_repo(repo)
+    subprocess.run(["git", "-C", str(repo), "checkout", "--quiet", "main"], check=True)
+    assert _head(repo) == identities["merge"]
+
+    recorder = _GitCommandRecorder()
+    monkeypatch.setattr(differential_gate, "subprocess", recorder)
+    resolution = differential_gate.resolve_baseline_context(
+        repo,
+        environ={},
+        expected_baseline=identities["main_tip"],
+    )
+
+    assert resolution.baseline_commit_sha == identities["main_tip"]
+    assert resolution.context.event == "push"
+    assert resolution.context.base_source == "git_first_parent"
+    assert resolution.context.candidate_sha == identities["merge"]
+    assert recorder.commands
+    forbidden = ("origin/main", "origin/HEAD", "origin/", "refs/remotes", "@{u}", "@{upstream}")
+    assert not [
+        command
+        for command in recorder.commands
+        for part in command
+        if any(token in part for token in forbidden)
+    ]
+    # The single ref this path is allowed to read is the checkout's own HEAD; every other
+    # revision it names is an explicit 40-hex object.
+    revisions = _revision_arguments(recorder.commands)
+    assert revisions.count("HEAD^{commit}") == 1
+    assert all(
+        differential_gate._is_lower_hex(
+            token.removesuffix("^{tree}").removesuffix("^{commit}"),
+            length=40,
+        )
+        for token in revisions
+        if token != "HEAD^{commit}"
+    )
+
+
+def test_the_branch_tip_fallback_is_labelled_locally_and_refused_inside_github_actions(
+    tmp_path: Path,
+) -> None:
+    """A single-parent tip has no second endpoint, so the frozen baseline is the base.
+
+    That makes the merge-base equality degenerate into "the baseline is an ancestor of HEAD",
+    which is why the mode is labelled and why CI may never take it: in CI the event always
+    states both endpoints, so a resolver that silently fell back here would be reporting a
+    weaker check under the same name.
+    """
+
+    repo = tmp_path / "branch-tip-repo"
+    identities = merge_fixture_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", identities["feature"]],
+        check=True,
+        capture_output=True,
+    )
+
+    resolution = differential_gate.resolve_baseline_context(
+        repo,
+        environ={},
+        expected_baseline=identities["main_tip"],
+    )
+    assert resolution.baseline_commit_sha == identities["main_tip"]
+    assert resolution.context.base_source == "frozen_baseline_fallback"
+    assert resolution.context.event == "pull_request"
+
+    with pytest.raises(ValueError, match="refused inside GitHub Actions"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={"GITHUB_ACTIONS": "true"},
+            expected_baseline=identities["main_tip"],
+        )
+
+
+def test_the_real_checkout_resolves_the_frozen_baseline_from_its_own_head() -> None:
+    """The smoke that has to hold wherever main happens to be sitting.
+
+    It asks HEAD what it descends from rather than asking a ref where main is, so it gives the
+    same answer on a branch tip, on a fresh clone, and on main itself right after the merge.
+    """
+
+    resolution = differential_gate.resolve_baseline_context(ROOT, environ={})
+
+    assert resolution.baseline_commit_sha == BASELINE_COMMIT_SHA
+    assert resolution.baseline_tree_sha == BASELINE_TREE_SHA
+    assert resolution.context.base_source in ("git_first_parent", "frozen_baseline_fallback")
+    assert resolution.context.candidate_sha == _head()
+
+
+def test_the_baseline_context_model_rejects_a_malformed_or_mismatched_declaration() -> None:
+    with pytest.raises(ValueError, match="two distinct commits"):
+        differential_gate.R07BaselineContextV1(
+            event="push",
+            base_sha="a" * 40,
+            candidate_sha="a" * 40,
+            base_source="explicit_cli",
+        )
+    with pytest.raises(ValueError, match="only a push context"):
+        differential_gate.R07BaselineContextV1(
+            event="pull_request",
+            base_sha="a" * 40,
+            candidate_sha="b" * 40,
+            base_source="explicit_cli",
+            event_before_sha="c" * 40,
+        )
+    with pytest.raises(ValueError, match="null commit"):
+        differential_gate.R07BaselineContextV1(
+            event="push",
+            base_sha="a" * 40,
+            candidate_sha="b" * 40,
+            base_source="git_first_parent",
+            event_before_sha="0" * 40,
+        )
+    with pytest.raises(ValueError):
+        differential_gate.R07BaselineContextV1(
+            event="pull_request",
+            base_sha="origin/main",
+            candidate_sha="b" * 40,
+            base_source="explicit_cli",
+        )
+    with pytest.raises(ValueError):
+        differential_gate.R07BaselineContextV1(
+            event="pull_request",
+            base_sha="a" * 40,
+            candidate_sha="b" * 40,
+            base_source="whatever_i_want",
+        )
+    with pytest.raises(TypeError, match="exact R07BaselineContextV1"):
+        differential_gate.verify_baseline_context(ROOT, object())  # type: ignore[arg-type]
