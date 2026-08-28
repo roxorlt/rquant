@@ -556,6 +556,7 @@ def test_real_terminal_to_run_step_recovery_gc_and_health_chain(tmp_path: Path) 
     )
     settings.migration.warm_root.mkdir(mode=0o700)
     settings.migration.cold_root.mkdir(mode=0o700)
+
     # 这条用例走真实的 full-verified 恢复闸门（每次 authorize 都重跑一遍固定回放校验），
     # 单个 run_step 里要花掉几秒真实时间。GC worker / 迁移 / 健康投影的时间预算默认挂在
     # time.monotonic 上，机器一慢就会在 _process 中途撞 deadline，把工作项打成 retry
