@@ -2143,3 +2143,110 @@ def test_hyb1_p1_06_serializer_and_role_collections_are_bounded(
     monkeypatch.setattr(authority_module, "MAX_RECORD_BYTES", len(encoded) - 1)
     with pytest.raises(RuntimeAuthorityRecordError, match="too large"):
         canonical_runtime_authority_bytes(record)
+
+
+# ---------------------------------------------------------------------------------------
+# R3-0: the second role of the shared prerequisite, held as data until its module exists
+# ---------------------------------------------------------------------------------------
+
+
+def _finalizer_unit_execstart() -> str:
+    unit = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "systemd"
+        / "rquant-lab-claim-finalizer.service"
+    ).read_text(encoding="utf-8")
+    line = next(
+        row for row in unit.splitlines() if row.startswith("ExecStart=") and " formal " in row
+    )
+    return line.removeprefix("ExecStart=")
+
+
+def test_the_pending_role_policy_is_held_to_the_rules_a_live_entry_obeys() -> None:
+    """R3-0 carries R3-B's role as data rather than registering it.
+
+    `lab_claim_finalizer` and `workload_admission` change the same lines of
+    `PRODUCTION_ROLE_POLICY` and of the wrapper allowlist, which is the whole reason this
+    prerequisite exists — settling both here keeps R3-A and R3-B off each other. But the
+    finalizer's module, `rquant.lab_formal_runtime_entry`, is the one file R3-B adds, and a
+    role whose module does not exist fails the module-entry contract rather than waiting
+    quietly. So the entry sits here instead, held to the same field rules a registered one
+    obeys and asserted to be reachable by nothing, and R3-B moves it across.
+    """
+
+    from rquant.runtime_exec_wrapper._verify import PROTECTED_ROLES
+
+    pending = authority_module._PENDING_ROLE_POLICIES
+    declared = {entry.name for entry in authority_module.PRODUCTION_ROLE_POLICY}
+
+    assert [entry.name for entry in pending] == ["lab_claim_finalizer"]
+    assert len(declared) + len(pending) <= authority_module.MAX_ROLES
+    for entry in pending:
+        # Reachable by nothing: not in the policy the profile is checked against, and not in
+        # the allowlist the wrapper accepts a role literal from.
+        assert entry.name not in declared
+        assert entry.name not in PROTECTED_ROLES
+        assert authority_module._ROLE_NAME.fullmatch(entry.name)
+        assert authority_module._MODULE_NAME.fullmatch(entry.module)
+        assert len(entry.environment_allowlist) <= authority_module.MAX_ENVIRONMENT_NAMES
+        assert len(set(entry.environment_allowlist)) == len(entry.environment_allowlist)
+        for name in entry.environment_allowlist:
+            assert authority_module._ENVIRONMENT_NAME.fullmatch(name), name
+        assert entry.instanced is False
+        assert entry.service_kind == ""
+        assert entry.control_root == ""
+        assert entry.once is False
+        assert entry.module_arguments
+        assert all(type(item) is str and item for item in entry.module_arguments)
+
+
+def test_the_pending_finalizer_argv_is_the_one_its_unit_carries_today() -> None:
+    """The frozen literals have to be the unit's, or R3-B changes behaviour by accident.
+
+    `deploy/systemd/rquant-lab-claim-finalizer.service` passes these arguments to
+    `scripts/run-lab-daemon.py formal` itself. Once the unit names only a role literal, the
+    root-owned profile is where they come from, so they are read back out of the unit here
+    rather than restated — a drift in either direction fails.
+    """
+
+    entry = next(
+        item
+        for item in authority_module._PENDING_ROLE_POLICIES
+        if item.name == "lab_claim_finalizer"
+    )
+    _, _, tail = _finalizer_unit_execstart().partition(" formal ")
+
+    assert entry.module == "rquant.lab_formal_runtime_entry"
+    assert entry.module_arguments == tuple(tail.split())
+
+
+def test_the_pending_finalizer_environment_covers_every_name_its_unit_sets() -> None:
+    """`build_child_environment` starts from an empty dictionary and copies the allowlist.
+
+    Anything the unit's own `Environment=` line sets that the role does not list is dropped
+    silently once the wrapper is in the path, which is how a finalizer starts in production
+    with `APP_ENV` unset and no error anywhere. The names are read from the unit.
+    """
+
+    unit = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "systemd"
+        / "rquant-lab-claim-finalizer.service"
+    ).read_text(encoding="utf-8")
+    assignments = next(
+        row.removeprefix("Environment=")
+        for row in unit.splitlines()
+        if row.startswith("Environment=")
+    )
+    unit_names = {item.split("=", 1)[0] for item in assignments.split()}
+    entry = next(
+        item
+        for item in authority_module._PENDING_ROLE_POLICIES
+        if item.name == "lab_claim_finalizer"
+    )
+
+    assert unit_names == {"APP_ENV", "RQUANT_DISABLE_DOTENV", "PYTHONDONTWRITEBYTECODE"}
+    assert unit_names <= set(entry.environment_allowlist)
+    assert set(authority_module._RUNTIME_ROLE_ENVIRONMENT) <= set(entry.environment_allowlist)
