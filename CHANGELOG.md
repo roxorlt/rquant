@@ -185,6 +185,14 @@
 ### Fixed
 
 
+- **09:25 发布截止用例改用相位时钟**：`test_reference_slow_runtime.py` 里两条截止用例原来把虚拟
+  墙钟锚在 09:24:59.700 上按真实速度推进，只留 300 ms 预算，再用 `sleep(0.35)` 越线；注入点之前
+  有 9 次 fsync，CI 上磁盘一慢（25 ms/fsync 即可复现）预算就在 registry/cursor 段耗尽，用例根本
+  没进到它声称的阶段，于是报 `assert 0 == 1`（缺 `rolled_back_deadline` evidence）与 `assert 1 == 86`。
+  改成「截止线前恒定、只在注入点翻转」的相位时钟并删掉两处 `sleep`，200 ms/fsync 下仍确定性通过；
+  同时补上阶段命中断言，将来若提前过期会以「阶段未命中」而不是「evidence 缺失」失败。
+  `write_completion_receipt` 的 evidence 阶段契约补成规范性 docstring（仅注释，行为不变），并由
+  一条负向用例与两条检查点用例分别钉住「不产出 evidence」与「产出 evidence」两个分支。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`

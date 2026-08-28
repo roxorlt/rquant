@@ -22,11 +22,12 @@ from rquant.live_contracts import (
     ConsumerCursor,
     LiveChannel,
 )
-from rquant.live_spool import LiveBatchSpool
+from rquant.live_spool import LiveBatchSpool, LiveSpoolIntegrityError
 from rquant.reference_data_registry import (
     ReferenceDataset,
     ReferenceDataUnavailableError,
     ReferencePublicationAuthenticator,
+    ReferencePublicationCompletionReceipt,
     ReferenceRegistry,
 )
 from rquant.reference_slow_publisher import (
@@ -513,17 +514,23 @@ def _exit_after_receipt_intent_fsync(
         source_read_only=True,
     )
     registry = ReferenceRegistry(Path(registry_path))
-    wall_start = datetime(2026, 7, 31, 1, 24, 59, 700_000, tzinfo=UTC)
-    monotonic_start = time.monotonic_ns()
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
     original_clear = spool._clear_completion_receipt_intent
 
-    def realtime_clock() -> datetime:
-        elapsed_microseconds = (time.monotonic_ns() - monotonic_start) // 1_000
-        return wall_start + timedelta(microseconds=elapsed_microseconds)
+    def constant_clock() -> datetime:
+        # The clock never crosses 09:25 here: `exit_late_after_durable_unlink` kills
+        # the process while the deadline is still in the future, so no checkpoint can
+        # expire no matter how slow the disk is. What this case reproduces is a crash
+        # between the durable unlink and the completion being sealed, and the recovery
+        # adjudication that follows depends only on the resulting on-disk state.
+        return before
 
     def exit_late_after_durable_unlink(publication_id: str) -> None:
         original_clear(publication_id)
-        time.sleep(0.35)
+        if spool.completion_receipt_intent_path(publication_id).exists():
+            # Distinguishable from 86 (crash after a durable unlink), 87 (no crash at
+            # all) and 1 (deadline expired before this hook was reached).
+            os._exit(88)
         os._exit(86)
 
     spool._clear_completion_receipt_intent = exit_late_after_durable_unlink  # type: ignore[method-assign]
@@ -532,9 +539,9 @@ def _exit_after_receipt_intent_fsync(
         registry=registry,
         calendar=_calendar(),
         consumer_id="reference-publisher",
-        observed_at=wall_start,
+        observed_at=before,
         producer_commit=COMMIT,
-        completion_clock=realtime_clock,
+        completion_clock=constant_clock,
     )
     os._exit(87)
 
@@ -891,6 +898,9 @@ def test_publisher_fails_closed_when_start_is_one_millisecond_after_cutoff(
 def test_publisher_compensates_registry_current_and_cursor_when_commit_crosses_cutoff(
     tmp_path: Path,
 ) -> None:
+    # Same crossing point as
+    # `test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence`, which
+    # additionally pins the evidence directory as empty; keep the two clocks in step.
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
     before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
@@ -938,24 +948,51 @@ def test_publisher_compensates_registry_when_cursor_write_crosses_cutoff(
     assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
 
 
-def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_release(
+def test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Pin the no-evidence half of the contract in `LiveBatchSpool.write_completion_receipt`.
+
+    The registry publication stage runs long before a completion receipt exists, so a
+    deadline crossing there must roll everything back and leave no durable evidence
+    behind. The fourth clock reading is the registry's post-commit check, the first
+    crossing that happens after a publication intent row is actually committed to
+    disk. The ordinal alone does not say that, so the crossing samples the intent
+    table from a second connection: only a committed row is visible there, which is
+    what separates this checkpoint from the pre-commit one a reading earlier.
+
+    Same crossing point as
+    `test_publisher_compensates_registry_current_and_cursor_when_commit_crosses_cutoff`;
+    this case exists to pin the empty evidence directory on top of the rollback.
+    """
+
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
-    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
-    wall_start = datetime(2026, 7, 31, 1, 24, 59, 700_000, tzinfo=UTC)
-    monotonic_start = time.monotonic()
-    original_clear = spool._clear_completion_receipt_intent
+    registry_path = tmp_path / "reference.sqlite3"
+    registry = ReferenceRegistry(registry_path)
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    readings = 0
+    publish_calls = 0
+    committed_intent_rows_at_crossing: int | None = None
+    original_publish = registry.append_many_and_publish_before
 
-    def realtime_clock() -> datetime:
-        return wall_start + timedelta(seconds=time.monotonic() - monotonic_start)
+    def witnessed_publish(*args: object, **kwargs: object) -> object:
+        nonlocal publish_calls
+        publish_calls += 1
+        return original_publish(*args, **kwargs)  # type: ignore[arg-type]
 
-    def delayed_cleanup(publication_id: str) -> None:
-        original_clear(publication_id)
-        time.sleep(0.35)
+    def ordinal_clock() -> datetime:
+        nonlocal readings, committed_intent_rows_at_crossing
+        readings += 1
+        if readings < 4:
+            return before
+        with closing(sqlite3.connect(registry_path)) as connection:
+            row = connection.execute("SELECT COUNT(*) FROM reference_publication_intent").fetchone()
+        committed_intent_rows_at_crossing = int(row[0])
+        return late
 
-    monkeypatch.setattr(spool, "_clear_completion_receipt_intent", delayed_cleanup)
+    monkeypatch.setattr(registry, "append_many_and_publish_before", witnessed_publish)
 
     with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25"):
         publish_reference_slow_batches(
@@ -963,11 +1000,145 @@ def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_rel
             registry=registry,
             calendar=_calendar(),
             consumer_id="reference-publisher",
-            observed_at=wall_start,
+            observed_at=before,
             producer_commit=COMMIT,
-            completion_clock=realtime_clock,
+            completion_clock=ordinal_clock,
         )
 
+    assert publish_calls == 1
+    assert committed_intent_rows_at_crossing == 1, (
+        "the deadline must cross inside the registry stage, after the publication "
+        "intent row is committed to disk"
+    )
+    assert _registry_publication_counts(registry) == (0, 0, 0)
+    assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
+    assert tuple(spool.completion_evidence_root.glob("*.json")) == ()
+
+
+def test_receipt_marker_crossing_cutoff_rolls_back_without_durable_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the `marker_durable_at` checkpoint of `write_completion_receipt`.
+
+    This is the one no-evidence checkpoint at which a receipt already exists: it has
+    been written and fsynced, but the commit intent is still on disk, uncleared, so
+    nothing ever acknowledged the receipt and the rollback unlinks it again without
+    sealing evidence. The phase clock crosses the instant the receipt lands, which is
+    after `durable_completed_at` and before `_clear_completion_receipt_intent` runs;
+    `cleanup_calls` witnesses that the run stopped short of the `final_durable_at`
+    checkpoint, the next one along and the first that does emit evidence.
+    """
+
+    spool, _cursor_root = _captured_consumer_spool(tmp_path)
+    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    crossed = False
+    cleanup_calls = 0
+    crossing_receipt: Path | None = None
+    intent_present_at_crossing: bool | None = None
+    original_atomic_write = spool._atomic_write
+    original_clear = spool._clear_completion_receipt_intent
+
+    def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint up to and including the receipt
+        # write observes `before`. Only `crossing_atomic_write` moves it past 09:25.
+        return late if crossed else before
+
+    def crossing_atomic_write(path: Path, payload: bytes) -> None:
+        nonlocal crossed, crossing_receipt, intent_present_at_crossing
+        original_atomic_write(path, payload)
+        # The receipt is `<completion_receipt_root>/<publication_id>.json`; the commit
+        # intent written a moment earlier carries an extra `.intent` suffix, so only
+        # the receipt has a bare 64-hex stem in that directory.
+        if crossed or path.parent != spool.completion_receipt_root:
+            return
+        if len(path.stem) != 64:
+            return
+        crossing_receipt = path
+        intent_present_at_crossing = spool.completion_receipt_intent_path(path.stem).exists()
+        crossed = True
+
+    def counted_clear(publication_id: str) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        original_clear(publication_id)
+
+    monkeypatch.setattr(spool, "_atomic_write", crossing_atomic_write)
+    monkeypatch.setattr(spool, "_clear_completion_receipt_intent", counted_clear)
+
+    with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25") as excinfo:
+        publish_reference_slow_batches(
+            spool=spool,
+            registry=registry,
+            calendar=_calendar(),
+            consumer_id="reference-publisher",
+            observed_at=before,
+            producer_commit=COMMIT,
+            completion_clock=phase_clock,
+        )
+
+    assert crossing_receipt is not None, "the completion receipt was never written"
+    assert intent_present_at_crossing is True
+    assert cleanup_calls == 0, (
+        "the run reached the completion-intent cleanup, so it crossed at a later "
+        "checkpoint than marker_durable_at"
+    )
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LiveSpoolIntegrityError)
+    assert str(cause) == "completion receipt completed after deadline"
+    assert not crossing_receipt.exists()
+    assert spool.completion_receipt_intent_path(crossing_receipt.stem).exists()
+    assert _registry_publication_counts(registry) == (0, 0, 0)
+    assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
+    assert tuple(spool.completion_evidence_root.glob("*.json")) == ()
+
+
+def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool, _cursor_root = _captured_consumer_spool(tmp_path)
+    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    crossed = False
+    cleared = False
+    original_clear = spool._clear_completion_receipt_intent
+
+    def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint before the completion-intent
+        # cleanup observes `before`, so no amount of fsync or CPU stall can expire
+        # the publication early. Only `crossing_cleanup` moves it past 09:25.
+        return late if crossed else before
+
+    def crossing_cleanup(publication_id: str) -> None:
+        nonlocal crossed, cleared
+        original_clear(publication_id)
+        assert not spool.completion_receipt_intent_path(publication_id).exists(), (
+            "the completion intent must be durably unlinked before the deadline crosses"
+        )
+        cleared = True
+        crossed = True
+
+    monkeypatch.setattr(spool, "_clear_completion_receipt_intent", crossing_cleanup)
+
+    with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25") as excinfo:
+        publish_reference_slow_batches(
+            spool=spool,
+            registry=registry,
+            calendar=_calendar(),
+            consumer_id="reference-publisher",
+            observed_at=before,
+            producer_commit=COMMIT,
+            completion_clock=phase_clock,
+        )
+
+    assert cleared, "the deadline expired before the completion-intent cleanup was reached"
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LiveSpoolIntegrityError)
+    assert str(cause) == "completion receipt completed after deadline"
     assert _registry_publication_counts(registry) == (0, 0, 0)
     assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
     evidence_files = tuple(spool.completion_evidence_root.glob("*.json"))
@@ -987,6 +1158,76 @@ def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_rel
         },
         authentication_mac,
     )
+
+
+def test_evidence_stage_crossing_cutoff_reseals_committed_evidence_as_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the second evidence-emitting checkpoint of `write_completion_receipt`.
+
+    The `evidence_durable_at` check runs after the `committed` evidence has already
+    been sealed, so a crossing there has to overwrite that evidence with
+    `rolled_back_deadline` instead of leaving a committed receipt behind. The captured
+    batch's `available_at` lands at 01:24:50, so the phase clock starts at 01:24:51 -
+    one second of headroom above that floor - which leaves the monotonic budget wide
+    enough that the earlier `final_durable_at` checkpoint cannot fire first on a slow
+    disk.
+    """
+
+    spool, _cursor_root = _captured_consumer_spool(tmp_path)
+    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+    before = datetime(2026, 7, 31, 1, 24, 51, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    crossed = False
+    sealed_outcomes: list[str] = []
+    original_persist = spool._persist_completion_evidence
+
+    def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint up to and including the
+        # `committed` evidence write observes `before`. Only `crossing_persist`,
+        # which runs inside that write, moves it past 09:25.
+        return late if crossed else before
+
+    def crossing_persist(
+        receipt: ReferencePublicationCompletionReceipt,
+        *,
+        durable_completed_at: datetime,
+        outcome: str,
+    ) -> None:
+        nonlocal crossed
+        original_persist(
+            receipt,
+            durable_completed_at=durable_completed_at,
+            outcome=outcome,
+        )
+        sealed_outcomes.append(outcome)
+        crossed = True
+
+    monkeypatch.setattr(spool, "_persist_completion_evidence", crossing_persist)
+
+    with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25") as excinfo:
+        publish_reference_slow_batches(
+            spool=spool,
+            registry=registry,
+            calendar=_calendar(),
+            consumer_id="reference-publisher",
+            observed_at=before,
+            producer_commit=COMMIT,
+            completion_clock=phase_clock,
+        )
+
+    assert sealed_outcomes == ["committed", "rolled_back_deadline"]
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LiveSpoolIntegrityError)
+    assert str(cause) == "completion evidence completed after deadline"
+    assert _registry_publication_counts(registry) == (0, 0, 0)
+    assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
+    evidence_files = tuple(spool.completion_evidence_root.glob("*.json"))
+    assert len(evidence_files) == 1
+    evidence = strict_canonical_json_loads(evidence_files[0].read_bytes())
+    assert isinstance(evidence, dict)
+    assert evidence["outcome"] == "rolled_back_deadline"
 
 
 def test_real_exit_after_late_receipt_intent_unlink_recovers_by_rolling_back(
@@ -1014,6 +1255,10 @@ def test_real_exit_after_late_receipt_intent_unlink_recovers_by_rolling_back(
         cursor_root=cursor_root,
         source_read_only=True,
     )
+    # The crash left a durable completion receipt behind but no durable evidence,
+    # so recovery must refuse the receipt and roll the publication back.
+    assert tuple(reopened_spool.completion_receipt_root.glob("*.json")) != ()
+    assert tuple(reopened_spool.completion_evidence_root.glob("*.json")) == ()
     assert _registry_publication_counts(reopened_registry) == (0, 0, 0)
     assert reopened_spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
 
@@ -1048,7 +1293,11 @@ def test_success_persists_authenticated_final_durable_completion_evidence(
 ) -> None:
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
-    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    # The captured batch's available_at lands at 01:24:50, which is the floor for a
+    # start instant here; 01:24:51 takes a second of headroom above it and leaves the
+    # real monotonic guard armed with a 9 s budget instead of 1 s. That is what the
+    # success path needs: the guard must stay live, but a slow disk must not trip it.
+    before = datetime(2026, 7, 31, 1, 24, 51, tzinfo=UTC)
 
     result = publish_reference_slow_batches(
         spool=spool,
