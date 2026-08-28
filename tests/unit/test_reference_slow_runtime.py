@@ -515,24 +515,22 @@ def _exit_after_receipt_intent_fsync(
     )
     registry = ReferenceRegistry(Path(registry_path))
     before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
-    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
-    crossed = False
     original_clear = spool._clear_completion_receipt_intent
 
-    def phase_clock() -> datetime:
-        # Deterministic phase clock: every checkpoint before the completion-intent
-        # cleanup observes `before`, so no amount of fsync or CPU stall can expire
-        # the publication early. Only `crossing_cleanup` moves it past 09:25.
-        return late if crossed else before
+    def constant_clock() -> datetime:
+        # The clock never crosses 09:25 here: `exit_late_after_durable_unlink` kills
+        # the process while the deadline is still in the future, so no checkpoint can
+        # expire no matter how slow the disk is. What this case reproduces is a crash
+        # between the durable unlink and the completion being sealed, and the recovery
+        # adjudication that follows depends only on the resulting on-disk state.
+        return before
 
     def exit_late_after_durable_unlink(publication_id: str) -> None:
-        nonlocal crossed
         original_clear(publication_id)
         if spool.completion_receipt_intent_path(publication_id).exists():
             # Distinguishable from 86 (crash after a durable unlink), 87 (no crash at
             # all) and 1 (deadline expired before this hook was reached).
             os._exit(88)
-        crossed = True
         os._exit(86)
 
     spool._clear_completion_receipt_intent = exit_late_after_durable_unlink  # type: ignore[method-assign]
@@ -543,7 +541,7 @@ def _exit_after_receipt_intent_fsync(
         consumer_id="reference-publisher",
         observed_at=before,
         producer_commit=COMMIT,
-        completion_clock=phase_clock,
+        completion_clock=constant_clock,
     )
     os._exit(87)
 
@@ -1170,10 +1168,11 @@ def test_evidence_stage_crossing_cutoff_reseals_committed_evidence_as_rolled_bac
 
     The `evidence_durable_at` check runs after the `committed` evidence has already
     been sealed, so a crossing there has to overwrite that evidence with
-    `rolled_back_deadline` instead of leaving a committed receipt behind. The phase
-    clock starts at 01:24:51, the earliest instant the captured batch's `available_at`
-    allows, so the monotonic budget stays wide and the earlier `final_durable_at`
-    checkpoint cannot fire first on a slow disk.
+    `rolled_back_deadline` instead of leaving a committed receipt behind. The captured
+    batch's `available_at` lands at 01:24:50, so the phase clock starts at 01:24:51 -
+    one second of headroom above that floor - which leaves the monotonic budget wide
+    enough that the earlier `final_durable_at` checkpoint cannot fire first on a slow
+    disk.
     """
 
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
@@ -1294,10 +1293,10 @@ def test_success_persists_authenticated_final_durable_completion_evidence(
 ) -> None:
     spool, _cursor_root = _captured_consumer_spool(tmp_path)
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
-    # 01:24:51 is the earliest start the captured batch's available_at permits. It
-    # leaves the real monotonic guard armed with a 9 s budget instead of 1 s, which
-    # is what the success path needs: the guard must stay live, but a slow disk must
-    # not be able to trip it.
+    # The captured batch's available_at lands at 01:24:50, which is the floor for a
+    # start instant here; 01:24:51 takes a second of headroom above it and leaves the
+    # real monotonic guard armed with a 9 s budget instead of 1 s. That is what the
+    # success path needs: the guard must stay live, but a slow disk must not trip it.
     before = datetime(2026, 7, 31, 1, 24, 51, tzinfo=UTC)
 
     result = publish_reference_slow_batches(
