@@ -127,21 +127,22 @@ RESEARCH_ARBITER_UNITS = frozenset(
 #: `rquant-research-ingest.service` is a shell script that lives on `origin/main`, and the
 #: finalizer is Codex round-3 RQ-WI-R2-P1-02, a separate package. The set is exact — a third
 #: entry, or a changed program, fails here rather than passing quietly.
+#: The one arbiter-fronted unit still allowed to hand the arbiter a checkout program.
+#: `rquant-research-ingest.service` runs a shell script that predates all of this and is not
+#: part of round 3; it is named here so that "a unit reaches into the checkout" stays a fact
+#: this table has to admit rather than something the closure test quietly tolerates. R3-B
+#: moved the finalizer onto the wrapper, so its entry is gone.
 LEGACY_CHECKOUT_CHILD_UNITS = {
-    "rquant-lab-claim-finalizer.service": "/home/lighthouse/rquant/.venv/bin/python",
     "rquant-research-ingest.service": (
         "/home/lighthouse/rquant/scripts/run-research-ingest-daily.sh"
     ),
 }
 #: Independent review R3A-SPEC-03. `ExecStartPre` runs *before* systemd execs `ExecStart`, so
 #: it is before the arbiter, before the plane locks and before the admission probe — a unit
-#: with a checkout `ExecStartPre` is not clean just because its admission stage is. Exactly
-#: one arbiter-fronted unit has one today, and it is the finalizer that round-3
-#: RQ-WI-R2-P1-02 covers; every other one must declare none at all. R3-B deletes this entry
-#: together with the `ExecStartPre` line itself.
-LEGACY_CHECKOUT_EXEC_START_PRE = {
-    "rquant-lab-claim-finalizer.service": ("/home/lighthouse/rquant/.venv/bin/rquant",),
-}
+#: with a checkout `ExecStartPre` is not clean just because its admission stage is. R3-B
+#: deleted the finalizer's line, which was the only one, so this table is now empty and every
+#: arbiter-fronted unit must declare no `ExecStartPre` at all.
+LEGACY_CHECKOUT_EXEC_START_PRE: dict[str, tuple[str, ...]] = {}
 #: Every interpreter the closure may name, and the flags it must carry before it is handed a
 #: path to run. `-I` drops `PYTHON*`, the user site directory and the script directory; `-S`
 #: drops `site` and every `.pth` hook with it. Without this the closure test would accept an
@@ -181,8 +182,13 @@ def _logical_lines(text: str) -> list[str]:
     for raw in text.splitlines():
         piece = raw.strip() if pending is not None else raw
         current = piece if pending is None else f"{pending} {piece}"
-        if current.endswith("\\"):
-            pending = current[:-1].rstrip()
+        # Independent review R3A-SPEC-10: the continuation test is against the stripped line.
+        # A first line is taken raw, so a `\` followed by a space or a tab used to read as an
+        # ordinary ending and the rest of the argv was dropped - the exact miss this reader
+        # exists to prevent.
+        stripped = current.rstrip()
+        if stripped.endswith("\\"):
+            pending = stripped[:-1].rstrip()
             continue
         joined.append(current)
         pending = None
@@ -1112,9 +1118,9 @@ def test_every_process_the_arbiter_starts_before_the_verified_child_is_root_owne
 
         assert introduced == ARBITER_INTRODUCED_EXECUTABLES, name
         _assert_interpreters_are_isolated(admission, name, minimum=1)
-        # The two legacy children name a checkout program rather than the system interpreter,
-        # so there is nothing there to carry the flags; they are pinned by the exemption
-        # tables instead, and lose their exemption when R3-B lands.
+        # The one remaining legacy child names a checkout program rather than the system
+        # interpreter, so there is nothing there to carry the flags; it is pinned by the
+        # exemption table instead.
         _assert_interpreters_are_isolated(
             wrapped_child,
             name,
@@ -1128,7 +1134,9 @@ def test_the_arbiter_fronted_units_declare_only_the_wrapper_or_a_listed_legacy_c
     from rquant.runtime_exec_wrapper._verify import RUNTIME_PYZ_PATH
 
     assert set(LEGACY_CHECKOUT_CHILD_UNITS) < RESEARCH_ARBITER_UNITS
-    assert len(LEGACY_CHECKOUT_CHILD_UNITS) == 2
+    # Exact, not an upper bound: one more entry here is one more unit reaching into the
+    # checkout, and it has to fail rather than be absorbed.
+    assert len(LEGACY_CHECKOUT_CHILD_UNITS) == 1
 
     for name in sorted(RESEARCH_ARBITER_UNITS):
         child = _exec_start(name).removeprefix(ARBITER_RESEARCH_EXEC_START).split()
@@ -1174,12 +1182,13 @@ def test_no_arbiter_fronted_unit_runs_anything_before_the_arbiter_but_the_listed
     """`ExecStartPre` is earlier than every step the arbiter controls.
 
     Independent review R3A-SPEC-03: closing the admission stage says nothing about a command
-    systemd runs before the arbiter is even started. Exactly one of the ten declares one, it
-    is the finalizer round-3 RQ-WI-R2-P1-02 covers, and the program is pinned by name.
+    systemd runs before the arbiter is even started. The finalizer was the only one that
+    declared such a command; RQ-WI-R2-P1-02 removed it, so the exemption table is empty and
+    none of them may declare one.
     """
 
-    assert set(LEGACY_CHECKOUT_EXEC_START_PRE) < RESEARCH_ARBITER_UNITS
-    assert len(LEGACY_CHECKOUT_EXEC_START_PRE) == 1
+    assert set(LEGACY_CHECKOUT_EXEC_START_PRE) <= RESEARCH_ARBITER_UNITS
+    assert len(LEGACY_CHECKOUT_EXEC_START_PRE) == 0
 
     for name in sorted(RESEARCH_ARBITER_UNITS):
         programs = tuple(command.split()[0] for command in _exec_start_pre(name))
@@ -1205,6 +1214,28 @@ def test_the_unit_reader_joins_a_continued_exec_line() -> None:
     ]
     assert _directive_values(unit, "ExecStartPre") == ["/bin/true first"]
     assert _directive_values(unit, "SuccessExitStatus") == ["0 75"]
+
+
+def test_a_continuation_survives_trailing_whitespace_after_the_backslash() -> None:
+    """Independent review R3A-SPEC-10: `\\ ` continues too, and systemd reads it that way.
+
+    The first line of a logical line is taken raw, so a backslash followed by a space used to
+    read as an ordinary line ending: the reader returned the arbiter prefix and dropped the
+    interpreter, the pyz and the role - a closure test would then have seen a unit that names
+    nothing suspicious because it could not see most of the argv.
+    """
+
+    unit = (
+        "[Service]\n"
+        "ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- \\  \n"
+        "    /usr/bin/python3.11 -I -S \\\t\n"
+        "    /usr/local/libexec/rquant-runtime-exec.pyz --role shadow_session\n"
+    )
+
+    assert _directive_values(unit, "ExecStart") == [
+        f"{ARBITER_RESEARCH_EXEC_START}/usr/bin/python3.11 -I -S "
+        "/usr/local/libexec/rquant-runtime-exec.pyz --role shadow_session"
+    ]
 
 
 def test_a_continued_exec_line_would_hide_half_its_argv_from_a_physical_line_reader() -> None:
