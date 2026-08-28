@@ -448,13 +448,12 @@ def test_the_generator_reports_which_source_decided_the_baseline(
     assert "base_source=github_event_payload" in from_event[0]
     assert "frozen_baseline_fallback" not in from_event[0]
 
-    # The contrast that makes the line worth printing: the same command outside CI takes the
-    # weaker branch-tip source and now says so.
-    monkeypatch.delenv("GITHUB_ACTIONS")
-    monkeypatch.delenv("GITHUB_EVENT_NAME")
-    monkeypatch.delenv("GITHUB_EVENT_PATH")
-
-    assert regenerate.main(["--repo", str(ROOT), "--check"]) == 0
-    local = summary_lines()
-    assert len(local) == 1
-    assert "base_source=frozen_baseline_fallback" in local[0]
+    # The two CI shapes have to be distinguishable from each other, and neither may be the
+    # degraded fallback. Nothing further is claimed about this checkout: whether a bare local
+    # run takes the fallback depends on whether HEAD has one parent or two, and every CI
+    # checkout has two, so asserting the fallback here would pass on a laptop and fail in CI.
+    # Both shapes are pinned exactly against fixture repositories in
+    # test_signal_family_differential_gate.py::
+    # test_the_resolution_summary_names_the_source_each_checkout_shape_produces.
+    observed = {line.rsplit("base_source=", 1)[1] for line in (stated[0], from_event[0])}
+    assert observed == {"explicit_cli", "github_event_payload"}

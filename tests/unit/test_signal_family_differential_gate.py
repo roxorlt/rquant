@@ -742,7 +742,21 @@ def test_the_frozen_baseline_is_the_merge_base_this_checkout_resolves_for_itself
     assert resolution.baseline_commit_sha == BASELINE_COMMIT_SHA
     assert resolution.baseline_tree_sha == BASELINE_TREE_SHA
     assert resolution.context.candidate_sha == _head()
-    assert resolution.context.base_source in ("git_first_parent", "frozen_baseline_fallback")
+    # Which source answers is decided by this checkout's shape, and both shapes are normal:
+    # a developer's branch tip has one parent, every CI checkout has two (a pull request
+    # builds the synthesized merge ref, a push to main is the merge commit itself). So the
+    # expectation is derived from the shape rather than written down as one of two options -
+    # that keeps the assertion discriminating on whichever shape is actually running. Each
+    # shape is pinned exactly, against fixture repositories, by
+    # test_the_resolution_summary_names_the_source_each_checkout_shape_produces.
+    parents = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", _head()],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[1:]
+    expected_source = "git_first_parent" if len(parents) == 2 else "frozen_baseline_fallback"
+    assert resolution.context.base_source == expected_source
     assert (
         subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{BASELINE_COMMIT_SHA}^{{tree}}"],
@@ -2028,6 +2042,64 @@ def test_a_derived_push_baseline_that_is_not_the_frozen_constant_is_refused(
             environ={},
             expected_baseline=identities["base"],
         )
+
+
+def test_the_resolution_summary_names_the_source_each_checkout_shape_produces(
+    tmp_path: Path,
+) -> None:
+    """Both checkout shapes, each pinned exactly, against a repository built for the purpose.
+
+    Which source answers is a property of the checkout, not of the code: a branch tip has one
+    parent and reaches the frozen-baseline fallback, while every CI checkout has two and
+    reaches the first parent. Asserting either one against the repository under test passes on
+    a laptop and fails in CI, and asserting "one of these two" stops telling them apart. Both
+    are built here instead, so the summary line is pinned character for character on each.
+    """
+
+    repo = tmp_path / "shape-repo"
+    identities = merge_fixture_repo(repo)
+
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", "main"],
+        check=True,
+        capture_output=True,
+    )
+    assert _head(repo) == identities["merge"]
+    merged = differential_gate.baseline_resolution_summary(
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    )
+    assert merged == (
+        f"R07 baseline: event=push base={identities['main_tip']} "
+        f"candidate={identities['merge']} base_source=git_first_parent"
+    )
+
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", identities["feature"]],
+        check=True,
+        capture_output=True,
+    )
+    assert _head(repo) == identities["feature"]
+    tip = differential_gate.baseline_resolution_summary(
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    )
+    assert tip == (
+        f"R07 baseline: event=pull_request base={identities['main_tip']} "
+        f"candidate={identities['feature']} base_source=frozen_baseline_fallback"
+    )
+    # The line has to separate them; a summary that read the same either way would be no
+    # more useful than the unread label it replaced.
+    assert merged != tip
+
+    with pytest.raises(TypeError, match="exact R07BaselineResolutionV1"):
+        differential_gate.baseline_resolution_summary(object())  # type: ignore[arg-type]
 
 
 def test_the_branch_tip_fallback_is_labelled_locally_and_refused_inside_github_actions(
