@@ -210,10 +210,14 @@ class RuntimeCodeFormalService(RuntimeContractModel):
         "lab-scheduler",
         "lab-worker",
     ]
+    #: Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. This carried a
+    #: `wrapper_path` naming `scripts/run-lab-daemon.py` so the migration preflight could
+    #: check the checkout wrapper's call graph. The unit no longer executes that script, so
+    #: there is no second artifact to inspect and no field to name it with — the service is
+    #: its unit, and the argv behind it comes from the root-owned role policy.
     unit_path: Path
-    wrapper_path: Path
 
-    @field_validator("unit_path", "wrapper_path", mode="after")
+    @field_validator("unit_path", mode="after")
     @classmethod
     def validate_paths(cls, value: Path) -> Path:
         return _absolute_path(value)
@@ -758,10 +762,7 @@ class RuntimeCodeGenerationOperator:
             if service.command not in _FORMAL_COMMANDS:
                 raise RuntimeCodeOperationError("formal runtime service command is invalid")
             try:
-                inspected = inspect_formal_systemd_service(
-                    unit_path=service.unit_path,
-                    wrapper_source_path=service.wrapper_path,
-                )
+                inspected = inspect_formal_systemd_service(unit_path=service.unit_path)
                 binding = inspected.wrapper.bootstrap
                 if (
                     inspected.wrapper.command != service.command

@@ -1802,10 +1802,7 @@ def verify_lab_claim_finalizer_unit(systemd_root: Path) -> FinalizerUnitCheck:
     try:
         from rquant.formal_runtime_command import inspect_formal_systemd_service
 
-        inspect_formal_systemd_service(
-            unit_path=path,
-            wrapper_source_path=systemd_root.parents[1] / "scripts" / "run-lab-daemon.py",
-        )
+        inspect_formal_systemd_service(unit_path=path)
     except (OSError, RuntimeError) as exc:
         return FinalizerUnitCheck(
             status="fail",

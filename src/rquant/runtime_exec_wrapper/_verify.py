@@ -71,6 +71,10 @@ PROTECTED_ROLES = (
     "daily_pipeline_orchestrator",
     "feature_live",
     "lab_artifact_catalog",
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02: the formal claim
+    # finalizer stops proving its own trustworthiness with the checkout it is proving things
+    # about, and reaches `rquant.lab_formal_runtime_entry` through this wrapper instead.
+    "lab_claim_finalizer",
     "lab_jobs_publisher",
     "market_minute_source",
     "notifier",

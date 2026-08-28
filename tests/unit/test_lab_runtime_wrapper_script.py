@@ -1604,3 +1604,158 @@ def test_lab_runtime_startup_scripts_are_stdlib_only(script: Path) -> None:
             "_run_preflight(\n            root=root"
         )
     assert imported_roots <= allowed
+
+
+# ---------------------------------------------------------------------------------------
+# Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02: importing the script runs no code
+# ---------------------------------------------------------------------------------------
+
+
+def _sentinel_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """A copy of the wrapper whose `contained_subprocess` records having been executed.
+
+    `_load_contained_runner` resolves its target from the script's own location, so a
+    two-directory copy is enough to observe exactly what importing the script executes.
+    """
+
+    checkout = tmp_path / "checkout"
+    (checkout / "scripts").mkdir(parents=True)
+    (checkout / "src" / "rquant").mkdir(parents=True)
+    script = checkout / "scripts" / "run-lab-daemon.py"
+    script.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+    marker = tmp_path / "contained-subprocess-executed"
+    (checkout / "src" / "rquant" / "contained_subprocess.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('executed', encoding='ascii')\n"
+        "\n"
+        "\n"
+        "def run_contained(*arguments, **keywords):\n"
+        "    return ('contained', arguments, keywords)\n",
+        encoding="utf-8",
+    )
+    return script, marker
+
+
+def _import_wrapper(script: Path, *, then: str = "") -> subprocess.CompletedProcess[str]:
+    program = (
+        "import importlib.util\n"
+        "import sys\n"
+        "spec = importlib.util.spec_from_file_location('wrapper_under_test', sys.argv[1])\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name] = module\n"
+        "spec.loader.exec_module(module)\n"
+        f"{then}"
+        "print('imported')\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", program, str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_importing_the_daemon_wrapper_executes_no_checkout_module(tmp_path: Path) -> None:
+    """The script's first instruction must not be "run some checkout code".
+
+    `run_contained = _load_contained_runner()` at module level meant the process executed
+    `<checkout>/src/rquant/contained_subprocess.py` — through `spec_from_file_location`, so
+    outside every import hook — before it had decided anything at all. On the launchd path
+    that is merely early; on the formal systemd path it was checkout code running ahead of
+    the generation verification that was supposed to authorise it.
+    """
+
+    script, marker = _sentinel_checkout(tmp_path)
+
+    completed = _import_wrapper(script)
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists(), "importing the wrapper executed a checkout module"
+
+
+def test_the_legacy_contained_runner_is_loaded_the_first_time_a_legacy_path_uses_it(
+    tmp_path: Path,
+) -> None:
+    """Deferred, not deleted: `deploy/launchd/` still needs the contained runner."""
+
+    script, marker = _sentinel_checkout(tmp_path)
+
+    completed = _import_wrapper(
+        script,
+        then="assert module.run_contained('probe')[0] == 'contained'\n",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="ascii") == "executed"
+
+
+def test_the_checkout_formal_entry_refuses_to_run() -> None:
+    """Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02, mirroring the P1-4 shape.
+
+    `run-lab-daemon.py formal` was the finalizer's production entry, and every step of it —
+    the `rquant.formal_runtime*` imports, the deployment lock, the runtime-code capability —
+    executed checkout code ahead of the verification that was meant to authorise it. The
+    branch stays so a stale unit or runbook fails loudly, and it now does nothing but say so.
+    """
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(WRAPPER),
+            "formal",
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
+            "--deployment-lock-path",
+            "/run/rquant-lab-claim-finalizer/deployment.lock",
+            "--",
+            "lab-claim-finalizer",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert "root-owned wrapper" in completed.stderr
+    assert "--role lab_claim_finalizer" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_the_checkout_formal_entry_no_longer_reaches_the_formal_runtime() -> None:
+    """The refusal has to be a refusal, not a shorter path to the same imports."""
+
+    source = WRAPPER.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(WRAPPER))
+    formal = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_formal_main"
+    )
+    names = {
+        node.value
+        for node in ast.walk(formal)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    dynamic_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "import_module"
+    ]
+
+    assert dynamic_imports == []
+    assert [
+        ast.unparse(node.func)
+        for node in ast.walk(formal)
+        if isinstance(node, ast.Call)
+    ] == ["sys.stderr.write"]
+    assert any("root-owned wrapper" in name for name in names)
+    assert "FORMAL_RUNTIME_WRAPPER_CONTRACT" not in source
