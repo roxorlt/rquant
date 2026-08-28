@@ -8,8 +8,9 @@ It has no scheduler, provider, queue, runtime, adapter, or worker authority.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -272,29 +273,77 @@ class _FinalizerStageCursor:
         self.stage: _FinalizerStage = stage
 
 
-# Closed (exception class, error code) -> category allowlist. Without it the
-# class-name rule below redacts every ClaimPublicationConflictError message into
-# "authority_conflict", which made a ledger signature failure indistinguishable
-# from a fencing/authority failure.
-_REDACTED_CATEGORIES: dict[tuple[type[BaseException], str], str] = {
-    (ClaimPublicationConflictError, "publication_cas_conflict"): "cas_conflict",
-    (
-        ClaimPublicationConflictError,
-        "finalizer_publication_signature_invalid",
-    ): "signature_invalid",
-    (
-        ClaimPublicationConflictError,
-        "finalizer_publication_signature_missing",
-    ): "signature_missing",
-    (ClaimPublicationConflictError, "finalizer_external_trust_invalid"): "trust_invalid",
-    (ClaimPublicationConflictError, "finalizer_authority_conflict"): "authority_conflict",
-    (ClaimPublicationConflictError, "ready_content_conflict"): "ready_content_conflict",
-    (ClaimPublicationConflictError, "published_receipt_conflict"): "receipt_conflict",
-    (ClaimPublicationConflictError, "ready_binding_conflict"): "ready_binding_conflict",
-    (ClaimPublicationConflictError, "attempt_identity_conflict"): "identity_conflict",
-    (InvalidClaimPublicationTransitionError, "transition_not_allowed"): "finalization_blocked",
-    (InvalidClaimPublicationTransitionError, "terminal_status_immutable"): "finalization_blocked",
-}
+# Closed (exception class, error code) -> category allowlist, covering every code
+# LabClaimFinalizer.finalize() can surface. Without it the class-name rule below
+# redacts every ClaimPublicationConflictError into "authority_conflict" and every
+# LabClaimFinalizerError into "finalization_blocked", which made a ledger
+# signature failure, a dispatch-tamper detection and a real fencing failure
+# indistinguishable. Keys are matched on the exact type, so the
+# LabClaimFinalizerObservationDegradedError subclass needs its own entry.
+# test_every_finalize_reachable_error_code_is_classified_by_the_allowlist keeps
+# this table in step with the source.
+_REDACTED_CATEGORIES: Mapping[tuple[type[BaseException], str], str] = MappingProxyType(
+    {
+        # --- ledger CAS / transition outcomes ---
+        (ClaimPublicationConflictError, "publication_cas_conflict"): "cas_conflict",
+        (ClaimPublicationConflictError, "attempt_identity_conflict"): "identity_conflict",
+        (ClaimPublicationConflictError, "ready_content_conflict"): "ready_content_conflict",
+        (ClaimPublicationConflictError, "ready_binding_conflict"): "ready_binding_conflict",
+        (ClaimPublicationConflictError, "published_receipt_conflict"): "receipt_conflict",
+        (InvalidClaimPublicationTransitionError, "transition_not_allowed"): "finalization_blocked",
+        (
+            InvalidClaimPublicationTransitionError,
+            "terminal_status_immutable",
+        ): "finalization_blocked",
+        # --- finalizer capability and trust chain ---
+        (ClaimPublicationConflictError, "finalizer_authority_conflict"): "authority_conflict",
+        (ClaimPublicationConflictError, "finalizer_authority_missing"): "authority_missing",
+        (ClaimPublicationConflictError, "finalizer_external_trust_invalid"): "trust_invalid",
+        (
+            ClaimPublicationConflictError,
+            "finalizer_publication_signature_invalid",
+        ): "signature_invalid",
+        (
+            ClaimPublicationConflictError,
+            "finalizer_publication_signature_missing",
+        ): "signature_missing",
+        # --- current-claim authority guard around the C and D CAS ---
+        (
+            ClaimPublicationConflictError,
+            "current_authority_guard_untrusted",
+        ): "authority_guard_untrusted",
+        (
+            ClaimPublicationConflictError,
+            "current_authority_guard_dispatch_tampered",
+        ): "authority_guard_tampered",
+        # --- source stage evidence consulted while issuing READY ---
+        (
+            ClaimPublicationConflictError,
+            "source_stage_authority_conflict",
+        ): "source_stage_authority_conflict",
+        (
+            ClaimPublicationConflictError,
+            "ready_source_stage_conflict",
+        ): "ready_source_stage_conflict",
+        # --- finalizer-local guards, including the worker D gate ---
+        (LabClaimFinalizerError, "publication_missing"): "publication_missing",
+        (LabClaimFinalizerError, "publication_not_published"): "publication_not_published",
+        (LabClaimFinalizerError, "publication_signature_invalid"): "signature_invalid",
+        (LabClaimFinalizerError, "published_claim_conflict"): "published_claim_conflict",
+        (LabClaimFinalizerError, "published_receipt_invalid"): "receipt_invalid",
+        (LabClaimFinalizerError, "publication_trust_verifier_missing"): "trust_verifier_missing",
+        (LabClaimFinalizerError, "finalizer_trust_verifier_missing"): "trust_verifier_missing",
+        (LabClaimFinalizerError, "concurrent_terminal_invalid"): "concurrent_terminal_invalid",
+        (LabClaimFinalizerError, "claim_preimage_invalid"): "claim_preimage_invalid",
+        (LabClaimFinalizerError, "claim_preimage_conflict"): "claim_preimage_conflict",
+        (LabClaimFinalizerError, "source_stage_binding_invalid"): "source_stage_binding_invalid",
+        (LabClaimFinalizerError, "source_stage_evidence_invalid"): "source_stage_evidence_invalid",
+        (
+            LabClaimFinalizerObservationDegradedError,
+            "observation_persistence_degraded",
+        ): "observation_degraded",
+    }
+)
 
 
 def _redacted_category(exc: Exception) -> str:
@@ -655,11 +704,14 @@ class LabClaimFinalizer:
         A READY reread may run the existing D saga once; a second race gets one
         final reread. No other state is a recoverable concurrency outcome.
 
-        Failures raised from here are reported under the "recovery" stage, so the
-        local cursor below is deliberately not the caller's cursor.
+        Failures raised from here are reported under the "recovery" stage: the
+        cursor below is deliberately not the caller's, and nothing ever reads it.
+        It exists only to absorb the sub-stage writes _publish_ready performs, so
+        that recovery failures stay flattened to "recovery" instead of surfacing
+        whichever pre-check they happened to die in.
         """
 
-        stage = _FinalizerStageCursor("recovery")
+        discarded_stage = _FinalizerStageCursor("recovery")
         for attempt in range(2):
             now = self._clock()
             record = self._record(identity)
@@ -673,7 +725,7 @@ class LabClaimFinalizer:
             if record.status is not ClaimPublicationStatus.READY_TO_PUBLISH:
                 return None
             try:
-                mutation = self._publish_ready(record, now=now, stage=stage)
+                mutation = self._publish_ready(record, now=now, stage=discarded_stage)
             except (
                 ClaimPublicationConflictError,
                 InvalidClaimPublicationTransitionError,
