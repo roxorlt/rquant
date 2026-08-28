@@ -294,6 +294,10 @@ class LabArtifactCommitSpoolEntry(LabArtifactCommitProtocolModel):
     envelope: LabArtifactCommitEnvelope
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
+    # The bytes this entry was parsed from. (device, inode) is reusable, so quarantining by
+    # that pair alone can isolate whatever file took the freed inode next.
+    content_sha256: str = Field(pattern=_HASH_PATTERN)
+    byte_count: int = Field(ge=0)
 
 
 class LabAcknowledgedArtifactCommit(LabArtifactCommitProtocolModel):
@@ -1210,11 +1214,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
 
     def load(self, path: Path) -> LabArtifactCommitSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
-        identity = LabSpoolFileIdentity(
-            path=candidate,
-            device=file_stat.st_dev,
-            inode=file_stat.st_ino,
-        )
+        identity = self._spool_identity(candidate, file_stat, payload=payload)
         try:
             _sequence, filename_request_id = self._pending_name_parts(candidate.name)
             envelope = strict_model_validate_canonical_json(LabArtifactCommitEnvelope, payload)
@@ -1233,6 +1233,8 @@ class LabArtifactCommitSpool(LabCommandSpool):
             envelope=envelope,
             device=file_stat.st_dev,
             inode=file_stat.st_ino,
+            content_sha256=hashlib.sha256(payload).hexdigest(),
+            byte_count=len(payload),
         )
 
     def pending_paths(self, *, limit: int | None = None) -> tuple[Path, ...]:
@@ -1332,6 +1334,8 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 path=entry_or_path.path,
                 device=entry_or_path.device,
                 inode=entry_or_path.inode,
+                byte_count=entry_or_path.byte_count,
+                content_sha256=entry_or_path.content_sha256,
             )
         else:
             source = entry_or_path

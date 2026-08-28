@@ -420,11 +420,11 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
             encoding="utf-8"
         )
     )["full_suite"]
-    assert full_suite["cases"] == 13094
+    assert full_suite["cases"] == 13105
     # The skip count is the Linux approved-skip map's size, and the manifest
     # loader already refuses any other value; this pins the number a reviewer
     # sees in the index.
-    assert full_suite["skips"] == 56
+    assert full_suite["skips"] == 55
 
 
 def test_validator_rejects_an_unapproved_skip(

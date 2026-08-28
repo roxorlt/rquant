@@ -1093,6 +1093,10 @@ class LabClaimSpoolEntry(LabShardProtocolModel):
     claim: LabSpoolClaim
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
+    # The bytes this entry was parsed from. (device, inode) is reusable, so quarantining by
+    # that pair alone can isolate whatever file took the freed inode next.
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=0)
 
 
 class LabConsumedClaim(LabShardProtocolModel):
@@ -1148,6 +1152,9 @@ class LabReportSpoolEntry(LabShardProtocolModel):
     report: LabWorkerReport
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
+    # See LabClaimSpoolEntry: the digest is what survives an inode reuse.
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=0)
 
 
 class LabAcknowledgedReport(LabShardProtocolModel):
@@ -1213,6 +1220,8 @@ class _TypedSpoolBase(LabCommandSpool):
                 path=entry_or_path.path,
                 device=entry_or_path.device,
                 inode=entry_or_path.inode,
+                byte_count=entry_or_path.byte_count,
+                content_sha256=entry_or_path.content_sha256,
             )
             return super().quarantine(identity, reason=reason)
         return super().quarantine(entry_or_path, reason=reason)
@@ -2364,11 +2373,7 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def load(self, path: Path) -> LabClaimSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
-        identity = LabSpoolFileIdentity(
-            path=candidate,
-            device=file_stat.st_dev,
-            inode=file_stat.st_ino,
-        )
+        identity = self._spool_identity(candidate, file_stat, payload=payload)
         try:
             _sequence, filename_token = self._message_name_parts(candidate.name)
             claim = _parse_spool_claim(payload)
@@ -2387,6 +2392,8 @@ class LabClaimSpool(_TypedSpoolBase):
             claim=claim,
             device=file_stat.st_dev,
             inode=file_stat.st_ino,
+            content_sha256=hashlib.sha256(payload).hexdigest(),
+            byte_count=len(payload),
         )
 
     def pending(self, *, limit: int | None = None) -> tuple[LabClaimSpoolEntry, ...]:
@@ -2484,11 +2491,7 @@ class LabReportSpool(_TypedSpoolBase):
 
     def load(self, path: Path) -> LabReportSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
-        identity = LabSpoolFileIdentity(
-            path=candidate,
-            device=file_stat.st_dev,
-            inode=file_stat.st_ino,
-        )
+        identity = self._spool_identity(candidate, file_stat, payload=payload)
         try:
             _sequence, filename_id = self._message_name_parts(candidate.name)
             report = strict_model_validate_canonical_json(LabWorkerReport, payload)
@@ -2507,6 +2510,8 @@ class LabReportSpool(_TypedSpoolBase):
             report=report,
             device=file_stat.st_dev,
             inode=file_stat.st_ino,
+            content_sha256=hashlib.sha256(payload).hexdigest(),
+            byte_count=len(payload),
         )
 
     def pending(self, *, limit: int | None = None) -> tuple[LabReportSpoolEntry, ...]:

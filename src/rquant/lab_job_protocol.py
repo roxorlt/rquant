@@ -74,12 +74,21 @@ class LabProtocolModel(BaseModel):
 
 
 class LabSpoolFileIdentity(LabProtocolModel):
+    # (device, inode) cannot name a file across an unlink: ext4 returns a just-freed inode
+    # to the very next create in the same directory, so an unlink-and-recreate replacement
+    # wears the identity of the entry it replaced. Timestamps do not separate them either --
+    # the production kernel stamps inode times from a coarse clock whose granularity is one
+    # tick, and an unlink followed immediately by a create lands inside one tick. What does
+    # separate them is the bytes, so a singly-linked regular entry carries the digest of what
+    # was read out of it, and the isolation path refuses to act on one that has none.
     path: Path
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
     file_type: _LabSpoolFileType = "regular"
     link_count: int = Field(default=1, ge=1)
     link_target: str | None = None
+    byte_count: int | None = Field(default=None, ge=0)
+    content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_link_target(self) -> LabSpoolFileIdentity:
@@ -87,7 +96,19 @@ class LabSpoolFileIdentity(LabProtocolModel):
             raise ValueError("symlink identity requires link_target")
         if self.file_type != "symlink" and self.link_target is not None:
             raise ValueError("only symlink identity may have link_target")
+        if self.content_sha256 is not None and (
+            self.file_type != "regular" or self.link_count != 1
+        ):
+            raise ValueError("only a singly-linked regular entry may bind a content hash")
+        if self.content_sha256 is not None and self.byte_count is None:
+            raise ValueError("a content hash requires the byte count it was read from")
         return self
+
+    @property
+    def binds_content(self) -> bool:
+        """Whether this identity names bytes and not only a reusable inode number."""
+
+        return self.content_sha256 is not None
 
 
 class InvalidCommandEnvelopeError(ValueError):
@@ -976,6 +997,39 @@ class LabCommandSpool:
             return "char_device"
         return "other"
 
+    @staticmethod
+    def _spool_identity(
+        path: Path,
+        observed: os.stat_result,
+        *,
+        link_target: str | None = None,
+        payload: bytes | None = None,
+    ) -> LabSpoolFileIdentity:
+        """Name a spool file by the bytes read out of it, not only by its inode number.
+
+        ``payload`` is the exact byte string read from ``observed``'s open descriptor. It is
+        bound as a digest only for a singly-linked regular entry: a second hard link can
+        rewrite the content without this directory entry moving at all, so a digest there
+        would name something the entry does not control.
+        """
+
+        file_type = LabCommandSpool._spool_file_type(observed.st_mode)
+        binds_content = payload is not None and file_type == "regular" and observed.st_nlink == 1
+        return LabSpoolFileIdentity(
+            path=path,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            file_type=file_type,
+            link_count=observed.st_nlink,
+            link_target=link_target,
+            byte_count=len(payload) if binds_content and payload is not None else None,
+            content_sha256=(
+                hashlib.sha256(payload).hexdigest()
+                if binds_content and payload is not None
+                else None
+            ),
+        )
+
     def _owned_source_area(self, parent: Path) -> Literal["root", "pending", "quarantine"]:
         normalized = Path(os.path.abspath(parent))
         if normalized == self.root:
@@ -1311,12 +1365,7 @@ class LabCommandSpool:
                 self._after_owned_entry_isolation_stage("evidence_written", source, container)
                 if stat.S_ISREG(observed.st_mode) and observed.st_nlink != 1:
                     self._after_hardlink_quarantine_evidence(
-                        LabSpoolFileIdentity(
-                            path=source,
-                            device=observed.st_dev,
-                            inode=observed.st_ino,
-                            link_count=observed.st_nlink,
-                        ),
+                        self._spool_identity(source, observed),
                         evidence_path,
                     )
                 lifecycle_state = "MOVE_UNCERTAIN"
@@ -2250,12 +2299,9 @@ class LabCommandSpool:
                 raise InvalidCommandEnvelopeError(f"unsafe spool file {name}: {exc}") from exc
             if stat.S_ISLNK(path_stat.st_mode):
                 link_target = os.readlink(name, dir_fd=directory_fd)
-                identity = LabSpoolFileIdentity(
-                    path=normalized,
-                    device=path_stat.st_dev,
-                    inode=path_stat.st_ino,
-                    file_type="symlink",
-                    link_count=path_stat.st_nlink,
+                identity = self._spool_identity(
+                    normalized,
+                    path_stat,
                     link_target=link_target,
                 )
                 raise InvalidCommandEnvelopeError(
@@ -2263,13 +2309,7 @@ class LabCommandSpool:
                     file_identity=identity,
                 )
             if not stat.S_ISREG(path_stat.st_mode):
-                identity = LabSpoolFileIdentity(
-                    path=normalized,
-                    device=path_stat.st_dev,
-                    inode=path_stat.st_ino,
-                    file_type=self._spool_file_type(path_stat.st_mode),
-                    link_count=path_stat.st_nlink,
-                )
+                identity = self._spool_identity(normalized, path_stat)
                 raise InvalidCommandEnvelopeError(
                     f"spool file {name} is not regular",
                     file_identity=identity,
@@ -2277,12 +2317,7 @@ class LabCommandSpool:
             if path_stat.st_nlink not in allowed_link_counts:
                 raise InvalidCommandEnvelopeError(
                     f"spool file {name} has an external hard link",
-                    file_identity=LabSpoolFileIdentity(
-                        path=normalized,
-                        device=path_stat.st_dev,
-                        inode=path_stat.st_ino,
-                        link_count=path_stat.st_nlink,
-                    ),
+                    file_identity=self._spool_identity(normalized, path_stat),
                 )
             try:
                 descriptor = os.open(name, file_flags, dir_fd=directory_fd)
@@ -2298,12 +2333,7 @@ class LabCommandSpool:
                 ):
                     raise InvalidCommandEnvelopeError(
                         f"spool file {name} was replaced while opening",
-                        file_identity=LabSpoolFileIdentity(
-                            path=normalized,
-                            device=path_stat.st_dev,
-                            inode=path_stat.st_ino,
-                            link_count=path_stat.st_nlink,
-                        ),
+                        file_identity=self._spool_identity(normalized, path_stat),
                     )
                 chunks: list[bytes] = []
                 while chunk := os.read(descriptor, 1024 * 1024):
@@ -2414,11 +2444,7 @@ class LabCommandSpool:
 
     def load(self, path: Path) -> LabSpoolEntry:
         candidate, payload, file_stat = self._read_regular_child(Path(path), self.pending_dir)
-        identity = LabSpoolFileIdentity(
-            path=candidate,
-            device=file_stat.st_dev,
-            inode=file_stat.st_ino,
-        )
+        identity = self._spool_identity(candidate, file_stat, payload=payload)
         try:
             _sequence, filename_request_id = self._pending_name_parts(candidate.name)
         except InvalidCommandEnvelopeError as exc:
@@ -2625,6 +2651,26 @@ class LabCommandSpool:
                     raise InvalidCommandEnvelopeError(
                         "pending command link count changed before quarantine"
                     )
+                if expected_type == "regular" and observed.st_nlink == 1:
+                    # The one shape whose bytes this directory entry owns, and the one shape
+                    # a freed inode can be handed back to. Read it again and require the very
+                    # bytes the identity was taken from: an inode reuse then reads as the
+                    # replacement it is, not as the file that was observed to be bad.
+                    if not entry_or_path.binds_content:
+                        raise InvalidCommandEnvelopeError(
+                            "pending command identity binds no content before quarantine"
+                        )
+                    _normalized, payload, observed = self._read_regular_child(
+                        source,
+                        self.pending_dir,
+                    )
+                    if (
+                        len(payload) != entry_or_path.byte_count
+                        or hashlib.sha256(payload).hexdigest() != entry_or_path.content_sha256
+                    ):
+                        raise InvalidCommandEnvelopeError(
+                            "pending command was replaced before quarantine"
+                        )
                 expected_link_target = entry_or_path.link_target
             elif isinstance(entry_or_path, LabSpoolEntry):
                 if (

@@ -946,6 +946,31 @@ def test_artifact_quarantine_uses_one_budget_for_conflict_and_isolation_records(
     assert len(conflicts) == 1
 
 
+def test_a_typed_artifact_commit_entry_carries_its_content_digest_into_quarantine(
+    tmp_path: Path,
+) -> None:
+    spool = LabArtifactCommitSpool(tmp_path / "commits")
+    entry = spool.publish(_envelope(tmp_path))
+    assert isinstance(entry, LabArtifactCommitSpoolEntry)
+    payload = entry.path.read_bytes()
+    assert entry.content_sha256 == hashlib.sha256(payload).hexdigest()
+    assert entry.byte_count == len(payload)
+
+    entry.path.unlink()
+    replacement = b"replacement-that-took-the-freed-inode"
+    entry.path.write_bytes(replacement)
+    replaced = entry.path.stat()
+    losing_entry = entry.model_copy(
+        update={"device": replaced.st_dev, "inode": replaced.st_ino},
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(losing_entry, reason="conflicting_commit")
+
+    assert entry.path.read_bytes() == replacement
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
 def test_artifact_quarantine_aggregate_count_budget_has_no_category_off_by_one(
     tmp_path: Path,
 ) -> None:
