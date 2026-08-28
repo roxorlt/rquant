@@ -2134,13 +2134,21 @@ class LiveBatchSpool:
           the ``final_durable_at`` check and the ``evidence_durable_at`` check. Both
           rewrite the commit intent, unlink the receipt, fsync the directory and only
           then seal the evidence.
-        * Every earlier checkpoint - the registry publication stage, the cursor
-          publication stage, ``durable_completed_at`` (receipt intent written, receipt
-          not yet written) and ``marker_durable_at`` (receipt written, commit intent
-          not yet cleared) - rolls the publication back and deliberately emits **no**
-          evidence at all. ``ReferencePublicationDurableEvidence`` is bound to a
-          receipt object that does not exist yet at those points, so "no evidence" is
-          the contract there, not an omission.
+        * Every earlier checkpoint rolls the publication back and deliberately emits
+          **no** evidence at all. "No evidence" is the contract at each of them, not
+          an omission, but for two different reasons:
+
+          - The registry publication stage, the cursor publication stage and
+            ``durable_completed_at`` (commit intent written, receipt not yet written)
+            all run before the receipt object exists.
+            ``ReferencePublicationDurableEvidence.create_authenticated`` is bound to a
+            receipt - it signs that receipt's content hash, stage hash and deadline -
+            so at those points there is nothing to sign.
+          - ``marker_durable_at`` runs after the receipt has been written and fsynced,
+            so a receipt does exist there. It stays evidence-free because its rollback
+            branch unlinks that receipt again while the commit intent is still on disk,
+            never cleared: nothing ever acknowledged the receipt, so evidence would
+            attest to a publication that was never visible to anyone.
         * Missing evidence is therefore not an audit gap in the recovery sense:
           :meth:`_validated_completion_evidence` returns ``None`` both when the
           evidence file is absent and when its ``outcome`` is not ``"committed"``, so
