@@ -10,8 +10,10 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1505,7 +1507,11 @@ class _GitCommandRecorder:
         self.commands: list[list[str]] = []
         self.CalledProcessError = subprocess.CalledProcessError
 
-    def run(self, arguments, **keywords):  # type: ignore[no-untyped-def]
+    def run(
+        self,
+        arguments: Sequence[str],
+        **keywords: Any,
+    ) -> subprocess.CompletedProcess[bytes]:
         self.commands.append([str(part) for part in arguments])
         return subprocess.run(arguments, **keywords)
 
