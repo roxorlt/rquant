@@ -512,3 +512,82 @@ def test_an_injected_admission_command_must_be_a_list_of_non_empty_strings(
 
         assert refused.returncode == 2, refused.stderr
         assert "non-empty" in refused.stderr
+
+
+# ---------------------------------------------------------------------------------------
+# R3A-SPEC-02: the arbiter's own interpreter, before any of its code runs
+# ---------------------------------------------------------------------------------------
+
+#: The exact first line of the installed helper. `-I` drops `PYTHON*` from the environment,
+#: drops the user site directory, and keeps the script's own directory off `sys.path`; `-S`
+#: drops `site` altogether, and with it every `.pth` hook. Linux passes everything after the
+#: interpreter path in a `#!` line as a single argument, so the two flags have to be spelled
+#: as one token.
+ARBITER_SHEBANG = "#!/usr/bin/python3 -IS"
+
+
+def test_the_arbiter_interpreter_is_isolated_before_it_runs_a_line_of_its_own() -> None:
+    """Independent review R3A-SPEC-02: `site.py` ran before `_prepare_root` could check anything.
+
+    `/usr/bin/python3` on the production host has `site.ENABLE_USER_SITE` true, and
+    `/home/lighthouse/.local/lib/python3.11/site-packages` is a directory the service user
+    owns. `ProtectHome=read-only` stops it being written from inside the unit, not from
+    outside, and it stops writes rather than reads — so a `usercustomize.py` placed there
+    would have been imported by `site` at interpreter start-up, ahead of the lock root check,
+    ahead of the admission probe, with the unit's whole sandbox and `EnvironmentFile`. The
+    same line closes the `PYTHONPATH` / `PYTHONHOME` route, which an `EnvironmentFile` the
+    service user can write could otherwise have supplied.
+    """
+
+    assert _arbiter_source().splitlines()[0] == ARBITER_SHEBANG
+
+
+def test_the_arbiter_shebang_flags_really_isolate_this_interpreter() -> None:
+    """Pin the spelling to its meaning, so `-IS` cannot rot into a token that parses but idles."""
+
+    flags = ARBITER_SHEBANG.split(" ", 1)[1]
+    observed = subprocess.run(
+        [
+            sys.executable,
+            flags,
+            "-c",
+            "import json, sys; print(json.dumps({"
+            "'isolated': bool(sys.flags.isolated),"
+            "'no_site': bool(sys.flags.no_site),"
+            "'user_site': bool(sys.flags.no_user_site),"
+            "}))",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": "/should-be-ignored"},
+    )
+
+    assert observed.returncode == 0, observed.stderr
+    assert json.loads(observed.stdout) == {
+        "isolated": True,
+        "no_site": True,
+        "user_site": True,
+    }
+
+
+def test_the_arbiter_still_runs_with_site_processing_disabled() -> None:
+    """The flags are only safe if the helper needs nothing `site` would have provided.
+
+    It imports the standard library and nothing else, but `fcntl` lives in `lib-dynload` and
+    a stdlib-only claim is worth executing rather than asserting: this starts the real file
+    under the real flags and lets `argparse` prove the module body imported.
+    """
+
+    observed = subprocess.run(
+        [sys.executable, "-I", "-S", str(ARBITER), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert observed.returncode == 0, observed.stderr
+    assert "research" in observed.stdout

@@ -1,5 +1,14 @@
-#!/usr/bin/python3
-"""Hold cross-plane flock contracts for an entire child-process lifecycle."""
+#!/usr/bin/python3 -IS
+"""Hold cross-plane flock contracts for an entire child-process lifecycle.
+
+The `-IS` in the interpreter line is load-bearing, not tidiness. Independent review
+R3A-SPEC-02: without it `site` runs before anything here does, and on the production host
+`ENABLE_USER_SITE` is true, so a `usercustomize` module under the service user's own
+`~/.local/lib` would execute inside the unit's sandbox ahead of the lock-root check and
+ahead of the admission probe. `-I` also drops `PYTHON*` from the environment, which an
+`EnvironmentFile` the service user can write would otherwise be able to set. Linux passes
+everything after the interpreter path as one argument, hence the combined token.
+"""
 
 from __future__ import annotations
 
