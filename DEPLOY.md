@@ -7,25 +7,58 @@
 
 ## v0.30.0 Release A 上线前置条件（尚未部署，非部署记录）
 
-**状态**：`cc/workload-isolation-continuation` 分支的 R07 / signal-family 工作已开 PR，等待
-Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务器 82.156.0.68（lighthouse 用户）
-上没有发生任何变更。本节记录的是这次发布**之前**必须逐条满足的条件，不是一条部署记录；
-真正部署后再按本文件的既有格式追加 `## YYYY-MM-DD · v0.30.0 · 标题`。
+**状态**：PR #155（`cc/workload-isolation-continuation`）已于 2026-08-28T12:51:28Z 以 merge
+commit `2df97ed6045c4ab7efc676f31c742c97ae2193f4` 合入 main，**尚未打 tag、尚未部署**，
+云服务器 82.156.0.68（lighthouse 用户）上没有发生任何变更。合入后那一次 main push CI 结论是
+failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 三个专用 job 全绿并
+产出了 evidence artifact，红的是 full-suite 分片。本节记录的是这次发布**之前**必须逐条满足的
+条件，不是一条部署记录；真正部署后再按本文件的既有格式追加
+`## YYYY-MM-DD · v0.30.0 · 标题`。
 
 1. **合版方式只能是 "Create a merge commit"**（技术强制，非约定）。R07 证据的 merge-provenance
-   检查要求候选 commit 恰有两个 parent、第一 parent 等于冻结 merge base `9699827b`、且
+   检查要求候选 commit 恰有两个 parent、第一 parent 等于冻结 baseline、且
    `git merge-tree --write-tree <parent1> <parent2>` 等于候选 tree；squash 与 rebase 只有一个
    parent，CI 的 push-to-main 路径会直接拒绝产出证据，Release B 也就永远拿不到部署证据。
    （实测：squash 提交的 tree 与 merge 提交完全相同，只有 parent 结构能区分两者。）
-   merge 之后立刻核对 `git merge-base --is-ancestor 45d0b57c origin/main` 返回 0——
-   `45d0b57c` 现在是 **historical baseline**，门禁仍单独要求它是候选祖先。
-2. **合并前 `origin/main` 必须仍冻结在 `9699827b`**。冻结 baseline 是
-   `merge_base(origin/main, candidate)`，764 条 allowlist 与 merge-tree 等式都以此为前提。
-   若在 PR #155 落地前先合了别的 PR，必须重跑
-   `uv run python scripts/r07_policy_regenerate.py --repo "$PWD"`，并同步改
-   `BASELINE_COMMIT_SHA` / `BASELINE_TREE_SHA` 与
-   `docs/architecture/production-interpreter-authority.md`，否则门禁全表失配。
-   合并前最后再跑一次 `scripts/r07_policy_regenerate.py --check` 确认 RC=0。
+   Release A 这一步已经完成：`2df97ed` 恰有两个 parent，第一 parent `9699827b` 就是当时冻结的
+   baseline。合并后实测 `git merge-base --is-ancestor 45d0b57c 2df97ed` 返回 0——
+   `45d0b57c` 是 **historical baseline**，门禁仍单独要求它是每个候选的祖先。
+2. **Release B 的冻结 baseline 是 commit `2df97ed6045c4ab7efc676f31c742c97ae2193f4` /
+   tree `1e145e8a2b84ea43934bdf5a1cdca5b591445cab`**，即 Release A 合入 main 产生的那个
+   merge commit。它不再由 checkout 里的 `merge_base(origin/main, HEAD)` 反推——那条语义在合入
+   之后自我否定：`origin/main` 就是候选本身，merge-base 恒等于 HEAD，任何冻结常量都对不上。
+   现在 baseline 由 `resolve_baseline_context()`（`src/rquant/signal_family_differential_gate.py`）
+   从**显式端点**判定，来源优先级固定为：显式 CLI 参数 → GitHub 事件载荷
+   (`pull_request.base.sha`/`head.sha`，push 的 `before`/`after`) → HEAD 自身的父结构；
+   `origin/main`、`origin/HEAD` 与任何 remote-tracking ref 都不再被读取。
+   allowlist 的条数随 baseline 变化：PR #155 合入时是 **792 条**（本文件旧版写的「764 条」是
+   更早一版的数字，已过期），重冻结到 `2df97ed` 之后只剩 Release B 自己的改动，确切条数以
+   `scripts/r07_policy_regenerate.py` 重生成的结果为准，不在文档里另记一个会过期的字面值。
+
+   **纪律（Release B 起强制）：任何 PR 合入 main 之前，它的最后一个 commit 必须把 baseline
+   重新冻结到当时的 `origin/main` tip，并重新生成 policy。** 理由是结构性的，不是流程洁癖：
+   合并产生的 merge commit `M` 的第一 parent 是合并前的 main tip，push-to-main 的 R07 job 要求
+   第一 parent 恰等于冻结 baseline；只要 baseline 停在更早的 commit，`M` 的 R07 job 就确定性
+   失败，evidence job 因 `needs` 不满足而 skip，**该 commit 永远拿不到 evidence artifact，也就
+   永远不能成为部署目标**。具体操作：
+
+   ```bash
+   # 在 PR 分支上，所有代码改动定稿之后
+   #   1) 把 BASELINE_COMMIT_SHA / BASELINE_TREE_SHA 改成当时的 origin/main tip 与它的 tree
+   #   2) 重生成 policy（必须用 Python 3.11 或 3.12，脚本会拒绝 3.13+）
+   uv run --python 3.11 python scripts/r07_policy_regenerate.py --repo "$PWD"
+   uv run --python 3.11 python scripts/r07_policy_regenerate.py --repo "$PWD" --check  # RC=0
+   #   3) 同步 docs/architecture/production-interpreter-authority.md 里的字面 SHA
+   ```
+
+   **两个 PR 并发时 main 被串行化**：先合的那个让 main 前进，后合的那个的 baseline 立刻过期，
+   必须重做第 1–3 步再合。忘记这一步的代价不是「CI 偶发红」，而是那个 commit 永久失去部署资格。
+
+   **开放项（待用户/Codex 裁决，本轮不实现）：R07 差分门的退役条件。** 上面的串行代价只有在
+   R07 门存在期间才需要承受。R07 本质上是一次性 cutover 门（v3 spool 切换 + Release A→B 的
+   bootstrap 边），一旦 Release B 部署完成、v3 切换收尾，policy、三个 CI job、shard-3 那批测试
+   与部署侧 evidence 消费可以整体退役。**是否退役、以什么条件退役，需要一次明确决策记录**；
+   在那之前按上面的纪律执行。
 3. **云服务器 82.156.0.68（lighthouse 用户）的 `/usr/bin/git --version` 必须 ≥ 2.38**。
    私有 verifier 用 `git merge-tree --write-tree` 离线重放 merge provenance，该子命令自 2.38
    起才可用；低于 2.38 时 Release B 的部署器会以

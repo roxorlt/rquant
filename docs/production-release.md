@@ -160,9 +160,22 @@ job 与 artifact 内部路径，向 GitHub 取该 target commit 的 `r07-dr-gate
 Linux 生产 profile 下部署器会要求这个目录精确等于 policy 声明的 `cache_path`。
 服务器缺 token 或无网络时结果是 **blocked**，不是降级放行。
 
-合版方式对这条链路是硬约束：R07 冻结 baseline 必须留在 `origin/main` 的祖先链上，所以带 R07
-policy 的 PR **只能用 "Create a merge commit"**；squash 或 rebase 会让 main 上任何 commit 永远
-过不了 ancestry 检查，Release B 也就永远拿不到证据。
+合版方式对这条链路是硬约束：**带 R07 policy 的 PR 只能用 "Create a merge commit"**。
+push-to-main 的 R07 job 要求被推的 commit 恰有两个 parent、第一 parent 等于冻结 baseline、
+`git merge-tree --write-tree <parent1> <parent2>` 等于候选 tree；squash 与 rebase 只留一个
+parent，永远过不了这条结构检查，Release B 也就永远拿不到证据。
+
+冻结 baseline 不再由 checkout 里的 `merge_base(origin/main, HEAD)` 反推。那条语义在 PR 合入
+之后自我否定——`origin/main` 就是候选本身，merge-base 恒等于 HEAD。现在由
+`resolve_baseline_context()` 从显式端点判定：pull_request 用
+`(pull_request.base.sha, pull_request.head.sha)` 的真·双边 merge-base；push 用被推 merge commit
+的第一 parent，并拿 `github.event.before` 交叉校验（不一致或为 null commit 都 fail closed）。
+两条路径都不读 `origin/main` 或任何 remote-tracking ref。
+
+由此派生一条硬纪律：**任何 PR 合入 main 之前，其最后一个 commit 必须把 baseline 重冻结到当时的
+`origin/main` tip 并重生成 policy**；两个 PR 并发时后合的那个必须重做。漏掉这一步的后果不是
+CI 偶发红，而是那个 merge commit 的 R07 job 确定性失败、evidence job 被 skip，该 commit
+**永久失去部署资格**。完整操作与退役开放项见 `DEPLOY.md` 第 2 条。
 
 ## 一次性安装
 

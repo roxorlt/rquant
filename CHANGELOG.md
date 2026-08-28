@@ -184,6 +184,22 @@
 
 ### Fixed
 
+- **R07 差分门的 baseline 生命周期语义（Release B 前置，WP-B0）**：冻结 baseline 过去在
+  checkout 内部用 `merge_base(origin/main, HEAD)` 反推，这条语义在冻结它的 PR 合入 main 之后
+  自我否定——`origin/main` 就是候选本身，merge-base 恒等于 HEAD，任何冻结常量都对不上，
+  于是 main 上的 `r07_policy_regenerate --check` 与配套单测确定性失败。现在由
+  `resolve_baseline_context()` 单点判定：显式 CLI 端点 → GitHub 事件载荷
+  （`pull_request.base.sha`/`head.sha`，push 的 `before`/`after`）→ HEAD 自身父结构；
+  `origin/main` 与任何 remote-tracking ref 都不再被读取。pull_request 语义证明的是
+  base tip 与 **PR head** 的双边 merge-base（不是 `github.sha` 那个合成 merge ref——它的第一
+  parent 就是 base，对任何 base 都恒真）；push 语义以被推 merge commit 的第一 parent 为区间
+  起点，并用 `github.event.before` 交叉校验，不一致或为 null commit 都 fail closed。
+  Release B 的 baseline 冻结为 `2df97ed6045c4ab7efc676f31c742c97ae2193f4` /
+  tree `1e145e8a2b84ea43934bdf5a1cdca5b591445cab`。
+- **R07 policy 生成器拒绝会漂移的解释器**：`scripts/r07_policy_regenerate.py` 在 3.13+ 上直接
+  退出。3.13 起 `ast.dump` 省略取默认值的字段，产出的 policy 自洽（自己的 `--check` 也过），
+  漂移只会在 CI 的 3.11/3.12 job 上暴露，那时字节已经提交了。
+  同时删除 `--baseline-ref`：把可变 ref 留在命令行上等于把这次故障留在一个参数之外。
 
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
