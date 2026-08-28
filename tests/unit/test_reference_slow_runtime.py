@@ -528,6 +528,10 @@ def _exit_after_receipt_intent_fsync(
     def exit_late_after_durable_unlink(publication_id: str) -> None:
         nonlocal crossed
         original_clear(publication_id)
+        if spool.completion_receipt_intent_path(publication_id).exists():
+            # Distinguishable from 86 (crash after a durable unlink), 87 (no crash at
+            # all) and 1 (deadline expired before this hook was reached).
+            os._exit(88)
         crossed = True
         os._exit(86)
 
@@ -998,6 +1002,9 @@ def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_rel
     def crossing_cleanup(publication_id: str) -> None:
         nonlocal crossed, cleared
         original_clear(publication_id)
+        assert not spool.completion_receipt_intent_path(publication_id).exists(), (
+            "the completion intent must be durably unlinked before the deadline crosses"
+        )
         cleared = True
         crossed = True
 
