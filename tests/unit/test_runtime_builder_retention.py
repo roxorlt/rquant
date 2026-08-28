@@ -556,9 +556,21 @@ def test_real_terminal_to_run_step_recovery_gc_and_health_chain(tmp_path: Path) 
     )
     settings.migration.warm_root.mkdir(mode=0o700)
     settings.migration.cold_root.mkdir(mode=0o700)
+    # 这条用例走真实的 full-verified 恢复闸门（每次 authorize 都重跑一遍固定回放校验），
+    # 单个 run_step 里要花掉几秒真实时间。GC worker / 迁移 / 健康投影的时间预算默认挂在
+    # time.monotonic 上，机器一慢就会在 _process 中途撞 deadline，把工作项打成 retry
+    # （表现为 processed_count 少 1 且 degraded_reasons=('artifact_gc:degraded',)）。
+    # 这里把 monotonic 也绑到注入时钟上，让预算只随 current_now 前进，用例断言的是
+    # 「终态权威事件 → 恢复闸门 → GC → 健康」这条持久化链路，与真实耗时无关。
+    # 真实预算到期的行为另有确定性覆盖：tests/unit/test_runtime_artifact_retention.py 的
+    # test_deadline_reached_* 三条用例。
+    def virtual_monotonic() -> float:
+        return current_now[0].timestamp()
+
     runtime = build_artifact_retention_runtime(
         settings=settings,
         clock=lambda: current_now[0],
+        monotonic=virtual_monotonic,
         deletion_gate_factory=lambda _settings: gate,
     )
     payload = b"trusted artifact"
@@ -652,6 +664,7 @@ def test_real_terminal_to_run_step_recovery_gc_and_health_chain(tmp_path: Path) 
         catalog=runtime.reference_store,
         state=runtime.gc_state,
         quarantine_inspector=runtime.transport,
+        monotonic=virtual_monotonic,
     ).snapshot(now=current_now[0])
 
     assert first.processed_count == 2
