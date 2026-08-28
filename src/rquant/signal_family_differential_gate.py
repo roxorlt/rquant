@@ -1502,10 +1502,32 @@ def parse_baseline_cli_arguments(
 def _head_commit(repo: Path) -> str:
     """Resolve the checkout's own HEAD, the only ref this resolver ever reads."""
 
-    resolved = _git_output(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+    try:
+        resolved = _git_output(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+    except subprocess.CalledProcessError as exc:
+        raise ValueError("the checkout has no resolvable HEAD commit") from exc
     if not _is_lower_hex(resolved, length=40):
         raise ValueError("checkout HEAD is not a lowercase 40-hex commit")
     return resolved
+
+
+def _context_commit(repo: Path, sha: str, *, field: str) -> str:
+    """Resolve one stated endpoint, turning "no such object" into an R07 refusal.
+
+    ``git rev-parse --verify`` exits nonzero for a well-formed SHA that names nothing, and
+    letting that surface as a CalledProcessError reports a bare git command line with no hint
+    of which endpoint was wrong. Failing closed is not enough on its own here: a gate that
+    refuses without saying what it refused is a gate people route around.
+    """
+
+    if not _is_lower_hex(sha, length=40):
+        raise ValueError(f"R07 {field} is not a lowercase 40-hex commit SHA: {sha!r}")
+    try:
+        return _resolved_commit(repo, sha)
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            f"R07 {field} does not name a commit in this repository: {sha}"
+        ) from exc
 
 
 def _commit_parents(repo: Path, commit: str) -> tuple[str, ...]:
@@ -1670,7 +1692,7 @@ def resolve_baseline_context(
     candidate = (
         _head_commit(repo)
         if declared.candidate_sha is None
-        else _resolved_commit(repo, declared.candidate_sha)
+        else _context_commit(repo, declared.candidate_sha, field="candidate SHA")
     )
     base = declared.base_sha
     if base is None:
@@ -1683,7 +1705,7 @@ def resolve_baseline_context(
         base = parents[0]
     context = R07BaselineContextV1(
         event=declared.event,
-        base_sha=_resolved_commit(repo, base),
+        base_sha=_context_commit(repo, base, field="base SHA"),
         candidate_sha=candidate,
         base_source=source,
         event_before_sha=declared.event_before_sha,
@@ -1701,8 +1723,8 @@ def verify_baseline_context(
 
     if type(context) is not R07BaselineContextV1:
         raise TypeError("exact R07BaselineContextV1 is required")
-    base = _resolved_commit(repo, context.base_sha)
-    candidate = _resolved_commit(repo, context.candidate_sha)
+    base = _context_commit(repo, context.base_sha, field="base SHA")
+    candidate = _context_commit(repo, context.candidate_sha, field="candidate SHA")
     if base == candidate:
         raise ValueError("R07 base and candidate are one commit, so the reviewed diff is empty")
     if context.event == "push":
@@ -1724,6 +1746,13 @@ def verify_baseline_context(
     else:
         baseline = _two_sided_merge_base(repo, base, candidate)
     if baseline != expected_baseline:
+        if context.event == "push":
+            # For a push the merge base *is* the first parent, so name it that way: the
+            # reader has to know which of the two commits to go look at.
+            raise ValueError(
+                "the pushed merge commit's first parent is not the frozen R07 baseline: "
+                f"{baseline}"
+            )
         raise ValueError(
             "the frozen R07 baseline is not the merge base of this run's stated endpoints: "
             f"{baseline}"

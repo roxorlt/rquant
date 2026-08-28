@@ -1691,13 +1691,37 @@ def test_baseline_context_fails_closed_on_a_wrong_absent_or_unresolvable_base(
             environ={},
             expected_baseline=identities["main_tip"],
         )
-    # F1: a well-formed SHA that names no object.
-    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+    # F1: a well-formed SHA that names no object, on each endpoint in turn. Failing closed
+    # is not the whole requirement - the refusal has to name which endpoint was wrong, or the
+    # next person reads a bare git command line and reaches for --no-verify.
+    with pytest.raises(ValueError, match="base SHA does not name a commit in this repository"):
         differential_gate.resolve_baseline_context(
             repo,
             event="pull_request",
             base_sha="0" * 40,
             candidate_sha=identities["feature"],
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    with pytest.raises(
+        ValueError,
+        match="candidate SHA does not name a commit in this repository",
+    ):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha=identities["main_tip"],
+            candidate_sha="0" * 40,
+            environ={},
+            expected_baseline=identities["main_tip"],
+        )
+    # ...and the malformed shape on the candidate side too, not only the base side.
+    with pytest.raises(ValueError, match="candidate SHA is not a lowercase 40-hex"):
+        differential_gate.resolve_baseline_context(
+            repo,
+            event="pull_request",
+            base_sha=identities["main_tip"],
+            candidate_sha="refs/pull/1/head",
             environ={},
             expected_baseline=identities["main_tip"],
         )
