@@ -89,7 +89,28 @@ def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object
     return module.run_contained
 
 
-run_contained = _load_contained_runner()
+_CONTAINED_RUNNER: Callable[..., subprocess.CompletedProcess[object]] | None = None
+
+
+def run_contained(
+    *arguments: object,
+    **keywords: object,
+) -> subprocess.CompletedProcess[object]:
+    """Load the contained-subprocess authority on first use rather than at import.
+
+    Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. This used to be a
+    module-level `run_contained = _load_contained_runner()`, which executed
+    `<checkout>/src/rquant/contained_subprocess.py` — via `spec_from_file_location`, so
+    outside every import hook and every `-I` protection — as the very first thing the
+    process did. The three callers below are all on the launchd path and still need it;
+    nothing on the systemd path does, and nothing at all should need it merely to import
+    this file.
+    """
+
+    global _CONTAINED_RUNNER
+    if _CONTAINED_RUNNER is None:
+        _CONTAINED_RUNNER = _load_contained_runner()
+    return _CONTAINED_RUNNER(*arguments, **keywords)
 
 
 @dataclass(frozen=True)
