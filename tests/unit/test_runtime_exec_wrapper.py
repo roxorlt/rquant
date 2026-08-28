@@ -49,7 +49,8 @@ BUILD_SCRIPT = ROOT / "scripts" / "build-runtime-exec-pyz.py"
 SYSTEMD = ROOT / "deploy" / "systemd"
 ARBITER = ROOT / "deploy" / "libexec" / "rquant-workload-arbiter"
 #: The one role no unit names and nothing else invokes: the `daily` HYBRID adapter of
-#: `authority.md` L200, whose caller argv count is 0.
+#: the `daily` production mapping of `authority.md`, whose caller argv count is 0. Named
+#: rather than cited by line: R30-SPEC-04 found the old `L200` had drifted off it.
 UNIT_LESS_ROLES = frozenset({"daily"})
 #: Roles `deploy/libexec/rquant-workload-arbiter` invokes itself, before it execs the unit's
 #: own child. They are in the wrapper allowlist without ever appearing in an `ExecStart`, so
@@ -1340,7 +1341,7 @@ class TestDerivedModuleArgv:
             for label in labels:
                 argv = world.resolve(entry.name, instance=label)["module_argv"]
                 if not argv:
-                    # `daily` is the HYBRID adapter of authority.md L200: "caller argv
+                    # `daily` is the HYBRID adapter of the authority.md daily mapping: "caller argv
                     # count 0". It is the one role with no unit in this package.
                     skipped.append(entry.name)
                     continue
@@ -1525,7 +1526,7 @@ class TestDerivedModuleArgv:
         self,
         tmp_path: Path,
     ) -> None:
-        """`daily` is still the HYBRID adapter of authority.md L200: caller argv count 0."""
+        """`daily` is still the HYBRID adapter of the authority.md daily mapping: argv count 0."""
 
         world = _build_world(tmp_path, whole_policy=True)
 

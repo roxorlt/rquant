@@ -257,6 +257,15 @@ The profile contains exactly one production mapping for this service:
 role daily -> module rquant.production_daily_main -> caller argv count 0
 ```
 
+*Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01.* A role without a
+`control_root` no longer receives an empty argv as a rule. It still receives no *derived*
+argument — with no instance label there is no service manifest, no `--control-root`, no
+`--expected-commit` and no `--expected-generation` — but the `module_arguments` frozen for it in
+the root-owned profile are delivered verbatim, under the same type, non-empty and unresolved
+expansion checks a role with a control root gets. That is the only way a role the arbiter invokes
+(`workload_admission`) can name the entry it wants, because the arbiter passes nothing but the
+role literal. The `daily` mapping below is unaffected: it has neither.
+
 The adapter is generation-local and manifest-covered. The frozen bootstrap receives only the
 literal role `daily`; immediately before `runpy` it sets module-visible `sys.argv` to exactly
 `["rquant.production_daily_main"]`. The adapter rejects any other `sys.argv` shape and exposes no
@@ -2048,6 +2057,38 @@ asserted against the descriptors actually passed, and a bound that does not cove
 refuses the launch. This does not weaken the threat model: it removes the fork/exec deadlock
 surface named above while keeping the identity change, the supplementary-group clear and
 `no-new-privs`, which the previous callable did not set at all.
+
+*Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01.* The workload arbiter no
+longer executes any interpreter out of the mutable application checkout. Between taking the
+research-plane locks and exec'ing the unit's own child it starts exactly two things, and both are
+already residual-TCB files: `/usr/bin/setpriv`, as the parent-death launcher, and
+`/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role workload_admission`,
+which is the same root-owned wrapper the unit's own child already goes through. The arbiter's own
+interpreter line is `#!/usr/bin/python3 -IS`, so neither a user-site `usercustomize` nor a
+`PYTHONPATH` or `PYTHONHOME` from an `EnvironmentFile` can execute code while the arbiter starts.
+The exit-code contract is unchanged: a non-zero admission makes the arbiter exit 75.
+
+This closes the admission stage, not every path. `rquant-research-ingest.service` still hands the
+arbiter a shell script from the checkout as its own child; that unit lives on `origin/main` and is
+outside this round. Its exemption is recorded by name in the closure contract, and an entry added
+to that table or a program changed under it fails.
+
+*Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02.* The formal claim finalizer is
+no longer an exception either. `deploy/systemd/rquant-lab-claim-finalizer.service` named a checkout
+interpreter twice — an `ExecStartPre` running `.venv/bin/rquant runtime-code dry-run` and an
+`ExecStart` running `.venv/bin/python .../run-lab-daemon.py formal`. Because `.venv` is an editable
+install whose `rquant.pth` resolves to `<checkout>/src`, and because `scripts/run-lab-daemon.py`
+additionally loaded `contained_subprocess.py` at module scope through `spec_from_file_location`,
+the whole runtime-code verification — ed25519 attestation, promotion receipt, anti-rollback — was
+performed by code living in the tree it was deciding about. The unit now runs the wrapper under the
+`lab_claim_finalizer` role and reaches `rquant.lab_formal_runtime_entry` inside the generation,
+whose imports are all ordinary top-level imports taken after the wrapper has narrowed `sys.path`;
+the `ExecStartPre` is deleted rather than moved. The two trust chains are therefore coupled in
+release order: the runtime-authority chain must already be satisfied for the runtime-code chain to
+run at all.
+
+*Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-03.* Lab spool entries are
+identified by content rather than by an inode that the filesystem is free to reuse.
 
 ## Rejected Alternatives
 

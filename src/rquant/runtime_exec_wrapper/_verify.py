@@ -638,7 +638,9 @@ def derive_module_argv(
     `module_arguments`, which are literals of the root-owned profile rather than anything
     derived, and are the only way an arbiter-invoked role such as `workload_admission` names
     the entry it wants. A role with neither is the `daily` HYBRID adapter of `authority.md`
-    L200, whose mapping is "caller argv count 0".
+    production mapping, whose declared shape is "caller argv count 0". (The reference is to
+    the mapping by name rather than by line: independent review R30-SPEC-04 found the old
+    `authority.md L200` had drifted off it.)
     """
 
     extra = profile_role.get("module_arguments")

@@ -117,21 +117,35 @@ the old generation current by editing pointer files.
 
 ## Legacy And Service Configuration
 
-Formal service arguments must include the exact configured values for:
+*Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02.* The formal service no
+longer carries these arguments, and no longer carries a command line at all in the sense this
+section used to describe. `deploy/systemd/rquant-lab-claim-finalizer.service` runs the root-owned
+wrapper under the `lab_claim_finalizer` role:
 
 ```text
---runtime-code-config
---runtime-code-trusted-base
---runtime-code-authority-uid
---runtime-code-authority-gid
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- \
+    /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz \
+    --role lab_claim_finalizer
 ```
 
-The migration preflight rejects `--checkout-root`, `--expected-checkout-root`,
+The four `--runtime-code-*` values are read from `/etc/rquant/runtime-code-migration.json` by
+`rquant.lab_formal_runtime_entry` inside the generation, and the unit's former `ExecStartPre`
+(`.venv/bin/rquant runtime-code dry-run …`) is deleted rather than moved: it ran before the
+arbiter and therefore before anything this document describes could apply to it.
+
+Two consequences for the configuration file. Every `formal_services[]` entry must **drop** its
+`wrapper_path` field — the request model is `extra="forbid"`, so leaving it in fails the migration
+gate with `extra_forbidden` and the finalizer exits non-zero on every start. And the bootstrap
+binding and the migration request path are now generation constants, so changing either requires a
+new generation rather than an edit in place.
+
+The migration preflight still rejects `--checkout-root`, `--expected-checkout-root`,
 `--expected-code-root`, `--trusted-git-path`, and `--release-managed-checkout`. Existing checkout
 wrappers and release-generation files may remain for exploratory recovery or packaging, but they
 must not appear in a formal service command or be treated as a runtime fallback.
 
-No systemd unit or template is installed or changed by these commands.
+The unit file itself did change this round, unlike previous rounds: it is the one systemd change
+RQ-WI-R2-P1-02 requires. Nothing else is installed or changed by these commands.
 
 ## External Linux Gates
 

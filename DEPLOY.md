@@ -97,14 +97,66 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    # 装到 /usr/local/libexec/，root:root，0555；SHA-256 写进 profile 的 runtime_pyz
    for u in /etc/systemd/system/rquant-runtime-*.service \
             /etc/systemd/system/rquant-artifact-retention.service \
-            /etc/systemd/system/rquant-page-control.service; do
+            /etc/systemd/system/rquant-page-control.service \
+            /etc/systemd/system/rquant-lab-claim-finalizer.service; do
      systemd-analyze verify "$u"
      systemctl show -p ExecStart "$(basename "$u")"
    done
+   systemctl show -p Environment rquant-lab-claim-finalizer   # 白名单补齐用
    ```
 
-   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 26 个 role**（Codex round-2 P1-3），`profile_id`
-   随之改变——这是刻意的 profile 版本演进，不是副作用。新版 profile 必须逐个 role 声明
+   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 28 个 role**（Codex round-2 P1-3 扩到 26，
+   round-3 verdict RQ-WI-R2-P1-01 加 `workload_admission`，RQ-WI-R2-P1-02 加
+   `lab_claim_finalizer`），`profile_id` 随之改变——这是刻意的 profile 版本演进，不是副作用。
+
+   `workload_admission` **不属于任何 unit**：它由 `/usr/local/libexec/rquant-workload-arbiter`
+   在取得 research 平面锁之后、exec 进 unit 自己的子进程之前调用，替换掉原先的
+   `.venv/bin/python -m rquant.workload_isolation research-admission`。新版 profile 必须声明它，
+   否则 10 个 research unit 全部起不来（admission 以 78 退出，被 arbiter 读成 research 被拒 →
+   unit 退 75）。非 instanced role：`instances` 为空、`control_root` 为空串、`module_arguments`
+   恰好是 `["research-admission"]`。
+
+   `lab_claim_finalizer` 由 `deploy/systemd/rquant-lab-claim-finalizer.service` 直接命名
+   （`--role lab_claim_finalizer`），该 unit 的 `ExecStartPre` 与旧的
+   `.venv/bin/python … run-lab-daemon.py formal` 已一并删除。非 instanced role：`instances`
+   为空、`control_root` 为空串、`module_arguments` 恰好是 `["lab-claim-finalizer"]`，
+   `environment_allowlist` 为 `["APP_ENV","LANG","LC_ALL","RQUANT_DISABLE_DOTENV","TZ"]`。
+
+   **⚠ 发布这一代 profile 之前必须做完的两件事**：
+
+   1. **补齐环境白名单**。wrapper 的 `build_child_environment` 从空字典起，只复制 profile 白名单
+      里的名字，未登记的名字**被静默丢弃**。`/etc/rquant/lab-claim-finalizer.env` 不在仓库里，
+      发布前先在云服务器 `82.156.0.68`（`lighthouse` 用户）上跑
+      `systemctl show -p Environment rquant-lab-claim-finalizer`，把 finalizer 真正需要的名字逐个
+      补进 `src/rquant/runtime_authority.py` 的 `lab_claim_finalizer` role 再发布。名字须排序去重、
+      不得以 `PYTHON` / `LD_` 开头、不得是 `PATH`，总数 ≤ 32。`PYTHONDONTWRITEBYTECODE` 故意不在
+      白名单里：两级都拒 `PYTHON*`，两级子进程都是 `-I -S`，generation 目录 0555，这个名字在旧
+      unit 下也从未到达 daemon。
+   2. **改 `/etc/rquant/runtime-code-migration.json`**：每个 `formal_services[]` 条目里的
+      `wrapper_path` 字段**必须删掉**。unit 不再执行 `scripts/run-lab-daemon.py`，
+      `RuntimeCodeFormalService` 已不再声明该字段，而请求模型是 `extra="forbid"`——留着它会让迁移
+      gate 以 `extra_forbidden` 失败，finalizer 启动即非零退出并被 `Restart=on-failure` 反复拉起。
+
+   **两条信任链的发布节奏现在是耦合的**（RQ-WI-R2-P1-02 的直接后果）。finalizer 先经
+   runtime-authority 链（wrapper 校验 generation），再跑 runtime-code 链（ed25519 attestation +
+   promotion receipt）。runtime-authority generation 没发布好——profile 与 `current.json` slot、
+   generation full-manifest 不同代，或磁盘上的 pyz 与 profile 的 `runtime_pyz.sha256` 不一致——
+   finalizer 就起不来。发布顺序必须是「安装新 pyz + 发布新 profile + 换代 generation」在同一次
+   事务里完成，然后才 `systemctl restart rquant-lab-claim-finalizer`。
+   bootstrap 绑定与迁移请求路径已经是 generation 常量，改它们同样要换代（R3B-SPEC-04）。
+
+   **R3-A 与 R3-B 必须同一次发布**（R3B-SPEC-01）：两者共用同一代 pyz 与同一个 `profile_id`，
+   分开发布会让先发的那一半带着后发那一半的 role 表或哈希，wrapper 直接 fail closed。
+
+   **`rquant-runtime-exec.pyz` 换代**：本轮 `_verify.py` 有改动，SHA-256 由
+   `5b903aeff9d5b8c44852825c54bd2531c0a994202bc575c08cce6d1b071a1aed` 变为
+   **`a5d9b3fff7388f7aa35a951a6b6bc51e3e9faf69bf8b94b598c7c69b2c9c9c5e`**
+   （`python scripts/build-runtime-exec-pyz.py --repository-root . --output <staging>/rquant-runtime-exec.pyz`
+   重算，连续两次构建逐字节相同）。安装新 pyz 与发布新 profile 必须同一次事务完成：profile 的
+   `runtime_pyz.sha256` 与磁盘上的 pyz 不一致时 wrapper 会 fail closed。
+
+   **R07 policy 必须用 py3.11 或 py3.12 生成**：3.13 的 AST 摘要与前两者不同，生成出来的 policy
+   在 CI 上对不上（Codex 非阻断项）。新版 profile 必须逐个 role 声明
    module / 环境白名单 / **instance 白名单**；instanced role 的 `instances` 至少一项且形如
    `svc-<64 hex>`，非 instanced role 必须为空。concrete 标签由
    `runtime_deployment_bundle` 从各 service manifest 派生，不冻结在代码里。
@@ -167,6 +219,46 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    ②Phase C child 以发布者 uid 运行（改变 child 身份模型）；
    ③修改 `_open_child_directory_at` 的 owner 谓词接受 `{0, euid}`（TCB 变更，需单独授权）。
    在裁决落地并实测之前，「Phase C 能在生产 generation 上产出 READY」没有证据。
+
+17. **arbiter 不再执行 checkout 解释器**（Codex round-3 verdict RQ-WI-R2-P1-01）。
+   `deploy/libexec/rquant-workload-arbiter` 在取得 research 平面锁之后、exec unit 自己的子进程
+   之前，只启动两类进程：`/usr/bin/setpriv`（parent-death launcher）与
+   `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role workload_admission`。
+   这三个可执行文件全部 root-owned、全部已在 TCB 表里。arbiter 自己的解释器行也收紧为
+   `#!/usr/bin/python3 -IS`，因此 `~/.local/lib/python3.11/site-packages/usercustomize.py` 与
+   `EnvironmentFile` 里的 `PYTHONPATH` / `PYTHONHOME` 都不再能在 arbiter 起步阶段执行代码
+   （独立评审 R3A-SPEC-02）。退出码契约不变：admission ≠ 0 → arbiter 退 75。
+
+   **闭包白名单不是零豁免，还剩一项**：`rquant-research-ingest.service` 把一个 checkout shell
+   脚本（`scripts/run-research-ingest-daily.sh`）交给 arbiter 当自有子进程，这个 unit 本体在
+   `origin/main` 上、不属于本轮范围。`ExecStartPre` 一侧现在是**零豁免**——finalizer 的那条
+   已随 RQ-WI-R2-P1-02 删除，所有 arbiter-fronted unit 都不得再声明 `ExecStartPre`。测试以两张
+   精确豁免表登记（子进程 1 项、`ExecStartPre` 0 项），多一项或程序变了都会红。
+
+   **`workload_admission` 的发布顺序有硬约束**：必须**先**装好新版 pyz 并发布声明了
+   `workload_admission` 的新版 profile，**再**用 `scripts/install-workload-isolation-infra.sh`
+   装新版 arbiter。顺序反了，10 个 research unit 的 admission 以 78 退出、unit 退 75——落在
+   `SuccessExitStatus=0 75` 之内不触发 `Restart=on-failure`，现象是「unit 秒退成功、什么都没跑」。
+   回滚同理：先回滚 arbiter，再回滚 pyz / profile。arbiter 的 `.sha256` 由安装脚本现算，
+   代码与文档都不冻结 arbiter 哈希。
+
+   **启动开销（生产口径）**。用户已选定 **A1**（admission 走 wrapper，每次都完整校验；若改选
+   A2 另行通知）。该探针让每次 research unit 启动多做 2 次完整 generation 校验（wrapper 父进程
+   1 次 + 冻结 bootstrap 在 generation 解释器里 1 次），每次逐条 SHA-256 约 666 MiB。
+   离线 arm64 容器、页缓存热的条件下 p95 = 0.889 s/次，**该数字不适用于生产**：生产机
+   `82.156.0.68` 是 Intel Xeon Platinum 8255C（Cascade Lake，2 vCPU），`/proc/cpuinfo` 无
+   `sha_ni`，实测单线程 SHA-256 吞吐 192–201 MB/s，据此推算单次校验的哈希下界 **≈ 3.5 s**，
+   **每次 research 启动新增 ≈ 7 s CPU**；连同 unit 自身子进程的校验合计 ≈ 14 s。
+   `rquant-artifact-retention.timer` 每 5 分钟一跳，按 288 次/天计新增 **≈ 34 min/天 CPU**。
+   相关 unit 的 `TimeoutStartSec` 在 30–300 s，余量充足，但**首次部署后必须实测确认**：
+   `systemd-analyze blame`，或
+   `systemctl show -p ExecMainStartTimestamp,ActiveEnterTimestamp rquant-artifact-retention.service`，
+   并观察一整个交易日的 1 分钟 load。若单次启动超过 30 s 或 load 明显抬升，按上面的回滚顺序
+   先回滚 arbiter。
+
+   **优化债务**：同一代 generation 在同一次启动里被校验两次，且每次都是全量逐文件 SHA-256。
+   按 generation 缓存校验结果（例如以 generation id + full-manifest 摘要为键，把结果记在
+   root-owned 的一次性文件里）可以把 ≈ 7 s 降到一次校验的量级。本轮不做，记为债务。
 
 **回滚**：本分支没有产生任何生产变更，因此没有回滚基线。PR 未合并前直接关闭 PR 即可；
 已合并但未部署时，生产仍停在上一次部署的 commit，无需任何动作。

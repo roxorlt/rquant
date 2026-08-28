@@ -74,6 +74,30 @@
 
 ### Security
 
+
+- **arbiter 的 admission 探针改走 root-owned wrapper**：
+  `deploy/libexec/rquant-workload-arbiter` 在取得 research 平面锁之后不再执行
+  `.venv/bin/python -m rquant.workload_isolation research-admission`——`.venv` 是 editable 安装、
+  `rquant.pth` 指回 checkout，那一步等于让可变源码在可信 wrapper 之前运行。现在它执行
+  `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role workload_admission`，
+  与 unit 自己的子进程同一条链。新增 `workload_admission` role，且无 `control_root` 的 role 现在
+  也能携带自己在 root-owned profile 里冻结的 `module_arguments`（Codex round-3 verdict,
+  RQ-WI-R2-P1-01）。
+
+- **formal claim finalizer 改走 root-owned wrapper**：
+  `deploy/systemd/rquant-lab-claim-finalizer.service` 原本两次命名 checkout 解释器（一条
+  `ExecStartPre` 跑 `.venv/bin/rquant runtime-code dry-run`，`ExecStart` 跑
+  `.venv/bin/python … run-lab-daemon.py formal`），而 `run-lab-daemon.py` 还在模块层用
+  `spec_from_file_location` 加载 `contained_subprocess.py`——整条 runtime-code 校验（ed25519
+  attestation、promotion receipt、anti-rollback）由它自己正在裁决的那棵树上的代码执行。现在
+  unit 以 `lab_claim_finalizer` role 走 wrapper，进 generation 内的
+  `rquant.lab_formal_runtime_entry`，`ExecStartPre` 直接删除（Codex round-3 verdict,
+  RQ-WI-R2-P1-02）。
+
+- **arbiter 自身的解释器行收紧为 `#!/usr/bin/python3 -IS`**：`-I` 关掉 `PYTHON*` 与 user-site，
+  `-S` 关掉 `site`，因此 `~/.local/lib/python3.11/site-packages/usercustomize.py` 与
+  `EnvironmentFile` 里的 `PYTHONPATH` / `PYTHONHOME` 都不再能在 arbiter 起步阶段执行代码
+  （独立评审 R3A-SPEC-02）。
 > 以下四项对应 Codex 第二轮工单 P1-3 / P1-4 / P1-5 与裁决 7。均为**代码与测试**，
 > 不安装、不部署；root-owned 路径的安装仍是单独授权的基础设施事务，前置条件见 `DEPLOY.md`。
 
@@ -98,6 +122,10 @@
 
 ### Changed
 
+
+- `PRODUCTION_ROLE_POLICY` 由 26 个 role 扩到 28（新增 `workload_admission` 与
+  `lab_claim_finalizer`），`profile_id` 与 `rquant-runtime-exec.pyz` 的 SHA-256 随之换代；
+  full-suite manifest 一并重生成。R3-A 与 R3-B 必须同一次发布。
 - **CI 全集分片**：原 90 分钟单 job 拆为 Python 3.11/3.12 的 core preflight 与 4 个
   fail-fast-disabled full-suite shard；版本化 nodeid manifest、pytest `@argsfile` runner 和
   每版本 JUnit 聚合契约会在 collect drift、漏片/重片、artifact 混入或测试失败时 fail closed；
@@ -156,6 +184,9 @@
 
 ### Fixed
 
+
+- **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
+  因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
   的 `run_identity` 变成必填，命中路径与下载路径一样比对 `(workflow_run_id, run_attempt)`；
   缓存目录、条目文件及**全部祖先**校验 owner / mode / no-symlink / `st_nlink == 1`，并加
