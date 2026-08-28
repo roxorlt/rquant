@@ -1383,12 +1383,6 @@ def verify_merge_provenance(
 # what they are, so the generator, the CI producer, and the tests cannot drift apart.
 
 NULL_COMMIT_SHA = "0" * 40
-BASELINE_CONTEXT_SOURCES = (
-    "explicit_cli",
-    "github_event_payload",
-    "git_first_parent",
-    "frozen_baseline_fallback",
-)
 
 
 class R07BaselineContextV1(_StrictModelMixin, BaseModel):
