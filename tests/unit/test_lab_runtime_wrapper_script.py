@@ -1687,3 +1687,75 @@ def test_the_legacy_contained_runner_is_loaded_the_first_time_a_legacy_path_uses
 
     assert completed.returncode == 0, completed.stderr
     assert marker.read_text(encoding="ascii") == "executed"
+
+
+def test_the_checkout_formal_entry_refuses_to_run() -> None:
+    """Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02, mirroring the P1-4 shape.
+
+    `run-lab-daemon.py formal` was the finalizer's production entry, and every step of it —
+    the `rquant.formal_runtime*` imports, the deployment lock, the runtime-code capability —
+    executed checkout code ahead of the verification that was meant to authorise it. The
+    branch stays so a stale unit or runbook fails loudly, and it now does nothing but say so.
+    """
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(WRAPPER),
+            "formal",
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
+            "--deployment-lock-path",
+            "/run/rquant-lab-claim-finalizer/deployment.lock",
+            "--",
+            "lab-claim-finalizer",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 78
+    assert "root-owned wrapper" in completed.stderr
+    assert "--role lab_claim_finalizer" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_the_checkout_formal_entry_no_longer_reaches_the_formal_runtime() -> None:
+    """The refusal has to be a refusal, not a shorter path to the same imports."""
+
+    source = WRAPPER.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(WRAPPER))
+    formal = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_formal_main"
+    )
+    names = {
+        node.value
+        for node in ast.walk(formal)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    dynamic_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "import_module"
+    ]
+
+    assert dynamic_imports == []
+    assert [
+        ast.unparse(node.func)
+        for node in ast.walk(formal)
+        if isinstance(node, ast.Call)
+    ] == ["sys.stderr.write"]
+    assert any("root-owned wrapper" in name for name in names)
+    assert "FORMAL_RUNTIME_WRAPPER_CONTRACT" not in source
