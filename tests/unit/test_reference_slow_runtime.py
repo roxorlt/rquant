@@ -1017,6 +1017,86 @@ def test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence(
     assert tuple(spool.completion_evidence_root.glob("*.json")) == ()
 
 
+def test_receipt_marker_crossing_cutoff_rolls_back_without_durable_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the `marker_durable_at` checkpoint of `write_completion_receipt`.
+
+    This is the one no-evidence checkpoint at which a receipt already exists: it has
+    been written and fsynced, but the commit intent is still on disk, uncleared, so
+    nothing ever acknowledged the receipt and the rollback unlinks it again without
+    sealing evidence. The phase clock crosses the instant the receipt lands, which is
+    after `durable_completed_at` and before `_clear_completion_receipt_intent` runs;
+    `cleanup_calls` witnesses that the run stopped short of the `final_durable_at`
+    checkpoint, the next one along and the first that does emit evidence.
+    """
+
+    spool, _cursor_root = _captured_consumer_spool(tmp_path)
+    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+    before = datetime(2026, 7, 31, 1, 24, 59, tzinfo=UTC)
+    late = datetime(2026, 7, 31, 1, 25, 0, 1000, tzinfo=UTC)
+    crossed = False
+    cleanup_calls = 0
+    crossing_receipt: Path | None = None
+    intent_present_at_crossing: bool | None = None
+    original_atomic_write = spool._atomic_write
+    original_clear = spool._clear_completion_receipt_intent
+
+    def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint up to and including the receipt
+        # write observes `before`. Only `crossing_atomic_write` moves it past 09:25.
+        return late if crossed else before
+
+    def crossing_atomic_write(path: Path, payload: bytes) -> None:
+        nonlocal crossed, crossing_receipt, intent_present_at_crossing
+        original_atomic_write(path, payload)
+        # The receipt is `<completion_receipt_root>/<publication_id>.json`; the commit
+        # intent written a moment earlier carries an extra `.intent` suffix, so only
+        # the receipt has a bare 64-hex stem in that directory.
+        if crossed or path.parent != spool.completion_receipt_root:
+            return
+        if len(path.stem) != 64:
+            return
+        crossing_receipt = path
+        intent_present_at_crossing = spool.completion_receipt_intent_path(path.stem).exists()
+        crossed = True
+
+    def counted_clear(publication_id: str) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        original_clear(publication_id)
+
+    monkeypatch.setattr(spool, "_atomic_write", crossing_atomic_write)
+    monkeypatch.setattr(spool, "_clear_completion_receipt_intent", counted_clear)
+
+    with pytest.raises(ReferenceSlowRuntimeError, match="completed after 09:25") as excinfo:
+        publish_reference_slow_batches(
+            spool=spool,
+            registry=registry,
+            calendar=_calendar(),
+            consumer_id="reference-publisher",
+            observed_at=before,
+            producer_commit=COMMIT,
+            completion_clock=phase_clock,
+        )
+
+    assert crossing_receipt is not None, "the completion receipt was never written"
+    assert intent_present_at_crossing is True
+    assert cleanup_calls == 0, (
+        "the run reached the completion-intent cleanup, so it crossed at a later "
+        "checkpoint than marker_durable_at"
+    )
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, LiveSpoolIntegrityError)
+    assert str(cause) == "completion receipt completed after deadline"
+    assert not crossing_receipt.exists()
+    assert spool.completion_receipt_intent_path(crossing_receipt.stem).exists()
+    assert _registry_publication_counts(registry) == (0, 0, 0)
+    assert spool.load_cursor("reference-publisher", LiveChannel.REFERENCE_SLOW) is None
+    assert tuple(spool.completion_evidence_root.glob("*.json")) == ()
+
+
 def test_delayed_final_intent_cleanup_crossing_cutoff_rolls_back_before_lock_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1105,6 +1185,9 @@ def test_evidence_stage_crossing_cutoff_reseals_committed_evidence_as_rolled_bac
     original_persist = spool._persist_completion_evidence
 
     def phase_clock() -> datetime:
+        # Deterministic phase clock: every checkpoint up to and including the
+        # `committed` evidence write observes `before`. Only `crossing_persist`,
+        # which runs inside that write, moves it past 09:25.
         return late if crossed else before
 
     def crossing_persist(
