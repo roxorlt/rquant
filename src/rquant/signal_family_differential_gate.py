@@ -1525,9 +1525,7 @@ def _context_commit(repo: Path, sha: str, *, field: str) -> str:
     try:
         return _resolved_commit(repo, sha)
     except subprocess.CalledProcessError as exc:
-        raise ValueError(
-            f"R07 {field} does not name a commit in this repository: {sha}"
-        ) from exc
+        raise ValueError(f"R07 {field} does not name a commit in this repository: {sha}") from exc
 
 
 def _commit_parents(repo: Path, commit: str) -> tuple[str, ...]:
@@ -1750,8 +1748,7 @@ def verify_baseline_context(
             # For a push the merge base *is* the first parent, so name it that way: the
             # reader has to know which of the two commits to go look at.
             raise ValueError(
-                "the pushed merge commit's first parent is not the frozen R07 baseline: "
-                f"{baseline}"
+                f"the pushed merge commit's first parent is not the frozen R07 baseline: {baseline}"
             )
         raise ValueError(
             "the frozen R07 baseline is not the merge base of this run's stated endpoints: "
