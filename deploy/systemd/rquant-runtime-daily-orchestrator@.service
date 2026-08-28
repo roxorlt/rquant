@@ -1,0 +1,47 @@
+[Unit]
+Description=rQuant isolated Shadow daily fan-in orchestrator (%i)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=3600s
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+Slice=rquant-research.slice
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role daily_pipeline_orchestrator --instance %i
+
+Restart=no
+TimeoutStartSec=300s
+TimeoutStopSec=60s
+SuccessExitStatus=0 75
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/daily-orchestrators/%i /home/lighthouse/rquant/data/runtime/research/daily-pipeline
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/live/daily-close -/home/lighthouse/rquant/data/runtime/current -/etc/rquant/daily-receipt-trusted-keys.json
+
+StandardOutput=journal
+StandardError=journal
+
+# The unit is installed but intentionally not enabled: legacy rquant-daily
+# remains authoritative during the real-session shadow comparison window.
+# Cloud deployment gate: systemd-analyze verify rquant-runtime-daily-orchestrator@.service

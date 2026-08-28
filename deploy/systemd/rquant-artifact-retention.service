@@ -1,0 +1,50 @@
+[Unit]
+Description=rQuant artifact retention and GC
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment=RQUANT_DISABLE_DOTENV=1
+LoadCredentialEncrypted=capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349/current.cred
+Slice=rquant-research.slice
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role artifact_retention --instance svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349
+SuccessExitStatus=0 75
+Restart=no
+TimeoutStartSec=120s
+TimeoutStopSec=30s
+RuntimeMaxSec=180s
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=64
+CPUWeight=20
+IOWeight=20
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/artifact-retention/svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349 /home/lighthouse/rquant/data/runtime/research/artifact-retention/svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349 /home/lighthouse/rquant/data/runtime/research/final-artifacts
+ReadOnlyPaths=-/var/lib/rquant/runtime-recovery/backups -/var/lib/rquant/runtime-recovery/restores -/home/lighthouse/rquant/data/runtime/current
+RestrictAddressFamilies=AF_UNIX
+StandardOutput=journal
+StandardError=journal
+
+# Cloud deployment gate: systemd-analyze verify rquant-artifact-retention.service

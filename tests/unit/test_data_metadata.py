@@ -147,9 +147,7 @@ def test_dataset_coverage_rejects_invalid_or_caller_derived_counts() -> None:
             code_commit="abc123",
             origin="local",
         ),
-        lambda: __import__(
-            "rquant.data_metadata", fromlist=["DatasetCoverage"]
-        ).DatasetCoverage(
+        lambda: __import__("rquant.data_metadata", fromlist=["DatasetCoverage"]).DatasetCoverage(
             snapshot_id="snapshot-1",
             dataset_id="minute-bars",
             coverage_scope="all",
@@ -170,9 +168,7 @@ def test_dataset_coverage_rejects_invalid_or_caller_derived_counts() -> None:
         ),
         lambda: __import__(
             "rquant.data_metadata", fromlist=["DatasetSnapshotFinalization"]
-        ).DatasetSnapshotFinalization(
-            completed_at=datetime(2026, 7, 13, 6, 30)
-        ),
+        ).DatasetSnapshotFinalization(completed_at=datetime(2026, 7, 13, 6, 30)),
     ],
 )
 def test_models_reject_naive_business_times(factory: object) -> None:
@@ -290,9 +286,7 @@ def test_metadata_storage_lifecycle_and_typed_json_round_trip(
         )
         assert finalized.status == "ready"
         assert finalized.completed_at == t0 + timedelta(minutes=4)
-        assert finalized.table_watermarks == {
-            "minute_bar": "2026-07-13T06:00:00Z"
-        }
+        assert finalized.table_watermarks == {"minute_bar": "2026-07-13T06:00:00Z"}
         assert finalized.quality_issue_ids == (reopened.issue_id,)
         assert store.get_dataset_snapshot(snapshot.snapshot_id) == finalized
         assert store.list_dataset_coverages(snapshot.snapshot_id) == [stored_coverage]
@@ -307,11 +301,40 @@ def test_metadata_queries_and_transitions_explain_missing_ids(tmp_path: Path) ->
         assert store.list_dataset_coverages("missing") == []
         assert store.list_snapshot_quality_issues("missing") == []
         with pytest.raises(KeyError, match="dataset snapshot.*missing"):
-            store.finalize_dataset_snapshot(
-                "missing", DatasetSnapshotFinalization()
-            )
+            store.finalize_dataset_snapshot("missing", DatasetSnapshotFinalization())
         with pytest.raises(KeyError, match="data quality issue.*missing"):
             store.resolve_data_quality_issue("missing")
+
+
+def test_dataset_snapshot_real_terminal_transition_invokes_artifact_outbox_hook(
+    tmp_path: Path,
+) -> None:
+    from rquant.data_metadata import DatasetSnapshot, DatasetSnapshotFinalization
+
+    now = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
+    events: list[tuple[str, str, datetime]] = []
+    snapshot = DatasetSnapshot(
+        strategy_name="n-shape",
+        as_of_time=now - timedelta(days=1),
+        code_commit="1" * 40,
+        origin="production",
+        status="building",
+        created_at=now - timedelta(minutes=1),
+    )
+    with DuckDBStore(
+        tmp_path / "snapshot-hook.duckdb",
+        artifact_terminal_hook=lambda owner_type, owner_id, observed_at: events.append(
+            (owner_type, owner_id, observed_at)
+        ),
+    ) as store:
+        store.begin_dataset_snapshot(snapshot)
+        assert events == []
+        store.finalize_dataset_snapshot(
+            snapshot.snapshot_id,
+            DatasetSnapshotFinalization(completed_at=now),
+        )
+
+    assert events == [("snapshot", snapshot.snapshot_id, now)]
 
 
 def _execution_manifest(
@@ -419,9 +442,7 @@ def test_execution_binding_requires_ready_parent_and_is_immutable(
         ),
         created_at=t0,
     )
-    finalization = DatasetSnapshotBindingFinalization(
-        completed_at=t0 + timedelta(minutes=2)
-    )
+    finalization = DatasetSnapshotBindingFinalization(completed_at=t0 + timedelta(minutes=2))
 
     with DuckDBStore(tmp_path / "binding.duckdb") as store:
         store.begin_dataset_snapshot(parent)
@@ -446,14 +467,9 @@ def test_execution_binding_requires_ready_parent_and_is_immutable(
         assert ready.status == "ready"
         assert ready.completed_at == t0 + timedelta(minutes=2)
         assert store.get_dataset_snapshot_binding(parent.snapshot_id) == ready
-        assert (
-            store.finalize_dataset_snapshot_binding(parent.snapshot_id, finalization)
-            == ready
-        )
+        assert store.finalize_dataset_snapshot_binding(parent.snapshot_id, finalization) == ready
 
-        different_manifest = manifest.model_copy(
-            update={"builder_version": "snapshot-builder-v2"}
-        )
+        different_manifest = manifest.model_copy(update={"builder_version": "snapshot-builder-v2"})
         conflicting = DatasetSnapshotBinding.create(
             manifest=different_manifest,
             artifact_root=binding.artifact_root,
@@ -691,9 +707,7 @@ def test_coverage_upsert_serializes_with_snapshot_finalization(
         available_count=10,
         created_at=t0,
     )
-    finalization = DatasetSnapshotFinalization(
-        completed_at=t0 + timedelta(minutes=1)
-    )
+    finalization = DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1))
 
     with DuckDBStore(db_path) as primary, DuckDBStore(db_path) as competitor:
         primary.begin_dataset_snapshot(snapshot)
@@ -726,9 +740,7 @@ def test_coverage_upsert_serializes_with_snapshot_finalization(
         assert len(finalization_conflicts) == 1
         assert snapshot.snapshot_id in str(finalization_conflicts[0])
         assert stored.available_count == 10
-        finalized = competitor.finalize_dataset_snapshot(
-            snapshot.snapshot_id, finalization
-        )
+        finalized = competitor.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
         assert finalized.status == "ready"
         assert primary.list_dataset_coverages(snapshot.snapshot_id) == [stored]
 
@@ -772,9 +784,7 @@ def test_finalization_serializes_with_coverage_upsert(
         available_count=10,
         created_at=t0,
     )
-    finalization = DatasetSnapshotFinalization(
-        completed_at=t0 + timedelta(minutes=1)
-    )
+    finalization = DatasetSnapshotFinalization(completed_at=t0 + timedelta(minutes=1))
 
     with DuckDBStore(db_path) as primary, DuckDBStore(db_path) as finalizer:
         primary.begin_dataset_snapshot(snapshot)
@@ -802,9 +812,7 @@ def test_finalization_serializes_with_coverage_upsert(
             get_with_concurrent_coverage,
         )
 
-        finalized = finalizer.finalize_dataset_snapshot(
-            snapshot.snapshot_id, finalization
-        )
+        finalized = finalizer.finalize_dataset_snapshot(snapshot.snapshot_id, finalization)
 
         assert finalized.status == "ready"
         assert len(coverage_conflicts) == 1
@@ -962,9 +970,7 @@ def test_coverage_requires_existing_snapshot(tmp_path: Path) -> None:
     with DuckDBStore(tmp_path / "coverage-reference.duckdb") as store:
         with pytest.raises(KeyError, match="dataset snapshot.*missing-snapshot"):
             store.upsert_dataset_coverage(coverage)
-        count = store._conn.execute(
-            "SELECT COUNT(*) FROM dataset_coverage"
-        ).fetchone()[0]
+        count = store._conn.execute("SELECT COUNT(*) FROM dataset_coverage").fetchone()[0]
         assert count == 0
 
 
@@ -1034,9 +1040,7 @@ def test_begin_snapshot_rolls_back_shallow_mutation(tmp_path: Path) -> None:
     with DuckDBStore(tmp_path / "mutated-begin.duckdb") as store:
         with pytest.raises(ValueError, match="write-boundary|building snapshot"):
             store.begin_dataset_snapshot(snapshot)
-        count = store._conn.execute(
-            "SELECT COUNT(*) FROM dataset_snapshot"
-        ).fetchone()[0]
+        count = store._conn.execute("SELECT COUNT(*) FROM dataset_snapshot").fetchone()[0]
         assert count == 0
 
 
@@ -1234,9 +1238,7 @@ def test_issue_write_boundary_rejects_mutated_non_finite_evidence(
     from rquant.data_metadata import DataQualityIssue
 
     t0 = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
-    ordinary_evidence = {
-        "sample": {"values": [1.5, None, True], "symbol": "600000.SH"}
-    }
+    ordinary_evidence = {"sample": {"values": [1.5, None, True], "symbol": "600000.SH"}}
     ordinary = DataQualityIssue.detected(
         rule_id="finite-evidence",
         dataset_id="minute-bars",

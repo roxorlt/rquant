@@ -46,7 +46,7 @@ import time as _time_module
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
 
@@ -55,6 +55,8 @@ import pandas as pd
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from rquant.legacy_shadow_export import LegacySurgeCollectionProof
+from rquant.runtime_contracts import canonical_sha256
 from rquant.state.derive import _classify_board, _detect_st
 
 CST = timezone(timedelta(hours=8))  # A 股墙钟（Asia/Shanghai）
@@ -72,6 +74,7 @@ assert len(_GRID_MINUTES) == CURVE_POINTS  # noqa: S101 - 模块加载期自证�
 
 # 会话时刻边界
 OPEN_TIME = dt_time(9, 30)
+COLLECTION_PROOF_START = dt_time(9, 25)
 MORNING_END = dt_time(11, 30)
 AFTERNOON_START = dt_time(13, 0)
 CLOSE_TIME = dt_time(15, 0)
@@ -88,6 +91,160 @@ _DEFAULT_SURGE_BOARDS = ("gem", "star")
 LIVE_DIR_NAME = "surge_live"
 
 SNAPSHOT_FULL_NAME = "snapshot_full.parquet"
+_MIN_FULL_MARKET_COVERAGE_COUNT = 4_000
+_MIN_MARKET_COVERAGE_BPS = 9_800
+
+
+def _active_session_offset_seconds(observed: datetime) -> int | None:
+    local_time = observed.time()
+    if OPEN_TIME <= local_time <= MORNING_END:
+        return int(
+            (
+                datetime.combine(observed.date(), local_time)
+                - datetime.combine(observed.date(), OPEN_TIME)
+            ).total_seconds()
+        )
+    if AFTERNOON_START <= local_time <= CLOSE_TIME:
+        morning_seconds = int(
+            (
+                datetime.combine(observed.date(), MORNING_END)
+                - datetime.combine(observed.date(), OPEN_TIME)
+            ).total_seconds()
+        )
+        return morning_seconds + int(
+            (
+                datetime.combine(observed.date(), local_time)
+                - datetime.combine(observed.date(), AFTERNOON_START)
+            ).total_seconds()
+        )
+    return None
+
+
+@dataclass
+class SurgeCollectionTracker:
+    trade_date: date
+    started_at: datetime
+    market_universe: frozenset[str]
+    minimum_market_coverage_count: int
+    first_success_at: datetime | None = None
+    last_success_at: datetime | None = None
+    successful_snapshots: int = 0
+    empty_successful_snapshots: int = 0
+    failed_snapshots: int = 0
+    maximum_active_gap_seconds: int = 0
+    maximum_consecutive_misses: int = 0
+    ending_consecutive_misses: int = 0
+    source_routes: set[str] = field(default_factory=set)
+    observed_minimum_market_coverage_count: int | None = None
+    _last_success_offset: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.minimum_market_coverage_count < 1:
+            raise ValueError("surge market universe contract is invalid")
+
+    @property
+    def market_universe_id(self) -> str:
+        return canonical_sha256(
+            {
+                "contract": "legacy-surge-market-universe/v1",
+                "source": "stock-basic-all-a-share",
+                "codes": tuple(sorted(self.market_universe)),
+            }
+        )
+
+    def observe_snapshot(
+        self,
+        observed_at: datetime,
+        snapshot: pd.DataFrame | None,
+    ) -> bool:
+        route = str(snapshot.attrs.get("route", "none")) if snapshot is not None else "none"
+        if snapshot is None or snapshot.empty or "ts_code" not in snapshot.columns:
+            self.observe_failure(observed_at, route=route)
+            return False
+        observed_codes = frozenset(snapshot["ts_code"].astype(str))
+        coverage_count = len(observed_codes & self.market_universe)
+        required_ratio_count = (
+            len(self.market_universe) * _MIN_MARKET_COVERAGE_BPS + 9_999
+        ) // 10_000
+        required_count = max(
+            self.minimum_market_coverage_count,
+            required_ratio_count,
+        )
+        if (
+            route != "tushare_rt"
+            or observed_codes - self.market_universe
+            or coverage_count < required_count
+        ):
+            self.observe_failure(observed_at, route=route)
+            return False
+        offset = _active_session_offset_seconds(observed_at)
+        if offset is None or observed_at.date() != self.trade_date:
+            return True
+        if self.first_success_at is None:
+            self.first_success_at = observed_at
+        if self._last_success_offset is not None:
+            self.maximum_active_gap_seconds = max(
+                self.maximum_active_gap_seconds,
+                offset - self._last_success_offset,
+            )
+        self._last_success_offset = offset
+        self.last_success_at = observed_at
+        self.successful_snapshots += 1
+        self.ending_consecutive_misses = 0
+        self.source_routes.add(route)
+        self.observed_minimum_market_coverage_count = (
+            coverage_count
+            if self.observed_minimum_market_coverage_count is None
+            else min(self.observed_minimum_market_coverage_count, coverage_count)
+        )
+        return True
+
+    def observe_failure(self, observed_at: datetime, *, route: str) -> None:
+        if (
+            _active_session_offset_seconds(observed_at) is None
+            or observed_at.date() != self.trade_date
+        ):
+            return
+        self.failed_snapshots += 1
+        self.ending_consecutive_misses += 1
+        self.maximum_consecutive_misses = max(
+            self.maximum_consecutive_misses,
+            self.ending_consecutive_misses,
+        )
+
+    def complete_proof(self) -> LegacySurgeCollectionProof | None:
+        if (
+            self.first_success_at is None
+            or self.last_success_at is None
+            or self.observed_minimum_market_coverage_count is None
+        ):
+            return None
+        try:
+            return LegacySurgeCollectionProof.create(
+                trade_date=self.trade_date,
+                started_at=self.started_at.astimezone(UTC),
+                first_success_at=self.first_success_at.astimezone(UTC),
+                last_success_at=self.last_success_at.astimezone(UTC),
+                successful_snapshots=self.successful_snapshots,
+                nonempty_successful_snapshots=self.successful_snapshots,
+                empty_successful_snapshots=0,
+                failed_snapshots=self.failed_snapshots,
+                maximum_active_gap_seconds=self.maximum_active_gap_seconds,
+                maximum_consecutive_misses=self.maximum_consecutive_misses,
+                ending_consecutive_misses=self.ending_consecutive_misses,
+                source_routes=tuple(sorted(self.source_routes)),
+                market_universe_id=self.market_universe_id,
+                market_universe_expected_count=len(self.market_universe),
+                minimum_market_coverage_count=(self.observed_minimum_market_coverage_count),
+                minimum_market_coverage_bps=(
+                    self.observed_minimum_market_coverage_count
+                    * 10_000
+                    // len(self.market_universe)
+                ),
+                source_health=("recovered" if self.failed_snapshots else "healthy"),
+            )
+        except ValueError:
+            return None
 
 
 def _boards_env() -> tuple[str, ...]:
@@ -194,11 +351,11 @@ class SurgeConfig(BaseModel):
     # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）标 unbuyable（报文加「临近涨停」
     # icon,仍推送、仍占「每票每日一次」名额）。0 = 只标已封板；负值可整体关闭（room 恒 > 负值）。
     max_room_to_limit_pct: float = 1.0
-    cum_lookback_days: int = 4       # 同刻累计中位回溯交易日数（v3 默认 4）
-    max_per_push: int = 8            # 单条报文最多 N 只，超出折叠
+    cum_lookback_days: int = 4  # 同刻累计中位回溯交易日数（v3 默认 4）
+    max_per_push: int = 8  # 单条报文最多 N 只，超出折叠
     silent_until_hhmm: str = "09:31"  # 该时刻前只收集不推送（用户要求 9:31 起就推）
-    tushare_rate_per_min: int = 2    # 确认层 stk_mins 限频（次/分）
-    tushare_max_retries: int = 3     # 单候选取数失败重试上限（延后不阻塞队列）
+    tushare_rate_per_min: int = 2  # 确认层 stk_mins 限频（次/分）
+    tushare_max_retries: int = 3  # 单候选取数失败重试上限（延后不阻塞队列）
     miss_circuit_threshold: int = 5  # 快照连续 miss 触发降级告警 + 退避
     # 检测范围（不是取数范围）：全市场快照在检测层按此过滤。默认创业+科创，
     # RQUANT_SURGE_BOARDS 可覆盖（default_factory 构造时读 env）。
@@ -216,13 +373,13 @@ class SurgeConfirmed(BaseModel):
     ts_code: str
     name: str
     theme: str = ""
-    confirmed_at: str = ""            # HH:MM
-    price: float = 0.0                # 推送当时价（入场价,供次日 S 点/最终收益闭环用）
+    confirmed_at: str = ""  # HH:MM
+    price: float = 0.0  # 推送当时价（入场价,供次日 S 点/最终收益闭环用）
     pct_chg: float = 0.0
-    cum_amount: float = 0.0           # 当日累计成交额（元）
-    rel_cum: float = 0.0              # today_cum / N 日同刻累计额中位（v3 纯累计核心判据）
-    rough_ratio: float = 0.0          # cum / (20 日均额 × 曲线(t))
-    minute_delta: float | None = None       # 本分钟增量（元，v2 遗留研究字段）
+    cum_amount: float = 0.0  # 当日累计成交额（元）
+    rel_cum: float = 0.0  # today_cum / N 日同刻累计额中位（v3 纯累计核心判据）
+    rough_ratio: float = 0.0  # cum / (20 日均额 × 曲线(t))
+    minute_delta: float | None = None  # 本分钟增量（元，v2 遗留研究字段）
     minute_delta_median: float | None = None  # N 日同分钟增量中位（元，v2 遗留研究字段）
     room_to_limit_pct: float | None = None  # 距涨停空间（%）
     return_1m_pct: float | None = None
@@ -243,9 +400,7 @@ class SurgePushHistory(BaseModel):
     @property
     def pushed_today(self) -> set[str]:
         return {
-            code
-            for code, push_dates in self.push_dates_by_code.items()
-            if self.as_of in push_dates
+            code for code, push_dates in self.push_dates_by_code.items() if self.as_of in push_dates
         }
 
     def count(self, ts_code: str) -> int:
@@ -255,7 +410,7 @@ class SurgePushHistory(BaseModel):
 class TickResult(BaseModel):
     """单分钟 tick 的产出：待推送报文 + 本分钟新确认（落 events）。"""
 
-    pushes: list[tuple[str, str]] = []   # [(title, body)]
+    pushes: list[tuple[str, str]] = []  # [(title, body)]
     confirmed: list[SurgeConfirmed] = []
 
 
@@ -267,11 +422,11 @@ class SurgeBaseline:
     """启动预载的市场基线（全部载内存）。"""
 
     avg_amount_20d: dict[str, float]  # ts_code → 元（daily_bar 千元 ×1000）
-    theme: dict[str, str]             # ts_code → 题材名（三级兜底链首个命中，见 load_theme_map）
-    curve: np.ndarray                 # 241 点进度曲线
+    theme: dict[str, str]  # ts_code → 题材名（三级兜底链首个命中，见 load_theme_map）
+    curve: np.ndarray  # 241 点进度曲线
     # rt_min 快照只带 ts_code/close/vol/amount，不带名称/昨收，故预载补齐（2026-07-07 换源）：
     code_universe: list[str] = field(default_factory=list)  # 全 A 股代码（stock_basic，喂 rt_min）
-    name_map: dict[str, str] = field(default_factory=dict)   # ts_code → 名称（ST 判定 + 报文）
+    name_map: dict[str, str] = field(default_factory=dict)  # ts_code → 名称（ST 判定 + 报文）
     pre_close: dict[str, float] = field(default_factory=dict)  # ts_code → T-1 收盘（涨停价/涨幅）
 
 
@@ -473,8 +628,12 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
         f"代码全集={len(codes)} 只、昨收={len(pre_close)} 只"
     )
     return SurgeBaseline(
-        avg_amount_20d=avg20, theme=theme, curve=curve,
-        code_universe=codes, name_map=names, pre_close=pre_close,
+        avg_amount_20d=avg20,
+        theme=theme,
+        curve=curve,
+        code_universe=codes,
+        name_map=names,
+        pre_close=pre_close,
     )
 
 
@@ -490,8 +649,17 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
 #   唯 daily_bar 是千元（load_avg_amount_20d 已 ×1000），不涉 rt_min。
 
 _RT_MIN_SNAPSHOT_COLS = [
-    "ts_code", "name", "price", "open", "high", "low",
-    "pre_close", "pct_chg", "volume", "amount", "trade_time",
+    "ts_code",
+    "name",
+    "price",
+    "open",
+    "high",
+    "low",
+    "pre_close",
+    "pct_chg",
+    "volume",
+    "amount",
+    "trade_time",
 ]
 
 
@@ -541,8 +709,11 @@ class CumulativeTracker:
                 continue
             code = str(r.ts_code)
             self._cum[code] = {
-                col: (float(getattr(r, col)) if getattr(r, col, None) is not None
-                      and not pd.isna(getattr(r, col, None)) else 0.0)
+                col: (
+                    float(getattr(r, col))
+                    if getattr(r, col, None) is not None and not pd.isna(getattr(r, col, None))
+                    else 0.0
+                )
                 for col in self._CUM_COLS
             }
             self._last_minute[code] = _minute_of_day(ts)
@@ -575,11 +746,7 @@ class CumulativeTracker:
                         minute = _minute_of_day(ts)
             cum = self._cum.setdefault(code, {c: 0.0 for c in self._CUM_COLS})
             last = self._last_minute.get(code)
-            advance = (
-                belongs_to_session
-                and minute is not None
-                and (last is None or minute > last)
-            )
+            advance = belongs_to_session and minute is not None and (last is None or minute > last)
             if advance:
                 for col in self._CUM_COLS:
                     v = getattr(r, col, None)
@@ -684,8 +851,8 @@ def _detection_domain(snapshot: pd.DataFrame, boards: tuple[str, ...]) -> pd.Dat
 class ThreeDayBaseline:
     """某票近 3 交易日的同刻累计额 / 同分钟增量中位（对齐 241 网格）。"""
 
-    cum_median: np.ndarray      # 241 点：3 日同刻累计额中位（元）
-    minute_median: np.ndarray   # 241 点：3 日同分钟增量中位（元）
+    cum_median: np.ndarray  # 241 点：3 日同刻累计额中位（元）
+    minute_median: np.ndarray  # 241 点：3 日同分钟增量中位（元）
     days_used: int
 
 
@@ -1025,10 +1192,7 @@ class SurgeWatcher:
         cached_strength = self.today_price_strength.get(code)
         if code in self.today_cum_series and (
             not self.config.require_price_strength
-            or (
-                cached_strength is not None
-                and cached_strength.minute_index >= required_gi
-            )
+            or (cached_strength is not None and cached_strength.minute_index >= required_gi)
         ):
             return
         try:
@@ -1246,10 +1410,7 @@ def build_surge_messages(
         if c.room_to_limit_pct is not None:
             price_parts.append(f"距涨停：{c.room_to_limit_pct:.1f}%")
         lines.append(f"- {' ｜ '.join(price_parts)}")
-        lines.append(
-            f"- 累计比：{n}日 {c.rel_cum:.1f}×"
-            f" ｜ 累计额：{_fmt_amount(c.cum_amount)}"
-        )
+        lines.append(f"- 累计比：{n}日 {c.rel_cum:.1f}× ｜ 累计额：{_fmt_amount(c.cum_amount)}")
         lines.append(f"- 近5日推送次数：{c.push_count_5d}")
 
         # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
@@ -1264,9 +1425,7 @@ def build_surge_messages(
                 if c.outer_inner_ratio_approx is not None
                 else "外盘占优"
             )
-            lines.append(
-                f"- 方向：1分钟 {c.return_1m_pct:+.2f}% ｜ {flow}"
-            )
+            lines.append(f"- 方向：1分钟 {c.return_1m_pct:+.2f}% ｜ {flow}")
         lines.append("")
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
@@ -1277,8 +1436,7 @@ def build_surge_messages(
     )
     vwap_seg = " / VWAP门" if config.require_vwap else ""
     direction_seg = (
-        f" / 1分钟>{config.min_return_1m_pct:g}%"
-        f"且外/内≈>{config.min_outer_inner_ratio:g}"
+        f" / 1分钟>{config.min_return_1m_pct:g}%且外/内≈>{config.min_outer_inner_ratio:g}"
         if config.require_price_strength
         else ""
     )
@@ -1370,9 +1528,7 @@ def load_recent_push_history(
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError as e:
-            logger.warning(
-                f"surge 推送历史读取失败 {path.name}: {type(e).__name__}: {e}"
-            )
+            logger.warning(f"surge 推送历史读取失败 {path.name}: {type(e).__name__}: {e}")
             continue
         for line in lines:
             if not line.strip():
@@ -1428,6 +1584,51 @@ def _backoff_next(streak: int) -> float:
     return ladder[min(streak - 1, len(ladder) - 1)] if streak >= 1 else 60.0
 
 
+def _publish_legacy_shadow_exports(
+    *,
+    trade_date: date,
+    events_path: Path,
+    collection_proof: LegacySurgeCollectionProof,
+) -> tuple[Path, dict[str, Path]]:
+    """Publish closed old surge evidence and read-only isolated runner fan-in."""
+
+    from rquant.config import settings
+    from rquant.legacy_shadow_export import (
+        fan_in_production_isolated_runner_exports,
+        publish_legacy_surge_production_export,
+    )
+
+    surge_export = publish_legacy_surge_production_export(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        events_path=events_path,
+        collection_proof=collection_proof,
+    )
+    isolated_exports = dict(
+        fan_in_production_isolated_runner_exports(
+            data_dir=settings.data_dir,
+            trade_date=trade_date,
+        )
+    )
+    return surge_export, isolated_exports
+
+
+def _recover_legacy_shadow_exports(trade_date: date) -> None:
+    from rquant.config import settings
+    from rquant.legacy_shadow_export import recover_production_legacy_shadow_exports
+
+    recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        source="surge",
+    )
+    recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        source="isolated-runners",
+    )
+
+
 def run_surge_watch(
     *,
     dry_run: bool = False,
@@ -1456,22 +1657,27 @@ def run_surge_watch(
     60/120/300。``force_session`` 忽略时段守卫（盘后验收）；``max_ticks`` 限定循环次数。
     """
     config = config or SurgeConfig()
-    day = now_fn().date()
+    started_at = now_fn()
+    day = started_at.date()
     trading_check = is_trading_day_fn or _load_is_trading_day
     if not force_session and not trading_check(day):
         logger.info(f"{day} 非交易日，surge-watch 退出")
         return 0
+    if not force_session and started_at.time() >= EXIT_TIME:
+        try:
+            _recover_legacy_shadow_exports(day)
+        except Exception:
+            logger.warning("legacy shadow surge recovery unavailable; shadow will degrade")
+        return 0
 
     baseline = baseline or preload_baseline()
     notify_fn = notify_fn or _default_notify
-    live_dir = (base_dir or default_live_dir())
+    live_dir = base_dir or default_live_dir()
     trading_days_loader = recent_trading_days_fn or _load_recent_trading_days
     try:
         recent_trading_days = trading_days_loader(day)
     except Exception as e:
-        logger.warning(
-            f"近5交易日窗口加载失败，退化为仅今日: {type(e).__name__}: {e}"
-        )
+        logger.warning(f"近5交易日窗口加载失败，退化为仅今日: {type(e).__name__}: {e}")
         recent_trading_days = (day,)
     push_history = load_recent_push_history(live_dir, day, recent_trading_days)
 
@@ -1499,8 +1705,10 @@ def run_surge_watch(
         today_cum_fetcher = _default_today_cum_fetcher
 
     watcher = SurgeWatcher(
-        baseline, config=config,
-        minute_fetcher=minute_fetcher, today_cum_fetcher=today_cum_fetcher,
+        baseline,
+        config=config,
+        minute_fetcher=minute_fetcher,
+        today_cum_fetcher=today_cum_fetcher,
         push_history=push_history,
     )
     events_path = live_dir / f"events-{day.isoformat()}.jsonl"
@@ -1513,6 +1721,13 @@ def run_surge_watch(
     miss_streak = 0
     degraded_alerted = False
     ticks = 0
+    collection_tracker = SurgeCollectionTracker(
+        trade_date=day,
+        started_at=started_at,
+        market_universe=frozenset(baseline.code_universe),
+        minimum_market_coverage_count=_MIN_FULL_MARKET_COVERAGE_COUNT,
+    )
+    natural_close = False
 
     logger.info(
         f"surge-watch 启动 day={day} 检测板块={config.boards} "
@@ -1527,13 +1742,19 @@ def run_surge_watch(
             if max_ticks is not None and ticks >= max_ticks:
                 break
             if not force_session and now.time() >= EXIT_TIME:
+                natural_close = True
                 break
             if not force_session and _is_lunch(now.time()):
                 sleep_fn(30.0)
                 continue
 
-            full = snapshot_fetcher()
+            try:
+                full = snapshot_fetcher()
+            except Exception as exc:
+                logger.warning(f"surge 快照 provider 失败（{type(exc).__name__}: {exc}）")
+                full = None
             route = full.attrs.get("route", "none") if full is not None else "none"
+            collection_tracker.observe_snapshot(now, full)
             if full is None or full.empty:
                 miss_streak += 1
                 logger.warning(f"surge 快照 miss（连续 {miss_streak}），route={route}")
@@ -1553,6 +1774,7 @@ def run_surge_watch(
                 continue
 
             miss_streak = 0
+            assert full is not None
             # 全市场快照每分钟原子落盘（共享 feed：云端/Mac 全景页 poller 读它，与主循环同拍）
             atomic_write_parquet(full, live_dir / SNAPSHOT_FULL_NAME)
             if now.time() >= OPEN_TIME:  # 集合竞价快照不喂脉搏（09:25-09:30 无成交分钟含义）
@@ -1578,6 +1800,22 @@ def run_surge_watch(
     series = watcher.dump_series()
     if not series.empty:
         atomic_write_parquet(series, live_dir / f"{day.isoformat()}-series.parquet")
+    collection_proof = collection_tracker.complete_proof() if natural_close else None
+    if collection_proof is not None:
+        try:
+            surge_export, isolated_exports = _publish_legacy_shadow_exports(
+                trade_date=day,
+                events_path=events_path,
+                collection_proof=collection_proof,
+            )
+            logger.info(
+                f"legacy shadow surge export: {surge_export}; "
+                f"isolated strategies={sorted(isolated_exports)}"
+            )
+        except Exception:
+            logger.exception("legacy shadow close exports unavailable; shadow will degrade")
+    elif natural_close:
+        logger.warning("surge collection coverage incomplete; legacy shadow will degrade")
     logger.info(f"surge-watch 退出 day={day} 累计推送票数={len(watcher.pushed_today)}")
     return 0
 
@@ -1607,10 +1845,11 @@ def run_simulate(
     baseline = baseline or _load_sim_baseline(sim_dir) or preload_baseline()
     minute_fetcher = minute_fetcher or _sim_minute_fetcher(sim_dir)
     notify_fn = notify_fn or _default_notify
-    live_dir = (base_dir or default_live_dir())
+    live_dir = base_dir or default_live_dir()
     reserved = {"confirm_bars.parquet"}
     files = sorted(
-        p for p in sim_dir.glob("*.parquet")
+        p
+        for p in sim_dir.glob("*.parquet")
         if not p.name.endswith(".tmp") and p.name not in reserved
     )
     if not files:
@@ -1681,7 +1920,7 @@ def _sim_day(path: Path) -> date:
     """文件名含 YYYY-MM-DD 则用之，否则回落今天。"""
     stem = path.stem
     for i in range(len(stem) - 9):
-        chunk = stem[i:i + 10]
+        chunk = stem[i : i + 10]
         try:
             return date.fromisoformat(chunk)
         except ValueError:

@@ -10,11 +10,13 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Every push to main must keep its own run: a cancelled run produces no R07
+  # evidence artifact, and that commit could then never be a deployment target.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  core-preflight:
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -22,17 +24,33 @@ jobs:
         python-version: ["3.11", "3.12"]
     env:
       TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
-      DATA_DIR: ${{ github.workspace }}/.ci/data
-      DUCKDB_PATH: ${{ github.workspace }}/.ci/data/test.duckdb
-      DUCKDB_READONLY_PATH: ${{ github.workspace }}/.ci/data/test_ro.duckdb
-      PARQUET_DIR: ${{ github.workspace }}/.ci/data/parquet
-      LOG_DIR: ${{ github.workspace }}/.ci/logs
       NOTIFY_ENABLED: "false"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Create private preflight test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$(mktemp -d "${HOME}/rqci.preflight.XXXXXXXX")"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'RQUANT_CI_ROOT=%s\n' "${root}"
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test_ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+          } >> "${GITHUB_ENV}"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -48,8 +66,768 @@ jobs:
       - name: Schema and fixed replay smoke
         run: >-
           uv run pytest -q
+          --basetemp="${RQUANT_CI_ROOT}/pt-smoke"
           tests/unit/test_storage_duckdb.py
           tests/unit/test_minute_replay.py::test_replay_enters_when_strong_carry_breaks_t_high_and_exits_next_day
 
-      - name: Full test suite
-        run: uv run pytest -q
+      - name: SourceBroker V2 saga (51 tests)
+        run: >-
+          uv run pytest -q tests/unit/test_source_broker_v2.py
+          --basetemp="$TMPDIR/pt-source"
+
+      - name: SourceBroker V2 frozen boundary
+        run: uv run python scripts/source_broker_v2_frozen.py
+
+  full-suite-shard:
+    name: Full suite shard (${{ matrix.python-version }}, ${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    # Measured on this runner class, not guessed: 3.11 shard 0 finishes in
+    # 39m41s and 3.12 - which runs 20-28% slower on the same files - was
+    # cancelled at the old 45-minute limit while at 87%. A hang is still caught
+    # early by pytest's faulthandler_timeout (600s), so a generous job limit
+    # only buys the slowest shard room to finish. Rebalancing the shard weights
+    # against measured x64 file times is tracked separately.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        shard: [0, 1, 2, 3]
+
+    steps:
+      # The full suite contains the R07 repository-identity tests, which resolve the frozen
+      # baseline commit and diff the candidate tree against it. A shallow clone has no such
+      # object, so those tests fail on `Needed a single revision` rather than on anything
+      # they are meant to check.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create private full-suite test root
+        shell: bash
+        run: >-
+          python scripts/full_suite_shards.py prepare-environment
+          --github-env "${GITHUB_ENV}"
+          --base-dir "${RUNNER_TEMP}"
+          --label "py${{ matrix.python-version }}-shard${{ matrix.shard }}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Collect, verify, and execute fixed shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run python scripts/full_suite_shards.py run \
+            --manifest-dir tests/manifests/full-suite-v1 \
+            --shard "${{ matrix.shard }}" \
+            --junitxml "test-results/junit.xml" \
+            --selection-evidence "test-results/selection.json" \
+            --basetemp "${RQUANT_CI_PYTEST_BASETEMP}"
+
+      - name: Upload full-suite shard evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: full-suite-evidence-py${{ matrix.python-version }}-shard${{ matrix.shard }}
+          path: test-results/
+          if-no-files-found: error
+
+  full-suite-contract:
+    name: Full suite contract (${{ matrix.python-version }})
+    if: always()
+    needs: [full-suite-shard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create private full-suite test root
+        shell: bash
+        run: >-
+          python scripts/full_suite_shards.py prepare-environment
+          --github-env "${GITHUB_ENV}"
+          --base-dir "${RUNNER_TEMP}"
+          --label "py${{ matrix.python-version }}-contract"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Download all shard evidence for this Python version
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
+        with:
+          pattern: full-suite-evidence-py${{ matrix.python-version }}-shard*
+          path: shard-evidence
+          merge-multiple: false
+
+      - name: Verify complete shard JUnit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run python tests/support/assert_full_suite_shards.py \
+            --manifest-dir tests/manifests/full-suite-v1 \
+            --artifact-dir shard-evidence \
+            --expected-python "${{ matrix.python-version }}" \
+            --platform linux \
+            --summary-json "test-results/full-suite-summary-py${{ matrix.python-version }}.json"
+
+      - name: Upload aggregated full-suite contract
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: full-suite-contract-py${{ matrix.python-version }}
+          path: test-results/full-suite-summary-py${{ matrix.python-version }}.json
+          if-no-files-found: error
+
+  full-suite-darwin-lane:
+    name: Darwin lane (macos-14, Python 3.12)
+    runs-on: macos-14
+    env:
+      # Belt and braces with `uv python install 3.12` below: never adopt the
+      # runner's preinstalled framework build.
+      UV_PYTHON_PREFERENCE: only-managed
+    timeout-minutes: 30
+
+    steps:
+      # The lane runs the launchd installer and R07-adjacent identity tests, which
+      # resolve real commits, so it needs full history like the shard jobs do.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create private Darwin lane test root
+        shell: bash
+        run: >-
+          python scripts/full_suite_shards.py prepare-environment
+          --github-env "${GITHUB_ENV}"
+          --base-dir "${RUNNER_TEMP}"
+          --label "py3.12-darwin-lane"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      # macOS runners preinstall the python.org framework build, and uv would
+      # otherwise adopt it. On a framework build CPython derives
+      # sys._base_executable from the framework the interpreter links against
+      # by absolute install name, so a fixture venv's `pyvenv.cfg` home is
+      # ignored and release_generation is handed
+      # /Library/Frameworks/.../bin/python3.12 - root-owned and 0775, which
+      # fails two identity predicates. Reproduced locally: that interpreter
+      # gives 30 failed / 4 passed in test_lab_launchd_install.py, the
+      # uv-managed build gives 34 passed. Pin the managed build.
+      - name: Install the managed Python the lane runs on
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --python 3.12
+
+      - name: Collect, verify, and execute the Darwin lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p lane-evidence/darwin-lane-evidence-py3.12-shard0
+          uv run --python 3.12 python scripts/full_suite_shards.py run \
+            --profile darwin-lane \
+            --manifest-dir tests/manifests/darwin-lane-v1 \
+            --shard 0 \
+            --junitxml "lane-evidence/darwin-lane-evidence-py3.12-shard0/junit.xml" \
+            --selection-evidence "lane-evidence/darwin-lane-evidence-py3.12-shard0/selection.json" \
+            --basetemp "${RQUANT_CI_PYTEST_BASETEMP}"
+
+      - name: Verify the Darwin lane JUnit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run --python 3.12 python tests/support/assert_full_suite_shards.py \
+            --manifest-dir tests/manifests/darwin-lane-v1 \
+            --artifact-dir lane-evidence \
+            --expected-python "3.12" \
+            --platform darwin \
+            --profile darwin-lane \
+            --artifact-prefix darwin-lane-evidence \
+            --summary-json "test-results/darwin-lane-summary-py3.12.json"
+
+      - name: Upload Darwin lane evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: darwin-lane-evidence-py3.12
+          path: |
+            lane-evidence/
+            test-results/
+          if-no-files-found: error
+
+  r07-differential-gate-py311:
+    name: R07 differential gate (Python 3.11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.after || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create private R07 test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-r07-py311"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test-ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+            printf 'TUSHARE_TOKEN_MAIN=00000000000000000000000000000000\n'
+            printf 'NOTIFY_ENABLED=false\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Validate pull request R07 gate without evidence
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse --verify 'HEAD^{tree}')"
+          uv run python scripts/r07_ci_evidence.py validate \
+            --repo "${GITHUB_WORKSPACE}" \
+            --candidate-commit "${GITHUB_SHA}" \
+            --candidate-tree "${tree}"
+
+      - name: Produce bound Python 3.11 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/r07_ci_evidence.py run-python \
+            --repo "${GITHUB_WORKSPACE}" \
+            --python-minor '3.11' \
+            --output "${RUNNER_TEMP}/r07-summary-py311/summary.json" \
+            --repository '${{ github.repository }}' \
+            --workflow-path '.github/workflows/ci.yml' \
+            --event-name '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --event-after-sha '${{ github.event.after }}' \
+            --checkout-sha '${{ github.sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --run-attempt '${{ github.run_attempt }}' \
+            --job-id 'r07-differential-gate-py311' \
+            --job-run-id '${{ job.check_run_id }}'
+
+      - name: Upload Python 3.11 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py311-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/r07-summary-py311/summary.json
+          if-no-files-found: error
+          retention-days: 1
+
+  r07-differential-gate-py312:
+    name: R07 differential gate (Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.after || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create private R07 test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-r07-py312"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test-ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+            printf 'TUSHARE_TOKEN_MAIN=00000000000000000000000000000000\n'
+            printf 'NOTIFY_ENABLED=false\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Validate pull request R07 gate without evidence
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse --verify 'HEAD^{tree}')"
+          uv run python scripts/r07_ci_evidence.py validate \
+            --repo "${GITHUB_WORKSPACE}" \
+            --candidate-commit "${GITHUB_SHA}" \
+            --candidate-tree "${tree}"
+
+      - name: Produce bound Python 3.12 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/r07_ci_evidence.py run-python \
+            --repo "${GITHUB_WORKSPACE}" \
+            --python-minor '3.12' \
+            --output "${RUNNER_TEMP}/r07-summary-py312/summary.json" \
+            --repository '${{ github.repository }}' \
+            --workflow-path '.github/workflows/ci.yml' \
+            --event-name '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --event-after-sha '${{ github.event.after }}' \
+            --checkout-sha '${{ github.sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --run-attempt '${{ github.run_attempt }}' \
+            --job-id 'r07-differential-gate-py312' \
+            --job-run-id '${{ job.check_run_id }}'
+
+      - name: Upload Python 3.12 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py312-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/r07-summary-py312/summary.json
+          if-no-files-found: error
+          retention-days: 1
+
+  r07-differential-gate-evidence:
+    name: R07 differential gate evidence
+    if: >-
+      ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          needs.r07-differential-gate-py311.result == 'success' &&
+          needs.r07-differential-gate-py312.result == 'success' }}
+    needs:
+      - r07-differential-gate-py311
+      - r07-differential-gate-py312
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ github.event.after }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create private R07 aggregate root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-r07-aggregate"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test-ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+            printf 'TUSHARE_TOKEN_MAIN=00000000000000000000000000000000\n'
+            printf 'NOTIFY_ENABLED=false\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Download Python 3.11 summary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py311-${{ github.run_id }}-${{ github.run_attempt }}
+          path: r07-input/py311
+
+      - name: Download Python 3.12 summary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py312-${{ github.run_id }}-${{ github.run_attempt }}
+          path: r07-input/py312
+
+      - name: Aggregate canonical R07 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/r07_ci_evidence.py aggregate \
+            --repo "${GITHUB_WORKSPACE}" \
+            --py311-summary 'r07-input/py311/summary.json' \
+            --py312-summary 'r07-input/py312/summary.json' \
+            --artifact-root 'r07-evidence-artifact-root' \
+            --repository '${{ github.repository }}' \
+            --workflow-path '.github/workflows/ci.yml' \
+            --event-name '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --event-after-sha '${{ github.event.after }}' \
+            --checkout-sha '${{ github.sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --run-attempt '${{ github.run_attempt }}' \
+            --job-id 'r07-differential-gate-evidence' \
+            --job-run-id '${{ job.check_run_id }}'
+
+      - name: Upload canonical R07 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: r07-dr-gate-${{ github.event.after }}
+          path: r07-evidence-artifact-root/
+          if-no-files-found: error
+          retention-days: 90
+
+  runtime-fd-exec-linux:
+    name: Linux FD-exec exact (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      DATA_DIR: ${{ github.workspace }}/.ci/data
+      DUCKDB_PATH: ${{ github.workspace }}/.ci/data/test.duckdb
+      DUCKDB_READONLY_PATH: ${{ github.workspace }}/.ci/data/test_ro.duckdb
+      PARQUET_DIR: ${{ github.workspace }}/.ci/data/parquet
+      LOG_DIR: ${{ github.workspace }}/.ci/logs
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run exact Linux FD-exec node with no skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run pytest -o addopts='' -rA \
+            --junitxml="test-results/fd-exec-py${{ matrix.python-version }}.xml" \
+            tests/integration/test_runtime_code_bootstrap.py::test_linux_default_executor_executes_verified_descriptor_after_path_swap
+          python - "test-results/fd-exec-py${{ matrix.python-version }}.xml" <<'PY'
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+
+          report = Path(sys.argv[1])
+          root = ElementTree.parse(report).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root)
+          assert len(suites) == 1, (root.tag, len(suites))
+          suite = suites[0]
+          assert suite.tag == "testsuite", suite.tag
+          assert int(suite.attrib.get("tests", "0")) == 1, suite.attrib
+          assert int(suite.attrib.get("failures", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("errors", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("skipped", "0")) == 0, suite.attrib
+          cases = suite.findall("testcase")
+          assert len(cases) == 1, len(cases)
+          assert not cases[0].findall("skipped"), "exact node was skipped"
+          PY
+
+      - name: Upload FD-exec JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: fd-exec-junit-py${{ matrix.python-version }}
+          path: test-results/
+          if-no-files-found: error
+
+  paper-publication-primitives:
+    name: Paper publication no-replace (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - name: Create private paper-publication test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-paper-publication"
+          mkdir -p "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+          } >> "${GITHUB_ENV}"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Exercise the native no-replace primitive with no skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run pytest -o addopts='' -rA \
+            --junitxml="test-results/paper-publication-${{ matrix.os }}.xml" \
+            tests/unit/test_paper_migration_publication.py::test_actual_platform_publication_capabilities
+          python - "test-results/paper-publication-${{ matrix.os }}.xml" <<'PY'
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+
+          report = Path(sys.argv[1])
+          root = ElementTree.parse(report).getroot()
+          assert root.tag in {"testsuite", "testsuites"}, root.tag
+          suites = [root] if root.tag == "testsuite" else list(root)
+          assert len(suites) == 1, (root.tag, len(suites))
+          suite = suites[0]
+          assert suite.tag == "testsuite", suite.tag
+          assert int(suite.attrib.get("tests", "0")) == 1, suite.attrib
+          assert int(suite.attrib.get("failures", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("errors", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("skipped", "0")) == 0, suite.attrib
+          cases = suite.findall("testcase")
+          assert len(cases) == 1, len(cases)
+          assert not cases[0].findall("failure"), "exact node failed"
+          assert not cases[0].findall("error"), "exact node errored"
+          assert not cases[0].findall("skipped"), "exact node was skipped"
+          PY
+
+      - name: Upload paper-publication JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: paper-publication-junit-${{ matrix.os }}
+          path: test-results/paper-publication-${{ matrix.os }}.xml
+          if-no-files-found: error
+
+  paper-sqlite-image-linux:
+    name: Paper SQLite image (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      DATA_DIR: ${{ github.workspace }}/.ci/data
+      DUCKDB_PATH: ${{ github.workspace }}/.ci/data/test.duckdb
+      DUCKDB_READONLY_PATH: ${{ github.workspace }}/.ci/data/test_ro.duckdb
+      PARQUET_DIR: ${{ github.workspace }}/.ci/data/parquet
+      LOG_DIR: ${{ github.workspace }}/.ci/logs
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run bound SQLite image tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run pytest -o addopts= -rA \
+            --junitxml="test-results/paper-sqlite-image-${{ matrix.python-version }}.xml" \
+            tests/unit/test_paper_sqlite_image.py::test_cpython_memory_deserialize_query_only \
+            tests/unit/test_paper_sqlite_image.py::test_memory_adapter_unavailable_is_closed \
+            tests/unit/test_paper_sqlite_image.py::test_memory_adapter_deserialize_raise_is_closed
+
+      - name: Verify bound SQLite image JUnit contract
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python tests/support/assert_junit_contract.py \
+            --path test-results/paper-sqlite-image-${{ matrix.python-version }}.xml \
+            --suites 1 --tests 3 --failures 0 --errors 0 --skipped 0 --cases 3
+
+      - name: Upload bound SQLite image JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: paper-sqlite-image-junit-${{ matrix.python-version }}
+          path: test-results/paper-sqlite-image-${{ matrix.python-version }}.xml
+          if-no-files-found: error
+
+  formal-smoke-real-generation-linux:
+    name: Linux real generation smoke (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - name: Create private formal-generation test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exact_root="${RUNNER_TEMP}/rquant-formal-exact-py${{ matrix.python-version }}"
+          mkdir -p "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          chmod 700 "${exact_root}" "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          {
+            printf 'RQUANT_FORMAL_EXACT_ROOT=%s\n' "${exact_root}"
+            printf 'DATA_DIR=%s/data\n' "${exact_root}"
+            printf 'DUCKDB_PATH=%s/data/main.duckdb\n' "${exact_root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/readonly.duckdb\n' "${exact_root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${exact_root}"
+            printf 'LOG_DIR=%s/logs\n' "${exact_root}"
+          } >> "${GITHUB_ENV}"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Preflight private root and OpenSSL Ed25519
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exact_root="${RQUANT_FORMAL_EXACT_ROOT}"
+          mkdir -p "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          mkdir -p "${exact_root}/test-results" "${exact_root}/openssl"
+          chmod 700 "${exact_root}" "${exact_root}/data" "${exact_root}/parquet"
+          chmod 700 "${exact_root}/logs" "${exact_root}/test-results" "${exact_root}/openssl"
+          openssl genpkey -algorithm ED25519 -out "${exact_root}/openssl/private.pem"
+          openssl pkey -in "${exact_root}/openssl/private.pem" -pubout \
+            -out "${exact_root}/openssl/public.pem"
+          printf 'rquant-formal-exact\n' > "${exact_root}/openssl/message"
+          openssl pkeyutl -sign -rawin -inkey "${exact_root}/openssl/private.pem" \
+            -in "${exact_root}/openssl/message" -out "${exact_root}/openssl/signature"
+          openssl pkeyutl -verify -rawin -pubin -inkey "${exact_root}/openssl/public.pem" \
+            -in "${exact_root}/openssl/message" -sigfile "${exact_root}/openssl/signature"
+
+      - name: Run two real generation smoke cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          facts="${RQUANT_FORMAL_EXACT_ROOT}/test-results/formal-smoke-real-generation-facts.json"
+          junit="${RQUANT_FORMAL_EXACT_ROOT}/test-results/formal-smoke-real-generation.xml"
+          export RQUANT_FORMAL_SMOKE_EXACT_FACTS_PATH="${facts}"
+          uv run python -m pytest -p tests.formal_smoke_real_generation_support \
+            -o addopts='' --strict-markers -m linux_exact -rA \
+            --basetemp="${RQUANT_FORMAL_EXACT_ROOT}/pytest" \
+            --junitxml="${junit}" \
+            tests/integration/test_formal_smoke_real_generation_linux_e2e.py
+          uv run python -m tests.formal_smoke_real_generation_support verify-ci-evidence \
+            --junit "${junit}" \
+            --facts "${facts}" \
+            --expected-python "${{ matrix.python-version }}"
+
+      - name: Upload real generation JUnit and redacted facts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: formal-smoke-real-generation-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/test-results/
+          if-no-files-found: error

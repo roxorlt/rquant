@@ -2,12 +2,43 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
+
+from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
+
+
+def _open_signed_runtime_capability(
+    tmp_path: Path,
+    *,
+    provenance_commit: str = "d" * 40,
+) -> RuntimeCodeGenerationCapability:
+    """Open the same signed immutable-generation capability used by runtime tests."""
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
+    package = build_test_package(
+        tmp_path / "runtime-package",
+        provenance_commit=provenance_commit,
+    )
+    trusted_base, runtime_root, _installer = install_test_package(
+        tmp_path,
+        package,
+    )
+    return open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
 
 
 @pytest.mark.parametrize(
@@ -42,14 +73,17 @@ def test_formal_smoke_specs_are_fixed_versioned_and_hash_stable(
     assert first.end_date == date(2026, 7, 2)
     assert len(first.spec_hash) == 64
     assert first.spec_hash == second.spec_hash
-    assert first.model_copy(
-        update={
-            "parameters": {
-                **first.parameters,
-                "test_parameter": "changed",
+    assert (
+        first.model_copy(
+            update={
+                "parameters": {
+                    **first.parameters,
+                    "test_parameter": "changed",
+                }
             }
-        }
-    ).spec_hash != first.spec_hash
+        ).spec_hash
+        != first.spec_hash
+    )
 
 
 def test_formal_smoke_specs_bind_the_documented_v1_parameters() -> None:
@@ -150,6 +184,7 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
         run_formal_smoke_replay,
     )
 
+    capability = _open_signed_runtime_capability(tmp_path)
     request = FormalSmokeReplayRequest(
         strategy="n_shape",
         start_date=date(2026, 4, 1),
@@ -158,6 +193,7 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
         dataset_snapshot_id="b" * 64,
         dataset_binding_hash="c" * 64,
         code_commit="d" * 40,
+        runtime_capability=capability,
     )
     captured_requests = []
     execution_store = object()
@@ -178,12 +214,8 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
                 "win_rate_pct": 100.0,
             },
             tables={
-                "strategy_summary": pd.DataFrame(
-                    [{"strategy": "n_shape", "trades": 1}]
-                ),
-                "trades": pd.DataFrame(
-                    [{"ts_code": "000001.SZ", "ret_pct": 3.5}]
-                ),
+                "strategy_summary": pd.DataFrame([{"strategy": "n_shape", "trades": 1}]),
+                "trades": pd.DataFrame([{"ts_code": "000001.SZ", "ret_pct": 3.5}]),
             },
             sample_count=1,
         )
@@ -199,8 +231,11 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
         execute_fixed_spec,
     )
 
-    result = run_formal_smoke_replay(request, base_dir=tmp_path)
-    repeated = run_formal_smoke_replay(request, base_dir=tmp_path)
+    try:
+        result = run_formal_smoke_replay(request, base_dir=tmp_path)
+        repeated = run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
 
     assert len(captured_requests) == 2
     gate_request = captured_requests[0]
@@ -223,25 +258,22 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
     assert repeated.result_hash == result.result_hash
 
     saved = load_strategy_lab_run(result.run_id, base_dir=tmp_path)
-    assert saved.manifest.schema_version == 2
+    assert saved.manifest.schema_version == 3
     assert saved.manifest.research_status == "comparable"
     assert saved.manifest.dataset_snapshot_id == request.dataset_snapshot_id
-    assert (
-        saved.manifest.dataset_binding_hash
-        == request.dataset_binding_hash
-    )
+    assert saved.manifest.dataset_binding_hash == request.dataset_binding_hash
     assert saved.manifest.strategy_spec_hash == result.strategy_spec_hash
     assert saved.manifest.result_hash == result.result_hash
     assert saved.manifest.missing_evidence == []
-    evidence = next(
-        table for table in saved.tables if table.name == "formal_evidence"
-    )
+    assert saved.manifest.code_trust_evidence == request.runtime_capability.evidence
+    evidence = next(table for table in saved.tables if table.name == "formal_evidence")
     assert evidence.rows == [
         {
             "audit_run_id": request.audit_run_id,
             "dataset_snapshot_id": request.dataset_snapshot_id,
             "dataset_binding_hash": request.dataset_binding_hash,
             "code_commit": request.code_commit,
+            "code_trust_evidence": request.runtime_capability.evidence.model_dump(mode="json"),
         }
     ]
 
@@ -257,6 +289,7 @@ def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
         run_formal_smoke_replay,
     )
 
+    capability = _open_signed_runtime_capability(tmp_path)
     request = FormalSmokeReplayRequest(
         strategy="growth_board_surge",
         start_date=date(2026, 4, 1),
@@ -265,6 +298,7 @@ def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
         dataset_snapshot_id="b" * 64,
         dataset_binding_hash="c" * 64,
         code_commit="d" * 40,
+        runtime_capability=capability,
     )
     execution_count = 0
 
@@ -319,8 +353,11 @@ def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
         execute_with_unstable_order,
     )
 
-    first = run_formal_smoke_replay(request, base_dir=tmp_path)
-    second = run_formal_smoke_replay(request, base_dir=tmp_path)
+    try:
+        first = run_formal_smoke_replay(request, base_dir=tmp_path)
+        second = run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
 
     assert first.run_id != second.run_id
     assert first.result_hash == second.result_hash
@@ -347,6 +384,7 @@ def test_formal_smoke_execution_fails_closed_on_gate_evidence_mismatch(
         run_formal_smoke_replay,
     )
 
+    capability = _open_signed_runtime_capability(tmp_path)
     request = FormalSmokeReplayRequest(
         strategy="n_shape",
         start_date=date(2026, 4, 1),
@@ -355,6 +393,7 @@ def test_formal_smoke_execution_fails_closed_on_gate_evidence_mismatch(
         dataset_snapshot_id="b" * 64,
         dataset_binding_hash="c" * 64,
         code_commit="d" * 40,
+        runtime_capability=capability,
     )
     executed = False
 
@@ -380,8 +419,118 @@ def test_formal_smoke_execution_fails_closed_on_gate_evidence_mismatch(
         reject_execution,
     )
 
-    with pytest.raises(PermissionError, match=message):
-        run_formal_smoke_replay(request, base_dir=tmp_path)
+    try:
+        with pytest.raises(PermissionError, match=message):
+            run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
+
+    assert executed is False
+    assert not (tmp_path / "strategy_lab_runs").exists()
+
+
+def test_formal_smoke_rejects_missing_runtime_generation_capability(
+    tmp_path: Path,
+) -> None:
+    from rquant.formal_smoke_replay import FormalSmokeReplayRequest
+
+    with pytest.raises(ValidationError, match="runtime_capability"):
+        FormalSmokeReplayRequest(
+            strategy="n_shape",
+            start_date=date(2026, 4, 1),
+            end_date=date(2026, 7, 2),
+            audit_run_id="a" * 64,
+            dataset_snapshot_id="b" * 64,
+            dataset_binding_hash="c" * 64,
+            code_commit="d" * 40,
+        )
+
+    assert not (tmp_path / "strategy_lab_runs").exists()
+
+
+def test_formal_smoke_rejects_capability_provenance_commit_mismatch(
+    tmp_path: Path,
+) -> None:
+    from rquant.formal_smoke_replay import FormalSmokeReplayRequest
+
+    capability = _open_signed_runtime_capability(tmp_path)
+    try:
+        with pytest.raises(ValidationError, match="code_commit"):
+            FormalSmokeReplayRequest(
+                strategy="n_shape",
+                start_date=date(2026, 4, 1),
+                end_date=date(2026, 7, 2),
+                audit_run_id="a" * 64,
+                dataset_snapshot_id="b" * 64,
+                dataset_binding_hash="c" * 64,
+                code_commit="e" * 40,
+                runtime_capability=capability,
+            )
+    finally:
+        capability.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    ["closed", "generation_changed", "bundle_tampered"],
+)
+def test_formal_smoke_rejects_invalid_runtime_generation_before_execution(
+    tmp_path: Path,
+    invalid_state: str,
+) -> None:
+    from rquant.formal_smoke_execution import (
+        FormalSmokeChildProcessResult,
+        FormalSmokeExecutionError,
+        _run_attested_formal_smoke,
+    )
+    from rquant.formal_smoke_protocol import FormalSmokeBootstrapReference
+
+    capability = _open_signed_runtime_capability(tmp_path)
+    executed = False
+
+    def reject_execution(
+        _session: object,
+        _request_bytes: bytes,
+    ) -> FormalSmokeChildProcessResult:
+        nonlocal executed
+        executed = True
+        return FormalSmokeChildProcessResult(exit_code=0, receipt_bytes=b"forbidden")
+
+    if invalid_state == "closed":
+        capability.close()
+    elif invalid_state == "generation_changed":
+        pointer = capability.loaded.generation_root.parent.parent / "current"
+        pointer.chmod(0o600)
+        pointer.write_text("e" * 64 + "\n", encoding="ascii")
+    else:
+        source = capability.release_root / "src/rquant/app.py"
+        source.parent.chmod(0o700)
+        source.chmod(0o600)
+        source.write_bytes(b"TAMPERED = True\n")
+        source.chmod(0o444)
+
+    try:
+        with pytest.raises(FormalSmokeExecutionError):
+            _run_attested_formal_smoke(
+                capability,
+                strategy="n_shape",
+                start_date=date(2026, 4, 1),
+                end_date=date(2026, 7, 2),
+                audit_run_id="a" * 64,
+                dataset_snapshot_id="b" * 64,
+                dataset_binding_hash="c" * 64,
+                output_dir=tmp_path,
+                bootstrap_reference=FormalSmokeBootstrapReference(
+                    configuration_path=(tmp_path / "authority/bootstrap.json").absolute(),
+                    trusted_base=(tmp_path / "authority").absolute(),
+                    expected_authority_uid=os.getuid(),
+                    expected_authority_gid=os.getgid(),
+                ),
+                environment_source={},
+                exchange=reject_execution,
+            )
+    finally:
+        capability.close()
 
     assert executed is False
     assert not (tmp_path / "strategy_lab_runs").exists()
@@ -413,9 +562,7 @@ def test_n_shape_formal_smoke_adapter_uses_only_fixed_v1_variant(
                     }
                 ]
             ),
-            trades=pd.DataFrame(
-                [{"ts_code": "000001.SZ", "ret_pct": 3.5}]
-            ),
+            trades=pd.DataFrame([{"ts_code": "000001.SZ", "ret_pct": 3.5}]),
         )
 
     monkeypatch.setattr(

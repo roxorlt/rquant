@@ -1,0 +1,50 @@
+[Unit]
+Description=rQuant Lab claim publication finalizer
+Requires=rquant-external-monotonic-root.service
+RequiresMountsFor=/home/lighthouse/rquant/data/runtime/research
+After=local-fs.target rquant-external-monotonic-root.service
+
+[Service]
+Type=simple
+Slice=rquant-research.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/etc/rquant/lab-claim-finalizer.env
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role lab_claim_finalizer
+SuccessExitStatus=0 75
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+RuntimeDirectory=rquant-lab-claim-finalizer
+RuntimeDirectoryMode=0750
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/etc/rquant/runtime-code-bootstrap.json /etc/rquant/runtime-code-migration.json /etc/rquant/lab-claim-finalizer.env /etc/rquant/lab-claim-finalizer-runtime
+ReadWritePaths=/run/rquant-lab-claim-finalizer /home/lighthouse/rquant/data/runtime/research/lab-finalizer-state /home/lighthouse/rquant/data/runtime/research/claims /home/lighthouse/rquant/data/runtime/research/locks /home/lighthouse/rquant/data/runtime/research/readiness /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3 /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-wal /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-shm
+InaccessiblePaths=/home/lighthouse/rquant/.env /home/lighthouse/rquant/data/runtime/current/secrets /home/lighthouse/rquant/data/runtime/current/credentials /home/lighthouse/rquant/data/runtime/research/legacy-lab-finalizer /home/lighthouse/rquant/data/runtime/research/lab-finalizer
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+# Cloud gate before installation: systemd-analyze verify rquant-lab-claim-finalizer.service

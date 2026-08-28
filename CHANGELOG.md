@@ -4,12 +4,214 @@
 
 ## [Unreleased]
 
+### Added
+
+- **工作负载隔离运行时主干**：七条独立流水线（采集、校验与权威发布、盘中特征、策略推理、
+  通知与模拟盘、研究与回测、serving 查询）及持久 Lab Job Center 已具备代码主体；页面提交
+  typed job 后可由 scheduler/worker/checkpoint/ETA 在页面断开后继续执行。
+- **实时与消费边界**：统一 source gateway、PIT feature、独立 strategy runner、signal router/
+  outbox/notifier/paper consumer，以及只读 serving 投影和页面入口均已落地；研究 worker 通过
+  资源准入、配额和可恢复任务边界与实时链路隔离。
+- **可追溯治理能力**：慢变参考数据的双时间版本与修订、schema/特征/策略注册表、样本外晋级、
+  artifact 保留、恢复清单与最小权限 credential capability 已纳入隔离运行时。
+
+> 以下 R07 / signal-family 条目全部属于 **Release A**（policy `deployment_mode=disabled_for_bootstrap`）：
+> 代码与测试已合入，但**未激活、未部署**，也不授予任何 activation。Successor contract、overlay
+> receipt、`READY`、high-watermark、drain/replay 与切流仍是显式 non-pass，需要后续阶段或单独授权的
+> activation amendment。
+
+- **R07 冻结 CI 证据链（WP1）**：differential gate 在 CI 中产出与 commit / tree / run identity 绑定的
+  `r07-dr-gate/evidence-v1.json`，双 Python 各一个 job 加一个聚合 evidence job；证据的检查计数从实际
+  执行的检查派生，probe 从物化的 candidate tree 加载。
+
+- **Release A/B 部署证据门（WP2）**：`src/rquant/ops/r07_deploy_evidence.py` 与
+  `scripts/r07_deploy_gate.py` 在任何 checkout、merge 或服务重启之前解析 installed / target 两侧的
+  R07 policy，按 Release A（bootstrap 安装，一次性，不消费证据）/ Release B（`enforced`，必须声明精确
+  predecessor 并核验下载的证据）决策表放行或拒绝。部署器本身跑在 `-I -S` 下，gate 在隔离子进程里用
+  release 解释器执行，子进程的任何失败都会被拒绝并写入审计。
+
+- **Phase B successor registry 与 staged overlay（WP3）**：五对 signal family 的 successor 契约与
+  staged overlay 以 canonical JSON 与内容哈希落库，registry 只读、拒绝重复与乱序，overlay 停留在
+  staged 状态，不产生任何 v3 writer 或 activation 路径。
+
+- **Phase C 根验证层与 harness（WP4）**：`signal_family_verification` 模型层、`signal_family_root_verifier`
+  根验证器（外部 root-owned policy 的 anchored no-follow 校验、bounded IPC、privilege drop、private
+  child workspace、append-only SQLite 收据存储、bounded audit evidence）与固定的
+  `signal_family_verifier_harness` zipapp（可复现构建）。真实 harness 覆盖 13 个 surface 中的 8 个；
+  `strategy-router` ×2 与 `strategy-shadow` ×3 因 producer 侧状态无法装进有界 vector 而 BLOCKED，
+  真实 harness 因此**不产生五对 READY**。
+
+- **spool ticket 崩溃与 orphan 矩阵（WP5）**：`tests/support/signal_route_spool_crash_matrix.py` 以合成
+  状态机固定 two-slot 单记录矩阵的每一个崩溃点与 orphan 行为，并把观察到的 v2 dialect 事实绑定到未被
+  改动的原语上；不发生 SQLite migration。**证据定性（Codex 第二轮裁决 5）**：该矩阵是**合成内存状态
+  机**产出的 Phase A 证据，只证明冻结契约本身，**不构成真实持久 writer 的崩溃/持久化证据**——Phase A
+  根本没有 current-family durable writer。`frozen-v2-observed` dialect 记录的是 v2 的观察事实（identical
+  retry 不二次 fsync 记录目录、byte conflict 不写 conflict audit），不是 v2 的合规状态；这两条义务只对
+  未来的 v3-only 原语成立。
+
+- **signal-family 声明域冻结（Codex 第二轮裁决 2）**：新增叶子模块
+  `src/rquant/signal_family_constants.py`（不 import 任何 `rquant` 模块），冻结三个
+  current-family channel（`channel_id` 在类型层就是 `Literal` 闭集）、唯一 accepted family、
+  successor/overlay 两个 namespace、五个 pair id，以及参与者 service id 的语法
+  （`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`、≤ 64 字符）、namespace 与「按 channel 按方向」的角色域。
+  bundle identity 就是 namespace，overlay identity 是 `(overlay_namespace,
+  base_bundle_content_hash)`，冲突审计记录从这两个属性取 identity。原模块按历史名字全部
+  re-export，下游 `signal_family_verification` 与 harness vectors 不受影响。该语法**不**下推到
+  `RuntimeServiceManifest.service_id` / `PairBindingV1`——生产 profile 现有 id（如
+  `signal-router.all-strategies.v1`、`strategy.n_shape.v1`）带点和下划线，不满足该语法，对齐属于
+  生产拓扑变更，需单独授权。
+
+- **`rquant signal-bus-recover`（Codex 第二轮裁决 5）**：`signal_high_watermark` 现在有三条成立
+  的不变量——单调、不自动纠正、与 `signal_envelope` 实际最大序号不一致时 fail closed。
+  `SignalBusStore` 在打开时与 `source_descriptor()` 读出时各校验一次，抛
+  `SignalBusWatermarkError`。水位键**整个缺失**同样 fail closed——只有 `signal_envelope` 为空的
+  全新库才允许种初值，表里已有行却缺键时不得按（可能已被截断的）`MAX(global_sequence)` 重种，
+  否则删掉一行 metadata 会比篡改它更容易过关，且把水位向下移动而无异常无审计。唯一修复路径是新 CLI
+  `rquant signal-bus-recover --database <path> --acknowledge <reason>`：理由原样写入 append-only
+  的 `signal_bus_watermark_recovery` 审计表，只把水位**抬高**到实际最大序号（缺键时按实际最大
+  序号重建该行，审计行的「修复前水位」记 NULL），水位高于实际行时拒绝（那是数据丢失，要走备份
+  恢复），无任何环境变量旁路。
+
+### Security
+
+
+- **arbiter 的 admission 探针改走 root-owned wrapper**：
+  `deploy/libexec/rquant-workload-arbiter` 在取得 research 平面锁之后不再执行
+  `.venv/bin/python -m rquant.workload_isolation research-admission`——`.venv` 是 editable 安装、
+  `rquant.pth` 指回 checkout，那一步等于让可变源码在可信 wrapper 之前运行。现在它执行
+  `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role workload_admission`，
+  与 unit 自己的子进程同一条链。新增 `workload_admission` role，且无 `control_root` 的 role 现在
+  也能携带自己在 root-owned profile 里冻结的 `module_arguments`（Codex round-3 verdict,
+  RQ-WI-R2-P1-01）。
+
+- **formal claim finalizer 改走 root-owned wrapper**：
+  `deploy/systemd/rquant-lab-claim-finalizer.service` 原本两次命名 checkout 解释器（一条
+  `ExecStartPre` 跑 `.venv/bin/rquant runtime-code dry-run`，`ExecStart` 跑
+  `.venv/bin/python … run-lab-daemon.py formal`），而 `run-lab-daemon.py` 还在模块层用
+  `spec_from_file_location` 加载 `contained_subprocess.py`——整条 runtime-code 校验（ed25519
+  attestation、promotion receipt、anti-rollback）由它自己正在裁决的那棵树上的代码执行。现在
+  unit 以 `lab_claim_finalizer` role 走 wrapper，进 generation 内的
+  `rquant.lab_formal_runtime_entry`，`ExecStartPre` 直接删除（Codex round-3 verdict,
+  RQ-WI-R2-P1-02）。
+
+- **arbiter 自身的解释器行收紧为 `#!/usr/bin/python3 -IS`**：`-I` 关掉 `PYTHON*` 与 user-site，
+  `-S` 关掉 `site`，因此 `~/.local/lib/python3.11/site-packages/usercustomize.py` 与
+  `EnvironmentFile` 里的 `PYTHONPATH` / `PYTHONHOME` 都不再能在 arbiter 起步阶段执行代码
+  （独立评审 R3A-SPEC-02）。
+> 以下四项对应 Codex 第二轮工单 P1-3 / P1-4 / P1-5 与裁决 7。均为**代码与测试**，
+> 不安装、不部署；root-owned 路径的安装仍是单独授权的基础设施事务，前置条件见 `DEPLOY.md`。
+
+- **root verifier 改为 root-owned 内容寻址制品（P1-4）**：新增
+  `scripts/build-signal-family-verifier-artifact.py`，确定性构建「venv 形态安装树 + 固定入口
+  pyz」。树装在 `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`，content-id 是树
+  manifest 规范字节的 SHA-256；入口 pyz 把该 manifest 冻结在自身内部，启动时逐文件校验属主、
+  mode、link count 与哈希，任何一个字节被改、多一个文件、少一个文件都拒绝启动。
+  `scripts/signal-family-root-verifier.py` 从 checkout 运行时直接退 78。
+- **狭窄 root-owned launcher 取代全部 `preexec_fn`（P1-5）**：新增 `rquant.privilege_launcher`；
+  root verifier 与 `deploy/libexec/rquant-workload-arbiter` 都改用 `/usr/bin/setpriv`
+  （`--reuid/--regid/--clear-groups/--no-new-privs`，arbiter 用 `--pdeathsig SIGKILL`）。
+  fd 关闭交给 `close_fds=True` + `pass_fds`，原来的 Python sweep 保留为纯计算断言。
+- **固定 root-owned runtime wrapper（P1-3）**：新增 `rquant.runtime_exec_wrapper` 与
+  `scripts/build-runtime-exec-pyz.py`，实现规格 L1707-1826 的
+  `/usr/local/libexec/rquant-runtime-exec.pyz`。25 个受保护 runtime unit 的 `ExecStart` 改为
+  `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role <literal>`；
+  `EnvironmentFile=.../current/runtime.env`、`%i` 插值的 manifest 路径与 checkout 解释器全部移除。
+- **TCB 清单补齐（裁决 7）**：`docs/architecture/production-interpreter-authority.md` 的 TCB 节
+  以引用式修订补入 verifier 安装树与入口 pyz、`/usr/bin/setpriv`、verifier policy、harness 与
+  append store 的路径、属主、mode 与安装校验方式。
+
 ### Changed
+
+
+- `PRODUCTION_ROLE_POLICY` 由 26 个 role 扩到 28（新增 `workload_admission` 与
+  `lab_claim_finalizer`），`profile_id` 与 `rquant-runtime-exec.pyz` 的 SHA-256 随之换代；
+  full-suite manifest 一并重生成。R3-A 与 R3-B 必须同一次发布。
+- **CI 全集分片**：原 90 分钟单 job 拆为 Python 3.11/3.12 的 core preflight 与 4 个
+  fail-fast-disabled full-suite shard；版本化 nodeid manifest、pytest `@argsfile` runner 和
+  每版本 JUnit 聚合契约会在 collect drift、漏片/重片、artifact 混入或测试失败时 fail closed；
+  v1 selector 固定为空，strict canonical JSON 与仓库内 `tests/**/*.py` 路径/大小边界拒绝
+  option、路径穿越、重复 key、未知字段及符号链接逃逸；shard 与聚合 job 共用 canonical
+  私有测试环境，默认 collect 强制禁用 dotenv、真实凭据和通知。
+
+- **模拟盘发布证据**：paper publication v4 将执行成本证据与不可变 SQLite 镜像绑定，发布前后
+  复核 schema、账本和源文件身份，避免迁移时把可变源库当作已验证输入。
+
+- **部署 recovery provenance（Codex 第二轮裁决 8）**：`_recover_locked` **不重跑** Release A/B
+  决策表，只重放此前已被接受并持久化的精确 intent pair；audit 行除 `r07_gate=recorded_intent`
+  外新增 `recovery_action`、`recovery_intent_operation_id`、`recovery_intent_stage`、
+  `recovery_intent_target_ref` 与该 intent 记录的 previous/target SHA。`docs/production-release.md`
+  原先写「rollback target 走同一张表」，与代码和裁决矛盾，已改正。
+
+- **旧链路退休门量化（Codex 第二轮裁决 6）**：设计文档新增 §18.1，冻结「切流前 ≥ 10 个有效交易
+  日 shadow + 切流后 ≥ 10 个有效交易日观察、合计 ≥ 20 日」，并给出样本量、严重偏差阈值和回滚演练
+  要求（后三组数字标注为 Claude 提案、待 Codex 确认）。原 Phase 2「5-10 个交易日」与 Phase 6
+  「10-20 个交易日」两处互相矛盾的数字改为引用该节。
+
+- **替代权威 identity 写成规范（Codex 第二轮裁决 3）**：`full manifest membership +
+  policy-anchored service_manifest_fingerprint` 从 gateway docstring 升格为规格条款，并补上 step 7
+  对 `full_manifest_sha256`、`profile_document_sha256`、单条 full-manifest entry 与
+  `manifest_fingerprint` 漂移的红测。
+
+- **CI 全集契约逐 nodeid 化**：聚合不再只比较用例总数与 skip 总数，而是要求 manifest 里每个
+  nodeid 恰好出现一次且结果为 passed 或**登记在案的 approved skip**（reason 逐字匹配）；
+  approved-skip map 按平台列表（`tests/manifests/full-suite-v1/approved-skips.json`），其
+  sha256 与 Linux 侧计数写进 manifest index，shard 记录预生成 JUnit classname/name 映射，
+  未登记的 skip、失败、缺失或多余用例一律 fail closed。新增 `full-suite-darwin-lane`
+  （macos-14，30 分钟上限）用同一条 manifest/契约链跑只有 Darwin 能执行的 320 个用例。
+  pytest 加 `faulthandler_timeout = 600`，挂死会打印全线程栈而不是吃满整个 job。
 
 - **题材梯队推送改版**：午间战报将最强题材与连续连板梯队合并为 Top5，并将下午候选池
   调整为适合手机阅读的三行分隔格式；30 分钟脉搏新增题材梯队 Top5，展示涨停数、完整
   连续板位、最高标的，以及相较前一脉搏的 `↑` / `↓` / 持平 / 新晋（每日首槽不显示
   排名变化）。项目版本从 `0.28.1` 更新到 `0.28.2`。
+
+- **R07 CI 证据生产链修复**：differential gate 的 summary 计数改为从实际执行的检查派生而不是
+  写死常量；boundary probe runner 通过 facade 从物化的 candidate Git tree 加载（ImportError 计入
+  拒绝集）；frozen policy 增加 `evidence_channel`（仓库、workflow、三个 job、artifact 内部路径、
+  保留天数、服务器缓存目录、`deployment_mode`、`bootstrap_predecessor`）；push-to-main 的 CI run
+  退出 `cancel-in-progress`，避免被取消的 run 让该 commit 永远无法成为部署目标。
+
+- **子进程工作区的祖先与权限类规则**：`open_child_workspace_root` 沿祖先链拒绝 group/world 可写
+  节点的规则改由真实 verifier 路径覆盖；工作区模式保持 `0715`，但当子进程与工作区同属一个 group
+  时（POSIX 在首个匹配的权限类停止判定，group 位 `--x` 缺少读权限）直接拒绝启动，而不是让八个
+  reader surface 再次静默失效。
+
+- **部署证据缓存目录与 policy 绑定**：`-I -S` 部署器手抄的服务器缓存目录字面量与 gate 模块的常量
+  由测试互相钉死；Linux 生产 profile 下 gate 会拒绝任何不等于 `policy.evidence_channel.cache_path`
+  的 `--evidence-cache-dir`。
+
+- **项目版本**：从 `0.29.0` 更新到 `0.30.0`。
+
+### Fixed
+
+
+- **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
+  因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
+- **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
+  的 `run_identity` 变成必填，命中路径与下载路径一样比对 `(workflow_run_id, run_attempt)`；
+  缓存目录、条目文件及**全部祖先**校验 owner / mode / no-symlink / `st_nlink == 1`，并加
+  64 KiB 上限。身份对不上时降级为 cache miss 走完整下载路径，而不是永久 blocked——否则
+  一个 commit 在 main 上被「Re-run all jobs」之后，它的缓存条目会因 attempt 号变化而永远
+  匹配不上，紧急回滚到这个已知良好的 commit 会被门禁拒绝。
+
+- **Lab artifact 进程锁自锁**：三个 per-inode 锁注册表 guard 改为可重入锁。GC 在临界区里
+  finalize 另一个同路径索引时，它的 `close()` 会在同一线程上重入同一个模块级 Lock，把
+  CPython 3.12 上的整个 CI 分片挂死 39 分钟且不留证据。
+
+- **immutable generation 硬链接**：`uv venv` / `uv sync` 构建 generation 时固定
+  `UV_LINK_MODE=copy`。uv 在 Linux 默认从缓存硬链接，而 generation manifest 拒绝
+  `st_nlink != 1`，生产 Linux 上会在发布阶段直接失败。
+
+- **wire session 清理误判空目录**：判空前把目录 fd 的 readdir 游标复位；tmpfs（RHEL 系默认
+  `/tmp`）会在游标越过条目后返回空列表，导致 cleanup 去 rmdir 一个非空目录。
+
+- **Source Broker 拒绝理由丢失**：客户端写请求撞 EPIPE 时先读取对端已排队的 failure 帧，
+  被拒绝的 peer 现在能拿到服务端明写的原因，而不是通用 transport 失败。
+
+- **盯盘行情 worker 收尸**：最后一次进程组 SIGKILL 之后补一次等待再判定。原来这一级发完
+  信号就直接读 `exitcode`，只会被组信号杀死的 worker 必然被误报成「could not be reaped」。
+
+- **午间空量比**：保留空量比结果的固定 schema，午间链路在空数据场景不再丢失该字段。
 
 ### Fixed
 

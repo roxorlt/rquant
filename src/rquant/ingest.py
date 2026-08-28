@@ -13,13 +13,17 @@ from typing import Literal, Protocol, cast
 import pandas as pd
 import tushare as ts
 from loguru import logger
+from pydantic import Field, model_validator
 
 from rquant.config import settings
+from rquant.daily_close_gateway import DailyCloseFacts
 from rquant.indicator_backfill import derive_target_daily_indicators
 from rquant.market_context import sync_market_sentiment
+from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
 from rquant.security_status import (
     DailySecurityKey,
     SecurityStatusAdapter,
+    SecurityStatusDaily,
     prefetch_security_status,
 )
 from rquant.state import derive_state
@@ -27,6 +31,7 @@ from rquant.state.derive import DailyStateSeed
 from rquant.storage import DuckDBStore
 from rquant.suspension import (
     SuspensionAdapter,
+    SuspensionSnapshot,
     normalize_suspend_d_snapshot,
     persist_suspension_snapshot,
 )
@@ -53,6 +58,218 @@ class DailyIngestClient(Protocol):
     def adj_factor(self, **kwargs: object) -> pd.DataFrame: ...
 
     def daily_basic(self, **kwargs: object) -> pd.DataFrame: ...
+
+
+class DailyIngestMaterialization(RuntimeContractModel):
+    trade_date: date
+    available_at: AwareUtcDatetime
+    facts: DailyCloseFacts
+    security_status: tuple[SecurityStatusDaily, ...]
+    suspension: SuspensionSnapshot
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> DailyIngestMaterialization:
+        dated_rows = (
+            *self.facts.daily_bar,
+            *self.facts.daily_basic,
+            *self.facts.adj_factor,
+            *self.facts.index_daily,
+            *self.security_status,
+        )
+        if any(row.trade_date != self.trade_date for row in dated_rows):
+            raise ValueError("daily materialization contains another trade_date")
+        if self.suspension.coverage.trade_date != self.trade_date:
+            raise ValueError("daily materialization suspension date changed")
+        if not self.facts.daily_bar:
+            raise ValueError("daily materialization requires daily bars")
+        return self
+
+
+class DailyIngestApplyResult(RuntimeContractModel):
+    trade_date: date
+    daily_rows: int = Field(ge=0)
+    status_rows: int = Field(ge=0)
+    suspension_rows: int = Field(ge=0)
+    index_rows: int = Field(ge=0)
+    adj_factor_rows: int = Field(ge=0)
+    daily_basic_rows: int = Field(ge=0)
+    indicator_rows: int = Field(ge=0)
+    state_rows: int = Field(ge=0)
+
+
+def _model_frame(
+    rows: tuple[RuntimeContractModel, ...],
+    *,
+    columns: tuple[str, ...],
+) -> pd.DataFrame:
+    return pd.DataFrame.from_records(
+        (row.model_dump(mode="python") for row in rows),
+        columns=columns,
+    )
+
+
+def derive_daily_materialization_indicators(
+    materialization: DailyIngestMaterialization,
+    *,
+    indicator_reader_factory: Callable[[], DuckDBStore],
+) -> pd.DataFrame:
+    verified = DailyIngestMaterialization.model_validate(materialization)
+    daily_rows = _model_frame(
+        verified.facts.daily_bar,
+        columns=(
+            "ts_code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ),
+    )
+    factor_rows = _model_frame(
+        verified.facts.adj_factor,
+        columns=("ts_code", "trade_date", "adj_factor"),
+    )
+    with indicator_reader_factory() as indicator_reader:
+        return derive_target_daily_indicators(
+            indicator_reader,
+            target_date=verified.trade_date,
+            daily_rows=daily_rows,
+            factor_rows=factor_rows,
+        )
+
+
+def apply_daily_materialization_in_transaction(
+    writer: DuckDBStore,
+    materialization: DailyIngestMaterialization,
+    *,
+    target_indicators: pd.DataFrame,
+    state_mode: Literal["recompute_tail", "invalidate_tail"] = "recompute_tail",
+    replace_trade_date: bool = False,
+    include_market_sentiment: bool = True,
+) -> DailyIngestApplyResult:
+    if state_mode not in {"recompute_tail", "invalidate_tail"}:
+        raise ValueError("state_mode must be 'recompute_tail' or 'invalidate_tail'")
+    verified = DailyIngestMaterialization.model_validate(materialization)
+    target_date = verified.trade_date
+    daily_rows = _model_frame(
+        verified.facts.daily_bar,
+        columns=(
+            "ts_code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ),
+    )
+    index_rows = _model_frame(
+        verified.facts.index_daily,
+        columns=(
+            "ts_code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ),
+    )
+    factor_rows = _model_frame(
+        verified.facts.adj_factor,
+        columns=("ts_code", "trade_date", "adj_factor"),
+    )
+    basic_market_rows = _model_frame(
+        verified.facts.daily_basic,
+        columns=(
+            "ts_code",
+            "trade_date",
+            "turnover_rate",
+            "volume_ratio",
+            "total_mv",
+            "circ_mv",
+        ),
+    )
+    incoming_codes = set(daily_rows["ts_code"].astype(str))
+    existing_codes: set[str] = set()
+    if replace_trade_date:
+        existing_codes = {
+            str(row[0])
+            for row in writer._conn.execute(
+                "SELECT ts_code FROM daily_bar WHERE trade_date = ?",
+                [target_date],
+            ).fetchall()
+        }
+        for table in (
+            "daily_bar",
+            "index_daily_bar",
+            "adj_factor",
+            "daily_basic",
+            "stock_status_daily",
+        ):
+            writer._conn.execute(f"DELETE FROM {table} WHERE trade_date = ?", [target_date])
+    affected_codes = sorted(incoming_codes | existing_codes)
+
+    daily_count = writer.upsert_daily(daily_rows)
+    status_count = writer.upsert_stock_status(
+        verified.security_status,
+        transaction_mode="existing",
+        require_daily_keys=True,
+    )
+    persist_suspension_snapshot(
+        writer,
+        verified.suspension,
+        transaction_mode="existing",
+    )
+    index_count = writer.upsert_index_daily(index_rows)
+    factor_count = writer.upsert_adj_factor(factor_rows)
+    if affected_codes:
+        writer._conn.execute(
+            "DELETE FROM daily_indicator WHERE trade_date >= ? AND ts_code = ANY(?)",
+            [target_date, affected_codes],
+        )
+    indicator_count = writer.upsert_indicators(target_indicators)
+    daily_basic_count = writer.upsert_daily_basic(basic_market_rows)
+    if affected_codes:
+        writer._conn.execute(
+            "DELETE FROM daily_state WHERE trade_date >= ? AND ts_code = ANY(?)",
+            [target_date, affected_codes],
+        )
+    state_count = 0
+    if state_mode == "recompute_tail" and affected_codes:
+        target_rows, seeds = _load_target_daily_state_inputs(
+            writer,
+            target_date,
+            affected_codes,
+        )
+        target_state = _derive_target_daily_states(target_rows, seeds)
+        state_count = writer.upsert_state(target_state)
+        if include_market_sentiment:
+            sync_market_sentiment(writer, target_date.isoformat())
+    return DailyIngestApplyResult(
+        trade_date=target_date,
+        daily_rows=daily_count,
+        status_rows=status_count,
+        suspension_rows=len(verified.suspension.events),
+        index_rows=index_count,
+        adj_factor_rows=factor_count,
+        daily_basic_rows=daily_basic_count,
+        indicator_rows=indicator_count,
+        state_rows=state_count,
+    )
 
 
 def _open_primary_indicator_reader() -> DuckDBStore:
@@ -128,9 +345,7 @@ def _load_daily_state_inputs(
         "status_available_at",
         "status_conflict_reason",
     ]
-    status = joined.loc[
-        joined["status_ts_code"].notna(), status_source_columns
-    ].rename(
+    status = joined.loc[joined["status_ts_code"].notna(), status_source_columns].rename(
         columns={
             "status_ts_code": "ts_code",
             "status_trade_date": "trade_date",
@@ -241,12 +456,8 @@ def _load_target_daily_state_inputs(
         seed_count = row["seed_consecutive_limit_ups"]
         seeds[str(row["ts_code"])] = DailyStateSeed(
             trade_date=pd.Timestamp(seed_trade_date).date(),
-            is_limit_up=(
-                None if pd.isna(seed_is_limit_up) else bool(seed_is_limit_up)
-            ),
-            consecutive_limit_ups=(
-                None if pd.isna(seed_count) else int(seed_count)
-            ),
+            is_limit_up=(None if pd.isna(seed_is_limit_up) else bool(seed_is_limit_up)),
+            consecutive_limit_ups=(None if pd.isna(seed_count) else int(seed_count)),
         )
     return joined, seeds
 
@@ -298,11 +509,7 @@ def _derive_target_daily_states(
                 seed=seeds.get(ts_code),
             )
         )
-    return (
-        pd.concat(state_frames, ignore_index=True)
-        if state_frames
-        else pd.DataFrame()
-    )
+    return pd.concat(state_frames, ignore_index=True) if state_frames else pd.DataFrame()
 
 
 def ingest_daily(
@@ -311,9 +518,7 @@ def ingest_daily(
     pro: DailyIngestClient | None = None,
     status_adapter: SecurityStatusAdapter | None = None,
     suspension_adapter: SuspensionAdapter | None = None,
-    indicator_reader_factory: Callable[[], DuckDBStore] = (
-        _open_primary_indicator_reader
-    ),
+    indicator_reader_factory: Callable[[], DuckDBStore] = (_open_primary_indicator_reader),
     writer_factory: Callable[[], DuckDBStore] = DuckDBStore,
     ingested_at: datetime | None = None,
     api_sleep: float = _API_SLEEP,
@@ -326,9 +531,7 @@ def ingest_daily(
     返回 daily_bar 行数（0 表示非交易日或数据未就绪）。
     """
     if state_mode not in {"recompute_tail", "invalidate_tail"}:
-        raise ValueError(
-            "state_mode must be 'recompute_tail' or 'invalidate_tail'"
-        )
+        raise ValueError("state_mode must be 'recompute_tail' or 'invalidate_tail'")
     pro = pro or ts.pro_api(settings.tushare_token_main)
     ds = trade_date.replace("-", "")
     target_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
@@ -349,9 +552,7 @@ def ingest_daily(
         logger.info(f"{trade_date} 无 daily_bar 数据（非交易日或未就绪）")
         return 0
     df_daily = df_daily.copy()
-    df_daily["trade_date"] = pd.to_datetime(
-        df_daily["trade_date"], format="%Y%m%d"
-    ).dt.date
+    df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"], format="%Y%m%d").dt.date
     df_daily = df_daily.loc[df_daily["trade_date"] == target_date].copy()
     if df_daily.empty:
         logger.warning(f"{trade_date} daily_bar 响应不含请求日期，未写库")
@@ -366,8 +567,7 @@ def ingest_daily(
     if suspension_adapter is None:
         if not hasattr(status_adapter, "suspend_d_raw"):
             raise TypeError(
-                "status_adapter must implement suspend_d_raw or "
-                "suspension_adapter must be provided"
+                "status_adapter must implement suspend_d_raw or suspension_adapter must be provided"
             )
         suspension_adapter = cast(SuspensionAdapter, status_adapter)
     status_keys = [
@@ -397,31 +597,21 @@ def ingest_daily(
                 end_date=ds,
             )
         except Exception as error:
-            logger.warning(
-                f"index_daily {index_code} {trade_date} 拉取失败: {error}"
-            )
+            logger.warning(f"index_daily {index_code} {trade_date} 拉取失败: {error}")
             continue
         if index_df is not None and not index_df.empty:
             index_frames.append(index_df)
         sleep(api_sleep)
-    df_index = (
-        pd.concat(index_frames, ignore_index=True)
-        if index_frames
-        else pd.DataFrame()
-    )
+    df_index = pd.concat(index_frames, ignore_index=True) if index_frames else pd.DataFrame()
     if not df_index.empty:
-        df_index["trade_date"] = pd.to_datetime(
-            df_index["trade_date"], format="%Y%m%d"
-        ).dt.date
+        df_index["trade_date"] = pd.to_datetime(df_index["trade_date"], format="%Y%m%d").dt.date
 
     logger.info(f"拉取 adj_factor {trade_date}...")
     try:
         df_factor = pro.adj_factor(trade_date=ds)
     except Exception as error:
         df_factor = None
-        logger.warning(
-            f"adj_factor {trade_date} 拉取失败，今日复权因子跳过: {error}"
-        )
+        logger.warning(f"adj_factor {trade_date} 拉取失败，今日复权因子跳过: {error}")
     if df_factor is not None and not df_factor.empty:
         factor_cols = ["ts_code", "trade_date", "adj_factor"]
         required_factor_cols = set(factor_cols)
@@ -495,18 +685,13 @@ def ingest_daily(
                 writer.upsert_adj_factor(df_factor)
                 logger.info(f"adj_factor: {len(df_factor)} 行")
             else:
-                logger.warning(
-                    f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子"
-                )
+                logger.warning(f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子")
             writer._conn.execute(
-                "DELETE FROM daily_indicator "
-                "WHERE trade_date >= ? AND ts_code = ANY(?)",
+                "DELETE FROM daily_indicator WHERE trade_date >= ? AND ts_code = ANY(?)",
                 [target_date, codes],
             )
             indicator_rows = writer.upsert_indicators(target_indicators)
-            logger.info(
-                f"daily_indicator: {indicator_rows} 行, {len(codes)} 只"
-            )
+            logger.info(f"daily_indicator: {indicator_rows} 行, {len(codes)} 只")
             if df_basic_mkt is not None and not df_basic_mkt.empty:
                 writer.upsert_daily_basic(df_basic_mkt)
                 logger.info(f"daily_basic: {len(df_basic_mkt)} 行")
@@ -515,10 +700,8 @@ def ingest_daily(
                     f"daily_basic {trade_date} 返回空（tushare 数据可能延迟未就绪），"
                     f"市值类筛选今日将失效；稍后可 `rquant run-daily {trade_date}` 重拉"
                 )
-
             writer._conn.execute(
-                "DELETE FROM daily_state "
-                "WHERE trade_date >= ? AND ts_code = ANY(?)",
+                "DELETE FROM daily_state WHERE trade_date >= ? AND ts_code = ANY(?)",
                 [target_date, codes],
             )
             if state_mode == "recompute_tail":
@@ -533,9 +716,7 @@ def ingest_daily(
                 sentiment_rows = sync_market_sentiment(writer, trade_date)
                 logger.info(f"market_sentiment_daily: {sentiment_rows} 行")
             else:
-                logger.info(
-                    f"state tail 已失效: {target_date}, {len(codes)} 只"
-                )
+                logger.info(f"state tail 已失效: {target_date}, {len(codes)} 只")
             writer._conn.execute("COMMIT")
             transaction_open = False
         except BaseException as error:

@@ -157,18 +157,18 @@ def _result_hash(
     tables: dict[str, pd.DataFrame],
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(
-        _canonical_json_bytes({"metrics": _hash_json_value(metrics)})
-    )
+    digest.update(_canonical_json_bytes({"metrics": _hash_json_value(metrics)}))
     for name in sorted(tables):
         df = tables[name]
         digest.update(
-            _canonical_json_bytes({
-                "table": name,
-                "columns": [str(column) for column in df.columns],
-                "dtypes": [str(dtype) for dtype in df.dtypes],
-                "row_count": len(df),
-            })
+            _canonical_json_bytes(
+                {
+                    "table": name,
+                    "columns": [str(column) for column in df.columns],
+                    "dtypes": [str(dtype) for dtype in df.dtypes],
+                    "row_count": len(df),
+                }
+            )
         )
         for row in df.itertuples(index=False, name=None):
             digest.update(_canonical_json_bytes(_hash_json_value(row)))
@@ -202,14 +202,8 @@ def _research_manifest_markdown_lines(manifest: ResearchManifest) -> list[str]:
     coverage = "未知"
     if manifest.coverage_ratio is not None:
         coverage = f"{manifest.coverage_ratio:.2%}"
-        if (
-            manifest.coverage_numerator is not None
-            and manifest.coverage_denominator is not None
-        ):
-            coverage += (
-                f"（{manifest.coverage_numerator:,}/"
-                f"{manifest.coverage_denominator:,}）"
-            )
+        if manifest.coverage_numerator is not None and manifest.coverage_denominator is not None:
+            coverage += f"（{manifest.coverage_numerator:,}/{manifest.coverage_denominator:,}）"
     data_range = "未知"
     if manifest.data_start_date is not None and manifest.data_end_date is not None:
         data_range = f"{manifest.data_start_date} 至 {manifest.data_end_date}"
@@ -279,12 +273,14 @@ def render_strategy_lab_markdown(run: StrategyLabSavedRun) -> str:
         "",
     ]
     for table in run.tables:
-        lines.extend([
-            f"## {table.name}",
-            "",
-            f"- 总行数：{table.total_rows}",
-            f"- 当前导出：{len(table.rows)} 行",
-        ])
+        lines.extend(
+            [
+                f"## {table.name}",
+                "",
+                f"- 总行数：{table.total_rows}",
+                f"- 当前导出：{len(table.rows)} 行",
+            ]
+        )
         if table.truncated:
             lines.append("- 注意：表格已截断，完整复盘请读取同名 JSON。")
         lines.extend(["", _markdown_table(table.rows), ""])
@@ -305,12 +301,14 @@ def build_strategy_lab_run(
     normalized_params = _json_value(params)
     normalized_metrics = _json_value(metrics)
     base_manifest = manifest or new_exploratory_manifest(run_type)
-    enriched_manifest = ResearchManifest.model_validate({
-        **base_manifest.model_dump(exclude={"missing_evidence"}),
-        "schema_version": 2,
-        "strategy_spec_hash": _strategy_spec_hash(run_type, params),
-        "result_hash": _result_hash(metrics, tables),
-    })
+    enriched_manifest = ResearchManifest.model_validate(
+        {
+            **base_manifest.model_dump(exclude={"missing_evidence"}),
+            "schema_version": max(2, base_manifest.schema_version),
+            "strategy_spec_hash": _strategy_spec_hash(run_type, params),
+            "result_hash": _result_hash(metrics, tables),
+        }
+    )
     saved_tables: list[StrategyLabRunTable] = []
     for name, df in tables.items():
         total_rows = len(df)
@@ -341,17 +339,19 @@ def save_strategy_lab_run(
     run: StrategyLabSavedRun,
     *,
     base_dir: Path | None = None,
+    staging_base_dir: Path | None = None,
 ) -> StrategyLabSavedRun:
     out_dir = strategy_lab_runs_dir(base_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    write_dir = strategy_lab_runs_dir(staging_base_dir) if staging_base_dir else out_dir
+    write_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{run.run_id}.json"
     markdown_path = out_dir / f"{run.run_id}.md"
-    payload = run.model_copy(
-        update={"json_path": json_path, "markdown_path": markdown_path}
-    )
+    write_json_path = write_dir / json_path.name
+    write_markdown_path = write_dir / markdown_path.name
+    payload = run.model_copy(update={"json_path": json_path, "markdown_path": markdown_path})
     json_created = False
     try:
-        with json_path.open("x", encoding="utf-8") as handle:
+        with write_json_path.open("x", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
                     payload.model_dump(mode="json"),
@@ -360,11 +360,11 @@ def save_strategy_lab_run(
                 )
             )
         json_created = True
-        with markdown_path.open("x", encoding="utf-8") as handle:
+        with write_markdown_path.open("x", encoding="utf-8") as handle:
             handle.write(run.markdown)
     except BaseException:
-        if json_created and not markdown_path.exists():
-            json_path.unlink(missing_ok=True)
+        if json_created and not write_markdown_path.exists():
+            write_json_path.unlink(missing_ok=True)
         raise
     return payload
 
@@ -386,9 +386,7 @@ def load_strategy_lab_run(
     markdown_path = out_dir / f"{run_id}.md"
     if is_legacy:
         original_markdown = (
-            markdown_path.read_text(encoding="utf-8")
-            if markdown_path.exists()
-            else run.markdown
+            markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else run.markdown
         )
         run.markdown = _inject_research_manifest_markdown(
             original_markdown,

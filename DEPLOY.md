@@ -5,6 +5,267 @@
 
 ---
 
+## v0.30.0 Release A 上线前置条件（尚未部署，非部署记录）
+
+**状态**：`cc/workload-isolation-continuation` 分支的 R07 / signal-family 工作已开 PR，等待
+Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务器 82.156.0.68（lighthouse 用户）
+上没有发生任何变更。本节记录的是这次发布**之前**必须逐条满足的条件，不是一条部署记录；
+真正部署后再按本文件的既有格式追加 `## YYYY-MM-DD · v0.30.0 · 标题`。
+
+1. **合版方式只能是 "Create a merge commit"**（技术强制，非约定）。R07 证据的 merge-provenance
+   检查要求候选 commit 恰有两个 parent、第一 parent 等于冻结 merge base `9699827b`、且
+   `git merge-tree --write-tree <parent1> <parent2>` 等于候选 tree；squash 与 rebase 只有一个
+   parent，CI 的 push-to-main 路径会直接拒绝产出证据，Release B 也就永远拿不到部署证据。
+   （实测：squash 提交的 tree 与 merge 提交完全相同，只有 parent 结构能区分两者。）
+   merge 之后立刻核对 `git merge-base --is-ancestor 45d0b57c origin/main` 返回 0——
+   `45d0b57c` 现在是 **historical baseline**，门禁仍单独要求它是候选祖先。
+2. **合并前 `origin/main` 必须仍冻结在 `9699827b`**。冻结 baseline 是
+   `merge_base(origin/main, candidate)`，764 条 allowlist 与 merge-tree 等式都以此为前提。
+   若在 PR #155 落地前先合了别的 PR，必须重跑
+   `uv run python scripts/r07_policy_regenerate.py --repo "$PWD"`，并同步改
+   `BASELINE_COMMIT_SHA` / `BASELINE_TREE_SHA` 与
+   `docs/architecture/production-interpreter-authority.md`，否则门禁全表失配。
+   合并前最后再跑一次 `scripts/r07_policy_regenerate.py --check` 确认 RC=0。
+3. **云服务器 82.156.0.68（lighthouse 用户）的 `/usr/bin/git --version` 必须 ≥ 2.38**。
+   私有 verifier 用 `git merge-tree --write-tree` 离线重放 merge provenance，该子命令自 2.38
+   起才可用；低于 2.38 时 Release B 的部署器会以
+   `the deployment Git cannot replay merge provenance` fail closed（不降级为 warning）。
+   部署前在云端执行 `git --version` 核对并把结果写进本节。
+4. **第一次真实 push-to-main run 之后**核对 WP1-SPEC-06 / SPEC-12：evidence 里的
+   `job.check_run_id` 与 artifact 内部路径必须与真实 GitHub API 返回一致（本地只用 fake
+   transport 验证过）。
+5. **服务器 `.env` 增加 `RQUANT_GITHUB_EVIDENCE_TOKEN`**。这属于生产密钥变更，需要用户单独
+   明确授权；Release A 本身不消费证据，这个 token 是 Release B 才需要的。
+6. **Release A 之后的下一次部署只能是 Release B**：`deployment_mode=enforced`，并且
+   `bootstrap_predecessor` 精确声明 Release A 的 commit 与 tree SHA。中间不允许插入其他
+   部署目标。
+7. **云端只读核对**：对每一个 live generation 核对
+   `sha256(full-manifest.json) == slot.full_manifest_hash`。只读操作，走
+   `open_readonly_store()` / 只读副本，不碰主库写锁。
+8. **云端 child 访问实验**：以真实 `lighthouse` 身份对 `0715` 的 child workspace 做
+   `O_RDONLY | O_DIRECTORY` 打开，并确认 `id -g lighthouse != 0`——工作区的 group 位是
+   `--x`，子进程一旦落进 group 类就会丢掉读权限（验证器现在会直接拒绝这种身份配对）。
+9. **root verifier 必须从 root-owned 树运行**（Codex round-2 P1-4 已落地，安装仍待授权）。
+   `scripts/signal-family-root-verifier.py` 现在直接拒绝运行并退出 78；生产入口改为固定的
+   root-owned 制品对，由 `scripts/build-signal-family-verifier-artifact.py` 构建：
+
+   ```bash
+   # --source-venv 必须显式指向**目标解释器**的 venv：制品树里带原生扩展
+   # （pydantic_core 的 .so），用别的 ABI/平台构建出来的树在生产 python3.11 上 import 不了，
+   # 而 content-id 是这棵树的哈希，所以构建主机不同 → TCB 锚点不同。
+   python scripts/build-signal-family-verifier-artifact.py \
+     --output-root <staging> \
+     --source-venv /home/lighthouse/rquant/.venv \
+     --python-version "$(/usr/bin/python3.11 -c 'import platform;print(platform.python_version())')" \
+     --target-platform linux
+   # 打印 content_id / entry_sha256 / manifest_entries 及安装位置
+   # 构建脚本现在自己 guard：源 venv 的解释器版本 / ABI tag / 平台与目标不一致就构建失败，
+   # 不会再产出一棵装着 cpython-313-darwin 扩展却声称 3.11 的树。下面这条只是人工复核。
+   find <staging>/<content-id> -name '*.so'   # 必须是 linux 的 ABI tag
+   ```
+
+   安装是**单独授权的 root 事务**，不能借受控发布器绕过。逐条核对：
+
+   - 树装到 `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`，`root:root`，
+     目录 `0555`、文件 `0444`（源可执行的为 `0555`），每个文件 `nlink == 1`；
+   - 入口装到 `/usr/local/libexec/rquant-signal-family-verifier-v1.pyz`，`root:root`，
+     `0555`，`nlink == 1`，SHA-256 与构建输出一致（两次构建必须字节相同）；
+   - 运行 `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-signal-family-verifier-v1.pyz`
+     应能通过树校验；树里任何一个字节被改、多一个文件、少一个文件、mode 放宽或换了属主，
+     都必须退 78 且不启动；
+   - 回滚 = 把入口换回上一个 content id 的构建产物，旧树不删；两棵树可以共存。
+
+10. **`/usr/bin/setpriv` 必须存在且进 TCB**（Codex round-2 P1-5）。root verifier 与
+   `rquant-workload-arbiter` 的降权/父进程死亡信号都改由它执行，不再有任何 `preexec_fn`。
+   OpenCloudOS 9.2 上部署前核对：
+
+   ```bash
+   /usr/bin/setpriv --version                 # util-linux ≥ 2.33（--pdeathsig 需要）
+   stat -c '%U:%G %a %h' /usr/bin/setpriv     # root:root，无 g/o 写位，nlink 1
+   sha256sum /usr/bin/setpriv                 # 记入 TCB 清单
+   ```
+
+   缺失或不满足属主/权限时，root verifier 会拒绝启动（fail closed），不会退回旧路径。
+
+11. **`/usr/local/libexec/rquant-runtime-exec.pyz` 必须先安装，profile 必须先声明全部 role**
+   （Codex round-2 P1-3）。本分支新增的 25 个受保护 runtime unit 已改为固定命令
+   `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role <literal>`，
+   不再读 `data/runtime/current/runtime.env`，也不再接受 `%i` 插值的 manifest 路径。部署前：
+
+   ```bash
+   python scripts/build-runtime-exec-pyz.py --output <staging>/rquant-runtime-exec.pyz
+   # 装到 /usr/local/libexec/，root:root，0555；SHA-256 写进 profile 的 runtime_pyz
+   for u in /etc/systemd/system/rquant-runtime-*.service \
+            /etc/systemd/system/rquant-artifact-retention.service \
+            /etc/systemd/system/rquant-page-control.service \
+            /etc/systemd/system/rquant-lab-claim-finalizer.service; do
+     systemd-analyze verify "$u"
+     systemctl show -p ExecStart "$(basename "$u")"
+   done
+   systemctl show -p Environment rquant-lab-claim-finalizer   # 白名单补齐用
+   ```
+
+   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 28 个 role**（Codex round-2 P1-3 扩到 26，
+   round-3 verdict RQ-WI-R2-P1-01 加 `workload_admission`，RQ-WI-R2-P1-02 加
+   `lab_claim_finalizer`），`profile_id` 随之改变——这是刻意的 profile 版本演进，不是副作用。
+
+   `workload_admission` **不属于任何 unit**：它由 `/usr/local/libexec/rquant-workload-arbiter`
+   在取得 research 平面锁之后、exec 进 unit 自己的子进程之前调用，替换掉原先的
+   `.venv/bin/python -m rquant.workload_isolation research-admission`。新版 profile 必须声明它，
+   否则 10 个 research unit 全部起不来（admission 以 78 退出，被 arbiter 读成 research 被拒 →
+   unit 退 75）。非 instanced role：`instances` 为空、`control_root` 为空串、`module_arguments`
+   恰好是 `["research-admission"]`。
+
+   `lab_claim_finalizer` 由 `deploy/systemd/rquant-lab-claim-finalizer.service` 直接命名
+   （`--role lab_claim_finalizer`），该 unit 的 `ExecStartPre` 与旧的
+   `.venv/bin/python … run-lab-daemon.py formal` 已一并删除。非 instanced role：`instances`
+   为空、`control_root` 为空串、`module_arguments` 恰好是 `["lab-claim-finalizer"]`，
+   `environment_allowlist` 为 `["APP_ENV","LANG","LC_ALL","RQUANT_DISABLE_DOTENV","TZ"]`。
+
+   **⚠ 发布这一代 profile 之前必须做完的两件事**：
+
+   1. **补齐环境白名单**。wrapper 的 `build_child_environment` 从空字典起，只复制 profile 白名单
+      里的名字，未登记的名字**被静默丢弃**。`/etc/rquant/lab-claim-finalizer.env` 不在仓库里，
+      发布前先在云服务器 `82.156.0.68`（`lighthouse` 用户）上跑
+      `systemctl show -p Environment rquant-lab-claim-finalizer`，把 finalizer 真正需要的名字逐个
+      补进 `src/rquant/runtime_authority.py` 的 `lab_claim_finalizer` role 再发布。名字须排序去重、
+      不得以 `PYTHON` / `LD_` 开头、不得是 `PATH`，总数 ≤ 32。`PYTHONDONTWRITEBYTECODE` 故意不在
+      白名单里：两级都拒 `PYTHON*`，两级子进程都是 `-I -S`，generation 目录 0555，这个名字在旧
+      unit 下也从未到达 daemon。
+   2. **改 `/etc/rquant/runtime-code-migration.json`**：每个 `formal_services[]` 条目里的
+      `wrapper_path` 字段**必须删掉**。unit 不再执行 `scripts/run-lab-daemon.py`，
+      `RuntimeCodeFormalService` 已不再声明该字段，而请求模型是 `extra="forbid"`——留着它会让迁移
+      gate 以 `extra_forbidden` 失败，finalizer 启动即非零退出并被 `Restart=on-failure` 反复拉起。
+
+   **两条信任链的发布节奏现在是耦合的**（RQ-WI-R2-P1-02 的直接后果）。finalizer 先经
+   runtime-authority 链（wrapper 校验 generation），再跑 runtime-code 链（ed25519 attestation +
+   promotion receipt）。runtime-authority generation 没发布好——profile 与 `current.json` slot、
+   generation full-manifest 不同代，或磁盘上的 pyz 与 profile 的 `runtime_pyz.sha256` 不一致——
+   finalizer 就起不来。发布顺序必须是「安装新 pyz + 发布新 profile + 换代 generation」在同一次
+   事务里完成，然后才 `systemctl restart rquant-lab-claim-finalizer`。
+   bootstrap 绑定与迁移请求路径已经是 generation 常量，改它们同样要换代（R3B-SPEC-04）。
+
+   **R3-A 与 R3-B 必须同一次发布**（R3B-SPEC-01）：两者共用同一代 pyz 与同一个 `profile_id`，
+   分开发布会让先发的那一半带着后发那一半的 role 表或哈希，wrapper 直接 fail closed。
+
+   **`rquant-runtime-exec.pyz` 换代**：本轮 `_verify.py` 有改动，SHA-256 由
+   `5b903aeff9d5b8c44852825c54bd2531c0a994202bc575c08cce6d1b071a1aed` 变为
+   **`a5d9b3fff7388f7aa35a951a6b6bc51e3e9faf69bf8b94b598c7c69b2c9c9c5e`**
+   （`python scripts/build-runtime-exec-pyz.py --repository-root . --output <staging>/rquant-runtime-exec.pyz`
+   重算，连续两次构建逐字节相同）。安装新 pyz 与发布新 profile 必须同一次事务完成：profile 的
+   `runtime_pyz.sha256` 与磁盘上的 pyz 不一致时 wrapper 会 fail closed。
+
+   **R07 policy 必须用 py3.11 或 py3.12 生成**：3.13 的 AST 摘要与前两者不同，生成出来的 policy
+   在 CI 上对不上（Codex 非阻断项）。新版 profile 必须逐个 role 声明
+   module / 环境白名单 / **instance 白名单**；instanced role 的 `instances` 至少一项且形如
+   `svc-<64 hex>`，非 instanced role 必须为空。concrete 标签由
+   `runtime_deployment_bundle` 从各 service manifest 派生，不冻结在代码里。
+   `current.json` 的 slot 也必须声明同一组 role（`_validate_slot_against_profile` 要求相等）。
+   profile 版本变更本身是单独授权的基础设施事务；`profile_id` 同时被 slot、generation
+   full-manifest 与 R07 policy 冻结，三者必须一起换代。
+
+12. **每个实例的 service manifest 必须落在 generation 里**。wrapper 不再从 unit 接收
+   `--manifest`，而是从权威记录派生：`<generation>/manifests/<instance>.json`，并要求这条
+   相对路径是该 generation full-manifest 里的一个 `file` 条目——于是它和其余代码一样被逐字节
+   校验。`--control-root` 由 profile 的 per-role `control_root` 前缀拼上已授权的实例标签，
+   `--expected-commit` / `--expected-generation` 来自 `current.json` 的 current slot；
+   `--expected-kind` / `--once` 由 profile role 策略决定。既有的
+   `rquant.runtime_service_main` **不需要任何改动**，它收到的正是原来由 unit 传的那组参数，
+   只是来源换成了 root-owned 记录。
+
+   发布 generation 时必须把 service manifest 写进 `<generation>/manifests/` 并纳入
+   full-manifest（旧位置 `data/runtime/current/manifests/` 由应用自己可写，已不再被读取）。
+   `current.json` 的 `current_commit` 必须是 40 位十六进制 commit sha，否则 wrapper 退 78——
+   该值只是转发给既有模块的 `--expected-commit`，wrapper 自身仍不据它做任何判定。
+
+   `rquant-runtime-recovery@` / `rquant-runtime-recovery-rehearsal@` 的
+   `--expected-profile-generation %i` 已移除，generation 同样来自 `current.json`。
+
+13. **`deploy/libexec/rquant-workload-arbiter` 的 pdeathsig 竞态**：`setpriv --pdeathsig`
+   在 fork 与 exec 之间设置 `PR_SET_PDEATHSIG`，与旧实现一样存在「父进程恰在此窗口内死亡」
+   的极小竞态；旧实现额外做的 `getppid()` 复查随 `preexec_fn` 一并移除。这是刻意的取舍：
+   ruling D-6 优先消除 fork/exec 之间跑 Python 的死锁面。
+14. **R07 证据缓存命中也需要网络与 token**：缓存命中不再跳过 GitHub run 身份核验，部署器仍会
+   用 `RQUANT_GITHUB_EVIDENCE_TOKEN` 查一次 workflow runs 解析出当前的 `workflow_run_id` /
+   `run_attempt`，因此**离线部署不可行**；GitHub 不可达、token 缺失、该 commit 没有唯一一个
+   push-main run 时结果都是 blocked，不降级放行。缓存目录及其全部祖先必须由 root 或部署身份（lighthouse）拥有、无
+   group/other 写位、无 symlink；缓存条目本身还必须由部署身份拥有、单链接、不超过 64 KiB，
+   否则同样 blocked。
+   **重跑 attempt 后旧缓存自动失效**：在 main 上对已部署 commit 点 Re-run all jobs 会产生新
+   attempt，GitHub 的 run 列表只返回当前 attempt，旧缓存条目从此对不上。这种「身份不一致」不
+   算失败，部署器会当作 cache miss 重新下载当前 attempt 的 artifact、全量重验后原子覆盖旧条目，
+   无需人工 `rm` 缓存文件。
+   **400 天以上历史不可核验 → blocked，且无补救**：GitHub 的 workflow run 历史保留 400 天
+   （artifact 默认 90 天过期，两者独立设置），所以缓存在 artifact 过期后仍可核验；但 commit 超过
+   400 天后 run 记录被归档删除，重下载与重核验都不再可能，该目标只能先在 main 上重新触发一次
+   CI（或用一个更新的等价 commit）才能部署。
+15. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
+   producer/consumer id 域、profile-service-manifests 文档绑定、WP5 Q1–Q4、wire schema
+   在 3.11/3.12 的可见性、退休门的交易日数字，全部等 Codex 裁决。
+   （`strategy-router` / `strategy-shadow` 五个 surface 的向量语义已在 R2-E 落地：13 个
+   reader surface 全部经真实 production builder 产出，离线 harness 世界在 Linux 上产出
+   五对 `READY`。这不改变「本轮不安装、不激活」——Phase C activation 仍不成立。）
+16. **Phase C 在真实生产 generation 上能否跑通：未决，且当前代码形态下不成立**。
+   `strategy-shadow` 的三个 reader 只能经 `FilesystemShadowSessionInputLoader` 读一份
+   accepted legacy shadow export，而 `legacy_shadow_export._open_child_directory_at`
+   要求 export 的 session 目录 `st_uid == os.geteuid()`（**不是** 文件那样的
+   `{0, euid}`），`_ensure_private_root` 又把 export 根 `fchmod` 到 `0700`。合起来：
+   **export 只能被与发布者同 uid 的进程读**。离线世界里发布者与 child 同 uid 所以能跑通；
+   生产 generation 是 root-owned、Phase C child 是非特权 lighthouse，这条路走不通。
+
+   **不要**按「构建后交给 root 并置 0555」去补救——交给 root 之后
+   `st_uid != geteuid()` 必然成立，shadow reader 会 100% 被拒。三条候选路径交 Codex 裁决：
+   ①generation 内的 shadow export 由 lighthouse 而非 root 拥有（弱化 generation 不可变性）；
+   ②Phase C child 以发布者 uid 运行（改变 child 身份模型）；
+   ③修改 `_open_child_directory_at` 的 owner 谓词接受 `{0, euid}`（TCB 变更，需单独授权）。
+   在裁决落地并实测之前，「Phase C 能在生产 generation 上产出 READY」没有证据。
+
+17. **arbiter 不再执行 checkout 解释器**（Codex round-3 verdict RQ-WI-R2-P1-01）。
+   `deploy/libexec/rquant-workload-arbiter` 在取得 research 平面锁之后、exec unit 自己的子进程
+   之前，只启动两类进程：`/usr/bin/setpriv`（parent-death launcher）与
+   `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role workload_admission`。
+   这三个可执行文件全部 root-owned、全部已在 TCB 表里。arbiter 自己的解释器行也收紧为
+   `#!/usr/bin/python3 -IS`，因此 `~/.local/lib/python3.11/site-packages/usercustomize.py` 与
+   `EnvironmentFile` 里的 `PYTHONPATH` / `PYTHONHOME` 都不再能在 arbiter 起步阶段执行代码
+   （独立评审 R3A-SPEC-02）。退出码契约不变：admission ≠ 0 → arbiter 退 75。
+
+   **闭包白名单不是零豁免，还剩一项**：`rquant-research-ingest.service` 把一个 checkout shell
+   脚本（`scripts/run-research-ingest-daily.sh`）交给 arbiter 当自有子进程，这个 unit 本体在
+   `origin/main` 上、不属于本轮范围。`ExecStartPre` 一侧现在是**零豁免**——finalizer 的那条
+   已随 RQ-WI-R2-P1-02 删除，所有 arbiter-fronted unit 都不得再声明 `ExecStartPre`。测试以两张
+   精确豁免表登记（子进程 1 项、`ExecStartPre` 0 项），多一项或程序变了都会红。
+
+   **`workload_admission` 的发布顺序有硬约束**：必须**先**装好新版 pyz 并发布声明了
+   `workload_admission` 的新版 profile，**再**用 `scripts/install-workload-isolation-infra.sh`
+   装新版 arbiter。顺序反了，10 个 research unit 的 admission 以 78 退出、unit 退 75——落在
+   `SuccessExitStatus=0 75` 之内不触发 `Restart=on-failure`，现象是「unit 秒退成功、什么都没跑」。
+   回滚同理：先回滚 arbiter，再回滚 pyz / profile。arbiter 的 `.sha256` 由安装脚本现算，
+   代码与文档都不冻结 arbiter 哈希。
+
+   **启动开销（生产口径）**。A1 为默认方案（协调者推荐，已向用户说明生产口径代价：每次研究
+   服务启动约 +7 s、retention timer 折合约 34 min/天；截至本轮回执用户尚未明确答复，若改选
+   A2 将以追加提交处理）。该探针让每次 research unit 启动多做 2 次完整 generation 校验（wrapper 父进程
+   1 次 + 冻结 bootstrap 在 generation 解释器里 1 次），每次逐条 SHA-256 约 666 MiB。
+   离线 arm64 容器、页缓存热的条件下 p95 = 0.889 s/次，**该数字不适用于生产**：生产机
+   `82.156.0.68` 是 Intel Xeon Platinum 8255C（Cascade Lake，2 vCPU），`/proc/cpuinfo` 无
+   `sha_ni`，实测单线程 SHA-256 吞吐 192–201 MB/s，据此推算单次校验的哈希下界 **≈ 3.5 s**，
+   **每次 research 启动新增 ≈ 7 s CPU**；连同 unit 自身子进程的校验合计 ≈ 14 s。
+   `rquant-artifact-retention.timer` 每 5 分钟一跳，按 288 次/天计新增 **≈ 34 min/天 CPU**。
+   相关 unit 的 `TimeoutStartSec` 在 30–300 s，余量充足，但**首次部署后必须实测确认**：
+   `systemd-analyze blame`，或
+   `systemctl show -p ExecMainStartTimestamp,ActiveEnterTimestamp rquant-artifact-retention.service`，
+   并观察一整个交易日的 1 分钟 load。若单次启动超过 30 s 或 load 明显抬升，按上面的回滚顺序
+   先回滚 arbiter。
+
+   **优化债务**：同一代 generation 在同一次启动里被校验两次，且每次都是全量逐文件 SHA-256。
+   按 generation 缓存校验结果（例如以 generation id + full-manifest 摘要为键，把结果记在
+   root-owned 的一次性文件里）可以把 ≈ 7 s 降到一次校验的量级。本轮不做，记为债务。
+
+**回滚**：本分支没有产生任何生产变更，因此没有回滚基线。PR 未合并前直接关闭 PR 即可；
+已合并但未部署时，生产仍停在上一次部署的 commit，无需任何动作。
+
+---
+
 ## 2026-08-04 · v0.28.3 · 爆量历史搜索与触发日趋势标记
 
 **状态**：PR #151 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag

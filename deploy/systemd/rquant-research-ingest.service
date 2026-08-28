@@ -1,5 +1,6 @@
 [Unit]
 Description=rQuant Cloud Research Daily Ingest
+Requires=rquant-replica-sync.service
 After=network-online.target rquant-daily.service rquant-replica-sync.service
 Wants=network-online.target
 
@@ -7,13 +8,15 @@ OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot
+Slice=rquant-research.slice
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
 Environment=TZ=Asia/Shanghai
 
-ExecStart=/home/lighthouse/rquant/scripts/run-research-ingest-daily.sh
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /home/lighthouse/rquant/scripts/run-research-ingest-daily.sh
+SuccessExitStatus=0 2 3 75
 
 Restart=no
 TimeoutStartSec=7200

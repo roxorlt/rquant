@@ -1,0 +1,11 @@
+[Unit]
+Description=rQuant Maintenance Workload Plane
+
+[Slice]
+CPUAccounting=true
+CPUWeight=50
+IOAccounting=true
+IOWeight=50
+MemoryAccounting=true
+TasksAccounting=true
+TasksMax=128

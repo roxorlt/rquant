@@ -84,9 +84,7 @@ class IntradayMinuteQuoteProvider:
         self._freq = freq
         self._daily_refresh_seconds = daily_refresh_seconds
         self._rt_min_poll_seconds = (
-            settings.rt_min_poll_seconds
-            if rt_min_poll_seconds is None
-            else rt_min_poll_seconds
+            settings.rt_min_poll_seconds if rt_min_poll_seconds is None else rt_min_poll_seconds
         )
         self._last_daily_refresh: datetime | None = None
         self._last_rt_min_success: datetime | None = None
@@ -114,9 +112,7 @@ class IntradayMinuteQuoteProvider:
         self.used_fresh_tushare = rt_min_fresh or daily_ok
 
         return {
-            code: quote
-            for code in ts_codes
-            if (quote := self._quote_from_cache(code)) is not None
+            code: quote for code in ts_codes if (quote := self._quote_from_cache(code)) is not None
         }
 
     def _should_refresh_daily(self) -> bool:
@@ -165,8 +161,15 @@ class IntradayMinuteQuoteProvider:
             return
 
         required = {
-            "ts_code", "trade_time", "freq", "open", "high",
-            "low", "close", "vol", "amount",
+            "ts_code",
+            "trade_time",
+            "freq",
+            "open",
+            "high",
+            "low",
+            "close",
+            "vol",
+            "amount",
         }
         missing = required - set(df.columns)
         if missing:
@@ -232,6 +235,7 @@ def _sum_optional(values: Iterable[float | None]) -> float | None:
 @dataclass
 class WatchItem:
     """单只监控标的。"""
+
     ts_code: str
     pool: str  # 'pool1' or 'pool2'
     limit_up_date: date
@@ -251,12 +255,14 @@ class WatchItem:
     limit_up_price_next: float | None = None
     blacklist_label: str | None = None
     blacklist_categories: list[str] = field(default_factory=list)
-    triggered: dict[str, bool] = field(default_factory=lambda: {
-        "attack_open_strength": False,
-        "attack_strong_carry": False,
-        "attack_break_high": False,
-        "attack_near_limit": False,
-    })
+    triggered: dict[str, bool] = field(
+        default_factory=lambda: {
+            "attack_open_strength": False,
+            "attack_strong_carry": False,
+            "attack_break_high": False,
+            "attack_near_limit": False,
+        }
+    )
 
 
 def _get_latest_screen_date(store: DuckDBStore) -> str | None:
@@ -383,9 +389,7 @@ def build_watchlist(
     return list(items.values())
 
 
-def _publish_research_watchlist(
-    items: Sequence[WatchItem], trade_date: date
-) -> Path | None:
+def _publish_research_watchlist(items: Sequence[WatchItem], trade_date: date) -> Path | None:
     """Persist the pre-open expected universe when cloud research shadowing is on."""
     if not settings.research_cloud_ingest_enabled:
         return None
@@ -404,10 +408,7 @@ def _publish_research_watchlist(
     return write_research_watchlist_snapshot(
         settings.research_staging_dir_resolved,
         trade_date=trade_date,
-        items=tuple(
-            ResearchWatchlistItem(ts_code=item.ts_code, pool=item.pool)
-            for item in items
-        ),
+        items=tuple(ResearchWatchlistItem(ts_code=item.ts_code, pool=item.pool) for item in items),
         captured_at=captured_at,
         code_commit=commit,
     )
@@ -426,9 +427,7 @@ def _as_date(value: object) -> date | None:
 
 
 def _round_limit_price(value: float) -> float:
-    return float(
-        Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    )
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _hydrate_attack_references(
@@ -463,18 +462,14 @@ def _hydrate_attack_references(
         item.reference_date = reference_date
         item.t_high = float(high)
         item.t_close = float(close)
-        item.limit_up_price_next = _round_limit_price(
-            item.t_close * (1 + float(limit_pct))
-        )
+        item.limit_up_price_next = _round_limit_price(item.t_close * (1 + float(limit_pct)))
 
 
 def is_trading_day(check_date: date) -> bool:
     """通过 akshare 交易日历检查是否为 A 股交易日。"""
     try:
         df = ak.tool_trade_date_hist_sina()
-        trade_dates = set(
-            pd.to_datetime(df["trade_date"]).dt.date
-        )
+        trade_dates = set(pd.to_datetime(df["trade_date"]).dt.date)
         return check_date in trade_dates
     except Exception:
         logger.error("获取交易日历失败，默认当作交易日")
@@ -573,12 +568,14 @@ def check_attack_signals(
         if item.triggered.get(level, False):
             return
         item.triggered[level] = True
-        events.append({
-            "level": level,
-            "trigger_price": trigger_price,
-            "level_price": level_price,
-            "trigger_type": trigger_type,
-        })
+        events.append(
+            {
+                "level": level,
+                "trigger_price": trigger_price,
+                "level_price": level_price,
+                "trigger_type": trigger_type,
+            }
+        )
 
     if item.t_close is None:
         return events
@@ -618,22 +615,10 @@ def check_attack_signals(
             "strong_carry",
         )
 
-    if (
-        limit_up_price_next is not None
-        and limit_up_price_next > 0
-        and t_high is not None
-    ):
+    if limit_up_price_next is not None and limit_up_price_next > 0 and t_high is not None:
         intraday_high = quote.high if quote.high is not None else quote.price
-        distance_to_limit = (
-            (limit_up_price_next - quote.price)
-            / limit_up_price_next
-            * 100
-        )
-        if (
-            distance_to_limit <= 1.5
-            and intraday_high > t_high
-            and quote.low >= t_close
-        ):
+        distance_to_limit = (limit_up_price_next - quote.price) / limit_up_price_next * 100
+        if distance_to_limit <= 1.5 and intraday_high > t_high and quote.low >= t_close:
             _append(
                 "attack_near_limit",
                 quote.price,
@@ -643,9 +628,8 @@ def check_attack_signals(
 
     return events
 
-def _count_trading_days_since(
-    store: DuckDBStore, entry_date: date, today: date
-) -> int:
+
+def _count_trading_days_since(store: DuckDBStore, entry_date: date, today: date) -> int:
     """entry_date 到 today 之间有多少个交易日（含两端）。"""
     row = store._conn.execute(
         """
@@ -709,56 +693,62 @@ def check_exits(store: DuckDBStore, today: date) -> int:
 
             if close_price < stop_w:
                 store.update_pool2_exit(code, today, "breakdown")
-                auto_kicked.append({
-                    "ts_code": code,
-                    "name": name_map.get(code, ""),
-                    "kind": "breakdown",
-                    "close": close_price,
-                    "threshold": stop_w,
-                    "reason_label": "弱止",
-                    "blacklist_label": bl_label,
-                })
+                auto_kicked.append(
+                    {
+                        "ts_code": code,
+                        "name": name_map.get(code, ""),
+                        "kind": "breakdown",
+                        "close": close_price,
+                        "threshold": stop_w,
+                        "reason_label": "弱止",
+                        "blacklist_label": bl_label,
+                    }
+                )
                 logger.info(f"Pool 2 自动踢出: {code} 跌破弱止 ¥{stop_w:.2f}")
             elif close_price < stop_s:
                 store.update_pool2_exit(code, today, "breakdown")
-                auto_kicked.append({
-                    "ts_code": code,
-                    "name": name_map.get(code, ""),
-                    "kind": "breakdown",
-                    "close": close_price,
-                    "threshold": stop_s,
-                    "reason_label": "强止",
-                    "blacklist_label": bl_label,
-                })
+                auto_kicked.append(
+                    {
+                        "ts_code": code,
+                        "name": name_map.get(code, ""),
+                        "kind": "breakdown",
+                        "close": close_price,
+                        "threshold": stop_s,
+                        "reason_label": "强止",
+                        "blacklist_label": bl_label,
+                    }
+                )
                 logger.info(f"Pool 2 自动踢出: {code} 跌破强止 ¥{stop_s:.2f}")
             elif days > settings.pool2_max_age_days:
                 store.update_pool2_exit(code, today, "aged_out")
-                auto_kicked.append({
-                    "ts_code": code,
-                    "name": name_map.get(code, ""),
-                    "kind": "aged_out",
-                    "entry_date": entry_date,
-                    "days_in_pool": days,
-                    "threshold_days": settings.pool2_max_age_days,
-                    "blacklist_label": bl_label,
-                })
+                auto_kicked.append(
+                    {
+                        "ts_code": code,
+                        "name": name_map.get(code, ""),
+                        "kind": "aged_out",
+                        "entry_date": entry_date,
+                        "days_in_pool": days,
+                        "threshold_days": settings.pool2_max_age_days,
+                        "blacklist_label": bl_label,
+                    }
+                )
                 logger.info(
                     f"Pool 2 自动踢出: {code} 已入池 {days} 日，"
                     f"超过阈值 {settings.pool2_max_age_days}"
                 )
             elif days >= 3:
-                expired_held.append({
-                    "ts_code": code,
-                    "name": name_map.get(code, ""),
-                    "entry_date": entry_date,
-                    "days_in_pool": days,
-                    "blacklist_label": bl_label,
-                })
+                expired_held.append(
+                    {
+                        "ts_code": code,
+                        "name": name_map.get(code, ""),
+                        "entry_date": entry_date,
+                        "days_in_pool": days,
+                        "blacklist_label": bl_label,
+                    }
+                )
                 logger.info(f"Pool 2 超期保留: {code} 第 {days} 日")
         except Exception:
-            logger.exception(
-                f"check_exits 单票处理失败，跳过: {row.get('ts_code', '?')}"
-            )
+            logger.exception(f"check_exits 单票处理失败，跳过: {row.get('ts_code', '?')}")
             continue
 
     if auto_kicked or expired_held:
@@ -831,6 +821,52 @@ def _wait_for_afternoon_open() -> None:
     time.sleep(wait_seconds)
 
 
+def _publish_legacy_shadow_export(
+    *,
+    spool: object,
+    trade_date: date,
+) -> Path:
+    """Mirror the closed legacy monitor output without reopening DuckDB."""
+
+    from rquant.legacy_shadow_export import (
+        LegacyMonitorCaptureSpool,
+        publish_legacy_monitor_production_export,
+    )
+
+    if not isinstance(spool, LegacyMonitorCaptureSpool):
+        raise TypeError("legacy monitor spool has an invalid contract")
+
+    return publish_legacy_monitor_production_export(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        spool=spool,
+    )
+
+
+def _prepare_legacy_shadow_spool(
+    *,
+    store: DuckDBStore,
+    trade_date: date,
+) -> object:
+    from rquant.legacy_shadow_export import prepare_legacy_monitor_production_spool
+
+    return prepare_legacy_monitor_production_spool(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        rows=store.iter_monitor_events(trade_date.isoformat(), batch_size=1_000),
+    )
+
+
+def _recover_legacy_shadow_export(trade_date: date) -> None:
+    from rquant.legacy_shadow_export import recover_production_legacy_shadow_exports
+
+    recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        source="monitor",
+    )
+
+
 def run_monitor(interval: int = 5) -> int:
     """盘中监控主循环。"""
     from rquant.notify import notify
@@ -845,7 +881,11 @@ def run_monitor(interval: int = 5) -> int:
     # 拒绝一切新连接，整晚占锁会挡日终 research-sync / 本地研究写入。
     # 9:25 systemd 正常启动时 phase 是 pre，不受影响，_wait_for_market_open 会等到 9:30。
     if _market_phase() == "closed":
-        logger.info("已过收盘（>=15:00），不启动盘中监控，退出")
+        logger.info("已过收盘（>=15:00），仅尝试恢复既有 shadow staging")
+        try:
+            _recover_legacy_shadow_export(today)
+        except Exception:
+            logger.warning("legacy shadow monitor recovery unavailable; shadow will degrade")
         return 0
 
     with DuckDBStore() as store:
@@ -867,7 +907,6 @@ def run_monitor(interval: int = 5) -> int:
 
         ts_codes = [item.ts_code for item in watchlist]
         item_map = {item.ts_code: item for item in watchlist}
-        today_str = today.isoformat()
         triggers_summary: dict[str, int] = {}
         quote_provider: IntradayMinuteQuoteProvider | None = None
         if settings.intraday_quote_source == "akshare":
@@ -933,23 +972,25 @@ def run_monitor(interval: int = 5) -> int:
 
                     for evt in events:
                         # 存库
-                        evt_df = pd.DataFrame([{
-                            "trade_date": today,
-                            "ts_code": code,
-                            "level": evt["level"],
-                            "trigger_price": evt["trigger_price"],
-                            "level_price": evt["level_price"],
-                            "trigger_time": _now(),
-                            "trigger_type": evt["trigger_type"],
-                            "pool": item.pool,
-                            "body_upper": item.body_upper,
-                            "body_lower": item.body_lower,
-                        }])
+                        evt_df = pd.DataFrame(
+                            [
+                                {
+                                    "trade_date": today,
+                                    "ts_code": code,
+                                    "level": evt["level"],
+                                    "trigger_price": evt["trigger_price"],
+                                    "level_price": evt["level_price"],
+                                    "trigger_time": _now(),
+                                    "trigger_type": evt["trigger_type"],
+                                    "pool": item.pool,
+                                    "body_upper": item.body_upper,
+                                    "body_lower": item.body_lower,
+                                }
+                            ]
+                        )
                         store.upsert_monitor_event(evt_df)
 
-                        triggers_summary[evt["level"]] = (
-                            triggers_summary.get(evt["level"], 0) + 1
-                        )
+                        triggers_summary[evt["level"]] = triggers_summary.get(evt["level"], 0) + 1
 
                         days = _count_trading_days_since(
                             store,
@@ -983,18 +1024,6 @@ def run_monitor(interval: int = 5) -> int:
 
             time.sleep(interval)
 
-        # 收盘后：事件汇总
-        all_events = store.query_monitor_events(today_str)
-        if not all_events.empty:
-            logger.info(f"当日事件汇总: {len(all_events)} 条")
-            for _, e in all_events.iterrows():
-                logger.info(
-                    f"  {e['ts_code']} {e['level']} "
-                    f"¥{e['trigger_price']:.2f} @ {e['trigger_time']}"
-                )
-        else:
-            logger.info("当日无事件触发")
-
         # 收盘后：退出检查（Phase 4 改造为自动踢出 + 推送）
         auto_kicked_count = check_exits(store, today)
 
@@ -1004,6 +1033,29 @@ def run_monitor(interval: int = 5) -> int:
             triggers_summary=triggers_summary,
             auto_kicked_count=auto_kicked_count or 0,
         )
+
+        # DuckDB 内只分页写有界 spool；签名、rename、发布在 writer context 外执行。
+        try:
+            monitor_spool = _prepare_legacy_shadow_spool(store=store, trade_date=today)
+        except Exception:
+            monitor_spool = None
+            logger.exception("legacy shadow monitor spool unavailable; shadow will degrade")
+
+    if monitor_spool is not None:
+        try:
+            shadow_export = _publish_legacy_shadow_export(
+                spool=monitor_spool,
+                trade_date=today,
+            )
+            logger.info(f"legacy shadow monitor export: {shadow_export}")
+        except Exception:
+            logger.exception("legacy shadow monitor export unavailable; shadow will degrade")
+
+    event_count = int(getattr(monitor_spool, "records_count", 0))
+    if event_count:
+        logger.info(f"当日事件汇总: {event_count} 条")
+    else:
+        logger.info("当日无事件触发")
 
     logger.info("监控结束")
     return 0

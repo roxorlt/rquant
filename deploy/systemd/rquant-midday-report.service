@@ -12,6 +12,7 @@ WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
 Environment=TZ=Asia/Shanghai
 Environment=RQUANT_PANORAMA_SOCKS=
+Slice=rquant-live.slice
 ExecStart=/home/lighthouse/rquant/.venv/bin/rquant midday-report
 Restart=no
 TimeoutStartSec=180

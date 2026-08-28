@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.roxor.rquant-lab-scheduler</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__RQUANT_GENERATION_PYTHON__</string>
+        <string>-I</string>
+        <string>-S</string>
+        <string>__RQUANT_CODE_ROOT__/scripts/run-lab-daemon.py</string>
+        <string>--expected-checkout-root</string>
+        <string>__RQUANT_CODE_ROOT__</string>
+        <string>--expected-code-root</string>
+        <string>__RQUANT_CODE_ROOT__</string>
+        <string>--expected-commit</string>
+        <string>__RQUANT_COMMIT__</string>
+        <string>--trusted-git-path</string>
+        <string>__RQUANT_TRUSTED_GIT__</string>
+        <string>--deployment-lock-path</string>
+        <string>__RQUANT_DEPLOYMENT_LOCK__</string>
+        <string>--</string>
+        <string>__RQUANT_LAUNCHER__</string>
+        <string>lab-scheduler</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__RQUANT_CODE_ROOT__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>__RQUANT_STDOUT__</string>
+    <key>StandardErrorPath</key>
+    <string>__RQUANT_STDERR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>APP_ENV</key>
+        <string>prod</string>
+        <key>PYTHONDONTWRITEBYTECODE</key>
+        <string>1</string>
+        <key>RQUANT_DISABLE_DOTENV</key>
+        <string>1</string>
+        <key>RQUANT_TRUSTED_GIT_PATH</key>
+        <string>__RQUANT_TRUSTED_GIT__</string>
+        <key>RQUANT_RELEASE_HANDOFF_MANAGED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

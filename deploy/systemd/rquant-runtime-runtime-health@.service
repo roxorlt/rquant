@@ -1,0 +1,42 @@
+[Unit]
+Description=rQuant isolated runtime health authority publisher (%i)
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=900s
+StartLimitBurst=4
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+Slice=rquant-serving.slice
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role runtime_health_publisher --instance %i
+
+Restart=on-failure
+RestartSec=20s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+SuccessExitStatus=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/runtime-health-publishers/%i /home/lighthouse/rquant/data/runtime/control/authority-runtime-health
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/control/reference-slow-sources -/home/lighthouse/rquant/data/runtime/control/reference-slow-publishers -/home/lighthouse/rquant/data/runtime/control/auction-universe-publishers -/home/lighthouse/rquant/data/runtime/control/auction-match-sources -/home/lighthouse/rquant/data/runtime/control/artifact-catalogs -/home/lighthouse/rquant/data/runtime/control/candidates -/home/lighthouse/rquant/data/runtime/control/features -/home/lighthouse/rquant/data/runtime/control/market-minute-sources -/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources -/home/lighthouse/rquant/data/runtime/control/daily-close-sources -/home/lighthouse/rquant/data/runtime/control/daily-orchestrators -/home/lighthouse/rquant/data/runtime/control/shadow-sessions -/home/lighthouse/rquant/data/runtime/control/notifiers -/home/lighthouse/rquant/data/runtime/control/paper-brokers -/home/lighthouse/rquant/data/runtime/control/paper-constraints -/home/lighthouse/rquant/data/runtime/control/promotions-publishers -/home/lighthouse/rquant/data/runtime/control/lab-jobs-publishers -/home/lighthouse/rquant/data/runtime/control/signal-routers -/home/lighthouse/rquant/data/runtime/control/strategies
+
+StandardOutput=journal
+StandardError=journal

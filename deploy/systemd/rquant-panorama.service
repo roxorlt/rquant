@@ -5,10 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Slice=rquant-serving.slice
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
+Environment=RQUANT_PANORAMA_FAKE=
 # EnvironmentFile 先加载 .env，随后 Environment= 覆盖生效——systemd 按出现顺序处理
 # 环境赋值，同名变量后者胜（systemd.exec: 后出现的 Environment=/EnvironmentFile= 覆盖前者）。
 # 这两项是云端部署形态专属，刻意写进 unit 不污染 .env：

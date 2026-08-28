@@ -15,7 +15,10 @@ from rquant.minute_replay import (
     run_minute_strong_carry_replay,
 )
 from rquant.paper import PaperTradeConfig
+from rquant.research_run_spec import ExecutionCostSpec
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strategy_dependencies import query_bound_strategy_eligibility
+from rquant.strategy_execution_costs import apply_round_trip_execution_costs
 from rquant.volume_profile import VolumeProfileRuleConfig
 
 ProfileVariant = Literal["baseline", "vp_risk_only", "vp_90"]
@@ -43,6 +46,27 @@ def _candidate_count(
     end_date: str | date,
     preset_name: str,
 ) -> int:
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    bound = query_bound_strategy_eligibility(
+        store,
+        strategy_id="n_shape",
+        start_date=start,
+        end_date=end,
+    )
+    if bound is not None:
+        variants = (
+            ("pool1", "pool2")
+            if preset_name == "n-shape-combined"
+            else ("pool2" if preset_name == "n-shape-pool2" else "pool1",)
+        )
+        return len(
+            {
+                (record.eligibility_date, record.ts_code)
+                for record in bound
+                if record.variant in variants
+            }
+        )
     if preset_name == "n-shape-combined":
         row = store._conn.execute(
             """
@@ -55,7 +79,7 @@ def _candidate_count(
                   AND preset_name IN ('n-shape-pool1', 'n-shape-pool2')
             )
             """,
-            [_parse_date(start_date), _parse_date(end_date)],
+            [start, end],
         ).fetchone()
         return int(row[0]) if row else 0
     row = store._conn.execute(
@@ -66,7 +90,7 @@ def _candidate_count(
           AND trade_date <= ?
           AND preset_name = ?
         """,
-        [_parse_date(start_date), _parse_date(end_date), preset_name],
+        [start, end, preset_name],
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -137,8 +161,16 @@ def run_entry_mode_comparison(
     freq: MinuteFreq = "1min",
     paper_config: PaperTradeConfig | None = None,
     factor_score_threshold: float = DEFAULT_FACTOR_SCORE_THRESHOLD,
+    execution_costs: ExecutionCostSpec | None = None,
 ) -> StrategyComparisonResult:
     """按多个入场模式跑分钟 replay，并生成对比表。"""
+    if (
+        paper_config is not None
+        and paper_config.entry_slippage_pct > 0
+        and execution_costs is not None
+        and execution_costs.slippage_bps > 0
+    ):
+        raise ValueError("slippage must have exactly one owner per comparison run")
     candidates_count = _candidate_count(store, start_date, end_date, preset_name)
     trade_frames: list[pd.DataFrame] = []
     summary_rows: list[dict[str, object]] = []
@@ -158,6 +190,8 @@ def run_entry_mode_comparison(
                 volume_profile_config=_volume_profile_config(variant),
                 factor_score_threshold=factor_score_threshold,
             )
+            if execution_costs is not None:
+                trades = apply_round_trip_execution_costs(trades, execution_costs)
             if not trades.empty:
                 trades = trades.copy()
                 trades.insert(0, "profile_variant", variant)

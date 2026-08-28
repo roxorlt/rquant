@@ -6,27 +6,55 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from datetime import date, datetime
+from typing import TypeVar
 
 import pandas as pd
 import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
+from rquant.source_quota_store import (
+    SourceQuotaConflictError,
+    SourceQuotaExhaustedError,
+)
+from rquant.source_quota_transport import SourceTransportObserver
 from rquant.trade_calendar import normalize_trade_calendar
 
 # 分页取数 / 多指数循环时相邻请求间隔（对齐 dataset_backfill._API_SLEEP）
 _PAGE_SLEEP = 0.35
+_T = TypeVar("_T")
 
 
 class TushareAdapter:
     """Tushare Pro 封装。主 token 失败时自动切备用 token 重试一次。"""
 
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(
+        self,
+        token: str | None = None,
+        backup_token: str | None = None,
+        transport_observer: SourceTransportObserver | None = None,
+    ) -> None:
         self._primary_token = token or settings.tushare_token_main
-        self._backup_token = settings.tushare_token_backup
+        self._backup_token = (
+            backup_token if backup_token is not None else settings.tushare_token_backup
+        )
         self._pro = ts.pro_api(self._primary_token)
         self._using_backup = False
+        self._transport_observer = transport_observer
+
+    def bind_transport_observer(
+        self,
+        observer: SourceTransportObserver | None,
+    ) -> None:
+        self._transport_observer = observer
+
+    def _transport_call(self, api_name: str, call: Callable[[], _T]) -> _T:
+        observer = getattr(self, "_transport_observer", None)
+        if observer is None:
+            return call()
+        return observer.observe(api_name, call)
 
     def _switch_to_backup(self) -> bool:
         if self._backup_token and not self._using_backup:
@@ -52,9 +80,7 @@ class TushareAdapter:
         start_str = start.strftime("%Y%m%d")
         end_str = end.strftime("%Y%m%d")
 
-        logger.info(
-            f"Tushare daily 请求：codes={codes_str} start={start_str} end={end_str}"
-        )
+        logger.info(f"Tushare daily 请求：codes={codes_str} start={start_str} end={end_str}")
 
         try:
             df = self._pro.daily(
@@ -73,9 +99,7 @@ class TushareAdapter:
                 raise RuntimeError(f"Tushare daily 调用失败：{e}") from e
 
         if df is None or df.empty:
-            logger.warning(
-                f"Tushare daily 返回空：codes={codes_str} {start_str}-{end_str}"
-            )
+            logger.warning(f"Tushare daily 返回空：codes={codes_str} {start_str}-{end_str}")
             return pd.DataFrame()
 
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
@@ -100,9 +124,7 @@ class TushareAdapter:
         start_str = start.strftime("%Y%m%d")
         end_str = end.strftime("%Y%m%d")
 
-        logger.info(
-            f"Tushare adj_factor 请求：codes={codes_str} start={start_str} end={end_str}"
-        )
+        logger.info(f"Tushare adj_factor 请求：codes={codes_str} start={start_str} end={end_str}")
 
         try:
             df = self._pro.adj_factor(
@@ -121,9 +143,7 @@ class TushareAdapter:
                 raise RuntimeError(f"Tushare adj_factor 调用失败：{e}") from e
 
         if df is None or df.empty:
-            logger.warning(
-                f"Tushare adj_factor 返回空：codes={codes_str} {start_str}-{end_str}"
-            )
+            logger.warning(f"Tushare adj_factor 返回空：codes={codes_str} {start_str}-{end_str}")
             return pd.DataFrame()
 
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
@@ -132,10 +152,7 @@ class TushareAdapter:
         logger.info(f"Tushare adj_factor 返回 {len(df)} 行")
         return df
 
-
-    def _call_with_backoff(
-        self, api_name: str, call, max_retries: int = 6
-    ) -> pd.DataFrame | None:
+    def _call_with_backoff(self, api_name: str, call, max_retries: int = 6) -> pd.DataFrame | None:
         """回补类调用的限频退避重试（by_date / 分页 / 快照通用）。
 
         限频错误（"频率超限"）绝不切备用 token：备用是免费档，daily_basic
@@ -144,7 +161,9 @@ class TushareAdapter:
         """
         for attempt in range(1, max_retries + 1):
             try:
-                return call()
+                return self._transport_call(api_name, call)
+            except (SourceQuotaConflictError, SourceQuotaExhaustedError):
+                raise
             except Exception as e:
                 msg = str(e)
                 if attempt >= max_retries:
@@ -157,29 +176,20 @@ class TushareAdapter:
                 time.sleep(wait)
         return None
 
-    def trade_cal_raw(
-        self, start: date, end: date, exchange: str = "SSE"
-    ) -> pd.DataFrame:
+    def trade_cal_raw(self, start: date, end: date, exchange: str = "SSE") -> pd.DataFrame:
         """Return all known civil dates, including weekends and exchange holidays."""
         columns = ["exchange", "cal_date", "is_open", "pretrade_date"]
         if start > end:
             return pd.DataFrame(columns=columns)
         start_str = start.strftime("%Y%m%d")
         end_str = end.strftime("%Y%m%d")
-        logger.info(
-            f"Tushare trade_cal 请求：exchange={exchange} "
-            f"start={start_str} end={end_str}"
-        )
+        logger.info(f"Tushare trade_cal 请求：exchange={exchange} start={start_str} end={end_str}")
 
         try:
-            df = self._pro.trade_cal(
-                exchange=exchange, start_date=start_str, end_date=end_str
-            )
+            df = self._pro.trade_cal(exchange=exchange, start_date=start_str, end_date=end_str)
         except Exception as e:
             if self._switch_to_backup():
-                df = self._pro.trade_cal(
-                    exchange=exchange, start_date=start_str, end_date=end_str
-                )
+                df = self._pro.trade_cal(exchange=exchange, start_date=start_str, end_date=end_str)
             else:
                 raise RuntimeError(f"Tushare trade_cal 调用失败：{e}") from e
 
@@ -252,8 +262,7 @@ class TushareAdapter:
         )
         if frame is None or frame.empty:
             logger.warning(
-                "Tushare namechange 返回空："
-                f"{kwargs['start_date']}-{kwargs['end_date']}"
+                f"Tushare namechange 返回空：{kwargs['start_date']}-{kwargs['end_date']}"
             )
             return pd.DataFrame(columns=columns)
         normalized = frame.reindex(columns=columns).reset_index(drop=True)
@@ -305,9 +314,7 @@ class TushareAdapter:
         ds = trade_date.strftime("%Y%m%d")
         logger.info(f"Tushare daily(by_date) 请求：trade_date={ds}")
 
-        df = self._call_with_backoff(
-            "daily", lambda: self._pro.daily(trade_date=ds)
-        )
+        df = self._call_with_backoff("daily", lambda: self._pro.daily(trade_date=ds))
 
         if df is None or df.empty:
             logger.warning(f"Tushare daily 返回空：trade_date={ds}")
@@ -342,9 +349,7 @@ class TushareAdapter:
         ds = trade_date.strftime("%Y%m%d")
         logger.info(f"Tushare adj_factor(by_date) 请求：trade_date={ds}")
 
-        df = self._call_with_backoff(
-            "adj_factor", lambda: self._pro.adj_factor(trade_date=ds)
-        )
+        df = self._call_with_backoff("adj_factor", lambda: self._pro.adj_factor(trade_date=ds))
 
         if df is None or df.empty:
             logger.warning(f"Tushare adj_factor 返回空：trade_date={ds}")
@@ -382,8 +387,7 @@ class TushareAdapter:
         start_str = start.strftime("%Y-%m-%d %H:%M:%S")
         end_str = end.strftime("%Y-%m-%d %H:%M:%S")
         logger.info(
-            f"Tushare stk_mins 请求：code={ts_code} freq={freq} "
-            f"start={start_str} end={end_str}"
+            f"Tushare stk_mins 请求：code={ts_code} freq={freq} start={start_str} end={end_str}"
         )
 
         df = self._call_with_backoff(
@@ -397,10 +401,7 @@ class TushareAdapter:
         )
 
         if df is None or df.empty:
-            logger.warning(
-                f"Tushare stk_mins 返回空：code={ts_code} {freq} "
-                f"{start_str}-{end_str}"
-            )
+            logger.warning(f"Tushare stk_mins 返回空：code={ts_code} {freq} {start_str}-{end_str}")
             return pd.DataFrame()
 
         required = ["ts_code", "trade_time", "open", "high", "low", "close", "vol", "amount"]
@@ -435,16 +436,22 @@ class TushareAdapter:
         if not ts_codes:
             return pd.DataFrame(
                 columns=[
-                    "ts_code", "trade_time", "freq", "open", "high",
-                    "low", "close", "vol", "amount", "source",
+                    "ts_code",
+                    "trade_time",
+                    "freq",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "vol",
+                    "amount",
+                    "source",
                 ]
             )
 
         codes_str = ",".join(ts_codes)
         tushare_freq = freq_map[freq]
-        logger.info(
-            f"Tushare rt_min 请求：codes={codes_str} freq={tushare_freq}"
-        )
+        logger.info(f"Tushare rt_min 请求：codes={codes_str} freq={tushare_freq}")
         try:
             df = self._pro.rt_min(ts_code=codes_str, freq=tushare_freq)
         except Exception as e:
@@ -473,8 +480,18 @@ class TushareAdapter:
         out["freq"] = freq
         out["source"] = "tushare_rt"
         out = out[
-            ["ts_code", "trade_time", "freq", "open", "high", "low", "close",
-             "vol", "amount", "source"]
+            [
+                "ts_code",
+                "trade_time",
+                "freq",
+                "open",
+                "high",
+                "low",
+                "close",
+                "vol",
+                "amount",
+                "source",
+            ]
         ]
         out = out.sort_values(["ts_code", "trade_time"]).reset_index(drop=True)
         logger.info(f"Tushare rt_min 返回 {len(out)} 行")
@@ -498,28 +515,30 @@ class TushareAdapter:
         if not ts_codes:
             return pd.DataFrame(
                 columns=[
-                    "ts_code", "trade_time", "freq", "open", "high",
-                    "low", "close", "vol", "amount", "source",
+                    "ts_code",
+                    "trade_time",
+                    "freq",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "vol",
+                    "amount",
+                    "source",
                 ]
             )
 
         tushare_freq = freq_map[freq]
         frames: list[pd.DataFrame] = []
         for ts_code in ts_codes:
-            logger.info(
-                f"Tushare rt_min_daily 请求：code={ts_code} freq={tushare_freq}"
-            )
+            logger.info(f"Tushare rt_min_daily 请求：code={ts_code} freq={tushare_freq}")
             try:
                 df = self._pro.rt_min_daily(ts_code=ts_code, freq=tushare_freq)
             except Exception as e:
-                raise RuntimeError(
-                    f"Tushare rt_min_daily 调用失败：{ts_code} {e}"
-                ) from e
+                raise RuntimeError(f"Tushare rt_min_daily 调用失败：{ts_code} {e}") from e
 
             if df is None or df.empty:
-                logger.warning(
-                    f"Tushare rt_min_daily 返回空：code={ts_code} freq={tushare_freq}"
-                )
+                logger.warning(f"Tushare rt_min_daily 返回空：code={ts_code} freq={tushare_freq}")
                 continue
 
             if "ts_code" not in df.columns and "code" in df.columns:
@@ -536,18 +555,28 @@ class TushareAdapter:
             ]
             missing = set(required) - set(df.columns)
             if missing:
-                raise RuntimeError(
-                    f"Tushare rt_min_daily 返回缺字段：{sorted(missing)}"
-                )
+                raise RuntimeError(f"Tushare rt_min_daily 返回缺字段：{sorted(missing)}")
 
             out = df[required].copy()
             out["trade_time"] = pd.to_datetime(out["time"])
             out["freq"] = freq
             out["source"] = "tushare_rt_daily"
-            frames.append(out[
-                ["ts_code", "trade_time", "freq", "open", "high", "low",
-                 "close", "vol", "amount", "source"]
-            ])
+            frames.append(
+                out[
+                    [
+                        "ts_code",
+                        "trade_time",
+                        "freq",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "vol",
+                        "amount",
+                        "source",
+                    ]
+                ]
+            )
 
         if not frames:
             return pd.DataFrame()
@@ -590,9 +619,7 @@ class TushareAdapter:
             raise RuntimeError(f"Tushare stk_auction 返回缺字段：{sorted(missing)}")
 
         out = df[required].copy()
-        out["trade_date"] = pd.to_datetime(
-            out["trade_date"], format="%Y%m%d"
-        ).dt.date
+        out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d").dt.date
         out["auction_type"] = "open_realtime"
         out["source"] = "tushare"
         out = out.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
@@ -600,9 +627,7 @@ class TushareAdapter:
         logger.info(f"Tushare stk_auction 返回 {len(out)} 行")
         return out
 
-    def limit_list_by_date(
-        self, trade_date: date, limit_type: str = ""
-    ) -> pd.DataFrame:
+    def limit_list_by_date(self, trade_date: date, limit_type: str = "") -> pd.DataFrame:
         """按交易日拉涨跌停/炸板榜（limit_list_d，5000 积分，历史从 2020 起）。
 
         limit_type 空串一次拿齐 U(涨停)/D(跌停)/Z(炸板)，省请求；单次上限
@@ -615,14 +640,10 @@ class TushareAdapter:
             "float_mv,total_mv,turnover_ratio,fd_amount,first_time,last_time,"
             "open_times,up_stat,limit_times,limit"
         )
-        logger.info(
-            f"Tushare limit_list_d 请求：date={ds} limit_type={limit_type or 'ALL'}"
-        )
+        logger.info(f"Tushare limit_list_d 请求：date={ds} limit_type={limit_type or 'ALL'}")
 
         try:
-            df = self._pro.limit_list_d(
-                trade_date=ds, limit_type=limit_type, fields=fields
-            )
+            df = self._pro.limit_list_d(trade_date=ds, limit_type=limit_type, fields=fields)
         except Exception as e:
             raise RuntimeError(f"Tushare limit_list_d 调用失败：{e}") from e
 
@@ -631,19 +652,31 @@ class TushareAdapter:
             return pd.DataFrame()
 
         required = [
-            "ts_code", "trade_date", "name", "industry", "close", "pct_chg",
-            "amount", "limit_amount", "float_mv", "total_mv", "turnover_ratio",
-            "fd_amount", "first_time", "last_time", "open_times", "up_stat",
-            "limit_times", "limit",
+            "ts_code",
+            "trade_date",
+            "name",
+            "industry",
+            "close",
+            "pct_chg",
+            "amount",
+            "limit_amount",
+            "float_mv",
+            "total_mv",
+            "turnover_ratio",
+            "fd_amount",
+            "first_time",
+            "last_time",
+            "open_times",
+            "up_stat",
+            "limit_times",
+            "limit",
         ]
         missing = set(required) - set(df.columns)
         if missing:
             raise RuntimeError(f"Tushare limit_list_d 返回缺字段：{sorted(missing)}")
 
         out = df[required].copy()
-        out["trade_date"] = pd.to_datetime(
-            out["trade_date"], format="%Y%m%d"
-        ).dt.date
+        out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d").dt.date
         out = out.sort_values(["limit", "ts_code"]).reset_index(drop=True)
         logger.info(f"Tushare limit_list_d 返回 {len(out)} 行")
         return out
@@ -687,9 +720,7 @@ class TushareAdapter:
             raise RuntimeError(f"Tushare moneyflow 返回缺字段：{sorted(missing)}")
 
         out = df[required].copy()
-        out["trade_date"] = pd.to_datetime(
-            out["trade_date"], format="%Y%m%d"
-        ).dt.date
+        out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d").dt.date
         out = out.rename(
             columns={
                 "net_mf_vol": "large_net_vol",
@@ -714,9 +745,7 @@ class TushareAdapter:
         codes_str = ",".join(ts_codes)
         trade_date_str = trade_date.strftime("%Y%m%d")
 
-        logger.info(
-            f"Tushare daily_basic 请求：codes={codes_str} trade_date={trade_date_str}"
-        )
+        logger.info(f"Tushare daily_basic 请求：codes={codes_str} trade_date={trade_date_str}")
 
         try:
             df = self._pro.daily_basic(
@@ -735,9 +764,7 @@ class TushareAdapter:
                 raise RuntimeError(f"Tushare daily_basic 调用失败：{e}") from e
 
         if df is None or df.empty:
-            logger.warning(
-                f"Tushare daily_basic 返回空：codes={codes_str} date={trade_date_str}"
-            )
+            logger.warning(f"Tushare daily_basic 返回空：codes={codes_str} date={trade_date_str}")
             return pd.DataFrame()
 
         df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
@@ -752,11 +779,16 @@ class TushareAdapter:
         list_status: L=上市, D=退市, P=暂停上市
         """
         logger.info(f"Tushare stock_basic 请求：list_status={list_status}")
-        df = self._pro.stock_basic(
-            exchange="",
-            list_status=list_status,
-            fields="ts_code,symbol,name,area,industry,list_date,market",
+        df = self._call_with_backoff(
+            "stock_basic",
+            lambda: self._pro.stock_basic(
+                exchange="",
+                list_status=list_status,
+                fields=("ts_code,symbol,name,area,industry,list_date,market,list_status"),
+            ),
         )
+        if df is None:
+            return pd.DataFrame()
         logger.info(f"Tushare stock_basic 返回 {len(df)} 行")
         return df
 
@@ -772,21 +804,15 @@ class TushareAdapter:
             return pd.DataFrame()
         df = df.copy()
         if "trade_date" in df.columns:
-            df["trade_date"] = pd.to_datetime(
-                df["trade_date"], format="%Y%m%d"
-            ).dt.date
+            df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.date
         logger.info(f"Tushare {api_name} 返回 {len(df)} 行")
         return df
 
-    def _dataset_by_date(
-        self, api_name: str, trade_date: date, fields: str
-    ) -> pd.DataFrame:
+    def _dataset_by_date(self, api_name: str, trade_date: date, fields: str) -> pd.DataFrame:
         """按 trade_date 全市场取数的数据集接口共用入口。"""
         ds = trade_date.strftime("%Y%m%d")
         api = getattr(self._pro, api_name)
-        df = self._call_with_backoff(
-            api_name, lambda: api(trade_date=ds, fields=fields)
-        )
+        df = self._call_with_backoff(api_name, lambda: api(trade_date=ds, fields=fields))
         return self._finalize_dataset(api_name, df)
 
     def _dataset_paged(
@@ -809,9 +835,7 @@ class TushareAdapter:
             offset = page * page_size
             df = self._call_with_backoff(
                 api_name,
-                lambda off=offset: api(
-                    offset=off, limit=page_size, fields=fields, **params
-                ),
+                lambda off=offset: api(offset=off, limit=page_size, fields=fields, **params),
             )
             if df is None or df.empty:
                 break
@@ -820,14 +844,10 @@ class TushareAdapter:
                 break
             time.sleep(_PAGE_SLEEP)
         else:
-            raise RuntimeError(
-                f"Tushare {api_name} 分页超过 {max_pages} 页仍未拉完，疑似异常"
-            )
+            raise RuntimeError(f"Tushare {api_name} 分页超过 {max_pages} 页仍未拉完，疑似异常")
         if not frames:
             return self._finalize_dataset(api_name, None)
-        return self._finalize_dataset(
-            api_name, pd.concat(frames, ignore_index=True)
-        )
+        return self._finalize_dataset(api_name, pd.concat(frames, ignore_index=True))
 
     # ── 板块日行情 ──
 
@@ -836,9 +856,10 @@ class TushareAdapter:
         high, low, close, pre_close, avg_price, change, pct_change, vol,
         turnover_rate（无 amount）。"""
         return self._dataset_by_date(
-            "ths_daily", trade_date,
+            "ths_daily",
+            trade_date,
             fields="ts_code,trade_date,open,high,low,close,pre_close,"
-                   "avg_price,change,pct_change,vol,turnover_rate",
+            "avg_price,change,pct_change,vol,turnover_rate",
         )
 
     def dc_daily_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -846,9 +867,10 @@ class TushareAdapter:
         open, high, low, change, pct_change, vol, amount, swing,
         turnover_rate, category。"""
         return self._dataset_by_date(
-            "dc_daily", trade_date,
+            "dc_daily",
+            trade_date,
             fields="ts_code,trade_date,open,high,low,close,change,"
-                   "pct_change,vol,amount,swing,turnover_rate,category",
+            "pct_change,vol,amount,swing,turnover_rate,category",
         )
 
     # ── 板块静态 / 成分快照 ──
@@ -876,10 +898,11 @@ class TushareAdapter:
         trade_date, name, leading, leading_code, pct_change, leading_pct,
         total_mv, turnover_rate, up_num, down_num, idx_type, level。"""
         return self._dataset_by_date(
-            "dc_index", trade_date,
+            "dc_index",
+            trade_date,
             fields="ts_code,trade_date,name,leading,leading_code,pct_change,"
-                   "leading_pct,total_mv,turnover_rate,up_num,down_num,"
-                   "idx_type,level",
+            "leading_pct,total_mv,turnover_rate,up_num,down_num,"
+            "idx_type,level",
         )
 
     def dc_member_snapshot(self, trade_date: date) -> pd.DataFrame:
@@ -895,9 +918,7 @@ class TushareAdapter:
     def hm_list_snapshot(self) -> pd.DataFrame:
         """游资名录（静态快照，实测 110 行）。实测 3 字段：name, desc, orgs
         （desc 落库前由 normalize 改名 description）。"""
-        return self._dataset_paged(
-            "hm_list", fields="name,desc,orgs", page_size=2000
-        )
+        return self._dataset_paged("hm_list", fields="name,desc,orgs", page_size=2000)
 
     # ── 资金流 ──
 
@@ -911,12 +932,13 @@ class TushareAdapter:
         与 moneyflow()（monitor 用的 8 字段窄口径）并存：本方法给
         dataset_backfill 落 moneyflow_daily 全字段。"""
         return self._dataset_by_date(
-            "moneyflow", trade_date,
+            "moneyflow",
+            trade_date,
             fields="ts_code,trade_date,buy_sm_vol,buy_sm_amount,sell_sm_vol,"
-                   "sell_sm_amount,buy_md_vol,buy_md_amount,sell_md_vol,"
-                   "sell_md_amount,buy_lg_vol,buy_lg_amount,sell_lg_vol,"
-                   "sell_lg_amount,buy_elg_vol,buy_elg_amount,sell_elg_vol,"
-                   "sell_elg_amount,net_mf_vol,net_mf_amount",
+            "sell_sm_amount,buy_md_vol,buy_md_amount,sell_md_vol,"
+            "sell_md_amount,buy_lg_vol,buy_lg_amount,sell_lg_vol,"
+            "sell_lg_amount,buy_elg_vol,buy_elg_amount,sell_elg_vol,"
+            "sell_elg_amount,net_mf_vol,net_mf_amount",
         )
 
     def moneyflow_dc_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -925,11 +947,12 @@ class TushareAdapter:
         buy_elg_amount_rate, buy_lg_amount, buy_lg_amount_rate, buy_md_amount,
         buy_md_amount_rate, buy_sm_amount, buy_sm_amount_rate。"""
         return self._dataset_by_date(
-            "moneyflow_dc", trade_date,
+            "moneyflow_dc",
+            trade_date,
             fields="trade_date,ts_code,name,pct_change,close,net_amount,"
-                   "net_amount_rate,buy_elg_amount,buy_elg_amount_rate,"
-                   "buy_lg_amount,buy_lg_amount_rate,buy_md_amount,"
-                   "buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate",
+            "net_amount_rate,buy_elg_amount,buy_elg_amount_rate,"
+            "buy_lg_amount,buy_lg_amount_rate,buy_md_amount,"
+            "buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate",
         )
 
     def moneyflow_ths_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -938,11 +961,12 @@ class TushareAdapter:
         buy_lg_amount_rate, buy_md_amount, buy_md_amount_rate, buy_sm_amount,
         buy_sm_amount_rate。"""
         return self._dataset_by_date(
-            "moneyflow_ths", trade_date,
+            "moneyflow_ths",
+            trade_date,
             fields="trade_date,ts_code,name,pct_change,latest,net_amount,"
-                   "net_d5_amount,buy_lg_amount,buy_lg_amount_rate,"
-                   "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
-                   "buy_sm_amount_rate",
+            "net_d5_amount,buy_lg_amount,buy_lg_amount_rate,"
+            "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
+            "buy_sm_amount_rate",
         )
 
     def moneyflow_ind_ths_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -950,10 +974,11 @@ class TushareAdapter:
         lead_stock, close, pct_change, company_num, pct_change_stock,
         close_price, net_buy_amount, net_sell_amount, net_amount。"""
         return self._dataset_by_date(
-            "moneyflow_ind_ths", trade_date,
+            "moneyflow_ind_ths",
+            trade_date,
             fields="trade_date,ts_code,industry,lead_stock,close,pct_change,"
-                   "company_num,pct_change_stock,close_price,net_buy_amount,"
-                   "net_sell_amount,net_amount",
+            "company_num,pct_change_stock,close_price,net_buy_amount,"
+            "net_sell_amount,net_amount",
         )
 
     def moneyflow_ind_dc_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -963,12 +988,13 @@ class TushareAdapter:
         buy_md_amount, buy_md_amount_rate, buy_sm_amount, buy_sm_amount_rate,
         buy_sm_amount_stock, rank（rank 落库前由 normalize 改名）。"""
         return self._dataset_by_date(
-            "moneyflow_ind_dc", trade_date,
+            "moneyflow_ind_dc",
+            trade_date,
             fields="trade_date,content_type,ts_code,name,pct_change,close,"
-                   "net_amount,net_amount_rate,buy_elg_amount,"
-                   "buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
-                   "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
-                   "buy_sm_amount_rate,buy_sm_amount_stock,rank",
+            "net_amount,net_amount_rate,buy_elg_amount,"
+            "buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
+            "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
+            "buy_sm_amount_rate,buy_sm_amount_stock,rank",
         )
 
     def moneyflow_cnt_ths_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -976,10 +1002,11 @@ class TushareAdapter:
         lead_stock, close_price, pct_change, industry_index, company_num,
         pct_change_stock, net_buy_amount, net_sell_amount, net_amount。"""
         return self._dataset_by_date(
-            "moneyflow_cnt_ths", trade_date,
+            "moneyflow_cnt_ths",
+            trade_date,
             fields="trade_date,ts_code,name,lead_stock,close_price,pct_change,"
-                   "industry_index,company_num,pct_change_stock,"
-                   "net_buy_amount,net_sell_amount,net_amount",
+            "industry_index,company_num,pct_change_stock,"
+            "net_buy_amount,net_sell_amount,net_amount",
         )
 
     def moneyflow_mkt_dc_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -988,12 +1015,13 @@ class TushareAdapter:
         buy_elg_amount, buy_elg_amount_rate, buy_lg_amount, buy_lg_amount_rate,
         buy_md_amount, buy_md_amount_rate, buy_sm_amount, buy_sm_amount_rate。"""
         return self._dataset_by_date(
-            "moneyflow_mkt_dc", trade_date,
+            "moneyflow_mkt_dc",
+            trade_date,
             fields="trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,"
-                   "net_amount,net_amount_rate,buy_elg_amount,"
-                   "buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
-                   "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
-                   "buy_sm_amount_rate",
+            "net_amount,net_amount_rate,buy_elg_amount,"
+            "buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
+            "buy_md_amount,buy_md_amount_rate,buy_sm_amount,"
+            "buy_sm_amount_rate",
         )
 
     # ── 龙虎榜 ──
@@ -1003,19 +1031,20 @@ class TushareAdapter:
         close, pct_change, turnover_rate, amount, l_sell, l_buy, l_amount,
         net_amount, net_rate, amount_rate, float_values, reason。"""
         return self._dataset_by_date(
-            "top_list", trade_date,
+            "top_list",
+            trade_date,
             fields="trade_date,ts_code,name,close,pct_change,turnover_rate,"
-                   "amount,l_sell,l_buy,l_amount,net_amount,net_rate,"
-                   "amount_rate,float_values,reason",
+            "amount,l_sell,l_buy,l_amount,net_amount,net_rate,"
+            "amount_rate,float_values,reason",
         )
 
     def top_inst_by_date(self, trade_date: date) -> pd.DataFrame:
         """龙虎榜机构席位明细。实测 10 字段：trade_date, ts_code, exalter,
         buy, buy_rate, sell, sell_rate, net_buy, side, reason。"""
         return self._dataset_by_date(
-            "top_inst", trade_date,
-            fields="trade_date,ts_code,exalter,buy,buy_rate,sell,sell_rate,"
-                   "net_buy,side,reason",
+            "top_inst",
+            trade_date,
+            fields="trade_date,ts_code,exalter,buy,buy_rate,sell,sell_rate,net_buy,side,reason",
         )
 
     # ── 其他榜单 / 统计 ──
@@ -1027,12 +1056,13 @@ class TushareAdapter:
         bid_pct_chg, rt_pct_chg, limit_order, amount, turnover_rate,
         free_float, lu_limit_order。"""
         return self._dataset_by_date(
-            "kpl_list", trade_date,
+            "kpl_list",
+            trade_date,
             fields="ts_code,name,trade_date,lu_time,ld_time,open_time,"
-                   "last_time,lu_desc,tag,theme,net_change,bid_amount,status,"
-                   "bid_change,bid_turnover,lu_bid_vol,pct_chg,bid_pct_chg,"
-                   "rt_pct_chg,limit_order,amount,turnover_rate,free_float,"
-                   "lu_limit_order",
+            "last_time,lu_desc,tag,theme,net_change,bid_amount,status,"
+            "bid_change,bid_turnover,lu_bid_vol,pct_chg,bid_pct_chg,"
+            "rt_pct_chg,limit_order,amount,turnover_rate,free_float,"
+            "lu_limit_order",
         )
 
     def daily_info_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -1040,15 +1070,20 @@ class TushareAdapter:
         ts_code, ts_name, com_count, total_share, float_share, total_mv,
         float_mv, amount, vol, trans_count, pe, tr, exchange。"""
         return self._dataset_by_date(
-            "daily_info", trade_date,
+            "daily_info",
+            trade_date,
             fields="trade_date,ts_code,ts_name,com_count,total_share,"
-                   "float_share,total_mv,float_mv,amount,vol,trans_count,"
-                   "pe,tr,exchange",
+            "float_share,total_mv,float_mv,amount,vol,trans_count,"
+            "pe,tr,exchange",
         )
 
     # 主要指数白名单：上证/深成/创业板/科创50/北证50
     MAJOR_INDEXES: tuple[str, ...] = (
-        "000001.SH", "399001.SZ", "399006.SZ", "000688.SH", "899050.BJ",
+        "000001.SH",
+        "399001.SZ",
+        "399006.SZ",
+        "000688.SH",
+        "899050.BJ",
     )
 
     def index_daily_major_by_date(self, trade_date: date) -> pd.DataFrame:
@@ -1057,23 +1092,16 @@ class TushareAdapter:
         amount。实测不支持多代码合并请求，逐指数各打 1 次（5 次/日）；
         单指数为空容错跳过（如 899050.BJ 在 2022-11 上市前）。"""
         ds = trade_date.strftime("%Y%m%d")
-        fields = (
-            "ts_code,trade_date,open,high,low,close,pre_close,"
-            "change,pct_chg,vol,amount"
-        )
+        fields = "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount"
         frames: list[pd.DataFrame] = []
         for code in self.MAJOR_INDEXES:
             df = self._call_with_backoff(
                 "index_daily",
-                lambda c=code: self._pro.index_daily(
-                    ts_code=c, trade_date=ds, fields=fields
-                ),
+                lambda c=code: self._pro.index_daily(ts_code=c, trade_date=ds, fields=fields),
             )
             if df is not None and not df.empty:
                 frames.append(df)
             time.sleep(_PAGE_SLEEP)
         if not frames:
             return self._finalize_dataset("index_daily", None)
-        return self._finalize_dataset(
-            "index_daily", pd.concat(frames, ignore_index=True)
-        )
+        return self._finalize_dataset("index_daily", pd.concat(frames, ignore_index=True))

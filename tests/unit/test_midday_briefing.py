@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ import pandas as pd
 import pytest
 
 from rquant import midday_briefing as mb
+from rquant import panorama_data
 from rquant.midday_briefing import (
     CandidateStock,
     DigestView,
@@ -23,6 +25,7 @@ from rquant.midday_briefing import (
     compute_board_ladder,
     compute_pulse_view,
     compute_theme_ladder_summaries,
+    compute_volume_anomalies,
     render_digest,
     render_pulse,
     resolve_slot,
@@ -46,6 +49,12 @@ def mk_snapshot(rows: list[dict]) -> pd.DataFrame:
             row["limit_down_price"] = round(row["pre_close"] * 0.9, 2)
         filled.append(row)
     return pd.DataFrame(filled, columns=_SNAP_COLS)
+
+
+@pytest.fixture(autouse=True)
+def _panorama_test_fixtures() -> Iterator[None]:
+    with panorama_data._panorama_test_fixtures():
+        yield
 
 
 # ── U1 槽位归属 ─────────────────────────────────────────────────────────────────
@@ -446,6 +455,42 @@ class TestPulseThemeLeaders:
 
 
 class TestU5CandidatePool:
+    def test_volume_anomalies_unmatched_avg20_codes_return_empty_without_network(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "300001.SZ", "price": 10.5, "pre_close": 10.0, "pct_chg": 5,
+             "volume": 1e7, "amount": 1e8, "limit_up_price": 12.0},
+        ])
+        avg20 = pd.DataFrame([{"ts_code": "300002.SZ", "avg_amount_20d": 1e5}])
+        fetch_snapshot = MagicMock(side_effect=AssertionError("network fallback must not run"))
+        sleep = MagicMock(side_effect=AssertionError("retry sleep must not run"))
+        monkeypatch.setattr(mb, "fetch_market_snapshot", fetch_snapshot)
+        monkeypatch.setattr(mb, "_sleep", sleep)
+
+        assert compute_volume_anomalies(snapshot, avg20) == []
+        fetch_snapshot.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_candidate_pool_unmatched_avg20_codes_return_empty_without_network(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "300001.SZ", "price": 10.5, "pre_close": 10.0, "pct_chg": 5,
+             "volume": 1e7, "amount": 1e8, "limit_up_price": 12.0},
+        ])
+        avg20 = pd.DataFrame([{"ts_code": "300002.SZ", "avg_amount_20d": 1e5}])
+        fetch_snapshot = MagicMock(side_effect=AssertionError("network fallback must not run"))
+        sleep = MagicMock(side_effect=AssertionError("retry sleep must not run"))
+        monkeypatch.setattr(mb, "fetch_market_snapshot", fetch_snapshot)
+        monkeypatch.setattr(mb, "_sleep", sleep)
+
+        assert build_candidate_pool(snapshot, avg20, {}) == []
+        fetch_snapshot.assert_not_called()
+        sleep.assert_not_called()
+
     def test_unit_conversion_1000x_trap(self) -> None:
         # amount=1e8 元、avg_amount_20d=5e5 千元(=5e8 元) → 正确量比 0.2 < 0.8 应排除；
         # 若漏掉 ×1000（拿 5e5 当元）量比会变 200 被错误纳入 → 借此验证换算生效

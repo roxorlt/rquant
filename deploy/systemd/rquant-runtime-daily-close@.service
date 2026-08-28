@@ -1,0 +1,46 @@
+[Unit]
+Description=rQuant isolated daily-close source (%i)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=3600s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+LoadCredentialEncrypted=capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/%i/current.cred
+Slice=rquant-live.slice
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role daily_close_source --instance %i
+
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=300s
+TimeoutStopSec=60s
+SuccessExitStatus=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/daily-close-sources/%i /home/lighthouse/rquant/data/runtime/live/daily-close
+
+StandardOutput=journal
+StandardError=journal
+
+# Cloud deployment gate: systemd-analyze verify rquant-runtime-daily-close@.service

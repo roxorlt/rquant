@@ -1,0 +1,13 @@
+[Unit]
+Description=Check whether the isolated rQuant recovery rehearsal is due for generation %i
+
+[Timer]
+# Deploy gate: cloud must pass:
+# systemd-analyze calendar 'hourly' --iterations 5
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+Unit=rquant-runtime-recovery-rehearsal@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -25,7 +27,13 @@ from typing import Literal
 from loguru import logger
 
 from rquant.config import settings
-
+from rquant.daily_receipt_socket_authority import (
+    probe_daily_receipt_authority_identity,
+)
+from rquant.runtime_deployment_preflight import (
+    RuntimeDeploymentInspection,
+    inspect_runtime_deployment,
+)
 
 CheckStatus = Literal["ok", "warn", "fail", "skip"]
 
@@ -44,9 +52,12 @@ SERVICES_TO_CHECK = [
     "rquant-monitor-watchdog.timer",
     "rquant-daily.timer",
     "rquant-dashboard.service",
+    "rquant-page-control.service",
     "rquant-nl-screen.service",
     "rquant-backup.timer",
     "rquant-daily-report.timer",
+    "rquant-daily-receipt-signer.socket",
+    "rquant-daily-receipt-signer.service",
 ]
 
 
@@ -64,14 +75,21 @@ def check_duckdb_lock(path: Path) -> CheckResult:
         return CheckResult("duckdb_lock", "warn", f"DuckDB 文件不存在: {path}")
     try:
         r = subprocess.run(
-            ["lsof", str(path)], capture_output=True, text=True, timeout=5,
+            ["lsof", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except subprocess.TimeoutExpired:
         return CheckResult("duckdb_lock", "fail", "lsof 5s 超时")
 
     # lsof 无持有者时退出码 1 + 空 stdout，正常
     if r.returncode not in (0, 1):
-        return CheckResult("duckdb_lock", "fail", f"lsof exit={r.returncode}: {r.stderr.strip()[:80]}")
+        return CheckResult(
+            "duckdb_lock",
+            "fail",
+            f"lsof exit={r.returncode}: {r.stderr.strip()[:80]}",
+        )
 
     rw_holders: list[str] = []
     ro_holders: list[str] = []
@@ -90,16 +108,19 @@ def check_duckdb_lock(path: Path) -> CheckResult:
 
     if len(rw_holders) > 1:
         return CheckResult(
-            "duckdb_lock", "fail",
+            "duckdb_lock",
+            "fail",
             f"{len(rw_holders)} 个写锁持有者：{', '.join(rw_holders)} — monitor 启动会撞锁",
         )
     if len(rw_holders) == 1:
         return CheckResult(
-            "duckdb_lock", "ok",
+            "duckdb_lock",
+            "ok",
             f"RW: {rw_holders[0]} + RO: {len(ro_holders)} 个",
         )
     return CheckResult(
-        "duckdb_lock", "ok",
+        "duckdb_lock",
+        "ok",
         f"无写锁（monitor 未跑），RO 持有: {len(ro_holders)} 个",
     )
 
@@ -110,8 +131,8 @@ def check_disk_space(path: Path, warn_gb: float = 5.0) -> CheckResult:
     if not target.exists():
         return CheckResult("disk", "fail", f"路径不存在: {path}")
     usage = shutil.disk_usage(target)
-    free_gb = usage.free / (1024 ** 3)
-    total_gb = usage.total / (1024 ** 3)
+    free_gb = usage.free / (1024**3)
+    total_gb = usage.total / (1024**3)
     pct_used = usage.used / usage.total * 100
     msg = f"剩余 {free_gb:.1f}GB / {total_gb:.0f}GB ({pct_used:.0f}% 已用)"
     if free_gb < warn_gb:
@@ -153,16 +174,15 @@ def check_tushare_credits(token: str | None, warn_threshold: int = 500) -> Check
             # 取最早的到期时间（多行付费包可能不同到期）
             expire = ""
             if "到期时间" in df.columns:
-                try:
+                with suppress(Exception):
                     expire = str(df["到期时间"].min())[:10]
-                except Exception:
-                    pass
             expire_msg = f"，{expire} 到期" if expire else ""
             n_rows = len(df)
             rows_msg = f"（{n_rows} 个积分包合计）" if n_rows > 1 else ""
             if pts < warn_threshold:
                 return CheckResult(
-                    "tushare", "warn",
+                    "tushare",
+                    "warn",
                     f"{pts} 积分{rows_msg} (低于阈值 {warn_threshold}){expire_msg}",
                 )
             return CheckResult("tushare", "ok", f"{pts} 积分{rows_msg}{expire_msg}")
@@ -184,7 +204,9 @@ def check_systemd_services(units: list[str]) -> list[CheckResult]:
         try:
             r = subprocess.run(
                 ["systemctl", "is-active", unit],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
         except subprocess.TimeoutExpired:
             results.append(CheckResult(f"svc:{unit}", "fail", "systemctl 超时"))
@@ -202,8 +224,54 @@ def check_systemd_services(units: list[str]) -> list[CheckResult]:
     return results
 
 
+def check_daily_receipt_authority_identity() -> CheckResult:
+    """Authenticate the source SHA served by the fixed root signer socket."""
+
+    if not shutil.which("systemctl"):
+        return CheckResult(
+            "daily_receipt_authority_identity",
+            "skip",
+            "无 systemctl（mac 本地 dev）",
+        )
+    try:
+        identity = probe_daily_receipt_authority_identity(
+            timeout_seconds=2.0,
+            max_attempts=1,
+        )
+    except Exception as exc:
+        return CheckResult(
+            "daily_receipt_authority_identity",
+            "fail",
+            f"identity probe 失败: {type(exc).__name__}: {str(exc)[:160]}",
+        )
+    return CheckResult(
+        "daily_receipt_authority_identity",
+        "ok",
+        f"running_sha={identity.source_sha256} key={identity.key_id}",
+    )
+
+
+def runtime_deployment_service_checks(
+    runtime_root: Path,
+) -> tuple[RuntimeDeploymentInspection, CheckResult]:
+    inspection = inspect_runtime_deployment(runtime_root)
+    return (
+        inspection,
+        CheckResult(
+            "watchlist_quote_runtime",
+            inspection.status,
+            "{}; inventory={}".format(
+                inspection.summary,
+                ",".join(inspection.inventory_units) or "none",
+            ),
+        ),
+    )
+
+
 def check_recent_errors(
-    units: list[str], hours: int = 24, warn_count: int = 10,
+    units: list[str],
+    hours: int = 24,
+    warn_count: int = 10,
 ) -> CheckResult:
     """journalctl 扫近 hours 小时各 unit 的 priority>=err 条数。"""
     if not shutil.which("journalctl"):
@@ -213,11 +281,18 @@ def check_recent_errors(
         try:
             r = subprocess.run(
                 [
-                    "journalctl", "-u", unit,
+                    "journalctl",
+                    "-u",
+                    unit,
                     f"--since={hours} hours ago",
-                    "-p", "err", "--no-pager", "--quiet",
+                    "-p",
+                    "err",
+                    "--no-pager",
+                    "--quiet",
                 ],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except subprocess.TimeoutExpired:
             logger.warning(f"journalctl -u {unit} 超时，跳过此 unit")
@@ -227,7 +302,8 @@ def check_recent_errors(
         total += len(lines)
     if total >= warn_count:
         return CheckResult(
-            "recent_errors", "warn",
+            "recent_errors",
+            "warn",
             f"近 {hours}h ERROR {total} 条 (阈值 {warn_count})",
         )
     return CheckResult("recent_errors", "ok", f"近 {hours}h ERROR {total} 条")
@@ -236,14 +312,24 @@ def check_recent_errors(
 # ---------- 聚合 + 输出 ----------
 
 
-def run_all_checks() -> list[CheckResult]:
+def run_all_checks(*, runtime_root: Path | None = None) -> list[CheckResult]:
     """跑所有体检，返回结果列表。"""
+    resolved_runtime_root = runtime_root or Path(
+        os.environ.get("RQUANT_RUNTIME_ROOT", str(settings.data_dir / "runtime"))
+    )
+    runtime_inspection, runtime_result = runtime_deployment_service_checks(resolved_runtime_root)
+    systemd_units = list(
+        dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.strict_authority_units))
+    )
+    journal_units = list(dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.inventory_units)))
     results: list[CheckResult] = []
     results.append(check_duckdb_lock(settings.duckdb_path))
     results.append(check_disk_space(settings.duckdb_path.parent))
     results.append(check_tushare_credits(settings.tushare_token_main))
-    results.extend(check_systemd_services(SERVICES_TO_CHECK))
-    results.append(check_recent_errors(SERVICES_TO_CHECK))
+    results.extend(check_systemd_services(systemd_units))
+    results.append(runtime_result)
+    results.append(check_daily_receipt_authority_identity())
+    results.append(check_recent_errors(journal_units))
     return results
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -402,14 +402,31 @@ def _security_status_from_row(row: tuple[object, ...]) -> SecurityStatusDaily:
 
 
 class DuckDBStore:
-    def __init__(self, path: Path | None = None, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        read_only: bool = False,
+        artifact_terminal_hook: Callable[[str, str, datetime], None] | None = None,
+    ) -> None:
         self.path = path or settings.duckdb_path
+        self._artifact_terminal_hook = artifact_terminal_hook
         self._conn = duckdb.connect(str(self.path), read_only=read_only)
         if not read_only:
             self._init_schema()
 
     def _init_schema(self) -> None:
         initialize_schema(self._conn)
+
+    def _emit_artifact_terminal(
+        self,
+        *,
+        owner_type: str,
+        owner_id: str,
+        observed_at: datetime,
+    ) -> None:
+        if self._artifact_terminal_hook is not None:
+            self._artifact_terminal_hook(owner_type, owner_id, observed_at)
 
     def list_daily_security_keys(
         self,
@@ -1106,6 +1123,12 @@ class DuckDBStore:
             )
             if current != expected:
                 raise ValueError(f"completed data audit run is immutable: {audit_run_id}")
+            assert current.completed_at is not None
+            self._emit_artifact_terminal(
+                owner_type="audit",
+                owner_id=audit_run_id,
+                observed_at=current.completed_at,
+            )
             return current
         if current.status != "running":
             raise ValueError(f"failed data audit run cannot be finalized: {audit_run_id}")
@@ -1127,6 +1150,12 @@ class DuckDBStore:
         stored = self.get_data_audit_run(audit_run_id)
         if stored != finalized:
             raise RuntimeError(f"data audit finalization lost update: {audit_run_id}")
+        assert stored is not None and stored.completed_at is not None
+        self._emit_artifact_terminal(
+            owner_type="audit",
+            owner_id=audit_run_id,
+            observed_at=stored.completed_at,
+        )
         return stored
 
     def fail_data_audit_run(
@@ -1140,6 +1169,12 @@ class DuckDBStore:
         if current is None:
             raise KeyError(f"data audit run not found: {audit_run_id}")
         if current.status != "running":
+            if current.completed_at is not None:
+                self._emit_artifact_terminal(
+                    owner_type="audit",
+                    owner_id=audit_run_id,
+                    observed_at=current.completed_at,
+                )
             return current
         failed = DataAuditRun.model_validate(
             {
@@ -1160,6 +1195,12 @@ class DuckDBStore:
         stored = self.get_data_audit_run(audit_run_id)
         if stored != failed:
             raise RuntimeError(f"data audit failure update lost: {audit_run_id}")
+        assert stored is not None and stored.completed_at is not None
+        self._emit_artifact_terminal(
+            owner_type="audit",
+            owner_id=audit_run_id,
+            observed_at=stored.completed_at,
+        )
         return stored
 
     def latest_completed_data_audit_run(
@@ -1319,6 +1360,12 @@ class DuckDBStore:
                     )
                 self._conn.execute("COMMIT")
                 transaction_open = False
+                assert existing.completed_at is not None
+                self._emit_artifact_terminal(
+                    owner_type="snapshot",
+                    owner_id=snapshot_id,
+                    observed_at=existing.completed_at,
+                )
                 return existing
             try:
                 updated = self._conn.execute(
@@ -1357,6 +1404,12 @@ class DuckDBStore:
                 )
             self._conn.execute("COMMIT")
             transaction_open = False
+            assert finalized.completed_at is not None
+            self._emit_artifact_terminal(
+                owner_type="snapshot",
+                owner_id=snapshot_id,
+                observed_at=finalized.completed_at,
+            )
             return finalized
         except Exception:
             if transaction_open:
@@ -2562,6 +2615,43 @@ class DuckDBStore:
             """,
             [trade_date],
         ).fetchdf()
+
+    def iter_monitor_events(
+        self,
+        trade_date: str,
+        *,
+        batch_size: int = 1_000,
+    ) -> Iterator[Mapping[str, object]]:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("monitor event batch_size must be a positive integer")
+        columns = (
+            "trade_date",
+            "ts_code",
+            "level",
+            "trigger_price",
+            "level_price",
+            "trigger_time",
+            "trigger_type",
+            "pool",
+            "body_upper",
+            "body_lower",
+        )
+        cursor = self._conn.execute(
+            """
+            SELECT trade_date, ts_code, level, trigger_price, level_price,
+                   trigger_time, trigger_type, pool, body_upper, body_lower
+            FROM monitor_event
+            WHERE strftime(trade_date, '%Y-%m-%d') = ?
+            ORDER BY trigger_time, ts_code, level
+            """,
+            [trade_date],
+        )
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                return
+            for row in rows:
+                yield dict(zip(columns, row, strict=True))
 
     # ── auction_bar / minute_bar / intraday research ──
 

@@ -1,0 +1,13 @@
+[Unit]
+Description=rQuant Aggregate Workload Budget
+
+[Slice]
+CPUAccounting=true
+CPUWeight=100
+IOAccounting=true
+IOWeight=100
+MemoryAccounting=true
+MemoryLow=3072M
+MemoryHigh=6144M
+TasksAccounting=true
+TasksMax=1024

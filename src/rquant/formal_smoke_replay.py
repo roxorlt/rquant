@@ -10,12 +10,19 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
 from rquant.auction_gap_strategy import AuctionGapMinuteReplayConfig
+from rquant.authority_path_security import AuthorityPathSecurityError
 from rquant.dashboard.strategy_lab_runs import (
     _canonical_json_bytes,
     _hash_json_value,
+    _result_hash,
     _strategy_spec_hash,
     build_strategy_lab_run,
     save_strategy_lab_run,
+)
+from rquant.formal_smoke_protocol import (
+    FormalSmokeReplayRequest,
+    FormalSmokeReplayResult,
+    FormalSmokeStrategy,
 )
 from rquant.growth_board_surge_strategy import GrowthBoardSurgeConfig
 from rquant.minute_replay import DEFAULT_FACTOR_SCORE_THRESHOLD
@@ -25,19 +32,15 @@ from rquant.research_gate import (
     build_gate_research_manifest,
     open_gated_research_store,
 )
+from rquant.research_manifest import require_formal_research_manifest
+from rquant.runtime_code_attestation import CodeTrustEvidence
+from rquant.runtime_code_generation import RuntimeCodeGenerationError
 
-FormalSmokeStrategy = Literal[
-    "n_shape",
-    "growth_board_surge",
-    "auction_gap",
-]
 FormalSmokeRunType = Literal[
     "n_shape_compare",
     "growth_board_surge",
     "auction_gap",
 ]
-_HASH_PATTERN = r"^[0-9a-f]{64}$"
-_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 
 
 class FormalSmokeSpec(BaseModel):
@@ -75,39 +78,6 @@ class FormalSmokeSpec(BaseModel):
         }
 
 
-class FormalSmokeReplayRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    strategy: FormalSmokeStrategy
-    start_date: date
-    end_date: date
-    audit_run_id: str
-    dataset_snapshot_id: str
-    dataset_binding_hash: str
-    code_commit: str
-
-    @model_validator(mode="after")
-    def validate_request(self) -> FormalSmokeReplayRequest:
-        if self.start_date > self.end_date:
-            raise ValueError("formal smoke start_date cannot be after end_date")
-        import re
-
-        for field_name in (
-            "audit_run_id",
-            "dataset_snapshot_id",
-            "dataset_binding_hash",
-        ):
-            if re.fullmatch(_HASH_PATTERN, getattr(self, field_name)) is None:
-                raise ValueError(
-                    f"formal smoke {field_name} must be a 64-character hash"
-                )
-        if re.fullmatch(_COMMIT_PATTERN, self.code_commit) is None:
-            raise ValueError(
-                "formal smoke code_commit must be a clean 40-character commit"
-            )
-        return self
-
-
 class FormalSmokeComputation(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -118,26 +88,6 @@ class FormalSmokeComputation(BaseModel):
     metrics: dict[str, Any]
     tables: dict[str, pd.DataFrame]
     sample_count: int
-
-
-class FormalSmokeReplayResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    status: Literal["comparable"] = "comparable"
-    strategy: FormalSmokeStrategy
-    fixed_spec_version: Literal["stage1-smoke-v1"]
-    run_id: str
-    audit_run_id: str
-    dataset_snapshot_id: str
-    dataset_binding_hash: str
-    code_commit: str
-    strategy_spec_hash: str
-    result_hash: str
-    sample_count: int
-    metrics: dict[str, Any]
-    missing_evidence: tuple[str, ...]
-    json_path: Path
-    markdown_path: Path
 
 
 def _n_shape_parameters() -> dict[str, Any]:
@@ -220,9 +170,7 @@ def _execute_formal_smoke_spec(
         return _execute_growth_board_surge(store, spec)
     if spec.strategy == "auction_gap":
         return _execute_auction_gap(store, spec)
-    raise ValueError(
-        f"unsupported formal smoke strategy: {spec.strategy}"
-    )
+    raise ValueError(f"unsupported formal smoke strategy: {spec.strategy}")
 
 
 def _return_metrics(
@@ -273,9 +221,7 @@ def _execute_n_shape(
         max_hold_days=int(parameters["max_hold_days"]),
         freq=str(parameters["freq"]),
         paper_config=PaperTradeConfig.model_validate(parameters["paper"]),
-        factor_score_threshold=float(
-            parameters["factor_score_threshold"]
-        ),
+        factor_score_threshold=float(parameters["factor_score_threshold"]),
     )
     mean_ret_pct, win_rate_pct = _return_metrics(result.trades)
     return FormalSmokeComputation(
@@ -370,9 +316,7 @@ def _verify_gate_evidence(
     decision: object,
 ) -> None:
     if not decision.allowed or decision.research_status != "comparable":
-        raise PermissionError(
-            "formal smoke gate did not return comparable research status"
-        )
+        raise PermissionError("formal smoke gate did not return comparable research status")
     expected = {
         "audit_run_id": request.audit_run_id,
         "dataset_snapshot_id": request.dataset_snapshot_id,
@@ -380,16 +324,30 @@ def _verify_gate_evidence(
     }
     for field_name, expected_value in expected.items():
         if getattr(decision, field_name) != expected_value:
-            raise PermissionError(
-                f"formal smoke gate {field_name} does not match request"
-            )
+            raise PermissionError(f"formal smoke gate {field_name} does not match request")
+
+
+def _require_runtime_code_evidence(
+    request: FormalSmokeReplayRequest,
+) -> CodeTrustEvidence:
+    capability = request.runtime_capability
+    try:
+        capability.require_live()
+    except (AuthorityPathSecurityError, RuntimeCodeGenerationError) as exc:
+        raise PermissionError("formal smoke runtime capability is invalid") from exc
+    evidence = capability.evidence
+    if evidence.provenance_commit != request.code_commit:
+        raise PermissionError("formal smoke code_commit does not match runtime capability")
+    return evidence
 
 
 def run_formal_smoke_replay(
     request: FormalSmokeReplayRequest,
     *,
     base_dir: Path | None = None,
+    staging_base_dir: Path | None = None,
 ) -> FormalSmokeReplayResult:
+    code_trust_evidence = _require_runtime_code_evidence(request)
     spec = build_formal_smoke_spec(
         request.strategy,
         start_date=request.start_date,
@@ -407,7 +365,12 @@ def run_formal_smoke_replay(
     )
     with open_gated_research_store(gate_request) as (store, decision):
         _verify_gate_evidence(request, decision)
+        if _require_runtime_code_evidence(request) != code_trust_evidence:
+            raise PermissionError("formal smoke runtime capability evidence changed")
         computation = _execute_formal_smoke_spec(store, spec)
+
+    if _require_runtime_code_evidence(request) != code_trust_evidence:
+        raise PermissionError("formal smoke runtime capability evidence changed")
 
     if "formal_evidence" in computation.tables:
         raise ValueError("formal smoke computation uses reserved evidence table")
@@ -418,14 +381,27 @@ def run_formal_smoke_replay(
                 "dataset_snapshot_id": request.dataset_snapshot_id,
                 "dataset_binding_hash": request.dataset_binding_hash,
                 "code_commit": request.code_commit,
+                "code_trust_evidence": code_trust_evidence.model_dump(mode="json"),
             }
         ]
     )
-    tables = _canonicalize_formal_tables({
-        **computation.tables,
-        "formal_evidence": evidence,
-    })
-    manifest = build_gate_research_manifest(gate_request, decision)
+    tables = _canonicalize_formal_tables(
+        {
+            **computation.tables,
+            "formal_evidence": evidence,
+        }
+    )
+    manifest = build_gate_research_manifest(
+        gate_request,
+        decision,
+        code_trust_evidence=code_trust_evidence,
+        strategy_spec_hash=spec.spec_hash,
+        result_hash=_result_hash(computation.metrics, tables),
+    )
+    require_formal_research_manifest(
+        manifest,
+        capability=request.runtime_capability,
+    )
     title = (
         f"Stage 1 {request.strategy} formal smoke "
         f"{request.start_date.isoformat()} to {request.end_date.isoformat()}"
@@ -440,6 +416,7 @@ def run_formal_smoke_replay(
             manifest=manifest,
         ),
         base_dir=base_dir,
+        staging_base_dir=staging_base_dir,
     )
     strategy_spec_hash = saved.manifest.strategy_spec_hash
     result_hash = saved.manifest.result_hash

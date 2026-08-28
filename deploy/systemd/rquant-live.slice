@@ -1,0 +1,13 @@
+[Unit]
+Description=rQuant Live Workload Plane
+
+[Slice]
+CPUAccounting=true
+CPUWeight=1000
+IOAccounting=true
+IOWeight=1000
+MemoryAccounting=true
+MemoryLow=3072M
+MemoryHigh=3840M
+TasksAccounting=true
+TasksMax=512

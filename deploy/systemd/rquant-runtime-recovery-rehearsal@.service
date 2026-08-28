@@ -1,0 +1,46 @@
+[Unit]
+Description=rQuant isolated runtime recovery rehearsal for generation %i
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=1h
+StartLimitBurst=2
+
+[Service]
+Type=oneshot
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Slice=rquant-research.slice
+Environment=RQUANT_DISABLE_DOTENV=1
+RuntimeDirectory=rquant/runtime-recovery/rehearsal/%i
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role runtime_recovery_rehearsal --instance %i
+Restart=no
+TimeoutStartSec=infinity
+TimeoutStopSec=30s
+RuntimeMaxSec=infinity
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=64
+CPUWeight=20
+IOWeight=20
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=-/home/lighthouse/rquant/data -/var/lib/rquant/runtime-recovery/backups
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/recovery -/var/lib/rquant/runtime-recovery/restores
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SuccessExitStatus=0 75

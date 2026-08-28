@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Gate the research daily ingest on the completed daily pipeline and a freshly
-# verified read-only replica. The target date and retry count are fixed here so
-# a failed service cannot drift across midnight or retry forever.
+# Gate the research daily ingest on the completed daily pipeline and the replica
+# prepared by the required systemd oneshot. The target date and retry count are
+# fixed here so a failed service cannot drift across midnight or retry forever.
 
 set -Eeuo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RQUANT_BIN="${PROJECT_DIR}/.venv/bin/rquant"
-REPLICA_SYNC="${PROJECT_DIR}/scripts/sync-readonly-replica.sh"
 DAILY_UNIT="rquant-daily.service"
 TARGET_DATE="$(TZ=Asia/Shanghai date +%F)"
 MAX_ATTEMPTS="${RQUANT_RESEARCH_INGEST_MAX_ATTEMPTS:-4}"
@@ -47,16 +46,10 @@ attempt_once() {
         return 1
     fi
 
-    if ! "${REPLICA_SYNC}"; then
-        echo "read-only replica refresh failed" >&2
-        return 1
-    fi
-
     if ! "${RQUANT_BIN}" research-ingest-readiness --date "${TARGET_DATE}"; then
-        echo "read-only replica is not ready for ${TARGET_DATE}" >&2
+        echo "required read-only replica is not ready for ${TARGET_DATE}" >&2
         return 1
     fi
-
     "${RQUANT_BIN}" research-ingest --date "${TARGET_DATE}" --scheduled
 }
 
@@ -66,7 +59,7 @@ for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
     attempt_once
     status=$?
     set -e
-    if [[ ${status} -eq 0 || ${status} -eq 2 || ${status} -eq 3 ]]; then
+    if [[ ${status} -eq 0 || ${status} -eq 2 || ${status} -eq 3 || ${status} -eq 75 ]]; then
         exit "${status}"
     fi
     if [[ ${attempt} -lt ${MAX_ATTEMPTS} ]]; then

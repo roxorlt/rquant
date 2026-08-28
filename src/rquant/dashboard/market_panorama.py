@@ -13,39 +13,38 @@ v2 单屏两栏布局（消灭 tab / 消灭滑动，1440×900 基准）：
 - 右栏（48%）上半下钻成分表（行选择联动图表），下半个股图表
   （分时 / 5日 / 日K，segmented_control 切周期，altair 绘制）。
 
-取数架构（2026-07-06 盘中事故后重构）：快照 + 行业/概念资金流由 SourcePoller
-后台 daemon 线程 60s 循环拉取（每源独立熔断，sina 兜底级单独熔断），UI 只读
-last-known-good slot——渲染永不等取数。fragment run_every=60 只做纯渲染零网络；
-「立即刷新」触发 poller 立即开跑一轮（不阻塞渲染）。合表/下钻 st.cache_data 120s
-（键含 poller 给的 as_of，as_of 不变即命中）、本地副本 300s、分时 60s、日K 600s。
-所有 DuckDB 读只经 panorama_data（只读副本），UI 层绝不直连主库。
+取数架构：每轮渲染只 acquire 一次不可变 serving generation，快照、板块总览、
+成分、分时、日 K 与爆量台账全部复用该 lease。页面不发外部行情请求、不读取生产
+主库或副本；缺少投影或 generation 损坏时明确显示数据不可用。
 """
 
 from __future__ import annotations
 
-import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from hashlib import sha256
+from typing import Any
 
 import altair as alt
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitAPIException
 
+from rquant.dashboard.serving_page_ui import render_serving_state_banner
 from rquant.panorama_data import (
     BOARD_SYSTEMS,
     ROUTE_LABELS,
     MarketPulse,
+    ServingRuntimeConfigRead,
     board_constituents,
-    build_board_overview,
     compute_market_pulse,
-    fetch_intraday_trend,
     industry_fallback_members,
     load_board_members,
     load_daily_kline,
     load_historical_intraday_trend,
+    load_intraday_kline_projection,
     load_kpl_concept_members,
     load_liquidity_baseline,
+    load_market_overview_projection,
+    load_market_snapshot_projection,
     load_pool_flags,
     load_pulse_alerts,
     load_pulse_history,
@@ -53,22 +52,15 @@ from rquant.panorama_data import (
     load_surge_log,
     load_surge_marks,
     load_surge_runtime_config,
+    open_panorama_serving_generation,
     search_surge_history,
     surge_mark_positions,
     volume_directions,
 )
-from rquant.panorama_poller import SourcePoller
 
 CST = timezone(timedelta(hours=8))
 REFRESH_SECONDS = 60
 _KPL_SYSTEM = "开盘啦题材"
-
-# 体系 → 资金流 sector_type；开盘啦题材不拉资金流（传空表，build_board_overview 补 NaN 列）
-_SYSTEM_FLOW_TYPE: dict[str, str | None] = {
-    "东财行业": "行业资金流",
-    "东财概念": "概念资金流",
-    _KPL_SYSTEM: None,
-}
 
 # 红涨绿跌（A 股口径），日K 蜡烛与量柱同色
 _UP_COLOR = "#ef4444"
@@ -158,138 +150,84 @@ st.set_page_config(
 )
 
 
-# ── 取数层（快照/资金流走后台 poller，本地副本走 st.cache_data） ───────────────
+# ── 取数层（整轮页面复用一个 serving generation） ─────────────────────────────
 
 
-@st.cache_resource(show_spinner=False)
-def get_poller() -> SourcePoller:
-    """进程级单例后台拉取器（所有浏览器会话共享，消掉会话数×源数的请求放大）。"""
-    poller = SourcePoller(interval=float(REFRESH_SECONDS))
-    poller.start()
-    return poller
+def serving_members(store: Any) -> tuple[pd.DataFrame, str]:
+    """东财成分优先，空时使用同代 stock universe 的行业粗分。"""
 
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_members() -> tuple[pd.DataFrame, str]:
-    """东财成分：dc_board_member 优先，空则降级 stock_basic.industry 粗分。"""
-    members = load_board_members()
+    members = load_board_members(store)
     if not members.empty:
         return members, "dc"
-    return industry_fallback_members(), "industry"
+    return industry_fallback_members(store), "industry"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_kpl_members() -> pd.DataFrame:
-    return load_kpl_concept_members()
+def serving_constituents(
+    board_code: str,
+    snapshot: pd.DataFrame,
+    store: Any,
+) -> pd.DataFrame:
+    """Build one board drill-down entirely from the acquired generation."""
 
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_pool_flags() -> dict[str, str]:
-    return load_pool_flags()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_liquidity() -> pd.DataFrame:
-    return load_liquidity_baseline()
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def cached_overview(system: str, as_of: str) -> tuple[pd.DataFrame, str | None]:
-    """合并板块总表（键=体系+快照时间戳；内部自取上游缓存，大表不入参免哈希开销）。
-
-    返回 (总表, 资金流路由)；开盘啦题材不拉资金流 → 路由 None、资金流三列全 NaN。
-    """
-    poller = get_poller()
-    snapshot, _, _ = poller.snapshot()
-    members, _ = cached_members()
-    kpl_members = cached_kpl_members()
-    flow_type = _SYSTEM_FLOW_TYPE.get(system)
-    if flow_type is not None:
-        flow, route = poller.flow(flow_type)
-    else:
-        flow, route = pd.DataFrame(), None
-    overview = build_board_overview(snapshot, members, kpl_members, flow, system)
-    return overview, route
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def cached_constituents(board_code: str, as_of: str) -> pd.DataFrame:
-    """板块下钻成分表（键=板块码+快照时间戳）。
-
-    board_code 在东财（BKxxxx.DC）/ 开盘啦（xxxxxx.KP）/ industry 兜底三套命名空间内
-    互不重叠，故东财 + 开盘啦成分按 board_code 合一即可唯一定位，无需再传体系。
-    """
-    snapshot, _, _ = get_poller().snapshot()
-    members, _ = cached_members()
-    kpl_members = cached_kpl_members()
+    members, _ = serving_members(store)
+    kpl_members = load_kpl_concept_members(store)
     combined = _combined_members(members, kpl_members)
     return board_constituents(
         board_code,
         combined,
         snapshot,
-        pool_flags=cached_pool_flags(),
-        liquidity=cached_liquidity(),
+        pool_flags=load_pool_flags(store),
+        liquidity=load_liquidity_baseline(store),
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_trend(ts_code: str, ndays: int) -> tuple[pd.DataFrame, str]:
-    """个股分时（ndays=1）/ 5日线（ndays=5）+ 路由标签。"""
-    trend = fetch_intraday_trend(ts_code, ndays)
-    return trend, trend.attrs.get("route", "none")
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_surge_history(generation_id: str, query: str, _store: Any) -> pd.DataFrame:
+    """Cross-day search cache is scoped to one immutable Serving generation."""
+    return search_surge_history(query.strip(), store=_store)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cached_kline(ts_code: str) -> pd.DataFrame:
-    """日K 基础序列（只读副本 daily_bar）；当日临时 bar 拼接在 UI 层做（依赖实时快照）。"""
-    return load_daily_kline(ts_code)
+def cached_historical_intraday_trend(
+    generation_id: str, ts_code: str, day_key: str, _store: Any
+) -> pd.DataFrame:
+    """Historical minute data cache is scoped to one immutable Serving generation."""
+    return load_historical_intraday_trend(ts_code, date.fromisoformat(day_key), store=_store)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def cached_surge_log(day_key: str) -> pd.DataFrame:
-    """指定日期爆量台账（键为该日 ISO 字符串，切换日期/跨日自动失效；ttl 30s 让盘中增长
-    的当日 jsonl 被读到）。"""
-    return load_surge_log(date.fromisoformat(day_key))
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def cached_surge_history(query: str) -> pd.DataFrame:
-    """跨日爆量检索（键=去首尾空白后的代码或名称查询）。"""
-    return search_surge_history(query.strip())
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_historical_intraday_trend(ts_code: str, day_key: str) -> pd.DataFrame:
-    """指定交易日完整分钟线（只读副本，避免历史回看触发实时网络取数）。"""
-    return load_historical_intraday_trend(ts_code, date.fromisoformat(day_key))
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def cached_surge_event_marks(ts_code: str, day_key: str) -> pd.DataFrame:
-    """指定交易日的全部爆量确认点，而非台账的每日首次确认。"""
-    return load_surge_event_marks(ts_code, date.fromisoformat(day_key))
+def cached_surge_event_marks(
+    generation_id: str, ts_code: str, day_key: str, _store: Any
+) -> pd.DataFrame:
+    """Historical event marks cache is scoped to one immutable Serving generation."""
+    return load_surge_event_marks(ts_code, date.fromisoformat(day_key), store=_store)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_surge_marks(ts_code: str, dates_key: str) -> pd.DataFrame:
-    """图表标记（键 = 票 + 交易日集合字符串；日集合来自 trend 实际数据）。"""
+def cached_surge_marks(
+    generation_id: str, ts_code: str, dates_key: str, _store: Any
+) -> pd.DataFrame:
+    """Chart event marks cache is scoped to one immutable Serving generation."""
     dates = [date.fromisoformat(s) for s in dates_key.split(",") if s]
-    return load_surge_marks(ts_code, dates)
+    return load_surge_marks(ts_code, dates, store=_store)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_runtime_config() -> dict | None:
-    return load_surge_runtime_config()
+def cached_runtime_config(
+    generation_id: str,
+    _store: Any,
+) -> ServingRuntimeConfigRead | dict[str, object] | None:
+    return load_surge_runtime_config(store=_store)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_pulse_history(day_key: str) -> pd.DataFrame:
-    return load_pulse_history()
+def cached_pulse_history(generation_id: str, day_key: str, _store: Any) -> pd.DataFrame:
+    return load_pulse_history(date.fromisoformat(day_key), store=_store)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_pulse_alerts(day_key: str) -> pd.DataFrame:
-    return load_pulse_alerts()
+def cached_pulse_alerts(generation_id: str, day_key: str, _store: Any) -> pd.DataFrame:
+    return load_pulse_alerts(date.fromisoformat(day_key), store=_store)
 
 
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
@@ -299,9 +237,7 @@ def _combined_members(members: pd.DataFrame, kpl_members: pd.DataFrame) -> pd.Da
     """东财成分 + 开盘啦成分按 board_code 合一（下钻只用 board_code/con_code，丢 idx_type）。"""
     cols = ["board_code", "board_name", "con_code"]
     frames = [
-        df[cols]
-        for df in (members, kpl_members)
-        if not df.empty and set(cols).issubset(df.columns)
+        df[cols] for df in (members, kpl_members) if not df.empty and set(cols).issubset(df.columns)
     ]
     if not frames:
         return pd.DataFrame(columns=cols)
@@ -368,9 +304,7 @@ def _constituents_display(cons: pd.DataFrame) -> pd.DataFrame:
     return disp
 
 
-def _append_intraday_bar(
-    kline: pd.DataFrame, snapshot: pd.DataFrame, ts_code: str
-) -> pd.DataFrame:
+def _append_intraday_bar(kline: pd.DataFrame, snapshot: pd.DataFrame, ts_code: str) -> pd.DataFrame:
     """副本日K缺今日 bar 时，用实时快照拼一根临时当日 bar（volume 用快照量，MA 不重算）。
 
     仅当副本最新日 < 今天且快照该票 open/high/low/price 均非空时追加。
@@ -448,20 +382,27 @@ def _pulse_facet_chart(hist: pd.DataFrame) -> alt.VConcatChart:
     ticks = hist["t"].tolist()[:: max(1, len(hist) // 6)]
     x = alt.X("t:O", title=None, axis=alt.Axis(values=ticks, labelAngle=0))
     rows = [
-        alt.Chart(hist).mark_line(color=color).encode(
+        alt.Chart(hist)
+        .mark_line(color=color)
+        .encode(
             x=x,
             y=alt.Y(f"{col}:Q", title=title, scale=alt.Scale(zero=False)),
             tooltip=["t", alt.Tooltip(f"{col}:Q", title=title)],
-        ).properties(height=64)
+        )
+        .properties(height=64)
         for col, title, color in _PULSE_FACETS
     ]
     return alt.vconcat(*rows).resolve_scale(x="shared", y="independent")
 
 
-def _render_pulse_alert_line(now: datetime) -> None:
+def _render_pulse_alert_line(now: datetime, store: Any) -> None:
     """最近 30 分钟内的异动：常驻 warning + 新异动一次性 toast（会话内去重）。"""
-    alerts = cached_pulse_alerts(now.date().isoformat())
+    alerts = cached_pulse_alerts(str(store.generation_id), now.date().isoformat(), store)
     if alerts.empty:
+        state = str(alerts.attrs.get("serving_state") or "")
+        if state in {"unavailable", "degraded"}:
+            detail = str(alerts.attrs.get("serving_detail") or "未提供状态详情")
+            st.warning(f"脉搏异动该代未发布/降级：{detail[:140]}")
         return
     latest = alerts.iloc[-1]
     try:
@@ -480,11 +421,13 @@ def _render_pulse_alert_line(now: datetime) -> None:
         st.toast(f"⚡ {latest['t']} {latest['kind_label']}：{latest['message']}")
 
 
-def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict) -> None:
+def render_pulse(
+    snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict, store: Any
+) -> None:
     pulse = compute_market_pulse(snapshot)
     if pulse.total_count == 0:
-        # slot 保留 last-known-good：空快照 ⇔ 后台从未成功过（首轮或全路由熔断）
-        st.info("首轮拉取进行中（东财直连 → SOCKS 出口 → 新浪 依次尝试），页面不阻塞，稍候自动出数")
+        detail = str(snapshot.attrs.get("serving_detail") or "市场快照投影没有可展示数据")
+        st.warning(f"Serving 数据不可用：{detail[:160]}")
         err = str((status.get("snapshot") or {}).get("last_error") or "").strip()
         if err:
             st.caption(f"最近错误：{err[:120]}")
@@ -498,10 +441,16 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: di
     c4.metric("上涨占比", f"{pulse.up_ratio_pct:.1f}%")
     c5.metric("涨/跌家数", f"{pulse.up_count} / {pulse.down_count}")
     st.caption(_snapshot_status_line(as_of, snap_route, status))
-    _render_pulse_alert_line(datetime.now(CST))
+    _render_pulse_alert_line(datetime.now(CST), store)
     with c6, st.popover("📈", width="stretch"):
         st.caption(f"快照 {as_of} · 有效样本 {pulse.total_count} 只（停牌除外）")
-        hist = cached_pulse_history(datetime.now(CST).date().isoformat())
+        hist = cached_pulse_history(
+            str(store.generation_id), datetime.now(CST).date().isoformat(), store
+        )
+        history_state = str(hist.attrs.get("serving_state") or "")
+        if history_state in {"unavailable", "degraded"}:
+            detail = str(hist.attrs.get("serving_detail") or "未提供状态详情")
+            st.warning(f"脉搏历史该代未发布/降级：{detail[:140]}")
         if len(hist) >= 2:
             st.altair_chart(_pulse_facet_chart(hist), width="stretch")
             st.caption("数据来源：服务端全天历史（surge-watch 每分钟落盘）")
@@ -518,7 +467,7 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: di
                 .properties(height=160)
             )
             st.altair_chart(chart, width="stretch")
-            st.caption("数据来源：本会话累积（服务端历史不可用，本地兜底）")
+            st.caption("数据来源：本会话临时累积（不替代服务端历史）")
         else:
             st.caption("脉搏曲线累积中（需 ≥2 分钟样本）")
 
@@ -526,30 +475,35 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: di
 # ── 左栏：板块合并总表 ────────────────────────────────────────────────────────
 
 
-def render_overview(as_of: str, snap_route: str) -> tuple[str | None, str | None]:
+def render_overview(store: Any, snap_route: str) -> tuple[str | None, str | None]:
     """渲染体系切换 + 合并总表，返回选中板块 (board_code, board_name)。
 
     体系 segmented_control 变更 → dataframe key 随体系切换 → 旧选择自然失效回退默认第一行
     （streamlit 无法程序化清空行选择，改 key 是绕过该限制的既定手法）。
     """
-    system = st.segmented_control(
-        "体系",
-        list(BOARD_SYSTEMS),
-        default=_KPL_SYSTEM,
-        key="sys_seg",
-        label_visibility="collapsed",
-    ) or _KPL_SYSTEM
+    system = (
+        st.segmented_control(
+            "体系",
+            list(BOARD_SYSTEMS),
+            default=_KPL_SYSTEM,
+            key="sys_seg",
+            label_visibility="collapsed",
+        )
+        or _KPL_SYSTEM
+    )
     is_kpl = system == _KPL_SYSTEM
 
-    overview, route = cached_overview(system, as_of)
+    overview = load_market_overview_projection(system, store)
+    route = str(overview.attrs.get("route") or "serving")
     if overview.empty:
-        st.info(f"{system}：快照或板块成分不可用，暂无总表")
+        detail = str(overview.attrs.get("serving_detail") or "该体系暂无板块总览")
+        st.warning(f"{system} 数据不可用：{detail[:140]}")
         return None, None
     # 展示层默认涨停数降序（次键成交额防并列）——数据层契约（amount 降序）不动；
     # 默认选中第一行随之变成涨停最多的板块，列头点击排序仍是客户端零 rerun
-    overview = overview.sort_values(
-        ["limit_up_count", "amount"], ascending=False
-    ).reset_index(drop=True)
+    overview = overview.sort_values(["limit_up_count", "amount"], ascending=False).reset_index(
+        drop=True
+    )
 
     event = st.dataframe(
         _overview_display(overview, is_kpl),
@@ -586,7 +540,10 @@ def render_overview(as_of: str, snap_route: str) -> tuple[str | None, str | None
 
 
 def render_drilldown(
-    board_code: str | None, board_name: str | None, as_of: str
+    board_code: str | None,
+    board_name: str | None,
+    snapshot: pd.DataFrame,
+    store: Any,
 ) -> tuple[str | None, str | None]:
     """渲染选中板块的下钻成分表，返回选中个股 (ts_code, name)。"""
     title = board_name or "—"
@@ -595,7 +552,7 @@ def render_drilldown(
         st.info("左侧选板块后查看成分")
         return None, None
 
-    cons = cached_constituents(board_code, as_of)
+    cons = serving_constituents(board_code, snapshot, store)
     if cons.empty:
         st.info("该板块成分与快照无交集")
         return None, None
@@ -666,9 +623,7 @@ def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.
     # 定域到全天(单日)或数据范围(多日):盘中数据不足整天时线停在当前、右边留空
     x_scale = alt.Scale(nice=False, zero=False, domain=domain)
     dt_tip = alt.Tooltip("dt:T", title="时间", format="%m-%d %H:%M")
-    x_price = alt.X(
-        "idx:Q", title=None, scale=x_scale, axis=alt.Axis(labels=False, ticks=False)
-    )
+    x_price = alt.X("idx:Q", title=None, scale=x_scale, axis=alt.Axis(labels=False, ticks=False))
     price_line = (
         alt.Chart(trend)
         .mark_line(color="#2563eb")
@@ -688,7 +643,8 @@ def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.
         layers.append(avg_line)
     mark_pos = (
         surge_mark_positions(trend, marks)
-        if marks is not None and not marks.empty else pd.DataFrame()
+        if marks is not None and not marks.empty
+        else pd.DataFrame()
     )
     if not mark_pos.empty:
         mark_tip = [
@@ -697,14 +653,14 @@ def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.
             alt.Tooltip("rel_cum_values:N", title="累计倍数"),
         ]
         layers.append(
-            alt.Chart(mark_pos).mark_rule(
-                color="#f97316", strokeDash=[6, 4], size=2
-            ).encode(x=alt.X("idx:Q", scale=x_scale), tooltip=mark_tip)
+            alt.Chart(mark_pos)
+            .mark_rule(color="#f97316", strokeDash=[6, 4], size=2)
+            .encode(x=alt.X("idx:Q", scale=x_scale), tooltip=mark_tip)
         )
         layers.append(
-            alt.Chart(mark_pos).mark_point(
-                color="#f97316", filled=True, size=80
-            ).encode(x=alt.X("idx:Q", scale=x_scale), y="price:Q", tooltip=mark_tip)
+            alt.Chart(mark_pos)
+            .mark_point(color="#f97316", filled=True, size=80)
+            .encode(x=alt.X("idx:Q", scale=x_scale), y="price:Q", tooltip=mark_tip)
         )
     price = alt.layer(*layers).properties(height=220)
     x_vol = alt.X(
@@ -743,11 +699,15 @@ def _kline_chart(kline: pd.DataFrame) -> alt.VConcatChart:
         axis=alt.Axis(values=ticks, labelAngle=-45, labelOverlap=True),
     )
 
-    rule = alt.Chart(df).mark_rule().encode(
-        x=x_price,
-        y=alt.Y("low:Q", title=None, scale=alt.Scale(zero=False)),
-        y2="high:Q",
-        color=_CANDLE_COLOR,
+    rule = (
+        alt.Chart(df)
+        .mark_rule()
+        .encode(
+            x=x_price,
+            y=alt.Y("low:Q", title=None, scale=alt.Scale(zero=False)),
+            y2="high:Q",
+            color=_CANDLE_COLOR,
+        )
     )
     bar = alt.Chart(df).mark_bar().encode(x=x_price, y="open:Q", y2="close:Q", color=_CANDLE_COLOR)
 
@@ -786,16 +746,24 @@ def _kline_chart(kline: pd.DataFrame) -> alt.VConcatChart:
 
 
 def render_stock_chart(
-    ts_code: str | None, name: str | None, snapshot: pd.DataFrame, *, key_prefix: str = "pano"
+    ts_code: str | None,
+    name: str | None,
+    snapshot: pd.DataFrame,
+    store: Any,
+    *,
+    key_prefix: str = "pano",
 ) -> None:
     st.markdown(f"**个股图表 · {name or '—'}**")
-    period = st.segmented_control(
-        "周期",
-        ["分时", "5日", "日K"],
-        default="分时",
-        key=f"chart_period_{key_prefix}",
-        label_visibility="collapsed",
-    ) or "分时"
+    period = (
+        st.segmented_control(
+            "周期",
+            ["分时", "5日", "日K"],
+            default="分时",
+            key=f"chart_period_{key_prefix}",
+            label_visibility="collapsed",
+        )
+        or "分时"
+    )
 
     if ts_code is None:
         st.info("点选个股查看图表")
@@ -803,12 +771,16 @@ def render_stock_chart(
 
     if period in ("分时", "5日"):
         ndays = 1 if period == "分时" else 5
-        trend, route = cached_trend(ts_code, ndays)
+        trend = load_intraday_kline_projection(ts_code, ndays, store)
+        route = str(trend.attrs.get("route") or "serving")
         if trend.empty:
-            st.info(f"{period}数据暂不可用")
+            detail = str(trend.attrs.get("serving_detail") or "该标的没有分钟投影")
+            st.warning(f"{period}数据不可用：{detail[:140]}")
             return
         days = sorted(pd.to_datetime(trend["dt"]).dt.date.unique())
-        marks = cached_surge_marks(ts_code, ",".join(d.isoformat() for d in days))
+        marks = cached_surge_marks(
+            str(store.generation_id), ts_code, ",".join(d.isoformat() for d in days), store
+        )
         st.altair_chart(_trend_chart(trend, marks), width="stretch")
         st.caption(
             f"数据路由：{ROUTE_LABELS.get(route, route)}"
@@ -816,9 +788,10 @@ def render_stock_chart(
             " · 橙线=爆量确认"
         )
     else:
-        kline = _append_intraday_bar(cached_kline(ts_code), snapshot, ts_code)
+        kline = _append_intraday_bar(load_daily_kline(ts_code, store=store), snapshot, ts_code)
         if kline.empty:
-            st.info("日K 数据暂不可用（本地副本 daily_bar 缺该票）")
+            detail = str(kline.attrs.get("serving_detail") or "该标的没有日 K 投影")
+            st.warning(f"日 K 数据不可用：{detail[:140]}")
             return
         st.altair_chart(_kline_chart(kline), width="stretch")
 
@@ -859,11 +832,7 @@ def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def _surge_history_display(df: pd.DataFrame) -> pd.DataFrame:
     """跨日台账展示：日期单列格式化，余列严格复用日台账口径。"""
-    dates = (
-        pd.to_datetime(df.get("trade_date"), errors="coerce")
-        .dt.strftime("%Y-%m-%d")
-        .fillna("")
-    )
+    dates = pd.to_datetime(df.get("trade_date"), errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     display = _surge_log_display(df.drop(columns=["trade_date"], errors="ignore"))
     display.insert(0, "日期", dates.reset_index(drop=True))
     return display
@@ -884,9 +853,25 @@ def _surge_history_table_key(query: str, df: pd.DataFrame) -> str:
 _BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北交"}
 
 
-def _surge_caption(n_rows: int) -> str:
-    """页脚口径：优先 runtime_config 动态展示，缺失退回写死文案。"""
-    cfg = cached_runtime_config()
+def _surge_caption(n_rows: int, store: Any) -> str:
+    """页脚口径：展示同代 runtime config 或明确的未发布状态。"""
+    cfg = cached_runtime_config(str(store.generation_id), store)
+    if isinstance(cfg, ServingRuntimeConfigRead):
+        if cfg.config is None:
+            return (
+                f"检测口径该代未发布/降级：{cfg.detail[:100]}"
+                " · 以下台账仍来自同代 Serving 投影"
+                f" · 共 {n_rows} 条"
+            )
+        config = cfg.config
+        boards = "/".join(_BOARD_LABELS.get(board, board) for board in config.boards)
+        return (
+            f"检测范围：{boards or '—'}"
+            f" · 口径 v4：累计放量 {config.k_cum:g}-{config.ratio_cap:g}×"
+            " + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+            " · 每标的取当日最早识别时刻"
+            f" · 观察提示非买入信号 · 共 {n_rows} 条"
+        )
     if cfg:
         boards = "/".join(_BOARD_LABELS.get(b, str(b)) for b in cfg.get("boards", []))
         return (
@@ -903,17 +888,17 @@ def _surge_caption(n_rows: int) -> str:
     )
 
 
-def render_historical_surge_detail(ts_code: str, name: str, day: date) -> None:
+def render_historical_surge_detail(ts_code: str, name: str, day: date, store: Any) -> None:
     """指定爆量日复盘：完整分钟趋势与该标的当天每个确认时刻。"""
     day_key = day.isoformat()
     st.markdown(f"**{ts_code} {name or '—'} · {day_key}**")
-    trend = cached_historical_intraday_trend(ts_code, day_key)
+    trend = cached_historical_intraday_trend(str(store.generation_id), ts_code, day_key, store)
     if trend.empty:
-        st.info(f"{day_key} 该日分钟数据未入库/暂不可用（只读副本 minute_bar 缺该日记录）")
+        st.info(f"{day_key} 该日分钟数据未入库/暂不可用（Serving 分钟投影缺该日记录）")
         return
-    marks = cached_surge_event_marks(ts_code, day_key)
+    marks = cached_surge_event_marks(str(store.generation_id), ts_code, day_key, store)
     st.altair_chart(_trend_chart(trend, marks), width="stretch")
-    st.caption("数据来源：只读副本 · 量柱色=分钟涨跌近似（tick-rule） · 橙线=爆量确认")
+    st.caption("数据来源：Serving 投影 · 量柱色=分钟涨跌近似（tick-rule） · 橙线=爆量确认")
 
 
 def _render_surge_table(df: pd.DataFrame, *, table_key: str, historical: bool) -> int | None:
@@ -930,9 +915,12 @@ def _render_surge_table(df: pd.DataFrame, *, table_key: str, historical: bool) -
     return _first_selected_row(event)
 
 
-def render_surge_log(snapshot: pd.DataFrame) -> None:
+def render_surge_log(store: Any) -> None:
     """爆量台账：空搜索按日查看；搜索时跨日检索，并可复盘任一爆量日。"""
     today = datetime.now(CST).date()
+    runtime_config = cached_runtime_config(str(store.generation_id), store)
+    if isinstance(runtime_config, ServingRuntimeConfigRead) and runtime_config.config is None:
+        st.warning(f"检测口径该代未发布/降级：{runtime_config.detail[:140]}")
     query = st.text_input(
         "搜索标的",
         placeholder="输入股票代码或名称，跨天检索全部爆量记录",
@@ -940,7 +928,7 @@ def render_surge_log(snapshot: pd.DataFrame) -> None:
     )
     normalized_query = query.strip()
     if normalized_query:
-        df = cached_surge_history(normalized_query)
+        df = cached_surge_history(str(store.generation_id), normalized_query, store)
         st.caption(f"跨日检索 · 命中 {len(df)} 条（每标的每日保留首次确认）")
         if df.empty:
             st.info(f"未找到“{normalized_query}”的爆量记录")
@@ -959,7 +947,7 @@ def render_surge_log(snapshot: pd.DataFrame) -> None:
             st.info("该记录日期无效，暂不能加载历史趋势")
             return
         render_historical_surge_detail(
-            str(row["ts_code"]), str(row.get("name", "")), selected_day.date()
+            str(row["ts_code"]), str(row.get("name", "")), selected_day.date(), store
         )
         return
 
@@ -968,21 +956,25 @@ def render_surge_log(snapshot: pd.DataFrame) -> None:
     )
     if sel is None:  # 被清空 → 回退今日
         sel = today
-    df = cached_surge_log(sel.isoformat())
+    df = load_surge_log(sel, store=store)
     if df.empty:
+        detail = str(df.attrs.get("serving_detail") or "")
+        if detail:
+            st.warning(detail[:160])
+            return
         if sel == today:
             st.info("今日暂无爆量记录（surge-watch 尚未识别到，或未到盘中）")
         else:
             st.info(f"{sel.isoformat()} 无爆量记录")
         return
     idx = _render_surge_table(df, table_key=f"surge_tbl_{sel.isoformat()}", historical=False)
-    caption = _surge_caption(len(df))
+    caption = _surge_caption(len(df), store)
     st.caption(caption)
     if idx is None or idx >= len(df):
         st.info("点选记录查看对应交易日的完整分钟趋势与全部爆量确认点")
         return
     row = df.iloc[idx]
-    render_historical_surge_detail(str(row["ts_code"]), str(row.get("name", "")), sel)
+    render_historical_surge_detail(str(row["ts_code"]), str(row.get("name", "")), sel, store)
 
 
 # ── 页面主体 ──────────────────────────────────────────────────────────────────
@@ -993,45 +985,64 @@ head_l, head_r = st.columns([5, 1])
 with head_l:
     st.markdown("### 盘中市场全景")
 with head_r:
-    if st.button("🔄 立即刷新", width="stretch", help="触发后台立即拉取一轮（不阻塞渲染）"):
-        get_poller().refresh_now()
+    if st.button("🔄 立即刷新", width="stretch", help="读取最新发布的 Serving 代"):
+        st.rerun()
 st.caption(
-    f"仅本地运行 · 后台拉取器 {REFRESH_SECONDS}s（快照/资金流，每源独立熔断）· "
-    "本地副本 300s / 合表下钻 120s / 分时 60s / 日K 600s 缓存 · "
-    f"页面 {REFRESH_SECONDS}s 自动刷新（纯渲染零等待）· 只读副本，不写主库"
+    f"页面每 {REFRESH_SECONDS}s 读取一次最新不可变 Serving 代 · "
+    "快照、板块、分时、日 K 与爆量台账同代一致 · 不连接生产主库"
 )
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def render_body() -> None:
-    # tabs 在 fragment 内创建 → 两个 tab 内容每 60s 随 fragment 重跑（爆量 tab 的
-    # cached_surge_log ttl 30s 保证读到盘中新增记录）；active tab 由前端保持不被弹回。
     tab_panorama, tab_surge = st.tabs(["市场全景", "爆量记录"])
-    poller = get_poller()
-    snapshot, as_of, snap_route = poller.snapshot()
+    try:
+        with open_panorama_serving_generation() as store:
+            snapshot = load_market_snapshot_projection(store)
+            raw_as_of = snapshot.attrs.get("as_of")
+            parsed_as_of = pd.to_datetime(raw_as_of, utc=True, errors="coerce")
+            if pd.isna(parsed_as_of):
+                as_of = "—"
+                age_seconds = None
+            else:
+                as_of = parsed_as_of.tz_convert(CST).strftime("%Y-%m-%d %H:%M:%S")
+                age_seconds = max(
+                    0.0,
+                    (datetime.now(UTC) - parsed_as_of.to_pydatetime()).total_seconds(),
+                )
+            status = {
+                "snapshot": {
+                    "age_seconds": age_seconds,
+                    "last_error": snapshot.attrs.get("serving_detail"),
+                }
+            }
+            snap_route = str(snapshot.attrs.get("route") or "serving")
 
-    with tab_panorama:
-        render_pulse(snapshot, as_of, snap_route, poller.status())
+            with tab_panorama:
+                render_pulse(snapshot, as_of, snap_route, status, store)
+                left, right = st.columns([52, 48])
+                with left:
+                    board_code, board_name = render_overview(store, snap_route)
+                with right:
+                    ts_code, stock_name = render_drilldown(
+                        board_code,
+                        board_name,
+                        snapshot,
+                        store,
+                    )
+                    render_stock_chart(ts_code, stock_name, snapshot, store)
 
-        if not as_of:
-            # 首拉未完成：提示已经画上（render_pulse 首轮 info），1s 后重跑再看 slot
-            # ——只重读内存 slot 不碰网络，避免冷启动空页面干等 60s fragment 周期。
-            # scope="fragment" 仅在 fragment rerun 中合法，初始整页运行时降级整页重跑
-            time.sleep(1.0)
-            try:
-                st.rerun(scope="fragment")
-            except StreamlitAPIException:
-                st.rerun()
-
-        left, right = st.columns([52, 48])
-        with left:
-            board_code, board_name = render_overview(as_of, snap_route)
-        with right:
-            ts_code, stock_name = render_drilldown(board_code, board_name, as_of)
-            render_stock_chart(ts_code, stock_name, snapshot)
-
-    with tab_surge:
-        render_surge_log(snapshot)
+            with tab_surge:
+                render_surge_log(store)
+            serving_health = store.serving_health()
+            if serving_health is not None:
+                render_serving_state_banner(st, serving_health, label="市场全景数据")
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"
+        with tab_panorama:
+            st.warning(f"Serving 数据不可用：{detail[:180]}")
+        with tab_surge:
+            st.warning(f"Serving 数据不可用：{detail[:180]}")
 
 
 if __name__ == "__main__":

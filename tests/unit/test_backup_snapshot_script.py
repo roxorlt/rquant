@@ -5,7 +5,6 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import shutil
 import signal
 import subprocess
 import time
@@ -14,6 +13,7 @@ from contextlib import suppress
 from pathlib import Path
 
 import duckdb
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP_UNIT = ROOT / "deploy" / "systemd" / "rquant-backup.service"
@@ -24,10 +24,24 @@ def _project(tmp_path: Path) -> Path:
     (project / "scripts").mkdir(parents=True)
     (project / "data").mkdir()
     (project / ".venv").symlink_to((ROOT / ".venv").resolve(), target_is_directory=True)
-    shutil.copy2(
-        ROOT / "scripts" / "backup-snapshot.sh",
-        project / "scripts" / "backup-snapshot.sh",
+    arbiter = project / "test-libexec/rquant-workload-arbiter"
+    arbiter.parent.mkdir()
+    arbiter.write_text(
+        """#!/usr/bin/env bash
+while [[ "${1:-}" != "--" ]]; do shift; done
+shift
+RQUANT_WORKLOAD_ARBITER_HELD=maintenance exec "$@"
+""",
+        encoding="utf-8",
     )
+    arbiter.chmod(0o755)
+    source = (ROOT / "scripts/backup-snapshot.sh").read_text(encoding="utf-8")
+    script = project / "scripts/backup-snapshot.sh"
+    script.write_text(
+        source.replace("/usr/local/libexec/rquant-workload-arbiter", str(arbiter)),
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
     return project
 
 
@@ -45,8 +59,24 @@ def _run(
     backup_project: Path | None = None,
     max_source_lag_seconds: int | None = None,
     replica_wait_seconds: int | None = None,
+    recovery_enabled: bool = False,
+    recovery_cli: Path | None = None,
+    recovery_config: Path | None = None,
+    recovery_credential: Path | None = None,
+    recovery_profile_generation: str | None = None,
+    recovery_signer_key_id: str | None = None,
+    runtime_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    for name in (
+        "RQUANT_RECOVERY_BACKUP_ENABLED",
+        "RQUANT_RECOVERY_BACKUP_CONFIG",
+        "RQUANT_RECOVERY_CREDENTIAL_FILE",
+        "RQUANT_RECOVERY_PROFILE_GENERATION",
+        "RQUANT_RECOVERY_SIGNER_KEY_ID",
+        "RQUANT_RUNTIME_ROOT",
+    ):
+        env.pop(name, None)
     if source is not None:
         env["RQUANT_BACKUP_SOURCE"] = source
     if backup_project is not None:
@@ -55,6 +85,20 @@ def _run(
         env["RQUANT_BACKUP_MAX_SOURCE_LAG_SECONDS"] = str(max_source_lag_seconds)
     if replica_wait_seconds is not None:
         env["RQUANT_BACKUP_REPLICA_WAIT_SECONDS"] = str(replica_wait_seconds)
+    if recovery_enabled:
+        env["RQUANT_RECOVERY_BACKUP_ENABLED"] = "true"
+    if recovery_cli is not None:
+        env["RQUANT_RECOVERY_CLI"] = str(recovery_cli)
+    if recovery_config is not None:
+        env["RQUANT_RECOVERY_BACKUP_CONFIG"] = str(recovery_config)
+    if recovery_credential is not None:
+        env["RQUANT_RECOVERY_CREDENTIAL_FILE"] = str(recovery_credential)
+    if recovery_profile_generation is not None:
+        env["RQUANT_RECOVERY_PROFILE_GENERATION"] = recovery_profile_generation
+    if recovery_signer_key_id is not None:
+        env["RQUANT_RECOVERY_SIGNER_KEY_ID"] = recovery_signer_key_id
+    if runtime_root is not None:
+        env["RQUANT_RUNTIME_ROOT"] = str(runtime_root)
     return subprocess.run(
         [str(project / "scripts" / "backup-snapshot.sh")],
         cwd=project,
@@ -188,10 +232,7 @@ def test_terminated_backup_cleans_private_generation(
     entered = tmp_path / "gzip-entered"
     fake_gzip = fake_bin / "gzip"
     fake_gzip.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -e\n"
-        "touch \"${RQUANT_TEST_GZIP_ENTERED}\"\n"
-        "sleep 60\n",
+        '#!/usr/bin/env bash\nset -e\ntouch "${RQUANT_TEST_GZIP_ENTERED}"\nsleep 60\n',
         encoding="utf-8",
     )
     fake_gzip.chmod(0o755)
@@ -225,3 +266,102 @@ def test_terminated_backup_cleans_private_generation(
     assert process.returncode != 0
     assert not tuple((project / "backup").glob(".latest.*"))
     assert (project / "backup" / "latest.duckdb.gz").read_bytes() == previous
+
+
+@pytest.mark.parametrize("recovery_enabled", [True, False], ids=["explicit", "profile-auto"])
+def test_verified_legacy_snapshot_can_publish_recovery_bundle_via_explicit_gate(
+    tmp_path: Path,
+    recovery_enabled: bool,
+) -> None:
+    project = _project(tmp_path)
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    cli = tmp_path / "fake-rquant"
+    calls = tmp_path / "recovery-calls.txt"
+    runtime_root = project / "runtime"
+    if not recovery_enabled:
+        runtime_root.mkdir()
+        (runtime_root / "current").write_text("generation", encoding="ascii")
+    config = tmp_path / "recovery-backup.json"
+    credential = tmp_path / "recovery-credential.json"
+    config.write_text("{}", encoding="ascii")
+    credential.write_text("{}", encoding="ascii")
+    cli.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "$*" >> "${RQUANT_TEST_RECOVERY_CALLS}"\n'
+        'if [[ "$1" == "runtime-recovery-production-config" ]]; then\n'
+        "  printf '%s\\n' "
+        + repr(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "runtime_root": str(runtime_root),
+                    "producer_commit": "a" * 40,
+                    "profile_id": "2" * 64,
+                    "profile_generation": "0" * 63 + "1",
+                    "backup_environment": {
+                        "RQUANT_RECOVERY_BACKUP_ENABLED": "true",
+                        "RQUANT_RECOVERY_BACKUP_CONFIG": str(config),
+                        "RQUANT_RECOVERY_CREDENTIAL_FILE": str(credential),
+                        "RQUANT_RECOVERY_PROFILE_GENERATION": "0" * 63 + "1",
+                        "RQUANT_RECOVERY_SIGNER_KEY_ID": "production-recovery-v1",
+                    },
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        + "\n"
+        'elif [[ "$2" == "dry-run" ]]; then\n'
+        '  printf \'{"plan_id":"%064d","target_profile_generation":"%064d",'
+        '"signer_key_id":"production-recovery-v1"}\\n\' 0 1\n'
+        "else\n"
+        '  printf \'{"status":"succeeded"}\\n\'\n'
+        "fi\n",
+        encoding="ascii",
+    )
+    cli.chmod(0o755)
+    env_calls = os.environ.get("RQUANT_TEST_RECOVERY_CALLS")
+    os.environ["RQUANT_TEST_RECOVERY_CALLS"] = str(calls)
+    try:
+        result = _run(
+            project,
+            source="main",
+            recovery_enabled=recovery_enabled,
+            recovery_cli=cli,
+            recovery_config=config,
+            recovery_credential=credential,
+            recovery_profile_generation="0" * 63 + "1",
+            recovery_signer_key_id="production-recovery-v1",
+            runtime_root=runtime_root,
+        )
+    finally:
+        if env_calls is None:
+            os.environ.pop("RQUANT_TEST_RECOVERY_CALLS", None)
+        else:
+            os.environ["RQUANT_TEST_RECOVERY_CALLS"] = env_calls
+
+    assert result.returncode == 0, result.stderr
+    invocations = calls.read_text(encoding="utf-8").splitlines()
+    assert invocations[0] == (f"runtime-recovery-production-config --runtime-root {runtime_root}")
+    assert invocations[1].startswith("runtime-recovery-backup dry-run")
+    assert invocations[2].startswith("runtime-recovery-backup execute")
+    assert "--plan-id " + "0" * 64 in invocations[2]
+
+
+def test_recovery_backup_gate_rejects_missing_profile_generation(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    config = tmp_path / "recovery-backup.json"
+    credential = tmp_path / "recovery-credential.json"
+    config.write_text("{}", encoding="ascii")
+    credential.write_text("{}", encoding="ascii")
+
+    result = _run(
+        project,
+        source="main",
+        recovery_enabled=True,
+        recovery_config=config,
+        recovery_credential=credential,
+    )
+
+    assert result.returncode == 2

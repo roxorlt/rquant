@@ -50,7 +50,7 @@ def main() -> int:
             plan = client.nl_to_screen_plan(q, today=today)
             print(f"trade_date: {plan.trade_date}")
             print(f"rationale:  {plan.rationale}")
-            print(f"stages:")
+            print("stages:")
             for s in plan.stages:
                 print(f"  · {s.label}")
                 for r in s.rules:

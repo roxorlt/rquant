@@ -12,6 +12,7 @@ from rquant.health import (
     ServiceSnapshot,
     _parse_systemd_ts,
     build_daily_report,
+    get_daily_receipt_authority_identity,
     get_service_snapshot,
     read_watchdog_log,
 )
@@ -101,6 +102,45 @@ class TestGetServiceSnapshot:
         assert snap.start_today is None
 
 
+class TestDailyReceiptAuthorityIdentity:
+    def test_mac_without_systemd_skips_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("rquant.health.shutil.which", lambda _: None)
+
+        result = get_daily_receipt_authority_identity()
+
+        assert result.status == "skip"
+        assert result.source_sha256 is None
+
+    def test_running_identity_uses_shared_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("rquant.health.shutil.which", lambda _: "/usr/bin/systemctl")
+        monkeypatch.setattr(
+            "rquant.health.probe_daily_receipt_authority_identity",
+            lambda **_: type(
+                "Identity",
+                (),
+                {"source_sha256": "a" * 64, "key_id": "daily-v1"},
+            )(),
+        )
+
+        result = get_daily_receipt_authority_identity()
+
+        assert result.status == "ok"
+        assert result.source_sha256 == "a" * 64
+        assert result.key_id == "daily-v1"
+
+    def test_probe_failure_is_visible(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("rquant.health.shutil.which", lambda _: "/usr/bin/systemctl")
+        monkeypatch.setattr(
+            "rquant.health.probe_daily_receipt_authority_identity",
+            lambda **_: (_ for _ in ()).throw(RuntimeError("socket unavailable")),
+        )
+
+        result = get_daily_receipt_authority_identity()
+
+        assert result.status == "fail"
+        assert "socket unavailable" in result.detail
+
+
 class TestReadWatchdogLog:
     def test_counts_tags(self, tmp_path: Path):
         d = tmp_path / "logs"
@@ -128,12 +168,8 @@ class TestReadWatchdogLog:
     def test_only_today_log_used(self, tmp_path: Path):
         d = tmp_path / "logs"
         d.mkdir()
-        (d / "watchdog-2026-04-29.log").write_text(
-            "2026-04-29T09:30:01+08:00 alert-restart\n"
-        )
-        (d / "watchdog-2026-04-30.log").write_text(
-            "2026-04-30T09:30:01+08:00 active\n"
-        )
+        (d / "watchdog-2026-04-29.log").write_text("2026-04-29T09:30:01+08:00 alert-restart\n")
+        (d / "watchdog-2026-04-30.log").write_text("2026-04-30T09:30:01+08:00 active\n")
         counts = read_watchdog_log(d, today=date(2026, 4, 30))
         assert counts == {"active": 1}
 
@@ -146,21 +182,30 @@ class TestBuildDailyReport:
         """节假日：monitor 几秒退、watchdog 全 skip、daily 未触发——全绿。"""
         monitor = ServiceSnapshot(
             unit="rquant-monitor.service",
-            active_state="inactive", sub_state="dead",
+            active_state="inactive",
+            sub_state="dead",
             start_today=datetime(2026, 5, 1, 9, 25, 0),
             exit_today=datetime(2026, 5, 1, 9, 25, 5),
             exit_status=0,
             duration_sec=5,
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         watchdog = {"skip-clean-exit": 60, "out-of-window": 14}
         subject, body = build_daily_report(
-            date(2026, 5, 1), is_trading_day_flag=False,
-            monitor=monitor, daily=daily,
-            watchdog_counts=watchdog, business=self._empty_business(),
+            date(2026, 5, 1),
+            is_trading_day_flag=False,
+            monitor=monitor,
+            daily=daily,
+            watchdog_counts=watchdog,
+            business=self._empty_business(),
         )
         assert "非交易日" in subject
         assert "✅ monitor" in body
@@ -173,20 +218,30 @@ class TestBuildDailyReport:
         """节假日告警轰炸 bug 复现：watchdog alert > 0 就该红色警告。"""
         monitor = ServiceSnapshot(
             unit="rquant-monitor.service",
-            active_state="inactive", sub_state="dead",
+            active_state="inactive",
+            sub_state="dead",
             start_today=datetime(2026, 5, 1, 9, 25, 0),
             exit_today=datetime(2026, 5, 1, 9, 25, 5),
-            exit_status=0, duration_sec=5,
+            exit_status=0,
+            duration_sec=5,
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         watchdog = {"alert-restart": 60}
         _, body = build_daily_report(
-            date(2026, 5, 1), is_trading_day_flag=False,
-            monitor=monitor, daily=daily,
-            watchdog_counts=watchdog, business=self._empty_business(),
+            date(2026, 5, 1),
+            is_trading_day_flag=False,
+            monitor=monitor,
+            daily=daily,
+            watchdog_counts=watchdog,
+            business=self._empty_business(),
         )
         assert "⚠️ watchdog" in body
         assert "alert 60" in body or "**alert 60" in body
@@ -197,20 +252,28 @@ class TestBuildDailyReport:
         """交易日：monitor 跑足 5h 跨午休、watchdog 60 次 active、daily 17:00 未到——日报正常。"""
         monitor = ServiceSnapshot(
             unit="rquant-monitor.service",
-            active_state="inactive", sub_state="dead",
+            active_state="inactive",
+            sub_state="dead",
             start_today=datetime(2026, 5, 6, 9, 25, 0),
             exit_today=datetime(2026, 5, 6, 15, 0, 30),
             exit_status=0,
             duration_sec=5 * 3600 + 35 * 60 + 30,  # 5h35m30s
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         watchdog = {"active": 60}
         _, body = build_daily_report(
-            date(2026, 5, 6), is_trading_day_flag=True,
-            monitor=monitor, daily=daily,
+            date(2026, 5, 6),
+            is_trading_day_flag=True,
+            monitor=monitor,
+            daily=daily,
             watchdog_counts=watchdog,
             business={"price_level_events": 12, "screen_n-shape-pool1": 0},
         )
@@ -223,19 +286,27 @@ class TestBuildDailyReport:
         """跨午休 bug 复发：monitor 11:31 就退了，时长 < 5h。"""
         monitor = ServiceSnapshot(
             unit="rquant-monitor.service",
-            active_state="inactive", sub_state="dead",
+            active_state="inactive",
+            sub_state="dead",
             start_today=datetime(2026, 5, 6, 9, 25, 0),
             exit_today=datetime(2026, 5, 6, 11, 31, 0),
             exit_status=0,
             duration_sec=2 * 3600 + 6 * 60,  # 2h6m
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         _, body = build_daily_report(
-            date(2026, 5, 6), is_trading_day_flag=True,
-            monitor=monitor, daily=daily,
+            date(2026, 5, 6),
+            is_trading_day_flag=True,
+            monitor=monitor,
+            daily=daily,
             watchdog_counts={"active": 60, "out-of-window": 14},
             business=self._empty_business(),
         )
@@ -246,19 +317,27 @@ class TestBuildDailyReport:
         """交易日 watchdog 一次都没触发——timer 出问题了。"""
         monitor = ServiceSnapshot(
             unit="rquant-monitor.service",
-            active_state="inactive", sub_state="dead",
+            active_state="inactive",
+            sub_state="dead",
             start_today=datetime(2026, 5, 6, 9, 25, 0),
             exit_today=datetime(2026, 5, 6, 15, 0, 30),
             exit_status=0,
             duration_sec=5 * 3600 + 35 * 60,
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         _, body = build_daily_report(
-            date(2026, 5, 6), is_trading_day_flag=True,
-            monitor=monitor, daily=daily,
+            date(2026, 5, 6),
+            is_trading_day_flag=True,
+            monitor=monitor,
+            daily=daily,
             watchdog_counts={},
             business=self._empty_business(),
         )
@@ -268,18 +347,28 @@ class TestBuildDailyReport:
     def test_daily_failed(self):
         """daily 失败：明确显示 status code。"""
         monitor = ServiceSnapshot(
-            unit="rquant-monitor.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-monitor.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="failed", sub_state="failed",
+            unit="rquant-daily.service",
+            active_state="failed",
+            sub_state="failed",
             start_today=datetime(2026, 4, 30, 17, 0, 0),
             exit_today=datetime(2026, 4, 30, 17, 0, 30),
-            exit_status=1, duration_sec=30,
+            exit_status=1,
+            duration_sec=30,
         )
         _, body = build_daily_report(
-            date(2026, 4, 30), is_trading_day_flag=True,
-            monitor=monitor, daily=daily,
+            date(2026, 4, 30),
+            is_trading_day_flag=True,
+            monitor=monitor,
+            daily=daily,
             watchdog_counts={},
             business=self._empty_business(),
         )
@@ -288,19 +377,29 @@ class TestBuildDailyReport:
     def test_holiday_only_out_of_window(self):
         """节假日 watchdog timer 触发但全在 09:30 前自检退（极端 edge case）。"""
         monitor = ServiceSnapshot(
-            unit="rquant-monitor.service", active_state="inactive", sub_state="dead",
+            unit="rquant-monitor.service",
+            active_state="inactive",
+            sub_state="dead",
             start_today=datetime(2026, 5, 1, 9, 25, 0),
             exit_today=datetime(2026, 5, 1, 9, 25, 5),
-            exit_status=0, duration_sec=5,
+            exit_status=0,
+            duration_sec=5,
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         # 只有 out-of-window，没有 in-window 触发（不该出现，但测兜底）
         _, body = build_daily_report(
-            date(2026, 5, 1), is_trading_day_flag=False,
-            monitor=monitor, daily=daily,
+            date(2026, 5, 1),
+            is_trading_day_flag=False,
+            monitor=monitor,
+            daily=daily,
             watchdog_counts={"out-of-window": 14},
             business=self._empty_business(),
         )
@@ -311,16 +410,28 @@ class TestBuildDailyReport:
     def test_monitor_never_triggered(self):
         """monitor 今天根本没触发——timer 出问题。"""
         monitor = ServiceSnapshot(
-            unit="rquant-monitor.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-monitor.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         daily = ServiceSnapshot(
-            unit="rquant-daily.service", active_state="inactive", sub_state="dead",
-            start_today=None, exit_today=None, exit_status=None, duration_sec=None,
+            unit="rquant-daily.service",
+            active_state="inactive",
+            sub_state="dead",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
         _, body = build_daily_report(
-            date(2026, 5, 6), is_trading_day_flag=True,
-            monitor=monitor, daily=daily,
+            date(2026, 5, 6),
+            is_trading_day_flag=True,
+            monitor=monitor,
+            daily=daily,
             watchdog_counts={},
             business=self._empty_business(),
         )
@@ -339,10 +450,26 @@ class TestAlertFailureReadout:
 
         log = tmp_path / "alert-failures.jsonl"
         log.write_text(
-            json.dumps({"failed_at": "2026-06-08 17:00:43", "unit": "rquant-daily.service",
-                        "host": "vm", "subject": "x"}, ensure_ascii=False) + "\n"
-            + json.dumps({"failed_at": "2026-06-07 09:00:00", "unit": "old.service",
-                          "host": "vm", "subject": "y"}, ensure_ascii=False) + "\n",
+            json.dumps(
+                {
+                    "failed_at": "2026-06-08 17:00:43",
+                    "unit": "rquant-daily.service",
+                    "host": "vm",
+                    "subject": "x",
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "failed_at": "2026-06-07 09:00:00",
+                    "unit": "old.service",
+                    "host": "vm",
+                    "subject": "y",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
             encoding="utf-8",
         )
         out = _read_recent_alert_failures(tmp_path, date(2026, 6, 8))
@@ -364,8 +491,16 @@ class TestAlertFailureReadout:
 
         log = tmp_path / "alert-failures.jsonl"
         log.write_text(
-            json.dumps({"failed_at": "2026-06-08 10:00:00", "unit": "a.service",
-                        "host": "vm", "subject": "x"}, ensure_ascii=False) + "\n"
+            json.dumps(
+                {
+                    "failed_at": "2026-06-08 10:00:00",
+                    "unit": "a.service",
+                    "host": "vm",
+                    "subject": "x",
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
             + "garbage not json\n",
             encoding="utf-8",
         )

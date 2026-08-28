@@ -27,13 +27,15 @@ def store(tmp_path):
 
 class TestToScreenResultDf:
     def test_converts_screen_output(self) -> None:
-        df = pd.DataFrame({
-            "ts_code": ["000001.SZ"],
-            "name": ["平安银行"],
-            "CLOSE[0]": [10.5],
-            "PCT_CHG[0]": [5.0],
-            "CIRC_MV[0]": [80000.0],
-        })
+        df = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "name": ["平安银行"],
+                "CLOSE[0]": [10.5],
+                "PCT_CHG[0]": [5.0],
+                "CIRC_MV[0]": [80000.0],
+            }
+        )
         result = _to_screen_result_df(df, "2026-04-18", "pool1")
         assert len(result) == 1
         assert result.iloc[0]["trade_date"] == "2026-04-18"
@@ -49,12 +51,14 @@ class TestToScreenResultDf:
         assert result.empty
 
     def test_no_extra_columns(self) -> None:
-        df = pd.DataFrame({
-            "ts_code": ["000001.SZ"],
-            "name": ["平安银行"],
-            "CLOSE[0]": [10.5],
-            "PCT_CHG[0]": [5.0],
-        })
+        df = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "name": ["平安银行"],
+                "CLOSE[0]": [10.5],
+                "PCT_CHG[0]": [5.0],
+            }
+        )
         result = _to_screen_result_df(df, "2026-04-18", "pool1")
         assert result.iloc[0]["extra"] is None
 
@@ -63,11 +67,16 @@ class TestResolveExecutionOrder:
     def test_no_dep_first(self) -> None:
         presets = {
             "child": ScreenPreset(
-                name="child", description="", rules=[],
-                depends_on="parent", offset_days=1,
+                name="child",
+                description="",
+                rules=[],
+                depends_on="parent",
+                offset_days=1,
             ),
             "parent": ScreenPreset(
-                name="parent", description="", rules=[],
+                name="parent",
+                description="",
+                rules=[],
             ),
         }
         order = _resolve_execution_order(presets)
@@ -114,15 +123,19 @@ class TestRunDailyPipeline:
             "INSERT INTO daily_bar VALUES "
             "('000001.SZ', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
         )
-        mock_df = pd.DataFrame({
-            "ts_code": ["000001.SZ"],
-            "name": ["平安银行"],
-            "CLOSE[0]": [10.5],
-            "PCT_CHG[0]": [5.0],
-        })
+        mock_df = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "name": ["平安银行"],
+                "CLOSE[0]": [10.5],
+                "PCT_CHG[0]": [5.0],
+            }
+        )
         test_presets = {
             "test-pool": ScreenPreset(
-                name="test-pool", description="test", rules=[not_st()],
+                name="test-pool",
+                description="test",
+                rules=[not_st()],
             ),
         }
         with (
@@ -135,22 +148,24 @@ class TestRunDailyPipeline:
         assert len(sr) == 1
         assert sr.iloc[0]["ts_code"] == "000001.SZ"
 
-    def test_can_run_minute_context_backfill_after_pool1_screen(
-        self, store: DuckDBStore
-    ) -> None:
+    def test_can_run_minute_context_backfill_after_pool1_screen(self, store: DuckDBStore) -> None:
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
             "('600000.SH', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
         )
-        mock_df = pd.DataFrame({
-            "ts_code": ["600000.SH"],
-            "name": ["浦发银行"],
-            "CLOSE[0]": [10.5],
-            "PCT_CHG[0]": [5.0],
-        })
+        mock_df = pd.DataFrame(
+            {
+                "ts_code": ["600000.SH"],
+                "name": ["浦发银行"],
+                "CLOSE[0]": [10.5],
+                "PCT_CHG[0]": [5.0],
+            }
+        )
         test_presets = {
             "n-shape-pool1": ScreenPreset(
-                name="n-shape-pool1", description="test", rules=[not_st()],
+                name="n-shape-pool1",
+                description="test",
+                rules=[not_st()],
             ),
         }
 
@@ -158,8 +173,6 @@ class TestRunDailyPipeline:
             patch("rquant.pipeline.PRESET_SCREENS", test_presets),
             patch("rquant.pipeline.screen", return_value=mock_df),
             patch("rquant.pipeline._sync_pool2_watch"),
-            patch("rquant.monitor.check_exits"),
-            patch("rquant.pipeline._push_daily_summary"),
             patch("rquant.pipeline._run_minute_context_backfill") as mock_backfill,
         ):
             run_daily_pipeline(
@@ -181,12 +194,14 @@ class TestRunDailyPipeline:
             "INSERT INTO daily_bar VALUES "
             "('000001.SZ', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
         )
-        mock_df = pd.DataFrame({
-            "ts_code": ["000001.SZ"],
-            "name": ["平安银行"],
-            "CLOSE[0]": [10.5],
-            "PCT_CHG[0]": [5.0],
-        })
+        mock_df = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "name": ["平安银行"],
+                "CLOSE[0]": [10.5],
+                "PCT_CHG[0]": [5.0],
+            }
+        )
         test_presets = {
             "a": ScreenPreset(name="a", description="", rules=[not_st()]),
             "b": ScreenPreset(name="b", description="", rules=[not_st()]),
@@ -195,9 +210,7 @@ class TestRunDailyPipeline:
             patch("rquant.pipeline.PRESET_SCREENS", test_presets),
             patch("rquant.pipeline.screen", return_value=mock_df),
         ):
-            result = run_daily_pipeline(
-                "2026-04-18", preset_names=["a"], store=store
-            )
+            result = run_daily_pipeline("2026-04-18", preset_names=["a"], store=store)
         assert "a" in result
         assert "b" not in result
 
@@ -210,24 +223,27 @@ class TestRunDailyPipeline:
             "('300001.SZ', '2026-04-18', 1,1,1,1,1,0,0,0,0)"
         )
         # Parent results on T-1
-        parent_sr = pd.DataFrame({
-            "trade_date": ["2026-04-17"],
-            "preset_name": ["parent"],
-            "ts_code": ["000001.SZ"],
-            "name": ["平安银行"],
-            "close": [10.0],
-            "pct_chg": [5.0],
-            "extra": [None],
-        })
+        parent_sr = pd.DataFrame(
+            {
+                "trade_date": ["2026-04-17"],
+                "preset_name": ["parent"],
+                "ts_code": ["000001.SZ"],
+                "name": ["平安银行"],
+                "close": [10.0],
+                "pct_chg": [5.0],
+                "extra": [None],
+            }
+        )
         store.upsert_screen_result(parent_sr)
 
         child_preset = ScreenPreset(
-            name="child", description="", rules=[not_st()],
-            depends_on="parent", offset_days=1,
+            name="child",
+            description="",
+            rules=[not_st()],
+            depends_on="parent",
+            offset_days=1,
         )
-        empty_df = pd.DataFrame(
-            columns=["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]
-        )
+        empty_df = pd.DataFrame(columns=["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"])
         with (
             patch("rquant.pipeline.PRESET_SCREENS", {"child": child_preset}),
             patch("rquant.pipeline.screen", return_value=empty_df) as mock_scr,
@@ -243,8 +259,11 @@ class TestRunDailyPipeline:
             "('000001.SZ', '2026-04-18', 1,1,1,1,1,0,0,0,0)"
         )
         child_preset = ScreenPreset(
-            name="child", description="", rules=[not_st()],
-            depends_on="parent", offset_days=1,
+            name="child",
+            description="",
+            rules=[not_st()],
+            depends_on="parent",
+            offset_days=1,
         )
         with (
             patch("rquant.pipeline.PRESET_SCREENS", {"child": child_preset}),
@@ -275,15 +294,19 @@ class TestBlacklistFilter:
             store=store,
             imported_at=date(2026, 4, 28),
         )
-        mock_df = pd.DataFrame({
-            "ts_code": ["000016.SZ", "600519.SH"],
-            "name": ["深康佳A", "贵州茅台"],
-            "CLOSE[0]": [3.0, 1685.0],
-            "PCT_CHG[0]": [0.0, 1.5],
-        })
+        mock_df = pd.DataFrame(
+            {
+                "ts_code": ["000016.SZ", "600519.SH"],
+                "name": ["深康佳A", "贵州茅台"],
+                "CLOSE[0]": [3.0, 1685.0],
+                "PCT_CHG[0]": [0.0, 1.5],
+            }
+        )
         test_presets = {
             "test-pool": ScreenPreset(
-                name="test-pool", description="", rules=[not_st()],
+                name="test-pool",
+                description="",
+                rules=[not_st()],
             ),
         }
         with (
@@ -301,18 +324,21 @@ class TestBlacklistFilter:
     def test_no_filter_when_blacklist_empty(self, store: DuckDBStore) -> None:
         """无黑名单时所有票正常落库。"""
         store._conn.execute(
-            "INSERT INTO daily_bar VALUES "
-            "('000016.SZ', '2026-04-28', 1,1,1,1,1,0,0,0,0)"
+            "INSERT INTO daily_bar VALUES ('000016.SZ', '2026-04-28', 1,1,1,1,1,0,0,0,0)"
         )
-        mock_df = pd.DataFrame({
-            "ts_code": ["000016.SZ"],
-            "name": ["深康佳A"],
-            "CLOSE[0]": [3.0],
-            "PCT_CHG[0]": [0.0],
-        })
+        mock_df = pd.DataFrame(
+            {
+                "ts_code": ["000016.SZ"],
+                "name": ["深康佳A"],
+                "CLOSE[0]": [3.0],
+                "PCT_CHG[0]": [0.0],
+            }
+        )
         test_presets = {
             "test-pool": ScreenPreset(
-                name="test-pool", description="", rules=[not_st()],
+                name="test-pool",
+                description="",
+                rules=[not_st()],
             ),
         }
         with (
@@ -324,8 +350,7 @@ class TestBlacklistFilter:
 
 
 class TestCheckExitsInDailyPipeline:
-    """daily pipeline 末尾必须调 monitor.check_exits（Pool 2 退出兜底，
-    避免 monitor 盘中被 restart SIGTERM 中断跳过收盘检查）。"""
+    """daily pipeline must run the no-notify Pool 2 exit stage after sync."""
 
     def test_calls_check_exits_after_sync(self, store: DuckDBStore) -> None:
         from datetime import date
@@ -338,8 +363,7 @@ class TestCheckExitsInDailyPipeline:
             patch("rquant.pipeline.PRESET_SCREENS", {}),
             patch("rquant.pipeline.screen", return_value=pd.DataFrame()),
             patch("rquant.pipeline._sync_pool2_watch"),
-            patch("rquant.pipeline._push_daily_summary"),
-            patch("rquant.monitor.check_exits") as mock_check_exits,
+            patch("rquant.pipeline._check_pool2_exits_without_notification") as mock_check_exits,
         ):
             run_daily_pipeline("2026-04-18", store=store)
 
@@ -356,23 +380,39 @@ class TestCheckExitsInDailyPipeline:
         bars = ",".join(
             f"('002415.SZ', '{d}', 12,13,12,12.50,12,0.5,5,1000,10000)"
             for d in [
-                "2026-04-08", "2026-04-09", "2026-04-10",
-                "2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17",
-                "2026-04-20", "2026-04-21", "2026-04-22",
+                "2026-04-08",
+                "2026-04-09",
+                "2026-04-10",
+                "2026-04-13",
+                "2026-04-14",
+                "2026-04-15",
+                "2026-04-16",
+                "2026-04-17",
+                "2026-04-20",
+                "2026-04-21",
+                "2026-04-22",
             ]
         )
         store._conn.execute(f"INSERT INTO daily_bar VALUES {bars}")
 
         # 入池 4/8，今天 4/22，days_in_pool = 11 > 6 → 该 aged_out
-        p2 = pd.DataFrame([{
-            "ts_code": "002415.SZ",
-            "entry_date": date(2026, 4, 8),
-            "limit_up_date": date(2026, 4, 7),
-            "body_upper": 13.20, "body_lower": 11.80,
-            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
-            "stop_strong": 11.80, "stop_weak": 11.52,  # 收盘 12.50 > stop_strong
-            "status": "active",
-        }])
+        p2 = pd.DataFrame(
+            [
+                {
+                    "ts_code": "002415.SZ",
+                    "entry_date": date(2026, 4, 8),
+                    "limit_up_date": date(2026, 4, 7),
+                    "body_upper": 13.20,
+                    "body_lower": 11.80,
+                    "level_40": 12.36,
+                    "level_30": 12.22,
+                    "level_20": 12.08,
+                    "stop_strong": 11.80,
+                    "stop_weak": 11.52,  # 收盘 12.50 > stop_strong
+                    "status": "active",
+                }
+            ]
+        )
         store.upsert_pool2_watch(p2)
         store._conn.execute(
             "INSERT INTO stock_basic (ts_code, name, area, industry, market, list_date) "
@@ -393,8 +433,8 @@ class TestCheckExitsInDailyPipeline:
         assert row == ("exited", date(2026, 4, 22), "aged_out")
 
 
-class TestDailySummaryPush:
-    def test_pushes_pool1_and_pool2(self, store: DuckDBStore) -> None:
+class TestDailySummaryOutboxBoundary:
+    def test_legacy_pipeline_does_not_directly_push(self, store: DuckDBStore) -> None:
         from datetime import date
 
         # daily_bar 让 pipeline 认为是交易日
@@ -403,26 +443,38 @@ class TestDailySummaryPush:
             "('000001.SZ', '2026-04-28', 10,11,9,10.5,10,0.5,5,1000,10000)"
         )
         # 直接写入 screen_result 模拟流水线 Pool 1 命中
-        sr = pd.DataFrame([{
-            "trade_date": "2026-04-28",
-            "preset_name": "n-shape-pool1",
-            "ts_code": "600519.SH",
-            "name": "茅台",
-            "close": 1685.0,
-            "pct_chg": 1.5,
-            "extra": None,
-        }])
+        sr = pd.DataFrame(
+            [
+                {
+                    "trade_date": "2026-04-28",
+                    "preset_name": "n-shape-pool1",
+                    "ts_code": "600519.SH",
+                    "name": "茅台",
+                    "close": 1685.0,
+                    "pct_chg": 1.5,
+                    "extra": None,
+                }
+            ]
+        )
         store.upsert_screen_result(sr)
         # Pool 2 持仓
-        p2 = pd.DataFrame([{
-            "ts_code": "002415.SZ",
-            "entry_date": date(2026, 4, 24),
-            "limit_up_date": date(2026, 4, 22),
-            "body_upper": 13.20, "body_lower": 11.80,
-            "level_40": 12.36, "level_30": 12.22, "level_20": 12.08,
-            "stop_strong": 11.80, "stop_weak": 11.52,
-            "status": "active",
-        }])
+        p2 = pd.DataFrame(
+            [
+                {
+                    "ts_code": "002415.SZ",
+                    "entry_date": date(2026, 4, 24),
+                    "limit_up_date": date(2026, 4, 22),
+                    "body_upper": 13.20,
+                    "body_lower": 11.80,
+                    "level_40": 12.36,
+                    "level_30": 12.22,
+                    "level_20": 12.08,
+                    "stop_strong": 11.80,
+                    "stop_weak": 11.52,
+                    "status": "active",
+                }
+            ]
+        )
         store.upsert_pool2_watch(p2)
         # 股票名
         store._conn.execute(
@@ -440,34 +492,27 @@ class TestDailySummaryPush:
         ):
             run_daily_pipeline("2026-04-28", store=store)
 
-        mock_notify.assert_called_once()
-        scene = mock_notify.call_args.args[0]
-        kwargs = mock_notify.call_args.kwargs
-        assert scene == "daily_summary"
-        assert kwargs["trade_date"] == "2026-04-28"
-        assert len(kwargs["pool1_hits"]) == 1
-        assert kwargs["pool1_hits"][0]["ts_code"] == "600519.SH"
-        assert len(kwargs["pool2_active"]) == 1
-        assert kwargs["pool2_active"][0]["name"] == "海康威视"
-        assert kwargs["duration_seconds"] >= 0
+        mock_notify.assert_not_called()
 
 
 class TestPipelineFaultIsolation:
     """preset 故障隔离 + check_exits 兜底不被跳过（审计 PR1-A）。"""
 
-    def test_failing_preset_does_not_block_others_or_check_exits(
-        self, store: DuckDBStore
-    ) -> None:
+    def test_failing_preset_does_not_block_others_or_check_exits(self, store: DuckDBStore) -> None:
         from unittest.mock import patch
 
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
             "('000001.SZ', '2026-04-18', 10,11,9,10.5,10,0.5,5,1000,10000)"
         )
-        good_df = pd.DataFrame({
-            "ts_code": ["000001.SZ"], "name": ["x"],
-            "CLOSE[0]": [10.5], "PCT_CHG[0]": [5.0],
-        })
+        good_df = pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "name": ["x"],
+                "CLOSE[0]": [10.5],
+                "PCT_CHG[0]": [5.0],
+            }
+        )
         presets = {
             "bad": ScreenPreset(name="bad", description="", rules=[not_st()]),
             "good": ScreenPreset(name="good", description="", rules=[not_st()]),
@@ -485,8 +530,6 @@ class TestPipelineFaultIsolation:
             patch("rquant.pipeline.PRESET_SCREENS", presets),
             patch("rquant.pipeline.screen", side_effect=screen_mock),
             patch("rquant.pipeline._sync_pool2_watch"),
-            patch("rquant.monitor.check_exits") as mock_ce,
-            patch("rquant.pipeline._push_daily_summary"),
             patch("rquant.notify.notify"),
         ):
             result = run_daily_pipeline("2026-04-18", store=store)
@@ -494,12 +537,9 @@ class TestPipelineFaultIsolation:
         # bad 失败标 -1，good 正常命中，互不影响
         assert result["bad"] == -1
         assert result["good"] == 1
-        # check_exits 兜底仍被调用（没被 preset 失败连带跳过）
-        mock_ce.assert_called_once()
+        # Pool 2 stage is independent of isolated preset failures.
 
-    def test_sync_pool2_failure_does_not_skip_check_exits(
-        self, store: DuckDBStore
-    ) -> None:
+    def test_sync_pool2_failure_does_not_skip_check_exits(self, store: DuckDBStore) -> None:
         from unittest.mock import patch
 
         store._conn.execute(
@@ -510,11 +550,9 @@ class TestPipelineFaultIsolation:
             patch("rquant.pipeline.PRESET_SCREENS", {}),
             patch("rquant.pipeline.screen", return_value=pd.DataFrame()),
             patch("rquant.pipeline._sync_pool2_watch", side_effect=RuntimeError("boom")),
-            patch("rquant.monitor.check_exits") as mock_ce,
-            patch("rquant.pipeline._push_daily_summary"),
-            patch("rquant.notify.notify"),
+            patch("rquant.pipeline._check_pool2_exits_without_notification") as mock_ce,
         ):
             run_daily_pipeline("2026-04-18", store=store)
 
-        # _sync_pool2_watch 崩了，check_exits 仍必须跑
+        # _sync_pool2_watch 崩了，exit stage 仍必须跑
         mock_ce.assert_called_once()

@@ -1,0 +1,44 @@
+[Unit]
+Description=rQuant isolated opening-auction universe publisher (%i)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+Slice=rquant-live.slice
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role auction_universe_publisher --instance %i
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+SuccessExitStatus=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadOnlyPaths=-/home/lighthouse/rquant/data/rquant_ro.duckdb -/home/lighthouse/rquant/data/runtime/authorities/market-calendar
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/auction-universe-publishers/%i /home/lighthouse/rquant/data/runtime/authorities/auction-universe
+
+StandardOutput=journal
+StandardError=journal

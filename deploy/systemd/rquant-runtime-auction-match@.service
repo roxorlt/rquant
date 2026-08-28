@@ -1,0 +1,45 @@
+[Unit]
+Description=rQuant isolated opening-auction source (%i)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+LoadCredentialEncrypted=capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/%i/current.cred
+Slice=rquant-live.slice
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role auction_match_source --instance %i
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+SuccessExitStatus=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/authorities/market-calendar -/home/lighthouse/rquant/data/runtime/authorities/auction-universe
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/auction-match-sources/%i /home/lighthouse/rquant/data/runtime/live/auction-match
+
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,52 @@
+{
+  "expected_nodeids_sha256": "89af5d0cc1e4367cef445434405c365b6e705e4bc5582932223df3468baa796f",
+  "expected_test_count": 474,
+  "modules": [
+    {
+      "boundary": "Issues and verifies the fenced current-claim generation consumed by every V2 saga.",
+      "path": "tests/unit/test_current_claim_authority.py"
+    },
+    {
+      "boundary": "Publishes and verifies the replay-lineage authority after source and quota terminalization.",
+      "path": "tests/unit/test_replay_lineage_authority.py"
+    },
+    {
+      "boundary": "Freezes the durable V1 broker authority whose receipt and recovery semantics V2 must not fake or regress.",
+      "path": "tests/unit/test_source_broker.py"
+    },
+    {
+      "boundary": "Freezes canonical framing, Unix peer identity, size limits, and response binding reused by the V2 Unix client.",
+      "path": "tests/unit/test_source_broker_transport.py"
+    },
+    {
+      "boundary": "Owns native quota parent and call terminal receipts consumed and replayed by the V2 saga.",
+      "path": "tests/unit/test_source_quota_authority.py"
+    },
+    {
+      "boundary": "Freezes the six-phase native quota adapter used by V2 reserve, authorize, finalize, and release stages.",
+      "path": "tests/unit/test_source_quota_broker_adapter.py"
+    },
+    {
+      "boundary": "Binds quota receipts to the external monotonic root so local rollback cannot forge authority progress.",
+      "path": "tests/unit/test_source_quota_external_root_adapter.py"
+    },
+    {
+      "boundary": "Freezes the bounded SQLite quota state and idempotent lease/call persistence below the authority.",
+      "path": "tests/unit/test_source_quota_store.py"
+    },
+    {
+      "boundary": "Freezes the closed quota Unix transport and canonical native receipt boundary used by the adapter.",
+      "path": "tests/unit/test_source_quota_transport.py"
+    }
+  ],
+  "pressure_gate": {
+    "nodeids": [
+      "tests/unit/test_current_claim_authority.py::test_hot_path_uses_incremental_checks_and_full_audit_stays_explicit",
+      "tests/unit/test_source_quota_authority.py::test_p1_hot_replay_has_no_global_history_or_clock_scan_after_scale",
+      "tests/unit/test_source_quota_authority.py::test_p1_parent_hot_queries_use_covering_indexes_with_large_call_usage_history"
+    ],
+    "rounds": 3
+  },
+  "schema_version": 1,
+  "suite_id": "source_broker_v2_frozen"
+}

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from rquant import panorama_data
+from rquant.dashboard.runtime_console_data import ServingFrameState
 from rquant.panorama_data import (
     add_limit_prices,
     aggregate_board_amount,
@@ -23,10 +24,83 @@ from rquant.panorama_data import (
     industry_fallback_members,
     load_board_members,
     load_kpl_concept_members,
+    load_market_snapshot_projection,
     load_pool_flags,
+    open_panorama_serving_generation,
 )
+from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
+from rquant.serving_publisher import ServingPublisher, ServingTableSpec
 from rquant.state.derive import derive_state
 from rquant.storage.duckdb import DuckDBStore
+
+
+def test_panorama_health_propagates_projection_staleness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "serving"
+    built_at = datetime.now(UTC) - timedelta(seconds=1)
+    available_at = built_at - timedelta(hours=1)
+    ServingPublisher(
+        root,
+        producer_commit="a" * 40,
+        table_specs={
+            "market_snapshot": ServingTableSpec(sort_keys=("as_of", "ts_code")),
+            "projection_status": ServingTableSpec(sort_keys=("table_name",)),
+        },
+    ).publish(
+        {
+            "market_snapshot": pd.DataFrame(
+                [
+                    {
+                        "as_of": available_at,
+                        "ts_code": "600000.SH",
+                        "name": "PF",
+                        "price": 10.0,
+                        "open": 9.9,
+                        "high": 10.1,
+                        "low": 9.8,
+                        "pre_close": 9.8,
+                        "pct_chg": 2.0,
+                        "volume": 1000.0,
+                        "amount": 10000.0,
+                    }
+                ]
+            ),
+            "projection_status": pd.DataFrame(
+                [
+                    {
+                        "table_name": "market_snapshot",
+                        "available": True,
+                        "reason": None,
+                        "owner_dataset_id": "signals",
+                        "available_at": available_at,
+                    }
+                ]
+            ),
+        },
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="signals",
+                generation_id="signals-1",
+                event_time=built_at,
+                published_at=built_at,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"signals": "signals-1"},
+        built_at=built_at,
+    )
+    monkeypatch.setenv("RQUANT_SERVING_ROOT", str(root))
+
+    with open_panorama_serving_generation() as store:
+        frame = load_market_snapshot_projection(store)
+        health = store.serving_health()
+
+    assert frame["ts_code"].tolist() == ["600000.SH"]
+    assert health is not None
+    assert health.state is ServingFrameState.STALE
 
 
 def _sina_spot_df() -> pd.DataFrame:
@@ -65,7 +139,11 @@ class TestFetchMarketSnapshot:
         assert df.attrs["route"] == "sina"
         # 'xx123' 后 6 位 'xx123' 非法代码被丢弃（实际 5 位）
         assert set(df["ts_code"]) == {
-            "600519.SH", "300750.SZ", "688981.SH", "920008.BJ", "600222.SH",
+            "600519.SH",
+            "300750.SZ",
+            "688981.SH",
+            "920008.BJ",
+            "600222.SH",
         }
         row = df[df["ts_code"] == "600519.SH"].iloc[0]
         assert row["price"] == 1500.0
@@ -86,9 +164,7 @@ class TestFetchMarketSnapshot:
         assert df.empty
         assert df.attrs["route"] == "none"
 
-    def test_missing_required_column_returns_empty(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_missing_required_column_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _kill_em_spot_tiers(monkeypatch)
         monkeypatch.setattr(
             panorama_data, "_fetch_spot", lambda: _sina_spot_df().drop(columns=["昨收"])
@@ -98,26 +174,62 @@ class TestFetchMarketSnapshot:
 
 # 东财 push2 clist 股票 diff 行（f5 成交量单位手；停牌票数值字段给 "-"）
 _EM_SPOT_ROWS: list[dict] = [
-    {"f12": "600519", "f14": "贵州茅台", "f2": 1500.0, "f17": 1480.0, "f15": 1510.0,
-     "f16": 1475.0, "f18": 1490.0, "f3": 0.67, "f5": 10000, "f6": 1.5e9},
-    {"f12": "300750", "f14": "宁德时代", "f2": 250.0, "f17": 245.0, "f15": 252.0,
-     "f16": 244.0, "f18": 240.0, "f3": 4.17, "f5": 200000, "f6": 5e9},
-    {"f12": "920008", "f14": "某北交所", "f2": "-", "f17": "-", "f15": "-",
-     "f16": "-", "f18": 12.0, "f3": "-", "f5": "-", "f6": "-"},
+    {
+        "f12": "600519",
+        "f14": "贵州茅台",
+        "f2": 1500.0,
+        "f17": 1480.0,
+        "f15": 1510.0,
+        "f16": 1475.0,
+        "f18": 1490.0,
+        "f3": 0.67,
+        "f5": 10000,
+        "f6": 1.5e9,
+    },
+    {
+        "f12": "300750",
+        "f14": "宁德时代",
+        "f2": 250.0,
+        "f17": 245.0,
+        "f15": 252.0,
+        "f16": 244.0,
+        "f18": 240.0,
+        "f3": 4.17,
+        "f5": 200000,
+        "f6": 5e9,
+    },
+    {
+        "f12": "920008",
+        "f14": "某北交所",
+        "f2": "-",
+        "f17": "-",
+        "f15": "-",
+        "f16": "-",
+        "f18": 12.0,
+        "f3": "-",
+        "f5": "-",
+        "f6": "-",
+    },
 ]
 
 _SNAPSHOT_COLUMNS = [
-    "ts_code", "name", "price", "open", "high", "low", "pre_close",
-    "pct_chg", "volume", "amount",
+    "ts_code",
+    "name",
+    "price",
+    "open",
+    "high",
+    "low",
+    "pre_close",
+    "pct_chg",
+    "volume",
+    "amount",
 ]
 
 
 class TestSnapshotRouting:
     """全市场快照三级路由：东财 clist 直连 → 同实现走 SOCKS → 新浪兜底 → 全败空表。"""
 
-    def test_em_direct_normalizes_volume_to_shares(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_em_direct_normalizes_volume_to_shares(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen: list[dict] = []
         sessions: list[object] = []
 
@@ -143,9 +255,7 @@ class TestSnapshotRouting:
         bj = df[df["ts_code"] == "920008.BJ"].iloc[0]
         assert pd.isna(bj["price"]) and pd.isna(bj["volume"])
 
-    def test_em_rows_missing_key_fields_fall_through(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_em_rows_missing_key_fields_fall_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """em 返回 200 但缺 f12/f2 关键字段 → 该级视为空，落到 sina 兜底。"""
         rows = [{"f14": "贵州茅台", "f3": 0.67}]
 
@@ -195,9 +305,18 @@ class TestSnapshotRouting:
             n = 100 if params["pn"] == 1 else 50
             start = (params["pn"] - 1) * 100
             diff = [
-                {"f12": f"{600000 + start + i:06d}", "f14": f"股{start + i}", "f2": 10.0,
-                 "f17": 9.9, "f15": 10.2, "f16": 9.8, "f18": 9.9, "f3": 1.0,
-                 "f5": 1000, "f6": 1e6}
+                {
+                    "f12": f"{600000 + start + i:06d}",
+                    "f14": f"股{start + i}",
+                    "f2": 10.0,
+                    "f17": 9.9,
+                    "f15": 10.2,
+                    "f16": 9.8,
+                    "f18": 9.9,
+                    "f3": 1.0,
+                    "f5": 1000,
+                    "f6": 1e6,
+                }
                 for i in range(n)
             ]
             return _FakeResp({"data": {"diff": diff, "total": 150}})
@@ -302,9 +421,7 @@ class TestLimitPrices:
                         [compact_name.startswith(("ST", "*ST", "SST"))],
                         dtype="boolean",
                     ),
-                    "available_at": [
-                        datetime(2026, 7, 3, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai"))
-                    ],
+                    "available_at": [datetime(2026, 7, 3, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai"))],
                     "conflict_reason": [None],
                 }
             )
@@ -332,11 +449,11 @@ class TestMarketPulse:
             # (code, price, high, pre_close)
             ("600001.SH", 11.00, 11.00, 10.0),  # 涨停
             ("600002.SH", 10.50, 11.00, 10.0),  # 炸板（触 11 回落）
-            ("600003.SH", 9.00, 9.80, 10.0),    # 跌停 + 下跌
+            ("600003.SH", 9.00, 9.80, 10.0),  # 跌停 + 下跌
             ("600004.SH", 10.20, 10.30, 10.0),  # 上涨
-            ("600005.SH", 9.90, 10.10, 10.0),   # 下跌
+            ("600005.SH", 9.90, 10.10, 10.0),  # 下跌
             ("600006.SH", 10.00, 10.05, 10.0),  # 平盘
-            ("600007.SH", 0.0, 0.0, 10.0),      # 停牌，剔除
+            ("600007.SH", 0.0, 0.0, 10.0),  # 停牌，剔除
         ]
         df = pd.DataFrame(rows, columns=["ts_code", "price", "high", "pre_close"])
         df["name"] = "普通票"
@@ -365,16 +482,42 @@ class TestMarketPulse:
 
 # 东财 push2 diff 行（字段结构对齐 2026-07-03 实测 JSON）
 _EM_ROWS: list[dict] = [
-    {"f12": "BK1211", "f14": "汽车", "f2": 4117.15, "f3": 3.89,
-     "f62": 7549719296.0, "f184": 7.28, "f204": "比亚迪"},
-    {"f12": "BK0481", "f14": "汽车零部件", "f2": 46786.0, "f3": 4.29,
-     "f62": 6368454912.0, "f184": 7.52, "f204": "拓普集团"},
-    {"f12": "BK0475", "f14": "银行", "f2": 3300.0, "f3": "-",
-     "f62": -1.1e9, "f184": "-", "f204": "-"},
+    {
+        "f12": "BK1211",
+        "f14": "汽车",
+        "f2": 4117.15,
+        "f3": 3.89,
+        "f62": 7549719296.0,
+        "f184": 7.28,
+        "f204": "比亚迪",
+    },
+    {
+        "f12": "BK0481",
+        "f14": "汽车零部件",
+        "f2": 46786.0,
+        "f3": 4.29,
+        "f62": 6368454912.0,
+        "f184": 7.52,
+        "f204": "拓普集团",
+    },
+    {
+        "f12": "BK0475",
+        "f14": "银行",
+        "f2": 3300.0,
+        "f3": "-",
+        "f62": -1.1e9,
+        "f184": "-",
+        "f204": "-",
+    },
 ]
 
 _FLOW_COLUMNS = [
-    "board_code", "board_name", "pct_chg", "main_net_amount", "main_net_rate", "leading_stock",
+    "board_code",
+    "board_name",
+    "pct_chg",
+    "main_net_amount",
+    "main_net_rate",
+    "leading_stock",
 ]
 
 
@@ -459,8 +602,14 @@ class TestSectorFundFlowRouting:
         def fake_get(self: object, url: str, **kwargs: object) -> _FakeResp:
             params = kwargs["params"]
             pages.append(params["pn"])
-            row = {"f12": f"BK{params['pn']:04d}", "f14": f"板块{params['pn']}",
-                   "f3": 1.0, "f62": 1e9 - params["pn"], "f184": 1.0, "f204": "某股"}
+            row = {
+                "f12": f"BK{params['pn']:04d}",
+                "f14": f"板块{params['pn']}",
+                "f3": 1.0,
+                "f62": 1e9 - params["pn"],
+                "f184": 1.0,
+                "f204": "某股",
+            }
             diff = [row] * (100 if params["pn"] <= 2 else 50)
             return _FakeResp({"data": {"diff": diff, "total": 250}})
 
@@ -563,9 +712,7 @@ class TestSectorFundFlowRouting:
         assert df.empty
         assert df.attrs["route"] == "none"
 
-    def test_em_missing_amount_field_falls_through(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_em_missing_amount_field_falls_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """东财返回 200 但缺 f62 → 该级视为空，落到 THS 兜底。"""
         rows = [{"f12": "BK1", "f14": "汽车", "f3": 1.0}]
 
@@ -645,7 +792,7 @@ class TestBoardLimitUpAggregation:
             ("600002.SH", 10.50, 11.00),  # 炸板（触 11 回落）
             ("600003.SH", 11.00, 11.00),  # 涨停
             ("600004.SH", 10.20, 10.30),  # 普通上涨
-            ("600005.SH", 0.0, 0.0),      # 停牌：不计入涨停/炸板
+            ("600005.SH", 0.0, 0.0),  # 停牌：不计入涨停/炸板
         ]
         df = pd.DataFrame(rows, columns=["ts_code", "price", "high"])
         df["pre_close"] = 10.0
@@ -659,8 +806,13 @@ class TestBoardLimitUpAggregation:
                 "board_code": ["KP1", "KP1", "KP1", "KP1", "KP2", "KP2", "KP3"],
                 "board_name": ["人形机器人"] * 4 + ["长鑫存储", "长鑫存储", "冷题材"],
                 "con_code": [
-                    "600001.SH", "600002.SH", "600004.SH", "600005.SH",
-                    "600001.SH", "600003.SH", "600004.SH",
+                    "600001.SH",
+                    "600002.SH",
+                    "600004.SH",
+                    "600005.SH",
+                    "600001.SH",
+                    "600003.SH",
+                    "600004.SH",
                 ],
             }
         )
@@ -828,20 +980,24 @@ class TestStrengthScore:
 
         from rquant.panorama_data import add_strength_score
 
-        df = pd.DataFrame({
-            "ts_code": ["600000.SH", "300001.SZ"],
-            "name": ["大票", "小票"],
-            "price": [10.5, 11.8],
-            "pre_close": [10.0, 10.0],
-            "pct_chg": [5.0, 18.0],
-            "amount": [5e9, 8e8],
-            "limit_up_price": [11.0, 12.0],
-        })
-        liquidity = pd.DataFrame({
-            "ts_code": ["600000.SH", "300001.SZ"],
-            "circ_mv": [8_000_000.0, 300_000.0],  # 万元：800亿 vs 30亿
-            "avg_amount_5d": [4.8e9, 2.0e8],
-        })
+        df = pd.DataFrame(
+            {
+                "ts_code": ["600000.SH", "300001.SZ"],
+                "name": ["大票", "小票"],
+                "price": [10.5, 11.8],
+                "pre_close": [10.0, 10.0],
+                "pct_chg": [5.0, 18.0],
+                "amount": [5e9, 8e8],
+                "limit_up_price": [11.0, 12.0],
+            }
+        )
+        liquidity = pd.DataFrame(
+            {
+                "ts_code": ["600000.SH", "300001.SZ"],
+                "circ_mv": [8_000_000.0, 300_000.0],  # 万元：800亿 vs 30亿
+                "avg_amount_5d": [4.8e9, 2.0e8],
+            }
+        )
         out = add_strength_score(df, liquidity)
         big = out.loc[out.ts_code == "600000.SH", "strength"].iloc[0]
         small = out.loc[out.ts_code == "300001.SZ", "strength"].iloc[0]
@@ -855,14 +1011,16 @@ class TestStrengthScore:
 
         from rquant.panorama_data import add_strength_score
 
-        df = pd.DataFrame({
-            "ts_code": ["600000.SH", "000001.SZ"],
-            "price": [10.5, 9.0],
-            "pre_close": [10.0, 10.0],
-            "pct_chg": [5.0, -10.0],
-            "amount": [1e9, 2e9],
-            "limit_up_price": [11.0, 11.0],
-        })
+        df = pd.DataFrame(
+            {
+                "ts_code": ["600000.SH", "000001.SZ"],
+                "price": [10.5, 9.0],
+                "pre_close": [10.0, 10.0],
+                "pct_chg": [5.0, -10.0],
+                "amount": [1e9, 2e9],
+                "limit_up_price": [11.0, 11.0],
+            }
+        )
         out = add_strength_score(df, None)
         assert out["strength"].notna().all()
         assert (

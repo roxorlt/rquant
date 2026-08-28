@@ -1,0 +1,106 @@
+{
+  "cost_policy": {
+    "commission_rate": "0.0003",
+    "minimum_commission": "5.00",
+    "sell_stamp_tax_rate": "0.001",
+    "buy_slippage_bps": "0",
+    "sell_slippage_bps": "0"
+  },
+  "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "frozen_now": "2026-07-30T00:00:00+00:00",
+  "ledger_generation": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "accounts": [
+    {
+      "account_id": "legacy-v4-account",
+      "initial_cash": "200000.00",
+      "expected_cash": "162888.1000",
+      "expected_realized_pnl": "2900.1000",
+      "ts_code": "600000.SH",
+      "price_snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "executions": [
+        {
+          "side": "BUY",
+          "signal_id": "1111111111111111111111111111111111111111111111111111111111111111",
+          "execution_id": "2222222222222222222222222222222222222222222222222222222222222222",
+          "event_time": "2026-07-31T01:30:58+00:00",
+          "decision_time": "2026-07-31T01:31:00+00:00",
+          "persisted_at": "2026-07-31T01:31:00+00:00",
+          "trade_date": "2026-07-31",
+          "available_date": "2026-08-03",
+          "quantity": 500,
+          "executable_quantity": 200,
+          "price": "200.00"
+        },
+        {
+          "side": "BUY",
+          "execution_id": "0d9d81da508fd94c7a9e86593b58810f01cea35c099e8aea780e1b5e3925d854",
+          "executed_at": "2026-07-31T01:31:30+00:00",
+          "persisted_at": "2026-07-31T01:31:30+00:00",
+          "trade_date": "2026-07-31",
+          "available_date": "2026-08-03",
+          "quantity": 300,
+          "price": "200.00"
+        },
+        {
+          "side": "SELL",
+          "signal_id": "3333333333333333333333333333333333333333333333333333333333333333",
+          "execution_id": "4444444444444444444444444444444444444444444444444444444444444444",
+          "event_time": "2026-08-03T01:30:58+00:00",
+          "decision_time": "2026-08-03T01:31:00+00:00",
+          "persisted_at": "2026-08-03T01:31:00+00:00",
+          "trade_date": "2026-08-03",
+          "quantity": 300,
+          "price": "210.00",
+          "action": "REDUCE",
+          "tranche_fraction": "0.6"
+        }
+      ]
+    },
+    {
+      "account_id": "legacy-v4-account-b",
+      "initial_cash": "150000.00",
+      "expected_cash": "121956.4000",
+      "expected_realized_pnl": "1965.4000",
+      "ts_code": "600000.SH",
+      "price_snapshot_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "executions": [
+        {
+          "side": "BUY",
+          "signal_id": "5555555555555555555555555555555555555555555555555555555555555555",
+          "execution_id": "c4b879d084bb7677fb2195ee3daf6f5cbed12f72cd8d8c1ef83c1b50f5e6ad13",
+          "event_time": "2026-08-01T01:30:58+00:00",
+          "decision_time": "2026-08-01T01:31:00+00:00",
+          "persisted_at": "2026-08-01T01:31:00+00:00",
+          "trade_date": "2026-08-01",
+          "available_date": "2026-08-04",
+          "quantity": 500,
+          "executable_quantity": 200,
+          "price": "100.00"
+        },
+        {
+          "side": "BUY",
+          "execution_id": "d9ea6e35ad9cb98f2214f9b604f1a948e2cf42047d4b29f6c0aa216b3645ce17",
+          "executed_at": "2026-08-01T01:31:30+00:00",
+          "persisted_at": "2026-08-01T01:31:30+00:00",
+          "trade_date": "2026-08-01",
+          "available_date": "2026-08-04",
+          "quantity": 300,
+          "price": "100.00"
+        },
+        {
+          "side": "SELL",
+          "signal_id": "7777777777777777777777777777777777777777777777777777777777777777",
+          "execution_id": "e5c1c8f2f77f429d8e745d566be4308c3b35d45185634789ad4c471a02f67b9e",
+          "event_time": "2026-08-04T01:30:58+00:00",
+          "decision_time": "2026-08-04T01:31:00+00:00",
+          "persisted_at": "2026-08-04T01:31:00+00:00",
+          "trade_date": "2026-08-04",
+          "quantity": 200,
+          "price": "110.00",
+          "action": "REDUCE",
+          "tranche_fraction": "0.4"
+        }
+      ]
+    }
+  ]
+}

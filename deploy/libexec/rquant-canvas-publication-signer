@@ -1,0 +1,291 @@
+#!/usr/bin/python3
+"""Root-owned Ed25519 signer for immutable PageControl Canvas receipts.
+
+The unprivileged PageControl process may submit only a bounded signing request on
+stdin.  Key material is loaded from one root-only manifest; callers cannot select
+an alternate helper, key path, namespace, or operation.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+KEYS_FILE = Path("/etc/rquant/canvas-publication-keys.json")
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_KEY_FILE_BYTES = 64 * 1024
+KEY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SIGNATURE = re.compile(r"^[A-Za-z0-9+/]{86}==$")
+NAMESPACES = frozenset(
+    {
+        "rquant-serving-canvas-publication-receipt",
+        "rquant-serving-canvas-publication-probe",
+    }
+)
+
+
+class CanvasSignerError(ValueError):
+    """Unsafe key material or malformed signing request."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CanvasSignerError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _openssl() -> str:
+    for candidate in ("/opt/homebrew/bin/openssl", "/usr/bin/openssl"):
+        if Path(candidate).is_file():
+            return candidate
+    raise CanvasSignerError("openssl is unavailable")
+
+
+def _run_openssl(arguments: list[str], *, input_data: bytes = b"") -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [_openssl(), *arguments],
+            input=input_data,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CanvasSignerError("openssl operation failed") from exc
+
+
+def _secure_file(path: Path, *, mode: int, label: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        expected_owner = 0 if os.geteuid() == 0 else os.geteuid()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or opened.st_uid != expected_owner
+            or stat.S_IMODE(opened.st_mode) != mode
+            or not 0 < opened.st_size <= MAX_KEY_FILE_BYTES
+        ):
+            raise CanvasSignerError(f"{label} is unsafe")
+        payload = os.read(descriptor, MAX_KEY_FILE_BYTES + 1)
+        after = os.fstat(descriptor)
+        if len(payload) != opened.st_size or (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise CanvasSignerError(f"{label} changed while reading")
+        return payload
+    except OSError as exc:
+        raise CanvasSignerError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _validate_public_key(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise CanvasSignerError(f"{label} is invalid")
+    result = _run_openssl(
+        ["pkey", "-pubin", "-pubcheck", "-text_pub", "-noout"],
+        input_data=value.encode("utf-8"),
+    )
+    if result.returncode != 0 or b"ED25519" not in result.stdout.upper():
+        raise CanvasSignerError(f"{label} is not Ed25519")
+    return value
+
+
+def _public_key_from_private(path: Path) -> str:
+    _secure_file(path, mode=0o600, label="Canvas private key")
+    result = _run_openssl(["pkey", "-in", str(path), "-pubout"])
+    if result.returncode != 0 or not result.stdout:
+        raise CanvasSignerError("Canvas private key is unusable")
+    return _validate_public_key(result.stdout.decode("utf-8"), label="Canvas active public key")
+
+
+def _load_keys(path: Path) -> tuple[str, Path, str, dict[str, str]]:
+    try:
+        document = json.loads(_secure_file(path, mode=0o600, label="Canvas key manifest"), object_pairs_hook=_unique_object)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CanvasSignerError("Canvas key manifest is invalid") from exc
+    expected = {
+        "schema_version",
+        "active_key_id",
+        "active_private_key_path",
+        "previous_public_keys",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or document.get("schema_version") != 1
+        or not isinstance(document.get("active_key_id"), str)
+        or KEY_ID.fullmatch(document["active_key_id"]) is None
+        or not isinstance(document.get("active_private_key_path"), str)
+        or not isinstance(document.get("previous_public_keys"), dict)
+    ):
+        raise CanvasSignerError("Canvas key manifest shape is invalid")
+    private_key = Path(document["active_private_key_path"])
+    if not private_key.is_absolute() or private_key != Path(os.path.abspath(private_key)):
+        raise CanvasSignerError("Canvas private key path is invalid")
+    active_key_id = document["active_key_id"]
+    previous: dict[str, str] = {}
+    for key_id, public_key in document["previous_public_keys"].items():
+        if (
+            not isinstance(key_id, str)
+            or KEY_ID.fullmatch(key_id) is None
+            or key_id == active_key_id
+        ):
+            raise CanvasSignerError("Canvas previous key id is invalid")
+        previous[key_id] = _validate_public_key(public_key, label="Canvas previous public key")
+    active_public_key = _public_key_from_private(private_key)
+    return active_key_id, private_key, active_public_key, dict(sorted(previous.items()))
+
+
+def _sign(private_key: Path, payload: bytes) -> str:
+    with tempfile.TemporaryDirectory(prefix="rquant-canvas-sign-") as raw_root:
+        root = Path(raw_root)
+        payload_path = root / "payload.bin"
+        payload_path.write_bytes(payload)
+        payload_path.chmod(0o600)
+        result = _run_openssl(
+            ["pkeyutl", "-sign", "-rawin", "-inkey", str(private_key), "-in", str(payload_path)]
+        )
+    if result.returncode != 0 or len(result.stdout) != 64:
+        raise CanvasSignerError("Canvas Ed25519 signing failed")
+    return base64.b64encode(result.stdout).decode("ascii")
+
+
+def _decode_request(payload: bytes) -> dict[str, object]:
+    if not payload or len(payload) > MAX_REQUEST_BYTES:
+        raise CanvasSignerError("Canvas signing request size is invalid")
+    try:
+        request = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CanvasSignerError("Canvas signing request is invalid JSON") from exc
+    expected = {
+        "schema_version",
+        "operation",
+        "request_id",
+        "key_id",
+        "namespace",
+        "payload_base64",
+        "payload_sha256",
+    }
+    if (
+        not isinstance(request, dict)
+        or set(request) != expected
+        or request.get("schema_version") != 1
+        or request.get("operation") != "sign"
+        or not isinstance(request.get("request_id"), str)
+        or SHA256.fullmatch(request["request_id"]) is None
+        or not isinstance(request.get("key_id"), str)
+        or KEY_ID.fullmatch(request["key_id"]) is None
+        or request.get("namespace") not in NAMESPACES
+        or not isinstance(request.get("payload_base64"), str)
+        or not isinstance(request.get("payload_sha256"), str)
+        or SHA256.fullmatch(request["payload_sha256"]) is None
+    ):
+        raise CanvasSignerError("Canvas signing request shape is invalid")
+    try:
+        decoded = base64.b64decode(request["payload_base64"], validate=True)
+    except (TypeError, ValueError) as exc:
+        raise CanvasSignerError("Canvas signing payload is invalid") from exc
+    if not decoded or len(decoded) > MAX_REQUEST_BYTES:
+        raise CanvasSignerError("Canvas signing payload size is invalid")
+    if hashlib.sha256(decoded).hexdigest() != request["payload_sha256"]:
+        raise CanvasSignerError("Canvas signing payload hash is invalid")
+    return request
+
+
+def _export_public_keyring(keys_path: Path) -> None:
+    active_key_id, _private_key, active_public_key, previous = _load_keys(keys_path)
+    sys.stdout.buffer.write(
+        _canonical_bytes(
+            {
+                "schema_version": 1,
+                "active_key_id": active_key_id,
+                "active_public_key": active_public_key,
+                "previous_public_keys": previous,
+            }
+        )
+    )
+
+
+def _sign_request(keys_path: Path) -> None:
+    request = _decode_request(sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1))
+    active_key_id, private_key, _active_public_key, _previous = _load_keys(keys_path)
+    if request["key_id"] != active_key_id:
+        raise CanvasSignerError("Canvas signing request does not use the active key")
+    payload = base64.b64decode(str(request["payload_base64"]), validate=True)
+    response = {
+        "schema_version": 1,
+        "operation": "sign",
+        "request_id": request["request_id"],
+        "key_id": active_key_id,
+        "namespace": request["namespace"],
+        "payload_sha256": request["payload_sha256"],
+        "signature": _sign(private_key, payload),
+    }
+    if SIGNATURE.fullmatch(str(response["signature"])) is None:
+        raise CanvasSignerError("Canvas signer returned an invalid signature")
+    sys.stdout.buffer.write(_canonical_bytes(response))
+
+
+def main(arguments: list[str]) -> int:
+    keys_path = KEYS_FILE
+    operation = "sign"
+    if arguments:
+        if arguments in (["--validate-key-material"], ["--export-public-keyring"]):
+            operation = arguments[0]
+        elif (
+            os.geteuid() != 0
+            and len(arguments) == 3
+            and arguments[0] == "--keys-file"
+            and arguments[2] in {"--validate-key-material", "--export-public-keyring"}
+        ):
+            keys_path = Path(arguments[1])
+            operation = arguments[2]
+        else:
+            raise CanvasSignerError("Canvas signer arguments are not allowed")
+    if operation == "--validate-key-material":
+        _load_keys(keys_path)
+        return 0
+    if operation == "--export-public-keyring":
+        _export_public_keyring(keys_path)
+        return 0
+    _sign_request(keys_path)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except CanvasSignerError as exc:
+        print(f"Canvas signer rejected request: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

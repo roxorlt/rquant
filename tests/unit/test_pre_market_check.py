@@ -31,14 +31,17 @@ class TestCheckTushareCredits:
 
     def test_ok_when_credits_above_threshold(self) -> None:
         import pandas as pd
+
         from rquant.pre_market_check import check_tushare_credits
 
         mock_ts = MagicMock()
         mock_pro = MagicMock()
-        mock_pro.user.return_value = pd.DataFrame([
-            {"到期积分": 2000, "到期时间": "2027-04-16"},
-            {"到期积分": 50, "到期时间": "2026-12-31"},
-        ])
+        mock_pro.user.return_value = pd.DataFrame(
+            [
+                {"到期积分": 2000, "到期时间": "2027-04-16"},
+                {"到期积分": 50, "到期时间": "2026-12-31"},
+            ]
+        )
         mock_ts.pro_api.return_value = mock_pro
 
         with patch.dict("sys.modules", {"tushare": mock_ts}):
@@ -54,18 +57,50 @@ class TestRunAllChecksExitCode:
 
     def test_tushare_warn_does_not_propagate_to_fail(self) -> None:
         """模拟 tushare 接口报错，整套 results 中应该只有 warn 没有 fail。"""
-        import pandas as pd
+        from rquant import pre_market_check
         from rquant.pre_market_check import run_all_checks
 
         mock_ts = MagicMock()
         mock_pro = MagicMock()
         mock_pro.user.side_effect = Exception("请指定正确的接口名")
         mock_ts.pro_api.return_value = mock_pro
+        host_which = pre_market_check.shutil.which
+        delegated_lookups: list[str] = []
 
-        # 跳过 systemd / journalctl 检查（mac 本地没有）— 它们已经 skip
-        with patch.dict("sys.modules", {"tushare": mock_ts}):
+        def lookup_without_systemctl(name: str) -> str | None:
+            if name == "systemctl":
+                return None
+            delegated_lookups.append(name)
+            return host_which(name)
+
+        # This test exercises Tushare warning aggregation, not the host's
+        # systemd/keyring capabilities.
+        with (
+            patch.dict("sys.modules", {"tushare": mock_ts}),
+            patch(
+                "rquant.pre_market_check.shutil.which",
+                side_effect=lookup_without_systemctl,
+            ),
+            patch(
+                "rquant.pre_market_check.check_duckdb_lock",
+                return_value=pre_market_check.CheckResult(
+                    "duckdb_lock", "skip", "isolated host probe"
+                ),
+            ),
+            patch(
+                "rquant.pre_market_check.check_recent_errors",
+                return_value=pre_market_check.CheckResult(
+                    "recent_errors", "skip", "isolated host probe"
+                ),
+            ),
+        ):
+            assert pre_market_check.shutil.which("systemctl") is None
+            pre_market_check.shutil.which("lsof")
+            pre_market_check.shutil.which("journalctl")
+            pre_market_check.shutil.which("rquant-test-probe")
             results = run_all_checks()
 
+        assert delegated_lookups == ["lsof", "journalctl", "rquant-test-probe"]
         tushare_results = [r for r in results if r.name == "tushare"]
         assert len(tushare_results) == 1
         assert tushare_results[0].status == "warn"

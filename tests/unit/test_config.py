@@ -33,6 +33,54 @@ class TestSettings:
     def test_app_env_valid(self) -> None:
         assert settings.app_env in ("dev", "prod")
 
+    def test_lab_resource_admission_settings_load_from_rquant_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        live_root = tmp_path / "runtime-health"
+        calendar_path = tmp_path / "market-calendar.json"
+        monkeypatch.setenv("RQUANT_LAB_RESOURCE_POLICY_VERSION", "lab-resource-v1")
+        monkeypatch.setenv("RQUANT_LAB_RESOURCE_AUTHORITY_CONFIG_JSON", '{"schema_version":1}')
+        root_service_config = tmp_path / "external-root.json"
+        resource_service_config = tmp_path / "resource-authority.json"
+        monkeypatch.setenv(
+            "RQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH",
+            str(root_service_config),
+        )
+        monkeypatch.setenv(
+            "RQUANT_RESOURCE_AUTHORITY_SERVICE_CONFIG_PATH",
+            str(resource_service_config),
+        )
+        monkeypatch.setenv("RQUANT_LAB_LIVE_SLO_AUTHORITY_ROOT", str(live_root))
+        monkeypatch.setenv("RQUANT_LAB_TRADE_CALENDAR_PATH", str(calendar_path))
+
+        configured = Settings(**_settings_values(tmp_path))
+
+        assert configured.rquant_lab_resource_policy_version == "lab-resource-v1"
+        assert configured.rquant_lab_resource_authority_config_json == '{"schema_version":1}'
+        assert configured.rquant_external_monotonic_root_service_config_path == (
+            root_service_config
+        )
+        assert configured.rquant_resource_authority_service_config_path == (resource_service_config)
+        assert configured.rquant_lab_live_slo_authority_root == live_root
+        assert configured.rquant_lab_trade_calendar_path == calendar_path
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "rquant_external_monotonic_root_service_config_path",
+            "rquant_resource_authority_service_config_path",
+        ],
+    )
+    def test_authority_service_config_paths_must_be_absolute(
+        self,
+        tmp_path: Path,
+        field: str,
+    ) -> None:
+        with pytest.raises(ValidationError, match="absolute"):
+            Settings(**_settings_values(tmp_path), **{field: Path("relative.json")})
+
     def test_backfill_state_uses_configurable_separate_sqlite_path(
         self,
         tmp_path: Path,

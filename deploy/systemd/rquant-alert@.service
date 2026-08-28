@@ -3,6 +3,7 @@ Description=rQuant alert relay (used by OnFailure= hooks, %i = failed unit name)
 
 [Service]
 Type=oneshot
+Slice=rquant-live.slice
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant

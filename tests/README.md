@@ -28,6 +28,38 @@ uv run pytest -m integration
 uv run pytest --cov=rquant --cov-report=term-missing
 ```
 
+## Full Suite CI 分片
+
+默认非网络、非 `linux_exact` 全集由
+`tests/manifests/full-suite-v1/index.json` 固定为 **11144 cases / 48 skips**，并以
+`757c3811f8181b587e558d5eecac8dcfbbe4afdc7b969e57d811128e1bd5e829` 绑定完整 nodeid
+集合。四个 JSONL shard 必须并集精确等于该集合、彼此不重叠；不要手改 nodeid 或 digest。
+
+在改动测试选择面时，使用与 CI 相同的 dummy 配置重生成清单，再审查分配与 digest：
+
+```bash
+RQUANT_DISABLE_DOTENV=1 TUSHARE_TOKEN_MAIN=00000000000000000000000000000000 \
+NOTIFY_ENABLED=false DATA_DIR=/private/tmp/rquant-ci/data \
+DUCKDB_PATH=/private/tmp/rquant-ci/data/test.duckdb \
+DUCKDB_READONLY_PATH=/private/tmp/rquant-ci/data/test_ro.duckdb \
+PARQUET_DIR=/private/tmp/rquant-ci/parquet LOG_DIR=/private/tmp/rquant-ci/logs \
+uv run python scripts/full_suite_shards.py generate \
+  --manifest-dir tests/manifests/full-suite-v1 --expected-skips 48
+```
+
+CI 先由 `core-preflight` 在 Python 3.11/3.12 运行 lint、smoke 与 SourceBroker 边界；
+随后 `full-suite-shard` 在每个 Python 版本运行四片。runner 每次都会重新 collect 默认
+selector、校验全量和 shard digest，并仅通过 pytest `@argsfile` 传入 nodeid。每版本的
+`full-suite-contract` 下载全部 4 份 JUnit/selection evidence，缺任一 artifact、版本或
+shard 混入、JUnit 失败/error、case/skip 偏移都会失败。
+
+shard runner 与 contract aggregator 通过同一个 stdlib 环境准备入口创建 canonical 私有
+根目录；默认 collect 会强制 dummy token、禁用 dotenv/通知并清除继承凭据，不读取仓库配置。
+
+v1 manifest 的 selector 固定为空列表。index 与 JSONL 必须是无重复 key、无未知字段的
+canonical JSON；nodeid 文件部分只能指向仓库内非符号链接的 `tests/**/*.py`。单 nodeid
+上限 1,100,000 bytes、单 JSONL 行上限 1,100,032 bytes、manifest 总量上限 4 MiB。
+
 ## 约定
 
 - **不联网测试打 `@pytest.mark.network`**：默认被 `addopts = -m 'not network'` 跳过

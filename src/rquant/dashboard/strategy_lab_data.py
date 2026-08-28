@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date, time, timedelta
+from enum import StrEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
 from pydantic import BaseModel, Field
+
+from rquant import strategy_replay_metrics
+from rquant.config import settings
+from rquant.metadata_catalog import ImmutableDuckDBMetadataCatalog
+
+auction_gap_metric_rows = strategy_replay_metrics.auction_gap_metric_rows
+growth_board_metric_rows = strategy_replay_metrics.growth_board_metric_rows
 
 TUSHARE_STAGE_LABELS: dict[str, str] = {
     "stage_0_integrated": "0 已接入",
@@ -76,6 +85,20 @@ class GrowthBoardAblationSpec(BaseModel):
     require_vwap_strength: bool = True
     use_same_minute_surge: bool = True
     use_accel_surge: bool = True
+
+
+class TushareMetadataState(StrEnum):
+    MISSING = "missing"
+    CORRUPT = "corrupt"
+    EMPTY = "empty"
+    READY = "ready"
+
+
+@dataclass(frozen=True)
+class TushareMetadataResult:
+    state: TushareMetadataState
+    detail: str
+    frame: pd.DataFrame
 
 
 def query_growth_board_candidates(
@@ -188,31 +211,16 @@ def estimate_strategy_optimization_workload(
     has_walk_forward = walk_forward_folds > 0
     replay_runs = hold_count * strategy_count * (2 + int(has_walk_forward))
     replay_candidate_passes = (
-        candidate_count
-        * hold_count
-        * strategy_count
-        * (1 + int(has_walk_forward))
+        candidate_count * hold_count * strategy_count * (1 + int(has_walk_forward))
     )
-    topn_combinations = (
-        hold_count
-        * strategy_count
-        * 2
-        * topn_count
-        * score_profile_count
-    )
+    topn_combinations = hold_count * strategy_count * 2 * topn_count * score_profile_count
     walk_forward_topn_combinations = (
-        hold_count
-        * walk_forward_folds
-        * strategy_count
-        * 2
-        * topn_count
-        * score_profile_count
+        hold_count * walk_forward_folds * strategy_count * 2 * topn_count * score_profile_count
     )
     estimated_seconds = round(
         replay_candidate_passes * seconds_per_candidate_pass
         + replay_runs * seconds_per_replay_run
-        + (topn_combinations + walk_forward_topn_combinations)
-        * seconds_per_topn_combination,
+        + (topn_combinations + walk_forward_topn_combinations) * seconds_per_topn_combination,
         3,
     )
     return StrategyOptimizationWorkloadEstimate(
@@ -248,8 +256,7 @@ def estimate_growth_board_workload(
         raise ValueError(msg)
     candidate_passes = candidate_count * variant_count
     estimated_seconds = round(
-        candidate_passes * seconds_per_candidate_pass
-        + variant_count * seconds_per_variant,
+        candidate_passes * seconds_per_candidate_pass + variant_count * seconds_per_variant,
         3,
     )
     return GrowthBoardWorkloadEstimate(
@@ -313,132 +320,6 @@ def safe_replay_end_date(
         return None
     calendar_safe_end = trading_calendar[-required_tail]
     return min(pool_max_date, calendar_safe_end)
-
-
-def _pct_mean(series: pd.Series) -> float | None:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return None
-    return round(float(clean.mean()), 4)
-
-
-def _pct_median(series: pd.Series) -> float | None:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return None
-    return round(float(clean.median()), 4)
-
-
-def _win_rate(series: pd.Series) -> float | None:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return None
-    return round(float((clean > 0).mean() * 100), 4)
-
-
-def _bool_rate(series: pd.Series) -> float | None:
-    clean = series.dropna()
-    if clean.empty:
-        return None
-    return round(float(clean.astype(bool).mean() * 100), 4)
-
-
-def auction_gap_metric_rows(
-    baseline: pd.DataFrame,
-    minute_trades: pd.DataFrame,
-) -> pd.DataFrame:
-    """汇总集合竞价基准与分钟 B/S replay，用于 Strategy Lab 对比。"""
-    candidates_count = len(baseline)
-    baseline_ret = (
-        baseline["next_open_ret_pct"]
-        if "next_open_ret_pct" in baseline.columns
-        else pd.Series(dtype=float)
-    )
-    minute_ret = (
-        minute_trades["ret_pct"]
-        if "ret_pct" in minute_trades.columns
-        else pd.Series(dtype=float)
-    )
-    baseline_hit = (
-        baseline["hit_limit_up_today"]
-        if "hit_limit_up_today" in baseline.columns
-        else pd.Series(dtype=bool)
-    )
-    baseline_high_ret = (
-        baseline["intraday_high_ret_pct"]
-        if "intraday_high_ret_pct" in baseline.columns
-        else pd.Series(dtype=float)
-    )
-    baseline_close_ret = (
-        baseline["day_close_ret_pct"]
-        if "day_close_ret_pct" in baseline.columns
-        else pd.Series(dtype=float)
-    )
-    minute_hit = (
-        minute_trades["b_hit_limit_up_today"]
-        if "b_hit_limit_up_today" in minute_trades.columns
-        else pd.Series(dtype=bool)
-    )
-    weak_exit_rate = None
-    if not minute_trades.empty and "exit_reason" in minute_trades.columns:
-        weak_exit_rate = round(
-            float(minute_trades["exit_reason"].fillna("").eq("next_auction_weak").mean() * 100),
-            4,
-        )
-    return pd.DataFrame([
-        {
-            "策略": "竞价直接B/次日开盘S",
-            "候选": candidates_count,
-            "交易": candidates_count,
-            "触发率%": 100.0 if candidates_count else None,
-            "当日上板率%": _bool_rate(baseline_hit),
-            "当日最高均值%": _pct_mean(baseline_high_ret),
-            "当日收盘均值%": _pct_mean(baseline_close_ret),
-            "平均收益%": _pct_mean(baseline_ret),
-            "中位收益%": _pct_median(baseline_ret),
-            "胜率%": _win_rate(baseline_ret),
-            "弱竞价退出%": None,
-        },
-        {
-            "策略": "竞价候选/分钟B/S",
-            "候选": candidates_count,
-            "交易": len(minute_trades),
-            "触发率%": round(len(minute_trades) / candidates_count * 100, 4)
-            if candidates_count
-            else None,
-            "当日上板率%": _bool_rate(minute_hit),
-            "当日最高均值%": None,
-            "当日收盘均值%": None,
-            "平均收益%": _pct_mean(minute_ret),
-            "中位收益%": _pct_median(minute_ret),
-            "胜率%": _win_rate(minute_ret),
-            "弱竞价退出%": weak_exit_rate,
-        },
-    ])
-
-
-def growth_board_metric_rows(
-    trades: pd.DataFrame,
-    *,
-    strategy_name: str = "科创/创业放量追击",
-) -> pd.DataFrame:
-    """汇总科创/创业板分钟放量 replay，用于 Strategy Lab 对比。"""
-    ret = trades["ret_pct"] if "ret_pct" in trades.columns else pd.Series(dtype=float)
-    hit = (
-        trades["hit_limit_up_today"]
-        if "hit_limit_up_today" in trades.columns
-        else pd.Series(dtype=bool)
-    )
-    return pd.DataFrame([
-        {
-            "策略": strategy_name,
-            "交易": len(trades),
-            "当日上板率%": _bool_rate(hit),
-            "平均收益%": _pct_mean(ret),
-            "中位收益%": _pct_median(ret),
-            "胜率%": _win_rate(ret),
-        }
-    ])
 
 
 def dataframe_preview(
@@ -510,10 +391,7 @@ def _point_unit_price(goods: pd.DataFrame) -> float | None:
         return None
     candidates = goods[
         (goods["good_type"] == 1)
-        & (
-            goods["name"].astype(str).str.contains("自定义", na=False)
-            | (goods["good_id"] == 7)
-        )
+        & (goods["name"].astype(str).str.contains("自定义", na=False) | (goods["good_id"] == 7))
     ]
     if candidates.empty or pd.isna(candidates.iloc[0]["price"]):
         return None
@@ -610,8 +488,8 @@ def _latest_account_points(conn: duckdb.DuckDBPyConnection) -> float | None:
 def load_tushare_purchase_goods(db_path: Path) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
+    with _open_tushare_metadata_catalog(db_path) as catalog:
+        conn = catalog.connection
         if not _table_exists(conn, "tushare_purchase_goods"):
             return pd.DataFrame()
         return conn.execute(
@@ -622,15 +500,13 @@ def load_tushare_purchase_goods(db_path: Path) -> pd.DataFrame:
             ORDER BY good_type, good_id
             """
         ).fetchdf()
-    finally:
-        conn.close()
 
 
 def load_tushare_activity_packages(db_path: Path) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
+    with _open_tushare_metadata_catalog(db_path) as catalog:
+        conn = catalog.connection
         if not _table_exists(conn, "tushare_activity_packages"):
             return pd.DataFrame()
         return conn.execute(
@@ -640,16 +516,16 @@ def load_tushare_activity_packages(db_path: Path) -> pd.DataFrame:
             ORDER BY package_id
             """
         ).fetchdf()
-    finally:
-        conn.close()
 
 
 def load_tushare_interface_catalog(db_path: Path) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
-        catalog = conn.execute(
+    with _open_tushare_metadata_catalog(db_path) as metadata:
+        conn = metadata.connection
+        if not _table_exists(conn, "tushare_interface_catalog"):
+            return pd.DataFrame()
+        catalog_frame = conn.execute(
             """
             SELECT doc_id, title, api_name, priority, integration_status,
                    integration_stage, update_cadence, target_table_hint,
@@ -661,8 +537,8 @@ def load_tushare_interface_catalog(db_path: Path) -> pd.DataFrame:
             ORDER BY integration_stage, priority, doc_id
             """
         ).fetchdf()
-        if catalog.empty:
-            return catalog
+        if catalog_frame.empty:
+            return catalog_frame
         goods = (
             conn.execute(
                 """
@@ -675,12 +551,84 @@ def load_tushare_interface_catalog(db_path: Path) -> pd.DataFrame:
             else pd.DataFrame()
         )
         return _enrich_catalog_with_purchase_data(
-            catalog,
+            catalog_frame,
             goods,
             current_points=_latest_account_points(conn),
         )
-    finally:
-        conn.close()
+
+
+def _load_tushare_metadata_state(
+    db_path: Path,
+    loader: Callable[[Path], pd.DataFrame],
+    *,
+    label: str,
+) -> TushareMetadataResult:
+    if not db_path.exists():
+        return TushareMetadataResult(
+            state=TushareMetadataState.MISSING,
+            detail=f"{label}元数据目录不存在",
+            frame=pd.DataFrame(),
+        )
+    try:
+        frame = loader(db_path)
+    except (duckdb.Error, OSError, RuntimeError, ValueError) as exc:
+        return TushareMetadataResult(
+            state=TushareMetadataState.CORRUPT,
+            detail=f"{label}元数据损坏或不可验证：{type(exc).__name__}: {exc}",
+            frame=pd.DataFrame(),
+        )
+    if frame.empty:
+        return TushareMetadataResult(
+            state=TushareMetadataState.EMPTY,
+            detail=f"{label}元数据可读，但当前没有记录",
+            frame=frame,
+        )
+    return TushareMetadataResult(
+        state=TushareMetadataState.READY,
+        detail=f"{label}元数据可用，共 {len(frame)} 条",
+        frame=frame,
+    )
+
+
+def load_tushare_interface_catalog_state(db_path: Path) -> TushareMetadataResult:
+    return _load_tushare_metadata_state(
+        db_path,
+        load_tushare_interface_catalog,
+        label="Tushare 接口",
+    )
+
+
+def load_tushare_purchase_goods_state(db_path: Path) -> TushareMetadataResult:
+    return _load_tushare_metadata_state(
+        db_path,
+        load_tushare_purchase_goods,
+        label="Tushare 权限商品",
+    )
+
+
+def load_tushare_activity_packages_state(db_path: Path) -> TushareMetadataResult:
+    return _load_tushare_metadata_state(
+        db_path,
+        load_tushare_activity_packages,
+        label="Tushare 套餐",
+    )
+
+
+def _open_tushare_metadata_catalog(db_path: Path) -> ImmutableDuckDBMetadataCatalog:
+    forbidden = tuple(
+        path
+        for path in (
+            settings.duckdb_path,
+            settings.duckdb_readonly_path,
+            settings.research_db_path_resolved,
+            settings.research_readonly_db_path_resolved,
+        )
+        if path is not None
+    )
+    return ImmutableDuckDBMetadataCatalog.open(
+        db_path.resolve(strict=False),
+        forbidden_paths=forbidden,
+    )
 
 
 def _format_price(value: object) -> str:
@@ -740,14 +688,14 @@ def format_tushare_catalog_display(df: pd.DataFrame) -> pd.DataFrame:
     ]:
         if column not in out.columns:
             out[column] = ""
-    out["阶段"] = out["integration_stage"].map(TUSHARE_STAGE_LABELS).fillna(
-        out["integration_stage"]
+    out["阶段"] = (
+        out["integration_stage"].map(TUSHARE_STAGE_LABELS).fillna(out["integration_stage"])
     )
-    out["状态"] = out["integration_status"].map(TUSHARE_STATUS_LABELS).fillna(
-        out["integration_status"]
+    out["状态"] = (
+        out["integration_status"].map(TUSHARE_STATUS_LABELS).fillna(out["integration_status"])
     )
-    out["权限"] = out["permission_level"].map(TUSHARE_PERMISSION_LABELS).fillna(
-        out["permission_level"]
+    out["权限"] = (
+        out["permission_level"].map(TUSHARE_PERMISSION_LABELS).fillna(out["permission_level"])
     )
     out["路径"] = out["category_path"].apply(lambda value: " > ".join(_decode_json_list(value)))
     out["能力"] = out["capability_tags"].apply(lambda value: "、".join(_decode_json_list(value)))

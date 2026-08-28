@@ -1,0 +1,1 @@
+{"default_no_target_reason":"no_matching_recipient","rules":[{"action":"watch","channel":"pushdeer","enabled":true,"recipient_id":"admin","strategy_id":"n-shape","strategy_version":"1"}]}

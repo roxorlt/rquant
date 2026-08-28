@@ -89,7 +89,7 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - [可信策略研究与盘中监控路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)
 - [不可变执行快照设计](docs/plans/2026-07-17-stage1-execution-snapshot-design.md)
 - [研究数据云化、告警治理与 Strategy Lab 重构计划](docs/plans/2026-07-16-research-cloud-alert-lab-implementation.md)
-- [Strategy Lab 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
+- [Strategy Lab 与持久 Job Center 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
 
 ## 运行架构
 
@@ -112,6 +112,10 @@ DuckDB 是单文件锁。盘中唯一写入者是 monitor；Dashboard、Lab 和�
 哈希与连续 observation 证据链。每日调度和 10 个交易日观察
 期全部验收前，本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。完整步骤见
 [研究数据首次迁云操作手册](docs/deploy/research-cloud-bootstrap.md)。可先用以下命令只读估算：
+
+隔离运行时的当前入口与验收边界见[工作负载解耦设计](docs/architecture/2026-07-22-workload-isolation-design.md)：
+代码主体及本地专项/全量归因已完成，但 Linux CI、云端 systemd 和真实交易日 shadow 仍待验收，
+旧链路继续保留对账；发布门见[受控自动发布](docs/production-release.md)。
 
 ```bash
 rquant research-export --dataset minute_bar \
@@ -217,7 +221,7 @@ bash scripts/check-core-quality.sh
 # 健康看板
 .venv/bin/streamlit run src/rquant/dashboard/app.py --server.port 8501
 
-# Strategy Lab
+# Strategy Lab（提交到持久 Job Center；关闭页面或切换页签不影响后台任务）
 .venv/bin/streamlit run src/rquant/dashboard/strategy_lab.py --server.port 8504
 
 # 盘中全景
