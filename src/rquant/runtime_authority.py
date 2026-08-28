@@ -333,6 +333,20 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         control_root="/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources",
         once=False,
     ),
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01. Not a unit's role:
+    # `deploy/libexec/rquant-workload-arbiter` execs this one itself, in place of the
+    # `.venv/bin/python -m rquant.workload_isolation research-admission` it runs today, so
+    # the probe is verified code rather than whatever the checkout happens to hold. It takes
+    # no instance and no control root, which is why the entry it wants has to be named by
+    # `module_arguments`: the arbiter passes the role literal and nothing else.
+    RuntimeRolePolicy(
+        "workload_admission",
+        "rquant.workload_isolation",
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=False,
+        control_root="",
+        module_arguments=("research-admission",),
+    ),
 )
 
 #: The frozen grammar of a systemd template label. `runtime_deployment_bundle` already

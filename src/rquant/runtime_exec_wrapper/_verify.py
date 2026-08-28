@@ -88,6 +88,11 @@ PROTECTED_ROLES = (
     "signal_router",
     "strategy_live",
     "watchlist_quote_source",
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01: the first role that
+    # no unit names. `deploy/libexec/rquant-workload-arbiter` execs it itself, before the
+    # unit's own child, so the research admission probe stops being checkout code that runs
+    # ahead of any verification.
+    "workload_admission",
 )
 
 _PROFILE_FIELDS = frozenset(

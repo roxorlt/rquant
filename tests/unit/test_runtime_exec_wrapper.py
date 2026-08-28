@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -42,6 +43,20 @@ tmp_path = _private_root.tmp_path
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = ROOT / "scripts" / "build-runtime-exec-pyz.py"
+SYSTEMD = ROOT / "deploy" / "systemd"
+#: The one role no unit names and nothing else invokes: the `daily` HYBRID adapter of
+#: `authority.md` L200, whose caller argv count is 0.
+UNIT_LESS_ROLES = frozenset({"daily"})
+#: Roles `deploy/libexec/rquant-workload-arbiter` invokes itself, before it execs the unit's
+#: own child. They are in the wrapper allowlist without ever appearing in an `ExecStart`, so
+#: the allowlist is no longer the unit set alone — it is the unit set plus these, exactly.
+ARBITER_INVOKED_ROLES = frozenset({"workload_admission"})
+#: Policy modules that answer "is this argv mine?" without argparse, and the function each
+#: one does its real work in. `rquant.workload_isolation.main` compares the argv tuple
+#: literally, so acceptance is checked against that comparison with the work stubbed out.
+PARSERLESS_MODULE_PROBES = {
+    "rquant.workload_isolation": "check_research_workload_admission",
+}
 ROLE = "strategy_live"
 MODULE = "rquant.runtime_service_main"
 INSTANCES = ("svc-" + "a" * 64, "svc-" + "b" * 64)
@@ -457,13 +472,32 @@ class TestArgumentTransport:
                 wrapper_main.parse_role(["pyz", "--role", role])
 
     def test_the_role_allowlist_is_sorted_and_covers_every_protected_unit(self) -> None:
+        """Both directions, with the roles no unit names spelled out rather than excused.
+
+        Every role a unit passes has to be allowlisted, or the unit cannot start. The other
+        direction used to hold implicitly — the allowlist was the unit set plus `daily` —
+        and R3-A adds the first role that is reached without a unit at all:
+        `workload_admission` is what the arbiter execs before the unit's own child. Relaxing
+        the equality to "every unit role is allowlisted" would let any future name sit in the
+        allowlist unnoticed, so the roles reached some other way are an explicit set that
+        takes part in the equality instead.
+        """
+
         roles = _verify.PROTECTED_ROLES
+        unit_roles = {
+            match.group(1)
+            for path in sorted(SYSTEMD.glob("*.service"))
+            for match in re.finditer(
+                r"--role ([a-z][a-z0-9_]*)", path.read_text(encoding="utf-8")
+            )
+        }
 
         assert list(roles) == sorted(roles)
         assert len(set(roles)) == len(roles)
-        assert "daily" in roles
-        assert "strategy_live" in roles
-        assert "page_control" in roles
+        assert unit_roles, "no unit named a role — the ExecStart shape must have changed"
+        assert unit_roles <= set(roles), sorted(unit_roles - set(roles))
+        assert set(roles) == unit_roles | UNIT_LESS_ROLES | ARBITER_INVOKED_ROLES
+        assert not unit_roles & (UNIT_LESS_ROLES | ARBITER_INVOKED_ROLES)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1078,7 +1112,33 @@ class TestEveryProtectedUnitResolves:
         declared = {entry.name for entry in PRODUCTION_ROLE_POLICY}
 
         assert set(_verify.PROTECTED_ROLES) == declared
-        assert len(declared) == 26
+        assert len(declared) == 27
+
+    def test_the_arbiter_invoked_admission_role_is_declared_with_its_frozen_argv(
+        self,
+    ) -> None:
+        """R3-A's half of the shared prerequisite: the role the arbiter will exec.
+
+        `deploy/libexec/rquant-workload-arbiter` runs the research admission probe through a
+        checkout interpreter today. Registering the probe as a role of its own is what lets
+        that call become the same root-owned wrapper the unit's real child already goes
+        through; the entry it wants is named by the profile's frozen `module_arguments`,
+        because the arbiter passes nothing but the role literal.
+        """
+
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        entry = next(
+            item for item in PRODUCTION_ROLE_POLICY if item.name == "workload_admission"
+        )
+
+        assert entry.module == "rquant.workload_isolation"
+        assert entry.environment_allowlist == ("LANG", "LC_ALL", "TZ")
+        assert entry.instanced is False
+        assert entry.control_root == ""
+        assert entry.service_kind == ""
+        assert entry.once is False
+        assert entry.module_arguments == ("research-admission",)
 
     def test_an_unauthorised_instance_is_refused_for_every_instanced_role(
         self,
@@ -1117,7 +1177,7 @@ class TestDerivedModuleArgv:
     def _real_parser(module: str) -> Any:
         """Each role's own module parser — not one fixed parser for all of them.
 
-        Three different modules are behind the 26 roles, and two of them did not have an
+        Four different modules are behind the 27 roles, and two of them did not have an
         entry point at all before this round. Validating everything against
         `runtime_service_main`'s parser hid exactly that.
         """
@@ -1129,9 +1189,43 @@ class TestDerivedModuleArgv:
         assert callable(builder), f"{module} exposes no build_parser"
         return builder()
 
+    @staticmethod
+    def _assert_parserless_module_accepts(
+        module: str,
+        argv: tuple[str, ...],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same question for a module that answers it without argparse.
+
+        `rquant.workload_isolation` has no parser: `main` compares the argv tuple literally
+        and answers 2 to anything else, so "the module accepts what the wrapper hands it" is
+        checked against that answer, with the probe itself stubbed out — the point here is
+        the argv contract, not the verdict. Adding the wrong literals to the role policy
+        would leave the arbiter's admission call exiting 2 forever, which the arbiter reads
+        as a rejected research plane.
+        """
+
+        import importlib
+
+        probe = PARSERLESS_MODULE_PROBES[module]
+        imported = importlib.import_module(module)
+        assert getattr(imported, "build_parser", None) is None, module
+        monkeypatch.setattr(
+            imported,
+            probe,
+            lambda: imported.WorkloadCheck(
+                name="research-admission", status="ok", summary="stubbed"
+            ),
+        )
+
+        assert imported.main(list(argv)) == 0
+        assert imported.main([*argv, "unexpected"]) == 2
+        assert imported.main([]) == 2
+
     def test_every_role_argv_is_accepted_by_its_own_module_parser(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 
@@ -1150,6 +1244,12 @@ class TestDerivedModuleArgv:
                     # count 0". It is the one role with no unit in this package.
                     skipped.append(entry.name)
                     continue
+                if not entry.control_root:
+                    # An arbiter-invoked role carries only its own frozen literals: there is
+                    # no instance, so none of the derived arguments below exist.
+                    self._assert_parserless_module_accepts(entry.module, argv, monkeypatch)
+                    accepted[entry.name] = accepted.get(entry.name, 0) + 1
+                    continue
                 parsed = self._real_parser(entry.module).parse_args(list(argv))
                 assert str(parsed.manifest).endswith(f"/manifests/{label}.json")
                 assert str(parsed.control_root).endswith(f"/{label}")
@@ -1164,12 +1264,37 @@ class TestDerivedModuleArgv:
 
         assert skipped == ["daily"]
         assert len(accepted) == len(PRODUCTION_ROLE_POLICY) - 1
-        assert sum(accepted.values()) == 2 * sum(
-            1 for e in PRODUCTION_ROLE_POLICY if e.instanced
+        assert sum(accepted.values()) == sum(
+            2 if entry.instanced else 1
+            for entry in PRODUCTION_ROLE_POLICY
+            if entry.control_root or entry.module_arguments
         )
 
+    def test_every_parserless_policy_module_is_registered_with_its_probe(self) -> None:
+        """The acceptance table above has to keep covering the policy, or it goes quiet.
+
+        A module with no `build_parser` that is missing from the table would raise `KeyError`
+        rather than assert, and one that grows a parser later would silently stop being
+        checked the parser-free way. Both are spelled out here so a new role is one line of
+        data in each table and nothing else.
+        """
+
+        import importlib
+
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        parserless = {
+            entry.module
+            for entry in PRODUCTION_ROLE_POLICY
+            if getattr(importlib.import_module(entry.module), "build_parser", None) is None
+        }
+
+        assert set(PARSERLESS_MODULE_PROBES) == parserless
+        for module, probe in PARSERLESS_MODULE_PROBES.items():
+            assert callable(getattr(importlib.import_module(module), probe)), module
+
     def test_each_policy_module_really_exposes_the_entry_the_wrapper_assumes(self) -> None:
-        """The three modules behind the 26 roles each have a real, argv-reading entry."""
+        """The four modules behind the 27 roles each have a real, argv-reading entry."""
 
         import importlib
         import inspect

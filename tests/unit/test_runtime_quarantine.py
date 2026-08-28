@@ -167,11 +167,13 @@ def _make_candidate(
     files = {
         "pyvenv.cfg": b"include-system-site-packages = false\n",
         "release/src/rquant/__init__.py": b"",
-        "release/src/rquant/runtime_service_main.py": b"def main():\n    return 0\n",
-        # The expanded role policy maps two roles onto other modules, and publication
-        # requires every allowlisted module to have a unique regular source in the tree.
-        "release/src/rquant/page_control_service.py": b"def main():\n    return 0\n",
-        "release/src/rquant/runtime_recovery_service.py": b"def main():\n    return 0\n",
+        # Publication requires every allowlisted module to have a unique regular source in
+        # the tree, and the policy maps its roles onto several modules. Deriving the sources
+        # from the policy keeps a new role one line of data there and nothing here.
+        **{
+            f"release/src/{entry.module.replace('.', '/')}.py": b"def main():\n    return 0\n"
+            for entry in authority_module.PRODUCTION_ROLE_POLICY
+        },
         "venv/bin/python": b"python executable bytes\n",
     }
     files.update(extra_files or {})
