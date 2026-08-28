@@ -1345,7 +1345,14 @@ class TestDerivedModuleArgv:
             assert callable(getattr(importlib.import_module(module), probe.attribute)), module
 
     def test_each_policy_module_really_exposes_the_entry_the_wrapper_assumes(self) -> None:
-        """The five modules behind the 28 roles each have a real, argv-reading entry."""
+        """The five modules behind the 28 roles each have a real, argv-reading entry.
+
+        The last assertion runs the wrapper's own static gate over the module's *production*
+        source. Everywhere else in this file the generation carries `CHILD_PROBE`, so
+        `assert_module_entry_contract` never sees what will actually be published; a module
+        that grew a keyword-only `main` or lost its `__main__` block would pass every other
+        test here and then be refused on the host, at exit 78, at start time.
+        """
 
         import importlib
         import inspect
@@ -1364,6 +1371,7 @@ class TestDerivedModuleArgv:
             ), f"{module}.main ignores argv"
             source = inspect.getsource(imported)
             assert '__name__ == "__main__"' in source, module
+            _verify.assert_module_entry_contract(source, expects_argv=True)
 
     def test_the_derived_paths_are_verbatim_from_the_authority_records(
         self,
