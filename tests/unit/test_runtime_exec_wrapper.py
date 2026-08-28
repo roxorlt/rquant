@@ -1264,10 +1264,62 @@ class TestDerivedModuleArgv:
         with pytest.raises(_verify.RuntimeExecError, match="forwardable commit sha"):
             world.resolve()
 
-    def test_a_role_without_a_control_root_receives_no_argv(self, tmp_path: Path) -> None:
+    def test_a_role_without_a_control_root_receives_its_own_module_arguments(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """R3-0: an arbiter-invoked role has no control root but still needs its literals.
+
+        `workload_admission` is reached as `--role workload_admission` and nothing else, so
+        the one thing that tells `rquant.workload_isolation` which of its entries to run is
+        the frozen `module_arguments` of the root-owned profile. Dropping them here left
+        that role no way to say what it is, which is why the arbiter had to keep calling a
+        checkout interpreter instead.
+        """
+
+        world = _build_world(
+            tmp_path,
+            profile_role_overrides={
+                "control_root": "",
+                "instances": [],
+                "module_arguments": ["research-admission"],
+            },
+        )
+
+        assert world.resolve(ROLE, instance=None)["module_argv"] == ("research-admission",)
+
+    def test_a_role_with_neither_a_control_root_nor_arguments_receives_no_argv(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """`daily` is still the HYBRID adapter of authority.md L200: caller argv count 0."""
+
         world = _build_world(tmp_path, whole_policy=True)
 
         assert world.resolve("daily", instance=None)["module_argv"] == ()
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [["research-admission", ""], ["research-admission", 7], "research-admission"],
+    )
+    def test_a_role_without_a_control_root_still_validates_its_arguments(
+        self,
+        tmp_path: Path,
+        arguments: Any,
+    ) -> None:
+        """The no-control-root path must not be a hole in the argument type check."""
+
+        world = _build_world(
+            tmp_path,
+            profile_role_overrides={
+                "control_root": "",
+                "instances": [],
+                "module_arguments": arguments,
+            },
+        )
+
+        with pytest.raises(_verify.RuntimeExecError, match="module arguments are invalid"):
+            world.resolve(ROLE, instance=None)
 
     def test_the_child_execs_into_the_module_with_the_derived_argv(
         self,
