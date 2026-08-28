@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -917,3 +919,46 @@ def test_sampling_unit_is_installed_but_not_automatically_enabled() -> None:
     assert "ReadWritePaths=/var/lib/rquant/workload-isolation" in service
     assert "[Install]" not in service
     assert "[Install]" not in timer
+
+
+def test_the_hash_pinned_arbiter_is_the_one_that_execs_the_root_owned_wrapper(
+    tmp_path: Path,
+) -> None:
+    """Tie the provenance pin to the call chain the round-3 verdict cares about.
+
+    `_write_arbiter_provenance` copies the repository's own helper byte for byte and derives
+    the `.sha256` companion from those bytes, so the digest follows the file automatically.
+    What that alone does not say is *which* helper the digest covers. Loading the copy the
+    digest was computed over, and reading its admission argv out of it, says it: the file
+    production pins is the one that runs the root-owned wrapper instead of checkout code.
+    """
+
+    from rquant.runtime_exec_wrapper._verify import RUNTIME_PYZ_PATH
+    from rquant.workload_isolation import _arbiter_provenance_failure
+
+    helper, digest = _write_arbiter_provenance(tmp_path)
+
+    assert _arbiter_provenance_failure(helper, digest, expected_uid=os.getuid()) is None
+    assert digest.read_text(encoding="ascii").strip() == hashlib.sha256(
+        (ROOT / "deploy/libexec/rquant-workload-arbiter").read_bytes()
+    ).hexdigest()
+
+    spec = importlib.util.spec_from_loader(
+        "rquant_workload_arbiter_provenance_copy",
+        loader=importlib.machinery.SourceFileLoader(
+            "rquant_workload_arbiter_provenance_copy",
+            str(helper),
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    pinned = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pinned)
+
+    assert tuple(pinned._ADMISSION_COMMAND) == (
+        "/usr/bin/python3.11",
+        "-I",
+        "-S",
+        RUNTIME_PYZ_PATH,
+        "--role",
+        "workload_admission",
+    )

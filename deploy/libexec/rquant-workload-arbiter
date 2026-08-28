@@ -1,5 +1,14 @@
-#!/usr/bin/python3
-"""Hold cross-plane flock contracts for an entire child-process lifecycle."""
+#!/usr/bin/python3 -IS
+"""Hold cross-plane flock contracts for an entire child-process lifecycle.
+
+The `-IS` in the interpreter line is load-bearing, not tidiness. Independent review
+R3A-SPEC-02: without it `site` runs before anything here does, and on the production host
+`ENABLE_USER_SITE` is true, so a `usercustomize` module under the service user's own
+`~/.local/lib` would execute inside the unit's sandbox ahead of the lock-root check and
+ahead of the admission probe. `-I` also drops `PYTHON*` from the environment, which an
+`EnvironmentFile` the service user can write would otherwise be able to set. Linux passes
+everything after the interpreter path as one argument, hence the combined token.
+"""
 
 from __future__ import annotations
 
@@ -26,11 +35,26 @@ _LOCK_NAMES = (
     "research-active.lock",
     "maintenance-active.lock",
 )
+#: Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01. The admission probe used to run an
+#: interpreter out of the mutable application checkout, on that checkout's own copy of the
+#: workload-isolation module, after the research locks were taken and before the unit's own
+#: child was exec'd. That handed the unit's whole sandbox — every `EnvironmentFile` value
+#: included — to unverified code, ahead of any verification. It is now the same fixed
+#: root-owned wrapper the units run, with a role literal and nothing else (ruling D-2): the
+#: wrapper verifies the generation file by file first, then runs the admission module out of
+#: the verified generation. The exit-code contract is unchanged — anything other than 0 is a
+#: rejected research plane, which the ten research units already declare as
+#: `SuccessExitStatus=0 75`. The argv is restated here rather than imported because this
+#: helper is installed outside the application tree and must not depend on it;
+#: `tests/unit/test_workload_plane_arbiter.py` pins it to the wrapper's own
+#: `rquant.runtime_exec_wrapper._verify.RUNTIME_PYZ_PATH` and to the wrapper role allowlist.
 _ADMISSION_COMMAND = (
-    "/home/lighthouse/rquant/.venv/bin/python",
-    "-m",
-    "rquant.workload_isolation",
-    "research-admission",
+    "/usr/bin/python3.11",
+    "-I",
+    "-S",
+    "/usr/local/libexec/rquant-runtime-exec.pyz",
+    "--role",
+    "workload_admission",
 )
 _BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 
@@ -363,12 +387,38 @@ def _run_child(command: list[str], *, plane: Plane, preempt_grace: float) -> int
             signal.signal(signum, handler)
 
 
+def _decode_admission_command(injected: str) -> list[str]:
+    """Decode the injected admission argv of `--test-admission-command`, or refuse it.
+
+    The seam exists so the offline suite can drive a rejecting or observing probe through the
+    real lock sequence. `main` restricts it to a test root on the research plane, so nothing
+    a production unit can pass ever reaches this.
+    """
+
+    try:
+        decoded = json.loads(injected)
+    except (TypeError, ValueError):
+        raise ArbiterError(
+            "--test-admission-command must be a JSON array of non-empty strings"
+        ) from None
+    if (
+        not isinstance(decoded, list)
+        or not decoded
+        or any(not isinstance(item, str) or not item for item in decoded)
+    ):
+        raise ArbiterError(
+            "--test-admission-command must be a JSON array of non-empty strings"
+        )
+    return list(decoded)
+
+
 def _run_research(
     root: Path,
     command: list[str],
     *,
     test_mode: bool,
     skip_admission: bool,
+    admission_command: list[str],
     preempt_grace: float,
 ) -> int:
     transition = _open_lock(root, "research-transition.lock", test_mode=test_mode)
@@ -392,7 +442,7 @@ def _run_research(
 
         if not skip_admission:
             admission_status = _run_child(
-                list(_ADMISSION_COMMAND),
+                list(admission_command),
                 plane="research",
                 preempt_grace=preempt_grace,
             )
@@ -450,6 +500,7 @@ def main() -> int:
     parser.add_argument("--preempt-grace-seconds", type=float, default=5.0)
     parser.add_argument("--test-root", type=Path)
     parser.add_argument("--test-skip-admission", action="store_true")
+    parser.add_argument("--test-admission-command")
     args = parser.parse_args(wrapper_arguments)
     if not command:
         parser.error("a child command is required after --")
@@ -457,6 +508,18 @@ def main() -> int:
         parser.error("timeouts must be positive")
     if args.test_skip_admission and (args.test_root is None or args.plane != "research"):
         parser.error("--test-skip-admission is limited to test-root research")
+    if args.test_admission_command is not None and (
+        args.test_root is None or args.plane != "research"
+    ):
+        parser.error("--test-admission-command is limited to test-root research")
+    if args.test_skip_admission and args.test_admission_command is not None:
+        parser.error("--test-skip-admission and --test-admission-command are mutually exclusive")
+    admission_command = list(_ADMISSION_COMMAND)
+    if args.test_admission_command is not None:
+        try:
+            admission_command = _decode_admission_command(args.test_admission_command)
+        except ArbiterError as exc:
+            parser.error(str(exc))
     try:
         root, test_mode = _prepare_root(args.test_root)
         test_identity = _create_test_process_identity(root) if test_mode else None
@@ -467,6 +530,7 @@ def main() -> int:
                     command,
                     test_mode=test_mode,
                     skip_admission=args.test_skip_admission,
+                    admission_command=admission_command,
                     preempt_grace=args.preempt_grace_seconds,
                 )
             return _run_maintenance(

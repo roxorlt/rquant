@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import configparser
+import importlib.machinery
+import importlib.util
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -86,6 +89,126 @@ RETENTION_INSTANCE = "svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f
 REQUIRED_INACCESSIBLE_PATHS = {
     "lab-jobs": frozenset({"/etc/rquant/lab-claim-finalizer-runtime"}),
 }
+ARBITER = ROOT / "deploy" / "libexec" / "rquant-workload-arbiter"
+ARBITER_RESEARCH_EXEC_START = "/usr/local/libexec/rquant-workload-arbiter research -- "
+#: Codex round-3 verdict RQ-WI-R2-P1-01. Every executable `deploy/libexec/rquant-workload-arbiter`
+#: introduces into a research unit's sandbox on its own initiative — the parent-death launcher
+#: it wraps every child in, and the admission probe it runs before the unit's own child. All
+#: three are root-owned installed files; there is no exemption, because an exemption here is
+#: exactly the hole the verdict names.
+ARBITER_INTRODUCED_EXECUTABLES = frozenset(
+    {
+        "/usr/bin/setpriv",
+        "/usr/bin/python3.11",
+        "/usr/local/libexec/rquant-runtime-exec.pyz",
+    }
+)
+#: The ten units whose child the arbiter fronts on the research plane. Frozen by name so a
+#: new one cannot appear without this file being read.
+RESEARCH_ARBITER_UNITS = frozenset(
+    {
+        "rquant-artifact-retention.service",
+        "rquant-lab-claim-finalizer.service",
+        "rquant-research-ingest.service",
+        "rquant-runtime-artifact-catalog@.service",
+        "rquant-runtime-daily-orchestrator@.service",
+        "rquant-runtime-lab-jobs@.service",
+        "rquant-runtime-promotions@.service",
+        "rquant-runtime-recovery-rehearsal@.service",
+        "rquant-runtime-recovery@.service",
+        "rquant-runtime-shadow@.service",
+    }
+)
+#: The two of those ten whose own child is still a checkout program. Both predate P1-3:
+#: `rquant-research-ingest.service` is a shell script that lives on `origin/main`, and the
+#: finalizer is Codex round-3 RQ-WI-R2-P1-02, a separate package. The set is exact — a third
+#: entry, or a changed program, fails here rather than passing quietly.
+LEGACY_CHECKOUT_CHILD_UNITS = {
+    "rquant-lab-claim-finalizer.service": "/home/lighthouse/rquant/.venv/bin/python",
+    "rquant-research-ingest.service": (
+        "/home/lighthouse/rquant/scripts/run-research-ingest-daily.sh"
+    ),
+}
+#: Independent review R3A-SPEC-03. `ExecStartPre` runs *before* systemd execs `ExecStart`, so
+#: it is before the arbiter, before the plane locks and before the admission probe — a unit
+#: with a checkout `ExecStartPre` is not clean just because its admission stage is. Exactly
+#: one arbiter-fronted unit has one today, and it is the finalizer that round-3
+#: RQ-WI-R2-P1-02 covers; every other one must declare none at all. R3-B deletes this entry
+#: together with the `ExecStartPre` line itself.
+LEGACY_CHECKOUT_EXEC_START_PRE = {
+    "rquant-lab-claim-finalizer.service": ("/home/lighthouse/rquant/.venv/bin/rquant",),
+}
+#: Every interpreter the closure may name, and the flags it must carry before it is handed a
+#: path to run. `-I` drops `PYTHON*`, the user site directory and the script directory; `-S`
+#: drops `site` and every `.pth` hook with it. Without this the closure test would accept an
+#: argv that named all the right files and then let `site` put the checkout back on the path.
+ISOLATED_INTERPRETER_FLAGS = {"/usr/bin/python3.11": ("-I", "-S")}
+
+
+def _load_arbiter() -> ModuleType:
+    """Import the installed helper by path: it is deliberately not importable as `rquant.*`."""
+
+    spec = importlib.util.spec_from_loader(
+        "rquant_workload_arbiter_under_test",
+        loader=importlib.machinery.SourceFileLoader(
+            "rquant_workload_arbiter_under_test",
+            str(ARBITER),
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _logical_lines(text: str) -> list[str]:
+    """systemd's own line joining: a trailing `\\` continues onto the next line.
+
+    Independent review R3A-SPEC-06. Five units in this directory already write their
+    `ExecStart` this way. None of them is arbiter-fronted today, but a reader that stops at
+    the physical newline would take the first fragment for the whole argv — it would see a
+    program and miss everything after it, which is precisely the half a closure test must not
+    miss. Continuation lines are left-stripped and joined with one space, which is the argv
+    those five units mean.
+    """
+
+    joined: list[str] = []
+    pending: str | None = None
+    for raw in text.splitlines():
+        piece = raw.strip() if pending is not None else raw
+        current = piece if pending is None else f"{pending} {piece}"
+        if current.endswith("\\"):
+            pending = current[:-1].rstrip()
+            continue
+        joined.append(current)
+        pending = None
+    if pending is not None:
+        joined.append(pending)
+    return joined
+
+
+def _directive_values(text: str, key: str) -> list[str]:
+    """Every value a unit gives `key`, read as text rather than through `configparser`.
+
+    Some units in this directory repeat drop-in keys, which `configparser(strict=True)`
+    refuses; the discovery below has to look at every unit file, not just the well-shaped
+    ones, or a unit could hide from it by being unparseable.
+    """
+
+    prefix = f"{key}="
+    return [
+        line.removeprefix(prefix) for line in _logical_lines(text) if line.startswith(prefix)
+    ]
+
+
+def _exec_start(name: str) -> str:
+    values = _directive_values((SYSTEMD / name).read_text(encoding="utf-8"), "ExecStart")
+    assert len(values) <= 1, name
+    return values[0] if values else ""
+
+
+def _exec_start_pre(name: str) -> list[str]:
+    return _directive_values((SYSTEMD / name).read_text(encoding="utf-8"), "ExecStartPre")
 
 
 def test_generic_write_plane_runtime_templates_are_retired() -> None:
@@ -947,3 +1070,152 @@ def test_manual_infrastructure_deployer_installs_root_owned_credential_sealer() 
     assert "-m 0755" in deployer
     assert "VISUDO_BIN" in deployer
     assert "install_file 0440" in deployer
+
+
+def test_the_research_units_the_arbiter_fronts_are_the_frozen_ten() -> None:
+    observed = {
+        path.name
+        for path in sorted(SYSTEMD.glob("*.service"))
+        if _exec_start(path.name).startswith(ARBITER_RESEARCH_EXEC_START)
+    }
+
+    assert observed == RESEARCH_ARBITER_UNITS
+    assert len(RESEARCH_ARBITER_UNITS) == 10
+
+
+def test_every_process_the_arbiter_starts_before_the_verified_child_is_root_owned() -> None:
+    """The contract the round-3 verdict says no test covered: the arbiter's own call chain.
+
+    Reading the unit's `ExecStart` only shows what the unit asks for. Between taking the
+    research locks and exec'ing that child, the arbiter starts processes of its own — the
+    admission probe, and the parent-death launcher it wraps everything in. Those come from
+    the arbiter's frozen constants, so they are read back out of the helper itself.
+    """
+
+    module = _load_arbiter()
+
+    for name in sorted(RESEARCH_ARBITER_UNITS):
+        child = _exec_start(name).removeprefix(ARBITER_RESEARCH_EXEC_START).split()
+        assert child, name
+        admission = tuple(
+            module.parent_death_argv(list(module._ADMISSION_COMMAND), platform="linux")
+        )
+        wrapped_child = tuple(module.parent_death_argv(list(child), platform="linux"))
+        launcher = wrapped_child[: len(wrapped_child) - len(child)]
+        introduced = {
+            token for token in (*admission, *launcher) if token.startswith("/")
+        }
+
+        assert introduced == ARBITER_INTRODUCED_EXECUTABLES, name
+        _assert_interpreters_are_isolated(admission, name, minimum=1)
+        # The two legacy children name a checkout program rather than the system interpreter,
+        # so there is nothing there to carry the flags; they are pinned by the exemption
+        # tables instead, and lose their exemption when R3-B lands.
+        _assert_interpreters_are_isolated(
+            wrapped_child,
+            name,
+            minimum=0 if name in LEGACY_CHECKOUT_CHILD_UNITS else 1,
+        )
+
+
+def test_the_arbiter_fronted_units_declare_only_the_wrapper_or_a_listed_legacy_child() -> None:
+    """The other half of the closure: what each unit asks for, with an exact exemption set."""
+
+    from rquant.runtime_exec_wrapper._verify import RUNTIME_PYZ_PATH
+
+    assert set(LEGACY_CHECKOUT_CHILD_UNITS) < RESEARCH_ARBITER_UNITS
+    assert len(LEGACY_CHECKOUT_CHILD_UNITS) == 2
+
+    for name in sorted(RESEARCH_ARBITER_UNITS):
+        child = _exec_start(name).removeprefix(ARBITER_RESEARCH_EXEC_START).split()
+
+        if name in LEGACY_CHECKOUT_CHILD_UNITS:
+            assert child[0] == LEGACY_CHECKOUT_CHILD_UNITS[name], name
+            continue
+        assert tuple(child[:4]) == (
+            "/usr/bin/python3.11",
+            "-I",
+            "-S",
+            RUNTIME_PYZ_PATH,
+        ), name
+        assert FORBIDDEN_EXECUTABLE not in " ".join(child), name
+
+
+def _assert_interpreters_are_isolated(
+    argv: tuple[str, ...],
+    name: str,
+    *,
+    minimum: int,
+) -> None:
+    """Independent review R3A-SPEC-04: the closure must see flags, not only file names.
+
+    Dropping `-S` from the admission argv leaves every path in the frozen set unchanged, so a
+    check that only collects tokens beginning with `/` waves it through — and a `-S`-less
+    interpreter reads `site`, which is how the checkout's own `.pth` gets back onto the path.
+    """
+
+    seen = 0
+    for index, token in enumerate(argv):
+        expected = ISOLATED_INTERPRETER_FLAGS.get(token)
+        if expected is None:
+            continue
+        seen += 1
+        assert tuple(argv[index + 1 : index + 1 + len(expected)]) == expected, (name, argv)
+    assert seen >= minimum, (name, argv)
+
+
+def test_no_arbiter_fronted_unit_runs_anything_before_the_arbiter_but_the_listed_legacy_one() -> (
+    None
+):
+    """`ExecStartPre` is earlier than every step the arbiter controls.
+
+    Independent review R3A-SPEC-03: closing the admission stage says nothing about a command
+    systemd runs before the arbiter is even started. Exactly one of the ten declares one, it
+    is the finalizer round-3 RQ-WI-R2-P1-02 covers, and the program is pinned by name.
+    """
+
+    assert set(LEGACY_CHECKOUT_EXEC_START_PRE) < RESEARCH_ARBITER_UNITS
+    assert len(LEGACY_CHECKOUT_EXEC_START_PRE) == 1
+
+    for name in sorted(RESEARCH_ARBITER_UNITS):
+        programs = tuple(command.split()[0] for command in _exec_start_pre(name))
+
+        assert programs == LEGACY_CHECKOUT_EXEC_START_PRE.get(name, ()), name
+
+
+def test_the_unit_reader_joins_a_continued_exec_line() -> None:
+    """R3A-SPEC-06. Five units already write `ExecStart` across lines; read the whole argv."""
+
+    unit = (
+        "[Service]\n"
+        "ExecStartPre=/bin/true first\n"
+        "ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- \\\n"
+        "    /usr/bin/python3.11 -I -S \\\n"
+        "    /usr/local/libexec/rquant-runtime-exec.pyz --role shadow_session\n"
+        "SuccessExitStatus=0 75\n"
+    )
+
+    assert _directive_values(unit, "ExecStart") == [
+        f"{ARBITER_RESEARCH_EXEC_START}/usr/bin/python3.11 -I -S "
+        "/usr/local/libexec/rquant-runtime-exec.pyz --role shadow_session"
+    ]
+    assert _directive_values(unit, "ExecStartPre") == ["/bin/true first"]
+    assert _directive_values(unit, "SuccessExitStatus") == ["0 75"]
+
+
+def test_a_continued_exec_line_would_hide_half_its_argv_from_a_physical_line_reader() -> None:
+    """The reason the joiner exists, stated as a fact rather than a comment."""
+
+    unit = (
+        "ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- \\\n"
+        "    /home/lighthouse/rquant/.venv/bin/python -m rquant.workload_isolation\n"
+    )
+    physical = [
+        line.removeprefix("ExecStart=")
+        for line in unit.splitlines()
+        if line.startswith("ExecStart=")
+    ]
+
+    assert physical == [f"{ARBITER_RESEARCH_EXEC_START.rstrip()} \\"]
+    assert FORBIDDEN_EXECUTABLE not in " ".join(physical)
+    assert FORBIDDEN_EXECUTABLE in _directive_values(unit, "ExecStart")[0]
