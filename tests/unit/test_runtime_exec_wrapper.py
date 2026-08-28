@@ -25,7 +25,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -51,11 +51,39 @@ UNIT_LESS_ROLES = frozenset({"daily"})
 #: own child. They are in the wrapper allowlist without ever appearing in an `ExecStart`, so
 #: the allowlist is no longer the unit set alone — it is the unit set plus these, exactly.
 ARBITER_INVOKED_ROLES = frozenset({"workload_admission"})
-#: Policy modules that answer "is this argv mine?" without argparse, and the function each
-#: one does its real work in. `rquant.workload_isolation.main` compares the argv tuple
-#: literally, so acceptance is checked against that comparison with the work stubbed out.
+class ParserlessProbe(NamedTuple):
+    """How one module with no argparse parser answers "is this argv mine?".
+
+    `attribute` is the function it does its real work in, `stub` builds a replacement for it
+    so the answer is about the argv rather than the verdict, and `refusal` is what the module
+    returns for an argv that is not its own. Both are per module: `rquant.workload_isolation`
+    prints usage and answers 2, while `rquant.lab_formal_runtime_entry` reports a failed
+    wrapper binding and answers 1.
+    """
+
+    attribute: str
+    stub: Any
+    refusal: int
+
+
+#: Policy modules that answer "is this argv mine?" without argparse. Held closed by
+#: `test_every_parserless_policy_module_is_registered_with_its_probe`: a new module without a
+#: parser has to add a line here, and one that grows a parser has to remove its line.
 PARSERLESS_MODULE_PROBES = {
-    "rquant.workload_isolation": "check_research_workload_admission",
+    "rquant.workload_isolation": ParserlessProbe(
+        "check_research_workload_admission",
+        lambda module: (
+            lambda: module.WorkloadCheck(
+                name="research-admission", status="ok", summary="stubbed"
+            )
+        ),
+        2,
+    ),
+    "rquant.lab_formal_runtime_entry": ParserlessProbe(
+        "run_formal_finalizer_session",
+        lambda _module: (lambda _binding: 0),
+        1,
+    ),
 }
 ROLE = "strategy_live"
 MODULE = "rquant.runtime_service_main"
@@ -1141,7 +1169,7 @@ class TestEveryProtectedUnitResolves:
         declared = {entry.name for entry in PRODUCTION_ROLE_POLICY}
 
         assert set(_verify.PROTECTED_ROLES) == declared
-        assert len(declared) == 27
+        assert len(declared) == 28
 
     def test_the_arbiter_invoked_admission_role_is_declared_with_its_frozen_argv(
         self,
@@ -1206,7 +1234,7 @@ class TestDerivedModuleArgv:
     def _real_parser(module: str) -> Any:
         """Each role's own module parser — not one fixed parser for all of them.
 
-        Four different modules are behind the 27 roles, and two of them did not have an
+        Five different modules are behind the 28 roles, and three of them did not have an
         entry point at all before this round. Validating everything against
         `runtime_service_main`'s parser hid exactly that.
         """
@@ -1239,17 +1267,11 @@ class TestDerivedModuleArgv:
         probe = PARSERLESS_MODULE_PROBES[module]
         imported = importlib.import_module(module)
         assert getattr(imported, "build_parser", None) is None, module
-        monkeypatch.setattr(
-            imported,
-            probe,
-            lambda: imported.WorkloadCheck(
-                name="research-admission", status="ok", summary="stubbed"
-            ),
-        )
+        monkeypatch.setattr(imported, probe.attribute, probe.stub(imported))
 
         assert imported.main(list(argv)) == 0
-        assert imported.main([*argv, "unexpected"]) == 2
-        assert imported.main([]) == 2
+        assert imported.main([*argv, "unexpected"]) == probe.refusal
+        assert imported.main([]) == probe.refusal
 
     def test_every_role_argv_is_accepted_by_its_own_module_parser(
         self,
@@ -1320,10 +1342,10 @@ class TestDerivedModuleArgv:
 
         assert set(PARSERLESS_MODULE_PROBES) == parserless
         for module, probe in PARSERLESS_MODULE_PROBES.items():
-            assert callable(getattr(importlib.import_module(module), probe)), module
+            assert callable(getattr(importlib.import_module(module), probe.attribute)), module
 
     def test_each_policy_module_really_exposes_the_entry_the_wrapper_assumes(self) -> None:
-        """The four modules behind the 27 roles each have a real, argv-reading entry."""
+        """The five modules behind the 28 roles each have a real, argv-reading entry."""
 
         import importlib
         import inspect
@@ -1625,3 +1647,164 @@ class TestModuleEntryContract:
 
         with pytest.raises(_verify.RuntimeExecError):
             world.resolve()
+
+
+# ---------------------------------------------------------------------------------------
+# Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02: the finalizer reaches its own entry
+# ---------------------------------------------------------------------------------------
+
+
+FINALIZER_ROLE = "lab_claim_finalizer"
+
+
+class TestTheFinalizerRoleReachesItsGenerationEntry:
+    """`rquant-lab-claim-finalizer.service` stops being an exception to the trust chain.
+
+    It used to run `.venv/bin/rquant runtime-code dry-run` and then
+    `.venv/bin/python .../run-lab-daemon.py formal` — two checkout commands, the first of
+    which decided whether the deployment was trustworthy using the tree in question. The
+    unit now carries `--role lab_claim_finalizer` and nothing else, so what has to hold is
+    that the role resolves, that it resolves to the generation's own copy of
+    `rquant.lab_formal_runtime_entry`, and that the environment the child is handed is the
+    role's allowlist rather than whatever the unit's `EnvironmentFile` happened to contain.
+    """
+
+    @staticmethod
+    def _entry() -> Any:
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        return next(item for item in PRODUCTION_ROLE_POLICY if item.name == FINALIZER_ROLE)
+
+    def test_the_finalizer_role_resolves_and_execs_the_generation_entry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A real exec through the frozen bootstrap into the role's own module."""
+
+        world = _build_world(tmp_path, whole_policy=True)
+        entry = self._entry()
+        launch = world.resolve(FINALIZER_ROLE, instance=None)
+
+        assert launch["module"] == "rquant.lab_formal_runtime_entry"
+        assert launch["instance"] is None
+        assert launch["service_manifest"] is None
+        assert launch["module_argv"] == entry.module_arguments
+        assert launch["module_source"] == "app/rquant/lab_formal_runtime_entry.py"
+
+        body = _verify.frozen_bootstrap()[: -len(_verify.CHILD_TRAILER)]
+        call = (
+            "raise SystemExit(child_main(\n"
+            "    _sys.argv[1], None,\n"
+            "    profile_path=_sys.argv[2], authority_path=_sys.argv[3],\n"
+            "    generation_root=_sys.argv[4], trusted_root=_sys.argv[5],\n"
+            "    expected_owner_uid=int(_sys.argv[6]),\n"
+            "))\n"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                f"{body}\n\nimport sys as _sys\n\n{call}",
+                FINALIZER_ROLE,
+                str(world.profile_path),
+                str(world.authority_path),
+                str(world.generation_root),
+                str(world.trusted_root),
+                str(world.owner_uid),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert completed.returncode == 0, completed.stderr
+        observed = json.loads(completed.stdout)
+
+        assert observed["outcome"] == "ran"
+        assert observed["argv"][0] == str(
+            world.generation_path / "app" / "rquant" / "lab_formal_runtime_entry.py"
+        )
+        assert observed["argv"][1:] == list(entry.module_arguments)
+        assert observed["main_argv"] == list(entry.module_arguments)
+        assert str(ROOT / "src") not in observed["sys_path"]
+
+    def test_the_finalizer_child_environment_is_exactly_the_role_allowlist(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The silent-drop hazard of moving the unit behind the wrapper, pinned by name.
+
+        `build_child_environment` starts from an empty dictionary, so a name the role does
+        not list never reaches the daemon and nothing says so. `APP_ENV` and
+        `RQUANT_DISABLE_DOTENV` are listed and must arrive; `PYTHONDONTWRITEBYTECODE` is one
+        the wrapper refuses outright and `formal_runtime.py` refuses again a chain deeper, so
+        it must not; and whatever else the `EnvironmentFile` contributes must not either.
+
+        The second half follows the same dictionary all the way to `execve`, because a
+        correct `build_child_environment` that the wrapper then ignored would look identical
+        from the first half alone.
+        """
+
+        world = _build_world(tmp_path, whole_policy=True)
+        ambient = {
+            "APP_ENV": "prod",
+            "RQUANT_DISABLE_DOTENV": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TZ": "UTC",
+            "LAB_FINALIZER_SECRET": "leak",
+            "PATH": "/usr/bin:/bin",
+        }
+        launch = world.resolve(
+            FINALIZER_ROLE,
+            instance=None,
+            source_environment=dict(ambient),
+        )
+
+        assert launch["environment"] == {
+            "APP_ENV": "prod",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "RQUANT_DISABLE_DOTENV": "1",
+            "TZ": "UTC",
+            "PWD": launch["working_directory"],
+        }
+        assert set(self._entry().environment_allowlist) == {
+            "APP_ENV",
+            "LANG",
+            "LC_ALL",
+            "RQUANT_DISABLE_DOTENV",
+            "TZ",
+        }
+
+        executed: dict[str, Any] = {}
+
+        def capture(path: str, argv: list[str], environment: dict[str, str]) -> None:
+            executed["path"] = path
+            executed["argv"] = argv
+            executed["environment"] = environment
+            raise OSError("captured")
+
+        monkeypatch.setattr(wrapper_main.os, "execve", capture)
+        monkeypatch.setattr(wrapper_main.os, "chdir", lambda _path: None)
+        monkeypatch.setattr(wrapper_main.os, "environ", dict(ambient))
+        monkeypatch.setattr(
+            wrapper_main,
+            "resolve_launch",
+            lambda role, *, instance, source_environment: world.resolve(
+                role, instance=instance, source_environment=source_environment
+            ),
+        )
+
+        assert wrapper_main.main(["pyz", "--role", FINALIZER_ROLE]) == (
+            wrapper_main.REFUSAL_EXIT_CODE
+        )
+        assert executed["environment"] == launch["environment"]
+        assert "PYTHONDONTWRITEBYTECODE" not in executed["environment"]
+        assert "LAB_FINALIZER_SECRET" not in executed["environment"]
+        assert executed["argv"][1:3] == ["-I", "-S"]
+        assert executed["argv"][-1] == FINALIZER_ROLE

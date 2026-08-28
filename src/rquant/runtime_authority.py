@@ -184,6 +184,36 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         control_root="/home/lighthouse/rquant/data/runtime/control/artifact-catalogs",
         once=False,
     ),
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. The finalizer's own
+    # unit used to name a checkout interpreter twice; it now names this role and nothing
+    # else. `module_arguments` selects the daemon entry the same way `workload_admission`
+    # does — the immutable bootstrap binding the unit used to spell out (config path, trusted
+    # base, authority uid/gid, deployment lock) is a frozen constant of
+    # `rquant.formal_runtime_command`, which lives inside the generation the wrapper verifies
+    # file by file against a root-owned manifest, so it is under the same root authority as
+    # the profile and does not need eight of this role's arguments to say it twice.
+    #
+    # The environment allowlist is the wrapper's entire answer to "what can this unit's
+    # `Environment=` and `EnvironmentFile=` reach": `build_child_environment` starts from an
+    # empty dictionary, and an unlisted name is dropped in silence. Two of the unit's three
+    # `Environment=` names are here. The third, `PYTHONDONTWRITEBYTECODE`, deliberately is
+    # not and cannot be: `build_child_environment` refuses any `PYTHON*` name outright, and
+    # `formal_runtime.py`'s `_ROUTING_PREFIXES` refuses it again one chain deeper, so it has
+    # never crossed into the daemon. Both children are started `-I -S`, which ignores it
+    # anyway, and every generation directory is 0555, so there is nowhere to write bytecode.
+    #
+    # What `/etc/rquant/lab-claim-finalizer.env` adds is not in this repository — no
+    # template, no installer, no document writes it — so it cannot be enumerated here. Read
+    # it off the host (`systemctl show -p Environment rquant-lab-claim-finalizer`) and add
+    # the names the finalizer actually needs before the profile is published.
+    RuntimeRolePolicy(
+        "lab_claim_finalizer",
+        "rquant.lab_formal_runtime_entry",
+        ("APP_ENV", "LANG", "LC_ALL", "RQUANT_DISABLE_DOTENV", "TZ"),
+        instanced=False,
+        control_root="",
+        module_arguments=("lab-claim-finalizer",),
+    ),
     RuntimeRolePolicy(
         "lab_jobs_publisher",
         _RUNTIME_SERVICE_MODULE,
@@ -346,54 +376,6 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         instanced=False,
         control_root="",
         module_arguments=("research-admission",),
-    ),
-)
-
-#: Roles that are settled but not yet registered, because their module has not landed.
-#:
-#: Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. `lab_claim_finalizer`
-#: is the other half of this change: `deploy/systemd/rquant-lab-claim-finalizer.service`
-#: still runs `.venv/bin/rquant` and `scripts/run-lab-daemon.py` out of the checkout, and the
-#: code that validates the deployment is the code being validated. Moving it behind the
-#: wrapper needs `rquant.lab_formal_runtime_entry`, a module that does not exist yet — and a
-#: registered role whose module is missing does not wait quietly, it fails the module-entry
-#: contract. So the entry waits here: nothing reads this tuple, `PROTECTED_ROLES` does not
-#: name the role, and a profile that declared it would be refused. What it buys is that the
-#: two roles touching these same lines are settled once, in one place, instead of colliding
-#: in two branches. The module's own change moves this entry into the policy above and adds
-#: the name to `PROTECTED_ROLES`.
-#:
-#: The environment allowlist is the wrapper's whole answer to "what can this unit's
-#: `Environment=` reach": `build_child_environment` starts from an empty dictionary. The
-#: three names below the shared locale set are the unit's own `Environment=` line. Whatever
-#: `/etc/rquant/lab-claim-finalizer.env` adds is not in this repository and must be read off
-#: the host before the role is registered, or those names are dropped in silence.
-_PENDING_ROLE_POLICIES: tuple[RuntimeRolePolicy, ...] = (
-    RuntimeRolePolicy(
-        "lab_claim_finalizer",
-        "rquant.lab_formal_runtime_entry",
-        (
-            *_RUNTIME_ROLE_ENVIRONMENT,
-            "APP_ENV",
-            "RQUANT_DISABLE_DOTENV",
-            "PYTHONDONTWRITEBYTECODE",
-        ),
-        instanced=False,
-        control_root="",
-        module_arguments=(
-            "--runtime-code-config",
-            "/etc/rquant/runtime-code-bootstrap.json",
-            "--runtime-code-trusted-base",
-            "/etc/rquant",
-            "--runtime-code-authority-uid",
-            "0",
-            "--runtime-code-authority-gid",
-            "0",
-            "--deployment-lock-path",
-            "/run/rquant-lab-claim-finalizer/deployment.lock",
-            "--",
-            "lab-claim-finalizer",
-        ),
     ),
 )
 

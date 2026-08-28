@@ -55,6 +55,7 @@ from rquant.formal_runtime_command import (
     FormalRuntimeCommandError,
     FormalRuntimeWrapperBinding,
     compose_formal_daemon_argv,
+    compose_formal_wrapper_argv,
     parse_formal_wrapper_argv,
 )
 from rquant.formal_runtime_composition import (
@@ -68,6 +69,11 @@ from rquant.runtime_code_operations import (
     load_runtime_code_bootstrap_configuration,
     load_runtime_code_operation_request,
 )
+
+#: The one daemon entry this module exists to start. The role policy names it and the
+#: parser accepts four other formal commands, so the agreement is asserted rather than
+#: assumed: a profile that froze `lab-worker` here must fail, not start a worker.
+FINALIZER_COMMAND = "lab-claim-finalizer"
 
 #: The same 60 second budget `_formal_main` gave itself, and the reason the unit can keep
 #: `TimeoutStartSec=30s`: this deadline bounds the work, not systemd's start phase.
@@ -274,15 +280,20 @@ def run_formal_finalizer_session(binding: FormalRuntimeWrapperBinding) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """The wrapper's entry point: the frozen `module_arguments` of the root-owned profile.
 
-    There is no argparse here and no defaulting. `parse_formal_wrapper_argv` is the same
-    typed parser the unit's argv went through before, and it accepts exactly one shape, so a
-    profile that froze the wrong literals fails loudly at the first instruction instead of
-    starting a differently-configured finalizer.
+    The profile freezes the daemon entry; `compose_formal_wrapper_argv` puts the immutable
+    bootstrap binding in front of it, and `parse_formal_wrapper_argv` — the same typed parser
+    the unit's own tail went through before — accepts exactly one shape. A profile that froze
+    the wrong literals therefore fails loudly at the first instruction instead of starting a
+    differently-configured finalizer.
     """
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        binding = parse_formal_wrapper_argv(arguments)
+        binding = parse_formal_wrapper_argv(compose_formal_wrapper_argv(arguments))
+        if binding.command != FINALIZER_COMMAND:
+            raise FormalRuntimeCommandError(
+                "formal runtime role selected an entry this module does not serve"
+            )
     except FormalRuntimeCommandError as exc:
         print(f"Lab formal daemon wrapper failed: {exc}", file=sys.stderr)
         return 1
@@ -290,6 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "FINALIZER_COMMAND",
     "STARTUP_BUDGET_SECONDS",
     "LabFormalRuntimeEntryError",
     "acquire_formal_deployment_lock",

@@ -58,7 +58,6 @@ def _migration(package: RuntimeCodeTestPackage) -> RuntimeCodeMigrationRequest:
             RuntimeCodeFormalService(
                 command="lab-claim-finalizer",
                 unit_path=ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service",
-                wrapper_path=ROOT / "scripts/run-lab-daemon.py",
             ),
         ),
         expected_configuration_path=Path("/etc/rquant/runtime-code-bootstrap.json"),
@@ -196,7 +195,6 @@ def test_preflight_rejects_legacy_service_arguments_and_residue_without_writes(
                 RuntimeCodeFormalService(
                     command="lab-claim-finalizer",
                     unit_path=ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service",
-                    wrapper_path=ROOT / "scripts/run-lab-daemon.py",
                 ),
             ),
             "legacy_paths": (legacy,),
@@ -217,14 +215,14 @@ def test_preflight_reads_actual_unit_and_rejects_static_drift(
     operator = _operator(tmp_path / "operator", package)
     unit = tmp_path / "rquant-lab-claim-finalizer.service"
     raw = (ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service").read_text(encoding="utf-8")
-    unit.write_text(raw.replace("-- lab-claim-finalizer", "-- lab-claim-finalizer --drift"))
+    assert "--role lab_claim_finalizer" in raw
+    unit.write_text(raw.replace("--role lab_claim_finalizer", "--role lab_claim_finalizer --drift"))
     request = _migration(package).model_copy(
         update={
             "formal_services": (
                 RuntimeCodeFormalService(
                     command="lab-claim-finalizer",
                     unit_path=unit,
-                    wrapper_path=ROOT / "scripts/run-lab-daemon.py",
                 ),
             ),
         }

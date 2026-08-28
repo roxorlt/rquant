@@ -78,6 +78,10 @@ PROTECTED_UNIT_ROLES = {
     "rquant-runtime-recovery@.service": "runtime_recovery",
     "rquant-runtime-recovery-rehearsal@.service": "runtime_recovery_rehearsal",
     "rquant-page-control.service": "page_control",
+    # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02: the formal claim
+    # finalizer joins the protected set, so `test_no_protected_unit_executes_a_checkout_
+    # interpreter` and the role-allowlist equality below start covering it too.
+    "rquant-lab-claim-finalizer.service": "lab_claim_finalizer",
 }
 #: `rquant-page-control.service` is not a template, so its authorised instance label is a
 #: unit-owned literal rather than `%i` — the same shape `rquant-artifact-retention` uses.

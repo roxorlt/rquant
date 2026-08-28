@@ -86,24 +86,44 @@ def test_static_contract_classifies_services_and_keeps_root_authority_separate()
     } == ROOT_AUTHORITY_UNITS
 
 
-def test_lab_claim_finalizer_uses_research_arbiter_and_exit_75_contract() -> None:
+def test_the_finalizer_unit_executes_only_the_fixed_root_owned_wrapper() -> None:
+    """Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02.
+
+    This test used to pin the two checkout commands verbatim: an `ExecStartPre` running
+    `.venv/bin/rquant runtime-code dry-run` and an `ExecStart` running
+    `.venv/bin/python .../run-lab-daemon.py formal`. `.venv` is an editable install pointing
+    at `<checkout>/src`, so anyone who could change the code being validated could change the
+    validator with it. Both lines are gone. The unit contributes one role literal, the same
+    way the other twenty-five protected units do, and the research arbiter and the exit-75
+    contract it always had are unchanged.
+    """
+
     from rquant.workload_isolation import WORKLOAD_ARBITER_PATH
 
     content = (SYSTEMD / "rquant-lab-claim-finalizer.service").read_text(encoding="utf-8")
+    start = next(
+        line.removeprefix("ExecStart=")
+        for line in content.splitlines()
+        if line.startswith("ExecStart=")
+    )
 
     assert "Slice=rquant-research.slice" in content
     assert "EnvironmentFile=/etc/rquant/lab-claim-finalizer.env" in content
-    assert (
-        "ExecStartPre=/home/lighthouse/rquant/.venv/bin/rquant "
-        "runtime-code dry-run --runtime-code-config "
-        "/etc/rquant/runtime-code-bootstrap.json"
-    ) in content
-    assert (
-        f"ExecStart={WORKLOAD_ARBITER_PATH} research -- "
-        "/home/lighthouse/rquant/.venv/bin/python -I "
-        "/home/lighthouse/rquant/scripts/run-lab-daemon.py formal "
-    ) in content
     assert "SuccessExitStatus=0 75" in content
+    assert "ExecStartPre" not in content
+    assert "/home/lighthouse/rquant/.venv" not in content
+    assert "run-lab-daemon.py" not in content
+    assert start.split() == [
+        str(WORKLOAD_ARBITER_PATH),
+        "research",
+        "--",
+        "/usr/bin/python3.11",
+        "-I",
+        "-S",
+        "/usr/local/libexec/rquant-runtime-exec.pyz",
+        "--role",
+        "lab_claim_finalizer",
+    ]
 
 
 def test_usable_8_gib_class_budget_marks_maintenance_pending_calibration() -> None:

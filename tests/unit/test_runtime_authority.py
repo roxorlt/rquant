@@ -2146,107 +2146,108 @@ def test_hyb1_p1_06_serializer_and_role_collections_are_bounded(
 
 
 # ---------------------------------------------------------------------------------------
-# R3-0: the second role of the shared prerequisite, held as data until its module exists
+# Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02: the finalizer role, now registered
 # ---------------------------------------------------------------------------------------
 
 
-def _finalizer_unit_execstart() -> str:
-    unit = (
+def _finalizer_unit_text() -> str:
+    return (
         Path(__file__).resolve().parents[2]
         / "deploy"
         / "systemd"
         / "rquant-lab-claim-finalizer.service"
     ).read_text(encoding="utf-8")
-    line = next(
-        row for row in unit.splitlines() if row.startswith("ExecStart=") and " formal " in row
+
+
+def _finalizer_entry() -> object:
+    return next(
+        entry
+        for entry in authority_module.PRODUCTION_ROLE_POLICY
+        if entry.name == "lab_claim_finalizer"
     )
-    return line.removeprefix("ExecStart=")
 
 
-def test_the_pending_role_policy_is_held_to_the_rules_a_live_entry_obeys() -> None:
-    """R3-0 carries R3-B's role as data rather than registering it.
+def test_the_finalizer_role_is_registered_and_reachable_through_the_wrapper() -> None:
+    """R3-0 held this entry in `_PENDING_ROLE_POLICIES` because its module did not exist.
 
-    `lab_claim_finalizer` and `workload_admission` change the same lines of
-    `PRODUCTION_ROLE_POLICY` and of the wrapper allowlist, which is the whole reason this
-    prerequisite exists — settling both here keeps R3-A and R3-B off each other. But the
-    finalizer's module, `rquant.lab_formal_runtime_entry`, is the one file R3-B adds, and a
-    role whose module does not exist fails the module-entry contract rather than waiting
-    quietly. So the entry sits here instead, held to the same field rules a registered one
-    obeys and asserted to be reachable by nothing, and R3-B moves it across.
+    `rquant.lab_formal_runtime_entry` exists now, so the entry moves into the policy the
+    profile is checked against and the name joins the allowlist the wrapper accepts a role
+    literal from. The pending table and its three contract tests are gone with it — a role
+    that is registered is held by the profile schema and by the wrapper, which is strictly
+    more than a private tuple nothing read.
     """
 
     from rquant.runtime_exec_wrapper._verify import PROTECTED_ROLES
 
-    pending = authority_module._PENDING_ROLE_POLICIES
-    declared = {entry.name for entry in authority_module.PRODUCTION_ROLE_POLICY}
+    entry = _finalizer_entry()
+    declared = {item.name for item in authority_module.PRODUCTION_ROLE_POLICY}
 
-    assert [entry.name for entry in pending] == ["lab_claim_finalizer"]
-    assert len(declared) + len(pending) <= authority_module.MAX_ROLES
-    for entry in pending:
-        # Reachable by nothing: not in the policy the profile is checked against, and not in
-        # the allowlist the wrapper accepts a role literal from.
-        assert entry.name not in declared
-        assert entry.name not in PROTECTED_ROLES
-        assert authority_module._ROLE_NAME.fullmatch(entry.name)
-        assert authority_module._MODULE_NAME.fullmatch(entry.module)
-        assert len(entry.environment_allowlist) <= authority_module.MAX_ENVIRONMENT_NAMES
-        assert len(set(entry.environment_allowlist)) == len(entry.environment_allowlist)
-        for name in entry.environment_allowlist:
-            assert authority_module._ENVIRONMENT_NAME.fullmatch(name), name
-        assert entry.instanced is False
-        assert entry.service_kind == ""
-        assert entry.control_root == ""
-        assert entry.once is False
-        assert entry.module_arguments
-        assert all(type(item) is str and item for item in entry.module_arguments)
-
-
-def test_the_pending_finalizer_argv_is_the_one_its_unit_carries_today() -> None:
-    """The frozen literals have to be the unit's, or R3-B changes behaviour by accident.
-
-    `deploy/systemd/rquant-lab-claim-finalizer.service` passes these arguments to
-    `scripts/run-lab-daemon.py formal` itself. Once the unit names only a role literal, the
-    root-owned profile is where they come from, so they are read back out of the unit here
-    rather than restated — a drift in either direction fails.
-    """
-
-    entry = next(
-        item
-        for item in authority_module._PENDING_ROLE_POLICIES
-        if item.name == "lab_claim_finalizer"
-    )
-    _, _, tail = _finalizer_unit_execstart().partition(" formal ")
-
+    assert not hasattr(authority_module, "_PENDING_ROLE_POLICIES")
+    assert "lab_claim_finalizer" in declared
+    assert "lab_claim_finalizer" in PROTECTED_ROLES
+    assert len(declared) <= authority_module.MAX_ROLES
     assert entry.module == "rquant.lab_formal_runtime_entry"
-    assert entry.module_arguments == tuple(tail.split())
+    assert entry.instanced is False
+    assert entry.service_kind == ""
+    assert entry.control_root == ""
+    assert entry.once is False
+    assert entry.module_arguments == ("lab-claim-finalizer",)
 
 
-def test_the_pending_finalizer_environment_covers_every_name_its_unit_sets() -> None:
-    """`build_child_environment` starts from an empty dictionary and copies the allowlist.
+def test_the_finalizer_role_environment_accounts_for_every_name_its_unit_sets() -> None:
+    """R1 of the scoping: a name the role does not list is dropped without a word.
 
-    Anything the unit's own `Environment=` line sets that the role does not list is dropped
-    silently once the wrapper is in the path, which is how a finalizer starts in production
-    with `APP_ENV` unset and no error anywhere. The names are read from the unit.
+    `build_child_environment` starts from an empty dictionary and copies only the profile's
+    allowlist, so an unlisted `APP_ENV` is not an error — it is a finalizer running in
+    production with the wrong settings and nothing in the journal. Every name the unit's own
+    `Environment=` line sets is therefore accounted for here: either the role lists it, or
+    the wrapper is proven to refuse it outright, in which case it never reached the daemon
+    under the old unit either.
+
+    `EnvironmentFile=/etc/rquant/lab-claim-finalizer.env` cannot be enumerated from this
+    repository — nothing here writes, templates or documents it — so its names are a known
+    gap, closed on the host before the profile is published, not something this test can
+    pretend to cover.
     """
 
-    unit = (
-        Path(__file__).resolve().parents[2]
-        / "deploy"
-        / "systemd"
-        / "rquant-lab-claim-finalizer.service"
-    ).read_text(encoding="utf-8")
+    from rquant.formal_runtime_command import _REQUIRED_ENVIRONMENT
+    from rquant.runtime_exec_wrapper import _verify
+
+    unit = _finalizer_unit_text()
     assignments = next(
         row.removeprefix("Environment=")
         for row in unit.splitlines()
         if row.startswith("Environment=")
     )
     unit_names = {item.split("=", 1)[0] for item in assignments.split()}
-    entry = next(
-        item
-        for item in authority_module._PENDING_ROLE_POLICIES
-        if item.name == "lab_claim_finalizer"
-    )
+    allowlist = set(_finalizer_entry().environment_allowlist)
+    refused: set[str] = set()
+    for name in sorted(unit_names - allowlist):
+        with pytest.raises(_verify.RuntimeExecError, match="interpreter behaviour"):
+            _verify.build_child_environment(
+                profile={"roles": {"lab_claim_finalizer": {"environment_allowlist": [name]}}},
+                role="lab_claim_finalizer",
+                spec={"working_directory": "/"},
+                source_environment={name: "1"},
+            )
+        refused.add(name)
 
+    # The unit's `Environment=` line is the one declaration of these names this repository
+    # holds, and `formal_runtime_command` enforces it on the unit, so the two must agree.
+    assert unit_names == set(_REQUIRED_ENVIRONMENT)
     assert unit_names == {"APP_ENV", "RQUANT_DISABLE_DOTENV", "PYTHONDONTWRITEBYTECODE"}
-    assert unit_names <= set(entry.environment_allowlist)
-    assert set(authority_module._RUNTIME_ROLE_ENVIRONMENT) <= set(entry.environment_allowlist)
+    assert unit_names - allowlist == refused == {"PYTHONDONTWRITEBYTECODE"}
+    assert set(authority_module._RUNTIME_ROLE_ENVIRONMENT) <= allowlist
+    assert "EnvironmentFile=/etc/rquant/lab-claim-finalizer.env" in unit
+
+
+def test_the_finalizer_role_environment_allowlist_is_an_explicit_sorted_constant() -> None:
+    """The profile schema requires sorted, deduplicated names; so does the policy entry."""
+
+    names = _finalizer_entry().environment_allowlist
+
+    assert names == ("APP_ENV", "LANG", "LC_ALL", "RQUANT_DISABLE_DOTENV", "TZ")
+    assert names == tuple(sorted(set(names)))
+    assert len(names) <= authority_module.MAX_ENVIRONMENT_NAMES
+    for name in names:
+        assert authority_module._ENVIRONMENT_NAME.fullmatch(name), name

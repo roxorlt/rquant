@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import shlex
 from collections.abc import Sequence
 from pathlib import Path
@@ -11,14 +10,26 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
+from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 from rquant.runtime_contracts import RuntimeContractModel
 
 FORMAL_RUNTIME_WRAPPER_CONTRACT = "rquant-formal-runtime-wrapper/v1"
 
-_RQUANT_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/rquant"
-_PYTHON_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
-_WRAPPER_EXECUTABLE = "/home/lighthouse/rquant/scripts/run-lab-daemon.py"
 _WORKLOAD_ARBITER = "/usr/local/libexec/rquant-workload-arbiter"
+#: Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. The unit named
+#: `/home/lighthouse/rquant/.venv/bin/rquant` for its dry-run and
+#: `/home/lighthouse/rquant/.venv/bin/python .../run-lab-daemon.py formal` for the daemon.
+#: Both are lighthouse-writable and `.venv` is an editable install pointing back at
+#: `<checkout>/src`, so the deployment was validated by the tree under validation. The
+#: unit now names the same fixed root-owned wrapper every other protected unit names, and
+#: the two retired executables are refused outright rather than merely unexpected.
+_SYSTEM_PYTHON = "/usr/bin/python3.11"
+_RUNTIME_PYZ = "/usr/local/libexec/rquant-runtime-exec.pyz"
+FINALIZER_ROLE = "lab_claim_finalizer"
+_RETIRED_CHECKOUT_EXECUTABLES = (
+    "/home/lighthouse/rquant/.venv/",
+    "/home/lighthouse/rquant/scripts/run-lab-daemon.py",
+)
 _RUNTIME_CODE_CONFIG = Path("/etc/rquant/runtime-code-bootstrap.json")
 #: The migration request the retired `ExecStartPre` dry-run named on the unit line. The
 #: gate now runs inside the verified generation (`rquant.lab_formal_runtime_entry`), so
@@ -48,6 +59,24 @@ _BOOTSTRAP_OPTIONS = (
     "--runtime-code-authority-uid",
     "--runtime-code-authority-gid",
     "--deployment-lock-path",
+)
+#: The immutable bootstrap binding the finalizer unit used to spell out after
+#: `run-lab-daemon.py formal`. It is a constant here rather than eight entries of the role's
+#: `module_arguments` because this module ships inside the generation the wrapper verifies
+#: byte for byte against a root-owned full manifest before executing any of it: a literal
+#: here and a literal in `/etc/rquant/production-runtime-profile.json` are protected by the
+#: same root authority, and the profile schema bounds a role at eight arguments.
+FINALIZER_BOOTSTRAP_ARGUMENTS: tuple[str, ...] = (
+    "--runtime-code-config",
+    str(_RUNTIME_CODE_CONFIG),
+    "--runtime-code-trusted-base",
+    str(_RUNTIME_CODE_TRUSTED_BASE),
+    "--runtime-code-authority-uid",
+    "0",
+    "--runtime-code-authority-gid",
+    "0",
+    "--deployment-lock-path",
+    str(_DEPLOYMENT_LOCK_PATH),
 )
 _FORMAL_COMMANDS = (
     "lab-claim-finalizer",
@@ -113,13 +142,14 @@ class InspectedFormalSystemdService(RuntimeContractModel):
     schema_version: Literal[1] = 1
     contract: Literal["rquant-formal-systemd-service/v1"] = "rquant-formal-systemd-service/v1"
     unit_path: Path
-    wrapper_source_path: Path
-    preflight_argv: tuple[str, ...] = Field(min_length=1)
+    #: The one literal the unit contributes. Everything else below is derived from the
+    #: root-owned role policy, never from the unit line.
+    role: Literal["lab_claim_finalizer"]
     wrapper: FormalRuntimeWrapperBinding
     environment_file: Path
     environment: dict[str, str]
 
-    @field_validator("unit_path", "wrapper_source_path", "environment_file", mode="after")
+    @field_validator("unit_path", "environment_file", mode="after")
     @classmethod
     def validate_paths(cls, value: Path) -> Path:
         return _canonical_absolute(value)
@@ -256,61 +286,65 @@ def _unit_values(source: str, key: str) -> tuple[str, ...]:
     )
 
 
-def _inspect_wrapper_source(path: Path) -> None:
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (OSError, SyntaxError, UnicodeError) as exc:
-        raise FormalRuntimeCommandError("formal runtime wrapper source is invalid") from exc
-    contract_matches = tuple(
-        node
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "FORMAL_RUNTIME_WRAPPER_CONTRACT"
-            for target in node.targets
-        )
-        and isinstance(node.value, ast.Constant)
-        and node.value.value == FORMAL_RUNTIME_WRAPPER_CONTRACT
-    )
-    formal_functions = tuple(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_formal_main"
-    )
-    if len(contract_matches) != 1 or len(formal_functions) != 1:
-        raise FormalRuntimeCommandError("formal runtime wrapper contract is missing")
-    formal_function = formal_functions[0]
-    names = {node.id for node in ast.walk(formal_function) if isinstance(node, ast.Name)}
-    required = {
-        "bind_formal_runtime",
-        "compose_formal_daemon_argv",
-        "exec_formal_runtime",
-        "open_formal_runtime_capability",
-        "parse_formal_wrapper_argv",
-    }
-    forbidden = {"_git_commit", "_require_trusted_git", "run_contained", "subprocess"}
-    if not required.issubset(names) or names.intersection(forbidden):
-        raise FormalRuntimeCommandError("formal runtime wrapper call graph is invalid")
+def compose_formal_wrapper_argv(module_arguments: Sequence[str]) -> tuple[str, ...]:
+    """The full wrapper argv: the frozen bootstrap binding plus the role's chosen entry.
+
+    The role policy names the daemon command (and any flag of it the deployment wants); the
+    binding in front of the separator is fixed. `parse_formal_wrapper_argv` then validates
+    the whole thing exactly as it validated the unit's own tail before, so a profile that
+    froze the wrong entry fails at the parser rather than starting a different daemon.
+    """
+
+    return (*FINALIZER_BOOTSTRAP_ARGUMENTS, "--", *module_arguments)
 
 
-def inspect_formal_systemd_service(
-    *,
-    unit_path: Path,
-    wrapper_source_path: Path,
-) -> InspectedFormalSystemdService:
+def _role_module_arguments(role: str) -> tuple[str, ...]:
+    """The frozen argv the root-owned profile hands the role, and the only source for it.
+
+    The unit used to carry these literals itself, which is exactly what made the finalizer a
+    self-certifying checkout entry point. They now live in `PRODUCTION_ROLE_POLICY`, are
+    published into `/etc/rquant/production-runtime-profile.json`, and are handed to the
+    module by the wrapper. Reading them back from the policy here — rather than restating
+    them — is what keeps this static inspection and the running service describing one thing.
+    """
+
+    matches = tuple(entry for entry in PRODUCTION_ROLE_POLICY if entry.name == role)
+    if len(matches) != 1:
+        raise FormalRuntimeCommandError("formal runtime role is not declared by the policy")
+    if matches[0].module != "rquant.lab_formal_runtime_entry":
+        raise FormalRuntimeCommandError("formal runtime role names an unexpected module")
+    return compose_formal_wrapper_argv(matches[0].module_arguments)
+
+
+def inspect_formal_systemd_service(*, unit_path: Path) -> InspectedFormalSystemdService:
+    """Hold the finalizer unit to the shape a protected runtime unit is allowed to have.
+
+    Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. This used to require
+    exactly one `ExecStartPre` running `rquant runtime-code dry-run` out of the checkout, and
+    an `ExecStart` whose tail spelled out the whole wrapper binding. Both were checkout code
+    executing ahead of the verification meant to authorise it, so both are now refused: the
+    preflight count is zero, the start command is the fixed root-owned wrapper and a role
+    literal, and the binding is read from the root-owned role policy instead of the unit.
+    """
+
     try:
         source = unit_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise FormalRuntimeCommandError("formal runtime service artifact is unavailable") from exc
     if any(argument in source for argument in _LEGACY_ARGUMENTS):
         raise FormalRuntimeCommandError("legacy runtime Git or checkout argument is forbidden")
-    preflight_values = _unit_values(source, "ExecStartPre")
+    if any(executable in source for executable in _RETIRED_CHECKOUT_EXECUTABLES):
+        raise FormalRuntimeCommandError("formal runtime service names a checkout interpreter")
+    if _unit_values(source, "ExecStartPre"):
+        raise FormalRuntimeCommandError(
+            "formal runtime service carries a start-phase preflight; the migration gate "
+            "belongs inside the verified generation"
+        )
     start_values = _unit_values(source, "ExecStart")
     environment_files = _unit_values(source, "EnvironmentFile")
-    if len(preflight_values) != 1 or len(start_values) != 1 or len(environment_files) != 1:
+    if len(start_values) != 1 or len(environment_files) != 1:
         raise FormalRuntimeCommandError("required immutable binding is missing from service")
     try:
-        preflight_tokens = tuple(shlex.split(preflight_values[0], posix=True))
         start_tokens = tuple(shlex.split(start_values[0], posix=True))
         environment_tokens = tuple(
             token
@@ -319,37 +353,19 @@ def inspect_formal_systemd_service(
         )
     except ValueError as exc:
         raise FormalRuntimeCommandError("formal runtime service argv is invalid") from exc
-    expected_preflight = (
-        _RQUANT_EXECUTABLE,
-        "runtime-code",
-        "dry-run",
-        "--runtime-code-config",
-        str(_RUNTIME_CODE_CONFIG),
-        "--runtime-code-trusted-base",
-        str(_RUNTIME_CODE_TRUSTED_BASE),
-        "--runtime-code-authority-uid",
-        "0",
-        "--runtime-code-authority-gid",
-        "0",
-        "--request",
-        str(RUNTIME_CODE_MIGRATION_REQUEST_PATH),
-        "--format",
-        "json",
-    )
-    if preflight_tokens != expected_preflight:
-        raise FormalRuntimeCommandError("required immutable binding is missing from preflight")
-    start_prefix = (
+    if start_tokens != (
         _WORKLOAD_ARBITER,
         "research",
         "--",
-        _PYTHON_EXECUTABLE,
+        _SYSTEM_PYTHON,
         "-I",
-        _WRAPPER_EXECUTABLE,
-        "formal",
-    )
-    if start_tokens[: len(start_prefix)] != start_prefix:
+        "-S",
+        _RUNTIME_PYZ,
+        "--role",
+        FINALIZER_ROLE,
+    ):
         raise FormalRuntimeCommandError("formal runtime service executable binding is invalid")
-    wrapper = parse_formal_wrapper_argv(start_tokens[len(start_prefix) :])
+    wrapper = parse_formal_wrapper_argv(_role_module_arguments(FINALIZER_ROLE))
     if wrapper != FormalRuntimeWrapperBinding(
         bootstrap=FormalRuntimeBootstrapBinding(
             configuration_path=_RUNTIME_CODE_CONFIG,
@@ -371,12 +387,10 @@ def inspect_formal_systemd_service(
         raise FormalRuntimeCommandError("required immutable environment binding is missing")
     if Path(environment_files[0]) != _ENVIRONMENT_FILE:
         raise FormalRuntimeCommandError("formal runtime service environment file is invalid")
-    _inspect_wrapper_source(wrapper_source_path)
     try:
         return InspectedFormalSystemdService(
             unit_path=unit_path,
-            wrapper_source_path=wrapper_source_path,
-            preflight_argv=preflight_tokens[1:],
+            role=FINALIZER_ROLE,
             wrapper=wrapper,
             environment_file=_ENVIRONMENT_FILE,
             environment=environment,
@@ -386,6 +400,8 @@ def inspect_formal_systemd_service(
 
 
 __all__ = [
+    "FINALIZER_BOOTSTRAP_ARGUMENTS",
+    "FINALIZER_ROLE",
     "FORMAL_RUNTIME_WRAPPER_CONTRACT",
     "RUNTIME_CODE_MIGRATION_REQUEST_PATH",
     "FormalRuntimeBootstrapBinding",
@@ -395,6 +411,7 @@ __all__ = [
     "add_formal_runtime_bootstrap_arguments",
     "add_formal_runtime_deployment_arguments",
     "compose_formal_daemon_argv",
+    "compose_formal_wrapper_argv",
     "inspect_formal_systemd_service",
     "parse_formal_wrapper_argv",
 ]

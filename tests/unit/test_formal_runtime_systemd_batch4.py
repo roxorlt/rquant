@@ -13,16 +13,21 @@ from rquant.formal_runtime_command import (
 
 ROOT = Path(__file__).resolve().parents[2]
 UNIT = ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service"
-WRAPPER = ROOT / "scripts/run-lab-daemon.py"
 
 
 def test_checked_in_finalizer_unit_composes_real_parser_argv_without_legacy() -> None:
-    inspected = inspect_formal_systemd_service(
-        unit_path=UNIT,
-        wrapper_source_path=WRAPPER,
-    )
+    """The unit contributes a role literal; the daemon argv comes from the role policy.
 
-    preflight = build_parser().parse_args(list(inspected.preflight_argv))
+    Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02. This used to read a start-phase
+    `ExecStartPre` out of the unit and parse it, and to reconstruct the wrapper binding from
+    the unit's own `ExecStart` tail — both of which were checkout commands the unit was free
+    to write. There is no preflight line left to parse and no tail left to read: the binding
+    is the root-owned profile's, and what is checked here is that it still composes an argv
+    the real CLI parser accepts.
+    """
+
+    inspected = inspect_formal_systemd_service(unit_path=UNIT)
+
     daemon_argv = compose_formal_daemon_argv(
         inspected.wrapper,
         deployment_generation="a" * 40,
@@ -31,8 +36,7 @@ def test_checked_in_finalizer_unit_composes_real_parser_argv_without_legacy() ->
     )
     daemon = build_parser().parse_args(list(daemon_argv))
 
-    assert preflight.command == "runtime-code"
-    assert preflight.action == "dry-run"
+    assert inspected.role == "lab_claim_finalizer"
     assert daemon.command == "lab-claim-finalizer"
     assert daemon.runtime_code_config == Path("/etc/rquant/runtime-code-bootstrap.json")
     assert daemon.runtime_code_trusted_base == Path("/etc/rquant")
@@ -45,25 +49,51 @@ def test_checked_in_finalizer_unit_composes_real_parser_argv_without_legacy() ->
     unit_text = UNIT.read_text(encoding="utf-8")
     assert "--expected-checkout-root" not in unit_text
     assert "--trusted-git-path" not in unit_text
+    assert "ExecStartPre" not in unit_text
+    assert "/home/lighthouse/rquant/.venv/" not in unit_text
+    assert "run-lab-daemon.py" not in unit_text
 
 
 @pytest.mark.parametrize(
     ("old", "new", "match"),
     (
         (
-            "--runtime-code-authority-gid 0",
-            "--trusted-git-path /usr/bin/git",
+            "--role lab_claim_finalizer",
+            "--role lab_claim_finalizer --trusted-git-path /usr/bin/git",
             "legacy",
         ),
         (
-            "--runtime-code-trusted-base /etc/rquant",
+            "--role lab_claim_finalizer",
+            "--role lab_claim_finalizer --instance svc-0",
+            "executable binding",
+        ),
+        (
+            "/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz",
+            "/home/lighthouse/rquant/.venv/bin/python -I",
+            "checkout interpreter",
+        ),
+        (
+            "ExecStart=/usr/local/libexec/rquant-workload-arbiter",
+            (
+                "ExecStartPre=/home/lighthouse/rquant/.venv/bin/rquant runtime-code dry-run\n"
+                "ExecStart=/usr/local/libexec/rquant-workload-arbiter"
+            ),
+            "checkout interpreter",
+        ),
+        (
+            "ExecStart=/usr/local/libexec/rquant-workload-arbiter",
+            "ExecStartPre=/bin/true\nExecStart=/usr/local/libexec/rquant-workload-arbiter",
+            "start-phase preflight",
+        ),
+        (
+            "EnvironmentFile=/etc/rquant/lab-claim-finalizer.env",
             "",
             "required immutable binding",
         ),
         (
-            "-- lab-claim-finalizer",
-            "-- lab-claim-finalizer --unknown-drift",
-            "unknown",
+            "Environment=APP_ENV=prod",
+            "Environment=APP_ENV=staging",
+            "required immutable environment",
         ),
     ),
 )
@@ -79,47 +109,62 @@ def test_static_unit_inspection_fails_closed_on_drift(
     unit.write_text(raw.replace(old, new, 1), encoding="utf-8")
 
     with pytest.raises(FormalRuntimeCommandError, match=match):
-        inspect_formal_systemd_service(unit_path=unit, wrapper_source_path=WRAPPER)
+        inspect_formal_systemd_service(unit_path=unit)
 
 
-def test_static_wrapper_inspection_fails_closed_when_typed_composition_drifts(
-    tmp_path: Path,
+def test_static_inspection_fails_closed_when_the_role_policy_argv_drifts(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wrapper = tmp_path / WRAPPER.name
-    raw = WRAPPER.read_text(encoding="utf-8")
-    assert "compose_formal_daemon_argv" in raw
-    wrapper.write_text(
-        raw.replace("compose_formal_daemon_argv", "compose_untrusted_argv"),
-        encoding="utf-8",
+    """The typed composition check moved from the checkout wrapper to the role policy.
+
+    It used to parse `scripts/run-lab-daemon.py` and demand that `_formal_main` still called
+    the typed helpers — a check on a file any deployment could rewrite. The binding now comes
+    from `PRODUCTION_ROLE_POLICY`, so that is what has to fail closed when it drifts.
+    """
+
+    from dataclasses import replace
+
+    import rquant.formal_runtime_command as command_module
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+    drifted = tuple(
+        replace(entry, module_arguments=("lab-worker",))
+        if entry.name == "lab_claim_finalizer"
+        else entry
+        for entry in PRODUCTION_ROLE_POLICY
+    )
+    monkeypatch.setattr(command_module, "PRODUCTION_ROLE_POLICY", drifted)
+
+    with pytest.raises(FormalRuntimeCommandError, match="not canonical"):
+        inspect_formal_systemd_service(unit_path=UNIT)
+
+
+def test_static_inspection_refuses_a_role_the_policy_does_not_declare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.formal_runtime_command as command_module
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+    monkeypatch.setattr(
+        command_module,
+        "PRODUCTION_ROLE_POLICY",
+        tuple(entry for entry in PRODUCTION_ROLE_POLICY if entry.name != "lab_claim_finalizer"),
     )
 
-    with pytest.raises(FormalRuntimeCommandError, match="wrapper"):
-        inspect_formal_systemd_service(unit_path=UNIT, wrapper_source_path=wrapper)
+    with pytest.raises(FormalRuntimeCommandError, match="not declared by the policy"):
+        inspect_formal_systemd_service(unit_path=UNIT)
 
 
 # ---------------------------------------------------------------------------------------
 # Codex round-3 verdict 2026-08-28, RQ-WI-R2-P1-02: the generation-local finalizer entry
 # ---------------------------------------------------------------------------------------
 
-#: The argv the root-owned profile freezes for the `lab_claim_finalizer` role, which is the
-#: same binding the unit used to spell out after `run-lab-daemon.py formal`. Held here as a
-#: literal and tied back to `PRODUCTION_ROLE_POLICY` by
+#: The argv the root-owned profile freezes for the `lab_claim_finalizer` role: the daemon
+#: entry, with the immutable bootstrap binding supplied by `compose_formal_wrapper_argv`.
+#: Held here as a literal and tied back to `PRODUCTION_ROLE_POLICY` by
 #: `test_the_finalizer_role_argv_is_the_binding_this_module_parses`, so the entry module and
 #: the role policy cannot drift apart in silence.
-FINALIZER_ARGV = (
-    "--runtime-code-config",
-    "/etc/rquant/runtime-code-bootstrap.json",
-    "--runtime-code-trusted-base",
-    "/etc/rquant",
-    "--runtime-code-authority-uid",
-    "0",
-    "--runtime-code-authority-gid",
-    "0",
-    "--deployment-lock-path",
-    "/run/rquant-lab-claim-finalizer/deployment.lock",
-    "--",
-    "lab-claim-finalizer",
-)
+FINALIZER_ARGV = ("lab-claim-finalizer",)
 
 
 def _finalizer_stage_recorder(
@@ -229,7 +274,8 @@ def test_the_entry_refuses_an_argv_that_is_not_the_frozen_binding(
 
     assert entry.main([]) == 1
     assert entry.main([*FINALIZER_ARGV, "--unknown-drift"]) == 1
-    assert entry.main(["--trusted-git-path", "/usr/bin/git", "--", "lab-claim-finalizer"]) == 1
+    assert entry.main(["--", "lab-claim-finalizer"]) == 1
+    assert entry.main(["lab-worker"]) == 1
     assert order == []
     assert "Lab formal daemon wrapper failed" in capsys.readouterr().err
 
@@ -281,7 +327,6 @@ def _real_migration_gate(
             RuntimeCodeFormalService(
                 command="lab-claim-finalizer",
                 unit_path=UNIT,
-                wrapper_path=WRAPPER,
             ),
         ),
         expected_configuration_path=Path("/etc/rquant/runtime-code-bootstrap.json"),
@@ -327,6 +372,7 @@ def test_the_dry_run_gate_still_refuses_an_unsatisfiable_migration_request(
     from rquant import lab_formal_runtime_entry as entry
     from rquant.formal_runtime_command import (
         RUNTIME_CODE_MIGRATION_REQUEST_PATH,
+        compose_formal_wrapper_argv,
         parse_formal_wrapper_argv,
     )
     from rquant.runtime_code_operations import (
@@ -334,7 +380,7 @@ def test_the_dry_run_gate_still_refuses_an_unsatisfiable_migration_request(
         RuntimeCodeOperationError,
     )
 
-    binding = parse_formal_wrapper_argv(list(FINALIZER_ARGV))
+    binding = parse_formal_wrapper_argv(compose_formal_wrapper_argv(FINALIZER_ARGV))
     wired = _real_migration_gate(monkeypatch, tmp_path / "ok", legacy_residue=False)
 
     checks = entry.assert_migration_request_is_satisfiable(binding)
@@ -361,10 +407,13 @@ def test_the_migration_gate_refuses_a_request_bound_to_other_authority(
     """The CLI compared the request's `expected_*` against its own flags; so does this."""
 
     from rquant import lab_formal_runtime_entry as entry
-    from rquant.formal_runtime_command import parse_formal_wrapper_argv
+    from rquant.formal_runtime_command import (
+        compose_formal_wrapper_argv,
+        parse_formal_wrapper_argv,
+    )
     from rquant.runtime_code_operations import RuntimeCodeOperationError
 
-    binding = parse_formal_wrapper_argv(list(FINALIZER_ARGV))
+    binding = parse_formal_wrapper_argv(compose_formal_wrapper_argv(FINALIZER_ARGV))
     wired = _real_migration_gate(monkeypatch, tmp_path, legacy_residue=False)
     drifted = wired.request.model_copy(update={"expected_authority_uid": 1})
     monkeypatch.setattr(
@@ -373,3 +422,35 @@ def test_the_migration_gate_refuses_a_request_bound_to_other_authority(
 
     with pytest.raises(RuntimeCodeOperationError, match="authority identity"):
         entry.assert_migration_request_is_satisfiable(binding)
+
+
+def test_the_finalizer_role_argv_is_the_binding_this_module_parses() -> None:
+    """One frozen argv, named by the policy and parsed by the entry, with no restatement."""
+
+    from rquant.formal_runtime_command import (
+        FINALIZER_BOOTSTRAP_ARGUMENTS,
+        compose_formal_wrapper_argv,
+        parse_formal_wrapper_argv,
+    )
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+    entry = next(
+        item for item in PRODUCTION_ROLE_POLICY if item.name == "lab_claim_finalizer"
+    )
+    binding = parse_formal_wrapper_argv(compose_formal_wrapper_argv(entry.module_arguments))
+
+    assert entry.module_arguments == FINALIZER_ARGV
+    assert entry.module == "rquant.lab_formal_runtime_entry"
+    assert binding.command == "lab-claim-finalizer"
+    assert binding.command_arguments == ()
+    assert binding.bootstrap.configuration_path == Path("/etc/rquant/runtime-code-bootstrap.json")
+    assert binding.bootstrap.trusted_base == Path("/etc/rquant")
+    assert binding.bootstrap.authority_uid == 0
+    assert binding.bootstrap.authority_gid == 0
+    assert binding.deployment_lock_path == Path(
+        "/run/rquant-lab-claim-finalizer/deployment.lock"
+    )
+    # The bootstrap half is a generation constant, not a unit line and not eight entries of
+    # the role's own arguments: the profile schema bounds a role at eight.
+    assert len(entry.module_arguments) <= 8
+    assert FINALIZER_BOOTSTRAP_ARGUMENTS[0] == "--runtime-code-config"
