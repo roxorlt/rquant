@@ -1978,6 +1978,49 @@ def test_a_release_merge_on_main_resolves_its_own_baseline_instead_of_failing_by
     assert resolution.baseline_tree_sha == BASELINE_TREE_SHA
 
 
+def test_a_derived_push_baseline_that_is_not_the_frozen_constant_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The branch that carries the whole push semantics, tested on its own.
+
+    When no base is stated, the base is taken from the candidate's first parent, so the only
+    thing standing between "any merge commit at all" and "the merge that continues this
+    release" is the equality against the frozen constant at the end. The other push cases
+    stop earlier - a squash has one parent, a stated base that disagrees with the first parent
+    trips merge provenance - so none of them reaches that equality. Short-circuiting it would
+    leave every one of them still green.
+    """
+
+    repo = tmp_path / "derived-push-repo"
+    identities = merge_fixture_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "--quiet", "main"],
+        check=True,
+        capture_output=True,
+    )
+    assert _head(repo) == identities["merge"]
+    first_parent = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"{identities['merge']}^1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert first_parent == identities["main_tip"]
+
+    # Everything about this candidate is structurally sound - two parents, a real merge tree,
+    # a first parent that is the merge base of the pair. It is simply not a continuation of
+    # the release the frozen baseline names.
+    with pytest.raises(
+        ValueError,
+        match="first parent is not the frozen R07 baseline",
+    ):
+        differential_gate.resolve_baseline_context(
+            repo,
+            environ={},
+            expected_baseline=identities["base"],
+        )
+
+
 def test_the_branch_tip_fallback_is_labelled_locally_and_refused_inside_github_actions(
     tmp_path: Path,
 ) -> None:
