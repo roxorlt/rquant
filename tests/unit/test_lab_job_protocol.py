@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -2094,16 +2096,206 @@ def test_load_rejects_non_direct_lexical_path_alias(tmp_path: Path) -> None:
         spool.load(aliased)
 
 
-@pytest.mark.xfail(
-    sys.platform != "darwin",
+def _stage_inode_reuse(
+    path: Path,
+    *,
+    original: bytes,
+    replacement: bytes,
+    observe: Callable[[], lab_job_protocol.LabSpoolFileIdentity],
+    attempts: int = 256,
+) -> tuple[lab_job_protocol.LabSpoolFileIdentity, int]:
+    """Write ``original`` at ``path``, observe it, then recreate ``path`` on its own inode.
+
+    ext4 returns a just-freed inode to the next create in the same block group, so the loop
+    normally lands on the first attempt. It is a loop and not a single shot only because
+    inode allocation is an allocator decision rather than a guarantee. Running out of
+    attempts is a failure and not a skip: a run that never reused the inode has not staged
+    the race this test exists for, and reporting it as a skip would hide that.
+    """
+
+    for _attempt in range(attempts):
+        path.write_bytes(original)
+        observation = observe()
+        original_inode = path.stat().st_ino
+        path.unlink()
+        path.write_bytes(replacement)
+        if path.stat().st_ino == original_inode:
+            return observation, original_inode
+        path.unlink()
+    raise AssertionError(
+        f"{path} never reused the freed inode in {attempts} attempts; the replacement race "
+        "this test covers was never staged"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
     reason=(
-        "LabSpoolFileIdentity identifies a spool file by (device, inode) only, and "
-        "ext4 reuses a just-freed inode, so an unlink-and-recreate replacement can "
-        "be quarantined as the original; owning package must add a reuse-proof "
-        "identity component"
+        "APFS numbers inodes from a monotonic counter and never returns a just-freed one, "
+        "so the ext4 inode-reuse replacement cannot be staged on Darwin"
     ),
-    strict=True,
 )
+def test_ext4_inode_reuse_never_quarantines_a_replacement(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    malformed = spool.pending_dir / "not-a-command.json"
+    replacement = b"replacement-that-took-the-freed-inode"
+
+    def observe() -> lab_job_protocol.LabSpoolFileIdentity:
+        with pytest.raises(InvalidCommandEnvelopeError) as captured:
+            spool.load(malformed)
+        identity = captured.value.file_identity
+        assert identity is not None
+        return identity
+
+    identity, reused_inode = _stage_inode_reuse(
+        malformed,
+        original=b"{broken",
+        replacement=replacement,
+        observe=observe,
+    )
+    current = malformed.stat()
+    assert identity.inode == reused_inode
+    assert (current.st_dev, current.st_ino) == (identity.device, identity.inode)
+    assert current.st_nlink == identity.link_count
+    assert stat.S_ISREG(current.st_mode)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(identity, reason="invalid_envelope")
+
+    assert malformed.read_bytes() == replacement
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+    assert spool.pending_paths() == (malformed,)
+
+
+def test_a_forged_identity_that_matches_the_replacement_inode_is_refused(tmp_path: Path) -> None:
+    """The ext4 race, staged by construction instead of by asking the allocator nicely."""
+
+    spool = LabCommandSpool(tmp_path / "commands")
+    malformed = spool.pending_dir / "not-a-command.json"
+    malformed.write_bytes(b"{broken")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    identity = captured.value.file_identity
+    assert identity is not None
+    assert identity.content_sha256 == hashlib.sha256(b"{broken").hexdigest()
+    assert identity.byte_count == len(b"{broken")
+
+    malformed.unlink()
+    replacement = b"replacement"
+    malformed.write_bytes(replacement)
+    current = malformed.stat()
+    reused = lab_job_protocol.LabSpoolFileIdentity(
+        path=identity.path,
+        device=current.st_dev,
+        inode=current.st_ino,
+        file_type=identity.file_type,
+        link_count=current.st_nlink,
+        byte_count=identity.byte_count,
+        content_sha256=identity.content_sha256,
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(reused, reason="invalid_envelope")
+
+    assert malformed.read_bytes() == replacement
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+    assert spool.pending_paths() == (malformed,)
+
+
+def test_a_byte_identical_replacement_is_still_quarantined(tmp_path: Path) -> None:
+    """Binding to content is not over-tightened: the same bad bytes are the same bad file."""
+
+    spool = LabCommandSpool(tmp_path / "commands")
+    malformed = spool.pending_dir / "not-a-command.json"
+    malformed.write_bytes(b"{broken")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    identity = captured.value.file_identity
+    assert identity is not None
+
+    malformed.unlink()
+    malformed.write_bytes(b"{broken")
+    current = malformed.stat()
+    identical = lab_job_protocol.LabSpoolFileIdentity(
+        path=identity.path,
+        device=current.st_dev,
+        inode=current.st_ino,
+        file_type=identity.file_type,
+        link_count=current.st_nlink,
+        byte_count=identity.byte_count,
+        content_sha256=identity.content_sha256,
+    )
+
+    quarantined = spool.quarantine(identical, reason="invalid_envelope")
+
+    assert quarantined.path.read_bytes() == b"{broken"
+    assert not os.path.lexists(malformed)
+    assert spool.pending_paths() == ()
+
+
+def test_quarantine_refuses_a_regular_identity_that_binds_no_content(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    malformed = spool.pending_dir / "not-a-command.json"
+    malformed.write_bytes(b"{broken")
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    identity = captured.value.file_identity
+    assert identity is not None
+    unbound = lab_job_protocol.LabSpoolFileIdentity(
+        path=identity.path,
+        device=identity.device,
+        inode=identity.inode,
+        file_type=identity.file_type,
+        link_count=identity.link_count,
+    )
+    assert not unbound.binds_content
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="binds no content"):
+        spool.quarantine(unbound, reason="invalid_envelope")
+
+    assert malformed.read_bytes() == b"{broken"
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
+def test_load_identity_binds_the_bytes_it_read(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    malformed = spool.pending_dir / "not-a-command.json"
+    payload = b"{broken"
+    malformed.write_bytes(payload)
+    with pytest.raises(InvalidCommandEnvelopeError) as captured:
+        spool.load(malformed)
+    identity = captured.value.file_identity
+    assert identity is not None
+    assert identity.byte_count == len(payload)
+    assert identity.content_sha256 == hashlib.sha256(payload).hexdigest()
+    assert identity.binds_content
+
+
+def test_spool_identity_rejects_a_content_hash_on_a_multiply_linked_entry(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="singly-linked regular entry"):
+        lab_job_protocol.LabSpoolFileIdentity(
+            path=tmp_path / "entry.json",
+            device=1,
+            inode=2,
+            link_count=2,
+            byte_count=7,
+            content_sha256="0" * 64,
+        )
+
+
+def test_spool_identity_accepts_a_record_written_before_the_digest_existed(
+    tmp_path: Path,
+) -> None:
+    identity = lab_job_protocol.LabSpoolFileIdentity(
+        path=tmp_path / "entry.json",
+        device=1,
+        inode=2,
+    )
+    assert identity.byte_count is None
+    assert identity.content_sha256 is None
+    assert not identity.binds_content
+
+
 def test_malformed_load_identity_prevents_quarantine_of_replacement(tmp_path: Path) -> None:
     spool = LabCommandSpool(tmp_path / "commands")
     malformed = spool.pending_dir / "not-a-command.json"
@@ -2134,6 +2326,8 @@ def test_symlink_load_identity_prevents_quarantine_of_replacement(tmp_path: Path
     assert identity is not None
     assert identity.file_type == "symlink"
     assert identity.link_target == str(victim)
+    assert identity.content_sha256 is None
+    assert identity.byte_count is None
     symlink.unlink()
     symlink.write_text("replacement", encoding="utf-8")
 

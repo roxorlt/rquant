@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -1397,6 +1398,72 @@ def test_malformed_and_symlink_report_do_not_block_later_report(tmp_path: Path) 
     assert link_error.value.file_identity is not None
     spool.quarantine(link_error.value.file_identity, reason="symlink")
     assert spool.load(good.path).report == good.report
+
+
+def test_a_typed_claim_entry_carries_its_content_digest_into_quarantine(tmp_path: Path) -> None:
+    spool = LabClaimSpool(tmp_path / "claims")
+    entry = spool.publish(_claim())
+    payload = entry.path.read_bytes()
+    assert entry.content_sha256 == hashlib.sha256(payload).hexdigest()
+    assert entry.byte_count == len(payload)
+
+    entry.path.unlink()
+    replacement = b"replacement-that-took-the-freed-inode"
+    entry.path.write_bytes(replacement)
+    replaced = entry.path.stat()
+    losing_entry = entry.model_copy(
+        update={"device": replaced.st_dev, "inode": replaced.st_ino},
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(losing_entry, reason="superseded")
+
+    assert entry.path.read_bytes() == replacement
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
+def test_a_replaced_claim_is_not_quarantined_when_the_worker_loses_the_race(
+    tmp_path: Path,
+) -> None:
+    """The lab_worker path: load a claim, lose the file to a replacement, quarantine it."""
+
+    spool = LabClaimSpool(tmp_path / "claims")
+    superseded = spool.publish(_claim(generation=1))
+    loaded = spool.load(superseded.path)
+
+    superseded.path.unlink()
+    live = canonical_model_json_bytes(_claim(generation=2))
+    superseded.path.write_bytes(live)
+    replaced = superseded.path.stat()
+    stale = loaded.model_copy(update={"device": replaced.st_dev, "inode": replaced.st_ino})
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(stale, reason="superseded")
+
+    assert superseded.path.read_bytes() == live
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
+
+
+def test_a_typed_report_entry_carries_its_content_digest_into_quarantine(tmp_path: Path) -> None:
+    spool = LabReportSpool(tmp_path / "reports")
+    entry = spool.publish(_report(_claim(), LabShardHeartbeat(lease_extension_seconds=10)))
+    payload = entry.path.read_bytes()
+    assert entry.content_sha256 == hashlib.sha256(payload).hexdigest()
+    assert entry.byte_count == len(payload)
+
+    entry.path.unlink()
+    replacement = b"replacement-that-took-the-freed-inode"
+    entry.path.write_bytes(replacement)
+    replaced = entry.path.stat()
+    losing_entry = entry.model_copy(
+        update={"device": replaced.st_dev, "inode": replaced.st_ino},
+    )
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
+        spool.quarantine(losing_entry, reason="conflicting_report")
+
+    assert entry.path.read_bytes() == replacement
+    assert tuple(spool.quarantine_dir.iterdir()) == ()
 
 
 def test_report_spool_cross_process_publish_and_restart_is_fifo(tmp_path: Path) -> None:
