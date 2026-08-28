@@ -18,6 +18,8 @@ which is the only concession to running without root.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -25,6 +27,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -44,6 +47,7 @@ tmp_path = _private_root.tmp_path
 ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = ROOT / "scripts" / "build-runtime-exec-pyz.py"
 SYSTEMD = ROOT / "deploy" / "systemd"
+ARBITER = ROOT / "deploy" / "libexec" / "rquant-workload-arbiter"
 #: The one role no unit names and nothing else invokes: the `daily` HYBRID adapter of
 #: `authority.md` L200, whose caller argv count is 0.
 UNIT_LESS_ROLES = frozenset({"daily"})
@@ -803,7 +807,12 @@ class TestFrozenBootstrap:
         compile(_verify.frozen_bootstrap(), "<frozen-bootstrap>", "exec")
 
     @staticmethod
-    def _run_bootstrap(world: World, call: str, *arguments: str) -> str:
+    def _run_bootstrap(
+        world: World,
+        call: str,
+        *arguments: str,
+        cwd: Path | None = None,
+    ) -> str:
         """Execute the real frozen bootstrap in a `-I -S` child, exactly as the wrapper does."""
 
         # Swap only the trailer, never the module body: `CHILD_TRAILER`'s own text also
@@ -816,6 +825,7 @@ class TestFrozenBootstrap:
             capture_output=True,
             text=True,
             check=False,
+            cwd=None if cwd is None else str(cwd),
             env={"PATH": "/usr/bin:/bin"},
         )
         assert completed.returncode == 0, completed.stderr
@@ -1625,3 +1635,147 @@ class TestModuleEntryContract:
 
         with pytest.raises(_verify.RuntimeExecError):
             world.resolve()
+
+
+# ---------------------------------------------------------------------------------------
+# Codex round-3 verdict RQ-WI-R2-P1-01: the arbiter's admission probe is a wrapper role
+# ---------------------------------------------------------------------------------------
+
+#: A module that records *which copy of itself* ran, by writing a marker its own source
+#: names. Two copies with different origins and different marker paths make "the generation's
+#: copy ran and the checkout's did not" a fact on disk rather than an inference.
+ADMISSION_ORIGIN_PROBE = """\
+import json
+import sys
+from pathlib import Path
+
+ORIGIN = {origin!r}
+MARKER = {marker!r}
+
+
+def main(argv=None):
+    Path(MARKER).write_text(
+        json.dumps({{"origin": ORIGIN, "file": __file__, "argv": list(argv or [])}}),
+        encoding="utf-8",
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+"""
+
+
+def _load_arbiter() -> ModuleType:
+    """Import the installed helper by path: it is deliberately not importable as `rquant.*`."""
+
+    spec = importlib.util.spec_from_loader(
+        "rquant_workload_arbiter_under_test",
+        loader=importlib.machinery.SourceFileLoader(
+            "rquant_workload_arbiter_under_test",
+            str(ARBITER),
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestArbiterAdmissionLaunch:
+    """What the arbiter now execs for its admission probe, and where that module comes from."""
+
+    @staticmethod
+    def _decoy_checkout(root: Path, marker: Path) -> Path:
+        """A checkout-shaped tree holding a second, hostile copy of the admission module."""
+
+        checkout = root / "checkout"
+        package = checkout / "rquant"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text('ORIGIN = "checkout"\n', encoding="utf-8")
+        (package / "workload_isolation.py").write_text(
+            ADMISSION_ORIGIN_PROBE.format(origin="checkout", marker=str(marker)),
+            encoding="utf-8",
+        )
+        return checkout
+
+    def test_the_arbiter_admission_argv_parses_as_a_wrapper_role_invocation(self) -> None:
+        """The arbiter passes a role literal and nothing else — the same D-2 shape a unit uses."""
+
+        admission = tuple(_load_arbiter()._ADMISSION_COMMAND)
+
+        assert admission[:4] == ("/usr/bin/python3.11", "-I", "-S", _verify.RUNTIME_PYZ_PATH)
+        assert wrapper_main.parse_role(["pyz", *admission[4:]]) == ("workload_admission", None)
+
+    def test_the_decoy_checkout_copy_really_runs_when_nothing_verifies_it(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The control arm: the shape the arbiter used to run does reach the checkout copy.
+
+        Without this the next test proves nothing — an inert decoy would satisfy it too.
+        `python -m` puts the working directory on `sys.path[0]`, which is exactly how
+        `.venv/bin/python -m rquant.workload_isolation` resolved out of `WorkingDirectory=`.
+        """
+
+        marker = tmp_path / "checkout-admission.json"
+        checkout = self._decoy_checkout(tmp_path, marker)
+
+        completed = subprocess.run(
+            [sys.executable, "-m", "rquant.workload_isolation", "research-admission"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=str(checkout),
+            env={"PATH": "/usr/bin:/bin"},
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(marker.read_text(encoding="utf-8"))["origin"] == "checkout"
+
+    def test_the_wrapper_runs_the_admission_module_from_the_generation_not_the_checkout(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The role the arbiter names resolves to the generation's module, with its frozen argv."""
+
+        role, instance = wrapper_main.parse_role(
+            ["pyz", *tuple(_load_arbiter()._ADMISSION_COMMAND)[4:]]
+        )
+        generation_marker = tmp_path / "generation-admission.json"
+        checkout_marker = tmp_path / "checkout-admission.json"
+        checkout = self._decoy_checkout(tmp_path, checkout_marker)
+        world = _build_world(
+            tmp_path,
+            whole_policy=True,
+            module_source=ADMISSION_ORIGIN_PROBE.format(
+                origin="generation", marker=str(generation_marker)
+            ),
+        )
+
+        call = (
+            "raise SystemExit(child_main(\n"
+            "    _sys.argv[1], None,\n"
+            "    profile_path=_sys.argv[2], authority_path=_sys.argv[3],\n"
+            "    generation_root=_sys.argv[4], trusted_root=_sys.argv[5],\n"
+            "    expected_owner_uid=int(_sys.argv[6]),\n"
+            "))\n"
+        )
+        TestFrozenBootstrap._run_bootstrap(
+            world,
+            call,
+            role,
+            str(world.profile_path),
+            str(world.authority_path),
+            str(world.generation_root),
+            str(world.trusted_root),
+            str(world.owner_uid),
+            cwd=checkout,
+        )
+
+        assert instance is None
+        observed = json.loads(generation_marker.read_text(encoding="utf-8"))
+        assert observed["origin"] == "generation"
+        assert observed["file"].startswith(str(world.generation_path / "app") + "/")
+        assert observed["argv"] == ["research-admission"]
+        assert not checkout_marker.exists()
