@@ -1181,6 +1181,45 @@ class TestEveryProtectedUnitResolves:
         assert set(_verify.PROTECTED_ROLES) == declared
         assert len(declared) == 28
 
+    def test_the_protected_roles_are_exactly_the_units_plus_the_two_listed_exceptions(
+        self,
+    ) -> None:
+        """Independent review R3B-SPEC-03: a closed set, checked from the units inwards.
+
+        The other direction is already covered - every protected role is declared by the
+        expanded policy. This one starts from `deploy/systemd/*.service` and asks the
+        converse: a unit that execs the pyz with a `--role` the wrapper does not protect
+        would be refused at runtime, and a role that no unit names, nothing arbiter-invokes
+        and is not the unit-less `daily` adapter is a role nobody can reach. Both are
+        mistakes the declaration-side check cannot see.
+        """
+
+        named: set[str] = set()
+        for unit in sorted(SYSTEMD.glob("*.service")):
+            text = unit.read_text(encoding="utf-8")
+            # systemd joins a trailing backslash onto the next line; read the whole argv.
+            joined = " ".join(
+                fragment.strip()
+                for fragment in text.replace("\\\n", " ").splitlines()
+                if fragment.strip().startswith("ExecStart")
+            )
+            tokens = joined.split()
+            named.update(
+                tokens[index + 1]
+                for index, token in enumerate(tokens[:-1])
+                if token == "--role"
+            )
+
+        assert named, "no unit names a wrapper role"
+        assert named <= set(_verify.PROTECTED_ROLES), sorted(
+            named - set(_verify.PROTECTED_ROLES)
+        )
+        assert named | UNIT_LESS_ROLES | ARBITER_INVOKED_ROLES == set(
+            _verify.PROTECTED_ROLES
+        ), sorted(set(_verify.PROTECTED_ROLES) - (named | UNIT_LESS_ROLES | ARBITER_INVOKED_ROLES))
+        assert not named & UNIT_LESS_ROLES
+        assert not named & ARBITER_INVOKED_ROLES
+
     def test_the_arbiter_invoked_admission_role_is_declared_with_its_frozen_argv(
         self,
     ) -> None:
@@ -1514,6 +1553,61 @@ class TestDerivedModuleArgv:
 
         with pytest.raises(_verify.RuntimeExecError, match="module arguments are invalid"):
             world.resolve(ROLE, instance=None)
+
+    @pytest.mark.parametrize(
+        "argument",
+        [
+            "research-admission\n--extra",
+            "research-admission\x00--extra",
+            "--manifest=/srv/%i.json",
+            "--manifest=${RUNTIME_ROOT}/x.json",
+        ],
+        ids=["newline", "nul", "systemd-specifier", "shell-expansion"],
+    )
+    def test_a_module_argument_may_not_carry_an_unresolved_expansion(
+        self,
+        tmp_path: Path,
+        argument: str,
+    ) -> None:
+        """Independent review R30-SPEC-01, the same bar the environment values already meet.
+
+        These literals become the child's argv verbatim. A newline or NUL splits or truncates
+        it wherever it is read next, and `%i` or `${` is a systemd or shell expansion that was
+        supposed to have been resolved long before this file saw it - the units used to carry
+        exactly those, which is what this round moved here to stop.
+        """
+
+        world = _build_world(
+            tmp_path,
+            profile_role_overrides={
+                "control_root": "",
+                "instances": [],
+                "module_arguments": [argument],
+            },
+        )
+
+        with pytest.raises(_verify.RuntimeExecError, match="unresolved expansion"):
+            world.resolve(ROLE, instance=None)
+
+    def test_a_module_argument_that_merely_looks_similar_is_still_accepted(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The rejection is for the expansion syntax, not for the characters around it."""
+
+        world = _build_world(
+            tmp_path,
+            profile_role_overrides={
+                "control_root": "",
+                "instances": [],
+                "module_arguments": ["--label=100%-instance", "--shell=$RUNTIME_ROOT"],
+            },
+        )
+
+        assert world.resolve(ROLE, instance=None)["module_argv"] == (
+            "--label=100%-instance",
+            "--shell=$RUNTIME_ROOT",
+        )
 
     def test_the_child_execs_into_the_module_with_the_derived_argv(
         self,

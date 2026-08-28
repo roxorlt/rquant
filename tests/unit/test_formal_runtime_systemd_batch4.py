@@ -454,3 +454,59 @@ def test_the_finalizer_role_argv_is_the_binding_this_module_parses() -> None:
     # the role's own arguments: the profile schema bounds a role at eight.
     assert len(entry.module_arguments) <= 8
     assert FINALIZER_BOOTSTRAP_ARGUMENTS[0] == "--runtime-code-config"
+
+
+def test_the_finalizer_entry_module_loads_nothing_dynamically() -> None:
+    """Independent review R3B-SPEC-02: the entry may only use the narrowed `sys.path`.
+
+    The retired checkout script reached its work through three `importlib.import_module`
+    calls that resolved via `rquant.pth` back into the checkout. This module exists so those
+    become ordinary top-level imports, taken after the wrapper has already narrowed
+    `sys.path` to the generation - which is only true while the module has no other way to
+    name a file. A dynamic loader here would reopen exactly the door the round closed, and it
+    would do so without changing any argv, unit or profile that the other cases inspect.
+
+    Read as source rather than by importing it: the point is what the file may contain, and
+    an import would only tell us what one execution happened to reach.
+    """
+
+    import ast
+
+    source = ROOT / "src" / "rquant" / "lab_formal_runtime_entry.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+
+    forbidden_names = {
+        "__import__",
+        "import_module",
+        "spec_from_file_location",
+        "spec_from_loader",
+        "module_from_spec",
+        "exec_module",
+        "SourceFileLoader",
+        "load_module",
+        "exec",
+        "eval",
+    }
+    called: set[str] = set()
+    sys_path_uses: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            function = node.func
+            if isinstance(function, ast.Name):
+                called.add(function.id)
+            elif isinstance(function, ast.Attribute):
+                called.add(function.attr)
+        if isinstance(node, ast.Attribute) and node.attr == "path":
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == "sys":
+                sys_path_uses.append(ast.dump(node))
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = getattr(node, "module", None) or ""
+            names = {alias.name for alias in node.names}
+            assert not module.startswith("importlib"), ast.dump(node)
+            assert "importlib" not in names, ast.dump(node)
+
+    assert called & forbidden_names == set(), sorted(called & forbidden_names)
+    # `sys.path` is not read, appended to, or assigned anywhere in the module: the wrapper
+    # owns it, and this file has to live with whatever it was handed.
+    assert sys_path_uses == []

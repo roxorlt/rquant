@@ -644,6 +644,15 @@ def derive_module_argv(
     extra = profile_role.get("module_arguments")
     if type(extra) is not list or any(type(item) is not str or not item for item in extra):
         raise _reject("the runtime profile role module arguments are invalid")
+    # Independent review R30-SPEC-01, aligned with the environment values above. These are
+    # literals of the root-owned profile that become the child's argv verbatim: a newline or
+    # NUL splits or truncates it downstream, and `%i` / `${` are systemd and shell expansions
+    # that are supposed to have been resolved before anything reaches this file. A profile
+    # still carrying one is a profile that was written to be interpolated somewhere else.
+    if any(
+        "\n" in item or "\x00" in item or "%i" in item or "${" in item for item in extra
+    ):
+        raise _reject("a runtime profile role module argument holds an unresolved expansion")
     control_root = profile_role.get("control_root")
     if type(control_root) is not str:
         raise _reject("the runtime profile role control root is invalid")
