@@ -1924,6 +1924,36 @@ def test_a_two_parent_head_resolves_itself_without_naming_origin_main_or_any_ref
     )
 
 
+def test_a_release_merge_on_main_resolves_its_own_baseline_instead_of_failing_by_construction(
+    tmp_path: Path,
+) -> None:
+    """The exact failure this work package exists for, on the real repository.
+
+    Once a release merges, main's tip *is* the merge commit and ``origin/main`` points at it,
+    so ``merge_base(origin/main, HEAD)`` is HEAD and no frozen constant can match. That is the
+    state every full-suite shard runs in on a push to main, and it is why those tests failed
+    deterministically rather than intermittently. The object GitHub's "Create a merge commit"
+    would write is materialized in a throwaway clone, HEAD is moved onto it, and the resolver
+    is asked with no arguments at all - which is how a shard asks it.
+    """
+
+    repo = _shared_clone(tmp_path / "post-merge-main")
+    candidate = _synthetic_merge_candidate(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "--no-deref", "HEAD", candidate],
+        check=True,
+        capture_output=True,
+    )
+
+    resolution = differential_gate.resolve_baseline_context(repo, environ={})
+
+    assert resolution.context.candidate_sha == candidate
+    assert resolution.context.event == "push"
+    assert resolution.context.base_source == "git_first_parent"
+    assert resolution.baseline_commit_sha == BASELINE_COMMIT_SHA
+    assert resolution.baseline_tree_sha == BASELINE_TREE_SHA
+
+
 def test_the_branch_tip_fallback_is_labelled_locally_and_refused_inside_github_actions(
     tmp_path: Path,
 ) -> None:
