@@ -218,6 +218,40 @@
   同时补上阶段命中断言，将来若提前过期会以「阶段未命中」而不是「evidence 缺失」失败。
   `write_completion_receipt` 的 evidence 阶段契约补成规范性 docstring（仅注释，行为不变），并由
   一条负向用例与两条检查点用例分别钉住「不产出 evidence」与「产出 evidence」两个分支。
+- **retention GC 用例的真实 monotonic 预算（Release B 前置，WP-B3）**：
+  `test_real_terminal_to_run_step_recovery_gc_and_health_chain` 注入了假 `clock` 却没注入
+  `monotonic`，GC worker 的 5 s `max_runtime` 仍挂在真实 `time.monotonic()` 上；第二次
+  `run_step()` 光是真实 full-verified 恢复闸门就要烧掉约 3.4 s（余量 1.49×），2 vCPU runner 一慢
+  就在 `_process` 中途撞 deadline，工作项被判 `retry`、`processed_count` 少 1、健康被推成
+  `degraded`。现在把 `virtual_monotonic` 一并注入 runtime 与末尾的 `ArtifactGcHealthProjector`：
+  deadline 与预算读同一条虚拟时间轴，`CPU ×16` 与 fsync ≥ 700 ms 压力下从 4/4 红转为 6/6 绿，
+  且墙钟与红态同量级——不是靠跑快挤进预算。
+- **source broker v2 用例的墙钟失配（WP-B4 / WP-B5 / WP-B6，六条 + 一条）**：
+  `test_source_broker_v2_service.py` 里七条用例把「前奏成本」「dispatch deadline」「provider 阻塞
+  时长」「busy timeout」用墙钟比例互相夹住，其中 dispatch deadline `_host(0.05)` 只有标定前奏的
+  4 倍，runner 前奏抖 3 倍就在 provider 进入之前过期：provider 线程从未创建，`entered` 永不 set，
+  30 s watchdog 报的是「永远不会发生」而不是「慢」；`match="deadline"` 对「provider 之前拒绝」
+  与「provider 之内拒绝」都匹配，所以用例悄悄走上与它声称性质无关的路径。改法按每条用例的被测
+  性质分别处理：deadline 只是搭台的，换成已评审的单边预算 `_BLOCKED_PROVIDER_DEADLINE_SECONDS`
+  并把 `entered.wait(30)` 收紧为返回那一刻 `entered.is_set()`；deadline 本身是被测对象的
+  （结果在 deadline 之后到达必须 reconcile、finalize 在 deadline 返回不自动重复），改成
+  「provider 阻塞到用例放行」——迟到由程序序构造、上界消失、只剩单边序；`locked_unknown_fence`
+  的「拒绝要快于 busy timeout」守卫改成三项同缩放（原守卫在 scale ≥ 2.5 时爬到固定 500 ms 之上，
+  会静默失效）；`duplicate_dispatch_wait` 的「用的是请求 deadline 而非 busy timeout」交给拒绝消息
+  的身份（`match="duplicate provider"`）而不是停表。`_PROVIDER_RACE_DEADLINE_SECONDS` 调用点
+  归零并删除其误导性注释；`_BlockingProvider` 的释放上限改由实测前奏推导（余量 95–98× 恒定，
+  旧字面量在 scale 8 时衰减到 12×）。零开销注入器下改前 scale 0.05–0.35 全红、改后 0.05–1.0
+  全绿。代价：六条用例各 `1.5 s × scale`。
+- **lab job protocol 保留用例的 umask 与 mtime 依赖（WP-B7）**：
+  `test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records` 里唯一一处裸
+  `incomplete.mkdir()`（同文件其余 16 处与生产 `lab_job_protocol.py` 都是 `mode=0o700`）在
+  runner 默认 umask 022 下建出 0755 目录，prune 打开时抛出「must be an owned physical 0700
+  private directory」；同时 prune 按 `(modified_at_ns, name)` 排序且永不删最新，evidence 解析
+  失败的 incomplete bundle 删不掉，8 个 bundle 的 mtime 在 CI 上撞进同一 tick 后排序退化成按
+  随机 uuid4 名，7/8 概率让 `assert len(bundles) <= 1` 失败。本地 APFS 纳秒 mtime 与 umask 077
+  从不触发。改为 `mkdir(mode=0o700)` 并用 `os.utime(ns=(1, 1))` 把七个完整 bundle 显式做旧
+  （同文件既有惯用法）；粗时间戳插件下修前 16/20（umask 022）与 18/20（umask 077）红，修后
+  两档各 0/25。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
