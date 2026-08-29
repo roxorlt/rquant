@@ -1041,9 +1041,21 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
         with pytest.raises(InvalidCommandEnvelopeError) as captured:
             spool.load(source)
         assert captured.value.file_identity is not None
-        spool.quarantine(captured.value.file_identity, reason="invalid_json")
+        isolated = spool.quarantine(captured.value.file_identity, reason="invalid_json")
+        # Retention never removes the newest record, and a bundle whose evidence cannot be
+        # parsed is never removable at all, so the incomplete bundle below has to be the
+        # newest one for the bound to be reachable. Age the complete bundles explicitly:
+        # relying on wall-clock mtime ordering ties on filesystems whose timestamp
+        # granularity is coarser than this loop, which drops the sort onto the random
+        # container uuid.
+        complete_container = isolated.path.parent
+        for child in complete_container.iterdir():
+            os.utime(child, ns=(1, 1), follow_symlinks=False)
+        os.utime(complete_container, ns=(1, 1), follow_symlinks=False)
     incomplete = spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
-    incomplete.mkdir()
+    # Production creates every isolation container with os.mkdir(..., mode=0o700); a bare
+    # mkdir() would inherit the process umask and stage a mode this spool never produces.
+    incomplete.mkdir(mode=0o700)
     (incomplete / "evidence.json").write_text("{truncated", encoding="utf-8")
 
     bounded = LabCommandSpool(root, max_isolation_records=1, max_isolation_bytes=1)
@@ -1579,8 +1591,15 @@ def test_owned_entry_isolation_retention_unlinks_only_the_owned_hardlink_name(
     identity = captured.value.file_identity
     assert identity is not None
     isolated = spool.quarantine(identity, reason="invalid_hardlink")
-    os.utime(isolated.path.parent, ns=(1, 1), follow_symlinks=False)
-    os.utime(isolated.path.parent / "evidence.json", ns=(1, 1), follow_symlinks=False)
+    # `entry` is a hardlink to a file staged outside the spool, so it keeps that file's
+    # wall-clock mtime. Retention keys each bundle on the max mtime across the container
+    # and every child, so pinning only the container and evidence.json still leaves this
+    # bundle looking as new as the one staged below, and prune then evicts the wrong one
+    # on any filesystem whose timestamp granularity ties the two.
+    isolated_container = isolated.path.parent
+    for child in isolated_container.iterdir():
+        os.utime(child, ns=(1, 1), follow_symlinks=False)
+    os.utime(isolated_container, ns=(1, 1), follow_symlinks=False)
 
     later = spool.pending_dir / f"{uuid4()}.json"
     later.write_text("{later", encoding="utf-8")
