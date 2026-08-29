@@ -1963,7 +1963,17 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
     assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
     started = time.monotonic()
-    with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
+    # Matched on the stage, not on the word "deadline". Every checkpoint in the
+    # dispatch prologue raises a message containing "deadline" too, so the loose
+    # match accepted a refusal that never reached the duplicate wait at all -
+    # and accepted it *green*, which is worse than a red: the case kept passing
+    # while silently testing nothing it names. Measured, not feared: at a
+    # prologue 5x its calibrated cost this case still passes with the refusal
+    # coming from `after dispatch claim verification`. `_wait_for_terminal` has
+    # exactly two deadline exits and both say "duplicate provider", so the
+    # family literal pins the stage without pinning which of the two won a race
+    # the case does not care about.
+    with pytest.raises(SourceBrokerV2TransportDeadlineError, match="duplicate provider"):
         service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
     assert time.monotonic() - started < _host(0.25)
 
