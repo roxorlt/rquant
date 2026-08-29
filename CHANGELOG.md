@@ -243,8 +243,9 @@
   旧字面量在 scale 8 时衰减到 12×）。零开销注入器下改前 scale 0.05–0.35 全红、改后 0.05–1.0
   全绿。代价：六条用例各 `1.5 s × scale`。
 - **lab job protocol 保留用例的 umask 与 mtime 依赖（WP-B7）**：
-  `test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records` 里唯一一处裸
-  `incomplete.mkdir()`（同文件其余 16 处与生产 `lab_job_protocol.py` 都是 `mode=0o700`）在
+  `test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records` 里唯一一处建隔离容器的裸
+  `incomplete.mkdir()`（同文件其余 22 处——20 处直接、2 处经 `real_mkdir` 透传——与生产
+  `lab_job_protocol.py` 都是 `mode=0o700`）在
   runner 默认 umask 022 下建出 0755 目录，prune 打开时抛出「must be an owned physical 0700
   private directory」；同时 prune 按 `(modified_at_ns, name)` 排序且永不删最新，evidence 解析
   失败的 incomplete bundle 删不掉，8 个 bundle 的 mtime 在 CI 上撞进同一 tick 后排序退化成按
