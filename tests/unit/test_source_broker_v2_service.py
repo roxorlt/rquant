@@ -2001,20 +2001,37 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
     thread.start()
     assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
-    started = time.monotonic()
-    # Matched on the stage, not on the word "deadline". Every checkpoint in the
-    # dispatch prologue raises a message containing "deadline" too, so the loose
-    # match accepted a refusal that never reached the duplicate wait at all -
-    # and accepted it *green*, which is worse than a red: the case kept passing
-    # while silently testing nothing it names. Measured, not feared: at a
-    # prologue 5x its calibrated cost this case still passes with the refusal
-    # coming from `after dispatch claim verification`. `_wait_for_terminal` has
-    # exactly two deadline exits and both say "duplicate provider", so the
-    # family literal pins the stage without pinning which of the two won a race
-    # the case does not care about.
+    # What this case is named for splits into two claims, and each now has its
+    # own witness instead of both leaning on one stopwatch.
+    #
+    # "Uses the single request deadline" - rather than the busy timeout - is a
+    # question of *which* refusal comes back, so it is answered by identity.
+    # `_wait_for_terminal` gives up on the busy timeout with
+    # `SourceBrokerTransportError("source provider operation is still in
+    # flight")` and on the request deadline with a message naming the duplicate
+    # wait; only the latter says "duplicate provider". Matching the word
+    # "deadline" told the two apart not at all, and did not even separate the
+    # duplicate wait from the dispatch prologue, whose checkpoints all say
+    # "deadline" as well - measured, at a prologue 5x its calibrated cost this
+    # case passed green on a refusal from `after dispatch claim verification`.
+    #
+    # "Returns *at* the deadline" is the temporal half, and it is anchored to
+    # the deadline rather than to the call's start, which is the only anchor
+    # that keeps meaning once the budget stops being a stopwatch reading.
+    #
+    # With the discriminator moved onto identity, the budget is no longer
+    # squeezed between the prologue below and the busy timeout above: the
+    # duplicate can never be handed a result - the first dispatch's provider
+    # blocks until this case releases it, further down - so the wait ends at
+    # this deadline however large it is. That leaves `prologue < deadline`,
+    # one-sided, and it takes the one-sided constant the other five cases of
+    # this file take. The 50ms literal left it a margin of four prologues and
+    # a loaded shard outruns four prologues.
+    deadline = time.monotonic() + _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS)
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="duplicate provider"):
-        service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
-    assert time.monotonic() - started < _host(0.25)
+        service.dispatch(envelope, deadline=deadline)
+    returned_at = time.monotonic()
+    assert returned_at - deadline < _host(0.2)
 
     provider.release.set()
     thread.join(timeout=2)
