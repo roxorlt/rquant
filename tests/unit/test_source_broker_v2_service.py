@@ -2328,9 +2328,29 @@ def test_provider_finalize_error_requires_reconcile_without_auto_repeat(
 def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
     tmp_path: Path,
 ) -> None:
+    # Three quantities decide this case, and - as the starved-signing pair above
+    # already had to learn - they only work as a set:
+    #
+    #   prologue  <  fence refusal  <  busy timeout
+    #
+    # The middle term is the subject: the service must refuse the moment it
+    # finds the fence unwritable, *not* sit on the lock until the busy timeout
+    # gives up. The guard below is what tells those two apart, and it can only
+    # do that while it sits strictly between them. The busy timeout was the one
+    # term of the three pinned to a bare literal while the other two scale with
+    # the host, so on a host slow enough for `_host()` to matter the guard drifts
+    # up past it and silently stops discriminating - at scale 2.5 the guard is
+    # already 0.5s and a service that waited out the whole 500ms would pass.
+    # All three scale together now, so both orderings hold at every host speed.
+    busy_timeout_seconds = _host(0.5)
+    refusal_guard_seconds = _host(0.2)
     ledger_path = tmp_path / "source-provider-ledger.sqlite3"
     provider = _LedgerLockingFailProvider(ledger_path=ledger_path)
-    service, keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
+    service, keyring = _service(
+        tmp_path,
+        provider=provider,
+        busy_timeout_ms=max(1, round(busy_timeout_seconds * 1000)),
+    )
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
     envelope = canonical_model_json_bytes(
@@ -2346,9 +2366,34 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
 
     started = time.monotonic()
     try:
-        with pytest.raises((SourceBrokerTransportError, SourceBrokerV2TransportDeadlineError)):
-            service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
-        assert time.monotonic() - started < _host(0.2)
+        # The refusal has to name itself. `SourceBrokerV2TransportDeadlineError`
+        # subclasses `SourceBrokerTransportError`, so the old two-element tuple
+        # was just `SourceBrokerTransportError` with extra words and it accepted
+        # a deadline expiry as if it were the fence refusal the case is named
+        # for - whether that expiry came from the prologue outrunning the budget
+        # or from the service waiting on the lock. Neither of those messages
+        # contains reconcile, required or unknown, so the stage is pinned here
+        # rather than inferred from the stopwatch two lines down.
+        #
+        # The budget is one-sided and therefore gets the one-sided constant.
+        # Measured, not assumed: what ends this call is the unwritable fence,
+        # not the deadline, so enlarging the budget from 50ms to 5s leaves the
+        # call at the same 15-25ms and leaves every assertion below untouched.
+        # All it has to do is survive the prologue, which the 50ms literal
+        # stopped doing at 2.9x its calibrated cost.
+        with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
+            service.dispatch(
+                envelope,
+                deadline=time.monotonic() + _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS),
+            )
+        returned_at = time.monotonic()
+        # Stated rather than inferred: the fence is unwritable *because the
+        # provider is holding the ledger lock*, and that precondition was until
+        # now taken on trust. `_LedgerLockingFailProvider` sets this only after
+        # `BEGIN IMMEDIATE` has succeeded, so it witnesses the lock, not just
+        # the entry that `dispatch_calls` already covers.
+        assert provider.locked.is_set()
+        assert returned_at - started < refusal_guard_seconds
         assert provider.dispatch_calls == 1
 
         replay = SourceBrokerV2ReplayResponse.model_validate_json(
@@ -2358,15 +2403,19 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
         assert replay.status is SourceBrokerV2ReplayStatus.UNKNOWN
 
         duplicate_started = time.monotonic()
+        # Scaled along with the busy timeout above: these two only have to
+        # outlast a refusal, but leaving them as literals while the busy timeout
+        # grows would invert `busy timeout < deadline` on a slow host and change
+        # which of the two ends the call.
         with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
-            service.dispatch(envelope, deadline=time.monotonic() + 1.0)
-        assert time.monotonic() - duplicate_started < _host(0.2)
+            service.dispatch(envelope, deadline=time.monotonic() + _host(1.0))
+        assert time.monotonic() - duplicate_started < refusal_guard_seconds
         assert provider.dispatch_calls == 1
     finally:
         provider.close()
 
     with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
-        service.dispatch(envelope, deadline=time.monotonic() + 1.0)
+        service.dispatch(envelope, deadline=time.monotonic() + _host(1.0))
     assert _ledger_row(tmp_path, request.operation_id)["status"] == "reconcile_required"
     assert provider.dispatch_calls == 1
 
