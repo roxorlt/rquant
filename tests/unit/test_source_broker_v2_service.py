@@ -161,6 +161,18 @@ _SIGNING_COST_SECONDS = 0.1
 # block cap from it rather than from a literal, so enlarging the deadline can
 # never collide with the block.
 _BLOCKED_PROVIDER_DEADLINE_SECONDS = 1.5
+# `_BlockingProvider` blocks until its case releases it, so this is not a budget
+# for anything a case measures - it is the guard that turns a hung case into a
+# named failure instead of a hung shard. What it has to outlast is the work the
+# case does *while holding* the provider: a signed claim plus a signed replay
+# round trip in one case, a whole second dispatch in the other. Every bit of
+# that scales with the host, and the cap was the one quantity in the pair that
+# did not - a bare `timeout=5`, the same shape of defect the blocked-dispatch
+# deadlines above were just converted out of. Expressed as a count of measured
+# prologues it is 5.0s on a quiet host, exactly what it has always been, and
+# 400x whatever prologue this process actually measured everywhere else, so the
+# guard and the work it guards move together.
+_BLOCKING_PROVIDER_RELEASE_PROLOGUES = 400
 # The calibration dispatch is not under test and must not be the thing that
 # fails when the host is slow, so it gets a watchdog rather than a budget.
 _PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
@@ -632,13 +644,16 @@ class _BlockingProvider(_CountingProvider):
         super().__init__()
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.block_seconds = _host(
+            _PROLOGUE_REFERENCE_SECONDS * _BLOCKING_PROVIDER_RELEASE_PROLOGUES
+        )
 
     def dispatch(self, request: SourceBrokerV2DispatchRequest):
         from rquant.source_broker_v2_service import SourceBrokerV2ProviderDispatchResult
 
         self.dispatch_calls += 1
         self.entered.set()
-        if not self.release.wait(timeout=5):
+        if not self.release.wait(timeout=self.block_seconds):
             raise TimeoutError("provider dispatch test release was not signaled")
         response = canonical_json_bytes(
             {"call": self.dispatch_calls, "operation_id": request.operation_id}
