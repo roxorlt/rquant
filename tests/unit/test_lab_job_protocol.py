@@ -1591,8 +1591,15 @@ def test_owned_entry_isolation_retention_unlinks_only_the_owned_hardlink_name(
     identity = captured.value.file_identity
     assert identity is not None
     isolated = spool.quarantine(identity, reason="invalid_hardlink")
-    os.utime(isolated.path.parent, ns=(1, 1), follow_symlinks=False)
-    os.utime(isolated.path.parent / "evidence.json", ns=(1, 1), follow_symlinks=False)
+    # `entry` is a hardlink to a file staged outside the spool, so it keeps that file's
+    # wall-clock mtime. Retention keys each bundle on the max mtime across the container
+    # and every child, so pinning only the container and evidence.json still leaves this
+    # bundle looking as new as the one staged below, and prune then evicts the wrong one
+    # on any filesystem whose timestamp granularity ties the two.
+    isolated_container = isolated.path.parent
+    for child in isolated_container.iterdir():
+        os.utime(child, ns=(1, 1), follow_symlinks=False)
+    os.utime(isolated_container, ns=(1, 1), follow_symlinks=False)
 
     later = spool.pending_dir / f"{uuid4()}.json"
     later.write_text("{later", encoding="utf-8")
