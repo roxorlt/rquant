@@ -253,6 +253,17 @@
   从不触发。改为 `mkdir(mode=0o700)` 并用 `os.utime(ns=(1, 1))` 把七个完整 bundle 显式做旧
   （同文件既有惯用法）；粗时间戳插件下修前 16/20（umask 022）与 18/20（umask 077）红，修后
   两档各 0/25。
+- **lab worker 读取 receipt 时与 scheduler 的发布窗口竞争（WP-B8，Codex RQ-RB-P1-01）**：
+  `LabReportSpool._publish_no_clobber()` 在 `os.link(tmp, target)` 之后、`finally` 里 `unlink(tmp)` 之前
+  夹着一次目录 fsync，这段时间目标 inode 的 `st_nlink == 2`；`LabWorker._wait_for_receipt()` 与
+  `_assert_no_terminal_success_evidence()` 原来**不持锁**地探测并读取 receipt，读取侧的
+  `st_nlink == 1` 安全校验于是把合法 receipt 判成「external hard link」，跑成功的 shard 被报成
+  `failed`（fence 阶段）。写者一直是持 `evidence_lock` 发布的，缺的是读者对称持锁：现在两处读取入口
+  改用已有的 locked twin——`_wait_for_receipt()` 每轮取锁、完成发现与读取后立即释放（不持锁等待），
+  `_assert_no_terminal_success_evidence()` 在同一锁区间完成 pending、receipt 路径快照与读取。
+  发布顺序与 `st_nlink == 1` 不变量均未改。新增确定性竞争用例：把 publisher 固定停在 link→unlink
+  窗口，证明 reader 等锁后在 nlink 恢复为 1 时才读到 receipt。CI 上该竞争约 1/10 命中（2 vCPU + ext4
+  目录 fsync 窗口约 1.7 ms），本地外科式加宽窗口至 50 ms 可 8/8 复现。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
