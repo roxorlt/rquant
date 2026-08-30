@@ -270,6 +270,18 @@
   （`completed=0`），与当轮改动无关。现在 NOW 从「前一天 08:00 UTC」派生（年龄恒在 16–40 小时，
   既不过期也不落到未来），`as_of_date` / `range_start` / `range_end` 仍相对派生。同批同步了
   full-suite 契约测试的字面 case 数（13204 → 13206，WP-B8 新增两条用例后漏改）。
+- **lab worker 等待 receipt 时取锁不受 timeout/stop 约束（Codex RQ-RB-P1-02）**：WP-B8 让
+  `LabWorker._wait_for_receipt()` 每轮持 `evidence_lock` 发现并读取 receipt，但取锁是阻塞式
+  `flock(LOCK_EX)`、无超时，而 stop 与剩余预算的检查都在锁块之后——同一把锁被回收、迁移或扫描
+  长期持有时，10 ms 的 receipt timeout 会被拖到锁释放之后（Codex 复现：持锁 200 ms → `TimeoutError`
+  206 ms 才到；预置 stop 的 `InterruptedError` 同样延迟）。现在 report spool 提供窄范围的非阻塞锁尝试
+  （进程内 thread lock `acquire(blocking=False)` + 跨进程 `flock(LOCK_EX | LOCK_NB)`，任一失败即回滚
+  已取得的一半，不用后台线程等锁）；`_wait_for_receipt()` 每轮**先**检查 stop 与剩余预算，再尝试取锁，
+  未取到时在锁外等待 `min(50 ms, remaining)` 重试；取到锁后 receipt 的发现与读取仍在同一锁区间。
+  `_assert_no_terminal_success_evidence()` 无 timeout/stop 契约，保持阻塞锁；`link → fsync → unlink`
+  顺序与 `st_nlink == 1` 不变量未动。新增确定性回归：锁持有超过 receipt timeout 按预算退出、锁竞争期间
+  stop 一个轮询周期内退出、锁在期限内释放后仍读到合法 receipt、同进程 thread-lock 与跨进程 flock 两种
+  竞争各自覆盖；WP-B8 两条发布窗口用例继续通过。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
