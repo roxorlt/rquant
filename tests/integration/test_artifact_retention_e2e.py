@@ -41,7 +41,12 @@ from rquant.runtime_artifact_retention import (
 )
 from rquant.runtime_contracts import canonical_sha256
 
-NOW = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+# Anchored to today rather than to a calendar literal. These cases drive the GC
+# worker at `receipt.completed_at + 1s` from a *real* restore, so the frozen
+# timeline has to stay within the gate's `max_recovery_age` of the real clock;
+# a fixed date silently ages out of that window and detonates on one specific
+# day (2026-07-31 + 30d).
+NOW = datetime.now(UTC).replace(hour=8, minute=0, second=0, microsecond=0)
 
 
 class AuditAuthority:
@@ -99,9 +104,9 @@ def _experiment() -> ExperimentAttempt:
 
 def _authorities() -> tuple[DataAuditRun, DatasetSnapshot, ExperimentAttempt]:
     audit = DataAuditRun(
-        as_of_date=date(2026, 7, 30),
-        range_start=date(2026, 7, 1),
-        range_end=date(2026, 7, 30),
+        as_of_date=(NOW - timedelta(days=1)).date(),
+        range_start=(NOW - timedelta(days=30)).date(),
+        range_end=(NOW - timedelta(days=1)).date(),
         rule_set_version="stage1-v2",
         status="completed",
         observed_at=NOW - timedelta(hours=4),
