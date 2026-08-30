@@ -3352,8 +3352,21 @@ class LabWorker:
         timeout_at_microseconds = _monotonic_microseconds() + timeout_microseconds
         receipt_path = self.report_spool.ack_dir / f"{report.report_id}.json"
         while True:
-            if os.path.lexists(receipt_path):
-                receipt = self.report_spool.load_receipt(receipt_path)
+            with self.report_spool.evidence_lock():
+                # Discovery and read have to share one hold. The publisher creates
+                # this directory entry with link(temporary, target) and only drops
+                # the temporary in its finally, so the name becomes visible at the
+                # same instant the inode carries a second link; an unlocked observer
+                # lands in that window and rejects a perfectly good receipt as an
+                # external hard link. The hold covers lexists and the read only -
+                # never the wait below, because holding across a poll interval would
+                # trade this race for starving the publisher.
+                receipt = (
+                    self.report_spool.load_receipt(receipt_path)
+                    if os.path.lexists(receipt_path)
+                    else None
+                )
+            if receipt is not None:
                 if (
                     receipt.report_id != report.report_id
                     or receipt.content_hash != report.content_hash
@@ -11018,13 +11031,19 @@ class LabArtifactReclaimer:
         manifest: LabShardResultManifest,
         current_claim: LabShardClaim,
     ) -> None:
-        self._assert_no_terminal_success_evidence_from(
-            claim,
-            manifest,
-            current_claim,
-            pending=self.report_spool.pending(),
-            receipt_paths=tuple(sorted(self.report_spool.ack_dir.glob("*.json"))),
-        )
+        # The snapshot and every read below belong to one hold: an unlocked
+        # ack_dir glob sees a receipt the moment the publisher links it, while the
+        # publisher's own temporary is still the inode's second link, and the read
+        # then rejects it as an external hard link. Delegate to the locked twin so
+        # pending, the receipt snapshot and the reads share this critical section:
+        # the plain pending() takes the same lock itself, so calling it from inside
+        # this hold would self-deadlock on a non-reentrant flock.
+        with self.report_spool.evidence_lock():
+            self._assert_no_terminal_success_evidence_locked(
+                claim,
+                manifest,
+                current_claim,
+            )
 
     def _assert_no_terminal_success_evidence_locked(
         self,
