@@ -875,13 +875,33 @@ class PrivateSqlitePathAuthority:
             ):
                 raise ValueError(f"{self.label} managed trust root identity changed")
             self._managed_trust_root_generation = observed_root_generation
-        self._parent_generation = self._validate_parent_chain()
+        self._parent_generation = self._bind_initial_parent_chain()
         if not os.path.lexists(self.path):
             if not create_if_missing:
                 self._generation: PathGeneration | None = None
                 return
             self._create_private_file()
         self._generation = self._validate_file()
+
+    def _bind_initial_parent_chain(self) -> tuple[PathGeneration, ...]:
+        """Bind the ancestry before any lock exists, tolerating benign ctime churn.
+
+        The trust root is a shared directory: a concurrent writer creating or
+        removing SQLite ``-wal``/``-shm`` sidecars bumps its ``st_ctime_ns``
+        while this constructor runs, before any cross-process lock can be held.
+        Bind a self-consistent observation (inode identity still fenced strictly)
+        instead of failing closed on a ctime the caller cannot have caused.
+        """
+
+        for _attempt in range(3):
+            before = self._validate_parent_chain(allow_managed_trust_root_ctime_change=True)
+            observed = self._validate_parent_chain(allow_managed_trust_root_ctime_change=True)
+            if self._same_parent_observation(before, observed):
+                self._managed_trust_root_generation = observed[
+                    len(self._managed_trust_root.parts) - 1
+                ]
+                return observed
+        raise ValueError(f"{self.label} parent ctime changed while binding")
 
     def _validate_managed_trust_root(
         self,
