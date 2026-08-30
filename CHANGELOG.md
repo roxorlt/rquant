@@ -264,6 +264,12 @@
   发布顺序与 `st_nlink == 1` 不变量均未改。新增确定性竞争用例：把 publisher 固定停在 link→unlink
   窗口，证明 reader 等锁后在 nlink 恢复为 1 时才读到 receipt。CI 上该竞争约 1/10 命中（2 vCPU + ext4
   目录 fsync 窗口约 1.7 ms），本地外科式把窗口加宽到 50–100 ms 即确定性复现（双版本合计 8/8）。
+- **artifact retention e2e 用例的日期定时炸弹**：`tests/integration/test_artifact_retention_e2e.py` 把「现在」冻结在
+  `2026-07-31`，而 `artifact_retention.py` 的恢复验证窗口用真实墙钟判 `now - 30d <= verified_at <= now`，
+  于是这份 fixture 只有 30 天保质期——2026-08-30 当天起在任何分片、任何解释器上都确定性失败
+  （`completed=0`），与当轮改动无关。现在 NOW 从「前一天 08:00 UTC」派生（年龄恒在 16–40 小时，
+  既不过期也不落到未来），`as_of_date` / `range_start` / `range_end` 仍相对派生。同批同步了
+  full-suite 契约测试的字面 case 数（13204 → 13206，WP-B8 新增两条用例后漏改）。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
