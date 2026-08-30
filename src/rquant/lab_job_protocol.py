@@ -375,14 +375,41 @@ class LabCommandSpool:
             self._prune_owned_isolations_locked()
 
     @contextmanager
-    def _exclusive_lock(self, *, require_root: bool = True) -> Iterator[None]:
-        with self._thread_lock:
+    def _exclusive_lock(
+        self,
+        *,
+        require_root: bool = True,
+        blocking: bool = True,
+    ) -> Iterator[bool]:
+        """Hold this spool exclusively; yield whether the hold was taken.
+
+        A blocking hold always yields True or raises, so existing callers that
+        ignore the value are unaffected. A non-blocking hold yields False instead
+        of waiting, which is what lets a caller with a deadline - a receipt wait
+        owns a timeout and a stop signal - keep answering to its own budget while
+        some other holder is mid-reclaim. Both halves are covered: the in-process
+        thread lock and the cross-process flock. Whichever half was taken is
+        released before yielding False, so a refused attempt leaves nothing held.
+        """
+        if not self._thread_lock.acquire(blocking=blocking):
+            yield False
+            return
+        try:
             parent_descriptor = self._open_lock_parent()
             descriptor = -1
             root_descriptor = -1
+            held = False
             try:
                 descriptor = self._open_private_lock(parent_descriptor)
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                if blocking:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                else:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        yield False
+                        return
+                held = True
                 active_lock = os.fstat(descriptor)
                 self._active_lock_parent_descriptor = parent_descriptor
                 self._active_lock_descriptor = descriptor
@@ -391,18 +418,24 @@ class LabCommandSpool:
                     root_descriptor = self._open_private_root()
                     self._active_root_descriptor = root_descriptor
                     self._assert_managed_directories_bound()
-                yield
+                yield True
             finally:
-                self._active_root_descriptor = None
-                self._active_lock_identity = None
-                self._active_lock_descriptor = None
-                self._active_lock_parent_descriptor = None
+                # Only a hold that was actually taken owns this state; a refused
+                # attempt must not clear what an enclosing hold established.
+                if held:
+                    self._active_root_descriptor = None
+                    self._active_lock_identity = None
+                    self._active_lock_descriptor = None
+                    self._active_lock_parent_descriptor = None
                 if root_descriptor >= 0:
                     os.close(root_descriptor)
                 if descriptor >= 0:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    if held:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
                     os.close(descriptor)
                 os.close(parent_descriptor)
+        finally:
+            self._thread_lock.release()
 
     def _fsync_directory(self, path: Path) -> None:
         descriptor = self._open_managed_directory(path)
