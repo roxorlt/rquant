@@ -41,7 +41,16 @@ from rquant.runtime_artifact_retention import (
 )
 from rquant.runtime_contracts import canonical_sha256
 
-NOW = datetime(2026, 7, 31, 8, 0, tzinfo=UTC)
+# Anchored to the real clock rather than to a calendar literal. These cases stamp
+# the catalog at NOW but drive the GC worker from a *real* restore receipt, and
+# `_cold_verification_is_fresh` accepts `now - verification_max_age <= verified_at
+# <= now` (artifact_retention.py:3577) - a two-sided window. A fixed date walks
+# out of the lower bound and detonates on one specific day (2026-07-31 + 30d),
+# while anchoring to *today* at 08:00 would cross the upper bound and reject NOW
+# as being in the future whenever CI starts before 08:00 UTC. Yesterday at 08:00
+# keeps the age in [16h, 40h) for every hour of the day: always positive, always
+# far inside 30 days.
+NOW = (datetime.now(UTC) - timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
 
 
 class AuditAuthority:
@@ -99,9 +108,9 @@ def _experiment() -> ExperimentAttempt:
 
 def _authorities() -> tuple[DataAuditRun, DatasetSnapshot, ExperimentAttempt]:
     audit = DataAuditRun(
-        as_of_date=date(2026, 7, 30),
-        range_start=date(2026, 7, 1),
-        range_end=date(2026, 7, 30),
+        as_of_date=(NOW - timedelta(days=1)).date(),
+        range_start=(NOW - timedelta(days=30)).date(),
+        range_end=(NOW - timedelta(days=1)).date(),
         rule_set_version="stage1-v2",
         status="completed",
         observed_at=NOW - timedelta(hours=4),
