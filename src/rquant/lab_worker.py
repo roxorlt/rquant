@@ -3352,20 +3352,30 @@ class LabWorker:
         timeout_at_microseconds = _monotonic_microseconds() + timeout_microseconds
         receipt_path = self.report_spool.ack_dir / f"{report.report_id}.json"
         while True:
-            with self.report_spool.evidence_lock():
-                # Discovery and read have to share one hold. The publisher creates
-                # this directory entry with link(temporary, target) and only drops
-                # the temporary in its finally, so the name becomes visible at the
-                # same instant the inode carries a second link; an unlocked observer
-                # lands in that window and rejects a perfectly good receipt as an
-                # external hard link. The hold covers lexists and the read only -
-                # never the wait below, because holding across a poll interval would
-                # trade this race for starving the publisher.
-                receipt = (
-                    self.report_spool.load_receipt(receipt_path)
-                    if os.path.lexists(receipt_path)
-                    else None
-                )
+            # Stop and budget are answered before anything that can wait. The
+            # evidence lock is shared with reclaim, migration and scan work that
+            # can hold it for far longer than a receipt wait is allowed to take,
+            # so parking on it would let an unrelated holder set this call's
+            # deadline instead of the caller.
+            if stop.is_set():
+                raise InterruptedError("worker stop requested while waiting for report receipt")
+            remaining_microseconds = timeout_at_microseconds - _monotonic_microseconds()
+            if remaining_microseconds <= 0:
+                raise TimeoutError(f"report receipt timed out: {report.report_id}")
+            receipt = None
+            with self.report_spool.try_evidence_lock() as acquired:
+                if acquired:
+                    # Discovery and read still share one hold. The publisher
+                    # creates this directory entry with link(temporary, target)
+                    # and only drops the temporary in its finally, so the name
+                    # becomes visible at the same instant the inode carries a
+                    # second link; an unlocked observer lands in that window and
+                    # rejects a perfectly good receipt as an external hard link.
+                    receipt = (
+                        self.report_spool.load_receipt(receipt_path)
+                        if os.path.lexists(receipt_path)
+                        else None
+                    )
             if receipt is not None:
                 if (
                     receipt.report_id != report.report_id
@@ -3375,11 +3385,8 @@ class LabWorker:
                 ):
                     raise ValueError("report receipt identity does not match published report")
                 return receipt
-            if stop.is_set():
-                raise InterruptedError("worker stop requested while waiting for report receipt")
-            remaining_microseconds = timeout_at_microseconds - _monotonic_microseconds()
-            if remaining_microseconds <= 0:
-                raise TimeoutError(f"report receipt timed out: {report.report_id}")
+            # Either the receipt is not there yet or someone else holds the lock;
+            # both wait out of the way, off the lock, for one poll interval.
             stop.wait(_microseconds_to_seconds(min(50_000, remaining_microseconds)))
 
     def _receipt_wait_timeout_seconds(self) -> float:
