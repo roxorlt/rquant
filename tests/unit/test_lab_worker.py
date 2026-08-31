@@ -13066,6 +13066,155 @@ def test_receipt_wait_reads_the_receipt_once_the_evidence_lock_is_free(
     assert worker._wait_for_receipt(report, _observe(2), LabStopSignal()) == receipt
 
 
+def _thread_lock_free_for_another_thread(reports: LabReportSpool) -> bool:
+    """Probe the spool's thread half from a thread that cannot already own it.
+
+    The probe has to run off the main thread: `_thread_lock` is an `RLock`, so a
+    main-thread `acquire(blocking=False)` succeeds by reentrancy even while this
+    very frame holds it, which would make the check vacuously true.
+    """
+    outcome: list[bool] = []
+
+    def probe() -> None:
+        taken = reports._thread_lock.acquire(blocking=False)
+        outcome.append(taken)
+        if taken:
+            reports._thread_lock.release()
+
+    prober = threading.Thread(target=probe)
+    prober.start()
+    prober.join(_observe(5))
+    assert not prober.is_alive(), "thread-half probe never finished"
+    assert len(outcome) == 1
+    return outcome[0]
+
+
+def _open_descriptor_count() -> int:
+    """Count this process's open descriptors.
+
+    `os.listdir` opens one descriptor of its own for the directory it is reading,
+    and closes it before returning, so the same transient appears in every sample
+    and cancels out between them.
+    """
+    return len(os.listdir("/dev/fd"))
+
+
+def test_refused_try_evidence_lock_holds_nothing_inside_the_false_body(
+    tmp_path: Path,
+) -> None:
+    """A refused attempt must hand back a body that owns nothing.
+
+    `_exclusive_lock` promises the half it took is "released before yielding
+    False". A `@contextmanager` generator suspends at its `yield`, so releasing in
+    a `finally` releases only after the caller has left the `with` block - during
+    the whole False body the refused attempt still held the thread lock and both
+    descriptors, and a caller that reacts to `acquired is False` by doing other
+    spool work would deadlock against itself or leak.
+    """
+    reports = LabReportSpool(tmp_path / "reports")
+
+    with _evidence_lock_held_in_subprocess(reports, tmp_path):
+        descriptors_before = _open_descriptor_count()
+        with reports.try_evidence_lock() as acquired:
+            assert acquired is False
+            assert _thread_lock_free_for_another_thread(reports), (
+                "refused attempt still holds the thread lock inside the False body"
+            )
+            assert _open_descriptor_count() == descriptors_before, (
+                "refused attempt still holds descriptors inside the False body"
+            )
+            assert reports._active_lock_descriptor is None
+            assert reports._active_lock_parent_descriptor is None
+        assert _open_descriptor_count() == descriptors_before
+
+
+def test_refused_try_evidence_lock_leaves_the_spool_reusable(
+    tmp_path: Path,
+) -> None:
+    """Repeated refusals must not accumulate, and must not poison the spool.
+
+    Every refusal releases both halves on its own, so twenty of them in a row cost
+    nothing, and once the other holder is gone the same spool takes the lock again
+    - both the non-blocking and the blocking way.
+    """
+    reports = LabReportSpool(tmp_path / "reports")
+    # Sampled before the holder exists so the holder's own bookkeeping cannot
+    # show up as a leak once it is reaped.
+    descriptors_at_rest = _open_descriptor_count()
+
+    with _evidence_lock_held_in_subprocess(reports, tmp_path):
+        descriptors_before = _open_descriptor_count()
+        for attempt in range(20):
+            with reports.try_evidence_lock() as acquired:
+                assert acquired is False, f"lock holder released early on attempt {attempt}"
+                assert _thread_lock_free_for_another_thread(reports), (
+                    f"attempt {attempt} still holds the thread lock"
+                )
+            assert _open_descriptor_count() == descriptors_before, (
+                f"attempt {attempt} leaked a descriptor"
+            )
+            assert _thread_lock_free_for_another_thread(reports)
+
+    with reports.try_evidence_lock() as acquired:
+        assert acquired is True
+    with reports.evidence_lock():
+        pass
+
+    assert _open_descriptor_count() == descriptors_at_rest
+    assert reports._active_lock_descriptor is None
+    assert reports._active_lock_parent_descriptor is None
+    assert reports._active_lock_identity is None
+    assert reports._active_root_descriptor is None
+    assert _thread_lock_free_for_another_thread(reports)
+
+
+@pytest.mark.parametrize("exhausted", ["stop", "budget"])
+def test_receipt_wait_never_tries_the_lock_once_stop_or_budget_is_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exhausted: str,
+) -> None:
+    """Stop and budget are answered before the lock is ever reached for.
+
+    Ordering is the whole fix for RQ-RB-P1-02: the evidence lock is shared with
+    reclaim, migration and scan work, so a wait that reaches for it before reading
+    its own stop flag and remaining budget hands its deadline to an unrelated
+    holder. A stub that both counts and raises pins the order in either direction.
+    """
+    import rquant.lab_worker as lab_worker
+    from rquant.lab_worker import LabStopSignal
+
+    reports = LabReportSpool(tmp_path / "reports")
+    worker, report = _receipt_wait_worker(tmp_path, reports)
+    attempts: list[str] = []
+
+    def refuse_the_attempt() -> object:
+        attempts.append(exhausted)
+        raise AssertionError("try_evidence_lock must not be attempted")
+
+    monkeypatch.setattr(reports, "try_evidence_lock", refuse_the_attempt)
+
+    stop = LabStopSignal()
+    if exhausted == "stop":
+        stop.request()
+        expected: type[BaseException] = InterruptedError
+    else:
+        # The first reading sets the deadline; every later one is already past it,
+        # so the budget is spent before the first pass reaches the lock.
+        readings = iter((0,))
+
+        def spent_clock() -> int:
+            return next(readings, 10**12)
+
+        monkeypatch.setattr(lab_worker, "_monotonic_microseconds", spent_clock)
+        expected = TimeoutError
+
+    with pytest.raises(expected):
+        worker._wait_for_receipt(report, 30.0, stop)
+
+    assert attempts == []
+
+
 def test_preflight_evidence_scan_never_reads_inside_the_publish_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
