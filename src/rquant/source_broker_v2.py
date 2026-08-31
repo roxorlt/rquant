@@ -74,6 +74,15 @@ SOURCE_BROKER_V2_CLAIM_ATTEMPT_CONTRACT = "rquant-source-broker-claim-attempt/v1
 _ZERO_HASH = "0" * 64
 _ED25519_SIGNATURE_BYTES = 64
 _PRODUCTION_SAGA_GRAPH_TOKEN = object()
+# One in-flight ``_heartbeat_outbox`` may legitimately spend a whole
+# ``busy_timeout_ms`` waiting for the write lock at ``BEGIN IMMEDIATE``, and
+# then an equal allowance on the durable tail that follows it: a
+# ``synchronous = FULL`` commit plus the passive checkpoint that closing the
+# connection performs.  ``busy_timeout_ms`` is the only tolerance this module
+# states for one SQLite operation on this file, so the tail is given the same
+# window as the wait.  A shutdown that waits less than the body it is waiting
+# on cannot tell a slow heartbeat from a stuck one.
+_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS = 2
 
 
 class _StrictV2Model(RuntimeContractModel):
@@ -1504,6 +1513,48 @@ class _ProductionSagaGraph:
         return original
 
 
+def _no_heartbeat_stage(stage: str) -> None:
+    """Stage sink for the heartbeats no shutdown is waiting on."""
+
+    del stage
+
+
+class _HeartbeatProgress:
+    """What one heartbeat thread is doing, for the shutdown that waits on it.
+
+    Written only by that thread and read only once ``join`` has given up, so
+    plain attributes are enough: the reader wants the last observation it can
+    put in a failure message, not a consistent snapshot.
+    """
+
+    __slots__ = ("last_tick_at", "stage", "stage_since", "ticks")
+
+    def __init__(self) -> None:
+        self.stage = "starting"
+        self.stage_since = time.monotonic()
+        self.ticks = 0
+        self.last_tick_at: float | None = None
+
+    def mark(self, stage: str) -> None:
+        self.stage = stage
+        self.stage_since = time.monotonic()
+
+    def completed_tick(self) -> None:
+        self.ticks += 1
+        self.last_tick_at = time.monotonic()
+
+    def describe(self, observed_at: float) -> str:
+        if self.last_tick_at is None:
+            ticks = "no completed tick"
+        else:
+            plural = "" if self.ticks == 1 else "s"
+            ticks = (
+                f"{self.ticks} completed tick{plural}, "
+                f"last {observed_at - self.last_tick_at:.3f}s ago"
+            )
+        return f"{ticks}; stage {self.stage!r} for {observed_at - self.stage_since:.3f}s"
+
+
 class SourceBrokerV2Saga:
     """SQLite-backed source call saga with a persisted outbox for every effect.
 
@@ -1694,6 +1745,7 @@ class SourceBrokerV2Saga:
         self._source_authority_keyring = source_authority_keyring
         self._busy_timeout_ms = busy_timeout_ms
         self._executor_owner_token = uuid4().hex
+        self._abandoned_heartbeats: list[Thread] = []
         self._executor_lease_seconds = executor_lease_seconds
         self._executor_wait_seconds = executor_wait_seconds
         self._source_request_deadline_seconds = source_request_deadline_seconds
@@ -3803,19 +3855,33 @@ class SourceBrokerV2Saga:
         stop = Event()
         failures: list[BaseException] = []
         interval = self._executor_lease_seconds / 3
+        progress = _HeartbeatProgress()
 
         def renew() -> None:
-            while not self._wait_for_heartbeat(stop, interval, phase=phase):
+            while True:
+                progress.mark("waiting")
+                if self._wait_for_heartbeat(stop, interval, phase=phase):
+                    break
+                if stop.is_set():
+                    # The wait can expire at the instant the shutdown sets
+                    # ``stop``.  Starting another write on that edge only
+                    # lengthens the shutdown that is already waiting for it.
+                    break
+                progress.mark("outbox-write")
                 try:
                     self._heartbeat_outbox(
                         phase=phase,
                         operation_id=operation_id,
                         owner_generation=owner_generation,
+                        mark_stage=progress.mark,
                     )
                 except BaseException as exc:
+                    progress.mark("failed")
                     failures.append(exc)
                     stop.set()
                     return
+                progress.completed_tick()
+            progress.mark("stopped")
 
         heartbeat = Thread(
             target=renew,
@@ -3823,20 +3889,42 @@ class SourceBrokerV2Saga:
             daemon=True,
         )
         heartbeat.start()
+        # ``stop`` ends the wait between ticks at once, so this budget has one
+        # job: cover the single renewal that may already be inside
+        # ``_heartbeat_outbox``.  That body's own bound is a write-lock wait of
+        # ``busy_timeout_ms`` plus the durable tail behind it, so the budget is
+        # derived from it (see ``_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS``) instead of
+        # from a fixed 0.1s floor that was unrelated to what it waits on.
+        shutdown_budget = max(
+            interval * 2,
+            _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
+        )
         try:
             result = invoke(payload)
         finally:
+            stop_requested_at = time.monotonic()
             stop.set()
-            heartbeat.join(timeout=max(0.1, interval * 2))
+            heartbeat.join(timeout=shutdown_budget)
+            stopped_at = time.monotonic()
         if heartbeat.is_alive():
+            self._abandon_heartbeat(heartbeat)
             raise SourceBrokerV2SagaUnavailableError(
-                f"outbox heartbeat did not stop after {phase.value}"
+                f"outbox heartbeat did not stop after {phase.value} "
+                f"(waited {stopped_at - stop_requested_at:.3f}s of a "
+                f"{shutdown_budget:.3f}s budget; {progress.describe(stopped_at)})"
             )
         if failures:
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat failed during {phase.value}"
             ) from failures[0]
         return result
+
+    def _abandon_heartbeat(self, heartbeat: Thread) -> None:
+        """Keep an over-budget heartbeat visible instead of dropping the handle."""
+
+        live = [thread for thread in self._abandoned_heartbeats if thread.is_alive()]
+        live.append(heartbeat)
+        self._abandoned_heartbeats = live
 
     def _begin_outbox(
         self,
@@ -4064,17 +4152,22 @@ class SourceBrokerV2Saga:
         phase: SourceBrokerV2OutboxPhase,
         operation_id: str,
         owner_generation: int,
+        mark_stage: Callable[[str], None] = _no_heartbeat_stage,
     ) -> None:
         current_time = datetime.now(UTC)
         expires_at = current_time + timedelta(seconds=self._executor_lease_seconds)
+        mark_stage("connect")
         with self._connect() as connection:
+            mark_stage("lock-wait")
             connection.execute("BEGIN IMMEDIATE")
             try:
+                mark_stage("read")
                 self._read_outbox(
                     connection,
                     operation_id=operation_id,
                     phase=phase,
                 )
+                mark_stage("update")
                 updated = connection.execute(
                     "UPDATE source_broker_v2_outbox SET executor_heartbeat_at = ?, "
                     "executor_lease_expires_at = ? WHERE operation_id = ? "
@@ -4092,10 +4185,12 @@ class SourceBrokerV2Saga:
                     raise SourceBrokerV2SagaConflictError(
                         "outbox executor lost ownership before heartbeat"
                     )
+                mark_stage("commit")
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
+            mark_stage("close")
 
     def _release_outbox_lease(
         self,
