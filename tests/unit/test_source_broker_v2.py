@@ -3034,6 +3034,7 @@ def test_v2_saga_shutdown_reports_a_heartbeat_that_outlives_its_derived_budget(
         assert f"of a {budget:.3f}s budget" in reason
         assert "1 completed tick" in reason
         assert "stage 'commit'" in reason
+        assert "1 abandoned heartbeat still alive" in reason
         assert transport.dispatch_calls == 1
         abandoned = saga._abandoned_heartbeats
         assert len(abandoned) == 1
@@ -3087,6 +3088,73 @@ def test_v2_saga_shutdown_surfaces_a_heartbeat_that_failed_in_flight(
     assert transport.dispatch_calls == 1
     assert saga._abandoned_heartbeats == []
     assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_records_an_overdue_heartbeat_when_the_body_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`invoke`'s own exception wins, and an over-budget renewal is still recorded."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True, lose_dispatch_once=True)
+    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 40
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    stall_barrier = Barrier(2)
+    release_stall = Event()
+    completed_ticks: list[float] = []
+    stalled: list[bool] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def stalling_heartbeat(**kwargs: Any) -> None:
+        if not _is_background_dispatch_heartbeat(kwargs) or stalled:
+            original_heartbeat(**kwargs)
+            return
+        if not completed_ticks:
+            original_heartbeat(**kwargs)
+            completed_ticks.append(time.monotonic())
+            return
+        stalled.append(True)
+        stall_barrier.wait(timeout=5)
+        if not release_stall.wait(timeout=30):
+            raise TimeoutError("test did not release the stalled heartbeat")
+        original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", stalling_heartbeat)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+            try:
+                assert transport.dispatch_entered.wait(timeout=5)
+                stall_barrier.wait(timeout=5)
+                transport.release_dispatch.set()
+                snapshot = future.result(timeout=30)
+            finally:
+                transport.release_dispatch.set()
+
+        # `lose_dispatch_once` makes `invoke` itself raise while the renewal is
+        # still stalled past the budget.  That exception is the one the caller
+        # must see - the heartbeat report must not displace it - but the
+        # over-budget thread still has to be recorded rather than dropped.
+        assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+        assert snapshot.reconcile_reason == "source dispatch response is unknown"
+        assert transport.dispatch_calls == 1
+        abandoned = saga._abandoned_heartbeats
+        assert len(abandoned) == 1
+        assert abandoned[0].name.startswith(_HEARTBEAT_THREAD_PREFIX)
+    finally:
+        release_stall.set()
+    _await_reclaimed_heartbeat_threads()
 
 
 def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(

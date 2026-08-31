@@ -3899,6 +3899,7 @@ class SourceBrokerV2Saga:
             interval * 2,
             _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
         )
+        abandoned = 0
         try:
             result = invoke(payload)
         finally:
@@ -3906,12 +3907,19 @@ class SourceBrokerV2Saga:
             stop.set()
             heartbeat.join(timeout=shutdown_budget)
             stopped_at = time.monotonic()
-        if heartbeat.is_alive():
-            self._abandon_heartbeat(heartbeat)
+            if heartbeat.is_alive():
+                # Recorded here rather than after the ``try`` so the renewal is
+                # also accounted for when ``invoke`` itself raised.  The report
+                # below stays outside the ``finally``: raising from inside it
+                # would displace the caller's own exception.
+                abandoned = self._abandon_heartbeat(heartbeat)
+        if abandoned:
+            plural = "" if abandoned == 1 else "s"
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat did not stop after {phase.value} "
                 f"(waited {stopped_at - stop_requested_at:.3f}s of a "
-                f"{shutdown_budget:.3f}s budget; {progress.describe(stopped_at)})"
+                f"{shutdown_budget:.3f}s budget; {progress.describe(stopped_at)}; "
+                f"{abandoned} abandoned heartbeat{plural} still alive)"
             )
         if failures:
             raise SourceBrokerV2SagaUnavailableError(
@@ -3919,12 +3927,13 @@ class SourceBrokerV2Saga:
             ) from failures[0]
         return result
 
-    def _abandon_heartbeat(self, heartbeat: Thread) -> None:
-        """Keep an over-budget heartbeat visible instead of dropping the handle."""
+    def _abandon_heartbeat(self, heartbeat: Thread) -> int:
+        """Record an over-budget heartbeat and report how many are still alive."""
 
         live = [thread for thread in self._abandoned_heartbeats if thread.is_alive()]
         live.append(heartbeat)
         self._abandoned_heartbeats = live
+        return len(live)
 
     def _begin_outbox(
         self,
