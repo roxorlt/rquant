@@ -1737,3 +1737,372 @@ def test_tier_migration_rejects_missing_or_mismatched_resolved_schema(
         )
 
     assert store.list_active_copies(CONTENT_HASH) == (registration.object_copy,)
+
+
+def _sidecar_churn_adversary_process(
+    path: str,
+    root: str,
+    credential_payload: dict[str, object],
+    ready: object,
+    requests: object,
+    responses: object,
+) -> None:
+    """Legitimate concurrent catalog writer that churns SQLite sidecars on request.
+
+    Each ``churn`` request opens and closes one real writer transaction, so the
+    managed trust root sees the same ``-wal``/``-shm`` create/delete pair that a
+    production writer produces. The handshake keeps the interleaving
+    deterministic: no sleeps, no polling, one round trip per injection point.
+    """
+
+    store = ArtifactReferenceStore(
+        Path(path),
+        managed_trust_root=Path(root),
+        writer_owner="sidecar-churn-process",
+        retention_writer_credential=(
+            artifact_retention_module.ArtifactRetentionWriterCredential.model_validate(
+                credential_payload
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    ready.set()
+    while True:
+        command = requests.get()
+        if command != "churn":
+            responses.put(("stopped", True))
+            store.close()
+            return
+        before = os.lstat(root).st_ctime_ns
+        moved = False
+        for _cycle in range(50):
+            with store._writer():
+                pass
+            if os.lstat(root).st_ctime_ns != before:
+                moved = True
+                break
+        responses.put(("churned", moved))
+
+
+@contextmanager
+def _sidecar_churn_adversary(
+    trust_root: Path,
+    database: Path,
+    credential: artifact_retention_module.ArtifactRetentionWriterCredential,
+) -> Iterator[Callable[[], bool]]:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    requests = context.Queue()
+    responses = context.Queue()
+    worker = context.Process(
+        target=_sidecar_churn_adversary_process,
+        args=(
+            str(database),
+            str(trust_root),
+            credential.model_dump(mode="python"),
+            ready,
+            requests,
+            responses,
+        ),
+    )
+    worker.start()
+    try:
+        assert ready.wait(60)
+
+        def churn() -> bool:
+            requests.put("churn")
+            outcome, moved = responses.get(timeout=60)
+            assert outcome == "churned"
+            return bool(moved)
+
+        yield churn
+    finally:
+        requests.put("stop")
+        worker.join(timeout=60)
+        if worker.exitcode is None:
+            worker.terminate()
+            worker.join(timeout=10)
+        assert worker.exitcode == 0
+
+
+@contextmanager
+def _inject_between_trust_root_bind_and_chain_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    injection: Callable[[], None],
+) -> Iterator[None]:
+    """Fire ``injection`` in the exact window issue #158 names.
+
+    ``PrivateSqlitePathAuthority.__init__`` binds the managed trust root
+    generation from ``_validate_managed_trust_root`` and only then rescans the
+    parent chain, with no cross-process lock held in between.
+    """
+
+    authority_type = artifact_retention_module.PrivateSqlitePathAuthority
+    real_validate = authority_type._validate_managed_trust_root
+    fired = {"done": False}
+
+    def validate_then_inject(
+        self: object,
+        managed_trust_root: Path,
+    ) -> tuple[Path, tuple[int, int, int]]:
+        result = real_validate(self, managed_trust_root)
+        if not fired["done"]:
+            fired["done"] = True
+            injection()
+        return result
+
+    monkeypatch.setattr(authority_type, "_validate_managed_trust_root", validate_then_inject)
+    yield
+    assert fired["done"]
+
+
+@contextmanager
+def _churn_before_every_bootstrap_trust_root_stat(
+    monkeypatch: pytest.MonkeyPatch,
+    trust_root: Path,
+    churn: Callable[[], bool],
+) -> Iterator[list[bool]]:
+    """Churn the trust root before every stat taken while binding the authority.
+
+    The whole of ``PrivateSqlitePathAuthority.__init__`` runs before the
+    cross-process writer flock exists, so a legitimate peer may touch the shared
+    managed root before any of its stats. Binding must therefore never depend on
+    the trust root ctime holding still.
+    """
+
+    authority_type = artifact_retention_module.PrivateSqlitePathAuthority
+    real_init = authority_type.__init__
+    real_lstat = artifact_retention_module.os.lstat
+    state = {"armed": 0, "reentrant": False}
+    moves: list[bool] = []
+
+    def churning_lstat(candidate: object, *args: object, **kwargs: object) -> os.stat_result:
+        if (
+            state["armed"]
+            and not state["reentrant"]
+            and isinstance(candidate, str | os.PathLike)
+            and Path(candidate) == trust_root
+        ):
+            state["reentrant"] = True
+            try:
+                moves.append(churn())
+            finally:
+                state["reentrant"] = False
+        return real_lstat(candidate, *args, **kwargs)
+
+    def armed_init(self: object, *args: object, **kwargs: object) -> None:
+        state["armed"] += 1
+        try:
+            real_init(self, *args, **kwargs)
+        finally:
+            state["armed"] -= 1
+
+    monkeypatch.setattr(authority_type, "__init__", armed_init)
+    monkeypatch.setattr(artifact_retention_module.os, "lstat", churning_lstat)
+    yield moves
+
+
+def _provision_catalog(
+    trust_root: Path,
+    path: Path,
+    credential: artifact_retention_module.ArtifactRetentionWriterCredential,
+) -> None:
+    ArtifactReferenceStore(
+        path,
+        managed_trust_root=trust_root,
+        retention_writer_credential=credential,
+        clock=lambda: NOW,
+    ).close()
+
+
+def _run_catalog_victim(
+    trust_root: Path,
+    path: Path,
+    credential: artifact_retention_module.ArtifactRetentionWriterCredential,
+) -> None:
+    store = ArtifactReferenceStore(
+        path,
+        managed_trust_root=trust_root,
+        retention_writer_credential=credential,
+        clock=lambda: NOW,
+    )
+    try:
+        with store._writer():
+            pass
+    finally:
+        store.close()
+
+
+def _writer_fence(path: Path) -> int:
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT fence FROM artifact_writer_fence WHERE singleton = 1"
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+@pytest.mark.parametrize("victim", ["provisioned", "forged"])
+def test_bootstrap_binding_survives_one_sidecar_churn_between_trust_root_bind_and_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    victim: str,
+) -> None:
+    path = tmp_path / "references.sqlite3"
+    credential = _writer_credential()
+    _provision_catalog(tmp_path, path, credential)
+    forged = _writer_credential(secret_hex="f" * 64, key_id="artifact-retention-forged")
+    moves: list[bool] = []
+
+    with (
+        _sidecar_churn_adversary(tmp_path, path, credential) as churn,
+        _inject_between_trust_root_bind_and_chain_scan(
+            monkeypatch,
+            lambda: moves.append(churn()),
+        ),
+    ):
+        if victim == "provisioned":
+            _run_catalog_victim(tmp_path, path, credential)
+        else:
+            with pytest.raises(
+                artifact_retention_module.ArtifactRetentionWriterAuthorizationError,
+                match="rotation|credential",
+            ):
+                _run_catalog_victim(tmp_path, path, forged)
+
+    assert moves == [True]
+
+
+@pytest.mark.parametrize("victim", ["provisioned", "forged"])
+def test_bootstrap_binding_survives_sidecar_churn_before_every_trust_root_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    victim: str,
+) -> None:
+    path = tmp_path / "references.sqlite3"
+    credential = _writer_credential()
+    _provision_catalog(tmp_path, path, credential)
+    forged = _writer_credential(secret_hex="f" * 64, key_id="artifact-retention-forged")
+
+    with (
+        _sidecar_churn_adversary(tmp_path, path, credential) as churn,
+        _churn_before_every_bootstrap_trust_root_stat(monkeypatch, tmp_path, churn) as moves,
+    ):
+        if victim == "provisioned":
+            _run_catalog_victim(tmp_path, path, credential)
+        else:
+            with pytest.raises(
+                artifact_retention_module.ArtifactRetentionWriterAuthorizationError,
+                match="rotation|credential",
+            ):
+                _run_catalog_victim(tmp_path, path, forged)
+
+    assert len(moves) >= 2
+    assert all(moves)
+
+
+def test_bootstrap_creation_survives_sidecar_churn_before_every_trust_root_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = _writer_credential()
+    neighbour = tmp_path / "neighbour.sqlite3"
+    _provision_catalog(tmp_path, neighbour, credential)
+    path = tmp_path / "references.sqlite3"
+
+    with (
+        _sidecar_churn_adversary(tmp_path, neighbour, credential) as churn,
+        _churn_before_every_bootstrap_trust_root_stat(monkeypatch, tmp_path, churn) as moves,
+    ):
+        _run_catalog_victim(tmp_path, path, credential)
+
+    assert path.exists()
+    assert _writer_fence(path) >= 1
+    assert len(moves) >= 2
+    assert all(moves)
+
+
+@pytest.mark.parametrize(
+    ("hazard", "expected"),
+    [
+        ("trust-root-inode", "managed trust root"),
+        ("trust-root-mode", "parent owner or mode is unsafe"),
+        ("trust-root-owner", "parent owner or mode is unsafe"),
+        ("ancestor-symlink", "symlink"),
+        ("database-hardlink", "hard link"),
+    ],
+)
+def test_bootstrap_binding_fails_closed_for_substitution_in_the_unlocked_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hazard: str,
+    expected: str,
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir(mode=0o700)
+    private = managed / "private"
+    private.mkdir(mode=0o700)
+    path = private / "references.sqlite3"
+    credential = _writer_credential()
+    _provision_catalog(managed, path, credential)
+    current_uid = os.geteuid()
+
+    def inject() -> None:
+        if hazard == "trust-root-inode":
+            retired = tmp_path / "retired"
+            managed.rename(retired)
+            managed.mkdir(mode=0o700)
+            (retired / "private").rename(private)
+        elif hazard == "trust-root-mode":
+            managed.chmod(0o755)
+        elif hazard == "trust-root-owner":
+            monkeypatch.setattr(
+                artifact_retention_module.os,
+                "geteuid",
+                lambda: current_uid + 1,
+            )
+        elif hazard == "ancestor-symlink":
+            real = managed / "real"
+            private.rename(real)
+            os.symlink(real, private, target_is_directory=True)
+        else:
+            os.link(path, private / "alias.sqlite3")
+
+    with (
+        _inject_between_trust_root_bind_and_chain_scan(monkeypatch, inject),
+        pytest.raises(ValueError, match=expected),
+    ):
+        _run_catalog_victim(managed, path, credential)
+
+
+def test_unlocked_window_inode_fence_reports_expected_and_observed_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir(mode=0o700)
+    private = managed / "private"
+    private.mkdir(mode=0o700)
+    path = private / "references.sqlite3"
+    credential = _writer_credential()
+    _provision_catalog(managed, path, credential)
+    bound = os.lstat(managed)
+
+    def swap_trust_root_inode() -> None:
+        retired = tmp_path / "retired"
+        managed.rename(retired)
+        managed.mkdir(mode=0o700)
+        (retired / "private").rename(private)
+
+    with (
+        _inject_between_trust_root_bind_and_chain_scan(monkeypatch, swap_trust_root_inode),
+        pytest.raises(ValueError) as failure,
+    ):
+        _run_catalog_victim(managed, path, credential)
+
+    observed = os.lstat(managed)
+    message = str(failure.value)
+    assert "managed trust root" in message
+    assert "inode" in message
+    assert f"{bound.st_dev}" in message and f"{bound.st_ino}" in message
+    assert f"{observed.st_dev}" in message and f"{observed.st_ino}" in message
