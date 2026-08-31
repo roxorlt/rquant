@@ -130,16 +130,15 @@ def _reservation_failure(message: str, exc: BaseException) -> RuntimeResourceAdm
 _MAX_ACTIVE_RESOURCE_RESERVATIONS = 4_096
 _MAX_RESOURCE_LEASE_SECONDS = 3_600
 _MAX_RESOURCE_LOCK_WAIT_SECONDS = 1.0
-# A contender has to outlast whatever the winner is doing under the write lock,
-# and the most expensive thing this store ever does there is the `_initialize`
-# schema commit - two tables, an index and the pragmas, flushed through a
-# rollback journal at the sqlite3 default `synchronous = FULL`, so several real
-# fsyncs.  4ce74b5 measured that window on a CI runner and bounded it at one
-# second, which is also the ceiling `_lock_wait_seconds` refuses to exceed;
-# every other critical section in the store is strictly smaller than the one
-# that number was cut for.  `reserve()` shipped with a flat 0.05 instead, so a
-# legitimate loser was refused whenever the winner's commit outran 50ms (issue
-# #159).  Widening it costs nothing in responsiveness: the wait polls
+# One second is the ceiling `_lock_wait_seconds` already refuses to exceed and
+# the one `_initialize` already waits under - 4ce74b5 measured that on a CI
+# runner and adopted it.  Sharing the cap is the point; it is *not* derived from
+# how long `reserve()` holds the lock, and no such derivation exists: the
+# critical section runs pydantic validation and calls back into the caller's
+# `snapshot_provider()`, so its cost is Python work of unbounded size rather
+# than a countable number of fsyncs.  What the flat 0.05 got wrong was refusing
+# a legitimate loser for a window nobody had measured at all (issue #159).
+# Raising it to the shared cap costs no responsiveness: the wait polls
 # `stop_requested` every 5ms and `_request_lock_wait_seconds` narrows the budget
 # again to whatever is left of the caller's own deadline.
 _DEFAULT_RESOURCE_LOCK_WAIT_SECONDS = _MAX_RESOURCE_LOCK_WAIT_SECONDS
