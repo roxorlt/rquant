@@ -282,6 +282,18 @@
   顺序与 `st_nlink == 1` 不变量未动。新增确定性回归：锁持有超过 receipt timeout 按预算退出、锁竞争期间
   stop 一个轮询周期内退出、锁在期限内释放后仍读到合法 receipt、同进程 thread-lock 与跨进程 flock 两种
   竞争各自覆盖；WP-B8 两条发布窗口用例继续通过。
+- **非阻塞 evidence lock 被拒时仍持有线程锁与两个描述符（Codex RQ-RB-P1-03）**：WP-B10 引入的
+  `LabCommandSpool._exclusive_lock(blocking=False)` 在跨进程 `flock(LOCK_EX | LOCK_NB)` 抛
+  `BlockingIOError` 时直接在内层 `try` 里 `yield False`，而生成器会在 `yield` 处挂起，负责释放的两层
+  `finally` 要等调用方退出 `with` 块后才执行——于是 `try_evidence_lock()` 的 False body 期间进程内
+  `_thread_lock`、lock 描述符与 parent 描述符都还被持有（Codex 复现：False body 内他线程
+  `acquire(blocking=False)` 得 False、`/dev/fd` 比进入前多 2），与 docstring「refused attempt leaves
+  nothing held」的契约相反。现在拒绝路径先关闭两个描述符（从未加锁的 fd 不发 `LOCK_UN`）、释放线程锁，
+  再在所有 `try/finally` 之外 `yield False`；`_active_lock_*` 记账不被触碰；阻塞路径逐语句不变。新增确定性
+  回归：子进程持 flock 时 False body 内他线程可立即取放 `_thread_lock` 且描述符零增量；多轮被拒后同一 spool
+  仍能取得 evidence lock、无描述符/锁泄漏；预置 stop 或预算已耗尽时 `try_evidence_lock` 一次都不被调用
+  （锁定 stop/预算先于取锁的顺序）。WP-B8 两条发布窗口用例与 WP-B10 五条用例继续通过；`link → fsync →
+  unlink` 顺序、`st_nlink == 1` 不变量与阻塞 `evidence_lock()` 语义均未动。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`
