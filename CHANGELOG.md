@@ -72,6 +72,28 @@
   序号重建该行，审计行的「修复前水位」记 NULL），水位高于实际行时拒绝（那是数据丢失，要走备份
   恢复），无任何环境变量旁路。
 
+- 为 `LabCommandSpool._exclusive_lock()` 的**两条拒绝路径**补上确定性回归用例
+  （`tests/unit/test_lab_job_protocol.py`，O-15）：
+  - **flock 半被拒**（外层持锁时同线程嵌套非阻塞尝试）不得清空外层建立的
+    `_active_lock_descriptor` / `_active_lock_parent_descriptor` /
+    `_active_root_descriptor` / `_active_lock_identity`；退出嵌套后
+    `_assert_active_lock_authority()` 仍成立、描述符计数不变、外层释放后 spool 仍可正常 `publish()`。
+  - **thread 半被拒**（他线程持锁时本线程非阻塞尝试）同样不得改动共享的四字段，
+    且该早退路径不得遗留任何探测描述符。
+  两条用例都在进入前 / 拒绝 body 内 / 退出后三点采样描述符计数，不用 sleep（同线程嵌套靠
+  `with` 结构定序，跨线程靠 `Barrier`）。
+  变异证据：删掉 `lab_job_protocol.py:431` 的 `if held:` 守卫（该守卫此前无任何测试守护，
+  两个 protocol 测试文件 168 条全绿）后用例转红；在 thread-half 早退分支泄漏一个描述符
+  同样转红。仅新增测试，`src/` 未改动。
+
+- **runtime resource admission**：新增 typed 拒绝层次
+  `RuntimeResourceAdmissionTransientError`（可重试的运行期争抢）、
+  `RuntimeResourceAdmissionLockWaitTimeoutError`（预算耗尽，transient 的子类）、
+  `RuntimeResourceAdmissionCancelledError`（stop 授权取消，**刻意不属于** transient）。
+  事务内逃逸的 SQLite `locked`/`busy` 错误也按同一口径归类。三者都是
+  `RuntimeResourceAdmissionError` 的子类，既有 `pytest.raises(RuntimeResourceAdmissionError)`
+  与调用方捕获逐条保持兼容。
+
 ### Security
 
 
@@ -122,6 +144,27 @@
 
 ### Changed
 
+
+- **artifact-retention**：路径 fail-closed 报错带上判定字段（哪一层、期望 vs 观测的
+  dev/ino、uid、mode、nlink），便于 CI 上直接归因。`managed trust root identity changed`
+  这一条严比分支的文案**逐字保持不变**——`experiment_registry.py:466` 用精确字符串比对它判断
+  绑定是否可重试；增强文案落在放宽分支（`managed trust root inode changed ...`）。
+- **tests（artifact-retention）**：`test_real_concurrent_cross_process_writer_race_accepts_only_provisioned_credential`
+  的断言保留子进程异常消息，并要求被拒方的消息指向凭据判定，避免路径身份错误冒充安全断言
+  通过（WP-B9 F-2）。
+- **tests（runtime resource admission，无生产行为变化）**：
+  `test_cross_process_resource_reservation_admits_exactly_one_last_capacity_contender`
+  的子进程把自身 traceback 回传队列，父进程先排空队列再比对退出码，容量 fence 的两条断言因此在
+  两个 contender 都完成时必定执行到；此前失败只留下 `assert [1, 0] == [0, 0]`，
+  traceback 因 `junit_logging` 未配置而结构性丢失。断言未放宽。
+- **同一锁等待预算改动也作用于 `SQLiteResourceAdmissionAuthority`（`runtime_resource_admission.py:1858` 起）**：
+  它的 `_begin_immediate` 委派 `SQLiteResourceReservationStore` 的同一函数对象，因此默认锁等待预算同样由
+  50 ms 变为 1.0 s（WP3 审查实测：对手持 `BEGIN IMMEDIATE` 300 ms 时，修前 57 ms 被拒、修后 304 ms 成功），
+  锁等待超时同样抛 `RuntimeResourceAdmissionLockWaitTimeoutError`（`RuntimeResourceAdmissionTransientError` 子类）。
+  该类类体零改动；其自有 7 处 `except (OSError, sqlite3.Error)`（`:2078/:2109/:2309/:3480/:3845/:3897/:3918`，以 2a2ea1b 行号计，合入后同）未改用统一的 `_reservation_failure` 分类（#163-E）；
+  客户端 socket 超时 1000 ms（`lab_resource_authority_adapter.py:391`）与服务端 1.0 s 预算同量级，且适配器
+  `:1044/:1077/:1124` 首行 `del lock_wait_timeout_seconds` 使调用方预算不透传（#163-D，均非本次引入）。
+  这条影响在实现时未「先报告再动」，仅在交付报告事后披露（WP3 报告 §9）。
 
 - `PRODUCTION_ROLE_POLICY` 由 26 个 role 扩到 28（新增 `workload_admission` 与
   `lab_claim_finalizer`），`profile_id` 与 `rquant-runtime-exec.pyz` 的 SHA-256 随之换代；
@@ -183,6 +226,65 @@
 - **项目版本**：从 `0.29.0` 更新到 `0.30.0`。
 
 ### Fixed
+
+- **artifact-retention**：修复 artifact catalog writer 的引导期路径绑定误杀合法并发 writer
+  （[#158](https://github.com/roxorlt/rquant/issues/158)）。`PrivateSqlitePathAuthority`
+  在 `ArtifactReferenceStore` 取得跨进程写锁**之前**绑定 managed trust root 的
+  `(st_dev, st_ino, st_ctime_ns)` 并重扫父链严比，而 trust root 就是库文件所在目录：另一个
+  合法 writer 建/删 SQLite `-wal`/`-shm` 会顶高该目录 ctime，受害者在到达凭据判定之前就抛
+  裸 `ValueError`。引导期改为绑定一次自洽观测（`_bind_unlocked_parent_chain`），trust root
+  仍按 `(st_dev, st_ino)` 严格 fence；symlink、非目录、owner、`0o700`、`st_nlink == 1`、
+  `0o600` 校验一条未动，持锁路径（`assert_current` / rebind）的 ctime 严格性完全保留。
+  锁外窗口内另外三处同类 ctime 严比（建目录的 fd 复核、`O_CREAT|O_EXCL` 前后的父目录复核、
+  `_create_private_file` 尾部重绑）一并对齐为 inode 身份比对。
+- **runtime resource admission**：`SQLiteResourceReservationStore.reserve()` / `recheck()` /
+  `release()` / `active_leases()` 的默认锁等待预算从固定 50 ms 提高到 `_MAX_RESOURCE_LOCK_WAIT_SECONDS`
+  （1.0 s）——即 `_lock_wait_seconds` 本来就强制的硬天花板，也是 `_initialize` 早已在等的那个值
+  （`4ce74b5` 在 CI runner 上实测采纳）。这是**共享同一个上限**，不是从 `reserve()` 临界区推导出来的
+  界：`reserve()` 锁内含两次 pydantic 校验与调用方 `snapshot_provider()` 回调，无可证明上界。
+  此前赢家在锁内没有任何上界、输家却只有从未被测量支撑的硬 50 ms，合法竞争者会在对手提交期间被判
+  `resource reservation lock wait timeout`（[#159](https://github.com/roxorlt/rquant/issues/159)）。
+  等待仍每 5 ms 检查 `stop_requested`，
+  并由 `_request_lock_wait_seconds` 按调用方 deadline 二次收敛（该二次收敛只在直连 store 的拓扑上
+  生效；`LabResourceAuthorityReservationAdapter` 会 `del` 掉该参数，属 #163-D，非本包）。
+- **lab worker**：`_RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS` 不再是三处重复的 `50_000`
+  裸常量，改为从 store 的同一常量推导，`reserve()` / `recheck()` / `release()` 三个调用点口径一致。
+  `reserve()` / `recheck()` 的瞬时锁争抢也不再被折叠成永久
+  `LabDaemonConfigurationError`。`run_forever` 在 `run_once` 之上没有任何 handler，因此这条折叠会
+  让 worker 因为「别人正在提交」而整个退出；现在按异常类型分派（不做字符串匹配），争抢期的 tick 记一次
+  `_resource_retry_at` 退避后返回 `idle`，claim 既不被消费也不被判失败。
+- **source broker v2 心跳停机预算恒 100 ms，误杀仍在推进的在途心跳（[#160](https://github.com/roxorlt/rquant/issues/160)，与 #159 同族）**：
+  `SourceBrokerV2Saga._invoke_with_heartbeat` 用 `max(0.1, executor_lease_seconds / 3 * 2)` 去 join
+  续约线程，lease 低于 0.15 s 时这个下界恒为 0.1 s；而 `stop.set()` 时可能仍在飞的那一次
+  `_heartbeat_outbox` 在 `BEGIN IMMEDIATE` 处最多要等 `busy_timeout_ms`（默认 5 s）的写锁，其后
+  还有 `synchronous = FULL` 的提交与关连接时的被动 checkpoint——没有任何 0.1 s 量级的约束。
+  于是一个**仍在正常推进**的心跳被判成 executor 不可用：外部效果已经成功、结果已在手，saga 却被推向
+  reconcile（PR #157 CI attempt 10 `Full suite shard (3.12, 2)` 的红点即此，run 33348277752，
+  phase `release_unused`）。旧写法只在 `lease ≥ 3 × busy_timeout / 2 = 7.5 s` 时才盖得住那扇受
+  `busy_timeout` 约束的窗，而 `for_production` 只保证 `lease ≥ deadline + grace`，deadline 取 1 s 时
+  lease 可低至 6 s，不变式并不成立。现在预算改为
+  `max(_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS × busy_timeout_ms / 1000, interval × 2)`：第一扇窗由
+  SQLite 的 busy handler 严格封顶，第二扇是给 WAL 耐久尾巴（FULL commit 的 fsync 与 close 时的
+  passive checkpoint，二者都不受 `busy_timeout` 约束）的**保守额度**，超额时可诊断地抛错而不是
+  静默误判。闭式上界 `max(2 × busy_timeout, 2 × lease / 3)` 由生产 runtime 模型的
+  `busy_timeout_ms le=30_000` 与 `executor_lease_seconds le=300` 收口在 **200 s**，生产默认值
+  维持 **20 s** 不变，而不变式变成无条件成立。派生项放在 `max()` 首位，顺带保住了旧写法
+  `max(0.1, nan)` 对非有限 lease 的吸收（`_configure` 只拒 `lease ≤ 0`，NaN 会让
+  `join(timeout=nan)` 在 `finally` 里抛 `ValueError` 而 `is_alive()` 永远判不到）。
+  同一路径另修四处：续约循环在等待报告超时后**再判一次** `stop`，`stop.set()` 同一瞬间到期的等待
+  不再启动一轮新的写；`is_alive()` 判定移进 `finally`，因此**连 `invoke` 自身抛错的那条路径**也会
+  把超预算线程登记进 `_abandoned_heartbeats`（登记表追加前剔除已退出者，有界），而放弃报告仍在
+  `finally` 之外抛出，绝不掩盖调用方自己的异常；错误消息补齐等待时长、预算、最后一次成功 tick
+  及其距今时间、心跳卡在哪个阶段（`lock-wait` / `commit` / `close` 等，由 `_heartbeat_outbox` 新增的
+  可选 `mark_stage` sink 上报）、以及当前仍存活的放弃线程计数（一条消息即可分辨偶发与堆积）。
+  新增七条确定性回归：`threading.Barrier` 配合另一条真持写锁的 SQLite 连接，把心跳钉在受
+  `busy_timeout` 约束的 `BEGIN IMMEDIATE` 等待里跨过旧 100 ms（旧代码双版本红，红点消息里的
+  `stage 'lock-wait'` 即根因见证）；心跳空闲时停机立即返回；超过新上界时抛错、线程被登记并最终回收；
+  心跳自身抛异常时停机路径不挂且错误可见；`invoke` 自身抛错时原异常照常传播而超预算线程仍被登记；
+  `stop` 已置位后不再发起新一轮写；NaN lease 不把预算变成 NaN。
+  base 版 `source_broker_v2.py:3831-3833` 这条**全库唯一零测试覆盖**的 raise 分支自此有用例守护。
+  租约算术、owner generation 比较、outbox 幂等键、外部调用次数与 recovery 分支逐字未改，
+  `_heartbeat_outbox` 的 SQL 与事务顺序未动。
 
 - **R07 差分门的 baseline 生命周期语义（Release B 前置，WP-B0）**：冻结 baseline 过去在
   checkout 内部用 `merge_base(origin/main, HEAD)` 反推，这条语义在冻结它的 PR 合入 main 之后
