@@ -9,10 +9,11 @@ import subprocess
 import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from threading import Barrier, Thread
+from threading import Barrier, BrokenBarrierError, Thread
 from uuid import UUID, uuid4
 
 import pytest
@@ -1967,6 +1968,119 @@ def test_replaced_spool_lock_cannot_create_parallel_mutation_authority(
             first._guard_mutation()
 
     assert len(second.pending()) == 1
+
+
+def _lock_authority_state(spool: LabCommandSpool) -> tuple[object, ...]:
+    """The four fields a taken hold binds, reduced to comparable values.
+
+    ``_active_lock_identity`` is an ``os.stat_result``; comparing the whole
+    structure would drag in timestamps, so only the pair that names the file is
+    kept.
+    """
+
+    identity = spool._active_lock_identity
+    return (
+        spool._active_lock_descriptor,
+        spool._active_lock_parent_descriptor,
+        spool._active_root_descriptor,
+        None if identity is None else (identity.st_dev, identity.st_ino),
+    )
+
+
+def _open_descriptor_count() -> int:
+    listing = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+    return len(os.listdir(listing))
+
+
+def test_a_refused_nested_hold_leaves_the_enclosing_hold_bound(tmp_path: Path) -> None:
+    """A refused nested attempt must not unbind the hold that encloses it.
+
+    The thread half is an ``RLock``, so a second attempt on the same thread takes
+    it; the flock half is taken on a fresh open file description, which by
+    definition does not hold what the enclosing description already holds, so the
+    attempt is refused. Both outcomes leave through one ``finally``, and only its
+    ``if held:`` guard stops the refusal from clearing the four descriptors the
+    *enclosing* hold established. Unguarded, ``_guard_mutation`` would then read
+    ``_active_lock_descriptor is None`` and skip ``_assert_active_lock_authority``
+    altogether: the mutation fence fails open while the outer ``with`` is still
+    running its body.
+    """
+
+    spool = LabCommandSpool(tmp_path / "commands")
+    assert _lock_authority_state(spool) == (None, None, None, None)
+    before = _open_descriptor_count()
+
+    with spool._exclusive_lock():
+        outer = _lock_authority_state(spool)
+        assert all(field is not None for field in outer)
+        held_descriptors = _open_descriptor_count()
+
+        with spool._exclusive_lock(blocking=False) as acquired:
+            assert acquired is False
+            assert _lock_authority_state(spool) == outer
+            # A refusal releases both halves before yielding, so it must not have
+            # left the descriptors it opened while probing behind either.
+            assert _open_descriptor_count() == held_descriptors
+
+        assert _lock_authority_state(spool) == outer
+        # Reached only while the descriptors are still bound: unbound, this raises
+        # and ``_guard_mutation`` stops checking authority at all.
+        spool._assert_active_lock_authority()
+        spool._guard_mutation()
+
+    assert _lock_authority_state(spool) == (None, None, None, None)
+    assert _open_descriptor_count() == before
+
+    spool.publish(_submit_envelope())
+    assert len(spool.pending()) == 1
+
+
+def test_a_refused_thread_half_leaves_another_threads_hold_bound(tmp_path: Path) -> None:
+    """The other refusal path: the thread half itself is denied.
+
+    A second thread cannot take the ``RLock``, so its non-blocking attempt is
+    refused before either descriptor is opened. The state that must survive is the
+    holder thread's, and it lives on the same spool object, so a refusal that
+    cleared it would unbind a hold running on another thread.
+    """
+
+    spool = LabCommandSpool(tmp_path / "commands")
+    holder_bound = Barrier(2)
+    refusal_observed = Barrier(2)
+    holder_state: list[tuple[object, ...]] = []
+    holder_failures: list[Exception] = []
+
+    def hold() -> None:
+        try:
+            with spool._exclusive_lock():
+                holder_state.append(_lock_authority_state(spool))
+                holder_bound.wait(timeout=30)
+                refusal_observed.wait(timeout=30)
+        except Exception as exc:  # surfaced on the main thread below
+            holder_failures.append(exc)
+            holder_bound.abort()
+            refusal_observed.abort()
+
+    holder = Thread(target=hold, name="spool-hold", daemon=True)
+    holder.start()
+    try:
+        holder_bound.wait(timeout=30)
+        bound = holder_state[0]
+        assert all(field is not None for field in bound)
+
+        with spool._exclusive_lock(blocking=False) as acquired:
+            assert acquired is False
+            assert _lock_authority_state(spool) == bound
+
+        assert _lock_authority_state(spool) == bound
+    finally:
+        with suppress(BrokenBarrierError):
+            refusal_observed.wait(timeout=30)
+        holder.join(timeout=30)
+
+    assert holder_failures == []
+    assert not holder.is_alive()
+    assert _lock_authority_state(spool) == (None, None, None, None)
 
 
 @pytest.mark.parametrize("unsafe_name", ["pending", "ack", "quarantine"])
