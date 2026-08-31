@@ -3895,9 +3895,14 @@ class SourceBrokerV2Saga:
         # ``busy_timeout_ms`` plus the durable tail behind it, so the budget is
         # derived from it (see ``_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS``) instead of
         # from a fixed 0.1s floor that was unrelated to what it waits on.
+        # The derived term comes first on purpose: ``_configure`` only rejects a
+        # lease of zero or less, so a NaN lease reaches this line, and ``max``
+        # keeps its first argument when the comparison against NaN is false.
+        # Ordered the other way the budget is NaN and ``join(timeout=nan)``
+        # raises inside the ``finally``, where ``is_alive()`` is never reached.
         shutdown_budget = max(
-            interval * 2,
             _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
+            interval * 2,
         )
         abandoned = 0
         try:

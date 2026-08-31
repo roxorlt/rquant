@@ -2763,6 +2763,7 @@ def _heartbeat_shutdown_saga(
     transport: _TestTransport,
     lineage: _TestLineageAuthority,
     busy_timeout_ms: int,
+    executor_lease_seconds: float = 0.05,
 ) -> SourceBrokerV2Saga:
     # lease 0.05 keeps `interval * 2` (0.033s) under the removed 0.1s floor, so
     # the shutdown budget is decided by `busy_timeout_ms` alone; the source
@@ -2775,7 +2776,7 @@ def _heartbeat_shutdown_saga(
         transport=transport,  # type: ignore[arg-type]
         lineage_authority=lineage,
         busy_timeout_ms=busy_timeout_ms,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=executor_lease_seconds,
         executor_wait_seconds=0.2,
         source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
         source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
@@ -3155,6 +3156,51 @@ def test_v2_saga_shutdown_records_an_overdue_heartbeat_when_the_body_raises(
     finally:
         release_stall.set()
     _await_reclaimed_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_budget_absorbs_a_non_finite_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN lease must not turn the join budget into NaN.
+
+    `_configure` only rejects `executor_lease_seconds <= 0`, so NaN reaches the
+    budget through `for_nonproduction`; the finite terms therefore have to come
+    first in `max()`, which absorbs NaN.  Ordered the other way the budget is
+    NaN and `join(timeout=nan)` raises inside the `finally`, where `is_alive()`
+    can never be reached.  The shutdown is exercised directly because a NaN
+    lease cannot reach it through `advance`: `_acquire_outbox_lease` builds a
+    `timedelta(seconds=nan)` first and raises there.
+    """
+
+    transport = _TestTransport()
+    lineage = _TestLineageAuthority()
+    saga = _heartbeat_shutdown_saga(
+        tmp_path / "saga.sqlite3",
+        current=object(),
+        quota=_quota_adapter(tmp_path),
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=40,
+        executor_lease_seconds=float("nan"),
+    )
+    monkeypatch.setattr(
+        saga,
+        "_wait_for_heartbeat",
+        lambda stop, interval, *, phase: stop.wait(30.0),
+    )
+
+    result = saga._invoke_with_heartbeat(
+        phase=SourceBrokerV2OutboxPhase.DISPATCH,
+        operation_id="0" * 64,
+        owner_generation=1,
+        payload=b'{"probe":1}',
+        invoke=lambda payload: payload,
+    )
+
+    assert result == b'{"probe":1}'
+    assert saga._abandoned_heartbeats == []
+    assert not _live_heartbeat_threads()
 
 
 def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
