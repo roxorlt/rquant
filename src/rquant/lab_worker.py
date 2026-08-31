@@ -95,6 +95,9 @@ from rquant.resource_admission import (
 )
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.runtime_resource_admission import (
+    _DEFAULT_RESOURCE_LOCK_WAIT_SECONDS as _RUNTIME_RESOURCE_LOCK_WAIT_SECONDS,
+)
+from rquant.runtime_resource_admission import (
     LocalResourceSnapshotProvider,
     PersistentResourceReservationStore,
     RuntimeHealthAuthorityLiveSloProbeConfig,
@@ -183,7 +186,13 @@ _CHILD_OUTCOME_EXIT_GRACE_MICROSECONDS = 250_000
 _CHILD_INTERPRETER_START_MICROSECONDS = 4_000_000
 _ISOLATION_READY_TIMEOUT_MICROSECONDS = _CHILD_INTERPRETER_START_MICROSECONDS
 _PROCESS_CLEANUP_RETRIES = 3
-_RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS = 50_000
+# Never a tighter budget than the store itself waits on the same lock; issue
+# #159 capped every reservation call at 50ms while the winning writer's commit
+# had no bound at all, so a worker that merely lost a race was refused.
+_RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS = seconds_to_microseconds(
+    _RUNTIME_RESOURCE_LOCK_WAIT_SECONDS,
+    label="resource reservation lock wait",
+)
 _RESOURCE_AUTHORITY_POLL_MICROSECONDS = 10_000
 _MAX_CONTROL_WIRE_BYTES = 1024 * 1024
 _MAX_SHARD_RESULT_WIRE_BYTES = MAX_RESULT_WIRE_BYTES

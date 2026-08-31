@@ -3853,7 +3853,15 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from rquant.lab_worker import (
+        _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS,
+        _microseconds_to_seconds,
+    )
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    reservation_lock_bound = _microseconds_to_seconds(
+        _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS
+    )
 
     spec = _nshape_compare_spec(hold_days=(1,))
     claim = _short_claim_for_spec(spec)
@@ -3866,7 +3874,9 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
     )
     original_reserve = store.reserve
     original_recheck = store.recheck
+    original_release = store.release
     observed: list[tuple[str, float, bool]] = []
+    released: list[float] = []
 
     def checked_reserve(**kwargs: object):
         stop_requested = kwargs["stop_requested"]
@@ -3884,8 +3894,15 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
         observed.append(("recheck", timeout, stop_requested()))
         return original_recheck(**kwargs)
 
+    def checked_release(*args: object, **kwargs: object):
+        timeout = kwargs["lock_wait_timeout_seconds"]
+        assert isinstance(timeout, float)
+        released.append(timeout)
+        return original_release(*args, **kwargs)
+
     monkeypatch.setattr(store, "reserve", checked_reserve)
     monkeypatch.setattr(store, "recheck", checked_recheck)
+    monkeypatch.setattr(store, "release", checked_release)
     worker = _worker(
         tmp_path,
         registry=SlowPidRegistry(
@@ -3905,8 +3922,14 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
 
     assert result.status == "succeeded"
     assert {operation for operation, _timeout, _stopped in observed} == {"reserve", "recheck"}
-    assert all(0 < timeout <= 0.05 for _operation, timeout, _stopped in observed)
+    # Every reservation call is capped by the store's own lock bound and then
+    # narrowed again by whatever is left of the tick and spec deadlines.
+    assert all(0 < timeout <= reservation_lock_bound for _operation, timeout, _stopped in observed)
     assert all(not stopped for _operation, _timeout, stopped in observed)
+    # The release path has no caller deadline to narrow it, so it carries the
+    # bound itself - which issue #159 left as a bare 50ms literal.
+    assert released == [pytest.approx(reservation_lock_bound)]
+    assert reservation_lock_bound > 0.05
 
 
 def test_initial_resource_rejection_is_a_hard_gate_before_adapter_execution(
