@@ -380,8 +380,11 @@ def test_real_concurrent_cross_process_writer_race_accepts_only_provisioned_cred
         contender.join(timeout=10)
         assert contender.exitcode == 0
 
-    outcomes = sorted(result.get(timeout=1)[0] for _ in contenders)
-    assert outcomes == ["ArtifactRetentionWriterAuthorizationError", "written"]
+    observed = sorted((result.get(timeout=1) for _ in contenders), key=lambda item: item[0])
+    outcomes = [item[0] for item in observed]
+    assert outcomes == ["ArtifactRetentionWriterAuthorizationError", "written"], observed
+    rejection = str(observed[0][1])
+    assert "rotation" in rejection or "credential" in rejection, observed
 
 
 def _release_terminal(
