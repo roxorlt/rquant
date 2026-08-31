@@ -2721,6 +2721,488 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
     )
 
 
+# The floor this package removed.  ``max(0.1, (lease / 3) * 2)`` is 0.1s for
+# every lease below 0.15s, and what that floor had to cover - one in-flight
+# ``_heartbeat_outbox`` - is bounded by ``busy_timeout_ms``, not by it.
+_LEGACY_HEARTBEAT_SHUTDOWN_BUDGET_SECONDS = 0.1
+# How long the competitor keeps the SQLite write lock once the barrier has put
+# the heartbeat inside its write.  `time.sleep` never returns early, so this is
+# a guaranteed lower bound on the in-flight write, not a window to hit: the
+# interleaving itself is fixed by the barrier, and the case asserts the
+# observed write duration afterwards rather than trusting this number.
+_PINNED_WRITE_HOLD_SECONDS = 0.6
+_HEARTBEAT_THREAD_PREFIX = "rquant-source-broker-v2-heartbeat-"
+
+
+def _is_background_dispatch_heartbeat(kwargs: dict[str, Any]) -> bool:
+    return kwargs.get(
+        "phase"
+    ) is SourceBrokerV2OutboxPhase.DISPATCH and current_thread().name.startswith(
+        _HEARTBEAT_THREAD_PREFIX
+    )
+
+
+def _live_heartbeat_threads() -> list[Thread]:
+    return [
+        thread for thread in enumerate_threads() if thread.name.startswith(_HEARTBEAT_THREAD_PREFIX)
+    ]
+
+
+def _await_reclaimed_heartbeat_threads(timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and _live_heartbeat_threads():
+        time.sleep(0.01)
+    assert not _live_heartbeat_threads()
+
+
+def _heartbeat_shutdown_saga(
+    path: Path,
+    *,
+    current: object,
+    quota: object,
+    transport: _TestTransport,
+    lineage: _TestLineageAuthority,
+    busy_timeout_ms: int,
+    executor_lease_seconds: float = 0.05,
+) -> SourceBrokerV2Saga:
+    # lease 0.05 keeps `interval * 2` (0.033s) under the removed 0.1s floor, so
+    # the shutdown budget is decided by `busy_timeout_ms` alone; the source
+    # deadline is left unconstrained because these cases are about the budget.
+    return SourceBrokerV2Saga.for_nonproduction(
+        path,
+        saga_id="saga-a",
+        current_claim_authority=current,
+        quota_adapter=quota,  # type: ignore[arg-type]
+        transport=transport,  # type: ignore[arg-type]
+        lineage_authority=lineage,
+        busy_timeout_ms=busy_timeout_ms,
+        executor_lease_seconds=executor_lease_seconds,
+        executor_wait_seconds=0.2,
+        source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
+        source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
+    )
+
+
+def _expected_shutdown_budget(busy_timeout_ms: int) -> float:
+    return source_broker_v2_module._HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * busy_timeout_ms / 1_000
+
+
+def test_v2_saga_shutdown_covers_a_heartbeat_pinned_inside_a_busy_timeout_bounded_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-flight ending: the renewal is inside its write when `stop` is set."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True)
+    lineage = _TestLineageAuthority()
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=5_000,
+    )
+    write_barrier = Barrier(2)
+    pinned: list[bool] = []
+    write_durations: list[float] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def pinned_heartbeat(**kwargs: Any) -> None:
+        if not _is_background_dispatch_heartbeat(kwargs) or pinned:
+            original_heartbeat(**kwargs)
+            return
+        pinned.append(True)
+        # Rendezvous: the test already holds the SQLite write lock when this
+        # returns, so the delegate below is guaranteed to enter the
+        # `busy_timeout`-bounded wait at `BEGIN IMMEDIATE`.
+        write_barrier.wait(timeout=5)
+        started = time.monotonic()
+        try:
+            original_heartbeat(**kwargs)
+        finally:
+            write_durations.append(time.monotonic() - started)
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", pinned_heartbeat)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+        try:
+            assert transport.dispatch_entered.wait(timeout=5)
+            competitor = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+            try:
+                competitor.execute("BEGIN IMMEDIATE")
+                write_barrier.wait(timeout=5)
+                transport.release_dispatch.set()
+                time.sleep(_PINNED_WRITE_HOLD_SECONDS)
+                competitor.execute("ROLLBACK")
+            finally:
+                competitor.close()
+        finally:
+            transport.release_dispatch.set()
+        snapshot = future.result(timeout=30)
+
+    assert write_durations
+    assert max(write_durations) > _LEGACY_HEARTBEAT_SHUTDOWN_BUDGET_SECONDS
+    assert snapshot.reconcile_reason is None
+    assert snapshot.state is SourceBrokerV2SagaState.COMPLETE
+    assert transport.dispatch_calls == 1
+    assert transport.finalize_calls == 1
+    assert saga._abandoned_heartbeats == []
+    assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_returns_at_once_when_the_heartbeat_is_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal ending: `stop` lands while the renewal is parked between ticks."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True)
+    lineage = _TestLineageAuthority()
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=5_000,
+    )
+    parked = Event()
+    dispatch_ticks: list[float] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def parked_wait(stop: Event, interval: float, *, phase: SourceBrokerV2OutboxPhase) -> bool:
+        if phase is not SourceBrokerV2OutboxPhase.DISPATCH:
+            return stop.wait(interval)
+        parked.set()
+        return stop.wait(30.0)
+
+    def count_dispatch_ticks(**kwargs: Any) -> None:
+        if _is_background_dispatch_heartbeat(kwargs):
+            dispatch_ticks.append(time.monotonic())
+        original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(saga, "_wait_for_heartbeat", parked_wait)
+    monkeypatch.setattr(saga, "_heartbeat_outbox", count_dispatch_ticks)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+        try:
+            assert transport.dispatch_entered.wait(timeout=5)
+            assert parked.wait(timeout=5)
+            released_at = time.monotonic()
+            transport.release_dispatch.set()
+            snapshot = future.result(timeout=30)
+        finally:
+            transport.release_dispatch.set()
+    shutdown_elapsed = time.monotonic() - released_at
+
+    assert dispatch_ticks == []
+    assert shutdown_elapsed < _expected_shutdown_budget(5_000)
+    assert snapshot.reconcile_reason is None
+    assert snapshot.state is SourceBrokerV2SagaState.COMPLETE
+    assert transport.dispatch_calls == 1
+    assert saga._abandoned_heartbeats == []
+    assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_heartbeat_starts_no_further_round_once_stop_is_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wait may report a timeout at the instant `stop` is set; that is not a tick."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True)
+    lineage = _TestLineageAuthority()
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=5_000,
+    )
+    raced = Event()
+    parked = Event()
+    dispatch_ticks: list[float] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def racing_wait(stop: Event, interval: float, *, phase: SourceBrokerV2OutboxPhase) -> bool:
+        if phase is not SourceBrokerV2OutboxPhase.DISPATCH or raced.is_set():
+            return stop.wait(interval)
+        raced.set()
+        parked.set()
+        # Return only once the shutdown has set `stop`, and report a timeout
+        # anyway: exactly the race a `stop.wait(interval)` expiry can lose.
+        stop.wait(30.0)
+        return False
+
+    def count_dispatch_ticks(**kwargs: Any) -> None:
+        if _is_background_dispatch_heartbeat(kwargs):
+            dispatch_ticks.append(time.monotonic())
+        original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(saga, "_wait_for_heartbeat", racing_wait)
+    monkeypatch.setattr(saga, "_heartbeat_outbox", count_dispatch_ticks)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+        try:
+            assert transport.dispatch_entered.wait(timeout=5)
+            assert parked.wait(timeout=5)
+            transport.release_dispatch.set()
+            snapshot = future.result(timeout=30)
+        finally:
+            transport.release_dispatch.set()
+
+    assert dispatch_ticks == []
+    assert snapshot.reconcile_reason is None
+    assert snapshot.state is SourceBrokerV2SagaState.COMPLETE
+    assert transport.dispatch_calls == 1
+    assert saga._abandoned_heartbeats == []
+    assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_reports_a_heartbeat_that_outlives_its_derived_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real timeout: the renewal is still stuck when the derived budget expires."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True)
+    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 40
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    budget = _expected_shutdown_budget(busy_timeout_ms)
+    stall_barrier = Barrier(2)
+    release_stall = Event()
+    completed_ticks: list[float] = []
+    stalled: list[bool] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def stalling_heartbeat(**kwargs: Any) -> None:
+        if not _is_background_dispatch_heartbeat(kwargs) or stalled:
+            original_heartbeat(**kwargs)
+            if _is_background_dispatch_heartbeat(kwargs) and not stalled:
+                completed_ticks.append(time.monotonic())
+            return
+        if not completed_ticks:
+            original_heartbeat(**kwargs)
+            completed_ticks.append(time.monotonic())
+            return
+        stalled.append(True)
+        mark_stage = kwargs["mark_stage"]
+        mark_stage("commit")
+        stall_barrier.wait(timeout=5)
+        if not release_stall.wait(timeout=30):
+            raise TimeoutError("test did not release the stalled heartbeat")
+        original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", stalling_heartbeat)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+            try:
+                assert transport.dispatch_entered.wait(timeout=5)
+                stall_barrier.wait(timeout=5)
+                transport.release_dispatch.set()
+                snapshot = future.result(timeout=30)
+            finally:
+                transport.release_dispatch.set()
+
+        assert completed_ticks
+        assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+        reason = snapshot.reconcile_reason
+        assert reason is not None
+        assert reason.startswith("outbox heartbeat did not stop after dispatch")
+        assert f"of a {budget:.3f}s budget" in reason
+        assert "1 completed tick" in reason
+        assert "stage 'commit'" in reason
+        assert "1 abandoned heartbeat still alive" in reason
+        assert transport.dispatch_calls == 1
+        abandoned = saga._abandoned_heartbeats
+        assert len(abandoned) == 1
+        assert abandoned[0].name.startswith(_HEARTBEAT_THREAD_PREFIX)
+    finally:
+        release_stall.set()
+    _await_reclaimed_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_surfaces_a_heartbeat_that_failed_in_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heartbeat-failure ending: the renewal raises, and the shutdown stays clean."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True)
+    lineage = _TestLineageAuthority()
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=5_000,
+    )
+    failed = Event()
+    original_heartbeat = saga._heartbeat_outbox
+
+    def failing_heartbeat(**kwargs: Any) -> None:
+        if _is_background_dispatch_heartbeat(kwargs):
+            failed.set()
+            raise ConnectionError("heartbeat authority unavailable")
+        original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", failing_heartbeat)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+        try:
+            assert transport.dispatch_entered.wait(timeout=5)
+            assert failed.wait(timeout=5)
+            transport.release_dispatch.set()
+            snapshot = future.result(timeout=30)
+        finally:
+            transport.release_dispatch.set()
+
+    assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert snapshot.reconcile_reason == "outbox heartbeat failed during dispatch"
+    assert transport.dispatch_calls == 1
+    assert saga._abandoned_heartbeats == []
+    assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_records_an_overdue_heartbeat_when_the_body_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`invoke`'s own exception wins, and an over-budget renewal is still recorded."""
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True, lose_dispatch_once=True)
+    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 40
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    stall_barrier = Barrier(2)
+    release_stall = Event()
+    completed_ticks: list[float] = []
+    stalled: list[bool] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def stalling_heartbeat(**kwargs: Any) -> None:
+        if not _is_background_dispatch_heartbeat(kwargs) or stalled:
+            original_heartbeat(**kwargs)
+            return
+        if not completed_ticks:
+            original_heartbeat(**kwargs)
+            completed_ticks.append(time.monotonic())
+            return
+        stalled.append(True)
+        stall_barrier.wait(timeout=5)
+        if not release_stall.wait(timeout=30):
+            raise TimeoutError("test did not release the stalled heartbeat")
+        original_heartbeat(**kwargs)
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", stalling_heartbeat)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+            try:
+                assert transport.dispatch_entered.wait(timeout=5)
+                stall_barrier.wait(timeout=5)
+                transport.release_dispatch.set()
+                snapshot = future.result(timeout=30)
+            finally:
+                transport.release_dispatch.set()
+
+        # `lose_dispatch_once` makes `invoke` itself raise while the renewal is
+        # still stalled past the budget.  That exception is the one the caller
+        # must see - the heartbeat report must not displace it - but the
+        # over-budget thread still has to be recorded rather than dropped.
+        assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+        assert snapshot.reconcile_reason == "source dispatch response is unknown"
+        assert transport.dispatch_calls == 1
+        abandoned = saga._abandoned_heartbeats
+        assert len(abandoned) == 1
+        assert abandoned[0].name.startswith(_HEARTBEAT_THREAD_PREFIX)
+    finally:
+        release_stall.set()
+    _await_reclaimed_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_budget_absorbs_a_non_finite_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN lease must not turn the join budget into NaN.
+
+    `_configure` only rejects `executor_lease_seconds <= 0`, so NaN reaches the
+    budget through `for_nonproduction`; the finite terms therefore have to come
+    first in `max()`, which absorbs NaN.  Ordered the other way the budget is
+    NaN and `join(timeout=nan)` raises inside the `finally`, where `is_alive()`
+    can never be reached.  The shutdown is exercised directly because a NaN
+    lease cannot reach it through `advance`: `_acquire_outbox_lease` builds a
+    `timedelta(seconds=nan)` first and raises there.
+    """
+
+    transport = _TestTransport()
+    lineage = _TestLineageAuthority()
+    saga = _heartbeat_shutdown_saga(
+        tmp_path / "saga.sqlite3",
+        current=object(),
+        quota=_quota_adapter(tmp_path),
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=40,
+        executor_lease_seconds=float("nan"),
+    )
+    monkeypatch.setattr(
+        saga,
+        "_wait_for_heartbeat",
+        lambda stop, interval, *, phase: stop.wait(30.0),
+    )
+
+    result = saga._invoke_with_heartbeat(
+        phase=SourceBrokerV2OutboxPhase.DISPATCH,
+        operation_id="0" * 64,
+        owner_generation=1,
+        payload=b'{"probe":1}',
+        invoke=lambda payload: payload,
+    )
+
+    assert result == b'{"probe":1}'
+    assert saga._abandoned_heartbeats == []
+    assert not _live_heartbeat_threads()
+
+
 def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
