@@ -1763,6 +1763,355 @@ def test_reservation_lock_wait_observes_cancellation_without_leaking_waiter(
     assert store.active_leases() == ()
 
 
+_LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS = 0.05
+"""The flat budget `reserve()` gave a contender before issue #159.
+
+Every test below pins the reservation write lock open past this value on
+purpose: a legitimate contender that dies inside that window is the defect
+under repair, not an artefact of the test.
+"""
+
+_RESERVATION_COMMIT_WINDOW_SECONDS = 3 * _LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS
+"""How long the winner stays inside `commit()` once the loser starts spinning.
+
+Measured from the loser's first busy retry, so the window is fixed by the
+contention itself rather than by a timer racing the test.
+"""
+
+
+class _CommitWindowConnection:
+    """Holds the winner's write lock open across `commit()` - the fsync window."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        entered: threading.Event,
+        may_commit: threading.Event,
+        window_seconds: list[float],
+    ) -> None:
+        self._connection = connection
+        self._entered = entered
+        self._may_commit = may_commit
+        self._window_seconds = window_seconds
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
+
+    def __enter__(self) -> _CommitWindowConnection:
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *exc_info: object) -> object:
+        return self._connection.__exit__(*exc_info)
+
+    def commit(self) -> None:
+        started = time.monotonic()
+        self._entered.set()
+        if not self._may_commit.wait(timeout=30):
+            raise AssertionError("the winner's commit window was never released")
+        self._connection.commit()
+        self._window_seconds.append(time.monotonic() - started)
+
+
+def _pin_the_commit_window(
+    monkeypatch: pytest.MonkeyPatch,
+    store: object,
+    *,
+    entered: threading.Event,
+    may_commit: threading.Event,
+) -> list[float]:
+    window_seconds: list[float] = []
+    original_connect = store._connect
+
+    def gated_connect() -> _CommitWindowConnection:
+        return _CommitWindowConnection(
+            original_connect(),
+            entered=entered,
+            may_commit=may_commit,
+            window_seconds=window_seconds,
+        )
+
+    monkeypatch.setattr(store, "_connect", gated_connect)
+    return window_seconds
+
+
+def _release_the_window_after_real_contention(
+    monkeypatch: pytest.MonkeyPatch,
+    retries: list[float],
+    release: threading.Event,
+    *,
+    hold_seconds: float = _RESERVATION_COMMIT_WINDOW_SECONDS,
+) -> None:
+    """Record the contender's busy retries and free the winner once it has spun.
+
+    The contender runs on the test's own thread, so the store's poll loop is the
+    only thing that can advance the hold - no sleeping timer is involved.
+    """
+
+    import rquant.runtime_resource_admission as admission_module
+
+    real_time = admission_module.system_time
+    contender = threading.current_thread()
+    contention_started: list[float] = []
+
+    def counted_sleep(seconds: float) -> None:
+        if threading.current_thread() is contender:
+            now = real_time.monotonic()
+            if not contention_started:
+                contention_started.append(now)
+            retries.append(seconds)
+            if now - contention_started[0] >= hold_seconds:
+                release.set()
+        real_time.sleep(seconds)
+
+    monkeypatch.setattr(
+        admission_module,
+        "system_time",
+        SimpleNamespace(monotonic=real_time.monotonic, sleep=counted_sleep),
+    )
+
+
+def test_reservation_lock_wait_outlasts_a_winner_commit_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legitimate loser must outlast the winner's commit, not be refused by it.
+
+    The winner is pinned inside `connection.commit()` - the real fsync window,
+    with the write lock held - while the loser burns busy retries against it.
+    Before issue #159 the loser's budget was a flat 50ms, so it died there with
+    `resource reservation lock wait timeout` and the capacity fence below was
+    never exercised at all.
+    """
+    from rquant.resource_admission import AdmissionOutcome
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    database_path = tmp_path / "resource-reservations.sqlite3"
+    winner_store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    loser_store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    reader_store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    winner_identity = _reservation_identity("worker-commit-winner", 8)
+    loser_identity = _reservation_identity("worker-commit-loser", 9)
+
+    entered_commit = threading.Event()
+    may_commit = threading.Event()
+    window_seconds = _pin_the_commit_window(
+        monkeypatch,
+        winner_store,
+        entered=entered_commit,
+        may_commit=may_commit,
+    )
+    loser_retries: list[float] = []
+    _release_the_window_after_real_contention(monkeypatch, loser_retries, may_commit)
+
+    winner_results: list[object] = []
+    winner_failures: list[BaseException] = []
+
+    def hold_the_write_lock() -> None:
+        try:
+            winner_results.append(
+                winner_store.reserve(
+                    identity=winner_identity,
+                    request=_reservation_request(winner_identity),
+                    policy=_reservation_policy(),
+                    snapshot_provider=_reservation_snapshot,
+                    lease_seconds=30,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced through the assertions
+            winner_failures.append(exc)
+            may_commit.set()
+
+    winner = threading.Thread(target=hold_the_write_lock)
+    winner.start()
+    loser_failure: BaseException | None = None
+    loser_result: object | None = None
+    try:
+        assert entered_commit.wait(timeout=30)
+        try:
+            loser_result = loser_store.reserve(
+                identity=loser_identity,
+                request=_reservation_request(loser_identity),
+                policy=_reservation_policy(),
+                snapshot_provider=_reservation_snapshot,
+                lease_seconds=30,
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced through the assertions
+            loser_failure = exc
+    finally:
+        may_commit.set()
+        winner.join(timeout=30)
+
+    assert not winner.is_alive()
+    assert not winner_failures, f"the winner failed to commit: {winner_failures!r}"
+    assert loser_failure is None, (
+        "a legitimate contender was refused inside the winner's commit window: "
+        f"{type(loser_failure).__name__}: {loser_failure}"
+    )
+    assert len(loser_retries) >= 5
+    assert window_seconds
+    assert window_seconds[0] > _LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS
+    assert winner_results[0].decision.outcome is AdmissionOutcome.ADMITTED
+    assert winner_results[0].lease is not None
+    assert loser_result is not None
+    assert loser_result.decision.outcome is AdmissionOutcome.DEFERRED
+    assert loser_result.lease is None
+    assert tuple(lease.identity for lease in reader_store.active_leases()) == (winner_identity,)
+
+
+def test_reservation_lock_wait_budget_tracks_the_store_bound_and_caller_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.runtime_resource_admission import (
+        _MAX_RESOURCE_LOCK_WAIT_SECONDS,
+        SQLiteResourceReservationStore,
+    )
+
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: _RESERVATION_NOW,
+    )
+    observed: list[float] = []
+    original_begin = store._begin_immediate
+
+    def recording_begin(
+        connection: object,
+        *,
+        lock_wait_timeout_seconds: object,
+        stop_requested: object,
+    ) -> None:
+        observed.append(lock_wait_timeout_seconds)
+        original_begin(
+            connection,
+            lock_wait_timeout_seconds=lock_wait_timeout_seconds,
+            stop_requested=stop_requested,
+        )
+
+    monkeypatch.setattr(store, "_begin_immediate", recording_begin)
+
+    unbounded = _reservation_identity("worker-budget-unbounded", 10)
+    store.reserve(
+        identity=unbounded,
+        request=_reservation_request(unbounded),
+        policy=_reservation_policy(),
+        snapshot_provider=_reservation_snapshot,
+        lease_seconds=30,
+    )
+    near_deadline = _reservation_identity("worker-budget-near-deadline", 11)
+    store.reserve(
+        identity=near_deadline,
+        request=_reservation_request(near_deadline).model_copy(
+            update={
+                "expected_duration_ms": 1,
+                "deadline": _RESERVATION_NOW + timedelta(milliseconds=20),
+            }
+        ),
+        policy=_reservation_policy(),
+        snapshot_provider=_reservation_snapshot,
+        lease_seconds=30,
+    )
+    configured = _reservation_identity("worker-budget-configured", 12)
+    store.reserve(
+        identity=configured,
+        request=_reservation_request(configured),
+        policy=_reservation_policy(),
+        snapshot_provider=_reservation_snapshot,
+        lease_seconds=30,
+        lock_wait_timeout_seconds=0.2,
+    )
+
+    assert observed[0] == _MAX_RESOURCE_LOCK_WAIT_SECONDS
+    assert observed[0] > _LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS
+    assert observed[1] == pytest.approx(0.02)
+    assert observed[2] == pytest.approx(0.2)
+
+
+def test_reservation_lock_wait_cancels_inside_a_winner_commit_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wider budget must not cost stop responsiveness.
+
+    The loser waits behind a pinned commit window with a full budget available
+    and still has to abandon the wait on the very next poll after the stop
+    authority flips, well inside the budget it was given.
+    """
+    from rquant.runtime_resource_admission import (
+        _MAX_RESOURCE_LOCK_WAIT_SECONDS,
+        RuntimeResourceAdmissionError,
+        SQLiteResourceReservationStore,
+    )
+
+    database_path = tmp_path / "resource-reservations.sqlite3"
+    winner_store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    loser_store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    reader_store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    winner_identity = _reservation_identity("worker-cancel-winner", 14)
+    loser_identity = _reservation_identity("worker-cancel-loser", 15)
+
+    entered_commit = threading.Event()
+    may_commit = threading.Event()
+    _pin_the_commit_window(
+        monkeypatch,
+        winner_store,
+        entered=entered_commit,
+        may_commit=may_commit,
+    )
+    loser_retries: list[float] = []
+    stop = threading.Event()
+    _release_the_window_after_real_contention(monkeypatch, loser_retries, stop)
+
+    winner_results: list[object] = []
+
+    def hold_the_write_lock() -> None:
+        try:
+            winner_results.append(
+                winner_store.reserve(
+                    identity=winner_identity,
+                    request=_reservation_request(winner_identity),
+                    policy=_reservation_policy(),
+                    snapshot_provider=_reservation_snapshot,
+                    lease_seconds=30,
+                )
+            )
+        except BaseException:  # noqa: BLE001 - surfaced through the assertions
+            may_commit.set()
+
+    winner = threading.Thread(target=hold_the_write_lock)
+    winner.start()
+    retries_at_stop = 0
+    started = 0.0
+    elapsed = 0.0
+    try:
+        assert entered_commit.wait(timeout=30)
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionError, match="cancel") as refusal:
+            loser_store.reserve(
+                identity=loser_identity,
+                request=_reservation_request(loser_identity),
+                policy=_reservation_policy(),
+                snapshot_provider=_reservation_snapshot,
+                lease_seconds=30,
+                stop_requested=stop.is_set,
+            )
+        elapsed = time.monotonic() - started
+        retries_at_stop = len(loser_retries)
+    finally:
+        may_commit.set()
+        winner.join(timeout=30)
+
+    assert not winner.is_alive()
+    assert refusal.value is not None
+    assert stop.is_set()
+    assert len(loser_retries) >= 5
+    assert len(loser_retries) - retries_at_stop <= 1
+    assert elapsed < _MAX_RESOURCE_LOCK_WAIT_SECONDS
+    assert winner_results[0].lease is not None
+    assert tuple(lease.identity for lease in reader_store.active_leases()) == (winner_identity,)
+
+
 def test_reserve_retry_returns_same_authoritative_lease_and_rejects_conflict(
     tmp_path: Path,
 ) -> None:
