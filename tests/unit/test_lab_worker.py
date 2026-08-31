@@ -3998,6 +3998,61 @@ def test_worker_separates_reservation_contention_from_configuration_faults(
     assert reports.pending() == ()
 
 
+def test_worker_recheck_contention_fails_the_shard_without_a_configuration_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-execution contention is a shard outcome, not a broken deployment.
+
+    The recheck dispatch folded the same transient refusal into
+    `LabDaemonConfigurationError`, and that one is re-raised out of the tick
+    (`lab_worker.py`'s resource-error triage), so a lost race during execution
+    also killed the worker.
+    """
+    from rquant.runtime_resource_admission import (
+        RuntimeResourceAdmissionLockWaitTimeoutError,
+        SQLiteResourceReservationStore,
+    )
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    rechecks: list[int] = []
+
+    def contended_recheck(**_kwargs: object):
+        rechecks.append(1)
+        raise RuntimeResourceAdmissionLockWaitTimeoutError("resource reservation lock wait timeout")
+
+    monkeypatch.setattr(store, "recheck", contended_recheck)
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(
+            pid_path=tmp_path / "contended-recheck-child.pid",
+            delay_seconds=0.12,
+        ),
+        claims=claims,
+        reports=reports,
+        resource_recheck_interval_seconds=0.02,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert rechecks
+    assert result.status == "failed"
+    assert store.active_leases() == ()
+    assert worker._active_resource_reservation is None
+
+
 def test_initial_resource_rejection_is_a_hard_gate_before_adapter_execution(
     tmp_path: Path,
 ) -> None:
