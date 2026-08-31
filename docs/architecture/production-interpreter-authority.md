@@ -727,17 +727,36 @@ cursor, drain, or cutover is outside Phase A and blocks.
 
 ##### Frozen Inputs And Policy
 
-Amended per Codex round-2 order 2026-08-25, item P1-1. The frozen baseline is the exact
-merge base of `origin/main` and the candidate, currently commit
-`9699827be09ca22479f6741e820722399fe40244` and Git tree
-`56bf300f296815acca414a1c7f5c2769ee5d466a`, so `baseline..candidate` is the complete pull
-request merge face rather than a branch-local subset. The superseded baseline
-`45d0b57c4c5cbab1700fa5e3c386c6756892a7d6` remains a separately checked candidate ancestor. CI
-receives the candidate commit and tree from its checked-out ref, requires both IDs to be
-lowercase 40-hex, requires the candidate to descend from both the merge base and that historical
-baseline, and records the exact pair. The deployment target must later equal that pair. The merge
-base is frozen: if `origin/main` advances before the merge, the recorded pair, allowlist, and
-merge-tree equality no longer hold and the policy must be regenerated.
+Amended for Release B. The frozen baseline is the merge base of the two commits the run
+*states*, currently commit `2df97ed6045c4ab7efc676f31c742c97ae2193f4` and Git tree
+`1e145e8a2b84ea43934bdf5a1cdca5b591445cab`, so `baseline..candidate` is the complete pull
+request merge face rather than a branch-local subset. It is no longer rediscovered inside the
+checkout as `merge_base(origin/main, candidate)`. That formulation denied itself: the merge
+that freezes a baseline is also what makes `origin/main` equal to the candidate, after which
+the expression collapses to the candidate and no constant can match it again.
+
+`resolve_baseline_context()` is the single implementation. Its sources are tried in one fixed
+order and no later source rescues an earlier bad one: explicit arguments, then the GitHub event
+payload (`pull_request.base.sha`/`pull_request.head.sha`, or a push's `before`/`after`), then
+HEAD's own parent structure. A `pull_request` context proves the two-sided merge base of the
+base tip and the pull request head — never of the synthesized merge ref, whose first parent is
+the base tip and against which the equality would hold for any base at all. A `push` context
+takes the interval start from the pushed merge commit's first parent, because only that is a
+property of the commit and therefore replayable offline, and cross-checks `github.event.before`
+against it; a disagreement, or a null `before`, is a refusal. A single-parent local branch tip
+falls back to the frozen baseline under an explicit `frozen_baseline_fallback` label, where the
+merge-base equality degenerates into ancestry and the allowlist equality plus the two ancestry
+constraints and the policy digest are what hold the line; that mode is refused inside GitHub
+Actions. Nothing on any path reads `origin/main`, `origin/HEAD`, or any remote-tracking ref.
+
+The superseded baseline `45d0b57c4c5cbab1700fa5e3c386c6756892a7d6` remains a separately checked
+candidate ancestor. CI receives the candidate commit and tree from its checked-out ref, requires
+both IDs to be lowercase 40-hex, requires the candidate to descend from both the merge base and
+that historical baseline, and records the exact pair. The deployment target must later equal
+that pair. The baseline is frozen per release: once main advances past it, the recorded pair,
+allowlist, and merge-tree equality no longer hold, so every pull request must refreeze the
+baseline to the then-current main tip and regenerate the policy in its final commit before it
+is merged.
 
 The repository-controlled, reviewed fixture
 `tests/fixtures/r07_differential_gate/policy-v1.json` is canonical JSON with a SHA-256 policy
@@ -990,9 +1009,12 @@ these steps in order:
 1. Strictly revalidate the wire and policy, resolve the wire's baseline/candidate commit and tree
    IDs as exact Git objects, require the declared trees to match those commits, require candidate
    ancestry from the frozen baseline, and read all source and policy inputs from those Git objects,
-   never from the caller's working tree. Amended per Codex round-2 order 2026-08-25, item P1-1: the
-   frozen baseline is the merge base, so this ancestry requirement is exactly the requirement that
-   `merge_base(origin/main, candidate)` still be that commit, and the superseded baseline
+   never from the caller's working tree. Amended for Release B: this ancestry requirement is no
+   longer justified as being "the same as" `merge_base(origin/main, candidate)` still being that
+   commit — that equivalence stopped holding once the freezing merge landed on main. Which two
+   commits meet at the baseline is decided by `resolve_baseline_context()` from explicit
+   endpoints; what remains here is the descent constraint the allowlist needs in order to mean
+   anything, and the allowlist equality is what carries the weight. The superseded baseline
    `45d0b57c…` is checked as a candidate ancestor independently. Also resolve the candidate's
    parents and require the merge provenance the `push main` channel above defines: exactly two
    distinct parents, the first equal to `merge_base_commit_sha`, the merge base an ancestor of the

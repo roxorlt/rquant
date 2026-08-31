@@ -2124,6 +2124,43 @@ class LiveBatchSpool:
         not_after: datetime,
         monotonic_deadline: float | None = None,
     ) -> ReferencePublicationCompletionReceipt:
+        """Commit a completion receipt, or fail closed when the deadline is crossed.
+
+        Durable-evidence contract (normative; the code below is the only place that
+        implements it):
+
+        * Only the two checkpoints that run *after* the receipt itself is durable and
+          the commit intent has been cleared emit ``rolled_back_deadline`` evidence:
+          the ``final_durable_at`` check and the ``evidence_durable_at`` check. Both
+          rewrite the commit intent, unlink the receipt, fsync the directory and only
+          then seal the evidence.
+        * Every earlier checkpoint rolls the publication back and deliberately emits
+          **no** evidence at all. "No evidence" is the contract at each of them, not
+          an omission, but for two different reasons:
+
+          - The registry publication stage, the cursor publication stage and
+            ``durable_completed_at`` (commit intent written, receipt not yet written)
+            all run before the receipt object exists.
+            ``ReferencePublicationDurableEvidence.create_authenticated`` is bound to a
+            receipt - it signs that receipt's content hash, stage hash and deadline -
+            so at those points there is nothing to sign.
+          - ``marker_durable_at`` runs after the receipt has been written and fsynced,
+            so a receipt does exist there. It stays evidence-free because its rollback
+            branch unlinks that receipt again while the commit intent is still on disk,
+            never cleared: nothing ever acknowledged the receipt, so evidence would
+            attest to a publication that was never visible to anyone.
+        * Missing evidence is therefore not an audit gap in the recovery sense:
+          :meth:`_validated_completion_evidence` returns ``None`` both when the
+          evidence file is absent and when its ``outcome`` is not ``"committed"``, so
+          recovery adjudicates "no evidence" and "``rolled_back_deadline`` evidence"
+          identically - the receipt is refused and the publication is rolled back.
+
+        ``tests/unit/test_reference_slow_runtime.py`` pins each branch of this
+        contract: the two evidence-emitting checkpoints have one deterministic case
+        each, and ``test_registry_stage_crossing_cutoff_rolls_back_without_durable_evidence``
+        pins the no-evidence branch.
+        """
+
         self._require_cursor_writer()
         deadline = normalize_aware_utc(not_after)
         authenticator = self.publication_authenticator

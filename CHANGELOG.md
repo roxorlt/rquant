@@ -184,7 +184,116 @@
 
 ### Fixed
 
+- **R07 差分门的 baseline 生命周期语义（Release B 前置，WP-B0）**：冻结 baseline 过去在
+  checkout 内部用 `merge_base(origin/main, HEAD)` 反推，这条语义在冻结它的 PR 合入 main 之后
+  自我否定——`origin/main` 就是候选本身，merge-base 恒等于 HEAD，任何冻结常量都对不上，
+  于是 main 上的 `r07_policy_regenerate --check` 与配套单测确定性失败。现在由
+  `resolve_baseline_context()` 单点判定：显式 CLI 端点 → GitHub 事件载荷
+  （`pull_request.base.sha`/`head.sha`，push 的 `before`/`after`）→ HEAD 自身父结构；
+  `origin/main` 与任何 remote-tracking ref 都不再被读取。pull_request 语义证明的是
+  base tip 与 **PR head** 的双边 merge-base（不是 `github.sha` 那个合成 merge ref——它的第一
+  parent 就是 base，对任何 base 都恒真）；push 语义以被推 merge commit 的第一 parent 为区间
+  起点，并用 `github.event.before` 交叉校验，不一致或为 null commit 都 fail closed。
+  Release B 的 baseline 冻结为 `2df97ed6045c4ab7efc676f31c742c97ae2193f4` /
+  tree `1e145e8a2b84ea43934bdf5a1cdca5b591445cab`。
+- **R07 policy 生成器拒绝会漂移的解释器**：`scripts/r07_policy_regenerate.py` 在 3.13+ 上直接
+  退出。3.13 起 `ast.dump` 省略取默认值的字段，产出的 policy 自洽（自己的 `--check` 也过），
+  漂移只会在 CI 的 3.11/3.12 job 上暴露，那时字节已经提交了。
+  同时删除 `--baseline-ref`：把可变 ref 留在命令行上等于把这次故障留在一个参数之外。
+- **claim finalizer 并发收敛（WP-B1）**：D 阶段 CAS 之前的 ready-attestation 预检原来把「对端
+  已经把 durable 记录推进到 `PUBLISHED`」和「attestation 签名不可信」合并成同一个不可恢复的
+  `finalizer_publication_signature_invalid`，于是两个合法共享 capability 的 finalizer 并发时
+  落后的那个被判成 `blocked`，脱敏后还被谎报成 `authority_conflict`。现在按 identity 与 status
+  分别判定：identity 不符仍是不可恢复的签名冲突，状态已推进则抛可恢复的
+  `transition_not_allowed`（本来就在恢复白名单里，白名单不放宽），并发结果确定性收敛为
+  `published` + `replayed`。blocked 的 `reason` 同时改为「封闭阶段枚举 + 封闭错误码分类」的
+  `{stage}_{category}`（如 `ready_attestation_signature_invalid`），真实签名失败不再被类名规则
+  塌缩成 `authority_conflict`。
 
+- **09:25 发布截止用例改用相位时钟**：`test_reference_slow_runtime.py` 里两条截止用例原来把虚拟
+  墙钟锚在 09:24:59.700 上按真实速度推进，只留 300 ms 预算，再用 `sleep(0.35)` 越线；注入点之前
+  有 9 次 fsync，CI 上磁盘一慢（25 ms/fsync 即可复现）预算就在 registry/cursor 段耗尽，用例根本
+  没进到它声称的阶段，于是报 `assert 0 == 1`（缺 `rolled_back_deadline` evidence）与 `assert 1 == 86`。
+  改成「截止线前恒定、只在注入点翻转」的相位时钟并删掉两处 `sleep`，200 ms/fsync 下仍确定性通过；
+  同时补上阶段命中断言，将来若提前过期会以「阶段未命中」而不是「evidence 缺失」失败。
+  `write_completion_receipt` 的 evidence 阶段契约补成规范性 docstring（仅注释，行为不变），并由
+  一条负向用例与两条检查点用例分别钉住「不产出 evidence」与「产出 evidence」两个分支。
+- **retention GC 用例的真实 monotonic 预算（Release B 前置，WP-B3）**：
+  `test_real_terminal_to_run_step_recovery_gc_and_health_chain` 注入了假 `clock` 却没注入
+  `monotonic`，GC worker 的 5 s `max_runtime` 仍挂在真实 `time.monotonic()` 上；第二次
+  `run_step()` 光是真实 full-verified 恢复闸门就要烧掉约 3.4 s（余量 1.49×），2 vCPU runner 一慢
+  就在 `_process` 中途撞 deadline，工作项被判 `retry`、`processed_count` 少 1、健康被推成
+  `degraded`。现在把 `virtual_monotonic` 一并注入 runtime 与末尾的 `ArtifactGcHealthProjector`：
+  deadline 与预算读同一条虚拟时间轴，`CPU ×16` 与 fsync ≥ 700 ms 压力下从 4/4 红转为 6/6 绿，
+  且墙钟与红态同量级——不是靠跑快挤进预算。
+- **source broker v2 用例的墙钟失配（WP-B4 / WP-B5 / WP-B6，六条 + 一条）**：
+  `test_source_broker_v2_service.py` 里七条用例把「前奏成本」「dispatch deadline」「provider 阻塞
+  时长」「busy timeout」用墙钟比例互相夹住，其中 dispatch deadline `_host(0.05)` 只有标定前奏的
+  4 倍，runner 前奏抖 3 倍就在 provider 进入之前过期：provider 线程从未创建，`entered` 永不 set，
+  30 s watchdog 报的是「永远不会发生」而不是「慢」；`match="deadline"` 对「provider 之前拒绝」
+  与「provider 之内拒绝」都匹配，所以用例悄悄走上与它声称性质无关的路径。改法按每条用例的被测
+  性质分别处理：deadline 只是搭台的，换成已评审的单边预算 `_BLOCKED_PROVIDER_DEADLINE_SECONDS`
+  并把 `entered.wait(30)` 收紧为返回那一刻 `entered.is_set()`；deadline 本身是被测对象的
+  （结果在 deadline 之后到达必须 reconcile、finalize 在 deadline 返回不自动重复），改成
+  「provider 阻塞到用例放行」——迟到由程序序构造、上界消失、只剩单边序；`locked_unknown_fence`
+  的「拒绝要快于 busy timeout」守卫改成三项同缩放（原守卫在 scale ≥ 2.5 时爬到固定 500 ms 之上，
+  会静默失效）；`duplicate_dispatch_wait` 的「用的是请求 deadline 而非 busy timeout」交给拒绝消息
+  的身份（`match="duplicate provider"`）而不是停表。`_PROVIDER_RACE_DEADLINE_SECONDS` 调用点
+  归零并删除其误导性注释；`_BlockingProvider` 的释放上限改由实测前奏推导（余量 95–98× 恒定，
+  旧字面量在 scale 8 时衰减到 12×）。零开销注入器下改前 scale 0.05–0.35 全红、改后 0.05–1.0
+  全绿。代价：六条用例各 `1.5 s × scale`。
+- **lab job protocol 保留用例的 umask 与 mtime 依赖（WP-B7）**：
+  `test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records` 里唯一一处建隔离容器的裸
+  `incomplete.mkdir()`（同文件其余 22 处——20 处直接、2 处经 `real_mkdir` 透传——与生产
+  `lab_job_protocol.py` 都是 `mode=0o700`）在
+  runner 默认 umask 022 下建出 0755 目录，prune 打开时抛出「must be an owned physical 0700
+  private directory」；同时 prune 按 `(modified_at_ns, name)` 排序且永不删最新，evidence 解析
+  失败的 incomplete bundle 删不掉，8 个 bundle 的 mtime 在 CI 上撞进同一 tick 后排序退化成按
+  随机 uuid4 名，7/8 概率让 `assert len(bundles) <= 1` 失败。本地 APFS 纳秒 mtime 与 umask 077
+  从不触发。改为 `mkdir(mode=0o700)` 并用 `os.utime(ns=(1, 1))` 把七个完整 bundle 显式做旧
+  （同文件既有惯用法）；粗时间戳插件下修前 16/20（umask 022）与 18/20（umask 077）红，修后
+  两档各 0/25。
+- **lab worker 读取 receipt 时与 scheduler 的发布窗口竞争（WP-B8，Codex RQ-RB-P1-01）**：
+  `LabCommandSpool._publish_no_clobber()`（`LabReportSpool` 经 `_TypedSpoolBase` 继承）在 `os.link(tmp, target)` 之后、`finally` 里 `unlink(tmp)` 之前
+  夹着一次目录 fsync，这段时间目标 inode 的 `st_nlink == 2`；`LabWorker._wait_for_receipt()` 与
+  `_assert_no_terminal_success_evidence()` 原来**不持锁**地探测并读取 receipt，读取侧的
+  `st_nlink == 1` 安全校验于是把合法 receipt 判成「external hard link」，跑成功的 shard 被报成
+  `failed`（fence 阶段）。写者一直是持 `evidence_lock` 发布的，缺的是读者对称持锁：现在两处读取入口
+  改用已有的 locked twin——`_wait_for_receipt()` 每轮取锁、完成发现与读取后立即释放（不持锁等待），
+  `_assert_no_terminal_success_evidence()` 在同一锁区间完成 pending、receipt 路径快照与读取。
+  发布顺序与 `st_nlink == 1` 不变量均未改。新增确定性竞争用例：把 publisher 固定停在 link→unlink
+  窗口，证明 reader 等锁后在 nlink 恢复为 1 时才读到 receipt。CI 上该竞争约 1/10 命中（2 vCPU + ext4
+  目录 fsync 窗口约 1.7 ms），本地外科式把窗口加宽到 50–100 ms 即确定性复现（双版本合计 8/8）。
+- **artifact retention e2e 用例的日期定时炸弹**：`tests/integration/test_artifact_retention_e2e.py` 把「现在」冻结在
+  `2026-07-31`，而 `artifact_retention.py` 的恢复验证窗口用真实墙钟判 `now - 30d <= verified_at <= now`，
+  于是这份 fixture 只有 30 天保质期——2026-08-30 当天起在任何分片、任何解释器上都确定性失败
+  （`completed=0`），与当轮改动无关。现在 NOW 从「前一天 08:00 UTC」派生（年龄恒在 16–40 小时，
+  既不过期也不落到未来），`as_of_date` / `range_start` / `range_end` 仍相对派生。同批同步了
+  full-suite 契约测试的字面 case 数（13204 → 13206，WP-B8 新增两条用例后漏改）。
+- **lab worker 等待 receipt 时取锁不受 timeout/stop 约束（Codex RQ-RB-P1-02）**：WP-B8 让
+  `LabWorker._wait_for_receipt()` 每轮持 `evidence_lock` 发现并读取 receipt，但取锁是阻塞式
+  `flock(LOCK_EX)`、无超时，而 stop 与剩余预算的检查都在锁块之后——同一把锁被回收、迁移或扫描
+  长期持有时，10 ms 的 receipt timeout 会被拖到锁释放之后（Codex 复现：持锁 200 ms → `TimeoutError`
+  206 ms 才到；预置 stop 的 `InterruptedError` 同样延迟）。现在 report spool 提供窄范围的非阻塞锁尝试
+  （进程内 thread lock `acquire(blocking=False)` + 跨进程 `flock(LOCK_EX | LOCK_NB)`，任一失败即回滚
+  已取得的一半，不用后台线程等锁）；`_wait_for_receipt()` 每轮**先**检查 stop 与剩余预算，再尝试取锁，
+  未取到时在锁外等待 `min(50 ms, remaining)` 重试；取到锁后 receipt 的发现与读取仍在同一锁区间。
+  `_assert_no_terminal_success_evidence()` 无 timeout/stop 契约，保持阻塞锁；`link → fsync → unlink`
+  顺序与 `st_nlink == 1` 不变量未动。新增确定性回归：锁持有超过 receipt timeout 按预算退出、锁竞争期间
+  stop 一个轮询周期内退出、锁在期限内释放后仍读到合法 receipt、同进程 thread-lock 与跨进程 flock 两种
+  竞争各自覆盖；WP-B8 两条发布窗口用例继续通过。
+- **非阻塞 evidence lock 被拒时仍持有线程锁与两个描述符（Codex RQ-RB-P1-03）**：WP-B10 引入的
+  `LabCommandSpool._exclusive_lock(blocking=False)` 在跨进程 `flock(LOCK_EX | LOCK_NB)` 抛
+  `BlockingIOError` 时直接在内层 `try` 里 `yield False`，而生成器会在 `yield` 处挂起，负责释放的两层
+  `finally` 要等调用方退出 `with` 块后才执行——于是 `try_evidence_lock()` 的 False body 期间进程内
+  `_thread_lock`、lock 描述符与 parent 描述符都还被持有（Codex 复现：False body 内他线程
+  `acquire(blocking=False)` 得 False、`/dev/fd` 比进入前多 2），与 docstring「refused attempt leaves
+  nothing held」的契约相反。现在拒绝路径先关闭两个描述符（从未加锁的 fd 不发 `LOCK_UN`）、释放线程锁，
+  再在所有 `try/finally` 之外 `yield False`；`_active_lock_*` 记账不被触碰；阻塞路径逐语句不变。新增确定性
+  回归：子进程持 flock 时 False body 内他线程可立即取放 `_thread_lock` 且描述符零增量；多轮被拒后同一 spool
+  仍能取得 evidence lock、无描述符/锁泄漏；预置 stop 或预算已耗尽时 `try_evidence_lock` 一次都不被调用
+  （锁定 stop/预算先于取锁的顺序）。WP-B8 两条发布窗口用例与 WP-B10 五条用例继续通过；`link → fsync →
+  unlink` 顺序、`st_nlink == 1` 不变量与阻塞 `evidence_lock()` 语义均未动。
 - **lab spool 条目按内容而非可复用 inode 识别**：inode 会被文件系统回收再分配，两个不同条目
   因此可能拿到同一个身份（Codex round-3 verdict, RQ-WI-R2-P1-03）。
 - **R07 evidence cache 信任边界（WP-C）**：缓存命中不再跳过运行身份核验——`bind_evidence_wire`

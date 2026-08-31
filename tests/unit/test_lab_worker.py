@@ -12698,6 +12698,623 @@ def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Pa
     assert all(receipt.status == "accepted" for receipt in receipts)
 
 
+def _pinned_ack_publisher(
+    reports: LabReportSpool,
+    entry: object,
+    receipt: LabReportReceipt,
+    *,
+    target_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Thread, threading.Event, threading.Event, list[BaseException]]:
+    """Park a real ack publish inside its own link-to-unlink window.
+
+    `_publish_no_clobber` makes the target name visible with `link(temporary,
+    target)` and drops `temporary` only in its `finally`, so between those two
+    syscalls the published inode carries two links while the publisher still holds
+    the spool lock. Pinning the publisher there turns that window from a
+    microsecond-wide timing accident into a state the case fully controls: for as
+    long as `release` is unset the target provably has `st_nlink == 2`, so any link
+    count a reader records is evidence about locking rather than a timing sample.
+    """
+    window_open = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    real_link = os.link
+
+    def pinned_link(source: object, target: object, **kwargs: object) -> object:
+        result = real_link(source, target, **kwargs)
+        if target == target_name:
+            window_open.set()
+            # Bounded only so a regression cannot wedge the session; the case
+            # always sets `release` itself on both paths.
+            release.wait(_observe(10))
+        return result
+
+    monkeypatch.setattr(os, "link", pinned_link)
+
+    def publish() -> None:
+        try:
+            reports.ack(entry, receipt)
+        except BaseException as exc:  # noqa: BLE001 - reported to the case
+            errors.append(exc)
+
+    return threading.Thread(target=publish), window_open, release, errors
+
+
+def _witness_evidence_lock(
+    reports: LabReportSpool,
+    progressed: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Announce every attempt to take the spool lock, blocking or not.
+
+    This is what lets the case release the pinned publisher at exactly the right
+    moment without waiting on a clock. A reader that asks for the lock announces
+    itself here - whether it then parks on `flock` or is refused and comes back a
+    poll interval later - and a reader that never asks announces nothing and
+    instead finishes early, which its own thread wrapper reports. Both outcomes
+    set `progressed`, so the case advances on whichever actually happened.
+    """
+    attempts: list[str] = []
+    real_evidence_lock = reports.evidence_lock
+    real_try_evidence_lock = reports.try_evidence_lock
+
+    @contextmanager
+    def witnessed_evidence_lock() -> Iterator[None]:
+        attempts.append("requested")
+        progressed.set()
+        with real_evidence_lock():
+            yield
+
+    @contextmanager
+    def witnessed_try_evidence_lock() -> Iterator[bool]:
+        attempts.append("requested")
+        progressed.set()
+        with real_try_evidence_lock() as acquired:
+            yield acquired
+
+    monkeypatch.setattr(reports, "evidence_lock", witnessed_evidence_lock)
+    monkeypatch.setattr(reports, "try_evidence_lock", witnessed_try_evidence_lock)
+    return attempts
+
+
+def test_receipt_wait_never_reads_inside_the_publish_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_wait_for_receipt` must not read a receipt that still carries two links.
+
+    The `st_nlink == 1` rule is a real defence against an external hard link and
+    stays exactly as it is; what changes is that the reader now takes the same lock
+    the publisher already holds, so it can only ever observe the settled inode.
+    """
+    from loguru import logger
+
+    from rquant.lab_worker import LabStopSignal
+
+    reports = LabReportSpool(tmp_path / "reports")
+    worker = _worker(tmp_path, reports=reports)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    report = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardHeartbeat(lease_extension_seconds=30),
+    )
+    entry = reports.publish(report)
+    receipt = LabReportReceipt.from_report(
+        report,
+        status="accepted",
+        reason="accepted",
+        accepted_at=NOW,
+    )
+    receipt_name = f"{report.report_id}.json"
+    receipt_path = reports.ack_dir / receipt_name
+
+    # Record the link count of every read this reader actually accepted, and the
+    # reason of any read it rejected, so a regression names the cause instead of
+    # leaving only a tick status behind.
+    observed: list[object] = []
+    original_read = reports._read_regular_child
+
+    def record_read(path: Path, parent: Path, **kwargs: object) -> object:
+        try:
+            result = original_read(path, parent, **kwargs)
+        except InvalidCommandEnvelopeError as exc:
+            if Path(path).name == receipt_name:
+                observed.append(f"rejected: {exc}")
+            raise
+        if Path(path).name == receipt_name:
+            observed.append(result[2].st_nlink)
+        return result
+
+    monkeypatch.setattr(reports, "_read_regular_child", record_read)
+
+    publisher, window_open, release, publish_errors = _pinned_ack_publisher(
+        reports,
+        entry,
+        receipt,
+        target_name=receipt_name,
+        monkeypatch=monkeypatch,
+    )
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(message.record["message"]), level="WARNING")
+    progressed = threading.Event()
+    lock_attempts = _witness_evidence_lock(reports, progressed, monkeypatch)
+    waited: list[LabReportReceipt] = []
+    wait_errors: list[BaseException] = []
+
+    def wait() -> None:
+        try:
+            waited.append(
+                worker._wait_for_receipt(
+                    report,
+                    worker._receipt_wait_timeout_seconds(),
+                    LabStopSignal(),
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - reported to the case
+            wait_errors.append(exc)
+        finally:
+            progressed.set()
+
+    reader = threading.Thread(target=wait)
+    try:
+        publisher.start()
+        assert window_open.wait(_observe(2))
+        # The window is genuinely open: the name is visible and the publisher's own
+        # temporary is still the inode's second link.
+        assert os.stat(receipt_path).st_nlink == 2
+        reader.start()
+        # Hold the publisher in the window until the reader has really acted on it -
+        # either it asked for the lock and is now parked, or it read without one and
+        # is already finished. Releasing on a clock instead would let a reader that
+        # skips the lock miss the window and pass by luck.
+        assert progressed.wait(_observe(2)), (
+            "reader neither asked for the spool lock nor finished: it is parked "
+            f"somewhere else while the window is open, observed={observed}"
+        )
+        release.set()
+        reader.join(timeout=_observe(2))
+        publisher.join(timeout=_observe(2))
+    finally:
+        release.set()
+        logger.remove(sink)
+
+    assert not reader.is_alive()
+    assert not publisher.is_alive()
+    assert publish_errors == []
+    assert wait_errors == []
+    # The reader asked for the lock the publisher was holding ...
+    assert lock_attempts != [], "reader read the receipt without taking the spool lock"
+    # ... so it can only have read after the temporary link was gone.
+    assert observed == [1]
+    assert waited[0] == receipt
+    assert [message for message in messages if "external hard link" in message] == []
+
+
+# Codex's reproduction holds the evidence lock for 0.200s against a 0.010s receipt
+# budget. Keep that shape: a bounded, self-releasing hold makes the regression fail
+# fast in both directions instead of parking the session on the defect it is naming.
+_LOCK_HOLD_SECONDS = 0.2
+_RECEIPT_BUDGET_SECONDS = 0.01
+
+
+@contextmanager
+def _evidence_lock_held_in_thread(reports: LabReportSpool) -> Iterator[float]:
+    """Hold the spool from another thread, covering the in-process half."""
+    held = threading.Event()
+    failures: list[BaseException] = []
+    hold_seconds = _observe(_LOCK_HOLD_SECONDS)
+
+    def hold() -> None:
+        try:
+            with reports.evidence_lock():
+                held.set()
+                time.sleep(hold_seconds)
+        except BaseException as exc:  # noqa: BLE001 - reported to the case
+            failures.append(exc)
+            held.set()
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert held.wait(_observe(2))
+        assert failures == []
+        yield hold_seconds
+    finally:
+        holder.join(timeout=_observe(10))
+        assert not holder.is_alive()
+    assert failures == []
+
+
+@contextmanager
+def _evidence_lock_held_in_subprocess(reports: LabReportSpool, tmp_path: Path) -> Iterator[float]:
+    """Hold the spool's flock from a real other process, covering the cross-process half.
+
+    The in-process thread lock is free here, so this pins the flock specifically:
+    the attempt has to be refused by `LOCK_EX | LOCK_NB` rather than by the thread
+    lock, which is the half a same-process holder can never exercise.
+    """
+    ready = tmp_path / "flock-held"
+    hold_seconds = _observe(_LOCK_HOLD_SECONDS)
+    program = (
+        "import fcntl, pathlib, sys, time\n"
+        "lock = open(sys.argv[1], 'r+')\n"
+        "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+        "pathlib.Path(sys.argv[2]).write_text('held')\n"
+        "time.sleep(float(sys.argv[3]))\n"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", program, str(reports._lock_path), str(ready), str(hold_seconds)]
+    )
+    try:
+        deadline = time.monotonic() + _observe(5)
+        while not ready.exists() and time.monotonic() < deadline:
+            if holder.poll() is not None:
+                raise AssertionError("flock holder exited before taking the lock")
+            time.sleep(0.005)
+        assert ready.exists(), "flock holder never reported taking the lock"
+        yield hold_seconds
+    finally:
+        holder.wait(timeout=_observe(10))
+
+
+def _receipt_wait_worker(tmp_path: Path, reports: LabReportSpool) -> tuple[object, object]:
+    worker = _worker(tmp_path, reports=reports)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    report = LabWorkerReport.from_claim(
+        claim,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardHeartbeat(lease_extension_seconds=30),
+    )
+    return worker, report
+
+
+@pytest.mark.parametrize(
+    "contention",
+    ["thread", "subprocess"],
+    ids=["in-process thread lock", "cross-process flock"],
+)
+def test_receipt_wait_honours_its_budget_while_the_evidence_lock_is_held(
+    tmp_path: Path,
+    contention: str,
+) -> None:
+    """A holder of the evidence lock must not become this call's deadline.
+
+    The lock is shared with reclaim, migration and scan work that can hold it far
+    longer than a receipt wait is allowed to take, so parking on it would let an
+    unrelated holder set the deadline. The wait has to give up on its own budget
+    while the holder is still holding.
+    """
+    from rquant.lab_worker import LabStopSignal
+
+    reports = LabReportSpool(tmp_path / "reports")
+    worker, report = _receipt_wait_worker(tmp_path, reports)
+    holder = (
+        _evidence_lock_held_in_thread(reports)
+        if contention == "thread"
+        else _evidence_lock_held_in_subprocess(reports, tmp_path)
+    )
+    budget = _observe(_RECEIPT_BUDGET_SECONDS)
+
+    with holder as hold_seconds:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            worker._wait_for_receipt(report, budget, LabStopSignal())
+        elapsed = time.monotonic() - started
+
+    # Returned while the lock was still held, and inside budget plus the one poll
+    # interval the loop is allowed to sleep before rechecking.
+    assert elapsed < hold_seconds, f"waited for the lock holder: {elapsed:.3f}s"
+    assert elapsed < budget + _observe(0.05) + _observe(0.05)
+
+
+@pytest.mark.parametrize(
+    "contention",
+    ["thread", "subprocess"],
+    ids=["in-process thread lock", "cross-process flock"],
+)
+def test_receipt_wait_stops_while_the_evidence_lock_is_held(
+    tmp_path: Path,
+    contention: str,
+) -> None:
+    """A stop request is answered while someone else holds the lock."""
+    from rquant.lab_worker import LabStopSignal
+
+    reports = LabReportSpool(tmp_path / "reports")
+    worker, report = _receipt_wait_worker(tmp_path, reports)
+    stop = LabStopSignal()
+    stop.request()
+    holder = (
+        _evidence_lock_held_in_thread(reports)
+        if contention == "thread"
+        else _evidence_lock_held_in_subprocess(reports, tmp_path)
+    )
+
+    with holder as hold_seconds:
+        started = time.monotonic()
+        with pytest.raises(InterruptedError):
+            worker._wait_for_receipt(report, _observe(30), stop)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < hold_seconds, f"waited for the lock holder: {elapsed:.3f}s"
+    assert elapsed < _observe(0.05) + _observe(0.05)
+
+
+def test_receipt_wait_reads_the_receipt_once_the_evidence_lock_is_free(
+    tmp_path: Path,
+) -> None:
+    """Giving up early must not cost correctness once the lock is available."""
+    from rquant.lab_worker import LabStopSignal
+
+    reports = LabReportSpool(tmp_path / "reports")
+    worker, report = _receipt_wait_worker(tmp_path, reports)
+    entry = reports.publish(report)
+    receipt = LabReportReceipt.from_report(
+        report,
+        status="accepted",
+        reason="accepted",
+        accepted_at=NOW,
+    )
+    reports.ack(entry, receipt)
+
+    with _evidence_lock_held_in_thread(reports), pytest.raises(TimeoutError):
+        worker._wait_for_receipt(report, _observe(_RECEIPT_BUDGET_SECONDS), LabStopSignal())
+
+    assert worker._wait_for_receipt(report, _observe(2), LabStopSignal()) == receipt
+
+
+def _thread_lock_free_for_another_thread(reports: LabReportSpool) -> bool:
+    """Probe the spool's thread half from a thread that cannot already own it.
+
+    The probe has to run off the main thread: `_thread_lock` is an `RLock`, so a
+    main-thread `acquire(blocking=False)` succeeds by reentrancy even while this
+    very frame holds it, which would make the check vacuously true.
+    """
+    outcome: list[bool] = []
+
+    def probe() -> None:
+        taken = reports._thread_lock.acquire(blocking=False)
+        outcome.append(taken)
+        if taken:
+            reports._thread_lock.release()
+
+    prober = threading.Thread(target=probe)
+    prober.start()
+    prober.join(_observe(5))
+    assert not prober.is_alive(), "thread-half probe never finished"
+    assert len(outcome) == 1
+    return outcome[0]
+
+
+def _open_descriptor_count() -> int:
+    """Count this process's open descriptors.
+
+    `os.listdir` opens one descriptor of its own for the directory it is reading,
+    and closes it before returning, so the same transient appears in every sample
+    and cancels out between them.
+    """
+    return len(os.listdir("/dev/fd"))
+
+
+def test_refused_try_evidence_lock_holds_nothing_inside_the_false_body(
+    tmp_path: Path,
+) -> None:
+    """A refused attempt must hand back a body that owns nothing.
+
+    `_exclusive_lock` promises the half it took is "released before yielding
+    False". A `@contextmanager` generator suspends at its `yield`, so releasing in
+    a `finally` releases only after the caller has left the `with` block - during
+    the whole False body the refused attempt still held the thread lock and both
+    descriptors, and a caller that reacts to `acquired is False` by doing other
+    spool work would deadlock against itself or leak.
+    """
+    reports = LabReportSpool(tmp_path / "reports")
+
+    with _evidence_lock_held_in_subprocess(reports, tmp_path):
+        descriptors_before = _open_descriptor_count()
+        with reports.try_evidence_lock() as acquired:
+            assert acquired is False
+            assert _thread_lock_free_for_another_thread(reports), (
+                "refused attempt still holds the thread lock inside the False body"
+            )
+            assert _open_descriptor_count() == descriptors_before, (
+                "refused attempt still holds descriptors inside the False body"
+            )
+            assert reports._active_lock_descriptor is None
+            assert reports._active_lock_parent_descriptor is None
+        assert _open_descriptor_count() == descriptors_before
+
+
+def test_refused_try_evidence_lock_leaves_the_spool_reusable(
+    tmp_path: Path,
+) -> None:
+    """Repeated refusals must not accumulate, and must not poison the spool.
+
+    Every refusal releases both halves on its own, so twenty of them in a row cost
+    nothing, and once the other holder is gone the same spool takes the lock again
+    - both the non-blocking and the blocking way.
+    """
+    reports = LabReportSpool(tmp_path / "reports")
+    # Sampled before the holder exists so the holder's own bookkeeping cannot
+    # show up as a leak once it is reaped.
+    descriptors_at_rest = _open_descriptor_count()
+
+    with _evidence_lock_held_in_subprocess(reports, tmp_path):
+        descriptors_before = _open_descriptor_count()
+        for attempt in range(20):
+            with reports.try_evidence_lock() as acquired:
+                assert acquired is False, f"lock holder released early on attempt {attempt}"
+                assert _thread_lock_free_for_another_thread(reports), (
+                    f"attempt {attempt} still holds the thread lock"
+                )
+            assert _open_descriptor_count() == descriptors_before, (
+                f"attempt {attempt} leaked a descriptor"
+            )
+            assert _thread_lock_free_for_another_thread(reports)
+
+    with reports.try_evidence_lock() as acquired:
+        assert acquired is True
+    with reports.evidence_lock():
+        pass
+
+    assert _open_descriptor_count() == descriptors_at_rest
+    assert reports._active_lock_descriptor is None
+    assert reports._active_lock_parent_descriptor is None
+    assert reports._active_lock_identity is None
+    assert reports._active_root_descriptor is None
+    assert _thread_lock_free_for_another_thread(reports)
+
+
+@pytest.mark.parametrize("exhausted", ["stop", "budget"])
+def test_receipt_wait_never_tries_the_lock_once_stop_or_budget_is_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exhausted: str,
+) -> None:
+    """Stop and budget are answered before the lock is ever reached for.
+
+    Ordering is the whole fix for RQ-RB-P1-02: the evidence lock is shared with
+    reclaim, migration and scan work, so a wait that reaches for it before reading
+    its own stop flag and remaining budget hands its deadline to an unrelated
+    holder. A stub that both counts and raises pins the order in either direction.
+    """
+    import rquant.lab_worker as lab_worker
+    from rquant.lab_worker import LabStopSignal
+
+    reports = LabReportSpool(tmp_path / "reports")
+    worker, report = _receipt_wait_worker(tmp_path, reports)
+    attempts: list[str] = []
+
+    def refuse_the_attempt() -> object:
+        attempts.append(exhausted)
+        raise AssertionError("try_evidence_lock must not be attempted")
+
+    monkeypatch.setattr(reports, "try_evidence_lock", refuse_the_attempt)
+
+    stop = LabStopSignal()
+    if exhausted == "stop":
+        stop.request()
+        expected: type[BaseException] = InterruptedError
+    else:
+        # The first reading sets the deadline; every later one is already past it,
+        # so the budget is spent before the first pass reaches the lock.
+        readings = iter((0,))
+
+        def spent_clock() -> int:
+            return next(readings, 10**12)
+
+        monkeypatch.setattr(lab_worker, "_monotonic_microseconds", spent_clock)
+        expected = TimeoutError
+
+    with pytest.raises(expected):
+        worker._wait_for_receipt(report, 30.0, stop)
+
+    assert attempts == []
+
+
+def test_preflight_evidence_scan_never_reads_inside_the_publish_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preflight evidence scan takes the same lock as its locked twin.
+
+    `_preflight` used to snapshot `ack_dir` with an unlocked glob and read the
+    receipts outside the spool lock, so it could reject a receipt the publisher was
+    still linking into place and fail a reclaim that had nothing wrong with it.
+    """
+    from loguru import logger
+
+    from rquant.lab_worker import LabArtifactReclaimer
+
+    reports = LabReportSpool(tmp_path / "reports")
+    old_claim, current_claim, _sealed, manifest = _sealed_obsolete_attempt(tmp_path, reports)
+    reclaimer = LabArtifactReclaimer(
+        artifact_root=tmp_path / "artifacts",
+        report_spool=reports,
+    )
+    heartbeat = LabWorkerReport.from_claim(
+        old_claim,
+        report_id=uuid4(),
+        reported_at=NOW,
+        body=LabShardHeartbeat(lease_extension_seconds=30),
+    )
+    entry = reports.publish(heartbeat)
+    receipt = LabReportReceipt.from_report(
+        heartbeat,
+        status="rejected",
+        reason="claim_generation_mismatch",
+        accepted_at=NOW,
+    )
+    receipt_name = f"{heartbeat.report_id}.json"
+    receipt_path = reports.ack_dir / receipt_name
+
+    observed: list[object] = []
+    original_read = reports._read_regular_child
+
+    def record_read(path: Path, parent: Path, **kwargs: object) -> object:
+        try:
+            result = original_read(path, parent, **kwargs)
+        except InvalidCommandEnvelopeError as exc:
+            if Path(path).name == receipt_name:
+                observed.append(f"rejected: {exc}")
+            raise
+        if Path(path).name == receipt_name:
+            observed.append(result[2].st_nlink)
+        return result
+
+    monkeypatch.setattr(reports, "_read_regular_child", record_read)
+
+    publisher, window_open, release, publish_errors = _pinned_ack_publisher(
+        reports,
+        entry,
+        receipt,
+        target_name=receipt_name,
+        monkeypatch=monkeypatch,
+    )
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(message.record["message"]), level="WARNING")
+    progressed = threading.Event()
+    lock_attempts = _witness_evidence_lock(reports, progressed, monkeypatch)
+    scan_errors: list[BaseException] = []
+
+    def scan() -> None:
+        try:
+            reclaimer._assert_no_terminal_success_evidence(old_claim, manifest, current_claim)
+        except BaseException as exc:  # noqa: BLE001 - reported to the case
+            scan_errors.append(exc)
+        finally:
+            progressed.set()
+
+    scanner = threading.Thread(target=scan)
+    try:
+        publisher.start()
+        assert window_open.wait(_observe(2))
+        assert os.stat(receipt_path).st_nlink == 2
+        scanner.start()
+        assert progressed.wait(_observe(2)), (
+            "preflight scan neither asked for the spool lock nor finished: an "
+            "unlocked snapshot blocks in pending() instead of holding one lock "
+            f"across discovery and read, observed={observed}"
+        )
+        release.set()
+        scanner.join(timeout=_observe(2))
+        publisher.join(timeout=_observe(2))
+    finally:
+        release.set()
+        logger.remove(sink)
+
+    assert not scanner.is_alive()
+    assert not publisher.is_alive()
+    assert publish_errors == []
+    assert scan_errors == []
+    assert lock_attempts != [], "preflight scan read receipts without taking the spool lock"
+    assert observed == [1]
+    assert [message for message in messages if "external hard link" in message] == []
+
+
 def test_crash_without_report_is_reclaimed_by_existing_lease_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

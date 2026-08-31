@@ -69,6 +69,16 @@ NOW = datetime(2026, 8, 9, 4, tzinfo=UTC)
 # A watchdog for "the provider thread got in at all", not a subject: the
 # bounded rejections these cases assert afterwards are what is under test. One
 # or two seconds is a developer machine's budget and the x64 runner missed it.
+#
+# Only the two cases that hand the whole dispatch to a helper thread with no
+# deadline may use it, because only there is provider entry *guaranteed*: with
+# no deadline there is no checkpoint that can refuse ahead of the provider, so
+# the wait either observes the entry or the service hung. A case whose dispatch
+# carries a deadline must not wait on entry - if a prologue checkpoint refuses
+# first the provider thread is never spawned, the event is never set, and the
+# wait can only burn its full timeout and then report `assert False`, which
+# names neither the stage that refused nor the reason. Those cases assert
+# `entered.is_set()` instead; see `_BLOCKED_PROVIDER_DEADLINE_SECONDS`.
 _PROVIDER_ENTRY_WATCHDOG_SECONDS = 30
 
 # Every deadline in this file that has to expire *while the provider is
@@ -95,15 +105,6 @@ _PROVIDER_ENTRY_WATCHDOG_SECONDS = 30
 # orderings between them (prologue < deadline < prologue + provider sleep) hold
 # at every scale precisely because none of the three is scaled alone.
 _PROLOGUE_REFERENCE_SECONDS = 0.0125
-# Two cases need a deadline that lands *after* the prologue and *before* the
-# provider returns from an 80ms sleep - an admissible window of one to about
-# seven measured prologues. Twenty milliseconds sat at the very bottom of it:
-# 1.6 prologues, which is inside the spread between a warm sample (7ms) and a
-# cold one (12ms) on the machine that wrote it, so the lower bound held by
-# luck. Forty puts the deadline at the middle of the window - half the
-# provider's sleep - which is the same invariant with margin on both sides
-# rather than none on one.
-_PROVIDER_RACE_DEADLINE_SECONDS = 0.04
 # Two cases starve the authority signing step of deadline and require the
 # service to refuse *at that step*. Three quantities decide whether they do,
 # and they only work as a set:
@@ -121,14 +122,20 @@ _PROVIDER_RACE_DEADLINE_SECONDS = 0.04
 # true at every host speed, which is the only form that is not a race.
 _SIGNING_STARVED_DEADLINE_SECONDS = 0.03
 _SIGNING_COST_SECONDS = 0.1
-# One case does *not* need a window, and paying for one is what broke it. Its
-# two siblings need `prologue < deadline < prologue + provider sleep`: squeezed
-# from both sides, so their deadline has to be measured. This one gets its
-# upper bound from the test instead - the provider blocks until the case
-# releases it, so the deadline expires while the provider is still inside it no
-# matter how large the deadline is. That leaves a single ordering to secure,
-# `prologue < deadline`, and a one-sided ordering is secured by margin rather
-# than by measurement.
+# No case here needs a window any more, and paying for one is what broke every
+# one of them in turn. The shape that kept failing was
+# `prologue < deadline < prologue + provider sleep`: a deadline squeezed from
+# both sides by two wall clock quantities, racing a third - the prologue - that
+# appears in neither. Each of the five cases that had it now gets its upper
+# bound from the test instead: the provider blocks until the case releases it,
+# so the deadline expires while the provider is still inside no matter how
+# large it is. That leaves a single ordering to secure, `prologue < deadline`,
+# and a one-sided ordering is secured by margin rather than by a measurement
+# taken at module import and then outrun by the shard's own load.
+#
+# The window form is gone from this file: the 40ms constant the last two cases
+# used was deleted with them, because a budget whose comment describes an
+# admissible window is a trap for whoever adds the sixth case.
 #
 # The old form was a 50ms deadline that had to beat the prologue, and inside a
 # full shard on a 2 vCPU runner it lost: `dispatch_calls == 0`, the provider
@@ -137,7 +144,32 @@ _SIGNING_COST_SECONDS = 0.1
 # the prologue is tens of milliseconds and the ledger writes behind it are
 # bounded by the 500ms busy timeout, so a budget in seconds is not a race with
 # anything. The calibrated scale still applies on top of it.
+#
+# The two `stop()` / global-gate cases were left on the 50ms literal when the
+# first one was converted, and the same cliff took the stop() case out on a
+# 3.12 shard (30.197s against a 0.108s norm). Their exposure was measured: the
+# 50ms literal leaves the prologue a margin of 4x its own calibrated cost, and
+# a sweep that shrinks the scale - the exact equivalent of the host degrading
+# *after* the module-scope calibration was taken - puts the cliff at 2.5x to
+# 3.3x on both 3.11 and 3.12, non-monotonically, which is a wall clock race and
+# not a bound. A 2.5x swing in a ~10ms prologue of SQLite commits, Ed25519
+# verification and openssl work, on a 2 vCPU runner 2500 cases into a shard, is
+# ordinary. All three now share this budget, and each derives its provider's
+# block cap from it rather than from a literal, so enlarging the deadline can
+# never collide with the block.
 _BLOCKED_PROVIDER_DEADLINE_SECONDS = 1.5
+# `_BlockingProvider` blocks until its case releases it, so this is not a budget
+# for anything a case measures - it is the guard that turns a hung case into a
+# named failure instead of a hung shard. What it has to outlast is the work the
+# case does *while holding* the provider: a signed claim plus a signed replay
+# round trip in one case, a whole second dispatch in the other. Every bit of
+# that scales with the host, and the cap was the one quantity in the pair that
+# did not - a bare `timeout=5`, the same shape of defect the blocked-dispatch
+# deadlines above were just converted out of. Expressed as a count of measured
+# prologues it is 5.0s on a quiet host, exactly what it has always been, and
+# 400x whatever prologue this process actually measured everywhere else, so the
+# guard and the work it guards move together.
+_BLOCKING_PROVIDER_RELEASE_PROLOGUES = 400
 # The calibration dispatch is not under test and must not be the thing that
 # fails when the host is slow, so it gets a watchdog rather than a budget.
 _PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
@@ -609,13 +641,16 @@ class _BlockingProvider(_CountingProvider):
         super().__init__()
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.block_seconds = _host(
+            _PROLOGUE_REFERENCE_SECONDS * _BLOCKING_PROVIDER_RELEASE_PROLOGUES
+        )
 
     def dispatch(self, request: SourceBrokerV2DispatchRequest):
         from rquant.source_broker_v2_service import SourceBrokerV2ProviderDispatchResult
 
         self.dispatch_calls += 1
         self.entered.set()
-        if not self.release.wait(timeout=5):
+        if not self.release.wait(timeout=self.block_seconds):
             raise TimeoutError("provider dispatch test release was not signaled")
         response = canonical_json_bytes(
             {"call": self.dispatch_calls, "operation_id": request.operation_id}
@@ -650,6 +685,33 @@ class _ShortBlockingProvider(_CountingProvider):
             outcome=SourceBrokerV2DispatchOutcome.SUCCESS,
             response=response,
             transport_receipt=receipt,
+        )
+
+
+class _ShortBlockingFinalizeProvider(_CountingProvider):
+    """The finalize twin of `_ShortBlockingProvider`.
+
+    Only finalize blocks: the cases that need it have to complete a real
+    dispatch first in order to have something to finalize at all.
+    """
+
+    def __init__(self, *, block_seconds: float) -> None:
+        super().__init__()
+        self.block_seconds = block_seconds
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def finalize(self, request: SourceBrokerV2FinalizeRequest):
+        from rquant.source_broker_v2_service import SourceBrokerV2ProviderFinalizeResult
+
+        self.finalize_calls += 1
+        self.entered.set()
+        if not self.release.wait(timeout=self.block_seconds):
+            raise TimeoutError("provider finalize remained blocked")
+        return SourceBrokerV2ProviderFinalizeResult(
+            final_receipt=canonical_json_bytes(
+                {"finalize": self.finalize_calls, "request_hash": request.request_hash}
+            )
         )
 
 
@@ -1939,10 +2001,37 @@ def test_duplicate_dispatch_wait_uses_single_request_deadline(tmp_path: Path) ->
     thread.start()
     assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
 
-    started = time.monotonic()
-    with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
-    assert time.monotonic() - started < _host(0.25)
+    # What this case is named for splits into two claims, and each now has its
+    # own witness instead of both leaning on one stopwatch.
+    #
+    # "Uses the single request deadline" - rather than the busy timeout - is a
+    # question of *which* refusal comes back, so it is answered by identity.
+    # `_wait_for_terminal` gives up on the busy timeout with
+    # `SourceBrokerTransportError("source provider operation is still in
+    # flight")` and on the request deadline with a message naming the duplicate
+    # wait; only the latter says "duplicate provider". Matching the word
+    # "deadline" told the two apart not at all, and did not even separate the
+    # duplicate wait from the dispatch prologue, whose checkpoints all say
+    # "deadline" as well - measured, at a prologue 5x its calibrated cost this
+    # case passed green on a refusal from `after dispatch claim verification`.
+    #
+    # "Returns *at* the deadline" is the temporal half, and it is anchored to
+    # the deadline rather than to the call's start, which is the only anchor
+    # that keeps meaning once the budget stops being a stopwatch reading.
+    #
+    # With the discriminator moved onto identity, the budget is no longer
+    # squeezed between the prologue below and the busy timeout above: the
+    # duplicate can never be handed a result - the first dispatch's provider
+    # blocks until this case releases it, further down - so the wait ends at
+    # this deadline however large it is. That leaves `prologue < deadline`,
+    # one-sided, and it takes the one-sided constant the other five cases of
+    # this file take. The 50ms literal left it a margin of four prologues and
+    # a loaded shard outruns four prologues.
+    deadline = time.monotonic() + _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS)
+    with pytest.raises(SourceBrokerV2TransportDeadlineError, match="duplicate provider"):
+        service.dispatch(envelope, deadline=deadline)
+    returned_at = time.monotonic()
+    assert returned_at - deadline < _host(0.2)
 
     provider.release.set()
     thread.join(timeout=2)
@@ -2003,7 +2092,8 @@ def test_blocked_provider_dispatch_returns_at_deadline_without_auto_repeat(
 def test_global_provider_gate_bounds_blocked_sources_before_authority_reserve(
     tmp_path: Path,
 ) -> None:
-    provider = _BlockingProvider()
+    blocked_deadline_seconds = _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS)
+    provider = _ShortBlockingProvider(block_seconds=blocked_deadline_seconds * 4)
     authority = _FakeExternalDispatchAuthority()
     events: list[object] = []
     service, _keyring = _service(
@@ -2030,8 +2120,10 @@ def test_global_provider_gate_bounds_blocked_sources_before_authority_reserve(
     second_envelope = envelope_for(second_request)
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-            service.dispatch(first_envelope, deadline=time.monotonic() + _host(0.05))
-        assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
+            service.dispatch(first_envelope, deadline=time.monotonic() + blocked_deadline_seconds)
+        # See the sibling stop() case: entry is a fact by the time the deadline
+        # has been spent inside the provider, so it is asserted, not waited for.
+        assert provider.entered.is_set()
 
         started = time.monotonic()
         with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
@@ -2073,7 +2165,8 @@ def test_global_provider_gate_bounds_blocked_sources_before_authority_reserve(
 
 
 def test_provider_service_stop_prevents_new_threads_and_reservations(tmp_path: Path) -> None:
-    provider = _BlockingProvider()
+    blocked_deadline_seconds = _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS)
+    provider = _ShortBlockingProvider(block_seconds=blocked_deadline_seconds * 4)
     authority = _FakeExternalDispatchAuthority()
     service, _keyring = _service(
         tmp_path,
@@ -2093,8 +2186,12 @@ def test_provider_service_stop_prevents_new_threads_and_reservations(tmp_path: P
 
     try:
         with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-            service.dispatch(first_envelope, deadline=time.monotonic() + _host(0.05))
-        assert provider.entered.wait(timeout=_PROVIDER_ENTRY_WATCHDOG_SECONDS)
+            service.dispatch(first_envelope, deadline=time.monotonic() + blocked_deadline_seconds)
+        # Stated rather than waited for: the deadline above is spent *inside*
+        # the provider call, so entry is already a fact here. When it was not -
+        # when a prologue checkpoint refused first - the provider thread was
+        # never spawned and no wait could ever have observed the entry.
+        assert provider.entered.is_set()
 
         service.stop()
         service.stop()
@@ -2167,7 +2264,24 @@ def test_security_events_are_structured_and_never_include_provider_secrets(
 def test_blocked_provider_finalize_returns_at_deadline_without_auto_repeat(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingProvider(sleep_finalize_seconds=_host(0.08))
+    # The finalize twin of test_blocked_provider_dispatch_returns_at_deadline_
+    # without_auto_repeat, and it gets that case's construction rather than the
+    # 40ms window it was left on. What this case is about is in its name: the
+    # finalize returns *at its deadline* while the provider is still inside the
+    # call, and the service does not repeat the provider call afterwards. That
+    # needs one ordering - provider entered, then deadline - and an 80ms sleep
+    # racing a 40ms deadline secures it only while the prologue stays under
+    # 40ms. It did not: the dispatch sibling of this pair went red on a 3.12
+    # shard with `dispatch_calls == 0`, the provider never reached.
+    #
+    # A provider that blocks until this case releases it turns that ordering
+    # into a fact. The deadline cannot outrun the provider's return because the
+    # provider does not return until released, and the release happens after
+    # the refusal has been observed. The budget is then one-sided, so it takes
+    # the one-sided constant, and the block cap is derived from it rather than
+    # from a literal that a larger deadline could collide with.
+    deadline_seconds = _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS)
+    provider = _ShortBlockingFinalizeProvider(block_seconds=deadline_seconds * 4)
     service, _keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
@@ -2193,13 +2307,24 @@ def test_blocked_provider_finalize_returns_at_deadline_without_auto_repeat(
         )
     )
 
-    started = time.monotonic()
-    with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.finalize(
-            envelope,
-            deadline=time.monotonic() + _host(_PROVIDER_RACE_DEADLINE_SECONDS),
-        )
-    assert time.monotonic() - started < _host(0.2)
+    deadline = time.monotonic() + deadline_seconds
+    try:
+        # Pinned to the stage, not to the word "deadline": every checkpoint in
+        # the finalize prologue also says "deadline", so the loose match used to
+        # accept a refusal that never reached the provider - which is exactly
+        # how this shape fails - and left it to be noticed three assertions
+        # later, if at all.
+        with pytest.raises(SourceBrokerV2TransportDeadlineError, match="during provider finalize"):
+            service.finalize(envelope, deadline=deadline)
+        returned_at = time.monotonic()
+    finally:
+        provider.release.set()
+    # Where the refusal came from, stated rather than inferred.
+    assert provider.entered.is_set()
+    # Anchored to the deadline rather than to the call's start, which is the
+    # only anchor that still says something once the budget is one-sided:
+    # returned at the deadline, not when the provider's block would have ended.
+    assert returned_at - deadline < _host(0.2)
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=finalize_request.saga_id,
@@ -2214,7 +2339,7 @@ def test_blocked_provider_finalize_returns_at_deadline_without_auto_repeat(
     assert replay.status is SourceBrokerV2ReplayStatus.UNKNOWN
 
     with pytest.raises((SourceBrokerTransportError, SourceBrokerV2TransportDeadlineError)):
-        service.finalize(envelope, deadline=time.monotonic() + 1.0)
+        service.finalize(envelope, deadline=time.monotonic() + _host(1.0))
     assert provider.finalize_calls == 1
 
 
@@ -2272,9 +2397,29 @@ def test_provider_finalize_error_requires_reconcile_without_auto_repeat(
 def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
     tmp_path: Path,
 ) -> None:
+    # Three quantities decide this case, and - as the starved-signing pair above
+    # already had to learn - they only work as a set:
+    #
+    #   prologue  <  fence refusal  <  busy timeout
+    #
+    # The middle term is the subject: the service must refuse the moment it
+    # finds the fence unwritable, *not* sit on the lock until the busy timeout
+    # gives up. The guard below is what tells those two apart, and it can only
+    # do that while it sits strictly between them. The busy timeout was the one
+    # term of the three pinned to a bare literal while the other two scale with
+    # the host, so on a host slow enough for `_host()` to matter the guard drifts
+    # up past it and silently stops discriminating - at scale 2.5 the guard is
+    # already 0.5s and a service that waited out the whole 500ms would pass.
+    # All three scale together now, so both orderings hold at every host speed.
+    busy_timeout_seconds = _host(0.5)
+    refusal_guard_seconds = _host(0.2)
     ledger_path = tmp_path / "source-provider-ledger.sqlite3"
     provider = _LedgerLockingFailProvider(ledger_path=ledger_path)
-    service, keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
+    service, keyring = _service(
+        tmp_path,
+        provider=provider,
+        busy_timeout_ms=max(1, round(busy_timeout_seconds * 1000)),
+    )
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
     envelope = canonical_model_json_bytes(
@@ -2290,9 +2435,34 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
 
     started = time.monotonic()
     try:
-        with pytest.raises((SourceBrokerTransportError, SourceBrokerV2TransportDeadlineError)):
-            service.dispatch(envelope, deadline=time.monotonic() + _host(0.05))
-        assert time.monotonic() - started < _host(0.2)
+        # The refusal has to name itself. `SourceBrokerV2TransportDeadlineError`
+        # subclasses `SourceBrokerTransportError`, so the old two-element tuple
+        # was just `SourceBrokerTransportError` with extra words and it accepted
+        # a deadline expiry as if it were the fence refusal the case is named
+        # for - whether that expiry came from the prologue outrunning the budget
+        # or from the service waiting on the lock. Neither of those messages
+        # contains reconcile, required or unknown, so the stage is pinned here
+        # rather than inferred from the stopwatch two lines down.
+        #
+        # The budget is one-sided and therefore gets the one-sided constant.
+        # Measured, not assumed: what ends this call is the unwritable fence,
+        # not the deadline, so enlarging the budget from 50ms to 5s leaves the
+        # call at the same 15-25ms and leaves every assertion below untouched.
+        # All it has to do is survive the prologue, which the 50ms literal
+        # stopped doing at 2.9x its calibrated cost.
+        with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
+            service.dispatch(
+                envelope,
+                deadline=time.monotonic() + _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS),
+            )
+        returned_at = time.monotonic()
+        # Stated rather than inferred: the fence is unwritable *because the
+        # provider is holding the ledger lock*, and that precondition was until
+        # now taken on trust. `_LedgerLockingFailProvider` sets this only after
+        # `BEGIN IMMEDIATE` has succeeded, so it witnesses the lock, not just
+        # the entry that `dispatch_calls` already covers.
+        assert provider.locked.is_set()
+        assert returned_at - started < refusal_guard_seconds
         assert provider.dispatch_calls == 1
 
         replay = SourceBrokerV2ReplayResponse.model_validate_json(
@@ -2302,15 +2472,19 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
         assert replay.status is SourceBrokerV2ReplayStatus.UNKNOWN
 
         duplicate_started = time.monotonic()
+        # Scaled along with the busy timeout above: these two only have to
+        # outlast a refusal, but leaving them as literals while the busy timeout
+        # grows would invert `busy timeout < deadline` on a slow host and change
+        # which of the two ends the call.
         with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
-            service.dispatch(envelope, deadline=time.monotonic() + 1.0)
-        assert time.monotonic() - duplicate_started < _host(0.2)
+            service.dispatch(envelope, deadline=time.monotonic() + _host(1.0))
+        assert time.monotonic() - duplicate_started < refusal_guard_seconds
         assert provider.dispatch_calls == 1
     finally:
         provider.close()
 
     with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
-        service.dispatch(envelope, deadline=time.monotonic() + 1.0)
+        service.dispatch(envelope, deadline=time.monotonic() + _host(1.0))
     assert _ledger_row(tmp_path, request.operation_id)["status"] == "reconcile_required"
     assert provider.dispatch_calls == 1
 
@@ -2318,19 +2492,58 @@ def test_locked_unknown_fence_blocks_duplicates_and_reconciles_after_release(
 def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
     tmp_path: Path,
 ) -> None:
-    provider = _CountingProvider(sleep_dispatch_seconds=_host(0.08))
-    service, _keyring = _service(tmp_path, provider=provider, busy_timeout_ms=500)
+    # "After the deadline" used to be arithmetic - an 80ms provider sleep against
+    # a 40ms deadline - and arithmetic on two wall clock quantities is a race on
+    # a third, the prologue, that is in neither of them. On a 3.12 shard the
+    # prologue ate the 40ms and the case failed with `dispatch_calls == 0`: the
+    # provider was never reached, so nothing arrived after the deadline and the
+    # property was not exercised at all.
+    #
+    # Here the ordering is made, not hoped for. The provider blocks until this
+    # case releases it, so the deadline necessarily expires while the provider
+    # is still inside; the release happens only after that refusal has been
+    # observed, so the successful result it then produces is *by construction*
+    # late. The deadline's size stops mattering, which is what lets it be sized
+    # to survive the prologue instead of to lose a race with it.
+    late_result = threading.Event()
+    events: list[object] = []
+
+    def record(event: object) -> None:
+        events.append(event)
+        if getattr(event, "category", None) == "provider_late_outcome":
+            late_result.set()
+
+    provider = _BlockingProvider()
+    service, _keyring = _service(
+        tmp_path, provider=provider, busy_timeout_ms=500, event_sink=record
+    )
     request = _dispatch_request()
     claim = _claim(service, _claim_once_request(request))
     envelope = canonical_model_json_bytes(
         SourceBrokerV2DispatchEnvelope(request=request, claim_receipt=claim)
     )
 
-    with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.dispatch(
-            envelope,
-            deadline=time.monotonic() + _host(_PROVIDER_RACE_DEADLINE_SECONDS),
-        )
+    try:
+        with pytest.raises(SourceBrokerV2TransportDeadlineError, match="during provider dispatch"):
+            service.dispatch(
+                envelope,
+                deadline=time.monotonic() + _host(_BLOCKED_PROVIDER_DEADLINE_SECONDS),
+            )
+        assert provider.entered.is_set()
+    finally:
+        provider.release.set()
+    # The subject is a result that *arrived* late, so wait for it to actually
+    # arrive before asking what the service did with it. The old form asserted
+    # over a provider that was very likely still sleeping, which is how a case
+    # can pass without its subject ever existing. The budget is the provider's
+    # own derived cap: after the release the result is one function return away,
+    # so this is a hang guard, not a race.
+    assert late_result.wait(timeout=provider.block_seconds)
+    assert any(
+        getattr(event, "category", None) == "provider_late_outcome"
+        and getattr(event, "outcome", None) == "success"
+        for event in events
+    )
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=request.saga_id,
@@ -2344,7 +2557,7 @@ def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
     )
     assert replay.status is SourceBrokerV2ReplayStatus.UNKNOWN
     with pytest.raises(SourceBrokerTransportError, match="reconcile|required|unknown"):
-        service.dispatch(envelope, deadline=time.monotonic() + 1.0)
+        service.dispatch(envelope, deadline=time.monotonic() + _host(1.0))
     assert provider.dispatch_calls == 1
 
 

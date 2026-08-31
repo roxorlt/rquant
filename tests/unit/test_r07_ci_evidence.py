@@ -18,6 +18,7 @@ from tests.unit.test_signal_family_differential_gate import (
     _EvidenceBundle,
     _newest_non_merge_commit,
     _shared_clone,
+    _synthetic_merge_candidate,
 )
 from tests.unit.test_signal_family_differential_gate import (
     evidence_bundle as _evidence_bundle_fixture,
@@ -30,6 +31,7 @@ ROOT = Path(__file__).parents[2]
 PRODUCER_PATH = ROOT / "scripts" / "r07_ci_evidence.py"
 COMMIT_SHA = "a" * 40
 TREE_SHA = "b" * 40
+BEFORE_SHA = "e" * 40
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "ci.yml"
 
 
@@ -42,6 +44,7 @@ def _context(
         workflow_path=".github/workflows/ci.yml",
         event_name="push",
         ref="refs/heads/main",
+        event_before_sha=BEFORE_SHA,
         event_after_sha=COMMIT_SHA,
         checkout_sha=COMMIT_SHA,
         workflow_run_id=100,
@@ -223,6 +226,8 @@ def test_python_jobs_emit_strict_canonical_bound_summaries(
         ({"repository": "fork/rquant"}, "repository"),
         ({"workflow_path": ".github/workflows/other.yml"}, "workflow"),
         ({"event_after_sha": "c" * 40}, "after"),
+        ({"event_before_sha": "0" * 40}, "null commit"),
+        ({"event_before_sha": COMMIT_SHA}, "nothing was pushed"),
         ({"checkout_sha": "d" * 40}, "checkout"),
         ({"job_id": "matrix-job"}, "job"),
     ),
@@ -477,6 +482,8 @@ def test_push_main_without_a_merge_commit_produces_no_summary(tmp_path: Path) ->
         "push",
         "--ref",
         "refs/heads/main",
+        "--event-before-sha",
+        differential_gate.BASELINE_COMMIT_SHA,
         "--event-after-sha",
         commit,
         "--checkout-sha",
@@ -581,17 +588,13 @@ def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
     assert len(set(expected)) == len(expected)
     assert gate_execution.collected == gate_execution.passed == len(expected)
     assert gate_execution.skipped == gate_execution.deselected == 0
-    assert gate_execution.collected == ci_evidence.expected_gate_check_total(
-        gate_execution.policy
-    )
+    assert gate_execution.collected == ci_evidence.expected_gate_check_total(gate_execution.policy)
     assert gate_execution.collected != 20
     assert len(gate_execution.static_result.checks) == len(
         differential_gate.FIXED_STATIC_CHECK_NAMES
-    ) + len(
-        gate_execution.policy.root_snapshots
-    ) + len(gate_execution.policy.production_declarations) + len(
-        gate_execution.policy.boundary_probes
-    )
+    ) + len(gate_execution.policy.root_snapshots) + len(
+        gate_execution.policy.production_declarations
+    ) + len(gate_execution.policy.boundary_probes)
     assert len(gate_execution.boundary_results) == ci_evidence.BOUNDARY_PROBE_COUNT
 
 
@@ -663,3 +666,176 @@ def test_artifact_writer_rejects_a_bare_observation_wire(
         )
 
     assert not artifact_root.exists()
+
+
+def test_the_workflow_states_both_pull_request_endpoints_and_the_push_interval_start() -> None:
+    """These expressions can only be exercised by pushing the workflow, so pin them here.
+
+    ``github.sha`` on a pull request is the merge ref GitHub synthesizes, whose first parent
+    is the base tip; using it as the candidate would make the merge-base claim true for every
+    base and prove nothing. The pull request head has to be named explicitly, and so does the
+    push interval start, because neither is available under any other name at run time.
+    """
+
+    jobs = _workflow()["jobs"]
+    for job_id in ("r07-differential-gate-py311", "r07-differential-gate-py312"):
+        steps = jobs[job_id]["steps"]
+        validate = next(
+            step for step in steps if str(step.get("name", "")).startswith("Validate pull request")
+        )
+        assert "--event 'pull_request'" in validate["run"]
+        assert "--base-sha '${{ github.event.pull_request.base.sha }}'" in validate["run"]
+        assert "--candidate-sha '${{ github.event.pull_request.head.sha }}'" in validate["run"]
+        assert '--candidate-sha "${GITHUB_SHA}"' not in validate["run"]
+
+        produce = next(
+            step for step in steps if str(step.get("name", "")).startswith("Produce bound Python")
+        )
+        assert "--event-before-sha '${{ github.event.before }}'" in produce["run"]
+
+    aggregate = jobs["r07-differential-gate-evidence"]
+    summarize = next(
+        step for step in aggregate["steps"] if str(step.get("name", "")).startswith("Aggregate")
+    )
+    assert "--event-before-sha '${{ github.event.before }}'" in summarize["run"]
+
+    checkout = next(
+        step
+        for step in aggregate["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    # The same ref expression the two Python jobs use, so all three resolve identically.
+    assert checkout["with"]["ref"] == (
+        "${{ github.event_name == 'push' && github.event.after || github.sha }}"
+    )
+
+
+def test_a_push_whose_before_sha_is_not_the_first_parent_produces_no_summary(
+    tmp_path: Path,
+) -> None:
+    """A force-push or an out-of-order delivery makes GitHub's claim and Git disagree.
+
+    Only the first parent is a property of the commit itself, so it is what the interval
+    start is taken from; ``github.event.before`` is cross-checked against it rather than
+    trusted, and a disagreement is a refusal rather than a preference for one of them.
+    """
+
+    repo = _shared_clone(tmp_path / "before-mismatch")
+    candidate = _synthetic_merge_candidate(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "--no-deref", "HEAD", candidate],
+        check=True,
+        capture_output=True,
+    )
+    output = tmp_path / "summary.json"
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    def arguments(before: str) -> list[str]:
+        return [
+            "run-python",
+            "--repo",
+            str(repo),
+            "--python-minor",
+            minor,
+            "--output",
+            str(output),
+            "--repository",
+            "roxorlt/rquant",
+            "--workflow-path",
+            ".github/workflows/ci.yml",
+            "--event-name",
+            "push",
+            "--ref",
+            "refs/heads/main",
+            "--event-before-sha",
+            before,
+            "--event-after-sha",
+            candidate,
+            "--checkout-sha",
+            candidate,
+            "--workflow-run-id",
+            "100",
+            "--run-attempt",
+            "1",
+            "--job-id",
+            f"r07-differential-gate-py{minor.replace('.', '')}",
+            "--job-run-id",
+            "101",
+        ]
+
+    with pytest.raises(ValueError, match="before SHA is not the first parent"):
+        ci_evidence.main(arguments(differential_gate.HISTORICAL_BASELINE_COMMIT_SHA))
+    assert not output.exists()
+
+    with pytest.raises(ValueError, match="null commit"):
+        ci_evidence.main(arguments("0" * 40))
+    assert not output.exists()
+
+
+def test_the_pull_request_validation_states_its_base_or_refuses_to_run(tmp_path: Path) -> None:
+    """A missing base is a workflow expression that resolved to nothing, not a default.
+
+    There is no ref to read the pull request base back from inside the checkout - that is the
+    whole failure this replaces - so the only safe answer to an absent base is to stop.
+    """
+
+    commit, tree = _actual_identity()
+    base = [
+        "validate",
+        "--repo",
+        str(ROOT),
+        "--candidate-commit",
+        commit,
+        "--candidate-tree",
+        tree,
+        "--event",
+        "pull_request",
+    ]
+
+    with pytest.raises(ValueError, match="must state its base SHA"):
+        ci_evidence.main([*base, "--base-sha", "", "--candidate-sha", commit])
+    with pytest.raises(ValueError, match="lowercase 40-hex"):
+        ci_evidence.main([*base, "--base-sha", "origin/main", "--candidate-sha", commit])
+    with pytest.raises(SystemExit):
+        ci_evidence.main(
+            [
+                "validate",
+                "--repo",
+                str(ROOT),
+                "--candidate-commit",
+                commit,
+                "--candidate-tree",
+                tree,
+            ]
+        )
+
+
+def test_the_push_producer_reports_which_source_decided_the_baseline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same line on the path that actually produces deployable evidence.
+
+    ``run-python`` and ``aggregate`` both reach the resolver through
+    ``require_push_main_merge_provenance``, so the CI log records that the interval start came
+    from the pushed commit's own first parent and not from the branch-tip fallback, which is
+    refused inside GitHub Actions and would be a bug if it ever appeared here.
+    """
+
+    repo = _shared_clone(tmp_path / "push-summary")
+    candidate = _synthetic_merge_candidate(repo)
+
+    ci_evidence.require_push_main_merge_provenance(
+        repo,
+        candidate_commit=candidate,
+        event_before_sha=differential_gate.BASELINE_COMMIT_SHA,
+    )
+
+    lines = [
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("R07 baseline: ")
+    ]
+    assert len(lines) == 1
+    assert f"event=push base={differential_gate.BASELINE_COMMIT_SHA}" in lines[0]
+    assert f"candidate={candidate}" in lines[0]
+    assert "base_source=git_first_parent" in lines[0]
+    assert "frozen_baseline_fallback" not in lines[0]

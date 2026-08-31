@@ -2451,6 +2451,16 @@ class LabReportSpool(_TypedSpoolBase):
         with self._exclusive_lock():
             yield
 
+    @contextmanager
+    def try_evidence_lock(self) -> Iterator[bool]:
+        """Attempt the evidence lock without waiting; yield whether it was taken.
+
+        For callers that answer to a deadline of their own and therefore cannot
+        afford to park on a holder that may be reclaiming, migrating or scanning.
+        """
+        with self._exclusive_lock(blocking=False) as acquired:
+            yield acquired
+
     def pending_locked(self) -> tuple[LabReportSpoolEntry, ...]:
         paths = tuple(
             sorted(

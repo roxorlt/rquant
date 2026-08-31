@@ -26,6 +26,7 @@ from rquant.signal_family_differential_gate import (
     R07PolicyV1,
     R07StaticGateResult,
     VerifiedR07DrGateEvidenceV1,
+    baseline_resolution_summary,
     boundary_probe_results_digest,
     candidate_gate_digest,
     canonical_evidence_json_bytes,
@@ -34,6 +35,7 @@ from rquant.signal_family_differential_gate import (
     gate_check_inventory,
     load_policy,
     python_run_result_digest,
+    resolve_baseline_context,
     resolve_merge_provenance,
     static_gate_result_digest,
     verify_candidate_gate,
@@ -121,6 +123,7 @@ class GitHubRunContextV1(BaseModel):
     workflow_path: StrictStr
     event_name: StrictStr
     ref: StrictStr
+    event_before_sha: StrictStr = Field(pattern=_SHA1)
     event_after_sha: StrictStr = Field(pattern=_SHA1)
     checkout_sha: StrictStr = Field(pattern=_SHA1)
     workflow_run_id: StrictInt = Field(gt=0)
@@ -154,6 +157,10 @@ def _require_push_main_context(
         raise ValueError("R07 deployable evidence requires refs/heads/main")
     if context.event_after_sha != observed_commit_sha:
         raise ValueError("GitHub event after SHA does not match observed HEAD")
+    if context.event_before_sha == differential_gate.NULL_COMMIT_SHA:
+        raise ValueError("GitHub push before SHA is the null commit, so main was created or reset")
+    if context.event_before_sha == observed_commit_sha:
+        raise ValueError("GitHub push before SHA equals the pushed commit, so nothing was pushed")
     if context.checkout_sha != observed_commit_sha:
         raise ValueError("GitHub checkout SHA does not match observed HEAD")
     if context.job_id != expected_job_id:
@@ -164,6 +171,7 @@ def require_push_main_merge_provenance(
     repo: Path,
     *,
     candidate_commit: str,
+    event_before_sha: str | None = None,
 ) -> MergeProvenanceResult:
     """A push to main only produces evidence when the pushed commit is a two-parent merge.
 
@@ -175,12 +183,24 @@ def require_push_main_merge_provenance(
     later consumer. A squash, a rebase, or a fast-forward direct push has one parent and
     produces no evidence at all. This is a check on commit structure; it does not prove the
     merge was reviewed.
+
+    ``event_before_sha`` is GitHub's own claim about where this release interval starts. It is
+    cross-checked against the first parent rather than trusted as the start, because a
+    force-push or an out-of-order delivery can make the two disagree, and only the first
+    parent is a property of the commit itself and therefore replayable offline.
     """
 
+    resolution = resolve_baseline_context(
+        repo,
+        event="push",
+        candidate_sha=candidate_commit,
+        event_before_sha=event_before_sha,
+    )
+    print(baseline_resolution_summary(resolution), file=sys.stderr)
     return resolve_merge_provenance(
         repo,
-        candidate_commit=candidate_commit,
-        merge_base_commit=differential_gate.BASELINE_COMMIT_SHA,
+        candidate_commit=resolution.context.candidate_sha,
+        merge_base_commit=resolution.baseline_commit_sha,
     )
 
 
@@ -459,7 +479,11 @@ def aggregate_evidence_from_summaries(
         expected_job_id=_AGGREGATE_JOB,
         observed_commit_sha=commit,
     )
-    require_push_main_merge_provenance(repository, candidate_commit=commit)
+    require_push_main_merge_provenance(
+        repository,
+        candidate_commit=commit,
+        event_before_sha=context.event_before_sha,
+    )
     runs = validate_python_run_pair(
         context,
         (
@@ -499,6 +523,7 @@ def _context_from_args(args: argparse.Namespace) -> GitHubRunContextV1:
         workflow_path=args.workflow_path,
         event_name=args.event_name,
         ref=args.ref,
+        event_before_sha=args.event_before_sha,
         event_after_sha=args.event_after_sha,
         checkout_sha=args.checkout_sha,
         workflow_run_id=args.workflow_run_id,
@@ -513,6 +538,7 @@ def _add_context_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workflow-path", required=True)
     parser.add_argument("--event-name", required=True)
     parser.add_argument("--ref", required=True)
+    parser.add_argument("--event-before-sha", required=True)
     parser.add_argument("--event-after-sha", required=True)
     parser.add_argument("--checkout-sha", required=True)
     parser.add_argument("--workflow-run-id", required=True, type=int)
@@ -529,6 +555,9 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     validate.add_argument("--repo", required=True, type=Path)
     validate.add_argument("--candidate-commit", required=True)
     validate.add_argument("--candidate-tree", required=True)
+    validate.add_argument("--event", choices=("pull_request", "push"), required=True)
+    validate.add_argument("--base-sha", default=None)
+    validate.add_argument("--candidate-sha", default=None)
 
     run = commands.add_parser("run-python")
     run.add_argument("--repo", required=True, type=Path)
@@ -551,6 +580,19 @@ def main(arguments: list[str] | None = None) -> int:
     if args.command == "validate":
         if (args.candidate_commit, args.candidate_tree) != (commit, tree):
             raise ValueError("R07 validation candidate does not match checkout HEAD/tree")
+        # Two different commits on purpose. The merge-base claim is proved against the pull
+        # request's own head, because ``github.sha`` on a pull request is the merge ref
+        # GitHub synthesizes, whose first parent is the base tip - so a merge base taken
+        # against it equals the base for any base at all and proves nothing. The diff and
+        # tree work stays on the checkout, which is that merge ref: it is what main will
+        # look like after the merge, which is the thing the allowlist describes.
+        resolution = resolve_baseline_context(
+            repository,
+            event=args.event,
+            base_sha=args.base_sha,
+            candidate_sha=args.candidate_sha,
+        )
+        print(baseline_resolution_summary(resolution), file=sys.stderr)
         _execute_exact_gate(repository, candidate_commit=commit, candidate_tree=tree)
         return 0
     context = _context_from_args(args)
@@ -563,7 +605,11 @@ def main(arguments: list[str] | None = None) -> int:
             expected_job_id=_PYTHON_JOBS.get(args.python_minor, ""),
             observed_commit_sha=commit,
         )
-        require_push_main_merge_provenance(repository, candidate_commit=commit)
+        require_push_main_merge_provenance(
+            repository,
+            candidate_commit=commit,
+            event_before_sha=context.event_before_sha,
+        )
         execution = _execute_exact_gate(
             repository,
             candidate_commit=commit,
