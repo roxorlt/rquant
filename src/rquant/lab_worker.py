@@ -102,6 +102,7 @@ from rquant.runtime_resource_admission import (
     PersistentResourceReservationStore,
     RuntimeHealthAuthorityLiveSloProbeConfig,
     RuntimeHealthAuthorityWatermark,
+    RuntimeResourceAdmissionTransientError,
     RuntimeTradeCalendarSessionResolver,
     SystemResourceProbe,
 )
@@ -4784,6 +4785,8 @@ class LabWorker:
                     raise TimeoutError("resource admission recheck timed out") from exc
                 if isinstance(exc, LabDaemonConfigurationError):
                     raise
+                if isinstance(exc, RuntimeResourceAdmissionTransientError):
+                    raise
                 raise LabDaemonConfigurationError(
                     str(exc) or "resource reservation recheck failed"
                 ) from exc
@@ -5032,6 +5035,13 @@ class LabWorker:
                         "ResearchRunSpec deadline reached during resource reservation admission"
                     ) from exc
                 if isinstance(exc, LabDaemonConfigurationError):
+                    raise
+                # Losing a race for the reservation lock says nothing about how
+                # this worker is configured, so the typed transient refusal
+                # travels intact to a caller that can back off and try again.
+                # Folding it into a configuration fault is what took workers
+                # down for a competitor's commit (issue #159).
+                if isinstance(exc, RuntimeResourceAdmissionTransientError):
                     raise
                 raise LabDaemonConfigurationError(
                     str(exc) or "resource reservation admission failed"
@@ -6878,6 +6888,24 @@ class LabWorker:
                 validated.spec,
                 tick_deadline_microseconds=tick_deadline_microseconds,
             )
+        except RuntimeResourceAdmissionTransientError as exc:
+            contended_retry_at = _utc(self.clock()) + timedelta(
+                seconds=max(1, _microseconds_to_seconds(self.poll_interval_microseconds))
+            )
+            self._resource_retry_at[claim.claim_token] = contended_retry_at
+            _safe_structured_log(
+                "info",
+                "shard_resource_reservation_contended",
+                message="research shard stays pending until the reservation lock frees",
+                component="lab_worker",
+                worker_id=self.worker_id,
+                job_id=str(claim.job_id),
+                shard_id=str(claim.shard_id),
+                claim_token=str(claim.claim_token),
+                reason=str(exc),
+                retry_at=contended_retry_at.isoformat(),
+            )
+            return LabWorkerTickResult(status="idle")
         except (InterruptedError, TimeoutError) as exc:
             if isinstance(exc, TimeoutError):
                 if self._consume_selected_claim(entry) is None:

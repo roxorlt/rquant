@@ -95,6 +95,38 @@ class RuntimeResourceAdmissionError(RuntimeError):
     """The worker cannot establish a trustworthy admission decision."""
 
 
+class RuntimeResourceAdmissionTransientError(RuntimeResourceAdmissionError):
+    """Another writer held the reservation database; nothing is misconfigured.
+
+    Contention is operational state with a next attempt, so callers must route
+    it somewhere retryable.  Issue #159 came from the opposite: `lab_worker`
+    folded a lost race into a permanent configuration fault and took the whole
+    worker down with it.
+    """
+
+
+class RuntimeResourceAdmissionLockWaitTimeoutError(RuntimeResourceAdmissionTransientError):
+    """The bounded lock wait elapsed with a competing writer still committing."""
+
+
+class RuntimeResourceAdmissionCancelledError(RuntimeResourceAdmissionError):
+    """A caller-supplied stop authority abandoned the wait.
+
+    Deliberately not transient: the caller asked to stop, so retrying is the
+    wrong answer even though nothing is broken.
+    """
+
+
+def _reservation_failure(message: str, exc: BaseException) -> RuntimeResourceAdmissionError:
+    """Classify a raw SQLite failure: contended is retryable, the rest is not."""
+
+    if isinstance(exc, sqlite3.OperationalError):
+        detail = str(exc).lower()
+        if "locked" in detail or "busy" in detail:
+            return RuntimeResourceAdmissionTransientError(message)
+    return RuntimeResourceAdmissionError(message)
+
+
 _MAX_ACTIVE_RESOURCE_RESERVATIONS = 4_096
 _MAX_RESOURCE_LEASE_SECONDS = 3_600
 _MAX_RESOURCE_LOCK_WAIT_SECONDS = 1.0
@@ -287,7 +319,9 @@ class SQLiteResourceReservationStore:
         deadline = system_time.monotonic() + wait_seconds
         while True:
             if self._stop_requested(stop_requested):
-                raise RuntimeResourceAdmissionError("resource reservation lock wait cancelled")
+                raise RuntimeResourceAdmissionCancelledError(
+                    "resource reservation lock wait cancelled"
+                )
             try:
                 connection.execute("BEGIN IMMEDIATE")
             except sqlite3.OperationalError as exc:
@@ -295,11 +329,11 @@ class SQLiteResourceReservationStore:
                 if "locked" not in message and "busy" not in message:
                     raise
                 if self._stop_requested(stop_requested):
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionCancelledError(
                         "resource reservation lock wait cancelled"
                     ) from exc
                 if system_time.monotonic() >= deadline:
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionLockWaitTimeoutError(
                         "resource reservation lock wait timeout"
                     ) from exc
                 system_time.sleep(
@@ -311,7 +345,9 @@ class SQLiteResourceReservationStore:
                 continue
             if self._stop_requested(stop_requested):
                 connection.rollback()
-                raise RuntimeResourceAdmissionError("resource reservation lock wait cancelled")
+                raise RuntimeResourceAdmissionCancelledError(
+                    "resource reservation lock wait cancelled"
+                )
             return
 
     def _request_lock_wait_seconds(
@@ -549,7 +585,7 @@ class SQLiteResourceReservationStore:
                     ) from exc
                 remaining = deadline - system_time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionTransientError(
                         "resource reservation store initialization failed"
                     ) from exc
                 system_time.sleep(
@@ -953,7 +989,7 @@ class SQLiteResourceReservationStore:
                     )
                 raw_snapshot = snapshot_provider()
                 if self._stop_requested(stop_requested):
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionCancelledError(
                         "resource reservation admission cancelled after resource probe"
                     )
                 sampled_at = self._authority_now(connection)
@@ -1053,7 +1089,7 @@ class SQLiteResourceReservationStore:
                         operation="insert",
                     )
                 if self._stop_requested(stop_requested):
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionCancelledError(
                         "resource reservation admission cancelled before commit"
                     )
                 connection.commit()
@@ -1067,7 +1103,7 @@ class SQLiteResourceReservationStore:
         except RuntimeResourceAdmissionError:
             raise
         except (OSError, sqlite3.Error) as exc:
-            raise RuntimeResourceAdmissionError("resource reservation transaction failed") from exc
+            raise _reservation_failure("resource reservation transaction failed", exc) from exc
 
     def active_leases(self) -> tuple[ResourceReservationLease, ...]:
         try:
@@ -1086,7 +1122,7 @@ class SQLiteResourceReservationStore:
         except RuntimeResourceAdmissionError:
             raise
         except (OSError, sqlite3.Error) as exc:
-            raise RuntimeResourceAdmissionError("resource reservation read failed") from exc
+            raise _reservation_failure("resource reservation read failed", exc) from exc
 
     def recheck(
         self,
@@ -1166,7 +1202,7 @@ class SQLiteResourceReservationStore:
                 self._delete_expired(connection, now=now)
                 raw_snapshot = snapshot_provider()
                 if self._stop_requested(stop_requested):
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionCancelledError(
                         "resource reservation recheck cancelled after resource probe"
                     )
                 sampled_at = self._authority_now(connection)
@@ -1188,7 +1224,7 @@ class SQLiteResourceReservationStore:
                 if is_idempotent_retry:
                     decision = self._admitted_decision(adjusted_snapshot)
                     if self._stop_requested(stop_requested):
-                        raise RuntimeResourceAdmissionError(
+                        raise RuntimeResourceAdmissionCancelledError(
                             "resource reservation recheck cancelled before commit"
                         )
                     connection.commit()
@@ -1233,7 +1269,7 @@ class SQLiteResourceReservationStore:
                             "resource reservation expired before renewal commit"
                         )
                     if self._stop_requested(stop_requested):
-                        raise RuntimeResourceAdmissionError(
+                        raise RuntimeResourceAdmissionCancelledError(
                             "resource reservation recheck cancelled before renewal"
                         )
                     renewed = ResourceReservationLease(
@@ -1276,7 +1312,7 @@ class SQLiteResourceReservationStore:
                         operation="renewal",
                     )
                 if self._stop_requested(stop_requested):
-                    raise RuntimeResourceAdmissionError(
+                    raise RuntimeResourceAdmissionCancelledError(
                         "resource reservation recheck cancelled before commit"
                     )
                 connection.commit()
@@ -1290,7 +1326,7 @@ class SQLiteResourceReservationStore:
         except RuntimeResourceAdmissionError:
             raise
         except (OSError, sqlite3.Error) as exc:
-            raise RuntimeResourceAdmissionError("resource reservation recheck failed") from exc
+            raise _reservation_failure("resource reservation recheck failed", exc) from exc
 
     def release(
         self,
@@ -1344,7 +1380,7 @@ class SQLiteResourceReservationStore:
         except RuntimeResourceAdmissionError:
             raise
         except (OSError, sqlite3.Error) as exc:
-            raise RuntimeResourceAdmissionError("resource reservation release failed") from exc
+            raise _reservation_failure("resource reservation release failed", exc) from exc
 
 
 PersistentResourceReservationStore = SQLiteResourceReservationStore

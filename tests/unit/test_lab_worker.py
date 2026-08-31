@@ -3932,6 +3932,72 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
     assert reservation_lock_bound > 0.05
 
 
+@pytest.mark.parametrize("refusal", ("contention", "contract"))
+def test_worker_separates_reservation_contention_from_configuration_faults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+) -> None:
+    """A lost race must not read as a permanent configuration fault.
+
+    `run_forever` has no handler above `run_once`, so folding transient
+    contention into `LabDaemonConfigurationError` took the worker down for the
+    duration of somebody else's commit (issue #159).  A real contract failure
+    still has to end the same way it always did.
+    """
+    from rquant.runtime_resource_admission import (
+        RuntimeResourceAdmissionError,
+        RuntimeResourceAdmissionLockWaitTimeoutError,
+        SQLiteResourceReservationStore,
+    )
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claims.publish(claim)
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+
+    def refusing_reserve(**_kwargs: object):
+        if refusal == "contention":
+            raise RuntimeResourceAdmissionLockWaitTimeoutError(
+                "resource reservation lock wait timeout"
+            )
+        raise RuntimeResourceAdmissionError("resource reservation schema identity mismatch")
+
+    monkeypatch.setattr(store, "reserve", refusing_reserve)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    if refusal == "contract":
+        with pytest.raises(LabDaemonConfigurationError, match="schema identity mismatch"):
+            worker.run_once()
+        assert registry.executions == 0
+        return
+
+    result = worker.run_once()
+
+    assert result.status == "idle"
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+    assert worker._active_resource_reservation is None
+    # The claim survives the contended tick and is backed off, not consumed.
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+    assert worker._resource_retry_at[claim.claim_token] > NOW
+    assert reports.pending() == ()
+
+
 def test_initial_resource_rejection_is_a_hard_gate_before_adapter_execution(
     tmp_path: Path,
 ) -> None:

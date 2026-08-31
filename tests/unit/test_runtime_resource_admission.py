@@ -2112,6 +2112,81 @@ def test_reservation_lock_wait_cancels_inside_a_winner_commit_window(
     assert tuple(lease.identity for lease in reader_store.active_leases()) == (winner_identity,)
 
 
+def test_reservation_refusals_separate_transient_contention_from_broken_contracts(
+    tmp_path: Path,
+) -> None:
+    """Contention, cancellation and a broken contract are three different answers.
+
+    Only the first is worth retrying, and issue #159 came from a caller that
+    could not tell them apart because they all arrived as the same base class.
+    """
+    from rquant.runtime_resource_admission import (
+        RuntimeResourceAdmissionCancelledError,
+        RuntimeResourceAdmissionError,
+        RuntimeResourceAdmissionLockWaitTimeoutError,
+        RuntimeResourceAdmissionTransientError,
+        SQLiteResourceReservationStore,
+    )
+
+    assert issubclass(RuntimeResourceAdmissionTransientError, RuntimeResourceAdmissionError)
+    assert issubclass(
+        RuntimeResourceAdmissionLockWaitTimeoutError,
+        RuntimeResourceAdmissionTransientError,
+    )
+    assert issubclass(RuntimeResourceAdmissionCancelledError, RuntimeResourceAdmissionError)
+    assert not issubclass(
+        RuntimeResourceAdmissionCancelledError,
+        RuntimeResourceAdmissionTransientError,
+    )
+
+    database_path = tmp_path / "resource-reservations.sqlite3"
+    store = SQLiteResourceReservationStore(database_path, clock=lambda: _RESERVATION_NOW)
+    identity = _reservation_identity("worker-typed-refusal", 6)
+    stopped = threading.Event()
+    stopped.set()
+    holder = sqlite3.connect(database_path, isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(RuntimeResourceAdmissionLockWaitTimeoutError) as contended:
+            store.reserve(
+                identity=identity,
+                request=_reservation_request(identity),
+                policy=_reservation_policy(),
+                snapshot_provider=_reservation_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=_LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS,
+            )
+        with pytest.raises(RuntimeResourceAdmissionCancelledError) as cancelled:
+            store.reserve(
+                identity=identity,
+                request=_reservation_request(identity),
+                policy=_reservation_policy(),
+                snapshot_provider=_reservation_snapshot,
+                lease_seconds=30,
+                stop_requested=stopped.is_set,
+            )
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert str(contended.value) == "resource reservation lock wait timeout"
+    assert isinstance(contended.value, RuntimeResourceAdmissionTransientError)
+    assert not isinstance(cancelled.value, RuntimeResourceAdmissionTransientError)
+
+    mismatched = _reservation_identity("worker-typed-mismatch", 7)
+    with pytest.raises(RuntimeResourceAdmissionError) as contract:
+        store.reserve(
+            identity=identity,
+            request=_reservation_request(mismatched),
+            policy=_reservation_policy(),
+            snapshot_provider=_reservation_snapshot,
+            lease_seconds=30,
+        )
+
+    assert not isinstance(contract.value, RuntimeResourceAdmissionTransientError)
+    assert store.active_leases() == ()
+
+
 def test_reserve_retry_returns_same_authoritative_lease_and_rejects_conflict(
     tmp_path: Path,
 ) -> None:
