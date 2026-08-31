@@ -92,24 +92,32 @@ def _compete_for_resource_reservation(
     barrier: object,
     outcomes: object,
 ) -> None:
+    import traceback
     from pathlib import Path
 
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
-    identity = _reservation_identity(worker_id, attempt_digit)
-    store = SQLiteResourceReservationStore(
-        Path(database_path),
-        clock=lambda: _RESERVATION_NOW,
-    )
-    barrier.wait(timeout=5)
-    result = store.reserve(
-        identity=identity,
-        request=_reservation_request(identity),
-        policy=_reservation_policy(),
-        snapshot_provider=_reservation_snapshot,
-        lease_seconds=30,
-    )
-    outcomes.put((worker_id, result.decision.outcome.value, result.lease is not None))
+    try:
+        identity = _reservation_identity(worker_id, attempt_digit)
+        store = SQLiteResourceReservationStore(
+            Path(database_path),
+            clock=lambda: _RESERVATION_NOW,
+        )
+        barrier.wait(timeout=5)
+        result = store.reserve(
+            identity=identity,
+            request=_reservation_request(identity),
+            policy=_reservation_policy(),
+            snapshot_provider=_reservation_snapshot,
+            lease_seconds=30,
+        )
+    except BaseException as exc:  # noqa: BLE001 - carried back to the parent
+        # An exit code alone tells the parent nothing, and the child's
+        # traceback never reaches JUnit; without this the capacity fence
+        # assertions read as an unattributable flake.
+        outcomes.put((worker_id, f"raised {type(exc).__name__}", False, traceback.format_exc()))
+        raise
+    outcomes.put((worker_id, result.decision.outcome.value, result.lease is not None, None))
 
 
 def _reserve_resource_then_crash(database_path: str, marker_path: str) -> None:
@@ -1249,8 +1257,13 @@ def test_cross_process_resource_reservation_admits_exactly_one_last_capacity_con
         for process in processes:
             process.join(10)
 
-        assert [process.exitcode for process in processes] == [0, 0]
-        results = sorted(outcomes.get(timeout=1) for _ in processes)
+        results = sorted(outcomes.get(timeout=5) for _ in processes)
+        # The contender's own traceback first, so a refused contender never
+        # reaches the fence assertions as a bare `[1, 0] == [0, 0]`.
+        assert not [result[3] for result in results if result[3] is not None], "\n".join(
+            result[3] for result in results if result[3] is not None
+        )
+        assert [process.exitcode for process in processes] == [0, 0], results
         assert sorted(result[1] for result in results) == ["admitted", "deferred"]
         assert sum(result[2] for result in results) == 1
     finally:
