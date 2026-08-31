@@ -3853,7 +3853,15 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from rquant.lab_worker import (
+        _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS,
+        _microseconds_to_seconds,
+    )
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    reservation_lock_bound = _microseconds_to_seconds(
+        _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS
+    )
 
     spec = _nshape_compare_spec(hold_days=(1,))
     claim = _short_claim_for_spec(spec)
@@ -3866,7 +3874,9 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
     )
     original_reserve = store.reserve
     original_recheck = store.recheck
+    original_release = store.release
     observed: list[tuple[str, float, bool]] = []
+    released: list[float] = []
 
     def checked_reserve(**kwargs: object):
         stop_requested = kwargs["stop_requested"]
@@ -3884,8 +3894,15 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
         observed.append(("recheck", timeout, stop_requested()))
         return original_recheck(**kwargs)
 
+    def checked_release(*args: object, **kwargs: object):
+        timeout = kwargs["lock_wait_timeout_seconds"]
+        assert isinstance(timeout, float)
+        released.append(timeout)
+        return original_release(*args, **kwargs)
+
     monkeypatch.setattr(store, "reserve", checked_reserve)
     monkeypatch.setattr(store, "recheck", checked_recheck)
+    monkeypatch.setattr(store, "release", checked_release)
     worker = _worker(
         tmp_path,
         registry=SlowPidRegistry(
@@ -3905,8 +3922,135 @@ def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
 
     assert result.status == "succeeded"
     assert {operation for operation, _timeout, _stopped in observed} == {"reserve", "recheck"}
-    assert all(0 < timeout <= 0.05 for _operation, timeout, _stopped in observed)
+    # Every reservation call is capped by the store's own lock bound and then
+    # narrowed again by whatever is left of the tick and spec deadlines.
+    assert all(0 < timeout <= reservation_lock_bound for _operation, timeout, _stopped in observed)
     assert all(not stopped for _operation, _timeout, stopped in observed)
+    # The release path has no caller deadline to narrow it, so it carries the
+    # bound itself - which issue #159 left as a bare 50ms literal.
+    assert released == [pytest.approx(reservation_lock_bound)]
+    assert reservation_lock_bound > 0.05
+
+
+@pytest.mark.parametrize("refusal", ("contention", "contract"))
+def test_worker_separates_reservation_contention_from_configuration_faults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+) -> None:
+    """A lost race must not read as a permanent configuration fault.
+
+    `run_forever` has no handler above `run_once`, so folding transient
+    contention into `LabDaemonConfigurationError` took the worker down for the
+    duration of somebody else's commit (issue #159).  A real contract failure
+    still has to end the same way it always did.
+    """
+    from rquant.runtime_resource_admission import (
+        RuntimeResourceAdmissionError,
+        RuntimeResourceAdmissionLockWaitTimeoutError,
+        SQLiteResourceReservationStore,
+    )
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claims.publish(claim)
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+
+    def refusing_reserve(**_kwargs: object):
+        if refusal == "contention":
+            raise RuntimeResourceAdmissionLockWaitTimeoutError(
+                "resource reservation lock wait timeout"
+            )
+        raise RuntimeResourceAdmissionError("resource reservation schema identity mismatch")
+
+    monkeypatch.setattr(store, "reserve", refusing_reserve)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    if refusal == "contract":
+        with pytest.raises(LabDaemonConfigurationError, match="schema identity mismatch"):
+            worker.run_once()
+        assert registry.executions == 0
+        return
+
+    result = worker.run_once()
+
+    assert result.status == "idle"
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+    assert worker._active_resource_reservation is None
+    # The claim survives the contended tick and is backed off, not consumed.
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+    assert worker._resource_retry_at[claim.claim_token] > NOW
+    assert reports.pending() == ()
+
+
+def test_worker_recheck_contention_fails_the_shard_without_a_configuration_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-execution contention is a shard outcome, not a broken deployment.
+
+    The recheck dispatch folded the same transient refusal into
+    `LabDaemonConfigurationError`, and that one is re-raised out of the tick
+    (`lab_worker.py`'s resource-error triage), so a lost race during execution
+    also killed the worker.
+    """
+    from rquant.runtime_resource_admission import (
+        RuntimeResourceAdmissionLockWaitTimeoutError,
+        SQLiteResourceReservationStore,
+    )
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    rechecks: list[int] = []
+
+    def contended_recheck(**_kwargs: object):
+        rechecks.append(1)
+        raise RuntimeResourceAdmissionLockWaitTimeoutError("resource reservation lock wait timeout")
+
+    monkeypatch.setattr(store, "recheck", contended_recheck)
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(
+            pid_path=tmp_path / "contended-recheck-child.pid",
+            delay_seconds=0.12,
+        ),
+        claims=claims,
+        reports=reports,
+        resource_recheck_interval_seconds=0.02,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert rechecks
+    assert result.status == "failed"
+    assert store.active_leases() == ()
+    assert worker._active_resource_reservation is None
 
 
 def test_initial_resource_rejection_is_a_hard_gate_before_adapter_execution(
