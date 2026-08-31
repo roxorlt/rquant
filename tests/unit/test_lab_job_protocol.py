@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Thread
+from typing import NamedTuple
 from uuid import UUID, uuid4
 
 import pytest
@@ -1970,8 +1971,17 @@ def test_replaced_spool_lock_cannot_create_parallel_mutation_authority(
     assert len(second.pending()) == 1
 
 
-def _lock_authority_state(spool: LabCommandSpool) -> tuple[object, ...]:
-    """The four fields a taken hold binds, reduced to comparable values.
+class _LockAuthorityState(NamedTuple):
+    """The four fields a taken hold binds, named so a mismatch says which moved."""
+
+    descriptor: int | None
+    parent_descriptor: int | None
+    root_descriptor: int | None
+    identity: tuple[int, int] | None
+
+
+def _lock_authority_state(spool: LabCommandSpool) -> _LockAuthorityState:
+    """Read the four fields off a spool, reduced to comparable values.
 
     ``_active_lock_identity`` is an ``os.stat_result``; comparing the whole
     structure would drag in timestamps, so only the pair that names the file is
@@ -1979,11 +1989,11 @@ def _lock_authority_state(spool: LabCommandSpool) -> tuple[object, ...]:
     """
 
     identity = spool._active_lock_identity
-    return (
-        spool._active_lock_descriptor,
-        spool._active_lock_parent_descriptor,
-        spool._active_root_descriptor,
-        None if identity is None else (identity.st_dev, identity.st_ino),
+    return _LockAuthorityState(
+        descriptor=spool._active_lock_descriptor,
+        parent_descriptor=spool._active_lock_parent_descriptor,
+        root_descriptor=spool._active_root_descriptor,
+        identity=None if identity is None else (identity.st_dev, identity.st_ino),
     )
 
 
@@ -2047,7 +2057,7 @@ def test_a_refused_thread_half_leaves_another_threads_hold_bound(tmp_path: Path)
     spool = LabCommandSpool(tmp_path / "commands")
     holder_bound = Barrier(2)
     refusal_observed = Barrier(2)
-    holder_state: list[tuple[object, ...]] = []
+    holder_state: list[_LockAuthorityState] = []
     holder_failures: list[Exception] = []
 
     def hold() -> None:
@@ -2067,12 +2077,19 @@ def test_a_refused_thread_half_leaves_another_threads_hold_bound(tmp_path: Path)
         holder_bound.wait(timeout=30)
         bound = holder_state[0]
         assert all(field is not None for field in bound)
+        # The holder is parked on a barrier and opens nothing while it waits, so a
+        # process-wide count is a deterministic sample of what this thread holds.
+        before = _open_descriptor_count()
 
         with spool._exclusive_lock(blocking=False) as acquired:
             assert acquired is False
             assert _lock_authority_state(spool) == bound
+            # This refusal is denied before either descriptor is opened, so unlike
+            # the flock half it must not even have probed the filesystem.
+            assert _open_descriptor_count() == before
 
         assert _lock_authority_state(spool) == bound
+        assert _open_descriptor_count() == before
     finally:
         with suppress(BrokenBarrierError):
             refusal_observed.wait(timeout=30)
