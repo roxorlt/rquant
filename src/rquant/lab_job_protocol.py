@@ -394,6 +394,12 @@ class LabCommandSpool:
         if not self._thread_lock.acquire(blocking=blocking):
             yield False
             return
+        # A refusal must not be answered from inside the generator's try blocks: a
+        # `@contextmanager` suspends at its `yield`, so a `finally` that releases
+        # runs only once the caller has already left the False body. The refusal is
+        # recorded here and yielded after both `finally` clauses have run, which is
+        # what makes the docstring's "released before yielding False" true.
+        refused = False
         try:
             parent_descriptor = self._open_lock_parent()
             descriptor = -1
@@ -407,18 +413,18 @@ class LabCommandSpool:
                     try:
                         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
-                        yield False
-                        return
-                held = True
-                active_lock = os.fstat(descriptor)
-                self._active_lock_parent_descriptor = parent_descriptor
-                self._active_lock_descriptor = descriptor
-                self._active_lock_identity = active_lock
-                if require_root:
-                    root_descriptor = self._open_private_root()
-                    self._active_root_descriptor = root_descriptor
-                    self._assert_managed_directories_bound()
-                yield True
+                        refused = True
+                if not refused:
+                    held = True
+                    active_lock = os.fstat(descriptor)
+                    self._active_lock_parent_descriptor = parent_descriptor
+                    self._active_lock_descriptor = descriptor
+                    self._active_lock_identity = active_lock
+                    if require_root:
+                        root_descriptor = self._open_private_root()
+                        self._active_root_descriptor = root_descriptor
+                        self._assert_managed_directories_bound()
+                    yield True
             finally:
                 # Only a hold that was actually taken owns this state; a refused
                 # attempt must not clear what an enclosing hold established.
@@ -436,6 +442,8 @@ class LabCommandSpool:
                 os.close(parent_descriptor)
         finally:
             self._thread_lock.release()
+        if refused:
+            yield False
 
     def _fsync_directory(self, path: Path) -> None:
         descriptor = self._open_managed_directory(path)
