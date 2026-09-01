@@ -1328,6 +1328,35 @@ def test_lock_wait_budget_is_validated_by_the_closed_request_contract() -> None:
         _decode(truncated, model=ResourceAuthorityAdapterRequest, label="legacy request")
 
 
+def test_error_kind_is_derived_from_typed_classes_and_restored_as_one() -> None:
+    """The retry semantics survive the wire without a message or sqlite code."""
+
+    from rquant.lab_resource_authority_adapter import _authority_error_kind, _remote_refusal
+
+    assert (
+        _authority_error_kind(RuntimeResourceAdmissionLockWaitTimeoutError("x"))
+        == "lock_wait_timeout"
+    )
+    assert _authority_error_kind(RuntimeResourceAdmissionTransientError("x")) == "transient"
+    assert _authority_error_kind(RuntimeResourceAdmissionCancelledError("x")) == "cancelled"
+    assert _authority_error_kind(RuntimeResourceAdmissionError("x")) == "contract"
+    assert _authority_error_kind(ValueError("x")) == "contract"
+
+    lock_wait = _remote_refusal("lock_wait_timeout")
+    assert isinstance(lock_wait, RuntimeResourceAdmissionLockWaitTimeoutError)
+    transient = _remote_refusal("transient")
+    assert isinstance(transient, RuntimeResourceAdmissionTransientError)
+    assert not isinstance(transient, RuntimeResourceAdmissionLockWaitTimeoutError)
+    cancelled = _remote_refusal("cancelled")
+    assert isinstance(cancelled, RuntimeResourceAdmissionCancelledError)
+    # A stop is not a lost race: retrying it is the wrong answer.
+    assert not isinstance(cancelled, RuntimeResourceAdmissionTransientError)
+    for absent in ("contract", None):
+        refusal = _remote_refusal(absent)
+        assert type(refusal) is ResourceAuthorityAdapterRemoteError
+        assert not isinstance(refusal, RuntimeResourceAdmissionError)
+
+
 def test_lock_wait_budget_ceiling_matches_the_store() -> None:
     """The wire ceiling is the store's own ceiling, so a request can only shorten."""
 
