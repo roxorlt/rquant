@@ -3998,6 +3998,56 @@ def test_worker_separates_reservation_contention_from_configuration_faults(
     assert reports.pending() == ()
 
 
+def test_worker_backs_off_when_the_real_authority_socket_is_contended(
+    tmp_path: Path,
+) -> None:
+    """Production reserves through the socket adapter, not a direct store.
+
+    A lost race inside the remote authority used to come back as
+    `ResourceAuthorityAdapterRemoteError` and got folded into
+    `LabDaemonConfigurationError`, so a competitor's commit still took the
+    worker down through the topology that actually ships (RQ-CTB-P1-01).
+    """
+    from rquant.lab_resource_authority_adapter import LabResourceAuthorityReservationAdapter
+    from tests.unit.test_lab_resource_authority_adapter import _LockingPolicyProvider, _Server
+
+    authority_root = tmp_path / "authority"
+    authority_root.mkdir(mode=0o700)
+    gate = _LockingPolicyProvider(authority_root / "resource.sqlite3")
+    server = _Server(authority_root, timeout_milliseconds=5_000, policy_provider=gate)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claims.publish(claim)
+    registry = RecordingRegistry()
+    try:
+        worker = _worker(
+            tmp_path,
+            claims=claims,
+            reports=reports,
+            registry=registry,
+            resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+            admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+            resource_reservation_store=LabResourceAuthorityReservationAdapter(server.configuration),
+            require_resource_admission=True,
+        )
+        gate.armed = True
+
+        result = worker.run_once()
+
+        assert gate.locked.is_set()
+        assert result.status == "idle"
+        assert registry.executions == 0
+        assert worker._active_resource_reservation is None
+        # The claim survives the contended tick and is backed off, not consumed.
+        assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+        assert worker._resource_retry_at[claim.claim_token] > NOW
+        assert reports.pending() == ()
+    finally:
+        gate.close()
+        server.close()
+
+
 def test_worker_recheck_contention_fails_the_shard_without_a_configuration_fault(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

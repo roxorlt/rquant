@@ -7,21 +7,27 @@ import hmac
 import multiprocessing
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 
 from rquant.lab_resource_authority_adapter import (
     LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
     LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
     LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
     RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES,
+    RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS,
     ExternalResourceJournalMonotonicRootAdapter,
     ExternalResourceJournalRootConfig,
     LabResourceAuthorityReservationAdapter,
@@ -38,7 +44,10 @@ from rquant.lab_resource_authority_adapter import (
     _decode,
     _encode,
     _operation_id,
+    _recv_frame,
+    _reservation_shell,
     _secure_socket_path,
+    _send_frame,
     compose_production_resource_authority_socket_server,
 )
 from rquant.resource_admission import (
@@ -62,7 +71,10 @@ from rquant.runtime_resource_admission import (
     RESOURCE_OPERATION_KEY_PURPOSE,
     ClosedResourceOperationKeyring,
     ResourceOperationReceipt,
+    RuntimeResourceAdmissionCancelledError,
     RuntimeResourceAdmissionError,
+    RuntimeResourceAdmissionLockWaitTimeoutError,
+    RuntimeResourceAdmissionTransientError,
     SQLiteResourceAdmissionAuthority,
 )
 from rquant.strict_json import (
@@ -252,7 +264,14 @@ def _request(identity: ResourceReservationIdentity) -> AdmissionRequest:
 
 
 class _Server:
-    def __init__(self, tmp_path: Path, *, filename: str = "resource.sqlite3") -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        filename: str = "resource.sqlite3",
+        timeout_milliseconds: int = 1_000,
+        policy_provider: Callable[[], AdmissionPolicy] = _policy,
+    ) -> None:
         tmp_path.chmod(0o700)
         socket_parent = Path(__file__).resolve().parents[2] / ".s"
         socket_parent.mkdir(parents=True, exist_ok=True)
@@ -280,12 +299,12 @@ class _Server:
             expected_gid=os.getgid(),
             authority_id=self.authority.authority_id,
             trusted_role_inventory_hash=self.inventory.policy_hash,
-            timeout_milliseconds=1_000,
+            timeout_milliseconds=timeout_milliseconds,
         )
         self.server = ResourceAuthorityJournalSocketServer(
             configuration=self.configuration,
             authority=self.authority,
-            policy_provider=_policy,
+            policy_provider=policy_provider,
             snapshot_provider=_snapshot,
         )
         self.listener = self.server.bind()
@@ -1071,5 +1090,461 @@ def test_tamper_unknown_duplicate_nan_and_oversize_frames_fail_closed(tmp_path: 
                 model=ResourceAuthorityAdapterRequest,
                 label="oversize",
             )
+    finally:
+        server.close()
+
+
+@contextmanager
+def _authority_write_lock(authority: SQLiteResourceAdmissionAuthority) -> Iterator[None]:
+    """Hold the authority's real SQLite write lock for the duration of the block."""
+
+    holder = sqlite3.connect(authority.path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        with suppress(sqlite3.Error):  # the lock was never taken
+            holder.execute("ROLLBACK")
+        holder.close()
+
+
+class _LockingPolicyProvider:
+    """Take the write lock exactly when the server enters a mutation.
+
+    ``_handle`` resolves the policy before it calls the authority, so arming
+    this seam pins the contention inside ``reserve``/``recheck`` itself - after
+    the adapter's recovery lookup already succeeded - with no timing race.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.armed = False
+        self.locked = threading.Event()
+        self._holder: sqlite3.Connection | None = None
+
+    def __call__(self) -> AdmissionPolicy:
+        if self.armed and self._holder is None:
+            holder = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+            holder.execute("BEGIN IMMEDIATE")
+            self._holder = holder
+            self.locked.set()
+        return _policy()
+
+    def close(self) -> None:
+        holder = self._holder
+        self._holder = None
+        if holder is not None:
+            with suppress(sqlite3.Error):  # already rolled back
+                holder.execute("ROLLBACK")
+            holder.close()
+
+
+def _record_handled(server: _Server) -> list[ResourceAuthorityAdapterRequest]:
+    seen: list[ResourceAuthorityAdapterRequest] = []
+    original = server.server._handle
+
+    def recording(
+        request: ResourceAuthorityAdapterRequest,
+    ) -> ResourceAuthorityAdapterResponse:
+        seen.append(request)
+        return original(request)
+
+    server.server._handle = recording  # type: ignore[method-assign]
+    return seen
+
+
+def _raw_round_trip(
+    server: _Server,
+    request: ResourceAuthorityAdapterRequest,
+    *,
+    timeout_seconds: float = 10.0,
+) -> ResourceAuthorityAdapterResponse:
+    """Speak the wire directly so the server's own classification is observable."""
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout_seconds)
+        connection.connect(str(server.configuration.endpoint))
+        _send_frame(connection, _encode(request))
+        raw = _recv_frame(connection, label="raw resource authority response")
+    decoded = _decode(raw, model=ResourceAuthorityAdapterResponse, label="raw response")
+    assert isinstance(decoded, ResourceAuthorityAdapterResponse)
+    return decoded
+
+
+def _reserve_wire_request(
+    identity: ResourceReservationIdentity,
+    request: AdmissionRequest,
+    **overrides: object,
+) -> ResourceAuthorityAdapterRequest:
+    return ResourceAuthorityAdapterRequest(
+        operation="reserve",
+        operation_id=_operation_id(operation="reserve", identity=identity, prior=None),
+        identity=identity,
+        admission_request=request,
+        lease=_reservation_shell(identity=identity, request=request),
+        lease_seconds=30,
+        **overrides,
+    )
+
+
+def test_adapter_reserve_stops_at_the_callers_remaining_lock_wait_budget(
+    tmp_path: Path,
+) -> None:
+    """20ms of caller budget must not turn into a full 1000ms socket wait.
+
+    The adapter used to open with ``del lock_wait_timeout_seconds``, so the
+    caller's remaining tick/deadline budget never reached either the socket or
+    the authority (issue #159 / RQ-CTB-P1-01).
+    """
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        with _authority_write_lock(server.authority):
+            started = time.monotonic()
+            with pytest.raises(RuntimeResourceAdmissionTransientError) as caught:
+                adapter.reserve(
+                    identity=identity,
+                    request=request,
+                    policy=_policy(),
+                    snapshot_provider=_snapshot,
+                    lease_seconds=30,
+                    lock_wait_timeout_seconds=0.02,
+                )
+            elapsed = time.monotonic() - started
+        assert isinstance(caught.value, RuntimeResourceAdmissionLockWaitTimeoutError)
+        assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 2
+        assert server.authority.active_leases() == ()
+    finally:
+        server.close()
+
+
+def test_adapter_recheck_stops_at_the_callers_remaining_lock_wait_budget(
+    tmp_path: Path,
+) -> None:
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        with _authority_write_lock(server.authority):
+            started = time.monotonic()
+            with pytest.raises(RuntimeResourceAdmissionTransientError) as caught:
+                adapter.recheck(
+                    lease=admitted.lease,
+                    identity=identity,
+                    request=request,
+                    policy=_policy(),
+                    snapshot_provider=_snapshot,
+                    lease_seconds=30,
+                    lock_wait_timeout_seconds=0.02,
+                )
+            elapsed = time.monotonic() - started
+        assert isinstance(caught.value, RuntimeResourceAdmissionLockWaitTimeoutError)
+        assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 2
+    finally:
+        server.close()
+
+
+def test_contended_authority_keeps_transient_contention_typed_on_the_wire(
+    tmp_path: Path,
+) -> None:
+    """The server must publish a structured retryable kind, not a bare refusal.
+
+    ``error_code`` alone collapsed a lost race and a broken contract into one
+    ``ResourceAuthorityAdapterRemoteError``, which ``lab_worker`` then folded
+    into ``LabDaemonConfigurationError``.
+    """
+
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        wire_request = _reserve_wire_request(
+            identity,
+            request,
+            lock_wait_timeout_milliseconds=20,
+        )
+        with _authority_write_lock(server.authority):
+            started = time.monotonic()
+            response = _raw_round_trip(server, wire_request)
+            elapsed = time.monotonic() - started
+        assert response.error_code == "authority"
+        assert response.error_kind == "lock_wait_timeout"
+        assert response.result is None
+        assert elapsed < 0.5
+        assert server.authority.active_leases() == ()
+    finally:
+        server.close()
+
+
+def test_authority_serves_a_request_that_carries_no_lock_wait_budget(
+    tmp_path: Path,
+) -> None:
+    """The new field is optional: an unset budget keeps the server's own default."""
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        wire_request = _reserve_wire_request(identity, request)
+        assert wire_request.lock_wait_timeout_milliseconds is None
+        response = _raw_round_trip(server, wire_request)
+        assert response.error_code is None
+        assert response.error_kind is None
+        assert response.result is not None
+        assert response.result.lease is not None
+    finally:
+        server.close()
+
+
+def test_lock_wait_budget_is_validated_by_the_closed_request_contract() -> None:
+    identity = _identity()
+    request = _request(identity)
+    for rejected in (0, -1, 1_001):
+        with pytest.raises(ValidationError):
+            _reserve_wire_request(identity, request, lock_wait_timeout_milliseconds=rejected)
+    with pytest.raises(ValueError, match="lock wait budget"):
+        ResourceAuthorityAdapterRequest(
+            operation="policy",
+            operation_id="policy-operation",
+            lock_wait_timeout_milliseconds=20,
+        )
+    accepted = _reserve_wire_request(identity, request, lock_wait_timeout_milliseconds=1_000)
+    assert accepted.lock_wait_timeout_milliseconds == 1_000
+    # The wire stays closed: a payload that simply omits the key is not canonical.
+    truncated = _encode(accepted).replace(b'"lock_wait_timeout_milliseconds":1000,', b"")
+    with pytest.raises(ResourceAuthorityAdapterTransportError):
+        _decode(truncated, model=ResourceAuthorityAdapterRequest, label="legacy request")
+
+
+def test_error_kind_is_derived_from_typed_classes_and_restored_as_one() -> None:
+    """The retry semantics survive the wire without a message or sqlite code."""
+
+    from rquant.lab_resource_authority_adapter import _authority_error_kind, _remote_refusal
+
+    assert (
+        _authority_error_kind(RuntimeResourceAdmissionLockWaitTimeoutError("x"))
+        == "lock_wait_timeout"
+    )
+    assert _authority_error_kind(RuntimeResourceAdmissionTransientError("x")) == "transient"
+    assert _authority_error_kind(RuntimeResourceAdmissionCancelledError("x")) == "cancelled"
+    assert _authority_error_kind(RuntimeResourceAdmissionError("x")) == "contract"
+    assert _authority_error_kind(ValueError("x")) == "contract"
+
+    lock_wait = _remote_refusal("lock_wait_timeout")
+    assert isinstance(lock_wait, RuntimeResourceAdmissionLockWaitTimeoutError)
+    transient = _remote_refusal("transient")
+    assert isinstance(transient, RuntimeResourceAdmissionTransientError)
+    assert not isinstance(transient, RuntimeResourceAdmissionLockWaitTimeoutError)
+    cancelled = _remote_refusal("cancelled")
+    assert isinstance(cancelled, RuntimeResourceAdmissionCancelledError)
+    # A stop is not a lost race: retrying it is the wrong answer.
+    assert not isinstance(cancelled, RuntimeResourceAdmissionTransientError)
+    for absent in ("contract", None):
+        refusal = _remote_refusal(absent)
+        assert type(refusal) is ResourceAuthorityAdapterRemoteError
+        assert not isinstance(refusal, RuntimeResourceAdmissionError)
+
+
+def test_lock_wait_budget_ceiling_matches_the_store() -> None:
+    """The wire ceiling is the store's own ceiling, so a request can only shorten."""
+
+    from rquant.runtime_resource_admission import _MAX_RESOURCE_LOCK_WAIT_SECONDS
+
+    assert RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS == _MAX_RESOURCE_LOCK_WAIT_SECONDS * 1_000
+
+
+def test_adapter_recheck_carries_the_budget_into_a_contended_server_mutation(
+    tmp_path: Path,
+) -> None:
+    """Contention inside the mutation itself stays retryable end to end."""
+
+    gate = _LockingPolicyProvider(tmp_path / "resource.sqlite3")
+    server = _Server(tmp_path, timeout_milliseconds=5_000, policy_provider=gate)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        seen = _record_handled(server)
+        gate.armed = True
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionTransientError) as caught:
+            adapter.recheck(
+                lease=admitted.lease,
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=0.5,
+            )
+        elapsed = time.monotonic() - started
+        assert isinstance(caught.value, RuntimeResourceAdmissionLockWaitTimeoutError)
+        assert gate.locked.is_set()
+        assert elapsed < 2.0
+        rechecks = [entry for entry in seen if entry.operation == "recheck"]
+        assert len(rechecks) == 1
+        budget = rechecks[0].lock_wait_timeout_milliseconds
+        assert budget is not None and 0 < budget <= 500
+    finally:
+        gate.close()
+        server.close()
+
+
+def test_adapter_release_carries_the_caller_budget_to_the_authority(
+    tmp_path: Path,
+) -> None:
+    """`release()` had a bare constant on the caller side and dropped it here."""
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        seen = _record_handled(server)
+        assert adapter.release(admitted.lease, identity=identity, lock_wait_timeout_seconds=0.5)
+        releases = [entry for entry in seen if entry.operation == "release"]
+        assert len(releases) == 1
+        budget = releases[0].lock_wait_timeout_milliseconds
+        assert budget is not None and 0 < budget <= 500
+        lookups = [entry for entry in seen if entry.operation == "lookup-latest"]
+        # The fenced recovery lookup takes no server budget: the authority's
+        # `lookup_latest` accepts none (issue #163 C), so the wire stays honest.
+        assert lookups and all(entry.lock_wait_timeout_milliseconds is None for entry in lookups)
+    finally:
+        server.close()
+
+
+def test_adapter_reserve_answers_a_stop_authority_before_and_during_the_wait(
+    tmp_path: Path,
+) -> None:
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        seen = _record_handled(server)
+        with pytest.raises(RuntimeResourceAdmissionCancelledError):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+                stop_requested=lambda: True,
+            )
+        assert seen == []
+
+        polls: list[bool] = []
+
+        def stop_once_the_server_is_handling() -> bool:
+            # The seam is the request's arrival, not a clock: the flip can only
+            # be observed by a poll taken while the response is in flight.
+            stopped = bool(seen)
+            polls.append(stopped)
+            return stopped
+
+        with _authority_write_lock(server.authority):
+            started = time.monotonic()
+            with pytest.raises(RuntimeResourceAdmissionCancelledError):
+                adapter.reserve(
+                    identity=identity,
+                    request=request,
+                    policy=_policy(),
+                    snapshot_provider=_snapshot,
+                    lease_seconds=30,
+                    lock_wait_timeout_seconds=1.0,
+                    stop_requested=stop_once_the_server_is_handling,
+                )
+            elapsed = time.monotonic() - started
+        assert polls.count(False) >= 2
+        assert polls[-1] is True
+        assert elapsed < 0.5
+    finally:
+        server.close()
+
+
+def test_adapter_recheck_answers_a_stop_authority_before_and_during_the_wait(
+    tmp_path: Path,
+) -> None:
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        seen = _record_handled(server)
+        with pytest.raises(RuntimeResourceAdmissionCancelledError):
+            adapter.recheck(
+                lease=admitted.lease,
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+                stop_requested=lambda: True,
+            )
+        assert seen == []
+
+        polls: list[bool] = []
+
+        def stop_once_the_server_is_handling() -> bool:
+            stopped = bool(seen)
+            polls.append(stopped)
+            return stopped
+
+        with _authority_write_lock(server.authority):
+            started = time.monotonic()
+            with pytest.raises(RuntimeResourceAdmissionCancelledError):
+                adapter.recheck(
+                    lease=admitted.lease,
+                    identity=identity,
+                    request=request,
+                    policy=_policy(),
+                    snapshot_provider=_snapshot,
+                    lease_seconds=30,
+                    lock_wait_timeout_seconds=1.0,
+                    stop_requested=stop_once_the_server_is_handling,
+                )
+            elapsed = time.monotonic() - started
+        assert polls.count(False) >= 2
+        assert polls[-1] is True
+        assert elapsed < 0.5
     finally:
         server.close()
