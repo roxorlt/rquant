@@ -1381,6 +1381,38 @@ def test_adapter_recheck_carries_the_budget_into_a_contended_server_mutation(
         server.close()
 
 
+def test_adapter_release_carries_the_caller_budget_to_the_authority(
+    tmp_path: Path,
+) -> None:
+    """`release()` had a bare constant on the caller side and dropped it here."""
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        seen = _record_handled(server)
+        assert adapter.release(admitted.lease, identity=identity, lock_wait_timeout_seconds=0.5)
+        releases = [entry for entry in seen if entry.operation == "release"]
+        assert len(releases) == 1
+        budget = releases[0].lock_wait_timeout_milliseconds
+        assert budget is not None and 0 < budget <= 500
+        lookups = [entry for entry in seen if entry.operation == "lookup-latest"]
+        # The fenced recovery lookup takes no server budget: the authority's
+        # `lookup_latest` accepts none (issue #163 C), so the wire stays honest.
+        assert lookups and all(entry.lock_wait_timeout_milliseconds is None for entry in lookups)
+    finally:
+        server.close()
+
+
 def test_adapter_reserve_answers_a_stop_authority_before_and_during_the_wait(
     tmp_path: Path,
 ) -> None:

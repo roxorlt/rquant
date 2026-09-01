@@ -152,10 +152,6 @@ class _CallerBudget:
             )
         self._stop_requested = stop_requested
 
-    @property
-    def bounded(self) -> bool:
-        return self._deadline is not None
-
     def stopped(self) -> bool:
         if self._stop_requested is None:
             return False
