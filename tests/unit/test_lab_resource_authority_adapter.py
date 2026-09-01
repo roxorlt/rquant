@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +27,7 @@ from rquant.lab_resource_authority_adapter import (
     LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
     LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
     RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES,
+    RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS,
     ExternalResourceJournalMonotonicRootAdapter,
     ExternalResourceJournalRootConfig,
     LabResourceAuthorityReservationAdapter,
@@ -1102,10 +1103,8 @@ def _authority_write_lock(authority: SQLiteResourceAdmissionAuthority) -> Iterat
         holder.execute("BEGIN IMMEDIATE")
         yield
     finally:
-        try:
+        with suppress(sqlite3.Error):  # the lock was never taken
             holder.execute("ROLLBACK")
-        except sqlite3.Error:  # pragma: no cover - the lock was never taken
-            pass
         holder.close()
 
 
@@ -1135,10 +1134,8 @@ class _LockingPolicyProvider:
         holder = self._holder
         self._holder = None
         if holder is not None:
-            try:
+            with suppress(sqlite3.Error):  # already rolled back
                 holder.execute("ROLLBACK")
-            except sqlite3.Error:  # pragma: no cover - already rolled back
-                pass
             holder.close()
 
 
@@ -1329,6 +1326,14 @@ def test_lock_wait_budget_is_validated_by_the_closed_request_contract() -> None:
     truncated = _encode(accepted).replace(b'"lock_wait_timeout_milliseconds":1000,', b"")
     with pytest.raises(ResourceAuthorityAdapterTransportError):
         _decode(truncated, model=ResourceAuthorityAdapterRequest, label="legacy request")
+
+
+def test_lock_wait_budget_ceiling_matches_the_store() -> None:
+    """The wire ceiling is the store's own ceiling, so a request can only shorten."""
+
+    from rquant.runtime_resource_admission import _MAX_RESOURCE_LOCK_WAIT_SECONDS
+
+    assert RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS == _MAX_RESOURCE_LOCK_WAIT_SECONDS * 1_000
 
 
 def test_adapter_recheck_carries_the_budget_into_a_contended_server_mutation(

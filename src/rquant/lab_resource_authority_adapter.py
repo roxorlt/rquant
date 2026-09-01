@@ -9,10 +9,12 @@ versioned descriptor and canonical JSON bytes.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import secrets
 import socket
 import struct
+import time as system_time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,7 +58,10 @@ from rquant.runtime_resource_admission import (
     ResourceOperationReceipt,
     ResourceOperationResult,
     ResourceReservationAdmission,
+    RuntimeResourceAdmissionCancelledError,
     RuntimeResourceAdmissionError,
+    RuntimeResourceAdmissionLockWaitTimeoutError,
+    RuntimeResourceAdmissionTransientError,
     SQLiteResourceAdmissionAuthority,
 )
 from rquant.strict_json import (
@@ -75,6 +80,21 @@ RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES = 1024 * 1024
 _FRAME_HEADER_BYTES = 4
 _RESOURCE_AUTHORITY_CONTRACT = "rquant-lab-resource-authority-adapter/v1"
 _RESOURCE_ROOT_ROLE = "resource_journal_monotonic_root"
+# The wire ceiling for a caller-supplied lock wait budget, in milliseconds.  It
+# mirrors `runtime_resource_admission._MAX_RESOURCE_LOCK_WAIT_SECONDS`, which
+# refuses anything larger on the store side anyway; the duplication is pinned by
+# `test_lock_wait_budget_ceiling_matches_the_store` rather than by an import of
+# a private constant.  A request can therefore only *shorten* a server wait.
+RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS = 1_000
+_MAX_CALLER_LOCK_WAIT_SECONDS = RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS / 1_000
+# Same 5ms cadence the store polls `stop_requested` at, so a stop authority is
+# answered on the socket with the granularity it already has in-process.
+_ADAPTER_STOP_POLL_SECONDS = 0.005
+# The caller's budget has to cover the server's wait *and* the response coming
+# back.  Handing the server the whole remainder would guarantee the client gave
+# up first and turned every server-side refusal into a blind transport timeout,
+# so one poll period plus a round trip is held back for delivery.
+_ADAPTER_TRANSPORT_RESERVE_SECONDS = 0.010
 
 
 class ResourceAuthorityAdapterError(RuntimeError):
@@ -91,6 +111,122 @@ class ResourceAuthorityAdapterTransportError(ResourceAuthorityAdapterError):
 
 class ResourceAuthorityAdapterRemoteError(ResourceAuthorityAdapterError):
     """The remote authority rejected a request without exposing internal details."""
+
+
+def _validated_caller_lock_wait_seconds(value: object) -> float:
+    """Apply the store's own admission rules to a budget bound for the wire."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeResourceAdmissionError("resource lock_wait_timeout_seconds must be numeric")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0 or seconds > _MAX_CALLER_LOCK_WAIT_SECONDS:
+        raise RuntimeResourceAdmissionError("resource lock_wait_timeout_seconds is outside 0..1")
+    return seconds
+
+
+class _CallerBudget:
+    """One caller's remaining wall clock and stop authority for an operation.
+
+    A single reservation call can cost several round trips (`reserve` then the
+    fenced `lookup-latest`, `recheck` after its recovery lookup), so the budget
+    is a deadline shared by all of them rather than a per-message timeout.
+    """
+
+    __slots__ = ("_deadline", "_stop_requested")
+
+    def __init__(
+        self,
+        *,
+        lock_wait_timeout_seconds: object | None,
+        stop_requested: Callable[[], bool] | None,
+    ) -> None:
+        if lock_wait_timeout_seconds is None:
+            self._deadline: float | None = None
+        else:
+            self._deadline = system_time.monotonic() + _validated_caller_lock_wait_seconds(
+                lock_wait_timeout_seconds
+            )
+        if stop_requested is not None and not callable(stop_requested):
+            raise RuntimeResourceAdmissionError(
+                "resource reservation cancellation authority returned an invalid contract"
+            )
+        self._stop_requested = stop_requested
+
+    @property
+    def bounded(self) -> bool:
+        return self._deadline is not None
+
+    def stopped(self) -> bool:
+        if self._stop_requested is None:
+            return False
+        stopped = self._stop_requested()
+        if not isinstance(stopped, bool):
+            raise RuntimeResourceAdmissionError(
+                "resource reservation cancellation authority returned an invalid contract"
+            )
+        return stopped
+
+    def raise_if_stopped(self, message: str) -> None:
+        if self.stopped():
+            raise RuntimeResourceAdmissionCancelledError(message)
+
+    def remaining_seconds(self) -> float | None:
+        if self._deadline is None:
+            return None
+        return self._deadline - system_time.monotonic()
+
+    def transport_seconds(self, ceiling_seconds: float) -> float:
+        """Bound one socket exchange by the smaller of config and caller budget."""
+
+        remaining = self.remaining_seconds()
+        if remaining is None:
+            return ceiling_seconds
+        if remaining <= 0:
+            raise RuntimeResourceAdmissionLockWaitTimeoutError(
+                "resource authority lock wait budget expired before the request"
+            )
+        return min(ceiling_seconds, remaining)
+
+    def server_milliseconds(self) -> int | None:
+        """The budget the authority itself may spend, in canonical milliseconds."""
+
+        remaining = self.remaining_seconds()
+        if remaining is None:
+            return None
+        if remaining <= 0:
+            raise RuntimeResourceAdmissionLockWaitTimeoutError(
+                "resource authority lock wait budget expired before the request"
+            )
+        deliverable = remaining - _ADAPTER_TRANSPORT_RESERVE_SECONDS
+        milliseconds = int(deliverable * 1_000)
+        return max(1, min(RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS, milliseconds))
+
+
+class _ResponseWaiter:
+    """Poll the caller's stop authority and deadline while a response is in flight."""
+
+    __slots__ = ("_budget", "_config_deadline")
+
+    def __init__(self, *, budget: _CallerBudget, config_seconds: float) -> None:
+        self._budget = budget
+        self._config_deadline = system_time.monotonic() + config_seconds
+
+    @property
+    def poll_seconds(self) -> float:
+        return _ADAPTER_STOP_POLL_SECONDS
+
+    def tick(self) -> None:
+        if self._budget.stopped():
+            raise RuntimeResourceAdmissionCancelledError("resource authority round trip cancelled")
+        remaining = self._budget.remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            # The caller's own budget ran out, not the deployment's: this is the
+            # retryable end of a lost race, never a configuration fault.
+            raise RuntimeResourceAdmissionLockWaitTimeoutError(
+                "resource authority round trip exceeded the caller lock wait budget"
+            )
+        if system_time.monotonic() >= self._config_deadline:
+            raise ResourceAuthorityAdapterTransportError("resource authority transport failed")
 
 
 class _AdapterModel(RuntimeContractModel):
@@ -515,9 +651,25 @@ class ResourceAuthorityAdapterRequest(_AdapterModel):
     lease_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     prior_receipt: ResourceOperationReceipt | None = None
     lease_seconds: int | None = Field(default=None, ge=1, le=3_600)
+    # How long the authority itself may wait for the reservation write lock.
+    # Absent means "use the server's own default", which keeps a caller that
+    # never had a deadline on exactly the behaviour it had before.
+    lock_wait_timeout_milliseconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS,
+    )
 
     @model_validator(mode="after")
     def validate_operation_shape(self) -> ResourceAuthorityAdapterRequest:
+        if self.lock_wait_timeout_milliseconds is not None and self.operation not in {
+            "reserve",
+            "recheck",
+            "release",
+        }:
+            # Only the mutations reach a call that accepts the budget, so
+            # carrying one anywhere else would advertise a bound nothing honours.
+            raise ValueError("resource authority lock wait budget is only carried by mutations")
         if self.operation in {"probe", "policy", "snapshot", "admission"}:
             if any(
                 value is not None
@@ -631,9 +783,15 @@ class ResourceAuthorityAdapterResponse(_AdapterModel):
     result: ResourceOperationResult | None = None
     capabilities: tuple[Literal["policy", "snapshot", "journal"], ...] | None = None
     error_code: Literal["configuration", "invalid_request", "authority", "integrity"] | None = None
+    # A refusal's retry semantics, derived from the typed exception class the
+    # authority raised - never from a SQLite code or a message.  `contract` is
+    # the fail-closed default a client assumes when the field is absent.
+    error_kind: Literal["transient", "lock_wait_timeout", "cancelled", "contract"] | None = None
 
     @model_validator(mode="after")
     def validate_response_shape(self) -> ResourceAuthorityAdapterResponse:
+        if self.error_kind is not None and self.error_code is None:
+            raise ValueError("resource authority error kind requires an error code")
         if self.error_code is not None:
             if any(
                 value is not None
@@ -699,11 +857,24 @@ def _decode(payload: bytes, *, model: type[_AdapterModel], label: str) -> _Adapt
         raise ResourceAuthorityAdapterTransportError(f"{label} is malformed") from exc
 
 
-def _recv_exact(connection: socket.socket, length: int) -> bytes:
+def _recv_exact(
+    connection: socket.socket,
+    length: int,
+    *,
+    waiter: _ResponseWaiter | None = None,
+) -> bytes:
     chunks: list[bytes] = []
     remaining = length
     while remaining:
-        chunk = connection.recv(remaining)
+        try:
+            chunk = connection.recv(remaining)
+        except TimeoutError:
+            if waiter is None:
+                raise
+            # The short socket timeout is the poll, not the bound: the partial
+            # frame stays buffered while stop and deadline are re-checked.
+            waiter.tick()
+            continue
         if not chunk:
             raise ResourceAuthorityAdapterTransportError(
                 "resource authority transport closed early"
@@ -721,11 +892,17 @@ def _send_frame(connection: socket.socket, payload: bytes) -> None:
     connection.sendall(struct.pack("!I", len(payload)) + payload)
 
 
-def _recv_frame(connection: socket.socket, *, label: str) -> bytes:
-    length = struct.unpack("!I", _recv_exact(connection, _FRAME_HEADER_BYTES))[0]
+def _recv_frame(
+    connection: socket.socket,
+    *,
+    label: str,
+    waiter: _ResponseWaiter | None = None,
+) -> bytes:
+    header = _recv_exact(connection, _FRAME_HEADER_BYTES, waiter=waiter)
+    length = struct.unpack("!I", header)[0]
     if length > RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES:
         raise ResourceAuthorityAdapterTransportError(f"{label} exceeds the wire bound")
-    return _recv_exact(connection, length)
+    return _recv_exact(connection, length, waiter=waiter)
 
 
 def _peer_credentials(connection: socket.socket) -> tuple[int, int]:
@@ -771,6 +948,28 @@ def _secure_socket_path(
         ) from exc
 
 
+def _remote_refusal(
+    error_kind: Literal["transient", "lock_wait_timeout", "cancelled", "contract"] | None,
+) -> ResourceAuthorityAdapterError | RuntimeResourceAdmissionError:
+    """Restore the authority's typed refusal on this side of the socket.
+
+    The kind is derived server-side from the exception class, so contention
+    stays retryable instead of arriving as one opaque remote error that
+    `lab_worker` then reads as a permanent configuration fault (#159).  An
+    absent kind keeps the old fail-closed answer.
+    """
+
+    if error_kind == "lock_wait_timeout":
+        return RuntimeResourceAdmissionLockWaitTimeoutError(
+            "resource authority reservation lock wait timeout"
+        )
+    if error_kind == "transient":
+        return RuntimeResourceAdmissionTransientError("resource authority is contended")
+    if error_kind == "cancelled":
+        return RuntimeResourceAdmissionCancelledError("resource authority cancelled the request")
+    return ResourceAuthorityAdapterRemoteError("resource authority rejected the request")
+
+
 class ResourceAuthorityJournalClient:
     """Byte-only client resolved from one frozen closed-registry descriptor."""
 
@@ -779,27 +978,51 @@ class ResourceAuthorityJournalClient:
             configuration, strict=True
         )
 
-    def _call(self, request: ResourceAuthorityAdapterRequest) -> ResourceAuthorityAdapterResponse:
+    def _call(
+        self,
+        request: ResourceAuthorityAdapterRequest,
+        *,
+        budget: _CallerBudget | None = None,
+    ) -> ResourceAuthorityAdapterResponse:
         payload = _encode(request)
         config = self.configuration
+        config_seconds = config.timeout_milliseconds / 1_000
+        if budget is not None:
+            budget.raise_if_stopped("resource authority round trip cancelled")
         _secure_socket_path(
             config.endpoint,
             expected_uid=config.expected_uid,
             expected_gid=config.expected_gid,
             expected_mode=config.socket_mode,
         )
+        waiter = (
+            None
+            if budget is None
+            else _ResponseWaiter(budget=budget, config_seconds=config_seconds)
+        )
+        connect_seconds = (
+            config_seconds if budget is None else budget.transport_seconds(config_seconds)
+        )
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(config.timeout_milliseconds / 1_000)
+                connection.settimeout(max(connect_seconds, _ADAPTER_STOP_POLL_SECONDS))
                 connection.connect(str(config.endpoint))
                 uid, gid = _peer_credentials(connection)
                 if (uid, gid) != config.expected_server_identity:
                     raise ResourceAuthorityAdapterTransportError(
                         "resource authority peer identity is invalid"
                     )
+                if budget is not None:
+                    budget.raise_if_stopped("resource authority round trip cancelled")
                 _send_frame(connection, payload)
-                raw = _recv_frame(connection, label="resource authority response")
-        except ResourceAuthorityAdapterError:
+                if waiter is not None:
+                    connection.settimeout(waiter.poll_seconds)
+                raw = _recv_frame(
+                    connection,
+                    label="resource authority response",
+                    waiter=waiter,
+                )
+        except (ResourceAuthorityAdapterError, RuntimeResourceAdmissionError):
             raise
         except (OSError, TimeoutError) as exc:
             raise ResourceAuthorityAdapterTransportError(
@@ -820,7 +1043,7 @@ class ResourceAuthorityJournalClient:
                 "resource authority response operation conflicts"
             )
         if response.error_code is not None:
-            raise ResourceAuthorityAdapterRemoteError("resource authority rejected the request")
+            raise _remote_refusal(response.error_kind)
         if (
             response.result is not None
             and response.result.receipt.authority_id != config.authority_id
@@ -884,6 +1107,7 @@ class ResourceAuthorityJournalClient:
         identity: ResourceReservationIdentity,
         request: AdmissionRequest,
         lease_seconds: int,
+        budget: _CallerBudget | None = None,
     ) -> ResourceOperationResult:
         lease = _reservation_shell(identity=identity, request=request)
         response = self._call(
@@ -894,7 +1118,11 @@ class ResourceAuthorityJournalClient:
                 admission_request=request,
                 lease=lease,
                 lease_seconds=lease_seconds,
-            )
+                lock_wait_timeout_milliseconds=(
+                    None if budget is None else budget.server_milliseconds()
+                ),
+            ),
+            budget=budget,
         )
         return _required_operation_result(response)
 
@@ -907,6 +1135,7 @@ class ResourceAuthorityJournalClient:
         request: AdmissionRequest,
         lease_seconds: int,
         prior_receipt: ResourceOperationReceipt,
+        budget: _CallerBudget | None = None,
     ) -> ResourceOperationResult:
         response = self._call(
             ResourceAuthorityAdapterRequest(
@@ -917,7 +1146,11 @@ class ResourceAuthorityJournalClient:
                 lease=lease,
                 lease_seconds=lease_seconds,
                 prior_receipt=prior_receipt,
-            )
+                lock_wait_timeout_milliseconds=(
+                    None if budget is None else budget.server_milliseconds()
+                ),
+            ),
+            budget=budget,
         )
         return _required_operation_result(response)
 
@@ -928,6 +1161,7 @@ class ResourceAuthorityJournalClient:
         lease: ResourceReservationLease,
         identity: ResourceReservationIdentity,
         prior_receipt: ResourceOperationReceipt,
+        budget: _CallerBudget | None = None,
     ) -> ResourceOperationResult:
         response = self._call(
             ResourceAuthorityAdapterRequest(
@@ -936,7 +1170,11 @@ class ResourceAuthorityJournalClient:
                 identity=identity,
                 lease=lease,
                 prior_receipt=prior_receipt,
-            )
+                lock_wait_timeout_milliseconds=(
+                    None if budget is None else budget.server_milliseconds()
+                ),
+            ),
+            budget=budget,
         )
         return _required_operation_result(response)
 
@@ -952,7 +1190,12 @@ class ResourceAuthorityJournalClient:
         *,
         identity: ResourceReservationIdentity,
         lease_id: str,
+        budget: _CallerBudget | None = None,
     ) -> ResourceOperationResult:
+        # The recovery lookup is a read that still takes the authority's write
+        # lock server-side, and `SQLiteResourceAdmissionAuthority.lookup_latest`
+        # accepts no budget (issue #163 C), so only the caller's own transport
+        # bound applies here - it is deliberately not advertised on the wire.
         return _required_operation_result(
             self._call(
                 ResourceAuthorityAdapterRequest(
@@ -964,7 +1207,8 @@ class ResourceAuthorityJournalClient:
                     ),
                     identity=identity,
                     lease_id=lease_id,
-                )
+                ),
+                budget=budget,
             )
         )
 
@@ -1041,19 +1285,27 @@ class LabResourceAuthorityReservationAdapter:
         lock_wait_timeout_seconds: float | None = None,
         stop_requested: Callable[[], bool] | None = None,
     ) -> ResourceReservationAdmission:
-        del quota_lease_provider, lock_wait_timeout_seconds
-        if stop_requested is not None and stop_requested():
-            raise RuntimeResourceAdmissionError("resource reservation admission cancelled")
+        del quota_lease_provider
+        # The caller's remaining tick/deadline budget is the whole point of this
+        # parameter: it bounds the socket wait *and* travels to the authority so
+        # the server stops holding the lock request on the caller's behalf.
+        budget = _CallerBudget(
+            lock_wait_timeout_seconds=lock_wait_timeout_seconds,
+            stop_requested=stop_requested,
+        )
+        budget.raise_if_stopped("resource reservation admission cancelled")
         del policy, snapshot_provider
         self._client.reserve(
             operation_id=_operation_id(operation="reserve", identity=identity, prior=None),
             identity=identity,
             request=request,
             lease_seconds=lease_seconds,
+            budget=budget,
         )
         result = self._client.lookup_latest(
             identity=identity,
             lease_id=canonical_sha256(identity),
+            budget=budget,
         )
         if result.released:
             raise RuntimeResourceAdmissionError(
@@ -1074,9 +1326,12 @@ class LabResourceAuthorityReservationAdapter:
         lock_wait_timeout_seconds: float | None = None,
         stop_requested: Callable[[], bool] | None = None,
     ) -> ResourceReservationAdmission:
-        del quota_lease_provider, lock_wait_timeout_seconds
-        if stop_requested is not None and stop_requested():
-            raise RuntimeResourceAdmissionError("resource reservation recheck cancelled")
+        del quota_lease_provider
+        budget = _CallerBudget(
+            lock_wait_timeout_seconds=lock_wait_timeout_seconds,
+            stop_requested=stop_requested,
+        )
+        budget.raise_if_stopped("resource reservation recheck cancelled")
         validated_lease = ResourceReservationLease.model_validate(lease)
         recheck_operation_id = _operation_id(
             operation="recheck",
@@ -1089,7 +1344,11 @@ class LabResourceAuthorityReservationAdapter:
                 }
             ),
         )
-        recovered = self._recover_latest(lease=validated_lease, identity=identity)
+        recovered = self._recover_latest(
+            lease=validated_lease,
+            identity=identity,
+            budget=budget,
+        )
         if recovered.released:
             raise RuntimeResourceAdmissionError(
                 "resource authority reservation is already terminal"
@@ -1104,6 +1363,7 @@ class LabResourceAuthorityReservationAdapter:
             return _as_admission(recovered)
         prior = recovered.receipt
         del policy, snapshot_provider
+        budget.raise_if_stopped("resource reservation recheck cancelled")
         result = self._client.recheck(
             operation_id=recheck_operation_id,
             lease=current_lease,
@@ -1111,6 +1371,7 @@ class LabResourceAuthorityReservationAdapter:
             request=request,
             lease_seconds=lease_seconds,
             prior_receipt=prior,
+            budget=budget,
         )
         return _as_admission(result)
 
@@ -1121,8 +1382,11 @@ class LabResourceAuthorityReservationAdapter:
         identity: ResourceReservationIdentity,
         lock_wait_timeout_seconds: float | None = None,
     ) -> bool:
-        del lock_wait_timeout_seconds
-        recovered = self._recover_latest(lease=lease, identity=identity)
+        budget = _CallerBudget(
+            lock_wait_timeout_seconds=lock_wait_timeout_seconds,
+            stop_requested=None,
+        )
+        recovered = self._recover_latest(lease=lease, identity=identity, budget=budget)
         if recovered.released:
             return True
         current_lease = recovered.lease
@@ -1136,6 +1400,7 @@ class LabResourceAuthorityReservationAdapter:
             lease=current_lease,
             identity=identity,
             prior_receipt=prior,
+            budget=budget,
         )
         if not result.released:
             raise RuntimeResourceAdmissionError("resource authority release was not terminal")
@@ -1146,6 +1411,7 @@ class LabResourceAuthorityReservationAdapter:
         *,
         lease: ResourceReservationLease,
         identity: ResourceReservationIdentity,
+        budget: _CallerBudget | None = None,
     ) -> ResourceOperationResult:
         validated_lease = ResourceReservationLease.model_validate(lease)
         validated_identity = ResourceReservationIdentity.model_validate(identity)
@@ -1159,6 +1425,7 @@ class LabResourceAuthorityReservationAdapter:
         return self._client.lookup_latest(
             identity=validated_identity,
             lease_id=validated_lease.lease_id,
+            budget=budget,
         )
 
 
@@ -1178,6 +1445,20 @@ def _as_admission(result: ResourceOperationResult) -> ResourceReservationAdmissi
         policy=result.policy,
         lease=result.lease,
     )
+
+
+def _authority_error_kind(
+    exc: BaseException,
+) -> Literal["transient", "lock_wait_timeout", "cancelled", "contract"]:
+    """Classify one refusal by typed exception class - not by message or code."""
+
+    if isinstance(exc, RuntimeResourceAdmissionLockWaitTimeoutError):
+        return "lock_wait_timeout"
+    if isinstance(exc, RuntimeResourceAdmissionTransientError):
+        return "transient"
+    if isinstance(exc, RuntimeResourceAdmissionCancelledError):
+        return "cancelled"
+    return "contract"
 
 
 class ResourceAuthorityJournalSocketServer:
@@ -1386,11 +1667,20 @@ class ResourceAuthorityJournalSocketServer:
                 response = self._handle(request)
             except ResourceAuthorityAdapterError:
                 response = ResourceAuthorityAdapterResponse(
-                    operation=operation, identity=self.identity, error_code="invalid_request"
+                    operation=operation,
+                    identity=self.identity,
+                    error_code="invalid_request",
+                    error_kind="contract",
                 )
-            except (RuntimeResourceAdmissionError, ValidationError, ValueError):
+            except (RuntimeResourceAdmissionError, ValidationError, ValueError) as exc:
+                # The kind comes from the exception class the authority raised,
+                # never from a SQLite code or a message, so a lost race stays
+                # retryable on the far side of the socket (#159).
                 response = ResourceAuthorityAdapterResponse(
-                    operation=operation, identity=self.identity, error_code="authority"
+                    operation=operation,
+                    identity=self.identity,
+                    error_code="authority",
+                    error_kind=_authority_error_kind(exc),
                 )
             payload = _encode(response)
             if self._drop_response_once and (
@@ -1454,6 +1744,11 @@ class ResourceAuthorityJournalSocketServer:
             raise ResourceAuthorityAdapterConfigurationError(
                 "resource authority request is incomplete"
             )
+        lock_wait_timeout_seconds = (
+            None
+            if request.lock_wait_timeout_milliseconds is None
+            else request.lock_wait_timeout_milliseconds / 1_000
+        )
         if request.operation == "reserve":
             assert request.admission_request is not None
             assert request.lease_seconds is not None
@@ -1466,6 +1761,7 @@ class ResourceAuthorityJournalSocketServer:
                     self._snapshot_provider()
                 ),
                 lease_seconds=request.lease_seconds,
+                lock_wait_timeout_seconds=lock_wait_timeout_seconds,
             )
         elif request.operation == "recheck":
             assert request.admission_request is not None
@@ -1482,6 +1778,7 @@ class ResourceAuthorityJournalSocketServer:
                 ),
                 lease_seconds=request.lease_seconds,
                 prior_receipt=request.prior_receipt,
+                lock_wait_timeout_seconds=lock_wait_timeout_seconds,
             )
         elif request.operation == "release":
             assert request.prior_receipt is not None
@@ -1490,6 +1787,7 @@ class ResourceAuthorityJournalSocketServer:
                 lease=request.lease,
                 identity=request.identity,
                 prior_receipt=request.prior_receipt,
+                lock_wait_timeout_seconds=lock_wait_timeout_seconds,
             )
         else:  # pragma: no cover - closed model above
             raise ResourceAuthorityAdapterConfigurationError(
@@ -1545,6 +1843,7 @@ __all__ = [
     "ExternalResourceJournalRootConfig",
     "LabResourceAuthorityReservationAdapter",
     "RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES",
+    "RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS",
     "ResourceAuthorityAdapterConfig",
     "ResourceAuthorityAdapterConfigurationError",
     "ResourceAuthorityAdapterError",

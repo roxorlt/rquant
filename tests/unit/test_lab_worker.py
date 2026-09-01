@@ -4009,7 +4009,6 @@ def test_worker_backs_off_when_the_real_authority_socket_is_contended(
     worker down through the topology that actually ships (RQ-CTB-P1-01).
     """
     from rquant.lab_resource_authority_adapter import LabResourceAuthorityReservationAdapter
-
     from tests.unit.test_lab_resource_authority_adapter import _LockingPolicyProvider, _Server
 
     authority_root = tmp_path / "authority"
@@ -6708,9 +6707,7 @@ def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
         # budget is the module's own spawn scale rather than a flat literal,
         # because what is being waited for is a spawned CPython re-importing
         # this module and then forking once more before either write.
-        grandchild_pid = _recorded_pid(
-            grandchild_pid_path, timeout_seconds=_child_startups(2)
-        )
+        grandchild_pid = _recorded_pid(grandchild_pid_path, timeout_seconds=_child_startups(2))
         child_pid = _recorded_pid(child_pid_path, timeout_seconds=_child_startups(2))
         assert child_pid is not None
         assert grandchild_pid is not None
