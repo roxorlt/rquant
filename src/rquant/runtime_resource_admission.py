@@ -117,13 +117,42 @@ class RuntimeResourceAdmissionCancelledError(RuntimeResourceAdmissionError):
     """
 
 
+_SQLITE_CONTENTION_PRIMARY_ERROR_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+
+def _is_sqlite_contention(exc: BaseException) -> bool:
+    """Did SQLite itself report BUSY/LOCKED?  Decided by error code, never text.
+
+    `str(exc)` is not a classification interface.  SQLite's English wording is
+    free to change between builds, and the same words appear on failures that
+    are not contention at all - `SQLITE_ERROR` and `SQLITE_READONLY` paths both
+    produce messages containing "locked" - so a text match simultaneously
+    misses real contention worded differently and retries permanent faults
+    until the caller's whole budget is gone.  `sqlite_errorcode` (Python 3.11+)
+    is the stable answer.  Its low byte is the primary code, so every extended
+    form - SQLITE_BUSY_SNAPSHOT, SQLITE_BUSY_RECOVERY, SQLITE_LOCKED_SHAREDCACHE
+    - classifies with its parent without being enumerated here.
+
+    Anything carrying no such code is *not* contention: a plain `OSError`, an
+    exception built by hand rather than raised by the driver, or a runtime that
+    predates the attribute.  That direction is the safe one - an unclassifiable
+    failure falls through to "do not retry", so a permanent fault is reported
+    once instead of being spun on.
+    """
+
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(code, int) or isinstance(code, bool):
+        return False
+    return (code & 0xFF) in _SQLITE_CONTENTION_PRIMARY_ERROR_CODES
+
+
 def _reservation_failure(message: str, exc: BaseException) -> RuntimeResourceAdmissionError:
     """Classify a raw SQLite failure: contended is retryable, the rest is not."""
 
-    if isinstance(exc, sqlite3.OperationalError):
-        detail = str(exc).lower()
-        if "locked" in detail or "busy" in detail:
-            return RuntimeResourceAdmissionTransientError(message)
+    if _is_sqlite_contention(exc):
+        return RuntimeResourceAdmissionTransientError(message)
     return RuntimeResourceAdmissionError(message)
 
 
@@ -324,8 +353,7 @@ class SQLiteResourceReservationStore:
             try:
                 connection.execute("BEGIN IMMEDIATE")
             except sqlite3.OperationalError as exc:
-                message = str(exc).lower()
-                if "locked" not in message and "busy" not in message:
+                if not _is_sqlite_contention(exc):
                     raise
                 if self._stop_requested(stop_requested):
                     raise RuntimeResourceAdmissionCancelledError(
@@ -577,8 +605,7 @@ class SQLiteResourceReservationStore:
                 self._initialize_once()
                 return
             except sqlite3.OperationalError as exc:
-                message = str(exc).lower()
-                if "locked" not in message and "busy" not in message:
+                if not _is_sqlite_contention(exc):
                     raise RuntimeResourceAdmissionError(
                         "resource reservation store initialization failed"
                     ) from exc
