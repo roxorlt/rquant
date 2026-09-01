@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -1530,6 +1530,19 @@ def _no_heartbeat_connection(connection: sqlite3.Connection | None) -> None:
     del connection
 
 
+class _HeartbeatInterrupt(StrEnum):
+    """What a shutdown's interrupt found, worded for the message it goes into.
+
+    Deliberately says what was *issued*, not what was aborted: SQLite ends the
+    statement running at that moment, and a shutdown cannot tell from here
+    whether one was.
+    """
+
+    UNBOUND = "found no connection bound"
+    ISSUED = "issued on the connection it held"
+    CLOSED = "found the connection it held already closed"
+
+
 class _HeartbeatConnection:
     """The SQLite connection a heartbeat thread is inside, for its shutdown.
 
@@ -1561,13 +1574,13 @@ class _HeartbeatConnection:
         with self._lock:
             self._connection = connection
 
-    def interrupt(self) -> bool:
-        """Abort the bound statement; report whether a connection was in hand."""
+    def interrupt(self) -> _HeartbeatInterrupt:
+        """Issue an interrupt on the bound connection; report what was found."""
 
         with self._lock:
             connection = self._connection
             if connection is None:
-                return False
+                return _HeartbeatInterrupt.UNBOUND
             try:
                 connection.interrupt()
             except sqlite3.ProgrammingError:
@@ -1576,16 +1589,18 @@ class _HeartbeatConnection:
                 # closes it, so an interrupt never lands on one being closed.
                 # The guard stays because a closed connection is the one thing
                 # ``interrupt`` refuses, whoever closed it.
-                return False
-            return True
+                return _HeartbeatInterrupt.CLOSED
+            return _HeartbeatInterrupt.ISSUED
 
 
 class _HeartbeatProgress:
     """What one heartbeat thread is doing, for the shutdown that waits on it.
 
-    Written only by that thread and read only once ``join`` has given up, so
-    plain attributes are enough: the reader wants the last observation it can
-    put in a failure message, not a consistent snapshot.
+    Written only by that thread, and read by the shutdown once the budget has
+    expired - which is before the interrupt, so the thread may still be running
+    at that moment.  Plain attributes are enough: the reader wants the last
+    observation it can put in a failure message, not a consistent snapshot, and
+    nothing here decides control flow.
     """
 
     __slots__ = ("last_tick_at", "stage", "stage_since", "ticks")
@@ -3978,10 +3993,13 @@ class SourceBrokerV2Saga:
             _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
             interval * 2,
         )
-        overdue: str | None = None
-        reached_connection = False
+        report: str | None = None
+        invoke_error: BaseException | None = None
         try:
             result = invoke(payload)
+        except BaseException as exc:
+            invoke_error = exc
+            raise
         finally:
             stop_requested_at = time.monotonic()
             stop.set()
@@ -3995,26 +4013,32 @@ class SourceBrokerV2Saga:
                 # and returns, and what the interrupt cannot cut short is the
                 # same ``busy_timeout`` lock wait plus durable tail the budget
                 # is derived from.  Done here rather than after the ``try`` so
-                # a raising ``invoke`` also leaves nothing running; the report
-                # below stays outside, since raising from inside a ``finally``
-                # would displace the caller's own exception.
+                # a raising ``invoke`` also leaves nothing running.  The report
+                # is only built here; the raise for it is outside, because
+                # raising from a ``finally`` displaces the caller's exception.
                 overdue = progress.describe(budget_expired_at)
                 reached_connection = heartbeat_connection.interrupt()
                 heartbeat.join()
-            stopped_at = time.monotonic()
-        if overdue is not None:
-            reached = (
-                "interrupted a live connection"
-                if reached_connection
-                else "interrupted with no connection bound"
-            )
-            raise SourceBrokerV2SagaUnavailableError(
-                f"outbox heartbeat did not stop after {phase.value} "
-                f"(waited {budget_expired_at - stop_requested_at:.3f}s of a "
-                f"{shutdown_budget:.3f}s budget; {overdue}; {reached}, then joined "
-                f"{stopped_at - budget_expired_at:.3f}s more, ending in stage "
-                f"{progress.stage!r})"
-            )
+                stopped_at = time.monotonic()
+                report = (
+                    f"outbox heartbeat did not stop after {phase.value} "
+                    f"(waited {budget_expired_at - stop_requested_at:.3f}s of a "
+                    f"{shutdown_budget:.3f}s budget; {overdue}; interrupt "
+                    f"{reached_connection}, then joined "
+                    f"{stopped_at - budget_expired_at:.3f}s more, ending in stage "
+                    f"{progress.stage!r})"
+                )
+                if invoke_error is not None:
+                    # The caller's exception is the one that has to survive, so
+                    # the report below is never raised on this path - it rides
+                    # along instead (PEP 678), which changes neither the type
+                    # nor anything an ``except`` can match on.  Raising from a
+                    # ``finally`` would displace the caller's exception, and so
+                    # would letting ``add_note`` itself escape.
+                    with suppress(Exception):
+                        invoke_error.add_note(report)
+        if report is not None:
+            raise SourceBrokerV2SagaUnavailableError(report)
         if failures:
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat failed during {phase.value}"

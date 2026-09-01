@@ -3173,7 +3173,7 @@ def test_v2_saga_shutdown_ends_a_heartbeat_that_outlives_its_derived_budget(
     assert f"of a {budget:.3f}s budget" in reason
     assert "1 completed tick" in reason
     assert "stage 'commit'" in reason
-    assert "interrupted a live connection" in reason
+    assert "interrupt issued on the connection it held" in reason
     assert "ending in stage 'interrupted'" in reason
     assert transport.dispatch_calls == 1
     assert not _live_heartbeat_threads()
@@ -3272,7 +3272,7 @@ def test_v2_saga_shutdown_ends_a_heartbeat_interrupted_inside_a_lock_wait(
     reason = str(raised.value)
     assert reason.startswith("outbox heartbeat did not stop after dispatch")
     assert f"of a {budget:.3f}s budget" in reason
-    assert "interrupted a live connection" in reason
+    assert "interrupt issued on the connection it held" in reason
     assert len(lock_waits) == 1
     contended_window = _CONTENDED_BUSY_TIMEOUT_MS / 1_000
     # The wait outlived the budget, and ended within the window its own
@@ -3379,6 +3379,202 @@ def test_v2_saga_shutdown_ends_an_overdue_heartbeat_when_the_body_raises(
     assert scans[0] > _expected_shutdown_budget(40)
     assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert snapshot.reconcile_reason == "source dispatch response is unknown"
+    assert transport.dispatch_calls == 1
+    assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_notes_an_overdue_heartbeat_on_the_caller_s_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's exception leaves untouched, carrying the shutdown's report.
+
+    On this path the report is never raised - doing so would displace what the
+    caller has to see - so it rides along as a PEP 678 note instead.  The
+    exception's type, `args` and `str()` are unchanged; only `__notes__` grows,
+    which is what keeps an interrupted renewal from being invisible here.
+    """
+
+    transport = _TestTransport()
+    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 40
+    saga = _heartbeat_shutdown_saga(
+        tmp_path / "saga.sqlite3",
+        current=object(),
+        quota=_quota_adapter(tmp_path),
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    budget = _expected_shutdown_budget(busy_timeout_ms)
+    scratch = tmp_path / "scratch.sqlite3"
+    threads = _record_heartbeat_threads(monkeypatch)
+    scanning = Event()
+    scans: list[float] = []
+
+    def report_progress() -> int:
+        scanning.set()
+        return 0
+
+    def scanning_heartbeat(**kwargs: Any) -> None:
+        bind_connection = kwargs["bind_connection"]
+        mark_stage = kwargs["mark_stage"]
+        connection = sqlite3.connect(scratch, isolation_level=None)
+        bind_connection(connection)
+        try:
+            mark_stage("scan")
+            connection.set_progress_handler(report_progress, _SCAN_PROGRESS_OPS)
+            started = time.monotonic()
+            try:
+                connection.execute(_STALLING_SCAN_SQL).fetchone()
+            finally:
+                scans.append(time.monotonic() - started)
+                connection.set_progress_handler(None, 0)
+        finally:
+            bind_connection(None)
+            connection.close()
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", scanning_heartbeat)
+    monkeypatch.setattr(
+        saga,
+        "_wait_for_heartbeat",
+        lambda stop, interval, *, phase: stop.wait(interval),
+    )
+    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+
+    def invoke(payload: bytes) -> bytes:
+        assert scanning.wait(timeout=10)
+        raise ConnectionError("transport committed but response was lost")
+
+    with pytest.raises(ConnectionError) as raised:
+        saga._invoke_with_heartbeat(
+            phase=SourceBrokerV2OutboxPhase.DISPATCH,
+            operation_id="0" * 64,
+            owner_generation=1,
+            payload=b'{"probe":1}',
+            invoke=invoke,
+        )
+
+    assert len(scans) == 1
+    assert str(raised.value) == "transport committed but response was lost"
+    assert raised.value.args == ("transport committed but response was lost",)
+    notes = getattr(raised.value, "__notes__", [])
+    assert len(notes) == 1
+    assert notes[0].startswith("outbox heartbeat did not stop after dispatch")
+    assert f"of a {budget:.3f}s budget" in notes[0]
+    assert "interrupt issued on the connection it held" in notes[0]
+    assert not _live_heartbeat_threads()
+
+
+def test_v2_saga_shutdown_ends_a_production_renewal_the_interrupt_cannot_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The interrupt lands between two statements of the production body.
+
+    SQLite documents that as a no-op that does not carry over, so the renewal
+    goes on to a real `BEGIN IMMEDIATE` against a lock somebody else holds.
+    Nothing aborts it; its own `busy_timeout` ends it, and the shutdown waits
+    that out rather than handing the thread back - the same guarantee as the
+    lock-wait case, but on the body production actually runs.
+    """
+
+    request, current, quota = _request(tmp_path)
+    path = tmp_path / "saga.sqlite3"
+    transport = _TestTransport(block_dispatch=True)
+    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 400
+    saga = _heartbeat_shutdown_saga(
+        path,
+        current=current,
+        quota=quota,
+        transport=transport,
+        lineage=lineage,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    budget = _expected_shutdown_budget(busy_timeout_ms)
+    threads = _record_heartbeat_threads(monkeypatch)
+    interrupted = Event()
+    original_interrupt = source_broker_v2_module._HeartbeatConnection.interrupt
+
+    def watched_interrupt(slot: Any) -> Any:
+        outcome = original_interrupt(slot)
+        interrupted.set()
+        return outcome
+
+    monkeypatch.setattr(
+        source_broker_v2_module._HeartbeatConnection, "interrupt", watched_interrupt
+    )
+    # Held across the whole shutdown by the competitor, and released from
+    # inside the heartbeat thread itself: the saga writes again right after the
+    # raise, and that write must never race the release.
+    competitor = sqlite3.connect(path, timeout=10.0, isolation_level=None, check_same_thread=False)
+    parked = Event()
+    lock_waits: list[float] = []
+    completed: list[float] = []
+    stalled: list[bool] = []
+    original_heartbeat = saga._heartbeat_outbox
+
+    def parking_heartbeat(**kwargs: Any) -> None:
+        if not _is_background_dispatch_heartbeat(kwargs) or stalled:
+            original_heartbeat(**kwargs)
+            return
+        if not completed:
+            original_heartbeat(**kwargs)
+            completed.append(time.monotonic())
+            return
+        stalled.append(True)
+        mark_stage = kwargs["mark_stage"]
+        started: list[float] = []
+
+        def marking(stage: str) -> None:
+            mark_stage(stage)
+            if stage != "lock-wait":
+                return
+            # `BEGIN IMMEDIATE` has not run yet and the reads before it are
+            # finished, so no statement is running when the interrupt arrives.
+            parked.set()
+            assert interrupted.wait(timeout=20)
+            started.append(time.monotonic())
+
+        try:
+            original_heartbeat(**{**kwargs, "mark_stage": marking})
+        finally:
+            lock_waits.append(time.monotonic() - started[-1])
+            competitor.execute("ROLLBACK")
+
+    monkeypatch.setattr(saga, "_heartbeat_outbox", parking_heartbeat)
+    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+            try:
+                assert transport.dispatch_entered.wait(timeout=5)
+                assert parked.wait(timeout=10)
+                competitor.execute("BEGIN IMMEDIATE")
+                transport.release_dispatch.set()
+                snapshot = future.result(timeout=60)
+            finally:
+                transport.release_dispatch.set()
+    finally:
+        with suppress(sqlite3.Error):
+            competitor.execute("ROLLBACK")
+        competitor.close()
+
+    assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    reason = snapshot.reconcile_reason
+    assert reason is not None
+    assert reason.startswith("outbox heartbeat did not stop after dispatch")
+    assert f"of a {budget:.3f}s budget" in reason
+    assert "stage 'lock-wait'" in reason
+    assert "interrupt issued on the connection it held" in reason
+    # Issued, but nothing was running to abort: the wait ran its own window out.
+    assert len(lock_waits) == 1
+    window = busy_timeout_ms / 1_000
+    assert lock_waits[0] < window * 2
+    joined = float(re.search(r"then joined (\d+\.\d+)s more", reason).group(1))
+    assert joined < window * 2
     assert transport.dispatch_calls == 1
     assert not _live_heartbeat_threads()
 
