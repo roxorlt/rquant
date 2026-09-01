@@ -1402,11 +1402,14 @@ def test_adapter_reserve_answers_a_stop_authority_before_and_during_the_wait(
             )
         assert seen == []
 
-        polls: list[float] = []
+        polls: list[bool] = []
 
-        def stop_after_two_polls() -> bool:
-            polls.append(time.monotonic())
-            return len(polls) >= 3
+        def stop_once_the_server_is_handling() -> bool:
+            # The seam is the request's arrival, not a clock: the flip can only
+            # be observed by a poll taken while the response is in flight.
+            stopped = bool(seen)
+            polls.append(stopped)
+            return stopped
 
         with _authority_write_lock(server.authority):
             started = time.monotonic()
@@ -1418,10 +1421,11 @@ def test_adapter_reserve_answers_a_stop_authority_before_and_during_the_wait(
                     snapshot_provider=_snapshot,
                     lease_seconds=30,
                     lock_wait_timeout_seconds=1.0,
-                    stop_requested=stop_after_two_polls,
+                    stop_requested=stop_once_the_server_is_handling,
                 )
             elapsed = time.monotonic() - started
-        assert len(polls) >= 3
+        assert polls.count(False) >= 2
+        assert polls[-1] is True
         assert elapsed < 0.5
     finally:
         server.close()
@@ -1457,11 +1461,12 @@ def test_adapter_recheck_answers_a_stop_authority_before_and_during_the_wait(
             )
         assert seen == []
 
-        polls: list[float] = []
+        polls: list[bool] = []
 
-        def stop_after_two_polls() -> bool:
-            polls.append(time.monotonic())
-            return len(polls) >= 3
+        def stop_once_the_server_is_handling() -> bool:
+            stopped = bool(seen)
+            polls.append(stopped)
+            return stopped
 
         with _authority_write_lock(server.authority):
             started = time.monotonic()
@@ -1474,10 +1479,11 @@ def test_adapter_recheck_answers_a_stop_authority_before_and_during_the_wait(
                     snapshot_provider=_snapshot,
                     lease_seconds=30,
                     lock_wait_timeout_seconds=1.0,
-                    stop_requested=stop_after_two_polls,
+                    stop_requested=stop_once_the_server_is_handling,
                 )
             elapsed = time.monotonic() - started
-        assert len(polls) >= 3
+        assert polls.count(False) >= 2
+        assert polls[-1] is True
         assert elapsed < 0.5
     finally:
         server.close()
