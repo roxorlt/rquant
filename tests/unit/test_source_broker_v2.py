@@ -2842,7 +2842,12 @@ def _stall_the_second_dispatch_renewal(
 
     def capturing_read(connection: sqlite3.Connection, **kwargs: Any) -> sqlite3.Row:
         row = original_read(connection, **kwargs)
-        if current_thread().name.startswith(_HEARTBEAT_THREAD_PREFIX):
+        # Phase-scoped through the same predicate the rest of the file uses:
+        # every outbox phase runs a heartbeat thread of its own, and on a slow
+        # machine the claim phase's renewal lands a tick here too.  That tick
+        # reads a different outbox row, and counting it made this case fail
+        # about 3% of the time.
+        if _is_background_dispatch_heartbeat(kwargs):
             connections.append(connection)
             read_heartbeat_at.append(row["executor_heartbeat_at"])
         return row
