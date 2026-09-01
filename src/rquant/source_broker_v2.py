@@ -82,6 +82,11 @@ _PRODUCTION_SAGA_GRAPH_TOKEN = object()
 # states for one SQLite operation on this file, so the tail is given the same
 # window as the wait.  A shutdown that waits less than the body it is waiting
 # on cannot tell a slow heartbeat from a stuck one.
+#
+# The budget decides when a renewal is *late*, not how long the shutdown may
+# stay: past it the shutdown interrupts the connection the thread is on and
+# then joins without a timeout (see ``_HeartbeatConnection``), so the method
+# never returns or raises while a heartbeat is still running.
 _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS = 2
 
 
@@ -1800,7 +1805,6 @@ class SourceBrokerV2Saga:
         self._lineage_authority = lineage_authority
         self._source_authority_keyring = source_authority_keyring
         self._busy_timeout_ms = busy_timeout_ms
-        self._abandoned_heartbeats: list[Thread] = []
         self._executor_owner_token = uuid4().hex
         self._executor_lease_seconds = executor_lease_seconds
         self._executor_wait_seconds = executor_wait_seconds
@@ -3974,41 +3978,48 @@ class SourceBrokerV2Saga:
             _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
             interval * 2,
         )
-        abandoned = 0
+        overdue: str | None = None
+        reached_connection = False
         try:
             result = invoke(payload)
         finally:
             stop_requested_at = time.monotonic()
             stop.set()
             heartbeat.join(timeout=shutdown_budget)
-            stopped_at = time.monotonic()
+            budget_expired_at = time.monotonic()
             if heartbeat.is_alive():
-                # Recorded here rather than after the ``try`` so the renewal is
-                # also accounted for when ``invoke`` itself raised.  The report
-                # below stays outside the ``finally``: raising from inside it
+                # Past the budget the renewal is late, and this method may not
+                # hand a live heartbeat back to its caller.  Interrupt what the
+                # thread is inside, then join with no timeout: the abort makes
+                # the statement fail at its next step, ``renew`` sees ``stop``
+                # and returns, and what the interrupt cannot cut short is the
+                # same ``busy_timeout`` lock wait plus durable tail the budget
+                # is derived from.  Done here rather than after the ``try`` so
+                # a raising ``invoke`` also leaves nothing running; the report
+                # below stays outside, since raising from inside a ``finally``
                 # would displace the caller's own exception.
-                abandoned = self._abandon_heartbeat(heartbeat)
-        if abandoned:
-            plural = "" if abandoned == 1 else "s"
+                overdue = progress.describe(budget_expired_at)
+                reached_connection = heartbeat_connection.interrupt()
+                heartbeat.join()
+            stopped_at = time.monotonic()
+        if overdue is not None:
+            reached = (
+                "interrupted a live connection"
+                if reached_connection
+                else "interrupted with no connection bound"
+            )
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat did not stop after {phase.value} "
-                f"(waited {stopped_at - stop_requested_at:.3f}s of a "
-                f"{shutdown_budget:.3f}s budget; {progress.describe(stopped_at)}; "
-                f"{abandoned} abandoned heartbeat{plural} still alive)"
+                f"(waited {budget_expired_at - stop_requested_at:.3f}s of a "
+                f"{shutdown_budget:.3f}s budget; {overdue}; {reached}, then joined "
+                f"{stopped_at - budget_expired_at:.3f}s more, ending in stage "
+                f"{progress.stage!r})"
             )
         if failures:
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat failed during {phase.value}"
             ) from failures[0]
         return result
-
-    def _abandon_heartbeat(self, heartbeat: Thread) -> int:
-        """Record an over-budget heartbeat and report how many are still alive."""
-
-        live = [thread for thread in self._abandoned_heartbeats if thread.is_alive()]
-        live.append(heartbeat)
-        self._abandoned_heartbeats = live
-        return len(live)
 
     def _begin_outbox(
         self,
