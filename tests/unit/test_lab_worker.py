@@ -6707,7 +6707,9 @@ def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
         # budget is the module's own spawn scale rather than a flat literal,
         # because what is being waited for is a spawned CPython re-importing
         # this module and then forking once more before either write.
-        grandchild_pid = _recorded_pid(grandchild_pid_path, timeout_seconds=_child_startups(2))
+        grandchild_pid = _recorded_pid(
+            grandchild_pid_path, timeout_seconds=_child_startups(2)
+        )
         child_pid = _recorded_pid(child_pid_path, timeout_seconds=_child_startups(2))
         assert child_pid is not None
         assert grandchild_pid is not None
