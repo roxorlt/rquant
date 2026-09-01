@@ -2679,9 +2679,7 @@ def test_begin_immediate_retries_a_busy_code_whose_message_changed(
         )
 
     assert isinstance(timed_out.value, RuntimeResourceAdmissionTransientError)
-    assert sum(clock.sleeps) == pytest.approx(
-        _LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS
-    )
+    assert sum(clock.sleeps) == pytest.approx(_LEGACY_RESERVATION_LOCK_WAIT_BUDGET_SECONDS)
     assert forever.attempts == len(clock.sleeps) + 1
     assert forever.rollbacks == 0
 
