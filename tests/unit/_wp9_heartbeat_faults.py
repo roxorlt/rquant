@@ -89,7 +89,7 @@ _SIGTERM_IGNORING_FAULTS = (
 
 # Gated faults that must do nothing at all until their window opens, rather
 # than renewing normally in the meantime.
-_IDLE_UNTIL_TOLD = ("renew-when-told",)
+_IDLE_UNTIL_TOLD = ("renew-when-told", "fail-renewal")
 
 # Faults that act during a renewal rather than during the handshake, and so
 # must wait for the case to open the window first.

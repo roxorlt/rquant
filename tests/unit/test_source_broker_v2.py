@@ -1500,12 +1500,20 @@ def test_v2_saga_happy_path_persists_all_effects_before_lineage(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        # Migrated T-B.  This case is about the durable effects, not about the
+        # heartbeat, and its old 30s default put the renewal interval at 10s -
+        # close enough to a slow window that whether the helper wrote during it
+        # was luck.  120s makes the interval 40s and "no renewal happened" a
+        # property of the configuration, which the boundary check then asserts.
+        executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
     )
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
 
     result = saga.advance(request, now=NOW + timedelta(seconds=1))
 
     assert result.state is SourceBrokerV2SagaState.COMPLETE
     assert result.dispatch_outcome is not None
+    _wp9_assert_no_renewal_in_any_window(boundary)
     assert transport.dispatch_calls == 1
     assert transport.finalize_calls == 1
     assert transport.claim_once_calls >= 2
@@ -1782,17 +1790,27 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
             results.join_thread()
 
     start = Barrier(3)
+    # Migrated T-B.  Two threads, one saga instance each, and a 120s lease so
+    # the renewal interval is 40s - longer than this whole case runs - which
+    # makes "neither helper renewed during the contended window" something the
+    # configuration guarantees rather than something the schedule happened to
+    # produce.  Instances are collected by identity, never counted by `id()`:
+    # addresses get reused.
+    contenders: list[SourceBrokerV2Saga] = []
 
     def run() -> object:
         start.wait(timeout=5)
-        return SourceBrokerV2Saga.for_nonproduction(
+        instance = SourceBrokerV2Saga.for_nonproduction(
             path,
             saga_id="saga-a",
             current_claim_authority=current,
             quota_adapter=quota,
             transport=transport,
             lineage_authority=lineage,
-        ).advance(request, now=NOW + timedelta(seconds=1))
+            executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
+        )
+        contenders.append(instance)
+        return instance.advance(request, now=NOW + timedelta(seconds=1))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(run)
@@ -1810,6 +1828,12 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
         results = [first.result(timeout=10), second.result(timeout=10)]
 
     assert {result.state for result in results} == {SourceBrokerV2SagaState.COMPLETE}
+    assert len(contenders) == 2
+    for contender in contenders:
+        session = contender._last_heartbeat_session
+        assert session is not None
+        assert session.ticks == 0
+        contender.close()
     assert current.signing_calls == 1
     assert transport.dispatch_calls == 1
 
@@ -2056,6 +2080,10 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
         quota_adapter=quota,
         transport=_TestTransport(clock=lambda: clock.now()),
         lineage_authority=_TestLineageAuthority(),
+        # Migrated T-B: a 40s renewal interval, so no window here can contain
+        # a renewal and the grant/observation timestamps this case reads are
+        # written only by the code paths it is about.
+        executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
     )
 
     result = saga.advance(request, now=NOW + timedelta(seconds=1))
@@ -2617,20 +2645,25 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.01,
-        source_request_deadline_seconds=0.08,
-        source_takeover_grace_seconds=0.04,
+        source_request_deadline_seconds=0.08 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.04 * _WP9_MIGRATED_SCALE,
     )
 
     def crash_before_invoke(phase: SourceBrokerV2OutboxPhase) -> None:
         if phase is SourceBrokerV2OutboxPhase.DISPATCH:
             raise SystemExit("owner stopped before source transport")
 
+    # Migrated T-B: every duration lifted by one factor, so the lease still
+    # expires before the cooldown does - which is the whole scenario - while
+    # the renewal interval goes from 16.7ms to 1s and no window can contain a
+    # tick.  The boundary check below asserts that outright.
+    boundary = _wp9_watch_boundary(first, monkeypatch)
     monkeypatch.setattr(first, "_before_external_effect", crash_before_invoke)
     with pytest.raises(SystemExit, match="before source transport"):
         first.advance(request, now=NOW + timedelta(seconds=1))
-    clock.advance(0.055)
+    clock.advance(0.055 * _WP9_MIGRATED_SCALE)
 
     takeover = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -2639,19 +2672,22 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.1,
-        source_request_deadline_seconds=0.08,
-        source_takeover_grace_seconds=0.04,
+        source_request_deadline_seconds=0.08 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.04 * _WP9_MIGRATED_SCALE,
     )
     waiting = takeover.advance(request, now=NOW + timedelta(seconds=2))
 
     assert waiting.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert transport.dispatch_calls == 0
-    clock.advance(0.08)
+    clock.advance(0.08 * _WP9_MIGRATED_SCALE)
     recovered = takeover.reconcile(request, now=NOW + timedelta(seconds=3))
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
+    _wp9_assert_no_renewal_in_any_window(boundary)
     assert transport.dispatch_calls == 1
+    first.close()
+    takeover.close()
 
 
 def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
@@ -2697,6 +2733,9 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
 
     first = build()
     boundary = _wp9_watch_boundary(first, monkeypatch)
+    # Idle until told: a helper renewing normally before the window opens would
+    # write real-clock timestamps onto the very row whose expiry decides
+    # whether the second saga may take over.
     _wp9_use_fault_helper(first, monkeypatch, "fail-renewal", marker)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -3390,9 +3429,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.01,
-        source_request_deadline_seconds=0.05,
+        source_request_deadline_seconds=0.05 * _WP9_MIGRATED_SCALE,
         source_takeover_grace_seconds=0.0,
     )
 
@@ -3400,11 +3439,14 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
         if phase is SourceBrokerV2OutboxPhase.DISPATCH:
             raise SystemExit("owner crashed before source invoke")
 
+    # Migrated T-B: scaled as one, so the lease still expires between the
+    # crash and the takeover while the renewal interval becomes 1s.
+    boundary = _wp9_watch_boundary(first, monkeypatch)
     monkeypatch.setattr(first, "_before_external_effect", crash_before_invoke)
     with pytest.raises(SystemExit, match="before source invoke"):
         first.advance(request, now=NOW + timedelta(seconds=1))
 
-    clock.advance(0.06)
+    clock.advance(0.06 * _WP9_MIGRATED_SCALE)
     restarted = SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
@@ -3412,9 +3454,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.2,
-        source_request_deadline_seconds=0.05,
+        source_request_deadline_seconds=0.05 * _WP9_MIGRATED_SCALE,
         source_takeover_grace_seconds=0.0,
     )
     result = restarted.advance(request, now=NOW + timedelta(seconds=2))
@@ -3426,6 +3468,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
             "SELECT executor_generation FROM source_broker_v2_outbox WHERE phase = 'dispatch'"
         ).fetchone()[0]
     assert generation == 2
+    _wp9_assert_no_renewal_in_any_window(boundary)
+    first.close()
+    restarted.close()
 
 
 def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
@@ -3445,18 +3490,26 @@ def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.01,
+        # Scaled with the lease: `for_nonproduction` defaults these to 0.25 and
+        # 0.05, and a lease lifted past them would put the persisted deadline
+        # behind the clock before the recovery this case is about even starts.
+        source_request_deadline_seconds=0.25 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.05 * _WP9_MIGRATED_SCALE,
     )
 
     def crash_after_invoke(phase: SourceBrokerV2OutboxPhase) -> None:
         if phase is SourceBrokerV2OutboxPhase.DISPATCH:
             raise ConnectionError("owner crashed after source invoke")
 
+    # Migrated T-B, scaled as one: the lease still expires before the restart
+    # takes over, and the renewal interval is 1s.
+    boundary = _wp9_watch_boundary(first, monkeypatch)
     monkeypatch.setattr(first, "_after_external_effect", crash_after_invoke)
     first_result = first.advance(request, now=NOW + timedelta(seconds=1))
     assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-    clock.advance(0.06)
+    clock.advance(0.06 * _WP9_MIGRATED_SCALE)
 
     restarted = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -3465,14 +3518,19 @@ def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.2,
+        source_request_deadline_seconds=0.25 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.05 * _WP9_MIGRATED_SCALE,
     )
     result = restarted.reconcile(request, now=NOW + timedelta(seconds=2))
 
     assert result.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
     assert transport.claim_once_calls > 0
+    _wp9_assert_no_renewal_in_any_window(boundary)
+    first.close()
+    restarted.close()
 
 
 def test_v2_saga_complete_reverifies_current_claim_and_rejects_new_generation(
@@ -3587,6 +3645,15 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
         source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
         source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
+    # Migrated T-C, not T-B.  This is the one case the lease cannot be lifted
+    # in: there is no fake clock here, and the recovery under test depends on
+    # the first owner's lease having really expired by the time the restored
+    # snapshot is advanced - milliseconds later.  A longer lease would block
+    # the takeover outright.  So the helper is neutralised instead: it is
+    # started, acknowledges and answers its end frame, but performs no renewal,
+    # which makes "no tick happened" true by construction rather than by
+    # timing.  The 0.05s lease is deliberately left alone.
+    _wp9_use_fault_helper(first, monkeypatch, "never-renews")
     captured = False
 
     def capture_after_dispatch(phase: SourceBrokerV2OutboxPhase) -> None:
@@ -3616,7 +3683,7 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     ):
         source.backup(target)
 
-    recovered = SourceBrokerV2Saga.for_nonproduction(
+    successor = SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
         current_claim_authority=current,
@@ -3626,9 +3693,13 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
         executor_lease_seconds=0.05,
         source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
         source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
-    ).advance(request, now=NOW + timedelta(seconds=3))
+    )
+    _wp9_use_fault_helper(successor, monkeypatch, "never-renews")
+    boundary = _wp9_watch_boundary(successor, monkeypatch)
+    recovered = successor.advance(request, now=NOW + timedelta(seconds=3))
 
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
+    _wp9_assert_no_renewal_in_any_window(boundary)
     assert transport.dispatch_calls == 1
     assert transport.claim_once_calls > 0
     with sqlite3.connect(path) as connection:
@@ -3642,6 +3713,8 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     assert type(migrated_attempt) is str
     assert migrated_receipts[0] == ("DEFINITIVELY_ABSENT", migrated_attempt)
     assert all(attempt_id is None for status, attempt_id in migrated_receipts if status == "FOUND")
+    first.close()
+    successor.close()
 
 
 def test_v2_saga_rejects_rehashed_forged_claim_receipt_against_authority(
@@ -3879,6 +3952,15 @@ _WP9_TAMPER_LEASE_SECONDS = 0.3
 # production shape: the default lease is 30s and the default source deadline is
 # 10s, so almost every real invocation ends with zero ticks.
 _WP9_QUIET_LEASE_SECONDS = 120.0
+# The scale the lease-expiry migrations are lifted by.  Those cases need a
+# lease that *does* expire - the takeover they are about depends on it - so a
+# 120s lease is no use to them.  Every duration in the scenario is multiplied
+# by the same factor instead, which leaves the arithmetic they assert exactly
+# as it was while putting the renewal interval at 1s, four orders of magnitude
+# past any window they open.  Time is on a fake clock in all of them, so the
+# multiplication costs no wall clock at all.
+_WP9_MIGRATED_SCALE = 60
+_WP9_MIGRATED_LEASE_SECONDS = 0.05 * _WP9_MIGRATED_SCALE
 # Every wait a case performs has its own deadline; none of them may hang the
 # suite if the thing they wait for never happens.
 _WP9_RENDEZVOUS_TIMEOUT_SECONDS = 30.0
@@ -4150,6 +4232,24 @@ def _wp9_watch_boundary(
 
     monkeypatch.setattr(saga, "_invoke_with_heartbeat", bounded)
     return seen
+
+
+def _wp9_assert_no_renewal_in_any_window(boundary: list[dict[str, Any]]) -> None:
+    """Every window this saga opened contained no renewal at all.
+
+    The T-B migrations rest on this: with a 120s lease the renewal interval is
+    40s, which no window in these cases comes within two orders of magnitude
+    of, so "no tick" is a property of the configuration rather than a race that
+    happens to come out right.  Asserted for every phase, not just the last.
+    """
+
+    assert boundary
+    for state in boundary:
+        outcome = state["outcome"]
+        assert outcome is not None, state["phase"]
+        assert outcome.ticks == 0, (state["phase"], outcome.ticks)
+        assert outcome.first_digest is None
+        assert outcome.digest_mismatch is False
 
 
 def _wp9_boundary_for(
