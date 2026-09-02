@@ -29,6 +29,8 @@ HELPER_MP_HANG = os.path.join(HERE, "helper_mp_hang.py")
 HELPER_SQLITE = os.path.join(HERE, "helper_sqlite_hold.py")
 HELPER_HEARTBEAT = os.path.join(HERE, "helper_heartbeat.py")
 HELPER_PARENT = os.path.join(HERE, "helper_parent.py")
+HELPER_PRODSHAPE = os.path.join(HERE, "helper_prodshape.py")
+HELPER_PARENT_V2 = os.path.join(HERE, "helper_parent_v2.py")
 
 BUSY_MS = 400
 RESULTS = []
@@ -810,6 +812,193 @@ def probe_parent_death_eof(root):
 
 
 # --------------------------------------------------------------------------
+# V4-M2: process-exit watch that needs NO extra fd on the production helper
+# --------------------------------------------------------------------------
+def process_create_time(pid):
+    """A pid-reuse-proof identity token for `pid`, or None.
+
+    Linux: field 22 (starttime) of /proc/<pid>/stat, parsed after the last ')'
+    so a comm containing spaces or parens cannot shift the fields.
+    macOS: `ps -o lstart=` (second resolution), which is stdlib-reachable via
+    subprocess; there is no pure-Python sysctl in the stdlib.
+    """
+    stat_path = f"/proc/{pid}/stat"
+    if os.path.exists(stat_path):
+        try:
+            with open(stat_path, encoding="utf-8") as handle:
+                raw = handle.read()
+        except OSError:
+            return None
+        tail = raw[raw.rindex(")") + 2 :].split()
+        return f"starttime:{tail[19]}"          # field 22 == index 19 after (pid, comm, state)
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return f"lstart:{out}" if out else None
+
+
+def open_exit_watch(pid):
+    """Return (kind, waiter) where waiter.wait(timeout) -> True once pid exits.
+
+    Neither mechanism needs the process to be our child, and neither needs an
+    extra fd handed to the watched process - which is the whole point (V4-M2).
+    """
+    if hasattr(os, "pidfd_open"):
+        fd = os.pidfd_open(pid)                 # raises ProcessLookupError if already gone
+
+        class _PidfdWaiter:
+            def wait(self, timeout):
+                readable, _, _ = select.select([fd], [], [], timeout)
+                return bool(readable)
+
+            def close(self):
+                os.close(fd)
+
+        return "pidfd", _PidfdWaiter()
+    if hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        event = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        queue.control([event], 0, 0)            # raises ProcessLookupError if already gone
+
+        class _KqueueWaiter:
+            def wait(self, timeout):
+                return bool(queue.control(None, 1, timeout))
+
+            def close(self):
+                queue.close()
+
+        return "kqueue", _KqueueWaiter()
+    raise RuntimeError("no exit-watch mechanism on this platform")
+
+
+def probe_parent_death_exit_watch(root):
+    """T9 as V4-M2 rewrites it: the helper keeps the frozen three-fd shape and
+    the supervisor learns of its exit through pidfd / kqueue, identified by
+    (pid, create_time)."""
+    db = os.path.join(root, "parent-death-v2.sqlite3")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(db + suffix)
+        except OSError:
+            pass
+    make_outbox(db)
+    interval = 0.2
+
+    report_r, report_w = os.pipe()
+    os.set_inheritable(report_w, True)
+    parent = subprocess.Popen(
+        [
+            sys.executable, "-I", HELPER_PARENT_V2, db, "wp9-probe-op", str(interval),
+            str(report_w), HELPER_PRODSHAPE, str(BUSY_MS),
+        ],
+        pass_fds=(report_w,),
+        start_new_session=True,
+        close_fds=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    os.close(report_w)
+    report = LineReader(report_r).poll(30.0)
+    assert isinstance(report, dict), f"no report from helper-parent: {report!r}"
+    helper_pid = report["ready"]["pid"]
+    ready_frame_keys = sorted(report["ready"])
+
+    created = process_create_time(helper_pid)
+    kind, waiter = open_exit_watch(helper_pid)
+
+    # a watch on a pid that cannot exist must fail loudly, not silently pass
+    bogus_rejected = None
+    try:
+        open_exit_watch(2 ** 22 - 1)
+        bogus_rejected = "no-error"
+    except ProcessLookupError:
+        bogus_rejected = "ProcessLookupError"
+    except (OSError, RuntimeError) as exc:
+        bogus_rejected = type(exc).__name__
+
+    deadline = time.monotonic() + 10.0
+    ticked = False
+    while time.monotonic() < deadline:
+        if read_outbox(db)[0] != "BASELINE":
+            ticked = True
+            break
+        time.sleep(0.05)
+
+    external = external_fd_view(helper_pid)
+    linux_fd_rows = [row for row in external.get("rows", []) if isinstance(row, dict)]
+    read_only_pipes = [row for row in linux_fd_rows if row.get("accmode") == "r" and
+                       str(row.get("target", "")).startswith("pipe:")]
+    created_before_kill = process_create_time(helper_pid)
+
+    os.kill(parent.pid, signal.SIGKILL)
+    killed_at = time.monotonic()
+    parent.wait(timeout=10)
+
+    fired = waiter.wait(15.0)
+    helper_exit_seconds = time.monotonic() - killed_at
+    waiter.close()
+    os.close(report_r)
+
+    lock_probe = try_begin_immediate(db, BUSY_MS)
+    before = read_outbox(db)
+    time.sleep(3 * interval)
+    after = read_outbox(db)
+    connection = sqlite3.connect(db)
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    connection.close()
+
+    ok = (
+        created is not None
+        and created == created_before_kill
+        and bogus_rejected in {"ProcessLookupError", "OSError", "PermissionError"}
+        and ticked
+        and fired
+        and helper_exit_seconds < 5.0
+        and lock_probe["ok"]
+        and before == after
+        and integrity == "ok"
+        and ready_frame_keys == ["pid", "protocol", "t"]     # production frame shape, no fd list
+    )
+    record(
+        "parent_death_exit_watch",
+        ok,
+        f"three-fd production-shaped helper; exit observed via {kind} in "
+        f"{helper_exit_seconds:.4f}s after the parent was SIGKILLed; identity "
+        f"{created!r} unchanged; write lock free in {lock_probe['elapsed_ms']}ms; "
+        f"no tick in {3 * interval:.1f}s afterwards",
+        {
+            "watch_kind": kind,
+            "helper_pid": helper_pid,
+            "create_time": created,
+            "create_time_before_kill": created_before_kill,
+            "bogus_pid_watch": bogus_rejected,
+            "ready_frame_keys": ready_frame_keys,
+            "heartbeat_ticked_before_kill": ticked,
+            "helper_exit_seconds": round(helper_exit_seconds, 4),
+            "exit_watch_fired": fired,
+            "write_lock_after_death": lock_probe,
+            "row_before": list(before),
+            "row_after": list(after),
+            "quiet_window_s": round(3 * interval, 3),
+            "integrity_check": integrity,
+            "external_fd_view_source": external["source"],
+            "external_read_only_pipe_fds": read_only_pipes,
+            "external_fd_rows": linux_fd_rows or external.get("rows", [])[:40],
+        },
+    )
+
+
+# --------------------------------------------------------------------------
 # (ii) AF_UNIX non-blocking connect errno set
 # --------------------------------------------------------------------------
 def probe_afunix_connect(root):
@@ -1103,6 +1292,7 @@ def main():
         probe_helper_lifecycle()
         probe_sqlite_takeover(root)
         probe_parent_death_eof(root)
+        probe_parent_death_exit_watch(root)
         probe_afunix_connect(root)
         probe_afunix_send()
         probe_isolated_module_env()
