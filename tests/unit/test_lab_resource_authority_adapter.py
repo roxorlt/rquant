@@ -1590,6 +1590,7 @@ class _SeamSocket:
         self.sendall_calls = 0
         self.sent_bytes = 0
         self.first_chunk_bytes = 0
+        self.first_progress_call = 0
         self.send_timeouts = 0
 
     def __enter__(self) -> _SeamSocket:
@@ -1632,6 +1633,8 @@ class _SeamSocket:
         except TimeoutError:
             self.send_timeouts += 1
             raise
+        if sent and not self.first_progress_call:
+            self.first_progress_call = self.send_calls
         self.sent_bytes += sent
         return sent
 
@@ -1721,6 +1724,32 @@ def test_wp9b_connect_answers_a_stop_authority_within_one_poll_period(
         assert made[0].sendall_calls == 0
         assert seen == []
         assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
+
+        # The other half of "before every attempt": a stop that lands after the
+        # entry guard but before the loop starts must cost zero connect calls.
+        # The seam's own construction is the trigger, so the case does not have
+        # to count the polls the caller took on the way in.
+        later = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _unix_socket(),
+                connect_codes=_stalling_connect_codes(attempts_before_refusal=64),
+            ),
+        )
+        with pytest.raises(RuntimeResourceAdmissionCancelledError):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+                stop_requested=lambda: bool(later),
+            )
+        assert len(later) == 1
+        assert later[0].connect_attempts == 0
+        assert later[0].send_calls == 0
+        assert seen == []
     finally:
         server.close()
 
@@ -1933,6 +1962,9 @@ def test_wp9b_send_answers_a_stop_authority_between_two_chunks(
         assert seam.send_timeouts >= 1, "the full peer never blocked the send"
         assert seam.sent_bytes > 0, "the offset never advanced"
         assert seam.sent_bytes < seam.first_chunk_bytes, "the whole frame left before the stop"
+        # The chunk that advanced the offset is the last one attempted: what
+        # follows a successful `send` is the poll, not another `send`.
+        assert seam.first_progress_call == seam.send_calls
         assert seen == []
         assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
     finally:
