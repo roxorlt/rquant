@@ -60,11 +60,6 @@ UPDATE_SQL = (
     "AND status = 'pending' AND executor_owner_token = ? "
     "AND executor_generation = ?"
 )
-# The column the self-healing fault moves and then puts back.  A plain string
-# column that the helper-side structural checks accept unchanged, so the only
-# thing that notices is the digest.
-TAMPER_COLUMN = "payload_hash"
-
 # Faults whose whole point is that the process cannot be asked to leave.  A
 # helper that honours SIGTERM exits at the first escalation step, which would
 # leave the SIGKILL stage untested - and that stage is the only reason a stuck
@@ -83,7 +78,6 @@ _GATED_FAULTS = (
     "stall-before-connect",
     "stall-before-commit",
     "stall-after-commit",
-    "tamper-self-healing",
 )
 
 FAULT_MODES = (
@@ -98,7 +92,6 @@ FAULT_MODES = (
     "stall-before-connect",
     "stall-before-commit",
     "stall-after-commit",
-    "tamper-self-healing",
 )
 
 
@@ -269,31 +262,6 @@ def _renew(
     return digest, connection
 
 
-def _tamper(config: dict[str, Any], session: dict[str, Any], value: str) -> None:
-    connection = _connect(config)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            f"UPDATE source_broker_v2_outbox SET {TAMPER_COLUMN} = ? WHERE operation_id = ?",
-            (value, session["operation_id"]),
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _original_column(config: dict[str, Any], session: dict[str, Any]) -> str:
-    connection = _connect(config)
-    try:
-        row = connection.execute(
-            f"SELECT {TAMPER_COLUMN} FROM source_broker_v2_outbox WHERE operation_id = ?",
-            (session["operation_id"],),
-        ).fetchone()
-    finally:
-        connection.close()
-    return str(row[0])
-
-
 def _emit_tick(status_fd: int, session: dict[str, Any], digest: str) -> None:
     session["ticks"] += 1
     if session["first_digest"] is None:
@@ -342,35 +310,6 @@ def _new_session(frame: dict[str, Any]) -> dict[str, Any]:
         "digest_changed": False,
         "outcome": "ok",
     }
-
-
-def _run_self_healing_tamper(
-    config: dict[str, Any],
-    session: dict[str, Any],
-    status_fd: int,
-    marker: str,
-) -> None:
-    """Sample, move a column, sample, put it back, sample.
-
-    Ordered entirely inside this process.  Nothing here waits to be told what
-    to do next, so the interleaving is a property of this function rather than
-    of two processes racing, and the case only has to wait for the marker that
-    says the whole sequence is done.
-    """
-
-    original = _original_column(config, session)
-    digest, connection = _renew(config, session)
-    connection.close()
-    _emit_tick(status_fd, session, digest)
-    _tamper(config, session, "f" * 64)
-    digest, connection = _renew(config, session)
-    connection.close()
-    _emit_tick(status_fd, session, digest)
-    _tamper(config, session, original)
-    digest, connection = _renew(config, session)
-    connection.close()
-    _emit_tick(status_fd, session, digest)
-    _announce(marker)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -453,11 +392,6 @@ def main(argv: list[str] | None = None) -> int:
             fault_now = fault
         else:
             fault_now = fault
-        if fault_now == "tamper-self-healing":
-            assert args.fault_marker is not None
-            _run_self_healing_tamper(config, session, status_fd, args.fault_marker)
-            session["open"] = False
-            continue
         if fault_now == "fail-renewal":
             session["open"] = False
             session["outcome"] = "failed"

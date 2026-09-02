@@ -5236,17 +5236,35 @@ def test_v2_saga_detects_a_self_healing_tamper_inside_the_invoke_window(
     lease = _WP9_QUIET_LEASE_SECONDS if shape == "zero-ticks" else _WP9_TAMPER_LEASE_SECONDS
     saga, _ = _wp9_saga(tmp_path, lease_seconds=lease)
     boundary = _wp9_watch_boundary(saga, monkeypatch)
-    marker = tmp_path / f"{shape}.marker"
-    if shape == "self-healing-tamper":
-        _wp9_use_fault_helper(saga, monkeypatch, "tamper-self-healing", marker)
     phase, operation_id, generation, payload = _wp9_window(saga)
+    original_hash = _wp9_outbox_column(saga.path, operation_id, "payload_hash")
 
     def invoke(_: bytes) -> bytes:
+        # The production helper takes every sample here, and the tampering is
+        # done from this process, so what the case exercises is the shipped
+        # helper's own bookkeeping rather than a stand-in's.
+        #
+        # Each step waits for the renewal that follows it before the next one
+        # starts, and a renewal takes its digest inside the same transaction
+        # that moves the timestamp this wait watches - so "the sample that saw
+        # the tampered row" is an observed fact, not a hoped-for interleaving.
+        if shape == "zero-ticks":
+            return canonical_json_bytes({"wp9": "result"})
+        _wp9_wait_for_renewals(saga, operation_id, 1)
         if shape == "self-healing-tamper":
-            _wp9_open_window(marker)
-            _wp9_wait_for(marker.exists, what="the tamper sequence to finish")
-        elif shape == "untouched-three-ticks":
-            _wp9_wait_for_renewals(saga, operation_id, 3)
+            _wp9_write(
+                saga.path,
+                "UPDATE source_broker_v2_outbox SET payload_hash = ? WHERE operation_id = ?",
+                ("f" * 64, operation_id),
+            )
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        if shape == "self-healing-tamper":
+            _wp9_write(
+                saga.path,
+                "UPDATE source_broker_v2_outbox SET payload_hash = ? WHERE operation_id = ?",
+                (original_hash, operation_id),
+            )
+        _wp9_wait_for_renewals(saga, operation_id, 1)
         return canonical_json_bytes({"wp9": "result"})
 
     before = _wp9_outbox_bytes(saga.path, operation_id)
@@ -5276,9 +5294,13 @@ def test_v2_saga_detects_a_self_healing_tamper_inside_the_invoke_window(
     if shape == "self-healing-tamper":
         assert outcome.ticks >= 3
         assert outcome.digest_changed is True
-        # Back where it started: only the sticky flag remembers, which is the
-        # whole claim.
+        # Back where it started: the last sample equals the first, this
+        # process recomputes the same digest again at the far edge of the
+        # window, and the row is byte for byte what it was.  Only the sticky
+        # flag remembers - which is the whole claim.
         assert outcome.last_digest == outcome.first_digest
+        assert outcome.observed_digest == outcome.first_digest
+        assert outcome.digest_mismatch is False
         after = _wp9_outbox_bytes(saga.path, operation_id)
         assert after[:9] == before[:9]
     elif shape == "untouched-three-ticks":
@@ -6208,3 +6230,71 @@ def test_wp9_a_missing_row_still_fails_the_synchronous_renewal_as_integrity(
     )
     with pytest.raises(SourceBrokerV2SagaIntegrityError, match="required outbox effect is missing"):
         saga._heartbeat_outbox(phase=phase, operation_id=operation_id, owner_generation=0)
+
+
+def test_wp9_a_tick_that_would_block_is_dropped_instead(tmp_path: Path) -> None:
+    """The one frame that can be frequent must never stop the renewals.
+
+    The parent does not read the status pipe while an invocation runs, so a
+    blocking write here would let a full pipe wedge the heartbeat itself - the
+    failure this whole design exists to remove, reintroduced from the other
+    end.  A tick that does not fit is dropped; the authoritative counters and
+    digests ride on the acknowledgement instead.
+    """
+
+    del tmp_path
+    read_end, write_end = os.pipe()
+    dropped: list[bool] = []
+    finished = Event()
+    try:
+        os.set_blocking(write_end, False)
+        while True:
+            try:
+                os.write(write_end, b"x" * 4096)
+            except BlockingIOError:
+                break
+        os.set_blocking(write_end, True)
+
+        def write_a_tick() -> None:
+            dropped.append(
+                source_broker_v2_heartbeat._write_tick_frame(
+                    write_end,
+                    {"t": "tick", "n": 1, "stage": "commit", "digest": "0" * 64},
+                )
+            )
+            finished.set()
+
+        writer = Thread(target=write_a_tick, name="wp9-tick-writer", daemon=True)
+        writer.start()
+        assert finished.wait(timeout=5)
+        assert dropped == [False]
+        # And the descriptor is handed back blocking, so the frames that must
+        # arrive are still written to completion.
+        assert os.get_blocking(write_end)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+
+def test_wp9_closing_only_the_stop_pipe_ends_the_helper(tmp_path: Path) -> None:
+    """Stopping is a close, never a message - which is why a dead parent works.
+
+    The helper is sitting in `select` on a pipe whose only write end this
+    process holds, so the kernel delivers the signal for us when this process
+    dies, however it dies.  A shutdown frame would need a live parent with time
+    to send it, which is exactly the case that has to work.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    state = saga._heartbeat_state
+    stop_w = state.stop_w
+    popen = state.popen
+    assert stop_w is not None
+    assert popen is not None
+    os.close(stop_w)
+    state.stop_w = None
+    assert popen.wait(timeout=10) == 0
+    # The control pipe was never touched: the stop pipe alone did it.
+    assert state.ctrl_w is not None
+    saga.close()
