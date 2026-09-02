@@ -6161,8 +6161,10 @@ def test_wp9_shutdown_bound_is_closed_form_at_production_defaults(tmp_path: Path
     for: the owner-guarded renewal that runs after the final acknowledgement
     and before the invocation.  It is spent before the external call, so a
     caller waiting on this bound waits through it, and leaving it out would
-    understate the wait by a whole write-lock window - 25.30s claimed against
-    30.30s possible.
+    understate the wait by a whole write transaction - 25.30s claimed against
+    35.30s possible.  That renewal is budgeted the same way the shutdown is,
+    because it runs the same body: a lock wait plus an equal allowance on the
+    durable tail behind it.
     """
 
     saga, _ = _wp9_saga(tmp_path, busy_timeout_ms=5_000, lease_seconds=30.0)
@@ -6172,7 +6174,9 @@ def test_wp9_shutdown_bound_is_closed_form_at_production_defaults(tmp_path: Path
     assert saga._heartbeat_shutdown_budget() == 10.0
     assert saga._heartbeat_handshake_budget() == 5.0
     assert saga._heartbeat_idle_exit_seconds() == 60.0
-    assert saga._heartbeat_fresh_lease_budget() == 5.0
+    assert saga._heartbeat_fresh_lease_budget() == 10.0
+    # The same two windows the shutdown budget is made of, for the same reason.
+    assert saga._heartbeat_fresh_lease_budget() == saga._heartbeat_shutdown_budget()
     bound = saga._heartbeat_shutdown_budget() + terminate + final_reap + epsilon
     assert bound == pytest.approx(15.30)
     handshake = saga._heartbeat_handshake_budget()
@@ -6183,16 +6187,16 @@ def test_wp9_shutdown_bound_is_closed_form_at_production_defaults(tmp_path: Path
         + epsilon
         + saga._heartbeat_fresh_lease_budget()
     )
-    assert session_start == pytest.approx(30.30)
+    assert session_start == pytest.approx(35.30)
     # And the renewal really is the difference: the handshake on its own is
-    # exactly one write-lock window short.
+    # exactly one write transaction short.
     assert session_start - saga._heartbeat_fresh_lease_budget() == pytest.approx(25.30)
     close_bound = (
         source_broker_v2_module._HEARTBEAT_EOF_SECONDS + terminate + final_reap + epsilon
     )
     assert close_bound == pytest.approx(5.55)
     # The whole method, before any time the external call itself takes.
-    assert session_start + bound == pytest.approx(45.60)
+    assert session_start + bound == pytest.approx(50.60)
 
 
 def test_wp9_finalizer_is_registered_against_a_plain_function_and_state(

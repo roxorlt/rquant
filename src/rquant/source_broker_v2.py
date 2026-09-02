@@ -131,8 +131,11 @@ _HEARTBEAT_HANDSHAKE_FLOOR_SECONDS = 2.0
 # ``B_renew`` is ``_heartbeat_fresh_lease_budget`` - the owner-guarded renewal
 # that runs after the final acknowledgement and before the invocation.  It is
 # counted here because it is spent before the external call, so a caller
-# waiting on ``T_session_start`` waits through it.  On production defaults
-# (busy 5s, lease 30s) that is 15.30s, 30.30s and 5.55s.
+# waiting on ``T_session_start`` waits through it, and it is ``T1`` rather than
+# one lock window because it runs the same body the shutdown budget is derived
+# from: a lock wait plus an equal allowance on the durable tail behind it.
+# On production defaults (busy 5s, lease 30s) that is 15.30s, 35.30s and 5.55s,
+# and the whole method before the external call itself is 50.60s.
 _HEARTBEAT_BOUND_EPSILON_SECONDS = 0.05
 # A helper with no session left waits this long before exiting on its own, so
 # an idle saga does not keep a process for the life of the interpreter.  Two
@@ -4310,21 +4313,29 @@ class SourceBrokerV2Saga:
     def _heartbeat_fresh_lease_budget(self) -> float:
         """What the renewal between the handshake and the invocation can cost.
 
-        Not a timer this process sets - SQLite enforces it, because the only
-        thing in that renewal that waits is ``BEGIN IMMEDIATE`` contending for
-        the write lock, and this connection is opened with exactly this
-        ``busy_timeout``.  Past it the statement fails rather than waiting on.
+        One complete saga write transaction, which this module has always
+        counted as two windows rather than one: a lock wait at ``BEGIN
+        IMMEDIATE`` bounded by ``busy_timeout``, and then an equal allowance on
+        the durable tail behind it - the ``synchronous = FULL`` commit and the
+        passive checkpoint that closing the connection performs.  That is the
+        same reasoning, and the same constant, as the shutdown budget above;
+        this renewal runs the identical body, so it cannot be budgeted for the
+        lock wait alone.
+
+        Only the first of the two is a number SQLite enforces.  The tail is an
+        allowance, not a guarantee - a disk that never answers has no
+        wall-clock bound, which is the whole reason the *helper's* renewals
+        were moved out of this process to begin with.  What this buys is that
+        the figure quoted to a caller matches the figure quoted for the same
+        work elsewhere in the file.
 
         It is a term in ``T_session_start`` rather than a footnote: the renewal
-        runs before the external call, so a caller that is told the method
-        cannot spend more than ``T_session_start`` before invoking is owed this
-        second of it.  The same caveat as every other SQLite operation this
-        saga performs applies - a disk that never answers has no wall-clock
-        bound, which is the whole reason the *helper's* renewals were moved out
-        of this process in the first place.
+        runs before the external call, so a caller told the method cannot spend
+        more than ``T_session_start`` before invoking is owed these seconds
+        of it.
         """
 
-        return self._busy_timeout_ms / 1_000
+        return _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000
 
     def _describe_orphaned_heartbeat_children(self) -> str:
         return "; ".join(orphan.describe() for orphan in self._orphaned_heartbeat_children)
