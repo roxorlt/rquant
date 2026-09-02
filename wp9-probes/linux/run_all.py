@@ -431,6 +431,91 @@ def probe_nonblocking_lock_gate(rounds=200):
 
 
 # --------------------------------------------------------------------------
+# Helper lifecycle: one PID across two sessions, then an explicit bounded close
+# --------------------------------------------------------------------------
+def probe_helper_lifecycle():
+    child, ctrl_w, reader, status_r, stop_w, _ = start_min_helper()
+    send_frame(ctrl_w, {"type": "config", "busy_timeout_ms": BUSY_MS})
+    ready = reader.poll(30.0)
+    assert isinstance(ready, dict), ready
+    pid = child.pid
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+
+    sessions = []
+    for token in ("s1", "s2"):
+        send_frame(ctrl_w, {"type": "session-start", "token": token})
+        ack = reader.poll(10.0)
+        send_frame(ctrl_w, {"type": "session-end", "token": token})
+        end = reader.poll(10.0)
+        sessions.append(
+            {
+                "token": token,
+                "ack": ack,
+                "end": end,
+                "pid": child.pid,
+                "poll_between_sessions": child.poll(),
+            }
+        )
+
+    # non-blocking sweep on a live child: poll() must return None at once
+    t0 = time.monotonic()
+    live_poll = child.poll()
+    live_poll_ms = round((time.monotonic() - t0) * 1000, 4)
+
+    # explicit, idempotent, bounded close(): drop every parent-held write end
+    t0 = time.monotonic()
+    for fd in (ctrl_w, stop_w):
+        os.close(fd)
+    child.wait(timeout=5.0)
+    close_seconds = round(time.monotonic() - t0, 4)
+    returncode = child.returncode
+    second_close = child.poll()  # idempotent: same answer, no exception
+    os.close(status_r)
+
+    try:
+        os.kill(pid, 0)
+        kill_zero = "no-error"
+    except ProcessLookupError:
+        kill_zero = "ESRCH"
+    except PermissionError:
+        kill_zero = "EPERM"
+
+    ok = (
+        sessions[0]["pid"] == sessions[1]["pid"] == pid
+        and sessions[0]["poll_between_sessions"] is None
+        and sessions[1]["poll_between_sessions"] is None
+        and live_poll is None
+        and returncode == 0
+        and second_close == 0
+        and close_seconds < 1.0
+        and pgid == pid
+        and isinstance(sessions[0]["ack"], dict)
+        and isinstance(sessions[1]["end"], dict)
+    )
+    record(
+        "helper_lifecycle_two_sessions_then_close",
+        ok,
+        f"pid {pid} served both sessions (poll() None throughout), start_new_session gave "
+        f"pgid=={pgid}, explicit close reaped it in {close_seconds}s with returncode "
+        f"{returncode}; poll() repeats the same answer",
+        {
+            "pid": pid,
+            "pgid": pgid,
+            "sessions": sessions,
+            "live_poll_returns": live_poll,
+            "live_poll_cost_ms": live_poll_ms,
+            "close_seconds": close_seconds,
+            "returncode": returncode,
+            "poll_after_reap": second_close,
+            "os_kill_zero_after_reap": kill_zero,
+        },
+    )
+
+
+# --------------------------------------------------------------------------
 # SQLite: write lock held across the durable tail; SIGKILL releases it
 # --------------------------------------------------------------------------
 def make_outbox(db):
@@ -1013,6 +1098,7 @@ def main():
         probe_popen_escalation_chain()
         probe_session_handshake()
         probe_nonblocking_lock_gate()
+        probe_helper_lifecycle()
         probe_sqlite_takeover(root)
         probe_parent_death_eof(root)
         probe_afunix_connect(root)
