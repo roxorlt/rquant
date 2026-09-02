@@ -4299,8 +4299,8 @@ def test_wp9_heartbeat_sql_and_digest_come_from_one_place() -> None:
     assert occurrences == 1
 
 
-def test_wp9_heartbeat_modules_import_no_multiprocessing() -> None:
-    """Neither module may reach for `multiprocessing`, now or later.
+def test_wp9_heartbeat_modules_import_no_multiprocessing_or_threads() -> None:
+    """Neither module may reach for `multiprocessing` or start a thread.
 
     Its exit handler joins every registered child without a timeout, so a
     process that outlives a SIGKILL - the exact case this design has to
@@ -4309,14 +4309,25 @@ def test_wp9_heartbeat_modules_import_no_multiprocessing() -> None:
     """
 
     for module in (source_broker_v2_module, source_broker_v2_heartbeat):
-        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        body = Path(module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(body)
         imported: set[str] = set()
+        names: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 imported.update(alias.name.split(".")[0] for alias in node.names)
+                names.update(alias.asname or alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
+                names.update(alias.asname or alias.name for alias in node.names)
         assert "multiprocessing" not in imported
+        # And no thread either, which is the other half of the same promise:
+        # this process must start nothing it cannot end.  The import guard is
+        # the load-bearing one - a name that was never imported cannot be
+        # called - and the source scan catches a fully qualified call.
+        assert "Thread" not in names
+        assert "threading.Thread" not in body
+        assert "Thread(" not in body
 
 
 def test_wp9_helper_module_imports_only_its_stdlib_allowlist() -> None:
@@ -6064,6 +6075,59 @@ def test_wp9_close_resources_reports_rather_than_raises(tmp_path: Path) -> None:
     assert state.status_r is None
 
 
+def _wp9_assert_one_registry_entry_per_process(saga: SourceBrokerV2Saga) -> None:
+    orphans = saga._orphaned_heartbeat_children
+    for index, orphan in enumerate(orphans):
+        assert not any(other.popen is orphan.popen for other in orphans[index + 1 :])
+
+
+def test_wp9_an_orphan_is_registered_once_however_many_paths_reach_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown that ends in an orphan passes the escalation twice.
+
+    Once from the session teardown and once from the release that follows it,
+    and both are correct - the second is what a later `close` or the finalizer
+    would also do.  What must not happen is the same child being recorded
+    twice: every diagnostic would then name one pid two times, and a reader
+    counting entries would think two helpers had survived.
+
+    Both directions still have to work afterwards, which is the part that
+    matters more than the tidiness: unconfirmed means the entry gate refuses,
+    and a confirmed exit clears it.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    state = saga._heartbeat_state
+    popen = state.popen
+    assert popen is not None
+    real_wait = popen.wait
+
+    def never_observed(timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd="helper", timeout=timeout or 0.0)
+
+    monkeypatch.setattr(popen, "wait", never_observed)
+    first = source_broker_v2_module._escalate_heartbeat_child(
+        state,
+        terminate_seconds=0.01,
+        kill_seconds=0.01,
+    )
+    second = source_broker_v2_module._close_resources(state)
+    assert first == (None, "orphan")
+    assert second.orphaned is True
+    assert len(saga._orphaned_heartbeat_children) == 1
+    _wp9_assert_one_registry_entry_per_process(saga)
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="has not reported its exit"):
+        saga._require_takeable_saga()
+
+    monkeypatch.setattr(popen, "wait", real_wait)
+    assert popen.wait(timeout=10) is not None
+    assert saga._sweep_orphaned_heartbeat_children() == 1
+    assert not saga._orphaned_heartbeat_children
+
+
 def test_wp9_a3_stops_rather_than_starting_a_helper_beside_an_orphan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6110,6 +6174,7 @@ def test_wp9_a3_stops_rather_than_starting_a_helper_beside_an_orphan(
     assert calls == []
     assert transport.dispatch_calls == 0
     assert len(saga._orphaned_heartbeat_children) == 1
+    _wp9_assert_one_registry_entry_per_process(saga)
     # The kill was really sent; only its observation was blocked.
     monkeypatch.setattr(popen, "wait", real_wait)
     os.close(real_ctrl_w)

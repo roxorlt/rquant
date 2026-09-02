@@ -1730,14 +1730,20 @@ def _escalate_heartbeat_child(
         return popen.wait(timeout=terminate_seconds), "sigterm"
     except subprocess.TimeoutExpired:
         pass
-    orphan = _HeartbeatOrphan(
-        popen=popen,
-        pid=popen.pid,
-        create_time=_process_create_time(popen.pid),
-        killed_at=time.time(),
-        operation_id=state.operation_id,
-    )
-    state.orphans.append(orphan)
+    # One entry per process, not one per attempt.  A teardown that ends in an
+    # orphan comes through here and then again through ``_close_resources``,
+    # and two records for the same child would say the same pid twice in every
+    # diagnostic without telling anyone anything new.
+    if not any(recorded.popen is popen for recorded in state.orphans):
+        state.orphans.append(
+            _HeartbeatOrphan(
+                popen=popen,
+                pid=popen.pid,
+                create_time=_process_create_time(popen.pid),
+                killed_at=time.time(),
+                operation_id=state.operation_id,
+            )
+        )
     with suppress(OSError):
         popen.kill()
     try:
@@ -1748,7 +1754,7 @@ def _escalate_heartbeat_child(
         # The process is recorded and every later entry fails closed until its
         # exit is observed.
         return None, "orphan"
-    state.orphans.remove(orphan)
+    state.orphans[:] = [recorded for recorded in state.orphans if recorded.popen is not popen]
     return returncode, "sigkill"
 
 
