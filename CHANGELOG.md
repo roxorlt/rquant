@@ -6,6 +6,27 @@
 
 ### Added
 
+- **outbox lease 续约搬进独立 helper 进程（WP9 / #169）**：新模块
+  `src/rquant/source_broker_v2_heartbeat.py` 是 stdlib-only 的续约执行体，不 import 任何其它
+  `rquant` 模块；对外提供连接形状（`open_saga_connection`）、两条续约 SQL 常量、结构层校验
+  （`validate_heartbeat_row`）、窗口摘要（`stable_row_digest`）、单次续约事务
+  （`heartbeat_write`）、帧编解码与 helper 进程入口 `main()`。
+- **每个 saga 实例一个长驻 helper 进程**的心跳模型：`subprocess.Popen`
+  （`sys.executable -I -m rquant.source_broker_v2_heartbeat`，`start_new_session=True`、
+  `close_fds=True`、`pass_fds` 恰三条匿名管道），配置经 control 管道首帧下发（owner token 与
+  库路径不进 argv），环境从空 dict 起 allowlist，stdin/stdout/stderr 全部 `/dev/null`。
+  父进程**不起任何线程**，且全程不使用 `multiprocessing`（两个模块各有 AST 守卫用例）。
+- **显式生命周期**：`SourceBrokerV2Saga.close()`（幂等、有界、清理完成后于 `finally` 外抛
+  typed error）、context manager 支持，以及只做兜底的 `weakref.finalize`（注册模块级函数与
+  不反向引用 owner 的状态对象，不是 bound method）。
+- **孤儿登记与入口 fail-closed**：SIGKILL 后未观测到退出的 helper 按
+  `(Popen, pid, create_time)` 登记；此后每次进入 `_invoke_with_heartbeat` 先做非阻塞清扫，
+  仍有未确认孤儿则在任何外部调用之前抛 typed error。清扫确认退出之后、启动替代 helper 之前，
+  生产控制流真实执行写锁探针（`BEGIN IMMEDIATE` → `ROLLBACK`）。
+- **窗口摘要比对**：每次续约在同一个 `BEGIN IMMEDIATE` 事务内对「窗口期间不应变化的列」取
+  sha256；`digest_changed` 是**粘滞**布尔，因此改完又改回的自愈式篡改不再被抹掉。
+  `ticks == 0` 时跳过比对——那与本改动之前的检测分辨率完全一致，且是生产默认下的常见路径。
+
 - **工作负载隔离运行时主干**：七条独立流水线（采集、校验与权威发布、盘中特征、策略推理、
   通知与模拟盘、研究与回测、serving 查询）及持久 Lab Job Center 已具备代码主体；页面提交
   typed job 后可由 scheduler/worker/checkpoint/ETA 在页面断开后继续执行。
@@ -150,6 +171,20 @@
 
 ### Changed
 
+- **heartbeat 停机语义（WP9 / #169）**：从「`sqlite3_interrupt` + 无超时 `join()`」改为
+  「end 帧 → `terminate` → `kill`，每步各有超时」。`sqlite3.connect`、`Connection.close` 的
+  passive checkpoint、`synchronous = FULL` 的 fsync 这三个窗口里线程无法被结束，而被 SIGKILL
+  的进程不会再执行任何一条字节码——调用方等待因此第一次有了闭式上界。
+- **闭式上界（生产默认 lease 30 s / busy_timeout 5 s）**：`T1 = 2 × busy_timeout = 10 s`、
+  `T_shutdown = 15.30 s`、`T_session_start = 35.30 s`、`T_close = 5.55 s`，整方法（不含外部
+  调用本身）`50.60 s`。`T_session_start` 含握手之后那次 owner/generation 守卫的同步续约
+  （`B_renew`，与停机预算同为两个写锁窗口：一次 `BEGIN IMMEDIATE` 的等待，加与之等额的耐久尾巴）。
+- **`_connect` 与 `_heartbeat_outbox` 改为调用共享实现**：全 saga 共用一份连接 pragma、一份
+  续约 SQL 与一份摘要函数（用例以 `is` 同一性与「`src/` 下字面唯一」双重钉死）。
+- **`_configure` 以 `math.isfinite` 拒收非有限时长**（lease / wait / deadline / grace）。非有限值
+  此前能穿过既有的正负判断，进而变成续约间隔、会话帧字段与另一个进程里 `select` 的超时；帧编码器
+  的 `allow_nan=False` 是同一条防线的第二道。
+
 
 - **资源准入适配器的请求/响应契约**（Codex RQ-CTB-P1-01）：`ResourceAuthorityAdapterRequest`
   新增可选 `lock_wait_timeout_milliseconds`（`ge=1`、`le=1000`，只允许 `reserve`/`recheck`/`release`
@@ -255,11 +290,36 @@
 
 ### Removed
 
+- **`_HeartbeatConnection`、`_HeartbeatInterrupt`、`_HeartbeatProgress`、`_wait_for_heartbeat`
+  与 `renew` 里的 `SQLITE_INTERRUPT` 分支**（`src/rquant/source_broker_v2.py`，WP9 / #169）：
+  它们整体是线程模型的停机机制；`sqlite3_interrupt` 只能结束「已登记连接上正在执行的语句」，
+  而上面三个关键窗口里没有这样的语句可结束。
+- **`test_v2_saga_shutdown_ends_a_production_renewal_the_interrupt_cannot_abort`——由 T5
+  取代的覆盖，不是被放弃的覆盖**：取代者 `..._reaps_a_heartbeat_stuck_in_its_durable_tail`
+  证明的是更强的性质——续约卡在 UPDATE 与 commit 之间并**持有写锁**时，竞争者撑满
+  `busy_timeout` 拿到 `SQLITE_BUSY`，SIGKILL 之后同一探针立刻成功，且两列时间戳整体回滚。
+  另一条 `test_v2_saga_shutdown_budget_absorbs_a_non_finite_lease` **改名重写**为
+  `..._refuses_a_non_finite_lease_before_any_budget_can_absorb_it`：原命题（NaN 不得把 join
+  预算变成 NaN）随 join 一起消失，新命题更强——非有限值在构造期就被拒绝，编码期还有第二道，
+  因此它根本到不了任何预算。
+- **测试侧的线程期脚手架**：`_record_heartbeat_threads`（它 patch 模块上的 `Thread`，而该模块
+  现已不导入 `Thread`）、`_is_background_dispatch_heartbeat`（判据是线程名前缀）、
+  `_stall_the_second_dispatch_renewal` 与配套的 2 亿行递归 CTE 常量、`set_progress_handler`
+  用法。`_live_heartbeat_threads()` **保留但降级为回归护栏**——它现在恒空，承重的是会话见证，
+  留着是为了让「有人把线程模型加回来」立刻可见。
+
 - `SourceBrokerV2Saga._abandoned_heartbeats` 与 `_abandon_heartbeat()`（Codex RQ-CTB-P1-02）：停机
   已经不会留下在跑的线程，这张「放弃线程登记表」失去对象。停机失败消息里的
   `N abandoned heartbeat(s) still alive` 一并移除。
 
 ### Fixed
+
+- **#160（outbox 幂等与 lease）**：续约在 owner + generation 守卫下进行这一点逐字节未变，
+  但停机不再可能把一个仍在写库的续约交还给调用方；被强杀的续约由 SQLite 崩溃语义整体回滚，
+  写锁随进程死亡即时释放，下一个打开者不再撞上「database is locked」。
+- **#169（heartbeat 停机无上界）**：`_invoke_with_heartbeat` 的任何路径——正常返回、invoke 抛错、
+  helper 卡在 connect / close / fsync、helper 死在窗口中、会话启动失败——返回或抛错前都不再遗留
+  活着的续约，且等待不超过 `Changed` 节列出的那组闭式上界。
 
 - **资源权威 adapter 的建连与发包按 5 ms 轮询 stop（WP9b / RQ-WP9-DESIGN-P1-06）**：
   `lab_resource_authority_adapter._call` 过去只有收包一侧（`_recv_exact`）每 5 ms 调
