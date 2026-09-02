@@ -1829,10 +1829,14 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
 
     assert {result.state for result in results} == {SourceBrokerV2SagaState.COMPLETE}
     assert len(contenders) == 2
+    sessions = [contender._last_heartbeat_session for contender in contenders]
+    # A contender that loses every race never opens a window at all - it finds
+    # each effect already applied and reuses the stored result - so the claim
+    # is about the windows that did open, and that at least one did.
+    assert any(session is not None for session in sessions)
+    for session in sessions:
+        assert session is None or session.ticks == 0
     for contender in contenders:
-        session = contender._last_heartbeat_session
-        assert session is not None
-        assert session.ticks == 0
         contender.close()
     assert current.signing_calls == 1
     assert transport.dispatch_calls == 1
