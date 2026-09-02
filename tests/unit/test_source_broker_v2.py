@@ -3277,7 +3277,6 @@ def test_v2_saga_shutdown_ends_an_overdue_heartbeat_when_the_body_raises(
     busy_timeout_ms = 200
     marker = tmp_path / "body-raises.marker"
     lock = _wp9_hold_fault_lock(marker)
-    started = time.monotonic()
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
@@ -3297,20 +3296,23 @@ def test_v2_saga_shutdown_ends_an_overdue_heartbeat_when_the_body_raises(
                 assert transport.dispatch_entered.wait(timeout=10)
                 _wp9_open_window(marker)
                 _wp9_wait_for(marker.exists, what="the helper to stall")
+                started = time.monotonic()
                 transport.release_dispatch.set()
                 snapshot = future.result(timeout=60)
+                elapsed = time.monotonic() - started
             finally:
                 transport.release_dispatch.set()
     finally:
         os.close(lock)
 
-    elapsed = time.monotonic() - started
     outcome = boundary[-1]["outcome"]
     assert outcome is not None
     assert outcome.child_returncode == -9
     assert outcome.escalation == "sigkill"
-    # Stated rather than inferred, as in every other case of this family: the
-    # shutdown really waited its end-frame budget out before escalating.
+    # Stated rather than inferred, as in every other case of this family, and
+    # timed from the release rather than from the top of the case: construction,
+    # patching and the phases before dispatch are not the shutdown, and a bound
+    # that swallowed them would pass without the shutdown having waited at all.
     assert elapsed >= _expected_shutdown_budget(busy_timeout_ms)
     assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert snapshot.reconcile_reason == "source dispatch response is unknown"
