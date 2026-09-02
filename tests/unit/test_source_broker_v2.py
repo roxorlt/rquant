@@ -2089,10 +2089,14 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
         # written only by the code paths it is about.
         executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
     )
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
 
     result = saga.advance(request, now=NOW + timedelta(seconds=1))
 
     assert result.state is SourceBrokerV2SagaState.COMPLETE
+    # The guard behind the comment above: without it that claim is prose, and
+    # a renewal landing mid-window would move the very timestamps read below.
+    _wp9_assert_no_renewal_in_any_window(boundary)
     with sqlite3.connect(path) as connection:
         row = connection.execute(
             "SELECT dispatch_started_at, max_external_deadline, "
@@ -2783,10 +2787,6 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
     second.close()
 
 
-# The floor this package removed.  ``max(0.1, (lease / 3) * 2)`` is 0.1s for
-# every lease below 0.15s, and what that floor had to cover - one in-flight
-# renewal - is bounded by ``busy_timeout_ms``, not by it.
-_LEGACY_HEARTBEAT_SHUTDOWN_BUDGET_SECONDS = 0.1
 # How long the competitor keeps the SQLite write lock once the helper has
 # announced it is about to contend for it.  `time.sleep` never returns early,
 # so this is a guaranteed lower bound on the pinned write, not a window to hit:
@@ -3277,6 +3277,7 @@ def test_v2_saga_shutdown_ends_an_overdue_heartbeat_when_the_body_raises(
     busy_timeout_ms = 200
     marker = tmp_path / "body-raises.marker"
     lock = _wp9_hold_fault_lock(marker)
+    started = time.monotonic()
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
@@ -3303,10 +3304,14 @@ def test_v2_saga_shutdown_ends_an_overdue_heartbeat_when_the_body_raises(
     finally:
         os.close(lock)
 
+    elapsed = time.monotonic() - started
     outcome = boundary[-1]["outcome"]
     assert outcome is not None
     assert outcome.child_returncode == -9
     assert outcome.escalation == "sigkill"
+    # Stated rather than inferred, as in every other case of this family: the
+    # shutdown really waited its end-frame budget out before escalating.
+    assert elapsed >= _expected_shutdown_budget(busy_timeout_ms)
     assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert snapshot.reconcile_reason == "source dispatch response is unknown"
     assert transport.dispatch_calls == 1
