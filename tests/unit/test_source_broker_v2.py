@@ -5192,20 +5192,56 @@ def test_v2_saga_refuses_before_invoking_when_the_helper_cannot_confirm_a_sessio
     # restart the session confirmation is allowed.
     assert len(starts) - started_before == 2
     handshake = max(0.12, _WP9_BUSY_TIMEOUT_MS / 1_000)
-    assert elapsed <= 2 * (handshake + handshake) + 0.25 + 5.0 + 0.05
+    # The same closed form the production-defaults case pins, including the
+    # renewal term - this path never reaches that renewal, so the bound it is
+    # measured against is if anything generous.
+    assert elapsed <= (
+        2 * (handshake + handshake)
+        + 0.25
+        + 5.0
+        + source_broker_v2_module._HEARTBEAT_BOUND_EPSILON_SECONDS
+        + saga._heartbeat_fresh_lease_budget()
+    )
     assert not saga._orphaned_heartbeat_children
     assert saga._heartbeat_state.popen is None
     assert boundary[-1]["outcome"] is None or boundary[-1]["outcome"].token
     assert _wp9_heartbeat_columns(saga.path, operation_id) == before
     # The failure lands after `_mark_invoke_started`, so the row already says
     # an invocation began even though none did.  That is the conservative
-    # direction - the next pass reconciles instead of dispatching again - and
-    # it is a consequence of refusing before the external call, so it is
-    # asserted rather than left implicit.
+    # direction, and it is a consequence of refusing before the external call,
+    # so it is asserted rather than left implicit.
     assert _wp9_outbox_column(saga.path, operation_id, "invoke_started") == 1
     saga._release_outbox_lease(
         phase=phase, operation_id=operation_id, owner_generation=generation
     )
+
+    # And the consequence itself, through the real `_apply_outbox`: the next
+    # pass is handed `invoke_started=True` and takes the authorize/recover
+    # branch, so the effect is reconciled rather than dispatched a second time.
+    # The refusal above is what makes that safe - an invocation that never ran
+    # is recorded as one that might have, and the conservative reading is the
+    # one that cannot produce a duplicate external effect.
+    reconciled: list[bool] = []
+
+    def authorize(
+        stored: bytes, generation_seen: int, invoke_started: bool
+    ) -> tuple[bytes | None, bytes | None]:
+        reconciled.append(invoke_started)
+        return canonical_json_bytes({"wp9": "reconciled"}), None
+
+    result = saga._apply_outbox(
+        phase=phase,
+        operation_id=operation_id,
+        payload=payload,
+        invoke=invoke,
+        authorize=authorize,
+    )
+    assert reconciled == [True]
+    assert result == canonical_json_bytes({"wp9": "reconciled"})
+    # The external call still happened exactly once, in the first window.
+    assert calls == [1]
+    assert len(starts) - started_before == 2
+    assert _wp9_outbox_column(saga.path, operation_id, "status") == "applied"
 
 
 @pytest.mark.parametrize(
@@ -6088,33 +6124,43 @@ def test_wp9_shutdown_bound_is_closed_form_at_production_defaults(tmp_path: Path
     `select` this process can wake, so there is no term for the interval
     between renewals any more.  On production defaults, busy_timeout 5s, that
     is 10 + 0.25 + 5 + 0.05 = 15.30s, whatever the disk is doing.
+
+    `T_session_start` carries one term the handshake alone does not account
+    for: the owner-guarded renewal that runs after the final acknowledgement
+    and before the invocation.  It is spent before the external call, so a
+    caller waiting on this bound waits through it, and leaving it out would
+    understate the wait by a whole write-lock window - 25.30s claimed against
+    30.30s possible.
     """
 
     saga, _ = _wp9_saga(tmp_path, busy_timeout_ms=5_000, lease_seconds=30.0)
+    epsilon = source_broker_v2_module._HEARTBEAT_BOUND_EPSILON_SECONDS
+    terminate = source_broker_v2_module._HEARTBEAT_TERMINATE_SECONDS
+    final_reap = source_broker_v2_module._HEARTBEAT_FINAL_REAP_SECONDS
     assert saga._heartbeat_shutdown_budget() == 10.0
     assert saga._heartbeat_handshake_budget() == 5.0
     assert saga._heartbeat_idle_exit_seconds() == 60.0
-    bound = (
-        saga._heartbeat_shutdown_budget()
-        + source_broker_v2_module._HEARTBEAT_TERMINATE_SECONDS
-        + source_broker_v2_module._HEARTBEAT_FINAL_REAP_SECONDS
-        + 0.05
-    )
+    assert saga._heartbeat_fresh_lease_budget() == 5.0
+    bound = saga._heartbeat_shutdown_budget() + terminate + final_reap + epsilon
     assert bound == pytest.approx(15.30)
+    handshake = saga._heartbeat_handshake_budget()
     session_start = (
-        2 * (saga._heartbeat_handshake_budget() + saga._heartbeat_handshake_budget())
-        + source_broker_v2_module._HEARTBEAT_TERMINATE_SECONDS
-        + source_broker_v2_module._HEARTBEAT_FINAL_REAP_SECONDS
-        + 0.05
+        2 * (handshake + handshake)
+        + terminate
+        + final_reap
+        + epsilon
+        + saga._heartbeat_fresh_lease_budget()
     )
-    assert session_start == pytest.approx(25.30)
+    assert session_start == pytest.approx(30.30)
+    # And the renewal really is the difference: the handshake on its own is
+    # exactly one write-lock window short.
+    assert session_start - saga._heartbeat_fresh_lease_budget() == pytest.approx(25.30)
     close_bound = (
-        source_broker_v2_module._HEARTBEAT_EOF_SECONDS
-        + source_broker_v2_module._HEARTBEAT_TERMINATE_SECONDS
-        + source_broker_v2_module._HEARTBEAT_FINAL_REAP_SECONDS
-        + 0.05
+        source_broker_v2_module._HEARTBEAT_EOF_SECONDS + terminate + final_reap + epsilon
     )
     assert close_bound == pytest.approx(5.55)
+    # The whole method, before any time the external call itself takes.
+    assert session_start + bound == pytest.approx(45.60)
 
 
 def test_wp9_finalizer_is_registered_against_a_plain_function_and_state(

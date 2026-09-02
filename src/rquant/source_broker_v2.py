@@ -119,6 +119,21 @@ _HEARTBEAT_EOF_SECONDS = 0.25
 # seconds is not a guess about the host - it is a bound wide enough that only a
 # genuinely broken start reaches it.
 _HEARTBEAT_HANDSHAKE_FLOOR_SECONDS = 2.0
+# The closed-form bounds these constants add up to, stated once so a caller can
+# check the arithmetic against what is actually spent.  With ``T0 = T_ack =
+# max(2.0, busy_timeout)``, ``T1 = 2 x busy_timeout`` and an epsilon of 0.05s
+# for descriptor closes and zero-second drains:
+#
+#   T_shutdown      = T1 + 0.25 + 5.0 + eps
+#   T_session_start = 2 x (T0 + T_ack) + 0.25 + 5.0 + eps + B_renew
+#   T_close         = 0.25 + 0.25 + 5.0 + eps
+#
+# ``B_renew`` is ``_heartbeat_fresh_lease_budget`` - the owner-guarded renewal
+# that runs after the final acknowledgement and before the invocation.  It is
+# counted here because it is spent before the external call, so a caller
+# waiting on ``T_session_start`` waits through it.  On production defaults
+# (busy 5s, lease 30s) that is 15.30s, 30.30s and 5.55s.
+_HEARTBEAT_BOUND_EPSILON_SECONDS = 0.05
 # A helper with no session left waits this long before exiting on its own, so
 # an idle saga does not keep a process for the life of the interpreter.  Two
 # leases is long enough that no ordinary sequence of invocations pays for a
@@ -4292,6 +4307,25 @@ class SourceBrokerV2Saga:
     def _heartbeat_idle_exit_seconds(self) -> float:
         return max(_HEARTBEAT_IDLE_EXIT_FLOOR_SECONDS, 2 * self._executor_lease_seconds)
 
+    def _heartbeat_fresh_lease_budget(self) -> float:
+        """What the renewal between the handshake and the invocation can cost.
+
+        Not a timer this process sets - SQLite enforces it, because the only
+        thing in that renewal that waits is ``BEGIN IMMEDIATE`` contending for
+        the write lock, and this connection is opened with exactly this
+        ``busy_timeout``.  Past it the statement fails rather than waiting on.
+
+        It is a term in ``T_session_start`` rather than a footnote: the renewal
+        runs before the external call, so a caller that is told the method
+        cannot spend more than ``T_session_start`` before invoking is owed this
+        second of it.  The same caveat as every other SQLite operation this
+        saga performs applies - a disk that never answers has no wall-clock
+        bound, which is the whole reason the *helper's* renewals were moved out
+        of this process in the first place.
+        """
+
+        return self._busy_timeout_ms / 1_000
+
     def _describe_orphaned_heartbeat_children(self) -> str:
         return "; ".join(orphan.describe() for orphan in self._orphaned_heartbeat_children)
 
@@ -4754,6 +4788,11 @@ class SourceBrokerV2Saga:
                 # of it.  One owner-and-generation guarded renewal here means
                 # the window opens on a lease this executor demonstrably still
                 # holds, rather than on one that may already have been taken.
+                #
+                # Its cost is a term in the stated bound, not an aside: see
+                # ``_heartbeat_fresh_lease_budget``, which is why
+                # ``T_session_start`` is 30.30s on production defaults and not
+                # the 25.30s the handshake alone would give.
                 self._heartbeat_outbox(
                     phase=phase,
                     operation_id=operation_id,
