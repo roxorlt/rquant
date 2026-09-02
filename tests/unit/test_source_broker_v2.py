@@ -4622,6 +4622,32 @@ def test_wp9_fault_helper_digest_matches_the_production_digest(tmp_path: Path) -
         connection.close()
 
 
+def test_wp9_fault_helper_stalls_have_a_deadline_of_their_own() -> None:
+    """Housekeeping, not a claim about the implementation.
+
+    The stalling faults ignore SIGTERM so that a case has to reach SIGKILL to
+    end them.  That is the point of them - and it also means a run in which the
+    SIGKILL never arrives, which is what mutating the escalation produces,
+    would leave a signal-proof process behind.  The deadline is what stops a
+    mutation experiment from littering the machine; it is far beyond anything a
+    passing case waits for.
+    """
+
+    from . import _wp9_heartbeat_faults
+
+    assert _wp9_heartbeat_faults.DEFAULT_STALL_SECONDS == 120.0
+    assert _wp9_heartbeat_faults.DEFAULT_STALL_SECONDS > _WP9_SHUTDOWN_BOUND_SECONDS * 10
+    # It has to be a timer armed *before* the wait, not a check after it: the
+    # wait is a blocking `flock` that does not return, so a deadline evaluated
+    # afterwards is unreachable in exactly the case it exists for.  Asserted on
+    # the source rather than by stalling for real, which would cost the suite
+    # more than the hygiene it buys.
+    body = Path(_wp9_heartbeat_faults.__file__).read_text(encoding="utf-8")
+    block = body[body.index("def _arrive_and_block") : body.index("def _connect(")]
+    assert "signal.setitimer" in block
+    assert block.index("signal.setitimer") < block.index("fcntl.flock(")
+
+
 def test_wp9_digest_ignores_only_the_two_columns_a_renewal_moves(tmp_path: Path) -> None:
     path = tmp_path / "digest.sqlite3"
     connection = sqlite3.connect(path, isolation_level=None)

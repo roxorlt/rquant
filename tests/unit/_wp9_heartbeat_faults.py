@@ -23,13 +23,18 @@ Three constraints, all of them load bearing:
 
 The stalling faults block on a real `flock` the case holds, not on a sleep, so
 what the shutdown has to survive is a genuine uninterruptible wait rather than
-a timer someone could argue about.  The marker file is how a case learns the
-helper has arrived: it is created with `open(path, "x")` immediately *before*
-the blocking call, so its existence means "already there and now stuck".  Every
-branch must be given a path of its own - the exclusive create is what makes the
-signal unambiguous, and a leftover file from a previous parametrisation would
-either release a case early or fail the helper outright.  A `FileExistsError`
-here is a hard failure, never ignored.
+a timer someone could argue about.  They also ignore SIGTERM, which is what
+makes a case walk the escalation all the way down to SIGKILL - and which is why
+the stall carries a deadline of its own (`--stall-seconds`): a run whose
+SIGKILL never arrives, exactly what a mutation of the escalation produces,
+would otherwise leave a signal-proof process on the machine indefinitely.
+
+The marker file is how a case learns the helper has arrived: it is created with
+`open(path, "x")` immediately *before* the blocking call, so its existence
+means "already there and now stuck". Every branch must be given a path of its
+own - the exclusive create is what makes the signal unambiguous, and a leftover
+file from a previous parametrisation would either release a case early or fail
+the helper outright. A `FileExistsError` here is a hard failure, never ignored.
 """
 
 from __future__ import annotations
@@ -51,6 +56,13 @@ from typing import Any
 
 PROTOCOL_VERSION = 1
 IDLE_POLL_SECONDS = 1.0
+# How long a stalling fault stays stuck before removing itself.  Far longer
+# than any case needs - every one of them kills this process within a couple of
+# seconds - and short enough that a mutation which breaks the escalation cannot
+# leave a SIGTERM-ignoring process on a developer's machine for an hour.
+DEFAULT_STALL_SECONDS = 120.0
+_STALL_DEADLINE_EXIT_CODE = 70
+_GO_MARKER_TIMEOUT_SECONDS = 60.0
 DIGEST_EXCLUDED_COLUMNS = ("executor_heartbeat_at", "executor_lease_expires_at")
 
 SELECT_SQL = "SELECT * FROM source_broker_v2_outbox WHERE operation_id = ?"
@@ -175,7 +187,7 @@ def _wait_for_go(marker: str) -> None:
     its own invocation, so the fault lands strictly inside the window.
     """
 
-    deadline = time.monotonic() + 60.0
+    deadline = time.monotonic() + _GO_MARKER_TIMEOUT_SECONDS
     while not os.path.exists(marker + ".go"):
         if time.monotonic() > deadline:
             raise RuntimeError("fault helper waited for its go marker and never got one")
@@ -189,22 +201,39 @@ def _announce(marker: str) -> None:
     os.close(descriptor)
 
 
-def _arrive_and_block(marker: str) -> None:
-    """Announce arrival, then wait on a lock the case holds.  Never returns.
+def _arrive_and_block(marker: str, stall_seconds: float) -> None:
+    """Announce arrival, then wait on a lock the case holds.  Then give up.
 
     The order matters: the marker is created first and exclusively, so a case
     that sees it knows the next thing this process did was block.  `flock` on a
     file another process holds `LOCK_EX` on is a real uninterruptible wait, not
     a sleep with a number in it.
+
+    The deadline is housekeeping, not part of what is under test.  These faults
+    also ignore SIGTERM - that is what makes the case walk the whole escalation
+    down to SIGKILL - so a run whose SIGKILL never arrives, which is exactly
+    what a mutation of the escalation produces, would otherwise leave this
+    process on the machine indefinitely.
+
+    It has to be a timer rather than a check after the wait: the wait is the
+    whole point and it does not return.  `SIGALRM` reaches a process blocked in
+    `flock`, and the handler leaves through `os._exit` rather than returning,
+    because returning would let PEP 475 restart the interrupted call.
     """
 
     handle = os.open(marker + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+
+    def give_up(_signal: int, _frame: object) -> None:
+        os._exit(_STALL_DEADLINE_EXIT_CODE)
+
+    signal.signal(signal.SIGALRM, give_up)
+    signal.setitimer(signal.ITIMER_REAL, stall_seconds)
     _announce(marker)
     fcntl.flock(handle, fcntl.LOCK_EX)
     # Only reachable if the case released the lock, which no case does; the
-    # helper is meant to be killed here.
+    # helper is meant to be killed while it is in the call above.
     while True:
-        time.sleep(3600)
+        time.sleep(1.0)
 
 
 def _connect(config: dict[str, Any]) -> sqlite3.Connection:
@@ -319,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stop-fd", type=int, required=True)
     parser.add_argument("--fault", required=True, choices=FAULT_MODES)
     parser.add_argument("--fault-marker", default=None)
+    parser.add_argument("--stall-seconds", type=float, default=DEFAULT_STALL_SECONDS)
     args = parser.parse_args(argv)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     fault = args.fault
@@ -410,18 +440,18 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if fault_now == "stall-before-connect":
             assert args.fault_marker is not None
-            _arrive_and_block(args.fault_marker)
+            _arrive_and_block(args.fault_marker, args.stall_seconds)
         if fault_now == "stall-before-commit":
             digest, connection = _renew(config, session, stop_before_commit=True)
             assert args.fault_marker is not None
-            _arrive_and_block(args.fault_marker)
+            _arrive_and_block(args.fault_marker, args.stall_seconds)
         if fault_now == "stall-after-commit":
             digest, connection = _renew(config, session)
             _emit_tick(status_fd, session, digest)
             assert args.fault_marker is not None
             # Still holding the committed connection, so the stall is inside
             # the window where `close` would run its passive checkpoint.
-            _arrive_and_block(args.fault_marker)
+            _arrive_and_block(args.fault_marker, args.stall_seconds)
         digest, connection = _renew(config, session)
         connection.close()
         _emit_tick(status_fd, session, digest)
