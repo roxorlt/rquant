@@ -91,6 +91,80 @@ HASH_6 = "6" * 64
 HASH_7 = "7" * 64
 _STAGE_STORES_BY_TRANSPORT: dict[int, LabSourceStageStore] = {}
 
+# Two cases here pit a real monotonic budget against real work - one needs it to
+# expire, one needs it not to - and every budget in the file was a wall clock
+# literal while the work was whatever the host could manage. On a loaded shard
+# the host wins: #168 recorded a ~230ms stall inside a GitHub Actions shard
+# blowing the 150ms total deadline and the 250ms lease derived from it together,
+# so the post-deadline reconcile write was fenced, `_mark_reconcile_any`
+# swallowed the fence, and the job stopped at CLAIMED - the failure names neither
+# the deadline nor the lease. The 40ms sibling went the same way on the main push
+# for 2b4099b.
+#
+# The mechanism is the one `test_source_broker_v2_service.py` already carries: a
+# budget here is not wall clock, it is a multiple of what one full publish - the
+# claim round trip, three native authority receipts, dispatch, the replay that
+# confirms it, finalize, and the `synchronous = FULL` ledger writes between them -
+# actually costs *in this process*. That cost is measured once at module scope, at
+# the point in the shard where these cases run, so the measurement carries the
+# shard's own degradation with it. `_runner()` is the only place budgets are
+# built, so the deadline, the lease, the takeover grace and the provider sleep all
+# take the same scale and the orderings between them survive it.
+#
+# The scale absorbs a host that is uniformly slower. It cannot absorb a stall
+# dropped inside one case after the measurement was taken, and neither can any
+# other measurement - so where a case needs one, the ordering it needs is secured
+# by margin instead, and stated as such below.
+#
+# The scale is floored at 1.0: on a host at least as fast as the reference, every
+# budget below is exactly the literal it reads as. The reference is what this
+# calibration measures on an idle machine - 26-29ms on 3.11 and 29-36ms on 3.12
+# over five runs of the max-of-three below - rounded up to the next round number,
+# so an idle host scales by 1.0 and anything slower scales up. It is also what
+# turns every literal in this file into a count: a budget of N seconds is never
+# worth less than N/0.04 of the publishes the host has just demonstrated.
+_PUBLISH_REFERENCE_SECONDS = 0.04
+# The calibration publish is not under test and must not be the thing that fails
+# when the host is slow, so it gets a watchdog rather than a budget.
+_PUBLISH_CALIBRATION_DEADLINE_SECONDS = 120.0
+# Production requires `lease_seconds >= total_deadline_seconds +
+# takeover_grace_seconds`; every runner here derives its lease that way.
+_LEASE_SLACK_SECONDS = 0.1
+_TAKEOVER_GRACE_SECONDS = 0.05
+# Both deadline cases below take this slack instead of the 100ms default. In the
+# refusal case the lease is no longer a bound on the work at all, it is a guard
+# on the bookkeeping that follows it: the outcome write happens *after* the
+# deadline is already gone, and if the lease went with it the write is fenced,
+# `_mark_reconcile_any` swallows the fence, and the case reads CLAIMED instead of
+# the refusal it asserts - the exact CI failure. In the publish case it keeps a
+# fenced terminal write from ever being how the case fails. A guard is secured by
+# margin, not by a race: a second is ~25 of the publishes measured below.
+_DEADLINE_CASE_LEASE_SLACK_SECONDS = 1.0
+# The budget the fast chain has to fit inside. The 150ms literal it replaces was
+# not merely uncalibrated, it was too small to calibrate: the scale it would be
+# multiplied by is measured once, and what takes this case out is not a host that
+# is uniformly slower - that the scale absorbs - but a single scheduler stall
+# dropped inside a ~30ms chain. Measured under 8x CPU oversubscription, a publish
+# costs 26-45ms nine times out of ten and 150-370ms the tenth, with no warning in
+# the sample before it; at 150ms the case loses to that tenth publish and the
+# calibration cannot see it coming. So the budget is sized to dominate the stall
+# rather than to track the chain, exactly as the service file's blocked-dispatch
+# deadline was (`_BLOCKED_PROVIDER_DEADLINE_SECONDS`, same 1.5s, same reason):
+# ~37 measured publishes and 4x the worst stall observed under that load, with
+# the calibrated scale still applying on top. What the case asserts is unchanged -
+# a fast native chain publishes inside one total budget, and every wire call in it
+# carries the same absolute deadline - and it still fails if the chain does not
+# fit: putting a 2s link in front of the provider, or cutting this budget to 15ms,
+# each turn it red on both interpreters.
+_FAST_CHAIN_DEADLINE_SECONDS = 1.5
+_publish_scale = 1.0
+
+
+def _host(seconds: float) -> float:
+    """Read a budget as wall clock on a quiet host, scaled by a loaded one."""
+
+    return seconds * _publish_scale
+
 
 def _spawn_initialize_runner_store(
     db_path_value: str,
@@ -706,6 +780,7 @@ def _runner(
     *,
     owner_id: str = "owner-a",
     total_deadline_seconds: float = 3.0,
+    lease_slack_seconds: float = _LEASE_SLACK_SECONDS,
     delay_seconds: float = 0,
     unknown_replay: bool = False,
     forged_kind: str | None = None,
@@ -733,7 +808,7 @@ def _runner(
         {
             "daily-bars": _registration(
                 transport,
-                delay_seconds=delay_seconds,
+                delay_seconds=_host(delay_seconds),
                 unknown_replay=unknown_replay,
                 forged_kind=forged_kind,
                 seen_credentials=seen_credentials,
@@ -744,11 +819,17 @@ def _runner(
     return SourceBrokerV2JobRunner(
         db_path=db_path,
         registry=registry,
+        # Every wall clock quantity a case hands to this helper - the budget, the
+        # lease that has to cover it, the grace inside the claim it issues and
+        # the provider sleep it races - is written at the call site as quiet-host
+        # seconds and scaled here, once. Scaling them together is the whole
+        # point: a deadline that grows while the sleep it must fire inside stays
+        # put is not calibration, it is a different case.
         config=SourceBrokerV2JobRunnerConfig(
             owner_id=owner_id,
-            lease_seconds=total_deadline_seconds + 0.1,
-            total_deadline_seconds=total_deadline_seconds,
-            takeover_grace_seconds=0.05,
+            lease_seconds=_host(total_deadline_seconds + lease_slack_seconds),
+            total_deadline_seconds=_host(total_deadline_seconds),
+            takeover_grace_seconds=_host(_TAKEOVER_GRACE_SECONDS),
             busy_timeout_ms=2_000,
             max_batch=max_batch,
             max_inbox=max_inbox,
@@ -774,6 +855,54 @@ def _use_fast_source_signatures(
         "require_verified_claim",
         lambda **_kwargs: None,
     )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _calibrate_publish_cost(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Time one full publish, three times, in this process.
+
+    A publish is the whole quantity the budgeted cases race: the claim round
+    trip, the three native authority receipts, the dispatch, the replay that
+    confirms it, the finalize, and the `synchronous = FULL` ledger writes
+    between them. Measuring it - rather than any one stage - is what lets a
+    budget be stated as a multiple of the work it bounds instead of as a wall
+    clock literal that a 2 vCPU runner can outrun.
+
+    It has to be measured here, at module scope, and not inside the cases: the
+    cases are holding the budget under test by the time they would ask, and a
+    measurement taken before the shard loaded the host would carry none of the
+    degradation the budgets exist to absorb. The slowest of three wins, which
+    keeps the scale on the conservative side of a host that is still degrading.
+    """
+
+    global _publish_scale
+
+    security = _RunnerSourceAuthoritySecurity()
+    samples: list[float] = []
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("RQUANT_SOURCE_TOKEN", "source-secret")
+            transport = _RunnerTestTransport(security)
+            _use_fast_source_signatures(patch, transport)
+            runner = _runner(
+                tmp_path_factory.mktemp("publish-cost-calibration"),
+                transport,
+                total_deadline_seconds=_PUBLISH_CALIBRATION_DEADLINE_SECONDS,
+            )
+            for index in range(3):
+                intent = _intent(transport, f"{index + 900:06d}.SZ")
+                runner.enqueue_intent(intent)
+                started = time.monotonic()
+                claimed = runner.run_once()
+                samples.append(time.monotonic() - started)
+                assert claimed == 1, "calibration publish did not run exactly one job"
+                state = runner.get_state(intent.operation_id)
+                assert state is SourceBrokerV2JobRunnerState.PUBLISHED, (
+                    f"calibration publish ended in {state}"
+                )
+    finally:
+        security.close()
+    _publish_scale = max(1.0, max(samples) / _PUBLISH_REFERENCE_SECONDS)
 
 
 def test_runner_rejects_direct_legacy_envelope_before_provider_effect(
@@ -1189,11 +1318,18 @@ def test_total_monotonic_deadline_40ms_rejects_late_acceptance(
     monkeypatch.setenv("RQUANT_SOURCE_TOKEN", "source-secret")
     transport = _RunnerTestTransport(source_security)
     _use_fast_source_signatures(monkeypatch, transport)
+    # The acceptance is late by construction, not by arithmetic: the provider
+    # takes half again the whole budget to answer the claim, so `budget.call`
+    # finds the deadline gone the moment it returns - at any host speed, and
+    # whatever the runner's own work costs. The previous form put a 30ms sleep
+    # and ~50ms of runner work against a 40ms budget and let the sum decide,
+    # which is a race the host can win from either side once the budget scales.
     runner = _runner(
         tmp_path,
         transport,
         total_deadline_seconds=0.04,
-        delay_seconds=0.03,
+        lease_slack_seconds=_DEADLINE_CASE_LEASE_SLACK_SECONDS,
+        delay_seconds=0.06,
     )
     intent = _intent(transport)
     runner.enqueue_intent(intent)
@@ -1203,7 +1339,7 @@ def test_total_monotonic_deadline_40ms_rejects_late_acceptance(
     assert transport.dispatch_calls == 0
 
 
-def test_total_monotonic_deadline_150ms_allows_fast_native_chain(
+def test_total_monotonic_deadline_allows_fast_native_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_security: _RunnerSourceAuthoritySecurity,
@@ -1211,10 +1347,15 @@ def test_total_monotonic_deadline_150ms_allows_fast_native_chain(
     monkeypatch.setenv("RQUANT_SOURCE_TOKEN", "source-secret")
     transport = _RunnerTestTransport(source_security)
     _use_fast_source_signatures(monkeypatch, transport)
+    # A budget that dominates the host's worst stall rather than tracking the
+    # chain's cost, and a lease that cannot fence the terminal write ahead of the
+    # budget: if this case fails now it is because the chain did not fit, not
+    # because the shard stalled somewhere inside it.
     runner = _runner(
         tmp_path,
         transport,
-        total_deadline_seconds=0.15,
+        total_deadline_seconds=_FAST_CHAIN_DEADLINE_SECONDS,
+        lease_slack_seconds=_DEADLINE_CASE_LEASE_SLACK_SECONDS,
         delay_seconds=0.002,
     )
     intent = _intent(transport)
