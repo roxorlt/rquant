@@ -116,13 +116,18 @@ _STAGE_STORES_BY_TRANSPORT: dict[int, LabSourceStageStore] = {}
 # other measurement - so where a case needs one, the ordering it needs is secured
 # by margin instead, and stated as such below.
 #
-# The scale is floored at 1.0: on a host at least as fast as the reference, every
-# budget below is exactly the literal it reads as. The reference is what this
-# calibration measures on an idle machine - 26-29ms on 3.11 and 29-36ms on 3.12
-# over five runs of the max-of-three below - rounded up to the next round number,
-# so an idle host scales by 1.0 and anything slower scales up. It is also what
-# turns every literal in this file into a count: a budget of N seconds is never
-# worth less than N/0.04 of the publishes the host has just demonstrated.
+# The scale is floored at 1.0, so it can only ever enlarge a budget. Where the
+# reference sits decides which hosts see the literals as written, and the two
+# interpreters CI runs do not agree: idle on an arm64 laptop, five runs of the
+# max-of-three below cost 42-78ms per publish on 3.11.15 (scale 1.06-1.95, never
+# floored) against 29-36ms on 3.12.13 (floored at 1.0 every time). 0.04 is
+# deliberately left between them rather than raised to cover 3.11: enlarging a
+# budget is the safe direction, the refusal case is a ratio and cannot be moved
+# by any scale, and a reference above 3.12's idle cost would take that standing
+# margin away from the interpreter that does floor. Slower hosts than either -
+# every CI runner here - scale up from whatever they measure. The reference is
+# also what turns every literal in this file into a count: a budget of N seconds
+# is never worth less than N/0.04 of the publishes the host just demonstrated.
 _PUBLISH_REFERENCE_SECONDS = 0.04
 # The calibration publish is not under test and must not be the thing that fails
 # when the host is slow, so it gets a watchdog rather than a budget.
