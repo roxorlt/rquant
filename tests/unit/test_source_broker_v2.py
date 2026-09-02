@@ -3975,6 +3975,11 @@ _WP9_MIGRATED_LEASE_SECONDS = 0.05 * _WP9_MIGRATED_SCALE
 # Every wait a case performs has its own deadline; none of them may hang the
 # suite if the thing they wait for never happens.
 _WP9_RENDEZVOUS_TIMEOUT_SECONDS = 30.0
+# How long a stalled helper is watched before its row is called unchanged.
+# Comfortably longer than one renewal interval (0.1s at the ticking lease), so
+# a helper that was *not* actually blocked would have committed at least one
+# renewal inside this window and moved the columns.
+_WP9_STALLED_SETTLE_SECONDS = 0.25
 _WP9_HELPER_STDLIB_IMPORTS = frozenset(
     {
         "argparse",
@@ -4592,6 +4597,18 @@ def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_a_window_no_interrupt_reach
     the helper's own code, not of any timing, so both are asserted outright.
     The stall is a real `flock` this case holds, and the helper announces its
     arrival by creating a file, so nothing here waits on a duration.
+
+    The evidence is taken from the announce onwards, never from before it.  A
+    fault only becomes active when this case opens its window, and until then
+    the helper renews on its ordinary schedule - deliberately, because blocking
+    it earlier would leave some previous phase's end frame unanswered and turn
+    that phase into a kill.  So a renewal landing between "read the row" and
+    "the helper announces" is possible, unrelated to the injection, and purely
+    a matter of how fast the host is; comparing across that gap made this case
+    fail on a slow 3.12 runner while every assertion about production behaviour
+    passed.  Watching the row from the announce onwards asks the question that
+    is actually being tested - does the *stalled* renewal write anything - and
+    the answer no longer depends on what happened before the window opened.
     """
 
     saga, _ = _wp9_saga(tmp_path)
@@ -4606,12 +4623,16 @@ def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_a_window_no_interrupt_reach
         columns["pre"] = _wp9_heartbeat_columns(saga.path, operation_id)
         _wp9_open_window(marker)
         _wp9_wait_for(marker.exists, what=f"the {fault} helper to block")
+        # From here the helper is inside the blocking call, so this is the
+        # first reading that can serve as a baseline for what the *stall* did.
         columns["stuck"] = _wp9_heartbeat_columns(saga.path, operation_id)
         if fault == "stall-after-commit":
             taken, code, _ = _wp9_probe_write_lock(saga.path, timeout_ms=_WP9_BUSY_TIMEOUT_MS)
             # Committing released the write lock; the stall is in the tail
             # behind it, which holds nothing.
             assert taken, code
+        time.sleep(_WP9_STALLED_SETTLE_SECONDS)
+        columns["settled"] = _wp9_heartbeat_columns(saga.path, operation_id)
         return canonical_json_bytes({"wp9": "result"})
 
     try:
@@ -4645,11 +4666,16 @@ def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_a_window_no_interrupt_reach
     assert boundary[-1]["helper_returncode"] is None
     assert saga._heartbeat_state.popen is None
     assert not boundary[-1]["orphans"]
-    # Whether a renewal happened is decided by where the injection sits in the
-    # helper's own code, so it is asserted rather than observed: stuck before
-    # connecting means nothing was written, stuck after committing means it was
-    # written and made durable.
-    assert (columns["stuck"] != columns["pre"]) is renewed
+    # The load-bearing one, and it holds for both injections: a helper that is
+    # genuinely stuck writes nothing.  The window watched here is longer than a
+    # whole renewal interval, so an injection that failed to block would have
+    # committed at least one renewal inside it and moved these columns.
+    assert columns["settled"] == columns["stuck"]
+    if renewed:
+        # Stuck after committing: that renewal is durable, so the row has moved
+        # on from where this case found it.  Extra ordinary renewals before the
+        # window opened can only make this more true, never less.
+        assert columns["stuck"] != columns["pre"]
     # And nothing at all happened after the process died.
     assert _wp9_heartbeat_columns(saga.path, operation_id) == columns["stuck"]
     assert _wp9_integrity_check(saga.path) == "ok"
