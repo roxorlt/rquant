@@ -4433,13 +4433,17 @@ class SourceBrokerV2Saga:
                 raise SourceBrokerV2SagaUnavailableError(
                     f"outbox heartbeat helper did not report ready ({frame!r})"
                 )
-        except BaseException:
+        except BaseException as exc:
             # One abort for every way the handshake can fail - a write that
             # hits a dead helper, a timeout, an EOF, a frame of the wrong
             # shape or a pid that is not this child's.  It is bounded and it
             # leaves no descriptor and no process behind.
             self._discard_heartbeat_child(helper)
-            raise
+            if isinstance(exc, SourceBrokerV2SagaError):
+                raise
+            raise SourceBrokerV2SagaUnavailableError(
+                "outbox heartbeat helper handshake failed"
+            ) from exc
         self._heartbeat_child = helper
         return helper
 
@@ -4476,14 +4480,14 @@ class SourceBrokerV2Saga:
             if helper is not None and helper.poll() is not None:
                 self._discard_heartbeat_child(helper)
                 helper = None
-            if helper is None:
-                if restarts:
-                    # A replacement is only allowed once the previous helper's
-                    # exit has been observed and the write lock itself has been
-                    # proven free.
-                    self._probe_saga_write_lock()
-                helper = self._start_helper_once(operation_id=operation_id)
             try:
+                if helper is None:
+                    if restarts:
+                        # A replacement is only allowed once the previous
+                        # helper's exit has been observed and the write lock
+                        # itself has been proven free.
+                        self._probe_saga_write_lock()
+                    helper = self._start_helper_once(operation_id=operation_id)
                 helper.send(
                     {
                         "t": "session",
@@ -4506,15 +4510,23 @@ class SourceBrokerV2Saga:
                 if acked:
                     return helper, restarts
                 reason = "outbox heartbeat helper did not acknowledge its session"
-            except (BrokenPipeError, OSError, HeartbeatProtocolError, ValueError) as exc:
-                if isinstance(exc, ValueError) and not isinstance(exc, OSError):
-                    # A non-finite interval is refused by the encoder, before
-                    # any external effect; it is a configuration fault, not a
-                    # dead helper, so it is not something to restart into.
-                    self._discard_heartbeat_child(helper)
-                    raise
+            except SourceBrokerV2SagaUnavailableError as exc:
+                # A start that failed has already released everything it made;
+                # it is still worth one replacement, which is what A3 is.
+                reason = str(exc)
+                helper = None
+            except (BrokenPipeError, OSError, HeartbeatProtocolError) as exc:
                 reason = f"outbox heartbeat helper session could not be sent ({exc!r})"
-            outcome = self._discard_heartbeat_child(helper)
+            except ValueError:
+                # A non-finite interval is refused by the encoder, before any
+                # external effect.  That is a configuration fault, not a dead
+                # helper, so it is not something to restart into.
+                if helper is not None:
+                    self._discard_heartbeat_child(helper)
+                raise
+            outcome = _HeartbeatCloseOutcome()
+            if helper is not None:
+                outcome = self._discard_heartbeat_child(helper)
             if outcome.orphaned or self._orphaned_heartbeat_children:
                 # A3 ends here rather than starting a second helper: an
                 # unconfirmed kill is exactly the state a new writer must not
