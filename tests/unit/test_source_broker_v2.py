@@ -1,28 +1,35 @@
 from __future__ import annotations
 
+import ast
 import base64
+import fcntl
+import gc
+import json
 import multiprocessing
 import os
-import re
+import select
 import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from queue import Empty
-from threading import Barrier, Event, Lock, Thread, current_thread
+from threading import Barrier, Event, Lock, Thread
 from threading import enumerate as enumerate_threads
 from typing import Any
 
 import pytest
 
 import rquant.source_broker_v2 as source_broker_v2_module
+import rquant.source_broker_v2_heartbeat as source_broker_v2_heartbeat
 from rquant.runtime_contracts import canonical_sha256
 from rquant.source_broker import ReplayLineageCheckpointReceipt
 from rquant.source_broker_protocol import (
@@ -1493,12 +1500,20 @@ def test_v2_saga_happy_path_persists_all_effects_before_lineage(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
+        # Migrated T-B.  This case is about the durable effects, not about the
+        # heartbeat, and its old 30s default put the renewal interval at 10s -
+        # close enough to a slow window that whether the helper wrote during it
+        # was luck.  120s makes the interval 40s and "no renewal happened" a
+        # property of the configuration, which the boundary check then asserts.
+        executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
     )
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
 
     result = saga.advance(request, now=NOW + timedelta(seconds=1))
 
     assert result.state is SourceBrokerV2SagaState.COMPLETE
     assert result.dispatch_outcome is not None
+    _wp9_assert_no_renewal_in_any_window(boundary)
     assert transport.dispatch_calls == 1
     assert transport.finalize_calls == 1
     assert transport.claim_once_calls >= 2
@@ -1775,17 +1790,27 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
             results.join_thread()
 
     start = Barrier(3)
+    # Migrated T-B.  Two threads, one saga instance each, and a 120s lease so
+    # the renewal interval is 40s - longer than this whole case runs - which
+    # makes "neither helper renewed during the contended window" something the
+    # configuration guarantees rather than something the schedule happened to
+    # produce.  Instances are collected by identity, never counted by `id()`:
+    # addresses get reused.
+    contenders: list[SourceBrokerV2Saga] = []
 
     def run() -> object:
         start.wait(timeout=5)
-        return SourceBrokerV2Saga.for_nonproduction(
+        instance = SourceBrokerV2Saga.for_nonproduction(
             path,
             saga_id="saga-a",
             current_claim_authority=current,
             quota_adapter=quota,
             transport=transport,
             lineage_authority=lineage,
-        ).advance(request, now=NOW + timedelta(seconds=1))
+            executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
+        )
+        contenders.append(instance)
+        return instance.advance(request, now=NOW + timedelta(seconds=1))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(run)
@@ -1803,6 +1828,16 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
         results = [first.result(timeout=10), second.result(timeout=10)]
 
     assert {result.state for result in results} == {SourceBrokerV2SagaState.COMPLETE}
+    assert len(contenders) == 2
+    sessions = [contender._last_heartbeat_session for contender in contenders]
+    # A contender that loses every race never opens a window at all - it finds
+    # each effect already applied and reuses the stored result - so the claim
+    # is about the windows that did open, and that at least one did.
+    assert any(session is not None for session in sessions)
+    for session in sessions:
+        assert session is None or session.ticks == 0
+    for contender in contenders:
+        contender.close()
     assert current.signing_calls == 1
     assert transport.dispatch_calls == 1
 
@@ -1811,6 +1846,27 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A renewal before the boundary protects the owner; one after it does not.
+
+    Migrated T-A.  The proposition, the competitor saga, its barrier group and
+    every boundary assertion are unchanged.  What moves is who drives the
+    schedule: the old case patched `_wait_for_heartbeat` so it could hold the
+    heartbeat thread at a chosen instant, and there is no such thread now.  The
+    renewal is therefore issued by this case, synchronously, through the very
+    method production calls - so the timestamps it writes are on the same fake
+    clock as the boundary arithmetic being checked.
+
+    The two scenarios need different halves of that, so they use different
+    modes.  The on-time one must write a timestamp on the fake clock, so the
+    helper is idle and this case issues the renewal.  The late one only needs
+    the renewal to be *refused*, which depends on ownership and not on time, so
+    there the helper makes it - and it has to, because a refusal reported by
+    the helper is what reaches the caller as `SourceBrokerV2SagaUnavailableError`
+    and lets `_dispatch` end in `RECONCILE_REQUIRED`.  A conflict raised in this
+    process instead would leave by a different door and change the saga's
+    outcome, which is precisely the thing this case is about.
+    """
+
     def run_schedule(
         scenario_root: Path,
         *,
@@ -1828,15 +1884,13 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
         expected_renewed_boundary = heartbeat_time + timedelta(seconds=0.05)
         transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
         lineage = _TestLineageAuthority()
-        wake_ready = Event()
-        wake_release = Event()
-        heartbeat_observed = Event()
         competitor_release = Event()
         competitor_observed_lease = Event()
         competitor_can_continue = Event()
         heartbeat_intervals: list[float] = []
         heartbeat_results: list[BaseException | None] = []
         competitor_lease_rows: list[tuple[datetime, str | None, str | None]] = []
+        operation_id = _dispatch_operation_id(request)
 
         def saga() -> SourceBrokerV2Saga:
             return SourceBrokerV2Saga.for_nonproduction(
@@ -1852,42 +1906,29 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
 
         first_saga = saga()
         competitor_saga = saga()
-        original_first_heartbeat = first_saga._heartbeat_outbox
         original_competitor_read = competitor_saga._read_outbox
+        original_open_session = first_saga._open_heartbeat_session
 
-        def controlled_heartbeat_wait(
-            stop: Event,
-            interval: float,
-            *,
-            phase: SourceBrokerV2OutboxPhase,
-        ) -> bool:
-            if phase is not SourceBrokerV2OutboxPhase.DISPATCH:
-                return stop.wait(interval)
-            heartbeat_intervals.append(interval)
-            if len(heartbeat_intervals) == 1:
-                wake_ready.set()
-                if not wake_release.wait(timeout=5):
-                    raise TimeoutError("test scheduler did not release the heartbeat wake")
-                return stop.is_set()
-            return stop.wait(timeout=5)
+        def record_dispatch_interval(**kwargs: Any) -> Any:
+            if kwargs.get("phase") is SourceBrokerV2OutboxPhase.DISPATCH:
+                heartbeat_intervals.append(kwargs["interval"])
+            return original_open_session(**kwargs)
 
-        def observe_first_heartbeat(**kwargs: object) -> None:
-            is_background_dispatch = kwargs.get(
-                "phase"
-            ) is SourceBrokerV2OutboxPhase.DISPATCH and current_thread().name.startswith(
-                "rquant-source-broker-v2-heartbeat-"
-            )
+        def renew_now() -> None:
+            """The on-time renewal, issued here so it lands on the fake clock."""
+
             try:
-                original_first_heartbeat(**kwargs)  # type: ignore[arg-type]
+                first_saga._heartbeat_outbox(
+                    phase=SourceBrokerV2OutboxPhase.DISPATCH,
+                    operation_id=operation_id,
+                    owner_generation=int(
+                        _wp9_outbox_column(path, operation_id, "executor_generation")
+                    ),
+                )
             except BaseException as exc:
-                if is_background_dispatch:
-                    heartbeat_results.append(exc)
-                    heartbeat_observed.set()
-                raise
+                heartbeat_results.append(exc)
             else:
-                if is_background_dispatch:
-                    heartbeat_results.append(None)
-                    heartbeat_observed.set()
+                heartbeat_results.append(None)
 
         def observe_competitor_lease(
             connection: sqlite3.Connection,
@@ -1905,26 +1946,28 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
                 expiry_raw = row["executor_lease_expires_at"]
                 competitor_lease_rows.append((clock.now(), heartbeat_raw, expiry_raw))
                 competitor_observed_lease.set()
-                if not competitor_can_continue.wait(timeout=5):
+                if not competitor_can_continue.wait(timeout=10):
                     raise TimeoutError("test scheduler did not release the competitor")
             return row
 
         def run_competitor() -> object:
-            if not competitor_release.wait(timeout=5):
+            if not competitor_release.wait(timeout=10):
                 raise TimeoutError("test scheduler did not start the competitor")
             return competitor_saga.advance(request, now=NOW + timedelta(seconds=2))
 
+        marker = scenario_root / "late-renewal.marker"
         with monkeypatch.context() as scenario_patch:
             clock.install_source_broker_clock(scenario_patch)
+            if expect_renewal:
+                _wp9_use_fault_helper(first_saga, scenario_patch, "never-renews")
+            else:
+                _wp9_use_fault_helper(first_saga, scenario_patch, "renew-when-told", marker)
+            _wp9_use_fault_helper(competitor_saga, scenario_patch, "never-renews")
+            boundary = _wp9_watch_boundary(first_saga, scenario_patch)
             scenario_patch.setattr(
                 first_saga,
-                "_wait_for_heartbeat",
-                controlled_heartbeat_wait,
-            )
-            scenario_patch.setattr(
-                first_saga,
-                "_heartbeat_outbox",
-                observe_first_heartbeat,
+                "_open_heartbeat_session",
+                record_dispatch_interval,
             )
             scenario_patch.setattr(
                 competitor_saga,
@@ -1939,21 +1982,19 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
                 )
                 competitor = executor.submit(run_competitor)
                 try:
-                    assert transport.dispatch_entered.wait(timeout=5)
-                    assert wake_ready.wait(timeout=5)
+                    assert transport.dispatch_entered.wait(timeout=10)
                     expected_interval = 0.05 / 3
                     assert heartbeat_intervals == [pytest.approx(expected_interval)]
                     assert heartbeat_intervals[0] < 0.05
 
                     if expect_renewal:
                         clock.current = heartbeat_time
-                        wake_release.set()
-                        assert heartbeat_observed.wait(timeout=5)
+                        renew_now()
                         assert heartbeat_results == [None]
 
                     clock.current = competitor_time
                     competitor_release.set()
-                    assert competitor_observed_lease.wait(timeout=5)
+                    assert competitor_observed_lease.wait(timeout=10)
                     observed_at, observed_heartbeat_raw, observed_expiry_raw = (
                         competitor_lease_rows[0]
                     )
@@ -1970,27 +2011,34 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
                         assert heartbeat_time < original_lease_boundary
                         assert competitor_time < expected_renewed_boundary
                         transport.release_dispatch.set()
-                        results = [first.result(timeout=10), competitor.result(timeout=10)]
+                        results = [first.result(timeout=30), competitor.result(timeout=30)]
                         assert {result.state for result in results} == {
                             SourceBrokerV2SagaState.COMPLETE
                         }
                     else:
                         assert original_lease_boundary < competitor_time < heartbeat_time
-                        competitor_result = competitor.result(timeout=10)
+                        competitor_result = competitor.result(timeout=30)
                         assert competitor_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+                        # The renewal arrives after the boundary the competitor
+                        # already crossed, and the owner guard refuses it.
                         clock.current = heartbeat_time
-                        wake_release.set()
-                        assert heartbeat_observed.wait(timeout=5)
+                        _wp9_open_window(marker)
+                        _wp9_wait_for(marker.exists, what="the late renewal to be refused")
                         transport.release_dispatch.set()
-                        first_result = first.result(timeout=10)
+                        first_result = first.result(timeout=30)
                         assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-                        assert any(
-                            isinstance(error, SourceBrokerV2SagaConflictError)
-                            for error in heartbeat_results
-                            if error is not None
+                        refused = _wp9_boundary_for(
+                            boundary, SourceBrokerV2OutboxPhase.DISPATCH
+                        )["outcome"]
+                        assert refused is not None
+                        assert refused.renewal_ok is False
+                        assert refused.failure is not None
+                        # Rebuilt from the failure frame, and it is still the
+                        # conflict a lost lease has always been.
+                        assert isinstance(
+                            refused.failure.rebuild(), SourceBrokerV2SagaConflictError
                         )
                 finally:
-                    wake_release.set()
                     competitor_release.set()
                     competitor_can_continue.set()
                     transport.release_dispatch.set()
@@ -1998,10 +2046,9 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
         assert transport.dispatch_calls == 1
         assert heartbeat_intervals
         assert all(interval == pytest.approx(0.05 / 3) for interval in heartbeat_intervals)
-        assert not any(
-            thread.name.startswith("rquant-source-broker-v2-heartbeat-")
-            for thread in enumerate_threads()
-        )
+        assert not _live_heartbeat_threads()
+        first_saga.close()
+        competitor_saga.close()
 
     run_schedule(
         tmp_path / "late-heartbeat",
@@ -2037,11 +2084,19 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
         quota_adapter=quota,
         transport=_TestTransport(clock=lambda: clock.now()),
         lineage_authority=_TestLineageAuthority(),
+        # Migrated T-B: a 40s renewal interval, so no window here can contain
+        # a renewal and the grant/observation timestamps this case reads are
+        # written only by the code paths it is about.
+        executor_lease_seconds=_WP9_QUIET_LEASE_SECONDS,
     )
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
 
     result = saga.advance(request, now=NOW + timedelta(seconds=1))
 
     assert result.state is SourceBrokerV2SagaState.COMPLETE
+    # The guard behind the comment above: without it that claim is prose, and
+    # a renewal landing mid-window would move the very timestamps read below.
+    _wp9_assert_no_renewal_in_any_window(boundary)
     with sqlite3.connect(path) as connection:
         row = connection.execute(
             "SELECT dispatch_started_at, max_external_deadline, "
@@ -2598,20 +2653,25 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.01,
-        source_request_deadline_seconds=0.08,
-        source_takeover_grace_seconds=0.04,
+        source_request_deadline_seconds=0.08 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.04 * _WP9_MIGRATED_SCALE,
     )
 
     def crash_before_invoke(phase: SourceBrokerV2OutboxPhase) -> None:
         if phase is SourceBrokerV2OutboxPhase.DISPATCH:
             raise SystemExit("owner stopped before source transport")
 
+    # Migrated T-B: every duration lifted by one factor, so the lease still
+    # expires before the cooldown does - which is the whole scenario - while
+    # the renewal interval goes from 16.7ms to 1s and no window can contain a
+    # tick.  The boundary check below asserts that outright.
+    boundary = _wp9_watch_boundary(first, monkeypatch)
     monkeypatch.setattr(first, "_before_external_effect", crash_before_invoke)
     with pytest.raises(SystemExit, match="before source transport"):
         first.advance(request, now=NOW + timedelta(seconds=1))
-    clock.advance(0.055)
+    clock.advance(0.055 * _WP9_MIGRATED_SCALE)
 
     takeover = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -2620,70 +2680,53 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.1,
-        source_request_deadline_seconds=0.08,
-        source_takeover_grace_seconds=0.04,
+        source_request_deadline_seconds=0.08 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.04 * _WP9_MIGRATED_SCALE,
     )
     waiting = takeover.advance(request, now=NOW + timedelta(seconds=2))
 
     assert waiting.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert transport.dispatch_calls == 0
-    clock.advance(0.08)
+    clock.advance(0.08 * _WP9_MIGRATED_SCALE)
     recovered = takeover.reconcile(request, now=NOW + timedelta(seconds=3))
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
+    _wp9_assert_no_renewal_in_any_window(boundary)
     assert transport.dispatch_calls == 1
+    first.close()
+    takeover.close()
 
 
 def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A failed renewal loses the lease, and the late result never re-dispatches.
+
+    Migrated T-C.  The failure used to be a patched `_heartbeat_outbox` raising
+    on the heartbeat thread; it is now the helper reporting a renewal it could
+    not complete, which is the only way this can happen once the renewal runs
+    in another process.
+
+    "Without thread leak" was always the weakest part of the name - the thread
+    is what this package removed - so the witness moves up a layer to what the
+    session itself reports: the end frame was answered, the renewal was not
+    successful, and the helper is still alive and unreaped.  An ordinary
+    renewal failure must not cost a healthy helper its life.  The
+    `_live_heartbeat_threads` check stays underneath as a regression guard.
+    """
+
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     clock = _MutableUtcClock(datetime.now(UTC))
     clock.install_source_broker_clock(monkeypatch)
     transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
-    first = SourceBrokerV2Saga.for_nonproduction(
-        path,
-        saga_id="saga-a",
-        current_claim_authority=current,
-        quota_adapter=quota,
-        transport=transport,
-        lineage_authority=lineage,
-        executor_lease_seconds=0.05,
-        executor_wait_seconds=0.2,
-        source_request_deadline_seconds=0.08,
-        source_takeover_grace_seconds=0.04,
-    )
-    original_heartbeat = first._heartbeat_outbox
-    heartbeat_failed = Event()
+    marker = tmp_path / "late-result.marker"
 
-    def fail_background_heartbeat(**kwargs: object) -> None:
-        if kwargs.get(
-            "phase"
-        ) is SourceBrokerV2OutboxPhase.DISPATCH and current_thread().name.startswith(
-            "rquant-source-broker-v2-heartbeat-"
-        ):
-            heartbeat_failed.set()
-            raise ConnectionError("heartbeat authority unavailable")
-        original_heartbeat(**kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(first, "_heartbeat_outbox", fail_background_heartbeat)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first_future = executor.submit(
-            first.advance,
-            request,
-            now=NOW + timedelta(seconds=1),
-        )
-        if not transport.dispatch_entered.wait(timeout=5):
-            first_future.result(timeout=1)
-            pytest.fail("source dispatch was not entered")
-        assert heartbeat_failed.wait(timeout=5)
-        clock.advance(0.07)
-        second = SourceBrokerV2Saga.for_nonproduction(
+    def build() -> SourceBrokerV2Saga:
+        return SourceBrokerV2Saga.for_nonproduction(
             path,
             saga_id="saga-a",
             current_claim_authority=current,
@@ -2695,196 +2738,71 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
             source_request_deadline_seconds=0.08,
             source_takeover_grace_seconds=0.04,
         )
+
+    first = build()
+    boundary = _wp9_watch_boundary(first, monkeypatch)
+    # Idle until told: a helper renewing normally before the window opens would
+    # write real-clock timestamps onto the very row whose expiry decides
+    # whether the second saga may take over.
+    _wp9_use_fault_helper(first, monkeypatch, "fail-renewal", marker)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            first.advance,
+            request,
+            now=NOW + timedelta(seconds=1),
+        )
+        if not transport.dispatch_entered.wait(timeout=10):
+            first_future.result(timeout=1)
+            pytest.fail("source dispatch was not entered")
+        _wp9_open_window(marker)
+        _wp9_wait_for(marker.exists, what="the injected renewal failure")
+        clock.advance(0.07)
+        second = build()
+        _wp9_use_fault_helper(second, monkeypatch, "never-renews")
         second_future = executor.submit(
             second.advance,
             request,
             now=NOW + timedelta(seconds=2),
         )
-        second_result = second_future.result(timeout=5)
+        second_result = second_future.result(timeout=30)
         assert second_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
         assert transport.dispatch_calls == 1
         transport.release_dispatch.set()
-        first_result = first_future.result(timeout=5)
+        first_result = first_future.result(timeout=30)
 
     assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    outcome = _wp9_boundary_for(boundary, SourceBrokerV2OutboxPhase.DISPATCH)["outcome"]
+    assert outcome is not None
+    assert outcome.acked is True
+    assert outcome.renewal_ok is False
+    assert outcome.failure is not None
+    assert outcome.escalation == "clean"
+    assert outcome.child_alive is True
     recovered = second.reconcile(request, now=NOW + timedelta(seconds=3))
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline and any(
-        thread.name.startswith("rquant-source-broker-v2-heartbeat-")
-        for thread in enumerate_threads()
-    ):
-        time.sleep(0.01)
-    assert not any(
-        thread.name.startswith("rquant-source-broker-v2-heartbeat-")
-        for thread in enumerate_threads()
-    )
+    assert not _live_heartbeat_threads()
+    first.close()
+    second.close()
 
 
-# The floor this package removed.  ``max(0.1, (lease / 3) * 2)`` is 0.1s for
-# every lease below 0.15s, and what that floor had to cover - one in-flight
-# ``_heartbeat_outbox`` - is bounded by ``busy_timeout_ms``, not by it.
-_LEGACY_HEARTBEAT_SHUTDOWN_BUDGET_SECONDS = 0.1
-# How long the competitor keeps the SQLite write lock once the barrier has put
-# the heartbeat inside its write.  `time.sleep` never returns early, so this is
-# a guaranteed lower bound on the in-flight write, not a window to hit: the
-# interleaving itself is fixed by the barrier, and the case asserts the
-# observed write duration afterwards rather than trusting this number.
-_PINNED_WRITE_HOLD_SECONDS = 0.6
+# How long the competitor keeps the SQLite write lock once the helper has
+# announced it is about to contend for it.  `time.sleep` never returns early,
+# so this is a guaranteed lower bound on the pinned write, not a window to hit:
+# the interleaving is fixed by the marker, and the case asserts what the row
+# shows afterwards rather than trusting this number.
+_PINNED_WRITE_HOLD_SECONDS = 0.3
+# Kept as a regression guard, not as evidence.  This process starts no
+# heartbeat thread at all any more, so the list is always empty - which is
+# exactly what makes it useful the day somebody puts one back.
 _HEARTBEAT_THREAD_PREFIX = "rquant-source-broker-v2-heartbeat-"
-
-
-def _is_background_dispatch_heartbeat(kwargs: dict[str, Any]) -> bool:
-    return kwargs.get(
-        "phase"
-    ) is SourceBrokerV2OutboxPhase.DISPATCH and current_thread().name.startswith(
-        _HEARTBEAT_THREAD_PREFIX
-    )
 
 
 def _live_heartbeat_threads() -> list[Thread]:
     return [
         thread for thread in enumerate_threads() if thread.name.startswith(_HEARTBEAT_THREAD_PREFIX)
     ]
-
-
-# A read long enough to still be running when a 0.08s budget expires, and
-# short enough (~15s at the ~13M rows/s this tree measures) to end by itself if
-# nothing ever interrupts it, so a tree without the interrupt leaves a bounded
-# mess behind instead of an endless one.
-_STALLING_SCAN_ROWS = 200_000_000
-_STALLING_SCAN_SQL = (
-    "WITH RECURSIVE stall(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM stall "
-    f"WHERE x < {_STALLING_SCAN_ROWS}) SELECT count(*) FROM stall"
-)
-# Virtual-machine steps between progress callbacks: small enough that the first
-# one lands within milliseconds of the scan starting, large enough not to slow
-# it down.  The callback is how a case learns the statement is really running.
-_SCAN_PROGRESS_OPS = 500_000
-# The lock-wait case contends on a database of its own so the wait can be given
-# a window wider than the saga's shutdown budget - the saga's own
-# `busy_timeout_ms` sets both the budget and its writes' waits, so a lock wait
-# on the saga file can never outlive the budget derived from it.
-_CONTENDED_BUSY_TIMEOUT_MS = 600
-
-
-def _record_heartbeat_threads(monkeypatch: pytest.MonkeyPatch) -> list[Thread]:
-    """Every heartbeat thread `_invoke_with_heartbeat` starts, in order."""
-
-    created: list[Thread] = []
-    real_thread = source_broker_v2_module.Thread
-
-    def factory(*args: Any, **kwargs: Any) -> Thread:
-        thread = real_thread(*args, **kwargs)
-        if str(kwargs.get("name", "")).startswith(_HEARTBEAT_THREAD_PREFIX):
-            created.append(thread)
-        return thread
-
-    monkeypatch.setattr(source_broker_v2_module, "Thread", factory)
-    return created
-
-
-def _assert_heartbeats_end_at_the_boundary(
-    saga: SourceBrokerV2Saga,
-    monkeypatch: pytest.MonkeyPatch,
-    threads: list[Thread],
-) -> None:
-    """Check for a live heartbeat where `_invoke_with_heartbeat` leaves.
-
-    Both assertions run before anything else can touch the thread - the one in
-    `except` is the first statement to execute after the raise - so a thread
-    still alive there is one the method itself handed back.  No case releases,
-    joins or reclaims a heartbeat afterwards to make this true.
-    """
-
-    original = saga._invoke_with_heartbeat
-
-    def bounded(**kwargs: Any) -> bytes:
-        started = len(threads)
-        try:
-            result = original(**kwargs)
-        except BaseException:
-            assert not [thread for thread in threads[started:] if thread.is_alive()]
-            raise
-        assert not [thread for thread in threads[started:] if thread.is_alive()]
-        return result
-
-    monkeypatch.setattr(saga, "_invoke_with_heartbeat", bounded)
-
-
-def _stall_the_second_dispatch_renewal(
-    saga: SourceBrokerV2Saga,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    scanning: Event,
-) -> tuple[list[float], list[str]]:
-    """Park the second dispatch renewal inside a SQLite read it cannot finish.
-
-    The scan runs on the connection `_heartbeat_outbox` opened and published,
-    inside the write transaction that body had already begun and after its
-    `UPDATE`, so the shutdown's interrupt has to end a statement the production
-    body owns - and SQLite has to roll that renewal back rather than leave it
-    half applied.  `scanning` is set from inside the running statement by a
-    progress handler, so no case has to guess when the thread got there.
-
-    Returns the durations of the stalled scan and the `executor_heartbeat_at`
-    values the renewals read before writing their own.
-    """
-
-    connections: list[sqlite3.Connection] = []
-    scans: list[float] = []
-    read_heartbeat_at: list[str] = []
-    completed: list[float] = []
-    stalled: list[bool] = []
-    original_read = saga._read_outbox
-    original_heartbeat = saga._heartbeat_outbox
-
-    def capturing_read(connection: sqlite3.Connection, **kwargs: Any) -> sqlite3.Row:
-        row = original_read(connection, **kwargs)
-        # Phase-scoped through the same predicate the rest of the file uses:
-        # every outbox phase runs a heartbeat thread of its own, and on a slow
-        # machine the claim phase's renewal lands a tick here too.  That tick
-        # reads a different outbox row, and counting it made this case fail
-        # about 3% of the time.
-        if _is_background_dispatch_heartbeat(kwargs):
-            connections.append(connection)
-            read_heartbeat_at.append(row["executor_heartbeat_at"])
-        return row
-
-    def report_progress() -> int:
-        scanning.set()
-        return 0
-
-    def stalling_heartbeat(**kwargs: Any) -> None:
-        if not _is_background_dispatch_heartbeat(kwargs) or stalled:
-            original_heartbeat(**kwargs)
-            return
-        if not completed:
-            original_heartbeat(**kwargs)
-            completed.append(time.monotonic())
-            return
-        stalled.append(True)
-        mark_stage = kwargs["mark_stage"]
-
-        def marking(stage: str) -> None:
-            mark_stage(stage)
-            if stage != "commit":
-                return
-            connection = connections[-1]
-            connection.set_progress_handler(report_progress, _SCAN_PROGRESS_OPS)
-            started = time.monotonic()
-            try:
-                connection.execute(_STALLING_SCAN_SQL).fetchone()
-            finally:
-                scans.append(time.monotonic() - started)
-                connection.set_progress_handler(None, 0)
-
-        original_heartbeat(**{**kwargs, "mark_stage": marking})
-
-    monkeypatch.setattr(saga, "_read_outbox", capturing_read)
-    monkeypatch.setattr(saga, "_heartbeat_outbox", stalling_heartbeat)
-    return scans, read_heartbeat_at
 
 
 def _outbox_heartbeat_at(path: Path, operation_id: str) -> str:
@@ -2900,6 +2818,13 @@ def _outbox_heartbeat_at(path: Path, operation_id: str) -> str:
     return str(row[0])
 
 
+def _dispatch_operation_id(request: Any) -> str:
+    return source_effect_operation_id(
+        saga_id=request.saga_id,
+        phase=SourceBrokerV2OutboxPhase.DISPATCH,
+    )
+
+
 def _heartbeat_shutdown_saga(
     path: Path,
     *,
@@ -2908,11 +2833,20 @@ def _heartbeat_shutdown_saga(
     transport: _TestTransport,
     lineage: _TestLineageAuthority,
     busy_timeout_ms: int,
-    executor_lease_seconds: float = 0.05,
+    executor_lease_seconds: float | None = None,
 ) -> SourceBrokerV2Saga:
-    # lease 0.05 keeps `interval * 2` (0.033s) under the removed 0.1s floor, so
-    # the shutdown budget is decided by `busy_timeout_ms` alone; the source
-    # deadline is left unconstrained because these cases are about the budget.
+    """A saga for the shutdown cases, on a lease that produces no renewal.
+
+    The default lease is deliberately far longer than any window these cases
+    open, so a case that does not ask for renewals provably gets none and can
+    assert `ticks == 0` outright.  Cases that need renewals pass a small lease
+    and say so.  The old default here was 0.05s, which put the renewal interval
+    at 16.7ms - small enough that the helper really did write during the
+    window, which is what made "no tick happened" unassertable.
+    """
+
+    if executor_lease_seconds is None:
+        executor_lease_seconds = _WP9_QUIET_LEASE_SECONDS
     return SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
@@ -2932,67 +2866,81 @@ def _expected_shutdown_budget(busy_timeout_ms: int) -> float:
     return source_broker_v2_module._HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * busy_timeout_ms / 1_000
 
 
+def _wp9_shutdown_bound(busy_timeout_ms: int) -> float:
+    """The closed form a caller is promised, for the double-sided assertions."""
+
+    return (
+        _expected_shutdown_budget(busy_timeout_ms)
+        + source_broker_v2_module._HEARTBEAT_TERMINATE_SECONDS
+        + source_broker_v2_module._HEARTBEAT_FINAL_REAP_SECONDS
+        + source_broker_v2_module._HEARTBEAT_BOUND_EPSILON_SECONDS
+    )
+
+
 def test_v2_saga_shutdown_covers_a_heartbeat_pinned_inside_a_busy_timeout_bounded_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """In-flight ending: the renewal is inside its write when `stop` is set."""
+    """In-flight ending: a renewal is inside its write when the session ends.
+
+    Migrated T-C.  The proposition is unchanged - a renewal that is already
+    contending for the write lock when the shutdown begins is covered by the
+    budget, and the caller still leaves cleanly - but the renewal now runs in
+    the helper, so the pin is a real `BEGIN IMMEDIATE` behind a lock this case
+    holds rather than a patched method body.
+
+    What ends the wait is the helper answering the end frame after its pinned
+    write completes, which is why `escalation` stays `"clean"`: nothing had to
+    be killed for the caller's bound to hold.
+    """
 
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     transport = _TestTransport(block_dispatch=True)
-    lineage = _TestLineageAuthority()
+    marker = tmp_path / "pinned.marker"
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
         quota=quota,
         transport=transport,
-        lineage=lineage,
+        lineage=_TestLineageAuthority(),
         busy_timeout_ms=5_000,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    threads = _record_heartbeat_threads(monkeypatch)
-    write_barrier = Barrier(2)
-    pinned: list[bool] = []
-    write_durations: list[float] = []
-    original_heartbeat = saga._heartbeat_outbox
-
-    def pinned_heartbeat(**kwargs: Any) -> None:
-        if not _is_background_dispatch_heartbeat(kwargs) or pinned:
-            original_heartbeat(**kwargs)
-            return
-        pinned.append(True)
-        # Rendezvous: the test already holds the SQLite write lock when this
-        # returns, so the delegate below is guaranteed to enter the
-        # `busy_timeout`-bounded wait at `BEGIN IMMEDIATE`.
-        write_barrier.wait(timeout=5)
-        started = time.monotonic()
-        try:
-            original_heartbeat(**kwargs)
-        finally:
-            write_durations.append(time.monotonic() - started)
-
-    monkeypatch.setattr(saga, "_heartbeat_outbox", pinned_heartbeat)
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "pin-in-lock-wait", marker)
+    operation_id = _dispatch_operation_id(request)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
         try:
-            assert transport.dispatch_entered.wait(timeout=5)
-            competitor = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+            assert transport.dispatch_entered.wait(timeout=10)
+            before = _outbox_heartbeat_at(path, operation_id)
+            competitor = sqlite3.connect(path, timeout=10.0, isolation_level=None)
             try:
                 competitor.execute("BEGIN IMMEDIATE")
-                write_barrier.wait(timeout=5)
-                transport.release_dispatch.set()
+                _wp9_open_window(marker)
+                # The helper announces immediately before it contends, so past
+                # this point the renewal is pinned on the lock held here.
+                _wp9_wait_for(marker.exists, what="the helper to reach its write")
                 time.sleep(_PINNED_WRITE_HOLD_SECONDS)
                 competitor.execute("ROLLBACK")
             finally:
                 competitor.close()
+            transport.release_dispatch.set()
+            snapshot = future.result(timeout=60)
         finally:
             transport.release_dispatch.set()
-        snapshot = future.result(timeout=30)
 
-    assert write_durations
-    assert max(write_durations) > _LEGACY_HEARTBEAT_SHUTDOWN_BUDGET_SECONDS
+    outcome = _wp9_boundary_for(boundary, SourceBrokerV2OutboxPhase.DISPATCH)["outcome"]
+    assert outcome is not None
+    assert outcome.acked is True
+    assert outcome.renewal_ok is True
+    assert outcome.escalation == "clean"
+    assert outcome.child_alive is True
+    assert outcome.shutdown_seconds < _expected_shutdown_budget(5_000)
+    # The pinned renewal was not lost: it landed once the lock was released.
+    assert _outbox_heartbeat_at(path, operation_id) != before
     assert snapshot.reconcile_reason is None
     assert snapshot.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
@@ -3004,118 +2952,107 @@ def test_v2_saga_shutdown_returns_at_once_when_the_heartbeat_is_idle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Normal ending: `stop` lands while the renewal is parked between ticks."""
+    """Normal ending: the session ends with no renewal in flight.
+
+    Migrated T-B.  The old case parked a patched `_wait_for_heartbeat` to force
+    "no tick"; the lease now makes it true by construction - 120s gives a
+    renewal interval of 40s, which no window here comes close to - so
+    `ticks == 0` is asserted outright rather than arranged.
+    """
 
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     transport = _TestTransport(block_dispatch=True)
-    lineage = _TestLineageAuthority()
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
         quota=quota,
         transport=transport,
-        lineage=lineage,
+        lineage=_TestLineageAuthority(),
         busy_timeout_ms=5_000,
     )
-    threads = _record_heartbeat_threads(monkeypatch)
-    parked = Event()
-    dispatch_ticks: list[float] = []
-    original_heartbeat = saga._heartbeat_outbox
-
-    def parked_wait(stop: Event, interval: float, *, phase: SourceBrokerV2OutboxPhase) -> bool:
-        if phase is not SourceBrokerV2OutboxPhase.DISPATCH:
-            return stop.wait(interval)
-        parked.set()
-        return stop.wait(30.0)
-
-    def count_dispatch_ticks(**kwargs: Any) -> None:
-        if _is_background_dispatch_heartbeat(kwargs):
-            dispatch_ticks.append(time.monotonic())
-        original_heartbeat(**kwargs)
-
-    monkeypatch.setattr(saga, "_wait_for_heartbeat", parked_wait)
-    monkeypatch.setattr(saga, "_heartbeat_outbox", count_dispatch_ticks)
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
         try:
-            assert transport.dispatch_entered.wait(timeout=5)
-            assert parked.wait(timeout=5)
+            assert transport.dispatch_entered.wait(timeout=10)
             released_at = time.monotonic()
             transport.release_dispatch.set()
-            snapshot = future.result(timeout=30)
+            snapshot = future.result(timeout=60)
         finally:
             transport.release_dispatch.set()
     shutdown_elapsed = time.monotonic() - released_at
 
-    assert dispatch_ticks == []
+    outcome = _wp9_boundary_for(boundary, SourceBrokerV2OutboxPhase.DISPATCH)["outcome"]
+    assert outcome is not None
+    assert outcome.ticks == 0
+    assert outcome.acked is True
+    assert outcome.renewal_ok is True
+    assert outcome.child_alive is True
+    assert outcome.escalation == "clean"
     assert shutdown_elapsed < _expected_shutdown_budget(5_000)
     assert snapshot.reconcile_reason is None
     assert snapshot.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
     assert not _live_heartbeat_threads()
+    saga.close()
 
 
 def test_v2_saga_heartbeat_starts_no_further_round_once_stop_is_requested(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The wait may report a timeout at the instant `stop` is set; that is not a tick."""
+    """No renewal starts after the session has ended.
+
+    Migrated T-C with the external witness.  The old case forced the race by
+    making a patched wait report a timeout at the instant `stop` was set.  The
+    edge now lives in the helper, so the evidence is external instead: once the
+    invocation has returned, this case takes the write lock and holds it for
+    longer than two renewal intervals, and reads the row inside that window and
+    again after it.  A helper that started one more round - or that was blocked
+    on the lock and landed one afterwards - would move those columns.
+    """
 
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     transport = _TestTransport(block_dispatch=True)
-    lineage = _TestLineageAuthority()
+    interval = _WP9_TICKING_LEASE_SECONDS / 3
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
         quota=quota,
         transport=transport,
-        lineage=lineage,
+        lineage=_TestLineageAuthority(),
         busy_timeout_ms=5_000,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    threads = _record_heartbeat_threads(monkeypatch)
-    raced = Event()
-    parked = Event()
-    dispatch_ticks: list[float] = []
-    original_heartbeat = saga._heartbeat_outbox
-
-    def racing_wait(stop: Event, interval: float, *, phase: SourceBrokerV2OutboxPhase) -> bool:
-        if phase is not SourceBrokerV2OutboxPhase.DISPATCH or raced.is_set():
-            return stop.wait(interval)
-        raced.set()
-        parked.set()
-        # Return only once the shutdown has set `stop`, and report a timeout
-        # anyway: exactly the race a `stop.wait(interval)` expiry can lose.
-        stop.wait(30.0)
-        return False
-
-    def count_dispatch_ticks(**kwargs: Any) -> None:
-        if _is_background_dispatch_heartbeat(kwargs):
-            dispatch_ticks.append(time.monotonic())
-        original_heartbeat(**kwargs)
-
-    monkeypatch.setattr(saga, "_wait_for_heartbeat", racing_wait)
-    monkeypatch.setattr(saga, "_heartbeat_outbox", count_dispatch_ticks)
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    operation_id = _dispatch_operation_id(request)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
         try:
-            assert transport.dispatch_entered.wait(timeout=5)
-            assert parked.wait(timeout=5)
+            assert transport.dispatch_entered.wait(timeout=10)
+            # Renewals are flowing before the session ends, so "no further
+            # round" is a statement about a helper that was actually ticking.
+            _wp9_wait_for_renewals(saga, operation_id, 1)
             transport.release_dispatch.set()
-            snapshot = future.result(timeout=30)
+            snapshot = future.result(timeout=60)
         finally:
             transport.release_dispatch.set()
 
-    assert dispatch_ticks == []
+    outcome = _wp9_boundary_for(boundary, SourceBrokerV2OutboxPhase.DISPATCH)["outcome"]
+    assert outcome is not None
+    assert outcome.ticks >= 1
+    assert outcome.acked is True
+    assert outcome.renewal_ok is True
+    _wp9_witness_no_renewal_after_the_session(saga, operation_id, interval=interval)
     assert snapshot.reconcile_reason is None
     assert snapshot.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
     assert not _live_heartbeat_threads()
+    saga.close()
 
 
 def test_v2_saga_shutdown_ends_a_heartbeat_that_outlives_its_derived_budget(
@@ -3124,163 +3061,143 @@ def test_v2_saga_shutdown_ends_a_heartbeat_that_outlives_its_derived_budget(
 ) -> None:
     """Real timeout: the renewal is still inside SQLite when the budget expires.
 
-    Past the budget the shutdown interrupts the connection that renewal opened
-    and joins with no timeout, so the method raises with the thread already
-    dead - the `except` in `_assert_heartbeats_end_at_the_boundary` checks that
-    before anything else runs.  The interrupted renewal is rolled back whole:
-    the row still carries the timestamp the last completed tick wrote.
+    Migrated T-C, and this is the case the 200-million-row recursive CTE used
+    to buy.  A statement that runs long enough was only ever a stand-in for
+    "the renewal will not end on its own"; the helper now stalls in a real
+    `flock` instead, which is both faster and closer to the windows this
+    package exists for.
+
+    The propositions are unchanged: the caller is told, within the closed-form
+    bound, and the renewal that was in flight is rolled back whole - the row
+    still carries what the last completed tick wrote, never a half of the one
+    that was cut off.
     """
 
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     transport = _TestTransport(block_dispatch=True)
-    lineage = _TestLineageAuthority()
-    busy_timeout_ms = 40
+    busy_timeout_ms = 200
+    marker = tmp_path / "outlives.marker"
+    lock = _wp9_hold_fault_lock(marker)
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
         quota=quota,
         transport=transport,
-        lineage=lineage,
+        lineage=_TestLineageAuthority(),
         busy_timeout_ms=busy_timeout_ms,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    budget = _expected_shutdown_budget(busy_timeout_ms)
-    threads = _record_heartbeat_threads(monkeypatch)
-    scanning = Event()
-    scans, read_heartbeat_at = _stall_the_second_dispatch_renewal(
-        saga,
-        monkeypatch,
-        scanning=scanning,
-    )
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "stall-after-commit", marker)
+    operation_id = _dispatch_operation_id(request)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
-        try:
-            assert transport.dispatch_entered.wait(timeout=5)
-            assert scanning.wait(timeout=10)
-            transport.release_dispatch.set()
-            snapshot = future.result(timeout=30)
-        finally:
-            transport.release_dispatch.set()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+            try:
+                assert transport.dispatch_entered.wait(timeout=10)
+                _wp9_open_window(marker)
+                _wp9_wait_for(marker.exists, what="the helper to stall after its commit")
+                committed = _outbox_heartbeat_at(path, operation_id)
+                started = time.monotonic()
+                transport.release_dispatch.set()
+                snapshot = future.result(timeout=60)
+                elapsed = time.monotonic() - started
+            finally:
+                transport.release_dispatch.set()
+    finally:
+        os.close(lock)
 
-    assert len(scans) == 1
-    assert scans[0] > budget
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.acked is False
+    assert outcome.child_returncode == -9
+    assert outcome.escalation == "sigkill"
+    assert outcome.orphaned is False
+    assert elapsed >= _expected_shutdown_budget(busy_timeout_ms)
+    assert elapsed <= _wp9_shutdown_bound(busy_timeout_ms) + 1.0
     assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     reason = snapshot.reconcile_reason
     assert reason is not None
-    assert reason.startswith("outbox heartbeat did not stop after dispatch")
-    assert f"of a {budget:.3f}s budget" in reason
-    assert "1 completed tick" in reason
-    assert "stage 'commit'" in reason
-    assert "interrupt issued on the connection it held" in reason
-    assert "ending in stage 'interrupted'" in reason
+    assert "outbox heartbeat session" in reason
+    assert "escalation 'sigkill'" in reason
     assert transport.dispatch_calls == 1
     assert not _live_heartbeat_threads()
-    # SQLite rolled the interrupted renewal back: the row kept what the tick
-    # before it committed, and never a half of what the interrupted one began.
-    assert len(read_heartbeat_at) == 2
-    dispatch_operation_id = source_effect_operation_id(
-        saga_id=request.saga_id,
-        phase=SourceBrokerV2OutboxPhase.DISPATCH,
-    )
-    assert _outbox_heartbeat_at(path, dispatch_operation_id) == read_heartbeat_at[-1]
+    # The renewal that was cut off left nothing: the row is exactly what the
+    # completed tick before it wrote.
+    assert _outbox_heartbeat_at(path, operation_id) == committed
+    assert _wp9_integrity_check(path) == "ok"
 
 
-def test_v2_saga_shutdown_ends_a_heartbeat_interrupted_inside_a_lock_wait(
+def test_v2_saga_shutdown_ends_a_heartbeat_stuck_in_a_lock_wait_it_cannot_abort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A lock wait is the stall `interrupt` cannot cut short - it still ends.
+    """A lock wait nothing can cut short - and the caller's bound holds anyway.
 
-    SQLite's busy handler sleeps through an interrupt, so what ends this
-    renewal is the `busy_timeout` of the connection it is waiting on, not the
-    abort.  That is the point: the wait the shutdown inherits is bounded by a
-    window SQLite states, so joining without a timeout still terminates, and
-    the message says how much of the wait came after the interrupt.  The
-    contended file is not the saga's, so the shutdown that follows is never
-    itself blocked by the competitor.
+    Migrated T-C from `..._interrupted_inside_a_lock_wait`.  That case existed
+    to show that `sqlite3_interrupt` cannot shorten a busy handler's sleep, so
+    the shutdown inherits the *contended connection's* window.  Interrupt is
+    gone with the thread model, and the sharper claim replaces it: the helper
+    waits on a foreign database whose `busy_timeout` is 60s - two orders of
+    magnitude past this saga's whole shutdown bound - and the caller still
+    leaves inside the closed form, because what ends it is the kill and not the
+    lock.
+
+    Foreign on purpose, exactly as before: contending on the saga's own file
+    would let the shutdown be blocked by the competitor it is waiting on.
     """
 
     transport = _TestTransport()
-    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 200
+    marker = tmp_path / "foreign-lock.marker"
+    contended = sqlite3.connect(str(marker) + ".contended", timeout=10.0, isolation_level=None)
+    contended.execute("PRAGMA journal_mode = WAL")
+    contended.execute("CREATE TABLE held(k INTEGER PRIMARY KEY)")
     saga = _heartbeat_shutdown_saga(
         tmp_path / "saga.sqlite3",
         current=object(),
         quota=_quota_adapter(tmp_path),
         transport=transport,
-        lineage=lineage,
-        busy_timeout_ms=40,
+        lineage=_TestLineageAuthority(),
+        busy_timeout_ms=busy_timeout_ms,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    budget = _expected_shutdown_budget(40)
-    contended = tmp_path / "contended.sqlite3"
-    competitor = sqlite3.connect(contended, timeout=5.0, isolation_level=None)
-    competitor.execute("PRAGMA journal_mode = WAL")
-    competitor.execute("CREATE TABLE held(k INTEGER PRIMARY KEY)")
-    threads = _record_heartbeat_threads(monkeypatch)
-    waiting = Event()
-    lock_waits: list[float] = []
-
-    def lock_waiting_heartbeat(**kwargs: Any) -> None:
-        bind_connection = kwargs["bind_connection"]
-        mark_stage = kwargs["mark_stage"]
-        connection = sqlite3.connect(
-            contended,
-            timeout=_CONTENDED_BUSY_TIMEOUT_MS / 1_000,
-            isolation_level=None,
-        )
-        connection.execute(f"PRAGMA busy_timeout = {_CONTENDED_BUSY_TIMEOUT_MS}")
-        bind_connection(connection)
-        try:
-            mark_stage("lock-wait")
-            waiting.set()
-            started = time.monotonic()
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-            finally:
-                lock_waits.append(time.monotonic() - started)
-        finally:
-            bind_connection(None)
-            connection.close()
-
-    monkeypatch.setattr(saga, "_heartbeat_outbox", lock_waiting_heartbeat)
-    monkeypatch.setattr(
-        saga,
-        "_wait_for_heartbeat",
-        lambda stop, interval, *, phase: stop.wait(interval),
-    )
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "stall-in-foreign-lock-wait", marker)
+    phase, operation_id, generation, payload = _wp9_window(saga)
 
     def invoke(payload: bytes) -> bytes:
-        assert waiting.wait(timeout=5)
+        _wp9_open_window(marker)
+        _wp9_wait_for(marker.exists, what="the helper to enter the foreign lock wait")
         return payload
 
-    competitor.execute("BEGIN IMMEDIATE")
+    contended.execute("BEGIN IMMEDIATE")
     try:
-        with pytest.raises(SourceBrokerV2SagaUnavailableError) as raised:
+        started = time.monotonic()
+        with pytest.raises(SourceBrokerV2SagaUnavailableError):
             saga._invoke_with_heartbeat(
-                phase=SourceBrokerV2OutboxPhase.DISPATCH,
-                operation_id="0" * 64,
-                owner_generation=1,
-                payload=b'{"probe":1}',
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
                 invoke=invoke,
             )
+        elapsed = time.monotonic() - started
     finally:
-        competitor.execute("ROLLBACK")
-        competitor.close()
+        contended.execute("ROLLBACK")
+        contended.close()
 
-    reason = str(raised.value)
-    assert reason.startswith("outbox heartbeat did not stop after dispatch")
-    assert f"of a {budget:.3f}s budget" in reason
-    assert "interrupt issued on the connection it held" in reason
-    assert len(lock_waits) == 1
-    contended_window = _CONTENDED_BUSY_TIMEOUT_MS / 1_000
-    # The wait outlived the budget, and ended within the window its own
-    # connection states rather than running on for as long as the lock is held.
-    assert lock_waits[0] > budget
-    assert lock_waits[0] < contended_window * 2
-    joined = float(re.search(r"then joined (\d+\.\d+)s more", reason).group(1))
-    assert joined < contended_window * 2
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.acked is False
+    assert outcome.child_returncode == -9
+    assert outcome.escalation == "sigkill"
+    # Both sides, and the upper one is the whole point: the foreign window is
+    # 60s and the caller left in a fraction of that.
+    assert elapsed >= _expected_shutdown_budget(busy_timeout_ms)
+    assert elapsed <= _wp9_shutdown_bound(busy_timeout_ms)
     assert not _live_heartbeat_threads()
 
 
@@ -3288,95 +3205,115 @@ def test_v2_saga_shutdown_surfaces_a_heartbeat_that_failed_in_flight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Heartbeat-failure ending: the renewal raises, and the shutdown stays clean.
+    """Heartbeat-failure ending: the renewal fails, and the shutdown stays clean.
 
-    The injected error is an `OperationalError` SQLite never produced, so it
-    carries no `sqlite_errorcode` at all: only a real `SQLITE_INTERRUPT` is a
-    stop signal, and everything else - including this - is still a failure.
+    Migrated T-C.  The failure is now reported by the helper as a frame
+    carrying SQLite's own error code, and the assertion on that code is kept
+    verbatim: a renewal failure is classified by `sqlite_errorcode`, never by
+    matching on a message.
+
+    The second half is what this case is really worth in the process model: a
+    failed renewal must not cost the helper its life.  `escalation` stays
+    `"clean"` and the child is still alive at the boundary.
     """
 
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     transport = _TestTransport(block_dispatch=True)
-    lineage = _TestLineageAuthority()
+    marker = tmp_path / "failed.marker"
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
         quota=quota,
         transport=transport,
-        lineage=lineage,
+        lineage=_TestLineageAuthority(),
         busy_timeout_ms=5_000,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    threads = _record_heartbeat_threads(monkeypatch)
-    failed = Event()
-    original_heartbeat = saga._heartbeat_outbox
-
-    def failing_heartbeat(**kwargs: Any) -> None:
-        if _is_background_dispatch_heartbeat(kwargs):
-            failed.set()
-            raise sqlite3.OperationalError("heartbeat authority unavailable")
-        original_heartbeat(**kwargs)
-
-    monkeypatch.setattr(saga, "_heartbeat_outbox", failing_heartbeat)
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "fail-renewal", marker)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
         try:
-            assert transport.dispatch_entered.wait(timeout=5)
-            assert failed.wait(timeout=5)
+            assert transport.dispatch_entered.wait(timeout=10)
+            _wp9_open_window(marker)
+            _wp9_wait_for(marker.exists, what="the injected renewal failure")
             transport.release_dispatch.set()
-            snapshot = future.result(timeout=30)
+            snapshot = future.result(timeout=60)
         finally:
             transport.release_dispatch.set()
 
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.acked is True
+    assert outcome.renewal_ok is False
+    assert outcome.escalation == "clean"
+    assert outcome.child_alive is True
+    assert outcome.failure is not None
+    assert outcome.failure.errorcode == sqlite3.SQLITE_BUSY
     assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert snapshot.reconcile_reason == "outbox heartbeat failed during dispatch"
     assert transport.dispatch_calls == 1
     assert not _live_heartbeat_threads()
+    saga.close()
 
 
 def test_v2_saga_shutdown_ends_an_overdue_heartbeat_when_the_body_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`invoke`'s own exception wins, and the renewal is still ended first.
+    """`invoke`'s own failure wins, and the renewal is still ended first.
 
-    The `finally` interrupts and joins on the way out, so the caller's
-    exception leaves with no heartbeat behind it; the heartbeat report is not
-    raised here, because raising it would displace the exception the caller
-    actually needs to see.
+    Migrated T-C.  The transport loses its response, so the saga's own outcome
+    has to stay `source dispatch response is unknown` - the heartbeat's report
+    must not displace it, at the saga layer as well as at the method layer.
+    Meanwhile the stalled helper is reaped rather than handed back.
     """
 
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     transport = _TestTransport(block_dispatch=True, lose_dispatch_once=True)
-    lineage = _TestLineageAuthority()
+    busy_timeout_ms = 200
+    marker = tmp_path / "body-raises.marker"
+    lock = _wp9_hold_fault_lock(marker)
     saga = _heartbeat_shutdown_saga(
         path,
         current=current,
         quota=quota,
         transport=transport,
-        lineage=lineage,
-        busy_timeout_ms=40,
+        lineage=_TestLineageAuthority(),
+        busy_timeout_ms=busy_timeout_ms,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    threads = _record_heartbeat_threads(monkeypatch)
-    scanning = Event()
-    scans, _ = _stall_the_second_dispatch_renewal(saga, monkeypatch, scanning=scanning)
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "stall-before-connect", marker)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
-        try:
-            assert transport.dispatch_entered.wait(timeout=5)
-            assert scanning.wait(timeout=10)
-            transport.release_dispatch.set()
-            snapshot = future.result(timeout=30)
-        finally:
-            transport.release_dispatch.set()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
+            try:
+                assert transport.dispatch_entered.wait(timeout=10)
+                _wp9_open_window(marker)
+                _wp9_wait_for(marker.exists, what="the helper to stall")
+                started = time.monotonic()
+                transport.release_dispatch.set()
+                snapshot = future.result(timeout=60)
+                elapsed = time.monotonic() - started
+            finally:
+                transport.release_dispatch.set()
+    finally:
+        os.close(lock)
 
-    assert len(scans) == 1
-    assert scans[0] > _expected_shutdown_budget(40)
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.child_returncode == -9
+    assert outcome.escalation == "sigkill"
+    # Stated rather than inferred, as in every other case of this family, and
+    # timed from the release rather than from the top of the case: construction,
+    # patching and the phases before dispatch are not the shutdown, and a bound
+    # that swallowed them would pass without the shutdown having waited at all.
+    assert elapsed >= _expected_shutdown_budget(busy_timeout_ms)
     assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert snapshot.reconcile_reason == "source dispatch response is unknown"
     assert transport.dispatch_calls == 1
@@ -3389,240 +3326,101 @@ def test_v2_saga_shutdown_notes_an_overdue_heartbeat_on_the_caller_s_exception(
 ) -> None:
     """The caller's exception leaves untouched, carrying the shutdown's report.
 
-    On this path the report is never raised - doing so would displace what the
-    caller has to see - so it rides along as a PEP 678 note instead.  The
-    exception's type, `args` and `str()` are unchanged; only `__notes__` grows,
-    which is what keeps an interrupted renewal from being invisible here.
+    Migrated T-C.  The injection is deliberately the *healthy* one - the helper
+    reports a failed renewal and stays alive - because that is the combination
+    nothing else covers: `renewal_ok is False` would normally make this method
+    raise, and it must not, because the body already raised.  The report rides
+    along as a PEP 678 note instead; type, `args` and `str()` are unchanged and
+    `__cause__` is untouched, which is what an `except` clause can see.
     """
 
     transport = _TestTransport()
-    lineage = _TestLineageAuthority()
-    busy_timeout_ms = 40
+    marker = tmp_path / "notes.marker"
     saga = _heartbeat_shutdown_saga(
         tmp_path / "saga.sqlite3",
         current=object(),
         quota=_quota_adapter(tmp_path),
         transport=transport,
-        lineage=lineage,
-        busy_timeout_ms=busy_timeout_ms,
+        lineage=_TestLineageAuthority(),
+        busy_timeout_ms=200,
+        executor_lease_seconds=_WP9_TICKING_LEASE_SECONDS,
     )
-    budget = _expected_shutdown_budget(busy_timeout_ms)
-    scratch = tmp_path / "scratch.sqlite3"
-    threads = _record_heartbeat_threads(monkeypatch)
-    scanning = Event()
-    scans: list[float] = []
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "fail-renewal", marker)
+    phase, operation_id, generation, payload = _wp9_window(saga)
 
-    def report_progress() -> int:
-        scanning.set()
-        return 0
-
-    def scanning_heartbeat(**kwargs: Any) -> None:
-        bind_connection = kwargs["bind_connection"]
-        mark_stage = kwargs["mark_stage"]
-        connection = sqlite3.connect(scratch, isolation_level=None)
-        bind_connection(connection)
-        try:
-            mark_stage("scan")
-            connection.set_progress_handler(report_progress, _SCAN_PROGRESS_OPS)
-            started = time.monotonic()
-            try:
-                connection.execute(_STALLING_SCAN_SQL).fetchone()
-            finally:
-                scans.append(time.monotonic() - started)
-                connection.set_progress_handler(None, 0)
-        finally:
-            bind_connection(None)
-            connection.close()
-
-    monkeypatch.setattr(saga, "_heartbeat_outbox", scanning_heartbeat)
-    monkeypatch.setattr(
-        saga,
-        "_wait_for_heartbeat",
-        lambda stop, interval, *, phase: stop.wait(interval),
-    )
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
-
-    def invoke(payload: bytes) -> bytes:
-        assert scanning.wait(timeout=10)
+    def invoke(_: bytes) -> bytes:
+        _wp9_open_window(marker)
+        _wp9_wait_for(marker.exists, what="the injected renewal failure")
         raise ConnectionError("transport committed but response was lost")
 
     with pytest.raises(ConnectionError) as raised:
         saga._invoke_with_heartbeat(
-            phase=SourceBrokerV2OutboxPhase.DISPATCH,
-            operation_id="0" * 64,
-            owner_generation=1,
-            payload=b'{"probe":1}',
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
             invoke=invoke,
         )
 
-    assert len(scans) == 1
+    assert type(raised.value) is ConnectionError
     assert str(raised.value) == "transport committed but response was lost"
     assert raised.value.args == ("transport committed but response was lost",)
+    assert raised.value.__cause__ is None
     notes = getattr(raised.value, "__notes__", [])
     assert len(notes) == 1
-    assert notes[0].startswith("outbox heartbeat did not stop after dispatch")
-    assert f"of a {budget:.3f}s budget" in notes[0]
-    assert "interrupt issued on the connection it held" in notes[0]
+    assert notes[0].startswith("outbox heartbeat session")
+    assert "renewal_ok False" in notes[0]
+    assert "escalation 'clean'" in notes[0]
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.renewal_ok is False
+    assert outcome.child_alive is True
     assert not _live_heartbeat_threads()
+    saga.close()
 
 
-def test_v2_saga_shutdown_ends_a_production_renewal_the_interrupt_cannot_abort(
+@pytest.mark.parametrize(
+    ("lease", "message"),
+    [
+        (float("nan"), "must be finite"),
+        (float("inf"), "must be finite"),
+        # Negative infinity is caught one line earlier by the ordinary
+        # positivity check, which is the point: only NaN needs the new guard.
+        (float("-inf"), "must be positive"),
+    ],
+    ids=["nan", "inf", "negative-inf"],
+)
+def test_v2_saga_refuses_a_non_finite_lease_before_any_budget_can_absorb_it(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    lease: float,
+    message: str,
 ) -> None:
-    """The interrupt lands between two statements of the production body.
+    """Migrated M4: the budget no longer has to absorb a NaN, because nothing
+    non-finite gets built in the first place.
 
-    SQLite documents that as a no-op that does not carry over, so the renewal
-    goes on to a real `BEGIN IMMEDIATE` against a lock somebody else holds.
-    Nothing aborts it; its own `busy_timeout` ends it, and the shutdown waits
-    that out rather than handing the thread back - the same guarantee as the
-    lock-wait case, but on the body production actually runs.
+    The old case checked that a NaN lease could not turn the join budget into a
+    NaN - the finite terms had to come first in `max()`, or `join(timeout=nan)`
+    raised inside the `finally`.  There is no join now, but a NaN would travel
+    further than it ever did before: into a renewal interval, into a session
+    frame, and into `select`'s timeout in another process.  So it is refused at
+    construction, and refused again by the encoder if it ever reached one.
     """
 
-    request, current, quota = _request(tmp_path)
-    path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport(block_dispatch=True)
-    lineage = _TestLineageAuthority()
-    busy_timeout_ms = 400
-    saga = _heartbeat_shutdown_saga(
-        path,
-        current=current,
-        quota=quota,
-        transport=transport,
-        lineage=lineage,
-        busy_timeout_ms=busy_timeout_ms,
-    )
-    budget = _expected_shutdown_budget(busy_timeout_ms)
-    threads = _record_heartbeat_threads(monkeypatch)
-    interrupted = Event()
-    original_interrupt = source_broker_v2_module._HeartbeatConnection.interrupt
-
-    def watched_interrupt(slot: Any) -> Any:
-        outcome = original_interrupt(slot)
-        interrupted.set()
-        return outcome
-
-    monkeypatch.setattr(
-        source_broker_v2_module._HeartbeatConnection, "interrupt", watched_interrupt
-    )
-    # Held across the whole shutdown by the competitor, and released from
-    # inside the heartbeat thread itself: the saga writes again right after the
-    # raise, and that write must never race the release.
-    competitor = sqlite3.connect(path, timeout=10.0, isolation_level=None, check_same_thread=False)
-    parked = Event()
-    lock_waits: list[float] = []
-    completed: list[float] = []
-    stalled: list[bool] = []
-    original_heartbeat = saga._heartbeat_outbox
-
-    def parking_heartbeat(**kwargs: Any) -> None:
-        if not _is_background_dispatch_heartbeat(kwargs) or stalled:
-            original_heartbeat(**kwargs)
-            return
-        if not completed:
-            original_heartbeat(**kwargs)
-            completed.append(time.monotonic())
-            return
-        stalled.append(True)
-        mark_stage = kwargs["mark_stage"]
-        started: list[float] = []
-
-        def marking(stage: str) -> None:
-            mark_stage(stage)
-            if stage != "lock-wait":
-                return
-            # `BEGIN IMMEDIATE` has not run yet and the reads before it are
-            # finished, so no statement is running when the interrupt arrives.
-            parked.set()
-            assert interrupted.wait(timeout=20)
-            started.append(time.monotonic())
-
-        try:
-            original_heartbeat(**{**kwargs, "mark_stage": marking})
-        finally:
-            lock_waits.append(time.monotonic() - started[-1])
-            competitor.execute("ROLLBACK")
-
-    monkeypatch.setattr(saga, "_heartbeat_outbox", parking_heartbeat)
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
-
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(saga.advance, request, now=NOW + timedelta(seconds=1))
-            try:
-                assert transport.dispatch_entered.wait(timeout=5)
-                assert parked.wait(timeout=10)
-                competitor.execute("BEGIN IMMEDIATE")
-                transport.release_dispatch.set()
-                snapshot = future.result(timeout=60)
-            finally:
-                transport.release_dispatch.set()
-    finally:
-        with suppress(sqlite3.Error):
-            competitor.execute("ROLLBACK")
-        competitor.close()
-
-    assert snapshot.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-    reason = snapshot.reconcile_reason
-    assert reason is not None
-    assert reason.startswith("outbox heartbeat did not stop after dispatch")
-    assert f"of a {budget:.3f}s budget" in reason
-    assert "stage 'lock-wait'" in reason
-    assert "interrupt issued on the connection it held" in reason
-    # Issued, but nothing was running to abort: the wait ran its own window out.
-    assert len(lock_waits) == 1
-    window = busy_timeout_ms / 1_000
-    assert lock_waits[0] < window * 2
-    joined = float(re.search(r"then joined (\d+\.\d+)s more", reason).group(1))
-    assert joined < window * 2
-    assert transport.dispatch_calls == 1
-    assert not _live_heartbeat_threads()
-
-
-def test_v2_saga_shutdown_budget_absorbs_a_non_finite_lease(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A NaN lease must not turn the join budget into NaN.
-
-    `_configure` only rejects `executor_lease_seconds <= 0`, so NaN reaches the
-    budget through `for_nonproduction`; the finite terms therefore have to come
-    first in `max()`, which absorbs NaN.  Ordered the other way the budget is
-    NaN and `join(timeout=nan)` raises inside the `finally`, where `is_alive()`
-    can never be reached.  The shutdown is exercised directly because a NaN
-    lease cannot reach it through `advance`: `_acquire_outbox_lease` builds a
-    `timedelta(seconds=nan)` first and raises there.
-    """
-
-    transport = _TestTransport()
-    lineage = _TestLineageAuthority()
-    saga = _heartbeat_shutdown_saga(
-        tmp_path / "saga.sqlite3",
-        current=object(),
-        quota=_quota_adapter(tmp_path),
-        transport=transport,
-        lineage=lineage,
-        busy_timeout_ms=40,
-        executor_lease_seconds=float("nan"),
-    )
-    threads = _record_heartbeat_threads(monkeypatch)
-    monkeypatch.setattr(
-        saga,
-        "_wait_for_heartbeat",
-        lambda stop, interval, *, phase: stop.wait(30.0),
-    )
-    _assert_heartbeats_end_at_the_boundary(saga, monkeypatch, threads)
-
-    result = saga._invoke_with_heartbeat(
-        phase=SourceBrokerV2OutboxPhase.DISPATCH,
-        operation_id="0" * 64,
-        owner_generation=1,
-        payload=b'{"probe":1}',
-        invoke=lambda payload: payload,
-    )
-
-    assert result == b'{"probe":1}'
-    assert not _live_heartbeat_threads()
+    with pytest.raises(ValueError, match=message):
+        _heartbeat_shutdown_saga(
+            tmp_path / "saga.sqlite3",
+            current=object(),
+            quota=_quota_adapter(tmp_path),
+            transport=_TestTransport(),
+            lineage=_TestLineageAuthority(),
+            busy_timeout_ms=40,
+            executor_lease_seconds=lease,
+        )
+    with pytest.raises(ValueError):
+        source_broker_v2_heartbeat.encode_frame(
+            {"t": "session", "interval_seconds": lease / 3}
+        )
 
 
 def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
@@ -3642,9 +3440,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.01,
-        source_request_deadline_seconds=0.05,
+        source_request_deadline_seconds=0.05 * _WP9_MIGRATED_SCALE,
         source_takeover_grace_seconds=0.0,
     )
 
@@ -3652,11 +3450,14 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
         if phase is SourceBrokerV2OutboxPhase.DISPATCH:
             raise SystemExit("owner crashed before source invoke")
 
+    # Migrated T-B: scaled as one, so the lease still expires between the
+    # crash and the takeover while the renewal interval becomes 1s.
+    boundary = _wp9_watch_boundary(first, monkeypatch)
     monkeypatch.setattr(first, "_before_external_effect", crash_before_invoke)
     with pytest.raises(SystemExit, match="before source invoke"):
         first.advance(request, now=NOW + timedelta(seconds=1))
 
-    clock.advance(0.06)
+    clock.advance(0.06 * _WP9_MIGRATED_SCALE)
     restarted = SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
@@ -3664,9 +3465,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.2,
-        source_request_deadline_seconds=0.05,
+        source_request_deadline_seconds=0.05 * _WP9_MIGRATED_SCALE,
         source_takeover_grace_seconds=0.0,
     )
     result = restarted.advance(request, now=NOW + timedelta(seconds=2))
@@ -3678,6 +3479,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
             "SELECT executor_generation FROM source_broker_v2_outbox WHERE phase = 'dispatch'"
         ).fetchone()[0]
     assert generation == 2
+    _wp9_assert_no_renewal_in_any_window(boundary)
+    first.close()
+    restarted.close()
 
 
 def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
@@ -3697,18 +3501,26 @@ def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.01,
+        # Scaled with the lease: `for_nonproduction` defaults these to 0.25 and
+        # 0.05, and a lease lifted past them would put the persisted deadline
+        # behind the clock before the recovery this case is about even starts.
+        source_request_deadline_seconds=0.25 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.05 * _WP9_MIGRATED_SCALE,
     )
 
     def crash_after_invoke(phase: SourceBrokerV2OutboxPhase) -> None:
         if phase is SourceBrokerV2OutboxPhase.DISPATCH:
             raise ConnectionError("owner crashed after source invoke")
 
+    # Migrated T-B, scaled as one: the lease still expires before the restart
+    # takes over, and the renewal interval is 1s.
+    boundary = _wp9_watch_boundary(first, monkeypatch)
     monkeypatch.setattr(first, "_after_external_effect", crash_after_invoke)
     first_result = first.advance(request, now=NOW + timedelta(seconds=1))
     assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-    clock.advance(0.06)
+    clock.advance(0.06 * _WP9_MIGRATED_SCALE)
 
     restarted = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -3717,14 +3529,19 @@ def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
         quota_adapter=quota,
         transport=transport,
         lineage_authority=lineage,
-        executor_lease_seconds=0.05,
+        executor_lease_seconds=_WP9_MIGRATED_LEASE_SECONDS,
         executor_wait_seconds=0.2,
+        source_request_deadline_seconds=0.25 * _WP9_MIGRATED_SCALE,
+        source_takeover_grace_seconds=0.05 * _WP9_MIGRATED_SCALE,
     )
     result = restarted.reconcile(request, now=NOW + timedelta(seconds=2))
 
     assert result.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
     assert transport.claim_once_calls > 0
+    _wp9_assert_no_renewal_in_any_window(boundary)
+    first.close()
+    restarted.close()
 
 
 def test_v2_saga_complete_reverifies_current_claim_and_rejects_new_generation(
@@ -3839,6 +3656,15 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
         source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
         source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
     )
+    # Migrated T-C, not T-B.  This is the one case the lease cannot be lifted
+    # in: there is no fake clock here, and the recovery under test depends on
+    # the first owner's lease having really expired by the time the restored
+    # snapshot is advanced - milliseconds later.  A longer lease would block
+    # the takeover outright.  So the helper is neutralised instead: it is
+    # started, acknowledges and answers its end frame, but performs no renewal,
+    # which makes "no tick happened" true by construction rather than by
+    # timing.  The 0.05s lease is deliberately left alone.
+    _wp9_use_fault_helper(first, monkeypatch, "never-renews")
     captured = False
 
     def capture_after_dispatch(phase: SourceBrokerV2OutboxPhase) -> None:
@@ -3868,7 +3694,7 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     ):
         source.backup(target)
 
-    recovered = SourceBrokerV2Saga.for_nonproduction(
+    successor = SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
         current_claim_authority=current,
@@ -3878,9 +3704,13 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
         executor_lease_seconds=0.05,
         source_request_deadline_seconds=_UNCONSTRAINED_SOURCE_DEADLINE_SECONDS,
         source_takeover_grace_seconds=_UNCONSTRAINED_SOURCE_TAKEOVER_GRACE_SECONDS,
-    ).advance(request, now=NOW + timedelta(seconds=3))
+    )
+    _wp9_use_fault_helper(successor, monkeypatch, "never-renews")
+    boundary = _wp9_watch_boundary(successor, monkeypatch)
+    recovered = successor.advance(request, now=NOW + timedelta(seconds=3))
 
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
+    _wp9_assert_no_renewal_in_any_window(boundary)
     assert transport.dispatch_calls == 1
     assert transport.claim_once_calls > 0
     with sqlite3.connect(path) as connection:
@@ -3894,6 +3724,8 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     assert type(migrated_attempt) is str
     assert migrated_receipts[0] == ("DEFINITIVELY_ABSENT", migrated_attempt)
     assert all(attempt_id is None for status, attempt_id in migrated_receipts if status == "FOUND")
+    first.close()
+    successor.close()
 
 
 def test_v2_saga_rejects_rehashed_forged_claim_receipt_against_authority(
@@ -4098,3 +3930,2379 @@ def test_v2_saga_recovers_each_external_effect_after_commit_response_loss(
     assert fired
     assert result.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# WP9: the heartbeat now runs in a helper process this saga can actually kill.
+# ---------------------------------------------------------------------------
+
+_WP9_FAULT_HELPER = Path(__file__).with_name("_wp9_heartbeat_faults.py")
+_WP9_PARENT_DEATH_LAYER = Path(__file__).with_name("_wp9_parent_death_layer.py")
+
+# Calibrations, written down rather than derived, because every one of them is
+# a statement about what fits inside a window and a reader has to be able to
+# check the arithmetic:
+#
+#   busy_timeout 100ms  =>  T1 (the shutdown budget) is 2 x 100ms = 0.2s, and
+#                           the whole bound is 0.2 + 0.25 + 5.0 + 0.05 = 5.50s.
+#                           Production runs 5s, giving 15.30s; the shape of the
+#                           arithmetic is what these cases check, not the size.
+#   lease 0.3s          =>  interval 0.1s, so a window that outlives one gets
+#                           renewals, and the external witness only has to hold
+#                           the write lock for 0.2s rather than the 60s two
+#                           default leases would need.  T10 needs three
+#                           renewals inside one window; the fault helper orders
+#                           those itself, so this only has to make the first
+#                           one due promptly.
+_WP9_BUSY_TIMEOUT_MS = 100
+_WP9_SHUTDOWN_BUDGET_SECONDS = 0.2
+_WP9_SHUTDOWN_BOUND_SECONDS = 0.2 + 0.25 + 5.0 + 0.05
+_WP9_TICKING_LEASE_SECONDS = 0.3
+_WP9_TAMPER_LEASE_SECONDS = 0.3
+# A window big enough that no renewal is due inside it, which is the ordinary
+# production shape: the default lease is 30s and the default source deadline is
+# 10s, so almost every real invocation ends with zero ticks.
+_WP9_QUIET_LEASE_SECONDS = 120.0
+# The scale the lease-expiry migrations are lifted by.  Those cases need a
+# lease that *does* expire - the takeover they are about depends on it - so a
+# 120s lease is no use to them.  Every duration in the scenario is multiplied
+# by the same factor instead, which leaves the arithmetic they assert exactly
+# as it was while putting the renewal interval at 1s, four orders of magnitude
+# past any window they open.  Time is on a fake clock in all of them, so the
+# multiplication costs no wall clock at all.
+_WP9_MIGRATED_SCALE = 60
+_WP9_MIGRATED_LEASE_SECONDS = 0.05 * _WP9_MIGRATED_SCALE
+# Every wait a case performs has its own deadline; none of them may hang the
+# suite if the thing they wait for never happens.
+_WP9_RENDEZVOUS_TIMEOUT_SECONDS = 30.0
+# How long a stalled helper is watched before its row is called unchanged.
+# Comfortably longer than one renewal interval (0.1s at the ticking lease), so
+# a helper that was *not* actually blocked would have committed at least one
+# renewal inside this window and moved the columns.
+_WP9_STALLED_SETTLE_SECONDS = 0.25
+_WP9_HELPER_STDLIB_IMPORTS = frozenset(
+    {
+        "argparse",
+        "datetime",
+        "errno",
+        "fcntl",
+        "hashlib",
+        "json",
+        "os",
+        "select",
+        "signal",
+        "sqlite3",
+        "struct",
+        "sys",
+        "time",
+        "typing",
+        "__future__",
+    }
+)
+
+
+def _wp9_saga(
+    tmp_path: Path,
+    *,
+    lease_seconds: float = _WP9_TICKING_LEASE_SECONDS,
+    busy_timeout_ms: int = _WP9_BUSY_TIMEOUT_MS,
+) -> tuple[SourceBrokerV2Saga, _TestTransport]:
+    """A saga built only as far as these cases need it.
+
+    Deliberately not `_request`: the claim authority and the lineage authority
+    are never reached from a heartbeat window, and building the signed claim
+    evidence for them is most of what constructing one costs.  The quota bridge
+    is real because the constructor demands that exact type.
+    """
+
+    transport = _TestTransport()
+    saga = _heartbeat_shutdown_saga(
+        tmp_path / "saga.sqlite3",
+        current=object(),
+        quota=_quota_adapter(tmp_path),
+        transport=transport,
+        lineage=_TestLineageAuthority(),
+        busy_timeout_ms=busy_timeout_ms,
+        executor_lease_seconds=lease_seconds,
+    )
+    return saga, transport
+
+
+def _wp9_window(saga: SourceBrokerV2Saga) -> tuple[SourceBrokerV2OutboxPhase, str, int, bytes]:
+    """A real pending outbox effect this executor owns, ready to be invoked.
+
+    Built through the production methods rather than by hand - `_begin_outbox`,
+    `_acquire_outbox_lease`, `_mark_invoke_started` - so the row the helper
+    renews is the row the saga would have written.  `LINEAGE` is a non-source
+    phase, which keeps the fixture free of the grant and attempt evidence a
+    dispatch row would also have to carry.
+    """
+
+    phase = SourceBrokerV2OutboxPhase.LINEAGE
+    operation_id = _operation_id(saga.saga_id, "wp9-window")
+    body = {"wp9": "window"}
+    payload = canonical_json_bytes(body)
+    with saga._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT OR IGNORE INTO source_broker_v2_saga "
+            "(saga_id, request_json, request_hash, state) VALUES (?, ?, ?, ?)",
+            (saga.saga_id, "{}", canonical_sha256({}), "claimed"),
+        )
+        connection.commit()
+    saga._begin_outbox(
+        phase=phase,
+        operation_id=operation_id,
+        payload=payload,
+        payload_hash=canonical_sha256(body),
+        idempotency_hash=source_broker_v2_module._outbox_payload_hash(payload),
+    )
+    generation, stored, _ = saga._acquire_outbox_lease(phase=phase, operation_id=operation_id)
+    saga._mark_invoke_started(
+        phase=phase, operation_id=operation_id, owner_generation=generation
+    )
+    return phase, operation_id, generation, stored
+
+
+def _wp9_fault_command(mode: str, marker: Path | None = None) -> tuple[str, ...]:
+    command = ("-I", str(_WP9_FAULT_HELPER), "--fault", mode)
+    if marker is not None:
+        command += ("--fault-marker", str(marker))
+    return command
+
+
+def _wp9_use_fault_helper(
+    saga: SourceBrokerV2Saga,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    marker: Path | None = None,
+) -> None:
+    command = _wp9_fault_command(mode, marker)
+    monkeypatch.setattr(saga, "_heartbeat_helper_command", lambda: command)
+
+
+def _wp9_count_helper_starts(
+    saga: SourceBrokerV2Saga, monkeypatch: pytest.MonkeyPatch
+) -> list[int]:
+    """Every `Popen` this saga attempts, counted at the one place it happens."""
+
+    starts: list[int] = []
+    original = saga._start_helper_once
+
+    def counting(**kwargs: Any) -> Any:
+        starts.append(len(starts) + 1)
+        return original(**kwargs)
+
+    monkeypatch.setattr(saga, "_start_helper_once", counting)
+    return starts
+
+
+def _wp9_heartbeat_columns(path: Path, operation_id: str) -> tuple[Any, Any]:
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        row = connection.execute(
+            "SELECT executor_heartbeat_at, executor_lease_expires_at "
+            "FROM source_broker_v2_outbox WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return row[0], row[1]
+
+
+def _wp9_outbox_bytes(path: Path, operation_id: str) -> tuple[Any, ...]:
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        row = connection.execute(
+            "SELECT * FROM source_broker_v2_outbox WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return tuple(row)
+
+
+def _wp9_outbox_column(path: Path, operation_id: str, column: str) -> Any:
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        row = connection.execute(
+            f"SELECT {column} FROM source_broker_v2_outbox WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return row[0]
+
+
+def _wp9_write(path: Path, statement: str, parameters: tuple[Any, ...]) -> None:
+    connection = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(statement, parameters)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _wp9_integrity_check(path: Path) -> str:
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        return str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _wp9_open_descriptors() -> list[str]:
+    directory = "/proc/self/fd" if sys.platform == "linux" else "/dev/fd"
+    return sorted(os.listdir(directory))
+
+
+def _wp9_wait_for(predicate: Callable[[], bool], *, what: str) -> None:
+    """Poll with a deadline of its own; a case may never wait indefinitely."""
+
+    deadline = time.monotonic() + _WP9_RENDEZVOUS_TIMEOUT_SECONDS
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.002)
+
+
+def _wp9_hold_fault_lock(marker: Path) -> int:
+    """Take the lock the fault helper will block on, before it is started."""
+
+    handle = os.open(str(marker) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def _wp9_open_window(marker: Path) -> None:
+    """Let a gated fault fire, now that the invocation is genuinely running."""
+
+    Path(str(marker) + ".go").write_bytes(b"")
+
+
+def _wp9_probe_write_lock(path: Path, *, timeout_ms: int) -> tuple[bool, int | None, float]:
+    """Try to take the file's write lock; report what happened and how long."""
+
+    connection = sqlite3.connect(path, timeout=timeout_ms / 1_000, isolation_level=None)
+    connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+    started = time.monotonic()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        return False, getattr(exc, "sqlite_errorcode", None), time.monotonic() - started
+    else:
+        connection.execute("ROLLBACK")
+        return True, None, time.monotonic() - started
+    finally:
+        connection.close()
+
+
+def _wp9_boundary_state(saga: SourceBrokerV2Saga) -> dict[str, Any]:
+    """Read the session witness at the exact edge of `_invoke_with_heartbeat`.
+
+    `_live_heartbeat_threads` is kept as a regression guard rather than as
+    load-bearing evidence: it is now always empty because this process starts no
+    heartbeat thread at all, and it goes red the day somebody puts one back.
+    `active_children` is the same shape of guard for `multiprocessing`, which
+    this design does not use and must not start using - its exit handler joins
+    without a timeout, which is the bound this whole change exists to get.
+    """
+
+    assert not _live_heartbeat_threads()
+    assert multiprocessing.active_children() == []
+    popen = saga._heartbeat_state.popen
+    return {
+        "outcome": saga._last_heartbeat_session,
+        "helper_returncode": None if popen is None else popen.poll(),
+        "orphans": list(saga._orphaned_heartbeat_children),
+    }
+
+
+def _wp9_watch_boundary(
+    saga: SourceBrokerV2Saga, monkeypatch: pytest.MonkeyPatch
+) -> list[dict[str, Any]]:
+    """Record the boundary state on both exits, before anything else runs."""
+
+    seen: list[dict[str, Any]] = []
+    original = saga._invoke_with_heartbeat
+
+    def bounded(**kwargs: Any) -> bytes:
+        started = time.monotonic()
+        try:
+            result = original(**kwargs)
+        except BaseException:
+            state = _wp9_boundary_state(saga)
+            state["seconds"] = time.monotonic() - started
+            state["phase"] = kwargs.get("phase")
+            seen.append(state)
+            raise
+        state = _wp9_boundary_state(saga)
+        state["seconds"] = time.monotonic() - started
+        state["phase"] = kwargs.get("phase")
+        seen.append(state)
+        return result
+
+    monkeypatch.setattr(saga, "_invoke_with_heartbeat", bounded)
+    return seen
+
+
+def _wp9_assert_no_renewal_in_any_window(boundary: list[dict[str, Any]]) -> None:
+    """Every window this saga opened contained no renewal at all.
+
+    The T-B migrations rest on this: with a 120s lease the renewal interval is
+    40s, which no window in these cases comes within two orders of magnitude
+    of, so "no tick" is a property of the configuration rather than a race that
+    happens to come out right.  Asserted for every phase, not just the last.
+    """
+
+    assert boundary
+    for state in boundary:
+        outcome = state["outcome"]
+        assert outcome is not None, state["phase"]
+        assert outcome.ticks == 0, (state["phase"], outcome.ticks)
+        assert outcome.first_digest is None
+        assert outcome.digest_mismatch is False
+
+
+def _wp9_boundary_for(
+    boundary: list[dict[str, Any]], phase: SourceBrokerV2OutboxPhase
+) -> dict[str, Any]:
+    """The recorded boundary for one phase.
+
+    A full `advance` opens a window per phase, so "the last one" is whichever
+    phase happened to finish last - `lineage`, usually.  A case about dispatch
+    has to name dispatch.
+    """
+
+    matched = [state for state in boundary if state.get("phase") is phase]
+    assert matched, f"no heartbeat window was recorded for {phase}"
+    return matched[-1]
+
+
+def test_wp9_heartbeat_sql_and_digest_come_from_one_place() -> None:
+    """The renewal guard and the window digest are objects, not copies.
+
+    Identity rather than equality: two equal strings drift the moment one of
+    them is edited, and this guard is the whole of the lease's fencing.  The
+    source scan is the other half - it refuses a second literal anywhere under
+    `src/`, which is how a copy would get made in the first place.
+    """
+
+    assert (
+        source_broker_v2_module.HEARTBEAT_UPDATE_SQL
+        is source_broker_v2_heartbeat.HEARTBEAT_UPDATE_SQL
+    )
+    assert (
+        source_broker_v2_module.HEARTBEAT_SELECT_SQL
+        is source_broker_v2_heartbeat.HEARTBEAT_SELECT_SQL
+    )
+    assert (
+        source_broker_v2_module.stable_row_digest is source_broker_v2_heartbeat.stable_row_digest
+    )
+    assert (
+        source_broker_v2_module.open_saga_connection
+        is source_broker_v2_heartbeat.open_saga_connection
+    )
+    needle = "UPDATE source_broker_v2_outbox SET executor_heartbeat_at"
+    source_root = Path(source_broker_v2_module.__file__).parent
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(needle) for path in source_root.rglob("*.py")
+    )
+    assert occurrences == 1
+
+
+def test_wp9_heartbeat_modules_import_no_multiprocessing_or_threads() -> None:
+    """Neither module may reach for `multiprocessing` or start a thread.
+
+    Its exit handler joins every registered child without a timeout, so a
+    process that outlives a SIGKILL - the exact case this design has to
+    survive - can hang the interpreter on the way out.  `subprocess` registers
+    nothing and its only cleanup is a non-blocking `waitpid`.
+    """
+
+    for module in (source_broker_v2_module, source_broker_v2_heartbeat):
+        body = Path(module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(body)
+        imported: set[str] = set()
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+                names.update(alias.asname or alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+                names.update(alias.asname or alias.name for alias in node.names)
+        assert "multiprocessing" not in imported
+        # And no thread either, which is the other half of the same promise:
+        # this process must start nothing it cannot end.  The import guard is
+        # the load-bearing one - a name that was never imported cannot be
+        # called - and the source scan catches a fully qualified call.
+        assert "Thread" not in names
+        assert "threading.Thread" not in body
+        assert "Thread(" not in body
+
+
+def test_wp9_helper_module_imports_only_its_stdlib_allowlist() -> None:
+    """The helper's capability surface is a list you can read in one screen."""
+
+    tree = ast.parse(Path(source_broker_v2_heartbeat.__file__).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert imported <= _WP9_HELPER_STDLIB_IMPORTS
+    assert not any(name.startswith("rquant") for name in imported)
+    assert "subprocess" not in imported
+
+
+def test_wp9_helper_import_closure_pulls_in_no_other_rquant_module() -> None:
+    """Structural, not promised: the code simply is not in that process.
+
+    A helper that imported `rquant.source_broker_v2` would be carrying the
+    transport, quota, authority and lineage modules - exactly the code the
+    threat model is about - into the process that renews a lease.  Measured by
+    importing it in a fresh isolated interpreter and listing what arrived.
+    """
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-c",
+            "import sys, json;"
+            " import rquant.source_broker_v2_heartbeat;"
+            " print(json.dumps(sorted(n for n in sys.modules if n.startswith('rquant'))))",
+        ),
+        check=True,
+        capture_output=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    modules = json.loads(completed.stdout.decode("utf-8").strip().splitlines()[-1])
+    assert modules == ["rquant", "rquant.source_broker_v2_heartbeat"]
+
+
+def test_wp9_helper_import_opens_no_dotenv() -> None:
+    """Nothing in that process reads configuration off the filesystem."""
+
+    probe = (
+        "import sys, json\n"
+        "opened = []\n"
+        "def hook(event, args):\n"
+        "    if event == 'open':\n"
+        "        opened.append(str(args[0]))\n"
+        "sys.addaudithook(hook)\n"
+        "import rquant.source_broker_v2_heartbeat\n"
+        "print(json.dumps([p for p in opened if '.env' in p]))\n"
+    )
+    completed = subprocess.run(
+        (sys.executable, "-I", "-c", probe),
+        check=True,
+        capture_output=True,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    assert json.loads(completed.stdout.decode("utf-8").strip().splitlines()[-1]) == []
+
+
+def test_wp9_helper_environment_is_an_allowlist_built_from_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RQUANT_SECRET_TOKEN", "must-not-travel")
+    monkeypatch.setenv("HOME", "/somewhere")
+    monkeypatch.setenv("TMPDIR", "/tmp/wp9-private")
+    environ = source_broker_v2_module._heartbeat_environ()
+    assert set(environ) <= {"PATH", "LC_ALL", "LANG", "TMPDIR", "SQLITE_TMPDIR"}
+    assert environ["PATH"] == "/usr/bin:/bin"
+    assert environ["TMPDIR"] == "/tmp/wp9-private"
+    assert "HOME" not in environ
+    assert not any(key.startswith("RQUANT") for key in environ)
+    monkeypatch.delenv("SQLITE_TMPDIR", raising=False)
+    assert "SQLITE_TMPDIR" not in source_broker_v2_module._heartbeat_environ()
+
+
+def test_wp9_helper_argv_carries_no_secret() -> None:
+    """Only descriptor numbers travel on the command line.
+
+    `ps` and `/proc/<pid>/cmdline` are readable by every process of this user,
+    so the owner token and the database path go in the config frame instead.
+    """
+
+    assert source_broker_v2_module._HEARTBEAT_HELPER_COMMAND == (
+        "-I",
+        "-m",
+        "rquant.source_broker_v2_heartbeat",
+    )
+    assert (
+        source_broker_v2_module._FROZEN_HELPER_COMMAND
+        is source_broker_v2_module._HEARTBEAT_HELPER_COMMAND
+    )
+
+
+@pytest.mark.parametrize("replacement", ["method", "module-constant"])
+def test_wp9_production_saga_refuses_a_replaced_helper_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    """Both ways of moving the seam, because one of them moves both sides.
+
+    Rebinding the module constant would change what the seam returns *and*
+    what a naive guard compared it against, so the comparison is against a
+    tuple captured at import time.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    monkeypatch.setattr(saga, "_production_graph", object())
+    evil = ("-I", str(_WP9_FAULT_HELPER), "--fault", "exit-immediately")
+    if replacement == "method":
+        monkeypatch.setattr(saga, "_heartbeat_helper_command", lambda: evil)
+    else:
+        monkeypatch.setattr(source_broker_v2_module, "_HEARTBEAT_HELPER_COMMAND", evil)
+    with pytest.raises(TypeError, match="helper command was replaced"):
+        saga._start_helper_once(operation_id="wp9")
+    assert saga._heartbeat_state.popen is None
+    assert not saga._orphaned_heartbeat_children
+
+
+def test_wp9_fault_helper_digest_matches_the_production_digest(tmp_path: Path) -> None:
+    """The fault helper's copy of the digest is pinned to the real one.
+
+    It cannot import `rquant` - `-I` and a single-file rule see to that - so it
+    carries its own implementation, and a copy that drifts would make T10 pass
+    for the wrong reason.
+    """
+
+    from . import _wp9_heartbeat_faults
+
+    path = tmp_path / "digest.sqlite3"
+    connection = sqlite3.connect(path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE source_broker_v2_outbox (operation_id TEXT, executor_heartbeat_at TEXT,"
+            " executor_lease_expires_at TEXT, text_column TEXT, int_column INTEGER,"
+            " real_column REAL, blob_column BLOB, null_column TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO source_broker_v2_outbox VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("op", "then", "later", "a value", 7, 1.5, b"\x00\x01", None),
+        )
+        cursor = connection.execute("SELECT * FROM source_broker_v2_outbox")
+        row = cursor.fetchone()
+        assert source_broker_v2_heartbeat.stable_row_digest(
+            row, cursor.description
+        ) == _wp9_heartbeat_faults.stable_row_digest(row, cursor.description)
+        assert (
+            _wp9_heartbeat_faults.DIGEST_EXCLUDED_COLUMNS
+            == source_broker_v2_heartbeat.DIGEST_EXCLUDED_COLUMNS
+        )
+        assert _wp9_heartbeat_faults.UPDATE_SQL == source_broker_v2_heartbeat.HEARTBEAT_UPDATE_SQL
+    finally:
+        connection.close()
+
+
+def test_wp9_fault_helper_stalls_have_a_deadline_of_their_own() -> None:
+    """Housekeeping, not a claim about the implementation.
+
+    The stalling faults ignore SIGTERM so that a case has to reach SIGKILL to
+    end them.  That is the point of them - and it also means a run in which the
+    SIGKILL never arrives, which is what mutating the escalation produces,
+    would leave a signal-proof process behind.  The deadline is what stops a
+    mutation experiment from littering the machine; it is far beyond anything a
+    passing case waits for.
+    """
+
+    from . import _wp9_heartbeat_faults
+
+    assert _wp9_heartbeat_faults.DEFAULT_STALL_SECONDS == 120.0
+    assert _wp9_heartbeat_faults.DEFAULT_STALL_SECONDS > _WP9_SHUTDOWN_BOUND_SECONDS * 10
+    # It has to be a timer armed *before* the wait, not a check after it: the
+    # wait is a blocking `flock` that does not return, so a deadline evaluated
+    # afterwards is unreachable in exactly the case it exists for.  Asserted on
+    # the source rather than by stalling for real, which would cost the suite
+    # more than the hygiene it buys.
+    body = Path(_wp9_heartbeat_faults.__file__).read_text(encoding="utf-8")
+    block = body[body.index("def _arrive_and_block") : body.index("def _connect(")]
+    assert "signal.setitimer" in block
+    assert block.index("signal.setitimer") < block.index("fcntl.flock(")
+
+
+def test_wp9_digest_ignores_only_the_two_columns_a_renewal_moves(tmp_path: Path) -> None:
+    path = tmp_path / "digest.sqlite3"
+    connection = sqlite3.connect(path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            "CREATE TABLE source_broker_v2_outbox (operation_id TEXT,"
+            " executor_heartbeat_at TEXT, executor_lease_expires_at TEXT, payload_hash TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO source_broker_v2_outbox VALUES ('op', 'a', 'b', 'hash')"
+        )
+        cursor = connection.execute("SELECT * FROM source_broker_v2_outbox")
+        before = source_broker_v2_heartbeat.stable_row_digest(cursor.fetchone(), cursor.description)
+        connection.execute(
+            "UPDATE source_broker_v2_outbox SET executor_heartbeat_at = 'c',"
+            " executor_lease_expires_at = 'd'"
+        )
+        cursor = connection.execute("SELECT * FROM source_broker_v2_outbox")
+        assert (
+            source_broker_v2_heartbeat.stable_row_digest(cursor.fetchone(), cursor.description)
+            == before
+        )
+        connection.execute("UPDATE source_broker_v2_outbox SET payload_hash = 'other'")
+        cursor = connection.execute("SELECT * FROM source_broker_v2_outbox")
+        assert (
+            source_broker_v2_heartbeat.stable_row_digest(cursor.fetchone(), cursor.description)
+            != before
+        )
+    finally:
+        connection.close()
+
+
+def test_wp9_frame_encoder_refuses_a_non_finite_number() -> None:
+    """The second of the three guards: `NaN` is not JSON, and never travels."""
+
+    with pytest.raises(ValueError):
+        source_broker_v2_heartbeat.encode_frame({"t": "session", "interval_seconds": float("nan")})
+    with pytest.raises(ValueError):
+        source_broker_v2_heartbeat.encode_frame({"t": "session", "interval_seconds": float("inf")})
+
+
+@pytest.mark.parametrize(
+    ("fault", "renewed"),
+    [("stall-before-connect", False), ("stall-after-commit", True)],
+    ids=["before-its-connection-exists", "closing-a-committed-connection"],
+)
+def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_a_window_no_interrupt_reaches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    renewed: bool,
+) -> None:
+    """T1 and T2: the two windows a thread could never be pulled out of.
+
+    `stall-before-connect` stands for a `sqlite3.connect` that never returns -
+    there is no connection to interrupt and nothing has been written.
+    `stall-after-commit` stands for the passive checkpoint inside `close` - the
+    renewal is already durable and the write lock is already gone, so a
+    competitor gets it immediately, but the process is still in a system call.
+
+    Whether the renewal happened is a property of where the injection sits in
+    the helper's own code, not of any timing, so both are asserted outright.
+    The stall is a real `flock` this case holds, and the helper announces its
+    arrival by creating a file, so nothing here waits on a duration.
+
+    The evidence is taken from the announce onwards, never from before it.  A
+    fault only becomes active when this case opens its window, and until then
+    the helper renews on its ordinary schedule - deliberately, because blocking
+    it earlier would leave some previous phase's end frame unanswered and turn
+    that phase into a kill.  So a renewal landing between "read the row" and
+    "the helper announces" is possible, unrelated to the injection, and purely
+    a matter of how fast the host is; comparing across that gap made this case
+    fail on a slow 3.12 runner while every assertion about production behaviour
+    passed.  Watching the row from the announce onwards asks the question that
+    is actually being tested - does the *stalled* renewal write anything - and
+    the answer no longer depends on what happened before the window opened.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    marker = tmp_path / f"{fault}.marker"
+    lock = _wp9_hold_fault_lock(marker)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, fault, marker)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    columns: dict[str, tuple[Any, Any]] = {}
+
+    def invoke(_: bytes) -> bytes:
+        columns["pre"] = _wp9_heartbeat_columns(saga.path, operation_id)
+        _wp9_open_window(marker)
+        _wp9_wait_for(marker.exists, what=f"the {fault} helper to block")
+        # From here the helper is inside the blocking call, so this is the
+        # first reading that can serve as a baseline for what the *stall* did.
+        columns["stuck"] = _wp9_heartbeat_columns(saga.path, operation_id)
+        if fault == "stall-after-commit":
+            taken, code, _ = _wp9_probe_write_lock(saga.path, timeout_ms=_WP9_BUSY_TIMEOUT_MS)
+            # Committing released the write lock; the stall is in the tail
+            # behind it, which holds nothing.
+            assert taken, code
+        time.sleep(_WP9_STALLED_SETTLE_SECONDS)
+        columns["settled"] = _wp9_heartbeat_columns(saga.path, operation_id)
+        return canonical_json_bytes({"wp9": "result"})
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(SourceBrokerV2SagaUnavailableError):
+            saga._invoke_with_heartbeat(
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
+                invoke=invoke,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        os.close(lock)
+
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.acked is False
+    assert outcome.child_returncode == -9
+    assert outcome.escalation == "sigkill"
+    assert outcome.orphaned is False
+    assert outcome.child_alive is False
+    # Both sides: long enough to have really waited out the end-frame budget,
+    # short enough that the wait ended at a number written down rather than at
+    # whatever the blocked system call was going to do.
+    assert elapsed >= _WP9_SHUTDOWN_BUDGET_SECONDS
+    assert elapsed <= _WP9_SHUTDOWN_BOUND_SECONDS
+    # The helper is reaped and released, so there is no process left for the
+    # boundary to report on and nothing recorded as unaccounted for.
+    assert boundary[-1]["helper_returncode"] is None
+    assert saga._heartbeat_state.popen is None
+    assert not boundary[-1]["orphans"]
+    # The load-bearing one, and it holds for both injections: a helper that is
+    # genuinely stuck writes nothing.  The window watched here is longer than a
+    # whole renewal interval, so an injection that failed to block would have
+    # committed at least one renewal inside it and moved these columns.
+    assert columns["settled"] == columns["stuck"]
+    if renewed:
+        # Stuck after committing: that renewal is durable, so the row has moved
+        # on from where this case found it.  Extra ordinary renewals before the
+        # window opened can only make this more true, never less.
+        assert columns["stuck"] != columns["pre"]
+    # And nothing at all happened after the process died.
+    assert _wp9_heartbeat_columns(saga.path, operation_id) == columns["stuck"]
+    assert _wp9_integrity_check(saga.path) == "ok"
+    # The lock is free the instant the process is gone, which is the thing a
+    # timed-out thread could never give: a real write succeeds right away.
+    saga._release_outbox_lease(
+        phase=phase, operation_id=operation_id, owner_generation=generation
+    )
+
+
+def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_its_durable_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5: stuck between the update and the commit, holding the write lock.
+
+    This is the window where a thread is unreachable *and* is standing on the
+    file: a competitor waits out its whole `busy_timeout` and gets SQLITE_BUSY.
+    After the kill the same probe succeeds, and the row shows the renewal was
+    rolled back whole - never half applied.
+
+    Stated plainly: this models a process stuck in a durable tail, not a kernel
+    D state.  SIGKILL does not preempt uninterruptible I/O either, and the
+    answer to that case is the orphan registry and fail-closed entry, not a
+    claim that the process can be killed.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    marker = tmp_path / "durable-tail.marker"
+    lock = _wp9_hold_fault_lock(marker)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "stall-before-commit", marker)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    before: list[tuple[Any, Any]] = []
+    contended: list[tuple[bool, int | None, float]] = []
+
+    def invoke(_: bytes) -> bytes:
+        before.append(_wp9_heartbeat_columns(saga.path, operation_id))
+        _wp9_open_window(marker)
+        _wp9_wait_for(marker.exists, what="the durable-tail helper to block")
+        contended.append(_wp9_probe_write_lock(saga.path, timeout_ms=_WP9_BUSY_TIMEOUT_MS))
+        return canonical_json_bytes({"wp9": "result"})
+
+    try:
+        with pytest.raises(SourceBrokerV2SagaUnavailableError):
+            saga._invoke_with_heartbeat(
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
+                invoke=invoke,
+            )
+    finally:
+        os.close(lock)
+
+    taken, code, waited = contended[0]
+    assert taken is False
+    assert code == sqlite3.SQLITE_BUSY
+    assert waited >= _WP9_BUSY_TIMEOUT_MS / 1_000 * 0.5
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.child_returncode == -9
+    assert outcome.escalation == "sigkill"
+    # The renewal that was in flight when the process died left nothing: two
+    # columns unmoved, not one moved and one not.
+    assert _wp9_heartbeat_columns(saga.path, operation_id) == before[0]
+    assert _wp9_integrity_check(saga.path) == "ok"
+    released, code, elapsed = _wp9_probe_write_lock(saga.path, timeout_ms=_WP9_BUSY_TIMEOUT_MS)
+    assert released, code
+    assert elapsed < _WP9_BUSY_TIMEOUT_MS / 1_000
+
+
+def test_v2_saga_shutdown_reaps_the_helper_when_the_body_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4: the caller's exception is the one that survives, verbatim.
+
+    The teardown that runs while it is in flight is full of things that can
+    fail - a broken pipe, an EOF, a timeout, a kill - and not one of them may
+    replace what the caller raised.  A note is the only thing allowed to be
+    added, because it changes nothing an `except` can see.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    marker = tmp_path / "body-raises.marker"
+    lock = _wp9_hold_fault_lock(marker)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "stall-after-commit", marker)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    raised = ConnectionError("boom", 7)
+
+    def invoke(_: bytes) -> bytes:
+        _wp9_open_window(marker)
+        _wp9_wait_for(marker.exists, what="the stalled helper to block")
+        raise raised
+
+    try:
+        with pytest.raises(ConnectionError) as caught:
+            saga._invoke_with_heartbeat(
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
+                invoke=invoke,
+            )
+    finally:
+        os.close(lock)
+
+    assert caught.value is raised
+    assert type(caught.value) is ConnectionError
+    assert caught.value.args == ("boom", 7)
+    assert str(caught.value) == str(ConnectionError("boom", 7))
+    notes = getattr(caught.value, "__notes__", [])
+    assert len(notes) == 1
+    assert "returncode -9" in notes[0]
+    assert "last stage" in notes[0]
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.child_returncode == -9
+    assert outcome.escalation == "sigkill"
+    saga._release_outbox_lease(
+        phase=phase, operation_id=operation_id, owner_generation=generation
+    )
+    assert _wp9_integrity_check(saga.path) == "ok"
+
+
+@pytest.mark.parametrize("body_raises", [False, True], ids=["invoke-returns", "invoke-raises"])
+def test_v2_saga_surfaces_a_helper_that_died_during_an_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_raises: bool,
+) -> None:
+    """T7 and T8: an invocation that ran unprotected is never called a success.
+
+    The helper exits straight after acknowledging the session, so the window
+    had no renewal behind it.  When the body returns normally that has to
+    surface as a failure; when the body raises, its own exception outranks the
+    diagnosis and comes out untouched.
+
+    The rendezvous is a fact, not a race: the body polls the helper's
+    `returncode` until it is set, so the death has already happened before the
+    teardown under test begins.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    _wp9_use_fault_helper(saga, monkeypatch, "exit-after-ack")
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    calls: list[int] = []
+    raised = ConnectionError("boom", 7)
+
+    def invoke(_: bytes) -> bytes:
+        calls.append(1)
+        popen = saga._heartbeat_state.popen
+        assert popen is not None
+        _wp9_wait_for(lambda: popen.poll() is not None, what="the helper to exit")
+        if body_raises:
+            raise raised
+        return canonical_json_bytes({"wp9": "result"})
+
+    expected: type[BaseException] = (
+        ConnectionError if body_raises else SourceBrokerV2SagaUnavailableError
+    )
+    with pytest.raises(expected) as caught:
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=invoke,
+        )
+
+    assert calls == [1]
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.acked is False
+    assert outcome.child_alive is False
+    assert outcome.orphaned is False
+    if body_raises:
+        assert caught.value is raised
+        assert caught.value.args == ("boom", 7)
+        assert str(caught.value) == str(ConnectionError("boom", 7))
+        assert caught.value.__cause__ is None
+        assert len(getattr(caught.value, "__notes__", [])) == 1
+    else:
+        assert not isinstance(caught.value, BrokenPipeError | OSError)
+    saga._release_outbox_lease(
+        phase=phase, operation_id=operation_id, owner_generation=generation
+    )
+    assert _wp9_outbox_column(saga.path, operation_id, "status") == "pending"
+    assert _wp9_outbox_column(saga.path, operation_id, "invoke_started") == 1
+
+
+def _wp9_wait_for_renewals(saga: SourceBrokerV2Saga, operation_id: str, count: int) -> list[Any] :
+    """Wait until the helper has moved the heartbeat column `count` times.
+
+    An external observation, so it says the renewals really happened rather
+    than that the code under test says they did - and it replaces a sleep with
+    a fact, so no case is gated on how fast the host is.
+    """
+
+    seen: list[Any] = [_wp9_heartbeat_columns(saga.path, operation_id)[0]]
+
+    def progressed() -> bool:
+        current = _wp9_heartbeat_columns(saga.path, operation_id)[0]
+        if current != seen[-1]:
+            seen.append(current)
+        return len(seen) > count
+
+    _wp9_wait_for(progressed, what=f"{count} renewal(s) from the helper")
+    return seen[1:]
+
+
+def _wp9_witness_no_renewal_after_the_session(
+    saga: SourceBrokerV2Saga, operation_id: str, *, interval: float
+) -> None:
+    """Evidence that does not come from the code under test.
+
+    `acked`, `ticks` and the digests are all self-reported.  This holds the
+    write lock for longer than two renewal intervals and reads the row inside
+    that window and again after it - the second read matters, because a helper
+    blocked on the lock would land its renewal the moment the lock is dropped.
+    """
+
+    before = _wp9_heartbeat_columns(saga.path, operation_id)
+    connection = sqlite3.connect(saga.path, timeout=5.0, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        time.sleep(interval * 2)
+        connection.execute("ROLLBACK")
+    finally:
+        connection.close()
+    assert _wp9_heartbeat_columns(saga.path, operation_id) == before
+    time.sleep(interval)
+    assert _wp9_heartbeat_columns(saga.path, operation_id) == before
+    assert not _live_heartbeat_threads()
+
+
+@pytest.mark.parametrize("first_session_fails", [False, True], ids=["clean", "after-a-failure"])
+def test_v2_saga_reuses_one_helper_across_sessions_and_closes_it_explicitly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_session_fails: bool,
+) -> None:
+    """T3: one process serves many windows, and an ordinary failure is ordinary.
+
+    The second parametrisation is the load-bearing one.  A renewal that fails is
+    a normal outcome - the helper closes the session, stays alive and goes back
+    to idle - and folding "did the renewal work" together with "did the session
+    end cleanly" would terminate and kill it instead: a healthy process
+    destroyed, a restart paid for, and a shutdown that took the whole budget
+    plus two signal timeouts rather than one pipe round trip.  Same pid across
+    both sessions is what says that did not happen.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    interval = _WP9_TICKING_LEASE_SECONDS / 3
+    marker = tmp_path / "reuse.marker"
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    if first_session_fails:
+        _wp9_use_fault_helper(saga, monkeypatch, "fail-renewal", marker)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+
+    def first_invoke(_: bytes) -> bytes:
+        if first_session_fails:
+            _wp9_open_window(marker)
+            _wp9_wait_for(marker.exists, what="the injected renewal failure")
+        else:
+            _wp9_wait_for_renewals(saga, operation_id, 1)
+        return canonical_json_bytes({"wp9": "first"})
+
+    if first_session_fails:
+        with pytest.raises(SourceBrokerV2SagaUnavailableError) as caught:
+            saga._invoke_with_heartbeat(
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
+                invoke=first_invoke,
+            )
+        cause = caught.value.__cause__
+        assert cause is not None
+        assert getattr(cause, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+    else:
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=first_invoke,
+        )
+
+    first = boundary[-1]["outcome"]
+    assert first is not None
+    # Whatever happened to the renewal, the session itself was acknowledged and
+    # the helper is still there.
+    assert first.acked is True
+    assert first.renewal_ok is not first_session_fails
+    assert first.escalation == "clean"
+    assert first.child_alive is True
+    assert first.restarts == 0
+    assert first.orphaned is False
+    if first_session_fails:
+        assert first.failure is not None
+        assert first.failure.errorcode == sqlite3.SQLITE_BUSY
+    else:
+        assert first.ticks >= 1
+        assert first.digest_changed is False
+        assert first.digest_mismatch is False
+        assert first.shutdown_seconds < 1.0
+    assert saga._heartbeat_state.popen is not None
+    assert saga._heartbeat_state.popen.poll() is None
+
+    def second_invoke(_: bytes) -> bytes:
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        return canonical_json_bytes({"wp9": "second"})
+
+    saga._invoke_with_heartbeat(
+        phase=phase,
+        operation_id=operation_id,
+        owner_generation=generation,
+        payload=payload,
+        invoke=second_invoke,
+    )
+    second = boundary[-1]["outcome"]
+    assert second is not None
+    assert second.acked is True
+    assert second.renewal_ok is True
+    assert second.ticks >= 1
+    assert second.escalation == "clean"
+    assert second.child_pid == first.child_pid
+    assert second.restarts == 0
+    assert second.shutdown_seconds < 1.0
+
+    if not first_session_fails:
+        # The external witness runs once for this case, not once per
+        # parametrisation: it is a statement about renewals stopping when a
+        # session ends, and the second parametrisation is about a helper
+        # surviving a failed renewal.  Holding the write lock for two intervals
+        # twice bought nothing and cost a third of a second.
+        _wp9_witness_no_renewal_after_the_session(saga, operation_id, interval=interval)
+
+    pid = second.child_pid
+    assert pid is not None
+    outcome = saga.close()
+    assert outcome.orphaned is False
+    assert outcome.returncode is not None
+    assert saga._heartbeat_state.popen is None
+    assert not saga._orphaned_heartbeat_children
+    assert multiprocessing.active_children() == []
+    # Only a corroborating check, and only valid here: `os.kill(pid, 0)` says
+    # nothing while a process is a zombie, and returns success on the orphan
+    # path where the exit was never observed.  `returncode` above is the
+    # evidence; this is the second opinion.
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert _wp9_integrity_check(saga.path) == "ok"
+
+
+def test_v2_saga_refuses_before_invoking_when_the_helper_cannot_confirm_a_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T6: no acknowledgement, no invocation - and exactly one restart.
+
+    A session frame that lands in a buffer nobody reads would leave the whole
+    invocation running with no renewal behind it and nobody the wiser, which is
+    the silent degradation this design forbids.  So the refusal happens before
+    the external call, which makes the external call count zero, and the retry
+    is one restart rather than a loop - a loop would be a new unbounded point.
+
+    Starts from a live helper and kills it first, so both detectors are on the
+    path: the pre-check that finds a dead process, and the acknowledgement
+    timeout that finds a live one that will not answer.
+    """
+
+    monkeypatch.setattr(source_broker_v2_module, "_HEARTBEAT_HANDSHAKE_FLOOR_SECONDS", 0.12)
+    saga, _ = _wp9_saga(tmp_path)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    starts = _wp9_count_helper_starts(saga, monkeypatch)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    calls: list[int] = []
+
+    def invoke(_: bytes) -> bytes:
+        calls.append(1)
+        return canonical_json_bytes({"wp9": "never"})
+
+    saga._invoke_with_heartbeat(
+        phase=phase,
+        operation_id=operation_id,
+        owner_generation=generation,
+        payload=payload,
+        invoke=invoke,
+    )
+    assert calls == [1]
+    live = saga._heartbeat_state.popen
+    assert live is not None
+    live.kill()
+    live.wait(timeout=5)
+    before = _wp9_heartbeat_columns(saga.path, operation_id)
+    _wp9_use_fault_helper(saga, monkeypatch, "no-ack")
+    started_before = len(starts)
+
+    started = time.monotonic()
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="did not acknowledge"):
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=invoke,
+        )
+    elapsed = time.monotonic() - started
+
+    assert calls == [1]
+    # Two starts: the replacement for the helper this case killed, and the one
+    # restart the session confirmation is allowed.
+    assert len(starts) - started_before == 2
+    handshake = max(0.12, _WP9_BUSY_TIMEOUT_MS / 1_000)
+    # The same closed form the production-defaults case pins, including the
+    # renewal term - this path never reaches that renewal, so the bound it is
+    # measured against is if anything generous.
+    assert elapsed <= (
+        2 * (handshake + handshake)
+        + 0.25
+        + 5.0
+        + source_broker_v2_module._HEARTBEAT_BOUND_EPSILON_SECONDS
+        + saga._heartbeat_fresh_lease_budget()
+    )
+    assert not saga._orphaned_heartbeat_children
+    assert saga._heartbeat_state.popen is None
+    assert boundary[-1]["outcome"] is None or boundary[-1]["outcome"].token
+    assert _wp9_heartbeat_columns(saga.path, operation_id) == before
+    # The failure lands after `_mark_invoke_started`, so the row already says
+    # an invocation began even though none did.  That is the conservative
+    # direction, and it is a consequence of refusing before the external call,
+    # so it is asserted rather than left implicit.
+    assert _wp9_outbox_column(saga.path, operation_id, "invoke_started") == 1
+    saga._release_outbox_lease(
+        phase=phase, operation_id=operation_id, owner_generation=generation
+    )
+
+    # And the consequence itself, through the real `_apply_outbox`: the next
+    # pass is handed `invoke_started=True` and takes the authorize/recover
+    # branch, so the effect is reconciled rather than dispatched a second time.
+    # The refusal above is what makes that safe - an invocation that never ran
+    # is recorded as one that might have, and the conservative reading is the
+    # one that cannot produce a duplicate external effect.
+    reconciled: list[bool] = []
+
+    def authorize(
+        stored: bytes, generation_seen: int, invoke_started: bool
+    ) -> tuple[bytes | None, bytes | None]:
+        reconciled.append(invoke_started)
+        return canonical_json_bytes({"wp9": "reconciled"}), None
+
+    result = saga._apply_outbox(
+        phase=phase,
+        operation_id=operation_id,
+        payload=payload,
+        invoke=invoke,
+        authorize=authorize,
+    )
+    assert reconciled == [True]
+    assert result == canonical_json_bytes({"wp9": "reconciled"})
+    # The external call still happened exactly once, in the first window.
+    assert calls == [1]
+    assert len(starts) - started_before == 2
+    assert _wp9_outbox_column(saga.path, operation_id, "status") == "applied"
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["self-healing-tamper", "untouched-three-ticks", "zero-ticks"],
+)
+def test_v2_saga_detects_a_self_healing_tamper_inside_the_invoke_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """T10: a change that is put back still leaves a mark.
+
+    The window between the two full validation points is sampled once per
+    renewal, which is the resolution it has always had.  What is new is that
+    the "it moved" flag is sticky, so a tamper that is undone before the next
+    sample - the case that used to leave nothing at all - is still reported.
+
+    Three shapes, because the rule has three answers.  With a tamper, the row
+    ends up byte-identical to how it started and only the sticky flag knows.
+    Untouched with samples taken, nothing is reported.  With no samples at all,
+    there is nothing to compare and the comparison is skipped - which is not a
+    relaxation but the same resolution as before any of this existed, and it is
+    the common case in production, where the default lease makes the renewal
+    interval as long as the whole request deadline.
+    """
+
+    lease = _WP9_QUIET_LEASE_SECONDS if shape == "zero-ticks" else _WP9_TAMPER_LEASE_SECONDS
+    saga, _ = _wp9_saga(tmp_path, lease_seconds=lease)
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    original_hash = _wp9_outbox_column(saga.path, operation_id, "payload_hash")
+
+    def invoke(_: bytes) -> bytes:
+        # The production helper takes every sample here, and the tampering is
+        # done from this process, so what the case exercises is the shipped
+        # helper's own bookkeeping rather than a stand-in's.
+        #
+        # Each step waits for the renewal that follows it before the next one
+        # starts, and a renewal takes its digest inside the same transaction
+        # that moves the timestamp this wait watches - so "the sample that saw
+        # the tampered row" is an observed fact, not a hoped-for interleaving.
+        if shape == "zero-ticks":
+            return canonical_json_bytes({"wp9": "result"})
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        if shape == "self-healing-tamper":
+            _wp9_write(
+                saga.path,
+                "UPDATE source_broker_v2_outbox SET payload_hash = ? WHERE operation_id = ?",
+                ("f" * 64, operation_id),
+            )
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        if shape == "self-healing-tamper":
+            _wp9_write(
+                saga.path,
+                "UPDATE source_broker_v2_outbox SET payload_hash = ? WHERE operation_id = ?",
+                (original_hash, operation_id),
+            )
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        return canonical_json_bytes({"wp9": "result"})
+
+    before = _wp9_outbox_bytes(saga.path, operation_id)
+    if shape == "self-healing-tamper":
+        with pytest.raises(SourceBrokerV2SagaUnavailableError) as caught:
+            saga._invoke_with_heartbeat(
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
+                invoke=invoke,
+            )
+        assert type(caught.value) is SourceBrokerV2SagaUnavailableError
+        assert type(caught.value.__cause__) is SourceBrokerV2SagaIntegrityError
+    else:
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=invoke,
+        )
+
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.renewal_ok is True
+    if shape == "self-healing-tamper":
+        assert outcome.ticks >= 3
+        assert outcome.digest_changed is True
+        # Back where it started: the last sample equals the first, this
+        # process recomputes the same digest again at the far edge of the
+        # window, and the row is byte for byte what it was.  Only the sticky
+        # flag remembers - which is the whole claim.
+        assert outcome.last_digest == outcome.first_digest
+        assert outcome.observed_digest == outcome.first_digest
+        assert outcome.digest_mismatch is False
+        after = _wp9_outbox_bytes(saga.path, operation_id)
+        assert after[:9] == before[:9]
+    elif shape == "untouched-three-ticks":
+        assert outcome.ticks >= 3
+        assert outcome.digest_changed is False
+        assert outcome.digest_mismatch is False
+        assert outcome.last_digest == outcome.first_digest
+        assert outcome.observed_digest == outcome.last_digest
+    else:
+        assert outcome.ticks == 0
+        assert outcome.first_digest is None
+        assert outcome.last_digest is None
+        assert outcome.digest_changed is False
+        assert outcome.digest_mismatch is False
+        assert outcome.observed_digest is None
+    assert _wp9_integrity_check(saga.path) == "ok"
+    saga.close()
+
+
+def _wp9_start_a_helper(saga: SourceBrokerV2Saga) -> Any:
+    helper = saga._start_helper_once(operation_id="wp9-lifecycle")
+    assert helper.poll() is None
+    return helper
+
+
+def test_wp9_saga_finalizer_releases_the_helper_with_no_strong_reference(
+    tmp_path: Path,
+) -> None:
+    """P1-01: the backstop has to be able to fire while the process is up.
+
+    `weakref.finalize(owner, owner.close)` cannot: a bound method holds the
+    owner, so the owner is never collected and the finalizer only ever runs at
+    interpreter shutdown.  Registering a module-level function against a state
+    object that points at nobody is what makes collection - and therefore the
+    backstop - actually happen, and that is what this measures.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    helper = _wp9_start_a_helper(saga)
+    popen = saga._heartbeat_state.popen
+    assert popen is not None
+    reference = weakref.ref(saga)
+    finalizer = saga._heartbeat_finalizer
+    assert finalizer.alive
+    del helper, saga
+    gc.collect()
+    assert reference() is None
+    assert not finalizer.alive
+    popen.wait(timeout=10)
+    assert popen.returncode is not None
+
+
+def test_wp9_saga_close_is_idempotent_and_survives_a_second_call(tmp_path: Path) -> None:
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    first = saga.close()
+    assert first.orphaned is False
+    assert first.returncode is not None
+    second = saga.close()
+    assert second.orphaned is False
+    assert saga._heartbeat_state.popen is None
+    assert not saga._orphaned_heartbeat_children
+
+
+def test_wp9_saga_close_retries_while_an_orphan_is_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An orphan is not a closed saga, and a closed saga is not retryable.
+
+    Only an observed `returncode` counts as closed.  While a kill has been sent
+    and its effect not seen, the state stays populated so a later `poll` can
+    still resolve it - and the typed error is raised after the cleanup, from
+    outside the `finally`, so nothing is left half released.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    popen = saga._heartbeat_state.popen
+    assert popen is not None
+    real_wait = popen.wait
+    refuse = {"on": True}
+
+    def stubborn_wait(timeout: float | None = None) -> int:
+        if refuse["on"]:
+            raise subprocess.TimeoutExpired(cmd="helper", timeout=timeout or 0.0)
+        return real_wait(timeout=timeout)
+
+    monkeypatch.setattr(popen, "wait", stubborn_wait)
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="SIGKILL"):
+        saga.close()
+    assert saga._orphaned_heartbeat_children
+    assert saga._heartbeat_state.popen is popen
+    assert saga._heartbeat_finalizer.alive
+    # The kill really was sent; only its observation was blocked.
+    refuse["on"] = False
+    assert popen.wait(timeout=10) is not None
+    outcome = saga.close()
+    assert outcome.orphaned is False
+    assert not saga._orphaned_heartbeat_children
+
+
+def test_wp9_saga_context_manager_keeps_the_block_exception(tmp_path: Path) -> None:
+    """A cleanup failure must never displace the reason the block ended.
+
+    `__exit__` forwarding to `close` and returning its result would swallow the
+    block's exception outright - any truthy return value does.  With an
+    exception already in flight the close failure becomes a note; with none, it
+    is allowed to surface.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    boom = ValueError("from inside the block")
+
+    def failing_close(**_: Any) -> Any:
+        raise SourceBrokerV2SagaUnavailableError("close failed")
+
+    original_close = saga.close
+    saga.close = failing_close  # type: ignore[method-assign]
+    with pytest.raises(ValueError) as caught, saga:
+        raise boom
+    assert caught.value is boom
+    assert type(caught.value) is ValueError
+    assert caught.value.args == ("from inside the block",)
+    notes = getattr(caught.value, "__notes__", [])
+    assert len(notes) == 1
+    assert "close" in notes[0]
+    saga.close = original_close  # type: ignore[method-assign]
+    saga.close()
+
+
+def test_wp9_saga_context_manager_surfaces_a_close_failure_on_a_clean_block(
+    tmp_path: Path,
+) -> None:
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+
+    def failing_close(**_: Any) -> Any:
+        raise SourceBrokerV2SagaUnavailableError("close failed")
+
+    original_close = saga.close
+    saga.close = failing_close  # type: ignore[method-assign]
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="close failed"), saga:
+        pass
+    saga.close = original_close  # type: ignore[method-assign]
+    saga.close()
+
+
+def test_wp9_saga_close_refuses_to_pull_descriptors_from_a_live_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-01: `close` and a running window share one gate.
+
+    Closing the control and stop descriptors is how the helper is told to
+    leave.  Doing that underneath a session in progress would end the renewals
+    for an invocation that is still running, so the gate that admits one window
+    at a time also admits `close`.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    outcomes: list[BaseException | None] = []
+
+    def invoke(_: bytes) -> bytes:
+        try:
+            saga.close()
+        except BaseException as exc:
+            outcomes.append(exc)
+        else:
+            outcomes.append(None)
+        assert saga._heartbeat_state.popen is not None
+        assert saga._heartbeat_state.ctrl_w is not None
+        return canonical_json_bytes({"wp9": "result"})
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            saga._invoke_with_heartbeat,
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=invoke,
+        )
+        future.result(timeout=30)
+    assert len(outcomes) == 1
+    assert type(outcomes[0]) is SourceBrokerV2SagaConflictError
+    saga.close()
+
+
+def test_wp9_saga_refuses_a_second_window_on_the_same_instance(
+    tmp_path: Path,
+) -> None:
+    """The gate is a non-blocking lock, not a boolean anybody can race."""
+
+    saga, _ = _wp9_saga(tmp_path)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    entered = Barrier(2)
+    rival_done = Event()
+    second: list[BaseException] = []
+
+    def invoke(_: bytes) -> bytes:
+        # The first window stays open until the second has tried, so the gate
+        # is genuinely contended rather than merely visited twice.
+        entered.wait(timeout=10)
+        assert rival_done.wait(timeout=10)
+        return canonical_json_bytes({"wp9": "result"})
+
+    def rival() -> None:
+        entered.wait(timeout=10)
+        try:
+            saga._invoke_with_heartbeat(
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=generation,
+                payload=payload,
+                invoke=lambda _: canonical_json_bytes({"wp9": "rival"}),
+            )
+        except BaseException as exc:
+            second.append(exc)
+        finally:
+            rival_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rival_future = executor.submit(rival)
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=invoke,
+        )
+        rival_future.result(timeout=30)
+    assert len(second) == 1
+    assert type(second[0]) is SourceBrokerV2SagaConflictError
+    saga.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "popen-raises",
+        "exit-immediately",
+        "no-ready",
+        "ready-wrong-pid",
+        "ready-wrong-protocol",
+        "ready-garbage",
+    ],
+)
+def test_wp9_a_failed_helper_start_owns_nothing_afterwards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    """P1-02: every way a start can fail closes exactly what it opened.
+
+    Six raw descriptors exist between the first `os.pipe` and a successful
+    `Popen`, and each of these faults aborts at a different point among them:
+    the spawn itself, an immediate exit, a silence, and three frames that are
+    the wrong shape.  Counting descriptors before and after is what says none
+    of them leaked one; the registry and the state say none of them left a
+    process behind either.
+    """
+
+    monkeypatch.setattr(source_broker_v2_module, "_HEARTBEAT_HANDSHAKE_FLOOR_SECONDS", 0.12)
+    saga, _ = _wp9_saga(tmp_path)
+    spawned: list[Any] = []
+    real_popen = source_broker_v2_module.subprocess.Popen
+
+    def recording_popen(args: Any, **kwargs: Any) -> Any:
+        popen = real_popen(args, **kwargs)
+        spawned.append(popen)
+        return popen
+
+    if fault == "popen-raises":
+        def refusing_popen(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("cannot spawn")
+
+        monkeypatch.setattr(source_broker_v2_module.subprocess, "Popen", refusing_popen)
+    else:
+        _wp9_use_fault_helper(saga, monkeypatch, fault)
+        monkeypatch.setattr(source_broker_v2_module.subprocess, "Popen", recording_popen)
+    before = _wp9_open_descriptors()
+    with pytest.raises(SourceBrokerV2SagaUnavailableError):
+        saga._start_helper_once(operation_id="wp9-start")
+    assert _wp9_open_descriptors() == before
+    # Exactly one spawn attempt, and whatever it started is already reaped.
+    assert len(spawned) == (0 if fault == "popen-raises" else 1)
+    for popen in spawned:
+        assert popen.returncode is not None
+    assert saga._heartbeat_state.popen is None
+    assert saga._heartbeat_state.ctrl_w is None
+    assert saga._heartbeat_state.status_r is None
+    assert saga._heartbeat_state.stop_w is None
+    assert saga._heartbeat_child is None
+    assert not saga._orphaned_heartbeat_children
+    assert multiprocessing.active_children() == []
+
+
+def test_wp9_a_second_helper_is_refused_while_one_is_running(tmp_path: Path) -> None:
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    before = _wp9_open_descriptors()
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="already running"):
+        saga._start_helper_once(operation_id="wp9-second")
+    assert _wp9_open_descriptors() == before
+    saga.close()
+
+
+def test_wp9_an_unconfirmed_orphan_blocks_the_next_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1 and R3: a kill nobody saw land is a reason to stop, not to retry.
+
+    A process that survived SIGKILL is one this system cannot say anything
+    about - it may still be inside a write.  So every later entry refuses
+    before the external call rather than starting a second writer beside it.
+    """
+
+    saga, transport = _wp9_saga(tmp_path)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    helper = _wp9_start_a_helper(saga)
+    popen = saga._heartbeat_state.popen
+    assert popen is not None
+    saga._orphaned_heartbeat_children.append(
+        source_broker_v2_module._HeartbeatOrphan(
+            popen=popen,
+            pid=popen.pid,
+            create_time=None,
+            killed_at=time.time(),
+            operation_id="earlier",
+        )
+    )
+    starts = _wp9_count_helper_starts(saga, monkeypatch)
+    calls: list[int] = []
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="has not reported its exit"):
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=lambda _: calls.append(1) or canonical_json_bytes({}),
+        )
+    assert calls == []
+    assert starts == []
+    assert transport.dispatch_calls == 0
+    del helper
+    saga.close()
+
+
+def test_wp9_entry_probes_the_write_lock_before_reusing_a_cleared_saga(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-04: a dead pid is not the same fact as a released write lock.
+
+    An exit that has been observed clears the orphan, but the file lock is held
+    by the kernel, not by the registry, and a process wedged in uninterruptible
+    I/O releases neither. So after clearing one, the production path takes the
+    write lock and lets it go before it will start anything - and when that
+    probe fails, no helper is started and no external call is made.
+    """
+
+    saga, transport = _wp9_saga(tmp_path)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    exited = subprocess.Popen([sys.executable, "-I", "-c", ""])
+    exited.wait(timeout=10)
+    probes: list[int] = []
+    original_probe = saga._probe_saga_write_lock
+
+    def probing() -> None:
+        probes.append(1)
+        original_probe()
+
+    monkeypatch.setattr(saga, "_probe_saga_write_lock", probing)
+    saga._orphaned_heartbeat_children.append(
+        source_broker_v2_module._HeartbeatOrphan(
+            popen=exited,
+            pid=exited.pid,
+            create_time=None,
+            killed_at=time.time(),
+            operation_id="earlier",
+        )
+    )
+    saga._invoke_with_heartbeat(
+        phase=phase,
+        operation_id=operation_id,
+        owner_generation=generation,
+        payload=payload,
+        invoke=lambda _: canonical_json_bytes({"wp9": "result"}),
+    )
+    assert probes == [1]
+    assert not saga._orphaned_heartbeat_children
+    saga.close()
+
+    # And now the same entry with the probe refusing: nothing starts, nothing
+    # is invoked.
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    saga2, transport2 = _wp9_saga(second_root)
+    phase2, operation2, generation2, payload2 = _wp9_window(saga2)
+    exited2 = subprocess.Popen([sys.executable, "-I", "-c", ""])
+    exited2.wait(timeout=10)
+    saga2._orphaned_heartbeat_children.append(
+        source_broker_v2_module._HeartbeatOrphan(
+            popen=exited2,
+            pid=exited2.pid,
+            create_time=None,
+            killed_at=time.time(),
+            operation_id="earlier",
+        )
+    )
+
+    def refusing() -> None:
+        raise SourceBrokerV2SagaUnavailableError("saga write lock is still held")
+
+    monkeypatch.setattr(saga2, "_probe_saga_write_lock", refusing)
+    starts = _wp9_count_helper_starts(saga2, monkeypatch)
+    calls: list[int] = []
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="write lock is still held"):
+        saga2._invoke_with_heartbeat(
+            phase=phase2,
+            operation_id=operation2,
+            owner_generation=generation2,
+            payload=payload2,
+            invoke=lambda _: calls.append(1) or canonical_json_bytes({}),
+        )
+    assert starts == []
+    assert calls == []
+    assert transport2.dispatch_calls == 0
+    assert transport.dispatch_calls == 0
+
+
+def test_wp9_a_fresh_lease_is_taken_between_the_handshake_and_the_invocation(
+    tmp_path: Path,
+) -> None:
+    """P1-04: the window opens on a lease this executor demonstrably holds.
+
+    A session start is allowed to be slow - a restart costs a terminate, a kill
+    and a second handshake - and the lease that covers the invocation was last
+    renewed before all of that.  One owner-and-generation guarded renewal after
+    the final acknowledgement closes the gap; if ownership changed in between,
+    it fails here, before the external call.
+    """
+
+    saga, _ = _wp9_saga(tmp_path, lease_seconds=_WP9_QUIET_LEASE_SECONDS)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    before = _wp9_heartbeat_columns(saga.path, operation_id)
+    observed: list[tuple[Any, Any]] = []
+
+    saga._invoke_with_heartbeat(
+        phase=phase,
+        operation_id=operation_id,
+        owner_generation=generation,
+        payload=payload,
+        invoke=lambda _: observed.append(_wp9_heartbeat_columns(saga.path, operation_id))
+        or canonical_json_bytes({"wp9": "result"}),
+    )
+    # No renewal is due inside this window - the lease is far longer than it -
+    # so the movement can only be the synchronous one after the handshake.
+    assert saga._last_heartbeat_session is not None
+    assert saga._last_heartbeat_session.ticks == 0
+    assert observed[0] != before
+    saga.close()
+
+
+def test_wp9_a_lost_lease_before_the_window_is_still_a_conflict(tmp_path: Path) -> None:
+    """The synchronous renewal after the handshake keeps its classification."""
+
+    saga, _ = _wp9_saga(tmp_path, lease_seconds=_WP9_QUIET_LEASE_SECONDS)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    calls: list[int] = []
+    with pytest.raises(SourceBrokerV2SagaConflictError, match="lost ownership"):
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation + 1,
+            payload=payload,
+            invoke=lambda _: calls.append(1) or canonical_json_bytes({}),
+        )
+    assert calls == []
+    saga.close()
+
+
+def test_wp9_a_takeover_inside_the_window_outranks_the_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legitimate takeover keeps its classification, and beats the digest.
+
+    Another executor taking the effect moves the owner columns, which moves the
+    row, which moves the digest too - so both signals fire at once and the
+    order they are reported in decides what the caller sees.  Ownership first:
+    a takeover is a conflict, as it has always been, and calling it tampering
+    would change what callers retry and what they escalate.
+    """
+
+    saga, _ = _wp9_saga(tmp_path, lease_seconds=_WP9_TAMPER_LEASE_SECONDS)
+    interval = _WP9_TAMPER_LEASE_SECONDS / 3
+    boundary = _wp9_watch_boundary(saga, monkeypatch)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+
+    def invoke(_: bytes) -> bytes:
+        # First make the digest move on its own, under an intact ownership, so
+        # that when the takeover lands both signals are live at once and the
+        # order they are reported in is what decides the answer.
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        _wp9_write(
+            saga.path,
+            "UPDATE source_broker_v2_outbox SET payload_hash = ? WHERE operation_id = ?",
+            ("f" * 64, operation_id),
+        )
+        _wp9_wait_for_renewals(saga, operation_id, 1)
+        # Renewals are flowing, so the window after the takeover is long enough
+        # to contain several attempts rather than a guess about this host.
+        connection = sqlite3.connect(saga.path, timeout=5.0, isolation_level=None)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE source_broker_v2_outbox SET executor_owner_token = ?, "
+                "executor_generation = ? WHERE operation_id = ?",
+                ("another-executor", generation + 1, operation_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        time.sleep(interval * 4)
+        return canonical_json_bytes({"wp9": "result"})
+
+    with pytest.raises(SourceBrokerV2SagaUnavailableError) as caught:
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=invoke,
+        )
+    assert type(caught.value.__cause__) is SourceBrokerV2SagaConflictError
+    outcome = boundary[-1]["outcome"]
+    assert outcome is not None
+    assert outcome.acked is True
+    assert outcome.renewal_ok is False
+    assert outcome.escalation == "clean"
+    assert outcome.child_alive is True
+    # The digest moved too - the owner columns are part of the row - and it is
+    # still not what got reported.
+    assert outcome.digest_changed is True
+    assert outcome.digest_mismatch is False
+    saga.close()
+
+
+def _wp9_watch_for_exit(pid: int) -> Callable[[float], bool]:
+    """Register interest in a process's exit *before* anything kills it.
+
+    Registration is what makes this immune to pid reuse: both `pidfd_open` and
+    a kqueue `EVFILT_PROC` bind to the process that exists at this instant, not
+    to the number.  Reading a creation timestamp afterwards and comparing would
+    not do the same job - on macOS `ps -o lstart=` is only accurate to the
+    second, so two processes started in the same second are indistinguishable.
+
+    The returned callable waits for the exit and says whether it arrived.
+    """
+
+    if sys.platform == "linux":
+        descriptor = os.pidfd_open(pid)
+
+        def wait_pidfd(timeout: float) -> bool:
+            ready, _, _ = select.select([descriptor], [], [], timeout)
+            os.close(descriptor)
+            return bool(ready)
+
+        return wait_pidfd
+
+    queue = select.kqueue()
+    queue.control(
+        [
+            select.kevent(
+                pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+        ],
+        0,
+        0,
+    )
+
+    def wait_kqueue(timeout: float) -> bool:
+        events = queue.control(None, 1, timeout)
+        queue.close()
+        return bool(events)
+
+    return wait_kqueue
+
+
+def _wp9_stop_pipe_descriptors(pid: int, inode: int) -> list[tuple[int, int]]:
+    """Every descriptor `pid` holds on the stop pipe, with its access mode."""
+
+    found: list[tuple[int, int]] = []
+    for name in os.listdir(f"/proc/{pid}/fd"):
+        try:
+            if os.stat(f"/proc/{pid}/fd/{name}").st_ino != inode:
+                continue
+            with open(f"/proc/{pid}/fdinfo/{name}", encoding="utf-8") as handle:
+                info = handle.read()
+        except OSError:
+            continue
+        flags = 0
+        for line in info.splitlines():
+            if line.startswith("flags:"):
+                flags = int(line.split()[1], 8)
+        found.append((int(name), flags & os.O_ACCMODE))
+    return found
+
+
+def test_v2_saga_helper_dies_with_its_parent_and_releases_the_write_lock(
+    tmp_path: Path,
+) -> None:
+    """T9: the helper is not an orphan when the process that started it dies.
+
+    Three layers, because pytest cannot both be the helper's parent and survive
+    to make the assertions: pytest supervises, a middle process runs the real
+    launch path and is killed outright, and the production helper sits under
+    it.  There is no `PR_SET_PDEATHSIG` here and none is wanted - it is
+    Linux-only.  The portable mechanism is that the parent holds the only write
+    end of a pipe the helper is reading, so the kernel closes it when the
+    parent dies and the helper wakes at once on EOF.
+
+    The exit is observed with a handle registered before the kill, so pid reuse
+    cannot make this pass by accident.  On Linux the fd assertion also runs: it
+    is what proves the helper never held the write end itself - if it did, the
+    EOF would never come and this whole mechanism would be silently dead.
+    macOS has no `/proc` and `lsof` will not attribute an inode, so that one
+    assertion is skipped there and said so; every other assertion runs on both.
+    """
+
+    root = tmp_path / "t9"
+    root.mkdir()
+    public_key = root / "authority.pub.pem"
+    public_key.write_bytes(_source_authority_security().public_key)
+    report = root / "report.json"
+    database = root / "saga.sqlite3"
+    lease_seconds = _WP9_TICKING_LEASE_SECONDS
+    interval = lease_seconds / 3
+    operation_id = _operation_id("saga-t9", "wp9-parent-death")
+    layer = subprocess.Popen(
+        (
+            sys.executable,
+            "-I",
+            str(_WP9_PARENT_DEATH_LAYER),
+            "--db",
+            str(database),
+            "--root",
+            str(root),
+            "--public-key",
+            str(public_key),
+            "--saga-id",
+            "saga-t9",
+            "--operation-id",
+            operation_id,
+            "--report",
+            str(report),
+            "--lease-seconds",
+            str(lease_seconds),
+            "--busy-timeout-ms",
+            str(_WP9_BUSY_TIMEOUT_MS),
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        def reported() -> bool:
+            if layer.poll() is not None:
+                raise AssertionError(
+                    f"parent-death layer exited early: {layer.stderr.read().decode()}"
+                    if layer.stderr is not None
+                    else "parent-death layer exited early"
+                )
+            return report.exists()
+
+        _wp9_wait_for(reported, what="the parent-death layer to open its window")
+        record = json.loads(report.read_text(encoding="utf-8"))
+        helper_pid = int(record["helper_pid"])
+        stop_inode = int(record["stop_inode"])
+        assert helper_pid != layer.pid
+
+        if sys.platform == "linux":
+            descriptors = _wp9_stop_pipe_descriptors(helper_pid, stop_inode)
+            assert len(descriptors) == 1
+            assert descriptors[0][1] == os.O_RDONLY
+        # macOS: `/proc` does not exist and `lsof` cannot attribute a pipe
+        # inode to an end, so this one assertion has no equivalent here.  Every
+        # other assertion in this case runs on both platforms.
+
+        # A watch on a pid that is gone has to fail loudly.  Were it silently
+        # accepted, the wait below would report an exit for a process that was
+        # never being watched, and this case would pass without evidence.
+        departed = subprocess.Popen([sys.executable, "-I", "-c", ""])
+        departed.wait(timeout=10)
+        with pytest.raises(ProcessLookupError):
+            _wp9_watch_for_exit(departed.pid)
+        wait_for_helper_exit = _wp9_watch_for_exit(helper_pid)
+
+        layer.kill()
+        layer.wait(timeout=10)
+        assert wait_for_helper_exit(10.0)
+    finally:
+        if layer.poll() is None:
+            layer.kill()
+            layer.wait(timeout=10)
+        if layer.stdout is not None:
+            layer.stdout.close()
+        if layer.stderr is not None:
+            layer.stderr.close()
+
+    taken, code, elapsed = _wp9_probe_write_lock(database, timeout_ms=_WP9_BUSY_TIMEOUT_MS)
+    assert taken, code
+    assert elapsed < _WP9_BUSY_TIMEOUT_MS / 1_000
+    settled = _wp9_heartbeat_columns(database, operation_id)
+    time.sleep(interval * 2)
+    assert _wp9_heartbeat_columns(database, operation_id) == settled
+    assert _wp9_integrity_check(database) == "ok"
+
+
+def test_wp9_helper_is_launched_with_three_descriptors_and_no_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole shape of the launch, asserted where it is decided.
+
+    Three inherited descriptors and no more, everything else closed, its own
+    session so signals go to it and nothing else, an environment built from
+    nothing, and a command line carrying only numbers.  The owner token and the
+    database path are the two secrets here and both travel in the config frame:
+    argv is world-readable through `ps`.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    recorded: list[dict[str, Any]] = []
+    real_popen = source_broker_v2_module.subprocess.Popen
+
+    def recording_popen(args: Any, **kwargs: Any) -> Any:
+        recorded.append({"args": list(args), **kwargs})
+        return real_popen(args, **kwargs)
+
+    monkeypatch.setattr(source_broker_v2_module.subprocess, "Popen", recording_popen)
+    saga._start_helper_once(operation_id="wp9-launch")
+    try:
+        assert len(recorded) == 1
+        launch = recorded[0]
+        assert launch["args"][:4] == [
+            sys.executable,
+            "-I",
+            "-m",
+            "rquant.source_broker_v2_heartbeat",
+        ]
+        assert len(launch["pass_fds"]) == 3
+        assert launch["close_fds"] is True
+        assert launch["start_new_session"] is True
+        assert set(launch["env"]) <= {"PATH", "LC_ALL", "LANG", "TMPDIR", "SQLITE_TMPDIR"}
+        assert launch["stdin"] is subprocess.DEVNULL
+        assert launch["stdout"] is subprocess.DEVNULL
+        assert launch["stderr"] is subprocess.DEVNULL
+        argv = " ".join(launch["args"])
+        assert saga._executor_owner_token not in argv
+        assert str(saga.path) not in argv
+        assert saga.saga_id not in argv
+        assert saga._executor_owner_token not in " ".join(launch["env"].values())
+        # And the child really only holds those three.
+        if sys.platform == "linux":
+            popen = saga._heartbeat_state.popen
+            assert popen is not None
+            held = sorted(os.listdir(f"/proc/{popen.pid}/fd"))
+            assert len(held) == 6  # 0, 1, 2 on /dev/null plus the three pipes
+    finally:
+        saga.close()
+
+
+def test_wp9_shutdown_bound_is_closed_form_at_production_defaults(tmp_path: Path) -> None:
+    """The number a caller can rely on, written out in full.
+
+    `T1` is two write-lock windows and nothing else - the helper sleeps in a
+    `select` this process can wake, so there is no term for the interval
+    between renewals any more.  On production defaults, busy_timeout 5s, that
+    is 10 + 0.25 + 5 + 0.05 = 15.30s, whatever the disk is doing.
+
+    `T_session_start` carries one term the handshake alone does not account
+    for: the owner-guarded renewal that runs after the final acknowledgement
+    and before the invocation.  It is spent before the external call, so a
+    caller waiting on this bound waits through it, and leaving it out would
+    understate the wait by a whole write transaction - 25.30s claimed against
+    35.30s possible.  That renewal is budgeted the same way the shutdown is,
+    because it runs the same body: a lock wait plus an equal allowance on the
+    durable tail behind it.
+    """
+
+    saga, _ = _wp9_saga(tmp_path, busy_timeout_ms=5_000, lease_seconds=30.0)
+    epsilon = source_broker_v2_module._HEARTBEAT_BOUND_EPSILON_SECONDS
+    terminate = source_broker_v2_module._HEARTBEAT_TERMINATE_SECONDS
+    final_reap = source_broker_v2_module._HEARTBEAT_FINAL_REAP_SECONDS
+    assert saga._heartbeat_shutdown_budget() == 10.0
+    assert saga._heartbeat_handshake_budget() == 5.0
+    assert saga._heartbeat_idle_exit_seconds() == 60.0
+    assert saga._heartbeat_fresh_lease_budget() == 10.0
+    # The same two windows the shutdown budget is made of, for the same reason.
+    assert saga._heartbeat_fresh_lease_budget() == saga._heartbeat_shutdown_budget()
+    bound = saga._heartbeat_shutdown_budget() + terminate + final_reap + epsilon
+    assert bound == pytest.approx(15.30)
+    handshake = saga._heartbeat_handshake_budget()
+    session_start = (
+        2 * (handshake + handshake)
+        + terminate
+        + final_reap
+        + epsilon
+        + saga._heartbeat_fresh_lease_budget()
+    )
+    assert session_start == pytest.approx(35.30)
+    # And the renewal really is the difference: the handshake on its own is
+    # exactly one write transaction short.
+    assert session_start - saga._heartbeat_fresh_lease_budget() == pytest.approx(25.30)
+    close_bound = (
+        source_broker_v2_module._HEARTBEAT_EOF_SECONDS + terminate + final_reap + epsilon
+    )
+    assert close_bound == pytest.approx(5.55)
+    # The whole method, before any time the external call itself takes.
+    assert session_start + bound == pytest.approx(50.60)
+
+
+def test_wp9_finalizer_is_registered_against_a_plain_function_and_state(
+    tmp_path: Path,
+) -> None:
+    """The registration itself, checked rather than inferred.
+
+    `weakref.finalize(saga, saga.close)` looks equivalent and is not: a bound
+    method holds the instance, the instance is then never collected, and the
+    finalizer only ever runs at interpreter exit.  What has to be registered is
+    a module-level function and a state object that points at nobody.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    finalizer = saga._heartbeat_finalizer
+    assert finalizer.alive
+    _, function, args, _ = finalizer.peek()
+    assert function is source_broker_v2_module._close_resources
+    assert args == (saga._heartbeat_state,)
+    state = saga._heartbeat_state
+    assert not any(value is saga for value in vars(state).values())
+    assert state.orphans is saga._orphaned_heartbeat_children
+    saga.close()
+
+
+def test_wp9_close_resources_reports_rather_than_raises(tmp_path: Path) -> None:
+    """The finalizer's callable has nowhere to raise to, so it never does."""
+
+    saga, _ = _wp9_saga(tmp_path)
+    state = saga._heartbeat_state
+    assert source_broker_v2_module._close_resources(state).closed is True
+    _wp9_start_a_helper(saga)
+    first = source_broker_v2_module._close_resources(state)
+    assert first.orphaned is False
+    assert first.returncode is not None
+    second = source_broker_v2_module._close_resources(state)
+    assert second.orphaned is False
+    assert state.popen is None
+    assert state.ctrl_w is None
+    assert state.stop_w is None
+    assert state.status_r is None
+
+
+def _wp9_assert_one_registry_entry_per_process(saga: SourceBrokerV2Saga) -> None:
+    orphans = saga._orphaned_heartbeat_children
+    for index, orphan in enumerate(orphans):
+        assert not any(other.popen is orphan.popen for other in orphans[index + 1 :])
+
+
+def test_wp9_an_orphan_is_registered_once_however_many_paths_reach_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown that ends in an orphan passes the escalation twice.
+
+    Once from the session teardown and once from the release that follows it,
+    and both are correct - the second is what a later `close` or the finalizer
+    would also do.  What must not happen is the same child being recorded
+    twice: every diagnostic would then name one pid two times, and a reader
+    counting entries would think two helpers had survived.
+
+    Both directions still have to work afterwards, which is the part that
+    matters more than the tidiness: unconfirmed means the entry gate refuses,
+    and a confirmed exit clears it.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    state = saga._heartbeat_state
+    popen = state.popen
+    assert popen is not None
+    real_wait = popen.wait
+
+    def never_observed(timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd="helper", timeout=timeout or 0.0)
+
+    monkeypatch.setattr(popen, "wait", never_observed)
+    first = source_broker_v2_module._escalate_heartbeat_child(
+        state,
+        terminate_seconds=0.01,
+        kill_seconds=0.01,
+    )
+    second = source_broker_v2_module._close_resources(state)
+    assert first == (None, "orphan")
+    assert second.orphaned is True
+    assert len(saga._orphaned_heartbeat_children) == 1
+    _wp9_assert_one_registry_entry_per_process(saga)
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="has not reported its exit"):
+        saga._require_takeable_saga()
+
+    monkeypatch.setattr(popen, "wait", real_wait)
+    assert popen.wait(timeout=10) is not None
+    assert saga._sweep_orphaned_heartbeat_children() == 1
+    assert not saga._orphaned_heartbeat_children
+
+
+def test_wp9_a3_stops_rather_than_starting_a_helper_beside_an_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement is not started next to a kill nobody saw land.
+
+    The restart the session confirmation is allowed exists for a helper that is
+    known to be gone.  When the one being replaced cannot be confirmed dead,
+    starting a second writer beside it is the one thing that must not happen -
+    so A3 ends there instead, before the external call.
+    """
+
+    saga, transport = _wp9_saga(tmp_path)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    _wp9_start_a_helper(saga)
+    popen = saga._heartbeat_state.popen
+    assert popen is not None
+    real_wait = popen.wait
+
+    def never_observed(timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd="helper", timeout=timeout or 0.0)
+
+    # A control descriptor whose reader is gone, swapped in for the real one:
+    # the session write hits EPIPE while the helper itself stays alive, so the
+    # pre-check does not get to notice anything first.
+    real_ctrl_w = saga._heartbeat_state.ctrl_w
+    assert real_ctrl_w is not None
+    dead_r, dead_w = os.pipe()
+    os.close(dead_r)
+    saga._heartbeat_state.ctrl_w = dead_w
+    monkeypatch.setattr(popen, "wait", never_observed)
+    starts = _wp9_count_helper_starts(saga, monkeypatch)
+    calls: list[int] = []
+
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="has not reported its exit"):
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=lambda _: calls.append(1) or canonical_json_bytes({}),
+        )
+    assert starts == []
+    assert calls == []
+    assert transport.dispatch_calls == 0
+    assert len(saga._orphaned_heartbeat_children) == 1
+    _wp9_assert_one_registry_entry_per_process(saga)
+    # The kill was really sent; only its observation was blocked.
+    monkeypatch.setattr(popen, "wait", real_wait)
+    os.close(real_ctrl_w)
+    assert popen.wait(timeout=10) is not None
+    saga._sweep_orphaned_heartbeat_children()
+    assert not saga._orphaned_heartbeat_children
+
+
+def test_wp9_a_missing_row_still_fails_the_synchronous_renewal_as_integrity(
+    tmp_path: Path,
+) -> None:
+    """The synchronous validation points keep the classification they had.
+
+    The shared write reports a missing row in its own vocabulary; in this
+    process that has always been an integrity failure, and callers match on it.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    phase, operation_id, _, _ = _wp9_window(saga)
+    _wp9_write(
+        saga.path,
+        "DELETE FROM source_broker_v2_outbox WHERE operation_id = ?",
+        (operation_id,),
+    )
+    with pytest.raises(SourceBrokerV2SagaIntegrityError, match="required outbox effect is missing"):
+        saga._heartbeat_outbox(phase=phase, operation_id=operation_id, owner_generation=0)
+
+
+def test_wp9_a_tick_that_would_block_is_dropped_instead(tmp_path: Path) -> None:
+    """The one frame that can be frequent must never stop the renewals.
+
+    The parent does not read the status pipe while an invocation runs, so a
+    blocking write here would let a full pipe wedge the heartbeat itself - the
+    failure this whole design exists to remove, reintroduced from the other
+    end.  A tick that does not fit is dropped; the authoritative counters and
+    digests ride on the acknowledgement instead.
+    """
+
+    del tmp_path
+    read_end, write_end = os.pipe()
+    dropped: list[bool] = []
+    finished = Event()
+    try:
+        os.set_blocking(write_end, False)
+        while True:
+            try:
+                os.write(write_end, b"x" * 4096)
+            except BlockingIOError:
+                break
+        os.set_blocking(write_end, True)
+
+        def write_a_tick() -> None:
+            dropped.append(
+                source_broker_v2_heartbeat._write_tick_frame(
+                    write_end,
+                    {"t": "tick", "n": 1, "stage": "commit", "digest": "0" * 64},
+                )
+            )
+            finished.set()
+
+        writer = Thread(target=write_a_tick, name="wp9-tick-writer", daemon=True)
+        writer.start()
+        assert finished.wait(timeout=5)
+        assert dropped == [False]
+        # And the descriptor is handed back blocking, so the frames that must
+        # arrive are still written to completion.
+        assert os.get_blocking(write_end)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+
+def test_wp9_closing_only_the_stop_pipe_ends_the_helper(tmp_path: Path) -> None:
+    """Stopping is a close, never a message - which is why a dead parent works.
+
+    The helper is sitting in `select` on a pipe whose only write end this
+    process holds, so the kernel delivers the signal for us when this process
+    dies, however it dies.  A shutdown frame would need a live parent with time
+    to send it, which is exactly the case that has to work.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    _wp9_start_a_helper(saga)
+    state = saga._heartbeat_state
+    stop_w = state.stop_w
+    popen = state.popen
+    assert stop_w is not None
+    assert popen is not None
+    os.close(stop_w)
+    state.stop_w = None
+    assert popen.wait(timeout=10) == 0
+    # The control pipe was never touched: the stop pipe alone did it.
+    assert state.ctrl_w is not None
+    saga.close()

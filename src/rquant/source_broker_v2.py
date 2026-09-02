@@ -12,21 +12,24 @@ import fcntl
 import hashlib
 import math
 import os
+import select
 import shutil
 import socket
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import time
+import weakref
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from threading import Event, Lock, Thread
-from typing import Literal, Protocol
+from threading import Lock
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import ConfigDict, Field, ValidationError, model_validator
@@ -43,6 +46,18 @@ from rquant.source_broker_protocol import (
     require_linux_source_broker_transport,
     validate_socket_endpoint,
     verify_connected_server_authority,
+)
+from rquant.source_broker_v2_heartbeat import (
+    HEARTBEAT_PROTOCOL_VERSION,
+    HEARTBEAT_SELECT_SQL,
+    HEARTBEAT_UPDATE_SQL,  # noqa: F401 - re-exported so both sides share one object
+    FrameReader,
+    HeartbeatOwnershipError,
+    HeartbeatProtocolError,
+    encode_frame,
+    heartbeat_write,
+    open_saga_connection,
+    stable_row_digest,
 )
 from rquant.source_operation_contracts import (
     CurrentClaimConsumptionV2,
@@ -74,20 +89,75 @@ SOURCE_BROKER_V2_CLAIM_ATTEMPT_CONTRACT = "rquant-source-broker-claim-attempt/v1
 _ZERO_HASH = "0" * 64
 _ED25519_SIGNATURE_BYTES = 64
 _PRODUCTION_SAGA_GRAPH_TOKEN = object()
-# One in-flight ``_heartbeat_outbox`` may legitimately spend a whole
-# ``busy_timeout_ms`` waiting for the write lock at ``BEGIN IMMEDIATE``, and
-# then an equal allowance on the durable tail that follows it: a
-# ``synchronous = FULL`` commit plus the passive checkpoint that closing the
-# connection performs.  ``busy_timeout_ms`` is the only tolerance this module
-# states for one SQLite operation on this file, so the tail is given the same
-# window as the wait.  A shutdown that waits less than the body it is waiting
-# on cannot tell a slow heartbeat from a stuck one.
+# One in-flight renewal may legitimately spend a whole ``busy_timeout_ms``
+# waiting for the write lock at ``BEGIN IMMEDIATE``, and then an equal
+# allowance on the durable tail that follows it: a ``synchronous = FULL``
+# commit plus the passive checkpoint that closing the connection performs.
+# ``busy_timeout_ms`` is the only tolerance this module states for one SQLite
+# operation on this file, so the tail is given the same window as the wait.  A
+# shutdown that waits less than the body it is waiting on cannot tell a slow
+# heartbeat from a stuck one.
 #
-# The budget decides when a renewal is *late*, not how long the shutdown may
-# stay: past it the shutdown interrupts the connection the thread is on and
-# then joins without a timeout (see ``_HeartbeatConnection``), so the method
-# never returns or raises while a heartbeat is still running.
+# The helper sleeps in ``select`` on a descriptor this process can make
+# readable at will, so it wakes the instant the end frame is written; this
+# budget therefore covers only a renewal that had already begun, and no longer
+# has a term for the interval between them.
 _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS = 2
+# Escalation timeouts, in the order they are spent.  Both are wall clock and
+# both are generous by three orders of magnitude against what was measured on
+# this tree: SIGTERM to exit is ~1-5ms, SIGKILL to a reaped ``returncode`` is
+# ~1-2ms.  What they buy is that the shutdown ends at a number written here,
+# never at how long a stuck fsync takes.
+_HEARTBEAT_TERMINATE_SECONDS = 0.25
+_HEARTBEAT_FINAL_REAP_SECONDS = 5.0
+# Closing the parent's write ends is the only exit signal the helper needs, and
+# it acts on it within a few milliseconds; this is the window before the same
+# escalation runs.
+_HEARTBEAT_EOF_SECONDS = 0.25
+# The floor under the start and session-ack budgets.  Helper start to ``ready``
+# was measured at 12-19ms across both versions on both platforms, so two
+# seconds is not a guess about the host - it is a bound wide enough that only a
+# genuinely broken start reaches it.
+_HEARTBEAT_HANDSHAKE_FLOOR_SECONDS = 2.0
+# The closed-form bounds these constants add up to, stated once so a caller can
+# check the arithmetic against what is actually spent.  With ``T0 = T_ack =
+# max(2.0, busy_timeout)``, ``T1 = 2 x busy_timeout`` and an epsilon of 0.05s
+# for descriptor closes and zero-second drains:
+#
+#   T_shutdown      = T1 + 0.25 + 5.0 + eps
+#   T_session_start = 2 x (T0 + T_ack) + 0.25 + 5.0 + eps + B_renew
+#   T_close         = 0.25 + 0.25 + 5.0 + eps
+#
+# ``B_renew`` is ``_heartbeat_fresh_lease_budget`` - the owner-guarded renewal
+# that runs after the final acknowledgement and before the invocation.  It is
+# counted here because it is spent before the external call, so a caller
+# waiting on ``T_session_start`` waits through it, and it is ``T1`` rather than
+# one lock window because it runs the same body the shutdown budget is derived
+# from: a lock wait plus an equal allowance on the durable tail behind it.
+# On production defaults (busy 5s, lease 30s) that is 15.30s, 35.30s and 5.55s,
+# and the whole method before the external call itself is 50.60s.
+_HEARTBEAT_BOUND_EPSILON_SECONDS = 0.05
+# A helper with no session left waits this long before exiting on its own, so
+# an idle saga does not keep a process for the life of the interpreter.  Two
+# leases is long enough that no ordinary sequence of invocations pays for a
+# restart, which the restart-count assertions in the tests measure directly.
+_HEARTBEAT_IDLE_EXIT_FLOOR_SECONDS = 30.0
+# The argv that follows ``sys.executable``.  ``-I`` drops every ``PYTHON*``
+# variable, the user site directory and the script directory from ``sys.path``,
+# and ``-m`` makes the helper module its own ``__main__`` - so nothing the
+# parent's entry point does is re-executed here.  Nothing secret is in it: a
+# command line is readable through ``ps`` and ``/proc/<pid>/cmdline`` by any
+# process of the same user, so the database path and the owner token travel in
+# the config frame instead.
+_HEARTBEAT_HELPER_COMMAND: tuple[str, ...] = (
+    "-I",
+    "-m",
+    "rquant.source_broker_v2_heartbeat",
+)
+# Captured at import, from the constant rather than from the seam.  Rebinding
+# the module attribute above would otherwise move both sides of the comparison
+# at once and the production guard would wave the replacement through.
+_FROZEN_HELPER_COMMAND: tuple[str, ...] = _HEARTBEAT_HELPER_COMMAND
 
 
 class _StrictV2Model(RuntimeContractModel):
@@ -1519,116 +1589,405 @@ class _ProductionSagaGraph:
 
 
 def _no_heartbeat_stage(stage: str) -> None:
-    """Stage sink for the heartbeats no shutdown is waiting on."""
+    """Stage sink for the heartbeats nothing is watching."""
 
     del stage
 
 
-def _no_heartbeat_connection(connection: sqlite3.Connection | None) -> None:
-    """Connection sink for the heartbeats no shutdown can interrupt."""
+def _heartbeat_environ() -> dict[str, str]:
+    """The helper's whole environment, built up from nothing.
 
-    del connection
+    Started from an empty dict rather than filtered from ``os.environ`` so a
+    variable is present only because a line here put it there.  ``PATH`` is a
+    constant because ``sys.executable`` is absolute and only libc fallbacks
+    read it; the locale is pinned so the helper's formatting does not depend on
+    the host's; the two temporary-directory variables are forwarded only when
+    already set, because SQLite spills there and a test's private root must
+    stay private.  No ``RQUANT_*``, no token, no ``HOME``.
 
-
-class _HeartbeatInterrupt(StrEnum):
-    """What a shutdown's interrupt found, worded for the message it goes into.
-
-    Deliberately says what was *issued*, not what was aborted: SQLite ends the
-    statement running at that moment, and a shutdown cannot tell from here
-    whether one was.
+    ``-I`` makes this belt and braces: even an injected ``PYTHONPATH`` would be
+    ignored by the interpreter.
     """
 
-    UNBOUND = "found no connection bound"
-    ISSUED = "issued on the connection it held"
-    CLOSED = "found the connection it held already closed"
+    environ = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+    for name in ("TMPDIR", "SQLITE_TMPDIR"):
+        value = os.environ.get(name)
+        if value is not None:
+            environ[name] = value
+    return environ
 
 
-class _HeartbeatConnection:
-    """The SQLite connection a heartbeat thread is inside, for its shutdown.
+def _process_create_time(pid: int) -> str | None:
+    """A diagnostic stamp for an orphan, never a liveness decision.
 
-    Python cannot kill a thread, and neither the ``synchronous = FULL`` commit
-    nor the passive checkpoint that ``close`` performs has a provable
-    wall-clock bound, so a shutdown that only joins with a timeout can never
-    say the thread is gone - it can only stop looking.  ``sqlite3_interrupt``
-    is the abort this process does have: the statement running on the bound
-    connection fails with ``SQLITE_INTERRUPT`` at its next step and SQLite
-    rolls its transaction back, which unwinds ``_heartbeat_outbox`` and lets
-    ``renew`` see ``stop`` and return.  The shutdown can then join for real.
-
-    It ends a statement that is *running*.  An interrupt that lands between two
-    statements is a documented no-op that does not carry over to the next one,
-    and the busy handler behind ``BEGIN IMMEDIATE`` sleeps through it (measured:
-    such a lock wait ends at its own ``busy_timeout``, not at the interrupt).
-    What the interrupt cannot cut short is therefore bounded by the same two
-    windows the budget above is built from - one ``busy_timeout`` lock wait and
-    the durable tail behind it - and never by the caller's own patience.
+    The ``Popen`` object is the reliable identity - ``poll`` only ever answers
+    for this process's own child and pid reuse cannot fool it - so this is
+    written into the failure message and compared by eye, nothing more.  It is
+    read from ``/proc`` where that exists and left unknown elsewhere rather
+    than shelling out inside a bounded teardown.
     """
 
-    __slots__ = ("_connection", "_lock")
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._connection: sqlite3.Connection | None = None
-
-    def bind(self, connection: sqlite3.Connection | None) -> None:
-        with self._lock:
-            self._connection = connection
-
-    def interrupt(self) -> _HeartbeatInterrupt:
-        """Issue an interrupt on the bound connection; report what was found."""
-
-        with self._lock:
-            connection = self._connection
-            if connection is None:
-                return _HeartbeatInterrupt.UNBOUND
-            try:
-                connection.interrupt()
-            except sqlite3.ProgrammingError:
-                # Holding the lock is what makes this cross-thread call safe:
-                # a body withdraws its connection here before ``_connect``
-                # closes it, so an interrupt never lands on one being closed.
-                # The guard stays because a closed connection is the one thing
-                # ``interrupt`` refuses, whoever closed it.
-                return _HeartbeatInterrupt.CLOSED
-            return _HeartbeatInterrupt.ISSUED
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            stat = handle.read()
+    except OSError:
+        return None
+    # The comm field is parenthesised and may itself contain spaces and
+    # parentheses, so fields are counted from after its last ``)``.
+    _, _, tail = stat.rpartition(")")
+    fields = tail.split()
+    if len(fields) < 20:
+        return None
+    return fields[19]
 
 
-class _HeartbeatProgress:
-    """What one heartbeat thread is doing, for the shutdown that waits on it.
+@dataclass
+class _HeartbeatOrphan:
+    """A helper that was sent SIGKILL and whose exit was never observed."""
 
-    Written only by that thread, and read by the shutdown once the budget has
-    expired - which is before the interrupt, so the thread may still be running
-    at that moment.  Plain attributes are enough: the reader wants the last
-    observation it can put in a failure message, not a consistent snapshot, and
-    nothing here decides control flow.
+    popen: subprocess.Popen[bytes]
+    pid: int
+    create_time: str | None
+    killed_at: float
+    operation_id: str
+
+    def describe(self) -> str:
+        stamp = "unknown" if self.create_time is None else self.create_time
+        return (
+            f"heartbeat helper pid {self.pid} (created {stamp}) was sent SIGKILL "
+            f"during {self.operation_id} and the kernel has not reported its exit"
+        )
+
+
+@dataclass
+class _HeartbeatResources:
+    """The parent's end of one helper: three descriptors and the child.
+
+    Deliberately holds no reference back to the saga.  ``weakref.finalize``
+    keeps its arguments alive, so a state object that pointed at its owner
+    would keep the owner alive too and the finalizer would never run while the
+    process is up - which is the whole reason it exists.  ``orphans`` is the
+    saga's own list, shared by identity: a finalizer that has to kill a helper
+    must be able to record the outcome, and a plain list points at nobody.
     """
 
-    __slots__ = ("last_tick_at", "stage", "stage_since", "ticks")
+    orphans: list[_HeartbeatOrphan]
+    popen: subprocess.Popen[bytes] | None = None
+    ctrl_w: int | None = None
+    status_r: int | None = None
+    stop_w: int | None = None
+    operation_id: str = "saga-close"
 
-    def __init__(self) -> None:
-        self.stage = "starting"
-        self.stage_since = time.monotonic()
-        self.ticks = 0
-        self.last_tick_at: float | None = None
 
-    def mark(self, stage: str) -> None:
-        self.stage = stage
-        self.stage_since = time.monotonic()
+@dataclass
+class _HeartbeatCloseOutcome:
+    """What one bounded close did, as values rather than as an exception."""
 
-    def completed_tick(self) -> None:
-        self.ticks += 1
-        self.last_tick_at = time.monotonic()
+    closed: bool = True
+    pid: int | None = None
+    returncode: int | None = None
+    escalation: str = "none"
+    orphaned: bool = False
+    seconds: float = 0.0
 
-    def describe(self, observed_at: float) -> str:
-        if self.last_tick_at is None:
-            ticks = "no completed tick"
-        else:
-            plural = "" if self.ticks == 1 else "s"
-            ticks = (
-                f"{self.ticks} completed tick{plural}, "
-                f"last {observed_at - self.last_tick_at:.3f}s ago"
+    def describe(self) -> str:
+        return (
+            f"heartbeat helper close ended after {self.seconds:.3f}s "
+            f"(pid {self.pid}, returncode {self.returncode}, "
+            f"escalation {self.escalation!r}, orphaned {self.orphaned})"
+        )
+
+
+def _close_descriptor(state: _HeartbeatResources, name: str) -> None:
+    descriptor = getattr(state, name)
+    if descriptor is None:
+        return
+    setattr(state, name, None)
+    with suppress(OSError):
+        os.close(descriptor)
+
+
+def _escalate_heartbeat_child(
+    state: _HeartbeatResources,
+    *,
+    terminate_seconds: float,
+    kill_seconds: float,
+) -> tuple[int | None, str]:
+    """SIGTERM, then SIGKILL, each with its own timeout.  Never raises.
+
+    The orphan is registered *before* the kill rather than after the wait.  A
+    signal this process has sent but whose effect it has not observed is
+    exactly the state the next entry has to refuse to run in, and a registry
+    written afterwards has a window where that state exists and is unrecorded.
+    """
+
+    popen = state.popen
+    if popen is None:  # pragma: no cover - callers check first
+        return None, "none"
+    with suppress(OSError):
+        popen.terminate()
+    try:
+        return popen.wait(timeout=terminate_seconds), "sigterm"
+    except subprocess.TimeoutExpired:
+        pass
+    # One entry per process, not one per attempt.  A teardown that ends in an
+    # orphan comes through here and then again through ``_close_resources``,
+    # and two records for the same child would say the same pid twice in every
+    # diagnostic without telling anyone anything new.
+    if not any(recorded.popen is popen for recorded in state.orphans):
+        state.orphans.append(
+            _HeartbeatOrphan(
+                popen=popen,
+                pid=popen.pid,
+                create_time=_process_create_time(popen.pid),
+                killed_at=time.time(),
+                operation_id=state.operation_id,
             )
-        return f"{ticks}; stage {self.stage!r} for {observed_at - self.stage_since:.3f}s"
+        )
+    with suppress(OSError):
+        popen.kill()
+    try:
+        returncode = popen.wait(timeout=kill_seconds)
+    except subprocess.TimeoutExpired:
+        # SIGKILL does not preempt an uninterruptible kernel I/O, and this
+        # method will not pretend otherwise by waiting again with no bound.
+        # The process is recorded and every later entry fails closed until its
+        # exit is observed.
+        return None, "orphan"
+    state.orphans[:] = [recorded for recorded in state.orphans if recorded.popen is not popen]
+    return returncode, "sigkill"
+
+
+def _close_resources(state: _HeartbeatResources) -> _HeartbeatCloseOutcome:
+    """Release one helper, bounded, idempotent, and without raising.
+
+    Split out of the saga on purpose: this is what ``weakref.finalize`` is
+    given, and a bound method would hand the finalizer a strong reference to
+    the very object whose collection is supposed to trigger it.
+
+    Only an observed ``returncode`` counts as closed.  A helper that survived
+    SIGKILL leaves the state populated, so a later ``poll`` can still find its
+    exit and a second call can finish the job.
+    """
+
+    started = time.monotonic()
+    popen = state.popen
+    if popen is None:
+        return _HeartbeatCloseOutcome(pid=None, returncode=None, escalation="none")
+    # Closing every write end this process holds is the helper's exit signal -
+    # it is sitting in ``select`` on the read ends and gets EOF at once.
+    _close_descriptor(state, "ctrl_w")
+    _close_descriptor(state, "stop_w")
+    returncode = popen.poll()
+    escalation = "clean"
+    if returncode is None:
+        try:
+            returncode = popen.wait(timeout=_HEARTBEAT_EOF_SECONDS)
+        except subprocess.TimeoutExpired:
+            returncode, escalation = _escalate_heartbeat_child(
+                state,
+                terminate_seconds=_HEARTBEAT_TERMINATE_SECONDS,
+                kill_seconds=_HEARTBEAT_FINAL_REAP_SECONDS,
+            )
+    _close_descriptor(state, "status_r")
+    orphaned = returncode is None
+    if not orphaned:
+        state.popen = None
+    return _HeartbeatCloseOutcome(
+        closed=not orphaned,
+        pid=popen.pid,
+        returncode=returncode,
+        escalation=escalation,
+        orphaned=orphaned,
+        seconds=time.monotonic() - started,
+    )
+
+
+class _HeartbeatFailure:
+    """One failed renewal, carried across the process boundary as primitives.
+
+    No exception object is ever serialized in either direction.  SQLite's own
+    ``sqlite_errorcode`` is what the caller branches on; the type name and the
+    truncated message are for a human.  Matching on message text is what the
+    code replaces, and rebuilding here keeps that closed.
+    """
+
+    __slots__ = ("detail", "errorcode", "failure_type")
+
+    def __init__(self, *, errorcode: int | None, failure_type: str, detail: str) -> None:
+        self.errorcode = errorcode
+        self.failure_type = failure_type
+        self.detail = detail
+
+    def rebuild(self) -> BaseException:
+        if self.failure_type == HeartbeatOwnershipError.__name__:
+            # The renewal guard matched no row, which is the same loss of
+            # ownership the in-process renewal has always reported, and it must
+            # keep reaching the caller as that classification.
+            return SourceBrokerV2SagaConflictError(
+                "outbox executor lost ownership before heartbeat"
+            )
+        error = _HeartbeatRenewalError(f"{self.failure_type}: {self.detail}")
+        error.sqlite_errorcode = self.errorcode
+        return error
+
+    def describe(self) -> str:
+        return f"{self.failure_type}(errorcode={self.errorcode}): {self.detail}"
+
+
+class _HeartbeatRenewalError(SourceBrokerV2SagaError):
+    """A renewal that failed in the helper, rebuilt from its structured report."""
+
+    sqlite_errorcode: int | None = None
+
+
+@dataclass
+class _HeartbeatSessionOutcome:
+    """Everything one invocation window can be asked about afterwards.
+
+    ``acked`` and ``renewal_ok`` are two fields, not one, and the difference
+    decides whether a helper lives.  ``acked`` is the protocol question - did
+    the end frame come back - and it is the only gate on escalation.
+    ``renewal_ok`` is the business question - did every renewal succeed - and
+    it only decides which error the caller sees.  Folded together, an ordinary
+    renewal failure would terminate and kill a helper that is healthy, sitting
+    idle, and about to serve the next invocation.
+    """
+
+    token: str
+    child_pid: int | None = None
+    acked: bool = False
+    renewal_ok: bool = True
+    ticks: int = 0
+    last_stage: str = "idle"
+    failure: _HeartbeatFailure | None = None
+    child_returncode: int | None = None
+    child_alive: bool = False
+    shutdown_seconds: float = 0.0
+    escalation: str = "clean"
+    restarts: int = 0
+    orphaned: bool = False
+    transport: str | None = None
+    first_digest: str | None = None
+    last_digest: str | None = None
+    digest_changed: bool = False
+    digest_mismatch: bool = False
+    observed_digest: str | None = None
+
+    def describe(self) -> str:
+        failure = "none" if self.failure is None else self.failure.describe()
+        return (
+            f"outbox heartbeat session {self.token[:12]} ended after "
+            f"{self.shutdown_seconds:.3f}s (helper pid {self.child_pid}, "
+            f"returncode {self.child_returncode}, escalation {self.escalation!r}, "
+            f"acked {self.acked}, renewal_ok {self.renewal_ok}, "
+            f"{self.ticks} tick(s), last stage {self.last_stage!r}, "
+            f"restarts {self.restarts}, orphaned {self.orphaned}, "
+            f"transport {self.transport!r}, digest_changed {self.digest_changed}, "
+            f"digest_mismatch {self.digest_mismatch}, failure {failure})"
+        )
+
+
+class _HeartbeatEndOfFile:
+    """The sentinel a status read returns when the helper's end is gone."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<heartbeat status EOF>"
+
+
+_HEARTBEAT_EOF = _HeartbeatEndOfFile()
+
+
+class _HeartbeatHelper:
+    """The parent's handle on one long-lived helper process.
+
+    Holds descriptors and a frame reader and nothing else - in particular no
+    reference to the saga, so the saga stays collectable and its finalizer
+    stays reachable.  Every read here is bounded by a deadline the caller
+    supplies and every write is a single small frame; this class starts no
+    thread and never waits without a timeout.
+    """
+
+    __slots__ = ("_reader", "pid", "state")
+
+    def __init__(self, state: _HeartbeatResources) -> None:
+        self.state = state
+        popen = state.popen
+        assert popen is not None
+        self.pid = popen.pid
+        assert state.status_r is not None
+        self._reader = FrameReader(state.status_r)
+
+    def send(self, frame: dict[str, Any]) -> None:
+        """Write one control frame.  A dead helper surfaces as BrokenPipeError."""
+
+        descriptor = self.state.ctrl_w
+        if descriptor is None:
+            raise BrokenPipeError("heartbeat control pipe is already closed")
+        payload = encode_frame(frame)
+        while payload:
+            payload = payload[os.write(descriptor, payload) :]
+
+    def poll(self) -> int | None:
+        popen = self.state.popen
+        return None if popen is None else popen.poll()
+
+    def poll_status(self, deadline: float) -> dict[str, Any] | _HeartbeatEndOfFile | None:
+        """Next status frame, the EOF sentinel, or ``None`` once past ``deadline``."""
+
+        descriptor = self.state.status_r
+        if descriptor is None:  # pragma: no cover - callers close last
+            return _HEARTBEAT_EOF
+        while True:
+            frame = self._reader.take_buffered()
+            if frame is not None:
+                return frame
+            if self._reader.at_eof:
+                return _HEARTBEAT_EOF
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([descriptor], [], [], remaining)
+            if not ready:
+                return None
+            if not self._reader.fill() and self._reader.at_eof:
+                return _HEARTBEAT_EOF
+
+    def drain_status(self) -> list[dict[str, Any]]:
+        """Whatever has already arrived, read with a zero-second poll."""
+
+        frames: list[dict[str, Any]] = []
+        descriptor = self.state.status_r
+        while True:
+            try:
+                frame = self._reader.take_buffered()
+            except HeartbeatProtocolError:
+                return frames
+            if frame is not None:
+                frames.append(frame)
+                continue
+            if descriptor is None or self._reader.at_eof:
+                return frames
+            ready, _, _ = select.select([descriptor], [], [], 0)
+            if not ready:
+                return frames
+            with suppress(OSError):
+                if not self._reader.fill():
+                    return frames
+                continue
+            return frames
+
+    def reap(self) -> tuple[int | None, str]:
+        return _escalate_heartbeat_child(
+            self.state,
+            terminate_seconds=_HEARTBEAT_TERMINATE_SECONDS,
+            kill_seconds=_HEARTBEAT_FINAL_REAP_SECONDS,
+        )
+
+    def release(self) -> _HeartbeatCloseOutcome:
+        return _close_resources(self.state)
 
 
 class SourceBrokerV2Saga:
@@ -1796,6 +2155,21 @@ class SourceBrokerV2Saga:
             raise ValueError("executor lease and wait durations must be positive")
         if source_request_deadline_seconds <= 0 or source_takeover_grace_seconds < 0:
             raise ValueError("source deadline must be positive and grace cannot be negative")
+        # A NaN passes every comparison above - it is neither ``<= 0`` nor
+        # ``> 0`` - and would then be divided into a renewal interval, encoded
+        # into a session frame and handed to ``select`` as a timeout.  Refusing
+        # it at construction is the first of three guards; the frame encoder
+        # (``allow_nan=False``) and the helper's own check are the other two.
+        if not all(
+            math.isfinite(value)
+            for value in (
+                executor_lease_seconds,
+                executor_wait_seconds,
+                source_request_deadline_seconds,
+                source_takeover_grace_seconds,
+            )
+        ):
+            raise ValueError("executor and source durations must be finite")
         if type(quota_adapter) not in {SourceQuotaBrokerAdapterV2, _UnixSourceQuotaAdapter}:
             raise TypeError("V2 saga requires an exact quota bridge")
         if production_graph is None:
@@ -1828,6 +2202,23 @@ class SourceBrokerV2Saga:
         self._production_graph = production_graph
         self._production_binding_hash = (
             None if production_graph is None else production_graph.binding_hash
+        )
+        # One non-blocking gate per saga instance.  It creates no thread, but
+        # two threads racing the same instance can no longer open two windows
+        # against one lease, and ``close`` uses the same gate to refuse to pull
+        # descriptors out from under a running session.
+        self._heartbeat_gate = Lock()
+        self._orphaned_heartbeat_children: list[_HeartbeatOrphan] = []
+        self._heartbeat_state = _HeartbeatResources(orphans=self._orphaned_heartbeat_children)
+        self._heartbeat_child: _HeartbeatHelper | None = None
+        self._last_heartbeat_session: _HeartbeatSessionOutcome | None = None
+        self._heartbeat_close_outcome: _HeartbeatCloseOutcome | None = None
+        # A backstop, not the path: ``close`` is.  The callable and the state
+        # are module-level and hold no reference to this saga, which is what
+        # lets the saga be collected at all - a bound method here would keep it
+        # alive and the finalizer would never run.
+        self._heartbeat_finalizer = weakref.finalize(
+            self, _close_resources, self._heartbeat_state
         )
         self._initialize()
 
@@ -3645,13 +4036,11 @@ class SourceBrokerV2Saga:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(
-            self.path, timeout=self._busy_timeout_ms / 1_000, isolation_level=None
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-        connection.execute("PRAGMA synchronous = FULL")
+        # The connection shape lives in the heartbeat module so the helper
+        # process and this one open the same file the same way; there is one
+        # definition of ``busy_timeout`` and ``synchronous`` for the whole saga
+        # rather than one per caller.
+        connection = open_saga_connection(str(self.path), self._busy_timeout_ms)
         try:
             yield connection
         finally:
@@ -3907,15 +4296,483 @@ class SourceBrokerV2Saga:
     def _before_external_effect(self, phase: SourceBrokerV2OutboxPhase) -> None:
         """Test seam after durable ownership but before an external invocation."""
 
-    def _wait_for_heartbeat(
+    def _heartbeat_helper_command(self) -> tuple[str, ...]:
+        """Seam: the argv that follows ``sys.executable`` when a helper starts.
+
+        A command line is the only thing that crosses this process boundary -
+        no import path, no pickle, no object - which is why the seam is safe to
+        expose at all.  Tests point it at a single-file fault helper; the guard
+        at the one place it is used refuses that in production.
+        """
+
+        return _HEARTBEAT_HELPER_COMMAND
+
+    def _heartbeat_shutdown_budget(self) -> float:
+        return _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000
+
+    def _heartbeat_handshake_budget(self) -> float:
+        return max(_HEARTBEAT_HANDSHAKE_FLOOR_SECONDS, self._busy_timeout_ms / 1_000)
+
+    def _heartbeat_idle_exit_seconds(self) -> float:
+        return max(_HEARTBEAT_IDLE_EXIT_FLOOR_SECONDS, 2 * self._executor_lease_seconds)
+
+    def _heartbeat_fresh_lease_budget(self) -> float:
+        """What the renewal between the handshake and the invocation can cost.
+
+        One complete saga write transaction, which this module has always
+        counted as two windows rather than one: a lock wait at ``BEGIN
+        IMMEDIATE`` bounded by ``busy_timeout``, and then an equal allowance on
+        the durable tail behind it - the ``synchronous = FULL`` commit and the
+        passive checkpoint that closing the connection performs.  That is the
+        same reasoning, and the same constant, as the shutdown budget above;
+        this renewal runs the identical body, so it cannot be budgeted for the
+        lock wait alone.
+
+        Only the first of the two is a number SQLite enforces.  The tail is an
+        allowance, not a guarantee - a disk that never answers has no
+        wall-clock bound, which is the whole reason the *helper's* renewals
+        were moved out of this process to begin with.  What this buys is that
+        the figure quoted to a caller matches the figure quoted for the same
+        work elsewhere in the file.
+
+        It is a term in ``T_session_start`` rather than a footnote: the renewal
+        runs before the external call, so a caller told the method cannot spend
+        more than ``T_session_start`` before invoking is owed these seconds
+        of it.
+        """
+
+        return _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000
+
+    def _describe_orphaned_heartbeat_children(self) -> str:
+        return "; ".join(orphan.describe() for orphan in self._orphaned_heartbeat_children)
+
+    def _sweep_orphaned_heartbeat_children(self) -> int:
+        """Non-blocking: ask each recorded orphan whether it has exited yet.
+
+        ``poll`` is the reliable question because these are this process's own
+        children, so the answer cannot be confused by pid reuse, and it never
+        waits.  Returns how many were confirmed gone.
+        """
+
+        cleared = 0
+        for orphan in list(self._orphaned_heartbeat_children):
+            if orphan.popen.poll() is not None:
+                self._orphaned_heartbeat_children.remove(orphan)
+                cleared += 1
+        return cleared
+
+    def _probe_saga_write_lock(self) -> None:
+        """Take the file's write lock and let it go: proof it is actually free.
+
+        A killed helper's exit is not the same fact as its write lock being
+        released - a process stuck in uninterruptible I/O still holds it, and a
+        logical lease expiring does not release a kernel lock.  This is the
+        only evidence that says so, and it is bounded by ``busy_timeout``
+        because that is what ``BEGIN IMMEDIATE`` waits with.
+        """
+
+        try:
+            connection = open_saga_connection(str(self.path), self._busy_timeout_ms)
+        except sqlite3.Error as exc:
+            raise SourceBrokerV2SagaUnavailableError(
+                "saga database could not be opened to prove its write lock is free"
+            ) from exc
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ROLLBACK")
+        except sqlite3.Error as exc:
+            raise SourceBrokerV2SagaUnavailableError(
+                "saga write lock is still held after a heartbeat helper was killed"
+            ) from exc
+        finally:
+            with suppress(sqlite3.Error):
+                connection.close()
+
+    def _require_takeable_saga(self) -> None:
+        """Entry gate: no unconfirmed orphan, and the write lock really free.
+
+        Runs before anything else this method does, and before any external
+        effect, so a saga instance that once failed to kill a helper refuses
+        every later invocation until that helper's exit is observed - and even
+        then only after the lock itself has been taken and released.
+        """
+
+        cleared = self._sweep_orphaned_heartbeat_children()
+        if self._orphaned_heartbeat_children:
+            raise SourceBrokerV2SagaUnavailableError(
+                self._describe_orphaned_heartbeat_children()
+            )
+        if cleared:
+            self._probe_saga_write_lock()
+
+    def _start_helper_once(self, *, operation_id: str) -> _HeartbeatHelper:
+        """Start one helper and complete its handshake, or own nothing.
+
+        Six raw descriptors exist between the first ``os.pipe`` and the moment
+        ``Popen`` returns, and every failure path below closes exactly the ones
+        this call created.  After a successful spawn the three child ends are
+        closed immediately - the parent keeping a copy of ``stop_r`` would mean
+        the helper never sees EOF, and keeping ``status_w`` would mean the
+        parent never sees one either.
+        """
+
+        state = self._heartbeat_state
+        if state.popen is not None:
+            raise SourceBrokerV2SagaUnavailableError(
+                "a heartbeat helper is already running for this saga"
+            )
+        command = self._heartbeat_helper_command()
+        if self._production_graph is not None and command != _FROZEN_HELPER_COMMAND:
+            # Compared against the constant captured at import, not against the
+            # seam: rebinding the module attribute would move both sides.
+            raise TypeError("production saga heartbeat helper command was replaced")
+        ctrl_r, ctrl_w = os.pipe()
+        status_r, status_w = os.pipe()
+        stop_r, stop_w = os.pipe()
+        popen: subprocess.Popen[bytes] | None = None
+        try:
+            popen = subprocess.Popen(  # noqa: S603 - argv is a frozen constant
+                [sys.executable, *command,
+                 "--control-fd", str(ctrl_r),
+                 "--status-fd", str(status_w),
+                 "--stop-fd", str(stop_r)],
+                pass_fds=(ctrl_r, status_w, stop_r),
+                close_fds=True,
+                start_new_session=True,
+                env=_heartbeat_environ(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except BaseException as exc:
+            for descriptor in (ctrl_r, ctrl_w, status_r, status_w, stop_r, stop_w):
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise SourceBrokerV2SagaUnavailableError(
+                "outbox heartbeat helper could not be started"
+            ) from exc
+        for descriptor in (ctrl_r, status_w, stop_r):
+            with suppress(OSError):
+                os.close(descriptor)
+        state.popen = popen
+        state.ctrl_w = ctrl_w
+        state.status_r = status_r
+        state.stop_w = stop_w
+        state.operation_id = operation_id
+        helper = _HeartbeatHelper(state)
+        try:
+            helper.send(
+                {
+                    "t": "config",
+                    "protocol": HEARTBEAT_PROTOCOL_VERSION,
+                    "db": str(self.path),
+                    "saga_id": self.saga_id,
+                    "owner_token": self._executor_owner_token,
+                    "busy_timeout_ms": self._busy_timeout_ms,
+                    "lease_seconds": self._executor_lease_seconds,
+                    "idle_exit_seconds": self._heartbeat_idle_exit_seconds(),
+                }
+            )
+            frame = helper.poll_status(time.monotonic() + self._heartbeat_handshake_budget())
+            if (
+                not isinstance(frame, dict)
+                or frame.get("t") != "ready"
+                or frame.get("protocol") != HEARTBEAT_PROTOCOL_VERSION
+                or type(frame.get("pid")) is not int
+                or frame["pid"] != popen.pid
+            ):
+                raise SourceBrokerV2SagaUnavailableError(
+                    f"outbox heartbeat helper did not report ready ({frame!r})"
+                )
+        except BaseException as exc:
+            # One abort for every way the handshake can fail - a write that
+            # hits a dead helper, a timeout, an EOF, a frame of the wrong
+            # shape or a pid that is not this child's.  It is bounded and it
+            # leaves no descriptor and no process behind.
+            self._discard_heartbeat_child(helper)
+            if isinstance(exc, SourceBrokerV2SagaError):
+                raise
+            raise SourceBrokerV2SagaUnavailableError(
+                "outbox heartbeat helper handshake failed"
+            ) from exc
+        self._heartbeat_child = helper
+        return helper
+
+    def _discard_heartbeat_child(self, helper: _HeartbeatHelper) -> _HeartbeatCloseOutcome:
+        """Bounded release of a helper this saga will not use again."""
+
+        outcome = helper.release()
+        if self._heartbeat_child is helper:
+            self._heartbeat_child = None
+        return outcome
+
+    def _open_heartbeat_session(
         self,
-        stop: Event,
+        *,
+        token: str,
+        phase: SourceBrokerV2OutboxPhase,
+        operation_id: str,
+        owner_generation: int,
         interval: float,
+    ) -> tuple[_HeartbeatHelper, int]:
+        """Get an acknowledged session, restarting the helper at most once.
+
+        Three detectors, because only the first is a pre-check and a pre-check
+        on another process is a race by construction: ``poll`` before the
+        write, ``BrokenPipeError`` from the write itself, and a timeout or EOF
+        while waiting for the ack.  Every failure here happens *before* the
+        external invocation, so a saga that cannot confirm a session makes zero
+        external calls rather than running one unprotected.
+        """
+
+        restarts = 0
+        while True:
+            helper = self._heartbeat_child
+            if helper is not None and helper.poll() is not None:
+                self._discard_heartbeat_child(helper)
+                helper = None
+            try:
+                if helper is None:
+                    if restarts:
+                        # A replacement is only allowed once the previous
+                        # helper's exit has been observed and the write lock
+                        # itself has been proven free.
+                        self._probe_saga_write_lock()
+                    helper = self._start_helper_once(operation_id=operation_id)
+                helper.send(
+                    {
+                        "t": "session",
+                        "token": token,
+                        "phase": phase.value,
+                        "operation_id": operation_id,
+                        "owner_generation": owner_generation,
+                        "interval_seconds": interval,
+                    }
+                )
+                deadline = time.monotonic() + self._heartbeat_handshake_budget()
+                acked = False
+                while True:
+                    frame = helper.poll_status(deadline)
+                    if not isinstance(frame, dict):
+                        break
+                    if frame.get("t") == "session-ack" and frame.get("token") == token:
+                        acked = True
+                        break
+                if acked:
+                    return helper, restarts
+                reason = "outbox heartbeat helper did not acknowledge its session"
+            except SourceBrokerV2SagaUnavailableError as exc:
+                # A start that failed has already released everything it made;
+                # it is still worth one replacement, which is what A3 is.
+                reason = str(exc)
+                helper = None
+            except (BrokenPipeError, OSError, HeartbeatProtocolError) as exc:
+                reason = f"outbox heartbeat helper session could not be sent ({exc!r})"
+            except ValueError:
+                # A non-finite interval is refused by the encoder, before any
+                # external effect.  That is a configuration fault, not a dead
+                # helper, so it is not something to restart into.
+                if helper is not None:
+                    self._discard_heartbeat_child(helper)
+                raise
+            outcome = _HeartbeatCloseOutcome()
+            if helper is not None:
+                outcome = self._discard_heartbeat_child(helper)
+            if outcome.orphaned or self._orphaned_heartbeat_children:
+                # A3 ends here rather than starting a second helper: an
+                # unconfirmed kill is exactly the state a new writer must not
+                # be started into.
+                raise SourceBrokerV2SagaUnavailableError(
+                    f"{reason}; {self._describe_orphaned_heartbeat_children()}"
+                )
+            if restarts >= 1:
+                raise SourceBrokerV2SagaUnavailableError(reason)
+            restarts += 1
+
+    def _absorb_heartbeat_frame(
+        self, outcome: _HeartbeatSessionOutcome, frame: dict[str, Any]
+    ) -> None:
+        kind = frame.get("t")
+        if kind == "tick":
+            if type(frame.get("n")) is int:
+                outcome.ticks = max(outcome.ticks, frame["n"])
+            if type(frame.get("stage")) is str:
+                outcome.last_stage = frame["stage"]
+            digest = frame.get("digest")
+            if type(digest) is str:
+                if outcome.first_digest is None:
+                    outcome.first_digest = digest
+                outcome.last_digest = digest
+                if digest != outcome.first_digest:
+                    outcome.digest_changed = True
+            return
+        if kind == "failed" and frame.get("token") == outcome.token:
+            outcome.renewal_ok = False
+            errorcode = frame.get("errorcode")
+            outcome.failure = _HeartbeatFailure(
+                errorcode=errorcode if type(errorcode) is int else None,
+                failure_type=str(frame.get("type", "Exception")),
+                detail=str(frame.get("detail", "")),
+            )
+            return
+        if kind == "end-ack" and frame.get("token") == outcome.token:
+            outcome.acked = True
+            if type(frame.get("ticks")) is int:
+                outcome.ticks = frame["ticks"]
+            if type(frame.get("last_stage")) is str:
+                outcome.last_stage = frame["last_stage"]
+            if frame.get("last_outcome") != "ok":
+                outcome.renewal_ok = False
+            for name in ("first_digest", "last_digest"):
+                value = frame.get(name)
+                if value is None or type(value) is str:
+                    setattr(outcome, name, value)
+            if frame.get("digest_changed") is True:
+                outcome.digest_changed = True
+
+    def _close_heartbeat_session(
+        self,
+        helper: _HeartbeatHelper,
+        token: str,
+        invoke_error: BaseException | None,
+        *,
+        restarts: int,
+    ) -> _HeartbeatSessionOutcome:
+        """End one session within a fixed budget.  Contains no ``raise``.
+
+        Every transport failure - a broken pipe on the end frame, an EOF, a
+        malformed frame, a timeout - becomes a field on the outcome and the
+        bounded reap continues.  Raising from here would displace the caller's
+        own exception, so the decisions are made by the caller afterwards.
+        """
+
+        outcome = _HeartbeatSessionOutcome(
+            token=token, child_pid=helper.pid, restarts=restarts
+        )
+        started = time.monotonic()
+        deadline = started + self._heartbeat_shutdown_budget()
+        try:
+            helper.send({"t": "end", "token": token})
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            outcome.transport = f"send-end: {exc!r}"
+        while outcome.transport is None and not outcome.acked:
+            try:
+                frame = helper.poll_status(deadline)
+            except (OSError, HeartbeatProtocolError) as exc:
+                outcome.transport = f"poll-end-ack: {exc!r}"
+                break
+            if frame is _HEARTBEAT_EOF:
+                outcome.transport = "poll-end-ack: end of file"
+                break
+            if frame is None:
+                break
+            if isinstance(frame, dict):
+                # A ``failed`` frame only records that a renewal failed and a
+                # ``tick`` only updates the digest; neither ends this wait.
+                # Only the acknowledgement for this token does, and the helper
+                # answers an end frame unconditionally, so an ordinary renewal
+                # failure still costs one pipe round trip rather than a
+                # terminate and a kill.
+                self._absorb_heartbeat_frame(outcome, frame)
+        if not outcome.acked:
+            returncode, escalation = helper.reap()
+            outcome.child_returncode = returncode
+            outcome.escalation = escalation
+            outcome.orphaned = returncode is None
+        for frame in helper.drain_status():
+            self._absorb_heartbeat_frame(outcome, frame)
+        if outcome.child_returncode is None and not outcome.orphaned:
+            outcome.child_returncode = helper.poll()
+        outcome.child_alive = outcome.child_returncode is None and not outcome.orphaned
+        if not outcome.child_alive:
+            # A helper that is gone takes its descriptors with it; a live one
+            # keeps them, because it is going to serve the next session.
+            self._discard_heartbeat_child(helper)
+        outcome.shutdown_seconds = time.monotonic() - started
+        if invoke_error is not None:
+            # The caller's exception is the one that has to survive intact, so
+            # the diagnosis rides along as a note (PEP 678): it changes neither
+            # the type, the args, the string, nor anything an ``except`` can
+            # match on.  ``add_note`` itself is suppressed for the same reason.
+            with suppress(Exception):
+                invoke_error.add_note(outcome.describe())
+        return outcome
+
+    def _observe_outbox_digest(
+        self,
         *,
         phase: SourceBrokerV2OutboxPhase,
-    ) -> bool:
-        del phase
-        return stop.wait(interval)
+        operation_id: str,
+    ) -> str:
+        """Recompute the window digest here, under the write lock.
+
+        Taken inside ``BEGIN IMMEDIATE`` for the same reason the helper takes
+        it there: a digest read without the lock could be changed between the
+        read and the comparison by exactly the writer it is meant to catch.
+        """
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(HEARTBEAT_SELECT_SQL, (operation_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise SourceBrokerV2SagaIntegrityError("required outbox effect is missing")
+                self._validate_outbox_row(
+                    row, expected_phase=phase, expected_operation_id=operation_id
+                )
+                return stable_row_digest(row, cursor.description)
+            finally:
+                connection.rollback()
+
+    def close(self, *, reason: str = "saga-closed") -> _HeartbeatCloseOutcome:
+        """Release this saga's heartbeat helper.  Idempotent and bounded.
+
+        Bounded by ``T_close`` = EOF window + terminate + kill.  Idempotent in
+        both directions: a second call after a clean close returns the same
+        outcome, and a call after an orphaned one tries again, because an
+        orphan is precisely the state a later ``poll`` may resolve.
+
+        It raises only after the cleanup has finished, and never from a
+        ``finally``.  A session that is still running holds the gate, and this
+        refuses rather than pulling descriptors out from under it.
+        """
+
+        if not self._heartbeat_gate.acquire(blocking=False):
+            raise SourceBrokerV2SagaConflictError(
+                "outbox heartbeat session is still open; close is refused"
+            )
+        try:
+            self._heartbeat_state.operation_id = reason
+            outcome = _close_resources(self._heartbeat_state)
+            self._heartbeat_child = None
+            if not outcome.orphaned:
+                self._heartbeat_close_outcome = outcome
+                self._heartbeat_finalizer.detach()
+        finally:
+            self._heartbeat_gate.release()
+        self._sweep_orphaned_heartbeat_children()
+        if outcome.orphaned or self._orphaned_heartbeat_children:
+            raise SourceBrokerV2SagaUnavailableError(
+                f"{outcome.describe()}; {self._describe_orphaned_heartbeat_children()}"
+            )
+        return outcome
+
+    def __enter__(self) -> SourceBrokerV2Saga:
+        return self
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, traceback: object) -> bool:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if exc is None:
+                raise
+            # There is already an exception on its way out of the block and it
+            # is the one the caller reasons about; replacing it with a cleanup
+            # failure would hide the reason the block ended.
+            with suppress(Exception):
+                exc.add_note(f"saga close after the block's failure: {close_error!r}")
+        return False
 
     def _invoke_with_heartbeat(
         self,
@@ -3927,122 +4784,85 @@ class SourceBrokerV2Saga:
         invoke: Callable[[bytes], bytes],
     ) -> bytes:
         self._before_external_effect(phase)
-        stop = Event()
-        failures: list[BaseException] = []
-        interval = self._executor_lease_seconds / 3
-        progress = _HeartbeatProgress()
-        heartbeat_connection = _HeartbeatConnection()
-
-        def renew() -> None:
-            while True:
-                progress.mark("waiting")
-                if self._wait_for_heartbeat(stop, interval, phase=phase):
-                    break
-                if stop.is_set():
-                    # The wait can expire at the instant the shutdown sets
-                    # ``stop``.  Starting another write on that edge only
-                    # lengthens the shutdown that is already waiting for it.
-                    break
-                progress.mark("outbox-write")
-                try:
-                    self._heartbeat_outbox(
-                        phase=phase,
-                        operation_id=operation_id,
-                        owner_generation=owner_generation,
-                        mark_stage=progress.mark,
-                        bind_connection=heartbeat_connection.bind,
-                    )
-                except BaseException as exc:
-                    # ``sqlite_errorcode`` is set by SQLite itself; an
-                    # ``OperationalError`` raised anywhere else carries no code
-                    # and is a real failure, so it is read defensively rather
-                    # than assumed - reading it directly would turn such a
-                    # failure into an ``AttributeError`` inside this handler.
-                    if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
-                        # The shutdown waiting on this thread ended the
-                        # statement on purpose; stopping is what it asked for,
-                        # so it is not a heartbeat failure.  SQLite has already
-                        # rolled this renewal back - nothing is half written.
-                        progress.mark("interrupted")
-                        return
-                    progress.mark("failed")
-                    failures.append(exc)
-                    stop.set()
-                    return
-                progress.completed_tick()
-            progress.mark("stopped")
-
-        heartbeat = Thread(
-            target=renew,
-            name=f"rquant-source-broker-v2-heartbeat-{operation_id[:12]}",
-            daemon=True,
-        )
-        heartbeat.start()
-        # ``stop`` ends the wait between ticks at once, so this budget has one
-        # job: cover the single renewal that may already be inside
-        # ``_heartbeat_outbox``.  That body's own bound is a write-lock wait of
-        # ``busy_timeout_ms`` plus the durable tail behind it, so the budget is
-        # derived from it (see ``_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS``) instead of
-        # from a fixed 0.1s floor that was unrelated to what it waits on.
-        # The derived term comes first on purpose: ``_configure`` only rejects a
-        # lease of zero or less, so a NaN lease reaches this line, and ``max``
-        # keeps its first argument when the comparison against NaN is false.
-        # Ordered the other way the budget is NaN and ``join(timeout=nan)``
-        # raises inside the ``finally``, where ``is_alive()`` is never reached.
-        shutdown_budget = max(
-            _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
-            interval * 2,
-        )
-        report: str | None = None
-        invoke_error: BaseException | None = None
+        self._require_takeable_saga()
+        if not self._heartbeat_gate.acquire(blocking=False):
+            raise SourceBrokerV2SagaConflictError("outbox heartbeat session already open")
         try:
-            result = invoke(payload)
-        except BaseException as exc:
-            invoke_error = exc
-            raise
-        finally:
-            stop_requested_at = time.monotonic()
-            stop.set()
-            heartbeat.join(timeout=shutdown_budget)
-            budget_expired_at = time.monotonic()
-            if heartbeat.is_alive():
-                # Past the budget the renewal is late, and this method may not
-                # hand a live heartbeat back to its caller.  Interrupt what the
-                # thread is inside, then join with no timeout: the abort makes
-                # the statement fail at its next step, ``renew`` sees ``stop``
-                # and returns, and what the interrupt cannot cut short is the
-                # same ``busy_timeout`` lock wait plus durable tail the budget
-                # is derived from.  Done here rather than after the ``try`` so
-                # a raising ``invoke`` also leaves nothing running.  The report
-                # is only built here; the raise for it is outside, because
-                # raising from a ``finally`` displaces the caller's exception.
-                overdue = progress.describe(budget_expired_at)
-                reached_connection = heartbeat_connection.interrupt()
-                heartbeat.join()
-                stopped_at = time.monotonic()
-                report = (
-                    f"outbox heartbeat did not stop after {phase.value} "
-                    f"(waited {budget_expired_at - stop_requested_at:.3f}s of a "
-                    f"{shutdown_budget:.3f}s budget; {overdue}; interrupt "
-                    f"{reached_connection}, then joined "
-                    f"{stopped_at - budget_expired_at:.3f}s more, ending in stage "
-                    f"{progress.stage!r})"
+            token = uuid4().hex
+            interval = self._executor_lease_seconds / 3
+            helper, restarts = self._open_heartbeat_session(
+                token=token,
+                phase=phase,
+                operation_id=operation_id,
+                owner_generation=owner_generation,
+                interval=interval,
+            )
+            invoke_error: BaseException | None = None
+            try:
+                # A session start may legitimately spend seconds - a restart
+                # costs a terminate, a kill and a second handshake - and the
+                # lease that covers this invocation was last renewed before all
+                # of it.  One owner-and-generation guarded renewal here means
+                # the window opens on a lease this executor demonstrably still
+                # holds, rather than on one that may already have been taken.
+                #
+                # Its cost is a term in the stated bound, not an aside: see
+                # ``_heartbeat_fresh_lease_budget``, which is why
+                # ``T_session_start`` is 30.30s on production defaults and not
+                # the 25.30s the handshake alone would give.
+                self._heartbeat_outbox(
+                    phase=phase,
+                    operation_id=operation_id,
+                    owner_generation=owner_generation,
                 )
-                if invoke_error is not None:
-                    # The caller's exception is the one that has to survive, so
-                    # the report below is never raised on this path - it rides
-                    # along instead (PEP 678), which changes neither the type
-                    # nor anything an ``except`` can match on.  Raising from a
-                    # ``finally`` would displace the caller's exception, and so
-                    # would letting ``add_note`` itself escape.
-                    with suppress(Exception):
-                        invoke_error.add_note(report)
-        if report is not None:
-            raise SourceBrokerV2SagaUnavailableError(report)
-        if failures:
+                result = invoke(payload)
+            except BaseException as exc:
+                invoke_error = exc
+                raise
+            finally:
+                outcome = self._close_heartbeat_session(
+                    helper, token, invoke_error, restarts=restarts
+                )
+                self._last_heartbeat_session = outcome
+        finally:
+            self._heartbeat_gate.release()
+
+        # Every raise below is outside the ``finally`` above, and the order is
+        # fixed: an unconfirmed kill outranks an unacknowledged session, which
+        # outranks a failed renewal, which outranks the digest - so a lease
+        # that was legitimately taken over is still reported as the conflict it
+        # has always been, not as a tamper.
+        if outcome.orphaned:
+            raise SourceBrokerV2SagaUnavailableError(outcome.describe())
+        if not outcome.acked:
+            raise SourceBrokerV2SagaUnavailableError(outcome.describe())
+        if not outcome.renewal_ok:
+            cause = (
+                None if outcome.failure is None else outcome.failure.rebuild()
+            )
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat failed during {phase.value}"
-            ) from failures[0]
+            ) from cause
+        if outcome.ticks >= 1:
+            # With no tick there is no sample, and this session's resolution is
+            # then exactly what it was before there was a helper at all: the
+            # full validation chain on both edges of the window and nothing in
+            # between.  Comparing a digest that was never taken would fail
+            # every ordinary invocation, because the production lease makes
+            # zero ticks the common case.
+            outcome.observed_digest = self._observe_outbox_digest(
+                phase=phase, operation_id=operation_id
+            )
+            outcome.digest_mismatch = (
+                outcome.last_digest != outcome.first_digest
+                or outcome.last_digest != outcome.observed_digest
+            )
+            if outcome.digest_changed or outcome.digest_mismatch:
+                raise SourceBrokerV2SagaUnavailableError(
+                    f"outbox row changed during {phase.value}"
+                ) from SourceBrokerV2SagaIntegrityError(outcome.describe())
+        if not outcome.child_alive:
+            raise SourceBrokerV2SagaUnavailableError(outcome.describe())
         return result
 
     def _begin_outbox(
@@ -4272,53 +5092,44 @@ class SourceBrokerV2Saga:
         operation_id: str,
         owner_generation: int,
         mark_stage: Callable[[str], None] = _no_heartbeat_stage,
-        bind_connection: Callable[[sqlite3.Connection | None], None] = _no_heartbeat_connection,
-    ) -> None:
+    ) -> str:
+        """Renew this executor's lease once, synchronously, in this process.
+
+        The statement, its owner and generation guard and its rowcount check
+        are the shared ones the helper runs - the same objects, not a copy - so
+        a renewal written here and a renewal written there cannot drift apart.
+        The full validation chain runs here because this process has it; the
+        helper runs the structural subset and samples the rest by digest.
+        """
+
         current_time = datetime.now(UTC)
         expires_at = current_time + timedelta(seconds=self._executor_lease_seconds)
         mark_stage("connect")
         with self._connect() as connection:
-            # Published before the first statement so the shutdown waiting on
-            # this thread can end whatever it is inside, and withdrawn before
-            # ``_connect`` closes it so no shutdown reaches a connection this
-            # body has already finished with.
-            bind_connection(connection)
             try:
-                mark_stage("lock-wait")
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    mark_stage("read")
-                    self._read_outbox(
-                        connection,
-                        operation_id=operation_id,
-                        phase=phase,
-                    )
-                    mark_stage("update")
-                    updated = connection.execute(
-                        "UPDATE source_broker_v2_outbox SET executor_heartbeat_at = ?, "
-                        "executor_lease_expires_at = ? WHERE operation_id = ? "
-                        "AND status = 'pending' AND executor_owner_token = ? "
-                        "AND executor_generation = ?",
-                        (
-                            current_time.isoformat(),
-                            expires_at.isoformat(),
-                            operation_id,
-                            self._executor_owner_token,
-                            owner_generation,
-                        ),
-                    ).rowcount
-                    if updated != 1:
-                        raise SourceBrokerV2SagaConflictError(
-                            "outbox executor lost ownership before heartbeat"
-                        )
-                    mark_stage("commit")
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
-                mark_stage("close")
-            finally:
-                bind_connection(None)
+                return heartbeat_write(
+                    connection,
+                    now_iso=current_time.isoformat(),
+                    expires_iso=expires_at.isoformat(),
+                    operation_id=operation_id,
+                    owner_token=self._executor_owner_token,
+                    owner_generation=owner_generation,
+                    phase=phase.value,
+                    saga_id=self.saga_id,
+                    validate=lambda row: self._validate_outbox_row(
+                        row, expected_phase=phase, expected_operation_id=operation_id
+                    ),
+                    mark_stage=mark_stage,
+                )
+            except HeartbeatOwnershipError as exc:
+                raise SourceBrokerV2SagaConflictError(
+                    "outbox executor lost ownership before heartbeat"
+                ) from exc
+            except HeartbeatProtocolError as exc:
+                # The shared write reports a missing row in its own vocabulary;
+                # in this process that has always been an integrity failure and
+                # callers match on it.
+                raise SourceBrokerV2SagaIntegrityError("required outbox effect is missing") from exc
 
     def _release_outbox_lease(
         self,
