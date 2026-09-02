@@ -5139,7 +5139,13 @@ def test_v2_saga_reuses_one_helper_across_sessions_and_closes_it_explicitly(
     assert second.restarts == 0
     assert second.shutdown_seconds < 1.0
 
-    _wp9_witness_no_renewal_after_the_session(saga, operation_id, interval=interval)
+    if not first_session_fails:
+        # The external witness runs once for this case, not once per
+        # parametrisation: it is a statement about renewals stopping when a
+        # session ends, and the second parametrisation is about a helper
+        # surviving a failed renewal.  Holding the write lock for two intervals
+        # twice bought nothing and cost a third of a second.
+        _wp9_witness_no_renewal_after_the_session(saga, operation_id, interval=interval)
 
     pid = second.child_pid
     assert pid is not None
