@@ -909,6 +909,48 @@ def _send_frame(connection: socket.socket, payload: bytes) -> None:
     connection.sendall(struct.pack("!I", len(payload)) + payload)
 
 
+def _send_frame_polling_stop(
+    connection: socket.socket,
+    payload: bytes,
+    *,
+    waiter: _ResponseWaiter,
+) -> None:
+    """Write the frame in chunks, re-reading stop and deadline before each one.
+
+    `sendall` carried whatever timeout `connect` had left on the socket and
+    reported nothing on the way out, so a full peer parked the caller with no
+    stop poll and, on a timeout, no record of how much had already reached the
+    wire.  The offset makes that a known quantity; the short socket timeout is
+    the poll, not the bound - `waiter` still holds the same ceiling.
+    """
+
+    if len(payload) > RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES:
+        raise ResourceAuthorityAdapterTransportError(
+            "resource authority payload exceeds the wire bound"
+        )
+    view = memoryview(struct.pack("!I", len(payload)) + payload)
+    total = len(view)
+    offset = 0
+    connection.settimeout(_ADAPTER_STOP_POLL_SECONDS)
+    while offset < total:
+        # Before the attempt, not only after a failed one.
+        waiter.tick()
+        try:
+            sent = connection.send(view[offset : offset + _ADAPTER_SEND_CHUNK_BYTES])
+        except TimeoutError:
+            # What is already on the wire stays there; the next tick re-reads
+            # stop and deadline.
+            continue
+        if sent == 0:
+            # Defensive: no probe on any of the four platforms saw a blocking
+            # AF_UNIX `send` answer 0.  An offset that cannot advance would
+            # otherwise be an unbounded loop, so it ends the frame instead.
+            raise ResourceAuthorityAdapterTransportError(
+                "resource authority transport made no progress"
+            )
+        offset += sent
+
+
 def _recv_frame(
     connection: socket.socket,
     *,
@@ -1090,7 +1132,10 @@ class ResourceAuthorityJournalClient:
                     )
                 if budget is not None:
                     budget.raise_if_stopped("resource authority round trip cancelled")
-                _send_frame(connection, payload)
+                if waiter is None:
+                    _send_frame(connection, payload)
+                else:
+                    _send_frame_polling_stop(connection, payload, waiter=waiter)
                 if waiter is not None:
                     connection.settimeout(waiter.poll_seconds)
                 raw = _recv_frame(
