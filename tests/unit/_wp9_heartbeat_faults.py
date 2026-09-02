@@ -61,6 +61,10 @@ IDLE_POLL_SECONDS = 1.0
 # seconds - and short enough that a mutation which breaks the escalation cannot
 # leave a SIGTERM-ignoring process on a developer's machine for an hour.
 DEFAULT_STALL_SECONDS = 120.0
+# The busy_timeout the foreign-lock fault opens its own connection with.  It has
+# to be far longer than any shutdown budget a case configures, so that the wait
+# ending by itself is never the reason the shutdown ended.
+_FOREIGN_LOCK_TIMEOUT_SECONDS = 60.0
 _STALL_DEADLINE_EXIT_CODE = 70
 _GO_MARKER_TIMEOUT_SECONDS = 60.0
 DIGEST_EXCLUDED_COLUMNS = ("executor_heartbeat_at", "executor_lease_expires_at")
@@ -81,6 +85,7 @@ _SIGTERM_IGNORING_FAULTS = (
     "stall-before-connect",
     "stall-before-commit",
     "stall-after-commit",
+    "stall-in-foreign-lock-wait",
 )
 
 # Faults that act during a renewal rather than during the handshake, and so
@@ -90,6 +95,8 @@ _GATED_FAULTS = (
     "stall-before-connect",
     "stall-before-commit",
     "stall-after-commit",
+    "stall-in-foreign-lock-wait",
+    "pin-in-lock-wait",
 )
 
 FAULT_MODES = (
@@ -101,9 +108,12 @@ FAULT_MODES = (
     "no-ack",
     "exit-after-ack",
     "fail-renewal",
+    "never-renews",
+    "pin-in-lock-wait",
     "stall-before-connect",
     "stall-before-commit",
     "stall-after-commit",
+    "stall-in-foreign-lock-wait",
 )
 
 
@@ -232,6 +242,36 @@ def _arrive_and_block(marker: str, stall_seconds: float) -> None:
     fcntl.flock(handle, fcntl.LOCK_EX)
     # Only reachable if the case released the lock, which no case does; the
     # helper is meant to be killed while it is in the call above.
+    while True:
+        time.sleep(1.0)
+
+
+def _block_on_a_foreign_write_lock(marker: str, stall_seconds: float) -> None:
+    """Wait for a write lock on a database that is not the saga's.  Never returns.
+
+    The point is a lock wait whose window is decided by *somebody else's*
+    connection: this one is opened with a `busy_timeout` far longer than the
+    saga's shutdown budget, so the caller's bound cannot be the lock wait
+    ending on its own.  Only the kill can end it.
+
+    Same deadline discipline as the flock stalls, and for the same reason -
+    this fault ignores SIGTERM.
+    """
+
+    connection = sqlite3.connect(
+        marker + ".contended",
+        timeout=_FOREIGN_LOCK_TIMEOUT_SECONDS,
+        isolation_level=None,
+    )
+    connection.execute(f"PRAGMA busy_timeout = {int(_FOREIGN_LOCK_TIMEOUT_SECONDS * 1000)}")
+
+    def give_up(_signal: int, _frame: object) -> None:
+        os._exit(_STALL_DEADLINE_EXIT_CODE)
+
+    signal.signal(signal.SIGALRM, give_up)
+    signal.setitimer(signal.ITIMER_REAL, stall_seconds)
+    _announce(marker)
+    connection.execute("BEGIN IMMEDIATE")
     while True:
         time.sleep(1.0)
 
@@ -422,6 +462,22 @@ def main(argv: list[str] | None = None) -> int:
             fault_now = fault
         else:
             fault_now = fault
+        if fault_now == "never-renews":
+            # Protocol-correct and completely idle: the session is
+            # acknowledged and the end frame will be answered, but this helper
+            # never touches the database.  That hands the renewal schedule back
+            # to the case, which is what the direct-call migrations need.
+            session["open"] = False
+            continue
+        if fault_now == "stall-in-foreign-lock-wait":
+            assert args.fault_marker is not None
+            _block_on_a_foreign_write_lock(args.fault_marker, args.stall_seconds)
+        if fault_now == "pin-in-lock-wait":
+            # Announce first, then run a real renewal that will sit in
+            # `BEGIN IMMEDIATE` behind the lock the case is holding.  Unlike
+            # the stalls this one is meant to finish once the case lets go.
+            assert args.fault_marker is not None
+            _announce(args.fault_marker)
         if fault_now == "fail-renewal":
             session["open"] = False
             session["outcome"] = "failed"
