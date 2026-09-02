@@ -1,0 +1,28 @@
+name: WP9 Linux probes
+
+# One-off branch only: gathers the Linux facts the WP9 v4 design needs
+# (RQ-WP9-DESIGN-P1-01 / P1-05 / P1-06).  Not part of the normal CI surface.
+on:
+  push:
+    branches: [cc/20260902-wp9-linux-probes]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Environment facts
+        run: |
+          python -VV
+          uname -a
+          nproc
+          python -c "import sqlite3; print('sqlite', sqlite3.sqlite_version)"
+      - name: Run WP9 v4 probes
+        run: python wp9-probes/linux/run_all.py
