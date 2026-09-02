@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import multiprocessing
 import os
+import select
 import socket
 import sqlite3
 import tempfile
@@ -1830,5 +1831,191 @@ def test_wp9b_connect_remembers_success_when_a_second_connect_would_answer_eagai
         # `reserve` plus the fenced `lookup-latest`, one connect attempt each.
         assert len(made) == 2
         assert [seam.connect_attempts for seam in made] == [1, 1]
+    finally:
+        server.close()
+
+
+def _full_peer_pair() -> tuple[socket.socket, socket.socket]:
+    """An AF_UNIX pair whose peer receive buffer is full.
+
+    The adapter builds its own client socket inside the round trip, so the
+    client's ``SO_SNDBUF`` is only reachable through the seam - which is why
+    this pair is handed to ``_socket_factory`` rather than dialled.  Both
+    directions are shrunk and then filled from the client end in small pieces,
+    so a later drain of one piece frees a bounded, sub-frame window on either
+    kernel (macOS accounts by ``SO_SNDLOWAT``, Linux by whole skbs).
+    """
+
+    client, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with suppress(OSError):  # a kernel is free to clamp to its own floor
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512)
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512)
+    client.setblocking(False)
+    filled = 0
+    with suppress(BlockingIOError):
+        while filled < 1 << 20:
+            filled += client.send(b"\0" * 512)
+    assert filled > 0, "the pair never accepted a byte"
+    client.setblocking(True)
+    return client, peer
+
+
+def _open_a_sub_frame_window(client: socket.socket, peer: socket.socket) -> int:
+    """Drain the least the kernel needs before it calls ``client`` writable.
+
+    Draining in small steps and stopping at the first writable poll keeps the
+    freed window far below one frame, so the send that follows makes partial
+    progress and the one after it blocks again.
+    """
+
+    drained = 0
+    while drained < 2_048:
+        drained += len(peer.recv(128))
+        if select.select((), (client,), (), 0)[1]:
+            break
+    return drained
+
+
+def test_wp9b_send_answers_a_stop_authority_between_two_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-2: a stop raised mid-frame is answered on the next poll.
+
+    ``_send_frame`` used to be one ``sendall`` carrying the socket timeout that
+    was set for *connect*, so a full peer parked the caller there with no stop
+    poll and no record of how much had already reached the wire.
+    """
+
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    client, peer = _full_peer_pair()
+    try:
+        seen = _record_handled(server)
+        made: list[_SeamSocket] = []
+
+        def open_a_window_before_the_second_chunk(call_index: int) -> int | None:
+            if call_index == 1:
+                _open_a_sub_frame_window(client, peer)
+            return None  # never script the return value: the kernel answers
+
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                client,
+                connect_codes=lambda _attempt: 0,  # the pair is already connected
+                send_bytes=open_a_window_before_the_second_chunk,
+            ),
+        )
+
+        def stop_once_a_chunk_reached_the_wire() -> bool:
+            # The seam is the partial write, not a clock: only a poll taken
+            # between two chunks can observe it.
+            return bool(made) and made[0].sent_bytes > 0
+
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionCancelledError):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+                stop_requested=stop_once_a_chunk_reached_the_wire,
+            )
+        elapsed = time.monotonic() - started
+        assert len(made) == 1
+        seam = made[0]
+        assert seam.sendall_calls == 0
+        assert seam.send_timeouts >= 1, "the full peer never blocked the send"
+        assert seam.sent_bytes > 0, "the offset never advanced"
+        assert seam.sent_bytes < seam.first_chunk_bytes, "the whole frame left before the stop"
+        assert seen == []
+        assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
+    finally:
+        peer.close()
+        client.close()
+        server.close()
+
+
+def test_wp9b_send_charges_an_exhausted_budget_to_the_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-3 (send phase): the same classification change, on the other half."""
+
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    client, peer = _full_peer_pair()
+    try:
+        seen = _record_handled(server)
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(client, connect_codes=lambda _attempt: 0),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionLockWaitTimeoutError) as caught:
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=0.05,
+            )
+        elapsed = time.monotonic() - started
+        assert not isinstance(caught.value, ResourceAuthorityAdapterTransportError)
+        assert made[0].send_timeouts >= 2
+        assert seen == []
+        assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
+    finally:
+        peer.close()
+        client.close()
+        server.close()
+
+
+def test_wp9b_a_send_that_makes_no_progress_fails_typed_instead_of_looping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-5: ``send`` returning 0 must end the frame, not repeat it forever.
+
+    No platform probe ever saw a blocking AF_UNIX ``send`` answer 0; this is
+    the guard rail for the offset that cannot advance, so the case bounds
+    itself and fails loudly rather than hanging if the guard is gone.
+    """
+
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        seen = _record_handled(server)
+
+        def never_makes_progress(call_index: int) -> int:
+            assert call_index < 8, "the zero-progress guard is missing"
+            return 0
+
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(_unix_socket(), send_bytes=never_makes_progress),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        with pytest.raises(ResourceAuthorityAdapterTransportError, match="made no progress"):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+            )
+        assert made[0].send_calls == 1
+        assert made[0].sendall_calls == 0
+        assert seen == []
     finally:
         server.close()
