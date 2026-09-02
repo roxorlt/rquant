@@ -912,6 +912,7 @@ def probe_parent_death_exit_watch(root):
     assert isinstance(report, dict), f"no report from helper-parent: {report!r}"
     helper_pid = report["ready"]["pid"]
     ready_frame_keys = sorted(report["ready"])
+    stop_ino = report["stop_ino"]          # from the TEST-owned middle layer, not the helper
 
     created = process_create_time(helper_pid)
     kind, waiter = open_exit_watch(helper_pid)
@@ -936,8 +937,13 @@ def probe_parent_death_exit_watch(root):
 
     external = external_fd_view(helper_pid)
     linux_fd_rows = [row for row in external.get("rows", []) if isinstance(row, dict)]
-    read_only_pipes = [row for row in linux_fd_rows if row.get("accmode") == "r" and
-                       str(row.get("target", "")).startswith("pipe:")]
+    stop_rows = [row for row in linux_fd_rows if row.get("ino") == stop_ino]
+    # Linux-only strong assertion (I-4): exactly one fd on the stop pipe, read-only.
+    stop_fd_assertion = (
+        "n/a (no /proc)"
+        if external["source"] != "/proc"
+        else ("ok" if len(stop_rows) == 1 and stop_rows[0]["accmode"] == "r" else "VIOLATED")
+    )
     created_before_kill = process_create_time(helper_pid)
 
     os.kill(parent.pid, signal.SIGKILL)
@@ -968,14 +974,15 @@ def probe_parent_death_exit_watch(root):
         and before == after
         and integrity == "ok"
         and ready_frame_keys == ["pid", "protocol", "t"]     # production frame shape, no fd list
+        and stop_fd_assertion in {"ok", "n/a (no /proc)"}
     )
     record(
         "parent_death_exit_watch",
         ok,
         f"three-fd production-shaped helper; exit observed via {kind} in "
         f"{helper_exit_seconds:.4f}s after the parent was SIGKILLed; identity "
-        f"{created!r} unchanged; write lock free in {lock_probe['elapsed_ms']}ms; "
-        f"no tick in {3 * interval:.1f}s afterwards",
+        f"{created!r} unchanged; stop-pipe fd assertion {stop_fd_assertion}; write lock "
+        f"free in {lock_probe['elapsed_ms']}ms; no tick in {3 * interval:.1f}s afterwards",
         {
             "watch_kind": kind,
             "helper_pid": helper_pid,
@@ -991,8 +998,10 @@ def probe_parent_death_exit_watch(root):
             "row_after": list(after),
             "quiet_window_s": round(3 * interval, 3),
             "integrity_check": integrity,
+            "stop_pipe_ino_from_test_layer": stop_ino,
+            "stop_fd_assertion": stop_fd_assertion,
+            "external_stop_pipe_rows": stop_rows,
             "external_fd_view_source": external["source"],
-            "external_read_only_pipe_fds": read_only_pipes,
             "external_fd_rows": linux_fd_rows or external.get("rows", [])[:40],
         },
     )

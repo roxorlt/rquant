@@ -61,9 +61,21 @@ def main():
         buf += chunk
     ready = json.loads(buf.split(b"\n", 1)[0])
 
+    # The middle layer is a TEST-owned file, so it may report the stop pipe's
+    # inode.  Both ends of a pipe share one inode, so its own stop_w is enough:
+    # the supervisor never needs anything from the production helper for this.
     os.write(
         report_w,
-        (json.dumps({"helper_parent_pid": os.getpid(), "ready": ready}) + "\n").encode("utf-8"),
+        (
+            json.dumps(
+                {
+                    "helper_parent_pid": os.getpid(),
+                    "stop_ino": os.fstat(stop_w).st_ino,
+                    "ready": ready,
+                }
+            )
+            + "\n"
+        ).encode("utf-8"),
     )
     deadline = time.monotonic() + 120.0
     while time.monotonic() < deadline:
