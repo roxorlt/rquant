@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from rquant import lab_resource_authority_adapter as adapter_module
 from rquant.lab_resource_authority_adapter import (
+    _ADAPTER_SEND_CHUNK_BYTES,
     LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
     LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
     LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
@@ -44,13 +45,16 @@ from rquant.lab_resource_authority_adapter import (
     ResourceAuthorityJournalClient,
     ResourceAuthorityJournalSocketServer,
     ResourceJournalExternalRootReceipt,
+    _CallerBudget,
     _decode,
     _encode,
     _operation_id,
     _recv_frame,
     _reservation_shell,
+    _ResponseWaiter,
     _secure_socket_path,
     _send_frame,
+    _send_frame_polling_stop,
     compose_production_resource_authority_socket_server,
 )
 from rquant.resource_admission import (
@@ -1889,31 +1893,58 @@ def _full_peer_pair() -> tuple[socket.socket, socket.socket]:
     return client, peer
 
 
-def _open_a_sub_frame_window(client: socket.socket, peer: socket.socket) -> int:
+def _open_a_sub_chunk_window(client: socket.socket, peer: socket.socket) -> int:
     """Drain the least the kernel needs before it calls ``client`` writable.
 
-    Draining in small steps and stopping at the first writable poll keeps the
-    freed window far below one frame, so the send that follows makes partial
-    progress and the one after it blocks again.
+    How much that is differs by kernel, and neither answer is small:
+
+    * Linux calls an AF_UNIX socket writable only once
+      ``sk_wmem_alloc * 4 <= sk_sndbuf``, and it raises ``SO_SNDBUF`` to
+      ``SOCK_MIN_SNDBUF`` (4608 on the probed CI kernels, design §7.4), so the
+      first writable poll already implies roughly 3.4 KiB of room and the drain
+      has to get that far - a 2 KiB cap would never see a writable socket.
+    * macOS uses ``SO_SNDLOWAT``, which tracks ``min(SO_SNDBUF, 2048)``; with
+      this pair's 512-byte ``SO_SNDBUF`` that is 512.
+
+    Either way the window stays below ``_ADAPTER_SEND_CHUNK_BYTES`` (16 KiB),
+    which is what the caller relies on: one chunk cannot complete, so the send
+    that follows makes *partial* progress and the one after it blocks again.
+    The peer is drained non-blocking so an empty queue ends the loop instead of
+    parking the test.
     """
 
     drained = 0
-    while drained < 2_048:
-        drained += len(peer.recv(128))
-        if select.select((), (client,), (), 0)[1]:
-            break
+    peer.setblocking(False)
+    try:
+        while drained < 128 * 1024:
+            try:
+                chunk = peer.recv(512)
+            except BlockingIOError:  # nothing left to free
+                break
+            if not chunk:  # pragma: no cover - the pair is open for the test
+                break
+            drained += len(chunk)
+            if select.select((), (client,), (), 0)[1]:
+                break
+    finally:
+        peer.setblocking(True)
     return drained
 
 
-def test_wp9b_send_answers_a_stop_authority_between_two_chunks(
+def test_wp9b_send_answers_a_stop_authority_while_the_frame_is_stuck(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """P2-2: a stop raised mid-frame is answered on the next poll.
+    """P2-2, round-trip half: a stop during the send phase, before the wire.
 
     ``_send_frame`` used to be one ``sendall`` carrying the socket timeout that
-    was set for *connect*, so a full peer parked the caller there with no stop
-    poll and no record of how much had already reached the wire.
+    was set for *connect*, so a peer whose receive buffer is full parked the
+    caller there with no stop poll at all.
+
+    A completely full peer is never writable on either kernel, so this half
+    needs no window arithmetic: the frame cannot move, and the only thing that
+    can end the wait is the poll taken between two ``send`` attempts.  The
+    chunk-level half below is what pins the *mid-frame* behaviour.
     """
 
     server = _Server(tmp_path, timeout_milliseconds=5_000)
@@ -1922,26 +1953,16 @@ def test_wp9b_send_answers_a_stop_authority_between_two_chunks(
     client, peer = _full_peer_pair()
     try:
         seen = _record_handled(server)
-        made: list[_SeamSocket] = []
-
-        def open_a_window_before_the_second_chunk(call_index: int) -> int | None:
-            if call_index == 1:
-                _open_a_sub_frame_window(client, peer)
-            return None  # never script the return value: the kernel answers
-
         made = _install_socket_seam(
             monkeypatch,
-            lambda: _SeamSocket(
-                client,
-                connect_codes=lambda _attempt: 0,  # the pair is already connected
-                send_bytes=open_a_window_before_the_second_chunk,
-            ),
+            # The pair is already connected; the seam only has to say so.
+            lambda: _SeamSocket(client, connect_codes=lambda _attempt: 0),
         )
 
-        def stop_once_a_chunk_reached_the_wire() -> bool:
-            # The seam is the partial write, not a clock: only a poll taken
-            # between two chunks can observe it.
-            return bool(made) and made[0].sent_bytes > 0
+        def stop_once_the_frame_is_stuck() -> bool:
+            # The seam is the blocked send, not a clock: the flip can only be
+            # observed by a poll taken after the attempt timed out.
+            return bool(made) and made[0].send_timeouts >= 1
 
         adapter = LabResourceAuthorityReservationAdapter(server.configuration)
         started = time.monotonic()
@@ -1953,24 +1974,77 @@ def test_wp9b_send_answers_a_stop_authority_between_two_chunks(
                 snapshot_provider=_snapshot,
                 lease_seconds=30,
                 lock_wait_timeout_seconds=1.0,
-                stop_requested=stop_once_a_chunk_reached_the_wire,
+                stop_requested=stop_once_the_frame_is_stuck,
             )
         elapsed = time.monotonic() - started
         assert len(made) == 1
         seam = made[0]
         assert seam.sendall_calls == 0
-        assert seam.send_timeouts >= 1, "the full peer never blocked the send"
-        assert seam.sent_bytes > 0, "the offset never advanced"
-        assert seam.sent_bytes < seam.first_chunk_bytes, "the whole frame left before the stop"
-        # The chunk that advanced the offset is the last one attempted: what
-        # follows a successful `send` is the poll, not another `send`.
-        assert seam.first_progress_call == seam.send_calls
+        assert seam.send_timeouts == 1, "the full peer never blocked the send"
+        assert seam.send_calls == 1, "the poll did not follow the blocked attempt"
+        assert seam.sent_bytes == 0
         assert seen == []
         assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
     finally:
         peer.close()
         client.close()
         server.close()
+
+
+def test_wp9b_send_polls_between_the_chunks_of_a_large_frame() -> None:
+    """P2-2, chunk half: the offset advances, and the poll follows the chunk.
+
+    Frame size is why this half drives ``_send_frame_polling_stop`` directly
+    instead of a ``reserve`` round trip.  A reserve frame is ~1.5 KiB, which is
+    *smaller than the window a Linux kernel can open*: writability there means
+    ``sk_wmem_alloc * 4 <= sk_sndbuf`` with ``SO_SNDBUF`` floored at
+    ``SOCK_MIN_SNDBUF`` = 4608 (design §7.4), so the first writable poll
+    already frees ~3.4 KiB and the whole request would leave in one ``send``.
+    "A window smaller than one reserve frame" is structurally unreachable on
+    Linux, so the frame is made larger than any window either kernel can open.
+
+    With a 256 KiB frame the two platform rules line up:
+    ``window <= 4.6 KiB`` (Linux) or ``<= 512 B`` (macOS ``SO_SNDLOWAT``, this
+    pair's ``SO_SNDBUF``) ``< _ADAPTER_SEND_CHUNK_BYTES`` (16 KiB)
+    ``<< len(frame)``.  One chunk cannot complete on either, so the send that
+    follows the window is partial by construction.
+    """
+
+    payload = b"\x5a" * (256 * 1024)
+    assert len(payload) < RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES
+    client, peer = _full_peer_pair()
+    seam = _SeamSocket(client)
+    try:
+
+        def open_a_window_before_the_second_chunk(call_index: int) -> int | None:
+            if call_index == 1:
+                _open_a_sub_chunk_window(client, peer)
+            return None  # never script the return value: the kernel answers
+
+        seam = _SeamSocket(client, send_bytes=open_a_window_before_the_second_chunk)
+        budget = _CallerBudget(
+            lock_wait_timeout_seconds=1.0,
+            # The seam is the partial write, not a clock: only a poll taken
+            # between two chunks can observe it.
+            stop_requested=lambda: seam.sent_bytes > 0,
+        )
+        waiter = _ResponseWaiter(budget=budget, config_seconds=5.0)
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionCancelledError):
+            _send_frame_polling_stop(seam, payload, waiter=waiter)
+        elapsed = time.monotonic() - started
+        assert seam.send_timeouts >= 1, "the full peer never blocked the send"
+        assert seam.first_chunk_bytes == _ADAPTER_SEND_CHUNK_BYTES
+        assert seam.sent_bytes > 0, "the offset never advanced"
+        assert seam.sent_bytes < seam.first_chunk_bytes, "one chunk left in a single send"
+        # The chunk that advanced the offset is the last one attempted: what
+        # follows a successful `send` is the poll, not another `send`.
+        assert seam.first_progress_call == seam.send_calls
+        assert seam.send_calls >= 2
+        assert elapsed < 0.5
+    finally:
+        peer.close()
+        client.close()
 
 
 def test_wp9b_send_charges_an_exhausted_budget_to_the_caller(
