@@ -65,6 +65,27 @@ UPDATE_SQL = (
 # thing that notices is the digest.
 TAMPER_COLUMN = "payload_hash"
 
+# Faults whose whole point is that the process cannot be asked to leave.  A
+# helper that honours SIGTERM exits at the first escalation step, which would
+# leave the SIGKILL stage untested - and that stage is the only reason a stuck
+# renewal has a bound at all.  Ignoring SIGTERM here is what makes the case go
+# all the way down the chain.
+_SIGTERM_IGNORING_FAULTS = (
+    "stall-before-connect",
+    "stall-before-commit",
+    "stall-after-commit",
+)
+
+# Faults that act during a renewal rather than during the handshake, and so
+# must wait for the case to open the window first.
+_GATED_FAULTS = (
+    "fail-renewal",
+    "stall-before-connect",
+    "stall-before-commit",
+    "stall-after-commit",
+    "tamper-self-healing",
+)
+
 FAULT_MODES = (
     "exit-immediately",
     "no-ready",
@@ -151,6 +172,30 @@ class _Reader:
         return self.eof and not self._buffer
 
 
+def _wait_for_go(marker: str) -> None:
+    """Block until the case says the window is open.
+
+    Every tick-time fault waits here first.  The parent runs one synchronous,
+    owner-guarded renewal between the session acknowledgement and the
+    invocation, and a fault that fired before that renewal would be racing it
+    rather than testing anything.  The case creates ``<marker>.go`` from inside
+    its own invocation, so the fault lands strictly inside the window.
+    """
+
+    deadline = time.monotonic() + 60.0
+    while not os.path.exists(marker + ".go"):
+        if time.monotonic() > deadline:
+            raise RuntimeError("fault helper waited for its go marker and never got one")
+        time.sleep(0.002)
+
+
+def _announce(marker: str) -> None:
+    """Exclusive create: the case is watching for exactly this file."""
+
+    descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(descriptor)
+
+
 def _arrive_and_block(marker: str) -> None:
     """Announce arrival, then wait on a lock the case holds.  Never returns.
 
@@ -161,8 +206,7 @@ def _arrive_and_block(marker: str) -> None:
     """
 
     handle = os.open(marker + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-    descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    os.close(descriptor)
+    _announce(marker)
     fcntl.flock(handle, fcntl.LOCK_EX)
     # Only reachable if the case released the lock, which no case does; the
     # helper is meant to be killed here.
@@ -326,8 +370,7 @@ def _run_self_healing_tamper(
     digest, connection = _renew(config, session)
     connection.close()
     _emit_tick(status_fd, session, digest)
-    descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    os.close(descriptor)
+    _announce(marker)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -340,6 +383,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     fault = args.fault
+    if fault in _SIGTERM_IGNORING_FAULTS:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if fault == "exit-immediately":
         return 0
     control_fd, status_fd, stop_fd = args.control_fd, args.status_fd, args.stop_fd
@@ -362,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
 
     session: dict[str, Any] | None = None
     next_tick_at = 0.0
+    # Every gated fault fires exactly once and then gets out of the way, so a
+    # case can follow "fail this renewal" with "and now serve the next session
+    # normally" on the same long-lived process.
+    fired: set[str] = set()
     while True:
         now = time.monotonic()
         if session is not None and session["open"]:
@@ -383,19 +432,33 @@ def main(argv: list[str] | None = None) -> int:
                 session = _new_session(frame)
                 next_tick_at = time.monotonic() + session["interval"]
                 if fault == "no-ack":
+                    # Models a session frame that reached a buffer nobody
+                    # processes: no acknowledgement, and no renewals either.
+                    session["open"] = False
                     continue
                 _write(status_fd, {"t": "session-ack", "token": session["token"]})
                 if fault == "exit-after-ack":
                     return 0
-                if fault == "tamper-self-healing":
-                    assert args.fault_marker is not None
-                    _run_self_healing_tamper(config, session, status_fd, args.fault_marker)
             elif frame["t"] == "end":
                 _write(status_fd, _end_ack(session, frame.get("token")))
                 session = None
         if session is None or not session["open"] or time.monotonic() < next_tick_at:
             continue
-        if fault == "fail-renewal":
+        if fault in _GATED_FAULTS and fault in fired:
+            fault_now = None
+        elif fault in _GATED_FAULTS:
+            assert args.fault_marker is not None
+            _wait_for_go(args.fault_marker)
+            fired.add(fault)
+            fault_now = fault
+        else:
+            fault_now = fault
+        if fault_now == "tamper-self-healing":
+            assert args.fault_marker is not None
+            _run_self_healing_tamper(config, session, status_fd, args.fault_marker)
+            session["open"] = False
+            continue
+        if fault_now == "fail-renewal":
             session["open"] = False
             session["outcome"] = "failed"
             _write(
@@ -408,15 +471,17 @@ def main(argv: list[str] | None = None) -> int:
                     "detail": "injected renewal failure",
                 },
             )
+            assert args.fault_marker is not None
+            _announce(args.fault_marker)
             continue
-        if fault == "stall-before-connect":
+        if fault_now == "stall-before-connect":
             assert args.fault_marker is not None
             _arrive_and_block(args.fault_marker)
-        if fault == "stall-before-commit":
+        if fault_now == "stall-before-commit":
             digest, connection = _renew(config, session, stop_before_commit=True)
             assert args.fault_marker is not None
             _arrive_and_block(args.fault_marker)
-        if fault == "stall-after-commit":
+        if fault_now == "stall-after-commit":
             digest, connection = _renew(config, session)
             _emit_tick(status_fd, session, digest)
             assert args.fault_marker is not None
