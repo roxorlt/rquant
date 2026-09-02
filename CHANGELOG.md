@@ -261,6 +261,48 @@
 
 ### Fixed
 
+- **资源权威 adapter 的建连与发包按 5 ms 轮询 stop（WP9b / RQ-WP9-DESIGN-P1-06）**：
+  `lab_resource_authority_adapter._call` 过去只有收包一侧（`_recv_exact`）每 5 ms 调
+  `waiter.tick()` 复查 stop 与 deadline，建连（一次阻塞 `connect`）和发包（一次 `sendall`，
+  且沿用 connect 那个大 timeout）整段不轮询，调用方在此期间置位 `stop_requested` 要等连接
+  落地或整段超时才被发现。现在这两段各自改成循环：`_connect_polling_stop` 在**每次
+  `connect_ex` 之前**、`_send_frame_polling_stop` 在**每次 `send` 之前**调用 `waiter.tick()`，
+  短 socket timeout 只当轮询周期用。**任何超时天花板都没有改动**——
+  `budget.transport_seconds(config_seconds)` 仍是唯一总上限。
+  - ⚠️ **分类变更声明（不是「零回归面」）**：把 `waiter.tick()` 放进 connect 与 send 循环，
+    会把「**调用方预算耗尽**」这一种失败**从 `TimeoutError → ResourceAuthorityAdapterTransportError`
+    改判为 `RuntimeResourceAdmissionLockWaitTimeoutError`**（`_ResponseWaiter.tick`）。语义上这是
+    **改进**：预算耗尽是调用方自己输掉的一次竞速，属于 retryable，本来就不该报成部署故障；
+    `RuntimeResourceAdmissionLockWaitTimeoutError` 是 `RuntimeResourceAdmissionTransientError`
+    的子类，`lab_worker` 因此不再把它读成永久配置错误。但它紧邻刚关闭的 P1-01 typed 分类，
+    故在此**显式声明**，不得称本次改动「零回归面」。
+  - **受影响范围：经 `LabResourceAuthorityReservationAdapter` 的每一次调用。** 它的 `reserve` /
+    `recheck` / `release`（`lab_resource_authority_adapter.py:1413` / `:1451` / `:1506`）
+    **无条件构造 `_CallerBudget`**——即使调用方既没传 `lock_wait_timeout_seconds` 也没传
+    `stop_requested`，`budget` 也不是 `None`，`waiter` 因此永不为 `None`，新循环照走。
+    （无预算时 `_deadline` 为 `None`，`tick()` 只剩 `_config_deadline` 一条判据，所以实际改判
+    只在调用方真的给了预算时才可能发生；但**代码路径**是所有 adapter 调用都改了。）
+    `waiter is None` 只剩 `ResourceAuthorityJournalClient` 的无预算调用，即 `lab_worker.py:1695`
+    与 `resource_authority_service.py:1104` 构造出的 client 上那些不带 `budget` 的方法
+    （`policy` / `probe` / `snapshot` / `admission` / `lookup`）。这条路径仍是原来的单次阻塞
+    `connect` / `sendall`，分类一个字都没变。回归护栏是
+    `test_wp9b_connect_charges_an_exhausted_budget_to_the_caller` 与
+    `test_wp9b_send_charges_an_exhausted_budget_to_the_caller`（两条都断言
+    `not isinstance(caught.value, ResourceAuthorityAdapterTransportError)`）。
+- **分块 `send` 记录 offset，`send` 返回 0 立即 typed 报错**：`sendall` 超时时报不出已写出多少
+  字节，只能折叠成一条 `ResourceAuthorityAdapterTransportError`；改成 16 KiB 分块后「已写多少」
+  成为已知量。`send` 返回 0 时抛
+  `ResourceAuthorityAdapterTransportError("resource authority transport made no progress")`，
+  杜绝 offset 不前进的无界循环（四平台探针从未观测到 `send` 返回 0，这是防御性护栏，不是实测路径）。
+- **非阻塞 connect 循环自己记住 `connected`，不以 `EISCONN` 反推**：Linux 实测
+  （3.11.16 / 3.12.14，run `33584787985`）显示 AF_UNIX 在 backlog 满时 `connect()` 回 `EAGAIN`
+  且 `select` 同时报可写，**已连接的 socket 再 `connect()` 也回 `EAGAIN` 而不是 `EISCONN`**
+  （macOS 回 `EISCONN`）。因此循环用自己的 `connected` 标志判成功；重试 errno 集合以
+  `EAGAIN`/`EWOULDBLOCK` 为实测项，`EINPROGRESS`/`EALREADY`/`EINTR` 为四平台均未观测到的
+  防御性条目。`_socket_factory` 是 `lab_resource_authority_adapter` 的**模块级测试缝**：
+  `ResourceAuthorityJournalClient` / `LabResourceAuthorityReservationAdapter` /
+  `ResourceAuthorityAdapterConfig` 的签名一个字段都没加，生产构造路径与改动前一致。
+
 - **source broker runner 的总单调 deadline 用例按宿主标定**：
   `test_total_monotonic_deadline_40ms_rejects_late_acceptance` 与
   `test_total_monotonic_deadline_allows_fast_native_chain` 过去把 40 ms / 150 ms 的墙钟字面值
