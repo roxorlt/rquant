@@ -689,10 +689,11 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
-    # Release B freezes the baseline to the merge commit PR #155 left on main. It is the
-    # merge base of the endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "2df97ed6045c4ab7efc676f31c742c97ae2193f4"
-    assert BASELINE_TREE_SHA == "1e145e8a2b84ea43934bdf5a1cdca5b591445cab"
+    # Each pull request refreezes the baseline to the merge commit its predecessor left on
+    # main; this one moves it from PR #155's to PR #157's. It is the merge base of the
+    # endpoints an R07 run states, not something rediscovered from a ref.
+    assert BASELINE_COMMIT_SHA == "6b89967f4c4fa5d563a861fdce82794517ade6c4"
+    assert BASELINE_TREE_SHA == "d7325e00251f39063fbeac23e23b8888318dd59d"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -785,8 +786,9 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     The construction this test used before is gone, and the reason matters. Under the old
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
-    the candidate reached exactly that state. Release B's baseline ``2df97ed`` does have
-    ``45d0b57c`` behind it, so on this repository the historical check is now implied by the
+    the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
+    including this topic's ``6b89967`` - does have ``45d0b57c`` behind it, so on this
+    repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
 
@@ -1479,15 +1481,17 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     architecture_paths = {
         entry.path for entry in policy.allowed_diff if entry.category == "architecture"
     }
-    assert "scripts/r07_ci_evidence.py" in architecture_paths
-    assert ".github/workflows/ci.yml" in architecture_paths
-    # Re-aimed for Release B. This used to name scripts/r07_deploy_gate.py, which was in the
-    # previous baseline's diff because that release created it; a refrozen baseline drops it
-    # from the allowlist and the sentence loses its truth value. The property it stood for -
-    # tooling that runs in the production chain but lives outside the declaration-scanned
-    # universe is categorized architecture, never production - is stated as the invariant it
-    # always was. The frozen category rules themselves are pinned by
-    # tests/unit/test_r07_policy_regenerate.py::test_diff_category_rules_are_frozen.
+    # Re-aimed twice now, for the same reason and by the same rule. Release B dropped
+    # scripts/r07_deploy_gate.py from this spot: it was in the previous baseline's diff only
+    # because that release created it, so a refrozen baseline left the sentence with no truth
+    # value. scripts/r07_ci_evidence.py and .github/workflows/ci.yml were named here on the
+    # same false premise and are dropped by the refreeze to 6b89967, which this topic does not
+    # touch either file across. Naming any path here asserts the shape of one particular diff,
+    # and the shape is not the property. The property - tooling that runs in the production
+    # chain but lives outside the declaration-scanned universe is categorized architecture,
+    # never production - is asserted below against whatever tooling this diff does contain,
+    # and the category rule for those two exact paths is pinned directly, independently of any
+    # diff, by tests/unit/test_r07_policy_regenerate.py::test_diff_category_rules_are_frozen.
     tooling = {
         entry.path
         for entry in policy.allowed_diff
@@ -1497,12 +1501,15 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     assert tooling <= architecture_paths
     assert not {path for path in architecture_paths if path.startswith(("src/", "tests/"))}
     # The negative control: an allowlist that quietly files one tooling path under a
-    # declaration-scanned category really does break the containment above.
+    # declaration-scanned category really does break the containment above. It relabels the
+    # tooling this diff actually has rather than assuming a scripts/ entry: with a baseline
+    # refrozen onto a topic that changed no script, "every scripts/ path" is the empty set,
+    # the copy is identical to the policy, and the control passes itself instead of the code.
     relabelled = policy.model_copy(
         update={
             "allowed_diff": tuple(
                 entry.model_copy(update={"category": "production"})
-                if entry.path.startswith("scripts/")
+                if entry.path in tooling
                 else entry
                 for entry in policy.allowed_diff
             )

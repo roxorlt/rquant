@@ -875,13 +875,68 @@ class PrivateSqlitePathAuthority:
             ):
                 raise ValueError(f"{self.label} managed trust root identity changed")
             self._managed_trust_root_generation = observed_root_generation
-        self._parent_generation = self._validate_parent_chain()
+        self._parent_generation = self._bind_unlocked_parent_chain()
         if not os.path.lexists(self.path):
             if not create_if_missing:
                 self._generation: PathGeneration | None = None
                 return
             self._create_private_file()
         self._generation = self._validate_file()
+
+    def _managed_trust_root_chain_index(self) -> int:
+        """Index of the managed trust root inside a validated parent chain.
+
+        ``_validate_parent_chain`` emits exactly one entry per component of
+        ``self.path.parent``, starting at the anchor, and the trust root is an
+        ancestor-or-self of that parent. The mapping is otherwise implicit, so
+        fix it here: a future change to the chain layout must fail loudly
+        instead of silently rebinding the wrong component.
+        """
+
+        index = len(self._managed_trust_root.parts) - 1
+        components = len(self.path.parent.parts)
+        if not 0 <= index < components:
+            raise ValueError(
+                f"{self.label} managed trust root sits at chain index {index}, "
+                f"outside its {components} parent components"
+            )
+        return index
+
+    def _bind_unlocked_parent_chain(self) -> tuple[PathGeneration, ...]:
+        """Bind the ancestry while no cross-process lock can be held.
+
+        Everything in this constructor runs before ``ArtifactReferenceStore``
+        takes its cross-process writer flock, and the managed trust root is a
+        directory shared with every other writer: any peer that creates or
+        removes SQLite ``-wal``/``-shm`` sidecars bumps its ``st_ctime_ns``
+        here. A ctime bound in this window is therefore not a fence, only a
+        tripwire that kills legitimate writers before they reach the credential
+        check (issue #158). Bind one self-consistent observation instead.
+
+        Nothing else is relaxed: ``_validate_parent_chain`` still rejects
+        symlinks and non-directories, still enforces owner and ``0o700`` mode
+        below the trust root, and still compares the trust root on ``(st_dev,
+        st_ino)``. ctime strictness is retained everywhere a lock is held --
+        ``assert_current`` and the rebind path are untouched.
+        """
+
+        index = self._managed_trust_root_chain_index()
+        observed = self._validate_parent_chain(allow_managed_trust_root_ctime_change=True)
+        components = len(self.path.parent.parts)
+        if len(observed) != components:
+            raise ValueError(
+                f"{self.label} parent chain returned {len(observed)} entries "
+                f"for {components} path components"
+            )
+        root_generation = observed[index]
+        if _node_identity(root_generation) != _node_identity(self._managed_trust_root_generation):
+            raise ValueError(
+                f"{self.label} managed trust root inode changed at chain index {index}: "
+                f"expected dev/ino {_node_identity(self._managed_trust_root_generation)}, "
+                f"observed {_node_identity(root_generation)}"
+            )
+        self._managed_trust_root_generation = root_generation
+        return observed
 
     def _validate_managed_trust_root(
         self,
@@ -899,9 +954,16 @@ class PrivateSqlitePathAuthority:
         except OSError as exc:
             raise ValueError(f"{self.label} managed trust root is missing or unsafe") from exc
         if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
-            raise ValueError(f"{self.label} managed trust root is a symlink or unsafe")
+            raise ValueError(
+                f"{self.label} managed trust root is a symlink or unsafe: "
+                f"expected a directory, observed mode {stat.S_IFMT(observed.st_mode):#o}"
+            )
         if observed.st_uid != os.geteuid() or stat.S_IMODE(observed.st_mode) != 0o700:
-            raise ValueError(f"{self.label} managed trust root owner or mode is unsafe")
+            raise ValueError(
+                f"{self.label} managed trust root owner or mode is unsafe: "
+                f"expected uid {os.geteuid()} mode 0o700, observed uid {observed.st_uid} "
+                f"mode {stat.S_IMODE(observed.st_mode):#o}"
+            )
         return root, _path_generation(observed)
 
     def _parent_requires_private_mode(self, path: Path) -> bool:
@@ -915,7 +977,11 @@ class PrivateSqlitePathAuthority:
         if not self._parent_requires_private_mode(path):
             return
         if observed.st_uid != os.geteuid() or stat.S_IMODE(observed.st_mode) != 0o700:
-            raise ValueError(f"{self.label} parent owner or mode is unsafe")
+            raise ValueError(
+                f"{self.label} parent owner or mode is unsafe at {path}: "
+                f"expected uid {os.geteuid()} mode 0o700, observed uid {observed.st_uid} "
+                f"mode {stat.S_IMODE(observed.st_mode):#o}"
+            )
 
     def _create_private_parent_chain(self) -> None:
         parent = self.path.parent
@@ -950,8 +1016,12 @@ class PrivateSqlitePathAuthority:
         )
         try:
             opened = os.fstat(descriptor)
-            if _path_generation(opened) != existing_identities[-1]:
-                raise ValueError(f"{self.label} parent changed while creating directory")
+            if _node_identity(_path_generation(opened)) != _node_identity(existing_identities[-1]):
+                raise ValueError(
+                    f"{self.label} parent changed while creating directory: "
+                    f"expected dev/ino {_node_identity(existing_identities[-1])}, "
+                    f"observed {_node_identity(_path_generation(opened))}"
+                )
             for component in missing_parts:
                 created = False
                 try:
@@ -1013,13 +1083,23 @@ class PrivateSqlitePathAuthority:
                 if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
                     raise ValueError(f"{self.label} path contains a symlink or unsafe parent")
                 self._validate_private_parent_stat(current, observed)
-                if self._managed_trust_root == current and (
-                    _node_identity(_path_generation(observed))
-                    != _node_identity(self._managed_trust_root_generation)
-                    if allow_managed_trust_root_ctime_change
-                    else _path_generation(observed) != self._managed_trust_root_generation
-                ):
-                    raise ValueError(f"{self.label} managed trust root identity changed")
+                if self._managed_trust_root == current:
+                    observed_generation = _path_generation(observed)
+                    if allow_managed_trust_root_ctime_change:
+                        if _node_identity(observed_generation) != _node_identity(
+                            self._managed_trust_root_generation
+                        ):
+                            raise ValueError(
+                                f"{self.label} managed trust root inode changed at {current}: "
+                                "expected dev/ino "
+                                f"{_node_identity(self._managed_trust_root_generation)}, "
+                                f"observed {_node_identity(observed_generation)}"
+                            )
+                    elif observed_generation != self._managed_trust_root_generation:
+                        # Message text is load bearing: experiment_registry
+                        # compares it verbatim to decide whether a bind is
+                        # retryable. Diagnostics go on the lenient branch.
+                        raise ValueError(f"{self.label} managed trust root identity changed")
                 identities.append(_path_generation(observed))
         except FileNotFoundError as exc:
             raise ValueError(f"{self.label} parent path is missing") from exc
@@ -1027,7 +1107,11 @@ class PrivateSqlitePathAuthority:
             raise ValueError(f"{self.label} parent path is unsafe") from exc
         parent = os.lstat(self.path.parent)
         if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) & 0o077:
-            raise ValueError(f"{self.label} parent owner or mode is unsafe")
+            raise ValueError(
+                f"{self.label} parent owner or mode is unsafe at {self.path.parent}: "
+                f"expected uid {os.geteuid()} with no group or other bits, observed uid "
+                f"{parent.st_uid} mode {stat.S_IMODE(parent.st_mode):#o}"
+            )
         return tuple(identities)
 
     def _create_private_file(self) -> None:
@@ -1049,12 +1133,17 @@ class PrivateSqlitePathAuthority:
         )
         try:
             parent_opened = os.fstat(parent_descriptor)
-            expected_parent = self._parent_generation[-1]
-            if (
-                _path_generation(parent_opened) != expected_parent
-                or _path_generation(parent_before) != expected_parent
-            ):
-                raise ValueError(f"{self.label} parent changed while creating database")
+            expected_parent = _node_identity(self._parent_generation[-1])
+            observed_parents = (
+                _node_identity(_path_generation(parent_opened)),
+                _node_identity(_path_generation(parent_before)),
+            )
+            if any(item != expected_parent for item in observed_parents):
+                raise ValueError(
+                    f"{self.label} parent changed while creating database: "
+                    f"expected dev/ino {expected_parent}, observed "
+                    f"opened {observed_parents[0]} named {observed_parents[1]}"
+                )
             descriptor = os.open(
                 self.path.name,
                 os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
@@ -1084,7 +1173,7 @@ class PrivateSqlitePathAuthority:
         ):
             raise ValueError(f"{self.label} managed trust root identity changed")
         self._managed_trust_root_generation = observed_root_generation
-        self._parent_generation = self._validate_parent_chain()
+        self._parent_generation = self._bind_unlocked_parent_chain()
 
     def durably_sync_current_database(self) -> None:
         """Persist the initialized database inode and its containing directory entry."""
@@ -1119,13 +1208,25 @@ class PrivateSqlitePathAuthority:
         except OSError as exc:
             raise ValueError(f"{self.label} file is missing or unsafe") from exc
         if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
-            raise ValueError(f"{self.label} file is a symlink or unsafe")
+            raise ValueError(
+                f"{self.label} file is a symlink or unsafe: expected a regular file, "
+                f"observed mode {stat.S_IFMT(observed.st_mode):#o}"
+            )
         if observed.st_nlink != 1:
-            raise ValueError(f"{self.label} file has an unsafe hard link")
+            raise ValueError(
+                f"{self.label} file has an unsafe hard link: "
+                f"expected st_nlink 1, observed {observed.st_nlink}"
+            )
         if observed.st_uid != os.geteuid():
-            raise ValueError(f"{self.label} file owner is unsafe")
+            raise ValueError(
+                f"{self.label} file owner is unsafe: "
+                f"expected uid {os.geteuid()}, observed {observed.st_uid}"
+            )
         if stat.S_IMODE(observed.st_mode) != 0o600:
-            raise ValueError(f"{self.label} file mode must be private 0600")
+            raise ValueError(
+                f"{self.label} file mode must be private 0600: "
+                f"observed {stat.S_IMODE(observed.st_mode):#o}"
+            )
         return _path_generation(observed)
 
     def assert_current(self) -> None:

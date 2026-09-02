@@ -20,12 +20,12 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -74,6 +74,20 @@ SOURCE_BROKER_V2_CLAIM_ATTEMPT_CONTRACT = "rquant-source-broker-claim-attempt/v1
 _ZERO_HASH = "0" * 64
 _ED25519_SIGNATURE_BYTES = 64
 _PRODUCTION_SAGA_GRAPH_TOKEN = object()
+# One in-flight ``_heartbeat_outbox`` may legitimately spend a whole
+# ``busy_timeout_ms`` waiting for the write lock at ``BEGIN IMMEDIATE``, and
+# then an equal allowance on the durable tail that follows it: a
+# ``synchronous = FULL`` commit plus the passive checkpoint that closing the
+# connection performs.  ``busy_timeout_ms`` is the only tolerance this module
+# states for one SQLite operation on this file, so the tail is given the same
+# window as the wait.  A shutdown that waits less than the body it is waiting
+# on cannot tell a slow heartbeat from a stuck one.
+#
+# The budget decides when a renewal is *late*, not how long the shutdown may
+# stay: past it the shutdown interrupts the connection the thread is on and
+# then joins without a timeout (see ``_HeartbeatConnection``), so the method
+# never returns or raises while a heartbeat is still running.
+_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS = 2
 
 
 class _StrictV2Model(RuntimeContractModel):
@@ -1502,6 +1516,119 @@ class _ProductionSagaGraph:
         ):
             raise TypeError("production saga graph components changed after composition")
         return original
+
+
+def _no_heartbeat_stage(stage: str) -> None:
+    """Stage sink for the heartbeats no shutdown is waiting on."""
+
+    del stage
+
+
+def _no_heartbeat_connection(connection: sqlite3.Connection | None) -> None:
+    """Connection sink for the heartbeats no shutdown can interrupt."""
+
+    del connection
+
+
+class _HeartbeatInterrupt(StrEnum):
+    """What a shutdown's interrupt found, worded for the message it goes into.
+
+    Deliberately says what was *issued*, not what was aborted: SQLite ends the
+    statement running at that moment, and a shutdown cannot tell from here
+    whether one was.
+    """
+
+    UNBOUND = "found no connection bound"
+    ISSUED = "issued on the connection it held"
+    CLOSED = "found the connection it held already closed"
+
+
+class _HeartbeatConnection:
+    """The SQLite connection a heartbeat thread is inside, for its shutdown.
+
+    Python cannot kill a thread, and neither the ``synchronous = FULL`` commit
+    nor the passive checkpoint that ``close`` performs has a provable
+    wall-clock bound, so a shutdown that only joins with a timeout can never
+    say the thread is gone - it can only stop looking.  ``sqlite3_interrupt``
+    is the abort this process does have: the statement running on the bound
+    connection fails with ``SQLITE_INTERRUPT`` at its next step and SQLite
+    rolls its transaction back, which unwinds ``_heartbeat_outbox`` and lets
+    ``renew`` see ``stop`` and return.  The shutdown can then join for real.
+
+    It ends a statement that is *running*.  An interrupt that lands between two
+    statements is a documented no-op that does not carry over to the next one,
+    and the busy handler behind ``BEGIN IMMEDIATE`` sleeps through it (measured:
+    such a lock wait ends at its own ``busy_timeout``, not at the interrupt).
+    What the interrupt cannot cut short is therefore bounded by the same two
+    windows the budget above is built from - one ``busy_timeout`` lock wait and
+    the durable tail behind it - and never by the caller's own patience.
+    """
+
+    __slots__ = ("_connection", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._connection: sqlite3.Connection | None = None
+
+    def bind(self, connection: sqlite3.Connection | None) -> None:
+        with self._lock:
+            self._connection = connection
+
+    def interrupt(self) -> _HeartbeatInterrupt:
+        """Issue an interrupt on the bound connection; report what was found."""
+
+        with self._lock:
+            connection = self._connection
+            if connection is None:
+                return _HeartbeatInterrupt.UNBOUND
+            try:
+                connection.interrupt()
+            except sqlite3.ProgrammingError:
+                # Holding the lock is what makes this cross-thread call safe:
+                # a body withdraws its connection here before ``_connect``
+                # closes it, so an interrupt never lands on one being closed.
+                # The guard stays because a closed connection is the one thing
+                # ``interrupt`` refuses, whoever closed it.
+                return _HeartbeatInterrupt.CLOSED
+            return _HeartbeatInterrupt.ISSUED
+
+
+class _HeartbeatProgress:
+    """What one heartbeat thread is doing, for the shutdown that waits on it.
+
+    Written only by that thread, and read by the shutdown once the budget has
+    expired - which is before the interrupt, so the thread may still be running
+    at that moment.  Plain attributes are enough: the reader wants the last
+    observation it can put in a failure message, not a consistent snapshot, and
+    nothing here decides control flow.
+    """
+
+    __slots__ = ("last_tick_at", "stage", "stage_since", "ticks")
+
+    def __init__(self) -> None:
+        self.stage = "starting"
+        self.stage_since = time.monotonic()
+        self.ticks = 0
+        self.last_tick_at: float | None = None
+
+    def mark(self, stage: str) -> None:
+        self.stage = stage
+        self.stage_since = time.monotonic()
+
+    def completed_tick(self) -> None:
+        self.ticks += 1
+        self.last_tick_at = time.monotonic()
+
+    def describe(self, observed_at: float) -> str:
+        if self.last_tick_at is None:
+            ticks = "no completed tick"
+        else:
+            plural = "" if self.ticks == 1 else "s"
+            ticks = (
+                f"{self.ticks} completed tick{plural}, "
+                f"last {observed_at - self.last_tick_at:.3f}s ago"
+            )
+        return f"{ticks}; stage {self.stage!r} for {observed_at - self.stage_since:.3f}s"
 
 
 class SourceBrokerV2Saga:
@@ -3803,19 +3930,47 @@ class SourceBrokerV2Saga:
         stop = Event()
         failures: list[BaseException] = []
         interval = self._executor_lease_seconds / 3
+        progress = _HeartbeatProgress()
+        heartbeat_connection = _HeartbeatConnection()
 
         def renew() -> None:
-            while not self._wait_for_heartbeat(stop, interval, phase=phase):
+            while True:
+                progress.mark("waiting")
+                if self._wait_for_heartbeat(stop, interval, phase=phase):
+                    break
+                if stop.is_set():
+                    # The wait can expire at the instant the shutdown sets
+                    # ``stop``.  Starting another write on that edge only
+                    # lengthens the shutdown that is already waiting for it.
+                    break
+                progress.mark("outbox-write")
                 try:
                     self._heartbeat_outbox(
                         phase=phase,
                         operation_id=operation_id,
                         owner_generation=owner_generation,
+                        mark_stage=progress.mark,
+                        bind_connection=heartbeat_connection.bind,
                     )
                 except BaseException as exc:
+                    # ``sqlite_errorcode`` is set by SQLite itself; an
+                    # ``OperationalError`` raised anywhere else carries no code
+                    # and is a real failure, so it is read defensively rather
+                    # than assumed - reading it directly would turn such a
+                    # failure into an ``AttributeError`` inside this handler.
+                    if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                        # The shutdown waiting on this thread ended the
+                        # statement on purpose; stopping is what it asked for,
+                        # so it is not a heartbeat failure.  SQLite has already
+                        # rolled this renewal back - nothing is half written.
+                        progress.mark("interrupted")
+                        return
+                    progress.mark("failed")
                     failures.append(exc)
                     stop.set()
                     return
+                progress.completed_tick()
+            progress.mark("stopped")
 
         heartbeat = Thread(
             target=renew,
@@ -3823,15 +3978,67 @@ class SourceBrokerV2Saga:
             daemon=True,
         )
         heartbeat.start()
+        # ``stop`` ends the wait between ticks at once, so this budget has one
+        # job: cover the single renewal that may already be inside
+        # ``_heartbeat_outbox``.  That body's own bound is a write-lock wait of
+        # ``busy_timeout_ms`` plus the durable tail behind it, so the budget is
+        # derived from it (see ``_HEARTBEAT_SHUTDOWN_LOCK_WINDOWS``) instead of
+        # from a fixed 0.1s floor that was unrelated to what it waits on.
+        # The derived term comes first on purpose: ``_configure`` only rejects a
+        # lease of zero or less, so a NaN lease reaches this line, and ``max``
+        # keeps its first argument when the comparison against NaN is false.
+        # Ordered the other way the budget is NaN and ``join(timeout=nan)``
+        # raises inside the ``finally``, where ``is_alive()`` is never reached.
+        shutdown_budget = max(
+            _HEARTBEAT_SHUTDOWN_LOCK_WINDOWS * self._busy_timeout_ms / 1_000,
+            interval * 2,
+        )
+        report: str | None = None
+        invoke_error: BaseException | None = None
         try:
             result = invoke(payload)
+        except BaseException as exc:
+            invoke_error = exc
+            raise
         finally:
+            stop_requested_at = time.monotonic()
             stop.set()
-            heartbeat.join(timeout=max(0.1, interval * 2))
-        if heartbeat.is_alive():
-            raise SourceBrokerV2SagaUnavailableError(
-                f"outbox heartbeat did not stop after {phase.value}"
-            )
+            heartbeat.join(timeout=shutdown_budget)
+            budget_expired_at = time.monotonic()
+            if heartbeat.is_alive():
+                # Past the budget the renewal is late, and this method may not
+                # hand a live heartbeat back to its caller.  Interrupt what the
+                # thread is inside, then join with no timeout: the abort makes
+                # the statement fail at its next step, ``renew`` sees ``stop``
+                # and returns, and what the interrupt cannot cut short is the
+                # same ``busy_timeout`` lock wait plus durable tail the budget
+                # is derived from.  Done here rather than after the ``try`` so
+                # a raising ``invoke`` also leaves nothing running.  The report
+                # is only built here; the raise for it is outside, because
+                # raising from a ``finally`` displaces the caller's exception.
+                overdue = progress.describe(budget_expired_at)
+                reached_connection = heartbeat_connection.interrupt()
+                heartbeat.join()
+                stopped_at = time.monotonic()
+                report = (
+                    f"outbox heartbeat did not stop after {phase.value} "
+                    f"(waited {budget_expired_at - stop_requested_at:.3f}s of a "
+                    f"{shutdown_budget:.3f}s budget; {overdue}; interrupt "
+                    f"{reached_connection}, then joined "
+                    f"{stopped_at - budget_expired_at:.3f}s more, ending in stage "
+                    f"{progress.stage!r})"
+                )
+                if invoke_error is not None:
+                    # The caller's exception is the one that has to survive, so
+                    # the report below is never raised on this path - it rides
+                    # along instead (PEP 678), which changes neither the type
+                    # nor anything an ``except`` can match on.  Raising from a
+                    # ``finally`` would displace the caller's exception, and so
+                    # would letting ``add_note`` itself escape.
+                    with suppress(Exception):
+                        invoke_error.add_note(report)
+        if report is not None:
+            raise SourceBrokerV2SagaUnavailableError(report)
         if failures:
             raise SourceBrokerV2SagaUnavailableError(
                 f"outbox heartbeat failed during {phase.value}"
@@ -4064,38 +4271,54 @@ class SourceBrokerV2Saga:
         phase: SourceBrokerV2OutboxPhase,
         operation_id: str,
         owner_generation: int,
+        mark_stage: Callable[[str], None] = _no_heartbeat_stage,
+        bind_connection: Callable[[sqlite3.Connection | None], None] = _no_heartbeat_connection,
     ) -> None:
         current_time = datetime.now(UTC)
         expires_at = current_time + timedelta(seconds=self._executor_lease_seconds)
+        mark_stage("connect")
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            # Published before the first statement so the shutdown waiting on
+            # this thread can end whatever it is inside, and withdrawn before
+            # ``_connect`` closes it so no shutdown reaches a connection this
+            # body has already finished with.
+            bind_connection(connection)
             try:
-                self._read_outbox(
-                    connection,
-                    operation_id=operation_id,
-                    phase=phase,
-                )
-                updated = connection.execute(
-                    "UPDATE source_broker_v2_outbox SET executor_heartbeat_at = ?, "
-                    "executor_lease_expires_at = ? WHERE operation_id = ? "
-                    "AND status = 'pending' AND executor_owner_token = ? "
-                    "AND executor_generation = ?",
-                    (
-                        current_time.isoformat(),
-                        expires_at.isoformat(),
-                        operation_id,
-                        self._executor_owner_token,
-                        owner_generation,
-                    ),
-                ).rowcount
-                if updated != 1:
-                    raise SourceBrokerV2SagaConflictError(
-                        "outbox executor lost ownership before heartbeat"
+                mark_stage("lock-wait")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    mark_stage("read")
+                    self._read_outbox(
+                        connection,
+                        operation_id=operation_id,
+                        phase=phase,
                     )
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+                    mark_stage("update")
+                    updated = connection.execute(
+                        "UPDATE source_broker_v2_outbox SET executor_heartbeat_at = ?, "
+                        "executor_lease_expires_at = ? WHERE operation_id = ? "
+                        "AND status = 'pending' AND executor_owner_token = ? "
+                        "AND executor_generation = ?",
+                        (
+                            current_time.isoformat(),
+                            expires_at.isoformat(),
+                            operation_id,
+                            self._executor_owner_token,
+                            owner_generation,
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        raise SourceBrokerV2SagaConflictError(
+                            "outbox executor lost ownership before heartbeat"
+                        )
+                    mark_stage("commit")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                mark_stage("close")
+            finally:
+                bind_connection(None)
 
     def _release_outbox_lease(
         self,

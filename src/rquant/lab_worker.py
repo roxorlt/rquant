@@ -95,10 +95,14 @@ from rquant.resource_admission import (
 )
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.runtime_resource_admission import (
+    _DEFAULT_RESOURCE_LOCK_WAIT_SECONDS as _RUNTIME_RESOURCE_LOCK_WAIT_SECONDS,
+)
+from rquant.runtime_resource_admission import (
     LocalResourceSnapshotProvider,
     PersistentResourceReservationStore,
     RuntimeHealthAuthorityLiveSloProbeConfig,
     RuntimeHealthAuthorityWatermark,
+    RuntimeResourceAdmissionTransientError,
     RuntimeTradeCalendarSessionResolver,
     SystemResourceProbe,
 )
@@ -183,7 +187,13 @@ _CHILD_OUTCOME_EXIT_GRACE_MICROSECONDS = 250_000
 _CHILD_INTERPRETER_START_MICROSECONDS = 4_000_000
 _ISOLATION_READY_TIMEOUT_MICROSECONDS = _CHILD_INTERPRETER_START_MICROSECONDS
 _PROCESS_CLEANUP_RETRIES = 3
-_RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS = 50_000
+# Never a tighter budget than the store itself waits on the same lock; issue
+# #159 capped every reservation call at 50ms while the winning writer's commit
+# had no bound at all, so a worker that merely lost a race was refused.
+_RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS = seconds_to_microseconds(
+    _RUNTIME_RESOURCE_LOCK_WAIT_SECONDS,
+    label="resource reservation lock wait",
+)
 _RESOURCE_AUTHORITY_POLL_MICROSECONDS = 10_000
 _MAX_CONTROL_WIRE_BYTES = 1024 * 1024
 _MAX_SHARD_RESULT_WIRE_BYTES = MAX_RESULT_WIRE_BYTES
@@ -4775,6 +4785,8 @@ class LabWorker:
                     raise TimeoutError("resource admission recheck timed out") from exc
                 if isinstance(exc, LabDaemonConfigurationError):
                     raise
+                if isinstance(exc, RuntimeResourceAdmissionTransientError):
+                    raise
                 raise LabDaemonConfigurationError(
                     str(exc) or "resource reservation recheck failed"
                 ) from exc
@@ -5023,6 +5035,13 @@ class LabWorker:
                         "ResearchRunSpec deadline reached during resource reservation admission"
                     ) from exc
                 if isinstance(exc, LabDaemonConfigurationError):
+                    raise
+                # Losing a race for the reservation lock says nothing about how
+                # this worker is configured, so the typed transient refusal
+                # travels intact to a caller that can back off and try again.
+                # Folding it into a configuration fault is what took workers
+                # down for a competitor's commit (issue #159).
+                if isinstance(exc, RuntimeResourceAdmissionTransientError):
                     raise
                 raise LabDaemonConfigurationError(
                     str(exc) or "resource reservation admission failed"
@@ -6869,6 +6888,24 @@ class LabWorker:
                 validated.spec,
                 tick_deadline_microseconds=tick_deadline_microseconds,
             )
+        except RuntimeResourceAdmissionTransientError as exc:
+            contended_retry_at = _utc(self.clock()) + timedelta(
+                seconds=max(1, _microseconds_to_seconds(self.poll_interval_microseconds))
+            )
+            self._resource_retry_at[claim.claim_token] = contended_retry_at
+            _safe_structured_log(
+                "info",
+                "shard_resource_reservation_contended",
+                message="research shard stays pending until the reservation lock frees",
+                component="lab_worker",
+                worker_id=self.worker_id,
+                job_id=str(claim.job_id),
+                shard_id=str(claim.shard_id),
+                claim_token=str(claim.claim_token),
+                reason=str(exc),
+                retry_at=contended_retry_at.isoformat(),
+            )
+            return LabWorkerTickResult(status="idle")
         except (InterruptedError, TimeoutError) as exc:
             if isinstance(exc, TimeoutError):
                 if self._consume_selected_claim(entry) is None:
