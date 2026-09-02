@@ -2051,3 +2051,126 @@ def test_wp9b_a_send_that_makes_no_progress_fails_typed_instead_of_looping(
         assert seen == []
     finally:
         server.close()
+
+
+def _preconnected(server: _Server) -> socket.socket:
+    """A real, already connected client socket for the seam to hand back."""
+
+    connection = _unix_socket()
+    connection.connect(str(server.configuration.endpoint))
+    return connection
+
+
+def test_wp9b_connect_accepts_eisconn_as_the_macos_success_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The errno table, 1/3: `EISCONN` on an already connected socket is success.
+
+    macOS answers `EISCONN` where Linux answers `EAGAIN`, so the loop has to
+    accept it as a completion - it just may not *depend* on it (see P2-6).
+    """
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _preconnected(server),
+                connect_codes=lambda _attempt: errno.EISCONN,
+            ),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+            lock_wait_timeout_seconds=1.0,
+        )
+        assert admitted.lease is not None
+        assert [seam.connect_attempts for seam in made] == [1, 1]
+    finally:
+        server.close()
+
+
+def test_wp9b_connect_retries_a_defensive_einprogress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The errno table, 2/3: `EINPROGRESS` is retried, not raised.
+
+    No AF_UNIX probe on any of the four platforms produced it - the stream
+    socket has no in-flight state - so this pins the defensive entry rather
+    than a measured path.
+    """
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _unix_socket(),
+                connect_codes=lambda attempt: errno.EINPROGRESS if attempt == 0 else None,
+            ),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+            lock_wait_timeout_seconds=1.0,
+        )
+        assert admitted.lease is not None
+        assert [seam.connect_attempts for seam in made] == [2, 2]
+    finally:
+        server.close()
+
+
+def test_wp9b_connect_fails_typed_and_at_once_on_a_refused_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The errno table, 3/3: `ECONNREFUSED` ends the round trip immediately.
+
+    It is macOS's answer for a listener whose backlog is full and the general
+    answer for a dead endpoint; retrying it would burn the caller's whole
+    budget on a socket that will never connect.
+    """
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        seen = _record_handled(server)
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _unix_socket(),
+                connect_codes=lambda _attempt: errno.ECONNREFUSED,
+            ),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        with pytest.raises(ResourceAuthorityAdapterTransportError, match="transport failed"):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+            )
+        assert len(made) == 1
+        assert made[0].connect_attempts == 1
+        assert made[0].send_calls == 0
+        assert made[0].sendall_calls == 0
+        assert seen == []
+    finally:
+        server.close()
