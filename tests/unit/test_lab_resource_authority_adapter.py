@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import multiprocessing
@@ -22,6 +23,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from rquant import lab_resource_authority_adapter as adapter_module
 from rquant.lab_resource_authority_adapter import (
     LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
     LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
@@ -1546,5 +1548,287 @@ def test_adapter_recheck_answers_a_stop_authority_before_and_during_the_wait(
         assert polls.count(False) >= 2
         assert polls[-1] is True
         assert elapsed < 0.5
+    finally:
+        server.close()
+
+
+# --- WP9b: the connect/send phases poll the stop authority (design §5.2/§5.3) ---
+#
+# Every case below drives the module-level ``_socket_factory`` seam.  The seam
+# is a *test* seam: production still constructs the same AF_UNIX socket and
+# ``ResourceAuthorityJournalClient`` grew no constructor field for it.
+
+
+def _unix_socket() -> socket.socket:
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+
+class _SeamSocket:
+    """A recording stand-in installed through ``_socket_factory``.
+
+    Anything the test does not script delegates to a real socket, so the
+    adapter keeps speaking the real wire; only the calls a case needs to bend
+    (``connect_ex`` return codes, ``send`` return values) are intercepted.
+    Every scripted hook is *bounded*: a missing stop poll or a missing
+    zero-progress guard has to fail the case, never hang the suite.
+    """
+
+    def __init__(
+        self,
+        inner: socket.socket,
+        *,
+        connect_codes: Callable[[int], int | None] | None = None,
+        send_bytes: Callable[[int], int | None] | None = None,
+    ) -> None:
+        self._inner = inner
+        self._connect_codes = connect_codes
+        self._send_bytes = send_bytes
+        self.connect_attempts = 0
+        self.blocking_connects = 0
+        self.send_calls = 0
+        self.sendall_calls = 0
+        self.sent_bytes = 0
+        self.first_chunk_bytes = 0
+        self.send_timeouts = 0
+
+    def __enter__(self) -> _SeamSocket:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self._inner.close()
+
+    def __getattr__(self, name: str) -> object:
+        inner = self.__dict__.get("_inner")
+        if inner is None:  # pragma: no cover - only during a failed __init__
+            raise AttributeError(name)
+        return getattr(inner, name)
+
+    def connect(self, address: object) -> None:
+        self.blocking_connects += 1
+        self._inner.connect(address)
+
+    def connect_ex(self, address: object) -> int:
+        attempt = self.connect_attempts
+        self.connect_attempts += 1
+        if self._connect_codes is None:
+            return self._inner.connect_ex(address)
+        code = self._connect_codes(attempt)
+        if code is None:
+            return self._inner.connect_ex(address)
+        return code
+
+    def send(self, data: object) -> int:
+        self.send_calls += 1
+        if self.send_calls == 1:
+            self.first_chunk_bytes = len(memoryview(data))  # type: ignore[arg-type]
+        if self._send_bytes is not None:
+            scripted = self._send_bytes(self.send_calls - 1)
+            if scripted is not None:
+                self.sent_bytes += scripted
+                return scripted
+        try:
+            sent = self._inner.send(data)
+        except TimeoutError:
+            self.send_timeouts += 1
+            raise
+        self.sent_bytes += sent
+        return sent
+
+    def sendall(self, data: object) -> None:
+        self.sendall_calls += 1
+        self._inner.sendall(data)
+
+
+def _install_socket_seam(
+    monkeypatch: pytest.MonkeyPatch,
+    build: Callable[[], _SeamSocket],
+) -> list[_SeamSocket]:
+    """Point the module seam at ``build`` and collect every socket it made."""
+
+    made: list[_SeamSocket] = []
+
+    def factory() -> _SeamSocket:
+        seam = build()
+        made.append(seam)
+        return seam
+
+    monkeypatch.setattr(adapter_module, "_socket_factory", factory)
+    return made
+
+
+def _stalling_connect_codes(*, attempts_before_refusal: int) -> Callable[[int], int | None]:
+    """Answer EAGAIN - Linux's AF_UNIX "backlog is full" - a bounded number of times.
+
+    The bound is the case's own guard rail: with the stop/deadline poll in
+    place the loop never reaches it, and without the poll the case fails on a
+    wrong exception type instead of spinning forever.
+    """
+
+    def codes(attempt: int) -> int | None:
+        if attempt < attempts_before_refusal:
+            return errno.EAGAIN
+        return errno.ECONNREFUSED
+
+    return codes
+
+
+def test_wp9b_connect_answers_a_stop_authority_within_one_poll_period(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-1: a stop raised while connecting is answered on the next poll.
+
+    Before WP9b the whole ``connect`` was one blocking call bounded only by
+    ``max(connect_seconds, poll)``, so a stop raised during it was invisible
+    until the connection either landed or timed out.
+    """
+
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        seen = _record_handled(server)
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _unix_socket(),
+                connect_codes=_stalling_connect_codes(attempts_before_refusal=64),
+            ),
+        )
+
+        def stop_after_the_first_connect_attempt() -> bool:
+            # The seam is the attempt itself, not a clock: the flip can only be
+            # observed by a poll taken between two connect attempts.
+            return bool(made) and made[0].connect_attempts >= 1
+
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionCancelledError):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=1.0,
+                stop_requested=stop_after_the_first_connect_attempt,
+            )
+        elapsed = time.monotonic() - started
+        assert len(made) == 1
+        assert made[0].connect_attempts == 1
+        assert made[0].send_calls == 0
+        assert made[0].sendall_calls == 0
+        assert seen == []
+        assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
+    finally:
+        server.close()
+
+
+def test_wp9b_connect_charges_an_exhausted_budget_to_the_caller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-3 (connect phase): budget exhaustion is retryable, not a deployment fault.
+
+    This is the classification change §5.2 point 5 requires to be declared:
+    the poll inside the connect loop reclassifies an exhausted caller budget
+    from ``ResourceAuthorityAdapterTransportError`` to
+    ``RuntimeResourceAdmissionLockWaitTimeoutError``.
+    """
+
+    server = _Server(tmp_path, timeout_milliseconds=5_000)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        seen = _record_handled(server)
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _unix_socket(),
+                connect_codes=_stalling_connect_codes(attempts_before_refusal=4_096),
+            ),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        started = time.monotonic()
+        with pytest.raises(RuntimeResourceAdmissionLockWaitTimeoutError) as caught:
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+                lock_wait_timeout_seconds=0.05,
+            )
+        elapsed = time.monotonic() - started
+        assert not isinstance(caught.value, ResourceAuthorityAdapterTransportError)
+        assert made[0].connect_attempts >= 1
+        assert made[0].send_calls == 0
+        assert seen == []
+        assert elapsed < server.configuration.timeout_milliseconds / 1_000 / 10
+    finally:
+        server.close()
+
+
+def test_wp9b_a_round_trip_without_a_budget_keeps_one_blocking_connect_and_sendall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-4: no budget means no waiter, and no waiter means the old shape.
+
+    ``waiter is None`` still takes the single blocking ``connect`` and the
+    single ``sendall`` - neither the non-blocking connect loop nor the chunked
+    send may appear on that path.
+    """
+
+    server = _Server(tmp_path)
+    try:
+        made = _install_socket_seam(monkeypatch, lambda: _SeamSocket(_unix_socket()))
+        policy = _client(server).policy(operation_id="wp9b-no-budget")
+        assert policy == _policy()
+        assert len(made) == 1
+        assert made[0].blocking_connects == 1
+        assert made[0].connect_attempts == 0
+        assert made[0].sendall_calls == 1
+        assert made[0].send_calls == 0
+    finally:
+        server.close()
+
+
+def test_wp9b_connect_remembers_success_when_a_second_connect_would_answer_eagain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-6: Linux answers EAGAIN on an *already connected* AF_UNIX socket.
+
+    Measured on Linux 3.11.16/3.12.14 (run 33584787985): with the listener's
+    backlog full, ``connect()`` on a connected socket answers ``EAGAIN``, not
+    ``EISCONN``.  Success therefore has to be remembered by the loop; probing
+    for ``EISCONN`` would spin until the caller's budget expired.
+    """
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        made = _install_socket_seam(
+            monkeypatch,
+            lambda: _SeamSocket(
+                _unix_socket(),
+                connect_codes=lambda attempt: None if attempt == 0 else errno.EAGAIN,
+            ),
+        )
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+            lock_wait_timeout_seconds=1.0,
+        )
+        assert admitted.lease is not None
+        # `reserve` plus the fenced `lookup-latest`, one connect attempt each.
+        assert len(made) == 2
+        assert [seam.connect_attempts for seam in made] == [1, 1]
     finally:
         server.close()
