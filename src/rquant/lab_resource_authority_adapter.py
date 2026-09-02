@@ -8,6 +8,7 @@ versioned descriptor and canonical JSON bytes.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import math
 import os
@@ -90,6 +91,26 @@ _MAX_CALLER_LOCK_WAIT_SECONDS = RESOURCE_AUTHORITY_MAX_LOCK_WAIT_MILLISECONDS / 
 # Same 5ms cadence the store polls `stop_requested` at, so a stop authority is
 # answered on the socket with the granularity it already has in-process.
 _ADAPTER_STOP_POLL_SECONDS = 0.005
+# Retryable `connect()` answers for a non-blocking AF_UNIX socket.  `EAGAIN` is
+# the only one ever observed: Linux answers it when the listener's backlog is
+# full (run 33584787985), and `EWOULDBLOCK` is the same value there and on
+# macOS.  macOS answers `ECONNREFUSED` instead and never reaches this set.
+# `EINPROGRESS`/`EALREADY`/`EINTR` were not observed on any of the four probed
+# platforms - AF_UNIX has no in-flight state to wait on - and are defensive
+# entries, not measured paths.
+_ADAPTER_CONNECT_RETRY_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        errno.EINPROGRESS,
+        errno.EALREADY,
+        errno.EINTR,
+    }
+)
+# One chunk of a `RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES` frame, so the
+# largest legal request is at most 64 send attempts and every one of them is
+# preceded by a stop/deadline poll.
+_ADAPTER_SEND_CHUNK_BYTES = 16 * 1024
 # The caller's budget has to cover the server's wait *and* the response coming
 # back.  Handing the server the whole remainder would guarantee the client gave
 # up first and turned every server-side refusal into a blind transport timeout,
@@ -944,6 +965,57 @@ def _secure_socket_path(
         ) from exc
 
 
+def _socket_factory() -> socket.socket:
+    """Build the client socket for one round trip.
+
+    A module-level test seam, not a construction parameter: no adapter or
+    client signature carries it, and replacing this name is exactly as
+    privileged as replacing `socket` in this module already was.
+    """
+
+    return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+
+def _connect_polling_stop(
+    connection: socket.socket,
+    endpoint: str,
+    *,
+    waiter: _ResponseWaiter,
+    connect_seconds: float,
+) -> None:
+    """Connect while re-reading stop and deadline once per poll period.
+
+    The ceiling is unchanged - `waiter.tick()` reads the same caller budget the
+    single blocking `connect` was already bounded by.  Only the granularity at
+    which a stop becomes visible changes, from "the whole connect" to one poll
+    period, matching what `_recv_exact` has always done for the response.
+    """
+
+    connection.setblocking(False)
+    connected = False
+    try:
+        while not connected:
+            # Before the attempt, not only after a failed one: a stop raised
+            # while the previous attempt was in flight is answered here.
+            waiter.tick()
+            code = connection.connect_ex(endpoint)
+            if code in (0, errno.EISCONN):
+                # The loop remembers success itself.  On Linux an *already
+                # connected* AF_UNIX socket answers `EAGAIN` (not `EISCONN`)
+                # while the listener's backlog is full, so re-probing for
+                # `EISCONN` would never terminate (run 33584787985).
+                connected = True
+            elif code in _ADAPTER_CONNECT_RETRY_ERRNOS:
+                system_time.sleep(_ADAPTER_STOP_POLL_SECONDS)
+            else:
+                raise ResourceAuthorityAdapterTransportError(
+                    "resource authority transport failed"
+                )
+    finally:
+        # Hand back exactly the socket state the no-budget path would have.
+        connection.settimeout(max(connect_seconds, _ADAPTER_STOP_POLL_SECONDS))
+
+
 def _remote_refusal(
     error_kind: Literal["transient", "lock_wait_timeout", "cancelled", "contract"] | None,
 ) -> ResourceAuthorityAdapterError | RuntimeResourceAdmissionError:
@@ -1000,9 +1072,17 @@ class ResourceAuthorityJournalClient:
             config_seconds if budget is None else budget.transport_seconds(config_seconds)
         )
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(max(connect_seconds, _ADAPTER_STOP_POLL_SECONDS))
-                connection.connect(str(config.endpoint))
+            with _socket_factory() as connection:
+                if waiter is None:
+                    connection.settimeout(max(connect_seconds, _ADAPTER_STOP_POLL_SECONDS))
+                    connection.connect(str(config.endpoint))
+                else:
+                    _connect_polling_stop(
+                        connection,
+                        str(config.endpoint),
+                        waiter=waiter,
+                        connect_seconds=connect_seconds,
+                    )
                 uid, gid = _peer_credentials(connection)
                 if (uid, gid) != config.expected_server_identity:
                     raise ResourceAuthorityAdapterTransportError(
