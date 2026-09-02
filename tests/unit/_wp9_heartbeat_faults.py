@@ -66,7 +66,6 @@ DEFAULT_STALL_SECONDS = 120.0
 # ending by itself is never the reason the shutdown ended.
 _FOREIGN_LOCK_TIMEOUT_SECONDS = 60.0
 _STALL_DEADLINE_EXIT_CODE = 70
-_GO_MARKER_TIMEOUT_SECONDS = 60.0
 DIGEST_EXCLUDED_COLUMNS = ("executor_heartbeat_at", "executor_lease_expires_at")
 
 SELECT_SQL = "SELECT * FROM source_broker_v2_outbox WHERE operation_id = ?"
@@ -88,10 +87,15 @@ _SIGTERM_IGNORING_FAULTS = (
     "stall-in-foreign-lock-wait",
 )
 
+# Gated faults that must do nothing at all until their window opens, rather
+# than renewing normally in the meantime.
+_IDLE_UNTIL_TOLD = ("renew-when-told",)
+
 # Faults that act during a renewal rather than during the handshake, and so
 # must wait for the case to open the window first.
 _GATED_FAULTS = (
     "fail-renewal",
+    "renew-when-told",
     "stall-before-connect",
     "stall-before-commit",
     "stall-after-commit",
@@ -109,6 +113,7 @@ FAULT_MODES = (
     "exit-after-ack",
     "fail-renewal",
     "never-renews",
+    "renew-when-told",
     "pin-in-lock-wait",
     "stall-before-connect",
     "stall-before-commit",
@@ -140,6 +145,16 @@ def stable_row_digest(row: sqlite3.Row, description: Any) -> str:
         digest.update(struct.pack("!I", len(payload)))
         digest.update(payload)
     return digest.hexdigest()
+
+
+class HeartbeatOwnershipError(Exception):
+    """The renewal guard matched no row: this executor no longer owns it.
+
+    Named to match the production helper's class, because the parent rebuilds
+    the caller-visible exception from the type *name* in the failure frame -
+    that is how a lost lease keeps arriving as a conflict rather than as some
+    generic renewal error.
+    """
 
 
 def _encode(frame: dict[str, Any]) -> bytes:
@@ -187,21 +202,23 @@ class _Reader:
         return self.eof and not self._buffer
 
 
-def _wait_for_go(marker: str) -> None:
-    """Block until the case says the window is open.
+def _window_is_open(marker: str) -> bool:
+    """Whether the case has said this is the window the fault belongs in.
 
-    Every tick-time fault waits here first.  The parent runs one synchronous,
+    Every tick-time fault checks here first.  The parent runs one synchronous,
     owner-guarded renewal between the session acknowledgement and the
-    invocation, and a fault that fired before that renewal would be racing it
-    rather than testing anything.  The case creates ``<marker>.go`` from inside
-    its own invocation, so the fault lands strictly inside the window.
+    invocation, and a fault that fired before it would be racing that renewal
+    rather than testing anything; a saga that runs several phases opens a
+    window per phase, and only one of them is the one under test.
+
+    A check rather than a wait, deliberately.  Blocking here would stop this
+    helper answering the end frame for some earlier phase's session, which the
+    parent would then have to escalate - turning an unrelated phase into a kill
+    and making the case measure the wrong thing entirely.  Renewing normally
+    until the window opens is both correct and invisible.
     """
 
-    deadline = time.monotonic() + _GO_MARKER_TIMEOUT_SECONDS
-    while not os.path.exists(marker + ".go"):
-        if time.monotonic() > deadline:
-            raise RuntimeError("fault helper waited for its go marker and never got one")
-        time.sleep(0.002)
+    return os.path.exists(marker + ".go")
 
 
 def _announce(marker: str) -> None:
@@ -318,7 +335,7 @@ def _renew(
             ),
         ).rowcount
         if updated != 1:
-            raise sqlite3.OperationalError("outbox executor lost ownership before heartbeat")
+            raise HeartbeatOwnershipError("outbox executor lost ownership before heartbeat")
         if stop_before_commit:
             # Left open on purpose: the write lock is held and no commit
             # record exists, which is the durable-tail window.
@@ -453,15 +470,48 @@ def main(argv: list[str] | None = None) -> int:
                 session = None
         if session is None or not session["open"] or time.monotonic() < next_tick_at:
             continue
-        if fault in _GATED_FAULTS and fault in fired:
+        if fault not in _GATED_FAULTS:
+            fault_now = fault
+        elif fault in fired:
             fault_now = None
-        elif fault in _GATED_FAULTS:
-            assert args.fault_marker is not None
-            _wait_for_go(args.fault_marker)
-            fired.add(fault)
-            fault_now = fault
         else:
-            fault_now = fault
+            assert args.fault_marker is not None
+            fault_now = fault if _window_is_open(args.fault_marker) else None
+            if fault_now is not None:
+                fired.add(fault)
+            elif fault in _IDLE_UNTIL_TOLD:
+                # Renewing normally while waiting would defeat the mode: these
+                # exist so the case owns *whether* a renewal happens at all,
+                # and a helper quietly renewing on the real clock in the
+                # meantime would move the very columns the case is reading.
+                next_tick_at = time.monotonic() + session["interval"]
+                continue
+        if fault_now == "renew-when-told":
+            # One real renewal, at the instant the case asks for it, reporting
+            # whatever the database says.  A refusal here is a genuine owner
+            # guard rejection, not a synthetic error code.
+            assert args.fault_marker is not None
+            try:
+                digest, connection = _renew(config, session)
+            except BaseException as exc:
+                session["open"] = False
+                session["outcome"] = "failed"
+                failure: dict[str, Any] = {"t": "failed", "token": session["token"]}
+                failure.update(
+                    {
+                        "errorcode": getattr(exc, "sqlite_errorcode", None),
+                        "type": type(exc).__name__,
+                        "detail": str(exc)[:1000],
+                    }
+                )
+                _write(status_fd, failure)
+                _announce(args.fault_marker)
+                continue
+            connection.close()
+            _emit_tick(status_fd, session, digest)
+            session["open"] = False
+            _announce(args.fault_marker)
+            continue
         if fault_now == "never-renews":
             # Protocol-correct and completely idle: the session is
             # acknowledged and the end frame will be answered, but this helper
