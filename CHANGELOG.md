@@ -261,6 +261,19 @@
 
 ### Fixed
 
+- **source broker runner 的总单调 deadline 用例按宿主标定**：
+  `test_total_monotonic_deadline_40ms_rejects_late_acceptance` 与
+  `test_total_monotonic_deadline_allows_fast_native_chain` 过去把 40 ms / 150 ms 的墙钟字面值
+  当成预算，CI runner 一旦被别的 job 挤住就随机变红（[#168](https://github.com/roxorlt/rquant/issues/168)
+  家族，main push run `33471831530` 与 `33602350085`）。现在沿用
+  `tests/unit/test_source_broker_v2_service.py` 的 `_host()` 机制：module 级 autouse fixture 先跑三次
+  完整 publish，取最慢样本除以参考值 `_PUBLISH_REFERENCE_SECONDS = 0.04` 得到只放大不缩小的
+  `_publish_scale`，两条用例的预算与时延都按它换算。拒绝用例改成**比值构造**——provider 应答固定
+  为整条预算的 1.5 倍，claim 返回时后置 `ensure` 必然判超时，落点与宿主快慢无关；接受用例的墙钟
+  上界从 150 ms 放到 1.5 s，这是**10 倍的量化放宽**（如实备案：被断言的延迟上界确实被削弱，保留的
+  命题是「快链路能在一个总预算内发布 + 所有 wire call 共享同一个绝对 deadline + 租约被释放」，
+  预算 ÷100 的变异仍能杀死它）。断言表达式一字未改，无 skip/xfail，生产代码零改动。
+
 - **artifact-retention**：修复 artifact catalog writer 的引导期路径绑定误杀合法并发 writer
   （[#158](https://github.com/roxorlt/rquant/issues/158)）。`PrivateSqlitePathAuthority`
   在 `ArtifactReferenceStore` 取得跨进程写锁**之前**绑定 managed trust root 的
