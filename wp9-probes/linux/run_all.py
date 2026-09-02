@@ -390,43 +390,45 @@ def probe_session_handshake():
 # Non-blocking Lock as the single-session gate (no thread is created)
 # --------------------------------------------------------------------------
 def probe_nonblocking_lock_gate(rounds=200):
+    """Two threads race for one saga's gate.  The winner must keep the lock
+    until *both* threads have made their attempt - releasing early would let the
+    loser win too and would measure nothing.  (The first version of this probe
+    released after 1ms and duly reported bogus 'double entries' on the 4 vCPU
+    Linux runner; the bug was in the probe, not in ``Lock``.)"""
     import threading
 
-    lock = threading.Lock()
-    winners = []
-    losers = []
-
-    def contend():
-        if lock.acquire(blocking=False):
-            winners.append(threading.get_ident())
-            time.sleep(0.001)
-            lock.release()
-        else:
-            losers.append(threading.get_ident())
-
-    double_entry = 0
+    violations = 0
+    both_attempted = 0
     for _ in range(rounds):
-        winners.clear()
-        losers.clear()
-        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        winners = []
+        start_gate = threading.Barrier(2)
+        attempted = threading.Barrier(2)
 
         def runner():
-            barrier.wait()
-            contend()
+            start_gate.wait(timeout=5)
+            acquired = lock.acquire(blocking=False)
+            if acquired:
+                winners.append(threading.get_ident())
+            attempted.wait(timeout=5)
+            if acquired:
+                lock.release()
 
         threads = [threading.Thread(target=runner) for _ in range(2)]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=5)
+            thread.join(timeout=10)
+        both_attempted += 1
         if len(winners) != 1:
-            double_entry += 1
-    ok = double_entry == 0
+            violations += 1
+    ok = violations == 0
     record(
         "nonblocking_lock_gate",
         ok,
-        f"{rounds} two-thread races, exactly one winner each time (violations={double_entry})",
-        {"rounds": rounds, "violations": double_entry},
+        f"{rounds} two-thread races with the winner holding the lock across both "
+        f"attempts: exactly one winner every time (violations={violations})",
+        {"rounds": rounds, "violations": violations, "rounds_completed": both_attempted},
     )
 
 
