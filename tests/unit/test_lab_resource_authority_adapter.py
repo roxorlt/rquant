@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from rquant import lab_resource_authority_adapter as adapter_module
 from rquant.lab_resource_authority_adapter import (
     _ADAPTER_SEND_CHUNK_BYTES,
+    _ADAPTER_STOP_POLL_SECONDS,
     LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
     LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
     LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
@@ -2013,7 +2014,6 @@ def test_wp9b_send_polls_between_the_chunks_of_a_large_frame() -> None:
     payload = b"\x5a" * (256 * 1024)
     assert len(payload) < RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES
     client, peer = _full_peer_pair()
-    seam = _SeamSocket(client)
     try:
 
         def open_a_window_before_the_second_chunk(call_index: int) -> int | None:
@@ -2029,11 +2029,20 @@ def test_wp9b_send_polls_between_the_chunks_of_a_large_frame() -> None:
             stop_requested=lambda: seam.sent_bytes > 0,
         )
         waiter = _ResponseWaiter(budget=budget, config_seconds=5.0)
+        # This half calls the send loop directly, so nothing upstream bounds a
+        # socket left in blocking mode: without this the full peer would park
+        # `send` forever if the loop ever stopped setting its own timeout.  It
+        # is a backstop, not the cadence - the loop replaces it with
+        # `_ADAPTER_STOP_POLL_SECONDS`, which the assertion below witnesses, so
+        # dropping the loop's `settimeout` is a fast red rather than a hang.
+        client.settimeout(0.05)
         started = time.monotonic()
         with pytest.raises(RuntimeResourceAdmissionCancelledError):
             _send_frame_polling_stop(seam, payload, waiter=waiter)
         elapsed = time.monotonic() - started
         assert seam.send_timeouts >= 1, "the full peer never blocked the send"
+        # The loop owns the poll cadence, not the backstop set above.
+        assert seam.gettimeout() == _ADAPTER_STOP_POLL_SECONDS
         assert seam.first_chunk_bytes == _ADAPTER_SEND_CHUNK_BYTES
         assert seam.sent_bytes > 0, "the offset never advanced"
         assert seam.sent_bytes < seam.first_chunk_bytes, "one chunk left in a single send"
