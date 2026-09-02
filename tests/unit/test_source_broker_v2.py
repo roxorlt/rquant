@@ -6093,3 +6093,118 @@ def test_wp9_shutdown_bound_is_closed_form_at_production_defaults(tmp_path: Path
         + 0.05
     )
     assert close_bound == pytest.approx(5.55)
+
+
+def test_wp9_finalizer_is_registered_against_a_plain_function_and_state(
+    tmp_path: Path,
+) -> None:
+    """The registration itself, checked rather than inferred.
+
+    `weakref.finalize(saga, saga.close)` looks equivalent and is not: a bound
+    method holds the instance, the instance is then never collected, and the
+    finalizer only ever runs at interpreter exit.  What has to be registered is
+    a module-level function and a state object that points at nobody.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    finalizer = saga._heartbeat_finalizer
+    assert finalizer.alive
+    _, function, args, _ = finalizer.peek()
+    assert function is source_broker_v2_module._close_resources
+    assert args == (saga._heartbeat_state,)
+    state = saga._heartbeat_state
+    assert not any(value is saga for value in vars(state).values())
+    assert state.orphans is saga._orphaned_heartbeat_children
+    saga.close()
+
+
+def test_wp9_close_resources_reports_rather_than_raises(tmp_path: Path) -> None:
+    """The finalizer's callable has nowhere to raise to, so it never does."""
+
+    saga, _ = _wp9_saga(tmp_path)
+    state = saga._heartbeat_state
+    assert source_broker_v2_module._close_resources(state).closed is True
+    _wp9_start_a_helper(saga)
+    first = source_broker_v2_module._close_resources(state)
+    assert first.orphaned is False
+    assert first.returncode is not None
+    second = source_broker_v2_module._close_resources(state)
+    assert second.orphaned is False
+    assert state.popen is None
+    assert state.ctrl_w is None
+    assert state.stop_w is None
+    assert state.status_r is None
+
+
+def test_wp9_a3_stops_rather_than_starting_a_helper_beside_an_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement is not started next to a kill nobody saw land.
+
+    The restart the session confirmation is allowed exists for a helper that is
+    known to be gone.  When the one being replaced cannot be confirmed dead,
+    starting a second writer beside it is the one thing that must not happen -
+    so A3 ends there instead, before the external call.
+    """
+
+    saga, transport = _wp9_saga(tmp_path)
+    phase, operation_id, generation, payload = _wp9_window(saga)
+    _wp9_start_a_helper(saga)
+    popen = saga._heartbeat_state.popen
+    assert popen is not None
+    real_wait = popen.wait
+
+    def never_observed(timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd="helper", timeout=timeout or 0.0)
+
+    # A control descriptor whose reader is gone, swapped in for the real one:
+    # the session write hits EPIPE while the helper itself stays alive, so the
+    # pre-check does not get to notice anything first.
+    real_ctrl_w = saga._heartbeat_state.ctrl_w
+    assert real_ctrl_w is not None
+    dead_r, dead_w = os.pipe()
+    os.close(dead_r)
+    saga._heartbeat_state.ctrl_w = dead_w
+    monkeypatch.setattr(popen, "wait", never_observed)
+    starts = _wp9_count_helper_starts(saga, monkeypatch)
+    calls: list[int] = []
+
+    with pytest.raises(SourceBrokerV2SagaUnavailableError, match="has not reported its exit"):
+        saga._invoke_with_heartbeat(
+            phase=phase,
+            operation_id=operation_id,
+            owner_generation=generation,
+            payload=payload,
+            invoke=lambda _: calls.append(1) or canonical_json_bytes({}),
+        )
+    assert starts == []
+    assert calls == []
+    assert transport.dispatch_calls == 0
+    assert len(saga._orphaned_heartbeat_children) == 1
+    # The kill was really sent; only its observation was blocked.
+    monkeypatch.setattr(popen, "wait", real_wait)
+    os.close(real_ctrl_w)
+    assert popen.wait(timeout=10) is not None
+    saga._sweep_orphaned_heartbeat_children()
+    assert not saga._orphaned_heartbeat_children
+
+
+def test_wp9_a_missing_row_still_fails_the_synchronous_renewal_as_integrity(
+    tmp_path: Path,
+) -> None:
+    """The synchronous validation points keep the classification they had.
+
+    The shared write reports a missing row in its own vocabulary; in this
+    process that has always been an integrity failure, and callers match on it.
+    """
+
+    saga, _ = _wp9_saga(tmp_path)
+    phase, operation_id, _, _ = _wp9_window(saga)
+    _wp9_write(
+        saga.path,
+        "DELETE FROM source_broker_v2_outbox WHERE operation_id = ?",
+        (operation_id,),
+    )
+    with pytest.raises(SourceBrokerV2SagaIntegrityError, match="required outbox effect is missing"):
+        saga._heartbeat_outbox(phase=phase, operation_id=operation_id, owner_generation=0)
