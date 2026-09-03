@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -21,7 +22,12 @@ import pytest
 import rquant.ops.production_deploy as production_deploy
 import rquant.ops.r07_deploy_evidence as r07_deploy_evidence
 import rquant.signal_family_differential_gate as differential_gate
+from rquant.cli import build_parser as build_cli_parser
 from rquant.contained_subprocess import ContainedProcessError
+from rquant.formal_runtime_command import (
+    _LEGACY_ARGUMENTS,
+    FINALIZER_BOOTSTRAP_ARGUMENTS,
+)
 from rquant.ops.production_deploy import (
     ALL_LONG_RUNNING_SERVICES,
     LAB_LAUNCHD_HANDOFF_LABELS,
@@ -434,6 +440,77 @@ def _config(tmp_path: Path, *, target: str = "v0.13.2", dry_run: bool = False) -
         runtime_profile_output_dir=(LINUX_PRODUCTION_RUNTIME_ROOT.parent / "runtime-profiles"),
         runtime_root=LINUX_PRODUCTION_RUNTIME_ROOT,
     )
+
+
+#: The frozen bootstrap binding `rquant lab-runtime-prepare` demands, spelled out on purpose:
+#: the deployer hand-copies the same literals because the `-I -S` interpreter it runs under
+#: cannot import `rquant.formal_runtime_command` (that module needs pydantic). Drift between
+#: the deployer's copy and the upstream constant is caught by
+#: `test_job_center_bootstrap_matches_formal_runtime_constants`, which imports the real one.
+_EXPECTED_JOB_CENTER_BOOTSTRAP: tuple[str, ...] = (
+    "--runtime-code-config",
+    "/etc/rquant/runtime-code-bootstrap.json",
+    "--runtime-code-trusted-base",
+    "/etc/rquant",
+    "--runtime-code-authority-uid",
+    "0",
+    "--runtime-code-authority-gid",
+    "0",
+)
+
+
+def _expected_prepare_argv(
+    runtime_root: Path,
+    target_sha: str,
+    *,
+    rquant_bin: str = "rquant",
+) -> tuple[str, ...]:
+    """Every token of the prepare argv up to the one value that cannot be predicted."""
+
+    return (
+        rquant_bin,
+        "lab-runtime-prepare",
+        *_EXPECTED_JOB_CENTER_BOOTSTRAP,
+        "--runtime-deployment-root",
+        str(runtime_root),
+        "--expected-code-sha",
+        target_sha,
+        "--startup-deadline-monotonic",
+    )
+
+
+def _assert_prepare_argv_exact(
+    call: tuple[str, ...],
+    *,
+    runtime_root: Path,
+    target_sha: str,
+    rquant_bin: str = "rquant",
+) -> float:
+    """Assert the argv literally and return the startup deadline it carries."""
+
+    assert call[:-1] == _expected_prepare_argv(runtime_root, target_sha, rquant_bin=rquant_bin)
+    assert not set(call) & _LEGACY_ARGUMENTS
+    deadline = float(call[-1])
+    assert math.isfinite(deadline)
+    assert deadline > time.monotonic()
+    return deadline
+
+
+def _capture_prepare_argv(
+    config: DeployConfig,
+    *,
+    runtime_root: Path,
+    target_sha: str,
+) -> tuple[str, ...]:
+    runner = FakeRunner()
+    production_deploy._prepare_job_center_authority(
+        config,
+        runner,
+        target_sha=target_sha,
+        runtime_root=runtime_root,
+    )
+    assert len(runner.calls) == 1
+    return runner.calls[0]
 
 
 @pytest.mark.parametrize(
@@ -1059,13 +1136,112 @@ def test_successful_deploy_runs_bound_runtime_profile_preview_apply_and_rollout(
         if len(call) >= 2 and call[:2] == ("rquant", "lab-runtime-prepare")
     ]
     assert len(prepare_calls) == 1
-    assert "--runtime-deployment-root" in prepare_calls[0]
-    assert str(runtime_root) in prepare_calls[0]
+    _assert_prepare_argv_exact(
+        prepare_calls[0],
+        runtime_root=runtime_root,
+        target_sha=target_sha,
+    )
     first_preflight = runner.calls.index(
         ("rquant", "preflight", "--runtime-root", str(runtime_root))
     )
     assert runner.calls.index(rollout) < runner.calls.index(prepare_calls[0]) < first_preflight
     assert runner.calls.count(("rquant", "preflight", "--runtime-root", str(runtime_root))) == 2
+
+
+def test_job_center_authority_argv_is_exact(tmp_path: Path) -> None:
+    runner = FakeRunner(_base_responses())
+
+    result = deploy(
+        _config(tmp_path),
+        runner=runner,
+        generation_authority=FakeGenerationAuthority(),
+        generation_finalizer=FakeGenerationFinalizer(),
+    )
+
+    assert result.status == "deployed"
+    prepare_calls = [
+        call
+        for call in runner.calls
+        if len(call) >= 2 and call[:2] == ("rquant", "lab-runtime-prepare")
+    ]
+    assert len(prepare_calls) == 1
+    _assert_prepare_argv_exact(
+        prepare_calls[0],
+        runtime_root=LINUX_PRODUCTION_RUNTIME_ROOT,
+        target_sha=_sha("b"),
+    )
+
+
+def test_job_center_authority_argv_parses_against_real_cli(tmp_path: Path) -> None:
+    runtime_root = tmp_path / "runtime"
+    target_sha = _sha("b")
+    argv = _capture_prepare_argv(
+        _config(tmp_path),
+        runtime_root=runtime_root,
+        target_sha=target_sha,
+    )
+    deadline = _assert_prepare_argv_exact(
+        argv,
+        runtime_root=runtime_root,
+        target_sha=target_sha,
+    )
+
+    # The real CLI parser, not a simplified stand-in: this is the seam that binds the argv the
+    # deployer writes to the argv `rquant lab-runtime-prepare` actually accepts.
+    args = build_cli_parser().parse_args(list(argv[1:]))
+
+    assert args.command == "lab-runtime-prepare"
+    assert args.runtime_code_config == Path("/etc/rquant/runtime-code-bootstrap.json")
+    assert args.runtime_code_trusted_base == Path("/etc/rquant")
+    assert args.runtime_code_authority_uid == 0
+    assert args.runtime_code_authority_gid == 0
+    assert args.runtime_deployment_root == runtime_root
+    assert args.expected_code_sha == target_sha
+    assert args.startup_deadline_monotonic == deadline
+    # Every optional deployment binding stays unset: each one we passed would be one more
+    # tamperable binding surface for no gain.
+    assert args.deployment_generation is None
+    assert args.deployment_lock_path is None
+    assert args.deployment_generation_fd is None
+    assert args.deployment_operation_id is None
+    assert args.deployment_environment_generation is None
+
+
+def test_job_center_bootstrap_matches_formal_runtime_constants() -> None:
+    lock_index = FINALIZER_BOOTSTRAP_ARGUMENTS.index("--deployment-lock-path")
+    head = FINALIZER_BOOTSTRAP_ARGUMENTS[:lock_index]
+    tail = FINALIZER_BOOTSTRAP_ARGUMENTS[lock_index + 2 :]
+    expected = head + tail
+
+    assert len(expected) == 8
+    assert expected == production_deploy._JOB_CENTER_BOOTSTRAP
+
+
+@pytest.mark.parametrize(
+    ("release_profile", "platform_name"),
+    [
+        (LINUX_RELEASE_PROFILE, "linux"),
+        (MACOS_LAB_RELEASE_PROFILE, "darwin"),
+    ],
+)
+def test_job_center_authority_argv_is_profile_invariant(
+    tmp_path: Path,
+    release_profile: str,
+    platform_name: str,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    target_sha = _sha("b")
+    config = replace(
+        _config(tmp_path),
+        release_profile=release_profile,
+        platform_name=platform_name,
+    )
+
+    argv = _capture_prepare_argv(config, runtime_root=runtime_root, target_sha=target_sha)
+
+    # Both parameters compare against the same frozen literal, which is what "identical across
+    # profiles" means here: the upstream constant has no profile branch either.
+    _assert_prepare_argv_exact(argv, runtime_root=runtime_root, target_sha=target_sha)
 
 
 def test_runtime_profile_dry_run_calculates_without_publish_apply_or_rollout(
@@ -2357,8 +2533,16 @@ def test_failed_job_authority_prepare_rolls_back_before_any_service_start(
         if len(call) >= 2 and call[:2] == ("rquant", "lab-runtime-prepare")
     ]
     assert len(prepare_calls) == 2
-    assert prepare_calls[0][prepare_calls[0].index("--expected-code-sha") + 1] == _sha("b")
-    assert prepare_calls[1][prepare_calls[1].index("--expected-code-sha") + 1] == _sha("a")
+    _assert_prepare_argv_exact(
+        prepare_calls[0],
+        runtime_root=LINUX_PRODUCTION_RUNTIME_ROOT,
+        target_sha=_sha("b"),
+    )
+    _assert_prepare_argv_exact(
+        prepare_calls[1],
+        runtime_root=LINUX_PRODUCTION_RUNTIME_ROOT,
+        target_sha=_sha("a"),
+    )
     target_prepare_index = runner.calls.index(prepare_calls[0])
     rollback_prepare_index = runner.calls.index(prepare_calls[1])
     service_mutations = [
