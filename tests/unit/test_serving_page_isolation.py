@@ -914,7 +914,14 @@ def test_every_serving_root_consumer_resolves_through_the_shared_default() -> No
 
 
 def test_page_units_pin_the_serving_root_to_the_publisher_directory() -> None:
-    """Four units must override .env with the directory the publisher writes."""
+    """Four units carry exactly one Environment= line naming the publisher directory.
+
+    This is the fallback the page reads when .env leaves the variable unset --
+    systemd.exec applies EnvironmentFile= after Environment= regardless of which
+    directive appears first in the unit, so a value set in .env would win over
+    this line, not the other way around (systemd/systemd#9788). The line's
+    ordinal position relative to EnvironmentFile= is therefore not asserted.
+    """
 
     from rquant.runtime_deployment_profile import LINUX_PRODUCTION_RUNTIME_ROOT
 
@@ -927,11 +934,6 @@ def test_page_units_pin_the_serving_root_to_the_publisher_directory() -> None:
     ):
         service = (_PROJECT_ROOT / f"deploy/systemd/{name}.service").read_text(encoding="utf-8")
         assert service.count(assignment + "\n") == 1, name
-        # systemd applies environment assignments in order; the override only wins
-        # when it follows EnvironmentFile=.
-        assert service.index(assignment) > service.index(
-            "EnvironmentFile=/home/lighthouse/rquant/.env"
-        ), name
 
 
 def test_dashboard_announces_an_unreadable_serving_root_instead_of_swallowing_it() -> None:
