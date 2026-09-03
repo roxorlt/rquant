@@ -245,20 +245,34 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    （`strategy-router` / `strategy-shadow` 五个 surface 的向量语义已在 R2-E 落地：13 个
    reader surface 全部经真实 production builder 产出，离线 harness 世界在 Linux 上产出
    五对 `READY`。这不改变「本轮不安装、不激活」——Phase C activation 仍不成立。）
-16. **Phase C 在真实生产 generation 上能否跑通：未决，且当前代码形态下不成立**。
-   `strategy-shadow` 的三个 reader 只能经 `FilesystemShadowSessionInputLoader` 读一份
-   accepted legacy shadow export，而 `legacy_shadow_export._open_child_directory_at`
-   要求 export 的 session 目录 `st_uid == os.geteuid()`（**不是** 文件那样的
-   `{0, euid}`），`_ensure_private_root` 又把 export 根 `fchmod` 到 `0700`。合起来：
-   **export 只能被与发布者同 uid 的进程读**。离线世界里发布者与 child 同 uid 所以能跑通；
-   生产 generation 是 root-owned、Phase C child 是非特权 lighthouse，这条路走不通。
+16. **Phase C 在真实生产 generation 上能否跑通：谓词侧已由 PR-C 解决，云端实测仍未做**。
+   原症状：`strategy-shadow` 的三个 reader 只能经 `FilesystemShadowSessionInputLoader` 读一份
+   accepted legacy shadow export，而 `legacy_shadow_export._open_child_directory_at` 曾无条件
+   要求 export 的 session 目录 `st_uid == os.geteuid()`（**不是**文件那样的 `{0, euid}`），
+   `_ensure_private_root` 又把 export 根 `fchmod` 到 `0700`。合起来：**export 只能被与发布者
+   同 uid 的进程读**。离线世界里发布者与 child 同 uid 所以能跑通；生产 generation 是
+   root-owned、Phase C child 是非特权 lighthouse，这条路走不通。**更严重的是同一条谓词还挡住
+   生产发布路径自身**：签名器 `deploy/libexec/rquant-shadow-report-signer` 经 `sudo -n` 以 root
+   运行并 `fchown(dir, 0, -1)` + `fchmod(0o555)`，而发布者 `lighthouse`（`rquant-monitor` /
+   `rquant-surge-watch`）在签名之后还要用同一谓词重开自己的 staging（`:1704` / `:2623` /
+   `:3224`）⇒ **生产上根本产不出一份 accepted export**，不只是 Phase C 读不到。
 
-   **不要**按「构建后交给 root 并置 0555」去补救——交给 root 之后
-   `st_uid != geteuid()` 必然成立，shadow reader 会 100% 被拒。三条候选路径交 Codex 裁决：
-   ①generation 内的 shadow export 由 lighthouse 而非 root 拥有（弱化 generation 不可变性）；
-   ②Phase C child 以发布者 uid 运行（改变 child 身份模型）；
-   ③修改 `_open_child_directory_at` 的 owner 谓词接受 `{0, euid}`（TCB 变更，需单独授权）。
-   在裁决落地并实测之前，「Phase C 能在生产 generation 上产出 READY」没有证据。
+   **裁决与落地（PR-C / TP5，TCB 变更）**：三条候选路径里取 ③「修改 `_open_child_directory_at`
+   的 owner 谓词」，但不写死 `{0, euid}`，而是**按 `allowed_modes` 推导**——`allowed_modes` 含
+   `_SESSION_MODE`（`0o555`，该模式只可能由 root 签名器产生，本模块自己从不生成）时 owner 集合
+   为 `{0, euid}`，否则仍是 `{euid}`；同时补一条 `st_mode & (S_IWGRP | S_IWOTH)` 的**无条件拒绝**，
+   把 g/o 可写目录从「靠 `allowed_modes` 间接排除」变成结构性拒绝。函数签名、模块内 **14 个调用点**
+   与 `scripts/build-signal-family-shadow-fixture.py` 一行未动，离线策略（`allowed_modes = {0o700}`）
+   下逐位不变。候选 ①（generation 内的 shadow export 改由 lighthouse 拥有）与 ②（Phase C child 以
+   发布者 uid 运行）均未采纳。
+
+   **仍未闭环 —— C7 是 Phase C activation 的前置**：云端真实发布验证还没做。它同时是唯一能证伪
+   上面「生产发布路径自身走不通」这条代码阅读结论的实验；在它跑通之前，「Phase C 能在生产
+   generation 上产出 READY」依然没有证据，本条仍不构成 activation 依据。
+
+   **运维残留（须 root 手工清理）**：已经产生的 `root:root 0555` staging 目录**不会**被自动清理——
+   `_discard_directory_at` 传的 `allowed_modes` 是 `{0o700}` ⇒ owner 推导仍为 `{euid}`，且
+   lighthouse 对该目录没有写权限。这类残留必须由 root 手工 `rm -rf`。
 
 17. **arbiter 不再执行 checkout 解释器**（Codex round-3 verdict RQ-WI-R2-P1-01）。
    `deploy/libexec/rquant-workload-arbiter` 在取得 research 平面锁之后、exec unit 自己的子进程
