@@ -2732,7 +2732,10 @@ def _validate_pyvenv_config(payload: bytes, *, system_python: Path) -> None:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not valid UTF-8") from exc
     if not text.endswith("\n") or "\r" in text:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not canonical")
-    if any(ord(character) < 0x20 and character != "\n" for character in text):
+    # Unicode category Cc: C0 (< 0x20), DEL (0x7f) and C1 (0x80-0x9f) alike (review S-R3).
+    if any(
+        unicodedata.category(character) == "Cc" and character != "\n" for character in text
+    ):
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains a control character")
     values: dict[str, str] = {}
     for line in text.splitlines():

@@ -1691,6 +1691,17 @@ def test_hyb1_p1_08_manifest_entries_exactly_cover_materialized_generation(
             "control",
         ),
         ((), b"home = /usr/bin\tinclude-system-site-packages = false\n", "control"),
+        # DEL and a C1 control (U+0085 NEL, UTF-8 c2 85) are control characters too.
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\ncommand = a\x7fb\n",
+            "control",
+        ),
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\ncommand = a\xc2\x85b\n",
+            "control",
+        ),
     ],
 )
 def test_rta_01_generation_requires_strict_isolated_pyvenv_config(
