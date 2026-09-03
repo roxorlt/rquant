@@ -7,7 +7,6 @@ the loopback PageControl outbox and are visible after the next publication.
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -21,6 +20,7 @@ from rquant.page_control import (
     SaveCanvas,
     SaveUserPool,
 )
+from rquant.serving_paths import serving_root_from_env
 
 _page_serving: ServingPageRenderContext | None = None
 
@@ -37,7 +37,7 @@ def run_canvas_app() -> None:
     st.title("rQuant 画布")
     try:
         _page_serving = ServingPageRenderContext.open(
-            os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
+            serving_root_from_env()
         )
     except Exception as exc:
         st.error(f"画布 Serving 不可用：{type(exc).__name__}: {exc}")

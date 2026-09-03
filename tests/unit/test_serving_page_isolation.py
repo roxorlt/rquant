@@ -884,3 +884,51 @@ def test_page_convenience_result_preserves_stale_state_instead_of_returning_raw_
     assert result.detail == "signals watermark is stale"
     assert result.generation_id == "generation-1"
     assert result.value == (date(2026, 7, 1), date(2026, 7, 31), 12)
+
+
+_SERVING_ROOT_CONSUMERS = {
+    _PROJECT_ROOT / "src/rquant/dashboard/app.py": 2,
+    _PROJECT_ROOT / "src/rquant/dashboard/nl_screen.py": 1,
+    _PROJECT_ROOT / "src/rquant/dashboard/nl_canvas.py": 1,
+    _PROJECT_ROOT / "src/rquant/dashboard/lab/app.py": 1,
+    _PROJECT_ROOT / "src/rquant/panorama_data.py": 1,
+}
+
+
+def test_every_serving_root_consumer_resolves_through_the_shared_default() -> None:
+    """All six reads share one default; none may re-inline the wrong "data/serving"."""
+
+    total = 0
+    for path, expected_calls in _SERVING_ROOT_CONSUMERS.items():
+        source = path.read_text(encoding="utf-8")
+        assert '"data/serving"' not in source, path
+        assert "'data/serving'" not in source, path
+        assert 'os.environ.get("RQUANT_SERVING_ROOT"' not in source, path
+        assert "os.environ.get('RQUANT_SERVING_ROOT'" not in source, path
+        assert "from rquant.serving_paths import serving_root_from_env" in source, path
+        calls = source.count("serving_root_from_env()")
+        assert calls == expected_calls, (path, calls)
+        total += calls
+
+    assert total == 6
+
+
+def test_page_units_pin_the_serving_root_to_the_publisher_directory() -> None:
+    """Four units must override .env with the directory the publisher writes."""
+
+    from rquant.runtime_deployment_profile import LINUX_PRODUCTION_RUNTIME_ROOT
+
+    assignment = f"Environment=RQUANT_SERVING_ROOT={LINUX_PRODUCTION_RUNTIME_ROOT / 'serving'}"
+    for name in (
+        "rquant-dashboard",
+        "rquant-nl-screen",
+        "rquant-canvas",
+        "rquant-panorama",
+    ):
+        service = (_PROJECT_ROOT / f"deploy/systemd/{name}.service").read_text(encoding="utf-8")
+        assert service.count(assignment + "\n") == 1, name
+        # systemd applies environment assignments in order; the override only wins
+        # when it follows EnvironmentFile=.
+        assert service.index(assignment) > service.index(
+            "EnvironmentFile=/home/lighthouse/rquant/.env"
+        ), name

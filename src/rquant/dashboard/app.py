@@ -11,9 +11,7 @@
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, date, datetime, timedelta, timezone
-from pathlib import Path
 
 import altair as alt
 import pandas as pd
@@ -24,6 +22,7 @@ from rquant.dashboard.runtime_console_data import (
 )
 from rquant.dashboard.serving_page_data import ServingPageRenderContext
 from rquant.dashboard.serving_page_ui import render_serving_state_banner
+from rquant.serving_paths import serving_root_from_env
 
 REFRESH_SECONDS = 30
 CST = timezone(timedelta(hours=8))
@@ -439,7 +438,7 @@ def get_minute_kline(ts_code: str) -> pd.DataFrame:
 
 try:
     _dashboard_serving_context = ServingPageRenderContext.open(
-        os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
+        serving_root_from_env()
     )
 except Exception:
     _dashboard_serving_context = None
@@ -1439,7 +1438,7 @@ try:
 
     st.divider()
     st.caption(
-        f"Serving: {Path(os.environ.get('RQUANT_SERVING_ROOT', 'data/serving')).name}  ·  "
+        f"Serving: {serving_root_from_env()}  ·  "
         f"Refresh: {REFRESH_SECONDS}s  ·  "
         f"Last render: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}"
     )
