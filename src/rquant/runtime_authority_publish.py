@@ -1006,13 +1006,20 @@ def _copy_staging_into_inbox(staging: Path, staged: _StagedGeneration, inbox: Pa
     assert type(planned) is dict
     _write_new_file(inbox / PLAN_NAME, staged.plan_payload)
     os.chmod(inbox / PLAN_NAME, FILE_MODE)
+    # The staging tree is `lighthouse`-writable. `O_NOFOLLOW` guards each final component;
+    # every directory on the way is `lstat`ed too, so a planted symlink cannot point root's
+    # copy at a tree the plan never described.
+    if not stat.S_ISDIR(os.lstat(staging).st_mode):
+        raise RuntimeAuthorityPublishError("staging is not a directory")
     for relative, entry in planned.items():
         destination = inbox / relative
-        if entry["type"] == "directory":
-            os.mkdir(destination, 0o700)
-            continue
         source = staging / relative
         info = os.lstat(source)
+        if entry["type"] == "directory":
+            if not stat.S_ISDIR(info.st_mode):
+                raise RuntimeAuthorityPublishError(f"staged {relative} is not a directory")
+            os.mkdir(destination, 0o700)
+            continue
         if not stat.S_ISREG(info.st_mode):
             raise RuntimeAuthorityPublishError(f"staged {relative} is not a regular file")
         digest, size = _copy_new_file(source, destination)

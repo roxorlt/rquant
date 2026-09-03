@@ -960,6 +960,22 @@ def test_t17_a9_a_staged_file_changed_after_staging_is_quarantined(world: World)
     assert not world.profile_path.exists()
 
 
+def test_t17_a_symlinked_staging_directory_is_refused(world: World) -> None:
+    plan = world.stage("t17c")
+    generation = plan.options.staging / "generation"
+    generation.chmod(0o755)
+    (generation / "scripts").chmod(0o755)  # Darwin: a directory must be writable to be renamed
+    (generation / "scripts").rename(generation / "scripts.real")
+    (generation / "scripts.real").chmod(0o555)
+    os.symlink("scripts.real", generation / "scripts")
+    generation.chmod(0o555)
+    with pytest.raises(RuntimeAuthorityPublishError, match="is not a directory"):
+        world.publish(plan)
+    assert not world.authority_path.exists()
+    assert not world.generation_path(plan).exists()
+    assert (world.quarantine / plan.options.operation_id).is_dir()
+
+
 def test_t17_a_tampered_plan_level_file_is_refused_before_the_inbox(world: World) -> None:
     plan = world.stage("t17b")
     _tamper(plan.options.staging / "production-runtime-profile.json")
