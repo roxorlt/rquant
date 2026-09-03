@@ -119,6 +119,18 @@
 ### Security
 
 
+- **TCB 语义变更：legacy shadow export 目录谓词的 owner 集合（TP5 / TCB-3）**：
+  `_open_child_directory_at` 在 `allowed_modes` 含 `_SESSION_MODE`（`0o555`）时接受
+  `st_uid == 0` 的目录，并新增一条 `st_mode & (stat.S_IWGRP | stat.S_IWOTH)` 的**无条件拒绝**。
+  **这次放宽不新增任何一个 lighthouse 可读的文件**：谓词的可触达集合被
+  `os.open(..., O_RDONLY|O_DIRECTORY|O_NOFOLLOW, dir_fd=...)` 与名字校验结构性限制在
+  `_ensure_private_root` 校验过的 export 根下**一层**子目录，而 `root:root 0555` 目录本来就对
+  所有人 r-x（谓词的拒绝是纯策略，不是访问控制），`root:root 0700` 目录则在 `os.open` 阶段就
+  `EACCES`、根本轮不到谓词；目录被接受之后每个文件仍要过 `_read_regular_at`（`S_ISREG` +
+  `st_uid ∈ {0, euid}` + `nlink == 1` + mode 恰为 `0444` + size 上限 + 读前/读中/读后三次身份
+  一致性）与 `recovery-marker.json` 的 Ed25519 签名，内容信任面一字未动。新增的 g/o 写位检查把
+  「root 拥有但 g/o 可写」从「靠 `allowed_modes` 间接排除」变成结构性拒绝，净收紧。
+
 - **资源准入适配器的新 wire 字段不放宽任何既有约束**（Codex RQ-CTB-P1-01）：容量 fence、lease、
   fencing token、请求签名与凭据校验一条未放宽；`lock_wait_timeout_milliseconds` 的上界等于 store
   自己的 `_MAX_RESOURCE_LOCK_WAIT_SECONDS`（由 `test_lock_wait_budget_ceiling_matches_the_store`
@@ -313,6 +325,16 @@
   `N abandoned heartbeat(s) still alive` 一并移除。
 
 ### Fixed
+
+- **legacy shadow export 的目录 owner 谓词按 `allowed_modes` 推导（TP5 / `DEPLOY.md` 第 16 条）**：
+  `_open_child_directory_at` 过去无条件要求 `st_uid == os.geteuid()`，而生产签名器经 `sudo -n`
+  以 root `fchown(dir, 0, -1)` + `fchmod(0o555)` 之后，连发布者 `lighthouse` 自己重开 staging
+  （`:1704` / `:2623` / `:3224`）都会被拒 ⇒ **生产上根本产不出一份 accepted legacy shadow
+  export**，不只是 Phase C 的 `strategy-shadow` reader 读不到。现在 owner 集合由
+  `allowed_modes` 推导：含 `_SESSION_MODE`（`0o555`，只可能由 root 签名器产生）时为
+  `{0, euid}`，否则仍为 `{euid}`。函数签名、模块内 **14 个调用点**与
+  `scripts/build-signal-family-shadow-fixture.py` 一行未动，离线策略（`{0o700}`）下逐位不变。
+  云端真实发布验证（C7）仍未做，是 Phase C activation 的前置。
 
 - **#175（R07 差分门的路径分类表漏了 `CLAUDE.md`）**：`scripts/r07_policy_regenerate.py` 的
   `diff_category` 通过冻结元组 `_ARCHITECTURE_ROOT_FILES` 归类根文件，表里有 `AGENTS.md` 却没有

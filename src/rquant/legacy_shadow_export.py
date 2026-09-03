@@ -1486,6 +1486,26 @@ def _open_child_directory_at(
     label: str,
     allowed_modes: frozenset[int],
 ) -> int:
+    """Open one child directory of an already validated parent, owner policy included.
+
+    The owner set is derived from ``allowed_modes`` rather than passed in, so no call site
+    can widen or forget to widen it. A session mode (``_SESSION_MODE``) is only ever
+    produced by the root signer sealing a transaction -- ``_protect_transaction_files`` in
+    ``deploy/libexec/rquant-shadow-report-signer`` runs under ``sudo -n`` and fchowns to uid
+    0 before fchmod -- so a directory carrying it legitimately belongs to root, and the
+    publisher must be able to reopen its own staging afterwards. Accepting root adds no
+    reachable authority: root can replace the object either way, and a ``0555`` directory is
+    world-readable already, so the refusal was policy rather than access control. Any
+    *other* foreign owner could chmod the directory writable and swap the tree underneath,
+    which is what the owner set still refuses. A build-phase mode (``_ROOT_MODE``) is
+    created by this very process, so it stays pinned to the effective uid.
+
+    The explicit ``0o022`` test refuses group- or other-writable directories outright
+    instead of relying on ``allowed_modes`` to exclude them by accident; it guards the day
+    someone adds a laxer mode to that set. It applies to a single child of the export root,
+    not to an ancestor chain, so it takes no sticky-bit exemption.
+    """
+
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise LegacyShadowExportUnavailableError(f"{label} name is unsafe")
     try:
@@ -1497,9 +1517,16 @@ def _open_child_directory_at(
     except OSError as exc:
         raise LegacyShadowExportUnavailableError(f"{label} is unavailable") from exc
     observed = os.fstat(descriptor)
+    # Evaluated per call: the process may have dropped privileges since import.
+    owners = (
+        frozenset({0, os.geteuid()})
+        if _SESSION_MODE in allowed_modes
+        else frozenset({os.geteuid()})
+    )
     if (
         not stat.S_ISDIR(observed.st_mode)
-        or observed.st_uid != os.geteuid()
+        or observed.st_uid not in owners
+        or observed.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         or stat.S_IMODE(observed.st_mode) not in allowed_modes
     ):
         os.close(descriptor)

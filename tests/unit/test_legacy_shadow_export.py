@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import inspect
 import json
 import os
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +23,7 @@ from rquant.legacy_shadow_export import (
     LegacyShadowExportError,
     LegacyShadowExportManifest,
     LegacyShadowExportUnavailableError,
+    LegacyShadowFilesystemPolicy,
     LegacyShadowFinalizationClaims,
     LegacyShadowFinalizationReceipt,
     LegacyShadowRecoveryMarkerClaims,
@@ -1940,3 +1945,355 @@ def test_shadow_filesystem_loader_accepts_only_validated_export_batches(tmp_path
             trade_date=TRADE_DATE,
             expected_export_commit=COMMIT,
         )
+
+
+# ---------------------------------------------------------------------------------------
+# TP5 (PR-C): `_open_child_directory_at` derives its owner set from `allowed_modes`.
+#
+# An unprivileged test process cannot chown, so the negative branches are only reachable by
+# faking the `st_uid` the predicate observes. `legacy_shadow_export` calls `os.fstat` in
+# fourteen places -- the file predicate, the identity rebinds and the fsync fences all use
+# it -- so the seam MUST dispatch on `stat.S_ISDIR` and leave every file observation alone;
+# an indiscriminate patch would move the file predicate too and fake the result either way.
+# ---------------------------------------------------------------------------------------
+
+_ROOT_MODE = legacy_shadow_export_module._ROOT_MODE
+_SESSION_MODE = legacy_shadow_export_module._SESSION_MODE
+_GROUP_OTHER_WRITABLE_SESSION_MODE = 0o557
+_GROUP_WRITABLE_SESSION_MODE = 0o575
+_FOREIGN_UID = 999
+
+
+def _stat_result_with_uid(observed: os.stat_result, uid: int) -> os.stat_result:
+    fields = list(observed)
+    fields[4] = uid
+    return os.stat_result(
+        fields,
+        {
+            "st_atime_ns": observed.st_atime_ns,
+            "st_mtime_ns": observed.st_mtime_ns,
+            "st_ctime_ns": observed.st_ctime_ns,
+        },
+    )
+
+
+@contextmanager
+def _faked_directory_owner(uid: int) -> Iterator[None]:
+    """Fake `st_uid` on directory observations only; file observations stay untouched."""
+
+    real_fstat = os.fstat
+    real_stat = os.stat
+
+    def patched_fstat(fd: int) -> os.stat_result:
+        observed = real_fstat(fd)
+        if stat.S_ISDIR(observed.st_mode):
+            return _stat_result_with_uid(observed, uid)
+        return observed
+
+    def patched_stat(
+        path: int | str | bytes | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        observed = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if stat.S_ISDIR(observed.st_mode):
+            return _stat_result_with_uid(observed, uid)
+        return observed
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fstat", patched_fstat)
+        patch.setattr(os, "stat", patched_stat)
+        yield
+
+
+def _production_filesystem_policy() -> LegacyShadowFilesystemPolicy:
+    return LegacyShadowFilesystemPolicy(mode="linux-production")
+
+
+def _named_allowed_modes(label: str) -> frozenset[int]:
+    signed_session_modes = legacy_shadow_export_module._signed_session_modes
+    return {
+        "root-mode": frozenset({_ROOT_MODE}),
+        "session-mode": frozenset({_SESSION_MODE}),
+        "root-and-session-mode": frozenset({_ROOT_MODE, _SESSION_MODE}),
+        "signed-session-modes-production": signed_session_modes(_production_filesystem_policy()),
+        "signed-session-modes-offline": signed_session_modes(
+            legacy_shadow_test_filesystem_policy()
+        ),
+    }[label]
+
+
+def _named_owner_uid(label: str) -> int:
+    return {"self": os.geteuid(), "root": 0, "foreign": _FOREIGN_UID}[label]
+
+
+def _child_directory(parent: Path, *, name: str, mode: int) -> Path:
+    child = parent / name
+    child.mkdir(mode=_ROOT_MODE)
+    os.chmod(child, mode)
+    return child
+
+
+def _directory_predicate_accepts(
+    parent: Path,
+    name: str,
+    *,
+    allowed_modes: frozenset[int],
+    owner_uid: int,
+) -> bool:
+    parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = -1
+    try:
+        with _faked_directory_owner(owner_uid):
+            descriptor = legacy_shadow_export_module._open_child_directory_at(
+                parent_descriptor,
+                name,
+                label="legacy shadow session",
+                allowed_modes=allowed_modes,
+            )
+    except LegacyShadowExportUnavailableError:
+        return False
+    else:
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def test_build_phase_modes_keep_the_owner_set_pinned_to_the_effective_uid(
+    tmp_path: Path,
+) -> None:
+    """C1 / I-TP5-1: `{0o700}` carries no session mode, so root ownership stays refused."""
+
+    root = tmp_path / "legacy-shadow"
+    root.mkdir(mode=_ROOT_MODE)
+    _child_directory(root, name="building", mode=_ROOT_MODE)
+
+    assert _directory_predicate_accepts(
+        root,
+        "building",
+        allowed_modes=frozenset({_ROOT_MODE}),
+        owner_uid=os.geteuid(),
+    )
+    assert not _directory_predicate_accepts(
+        root,
+        "building",
+        allowed_modes=frozenset({_ROOT_MODE}),
+        owner_uid=0,
+    )
+
+
+def test_session_mode_admits_the_root_signer_that_sealed_the_directory(tmp_path: Path) -> None:
+    """C2: `0o555` is only ever produced by the root signer, so uid 0 must be admitted."""
+
+    root = tmp_path / "legacy-shadow"
+    root.mkdir(mode=_ROOT_MODE)
+    _child_directory(root, name=TRADE_DATE.isoformat(), mode=_SESSION_MODE)
+
+    assert _directory_predicate_accepts(
+        root,
+        TRADE_DATE.isoformat(),
+        allowed_modes=frozenset({_SESSION_MODE}),
+        owner_uid=0,
+    )
+    assert _directory_predicate_accepts(
+        root,
+        TRADE_DATE.isoformat(),
+        allowed_modes=frozenset({_SESSION_MODE}),
+        owner_uid=os.geteuid(),
+    )
+
+
+def test_session_mode_still_refuses_every_other_foreign_owner(tmp_path: Path) -> None:
+    """C3: the widening admits uid 0 only; any third owner remains unsafe."""
+
+    root = tmp_path / "legacy-shadow"
+    root.mkdir(mode=_ROOT_MODE)
+    _child_directory(root, name=TRADE_DATE.isoformat(), mode=_SESSION_MODE)
+
+    assert not _directory_predicate_accepts(
+        root,
+        TRADE_DATE.isoformat(),
+        allowed_modes=frozenset({_SESSION_MODE}),
+        owner_uid=_FOREIGN_UID,
+    )
+
+
+def test_group_or_other_writable_directories_are_refused_even_when_allowed(
+    tmp_path: Path,
+) -> None:
+    """C4 / I-TP5-7: the explicit `0o022` test must survive a widened `allowed_modes`."""
+
+    root = tmp_path / "legacy-shadow"
+    root.mkdir(mode=_ROOT_MODE)
+    _child_directory(
+        root,
+        name=TRADE_DATE.isoformat(),
+        mode=_GROUP_OTHER_WRITABLE_SESSION_MODE,
+    )
+    _child_directory(root, name="group-writable", mode=_GROUP_WRITABLE_SESSION_MODE)
+
+    assert not _directory_predicate_accepts(
+        root,
+        TRADE_DATE.isoformat(),
+        allowed_modes=frozenset({_SESSION_MODE}),
+        owner_uid=0,
+    )
+    assert not _directory_predicate_accepts(
+        root,
+        TRADE_DATE.isoformat(),
+        allowed_modes=frozenset({_SESSION_MODE, _GROUP_OTHER_WRITABLE_SESSION_MODE}),
+        owner_uid=0,
+    )
+    assert not _directory_predicate_accepts(
+        root,
+        TRADE_DATE.isoformat(),
+        allowed_modes=frozenset({_SESSION_MODE, _GROUP_OTHER_WRITABLE_SESSION_MODE}),
+        owner_uid=os.geteuid(),
+    )
+
+    # The group half of the guard needs its own hostage. `0o557` sets only the other-write
+    # bit, so narrowing `S_IWGRP | S_IWOTH` to `S_IWOTH` leaves every case above green and
+    # the group half becomes dead code in the regression sense.
+    assert not _directory_predicate_accepts(
+        root,
+        "group-writable",
+        allowed_modes=frozenset({_SESSION_MODE, _GROUP_WRITABLE_SESSION_MODE}),
+        owner_uid=0,
+    )
+    assert not _directory_predicate_accepts(
+        root,
+        "group-writable",
+        allowed_modes=frozenset({_SESSION_MODE, _GROUP_WRITABLE_SESSION_MODE}),
+        owner_uid=os.geteuid(),
+    )
+
+
+def test_signed_session_modes_pin_the_inputs_of_the_owner_derivation() -> None:
+    """S13: the truth table's last two rows are only meaningful while these stay frozen."""
+
+    signed_session_modes = legacy_shadow_export_module._signed_session_modes
+    assert signed_session_modes(_production_filesystem_policy()) == frozenset({0o555})
+    assert signed_session_modes(legacy_shadow_test_filesystem_policy()) == frozenset({0o700})
+
+
+@pytest.mark.parametrize(
+    ("allowed_modes_label", "directory_mode", "owner_label", "accepted"),
+    (
+        ("root-mode", _ROOT_MODE, "self", True),
+        ("root-mode", _ROOT_MODE, "root", False),
+        ("root-mode", _ROOT_MODE, "foreign", False),
+        ("root-mode", _SESSION_MODE, "self", False),
+        ("root-mode", _SESSION_MODE, "root", False),
+        ("root-mode", _SESSION_MODE, "foreign", False),
+        ("session-mode", _SESSION_MODE, "self", True),
+        ("session-mode", _SESSION_MODE, "root", True),
+        ("session-mode", _SESSION_MODE, "foreign", False),
+        ("session-mode", _ROOT_MODE, "self", False),
+        ("session-mode", _ROOT_MODE, "root", False),
+        ("session-mode", _ROOT_MODE, "foreign", False),
+        ("root-and-session-mode", _ROOT_MODE, "self", True),
+        ("root-and-session-mode", _ROOT_MODE, "root", True),
+        ("root-and-session-mode", _ROOT_MODE, "foreign", False),
+        ("root-and-session-mode", _SESSION_MODE, "self", True),
+        ("root-and-session-mode", _SESSION_MODE, "root", True),
+        ("root-and-session-mode", _SESSION_MODE, "foreign", False),
+        ("signed-session-modes-production", _SESSION_MODE, "self", True),
+        ("signed-session-modes-production", _SESSION_MODE, "root", True),
+        ("signed-session-modes-production", _SESSION_MODE, "foreign", False),
+        ("signed-session-modes-offline", _ROOT_MODE, "self", True),
+        ("signed-session-modes-offline", _ROOT_MODE, "root", False),
+        ("signed-session-modes-offline", _ROOT_MODE, "foreign", False),
+    ),
+)
+def test_directory_owner_predicate_truth_table(
+    tmp_path: Path,
+    allowed_modes_label: str,
+    directory_mode: int,
+    owner_label: str,
+    accepted: bool,
+) -> None:
+    """C6 / I-TP5-2: the owner set follows `allowed_modes` alone, never the call site."""
+
+    root = tmp_path / "legacy-shadow"
+    root.mkdir(mode=_ROOT_MODE)
+    _child_directory(root, name=TRADE_DATE.isoformat(), mode=directory_mode)
+
+    assert (
+        _directory_predicate_accepts(
+            root,
+            TRADE_DATE.isoformat(),
+            allowed_modes=_named_allowed_modes(allowed_modes_label),
+            owner_uid=_named_owner_uid(owner_label),
+        )
+        is accepted
+    )
+
+
+def test_root_sealed_session_loads_the_same_batch_as_a_publisher_owned_session(
+    tmp_path: Path,
+) -> None:
+    """C5: the production seal (`root:root 0555`) yields a field-for-field identical batch."""
+
+    legacy_root = (tmp_path / "legacy-shadow" / "monitor").resolve()
+    publish_legacy_monitor_export(
+        root=legacy_root,
+        trade_date=TRADE_DATE,
+        rows=_monitor_rows(),
+        producer_commit=COMMIT,
+        producer_version="legacy-monitor-v1",
+        dependencies=_dependencies(datetime(2026, 8, 3, 7, 3, tzinfo=UTC)),
+    )
+    baseline = load_accepted_legacy_shadow_export(
+        root=legacy_root,
+        trade_date=TRADE_DATE,
+        expected_source_id=None,
+        expected_commit=COMMIT,
+    )
+
+    # I-TP5-1 end to end: the offline policy never carries the session mode, so a
+    # root-owned session stays refused no matter how the reader is invoked.
+    with _faked_directory_owner(0), pytest.raises(LegacyShadowExportUnavailableError):
+        load_accepted_legacy_shadow_export(
+            root=legacy_root,
+            trade_date=TRADE_DATE,
+            expected_source_id=None,
+            expected_commit=COMMIT,
+        )
+
+    def production_signed_session_modes(policy: LegacyShadowFilesystemPolicy) -> frozenset[int]:
+        return frozenset({_SESSION_MODE})
+
+    session = legacy_root / TRADE_DATE.isoformat()
+    os.chmod(session, _SESSION_MODE)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                legacy_shadow_export_module,
+                "_signed_session_modes",
+                production_signed_session_modes,
+            )
+            with _faked_directory_owner(0):
+                sealed = load_accepted_legacy_shadow_export(
+                    root=legacy_root,
+                    trade_date=TRADE_DATE,
+                    expected_source_id=None,
+                    expected_commit=COMMIT,
+                )
+    finally:
+        os.chmod(session, _ROOT_MODE)
+
+    compared = {field.name for field in dataclasses.fields(baseline)}
+    assert compared == {
+        "root",
+        "session_path",
+        "manifest",
+        "records",
+        "records_path",
+        "completion_receipt",
+        "completed_batch",
+    }
+    for name in sorted(compared):
+        assert getattr(sealed, name) == getattr(baseline, name), name
