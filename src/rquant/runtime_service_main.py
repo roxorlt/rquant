@@ -309,6 +309,10 @@ class _StartupDegradedRegistry(RuntimeServiceRegistry):
     def startup_degraded_reasons(self) -> tuple[str, ...]:
         return self._reasons
 
+    @property
+    def registered_kinds(self) -> tuple[RuntimeServiceKind, ...]:
+        return self._inner.registered_kinds
+
     def open_artifact_terminal_lifecycle(self) -> ProductionArtifactTerminalLifecycle:
         return self._inner.open_artifact_terminal_lifecycle()
 

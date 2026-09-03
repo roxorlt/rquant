@@ -201,7 +201,6 @@ def test_t9_7_module_attribute_yields_the_same_object_as_get_settings() -> None:
     """The 78 `setattr(<…>settings, …)` call points mutate this one cached instance."""
 
     import rquant.config as config
-
     from rquant.config import get_settings
 
     assert config.settings is get_settings()
@@ -253,11 +252,11 @@ def test_t9_9_cli_entry_builds_settings_before_parsing_arguments(
     import rquant.cli as cli
     import rquant.config as config
 
-    class _ConfigMissing(RuntimeError):
+    class _ConfigMissingError(RuntimeError):
         pass
 
     def refuse() -> object:
-        raise _ConfigMissing("settings are unavailable")
+        raise _ConfigMissingError("settings are unavailable")
 
     def unreachable_parser() -> object:
         raise AssertionError("the entry point parsed arguments before reading the settings")
@@ -265,7 +264,7 @@ def test_t9_9_cli_entry_builds_settings_before_parsing_arguments(
     monkeypatch.setattr(config, "get_settings", refuse)
     monkeypatch.setattr(cli, "build_parser", unreachable_parser)
 
-    with pytest.raises(_ConfigMissing):
+    with pytest.raises(_ConfigMissingError):
         cli.main()
 
 
@@ -301,3 +300,435 @@ def test_t9_9_cli_help_still_fails_closed_without_configuration(tmp_path: Path) 
     )
     assert configured.returncode == 0
     assert "usage:" in configured.stdout
+
+
+# ---------------------------------------------------------------------------------------
+# T9-4 / T9-5 / T9-6: `runtime_service_main.run()` under `--authority-runtime`
+# ---------------------------------------------------------------------------------------
+
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+GENERATION = "f" * 64
+INSTANCE = "svc-" + "a" * 64
+PRODUCTION_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
+
+
+def _kind_manifest(kind: str, *, service_id: str = "source.market-minute") -> object:
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
+
+    return RuntimeServiceManifest(
+        service_id=service_id,
+        service_kind=RuntimeServiceKind(kind),
+        plane="live",
+        interval_seconds=15,
+        stale_after_seconds=45,
+        producer_commit=COMMIT,
+        settings={},
+    )
+
+
+def _write_generation_manifest(
+    root: Path,
+    manifest: object,
+    *,
+    generation: str = GENERATION,
+    instance: str = INSTANCE,
+    mode: int = 0o444,
+) -> Path:
+    """`<root>/generations/<generation>/manifests/<instance>.json`, as a generation holds it."""
+
+    directory = root / "generations" / generation / "manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{instance}.json"
+    path.write_text(manifest.model_dump_json(), encoding="utf-8")  # type: ignore[attr-defined]
+    path.chmod(mode)
+    return path
+
+
+def _authority_args(
+    manifest_path: Path,
+    control_root: Path,
+    *,
+    kind: str | None = None,
+    once: bool = False,
+) -> object:
+    from rquant.runtime_service_main import build_parser
+
+    argv = [
+        "--manifest",
+        str(manifest_path),
+        "--control-root",
+        str(control_root),
+        "--expected-commit",
+        COMMIT,
+        "--expected-generation",
+        GENERATION,
+    ]
+    if kind is not None:
+        argv.extend(["--expected-kind", kind])
+    if once:
+        argv.append("--once")
+    argv.append("--authority-runtime")
+    return build_parser().parse_args(argv)
+
+
+def _forbid_git(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    calls: list[object] = []
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        raise AssertionError("run() must not start a git subprocess under --authority-runtime")
+
+    monkeypatch.setattr("rquant.runtime_service_main.subprocess.run", refuse)
+    return calls
+
+
+def test_t9_4_authority_runtime_trusts_expected_commit_and_runs_no_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-4: no git subprocess; the commit is `--expected-commit`, checked against the manifest."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    git_calls = _forbid_git(monkeypatch)
+    observed: dict[str, object] = {}
+
+    def fake_registry(**kwargs: object) -> object:
+        observed["registry_kwargs"] = kwargs
+        return object()
+
+    def fake_run(
+        loaded: object, *, registry: object, control_root: Path, **_kwargs: object
+    ) -> object:
+        observed.update(manifest=loaded, registry=registry, control_root=control_root)
+        return object()
+
+    monkeypatch.setattr(service_main, "build_builtin_registry", fake_registry)
+    monkeypatch.setattr(service_main, "run_runtime_service_manifest", fake_run)
+
+    args = _authority_args(manifest_path, control_root, kind="market_minute_source")
+    assert service_main.run(args) == 0
+
+    assert git_calls == []
+    assert observed["manifest"] == manifest
+    assert observed["control_root"] == control_root
+    assert observed["registry_kwargs"]["runtime_capabilities"] == {}  # type: ignore[index]
+
+
+def test_t9_4_authority_runtime_rejects_a_manifest_for_another_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The commit comparison did not go away with git: the manifest still has to match it."""
+
+    import rquant.runtime_service_main as service_main
+    from rquant.runtime_service_entrypoint import RuntimeServiceManifest
+
+    manifest = _kind_manifest("market_minute_source")
+    other = RuntimeServiceManifest.model_validate(
+        {**manifest.model_dump(), "producer_commit": "9" * 40}
+    )
+    manifest_path = _write_generation_manifest(tmp_path, other)
+    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    _forbid_git(monkeypatch)
+    monkeypatch.setattr(
+        service_main,
+        "build_builtin_registry",
+        lambda **_kwargs: pytest.fail("registry must not be built"),
+    )
+
+    with pytest.raises(ValueError, match="commit does not match running code"):
+        service_main.run(_authority_args(manifest_path, control_root))
+
+
+@pytest.mark.parametrize(
+    ("relocate", "match"),
+    [
+        (lambda p: p.parent.parent / "elsewhere" / p.name, "outside the generation manifest"),
+        (lambda p: p.parents[2] / ("e" * 64) / "manifests" / p.name, "generation does not match"),
+    ],
+)
+def test_t9_4_authority_manifest_must_sit_in_the_expected_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relocate: object,
+    match: str,
+) -> None:
+    from rquant.runtime_service_main import load_authority_service_manifest
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    moved = relocate(manifest_path)  # type: ignore[operator]
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.rename(moved)
+
+    with pytest.raises(ValueError, match=match):
+        load_authority_service_manifest(
+            moved, expected_commit=COMMIT, expected_generation=GENERATION
+        )
+
+
+def test_t9_4_authority_manifest_accepts_root_style_0444_and_refuses_group_writable(
+    tmp_path: Path,
+) -> None:
+    """A generation's copy is root-owned 0444; the legacy reader's 0600 rule cannot apply."""
+
+    from rquant.runtime_service_main import load_authority_service_manifest
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest, mode=0o444)
+    loaded = load_authority_service_manifest(
+        manifest_path, expected_commit=COMMIT, expected_generation=GENERATION
+    )
+    assert loaded == manifest
+
+    manifest_path.chmod(0o464)
+    with pytest.raises(ValueError, match="writable outside its owner"):
+        load_authority_service_manifest(
+            manifest_path, expected_commit=COMMIT, expected_generation=GENERATION
+        )
+
+
+def test_t9_4_authority_manifest_refuses_a_symlinked_component(tmp_path: Path) -> None:
+    from rquant.runtime_service_main import load_authority_service_manifest
+
+    manifest = _kind_manifest("market_minute_source")
+    real = _write_generation_manifest(tmp_path / "real", manifest)
+    linked_root = tmp_path / "linked"
+    (linked_root / "generations").mkdir(parents=True)
+    (linked_root / "generations" / GENERATION).symlink_to(real.parent.parent)
+    via_link = linked_root / "generations" / GENERATION / "manifests" / real.name
+    assert via_link.read_bytes() == real.read_bytes()
+
+    with pytest.raises(ValueError, match="contains a symlink"):
+        load_authority_service_manifest(
+            via_link, expected_commit=COMMIT, expected_generation=GENERATION
+        )
+
+
+def test_t9_5_runtime_root_arithmetic_holds_for_every_control_root_in_the_policy() -> None:
+    """T9-5: `parents[2]` of every real control root, with any instance label appended."""
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+    from rquant.runtime_service_main import runtime_root_from_control_root
+
+    with_control_root = [entry for entry in PRODUCTION_ROLE_POLICY if entry.control_root]
+    # 22 kind-backed roles + page_control + the two recovery roles. The three roles without
+    # a control root (`daily`, `lab_claim_finalizer`, `workload_admission`) derive nothing.
+    assert len(with_control_root) == 25
+    for entry in with_control_root:
+        derived = runtime_root_from_control_root(Path(entry.control_root) / INSTANCE)
+        assert derived == PRODUCTION_RUNTIME_ROOT, entry.name
+
+
+@pytest.mark.parametrize(
+    "control_root",
+    [
+        "/svc-instance",
+        "/control/svc-instance",
+        "/runtime/not-control/strategies/svc-instance",
+        "/home/lighthouse/rquant/data/runtime/strategies/svc-instance",
+    ],
+)
+def test_t9_5_runtime_root_arithmetic_raises_on_an_unexpected_shape(control_root: str) -> None:
+    """Never `None`: a control root that is not `<root>/control/<kind>/<instance>` is an error."""
+
+    from rquant.runtime_service_main import runtime_root_from_control_root
+
+    with pytest.raises(ValueError, match="runtime control tree"):
+        runtime_root_from_control_root(Path(control_root))
+
+
+def test_t9_5_runtime_root_is_not_the_recovery_specific_helper() -> None:
+    """S-16: `runtime_recovery_service.runtime_root_for` refuses 22 of the 26 control roots."""
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+    from rquant.runtime_recovery_service import runtime_root_for
+    from rquant.runtime_service_main import runtime_root_from_control_root
+
+    refused = 0
+    for entry in PRODUCTION_ROLE_POLICY:
+        if not entry.control_root:
+            continue
+        control_root = Path(entry.control_root) / INSTANCE
+        assert runtime_root_from_control_root(control_root) == PRODUCTION_RUNTIME_ROOT
+        try:
+            runtime_root_for(control_root)
+        except ValueError:
+            refused += 1
+    assert refused == 23  # every kind directory except `recovery` (2 roles share it)
+
+
+def test_t9_5_existing_runtime_root_is_used_for_schema_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the derived root exists, it is the one handed to the schema-binding loader."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    runtime_root = tmp_path / "runtime"
+    control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
+    control_root.mkdir(parents=True)
+    _forbid_git(monkeypatch)
+    observed: dict[str, object] = {}
+
+    def fake_bindings(root: Path, **kwargs: object) -> tuple[()]:
+        observed["schema_root"] = root
+        return ()
+
+    monkeypatch.setattr(service_main, "load_runtime_schema_service_bindings", fake_bindings)
+    monkeypatch.setattr(
+        service_main,
+        "build_builtin_registry",
+        lambda **kwargs: observed.update(registry_kwargs=kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        service_main, "run_runtime_service_manifest", lambda *_a, **_k: object()
+    )
+
+    assert service_main.run(_authority_args(manifest_path, control_root)) == 0
+    assert observed["schema_root"] == runtime_root
+    assert "startup_degraded_reasons" not in observed["registry_kwargs"]  # type: ignore[operator]
+
+
+def test_t9_6_missing_runtime_root_warns_and_marks_the_registry_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-6: the degradation is a WARNING in the journal and a reason on the registry."""
+
+    from loguru import logger
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    assert not (tmp_path / "runtime").exists()
+    _forbid_git(monkeypatch)
+    monkeypatch.setattr(
+        service_main,
+        "load_runtime_schema_service_bindings",
+        lambda *_a, **_k: pytest.fail("schema bindings must not be loaded without a root"),
+    )
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        service_main,
+        "build_builtin_registry",
+        lambda **kwargs: observed.update(registry_kwargs=kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        service_main, "run_runtime_service_manifest", lambda *_a, **_k: object()
+    )
+    records: list[object] = []
+    sink = logger.add(lambda message: records.append(message.record), level="WARNING")
+    try:
+        assert service_main.run(_authority_args(manifest_path, control_root)) == 0
+    finally:
+        logger.remove(sink)
+
+    warnings = [r for r in records if r["level"].name == "WARNING"]  # type: ignore[index]
+    assert len(warnings) == 1
+    text = warnings[0]["message"]  # type: ignore[index]
+    assert str(tmp_path / "runtime") in text
+    assert "market_minute_source" in text
+    assert "schema dual write" in text
+    kwargs = observed["registry_kwargs"]
+    assert kwargs["startup_degraded_reasons"] == (  # type: ignore[index]
+        service_main.RUNTIME_ROOT_DEGRADED_REASON,
+    )
+
+
+def test_t9_6_degraded_reason_reaches_the_published_heartbeat(tmp_path: Path) -> None:
+    """The health signal, not only the log: the loop's heartbeat carries the reason."""
+
+    from threading import Event
+
+    from rquant.runtime_service_control import (
+        RuntimeServiceControl,
+        RuntimeServiceStatus,
+        RuntimeStepResult,
+    )
+    from rquant.runtime_service_entrypoint import (
+        RuntimeServiceKind,
+        RuntimeServiceRegistry,
+        run_runtime_service_manifest,
+    )
+    from rquant.runtime_service_main import (
+        RUNTIME_ROOT_DEGRADED_REASON,
+        _StartupDegradedRegistry,
+    )
+
+    manifest = _kind_manifest("market_minute_source")
+    inner = RuntimeServiceRegistry()
+    inner.register(
+        RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        lambda _manifest: (lambda: RuntimeStepResult(processed_count=1)),
+    )
+    registry = _StartupDegradedRegistry(inner, reasons=(RUNTIME_ROOT_DEGRADED_REASON,))
+    assert registry.registered_kinds == (RuntimeServiceKind.MARKET_MINUTE_SOURCE,)
+
+    # The step the loop will call carries the startup reason on top of its own result.
+    step = registry.build(manifest)
+    stamped = step()
+    assert stamped.processed_count == 1
+    assert stamped.degraded_reasons == (RUNTIME_ROOT_DEGRADED_REASON,)
+
+    # One real loop iteration through the real control: the persisted heartbeat, which is
+    # what `runtime_health_publisher` reads, keeps the reason after the loop stops.
+    control_root = tmp_path / "control"
+    heartbeat = run_runtime_service_manifest(
+        manifest,
+        registry=registry,
+        control_root=control_root,
+        stop_event=Event(),
+        max_iterations=1,
+    )
+    assert heartbeat.total_successes == 1
+    assert RUNTIME_ROOT_DEGRADED_REASON in heartbeat.degraded_reasons
+    persisted = RuntimeServiceControl.read_heartbeat(control_root, manifest.service_spec)
+    assert persisted is not None
+    assert RUNTIME_ROOT_DEGRADED_REASON in persisted.degraded_reasons
+
+    # And while the service runs, that reason is what turns `running` into `degraded`.
+    control = RuntimeServiceControl(tmp_path / "control-live", spec=manifest.service_spec)
+    control.start()
+    try:
+        live = control.record_success(stamped)
+    finally:
+        control.stop(reason="test complete")
+    assert live.status is RuntimeServiceStatus.DEGRADED
+    assert live.degraded_reasons == (RUNTIME_ROOT_DEGRADED_REASON,)
+
+
+def test_t9_6_strategy_live_still_fails_closed_without_a_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one kind that must not degrade: no root, no service, no registry, no loop."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("strategy_live", service_id="strategy.n_shape.v1")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    control_root = tmp_path / "runtime" / "control" / "strategies" / INSTANCE
+    _forbid_git(monkeypatch)
+    monkeypatch.setattr(
+        service_main,
+        "build_builtin_registry",
+        lambda **_kwargs: pytest.fail("registry must not be built"),
+    )
+    monkeypatch.setattr(
+        service_main,
+        "run_runtime_service_manifest",
+        lambda *_a, **_k: pytest.fail("service must not run"),
+    )
+
+    with pytest.raises(ValueError, match="strategy-live runtime must use a current deployment"):
+        service_main.run(_authority_args(manifest_path, control_root, kind="strategy_live"))
