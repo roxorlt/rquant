@@ -8128,6 +8128,14 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_production_profile_p.add_argument("--apply", action="store_true")
     runtime_production_profile_p.add_argument("--profile-id", type=_parse_sha256)
 
+    # Listed for `--help` only: `main()` hands the command to `runtime_authority_stage`
+    # before configuration is constructed, so this stub never parses anything.
+    sub.add_parser(
+        "runtime-authority-stage",
+        help="从 checkout 生成 root 权威链的 staging 与 plan.json（无特权，无需 .env）",
+        add_help=False,
+    )
+
     runtime_production_prerequisites_p = sub.add_parser(
         "runtime-production-prerequisites",
         help="预演或安装生产画像所需的不可变 authority generation",
@@ -8520,6 +8528,14 @@ def main() -> int:
     某条子命令跑到一半才炸——CLI 的每条命令最终都要用它，所以在入口一次性把它构造出来，
     保住原来「import 期就 fail-fast」的行为。
     """
+
+    # `runtime-authority-stage` is the one command that must run without configuration
+    # (acceptance A22): the bootstrap worktree has no `.env`, and staging reads settings from
+    # nothing. It is dispatched ahead of the fail-fast construction on purpose.
+    if sys.argv[1:2] == ["runtime-authority-stage"]:
+        from rquant.runtime_authority_stage import main as stage_main
+
+        return stage_main(sys.argv[2:])
 
     from rquant.config import get_settings
 
