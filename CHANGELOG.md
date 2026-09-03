@@ -314,6 +314,14 @@
 
 ### Fixed
 
+- **#175（R07 差分门的路径分类表漏了 `CLAUDE.md`）**：`scripts/r07_policy_regenerate.py` 的
+  `diff_category` 通过冻结元组 `_ARCHITECTURE_ROOT_FILES` 归类根文件，表里有 `AGENTS.md` 却没有
+  `CLAUDE.md`，于是任何改到 `CLAUDE.md` 的 PR 在生成 policy 时都会抛
+  `unclassified repository path needs a reviewed category rule: CLAUDE.md`——差分门实际上让
+  `CLAUDE.md` 无法走正常 PR 流程修改。现按与 `AGENTS.md` 同类的 architecture 补进元组；两者一起
+  在冻结规则用例里钉死，同时补一条未登记根文件仍报错的用例，说明这是**补一个表项**而不是新增
+  「根 Markdown 都算 architecture」的规则。
+
 - **#160（outbox 幂等与 lease）**：续约在 owner + generation 守卫下进行这一点逐字节未变，
   但停机不再可能把一个仍在写库的续约交还给调用方；被强杀的续约由 SQLite 崩溃语义整体回滚，
   写锁随进程死亡即时释放，下一个打开者不再撞上「database is locked」。

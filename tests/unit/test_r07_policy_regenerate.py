@@ -42,6 +42,12 @@ def _head() -> str:
         ("pyproject.toml", "architecture"),
         ("uv.lock", "architecture"),
         (".env.example", "architecture"),
+        # The agent instruction files are one category, not one file: CLAUDE.md was missing
+        # from the frozen tuple while AGENTS.md was in it, which left CLAUDE.md unmodifiable
+        # through the normal pull request flow because policy generation refused to classify
+        # it at all (#175). Both are pinned here so the pair cannot drift apart again.
+        ("AGENTS.md", "architecture"),
+        ("CLAUDE.md", "architecture"),
     ),
 )
 def test_diff_category_rules_are_frozen(path: str, category: str) -> None:
@@ -53,6 +59,10 @@ def test_unknown_top_level_paths_require_review_instead_of_a_silent_category() -
         regenerate.diff_category("unknown-top-level/thing.txt")
     with pytest.raises(ValueError, match="src/rquant"):
         regenerate.diff_category("src/other/thing.py")
+    # Admitting CLAUDE.md is an entry in the frozen tuple, not a rule that root Markdown is
+    # architecture: an unlisted root file still has to be categorized by a reviewer.
+    with pytest.raises(ValueError, match="unclassified"):
+        regenerate.diff_category("CONTRIBUTING.md")
 
 
 def test_check_mode_passes_on_the_checked_in_policy() -> None:
