@@ -81,12 +81,18 @@ from rquant.serving_page_projection_source import (
     DuckDBSignalPageProjectionSource,
     SignalPageProjectionProducer,
 )
-from rquant.serving_publisher import ServingPublisher, ServingReader, ServingTableSpec
+from rquant.serving_publisher import (
+    ServingIntegrityError,
+    ServingPublisher,
+    ServingReader,
+    ServingTableSpec,
+)
 from rquant.serving_read_models import (
     SERVING_TABLE_SPECS,
     NlScreenPage,
     NlScreenPageError,
     ServingProjectionPayload,
+    nl_screen_query_digest,
     screen_nl_projection,
 )
 from rquant.storage.duckdb import DuckDBStore
@@ -366,6 +372,138 @@ def test_nl_page_load_error_keeps_history_and_current_page_atomic() -> None:
     assert state["nl_next_cursor"] == "next"
     assert state["nl_cursor_history"] == ["first"]
     assert state["nl_page_error"] == serving_page_data.NL_SCREEN_PAGE_RERUN_REQUIRED
+
+
+def test_nl_page_session_names_a_serving_outage_instead_of_asking_for_a_rerun() -> None:
+    """A dead serving root must not be reported as an expired pagination cursor."""
+
+    old_frame = pd.DataFrame({"ts_code": ["600001.SH"]})
+    state: dict[str, object] = {
+        "nl_result_df": old_frame,
+        "nl_diagnostics": [("all", 1)],
+        "nl_current_cursor": "current",
+        "nl_start_cursor": "current",
+        "nl_next_cursor": "next",
+        "nl_cursor_history": ["first"],
+        "nl_page_error": None,
+    }
+
+    def _fail_page_load() -> ServingPageResult[NlScreenPage]:
+        raise serving_page_data.NlScreenServingUnavailableError(
+            "nl screen serving root is unreachable"
+        )
+
+    loaded = serving_page_data.load_nl_screen_page_session(
+        state,
+        load_page=_fail_page_load,
+        navigation="next",
+    )
+
+    assert loaded is None
+    assert state["nl_result_df"] is old_frame
+    assert state["nl_cursor_history"] == ["first"]
+    assert state["nl_page_error"] == serving_page_data.NL_SCREEN_SERVING_UNAVAILABLE
+    assert state["nl_page_error"] != serving_page_data.NL_SCREEN_PAGE_RERUN_REQUIRED
+
+
+def test_nl_page_unreachable_serving_root_is_typed_as_a_serving_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ServingReader rejects a missing root in __init__; that must not escape raw."""
+
+    class _Reader:
+        def __init__(self, _root: object) -> None:
+            raise ServingIntegrityError("serving root is missing or is not a directory")
+
+    monkeypatch.setattr(serving_page_data, "ServingReader", _Reader)
+
+    with pytest.raises(
+        serving_page_data.NlScreenServingUnavailableError,
+        match="serving root is unreachable",
+    ):
+        read_nl_screen_page(
+            "unused",
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan={"trade_date": "2026-07-31"},
+            page_size=1,
+            signing_key=CURSOR_SIGNING_KEY,
+            now=NOW,
+        )
+
+
+def test_nl_page_missing_current_generation_is_a_serving_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No cursor means the page asked for the live generation; failing is an outage."""
+
+    class _Reader:
+        def __init__(self, _root: object) -> None:
+            pass
+
+        def acquire_generation(self) -> object:
+            raise ServingIntegrityError("serving current pointer is missing")
+
+    monkeypatch.setattr(serving_page_data, "ServingReader", _Reader)
+
+    with pytest.raises(
+        serving_page_data.NlScreenServingUnavailableError,
+        match="serving current generation is unavailable",
+    ):
+        read_nl_screen_page(
+            "unused",
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan={"trade_date": "2026-07-31"},
+            page_size=1,
+            signing_key=CURSOR_SIGNING_KEY,
+            now=NOW,
+        )
+
+
+def test_nl_page_retired_pinned_generation_still_asks_for_a_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cursor pinned to a retired generation is a pagination failure, not an outage."""
+
+    plan = {"trade_date": "2026-07-31"}
+
+    class _Decoded:
+        generation_id = "a" * 64
+
+        def __init__(self) -> None:
+            self.query_digest = nl_screen_query_digest(plan, ())
+
+    class _Reader:
+        def __init__(self, _root: object) -> None:
+            pass
+
+        def acquire_historical_generation(self, _generation_id: str) -> object:
+            raise ServingIntegrityError("historical generation directory is missing")
+
+    monkeypatch.setattr(serving_page_data, "ServingReader", _Reader)
+    monkeypatch.setattr(
+        serving_page_data,
+        "decode_nl_screen_cursor",
+        lambda _cursor, *, signing_key: _Decoded(),
+    )
+
+    with pytest.raises(NlScreenPageError, match="cursor requires rerun") as raised:
+        read_nl_screen_page(
+            "unused",
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan=plan,
+            page_size=1,
+            signing_key=CURSOR_SIGNING_KEY,
+            cursor="pinned",
+            now=NOW,
+        )
+
+    assert not isinstance(raised.value, serving_page_data.NlScreenServingUnavailableError)
 
 
 def test_nl_page_load_success_commits_navigation_history_after_read() -> None:
