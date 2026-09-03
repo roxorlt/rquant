@@ -607,6 +607,7 @@ def test_t9_5_existing_runtime_root_is_used_for_schema_bindings(
     runtime_root = tmp_path / "runtime"
     control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
     control_root.mkdir(parents=True)
+    _install_legacy_current(runtime_root)
     _forbid_git(monkeypatch)
     observed: dict[str, object] = {}
 
@@ -737,6 +738,162 @@ def test_t9_6_degraded_reason_reaches_the_published_heartbeat(tmp_path: Path) ->
         control.stop(reason="test complete")
     assert live.status is RuntimeServiceStatus.DEGRADED
     assert live.degraded_reasons == (RUNTIME_ROOT_DEGRADED_REASON,)
+
+
+LEGACY_GENERATION = "c" * 64
+
+
+def _install_legacy_current(runtime_root: Path, *, generation: str = LEGACY_GENERATION) -> Path:
+    """`<runtime_root>/current -> generations/<id>`, the legacy chain's own pointer shape."""
+
+    (runtime_root / "generations" / generation).mkdir(parents=True, exist_ok=True)
+    current = runtime_root / "current"
+    current.symlink_to(Path("generations") / generation, target_is_directory=True)
+    return current
+
+
+def _stub_registry_factory(monkeypatch: pytest.MonkeyPatch, kind: str) -> list[dict[str, object]]:
+    """A real `RuntimeServiceRegistry` for one kind, wrapped exactly as `run()` wraps it.
+
+    The real service loop then runs against it, so the heartbeat, the lock files and the
+    control directories are the ones a production role leaves behind.
+    """
+
+    from rquant.runtime_service_control import RuntimeStepResult
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceRegistry
+    from rquant.runtime_service_main import _StartupDegradedRegistry
+
+    calls: list[dict[str, object]] = []
+
+    def build(**kwargs: object) -> RuntimeServiceRegistry:
+        calls.append(kwargs)
+        inner = RuntimeServiceRegistry()
+        inner.register(
+            RuntimeServiceKind(kind),
+            lambda _manifest: (lambda: RuntimeStepResult(processed_count=1)),
+        )
+        reasons = kwargs.get("startup_degraded_reasons")
+        if reasons:
+            return _StartupDegradedRegistry(inner, reasons=tuple(reasons))  # type: ignore[arg-type]
+        return inner
+
+    monkeypatch.setattr("rquant.runtime_service_main.build_builtin_registry", build)
+    return calls
+
+
+def _warning_records(records: list[object]) -> list[object]:
+    return [record for record in records if record["level"].name == "WARNING"]  # type: ignore[index]
+
+
+def test_t9_6_degradation_survives_the_root_the_first_run_creates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M-R1: the first run's heartbeat creates `<runtime_root>`; the second run must still
+    degrade — with its WARNING and its reason — instead of failing on schema bindings."""
+
+    from loguru import logger
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    runtime_root = tmp_path / "runtime"
+    control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
+    assert not runtime_root.exists()
+    _forbid_git(monkeypatch)
+    calls = _stub_registry_factory(monkeypatch, "market_minute_source")
+    args = _authority_args(manifest_path, control_root, kind="market_minute_source", once=True)
+
+    records: list[object] = []
+    sink = logger.add(lambda message: records.append(message.record), level="WARNING")
+    try:
+        assert service_main.run(args) == 0
+        assert runtime_root.is_dir()
+        assert control_root.is_dir()
+        assert not (runtime_root / "current").exists()
+        first_warnings = len(_warning_records(records))
+
+        assert service_main.run(args) == 0
+    finally:
+        logger.remove(sink)
+
+    assert first_warnings == 1
+    assert len(_warning_records(records)) == 2
+    assert [call["startup_degraded_reasons"] for call in calls] == [
+        (service_main.RUNTIME_ROOT_DEGRADED_REASON,),
+        (service_main.RUNTIME_ROOT_DEGRADED_REASON,),
+    ]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["bare-root", "current-regular-file", "current-dangling-symlink", "current-foreign-target"],
+)
+def test_t9_6_a_root_without_a_usable_current_still_degrades(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """A runtime root directory alone is not a legacy deployment: only a `current` that
+    resolves to a generation switches the schema-binding path on."""
+
+    from loguru import logger
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    runtime_root = tmp_path / "runtime"
+    control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
+    runtime_root.mkdir()
+    if shape == "current-regular-file":
+        (runtime_root / "current").write_text("generations/" + LEGACY_GENERATION + "\n")
+    elif shape == "current-dangling-symlink":
+        (runtime_root / "current").symlink_to(Path("generations") / LEGACY_GENERATION)
+    elif shape == "current-foreign-target":
+        (tmp_path / "elsewhere").mkdir()
+        (runtime_root / "current").symlink_to(tmp_path / "elsewhere")
+    _forbid_git(monkeypatch)
+    monkeypatch.setattr(
+        service_main,
+        "load_runtime_schema_service_bindings",
+        lambda *_a, **_k: pytest.fail("schema bindings must not be loaded without a current"),
+    )
+    calls = _stub_registry_factory(monkeypatch, "market_minute_source")
+    monkeypatch.setattr(service_main, "run_runtime_service_manifest", lambda *_a, **_k: object())
+
+    records: list[object] = []
+    sink = logger.add(lambda message: records.append(message.record), level="WARNING")
+    try:
+        assert service_main.run(_authority_args(manifest_path, control_root)) == 0
+    finally:
+        logger.remove(sink)
+
+    assert len(_warning_records(records)) == 1
+    assert [call["startup_degraded_reasons"] for call in calls] == [
+        (service_main.RUNTIME_ROOT_DEGRADED_REASON,)
+    ]
+
+
+def test_t9_6_strategy_live_still_fails_closed_on_a_bare_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("strategy_live", service_id="strategy.n_shape.v1")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    runtime_root = tmp_path / "runtime"
+    control_root = runtime_root / "control" / "strategies" / INSTANCE
+    control_root.mkdir(parents=True)
+    _forbid_git(monkeypatch)
+    monkeypatch.setattr(
+        service_main, "build_builtin_registry", lambda **_k: pytest.fail("no registry")
+    )
+
+    with pytest.raises(ValueError, match="strategy-live runtime must use a current deployment"):
+        service_main.run(_authority_args(manifest_path, control_root, kind="strategy_live"))
 
 
 def test_t9_6_strategy_live_still_fails_closed_without_a_runtime_root(

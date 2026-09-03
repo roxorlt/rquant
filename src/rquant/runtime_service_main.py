@@ -188,6 +188,40 @@ def runtime_root_from_control_root(control_root: Path) -> Path:
     return parents[2]
 
 
+_LEGACY_GENERATION_ID = re.compile(r"[0-9a-f]{64}")
+
+
+def legacy_runtime_root_is_current(runtime_root: Path) -> bool:
+    """Whether `<runtime_root>/current` names a generation the legacy chain can serve.
+
+    The existence of the directory says nothing: the first role to publish a heartbeat
+    creates `<runtime_root>/control/<kind>/<instance>` with `mkdir(parents=True)`, and with
+    it the root itself. Deciding on `is_dir()` therefore let exactly one role degrade and
+    made every later start — the same role restarted, every other kind-backed role — walk
+    into `load_runtime_schema_service_bindings` and fail on a `current` that is not there
+    (review M-R1). What the schema-binding path actually needs is the pointer: a symlink
+    `current -> generations/<64 hex>` whose target exists. Anything else is "no legacy
+    deployment here", and the role degrades exactly as it did on its first start.
+    """
+
+    current = Path(runtime_root) / "current"
+    try:
+        info = current.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISLNK(info.st_mode):
+        return False
+    target = Path(os.readlink(current))
+    if (
+        target.is_absolute()
+        or len(target.parts) != 2
+        or target.parts[0] != "generations"
+        or _LEGACY_GENERATION_ID.fullmatch(target.parts[1]) is None
+    ):
+        return False
+    return (Path(runtime_root) / target).is_dir()
+
+
 def _read_authority_manifest(path: Path) -> bytes:
     """Read a manifest out of the immutable generation, one path component at a time.
 
@@ -542,14 +576,16 @@ def run(args: argparse.Namespace) -> int:
     startup_degraded_reasons: tuple[str, ...] = ()
     if authority_runtime:
         derived_root = runtime_root_from_control_root(args.control_root)
-        if derived_root.is_dir():
+        if legacy_runtime_root_is_current(derived_root):
             runtime_root = derived_root
         else:
-            # Route B publishes no legacy runtime root, so the first generation runs
+            # Route B publishes no legacy deployment, so the first generation runs
             # without schema dual write and without an artifact terminal lifecycle. That
             # is an accepted degradation, not an accident — but it used to be indicated by
-            # nothing at all, which is what made the review call it silent. The one kind
-            # that does not degrade refuses here, before any "disabled" is announced.
+            # nothing at all, which is what made the review call it silent. It is decided
+            # on the `current` pointer, not on the directory, because the service's own
+            # heartbeat creates the directory on its first run. The one kind that does
+            # not degrade refuses here, before any "disabled" is announced.
             if manifest.service_kind is RuntimeServiceKind.STRATEGY_LIVE:
                 raise ValueError("strategy-live runtime must use a current deployment profile")
             runtime_root = None
@@ -644,6 +680,7 @@ __all__ = [
     "build_runtime_strategy_completion_attestation_signer",
     "build_builtin_registry",
     "build_parser",
+    "legacy_runtime_root_is_current",
     "load_authority_service_manifest",
     "main",
     "resolve_checkout_commit",
