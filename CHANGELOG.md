@@ -314,6 +314,21 @@
 
 ### Fixed
 
+- **受控部署器发给 `lab-runtime-prepare` 的 argv 与 CLI 契约不一致（TP3）**：
+  `src/rquant/ops/production_deploy.py` 的 `_prepare_job_center_authority()` 沿用
+  `run-lab-daemon.py` 时代的 wrapper 参数形态，传了 `--expected-checkout-root` 与
+  `--trusted-git-path`——这两个是 `formal_runtime_command._LEGACY_ARGUMENTS` 里的禁用项——
+  却一个都没传四个 `required=True` 的 `--runtime-code-*`，于是首次普通部署会在第一次
+  `rquant preflight` 之前以 argparse `exit 2` 失败并触发自动回滚。现在部署器发冻结的
+  bootstrap 绑定（`/etc/rquant/runtime-code-bootstrap.json`、`/etc/rquant`、uid/gid 各 0），
+  字面量在模块里手抄——`deploy-production.sh` 以 `-I -S` 起解释器，部署器不能 import 需要
+  pydantic 的 `formal_runtime_command`——漂移由一条比对 `FINALIZER_BOOTSTRAP_ARGUMENTS` 的
+  测试锁死，argv 本身再由一条喂真实 `rquant.cli.build_parser()` 的契约测试锁死，两条覆盖
+  不同的漂移形态（改值 / 新增 required 选项），缺一不可。argv 不随 release profile 分叉，
+  与上游常量一致。`docs/production-release.md` 的 macOS Lab 一次性安装示例同步补齐四个参数，
+  并加前置警示句标注**当前不可执行**（还缺 root 持有的 bootstrap 配置、两套 Ed25519 keyring、
+  promotion socket 与 attested generation，属 TP1/TP2）。
+
 - **#175（R07 差分门的路径分类表漏了 `CLAUDE.md`）**：`scripts/r07_policy_regenerate.py` 的
   `diff_category` 通过冻结元组 `_ARCHITECTURE_ROOT_FILES` 归类根文件，表里有 `AGENTS.md` 却没有
   `CLAUDE.md`，于是任何改到 `CLAUDE.md` 的 PR 在生成 policy 时都会抛
