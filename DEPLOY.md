@@ -128,7 +128,7 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    缺失或不满足属主/权限时，root verifier 会拒绝启动（fail closed），不会退回旧路径。
 
 11. **`/usr/local/libexec/rquant-runtime-exec.pyz` 必须先安装，profile 必须先声明全部 role**
-   （Codex round-2 P1-3）。本分支新增的 25 个受保护 runtime unit 已改为固定命令
+   （Codex round-2 P1-3）。本分支新增的 26 个受保护 runtime unit 已改为固定命令
    `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role <literal>`，
    不再读 `data/runtime/current/runtime.env`，也不再接受 `%i` 插值的 manifest 路径。部署前：
 
@@ -168,7 +168,10 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
       里的名字，未登记的名字**被静默丢弃**。`/etc/rquant/lab-claim-finalizer.env` 不在仓库里，
       发布前先在云服务器 `82.156.0.68`（`lighthouse` 用户）上跑
       `systemctl show -p Environment rquant-lab-claim-finalizer`，把 finalizer 真正需要的名字逐个
-      补进 `src/rquant/runtime_authority.py` 的 `lab_claim_finalizer` role 再发布。名字须排序去重、
+      补进 `src/rquant/runtime_authority.py` 的 `lab_claim_finalizer` role 再发布。
+      **首次安装场景无从执行**：该 unit 从未装过，`systemctl show` 读不出任何值（S1 U-7）；
+      第一代 profile 用现有五个名字发布，装上 unit 跑起来后若报缺变量，再按 §7 B-13 另开 PR
+      补白名单并换代三件套。名字须排序去重、
       不得以 `PYTHON` / `LD_` 开头、不得是 `PATH`，总数 ≤ 32。`PYTHONDONTWRITEBYTECODE` 故意不在
       白名单里：两级都拒 `PYTHON*`，两级子进程都是 `-I -S`，generation 目录 0555，这个名字在旧
       unit 下也从未到达 daemon。
@@ -314,6 +317,60 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    **优化债务**：同一代 generation 在同一次启动里被校验两次，且每次都是全量逐文件 SHA-256。
    按 generation 缓存校验结果（例如以 generation id + full-manifest 摘要为键，把结果记在
    root-owned 的一次性文件里）可以把 ≈ 7 s 降到一次校验的量级。本轮不做，记为债务。
+
+18. **root 权威链发布器（PR-A / TP1，S1 §1.3、§9）**。`/etc/rquant/production-runtime-profile.json`、
+   `/var/lib/rquant/runtime-authority/current.json` 与 `generations/<id>/` 三样 root 持有产物从此
+   有了仓库内的产生者，分两段、两种身份：
+
+   ```bash
+   # ① lighthouse：从 checkout 造 staging + plan.json（无特权，不碰 root 路径，不需要 .env）
+   #   有 .env 时 `uv run rquant runtime-authority-stage …` 等价；无 .env 的临时 worktree 必须走模块入口——
+   #   `rquant.cli` 一 import 就经 `rquant.logging` 构造 Settings，与 stage 本身无关
+   uv run python -m rquant.runtime_authority_stage --bootstrap-from-checkout \
+     --checkout-root /home/lighthouse/rquant-v0300 --commit <40 hex，须等于 HEAD> \
+     --runtime-pyz /usr/local/libexec/rquant-runtime-exec.pyz \
+     --deploy-pyz  /usr/local/libexec/rquant-production-deploy.pyz \
+     --system-python /usr/bin/python3.11 --venv-source /home/lighthouse/rquant-v0300/.venv \
+     --staging /home/lighthouse/rquant/var/authority-staging/first          # 先 dry-run：stdout 是 plan.json
+   # 再加 --apply 落盘，stderr 打印 plan.json 的 sha256，人工抄给 ②
+   # ② root：收进 inbox、逐文件重算哈希、装 profile、原子换代、wrapper 对 32 个 (role, instance) 预检、写 current.json
+   sudo /usr/bin/python3.11 /usr/local/libexec/rquant-production-deploy.pyz publish \
+     --staging /home/lighthouse/rquant/var/authority-staging/first --expect-plan-sha256 <①抄下的值> [--dry-run]
+   ```
+
+   `rquant-production-deploy.pyz` 由 `python scripts/build-production-deploy-pyz.py --repository-root . --output <path>`
+   构建（stdlib-only 运行面，连续两次构建逐字节相同，stdout 打印 sha256），装到 `/usr/local/libexec/`
+   `root:root 0555`。发布器不加任何 sudoers 条目（U-5），`publish` 走 owner 交互式 sudo。
+
+   **计数补记**：跑 `rquant-runtime-exec.pyz` 的 unit 是 **26** 个（不是早先写的 25）；其中既有
+   unit 改动的是 **19** 个（此 19 是「改了 ExecStart 的既有 unit」计数，与下面的第一关启用集合无关）。
+
+   **第一关只启用 16/26 个 protected unit**（S1 §10.6，`acceptance-pra.md` §5）：
+   `rquant-lab-claim-finalizer.service`、`rquant-runtime-artifact-catalog@.service`、
+   `rquant-runtime-auction-universe@.service`、`rquant-runtime-candidate@.service`、
+   `rquant-runtime-daily-orchestrator@.service`、`rquant-runtime-feature@.service`、
+   `rquant-runtime-lab-jobs@.service`、`rquant-runtime-paper-broker@.service`、
+   `rquant-runtime-paper-constraint@.service`、`rquant-runtime-promotions@.service`、
+   `rquant-runtime-runtime-health@.service`、`rquant-runtime-serving@.service`、
+   `rquant-runtime-shadow@.service`、`rquant-runtime-signal-router@.service`、
+   `rquant-runtime-strategy@.service`、`rquant-runtime-watchlist-quote@.service`。
+   推迟 **10** 个，预期状态一律「**未启用**」而不是 failed：credstore 依赖 7 个
+   （`rquant-artifact-retention` / `rquant-runtime-auction-match@` / `rquant-runtime-daily-close@` /
+   `rquant-runtime-market-minute@` / `rquant-runtime-notifier@` / `rquant-runtime-reference-slow-publisher@` /
+   `rquant-runtime-reference-slow-source@`，等路线 A 的 `_seal_runtime_credentials`）、
+   硬依赖旧链路 `data/runtime/current` 3 个（`rquant-page-control` / `rquant-runtime-recovery@` /
+   `rquant-runtime-recovery-rehearsal@`）。**不承诺 26 全绿，不承诺页面有数据**（serving 的六个
+   owner 里 `notifier` 与 `reference_slow_publisher` 都在推迟组）。`rquant-runtime-strategy@`
+   在启用名单内，但按 U-12 裁决它在无 `data/runtime/current` 时硬失败（PA-1 D-3，待协调者裁定）。
+
+   **首次发布没有 prior，回滚只有一条路**：停掉已启用的 unit，`sudo rm -f
+   /var/lib/rquant/runtime-authority/current.json`（U-4）。第二代起 `rquant-production-deploy.pyz
+   rollback --operation-id <新 32 hex>` 做单级回滚。旧 generation 目录内容寻址，永不删除。
+
+   **已知限制**：`publish_runtime_authority` 用**已安装**的 profile 校验每一条 record，所以
+   「已有 record 时换 profile」不是现有原语支持的转换——发布器在动任何 root 路径之前就拒绝
+   （`not a supported transition`）。任何会改 `profile_id` 的改动（策略表、环境白名单、实例标签）
+   在第二代起都需要先补这条转换（另开 issue）。
 
 **回滚**：本分支没有产生任何生产变更，因此没有回滚基线。PR 未合并前直接关闭 PR 即可；
 已合并但未部署时，生产仍停在上一次部署的 commit，无需任何动作。
