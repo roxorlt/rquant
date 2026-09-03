@@ -1079,6 +1079,14 @@ LEGACY_ROOT_REFUSALS = (
     "ValueError: runtime root contains a symlink parent: /home",
 )
 RUNTIME_ROOT_WARNING = "is unavailable: schema dual write and the artifact terminal lifecycle"
+#: loguru's default stderr line: `<time> | WARNING  | <module>:<func>:<line> - <message>`.
+#: The level column is what the child-side assertion reads, so a degradation that is
+#: logged at any other level fails the test (review S-R1).
+LOGURU_WARNING_COLUMN = "| WARNING  |"
+
+
+def _degradation_log_lines(stderr: str) -> list[str]:
+    return [line for line in stderr.splitlines() if RUNTIME_ROOT_WARNING in line]
 
 WORLD_COMMIT = "2b26280cf118c54a4ae4bb495f28bc2bc849b17d"
 RECORD_PREFIX = "TP9-RECORD "
@@ -1672,8 +1680,10 @@ def test_t9_2_first_gate_service_role_reaches_its_service_loop(
     if _expect_degraded():
         assert record["registry_type"] == "_StartupDegradedRegistry"
         assert record["startup_degraded_reasons"] == ["runtime_root_unavailable"]
-        assert RUNTIME_ROOT_WARNING in completed.stderr
-        assert str(PRODUCTION_RUNTIME_ROOT) in completed.stderr
+        (degradation,) = _degradation_log_lines(completed.stderr)
+        assert LOGURU_WARNING_COLUMN in degradation, degradation
+        assert str(PRODUCTION_RUNTIME_ROOT) in degradation
+        assert entry.service_kind in degradation
     else:  # pragma: no cover - only on a host that has the legacy runtime root
         assert record["startup_degraded_reasons"] == []
 
@@ -1724,8 +1734,9 @@ def test_t9_2_strategy_live_fails_closed_without_the_legacy_runtime_root(
     assert STRATEGY_LIVE_REFUSAL in completed.stderr
     assert "validation errors for Settings" not in completed.stderr
     assert _records(completed) == []
-    # It got past manifest admission and the runtime-root decision before refusing.
-    assert RUNTIME_ROOT_WARNING not in completed.stderr
+    # It got past manifest admission and the runtime-root decision before refusing, and
+    # nothing announced a degradation it does not have.
+    assert _degradation_log_lines(completed.stderr) == []
 
 
 @pytest.mark.parametrize("role", LEGACY_ROOT_ROLES)
