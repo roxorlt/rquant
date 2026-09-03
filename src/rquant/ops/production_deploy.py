@@ -57,6 +57,22 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 LINUX_PRODUCTION_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
 LINUX_PRODUCTION_EVIDENCE_CACHE_DIR = Path("/home/lighthouse/rquant/var/r07-dr-evidence")
+#: Hand-copied from `rquant.formal_runtime_command.FINALIZER_BOOTSTRAP_ARGUMENTS` minus the
+#: `--deployment-lock-path` pair, which only the finalizer unit spells out. The `-I -S`
+#: interpreter this module runs under cannot import that module (it needs pydantic), the same
+#: reason the R07 evidence cache directory above is a literal. There is no profile branch
+#: upstream, so there is none here either; drift is caught in pytest by
+#: `test_job_center_bootstrap_matches_formal_runtime_constants`.
+_JOB_CENTER_BOOTSTRAP: tuple[str, ...] = (
+    "--runtime-code-config",
+    "/etc/rquant/runtime-code-bootstrap.json",
+    "--runtime-code-trusted-base",
+    "/etc/rquant",
+    "--runtime-code-authority-uid",
+    "0",
+    "--runtime-code-authority-gid",
+    "0",
+)
 R07_DEPLOY_GATE_SCRIPT = "scripts/r07_deploy_gate.py"
 R07_DECISION_GATES = ("bootstrap_disabled", "enforced", "rejected")
 R07_DECISION_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -768,10 +784,7 @@ def _prepare_job_center_authority(
     command = [
         config.rquant_bin,
         "lab-runtime-prepare",
-        "--expected-checkout-root",
-        str(config.repo),
-        "--trusted-git-path",
-        str(config.git_path),
+        *_JOB_CENTER_BOOTSTRAP,
         "--runtime-deployment-root",
         str(runtime_root),
         "--expected-code-sha",

@@ -233,6 +233,16 @@ bash scripts/deploy-production.sh \
 `-wal`/`-shm`/`-journal`，
 迁移会失败关闭，必须先在旧服务停机状态完成 SQLite checkpoint，再重新运行：
 
+> **前置警示：此示例当前不可执行。** 补齐参数后命令会走到 `_establish_lab_runtime_identity` →
+> `open_formal_runtime_capability`，那里还需要四样 macOS Lab 侧尚未交付的东西：root 持有的
+> `0400/0440/0444` 的 `/etc/rquant/runtime-code-bootstrap.json`、文件里的 `root_keys` 与
+> `runtime_keys` 两套 Ed25519 keyring、`promotion_transport` 的 Unix socket，以及一套被
+> `open_attested_runtime_generation` 认可的 runtime generation。下面补齐四个 `--runtime-code-*`
+> 参数只是让 argv 与 CLI 契约一致：补齐之前 argparse 直接 `exit 2`，补齐之后失败点挪到
+> `FormalRuntimeCompositionError`，**仍然跑不通**。另外 wrapper 自己从 `RQUANT_RUNTIME_ROOT`
+> 绑定 `--runtime-deployment-root`、`scripts/bootstrap-lab-daemon.py` 自己追加
+> `--startup-deadline-monotonic`，这两个参数不要手写。
+
 ```bash
 ROOT=/Users/roxor/brain/30-projects/rQuant
 LOCK=/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
@@ -245,7 +255,11 @@ export LAB_FINAL_ARTIFACT_DIR="${LAB_RUNTIME_DIR}/final-artifacts"
   --expected-checkout-root "${ROOT}" \
   --trusted-git-path /usr/bin/git \
   --deployment-lock-path "${LOCK}" \
-  -- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare
+  -- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare \
+  --runtime-code-config /etc/rquant/runtime-code-bootstrap.json \
+  --runtime-code-trusted-base /etc/rquant \
+  --runtime-code-authority-uid 0 \
+  --runtime-code-authority-gid 0
 ```
 
 `RQUANT_RUNTIME_ROOT` 是已经由 `runtime-deployment-profile --apply` 安装 current profile/receipt 的
