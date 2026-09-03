@@ -932,3 +932,40 @@ def test_page_units_pin_the_serving_root_to_the_publisher_directory() -> None:
         assert service.index(assignment) > service.index(
             "EnvironmentFile=/home/lighthouse/rquant/.env"
         ), name
+
+
+def test_dashboard_announces_an_unreadable_serving_root_instead_of_swallowing_it() -> None:
+    """A serving root that will not open must reach both the journal and the page."""
+
+    app_path = _PROJECT_ROOT / "src/rquant/dashboard/app.py"
+    tree = ast.parse(app_path.read_text(encoding="utf-8"), filename=str(app_path))
+
+    open_guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "open"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "ServingPageRenderContext"
+            for call in ast.walk(ast.Module(body=node.body, type_ignores=[]))
+        )
+    ]
+
+    assert len(open_guards) == 1
+    handlers = open_guards[0].handlers
+    assert len(handlers) == 1
+    handler = handlers[0]
+    assert handler.name is not None, "the exception must be bound, not discarded"
+
+    handler_body = ast.Module(body=handler.body, type_ignores=[])
+    called = {
+        call.func.id if isinstance(call.func, ast.Name) else call.func.attr
+        for call in ast.walk(handler_body)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name | ast.Attribute)
+    }
+
+    assert "render_serving_root_failure" in called
+    assert "exception" in called, "the traceback must reach the journal"
