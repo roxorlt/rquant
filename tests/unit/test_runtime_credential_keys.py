@@ -861,6 +861,31 @@ def test_rotate_refuses_when_the_published_keyring_is_stale(prefix: Path) -> Non
     assert not _expected_files(prefix, "v2")["highwater_private"].exists()
 
 
+# --------------------------------------------------- verify after a published rotation
+
+@pytest.mark.parametrize("target", ("highwater", "canvas", "shadow", "daily"))
+def test_verify_succeeds_after_a_rotation_with_the_keyring_published(
+    prefix: Path, target: str
+) -> None:
+    # Regression guard: verify --prefix's non-root high-water self-check degrades to
+    # `--export-public-keyring` (the authority has no non-root --validate-key-material
+    # at all).  Without `--current-keyring` that export always treats the manifest as a
+    # fresh chain and rejects generation > 1, so `verify` would falsely fail after every
+    # legitimate `rotate highwater` even though install-runtime-credential-infra.sh's own
+    # export_highwater_public_keyring (:1302-1318) already appends --current-keyring
+    # whenever a keyring has been published.  Parametrized over all four rotate targets,
+    # not just the one that was broken, so a regression on any of them is caught here.
+    assert _init(prefix).returncode == 0
+    assert _install_infra(prefix).returncode == 0
+
+    rotated = _run("rotate", target, "--prefix", str(prefix), "--new-key-suffix", "v2")
+    assert rotated.returncode == 0, rotated.stdout + rotated.stderr
+
+    result = _verify(prefix)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "consumer self-check passed" in result.stderr
+
+
 # ----------------------------------------------------------------------- B8-B10
 
 DOC = ROOT / "docs" / "operations" / "runtime-credential-keys.md"

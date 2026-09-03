@@ -954,6 +954,16 @@ manifest_file() {
     esac
 }
 
+keyring_file() {
+    case "$1" in
+        highwater) printf '%s/lab-highwater-trusted-keys.json\n' "$(etc_root)" ;;
+        canvas) printf '%s/canvas-publication-trusted-keys.json\n' "$(etc_root)" ;;
+        shadow) printf '%s/shadow-report-trusted-keys.json\n' "$(etc_root)" ;;
+        daily) printf '%s/daily-receipt-trusted-keys.json\n' "$(etc_root)" ;;
+        *) fail "unknown credential kind: $1" 2 ;;
+    esac
+}
+
 run_consumer_self_checks() {
     local helper_dir
     helper_dir="$(resolve_helper_dir)"
@@ -980,8 +990,20 @@ run_consumer_self_checks() {
         --keys-file "$(manifest_file canvas)" --validate-key-material >/dev/null
     "${PYTHON_BIN}" "${helper_dir}/rquant-shadow-report-signer" \
         --keys-file "$(manifest_file shadow)" --validate-key-material >/dev/null
-    "${PYTHON_BIN}" "${helper_dir}/rquant-lab-highwater-authority" \
-        --keys-file "$(manifest_file highwater)" --export-public-keyring >/dev/null
+    # A published trusted keyring pins the chain's generation ceiling for the
+    # consumer's own export.  install-runtime-credential-infra.sh:1302-1318 always
+    # appends --current-keyring when one exists; without it here, the export always
+    # treats the manifest as a fresh chain and rejects generation > 1, so `verify
+    # --prefix` would falsely fail after every legitimate `rotate highwater`.
+    local -a highwater_export=(
+        "${PYTHON_BIN}" "${helper_dir}/rquant-lab-highwater-authority"
+        --keys-file "$(manifest_file highwater)"
+        --export-public-keyring
+    )
+    if [[ -e "$(keyring_file highwater)" ]]; then
+        highwater_export+=(--current-keyring "$(keyring_file highwater)")
+    fi
+    "${highwater_export[@]}" >/dev/null
     printf '%s' "${DAILY_VALIDATE_REQUEST}" \
         | "${PYTHON_BIN}" -I -S -c "${DAILY_STDIN_SEAM}" \
             "${helper_dir}/rquant-daily-receipt-signer" \
