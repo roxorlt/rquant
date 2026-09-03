@@ -226,6 +226,33 @@ def test_t9_7_attribute_mutation_is_visible_through_every_reader(
     assert duckdb_settings().pushdeer_keys == "tp9-probe"
 
 
+@pytest.mark.parametrize(
+    "module_name", ["rquant.storage.duckdb", "rquant.page_control_service"]
+)
+def test_t9_7_lazified_modules_still_expose_the_settings_attribute(
+    module_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`monkeypatch.setattr(duckdb_mod.settings, "duckdb_path", …)` and friends keep working:
+    the attribute resolves to the cached instance, and a rebinding of the module attribute
+    is what `_settings()` returns while it lasts."""
+
+    import importlib
+
+    from rquant.config import get_settings
+
+    module = importlib.import_module(module_name)
+    assert "settings" not in vars(module)
+    assert module.settings is get_settings()
+    assert module._settings() is get_settings()
+
+    sentinel = object()
+    monkeypatch.setattr(module, "settings", sentinel)
+    assert module._settings() is sentinel
+    monkeypatch.undo()
+    assert module._settings() is get_settings()
+
+
 def test_t9_7_module_rebinding_still_shadows_the_lazy_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

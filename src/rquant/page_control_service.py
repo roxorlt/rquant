@@ -52,12 +52,26 @@ def _settings() -> Settings:
 
     This module is the `page_control` role's entry point. The wrapper hands its child an
     environment holding `LANG` / `LC_ALL` / `TZ` and nothing else, so a module-level
-    `Settings` would make the import itself impossible there.
+    `Settings` would make the import itself impossible there. A `settings` that a test has
+    bound onto this module still wins, exactly as the old module-level name did.
     """
 
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound  # type: ignore[no-any-return]
     from rquant.config import get_settings
 
     return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`rquant.page_control_service.settings` stays readable, built on first use."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):

@@ -108,12 +108,31 @@ def _settings() -> Settings:
     `rquant.config` builds its `Settings` on first use now, so importing it costs nothing.
     Binding `settings` here at module level would undo that for every importer of this
     module — including `runtime_service_main`, whose role children have no environment to
-    build one from.
+    build one from. A `settings` that a test has bound onto this module still wins, exactly
+    as the old module-level name did.
     """
 
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound  # type: ignore[no-any-return]
     from rquant.config import get_settings
 
     return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`rquant.storage.duckdb.settings` stays readable — built on first use, like the source.
+
+    The suite mutates attributes of that object (`monkeypatch.setattr(duckdb_mod.settings,
+    "duckdb_path", …)`); it is the one cached instance `rquant.config.get_settings` returns,
+    so the mutation is what `_settings()` sees.
+    """
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _is_retryable_stock_status_upsert_error(error: BaseException) -> bool:
