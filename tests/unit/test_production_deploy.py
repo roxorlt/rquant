@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -1242,6 +1243,53 @@ def test_job_center_authority_argv_is_profile_invariant(
     # Both parameters compare against the same frozen literal, which is what "identical across
     # profiles" means here: the upstream constant has no profile branch either.
     _assert_prepare_argv_exact(argv, runtime_root=runtime_root, target_sha=target_sha)
+
+
+def _doc_prepare_daemon_argv() -> list[str]:
+    """The `lab-runtime-prepare` argv the one-time install doc hands to the wrapper."""
+
+    doc = (ROOT / "docs" / "production-release.md").read_text(encoding="utf-8")
+    blocks = [
+        block
+        for block in doc.split("```")
+        if block.startswith("bash") and "lab-runtime-prepare" in block
+    ]
+    assert len(blocks) == 1
+    tokens = shlex.split(blocks[0].replace("\\\n", " "))
+    daemon_argv = tokens[tokens.index("--") + 1 :]
+    assert daemon_argv[1] == "lab-runtime-prepare"
+    return daemon_argv[1:]
+
+
+def test_production_release_doc_prepare_example_matches_the_cli_contract() -> None:
+    doc = (ROOT / "docs" / "production-release.md").read_text(encoding="utf-8")
+    daemon_argv = _doc_prepare_daemon_argv()
+
+    assert tuple(daemon_argv) == ("lab-runtime-prepare", *_EXPECTED_JOB_CENTER_BOOTSTRAP)
+    assert not set(daemon_argv) & _LEGACY_ARGUMENTS
+    # `run-lab-daemon.py` binds the deployment root from RQUANT_RUNTIME_ROOT and
+    # `bootstrap-lab-daemon.py` appends the deadline, so the operator types neither by hand.
+    assert "--runtime-deployment-root" not in daemon_argv
+    assert "--startup-deadline-monotonic" not in daemon_argv
+
+    args = build_cli_parser().parse_args(
+        [
+            *daemon_argv,
+            "--runtime-deployment-root",
+            "/Users/roxor/brain/30-projects/rQuant/data/runtime",
+            "--startup-deadline-monotonic",
+            str(time.monotonic() + 300.0),
+        ]
+    )
+
+    assert args.command == "lab-runtime-prepare"
+    assert args.runtime_code_config == Path("/etc/rquant/runtime-code-bootstrap.json")
+    assert args.runtime_code_trusted_base == Path("/etc/rquant")
+    assert args.runtime_code_authority_uid == 0
+    assert args.runtime_code_authority_gid == 0
+    # The example is argv-correct, not runnable: macOS Lab still has none of the formal runtime
+    # authority it needs. The doc has to say so in the same breath.
+    assert "此示例当前不可执行" in doc
 
 
 def test_runtime_profile_dry_run_calculates_without_publish_apply_or_rollout(
