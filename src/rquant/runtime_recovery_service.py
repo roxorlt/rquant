@@ -3120,7 +3120,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     unusable argument set has to be a non-zero exit rather than a no-op.
     """
 
-    from rquant.cli import cmd_runtime_recovery_production
+    # Not `rquant.cli`: importing it drags in the settings-reading modules, which a role
+    # child started from a three-name environment cannot construct. The recovery body now
+    # lives in a module that reads nothing at import time.
+    from rquant.runtime_recovery_production import cmd_runtime_recovery_production
 
     arguments = build_parser().parse_args(argv)
     return int(

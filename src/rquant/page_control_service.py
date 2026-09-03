@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from rquant.canvas_publication_receipt import (
@@ -21,7 +22,6 @@ from rquant.canvas_publication_receipt import (
     Ed25519CanvasPublicationSigner,
     SecureCanvasPublicationSigningClient,
 )
-from rquant.config import settings
 from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer
@@ -37,11 +37,27 @@ from rquant.research_manifest import detect_verified_code_commit
 from rquant.runtime_shadow_validation import _ed25519_signing_payload
 from rquant.strict_json import canonical_json_bytes
 
+if TYPE_CHECKING:
+    from rquant.config import Settings
+
 PRODUCTION_CANVAS_SIGNER_COMMAND = (
     "/usr/bin/sudo",
     "-n",
     "/usr/local/libexec/rquant-canvas-publication-signer",
 )
+
+
+def _settings() -> Settings:
+    """Read the process settings at call time, never at import time.
+
+    This module is the `page_control` role's entry point. The wrapper hands its child an
+    environment holding `LANG` / `LC_ALL` / `TZ` and nothing else, so a module-level
+    `Settings` would make the import itself impossible there.
+    """
+
+    from rquant.config import get_settings
+
+    return get_settings()
 
 
 class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
@@ -58,7 +74,7 @@ def _server_class_for_host(host: str) -> type[ThreadingHTTPServer]:
 
 def _build_lab_backend() -> object | None:
     code_sha = detect_verified_code_commit(
-        trusted_git_path=settings.lab_trusted_git_path,
+        trusted_git_path=_settings().lab_trusted_git_path,
     )
     deployment_root = os.environ.get("RQUANT_RUNTIME_ROOT", "")
     if code_sha is None or not deployment_root:
@@ -66,10 +82,10 @@ def _build_lab_backend() -> object | None:
     binding = resolve_current_job_center_authority_binding(
         Path(deployment_root),
         expected_code_sha=code_sha,
-        runtime_root=settings.lab_runtime_dir_resolved,
-        lab_jobs_path=settings.lab_jobs_path_resolved,
-        command_spool_path=settings.lab_job_command_dir_resolved,
-        final_artifact_root=settings.lab_final_artifact_dir_resolved,
+        runtime_root=_settings().lab_runtime_dir_resolved,
+        lab_jobs_path=_settings().lab_jobs_path_resolved,
+        command_spool_path=_settings().lab_job_command_dir_resolved,
+        final_artifact_root=_settings().lab_final_artifact_dir_resolved,
     )
     manifest = load_lab_job_center_authority_manifest(
         binding.runtime_root / "job-center-authority.json",
@@ -139,7 +155,7 @@ def build_page_control_service_with_dependencies(
         configured_roots = os.environ.get("RQUANT_PAGE_CONTROL_ALLOWED_EXPORT_ROOTS", "")
         allowed_roots = tuple(
             Path(value.strip()) for value in configured_roots.split(os.pathsep) if value.strip()
-        ) or (settings.lab_runtime_dir_resolved / "exports",)
+        ) or (_settings().lab_runtime_dir_resolved / "exports",)
     else:
         allowed_roots = allowed_lab_export_roots
     outbox = PageControlOutbox(
@@ -147,7 +163,7 @@ def build_page_control_service_with_dependencies(
             outbox_path
             or os.environ.get(
                 "RQUANT_PAGE_CONTROL_OUTBOX",
-                settings.data_dir / "page-control.sqlite3",
+                _settings().data_dir / "page-control.sqlite3",
             )
         )
     )
@@ -155,8 +171,8 @@ def build_page_control_service_with_dependencies(
         outbox=outbox,
         consumer=PageControlConsumer(
             outbox=outbox,
-            data_dir=settings.data_dir if data_dir is None else data_dir,
-            log_dir=settings.log_dir if log_dir is None else log_dir,
+            data_dir=_settings().data_dir if data_dir is None else data_dir,
+            log_dir=_settings().log_dir if log_dir is None else log_dir,
             allowed_lab_export_roots=allowed_roots,
             lab_backend=(
                 lab_backend
@@ -258,7 +274,7 @@ def _serve(
     )
     profile = load_current_runtime_deployment_profile(resolved_runtime_root)
     resolved_commit = expected_commit or detect_verified_code_commit(
-        trusted_git_path=settings.lab_trusted_git_path,
+        trusted_git_path=_settings().lab_trusted_git_path,
     )
     if resolved_commit is None or profile.producer_commit != resolved_commit:
         raise ValueError("PageControl runtime profile commit is not the running commit")

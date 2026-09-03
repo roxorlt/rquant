@@ -38,6 +38,7 @@ from rquant.backfill_state import (
     open_backfill_state_snapshot,
 )
 from rquant.logging import setup_logging
+from rquant.runtime_recovery_production import cmd_runtime_recovery_production
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
 if TYPE_CHECKING:
@@ -4161,87 +4162,6 @@ def _runtime_recovery_rehearsal_due(
         raise ValueError("recovery rehearsal receipt is dated in the future")
     next_due = last + timedelta(seconds=interval_seconds)
     return observed_now >= next_due, last, next_due
-
-
-def cmd_runtime_recovery_production(args: argparse.Namespace) -> int:
-    """Run recovery using only the current trusted production profile."""
-
-    from rquant.runtime_deployment_profile import (
-        load_current_runtime_deployment_profile,
-        validate_runtime_recovery_backup_config,
-    )
-    from rquant.runtime_recovery_backup import load_recovery_backup_config
-
-    runtime_root = Path(args.runtime_root)
-    profile = load_current_runtime_deployment_profile(runtime_root)
-    recovery = profile.recovery
-    if recovery is None or recovery.profile_generation is None:
-        raise ValueError("current runtime profile has no recovery production configuration")
-    if recovery.profile_generation != str(args.expected_profile_generation):
-        raise ValueError("recovery unit profile generation is stale")
-    backup_config = load_recovery_backup_config(recovery.backup_config_path)
-    validate_runtime_recovery_backup_config(profile, backup_config)
-    arguments = dict(recovery.recovery_service_arguments())
-    required = {
-        "publication_root",
-        "state_path",
-        "receipt_root",
-        "restore_root",
-        "credential_file",
-        "lease_seconds",
-        "max_attempts",
-        "retry_delay_seconds",
-        "deadline_seconds",
-        "rehearsal_interval_seconds",
-    }
-    if set(arguments) != required:
-        raise ValueError("current recovery profile service arguments are incomplete")
-    action = str(args.production_recovery_action)
-    if action not in {"execute", "rehearse"}:  # pragma: no cover - argparse guards this
-        raise ValueError("unknown production recovery action")
-    rehearsal_interval = int(arguments["rehearsal_interval_seconds"])
-    if action == "rehearse":
-        due, last_successful, next_due = _runtime_recovery_rehearsal_due(
-            state_path=Path(arguments["state_path"]),
-            receipt_root=Path(arguments["receipt_root"]),
-            interval_seconds=rehearsal_interval,
-            now=_utc_now(),
-        )
-        if not due:
-            print(
-                json.dumps(
-                    {
-                        "last_successful_at": (
-                            None if last_successful is None else last_successful.isoformat()
-                        ),
-                        "next_due_at": None if next_due is None else next_due.isoformat(),
-                        "profile_generation": recovery.profile_generation,
-                        "reason": "rehearsal_not_due",
-                        "status": "skipped",
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-            )
-            return 0
-    return cmd_runtime_recovery(
-        argparse.Namespace(
-            recovery_action="execute",
-            publication_root=Path(arguments["publication_root"]),
-            state_path=Path(arguments["state_path"]),
-            receipt_root=Path(arguments["receipt_root"]),
-            restore_root=Path(arguments["restore_root"]),
-            credential_file=Path(arguments["credential_file"]),
-            lease_seconds=int(arguments["lease_seconds"]),
-            max_attempts=int(arguments["max_attempts"]),
-            retry_delay_seconds=int(arguments["retry_delay_seconds"]),
-            deadline_seconds=int(arguments["deadline_seconds"]),
-            schedule_cycle_seconds=(None if action == "execute" else rehearsal_interval),
-            worker_id=(f"runtime-recovery-{action}-{recovery.profile_generation[:12]}"),
-            accept_current_plan=True,
-            plan_id=None,
-        )
-    )
 
 
 def _runtime_recovery_preview(args: argparse.Namespace) -> tuple[dict[str, object], object]:
@@ -8595,7 +8515,15 @@ def main() -> int:
     """CLI 入口函数。一次性命令的异常顶层捕获后推 PushDeer。
 
     serve 内的 daily_job 自有 try/except + typed outbox，main 不重复抓。
+
+    第一句显式构造配置：`rquant.config` 改成惰性构造之后，缺配置的失败点不能被推迟到
+    某条子命令跑到一半才炸——CLI 的每条命令最终都要用它，所以在入口一次性把它构造出来，
+    保住原来「import 期就 fail-fast」的行为。
     """
+
+    from rquant.config import get_settings
+
+    get_settings()
     parser = build_parser()
     args = parser.parse_args()
 

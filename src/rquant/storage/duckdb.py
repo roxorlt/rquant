@@ -9,14 +9,13 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 import duckdb
 import pandas as pd
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 
-from rquant.config import settings
 from rquant.data_metadata import (
     DataAuditRun,
     DataAuditRunFinalization,
@@ -96,8 +95,25 @@ _ACTIONABLE_CONFLICT_STATUS_PREDICATE = (
     f"{_INTENTIONAL_STATUS_EXCLUSION_PREDICATE}, FALSE)"
 )
 
+if TYPE_CHECKING:
+    from rquant.config import Settings
+
 ModelT = TypeVar("ModelT", bound=BaseModel)
 _SECURITY_STATUS_ROWS_ADAPTER = TypeAdapter(list[SecurityStatusDaily])
+
+
+def _settings() -> Settings:
+    """Read the process settings at call time, never at import time.
+
+    `rquant.config` builds its `Settings` on first use now, so importing it costs nothing.
+    Binding `settings` here at module level would undo that for every importer of this
+    module — including `runtime_service_main`, whose role children have no environment to
+    build one from.
+    """
+
+    from rquant.config import get_settings
+
+    return get_settings()
 
 
 def _is_retryable_stock_status_upsert_error(error: BaseException) -> bool:
@@ -409,7 +425,7 @@ class DuckDBStore:
         read_only: bool = False,
         artifact_terminal_hook: Callable[[str, str, datetime], None] | None = None,
     ) -> None:
-        self.path = path or settings.duckdb_path
+        self.path = path or _settings().duckdb_path
         self._artifact_terminal_hook = artifact_terminal_hook
         self._conn = duckdb.connect(str(self.path), read_only=read_only)
         if not read_only:
@@ -3343,10 +3359,10 @@ class DuckDBStore:
 
 def _readonly_candidate_paths() -> list[Path]:
     """返回 read_only 打开的候选路径列表，按优先级排序（副本在前）。"""
-    ro = settings.duckdb_readonly_path_resolved
+    ro = _settings().duckdb_readonly_path_resolved
     if ro.exists():
-        return [ro, settings.duckdb_path]
-    return [settings.duckdb_path]
+        return [ro, _settings().duckdb_path]
+    return [_settings().duckdb_path]
 
 
 def _store_has_required_tables(
@@ -3406,10 +3422,10 @@ def open_readonly_connection(
 ) -> duckdb.DuckDBPyConnection:
     """裸 read-only 连接；大批量导出可要求副本并禁止回退主库。"""
     if require_replica:
-        replica = settings.duckdb_readonly_path_resolved
+        replica = _settings().duckdb_readonly_path_resolved
         if not replica.is_file():
             raise FileNotFoundError(f"read-only replica does not exist: {replica}")
-        if replica.resolve() == settings.duckdb_path.resolve():
+        if replica.resolve() == _settings().duckdb_path.resolve():
             raise ValueError("read-only replica must not resolve to the primary DuckDB")
         return duckdb.connect(str(replica), read_only=True)
     paths = _readonly_candidate_paths()
