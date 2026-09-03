@@ -2,11 +2,11 @@
 
 The publisher writes ``LINUX_PRODUCTION_RUNTIME_ROOT / "serving"``
 (``runtime_production_profile`` publishes ``"serving_root": str(root / "serving")``),
-i.e. ``/home/lighthouse/rquant/data/runtime/serving``.  Each page used to carry its
-own ``os.environ.get("RQUANT_SERVING_ROOT", "data/serving")`` literal, and that
-literal named a directory no publisher has ever written -- a page whose unit did
-not set the variable rendered blank against a plausible-looking wrong path, and
-one consumer (Strategy Lab) has no unit at all, so ``Environment=`` cannot reach it.
+i.e. ``/home/lighthouse/rquant/data/runtime/serving``.  Each page used to inline its
+own fallback, and every one of them dropped the ``runtime`` segment, naming a
+directory no publisher has ever written -- a page whose unit did not set the
+variable rendered blank against a plausible-looking wrong path, and one consumer
+(Strategy Lab) has no unit at all, so ``Environment=`` cannot reach it.
 Both halves of the resolution live here so the six consumers cannot drift again.
 """
 
