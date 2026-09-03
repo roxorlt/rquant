@@ -51,6 +51,7 @@ _ARCHITECTURE_ROOT_FILES = (
     ".gitignore",
     "AGENTS.md",
     "CHANGELOG.md",
+    "CLAUDE.md",
     "DEPLOY.md",
     "README.md",
     "pyproject.toml",
