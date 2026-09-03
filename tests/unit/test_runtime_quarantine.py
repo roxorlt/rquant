@@ -165,7 +165,8 @@ def _make_candidate(
     elif candidate.is_symlink():
         candidate.unlink()
     files = {
-        "pyvenv.cfg": b"include-system-site-packages = false\n",
+        # U-1-R (TCB-1): a generation pyvenv.cfg needs `home` bound to the profile interpreter.
+        "pyvenv.cfg": b"home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.15\n",
         "release/src/rquant/__init__.py": b"",
         # Publication requires every allowlisted module to have a unique regular source in
         # the tree, and the policy maps its roles onto several modules. Deriving the sources

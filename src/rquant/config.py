@@ -719,4 +719,38 @@ def _default_settings_env_file() -> str | None:
     return None if disabled in {"1", "true", "yes", "on"} else ".env"
 
 
-settings = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+_SETTINGS: Settings | None = None
+
+
+def get_settings() -> Settings:
+    """Build the process-wide `Settings` on first use, then hand back that same object.
+
+    Importing this module used to construct it, which made five environment variables a
+    precondition of the import itself. The runtime-exec wrapper starts every role child
+    from an empty environment and copies only `LANG` / `LC_ALL` / `TZ` into it, so under
+    that regime the import died before any role code ran — and the roles served by
+    `runtime_service_main` never read this object at all, because their configuration
+    arrives in the root-owned service manifest instead. Deferring the construction to the
+    first reader is what lets those children import; a reader that does need the settings
+    is unaffected, because it still gets a fully validated object, and always the same one.
+    """
+
+    global _SETTINGS
+    if _SETTINGS is None:
+        _SETTINGS = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
+    return _SETTINGS
+
+
+def __getattr__(name: str) -> object:
+    """Keep `from rquant.config import settings` working, one construction later.
+
+    PEP 562 module `__getattr__` runs only when the name is not already a module
+    attribute, so the twenty-odd modules that import `settings` at module level see the
+    identical object they always saw — the difference is when it is built, not what it is.
+    A test that rebinds the attribute (`monkeypatch.setattr(config, "settings", …)`)
+    shadows this hook for the duration, which is the same behaviour it had before.
+    """
+
+    if name == "settings":
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
