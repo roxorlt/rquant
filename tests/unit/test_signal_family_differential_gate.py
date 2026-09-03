@@ -692,8 +692,8 @@ def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
     # main; this one moves it from PR #174's to PR #176's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "16a1f019dbc5e081f3742018659489bb28f99baa"
-    assert BASELINE_TREE_SHA == "66d8e95118dea490ca01de2331d0888338f7e1e2"
+    assert BASELINE_COMMIT_SHA == "502883604af879f38532d354f3e54dd93cf10a82"
+    assert BASELINE_TREE_SHA == "2ea22d78857c342570f0607f00733ebd8ce08a4b"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
