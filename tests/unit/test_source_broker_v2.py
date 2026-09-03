@@ -4701,6 +4701,14 @@ def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_its_durable_tail(
     D state.  SIGKILL does not preempt uninterruptible I/O either, and the
     answer to that case is the orphan registry and fail-closed entry, not a
     claim that the process can be killed.
+
+    As in the two windows above, the baseline is read once the helper has
+    announced and not before.  A fault only becomes active when this case opens
+    its window, and until then the helper renews on its ordinary schedule -
+    deliberately so, because blocking it earlier would leave an earlier phase's
+    end frame unanswered.  A renewal landing between "read the row" and "the
+    helper announces" is therefore possible, unrelated to the injection, and
+    purely a matter of how fast the host is.
     """
 
     saga, _ = _wp9_saga(tmp_path)
@@ -4709,14 +4717,20 @@ def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_its_durable_tail(
     boundary = _wp9_watch_boundary(saga, monkeypatch)
     _wp9_use_fault_helper(saga, monkeypatch, "stall-before-commit", marker)
     phase, operation_id, generation, payload = _wp9_window(saga)
-    before: list[tuple[Any, Any]] = []
+    columns: dict[str, tuple[Any, Any]] = {}
     contended: list[tuple[bool, int | None, float]] = []
 
     def invoke(_: bytes) -> bytes:
-        before.append(_wp9_heartbeat_columns(saga.path, operation_id))
         _wp9_open_window(marker)
         _wp9_wait_for(marker.exists, what="the durable-tail helper to block")
+        # The helper is now inside the tail, standing on the write lock with an
+        # uncommitted update behind it, so this is the first reading that says
+        # anything about the renewal being stalled rather than about whatever
+        # the helper did on its ordinary schedule beforehand.
+        columns["stuck"] = _wp9_heartbeat_columns(saga.path, operation_id)
         contended.append(_wp9_probe_write_lock(saga.path, timeout_ms=_WP9_BUSY_TIMEOUT_MS))
+        time.sleep(_WP9_STALLED_SETTLE_SECONDS)
+        columns["settled"] = _wp9_heartbeat_columns(saga.path, operation_id)
         return canonical_json_bytes({"wp9": "result"})
 
     try:
@@ -4739,9 +4753,12 @@ def test_v2_saga_shutdown_reaps_a_heartbeat_stuck_in_its_durable_tail(
     assert outcome is not None
     assert outcome.child_returncode == -9
     assert outcome.escalation == "sigkill"
+    # Watched for longer than a renewal interval while the helper is stuck: an
+    # injection that failed to block would have committed inside this window.
+    assert columns["settled"] == columns["stuck"]
     # The renewal that was in flight when the process died left nothing: two
     # columns unmoved, not one moved and one not.
-    assert _wp9_heartbeat_columns(saga.path, operation_id) == before[0]
+    assert _wp9_heartbeat_columns(saga.path, operation_id) == columns["stuck"]
     assert _wp9_integrity_check(saga.path) == "ok"
     released, code, elapsed = _wp9_probe_write_lock(saga.path, timeout_ms=_WP9_BUSY_TIMEOUT_MS)
     assert released, code
