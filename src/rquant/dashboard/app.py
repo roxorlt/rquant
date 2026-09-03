@@ -11,19 +11,22 @@
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, date, datetime, timedelta, timezone
-from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from loguru import logger
 
 from rquant.dashboard.runtime_console_data import (
     ServingFrameState,
 )
 from rquant.dashboard.serving_page_data import ServingPageRenderContext
-from rquant.dashboard.serving_page_ui import render_serving_state_banner
+from rquant.dashboard.serving_page_ui import (
+    render_serving_root_failure,
+    render_serving_state_banner,
+)
+from rquant.serving_paths import serving_root_from_env
 
 REFRESH_SECONDS = 30
 CST = timezone(timedelta(hours=8))
@@ -437,12 +440,13 @@ def get_minute_kline(ts_code: str) -> pd.DataFrame:
     return frame.reset_index(drop=True)
 
 
+_dashboard_serving_root = serving_root_from_env()
 try:
-    _dashboard_serving_context = ServingPageRenderContext.open(
-        os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
-    )
-except Exception:
+    _dashboard_serving_context = ServingPageRenderContext.open(_dashboard_serving_root)
+except Exception as exc:
     _dashboard_serving_context = None
+    logger.exception("dashboard serving root is unreadable: {}", _dashboard_serving_root)
+    render_serving_root_failure(st, root=_dashboard_serving_root, error=exc)
 
 try:
     dashboard_health = query_duckdb(
@@ -1439,7 +1443,7 @@ try:
 
     st.divider()
     st.caption(
-        f"Serving: {Path(os.environ.get('RQUANT_SERVING_ROOT', 'data/serving')).name}  ·  "
+        f"Serving: {serving_root_from_env()}  ·  "
         f"Refresh: {REFRESH_SECONDS}s  ·  "
         f"Last render: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}"
     )

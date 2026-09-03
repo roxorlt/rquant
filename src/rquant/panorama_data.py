@@ -47,6 +47,7 @@ from rquant.dashboard.serving_only_page_data import (
     ServingOnlyRenderContext,
 )
 from rquant.security_codes import to_ts_code
+from rquant.serving_paths import serving_root_from_env
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
 
 _CST = timezone(timedelta(hours=8))  # A 股墙钟（当日 events 文件按此取「今日」）
@@ -66,7 +67,7 @@ class _ReadableStore(Protocol):
 
 class _ServingStore:
     def __init__(self, required_projections: tuple[str, ...] = ()) -> None:
-        root = os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
+        root = serving_root_from_env()
         self._context = ServingOnlyRenderContext.open(root)
         self.generation_id = self._context.generation_id
         self._query_results: list[ServingFrameResult] = []

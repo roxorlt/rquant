@@ -10,6 +10,7 @@ User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/.env
+Environment=RQUANT_SERVING_ROOT=/home/lighthouse/rquant/data/runtime/serving
 ExecStart=/home/lighthouse/rquant/.venv/bin/streamlit run \
     /home/lighthouse/rquant/src/rquant/dashboard/nl_canvas.py \
     --server.port 8504 \

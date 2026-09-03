@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import json
-import os
 import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -36,6 +35,7 @@ from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
 from rquant.llm.dispatch import build_rules
 from rquant.llm.schemas import RuleCall, ScreenPlan
 from rquant.page_control import AppendNlQueryLog, PageControlClient, SaveNlPreset
+from rquant.serving_paths import serving_root_from_env
 from rquant.serving_read_models import nl_screen_query_digest
 
 st.set_page_config(
@@ -210,7 +210,7 @@ try:
             page_result = load_nl_screen_page_session(
                 st.session_state,
                 load_page=lambda: read_nl_screen_page(
-                    os.environ.get("RQUANT_SERVING_ROOT", "data/serving"),
+                    serving_root_from_env(),
                     trade_date=plan.trade_date,
                     rules=rules,
                     rule_labels=labels,
