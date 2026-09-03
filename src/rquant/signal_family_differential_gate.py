@@ -45,8 +45,8 @@ from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 # be rediscovered as merge_base(origin/main, candidate), and that stopped having an answer the
 # moment the merge that froze it landed, because origin/main then *was* the candidate.
 # Refreezing this pair and regenerating the policy is the last commit of every pull request.
-BASELINE_COMMIT_SHA = "16a1f019dbc5e081f3742018659489bb28f99baa"
-BASELINE_TREE_SHA = "66d8e95118dea490ca01de2331d0888338f7e1e2"
+BASELINE_COMMIT_SHA = "502883604af879f38532d354f3e54dd93cf10a82"
+BASELINE_TREE_SHA = "2ea22d78857c342570f0607f00733ebd8ce08a4b"
 # The pre-amendment baseline. It is not an origin/main ancestor, so it can no longer anchor
 # the diff, but the Git hard constraint requires it to stay reachable from every candidate.
 HISTORICAL_BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
