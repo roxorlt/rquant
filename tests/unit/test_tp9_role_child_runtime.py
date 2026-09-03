@@ -732,3 +732,104 @@ def test_t9_6_strategy_live_still_fails_closed_without_a_runtime_root(
 
     with pytest.raises(ValueError, match="strategy-live runtime must use a current deployment"):
         service_main.run(_authority_args(manifest_path, control_root, kind="strategy_live"))
+
+
+# ---------------------------------------------------------------------------------------
+# TCB-2: the frozen policy hands `--authority-runtime` to the 22 kind-backed roles
+# ---------------------------------------------------------------------------------------
+
+AUTHORITY_RUNTIME_ARGUMENT = "--authority-runtime"
+
+
+def test_tcb_2_every_kind_backed_role_carries_the_authority_runtime_literal() -> None:
+    """The 22 roles served by `runtime_service_main` with a service kind, and only those."""
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+    kind_backed = [entry for entry in PRODUCTION_ROLE_POLICY if entry.service_kind]
+    assert len(kind_backed) == 22
+    for entry in kind_backed:
+        assert entry.module == "rquant.runtime_service_main", entry.name
+        assert entry.control_root, entry.name
+        assert entry.module_arguments == (AUTHORITY_RUNTIME_ARGUMENT,), entry.name
+
+    untouched = {
+        entry.name: entry.module_arguments
+        for entry in PRODUCTION_ROLE_POLICY
+        if not entry.service_kind
+    }
+    assert untouched == {
+        "daily": (),
+        "lab_claim_finalizer": ("lab-claim-finalizer",),
+        "page_control": (),
+        "runtime_recovery": ("--mode", "execute"),
+        "runtime_recovery_rehearsal": ("--mode", "rehearse"),
+        "workload_admission": ("research-admission",),
+    }
+
+
+def test_tcb_2_the_literal_survives_the_profile_role_and_parses_as_the_flag() -> None:
+    """Profile-side validation admits it, and the module parser reads it as the flag."""
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY, RuntimeProfileRole
+    from rquant.runtime_service_main import build_parser
+
+    for entry in PRODUCTION_ROLE_POLICY:
+        if not entry.service_kind:
+            continue
+        role = RuntimeProfileRole(
+            module=entry.module,
+            environment_allowlist=entry.environment_allowlist,
+            instances=(INSTANCE,),
+            service_kind=entry.service_kind,
+            control_root=entry.control_root,
+            once=entry.once,
+            module_arguments=entry.module_arguments,
+        )
+        assert role.payload()["module_arguments"] == [AUTHORITY_RUNTIME_ARGUMENT]
+        derived = [
+            "--manifest",
+            f"/g/{GENERATION}/manifests/{INSTANCE}.json",
+            "--control-root",
+            f"{entry.control_root}/{INSTANCE}",
+            "--expected-commit",
+            COMMIT,
+            "--expected-generation",
+            GENERATION,
+            "--expected-kind",
+            entry.service_kind,
+            *(["--once"] if entry.once else []),
+            *entry.module_arguments,
+        ]
+        parsed = build_parser().parse_args(derived)
+        assert parsed.authority_runtime is True
+        assert parsed.once is entry.once
+        assert [kind.value for kind in parsed.expected_kind] == [entry.service_kind]
+
+
+def test_tcb_2_module_arguments_are_part_of_the_profile_identity() -> None:
+    """`profile_id = sha256(canonical(body))` and `body` carries `module_arguments`."""
+
+    import hashlib
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+    from rquant.strict_json import canonical_json_bytes
+
+    def body(strip_flag: bool) -> dict[str, object]:
+        return {
+            "roles": {
+                entry.name: {
+                    "module": entry.module,
+                    "module_arguments": [
+                        argument
+                        for argument in entry.module_arguments
+                        if not (strip_flag and argument == AUTHORITY_RUNTIME_ARGUMENT)
+                    ],
+                }
+                for entry in PRODUCTION_ROLE_POLICY
+            }
+        }
+
+    with_flag = hashlib.sha256(canonical_json_bytes(body(strip_flag=False))).hexdigest()
+    without_flag = hashlib.sha256(canonical_json_bytes(body(strip_flag=True))).hexdigest()
+    assert with_flag != without_flag
