@@ -322,3 +322,209 @@ def test_dry_run_lists_the_plan_without_writing_anything(prefix: Path) -> None:
         assert str(path) in result.stdout
     for directory in _expected_directories(prefix):
         assert str(directory) in result.stdout
+
+
+# --------------------------------------------------------------------------- K-7 / K-8
+
+_DAILY_RUNPY_WITH_KEYRING = (
+    "from pathlib import Path; import runpy, sys; "
+    'module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; '
+    'operation.__globals__["PUBLIC_KEYS_FILE"] = Path(sys.argv[3]); '
+    "operation(Path(sys.argv[2]))"
+)
+
+
+def _public_key(private_key: Path) -> str:
+    result = subprocess.run(
+        [_require_openssl(), "pkey", "-in", str(private_key), "-pubout"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout
+
+
+def _export_highwater_keyring(
+    prefix: Path, current: Path | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    arguments = [
+        SYSTEM_PYTHON,
+        str(HIGHWATER_HELPER),
+        "--keys-file",
+        str(_expected_files(prefix)["highwater_manifest"]),
+        "--export-public-keyring",
+    ]
+    if current is not None:
+        arguments += ["--current-keyring", str(current)]
+    return subprocess.run(arguments, check=False, capture_output=True)
+
+
+def _export_daily_keyring(
+    prefix: Path, current: Path
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [
+            SYSTEM_PYTHON,
+            "-I",
+            "-S",
+            "-c",
+            _DAILY_RUNPY_WITH_KEYRING,
+            str(DAILY_HELPER),
+            str(_expected_files(prefix)["daily_manifest"]),
+            str(current),
+        ],
+        input=b'{"operation":"export-public-keyring","schema_version":1}',
+        check=False,
+        capture_output=True,
+    )
+
+
+def _publish_keyring(path: Path, payload: bytes) -> Path:
+    path.write_bytes(payload)
+    path.chmod(0o444)
+    return path
+
+
+def test_rotate_highwater_advances_the_chain_and_unlinks_the_retired_key(
+    prefix: Path, tmp_path: Path
+) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    retired_public_key = _public_key(files["highwater_private"])
+    exported = _export_highwater_keyring(prefix)
+    assert exported.returncode == 0, exported.stderr.decode("utf-8", "replace")
+    published = _publish_keyring(tmp_path / "lab-highwater-trusted-keys.json", exported.stdout)
+    genesis_keyring = json.loads(exported.stdout)
+
+    result = _run("rotate", "highwater", "--prefix", str(prefix), "--new-key-suffix", "v2")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    document = json.loads(files["highwater_manifest"].read_text(encoding="utf-8"))
+    assert document["generation"] == 2
+    assert document["previous_manifest_hash"] == genesis_keyring["manifest_hash"]
+    assert document["previous_manifest_hash"] != "0" * 64
+    assert document["active_key_id"] == "hw-v2"
+    assert document["previous_public_keys"] == {"hw-v1": retired_public_key}
+    rotated_private = _expected_files(prefix, "v2")["highwater_private"]
+    assert document["active_private_key_path"] == str(rotated_private)
+    assert not files["highwater_private"].exists()
+    observed = rotated_private.lstat()
+    assert stat.S_IMODE(observed.st_mode) == 0o600
+    assert observed.st_nlink == 1
+
+    chained = _export_highwater_keyring(prefix, current=published)
+    assert chained.returncode == 0, chained.stderr.decode("utf-8", "replace")
+    rotated_keyring = json.loads(chained.stdout)
+    assert rotated_keyring["generation"] == 2
+    assert rotated_keyring["active_key_id"] == "hw-v2"
+    assert tuple(rotated_keyring["previous_public_keys"]) == ("hw-v1",)
+
+
+def test_rotate_daily_keeps_the_manifest_canonical_and_chained(
+    prefix: Path, tmp_path: Path
+) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    retired_public_key = _public_key(files["daily_private"])
+    missing = tmp_path / "absent-trusted-keys.json"
+    exported = _export_daily_keyring(prefix, missing)
+    assert exported.returncode == 0, exported.stderr.decode("utf-8", "replace")
+    published = _publish_keyring(tmp_path / "daily-receipt-trusted-keys.json", exported.stdout)
+    genesis_keyring = json.loads(exported.stdout)
+
+    result = _run("rotate", "daily", "--prefix", str(prefix), "--new-key-suffix", "v2")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    payload = files["daily_manifest"].read_bytes()
+    document = json.loads(payload)
+    assert _canonical(document) == payload
+    assert not payload.endswith(b"\n")
+    assert document["generation"] == 2
+    assert document["previous_manifest_hash"] == genesis_keyring["manifest_hash"]
+    assert document["active_key_id"] == "daily-v2"
+    assert document["previous_public_keys"] == {"daily-v1": retired_public_key}
+    assert not files["daily_private"].exists()
+
+    chained = _export_daily_keyring(prefix, published)
+    assert chained.returncode == 0, chained.stderr.decode("utf-8", "replace")
+    rotated_keyring = json.loads(chained.stdout)
+    assert rotated_keyring["generation"] == 2
+    assert rotated_keyring["active_key_id"] == "daily-v2"
+    assert tuple(rotated_keyring["previous_public_keys"]) == ("daily-v1",)
+
+    accepted = subprocess.run(
+        [
+            SYSTEM_PYTHON,
+            "-I",
+            "-S",
+            "-c",
+            _DAILY_RUNPY,
+            str(DAILY_HELPER),
+            str(files["daily_manifest"]),
+        ],
+        input='{"operation":"validate-key-material","schema_version":1}',
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+
+
+def test_rotate_canvas_and_shadow_retain_history_without_a_chain(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    retired_canvas = _public_key(files["canvas_private"])
+    retired_shadow = _public_key(files["shadow_private"])
+
+    for target in ("canvas", "shadow"):
+        result = _run("rotate", target, "--prefix", str(prefix), "--new-key-suffix", "v2")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    canvas = json.loads(files["canvas_manifest"].read_text(encoding="utf-8"))
+    assert set(canvas) == {
+        "schema_version",
+        "active_key_id",
+        "active_private_key_path",
+        "previous_public_keys",
+    }
+    assert canvas["active_key_id"] == "canvas-v2"
+    assert canvas["previous_public_keys"] == {"canvas-v1": retired_canvas}
+    assert not files["canvas_private"].exists()
+
+    shadow = json.loads(files["shadow_manifest"].read_text(encoding="utf-8"))
+    assert shadow["active_key_id"] == "shadow-v2"
+    assert shadow["previous_public_keys"] == {"shadow-v1": retired_shadow}
+    assert shadow["legacy_recovery_calendar_path"] == str(files["shadow_calendar"])
+    assert not files["shadow_private"].exists()
+
+    for helper, manifest in (
+        (CANVAS_HELPER, files["canvas_manifest"]),
+        (SHADOW_HELPER, files["shadow_manifest"]),
+    ):
+        accepted = subprocess.run(
+            [
+                SYSTEM_PYTHON,
+                str(helper),
+                "--keys-file",
+                str(manifest),
+                "--validate-key-material",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+
+
+def test_rotate_refuses_to_reuse_the_active_key_suffix(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    before = _expected_files(prefix)["canvas_manifest"].read_bytes()
+    result = _run("rotate", "canvas", "--prefix", str(prefix), "--new-key-suffix", "v1")
+    assert result.returncode != 0
+    assert _expected_files(prefix)["canvas_manifest"].read_bytes() == before
+
+
+def test_rotate_rejects_an_unknown_target(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    result = _run("rotate", "sealer", "--prefix", str(prefix))
+    assert result.returncode == 2

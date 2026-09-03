@@ -361,6 +361,100 @@ def command_check_absent(argv):
     return 3 if existing else 0
 
 
+def load_manifest(prefix, kind):
+    path = manifest_path(prefix, kind)
+    document, payload = read_json(path)
+    if not isinstance(document, dict):
+        raise Failure("%s is not a JSON object" % path)
+    layout = KIND_LAYOUT[kind]
+    required = {
+        "schema_version",
+        "active_key_id",
+        "active_private_key_path",
+        "previous_public_keys",
+    }
+    if layout["chained"]:
+        required |= {"generation", "previous_manifest_hash"}
+    if kind == "shadow":
+        required |= {"legacy_recovery_calendar_path"}
+    if set(document) != required:
+        raise Failure("%s does not have the expected %s field set" % (path, kind))
+    if document["schema_version"] != layout["schema_version"]:
+        raise Failure("%s has an unexpected schema_version" % path)
+    if not isinstance(document["previous_public_keys"], dict):
+        raise Failure("%s has invalid previous_public_keys" % path)
+    return document, payload
+
+
+def command_rotate_current(argv):
+    prefix, kind = argv[0], argv[1]
+    document, _payload = load_manifest(prefix, kind)
+    sys.stdout.write("%s\n" % document["active_private_key_path"])
+    return 0
+
+
+def command_rotate_write(argv):
+    prefix, kind, suffix = argv[0], argv[1], argv[2]
+    uid, gid = int(argv[3]), int(argv[4])
+    retired_public_key_file, pid = argv[5], argv[6]
+    layout = KIND_LAYOUT[kind]
+    document, _payload = load_manifest(prefix, kind)
+
+    retired_key_id = document["active_key_id"]
+    retired_private_key = document["active_private_key_path"]
+    active_key_id = "%s-%s" % (layout["key_prefix"], suffix)
+    active_private_key = private_key_path(prefix, kind, suffix)
+    require_normalized(active_private_key, "active_private_key_path")
+    if active_key_id == retired_key_id:
+        raise Failure("rotation must change the active key id (%s)" % active_key_id)
+    if active_key_id in document["previous_public_keys"]:
+        raise Failure("key id %s is already a retired key" % active_key_id)
+    if active_private_key == retired_private_key:
+        raise Failure("rotation must change the active private key path")
+    if os.path.lexists(active_private_key):
+        raise Failure("refusing to overwrite existing key material: %s" % active_private_key)
+
+    with open(retired_public_key_file, "r") as handle:
+        retired_public_key = handle.read()
+    if "BEGIN PUBLIC KEY" not in retired_public_key:
+        raise Failure("retired public key export is not a PEM public key")
+
+    previous_public_keys = dict(document["previous_public_keys"])
+    previous_public_keys[retired_key_id] = retired_public_key
+
+    rotated = {
+        "schema_version": layout["schema_version"],
+        "active_key_id": active_key_id,
+        "active_private_key_path": active_private_key,
+        "previous_public_keys": previous_public_keys,
+    }
+    if kind == "shadow":
+        rotated["legacy_recovery_calendar_path"] = document["legacy_recovery_calendar_path"]
+    if layout["chained"]:
+        chain_hash = public_keyring_manifest_hash(kind, document, retired_public_key)
+        published = keyring_path(prefix, kind)
+        if os.path.exists(published):
+            current, _current_payload = read_json(published)
+            if current.get("manifest_hash") != chain_hash:
+                raise Failure(
+                    "published keyring %s does not match the manifest it was exported "
+                    "from; re-run install-runtime-credential-infra.sh before rotating"
+                    % published
+                )
+        rotated["generation"] = int(document["generation"]) + 1
+        rotated["previous_manifest_hash"] = chain_hash
+
+    temporary = "%s.tmp-%s" % (active_private_key, pid)
+    finalize_existing(temporary, active_private_key, 0o600, uid, gid)
+    atomic_write(manifest_path(prefix, kind), canonical(rotated), 0o600, uid, gid)
+    os.unlink(retired_private_key)
+    fsync_directory(key_directory(prefix, kind))
+    sys.stdout.write(
+        "rotated %s: %s -> %s\n" % (kind, retired_key_id, active_key_id)
+    )
+    return 0
+
+
 def command_init_write(argv):
     prefix, suffix, uid, gid = argv[0], argv[1], int(argv[2]), int(argv[3])
     coverage_start, coverage_end, open_dates_csv = argv[4], argv[5], argv[6]
@@ -382,6 +476,8 @@ def main(argv):
         "plan": command_plan,
         "check-absent": command_check_absent,
         "init-write": command_init_write,
+        "rotate-current": command_rotate_current,
+        "rotate-write": command_rotate_write,
     }
     handler = handlers.get(command)
     if handler is None:
@@ -587,13 +683,70 @@ command_init() {
     printf 'created 9 credential files under %s\n' "$(etc_root)"
 }
 
+command_rotate() {
+    (( $# > 0 )) || usage
+    ROTATE_TARGET="$1"
+    shift
+    case "${ROTATE_TARGET}" in
+        highwater|canvas|shadow|daily) ;;
+        *) fail "rotate target must be one of highwater|canvas|shadow|daily" 2 ;;
+    esac
+    while (( $# > 0 )); do
+        parse_common_option "$@"
+        if (( CONSUMED > 0 )); then
+            shift "${CONSUMED}"
+            continue
+        fi
+        case "$1" in
+            --new-key-suffix)
+                [[ $# -ge 2 ]] || usage
+                NEW_KEY_SUFFIX="$2"
+                shift 2
+                ;;
+            *)
+                usage
+                ;;
+        esac
+    done
+    [[ -n "${NEW_KEY_SUFFIX}" ]] || fail "rotate requires --new-key-suffix SUFFIX" 2
+    validate_suffix "${NEW_KEY_SUFFIX}"
+    require_privilege
+
+    local uid gid openssl_bin retired_private target temporary public_export
+    uid="$(owner_uid)"
+    gid="$(owner_gid)"
+    openssl_bin="$(openssl_binary)"
+
+    retired_private="$(run_worker rotate-current "${PREFIX}" "${ROTATE_TARGET}")"
+    [[ -f "${retired_private}" ]] || fail "retired private key is missing: ${retired_private}"
+
+    target="$(private_key_path "${ROTATE_TARGET}" "${NEW_KEY_SUFFIX}")"
+    temporary="${target}.tmp-$$"
+    public_export="${target}.pub-$$"
+    TMP_PATHS+=("${temporary}" "${public_export}")
+
+    "${openssl_bin}" pkey -in "${retired_private}" -pubout -out "${public_export}" >/dev/null
+    "${openssl_bin}" genpkey -algorithm ED25519 -out "${temporary}" >/dev/null
+
+    run_worker rotate-write \
+        "${PREFIX}" \
+        "${ROTATE_TARGET}" \
+        "${NEW_KEY_SUFFIX}" \
+        "${uid}" \
+        "${gid}" \
+        "${public_export}" \
+        "$$"
+    /bin/rm -f -- "${public_export}"
+    TMP_PATHS=()
+}
+
 main() {
     (( $# > 0 )) || usage
     COMMAND="$1"
     shift
     case "${COMMAND}" in
         init) command_init "$@" ;;
-        rotate) fail "rotate is not implemented yet" 2 ;;
+        rotate) command_rotate "$@" ;;
         verify) fail "verify is not implemented yet" 2 ;;
         -h|--help|help) usage ;;
         *) usage ;;
