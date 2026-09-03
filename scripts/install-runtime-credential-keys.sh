@@ -878,14 +878,17 @@ command_init() {
     validate_suffix "${KEY_SUFFIX}"
     require_privilege
 
+    local status=0
     if (( DRY_RUN == 1 )); then
         run_worker plan "${PREFIX}" "${KEY_SUFFIX}"
-        run_worker check-absent "${PREFIX}" "${KEY_SUFFIX}"
+        run_worker check-absent "${PREFIX}" "${KEY_SUFFIX}" || status=$?
+        if (( status != 0 )); then
+            exit "${status}"
+        fi
         printf 'dry run: nothing was written\n'
         return 0
     fi
 
-    local status=0
     run_worker check-absent "${PREFIX}" "${KEY_SUFFIX}" || status=$?
     if (( status != 0 )); then
         exit "${status}"

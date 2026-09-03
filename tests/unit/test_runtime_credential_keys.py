@@ -903,3 +903,31 @@ def test_repository_carries_no_private_key_material() -> None:
     assert not [path for path in paths if path.suffix in {".pem", ".key", ".p8"}]
     for path in (SCRIPT, DOC, Path(__file__)):
         assert PRIVATE_KEY_BLOCK.search(path.read_bytes()) is None, path
+
+
+def test_dry_run_reports_an_existing_tree_without_writing(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    before = {name: path.read_bytes() for name, path in files.items()}
+
+    result = _init(prefix, "--dry-run")
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert {name: path.read_bytes() for name, path in files.items()} == before
+
+
+def test_verify_pins_the_four_root_call_shapes(prefix: Path) -> None:
+    # B2: the root branch cannot be exercised unprivileged, so pin the exact
+    # argument shapes.  Adding an argument to any of the four stdin-only sudo
+    # aliases would turn the root boundary into a confused deputy.
+    text = SCRIPT.read_text(encoding="utf-8")
+    root_branch = text.split("Root form:", 1)[1].split("Non-root form", 1)[0]
+    for helper in (
+        "rquant-lab-highwater-authority",
+        "rquant-canvas-publication-signer",
+        "rquant-shadow-report-signer",
+    ):
+        assert f'"${{helper_dir}}/{helper}" \\\n            --validate-key-material' in root_branch
+    assert '"${helper_dir}/rquant-daily-receipt-signer" >/dev/null' in root_branch
+    assert "--keys-file" not in root_branch
+    # ... and the reason the root branch is unreachable under --prefix.
+    assert "must run unprivileged" in text
