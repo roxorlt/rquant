@@ -1960,6 +1960,7 @@ def test_shadow_filesystem_loader_accepts_only_validated_export_batches(tmp_path
 _ROOT_MODE = legacy_shadow_export_module._ROOT_MODE
 _SESSION_MODE = legacy_shadow_export_module._SESSION_MODE
 _GROUP_OTHER_WRITABLE_SESSION_MODE = 0o557
+_GROUP_WRITABLE_SESSION_MODE = 0o575
 _FOREIGN_UID = 999
 
 
@@ -2132,6 +2133,7 @@ def test_group_or_other_writable_directories_are_refused_even_when_allowed(
         name=TRADE_DATE.isoformat(),
         mode=_GROUP_OTHER_WRITABLE_SESSION_MODE,
     )
+    _child_directory(root, name="group-writable", mode=_GROUP_WRITABLE_SESSION_MODE)
 
     assert not _directory_predicate_accepts(
         root,
@@ -2149,6 +2151,22 @@ def test_group_or_other_writable_directories_are_refused_even_when_allowed(
         root,
         TRADE_DATE.isoformat(),
         allowed_modes=frozenset({_SESSION_MODE, _GROUP_OTHER_WRITABLE_SESSION_MODE}),
+        owner_uid=os.geteuid(),
+    )
+
+    # The group half of the guard needs its own hostage. `0o557` sets only the other-write
+    # bit, so narrowing `S_IWGRP | S_IWOTH` to `S_IWOTH` leaves every case above green and
+    # the group half becomes dead code in the regression sense.
+    assert not _directory_predicate_accepts(
+        root,
+        "group-writable",
+        allowed_modes=frozenset({_SESSION_MODE, _GROUP_WRITABLE_SESSION_MODE}),
+        owner_uid=0,
+    )
+    assert not _directory_predicate_accepts(
+        root,
+        "group-writable",
+        allowed_modes=frozenset({_SESSION_MODE, _GROUP_WRITABLE_SESSION_MODE}),
         owner_uid=os.geteuid(),
     )
 
