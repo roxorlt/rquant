@@ -109,6 +109,7 @@ PY_HELPER=$(
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -150,7 +151,11 @@ KIND_LAYOUT = {
 }
 KIND_ORDER = ("highwater", "canvas", "shadow", "daily")
 CALENDAR_NAME = "legacy-recovery-calendar.json"
-DIRECTORY_MODES = {"": 0o755}
+MAX_KEY_FILE_BYTES = 64 * 1024
+MAX_CALENDAR_FILE_BYTES = 4 * 1024 * 1024
+KEY_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ISO_DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 class Failure(Exception):
@@ -470,6 +475,239 @@ def command_init_write(argv):
     return 0
 
 
+def inspect_path(path, expected_mode, uid, gid, label, problems, maximum_bytes, directory=False):
+    try:
+        observed = os.lstat(path)
+    except OSError as exc:
+        problems.append("%s is unavailable: %s" % (label, exc))
+        return None
+    if directory:
+        if not stat.S_ISDIR(observed.st_mode):
+            problems.append("%s is not a directory: %s" % (label, path))
+            return None
+    else:
+        if not stat.S_ISREG(observed.st_mode):
+            problems.append("%s is not a regular file: %s" % (label, path))
+            return None
+        if observed.st_nlink != 1:
+            problems.append(
+                "%s has nlink %d (expected 1): %s" % (label, observed.st_nlink, path)
+            )
+        if observed.st_size <= 0 or observed.st_size > maximum_bytes:
+            problems.append(
+                "%s has an unsafe size %d: %s" % (label, observed.st_size, path)
+            )
+    mode = stat.S_IMODE(observed.st_mode)
+    if mode != expected_mode:
+        problems.append(
+            "%s has mode %04o (expected %04o): %s" % (label, mode, expected_mode, path)
+        )
+    if uid >= 0 and observed.st_uid != uid:
+        problems.append(
+            "%s has uid %d (expected %d): %s" % (label, observed.st_uid, uid, path)
+        )
+    if gid >= 0 and observed.st_gid != gid:
+        problems.append(
+            "%s has gid %d (expected %d): %s" % (label, observed.st_gid, gid, path)
+        )
+    return observed
+
+
+def check_previous_public_keys(document, label, problems):
+    previous = document.get("previous_public_keys")
+    if not isinstance(previous, dict):
+        problems.append("%s has invalid previous_public_keys" % label)
+        return {}
+    for key_id, public_key in previous.items():
+        if not isinstance(key_id, str) or KEY_ID_PATTERN.match(key_id) is None:
+            problems.append("%s has an invalid retired key id: %r" % (label, key_id))
+        if key_id == document.get("active_key_id"):
+            problems.append(
+                "%s lists the active key %s as a retired key" % (label, key_id)
+            )
+        if not isinstance(public_key, str) or "BEGIN PUBLIC KEY" not in public_key:
+            problems.append("%s has a retired key without a PEM public key: %s" % (label, key_id))
+    return previous
+
+
+def check_calendar(prefix, document, problems, uid, gid):
+    path = document.get("legacy_recovery_calendar_path")
+    expected = calendar_path(prefix)
+    if path != expected:
+        problems.append(
+            "shadow manifest legacy_recovery_calendar_path is %r (expected %s)"
+            % (path, expected)
+        )
+        return
+    inspect_path(
+        path,
+        0o600,
+        uid,
+        gid,
+        "shadow recovery calendar",
+        problems,
+        MAX_CALENDAR_FILE_BYTES,
+    )
+    if problems and problems[-1].startswith("shadow recovery calendar is unavailable"):
+        return
+    try:
+        calendar, _payload = read_json(path)
+    except Failure as exc:
+        problems.append(str(exc))
+        return
+    expected_fields = {
+        "schema_version",
+        "exchange",
+        "coverage_start",
+        "coverage_end",
+        "open_dates",
+        "content_sha256",
+    }
+    if not isinstance(calendar, dict) or set(calendar) != expected_fields:
+        problems.append("shadow recovery calendar does not have the six expected fields")
+        return
+    if calendar["schema_version"] != 1 or calendar["exchange"] != "SSE":
+        problems.append("shadow recovery calendar schema_version/exchange are invalid")
+    body = {key: value for key, value in calendar.items() if key != "content_sha256"}
+    digest = hashlib.sha256(canonical(body)).hexdigest()
+    if calendar.get("content_sha256") != digest:
+        problems.append(
+            "shadow recovery calendar content_sha256 does not match its own body"
+        )
+    open_dates = calendar.get("open_dates")
+    start = calendar.get("coverage_start")
+    end = calendar.get("coverage_end")
+    for label, value in (("coverage_start", start), ("coverage_end", end)):
+        if not isinstance(value, str) or ISO_DATE_PATTERN.match(value) is None:
+            problems.append("shadow recovery calendar %s is invalid: %r" % (label, value))
+            return
+    if start > end:
+        problems.append("shadow recovery calendar coverage_start is after coverage_end")
+    if not isinstance(open_dates, list):
+        problems.append("shadow recovery calendar open_dates is not a list")
+        return
+    if any(
+        not isinstance(value, str) or ISO_DATE_PATTERN.match(value) is None
+        for value in open_dates
+    ):
+        problems.append("shadow recovery calendar open_dates contains an invalid date")
+        return
+    if open_dates != sorted(set(open_dates)):
+        problems.append(
+            "shadow recovery calendar open_dates are not strictly ascending and unique"
+        )
+    if any(value < start or value > end for value in open_dates):
+        problems.append(
+            "shadow recovery calendar open_dates fall outside the coverage window"
+        )
+
+
+def command_verify_tree(argv):
+    prefix, uid, gid = argv[0], int(argv[1]), int(argv[2])
+    problems = []
+    reported = []
+
+    for path, mode in directories(prefix):
+        inspect_path(path, mode, uid, gid, "credential directory", problems, 0, directory=True)
+
+    for kind in KIND_ORDER:
+        layout = KIND_LAYOUT[kind]
+        path = manifest_path(prefix, kind)
+        label = "%s key manifest" % kind
+        if inspect_path(path, 0o600, uid, gid, label, problems, MAX_KEY_FILE_BYTES) is None:
+            continue
+        try:
+            document, payload = read_json(path)
+        except Failure as exc:
+            problems.append(str(exc))
+            continue
+        if not isinstance(document, dict):
+            problems.append("%s is not a JSON object" % label)
+            continue
+        expected_fields = {
+            "schema_version",
+            "active_key_id",
+            "active_private_key_path",
+            "previous_public_keys",
+        }
+        if layout["chained"]:
+            expected_fields |= {"generation", "previous_manifest_hash"}
+        if kind == "shadow":
+            expected_fields |= {"legacy_recovery_calendar_path"}
+        if set(document) != expected_fields:
+            problems.append(
+                "%s field set is %s (expected %s)"
+                % (label, sorted(document), sorted(expected_fields))
+            )
+            continue
+        if document["schema_version"] != layout["schema_version"]:
+            problems.append(
+                "%s schema_version is %r (expected %d)"
+                % (label, document["schema_version"], layout["schema_version"])
+            )
+        active_key_id = document.get("active_key_id")
+        if not isinstance(active_key_id, str) or KEY_ID_PATTERN.match(active_key_id) is None:
+            problems.append("%s active_key_id is invalid: %r" % (label, active_key_id))
+        previous = check_previous_public_keys(document, label, problems)
+        if kind == "daily" and canonical(document) != payload:
+            problems.append(
+                "%s is not canonical JSON (ensure_ascii=True, sorted keys, no trailing newline)"
+                % label
+            )
+        if layout["chained"]:
+            generation = document.get("generation")
+            chain = document.get("previous_manifest_hash")
+            if type(generation) is not int or generation < 1:
+                problems.append("%s generation is invalid: %r" % (label, generation))
+                generation = None
+            if not isinstance(chain, str) or HEX64_PATTERN.match(chain) is None:
+                problems.append("%s previous_manifest_hash is invalid: %r" % (label, chain))
+                chain = None
+            if generation == 1 and (chain != GENESIS_HASH or previous):
+                problems.append("%s genesis binding is invalid" % label)
+            if generation is not None and generation > 1 and (chain == GENESIS_HASH or not previous):
+                problems.append("%s rotation binding is invalid" % label)
+        private_key = document.get("active_private_key_path")
+        expected_directory = key_directory(prefix, kind)
+        if (
+            not isinstance(private_key, str)
+            or not os.path.isabs(private_key)
+            or private_key != os.path.abspath(private_key)
+            or os.path.dirname(private_key) != expected_directory
+        ):
+            problems.append(
+                "%s active_private_key_path must be a normalized path inside %s: %r"
+                % (label, expected_directory, private_key)
+            )
+            reported.append(path)
+            continue
+        reported.append(path)
+        key_label = "%s private key" % kind
+        if (
+            inspect_path(private_key, 0o600, uid, gid, key_label, problems, MAX_KEY_FILE_BYTES)
+            is not None
+        ):
+            with open(private_key, "rb") as handle:
+                head = handle.read(64)
+            if not head.startswith(b"-----BEGIN PRIVATE KEY-----"):
+                problems.append("%s is not a PKCS#8 PEM: %s" % (key_label, private_key))
+        reported.append(private_key)
+        if kind == "shadow":
+            check_calendar(prefix, document, problems, uid, gid)
+            reported.append(calendar_path(prefix))
+
+    if problems:
+        for problem in problems:
+            sys.stderr.write("%s\n" % problem)
+        return 1
+    if len(reported) != 9:
+        sys.stderr.write("expected nine credential files, inspected %d\n" % len(reported))
+        return 1
+    for path in reported:
+        sys.stdout.write("OK %s\n" % path)
+    return 0
+
+
 def main(argv):
     command = argv[0]
     handlers = {
@@ -478,6 +716,7 @@ def main(argv):
         "init-write": command_init_write,
         "rotate-current": command_rotate_current,
         "rotate-write": command_rotate_write,
+        "verify-tree": command_verify_tree,
     }
     handler = handlers.get(command)
     if handler is None:
@@ -683,6 +922,87 @@ command_init() {
     printf 'created 9 credential files under %s\n' "$(etc_root)"
 }
 
+DAILY_STDIN_SEAM='from pathlib import Path; import runpy, sys; module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; operation(Path(sys.argv[2]))'
+DAILY_VALIDATE_REQUEST='{"operation":"validate-key-material","schema_version":1}'
+readonly DAILY_STDIN_SEAM DAILY_VALIDATE_REQUEST
+
+resolve_helper_dir() {
+    local candidate
+    if [[ -n "${HELPER_DIR}" ]]; then
+        printf '%s\n' "${HELPER_DIR}"
+        return 0
+    fi
+    for candidate in "${PREFIX}/usr/local/libexec" "${PROJECT_DIR}/deploy/libexec"; do
+        if [[ -f "${candidate}/rquant-canvas-publication-signer" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    fail "no credential helper directory found; pass --helper-dir DIR"
+}
+
+manifest_file() {
+    case "$1" in
+        highwater) printf '%s/lab-highwater-keys.json\n' "$(etc_root)" ;;
+        canvas) printf '%s/canvas-publication-keys.json\n' "$(etc_root)" ;;
+        shadow) printf '%s/shadow-report-keys.json\n' "$(etc_root)" ;;
+        daily) printf '%s/daily-receipt-keys.json\n' "$(etc_root)" ;;
+        *) fail "unknown credential kind: $1" 2 ;;
+    esac
+}
+
+run_consumer_self_checks() {
+    local helper_dir
+    helper_dir="$(resolve_helper_dir)"
+    if [[ "$(/usr/bin/id -u)" == "0" ]]; then
+        # Root form: canvas/shadow/highwater take zero arguments and pin
+        # /etc/rquant themselves; daily is stdin-only and also pins its path.
+        "${PYTHON_BIN}" "${helper_dir}/rquant-lab-highwater-authority" \
+            --validate-key-material >/dev/null
+        "${PYTHON_BIN}" "${helper_dir}/rquant-canvas-publication-signer" \
+            --validate-key-material >/dev/null
+        "${PYTHON_BIN}" "${helper_dir}/rquant-shadow-report-signer" \
+            --validate-key-material >/dev/null
+        printf '%s' "${DAILY_VALIDATE_REQUEST}" \
+            | "${PYTHON_BIN}" "${helper_dir}/rquant-daily-receipt-signer" >/dev/null
+        printf 'consumer self-check passed (root form)\n' >&2
+        return 0
+    fi
+    # Non-root form.  canvas/shadow accept `--keys-file <p> --validate-key-material`
+    # only when euid != 0; the high-water authority has no non-root validate at all,
+    # so it degrades to --export-public-keyring; the daily helper is zero-argument
+    # with a module-level KEYS_FILE, so it is driven through the same runpy seam
+    # scripts/install-runtime-credential-infra.sh already uses.
+    "${PYTHON_BIN}" "${helper_dir}/rquant-canvas-publication-signer" \
+        --keys-file "$(manifest_file canvas)" --validate-key-material >/dev/null
+    "${PYTHON_BIN}" "${helper_dir}/rquant-shadow-report-signer" \
+        --keys-file "$(manifest_file shadow)" --validate-key-material >/dev/null
+    "${PYTHON_BIN}" "${helper_dir}/rquant-lab-highwater-authority" \
+        --keys-file "$(manifest_file highwater)" --export-public-keyring >/dev/null
+    printf '%s' "${DAILY_VALIDATE_REQUEST}" \
+        | "${PYTHON_BIN}" -I -S -c "${DAILY_STDIN_SEAM}" \
+            "${helper_dir}/rquant-daily-receipt-signer" \
+            "$(manifest_file daily)" >/dev/null
+    printf 'consumer self-check passed (non-root --prefix form)\n' >&2
+}
+
+command_verify() {
+    while (( $# > 0 )); do
+        parse_common_option "$@"
+        if (( CONSUMED > 0 )); then
+            shift "${CONSUMED}"
+            continue
+        fi
+        usage
+    done
+    require_privilege
+    if [[ -n "${PREFIX}" && "$(/usr/bin/id -u)" == "0" ]]; then
+        fail "verify --prefix must run unprivileged: the helpers reject --keys-file for euid 0" 2
+    fi
+    run_worker verify-tree "${PREFIX}" "$(owner_uid)" "$(owner_gid)"
+    run_consumer_self_checks
+}
+
 command_rotate() {
     (( $# > 0 )) || usage
     ROTATE_TARGET="$1"
@@ -747,7 +1067,7 @@ main() {
     case "${COMMAND}" in
         init) command_init "$@" ;;
         rotate) command_rotate "$@" ;;
-        verify) fail "verify is not implemented yet" 2 ;;
+        verify) command_verify "$@" ;;
         -h|--help|help) usage ;;
         *) usage ;;
     esac

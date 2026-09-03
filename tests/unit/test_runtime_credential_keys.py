@@ -528,3 +528,241 @@ def test_rotate_rejects_an_unknown_target(prefix: Path) -> None:
     assert _init(prefix).returncode == 0
     result = _run("rotate", "sealer", "--prefix", str(prefix))
     assert result.returncode == 2
+
+
+# --------------------------------------------------------------------------- K-9
+
+def _verify(prefix: Path) -> subprocess.CompletedProcess[str]:
+    return _run("verify", "--prefix", str(prefix))
+
+
+def _rewrite(path: Path, document: object) -> None:
+    path.chmod(0o600)
+    path.write_bytes(_canonical(document))
+    path.chmod(0o600)
+
+
+def test_verify_reports_nine_ok_lines_and_changes_nothing(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    before = {
+        name: (path.read_bytes(), path.lstat().st_mtime_ns) for name, path in files.items()
+    }
+
+    result = _verify(prefix)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert len(lines) == 9, result.stdout
+    assert all(line.startswith("OK ") for line in lines), result.stdout
+    reported = [line.split(" ", 1)[1] for line in lines]
+    assert sorted(reported) == sorted(str(path) for path in files.values())
+
+    after = {
+        name: (path.read_bytes(), path.lstat().st_mtime_ns) for name, path in files.items()
+    }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "highwater_manifest",
+        "canvas_manifest",
+        "shadow_manifest",
+        "daily_manifest",
+        "shadow_calendar",
+        "highwater_private",
+    ),
+)
+def test_verify_rejects_a_world_readable_file(prefix: Path, name: str) -> None:
+    assert _init(prefix).returncode == 0
+    target = _expected_files(prefix)[name]
+    target.chmod(0o644)
+
+    result = _verify(prefix)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert str(target) in result.stderr
+    assert "0644" in result.stderr
+
+
+def test_verify_rejects_a_hardlinked_private_key(prefix: Path, tmp_path: Path) -> None:
+    assert _init(prefix).returncode == 0
+    private_key = _expected_files(prefix)["highwater_private"]
+    os.link(private_key, tmp_path / "stolen.pem")
+
+    result = _verify(prefix)
+    assert result.returncode != 0
+    assert "nlink" in result.stderr or "link" in result.stderr
+
+
+# ------------------------------------------------------------------ mutations
+
+def test_verify_rejects_a_broken_genesis_binding(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    manifest = _expected_files(prefix)["daily_manifest"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["previous_manifest_hash"] = "a" * 64
+    _rewrite(manifest, document)
+
+    result = _verify(prefix)
+    assert result.returncode != 0
+    assert "genesis" in result.stderr.lower()
+
+
+def test_verify_rejects_a_duplicated_key_id(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    manifest = _expected_files(prefix)["canvas_manifest"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["previous_public_keys"] = {
+        document["active_key_id"]: _public_key(_expected_files(prefix)["canvas_private"])
+    }
+    _rewrite(manifest, document)
+
+    result = _verify(prefix)
+    assert result.returncode != 0
+    assert "active key" in result.stderr.lower()
+
+
+def test_verify_rejects_a_daily_manifest_with_a_trailing_newline(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    manifest = _expected_files(prefix)["daily_manifest"]
+    manifest.chmod(0o600)
+    manifest.write_bytes(manifest.read_bytes() + b"\n")
+    manifest.chmod(0o600)
+
+    result = _verify(prefix)
+    assert result.returncode != 0
+    assert "canonical" in result.stderr.lower()
+
+
+def test_verify_rejects_a_calendar_whose_digest_no_longer_matches(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    calendar = _expected_files(prefix)["shadow_calendar"]
+    document = json.loads(calendar.read_text(encoding="utf-8"))
+    document["coverage_end"] = "2099-12-31"
+    _rewrite(calendar, document)
+
+    result = _verify(prefix)
+    assert result.returncode != 0
+    assert "content_sha256" in result.stderr
+
+
+def test_verify_rejects_a_manifest_pointing_outside_its_key_directory(
+    prefix: Path, tmp_path: Path
+) -> None:
+    assert _init(prefix).returncode == 0
+    stray = tmp_path / "stray.pem"
+    stray.write_bytes(_expected_files(prefix)["canvas_private"].read_bytes())
+    stray.chmod(0o600)
+    manifest = _expected_files(prefix)["canvas_manifest"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["active_private_key_path"] = str(stray)
+    _rewrite(manifest, document)
+
+    result = _verify(prefix)
+    assert result.returncode != 0
+    assert str(stray) in result.stderr
+
+
+# ------------------------------------- mutations proven against the consumers
+
+def _daily_validate(manifest: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [SYSTEM_PYTHON, "-I", "-S", "-c", _DAILY_RUNPY, str(DAILY_HELPER), str(manifest)],
+        input='{"operation":"validate-key-material","schema_version":1}',
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_daily_helper_rejects_a_trailing_newline(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    manifest = _expected_files(prefix)["daily_manifest"]
+    assert _daily_validate(manifest).returncode == 0
+    manifest.write_bytes(manifest.read_bytes() + b"\n")
+    manifest.chmod(0o600)
+
+    rejected = _daily_validate(manifest)
+    assert rejected.returncode != 0
+    assert "not canonical" in rejected.stderr
+
+
+def test_daily_helper_rejects_the_four_field_manifest_from_spec_v1(prefix: Path) -> None:
+    # Regression guard for review finding M-6: the four-field manifest the first
+    # spec draft implied is rejected outright, so the generator must emit six.
+    assert _init(prefix).returncode == 0
+    manifest = _expected_files(prefix)["daily_manifest"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    truncated = {
+        key: value
+        for key, value in document.items()
+        if key not in {"generation", "previous_manifest_hash"}
+    }
+    manifest.write_bytes(_canonical(truncated))
+    manifest.chmod(0o600)
+
+    rejected = _daily_validate(manifest)
+    assert rejected.returncode != 0
+    assert "shape is invalid" in rejected.stderr
+
+
+def test_canvas_helper_rejects_a_duplicated_active_key_id(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    manifest = files["canvas_manifest"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["previous_public_keys"] = {
+        document["active_key_id"]: _public_key(files["canvas_private"])
+    }
+    manifest.write_bytes(_canonical(document))
+    manifest.chmod(0o600)
+
+    rejected = subprocess.run(
+        [
+            SYSTEM_PYTHON,
+            str(CANVAS_HELPER),
+            "--keys-file",
+            str(manifest),
+            "--validate-key-material",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "previous key id is invalid" in rejected.stderr
+
+
+def test_shadow_helper_rejects_a_world_readable_recovery_calendar(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    files["shadow_calendar"].chmod(0o444)
+
+    rejected = subprocess.run(
+        [
+            SYSTEM_PYTHON,
+            str(SHADOW_HELPER),
+            "--keys-file",
+            str(files["shadow_manifest"]),
+            "--validate-key-material",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "Shadow recovery calendar is unsafe" in rejected.stderr
+
+
+def test_highwater_helper_rejects_a_broken_rotation_binding(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    manifest = _expected_files(prefix)["highwater_manifest"]
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    document["generation"] = 2
+    manifest.write_bytes(_canonical(document))
+    manifest.chmod(0o600)
+
+    rejected = _export_highwater_keyring(prefix)
+    assert rejected.returncode != 0
+    assert b"rotation binding is invalid" in rejected.stderr
