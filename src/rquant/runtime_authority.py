@@ -2351,7 +2351,7 @@ def _revalidate_generation_slot(
             manifest_entries,
             profile,
         )
-        _validate_generation_semantics(generation_fd, manifest_entries, slot)
+        _validate_generation_semantics(generation_fd, manifest_entries, slot, profile)
         active_generation = os.stat(
             slot.generation_id,
             dir_fd=generation_root_fd,
@@ -2625,6 +2625,7 @@ def _validate_generation_semantics(
     generation_fd: int,
     entries: tuple[_GenerationManifestEntry, ...],
     slot: RuntimeGenerationSlot,
+    profile: RuntimeClosureProfile,
 ) -> None:
     by_path = {entry.path: entry for entry in entries}
     role_payloads = tuple(
@@ -2666,7 +2667,7 @@ def _validate_generation_semantics(
     )
     if pyvenv_payload is None:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is missing")
-    _validate_pyvenv_config(pyvenv_payload)
+    _validate_pyvenv_config(pyvenv_payload, system_python=profile.system_python.path)
 
     for role, role_payload in role_payloads:
         app_source = role_payload["app_source"]
@@ -2698,13 +2699,41 @@ def _validate_generation_semantics(
                 )
 
 
-def _validate_pyvenv_config(payload: bytes) -> None:
+#: The keys `python -m venv --copies` writes (3.11.15 and 3.12.13 both produce exactly
+#: these five). A generation's `pyvenv.cfg` may carry any subset that includes `home` and
+#: `include-system-site-packages`, and nothing outside the set (S1 §1.4 U-1-R, TCB-1).
+_PYVENV_ALLOWED_KEYS = frozenset(
+    {"home", "include-system-site-packages", "version", "executable", "command"}
+)
+_PYVENV_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+
+
+def _validate_pyvenv_config(payload: bytes, *, system_python: Path) -> None:
+    """Admit only a `pyvenv.cfg` the copied interpreter can boot from, bound to the profile.
+
+    The earlier rule admitted exactly one line, `include-system-site-packages = false`. A
+    generation interpreter is a physical copy of the system Python, and a `pyvenv.cfg`
+    without `home` does not make a venv: CPython falls back to searching for its landmarks
+    from `argv[0]`, finds none inside the generation, and dies before the first import —
+    the single-line form was the one form that could never run (probe 1, scenarios A/C).
+
+    `home` is therefore required, and it is not free text: it must be the directory of the
+    profile's `system_python`, so the standard library the child resolves is the one the
+    profile's closure hashes. `executable`, when written, must be that interpreter itself.
+    `include-system-site-packages` must still be the literal `false`, `version` must look
+    like a version, and no value may carry a control character. Everything that held before
+    — UTF-8, a trailing newline, no `\r`, `key = value` lines, no duplicate keys — still
+    holds; this widens the key set and tightens what the keys may say.
+    """
+
     try:
         text = payload.decode("utf-8")
     except (UnicodeDecodeError, ValueError) as exc:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not valid UTF-8") from exc
     if not text.endswith("\n") or "\r" in text:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not canonical")
+    if any(ord(character) < 0x20 and character != "\n" for character in text):
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains a control character")
     values: dict[str, str] = {}
     for line in text.splitlines():
         key, separator, value = line.partition("=")
@@ -2713,13 +2742,28 @@ def _validate_pyvenv_config(payload: bytes) -> None:
             raise RuntimeAuthorityPublishError("generation pyvenv.cfg is malformed")
         if normalized_key in values:
             raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains a duplicate key")
-        if normalized_key != "include-system-site-packages":
+        if normalized_key not in _PYVENV_ALLOWED_KEYS:
             raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains an unknown key")
         values[normalized_key] = value.strip()
     if values.get("include-system-site-packages") != "false":
         raise RuntimeAuthorityPublishError(
             "generation pyvenv.cfg include-system-site-packages must be false"
         )
+    home = values.get("home")
+    if home is None:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg declares no home")
+    if home != str(system_python.parent):
+        raise RuntimeAuthorityPublishError(
+            "generation pyvenv.cfg home is not the profile system Python directory"
+        )
+    executable = values.get("executable")
+    if executable is not None and executable != str(system_python):
+        raise RuntimeAuthorityPublishError(
+            "generation pyvenv.cfg executable is not the profile system Python"
+        )
+    version = values.get("version")
+    if version is not None and _PYVENV_VERSION.fullmatch(version) is None:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg version is malformed")
 
 
 def _validate_generation_tree(
