@@ -548,7 +548,10 @@ def run(args: argparse.Namespace) -> int:
             # Route B publishes no legacy runtime root, so the first generation runs
             # without schema dual write and without an artifact terminal lifecycle. That
             # is an accepted degradation, not an accident — but it used to be indicated by
-            # nothing at all, which is what made the review call it silent.
+            # nothing at all, which is what made the review call it silent. The one kind
+            # that does not degrade refuses here, before any "disabled" is announced.
+            if manifest.service_kind is RuntimeServiceKind.STRATEGY_LIVE:
+                raise ValueError("strategy-live runtime must use a current deployment profile")
             runtime_root = None
             startup_degraded_reasons = (RUNTIME_ROOT_DEGRADED_REASON,)
             logger.warning(

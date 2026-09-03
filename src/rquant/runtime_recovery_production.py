@@ -7,10 +7,11 @@ nothing else, so that import chain made the two recovery roles die on the first 
 of their entry point — before any recovery policy was even read.
 
 Nothing here is new behaviour: the body is the one that lived at
-`cli.cmd_runtime_recovery_production`, moved verbatim. The three helpers it still needs
-from the CLI module are imported at call time, after the trusted profile has been loaded,
-so a child that has no current deployment fails on the profile rather than on an import.
-Resolving them through the module at call time also keeps them monkeypatchable as before.
+`cli.cmd_runtime_recovery_production`, moved as is, with one import pushed past the profile
+load (see the comment at that import). The three helpers it still needs from the CLI module
+are imported at call time, after the trusted profile has been loaded, so a child that has
+no current deployment fails on the profile rather than on an import. Resolving them through
+the module at call time also keeps them monkeypatchable as before.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ def cmd_runtime_recovery_production(args: argparse.Namespace) -> int:
         load_current_runtime_deployment_profile,
         validate_runtime_recovery_backup_config,
     )
-    from rquant.runtime_recovery_backup import load_recovery_backup_config
 
     runtime_root = Path(args.runtime_root)
     profile = load_current_runtime_deployment_profile(runtime_root)
@@ -36,6 +36,14 @@ def cmd_runtime_recovery_production(args: argparse.Namespace) -> int:
         raise ValueError("current runtime profile has no recovery production configuration")
     if recovery.profile_generation != str(args.expected_profile_generation):
         raise ValueError("recovery unit profile generation is stale")
+    # Imported after the profile is loaded, not before: `runtime_recovery_backup` reaches
+    # `dashboard/strategy_lab_runs.py` through a module-level fingerprint computation in
+    # `runtime_recovery_coordinator`, and that module reads the process settings while it is
+    # imported. A child with no current deployment therefore fails on the missing profile,
+    # which is the failure the operator can act on; the import-time settings read is a
+    # separate defect outside this module (PA-1 report, finding F-1).
+    from rquant.runtime_recovery_backup import load_recovery_backup_config
+
     backup_config = load_recovery_backup_config(recovery.backup_config_path)
     validate_runtime_recovery_backup_config(profile, backup_config)
     arguments = dict(recovery.recovery_service_arguments())
