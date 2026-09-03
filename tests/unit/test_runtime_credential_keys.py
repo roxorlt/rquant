@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -766,3 +767,139 @@ def test_highwater_helper_rejects_a_broken_rotation_binding(prefix: Path) -> Non
     rejected = _export_highwater_keyring(prefix)
     assert rejected.returncode != 0
     assert b"rotation binding is invalid" in rejected.stderr
+
+
+# -------------------------------------------------------------------------- K-10
+
+INFRA_INSTALLER = ROOT / "scripts" / "install-runtime-credential-infra.sh"
+
+TRUSTED_KEYRINGS = (
+    "lab-highwater-trusted-keys.json",
+    "canvas-publication-trusted-keys.json",
+    "shadow-report-trusted-keys.json",
+    "daily-receipt-trusted-keys.json",
+)
+
+
+def _install_infra(prefix: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/bash", str(INFRA_INSTALLER), "--test-root", str(prefix)],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_infra_installer_accepts_the_generated_tree(prefix: Path) -> None:
+    from rquant.lab_highwater_authority import load_highwater_trusted_keys
+
+    assert _init(prefix).returncode == 0
+    result = _install_infra(prefix)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    etc = prefix / "etc" / "rquant"
+    for name in TRUSTED_KEYRINGS:
+        published = etc / name
+        observed = published.lstat()
+        assert stat.S_ISREG(observed.st_mode), name
+        assert stat.S_IMODE(observed.st_mode) == 0o444, name
+        assert "PRIVATE KEY" not in published.read_text(encoding="utf-8"), name
+
+    keyring = load_highwater_trusted_keys(etc / "lab-highwater-trusted-keys.json")
+    assert keyring.active_key_id == "hw-v1"
+    assert keyring.previous_key_ids == ()
+
+
+def test_infra_installer_chains_a_rotation_produced_by_this_script(prefix: Path) -> None:
+    from rquant.lab_highwater_authority import load_highwater_trusted_keys
+
+    assert _init(prefix).returncode == 0
+    assert _install_infra(prefix).returncode == 0
+    etc = prefix / "etc" / "rquant"
+    highwater_keyring = etc / "lab-highwater-trusted-keys.json"
+    daily_keyring = etc / "daily-receipt-trusted-keys.json"
+    first_highwater = load_highwater_trusted_keys(highwater_keyring)
+    first_daily = json.loads(daily_keyring.read_text(encoding="utf-8"))
+
+    for target in ("highwater", "daily"):
+        rotated = _run("rotate", target, "--prefix", str(prefix), "--new-key-suffix", "v2")
+        assert rotated.returncode == 0, rotated.stdout + rotated.stderr
+
+    result = _install_infra(prefix)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    rotated_highwater = load_highwater_trusted_keys(highwater_keyring)
+    assert rotated_highwater.active_key_id == "hw-v2"
+    assert rotated_highwater.previous_key_ids == ("hw-v1",)
+    assert rotated_highwater.manifest_hash != first_highwater.manifest_hash
+
+    rotated_daily = json.loads(daily_keyring.read_text(encoding="utf-8"))
+    assert rotated_daily["generation"] == 2
+    assert rotated_daily["active_key_id"] == "daily-v2"
+    assert rotated_daily["previous_manifest_hash"] == first_daily["manifest_hash"]
+    assert tuple(rotated_daily["previous_public_keys"]) == ("daily-v1",)
+
+
+def test_rotate_refuses_when_the_published_keyring_is_stale(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    assert _install_infra(prefix).returncode == 0
+    manifest = _expected_files(prefix)["highwater_manifest"]
+    before = manifest.read_bytes()
+    published = prefix / "etc" / "rquant" / "lab-highwater-trusted-keys.json"
+    document = json.loads(published.read_text(encoding="utf-8"))
+    document["manifest_hash"] = "b" * 64
+    published.chmod(0o644)
+    published.write_bytes(_canonical(document))
+    published.chmod(0o444)
+
+    result = _run("rotate", "highwater", "--prefix", str(prefix), "--new-key-suffix", "v2")
+    assert result.returncode != 0
+    assert "does not match the manifest" in result.stderr
+    assert manifest.read_bytes() == before
+    assert _expected_files(prefix)["highwater_private"].exists()
+    assert not _expected_files(prefix, "v2")["highwater_private"].exists()
+
+
+# ----------------------------------------------------------------------- B8-B10
+
+DOC = ROOT / "docs" / "operations" / "runtime-credential-keys.md"
+PRIVATE_KEY_BLOCK = re.compile(
+    rb"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----\s*\n[A-Za-z0-9+/=\s]{40,}-----END"
+)
+
+
+def test_operations_doc_records_rotation_backup_and_the_known_limits() -> None:
+    text = DOC.read_text(encoding="utf-8")
+    assert "私钥丢失不可恢复" in text
+    assert "没有任何备份机制" in text
+    assert "Canvas 与 Shadow 的轮换不成链" in text
+    assert "没有 `generation` / `previous_manifest_hash` 字段" in text
+    assert "rotate" in text and "verify" in text
+    assert "离线加密" in text
+
+
+def test_script_is_stdlib_only_and_never_touches_sudoers() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "import rquant" not in text
+    assert "from rquant" not in text
+    assert "sudoers" not in text
+    assert "uv run" not in text
+    assert ".venv" not in text
+    # The four stdin-only sudo aliases must stay zero-argument; this script is
+    # invoked *under* sudo and never shells out to sudo itself.
+    assert "sudo " not in text.replace("sudo bash", "")
+    assert "/usr/local/libexec/rquant-lab-highwater-authority \"\"" not in text
+
+
+def test_repository_carries_no_private_key_material() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=str(ROOT),
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    paths = [Path(name.decode("utf-8")) for name in tracked if name]
+    assert not [path for path in paths if path.suffix in {".pem", ".key", ".p8"}]
+    for path in (SCRIPT, DOC, Path(__file__)):
+        assert PRIVATE_KEY_BLOCK.search(path.read_bytes()) is None, path
