@@ -5,6 +5,71 @@
 
 ---
 
+## v0.31.0 Release A 上线目标（尚未部署）
+
+**状态**：等你操作。本节写在装机之前，**不是部署记录**；真正部署完成后按本文件既有格式在它上面
+追加一条 `## YYYY-MM-DD · v0.31.0 · 标题`。下一节（v0.30.0）是 Release A 的前置条件清单，逐条仍然
+有效，只是 tag 号从 v0.30.0 顺延到了 v0.31.0——v0.30.0 已打 tag 但从未部署，最后一次真实部署是
+2026-08-04 的 v0.28.3。
+
+### tag 目标
+
+`v0.31.0` 指向定版 PR（`chore(release): cut v0.31.0 (Release A toolchain)`）**合入 main 之后产生的
+那个 merge commit**，不是定版分支上的任何 commit，也不是 main 的浮动 HEAD。tag 由协调者在 CI 全绿、
+PR 合入之后创建。部署一律走：
+
+```bash
+bash scripts/deploy-production.sh --target v0.31.0     # 或该 merge commit 的完整 SHA
+```
+
+合版方式只能是 "Create a merge commit"，理由见下一节第 1 条（R07 证据的 merge-provenance 检查要求
+候选 commit 恰有两个 parent；squash / rebase 会让这个 commit 永久失去部署资格）。
+
+Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
+`9a42bdee5aa1e7be39329ea720d3801cd269540f`；定版 PR 的 R07 baseline 就冻结在它上面。
+
+### 执行材料（不在仓库里）
+
+- **runbook**：本机 Mac 上的
+  `/Users/roxor/brain/30-projects/rQuant/.worktrees/release-a-cc/.superpowers/sdd/2026-09-03-release-a-rollout/release-a-runbook-v2.md`
+  （v1 `release-a-runbook.md` 已被它取代，不要再用）。
+- **给 owner 的一页摘要**：同目录 `go-no-go.md`。
+- 两份都在 Mac 本地的 worktree 里，**没有进仓库**；服务器上不存在这两个文件。
+
+### 第一关判据
+
+- **真判据**：root 权威链就位——`/etc/rquant/production-runtime-profile.json` 与
+  `/var/lib/rquant/runtime-authority/current.json` 都是 `root:root 0444`，profile 声明 28 个 role，
+  发布回执里 **`wrapper_preflight == 32`**（wrapper 对全部 32 个「角色 × 实例」组合逐一预检通过）。
+  Release A 的目标就是这一条，不是「26 个服务全绿」。
+- **服务状态口径**（协调者 2026-09-04 已接受的应急口径，起因是 #191）：
+  **13 个持续运行**（带降级警告，因为旧目录结构还不存在，这是设计）
+  + **1 个 oneshot 跑完退 0**
+  + **`rquant-runtime-strategy@` failed（设计，协调者已裁定）**
+  + **`rquant-lab-claim-finalizer` 受阻**（缺仓库外的 `/etc/rquant` 输入，journal 追加到 #191，
+  留到影子窗口前修）
+  + **10 个未启用**（7 个等 credstore 密钥、3 个硬依赖旧目录结构；预期状态是「未启用」，不是失败）。
+- 七个常驻服务与四个端口与上线前基线逐项一致。
+- **明确不承诺**：26 个服务全绿、页面有数据。
+
+### 已知限制（装机前已登记的 issue，本轮都不修）
+
+| 号 | 是什么 | 本次窗口怎么办 |
+|---|---|---|
+| #186 | recovery role 在 wrapper 下起不来：`runtime_recovery_backup` → coordinator → `formal_smoke_replay` → `dashboard/strategy_lab_runs` 这条 import 链在模块级构造 `Settings` | 两个 recovery role 不在第一关的 16 个里，留到影子窗口前修 |
+| #187 | legacy `current` 的 generation id 与 `--expected-generation` 属不同名字空间，权威链下 schema binding 永远不可能是 current | 22 个 kind-backed role 以降级方式运行，健康信号里可见 `runtime_root_unavailable` |
+| #188 | recovery role 在 wrapper 子环境里 import `runtime_recovery_backup` 即死（同为 import 期 `Settings`） | 同 #186 |
+| #189 | `rquant/logging.py:15` 在 import 期构造 `Settings`，没有 `.env` 时 `rquant` console script 不可用 | staging 只能走模块入口 `python -m rquant.runtime_authority_stage`，runbook 已按这条写 |
+| #190 | 已有 `current.json` 时无法更换 profile（发布原语拿已安装 profile 校验 previous），profile / generation / R07 policy 三件套从第二代起换不了代 | 首次发布 `previous=None`，本次不受影响；第二代起要改 `profile_id` 需 owner 单独授权扩展原语 |
+| #191 | `rquant-lab-claim-finalizer` 与 `rquant-runtime-lab-jobs@` 依赖仓库里根本没有产生者的四份 `/etc/rquant` 输入，外加一个文档明令「不安装」的草案 unit | `lab-jobs@` 用一个空目录绕过；finalizer 本次不启用，判据按上面的应急口径 |
+| #192 | 26 个 protected unit：25 个没有 `[Install]` 段、`systemctl enable` 不了（重启机器不自动拉起）；16 个的 `ReadWritePaths=` 全无 `-` 前缀，目录缺失即在挂载命名空间阶段 `226/NAMESPACE` | 本次用 `systemctl start`；启动前按 runbook §3 C-1 预建 31 个目录，且不能顺带创建 `data/runtime/current` |
+| #193 | TP1 发布链路两处 `os.open` flag：`ldd` 输出里的 symlink 成员被 `O_NOFOLLOW` 拒（G-2）；`_copy_new_file` 缺 `O_NONBLOCK`，路径被换成 FIFO 可让 root publish 挂死（N-6） | 前者撞上就停下来记录、不临时改代码；后者 Ctrl-C 之后查非普通文件 |
+| #195 | WP9 rendezvous poll 与它自己在等的 SQLite 锁争用，helper 首次续约可能输给 `database is locked` | CI 间歇性红，不影响生产行为；重跑前先按此条判因 |
+
+（#194 是 Release A 工具链的 PR，不是 issue。）
+
+---
+
 ## v0.30.0 Release A 上线前置条件（尚未部署，非部署记录）
 
 **状态**：PR #155（`cc/workload-isolation-continuation`）已于 2026-08-28T12:51:28Z 以 merge
