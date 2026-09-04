@@ -191,8 +191,15 @@ def _directive(unit: str, key: str) -> list[str]:
 
 
 def test_the_first_gate_covers_sixteen_wrapper_units() -> None:
-    """`acceptance-pra.md` §5: 16 of the 26 protected units are started in the first gate."""
+    """`acceptance-pra.md` §5: 16 of the 26 protected units are started in the first gate.
 
+    The authoritative list is `test_runtime_authority_publish.FIRST_GATE_UNITS`, which is what
+    the A23 deploy-note test reads. Two copies of a list drift; this pins them to each other.
+    """
+
+    from tests.unit.test_runtime_authority_publish import FIRST_GATE_UNITS as AUTHORITATIVE
+
+    assert set(FIRST_GATE_UNITS) == set(AUTHORITATIVE)
     assert len(FIRST_GATE_UNITS) == 16
     assert set(FIRST_GATE_EXECUTION) == set(FIRST_GATE_WRITABLE_PATHS)
     for unit in FIRST_GATE_UNITS:
