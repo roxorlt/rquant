@@ -375,13 +375,37 @@ class ServiceSet:
     manifests: Mapping[str, bytes]
 
 
+def role_plane(role: str) -> str:
+    """The plane `role` runs on, read out of the one table the builders assert against.
+
+    `runtime_deployment_bundle._EXPECTED_PLANE` is that table: `validate_runtime_deployment_
+    topology` refuses a profile whose manifest disagrees with it, and every builder repeats
+    the same expectation as its own first assertion. Route B used to write `live` into all
+    28 manifests (#200), which the seven serving and research builders rejected on sight, so
+    this reads the shared table rather than restating it (the `_DISTRIBUTION_OWNED_
+    DIRECTORIES` rule of #198).
+    """
+
+    from rquant.runtime_deployment_bundle import _EXPECTED_PLANE
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    try:
+        kind = RuntimeServiceKind(role)
+    except ValueError as exc:
+        raise RuntimeAuthorityStageError(f"role names no runtime service kind: {role}") from exc
+    plane = _EXPECTED_PLANE.get(kind)
+    if plane is None:
+        raise RuntimeAuthorityStageError(f"role has no plane in the shared table: {role}")
+    return str(plane.value)
+
+
 def _kind_backed_manifest(role: str, service_id: str, commit: str) -> bytes:
     return canonical_json_bytes(
         {
             "schema_version": 2,
             "service_id": service_id,
             "service_kind": role,
-            "plane": "live",
+            "plane": role_plane(role),
             "interval_seconds": 60.0,
             "stale_after_seconds": 900.0,
             "producer_commit": commit,

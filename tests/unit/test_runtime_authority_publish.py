@@ -1867,3 +1867,75 @@ def test_blk2_the_publisher_creates_only_the_directories_whose_mode_it_declares(
 
     assert declared.is_dir() and stat.S_IMODE(declared.lstat().st_mode) == 0o755
     assert not undeclared.exists()
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): the bootstrap manifests carry each role's real plane
+# ---------------------------------------------------------------------------------------
+
+
+def _staged_manifests(
+    world: World, plan: stage_module.StagePlan
+) -> dict[str, list[Any]]:
+    """Every kind-backed manifest of a staged generation, parsed by the real contract."""
+
+    from rquant.runtime_service_entrypoint import RuntimeServiceManifest
+
+    generation = plan.options.staging / "generation"
+    mapping = world.instances(plan)
+    manifests: dict[str, list[Any]] = {}
+    for role in KIND_BACKED_ROLES:
+        for label in mapping[role]:
+            payload = (generation / "manifests" / f"{label}.json").read_bytes()
+            manifests.setdefault(role, []).append(
+                RuntimeServiceManifest.model_validate_json(payload)
+            )
+    return manifests
+
+
+def test_blk3_every_kind_backed_manifest_carries_the_role_plane(
+    published: tuple[World, stage_module.StagePlan],
+) -> None:
+    """#200: route B wrote `plane: live` into all 28 manifests, so the seven serving and
+    research builders refused their own manifest on the production host."""
+
+    from rquant.runtime_deployment_bundle import _EXPECTED_PLANE
+    from rquant.runtime_service_control import RuntimeServicePlane
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    world, plan = published
+    manifests = _staged_manifests(world, plan)
+    assert set(manifests) == set(KIND_BACKED_ROLES)
+    observed: dict[str, RuntimeServicePlane] = {}
+    for role, staged in manifests.items():
+        expected = _EXPECTED_PLANE[RuntimeServiceKind(role)]
+        for manifest in staged:
+            assert manifest.plane is expected, role
+        observed[role] = expected
+    assert set(observed.values()) == {
+        RuntimeServicePlane.LIVE,
+        RuntimeServicePlane.SERVING,
+        RuntimeServicePlane.RESEARCH,
+    }
+    assert observed["runtime_health_publisher"] is RuntimeServicePlane.SERVING
+    assert observed["serving_publisher"] is RuntimeServicePlane.SERVING
+    assert observed["daily_pipeline_orchestrator"] is RuntimeServicePlane.RESEARCH
+    assert observed["paper_broker"] is RuntimeServicePlane.LIVE
+
+
+def test_blk3_the_plane_comes_from_the_shared_table_not_a_second_copy(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one authority is `runtime_deployment_bundle._EXPECTED_PLANE`; bend it and the
+    staged manifest bends with it (the `_DISTRIBUTION_OWNED_DIRECTORIES` pattern of #198)."""
+
+    import rquant.runtime_deployment_bundle as bundle
+    from rquant.runtime_service_control import RuntimeServicePlane
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    bent = dict(bundle._EXPECTED_PLANE)
+    bent[RuntimeServiceKind.PAPER_BROKER] = RuntimeServicePlane.RESEARCH
+    monkeypatch.setattr(bundle, "_EXPECTED_PLANE", bent)
+    plan = world.stage("blk3-plane-seam")
+    manifests = _staged_manifests(world, plan)
+    assert manifests["paper_broker"][0].plane is RuntimeServicePlane.RESEARCH
