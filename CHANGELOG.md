@@ -17,6 +17,27 @@
   staging 树里被换成 FIFO 的路径不再让持有 `deployment.lock` 的 root publish 永久阻塞，
   `S_ISREG` 检查照旧在描述符上决定。
 
+- **打包时不再要求一个发行版从不创建的 `platstdlib`（#198 BLK-1）**：`sysconfig` 在 RHEL 系上把
+  默认安装方案的 `platstdlib` 指到 `/usr/local/lib64/python3.11`，而发行版从不创建这个目录，
+  于是生产机 82.156.0.68（OpenCloudOS 9.2）上 `rquant runtime-authority-stage` 以
+  `refused: standard library directory is missing: /usr/local/lib64/python3.11` 退出，造不出第一代
+  generation。`src/rquant/runtime_authority_stage.py` 新增 `stdlib_directories()`，把不存在的
+  `platstdlib` 移出遍历集合；**`stdlib` 缺失仍然直接拒绝，报错文案一字未改**，`stdlib_files()`
+  整段保留为第二道防线。跳过不是静默的：`InterpreterClosure` 分出 `stdlib_roots` 与
+  `skipped_stdlib_roots` 两个字段，staging 打两行日志（`stdlib subtrees …` /
+  `stdlib subtrees absent on this host and skipped: …`），`plan.json` 的 `closure_summary`
+  同时序列化这两个集合，装机验收可据此核对实际收集到的目录集合。
+- **发布器与隔离遍历改按属主与写位判定发行版自有的上级目录（#198 BLK-2）**：取部署锁前的可信祖先
+  遍历原来要求每一级祖先 `root:root` 且 mode **精确等于** `0755`，而 OpenCloudOS 9.2 的 `/` 是
+  `0555`（`rpm -V filesystem` 干净，即发行版默认），root `publish` 以
+  `RuntimeAuthorityPublishError: deployment lock ancestor / is unsafe` 失败，权威链发布不了、
+  `wrapper_preflight == 32` 拿不到。同一根因在仓库里有两份副本，本次一起改：
+  `src/rquant/runtime_authority.py` 的权威链遍历与 `src/rquant/runtime_quarantine.py` 的隔离遍历
+  共用新常量 `_DISTRIBUTION_OWNED_DIRECTORIES`（`/`、`/etc`、`/var`、`/var/lib`），三张策略表把
+  这四个目录的期望 mode 写成 `None`，`_require_directory_stat` 只在 `mode is not None` 时才比相等；
+  `runtime_authority_publish.py` 的 `_ensure_authority_directories` 相应改为「没有声明 mode 的目录
+  不创建」。详见下面的 Security 一条。
+
 ### Changed
 
 - **16 个第一关 protected unit 的 `ReadWritePaths=` 补上 `-` 前缀（#192 的一半）**：路径缺失不再让
@@ -24,6 +45,37 @@
   `ProtectSystem=strict` + `ProtectHome=read-only` 下被跳过的路径仍是只读，runbook §3 C-1 的 31 条
   目录照旧要预建；收益是把故障从 systemd 层挪到 wrapper / role 层，便于分辨 `226` / `78` / `1`。
   `[Install]` 段本轮未加，#192 保持打开。
+
+### Security
+
+- **信任基线（TCB）语义变更：四个发行版自有目录不再比 mode 相等（#198 BLK-2）**：可信祖先遍历原来的
+  判据是「属主是 root **且** 权限位恰好等于 `0755`」，本次**只**去掉「恰好等于」这一条，而且**只对
+  `/`、`/etc`、`/var`、`/var/lib` 四个由发行版安装、rQuant 从不创建的目录**去掉；这四个目录写在共用
+  常量 `runtime_authority._DISTRIBUTION_OWNED_DIRECTORIES` 里，权威链与隔离两条遍历都读它，一处清单。
+  - **放宽范围**：三张策略表里只有这四个目录变成 `None`。`/var/lib/rquant`、`runtime-authority`、
+    `generations`、`/etc/rquant`、`inbox`、`quarantine` **仍然精确校验 `0o755`**——没有任何 rQuant
+    自己创建的目录被放宽；`_require_file_stat` 整段未改，部署锁 `0o600`、`current.json` 与 profile
+    的 `0o444` 仍逐字节按精确 mode 校验。
+  - **新接受的模式集合**：从「恰好 `0755`」变成 `mode & 0o022 == 0`，即任何**不给 group 或 other
+    写位**的模式。`0555` 接受（改前拒）、`0755` 接受、`0000` 接受；`0775`、`0757`、`0777` 仍拒，
+    属主非 root 仍拒，符号链接与非目录仍拒，隔离侧的 `st_nlink >= 2` 仍在。**新接受的都是比 `0755`
+    更严的模式**，方向是收紧不是放松。
+  - **威胁模型未变**：Linux 上 root 持 `CAP_DAC_OVERRIDE`，`/` 是 `0755` 还是 `0555`，root 都能在
+    里面增删条目——旧判据里「恰好等于 `0755`」从未提供任何针对 root 的保护；真正有安全含义的
+    「非 root 主体不能写」（`st_uid == 0` 与 `mode & 0o022 == 0`）一个字都没动。这条遍历要防的
+    「非 root 主体替换路径上某一级目录、把部署锁或权威文件换成别的对象」，防线完整保留。
+  - **与仓库既有口径统一**：`runtime_exec_wrapper/_verify.py` 的 `_require_trusted_directory` 与
+    `authority_path_security.py` 的 `_validate_directory` 本来就是「是目录、属主对、无 g/o 写位」，
+    不比 mode；改后的 `_require_directory_stat` 比 wrapper 还多一条非符号链接检查。改之前全仓只有
+    这两处在用严格相等，改之后口径一致。
+  - **为什么不在主机上 `chmod 0755 /`**：那会把文件系统根目录改成偏离 OpenCloudOS 发行版默认的状态
+    （此后 `rpm -V filesystem` 会一直报这一项），换一台 RHEL 系机器就要重做一次，整个机群从此依赖
+    一处没有任何东西会去校验的手改；而它加上去的那个写位，root 本来就有。
+  - **一个诚实的边角**：`stat.S_IMODE` 含 setuid/setgid/sticky，旧的「恰好等于 `0755`」顺带也拒绝了
+    这四个目录带特殊位的情形，新判据不再拒（实测 `1555`、`2555` 接受）。sticky 只限制删除、纯收紧；
+    setuid 对目录在 Linux 上无效；setgid 只影响新建条目的属组，而这四个目录不给 g/o 写位，非 root
+    根本无法在里面新建条目，且 publisher 创建目录后会显式 `os.chown(root, PUBLISH_OWNER_GID)`。
+    没有可利用的路径；若要收回，在 `mode is None` 分支加 `mode & 0o7000 == 0` 即可。
 
 ## [v0.31.0] — 2026-09-04 — Release A 工具链
 
