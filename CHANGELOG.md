@@ -253,12 +253,15 @@
   `get_settings()`，配置缺失仍在启动时 fail-fast，不推迟到业务中途。
 - **kind-backed role 在无 legacy `data/runtime/current` 时的降级（PR-A / TP9，U-12）**：22 个
   kind-backed role 以 WARNING 日志降级运行（schema 双写与 artifact 生命周期不可用，健康信号里可见
-  `runtime_root_unavailable`），`strategy_live` 保持硬失败；`data/runtime` 与
-  `control/<kind>/<label>` 由首个启动的 role 以 lighthouse 属主自建属预期。第一关放行判据定稿为
+  `runtime_root_unavailable`），`strategy_live` 保持硬失败。第一关放行判据定稿为
   「15 个 active（degraded）+ `rquant-runtime-strategy@` failed（设计）+ 10 个未启用」，页面无数据。
+  首次启动前 `data/runtime` 等目录必须由运维按各 unit 的 `ReadWritePaths=` 预建：这些路径全无 `-` 前缀，
+  缺失时 systemd 在挂载命名空间阶段就以 `226/NAMESPACE` 失败，进不到服务进程，所以服务进程内的自建
+  只在稳态重启时管用；预建时不能顺带创建 `data/runtime/current`（#192）。
 - **`DEPLOY.md` 第 11 / 18 条与 `CLAUDE.md`（PR-A）**：跑 `rquant-runtime-exec.pyz` 的 unit 数
   25→26、既有 unit 改动 21→19；finalizer 环境白名单步骤标注「首次安装场景无从执行」；root 侧
-  `rquant-production-deploy.pyz` 一律 `-I -S`；第一关判据与 `data/runtime` 自建语义写入第 18 条；
+  `rquant-production-deploy.pyz` 一律 `-I -S`；第一关判据与首次启动前预建 `ReadWritePaths=` 目录的要求
+  （#192）写入第 18 条；
   `CLAUDE.md`「常用命令」的全量测试规模改为实测口径（约 13.4k 用例、本机约 60 分钟、CI 走分片）。
 
 - **heartbeat 停机语义（WP9 / #169）**：从「`sqlite3_interrupt` + 无超时 `join()`」改为
@@ -411,7 +414,8 @@
   「清单损坏」（PR-A / TP2）**：`rotate` 现在先发布受信公钥环再跑高水位自检（回归测试覆盖四个
   rotate 目标）；`--dry-run` 下有意的拒绝不再被当作中止。
 - **wrapper 子进程里 `runtime_service_main.run()` 对缺失 runtime root 的判断（PR-A / TP9，M-R1）**：
-  原实现只在 `data/runtime` 目录不存在时降级，目录一旦被首个 role 自建而 `current` 仍缺失，
+  原实现只在 `data/runtime` 目录不存在时降级，目录一旦存在（预建或稳态重启时由首个 role 建出）而
+  `current` 仍缺失，
   第二次启动就硬失败（稳态全 failed）；现在统一以 legacy `current` 是否存在为准。
 
 - **受控部署器发给 `lab-runtime-prepare` 的 argv 与 CLI 契约不一致（TP3）**：

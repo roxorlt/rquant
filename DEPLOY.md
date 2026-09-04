@@ -367,11 +367,15 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
 
    **第一关放行判据（定稿，与 runbook 附录 S 一致）**：15 个 kind-backed / oneshot unit `active`
    （degraded：心跳带 `runtime_root_unavailable`，WARNING 日志可见）+ `rquant-runtime-strategy@` failed
-   （设计）+ 10 个「未启用」。「bootstrap 先建 runtime root」**不是**裸 `mkdir /home/lighthouse/rquant/data/runtime`：
-   `data/runtime` 与 `control/<kind>/<label>` 会由首个启动的 kind-backed role 以 lighthouse 属主自建
-   （`runtime_service_control.py` 的 `mkdir(mode=0o700, parents=True)`），这是预期；`stage --bootstrap-from-checkout`
-   全程不创建该目录（A17）。策略表给 22 个 kind-backed role 加 `--authority-runtime` 使 `profile_id` 改变
-   （TCB-2），首次发布没有 prior，不需要同步换代任何前代产物。
+   （设计）+ 10 个「未启用」。**首次启动前必须由运维按各 unit 的 `ReadWritePaths=` 预建目录**（见 issue #192
+   与 runbook v2 的 C-1 步骤）：16 个 unit 的 `ReadWritePaths=` 全无 `-` 前缀，路径缺失时 systemd 在挂载
+   命名空间搭建阶段就以 `226/NAMESPACE` 失败，根本进不到服务进程——`runtime_service_control.py` 的
+   `mkdir(mode=0o700, parents=True)` 跑在服务进程内、晚于该阶段，所以**「`data/runtime` 由首个 role 自建」
+   在首次安装场景不成立**（稳态重启才成立）。预建时**绝不能顺带创建 `data/runtime/current`**，否则 15 个
+   kind-backed role 会从 degraded 变成硬失败（PA-1 M-R1 的事故形态）。`ReadWritePaths=` 缺 `-` 前缀与
+   25/26 个 unit 缺 `[Install]` 段一并记在 #192。`stage --bootstrap-from-checkout` 全程不创建这些目录（A17）。
+   策略表给 22 个 kind-backed role 加 `--authority-runtime` 使 `profile_id` 改变（TCB-2），首次发布没有
+   prior，不需要同步换代任何前代产物。
 
    **首次发布没有 prior，回滚只有一条路**：停掉已启用的 unit，`sudo rm -f
    /var/lib/rquant/runtime-authority/current.json`（U-4）。第二代起 `rquant-production-deploy.pyz
