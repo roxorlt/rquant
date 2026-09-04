@@ -1056,6 +1056,72 @@ def test_a9_a_profile_change_over_an_existing_record_is_refused_before_writing(
     assert not (world.quarantine / ("9" * 32)).exists()
 
 
+def _other_closure(python: Path) -> stage_module.InterpreterClosure:
+    base = _fake_closure(python)
+    return stage_module.InterpreterClosure(
+        version="3.11.16",
+        elf_loader=base.elf_loader,
+        stdlib=(RuntimeFilePolicy(Path("/usr/lib64/python3.11/os.py"), "9" * 64, 0, 0o444),),
+        shared_libraries=base.shared_libraries,
+    )
+
+
+def _stale_preflight_after(
+    world: World, monkeypatch: pytest.MonkeyPatch, plan_b: stage_module.StagePlan
+) -> Any:
+    """B's read-only preflight, taken before A commits, then frozen: the D-3 window."""
+
+    staged_b = publish_module._load_staging(plan_b.options.staging, plan_b.plan_sha256)
+    stale = publish_module._preflight(staged_b)
+    assert stale.installed is None and stale.previous is None
+    monkeypatch.setattr(publish_module, "_preflight", lambda staged: stale)
+    return stale
+
+
+@pytest.mark.parametrize("same_profile", (False, True), ids=("different-profile", "same-profile"))
+def test_s1_a_first_publisher_racing_through_the_lock_window_is_refused_inside_the_lock(
+    world: World, monkeypatch: pytest.MonkeyPatch, same_profile: bool
+) -> None:
+    """S-1: A commits between B's preflight and B's lock. B must re-read the installed
+    profile / record / runtime pyz inside the lock and refuse before touching any root path,
+    so the live chain stays exactly A's — with another profile as much as with the same."""
+
+    plan_a = world.stage("a")
+    if not same_profile:
+        monkeypatch.setattr(stage_module, "discover_interpreter_closure", _other_closure)
+    plan_b = world.stage("b", operation_id="b" * 32)
+    assert (plan_b.plan["profile_id"] == plan_a.plan["profile_id"]) is same_profile
+    _stale_preflight_after(world, monkeypatch, plan_b)
+    world.publish(plan_a)
+    profile_a = world.profile_path.read_bytes()
+    record_a = world.authority_path.read_bytes()
+    with pytest.raises(RuntimeAuthorityPublishError, match="changed since preflight"):
+        world.publish(plan_b)
+    assert world.profile_path.read_bytes() == profile_a
+    assert world.authority_path.read_bytes() == record_a
+    assert not (world.inbox / ("b" * 32)).exists()
+    assert not (world.quarantine / ("b" * 32)).exists()
+    assert not world.generation_path(plan_b).exists() or same_profile
+    assert world.resolve("daily")["operation_id"] == plan_a.options.operation_id
+    assert len((world.var / "publications.jsonl").read_bytes().splitlines()) == 1
+
+
+def test_s1_a_runtime_pyz_replaced_in_the_lock_window_is_refused(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = world.stage("pyz")
+    _stale_preflight_after(world, monkeypatch, plan)
+    world.runtime_pyz.chmod(0o644)
+    world.runtime_pyz.write_bytes(RUNTIME_PYZ_BYTES + b"swapped")
+    world.runtime_pyz.chmod(0o555)
+    with pytest.raises(RuntimeAuthorityPublishError, match="installed runtime pyz differs"):
+        world.publish(plan)
+    assert not world.profile_path.exists() and not world.authority_path.exists()
+    assert not (world.inbox / plan.options.operation_id).exists()
+    assert not (world.quarantine / plan.options.operation_id).exists()
+    assert not world.generation_path(plan).exists()
+
+
 def test_publish_is_idempotent_for_the_same_operation(
     published: tuple[World, stage_module.StagePlan],
 ) -> None:

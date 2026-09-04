@@ -831,10 +831,73 @@ def _load_staging(staging: Path, expected_plan_sha256: str) -> _StagedGeneration
     )
 
 
-def _installed_profile() -> RuntimeClosureProfile | None:
-    if not os.path.lexists(authority.PRODUCTION_PROFILE_PATH):
+@dataclass(frozen=True)
+class _AuthorityState:
+    """The three root-owned inputs a publication decides on, as bytes read off the disk."""
+
+    profile_payload: bytes | None
+    record_payload: bytes | None
+    runtime_pyz_sha256: str
+
+
+def _read_root_bytes(path: Path, *, profile: bool) -> bytes | None:
+    if not os.path.lexists(path):
         return None
-    return authority.load_production_runtime_profile()
+    if profile:
+        return authority._read_trusted_file(
+            path,
+            directory_policy=authority._PRODUCTION_PROFILE_DIRECTORY_POLICY,
+            owner_uid=authority.PRODUCTION_PROFILE_OWNER_UID,
+            file_mode=authority.PRODUCTION_PROFILE_MODE,
+            max_bytes=authority.MAX_PROFILE_BYTES,
+            error_type=authority.ProductionRuntimeProfileError,
+            label="installed profile",
+        )
+    return authority._read_trusted_file(
+        path,
+        directory_policy=authority._PRODUCTION_RUNTIME_DIRECTORY_POLICY,
+        owner_uid=authority.RUNTIME_AUTHORITY_OWNER_UID,
+        file_mode=authority.RUNTIME_AUTHORITY_RECORD_MODE,
+        max_bytes=authority.MAX_RECORD_BYTES,
+        error_type=RuntimeAuthorityRecordError,
+        label="installed authority record",
+    )
+
+
+def _authority_state() -> _AuthorityState:
+    try:
+        profile_payload = _read_root_bytes(authority.PRODUCTION_PROFILE_PATH, profile=True)
+        record_payload = _read_root_bytes(authority.RUNTIME_AUTHORITY_PATH, profile=False)
+    except RuntimeAuthorityError as exc:
+        raise RuntimeAuthorityPublishError(
+            f"installed authority state is unreadable: {exc}"
+        ) from exc
+    try:
+        runtime_pyz_sha256, _size = sha256_file(INSTALLED_RUNTIME_PYZ)
+    except (OSError, RuntimeAuthorityError) as exc:
+        raise RuntimeAuthorityPublishError(
+            f"installed runtime pyz {INSTALLED_RUNTIME_PYZ} is unreadable: {exc}"
+        ) from exc
+    return _AuthorityState(
+        profile_payload=profile_payload,
+        record_payload=record_payload,
+        runtime_pyz_sha256=runtime_pyz_sha256,
+    )
+
+
+def _require_state_unchanged(snapshot: _AuthorityState) -> None:
+    """S-1: the preflight read outside the lock; nothing it saw may have moved since."""
+
+    current = _authority_state()
+    for label, before, after in (
+        ("profile", snapshot.profile_payload, current.profile_payload),
+        ("record", snapshot.record_payload, current.record_payload),
+        ("runtime pyz", snapshot.runtime_pyz_sha256, current.runtime_pyz_sha256),
+    ):
+        if before != after:
+            raise RuntimeAuthorityPublishError(
+                f"authority state changed since preflight: the installed {label} differs"
+            )
 
 
 def read_previous_record(profile: RuntimeClosureProfile) -> RuntimeAuthorityRecord | None:
@@ -863,6 +926,8 @@ class _Preflight:
     previous: RuntimeAuthorityRecord | None
     #: The installed record already is this operation's record: nothing to do but prove it.
     idempotent: bool
+    #: What the disk held when these decisions were made; re-read inside the lock (S-1).
+    state: _AuthorityState
 
 
 def _preflight(staged: _StagedGeneration) -> _Preflight:
@@ -872,28 +937,38 @@ def _preflight(staged: _StagedGeneration) -> _Preflight:
         raise RuntimeAuthorityPublishError(
             f"publish must run as uid {authority.RUNTIME_AUTHORITY_OWNER_UID}"
         )
-    try:
-        installed = _installed_profile()
-    except RuntimeAuthorityError as exc:
-        raise RuntimeAuthorityPublishError(f"installed profile is unreadable: {exc}") from exc
+    state = _authority_state()
+    installed: RuntimeClosureProfile | None = None
     previous: RuntimeAuthorityRecord | None = None
-    if installed is not None:
-        try:
-            previous = read_previous_record(installed)
-        except RuntimeAuthorityError as exc:
-            raise RuntimeAuthorityPublishError(
-                f"installed authority record is unreadable: {exc}"
-            ) from exc
+    try:
+        if state.profile_payload is not None:
+            installed = parse_runtime_closure_profile(state.profile_payload)
+        if state.record_payload is not None:
+            if installed is None:
+                raise RuntimeAuthorityPublishError(
+                    "an authority record is installed without a profile"
+                )
+            previous = authority._parse_runtime_authority_record(state.record_payload, installed)
+            if state.record_payload != canonical_runtime_authority_bytes(previous):
+                raise RuntimeAuthorityRecordError("runtime authority record is not canonical")
+    except RuntimeAuthorityPublishError:
+        raise
+    except RuntimeAuthorityError as exc:
+        raise RuntimeAuthorityPublishError(f"installed authority state is invalid: {exc}") from exc
     operation_id = staged.plan["operation_id"]
     assert type(operation_id) is str
-    _require_installed_runtime_pyz(staged)
+    if state.runtime_pyz_sha256 != staged.profile.runtime_pyz.sha256:
+        raise RuntimeAuthorityPublishError(
+            f"installed runtime pyz {INSTALLED_RUNTIME_PYZ} sha256 {state.runtime_pyz_sha256} "
+            f"does not match the profile's {staged.profile.runtime_pyz.sha256}"
+        )
     if previous is not None and previous.operation_id == operation_id:
         if canonical_runtime_authority_bytes(previous) != staged.record_payload:
             raise RuntimeAuthorityPublishError("authority operation id conflicts")
         assert installed is not None
         if installed.profile_id != staged.profile.profile_id:
             raise RuntimeAuthorityPublishError("authority operation id conflicts")
-        return _Preflight(installed=installed, previous=previous, idempotent=True)
+        return _Preflight(installed=installed, previous=previous, idempotent=True, state=state)
     if (
         installed is not None
         and previous is not None
@@ -919,21 +994,7 @@ def _preflight(staged: _StagedGeneration) -> _Preflight:
         raise RuntimeAuthorityPublishError(
             "staged current.json is not the record this publication would write"
         )
-    return _Preflight(installed=installed, previous=previous, idempotent=False)
-
-
-def _require_installed_runtime_pyz(staged: _StagedGeneration) -> None:
-    try:
-        disk_digest, _size = sha256_file(INSTALLED_RUNTIME_PYZ)
-    except (OSError, RuntimeAuthorityError) as exc:
-        raise RuntimeAuthorityPublishError(
-            f"installed runtime pyz {INSTALLED_RUNTIME_PYZ} is unreadable: {exc}"
-        ) from exc
-    if disk_digest != staged.profile.runtime_pyz.sha256:
-        raise RuntimeAuthorityPublishError(
-            f"installed runtime pyz {INSTALLED_RUNTIME_PYZ} sha256 {disk_digest} does not "
-            f"match the profile's {staged.profile.runtime_pyz.sha256}"
-        )
+    return _Preflight(installed=installed, previous=previous, idempotent=False, state=state)
 
 
 def _ensure_directory(path: Path, *, mode: int) -> None:
@@ -1042,20 +1103,20 @@ def _copy_staging_into_inbox(staging: Path, staged: _StagedGeneration, inbox: Pa
     os.sync()
 
 
-def _install_profile(staged: _StagedGeneration, installed: RuntimeClosureProfile | None) -> bool:
-    if installed is not None and installed.profile_id == staged.profile.profile_id:
-        current = authority._read_trusted_file(
-            authority.PRODUCTION_PROFILE_PATH,
-            directory_policy=authority._PRODUCTION_PROFILE_DIRECTORY_POLICY,
-            owner_uid=authority.PRODUCTION_PROFILE_OWNER_UID,
-            file_mode=authority.PRODUCTION_PROFILE_MODE,
-            max_bytes=authority.MAX_PROFILE_BYTES,
-            error_type=RuntimeAuthorityPublishError,
-            label="installed profile",
-        )
-        if current == staged.profile_payload:
-            return False
+def _install_profile(staged: _StagedGeneration, snapshot: _AuthorityState) -> bool:
     target = authority.PRODUCTION_PROFILE_PATH
+    try:
+        current = _read_root_bytes(target, profile=True)
+    except RuntimeAuthorityError as exc:
+        raise RuntimeAuthorityPublishError(f"installed profile is unreadable: {exc}") from exc
+    # Never replace bytes the preflight did not decide on (S-1): the disk must still hold
+    # exactly what the snapshot held, whether that is nothing or the profile being kept.
+    if current != snapshot.profile_payload:
+        raise RuntimeAuthorityPublishError(
+            "authority state changed since preflight: the installed profile differs"
+        )
+    if current == staged.profile_payload:
+        return False
     operation_id = staged.plan["operation_id"]
     temporary = target.with_name(f".{target.name}.{operation_id}.tmp")
     with suppress(FileNotFoundError):
@@ -1173,7 +1234,7 @@ def publish_staging(
     staging = Path(os.path.abspath(staging))
     staged = _load_staging(staging, expect_plan_sha256)
     preflight = _preflight(staged)
-    installed, previous = preflight.installed, preflight.previous
+    previous = preflight.previous
     operation_id = staged.plan["operation_id"]
     assert type(operation_id) is str
     if preflight.idempotent:
@@ -1211,6 +1272,10 @@ def publish_staging(
     profile_written = False
     try:
         with lock:
+            # The preflight read outside the lock (`publish_runtime_authority` takes it
+            # itself, so it cannot be held across the whole transaction). Re-read the same
+            # three inputs here and refuse if any moved, before a single root path is touched.
+            _require_state_unchanged(preflight.state)
             if os.path.lexists(inbox):
                 raise RuntimeAuthorityPublishError(
                     f"inbox {inbox} already exists; inspect and remove it before retrying"
@@ -1220,7 +1285,7 @@ def publish_staging(
             try:
                 _log(f"copying staging into {inbox}")
                 _copy_staging_into_inbox(staging, staged, inbox)
-                profile_written = _install_profile(staged, installed)
+                profile_written = _install_profile(staged, preflight.state)
                 _log(
                     f"profile {authority.PRODUCTION_PROFILE_PATH} "
                     f"{'installed' if profile_written else 'already current'}"
