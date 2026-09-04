@@ -52,7 +52,7 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 - 七个常驻服务与四个端口与上线前基线逐项一致。
 - **明确不承诺**：26 个服务全绿、页面有数据。
 
-### 已知限制（装机前已登记的 issue；末列写「已修（本分支）」的两条本轮已修，其余不修）
+### 已知限制（装机前已登记的 issue，外加装机当场发现的 #198；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -65,6 +65,17 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #192 | 26 个 protected unit：25 个没有 `[Install]` 段、`systemctl enable` 不了（重启机器不自动拉起）；16 个第一关 unit 的 `ReadWritePaths=` 原先全无 `-` 前缀，目录缺失即在挂载命名空间阶段 `226/NAMESPACE`（前缀已补，`[Install]` 仍未做） | 本次用 `systemctl start`；**预建 31 个目录这一步照旧必须做**——`-` 前缀只把 `226/NAMESPACE` 换成 wrapper 层可诊断的失败，不让服务自己建出目录（`ProtectSystem=strict` + `ProtectHome=read-only` 下被忽略的路径在命名空间里仍是只读，`mkdir` 得 `EROFS`）；且不能顺带创建 `data/runtime/current` |
 | #193 | TP1 发布链路两处 `os.open` flag：`ldd` 输出里的 symlink 成员被 `O_NOFOLLOW` 拒（G-2）；`_copy_new_file` 缺 `O_NONBLOCK`，路径被换成 FIFO 可让 root publish 挂死（N-6） | **已修（本分支，同一 PR）**：闭包成员与 loader 按真实路径声明（`resolved_closure_member`），读侧 `_READ_FLAGS` 带 `O_NONBLOCK`。实测本机 `ldd` 报的三个成员都是普通文件，G-2 本来也不会命中；N-6 不再需要 Ctrl-C 兜底 |
 | #195 | WP9 rendezvous poll 与它自己在等的 SQLite 锁争用，helper 首次续约可能输给 `database is locked` | CI 间歇性红，不影响生产行为；重跑前先按此条判因 |
+| #198 | 2026-09-05 首次装机当场撞到的两处主机形状硬拒绝：**BLK-1** stage 报 `refused: standard library directory is missing: /usr/local/lib64/python3.11`（RHEL 系 `sysconfig` 把 `platstdlib` 指到一个发行版从不创建的目录）；**BLK-2** root publish 报 `RuntimeAuthorityPublishError: deployment lock ancestor / is unsafe`（可信祖先遍历要求 `/` 恰为 `root:root 0755`，OpenCloudOS 9.2 的 `/` 是发行版默认的 `0555`） | **已修（PR「fix(runtime): unblock the Release A first gate on a real RHEL host」，本条的修复分支）**：缺失的 `platstdlib` 移出闭包并在 `plan.json` 的 `closure_summary.skipped_stdlib_roots` 如实记录；`/`、`/etc`、`/var`、`/var/lib` 四个发行版自有目录改按「属主 root + 无 group/other 写位」判定，rQuant 自建目录与所有文件级校验不变（TCB 语义变更，详见 CHANGELOG 的 Security 一条）。**云端验收判据**：B-6' 的 `plan.json` 里 `closure_summary.stdlib_roots == ["/usr/lib64/python3.11"]` 且 `skipped_stdlib_roots == ["/usr/local/lib64/python3.11"]`；B-7 root publish 能取到部署锁；最终 `wrapper_preflight == 32`。**不要**拿 `publish --dry-run` 通过代替 B-7——dry-run 在取锁之前就返回 |
+
+### 2026-09-05 首次装机窗口的结果（决定下次从哪起跑）
+
+窗口在 `v0.31.1`（`0fb7d95b16189af5763c8015c87b969ea69f7156`）上执行，**生产代码未切换**，第一关的真判据（`wrapper_preflight == 32`）未取得。
+
+- **A 段通过验收，装好的东西全部保留**：三个 root 制品、workload arbiter、5 个 slice、19 个既有 unit 都在，`/home/lighthouse/rquant-relA` 的 worktree 与 `/home/lighthouse/rquant/.venv.new-3.11` 也在。**下个窗口不必重做 A 段**，省掉 A-0 那 88 分钟。
+- **B 段停在 #198 的两处硬拒绝上，C 段未开始**；B-2（生成四套 Ed25519 私钥）与 B-3 是主动跳过的，没有任何密钥落地。
+- **A-1（生产 venv 换 3.11）当场整体回滚**：`mv .venv` 会让 Streamlit 按绝对路径读静态资源的三个页面立刻 500，runbook 里「对现役零影响」这句不成立。生产 venv 仍是原来的解释器，3.11 的 venv 原地留作 `/home/lighthouse/rquant/.venv.new-3.11`，等第二关的停服窗口再改名启用。
+- **#198 修复合入并重新打 tag 之后，装机从 B-2 起跑**，预算 B 段 1.5–2 h + C 段 1–1.5 h。
+- 完整执行记录（含每条命令与输出原文）在 Mac 本地的 `/Users/roxor/brain/30-projects/rQuant/.worktrees/blk-cc/.superpowers/sdd/2026-09-05-host-blockers/rollout-exec-report.md`，没有进仓库。它的 P1 一节列了 runbook 的四处订正（A-1 移出第一关、A-8 移到 C-2 之后并以 root 跑、A-5 改用 `verify` 子命令、§0.4 的常驻服务基线口径），开工前先改掉。
 
 （#194 是 Release A 工具链的 PR，不是 issue。）
 
