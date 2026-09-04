@@ -1557,3 +1557,98 @@ def test_real_checkout_stages_in_a_dry_run(
             ["git", "-C", str(REPO_ROOT), "worktree", "remove", "--force", str(worktree)],
             check=False, capture_output=True,
         )
+
+
+# ---------------------------------------------------------------------------------------
+# #198 BLK-1: the host's `platstdlib` is a directory the distribution never creates
+# ---------------------------------------------------------------------------------------
+
+
+def _facts(stdlib: Path, platstdlib: Path) -> dict[str, str]:
+    return {"version": "3.11.6", "stdlib": str(stdlib), "platstdlib": str(platstdlib)}
+
+
+def test_blk1_a_platstdlib_the_distribution_never_creates_is_skipped_and_recorded(
+    tmp_path: Path,
+) -> None:
+    """The 2026-09-05 shape on 82.156.0.68: RHEL redirects `platstdlib` into `/usr/local`.
+
+    `sysconfig` there answers `stdlib=/usr/lib64/python3.11` (present) and
+    `platstdlib=/usr/local/lib64/python3.11` (absent, and the distribution never creates
+    it). A directory that does not exist contributes no files, so the closure is exactly
+    the one the walk would have produced anyway — but the skip has to be visible.
+    """
+
+    stdlib = tmp_path / "usr" / "lib64" / "python3.11"
+    (stdlib / "json").mkdir(parents=True)
+    (stdlib / "os.py").write_bytes(b"x")
+    (stdlib / "json" / "__init__.py").write_bytes(b"x")
+    absent = tmp_path / "usr" / "local" / "lib64" / "python3.11"
+
+    walked, skipped = stage_module.stdlib_directories(_facts(stdlib, absent))
+
+    assert walked == (stdlib,)
+    assert skipped == (absent,)
+    assert stage_module.stdlib_files(walked) == tuple(
+        sorted([stdlib / "json" / "__init__.py", stdlib / "os.py"])
+    )
+
+
+def test_blk1_a_missing_stdlib_is_still_refused(tmp_path: Path) -> None:
+    absent = tmp_path / "usr" / "lib64" / "python3.11"
+    platstdlib = tmp_path / "usr" / "local" / "lib64" / "python3.11"
+    platstdlib.mkdir(parents=True)
+
+    with pytest.raises(RuntimeAuthorityStageError, match="standard library directory is missing"):
+        stage_module.stdlib_directories(_facts(absent, platstdlib))
+
+
+def test_blk1_two_existing_subtrees_are_both_walked_exactly_as_before(tmp_path: Path) -> None:
+    stdlib = tmp_path / "usr" / "lib" / "python3.11"
+    platstdlib = tmp_path / "usr" / "lib64" / "python3.11"
+    stdlib.mkdir(parents=True)
+    platstdlib.mkdir(parents=True)
+    (stdlib / "os.py").write_bytes(b"x")
+    (platstdlib / "_json.so").write_bytes(b"x")
+
+    walked, skipped = stage_module.stdlib_directories(_facts(stdlib, platstdlib))
+
+    assert walked == tuple(sorted([stdlib, platstdlib]))
+    assert skipped == ()
+    assert stage_module.stdlib_files(walked) == tuple(
+        sorted([stdlib / "os.py", platstdlib / "_json.so"])
+    )
+
+
+def test_blk1_a_platstdlib_equal_to_the_stdlib_is_walked_once(tmp_path: Path) -> None:
+    """The Debian shape, which is why the ubuntu CI runners never saw this."""
+
+    stdlib = tmp_path / "usr" / "lib" / "python3.11"
+    stdlib.mkdir(parents=True)
+
+    assert stage_module.stdlib_directories(_facts(stdlib, stdlib)) == ((stdlib,), ())
+
+
+def test_blk1_the_plan_records_the_subtrees_walked_and_the_ones_skipped(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    walked = Path("/usr/lib64/python3.11")
+    absent = Path("/usr/local/lib64/python3.11")
+
+    def closure(python: Path) -> stage_module.InterpreterClosure:
+        base = _fake_closure(python)
+        return stage_module.InterpreterClosure(
+            version=base.version,
+            elf_loader=base.elf_loader,
+            stdlib=base.stdlib,
+            shared_libraries=base.shared_libraries,
+            stdlib_roots=(walked,),
+            skipped_stdlib_roots=(absent,),
+        )
+
+    monkeypatch.setattr(stage_module, "discover_interpreter_closure", closure)
+
+    summary = world.stage("blk1").plan["closure_summary"]
+
+    assert summary["stdlib_roots"] == [str(walked)]
+    assert summary["skipped_stdlib_roots"] == [str(absent)]

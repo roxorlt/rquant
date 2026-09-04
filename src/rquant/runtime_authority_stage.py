@@ -120,6 +120,12 @@ class InterpreterClosure:
     elf_loader: RuntimeFilePolicy
     stdlib: tuple[RuntimeFilePolicy, ...]
     shared_libraries: tuple[RuntimeFilePolicy, ...]
+    #: The standard library subtrees the walk actually read, in canonical order.
+    stdlib_roots: tuple[Path, ...] = ()
+    #: Subtrees `sysconfig` named that this host does not have (#198 BLK-1). They hold no
+    #: files, so they change nothing about the closure — but the plan states them, because a
+    #: silent skip would make the closure's contents unverifiable from the plan alone.
+    skipped_stdlib_roots: tuple[Path, ...] = ()
 
 
 def elf_loader_from_readelf(text: str) -> str:
@@ -232,6 +238,34 @@ def interpreter_facts(system_python: Path) -> dict[str, str]:
     return {key: str(value) for key, value in facts.items()}
 
 
+def stdlib_directories(facts: Mapping[str, str]) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """The stdlib subtrees to walk and the ones this host does not have (#198 BLK-1).
+
+    `stdlib` is the standard library itself; its absence means the probe described an
+    interpreter that cannot exist, and it is still refused. `platstdlib` is the
+    platform-specific half, and the RHEL family redirects the default scheme's copy into
+    `/usr/local/lib64/pythonX.Y` so that `pip install` cannot write into an RPM-owned
+    directory — a path the distribution never creates. On 82.156.0.68 (OpenCloudOS 9.2,
+    2026-09-05) that absent directory refused the whole staging; Debian maps `platstdlib`
+    onto `/usr/lib/pythonX.Y`, which is why the ubuntu CI runners never showed it.
+
+    A directory that does not exist contributes no files, so skipping it leaves the closure
+    byte for byte the one the walk would have produced. What it must not do is vanish
+    quietly: the skipped roots come back to the caller, reach the staging log, and are
+    written into `plan.json`.
+    """
+
+    stdlib = Path(facts["stdlib"])
+    if not stdlib.is_dir():
+        raise RuntimeAuthorityStageError(f"standard library directory is missing: {stdlib}")
+    walked = {stdlib}
+    skipped: set[Path] = set()
+    platstdlib = Path(facts["platstdlib"])
+    if platstdlib != stdlib:
+        (walked if platstdlib.is_dir() else skipped).add(platstdlib)
+    return tuple(sorted(walked)), tuple(sorted(skipped))
+
+
 def stdlib_files(directories: Iterable[Path]) -> tuple[Path, ...]:
     """Regular files of the standard library subtrees, minus the B-5a exclusions."""
 
@@ -266,12 +300,20 @@ def discover_interpreter_closure(system_python: Path) -> InterpreterClosure:
     libraries = shared_libraries_from_ldd(
         _run([ldd, str(system_python)], label="ldd"), elf_loader=loader
     )
-    stdlib_roots = {Path(facts["stdlib"]), Path(facts["platstdlib"])}
+    walked, skipped = stdlib_directories(facts)
+    _log(f"stdlib subtrees {', '.join(str(path) for path in walked)}")
+    if skipped:
+        _log(
+            "stdlib subtrees absent on this host and skipped: "
+            f"{', '.join(str(path) for path in skipped)}"
+        )
     return InterpreterClosure(
         version=facts["version"],
         elf_loader=file_policy(Path(loader), mode=EXECUTABLE_MODE),
-        stdlib=tuple(file_policy(path) for path in stdlib_files(sorted(stdlib_roots))),
+        stdlib=tuple(file_policy(path) for path in stdlib_files(walked)),
         shared_libraries=tuple(file_policy(Path(path)) for path in libraries),
+        stdlib_roots=walked,
+        skipped_stdlib_roots=skipped,
     )
 
 
@@ -773,6 +815,8 @@ def build_stage_plan(options: StageOptions) -> StagePlan:
         "closure_summary": {
             "interpreter_version": closure.version,
             "elf_loader": str(closure.elf_loader.path),
+            "stdlib_roots": [str(path) for path in closure.stdlib_roots],
+            "skipped_stdlib_roots": [str(path) for path in closure.skipped_stdlib_roots],
             "stdlib_files": len(closure.stdlib),
             "shared_libraries": len(closure.shared_libraries),
             "closure_files": len(profile.files),
