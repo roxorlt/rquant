@@ -42,16 +42,21 @@ PRODUCTION_PROFILE_ANCHOR = Path("/etc/rquant")
 PRODUCTION_PROFILE_OWNER_UID = 0
 PRODUCTION_PROFILE_MODE = 0o444
 PRODUCTION_PROFILE_DIRECTORY_MODE = 0o755
-#: `(owner uid, mode)` per trusted ancestor. A `None` mode says the directory belongs to
-#: the distribution, so its permission bits are the distribution's decision and not
-#: rQuant's: the walk still demands root ownership and refuses any group or other write
-#: bit, but it does not insist on one exact value (#198 BLK-2). OpenCloudOS 9.2 ships `/`
-#: as `0555` with `rpm -V filesystem` clean, Debian ships `0755`, and neither is unsafe.
-#: This is the predicate the runtime-exec wrapper has always applied to its own ancestors
+#: The directories on the trusted walks that the distribution installs and owns. rQuant
+#: never creates them and does not get to legislate their permission bits: OpenCloudOS 9.2
+#: ships `/` as `0555` with `rpm -V filesystem` clean, Debian ships `0755`, and neither is
+#: unsafe (#198 BLK-2). Every policy below declares a `None` mode for exactly these, which
+#: drops the exact-mode comparison and nothing else — the walk still demands a real
+#: directory, root ownership, and no group or other write bit. That is the predicate the
+#: runtime-exec wrapper has always applied to its own ancestors
 #: (`runtime_exec_wrapper/_verify.py`, `_require_trusted_directory`) and the one
-#: `authority_path_security._validate_directory` applies to every walk it anchors at `/`;
-#: it is stated here per path so a reader sees exactly which four directories are judged
-#: that way. Every directory the publisher creates keeps its exact mode below.
+#: `authority_path_security._validate_directory` applies to every walk it anchors at `/`.
+#: `runtime_quarantine._production_anchor_policy` reads this same set, so the two walks
+#: cannot drift apart. Every directory rQuant creates keeps its exact mode.
+_DISTRIBUTION_OWNED_DIRECTORIES = frozenset(
+    {Path("/"), Path("/etc"), Path("/var"), Path("/var/lib")}
+)
+#: `(owner uid, mode)` per trusted ancestor; `None` marks the four directories above.
 _PRODUCTION_PROFILE_DIRECTORY_POLICY = MappingProxyType(
     {
         Path("/"): (0, None),

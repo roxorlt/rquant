@@ -1763,12 +1763,12 @@ def test_blk2_only_the_ancestors_the_distribution_owns_are_relaxed() -> None:
     runtime = authority_module._PRODUCTION_RUNTIME_DIRECTORY_POLICY
     profile = authority_module._PRODUCTION_PROFILE_DIRECTORY_POLICY
 
-    assert {path for path, (_uid, mode) in runtime.items() if mode is None} == {
-        Path("/"), Path("/var"), Path("/var/lib")
-    }
-    assert {path for path, (_uid, mode) in profile.items() if mode is None} == {
-        Path("/"), Path("/etc")
-    }
+    relaxed_runtime = {path for path, (_uid, mode) in runtime.items() if mode is None}
+    relaxed_profile = {path for path, (_uid, mode) in profile.items() if mode is None}
+    assert relaxed_runtime == {Path("/"), Path("/var"), Path("/var/lib")}
+    assert relaxed_profile == {Path("/"), Path("/etc")}
+    # Both tables and the quarantine walk read one list, so they cannot drift apart.
+    assert relaxed_runtime | relaxed_profile == authority_module._DISTRIBUTION_OWNED_DIRECTORIES
     assert {path: mode for path, (_uid, mode) in runtime.items() if mode is not None} == {
         Path("/var/lib/rquant"): 0o755,
         authority_module.RUNTIME_AUTHORITY_ANCHOR: 0o755,
