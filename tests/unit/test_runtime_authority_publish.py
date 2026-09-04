@@ -22,6 +22,7 @@ import sys
 import zipfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -2192,3 +2193,101 @@ def test_blk3_derived_settings_stay_inside_the_frozen_production_topology(
     assert settings["paper-constraint.market.v1"]["reference_registry_path"] == str(
         root / "authorities" / "reference-slow" / "reference.sqlite3"
     )
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): a builder is constructed out of the packaged manifest, one per plane
+# ---------------------------------------------------------------------------------------
+
+
+def _builtin_registry(manifests: dict[str, list[Any]]) -> Any:
+    """The production registry, with only the two capabilities a terminal-owner role needs.
+
+    The lab jobs publisher opens its ledger reader through the registry's artifact terminal
+    lifecycle; the reader is bound to the very path the staged manifest names, so a manifest
+    that pointed somewhere else would fail the builder's own path check.
+    """
+
+    from rquant.lab_jobs import LabJobReader
+    from rquant.runtime_artifact_terminal_lifecycle import ProductionArtifactTerminalLifecycle
+    from rquant.runtime_service_builtin import build_builtin_registry
+
+    lab_jobs_path = Path(str(manifests["lab_jobs_publisher"][0].settings["lab_jobs_path"]))
+
+    def lifecycle() -> Any:
+        return ProductionArtifactTerminalLifecycle(lab_job_reader=LabJobReader(lab_jobs_path))
+
+    return build_builtin_registry(
+        clock=lambda: datetime.now(UTC),
+        artifact_terminal_lifecycle_factory=lifecycle,
+    )
+
+
+def test_blk3_builders_start_from_the_packaged_manifest_on_all_three_planes(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """The gap that let #200 reach the production host: the bootstrap probe only proved the
+    wrapper could resolve a launch, never that a builder accepts the manifest the generation
+    ships. This reads the staged manifest files, hands them to the real registry, and takes
+    one role of each plane all the way to a runtime step.
+    """
+
+    from rquant.reference_data_registry import ReferenceRegistry
+    from rquant.runtime_service_control import RuntimeServicePlane
+
+    world, plan = bootstrap
+    manifests = _staged_manifests(world, plan)
+    registry = _builtin_registry(manifests)
+    roles = {
+        RuntimeServicePlane.LIVE: "paper_constraint_publisher",
+        RuntimeServicePlane.SERVING: "runtime_health_publisher",
+        RuntimeServicePlane.RESEARCH: "lab_jobs_publisher",
+    }
+    constraint = manifests["paper_constraint_publisher"][0]
+    ReferenceRegistry(Path(str(constraint.settings["reference_registry_path"])))
+
+    for plane, role in roles.items():
+        manifest = manifests[role][0]
+        assert manifest.plane is plane
+        step = registry.build(manifest)
+        assert callable(step)
+        closer = getattr(step, "close", None)
+        if closer is not None:
+            closer()
+
+
+def test_blk3_the_two_hardcoded_values_are_what_the_builders_refuse(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """The same three builders, given the manifest route B used to ship: `plane: live` for
+    everyone and an empty settings object. Both halves of #200 must still be refusals, or
+    the test above proves nothing."""
+
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from rquant.reference_data_registry import ReferenceRegistry
+    from rquant.runtime_service_entrypoint import RuntimeServiceManifest
+
+    world, plan = bootstrap
+    manifests = _staged_manifests(world, plan)
+    registry = _builtin_registry(manifests)
+    constraint = manifests["paper_constraint_publisher"][0]
+    ReferenceRegistry(Path(str(constraint.settings["reference_registry_path"])))
+
+    for role, message in (
+        ("runtime_health_publisher", "must run on the serving plane"),
+        ("lab_jobs_publisher", "must run on the research plane"),
+    ):
+        document = strict_json_loads(manifests[role][0].model_dump_json().encode("utf-8"))
+        assert isinstance(document, dict)
+        document["plane"] = "live"
+        with _pytest.raises(ValueError, match=message):
+            registry.build(RuntimeServiceManifest.model_validate(document))
+
+    for role in ("paper_constraint_publisher", "runtime_health_publisher", "lab_jobs_publisher"):
+        document = strict_json_loads(manifests[role][0].model_dump_json().encode("utf-8"))
+        assert isinstance(document, dict)
+        document["settings"] = {}
+        with _pytest.raises(ValidationError):
+            registry.build(RuntimeServiceManifest.model_validate(document))
