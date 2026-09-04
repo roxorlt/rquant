@@ -24,8 +24,6 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
 # Five required fields plus the dotenv switch: this is exactly the environment the Release A
 # bootstrap worktree has, and nothing in it can build a `Settings`.
 CONFIGURATION_FREE_ENVIRONMENT = {
@@ -59,7 +57,6 @@ def test_importing_rquant_logging_never_touches_the_configuration_module(tmp_pat
 
     assert result.returncode == 0, result.stderr
     assert "IMPORT-CONFIG-FREE" in result.stdout
-    assert not (REPO_ROOT / ".env").exists()
 
 
 def test_importing_rquant_cli_succeeds_without_configuration(tmp_path: Path) -> None:

@@ -616,8 +616,22 @@ def test_a4_b5a_elf_loader_is_pt_interp_and_never_a_shared_library() -> None:
     loader = stage_module.elf_loader_from_readelf(readelf)
     assert loader == "/lib64/ld-linux-x86-64.so.2"
     libraries = stage_module.shared_libraries_from_ldd(ldd, elf_loader=loader)
-    assert libraries == ("/lib64/libc.so.6", "/lib64/libm.so.6", "/lib64/libpython3.11.so.1.0")
+    # The members are declared under their real paths (#193 G-2), and on a usrmerge Linux
+    # `/lib64` is a symlink to `usr/lib64`, so the expectation has to be resolved the same
+    # way the stage resolves them. On macOS, where `/lib64` does not exist, `realpath` is the
+    # identity and these are the literal paths the fixture prints.
+    assert libraries == tuple(
+        sorted(
+            os.path.realpath(path)
+            for path in (
+                "/lib64/libc.so.6",
+                "/lib64/libm.so.6",
+                "/lib64/libpython3.11.so.1.0",
+            )
+        )
+    )
     assert loader not in libraries
+    assert os.path.realpath(loader) not in libraries
     with pytest.raises(RuntimeAuthorityStageError, match="exactly one"):
         stage_module.elf_loader_from_readelf("no interpreter here")
 
