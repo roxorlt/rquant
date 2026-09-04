@@ -478,6 +478,16 @@ def test_a1_deploy_pyz_builder_refuses_a_non_stdlib_import(tmp_path: Path) -> No
     builder.assert_stdlib_only(
         "import os\nfrom rquant.strict_json import canonical_json_bytes\n", "rquant/ok.py"
     )
+    # S-2: an import buried in a function body or a branch is caught as well.
+    for nested in (
+        "def later():\n    import rquant.config\n",
+        "def later():\n    from rquant.runtime_production_profile import x\n",
+        "if True:\n    import pydantic\n",
+        "try:\n    import pandas\nexcept ImportError:\n    pass\n",
+    ):
+        with pytest.raises(SystemExit, match="cannot carry"):
+            builder.assert_stdlib_only(nested, "rquant/runtime_authority_publish.py")
+    builder.assert_stdlib_only("def later():\n    import argparse\n", "rquant/ok.py")
 
 
 # ---------------------------------------------------------------------------------------

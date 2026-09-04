@@ -66,13 +66,17 @@ ALLOWED_PACKAGE_IMPORTS: Final[frozenset[str]] = frozenset(
 )
 
 
-def _top_level_imports(source: str, archive_name: str) -> set[str]:
+def _all_imports(source: str, archive_name: str) -> set[str]:
+    """Every import anywhere in the module — function bodies and branches included. A
+    nested `import rquant.config` would pass a top-level scan and only fail at root run
+    time, inside the transaction (review S-2)."""
+
     try:
         tree = ast.parse(source, filename=archive_name)
     except SyntaxError as error:
         raise SystemExit(f"{archive_name} does not parse: {error}") from error
     names: set[str] = set()
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -84,7 +88,7 @@ def _top_level_imports(source: str, archive_name: str) -> set[str]:
 
 def assert_stdlib_only(source: str, archive_name: str) -> None:
     stdlib = sys.stdlib_module_names
-    for name in sorted(_top_level_imports(source, archive_name)):
+    for name in sorted(_all_imports(source, archive_name)):
         root = name.split(".")[0]
         if root in stdlib or name == "__future__":
             continue
