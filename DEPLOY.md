@@ -362,7 +362,16 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    硬依赖旧链路 `data/runtime/current` 3 个（`rquant-page-control` / `rquant-runtime-recovery@` /
    `rquant-runtime-recovery-rehearsal@`）。**不承诺 26 全绿，不承诺页面有数据**（serving 的六个
    owner 里 `notifier` 与 `reference_slow_publisher` 都在推迟组）。`rquant-runtime-strategy@`
-   在启用名单内，但按 U-12 裁决它在无 `data/runtime/current` 时硬失败（PA-1 D-3，待协调者裁定）。
+   在启用名单内，但按 U-12 裁决它在无 legacy `data/runtime/current` 时硬失败（PA-1 D-3，协调者已裁定：
+   **failed 是设计**，不是事故；路线 A 产出 `current` 之后它仍受 #187 阻塞）。
+
+   **第一关放行判据（定稿，与 runbook 附录 S 一致）**：15 个 kind-backed / oneshot unit `active`
+   （degraded：心跳带 `runtime_root_unavailable`，WARNING 日志可见）+ `rquant-runtime-strategy@` failed
+   （设计）+ 10 个「未启用」。「bootstrap 先建 runtime root」**不是**裸 `mkdir /home/lighthouse/rquant/data/runtime`：
+   `data/runtime` 与 `control/<kind>/<label>` 会由首个启动的 kind-backed role 以 lighthouse 属主自建
+   （`runtime_service_control.py` 的 `mkdir(mode=0o700, parents=True)`），这是预期；`stage --bootstrap-from-checkout`
+   全程不创建该目录（A17）。策略表给 22 个 kind-backed role 加 `--authority-runtime` 使 `profile_id` 改变
+   （TCB-2），首次发布没有 prior，不需要同步换代任何前代产物。
 
    **首次发布没有 prior，回滚只有一条路**：停掉已启用的 unit，`sudo rm -f
    /var/lib/rquant/runtime-authority/current.json`（U-4）。第二代起 `rquant-production-deploy.pyz
