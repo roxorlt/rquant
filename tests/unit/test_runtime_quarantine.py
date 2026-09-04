@@ -9,6 +9,8 @@ import shutil
 import socket
 import stat
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -1584,3 +1586,109 @@ def test_manifest_serializer_never_receives_a_duplicate_whole_tree_payload(
 
     monkeypatch.setattr(quarantine_module, "canonical_json_bytes", reject_aggregate_entries)
     assert publish_runtime_candidate(_request()).status is RuntimeQuarantineStatus.PUBLISHED
+
+
+# ---------------------------------------------------------------------------------------
+# #198 BLK-2, second copy: the quarantine walk has its own ancestor policy
+# ---------------------------------------------------------------------------------------
+
+
+@contextmanager
+def _mode(path: Path, mode: int) -> Iterator[None]:
+    original = stat.S_IMODE(path.lstat().st_mode)
+    path.chmod(mode)
+    try:
+        yield
+    finally:
+        path.chmod(original)
+
+
+def _anchor_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, dict[Path, tuple[int, int | None]]]:
+    """A stand-in `/` with an inbox root under it, plus the policy that closes the walk.
+
+    The returned dict is the object the module consults, so relaxing or tightening one
+    entry after the fact is what the next walk sees.
+    """
+
+    root = tmp_path / "root"
+    inbox = root / "var" / "lib" / "rquant" / "runtime-authority" / "inbox"
+    inbox.mkdir(parents=True)
+    current = root
+    for component in inbox.relative_to(root).parts:
+        current /= component
+        current.chmod(0o755)
+    root.chmod(0o755)
+    policy: dict[Path, tuple[int, int | None]] = dict(_directory_policy(inbox))
+    monkeypatch.setattr(quarantine_module, "_ANCHOR_DIRECTORY_POLICY", policy)
+    return root, inbox, policy
+
+
+def _walk(inbox: Path) -> None:
+    descriptors, _fd = quarantine_module._open_fixed_root(inbox, "candidate inbox")
+    quarantine_module._close_descriptors(descriptors)
+
+
+def test_blk2_quarantine_accepts_a_distribution_owned_ancestor_at_0555(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same OpenCloudOS 9.2 `/` that refused the deployment lock (#198 BLK-2)."""
+
+    root, inbox, policy = _anchor_world(tmp_path, monkeypatch)
+    policy[root] = (os.getuid(), None)
+
+    with _mode(root, 0o555):
+        _walk(inbox)
+
+
+@pytest.mark.parametrize("mode", (0o757, 0o775), ids=("other-writable", "group-writable"))
+def test_blk2_quarantine_still_refuses_an_ancestor_anyone_can_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    root, inbox, policy = _anchor_world(tmp_path, monkeypatch)
+    policy[root] = (os.getuid(), None)
+
+    with _mode(root, mode), pytest.raises(RuntimeQuarantineError, match="ancestor"):
+        _walk(inbox)
+
+
+def test_blk2_quarantine_still_refuses_an_ancestor_owned_by_someone_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, inbox, policy = _anchor_world(tmp_path, monkeypatch)
+    policy[root] = (os.getuid() + 1, None)
+
+    with _mode(root, 0o555), pytest.raises(RuntimeQuarantineError, match="ancestor"):
+        _walk(inbox)
+
+
+def test_blk2_quarantine_keeps_the_exact_mode_of_a_directory_rquant_creates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, inbox, policy = _anchor_world(tmp_path, monkeypatch)
+    policy[root] = (os.getuid(), None)
+    assert policy[inbox] == (os.getuid(), 0o755)
+
+    with (
+        _mode(root, 0o555),
+        _mode(inbox, 0o555),
+        pytest.raises(RuntimeQuarantineError, match="ancestor"),
+    ):
+        _walk(inbox)
+
+
+def test_blk2_quarantine_relaxes_the_same_directories_the_authority_walk_does() -> None:
+    policy = quarantine_module._production_anchor_policy()
+
+    relaxed = {path for path, (_uid, mode) in policy.items() if mode is None}
+    assert relaxed == authority_module._DISTRIBUTION_OWNED_DIRECTORIES & set(policy)
+    assert relaxed == {Path("/"), Path("/var"), Path("/var/lib")}
+    assert {path: mode for path, (_uid, mode) in policy.items() if mode is not None} == {
+        Path("/var/lib/rquant"): 0o755,
+        Path("/var/lib/rquant/runtime-authority"): 0o755,
+        authority_module.PRODUCTION_INBOX_ROOT: 0o755,
+        authority_module.PRODUCTION_QUARANTINE_ROOT: 0o755,
+        authority_module.PRODUCTION_GENERATION_ROOT: 0o755,
+    }
+    assert all(uid == 0 for uid, _mode in policy.values())

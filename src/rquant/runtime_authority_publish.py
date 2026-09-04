@@ -1028,7 +1028,11 @@ def _ensure_authority_directories() -> None:
         authority._PRODUCTION_RUNTIME_DIRECTORY_POLICY,
     ):
         for path, (_owner, mode) in policy.items():
-            if path.parent == path or path in (Path("/etc"), Path("/var"), Path("/var/lib")):
+            # A `None` mode marks a directory the distribution owns — `/`, `/etc`, `/var`,
+            # `/var/lib`. The publisher neither creates those nor decides their mode
+            # (#198 BLK-2), so the two lists cannot drift apart any more: the policy is the
+            # single place that says which directories are rQuant's to make.
+            if mode is None:
                 continue
             _ensure_directory(path, mode=mode)
     _ensure_directory(authority.PRODUCTION_INBOX_ROOT, mode=INBOX_DIRECTORY_MODE)
@@ -1259,6 +1263,10 @@ def publish_staging(
         f"append a receipt to {authority.RUNTIME_AUTHORITY_ANCHOR / PUBLICATIONS_NAME}",
     ]
     if dry_run:
+        # This returns before `_ensure_authority_directories()` and before the deployment
+        # lock is taken, so it exercises neither the trusted-ancestor walk nor the lock
+        # file's own checks. A passing dry-run is not evidence that the real publication
+        # will pass — #198 BLK-2 was invisible to it and refused the first real attempt.
         for step in steps:
             _log(f"dry-run: {step}")
         return {

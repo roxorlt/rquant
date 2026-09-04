@@ -20,6 +20,8 @@ import stat
 import subprocess
 import sys
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +159,11 @@ def _git(checkout: Path, *arguments: str) -> str:
         text=True,
         check=True,
     ).stdout
+
+
+#: `World` replaces `stage_module.discover_interpreter_closure` with `_fake_closure`, so
+#: this is the real one, bound at import time, for the single case that must run it (SF-1).
+_REAL_INTERPRETER_CLOSURE = stage_module.discover_interpreter_closure
 
 
 def _fake_closure(_system_python: Path) -> stage_module.InterpreterClosure:
@@ -1557,3 +1564,306 @@ def test_real_checkout_stages_in_a_dry_run(
             ["git", "-C", str(REPO_ROOT), "worktree", "remove", "--force", str(worktree)],
             check=False, capture_output=True,
         )
+
+
+# ---------------------------------------------------------------------------------------
+# #198 BLK-1: the host's `platstdlib` is a directory the distribution never creates
+# ---------------------------------------------------------------------------------------
+
+
+def _facts(stdlib: Path, platstdlib: Path) -> dict[str, str]:
+    return {"version": "3.11.6", "stdlib": str(stdlib), "platstdlib": str(platstdlib)}
+
+
+def test_blk1_a_platstdlib_the_distribution_never_creates_is_skipped_and_recorded(
+    tmp_path: Path,
+) -> None:
+    """The 2026-09-05 shape on 82.156.0.68: RHEL redirects `platstdlib` into `/usr/local`.
+
+    `sysconfig` there answers `stdlib=/usr/lib64/python3.11` (present) and
+    `platstdlib=/usr/local/lib64/python3.11` (absent, and the distribution never creates
+    it). A directory that does not exist contributes no files, so the closure is exactly
+    the one the walk would have produced anyway — but the skip has to be visible.
+    """
+
+    stdlib = tmp_path / "usr" / "lib64" / "python3.11"
+    (stdlib / "json").mkdir(parents=True)
+    (stdlib / "os.py").write_bytes(b"x")
+    (stdlib / "json" / "__init__.py").write_bytes(b"x")
+    absent = tmp_path / "usr" / "local" / "lib64" / "python3.11"
+
+    walked, skipped = stage_module.stdlib_directories(_facts(stdlib, absent))
+
+    assert walked == (stdlib,)
+    assert skipped == (absent,)
+    assert stage_module.stdlib_files(walked) == tuple(
+        sorted([stdlib / "json" / "__init__.py", stdlib / "os.py"])
+    )
+
+
+def test_blk1_a_missing_stdlib_is_still_refused(tmp_path: Path) -> None:
+    absent = tmp_path / "usr" / "lib64" / "python3.11"
+    platstdlib = tmp_path / "usr" / "local" / "lib64" / "python3.11"
+    platstdlib.mkdir(parents=True)
+
+    with pytest.raises(RuntimeAuthorityStageError, match="standard library directory is missing"):
+        stage_module.stdlib_directories(_facts(absent, platstdlib))
+
+
+def test_blk1_two_existing_subtrees_are_both_walked_exactly_as_before(tmp_path: Path) -> None:
+    stdlib = tmp_path / "usr" / "lib" / "python3.11"
+    platstdlib = tmp_path / "usr" / "lib64" / "python3.11"
+    stdlib.mkdir(parents=True)
+    platstdlib.mkdir(parents=True)
+    (stdlib / "os.py").write_bytes(b"x")
+    (platstdlib / "_json.so").write_bytes(b"x")
+
+    walked, skipped = stage_module.stdlib_directories(_facts(stdlib, platstdlib))
+
+    assert walked == tuple(sorted([stdlib, platstdlib]))
+    assert skipped == ()
+    assert stage_module.stdlib_files(walked) == tuple(
+        sorted([stdlib / "os.py", platstdlib / "_json.so"])
+    )
+
+
+def test_blk1_a_platstdlib_equal_to_the_stdlib_is_walked_once(tmp_path: Path) -> None:
+    """The Debian shape, which is why the ubuntu CI runners never saw this."""
+
+    stdlib = tmp_path / "usr" / "lib" / "python3.11"
+    stdlib.mkdir(parents=True)
+
+    assert stage_module.stdlib_directories(_facts(stdlib, stdlib)) == ((stdlib,), ())
+
+
+def test_blk1_the_plan_records_the_subtrees_walked_and_the_ones_skipped(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    walked = Path("/usr/lib64/python3.11")
+    absent = Path("/usr/local/lib64/python3.11")
+
+    def closure(python: Path) -> stage_module.InterpreterClosure:
+        base = _fake_closure(python)
+        return stage_module.InterpreterClosure(
+            version=base.version,
+            elf_loader=base.elf_loader,
+            stdlib=base.stdlib,
+            shared_libraries=base.shared_libraries,
+            stdlib_roots=(walked,),
+            skipped_stdlib_roots=(absent,),
+        )
+
+    monkeypatch.setattr(stage_module, "discover_interpreter_closure", closure)
+
+    summary = world.stage("blk1").plan["closure_summary"]
+
+    assert summary["stdlib_roots"] == [str(walked)]
+    assert summary["skipped_stdlib_roots"] == [str(absent)]
+
+
+def test_blk1_the_real_closure_walk_records_the_skip_it_took(
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`discover_interpreter_closure` itself, not a stand-in for it.
+
+    Every other case in this file replaces this function with `_fake_closure`, which left
+    the wiring between `stdlib_directories` and what the plan reports unguarded: dropping
+    `skipped_stdlib_roots=` from the constructor, or the two log lines, kept the suite
+    green while making the skip silent on the host — the one shape #198 BLK-1 was fixed to
+    avoid, and the one the B-6' acceptance step reads.
+    """
+
+    stdlib = tmp_path / "usr" / "lib64" / "python3.11"
+    stdlib.mkdir(parents=True)
+    (stdlib / "os.py").write_bytes(b"os\n")
+    absent = tmp_path / "usr" / "local" / "lib64" / "python3.11"
+    loader = tmp_path / "ld-linux-x86-64.so.2"
+    loader.write_bytes(b"loader")
+    library = tmp_path / "libpython3.11.so.1.0"
+    library.write_bytes(b"library")
+    for path in (loader, library, stdlib / "os.py"):
+        path.chmod(0o644)
+
+    monkeypatch.setattr(
+        stage_module,
+        "interpreter_facts",
+        lambda python: {"version": "3.11.6", "stdlib": str(stdlib), "platstdlib": str(absent)},
+    )
+    monkeypatch.setattr(stage_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        stage_module,
+        "_run",
+        lambda command, *, label: (
+            f"      [Requesting program interpreter: {loader}]\n"
+            if label == "readelf"
+            else f"\tlibpython3.11.so.1.0 => {library} (0x00007f0000000000)\n"
+        ),
+    )
+
+    closure = _REAL_INTERPRETER_CLOSURE(world.system_python)
+
+    assert closure.stdlib_roots == (stdlib,)
+    assert closure.skipped_stdlib_roots == (absent,)
+    assert [item.path for item in closure.stdlib] == [stdlib / "os.py"]
+    assert closure.elf_loader.path == Path(os.path.realpath(loader))
+    assert [item.path for item in closure.shared_libraries] == [Path(os.path.realpath(library))]
+    logged = capsys.readouterr().err
+    assert f"stdlib subtrees {stdlib}\n" in logged
+    assert f"stdlib subtrees absent on this host and skipped: {absent}\n" in logged
+
+    # And the plan states the same two sets, so the whole chain is nailed end to end.
+    monkeypatch.setattr(stage_module, "discover_interpreter_closure", lambda python: closure)
+    summary = world.stage("real-closure").plan["closure_summary"]
+    assert summary["stdlib_roots"] == [str(stdlib)]
+    assert summary["skipped_stdlib_roots"] == [str(absent)]
+
+
+# ---------------------------------------------------------------------------------------
+# #198 BLK-2: an ancestor the distribution owns, at the mode the distribution ships
+# ---------------------------------------------------------------------------------------
+
+
+@contextmanager
+def _mode(path: Path, mode: int) -> Iterator[None]:
+    original = stat.S_IMODE(path.lstat().st_mode)
+    path.chmod(mode)
+    try:
+        yield
+    finally:
+        path.chmod(original)
+
+
+def _lock_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, dict[Path, tuple[int, int | None]]]:
+    """A stand-in `/` with the authority anchor under it, plus the policy that closes it.
+
+    The returned dict is the very object the module now consults, so a test can relax or
+    tighten one entry after the fact and the next walk sees it.
+    """
+
+    root = tmp_path / "root"
+    anchor = root / "var" / "lib" / "rquant" / "runtime-authority"
+    anchor.mkdir(parents=True)
+    for path in (root, root / "var", root / "var" / "lib", anchor.parent, anchor):
+        path.chmod(0o755)
+    policy: dict[Path, tuple[int, int | None]] = dict(_directory_policy(anchor))
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_ANCHOR", anchor)
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_LOCK_PATH", anchor / "deployment.lock")
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", UID)
+    monkeypatch.setattr(authority_module, "_PRODUCTION_RUNTIME_DIRECTORY_POLICY", policy)
+    return root, anchor, policy
+
+
+def test_blk2_a_distribution_owned_ancestor_at_0555_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenCloudOS 9.2 ships `/` as `dr-xr-xr-x`; `rpm -V filesystem` is clean on that host."""
+
+    root, _anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+
+    with _mode(root, 0o555), authority_module.acquire_runtime_deployment_lock() as lock:
+        lock.assert_current()
+
+
+@pytest.mark.parametrize("mode", (0o757, 0o775), ids=("other-writable", "group-writable"))
+def test_blk2_a_relaxed_ancestor_that_anyone_can_write_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    root, _anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+
+    with _mode(root, mode), pytest.raises(RuntimeAuthorityPublishError, match="ancestor"):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_a_relaxed_ancestor_owned_by_someone_else_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID + 1, None)
+
+    with _mode(root, 0o555), pytest.raises(RuntimeAuthorityPublishError, match="ancestor"):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_a_directory_the_publisher_declares_a_mode_for_stays_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the distribution's own directories were relaxed; rQuant's anchor was not."""
+
+    root, anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+    assert policy[anchor] == (UID, 0o755)
+
+    with (
+        _mode(root, 0o555),
+        _mode(anchor, 0o555),
+        pytest.raises(RuntimeAuthorityPublishError, match="ancestor"),
+    ):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_the_deployment_lock_file_keeps_its_exact_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+    lock_path = anchor / "deployment.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o644)
+
+    with (
+        _mode(root, 0o555),
+        pytest.raises(RuntimeAuthorityPublishError, match="deployment lock is unsafe"),
+    ):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_only_the_ancestors_the_distribution_owns_are_relaxed() -> None:
+    runtime = authority_module._PRODUCTION_RUNTIME_DIRECTORY_POLICY
+    profile = authority_module._PRODUCTION_PROFILE_DIRECTORY_POLICY
+
+    relaxed_runtime = {path for path, (_uid, mode) in runtime.items() if mode is None}
+    relaxed_profile = {path for path, (_uid, mode) in profile.items() if mode is None}
+    assert relaxed_runtime == {Path("/"), Path("/var"), Path("/var/lib")}
+    assert relaxed_profile == {Path("/"), Path("/etc")}
+    # Both tables and the quarantine walk read one list, so they cannot drift apart.
+    assert relaxed_runtime | relaxed_profile == authority_module._DISTRIBUTION_OWNED_DIRECTORIES
+    assert {path: mode for path, (_uid, mode) in runtime.items() if mode is not None} == {
+        Path("/var/lib/rquant"): 0o755,
+        authority_module.RUNTIME_AUTHORITY_ANCHOR: 0o755,
+        authority_module.PRODUCTION_GENERATION_ROOT: 0o755,
+    }
+    assert {path: mode for path, (_uid, mode) in profile.items() if mode is not None} == {
+        authority_module.PRODUCTION_PROFILE_ANCHOR: 0o755,
+    }
+    assert all(uid == 0 for uid, _mode in (*runtime.values(), *profile.values()))
+
+
+def test_blk2_the_publisher_creates_only_the_directories_whose_mode_it_declares(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    declared = root / "rquant"
+    undeclared = root / "distribution-owned"
+    monkeypatch.setattr(
+        authority_module,
+        "_PRODUCTION_RUNTIME_DIRECTORY_POLICY",
+        {undeclared: (UID, None), declared: (UID, 0o755)},
+    )
+    monkeypatch.setattr(authority_module, "_PRODUCTION_PROFILE_DIRECTORY_POLICY", {})
+    monkeypatch.setattr(authority_module, "PRODUCTION_INBOX_ROOT", root / "inbox")
+    monkeypatch.setattr(authority_module, "PRODUCTION_QUARANTINE_ROOT", root / "quarantine")
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", UID)
+    monkeypatch.setattr(publish_module, "PUBLISH_OWNER_GID", GID)
+
+    publish_module._ensure_authority_directories()
+
+    assert declared.is_dir() and stat.S_IMODE(declared.lstat().st_mode) == 0o755
+    assert not undeclared.exists()

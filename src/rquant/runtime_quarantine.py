@@ -52,19 +52,31 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-def _production_anchor_policy() -> MappingProxyType[Path, tuple[int, int]]:
-    policy: dict[Path, tuple[int, int]] = {}
+def _production_anchor_policy() -> MappingProxyType[Path, tuple[int, int | None]]:
+    """The quarantine walk's own ancestor table, relaxed exactly where the authority's is.
+
+    A `None` mode marks a directory the distribution installs and owns — `/`, `/var`,
+    `/var/lib` on this walk — whose permission bits rQuant does not get to legislate
+    (#198 BLK-2). The set comes from `runtime_authority` rather than a second literal list,
+    so this table cannot drift away from the one the deployment lock walks. Everything else
+    stays: `/var/lib/rquant` and every root below it are rQuant's own and keep their exact
+    `0755`, and the predicate still refuses a non-directory, a symlink, a non-root owner or
+    any group or other write bit.
+    """
+
+    policy: dict[Path, tuple[int, int | None]] = {}
     for root in (
         authority.PRODUCTION_INBOX_ROOT,
         authority.PRODUCTION_QUARANTINE_ROOT,
         authority.PRODUCTION_GENERATION_ROOT,
     ):
         for path in (Path("/"), *reversed(root.parents[:-1]), root):
-            policy[path] = (0, 0o755)
+            distribution_owned = path in authority._DISTRIBUTION_OWNED_DIRECTORIES
+            policy[path] = (0, None if distribution_owned else 0o755)
     return MappingProxyType(policy)
 
 
-_ANCHOR_DIRECTORY_POLICY: Mapping[Path, tuple[int, int]] = _production_anchor_policy()
+_ANCHOR_DIRECTORY_POLICY: Mapping[Path, tuple[int, int | None]] = _production_anchor_policy()
 
 
 def _no_failpoint(_stage: str) -> None:
@@ -506,16 +518,22 @@ def _require_directory_stat(
     observed: os.stat_result,
     *,
     owner_uid: int,
-    modes: set[int],
+    modes: set[int] | None,
     label: str,
 ) -> None:
+    """`modes` is `None` only for a directory the distribution owns (#198 BLK-2).
+
+    Every other clause below still applies to such a directory; the `None` drops the
+    membership test and nothing more.
+    """
+
     mode = stat.S_IMODE(observed.st_mode)
     if (
         not stat.S_ISDIR(observed.st_mode)
         or stat.S_ISLNK(observed.st_mode)
         or observed.st_uid != owner_uid
         or observed.st_nlink < 2
-        or mode not in modes
+        or (modes is not None and mode not in modes)
         or mode & 0o022
     ):
         raise RuntimeQuarantineError(f"{label} directory metadata is unsafe")
@@ -566,17 +584,18 @@ def _open_fixed_root(path: Path, label: str) -> tuple[list[int], int]:
             else:
                 named = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
                 descriptor = os.open(component, flags, dir_fd=parent_fd)
+            allowed = None if expected[1] is None else {expected[1]}
             _require_directory_stat(
                 named,
                 owner_uid=expected[0],
-                modes={expected[1]},
+                modes=allowed,
                 label=f"{label} ancestor {current}",
             )
             opened = os.fstat(descriptor)
             _require_directory_stat(
                 opened,
                 owner_uid=expected[0],
-                modes={expected[1]},
+                modes=allowed,
                 label=f"{label} ancestor {current}",
             )
             if _identity(named) != _identity(opened):
