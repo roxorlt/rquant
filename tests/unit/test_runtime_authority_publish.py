@@ -2291,3 +2291,66 @@ def test_blk3_the_two_hardcoded_values_are_what_the_builders_refuse(
         document["settings"] = {}
         with _pytest.raises(ValidationError):
             registry.build(RuntimeServiceManifest.model_validate(document))
+
+
+def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`build_production_runtime_profile` is the authority for what a manifest says; route B
+    cannot call it, because its inputs are the operator facts a first installation lacks.
+    So the derivation restates the expressions, and this pins the restatement to the
+    original the way `instance_label` is pinned to `_instance_name`: point both at one
+    runtime root, build both, and demand agreement on every field route B derives.
+
+    Five differences are the derivation itself, not drift:
+      * `database_path` / `page_projection_*` come from
+        `runtime_artifact_terminal_lifecycle.operational_database_path`, the frozen function
+        of the root, instead of the profile's operator input;
+      * `stage_commands` names the production interpreter, which the profile only does in
+        `linux-production` mode;
+      * the health publisher's `sources` carry route B's one staleness bound instead of the
+        published profile's per-role cadence — the composition itself is compared below.
+    """
+
+    from rquant.runtime_production_profile import build_production_runtime_profile
+    from tests.unit.test_runtime_production_profile import _inputs
+
+    inputs = _inputs(tmp_path)
+    profile = build_production_runtime_profile(inputs)
+    monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", inputs.runtime_root)
+    derived = stage_module.bootstrap_settings(inputs.producer_commit)
+    published = {
+        manifest.service_id: json.loads(manifest.model_dump_json())["settings"]
+        for manifest in profile.manifests
+    }
+    assert set(derived) == set(published)
+    input_derived = {
+        "database_path",
+        "page_projection_database_path",
+        "page_projection_surge_live_root",
+        "stage_commands",
+        "sources",
+    }
+    for service_id, settings in sorted(derived.items()):
+        for key, value in settings.items():
+            assert key in published[service_id], (service_id, key)
+            if key in input_derived:
+                continue
+            assert value == published[service_id][key], (service_id, key)
+
+    def composition(sources: Any) -> set[tuple[str, ...]]:
+        return {
+            (
+                str(source["control_root"]),
+                str(source["service_id"]),
+                str(source["plane"]),
+                str(source["producer_commit"]),
+            )
+            for source in sources
+        }
+
+    health = "runtime-health.all.v1"
+    assert composition(derived[health]["sources"]) == composition(published[health]["sources"])
+    assert {source["stale_after_seconds"] for source in derived[health]["sources"]} == {
+        stage_module.MANIFEST_STALE_AFTER_SECONDS
+    }
