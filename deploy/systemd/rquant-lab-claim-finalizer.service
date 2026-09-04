@@ -38,7 +38,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 ReadOnlyPaths=/etc/rquant/runtime-code-bootstrap.json /etc/rquant/runtime-code-migration.json /etc/rquant/lab-claim-finalizer.env /etc/rquant/lab-claim-finalizer-runtime
-ReadWritePaths=/run/rquant-lab-claim-finalizer /home/lighthouse/rquant/data/runtime/research/lab-finalizer-state /home/lighthouse/rquant/data/runtime/research/claims /home/lighthouse/rquant/data/runtime/research/locks /home/lighthouse/rquant/data/runtime/research/readiness /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3 /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-wal /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-shm
+ReadWritePaths=-/run/rquant-lab-claim-finalizer -/home/lighthouse/rquant/data/runtime/research/lab-finalizer-state -/home/lighthouse/rquant/data/runtime/research/claims -/home/lighthouse/rquant/data/runtime/research/locks -/home/lighthouse/rquant/data/runtime/research/readiness -/home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3 -/home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-wal -/home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-shm
 InaccessiblePaths=/home/lighthouse/rquant/.env /home/lighthouse/rquant/data/runtime/current/secrets /home/lighthouse/rquant/data/runtime/current/credentials /home/lighthouse/rquant/data/runtime/research/legacy-lab-finalizer /home/lighthouse/rquant/data/runtime/research/lab-finalizer
 
 StandardOutput=journal

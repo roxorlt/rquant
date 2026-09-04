@@ -52,18 +52,18 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 - 七个常驻服务与四个端口与上线前基线逐项一致。
 - **明确不承诺**：26 个服务全绿、页面有数据。
 
-### 已知限制（装机前已登记的 issue，本轮都不修）
+### 已知限制（装机前已登记的 issue；末列写「已修（本分支）」的两条本轮已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
 | #186 | recovery role 在 wrapper 下起不来：`runtime_recovery_backup` → coordinator → `formal_smoke_replay` → `dashboard/strategy_lab_runs` 这条 import 链在模块级构造 `Settings` | 两个 recovery role 不在第一关的 16 个里，留到影子窗口前修 |
 | #187 | legacy `current` 的 generation id 与 `--expected-generation` 属不同名字空间，权威链下 schema binding 永远不可能是 current | 22 个 kind-backed role 以降级方式运行，健康信号里可见 `runtime_root_unavailable` |
 | #188 | recovery role 在 wrapper 子环境里 import `runtime_recovery_backup` 即死（同为 import 期 `Settings`） | 同 #186 |
-| #189 | `rquant/logging.py:15` 在 import 期构造 `Settings`，没有 `.env` 时 `rquant` console script 不可用 | staging 只能走模块入口 `python -m rquant.runtime_authority_stage`，runbook 已按这条写 |
+| #189 | `rquant/logging.py:15` 在 import 期构造 `Settings`，没有 `.env` 时 `rquant` console script 不可用 | **已修（本分支，PR「fix(rollout): prerequisites for the Release A window」）**：`logging.py` 已惰性化，`rquant runtime-authority-stage` 在无 `.env` 的 worktree 里可直接用；`python -m rquant.runtime_authority_stage` 仍然等价，runbook 两种入口都成立。`rquant --help` 按 T9-9 保持 fail-closed，未变 |
 | #190 | 已有 `current.json` 时无法更换 profile（发布原语拿已安装 profile 校验 previous），profile / generation / R07 policy 三件套从第二代起换不了代 | 首次发布 `previous=None`，本次不受影响；第二代起要改 `profile_id` 需 owner 单独授权扩展原语 |
 | #191 | `rquant-lab-claim-finalizer` 与 `rquant-runtime-lab-jobs@` 依赖仓库里根本没有产生者的四份 `/etc/rquant` 输入，外加一个文档明令「不安装」的草案 unit | `lab-jobs@` 用一个空目录绕过；finalizer 本次不启用，判据按上面的应急口径 |
-| #192 | 26 个 protected unit：25 个没有 `[Install]` 段、`systemctl enable` 不了（重启机器不自动拉起）；16 个的 `ReadWritePaths=` 全无 `-` 前缀，目录缺失即在挂载命名空间阶段 `226/NAMESPACE` | 本次用 `systemctl start`；启动前按 runbook §3 C-1 预建 31 个目录，且不能顺带创建 `data/runtime/current` |
-| #193 | TP1 发布链路两处 `os.open` flag：`ldd` 输出里的 symlink 成员被 `O_NOFOLLOW` 拒（G-2）；`_copy_new_file` 缺 `O_NONBLOCK`，路径被换成 FIFO 可让 root publish 挂死（N-6） | 前者撞上就停下来记录、不临时改代码；后者 Ctrl-C 之后查非普通文件 |
+| #192 | 26 个 protected unit：25 个没有 `[Install]` 段、`systemctl enable` 不了（重启机器不自动拉起）；16 个第一关 unit 的 `ReadWritePaths=` 原先全无 `-` 前缀，目录缺失即在挂载命名空间阶段 `226/NAMESPACE`（前缀已补，`[Install]` 仍未做） | 本次用 `systemctl start`；**预建 31 个目录这一步照旧必须做**——`-` 前缀只把 `226/NAMESPACE` 换成 wrapper 层可诊断的失败，不让服务自己建出目录（`ProtectSystem=strict` + `ProtectHome=read-only` 下被忽略的路径在命名空间里仍是只读，`mkdir` 得 `EROFS`）；且不能顺带创建 `data/runtime/current` |
+| #193 | TP1 发布链路两处 `os.open` flag：`ldd` 输出里的 symlink 成员被 `O_NOFOLLOW` 拒（G-2）；`_copy_new_file` 缺 `O_NONBLOCK`，路径被换成 FIFO 可让 root publish 挂死（N-6） | **已修（本分支，同一 PR）**：闭包成员与 loader 按真实路径声明（`resolved_closure_member`），读侧 `_READ_FLAGS` 带 `O_NONBLOCK`。实测本机 `ldd` 报的三个成员都是普通文件，G-2 本来也不会命中；N-6 不再需要 Ctrl-C 兜底 |
 | #195 | WP9 rendezvous poll 与它自己在等的 SQLite 锁争用，helper 首次续约可能输给 `database is locked` | CI 间歇性红，不影响生产行为；重跑前先按此条判因 |
 
 （#194 是 Release A 工具链的 PR，不是 issue。）
@@ -389,8 +389,8 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
 
    ```bash
    # ① lighthouse：从 checkout 造 staging + plan.json（无特权，不碰 root 路径，不需要 .env）
-   #   有 .env 时 `uv run rquant runtime-authority-stage …` 等价；无 .env 的临时 worktree 必须走模块入口——
-   #   `rquant.cli` 一 import 就经 `rquant.logging` 构造 Settings，与 stage 本身无关
+   #   两种入口等价：`uv run rquant runtime-authority-stage …` 与下面的模块入口都可以，无 .env 的临时
+   #   worktree 也一样——#189 修好后 `rquant.logging` 不再在 import 期构造 Settings
    uv run python -m rquant.runtime_authority_stage --bootstrap-from-checkout \
      --checkout-root /home/lighthouse/rquant-v0300 --commit <40 hex，须等于 HEAD> \
      --runtime-pyz /usr/local/libexec/rquant-runtime-exec.pyz \
@@ -433,12 +433,15 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    **第一关放行判据（定稿，与 runbook 附录 S 一致）**：15 个 kind-backed / oneshot unit `active`
    （degraded：心跳带 `runtime_root_unavailable`，WARNING 日志可见）+ `rquant-runtime-strategy@` failed
    （设计）+ 10 个「未启用」。**首次启动前必须由运维按各 unit 的 `ReadWritePaths=` 预建目录**（见 issue #192
-   与 runbook v2 的 C-1 步骤）：16 个 unit 的 `ReadWritePaths=` 全无 `-` 前缀，路径缺失时 systemd 在挂载
-   命名空间搭建阶段就以 `226/NAMESPACE` 失败，根本进不到服务进程——`runtime_service_control.py` 的
-   `mkdir(mode=0o700, parents=True)` 跑在服务进程内、晚于该阶段，所以**「`data/runtime` 由首个 role 自建」
-   在首次安装场景不成立**（稳态重启才成立）。预建时**绝不能顺带创建 `data/runtime/current`**，否则 15 个
-   kind-backed role 会从 degraded 变成硬失败（PA-1 M-R1 的事故形态）。`ReadWritePaths=` 缺 `-` 前缀与
-   25/26 个 unit 缺 `[Install]` 段一并记在 #192。`stage --bootstrap-from-checkout` 全程不创建这些目录（A17）。
+   与 runbook v2 的 C-1 步骤）：这 16 个 unit 的 `ReadWritePaths=` 现在每条都带 `-` 前缀（#192 的一半已修），
+   路径缺失不再让 systemd 在挂载命名空间搭建阶段以 `226/NAMESPACE` 失败。**但预建目录这一步不能省**：
+   这些 unit 带 `ProtectSystem=strict` + `ProtectHome=read-only`，被 `-` 忽略掉的路径不会变成可写挂载点，
+   在命名空间里仍然是只读的，`runtime_service_control.py` 的 `mkdir(mode=0o700, parents=True)` 跑到那里会
+   拿到 `EROFS`。前缀的真实收益是把「systemd 层 `226/NAMESPACE`、stderr 一片空白」换成 wrapper / role 层
+   读得到的失败，排障时能分清是目录没建还是权威链没装。所以**「`data/runtime` 由首个 role 自建」在首次
+   安装场景仍然不成立**（稳态重启才成立）。预建时**绝不能顺带创建 `data/runtime/current`**，否则 15 个
+   kind-backed role 会从 degraded 变成硬失败（PA-1 M-R1 的事故形态）。`ReadWritePaths=` 的 `-` 前缀与
+   25/26 个 unit 缺 `[Install]` 段一并记在 #192（前缀已补，`[Install]` 待 owner 决定）。`stage --bootstrap-from-checkout` 全程不创建这些目录（A17）。
    策略表给 22 个 kind-backed role 加 `--authority-runtime` 使 `profile_id` 改变（TCB-2），首次发布没有
    prior，不需要同步换代任何前代产物。
 

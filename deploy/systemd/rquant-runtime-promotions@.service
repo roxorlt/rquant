@@ -35,7 +35,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/promotions-publishers/%i /home/lighthouse/rquant/data/runtime/research/serving-authorities/promotions
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/promotions-publishers/%i -/home/lighthouse/rquant/data/runtime/research/serving-authorities/promotions
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/research/experiment_registry.sqlite3
 
 StandardOutput=journal

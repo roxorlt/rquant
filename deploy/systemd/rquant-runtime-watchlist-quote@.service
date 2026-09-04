@@ -37,7 +37,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources/%i /home/lighthouse/rquant/data/runtime/live/watchlist-quote
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources/%i -/home/lighthouse/rquant/data/runtime/live/watchlist-quote
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/authorities/market-calendar -/home/lighthouse/rquant/data/runtime/live/candidates
 
 StandardOutput=journal

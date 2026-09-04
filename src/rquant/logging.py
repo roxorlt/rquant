@@ -9,18 +9,50 @@
 """
 
 import sys
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from rquant.config import settings
+if TYPE_CHECKING:
+    from rquant.config import Settings
 
 _initialized = False
+
+
+def _settings() -> "Settings":
+    """Read the process settings at call time, never at import time.
+
+    `rquant.cli` imports this module, so a module-level `Settings` made five environment
+    variables a precondition of the console script's own import: `rquant
+    runtime-authority-stage` died before `main()` could dispatch it, and the bootstrap
+    worktree it has to run in (acceptance A22) has no `.env`. A `settings` that a test has
+    bound onto this module still wins, exactly as the old module-level name did.
+    """
+
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound  # type: ignore[no-any-return]
+    from rquant.config import get_settings
+
+    return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`rquant.logging.settings` stays readable — built on first use, like the source."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def setup_logging(*, enqueue: bool = True) -> None:
     global _initialized
     if _initialized:
         return
+
+    settings = _settings()
 
     logger.remove()
 

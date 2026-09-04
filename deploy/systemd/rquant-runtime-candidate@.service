@@ -37,7 +37,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/candidates/%i /home/lighthouse/rquant/data/runtime/live/candidates/%i
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/candidates/%i -/home/lighthouse/rquant/data/runtime/live/candidates/%i
 
 StandardOutput=journal
 StandardError=journal

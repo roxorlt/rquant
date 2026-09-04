@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rquant` console script 在无 `.env` 时不可用（#189）**：`src/rquant/logging.py` 不再在 import 期
+  经 `from rquant.config import settings` 构造 `Settings`，改为 `_settings()` 加 PEP 562 模块钩子
+  （与 TP9 对 `storage/duckdb.py` / `page_control_service.py` 的处理同形）。
+  `rquant runtime-authority-stage` 现在能在没有 `.env` 的 bootstrap worktree 里直接跑（验收 A22）；
+  `rquant --help` 仍按 T9-9 fail-closed，行为未变。
+- **TP1 发布链路两处 `os.open` flag（#193）**：stage 侧对 `ldd` 报的闭包成员与 `readelf` 报的 loader
+  做 `os.path.realpath`（`resolved_closure_member`），profile 声明真实文件，`O_NOFOLLOW` 保留；
+  publish 侧 `sha256_file` / `_copy_new_file` / `_read_staged` 共用的 `_READ_FLAGS` 增加 `O_NONBLOCK`，
+  staging 树里被换成 FIFO 的路径不再让持有 `deployment.lock` 的 root publish 永久阻塞，
+  `S_ISREG` 检查照旧在描述符上决定。
+
+### Changed
+
+- **16 个第一关 protected unit 的 `ReadWritePaths=` 补上 `-` 前缀（#192 的一半）**：路径缺失不再让
+  systemd 在挂载命名空间搭建阶段以 `226/NAMESPACE` 失败。**这不免除预建目录**——
+  `ProtectSystem=strict` + `ProtectHome=read-only` 下被跳过的路径仍是只读，runbook §3 C-1 的 31 条
+  目录照旧要预建；收益是把故障从 systemd 层挪到 wrapper / role 层，便于分辨 `226` / `78` / `1`。
+  `[Install]` 段本轮未加，#192 保持打开。
+
 ## [v0.31.0] — 2026-09-04 — Release A 工具链
 
 > 本节是 CHANGELOG 自 v0.12.0 之后的第一次定版。v0.13.0 到 v0.30.0 的各个 tag 当时只在条目正文里

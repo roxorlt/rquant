@@ -37,7 +37,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/paper-brokers/%i /home/lighthouse/rquant/data/runtime/live/paper-brokers/%i
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/paper-brokers/%i -/home/lighthouse/rquant/data/runtime/live/paper-brokers/%i
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/authorities/paper-execution -/home/lighthouse/rquant/data/runtime/live/market-minute -/home/lighthouse/rquant/data/runtime/live/signal-bus/spool
 
 StandardOutput=journal

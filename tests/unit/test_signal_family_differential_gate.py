@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #182's to PR #194's. It is the merge base of the
+    # main; this one moves it from PR #194's to PR #196's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "9a42bdee5aa1e7be39329ea720d3801cd269540f"
-    assert BASELINE_TREE_SHA == "8b299ab0dc96108da173d34dd8331ac65d96a7f6"
+    assert BASELINE_COMMIT_SHA == "e86586d840fd0e0e733170f64d0f999d063c0b3b"
+    assert BASELINE_TREE_SHA == "954b4dac03288350471f0a125368dd385dcdf07b"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``9a42bde`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``e86586d`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1485,7 +1485,7 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # scripts/r07_deploy_gate.py from this spot: it was in the previous baseline's diff only
     # because that release created it, so a refrozen baseline left the sentence with no truth
     # value. scripts/r07_ci_evidence.py and .github/workflows/ci.yml were named here on the
-    # same false premise and are dropped by the refreeze to 9a42bde, which this topic does not
+    # same false premise and are dropped by the refreeze to e86586d, which this topic does not
     # touch either file across. Naming any path here asserts the shape of one particular diff,
     # and the shape is not the property. The property - tooling that runs in the production
     # chain but lives outside the declaration-scanned universe is categorized architecture,

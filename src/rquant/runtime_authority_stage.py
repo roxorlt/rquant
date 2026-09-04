@@ -136,15 +136,33 @@ def elf_loader_from_readelf(text: str) -> str:
     return loader
 
 
+def resolved_closure_member(path: str) -> str:
+    """The real path of a closure member, which is the only path this chain can open (G-2).
+
+    A closure member is opened with `O_NOFOLLOW` on both sides — here and again in the
+    wrapper, against the path the profile declares — and `O_NOFOLLOW` constrains the last
+    segment. `ldd` prints the name it was asked for, and on RHEL 9 that name is routinely a
+    versioned symlink (`libcrypt.so.1 -> libcrypt.so.1.1.0`), so declaring it would make the
+    open fail with `ELOOP` for a file that is perfectly legitimate. Resolving here keeps
+    `O_NOFOLLOW` doing its one job — refusing a member that was swapped for a symlink after
+    the profile was written — while the profile names the file the digest was taken from.
+    """
+
+    return os.path.realpath(path)
+
+
 def shared_libraries_from_ldd(text: str, *, elf_loader: str) -> tuple[str, ...]:
-    """The `name => path` lines of `ldd`, minus the loader (B-5a / M-4 dedup rule).
+    """The `name => path` lines of `ldd`, resolved, minus the loader (B-5a / M-4 dedup rule).
 
     `ldd` prints the dynamic loader as its own line without `=>` on most systems and as
     `loader => loader` on some; either way it is `elf_loader` and must not be repeated in
     `shared_libraries`, or `RuntimeClosureProfile` rejects the closure for duplicate paths.
+    The comparison is between resolved paths, because the loader is one of the members that
+    reaches this closure under a versioned symlink.
     `linux-vdso` has no file and is dropped with every other `=>` line without a path.
     """
 
+    loader = resolved_closure_member(elf_loader)
     paths: set[str] = set()
     for line in text.splitlines():
         if " => " not in line:
@@ -153,9 +171,10 @@ def shared_libraries_from_ldd(text: str, *, elf_loader: str) -> tuple[str, ...]:
         candidate = remainder.strip().split(" ")[0]
         if not candidate.startswith("/"):
             continue
-        if candidate == elf_loader:
+        resolved = resolved_closure_member(candidate)
+        if resolved == loader:
             continue
-        paths.add(candidate)
+        paths.add(resolved)
     return tuple(sorted(paths))
 
 
@@ -241,7 +260,9 @@ def discover_interpreter_closure(system_python: Path) -> InterpreterClosure:
     ldd = shutil.which("ldd")
     if readelf is None or ldd is None:
         raise RuntimeAuthorityStageError("readelf and ldd are required to discover the closure")
-    loader = elf_loader_from_readelf(_run([readelf, "-l", str(system_python)], label="readelf"))
+    loader = resolved_closure_member(
+        elf_loader_from_readelf(_run([readelf, "-l", str(system_python)], label="readelf"))
+    )
     libraries = shared_libraries_from_ldd(
         _run([ldd, str(system_python)], label="ldd"), elf_loader=loader
     )
@@ -981,6 +1002,7 @@ __all__ = [
     "derive_bootstrap_services",
     "discover_interpreter_closure",
     "elf_loader_from_readelf",
+    "resolved_closure_member",
     "instance_label",
     "legacy_services",
     "main",
