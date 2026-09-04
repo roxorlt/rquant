@@ -161,6 +161,11 @@ def _git(checkout: Path, *arguments: str) -> str:
     ).stdout
 
 
+#: `World` replaces `stage_module.discover_interpreter_closure` with `_fake_closure`, so
+#: this is the real one, bound at import time, for the single case that must run it (SF-1).
+_REAL_INTERPRETER_CLOSURE = stage_module.discover_interpreter_closure
+
+
 def _fake_closure(_system_python: Path) -> stage_module.InterpreterClosure:
     def policy(path: str, digest: str, mode: int) -> RuntimeFilePolicy:
         return RuntimeFilePolicy(path=Path(path), sha256=digest, owner_uid=0, mode=mode)
@@ -1653,6 +1658,66 @@ def test_blk1_the_plan_records_the_subtrees_walked_and_the_ones_skipped(
     summary = world.stage("blk1").plan["closure_summary"]
 
     assert summary["stdlib_roots"] == [str(walked)]
+    assert summary["skipped_stdlib_roots"] == [str(absent)]
+
+
+def test_blk1_the_real_closure_walk_records_the_skip_it_took(
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`discover_interpreter_closure` itself, not a stand-in for it.
+
+    Every other case in this file replaces this function with `_fake_closure`, which left
+    the wiring between `stdlib_directories` and what the plan reports unguarded: dropping
+    `skipped_stdlib_roots=` from the constructor, or the two log lines, kept the suite
+    green while making the skip silent on the host — the one shape #198 BLK-1 was fixed to
+    avoid, and the one the B-6' acceptance step reads.
+    """
+
+    stdlib = tmp_path / "usr" / "lib64" / "python3.11"
+    stdlib.mkdir(parents=True)
+    (stdlib / "os.py").write_bytes(b"os\n")
+    absent = tmp_path / "usr" / "local" / "lib64" / "python3.11"
+    loader = tmp_path / "ld-linux-x86-64.so.2"
+    loader.write_bytes(b"loader")
+    library = tmp_path / "libpython3.11.so.1.0"
+    library.write_bytes(b"library")
+    for path in (loader, library, stdlib / "os.py"):
+        path.chmod(0o644)
+
+    monkeypatch.setattr(
+        stage_module,
+        "interpreter_facts",
+        lambda python: {"version": "3.11.6", "stdlib": str(stdlib), "platstdlib": str(absent)},
+    )
+    monkeypatch.setattr(stage_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        stage_module,
+        "_run",
+        lambda command, *, label: (
+            f"      [Requesting program interpreter: {loader}]\n"
+            if label == "readelf"
+            else f"\tlibpython3.11.so.1.0 => {library} (0x00007f0000000000)\n"
+        ),
+    )
+
+    closure = _REAL_INTERPRETER_CLOSURE(world.system_python)
+
+    assert closure.stdlib_roots == (stdlib,)
+    assert closure.skipped_stdlib_roots == (absent,)
+    assert [item.path for item in closure.stdlib] == [stdlib / "os.py"]
+    assert closure.elf_loader.path == Path(os.path.realpath(loader))
+    assert [item.path for item in closure.shared_libraries] == [Path(os.path.realpath(library))]
+    logged = capsys.readouterr().err
+    assert f"stdlib subtrees {stdlib}\n" in logged
+    assert f"stdlib subtrees absent on this host and skipped: {absent}\n" in logged
+
+    # And the plan states the same two sets, so the whole chain is nailed end to end.
+    monkeypatch.setattr(stage_module, "discover_interpreter_closure", lambda python: closure)
+    summary = world.stage("real-closure").plan["closure_summary"]
+    assert summary["stdlib_roots"] == [str(stdlib)]
     assert summary["skipped_stdlib_roots"] == [str(absent)]
 
 
