@@ -35,7 +35,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/artifact-catalogs/%i /home/lighthouse/rquant/data/runtime/research/artifact-catalogs/%i /home/lighthouse/rquant/data/runtime/research/artifact-retention/svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349/catalog-registration-outbox
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/artifact-catalogs/%i -/home/lighthouse/rquant/data/runtime/research/artifact-catalogs/%i -/home/lighthouse/rquant/data/runtime/research/artifact-retention/svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349/catalog-registration-outbox
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/research/final-artifacts -/home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3 -/home/lighthouse/rquant/data/runtime/research/research_ro.duckdb -/home/lighthouse/rquant/data/runtime/research/experiment_registry.sqlite3
 
 StandardOutput=journal

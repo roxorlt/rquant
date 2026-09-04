@@ -36,7 +36,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/daily-orchestrators/%i /home/lighthouse/rquant/data/runtime/research/daily-pipeline
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/daily-orchestrators/%i -/home/lighthouse/rquant/data/runtime/research/daily-pipeline
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/live/daily-close -/home/lighthouse/rquant/data/runtime/current -/etc/rquant/daily-receipt-trusted-keys.json
 
 StandardOutput=journal

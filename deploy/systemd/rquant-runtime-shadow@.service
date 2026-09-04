@@ -37,7 +37,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/shadow-sessions/%i /home/lighthouse/rquant/data/runtime/research/shadow-reports
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/shadow-sessions/%i -/home/lighthouse/rquant/data/runtime/research/shadow-reports
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/authorities/market-calendar -/home/lighthouse/rquant/data/legacy-shadow
 
 StandardOutput=journal

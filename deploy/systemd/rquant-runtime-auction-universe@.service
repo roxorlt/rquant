@@ -38,7 +38,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
 ReadOnlyPaths=-/home/lighthouse/rquant/data/rquant_ro.duckdb -/home/lighthouse/rquant/data/runtime/authorities/market-calendar
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/auction-universe-publishers/%i /home/lighthouse/rquant/data/runtime/authorities/auction-universe
+ReadWritePaths=-/home/lighthouse/rquant/data/runtime/control/auction-universe-publishers/%i -/home/lighthouse/rquant/data/runtime/authorities/auction-universe
 
 StandardOutput=journal
 StandardError=journal

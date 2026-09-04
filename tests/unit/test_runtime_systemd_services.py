@@ -197,6 +197,19 @@ def _logical_lines(text: str) -> list[str]:
     return joined
 
 
+def _granted_paths(value: str) -> set[str]:
+    """`ReadWritePaths=` entries with systemd's ignore-if-missing marker taken off.
+
+    #192: a first-gate unit writes every entry as `-/path`, so a path that does not exist
+    yet is ignored instead of failing the unit while the mount namespace is being built.
+    Which paths a unit may write is what the assertions below are about, and the marker does
+    not change that; the marker itself is asserted, per unit, in
+    `test_runtime_systemd_read_write_paths.py`.
+    """
+
+    return {entry.removeprefix("-") for entry in value.split()}
+
+
 def _directive_values(text: str, key: str) -> list[str]:
     """Every value a unit gives `key`, read as text rather than through `configparser`.
 
@@ -247,7 +260,7 @@ def test_artifact_retention_oneshot_and_timer_are_static_production_contracts() 
     )
     assert f"manifests/{RETENTION_INSTANCE}.json" not in unit["ExecStart"]
     assert "EnvironmentFile" not in unit
-    assert set(unit["ReadWritePaths"].split()) == {
+    assert _granted_paths(unit["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/artifact-retention/{RETENTION_INSTANCE}",
         f"{RUNTIME_ROOT}/research/artifact-retention/{RETENTION_INSTANCE}",
         f"{RUNTIME_ROOT}/research/final-artifacts",
@@ -292,7 +305,7 @@ def test_daily_close_source_is_a_dedicated_least_privilege_live_unit() -> None:
     assert service["Type"] == "simple"
     assert service["Slice"] == "rquant-live.slice"
     assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_close_source --instance %i")
-    assert set(service["ReadWritePaths"].split()) == {
+    assert _granted_paths(service["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/daily-close-sources/%i",
         f"{RUNTIME_ROOT}/live/daily-close",
     }
@@ -312,7 +325,7 @@ def test_watchlist_quote_has_an_independent_least_privilege_live_unit() -> None:
     assert service["Slice"] == "rquant-live.slice"
     assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} watchlist_quote_source --instance %i")
     assert "LoadCredentialEncrypted" not in service
-    assert set(service["ReadWritePaths"].split()) == {
+    assert _granted_paths(service["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
         f"{RUNTIME_ROOT}/live/watchlist-quote",
     }
@@ -334,7 +347,7 @@ def test_shadow_session_is_a_readonly_legacy_consumer_with_its_own_report_root()
     assert service["Type"] == "simple"
     assert service["Slice"] == "rquant-research.slice"
     assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} shadow_session --instance %i")
-    assert set(service["ReadWritePaths"].split()) == {
+    assert _granted_paths(service["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/shadow-sessions/%i",
         f"{RUNTIME_ROOT}/research/shadow-reports",
     }
@@ -374,7 +387,7 @@ def test_daily_orchestrator_is_an_unenabled_shadow_fan_in_oneshot() -> None:
     assert unit["AmbientCapabilities"] == ""
     assert unit["RestrictSUIDSGID"] == "true"
     assert unit["UMask"] == "0077"
-    assert set(unit["ReadWritePaths"].split()) == {
+    assert _granted_paths(unit["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/daily-orchestrators/%i",
         f"{RUNTIME_ROOT}/research/daily-pipeline",
     }
@@ -720,28 +733,28 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
 
     for plane in PLANES:
         parser = _load(plane)
-        writable = set(parser["Service"]["ReadWritePaths"].split())
+        writable = _granted_paths(parser["Service"]["ReadWritePaths"])
         assert writable == expected[plane]
         assert f"{RUNTIME_ROOT}/rquant.duckdb" not in writable
         assert "/home/lighthouse/rquant/data/rquant.duckdb" not in writable
 
-    assert set(_load("market-minute")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("market-minute")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/market-minute-sources/%i",
         f"{RUNTIME_ROOT}/live/market-minute",
     }
-    assert set(_load("watchlist-quote")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("watchlist-quote")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
         f"{RUNTIME_ROOT}/live/watchlist-quote",
     }
-    assert set(_load("auction-match")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("auction-match")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/auction-match-sources/%i",
         f"{RUNTIME_ROOT}/live/auction-match",
     }
-    assert set(_load("auction-universe")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("auction-universe")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/auction-universe-publishers/%i",
         f"{RUNTIME_ROOT}/authorities/auction-universe",
     }
-    assert set(_load("reference-slow-source")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("reference-slow-source")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/reference-slow-sources/%i",
         f"{RUNTIME_ROOT}/live/reference-slow",
     }
@@ -751,7 +764,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         f"-{CONTROL_ROOT}/reference-slow-publishers/"
         "svc-62c9061740150340b1f1e3a8a54323e26794caf9616d34047546383cdc027abd/cursors",
     }
-    assert set(_load("reference-slow-publisher")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("reference-slow-publisher")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/reference-slow-publishers/%i",
         f"{RUNTIME_ROOT}/authorities/reference-slow",
     }
@@ -759,19 +772,19 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         f"-{RUNTIME_ROOT}/authorities/market-calendar",
         f"-{RUNTIME_ROOT}/live/reference-slow",
     }
-    assert set(_load("feature")["Service"]["ReadWritePaths"].split()) == {
+    assert _granted_paths(_load("feature")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/features/%i",
         f"{RUNTIME_ROOT}/live/features",
     }
 
-    candidate_writable = set(_load("candidate")["Service"]["ReadWritePaths"].split())
+    candidate_writable = _granted_paths(_load("candidate")["Service"]["ReadWritePaths"])
     assert candidate_writable == {
         f"{CONTROL_ROOT}/candidates/%i",
         f"{RUNTIME_ROOT}/live/candidates/%i",
     }
     assert f"{RUNTIME_ROOT}/live" not in candidate_writable
 
-    strategy_writable = set(_load("strategy")["Service"]["ReadWritePaths"].split())
+    strategy_writable = _granted_paths(_load("strategy")["Service"]["ReadWritePaths"])
     assert strategy_writable == {
         f"{CONTROL_ROOT}/strategies/%i",
         f"{RUNTIME_ROOT}/live/strategies/%i",
@@ -821,7 +834,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         },
     }
     for template, expected_paths in dedicated_writable.items():
-        writable = set(_load(template)["Service"]["ReadWritePaths"].split())
+        writable = _granted_paths(_load(template)["Service"]["ReadWritePaths"])
         assert writable == expected_paths
         assert f"{RUNTIME_ROOT}/live" not in writable
 
@@ -977,11 +990,11 @@ def test_artifact_catalog_has_exact_read_scopes() -> None:
 
 
 def test_quote_and_market_minute_units_cannot_modify_other_live_owners() -> None:
-    universe_writable = set(_load("auction-universe")["Service"]["ReadWritePaths"].split())
-    auction_writable = set(_load("auction-match")["Service"]["ReadWritePaths"].split())
-    source_writable = set(_load("market-minute")["Service"]["ReadWritePaths"].split())
-    quote_writable = set(_load("watchlist-quote")["Service"]["ReadWritePaths"].split())
-    feature_writable = set(_load("feature")["Service"]["ReadWritePaths"].split())
+    universe_writable = _granted_paths(_load("auction-universe")["Service"]["ReadWritePaths"])
+    auction_writable = _granted_paths(_load("auction-match")["Service"]["ReadWritePaths"])
+    source_writable = _granted_paths(_load("market-minute")["Service"]["ReadWritePaths"])
+    quote_writable = _granted_paths(_load("watchlist-quote")["Service"]["ReadWritePaths"])
+    feature_writable = _granted_paths(_load("feature")["Service"]["ReadWritePaths"])
     forbidden = {
         f"{RUNTIME_ROOT}/live/signal-bus",
         f"{RUNTIME_ROOT}/live/notifications",
@@ -1020,7 +1033,7 @@ def test_serving_publisher_reads_owner_authorities_without_writing_owner_state()
         f"-{RUNTIME_ROOT}/live/signal-bus",
         f"-{RUNTIME_ROOT}/research",
     }
-    assert set(service["ReadWritePaths"].split()) == {
+    assert _granted_paths(service["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/serving-publishers/%i",
         f"{RUNTIME_ROOT}/serving",
     }
