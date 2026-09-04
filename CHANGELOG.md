@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [v0.31.0] — 2026-09-04 — Release A 工具链
+
+> 本节是 CHANGELOG 自 v0.12.0 之后的第一次定版。v0.13.0 到 v0.30.0 的各个 tag 当时只在条目正文里
+> 以「项目版本从 X 更新到 Y」内联记录，没有各自切分 section，条目一直堆在 `[Unreleased]` 里，本次
+> 一并归入本节。其中 v0.28.3（2026-08-04 部署）之前的条目已经随各自的 tag 上过生产；v0.28.3 之后的
+> 条目——Release A 工具链、WP9 心跳 helper、R07 与工作负载隔离等——是本次 Release A 第一次上生产的内容。
+
 ### Added
 
 - **root 权威链发布器（PR-A / TP1，S1 §1.3 与 §9）**：新增 `rquant runtime-authority-stage`
@@ -380,6 +387,8 @@
   的 `--evidence-cache-dir`。
 
 - **项目版本**：从 `0.29.0` 更新到 `0.30.0`。
+- **项目版本**：从 `0.30.0` 更新到 `0.31.0`——Release A 装机的 tag 目标，`pyproject.toml`、`uv.lock`
+  与 `src/rquant/__init__.py` 三处一起对齐。
 
 ### Removed
 
@@ -406,6 +415,10 @@
   `N abandoned heartbeat(s) still alive` 一并移除。
 
 ### Fixed
+
+- **`rquant.__version__` 与 `pyproject.toml` 的版本号脱节**：`src/rquant/__init__.py` 停在 `0.29.0`，
+  比 `pyproject.toml` 落后两个版本；本次定版一并对齐到 `0.31.0`。该常量目前没有任何代码消费，
+  脱节只影响人读，但它是唯一一处会被误当成「当前版本」的字面量。
 
 - **页面 serving 根不可读时静默空白（PR-A / TP6-b）**：`dashboard/app.py` 读 serving 根的裸
   `except` 改为显式告警，页面明确显示 serving 根不可读；`nl_screen` 区分「serving 不可达」与
