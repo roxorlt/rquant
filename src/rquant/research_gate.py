@@ -397,9 +397,9 @@ def open_gated_research_store(
             raise PermissionError("正式研究门执行数据绑定发生变化")
 
         if lake_root is None:
-            from rquant.config import settings
+            from rquant.config import get_settings
 
-            lake_root = settings.research_lake_dir_resolved
+            lake_root = get_settings().research_lake_dir_resolved
         if execution_session_factory is None:
             from rquant.research_snapshot import ResearchExecutionSession
 

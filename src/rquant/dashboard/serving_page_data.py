@@ -36,6 +36,18 @@ from rquant.serving_read_models import (
 _ValueT = TypeVar("_ValueT")
 NlScreenPageNavigation = Literal["replace", "next", "previous"]
 NL_SCREEN_PAGE_RERUN_REQUIRED = "分页状态已失效，请重新运行筛选。"
+NL_SCREEN_SERVING_UNAVAILABLE = (
+    "Serving 数据不可达，重新运行筛选无法恢复；"
+    "请检查 rquant-runtime-serving@ 服务与 RQUANT_SERVING_ROOT 指向的 serving 根。"
+)
+
+
+class NlScreenServingUnavailableError(NlScreenPageError):
+    """The serving root or its live generation is unreachable.
+
+    Distinguished from the plain pagination failure because rerunning the screen
+    cannot recover it: the publisher, not the cursor, is what broke.
+    """
 
 
 @dataclass(frozen=True)
@@ -126,6 +138,9 @@ def load_nl_screen_page_session(
 
     try:
         result = load_page()
+    except NlScreenServingUnavailableError:
+        state["nl_page_error"] = NL_SCREEN_SERVING_UNAVAILABLE
+        return None
     except NlScreenPageError:
         state["nl_page_error"] = NL_SCREEN_PAGE_RERUN_REQUIRED
         return None
@@ -487,14 +502,22 @@ def read_nl_screen_page(
         raise NlScreenPageError("nl screen cursor requires rerun: query changed")
     observed_at = normalize_aware_utc(now or datetime.now(UTC))
     contract = PAGE_PROJECTION_CONTRACTS["nl_screen_universe"]
-    reader = ServingReader(serving_root)
     try:
-        lease = (
-            reader.acquire_generation()
-            if decoded is None
-            else reader.acquire_historical_generation(decoded.generation_id)
-        )
+        reader = ServingReader(serving_root)
     except Exception as exc:
+        raise NlScreenServingUnavailableError("nl screen serving root is unreachable") from exc
+    try:
+        if decoded is None:
+            lease = reader.acquire_generation()
+        else:
+            lease = reader.acquire_historical_generation(decoded.generation_id)
+    except Exception as exc:
+        if decoded is None:
+            # No cursor: the page asked for whatever is live, so this is the
+            # publisher failing, not a stale pagination state.
+            raise NlScreenServingUnavailableError(
+                "nl screen serving current generation is unavailable"
+            ) from exc
         raise NlScreenPageError(
             "nl screen cursor requires rerun: generation is unavailable"
         ) from exc
@@ -523,7 +546,9 @@ def read_nl_screen_page(
                     raise NlScreenPageError(
                         "nl screen candidate universe exceeds registered serving budget"
                     )
-                raise NlScreenPageError("nl screen serving generation is unavailable")
+                raise NlScreenServingUnavailableError(
+                    "nl screen serving generation is unavailable"
+                )
             universe = result.dataframe()
             assert isinstance(universe, pd.DataFrame)
             page = paginate_nl_screen_projection(
@@ -541,7 +566,9 @@ def read_nl_screen_page(
     except NlScreenPageError:
         raise
     except Exception as exc:
-        raise NlScreenPageError("nl screen serving generation is unavailable") from exc
+        raise NlScreenServingUnavailableError(
+            "nl screen serving generation is unavailable"
+        ) from exc
     finally:
         lease.close()
     return _page_result(result, page)
@@ -549,6 +576,8 @@ def read_nl_screen_page(
 
 __all__ = [
     "NL_SCREEN_PAGE_RERUN_REQUIRED",
+    "NL_SCREEN_SERVING_UNAVAILABLE",
+    "NlScreenServingUnavailableError",
     "ServingPageRenderContext",
     "ServingPageResult",
     "bind_nl_screen_plan_session",

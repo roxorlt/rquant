@@ -65,6 +65,15 @@ PRODUCTION_ALLOWED_OPERATIONS = ("publish", "rollback")
 #: complete answer to "what can a unit's own `Environment=` line reach".
 _RUNTIME_ROLE_ENVIRONMENT = ("LANG", "LC_ALL", "TZ")
 _RUNTIME_SERVICE_MODULE = "rquant.runtime_service_main"
+#: The argv literal every kind-backed `runtime_service_main` role receives (TP9, S1 §10.4).
+#: Seeing it, the module takes its commit from `--expected-commit` (root-owned `current.json`)
+#: instead of `git rev-parse` in a working directory that is not a checkout, and derives the
+#: runtime root from `--control-root` instead of a `current` path component that the
+#: authority chain does not have. It is a frozen literal of this policy, transported by
+#: `derive_module_argv` verbatim, so a child can only be told this by the root-owned profile.
+#: Adding it changed `profile_id` — free for the first publication, which has no prior
+#: profile, generation or R07 policy to keep in step (TCB-2 of `acceptance-pra.md`).
+_AUTHORITY_RUNTIME_ARGUMENTS = ("--authority-runtime",)
 
 #: Every role `/usr/local/libexec/rquant-runtime-exec.pyz` will execute, as
 #: `(name, module, environment_allowlist, instanced)`.
@@ -115,6 +124,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="artifact_retention",
         control_root="/home/lighthouse/rquant/data/runtime/control/artifact-retention",
         once=True,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "auction_match_source",
@@ -124,6 +134,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="auction_match_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/auction-match-sources",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "auction_universe_publisher",
@@ -133,6 +144,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="auction_universe_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/auction-universe-publishers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "candidate_publisher",
@@ -142,6 +154,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="candidate_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/candidates",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "daily",
@@ -157,6 +170,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="daily_close_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/daily-close-sources",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "daily_pipeline_orchestrator",
@@ -166,6 +180,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="daily_pipeline_orchestrator",
         control_root="/home/lighthouse/rquant/data/runtime/control/daily-orchestrators",
         once=True,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "feature_live",
@@ -175,6 +190,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="feature_live",
         control_root="/home/lighthouse/rquant/data/runtime/control/features",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "lab_artifact_catalog",
@@ -184,6 +200,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="lab_artifact_catalog",
         control_root="/home/lighthouse/rquant/data/runtime/control/artifact-catalogs",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-02. The finalizer's own
     # unit used to name a checkout interpreter twice; it now names this role and nothing
@@ -223,6 +240,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="lab_jobs_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/lab-jobs-publishers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "market_minute_source",
@@ -232,6 +250,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="market_minute_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/market-minute-sources",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "notifier",
@@ -241,6 +260,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="notifier",
         control_root="/home/lighthouse/rquant/data/runtime/control/notifiers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "page_control",
@@ -257,6 +277,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="paper_broker",
         control_root="/home/lighthouse/rquant/data/runtime/control/paper-brokers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "paper_constraint_publisher",
@@ -266,6 +287,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="paper_constraint_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/paper-constraints",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "promotions_publisher",
@@ -275,6 +297,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="promotions_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/promotions-publishers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "reference_slow_publisher",
@@ -284,6 +307,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="reference_slow_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/reference-slow-publishers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "reference_slow_source",
@@ -293,6 +317,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="reference_slow_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/reference-slow-sources",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "runtime_health_publisher",
@@ -302,6 +327,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="runtime_health_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/runtime-health-publishers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "runtime_recovery",
@@ -327,6 +353,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="serving_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/serving-publishers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "shadow_session",
@@ -336,6 +363,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="shadow_session",
         control_root="/home/lighthouse/rquant/data/runtime/control/shadow-sessions",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "signal_router",
@@ -345,6 +373,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="signal_router",
         control_root="/home/lighthouse/rquant/data/runtime/control/signal-routers",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "strategy_live",
@@ -354,6 +383,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="strategy_live",
         control_root="/home/lighthouse/rquant/data/runtime/control/strategies",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     RuntimeRolePolicy(
         "watchlist_quote_source",
@@ -363,6 +393,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         service_kind="watchlist_quote_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources",
         once=False,
+        module_arguments=_AUTHORITY_RUNTIME_ARGUMENTS,
     ),
     # Amended per Codex round-3 verdict 2026-08-28, item RQ-WI-R2-P1-01. Not a unit's role:
     # `deploy/libexec/rquant-workload-arbiter` execs this one itself, in place of the
@@ -2320,7 +2351,7 @@ def _revalidate_generation_slot(
             manifest_entries,
             profile,
         )
-        _validate_generation_semantics(generation_fd, manifest_entries, slot)
+        _validate_generation_semantics(generation_fd, manifest_entries, slot, profile)
         active_generation = os.stat(
             slot.generation_id,
             dir_fd=generation_root_fd,
@@ -2594,6 +2625,7 @@ def _validate_generation_semantics(
     generation_fd: int,
     entries: tuple[_GenerationManifestEntry, ...],
     slot: RuntimeGenerationSlot,
+    profile: RuntimeClosureProfile,
 ) -> None:
     by_path = {entry.path: entry for entry in entries}
     role_payloads = tuple(
@@ -2635,7 +2667,7 @@ def _validate_generation_semantics(
     )
     if pyvenv_payload is None:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is missing")
-    _validate_pyvenv_config(pyvenv_payload)
+    _validate_pyvenv_config(pyvenv_payload, system_python=profile.system_python.path)
 
     for role, role_payload in role_payloads:
         app_source = role_payload["app_source"]
@@ -2667,13 +2699,44 @@ def _validate_generation_semantics(
                 )
 
 
-def _validate_pyvenv_config(payload: bytes) -> None:
+#: The keys `python -m venv --copies` writes (3.11.15 and 3.12.13 both produce exactly
+#: these five). A generation's `pyvenv.cfg` may carry any subset that includes `home` and
+#: `include-system-site-packages`, and nothing outside the set (S1 §1.4 U-1-R, TCB-1).
+_PYVENV_ALLOWED_KEYS = frozenset(
+    {"home", "include-system-site-packages", "version", "executable", "command"}
+)
+_PYVENV_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+
+
+def _validate_pyvenv_config(payload: bytes, *, system_python: Path) -> None:
+    """Admit only a `pyvenv.cfg` the copied interpreter can boot from, bound to the profile.
+
+    The earlier rule admitted exactly one line, `include-system-site-packages = false`. A
+    generation interpreter is a physical copy of the system Python, and a `pyvenv.cfg`
+    without `home` does not make a venv: CPython falls back to searching for its landmarks
+    from `argv[0]`, finds none inside the generation, and dies before the first import —
+    the single-line form was the one form that could never run (probe 1, scenarios A/C).
+
+    `home` is therefore required, and it is not free text: it must be the directory of the
+    profile's `system_python`, so the standard library the child resolves is the one the
+    profile's closure hashes. `executable`, when written, must be that interpreter itself.
+    `include-system-site-packages` must still be the literal `false`, `version` must look
+    like a version, and no value may carry a control character. Everything that held before
+    — UTF-8, a trailing newline, no `\r`, `key = value` lines, no duplicate keys — still
+    holds; this widens the key set and tightens what the keys may say.
+    """
+
     try:
         text = payload.decode("utf-8")
     except (UnicodeDecodeError, ValueError) as exc:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not valid UTF-8") from exc
     if not text.endswith("\n") or "\r" in text:
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not canonical")
+    # Unicode category Cc: C0 (< 0x20), DEL (0x7f) and C1 (0x80-0x9f) alike (review S-R3).
+    if any(
+        unicodedata.category(character) == "Cc" and character != "\n" for character in text
+    ):
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains a control character")
     values: dict[str, str] = {}
     for line in text.splitlines():
         key, separator, value = line.partition("=")
@@ -2682,13 +2745,28 @@ def _validate_pyvenv_config(payload: bytes) -> None:
             raise RuntimeAuthorityPublishError("generation pyvenv.cfg is malformed")
         if normalized_key in values:
             raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains a duplicate key")
-        if normalized_key != "include-system-site-packages":
+        if normalized_key not in _PYVENV_ALLOWED_KEYS:
             raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains an unknown key")
         values[normalized_key] = value.strip()
     if values.get("include-system-site-packages") != "false":
         raise RuntimeAuthorityPublishError(
             "generation pyvenv.cfg include-system-site-packages must be false"
         )
+    home = values.get("home")
+    if home is None:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg declares no home")
+    if home != str(system_python.parent):
+        raise RuntimeAuthorityPublishError(
+            "generation pyvenv.cfg home is not the profile system Python directory"
+        )
+    executable = values.get("executable")
+    if executable is not None and executable != str(system_python):
+        raise RuntimeAuthorityPublishError(
+            "generation pyvenv.cfg executable is not the profile system Python"
+        )
+    version = values.get("version")
+    if version is not None and _PYVENV_VERSION.fullmatch(version) is None:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg version is malformed")
 
 
 def _validate_generation_tree(

@@ -884,3 +884,90 @@ def test_page_convenience_result_preserves_stale_state_instead_of_returning_raw_
     assert result.detail == "signals watermark is stale"
     assert result.generation_id == "generation-1"
     assert result.value == (date(2026, 7, 1), date(2026, 7, 31), 12)
+
+
+_SERVING_ROOT_CONSUMERS = {
+    _PROJECT_ROOT / "src/rquant/dashboard/app.py": 2,
+    _PROJECT_ROOT / "src/rquant/dashboard/nl_screen.py": 1,
+    _PROJECT_ROOT / "src/rquant/dashboard/nl_canvas.py": 1,
+    _PROJECT_ROOT / "src/rquant/dashboard/lab/app.py": 1,
+    _PROJECT_ROOT / "src/rquant/panorama_data.py": 1,
+}
+
+
+def test_every_serving_root_consumer_resolves_through_the_shared_default() -> None:
+    """All six reads share one default; none may re-inline the wrong "data/serving"."""
+
+    total = 0
+    for path, expected_calls in _SERVING_ROOT_CONSUMERS.items():
+        source = path.read_text(encoding="utf-8")
+        assert '"data/serving"' not in source, path
+        assert "'data/serving'" not in source, path
+        assert 'os.environ.get("RQUANT_SERVING_ROOT"' not in source, path
+        assert "os.environ.get('RQUANT_SERVING_ROOT'" not in source, path
+        assert "from rquant.serving_paths import serving_root_from_env" in source, path
+        calls = source.count("serving_root_from_env()")
+        assert calls == expected_calls, (path, calls)
+        total += calls
+
+    assert total == 6
+
+
+def test_page_units_pin_the_serving_root_to_the_publisher_directory() -> None:
+    """Four units carry exactly one Environment= line naming the publisher directory.
+
+    This is the fallback the page reads when .env leaves the variable unset --
+    systemd.exec applies EnvironmentFile= after Environment= regardless of which
+    directive appears first in the unit, so a value set in .env would win over
+    this line, not the other way around (systemd/systemd#9788). The line's
+    ordinal position relative to EnvironmentFile= is therefore not asserted.
+    """
+
+    from rquant.runtime_deployment_profile import LINUX_PRODUCTION_RUNTIME_ROOT
+
+    assignment = f"Environment=RQUANT_SERVING_ROOT={LINUX_PRODUCTION_RUNTIME_ROOT / 'serving'}"
+    for name in (
+        "rquant-dashboard",
+        "rquant-nl-screen",
+        "rquant-canvas",
+        "rquant-panorama",
+    ):
+        service = (_PROJECT_ROOT / f"deploy/systemd/{name}.service").read_text(encoding="utf-8")
+        assert service.count(assignment + "\n") == 1, name
+
+
+def test_dashboard_announces_an_unreadable_serving_root_instead_of_swallowing_it() -> None:
+    """A serving root that will not open must reach both the journal and the page."""
+
+    app_path = _PROJECT_ROOT / "src/rquant/dashboard/app.py"
+    tree = ast.parse(app_path.read_text(encoding="utf-8"), filename=str(app_path))
+
+    open_guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "open"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "ServingPageRenderContext"
+            for call in ast.walk(ast.Module(body=node.body, type_ignores=[]))
+        )
+    ]
+
+    assert len(open_guards) == 1
+    handlers = open_guards[0].handlers
+    assert len(handlers) == 1
+    handler = handlers[0]
+    assert handler.name is not None, "the exception must be bound, not discarded"
+
+    handler_body = ast.Module(body=handler.body, type_ignores=[])
+    called = {
+        call.func.id if isinstance(call.func, ast.Name) else call.func.attr
+        for call in ast.walk(handler_body)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name | ast.Attribute)
+    }
+
+    assert "render_serving_root_failure" in called
+    assert "exception" in called, "the traceback must reach the journal"

@@ -20,7 +20,7 @@ rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
 ```bash
 uv sync                                  # 安装/同步依赖（含 dev 组）
 uv sync --python 3.11   # worktree 无 .python-version，裸 uv sync 会选 3.13；R07 policy 生成拒绝 3.13+
-uv run pytest -q                         # 全量测试（约 1860 个，跑 ~90 秒）
+uv run pytest -q                         # 全量测试（约 13.4k 用例，本机单进程约 60 分钟；CI 按 tests/manifests/full-suite-v1 分 4 片跑，本地改哪块测哪块）
 uv run pytest tests/unit/test_xxx.py -q  # 改哪块测哪块（秒级）
 uv run ruff check <改动的文件>            # lint 只查改动文件——全库存量约 980 个历史告警，全量跑会误判为本次改动引入
 uv run rquant --help                     # CLI 入口（serve / run-daily / monitor / notify-test 等 40+ 子命令）

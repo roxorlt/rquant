@@ -6,6 +6,46 @@
 
 ### Added
 
+- **root 权威链发布器（PR-A / TP1，S1 §1.3 与 §9）**：新增 `rquant runtime-authority-stage`
+  （`src/rquant/runtime_authority_stage.py`，lighthouse 无特权、不需要 `.env`）从干净 checkout 产出
+  完整 staging（28 role 的 closure profile、镜像布局 `<gen>/src` + `<gen>/scripts/strict_json.py` +
+  整棵 venv site-packages + `bin/python` 物理副本 + 三行 `pyvenv.cfg` + `manifests/<label>.json`）与
+  带全部产物 sha256 的 `plan.json`；缺省 dry-run 只打印 plan，`--apply` 在临时目录物化、与预测逐条
+  比对后 `rename`。`--bootstrap-from-checkout` 无 prior 时从冻结常量派生 25 个 instanced role 的
+  标签与 service manifest（20 个 singleton + 策略 3×2 → `svc-`+sha256；`page_control` 读 unit 字面量；
+  两个 recovery role 共用 `recovery.primary.v1`），全程不读写 `data/runtime`。
+- **`scripts/build-production-deploy-pyz.py`** 构建 stdlib-only、逐字节可复现的
+  `rquant-production-deploy.pyz`；其 `publish --expect-plan-sha256 <sha>`（`src/rquant/runtime_authority_publish.py`）
+  以 root 把 staging 收进 profile `inbox_root`、逐文件重算哈希、chown/chmod、装 profile、原子换代、
+  对 profile 里每个 (role, instance) 跑真实的 `_verify.resolve_launch` 预检，再调既有
+  `publish_runtime_authority`；任一步不符即移入 quarantine 并非零退出；幂等；`rollback --operation-id`
+  做单级回滚。不加 sudoers 条目。
+- **runtime 凭证密钥安装脚本（PR-A / TP2，S1 §2）**：新增 `scripts/install-runtime-credential-keys.sh`
+  （bash + `openssl`，不 import `rquant`，不写 `deploy/sudoers`，不给四个 stdin-only helper 加参数）。
+  `init --prefix <root>` 一次生成高水位权威、daily 收据、canvas 发布签名、shadow 日报签名四条链的
+  私钥与清单共九个文件（属主 / mode / nlink 逐一落到规格值；二次运行退 3 且九个文件字节不变）；
+  `rotate <chain>` 换一把私钥、清单保持成链、旧私钥 unlink；`verify` 按 euid 分支用四个消费者自己的
+  `validate-key-material` 调用形式复核，能识别被 `chmod 0644` 的清单。配套
+  `docs/operations/runtime-credential-keys.md` 写明轮换、备份、Canvas/Shadow 不成链的已知限制与
+  「私钥丢失不可恢复」的告警。
+- **role 服务在 runtime-exec wrapper 下真正可运行（PR-A / TP9，S1 §10）**：`rquant.config` 改为
+  首次读取时构造 `Settings`（`get_settings()` 单例 + PEP 562 `__getattr__` 保住
+  `from rquant.config import settings`），`storage/duckdb.py`、`research_gate.py`、
+  `page_control_service.py` 的 import 期取值一并惰性化，28/28 role 的模块在 `-I -S`、环境只有
+  `LANG/LC_ALL/TZ`、非 git cwd 下 import 成功；`runtime_service_main.run()` 带 `--authority-runtime`
+  时 commit 直接取 `--expected-commit`、runtime root 从 `--control-root` 反推，不执行任何 git 子进程；
+  `cmd_runtime_recovery_production` 的函数体搬到新模块 `rquant.runtime_recovery_production`，
+  `runtime_recovery_service.main()` 改 import 它。新增 `tests/unit/test_tp9_role_child_runtime.py`
+  在镜像 generation 里以 wrapper 子进程拉起第一关的 16 个 role。已知限制留待影子窗口前另开 PR：
+  #186 / #188（两个 recovery role 的 import 链撞 Settings）、#187（legacy `current` 的 generation id
+  与 `--expected-generation` 不同名字空间）、#189（`rquant/logging.py` import 期构造 Settings，
+  无 `.env` 时 stage 只能走 `python -m rquant.runtime_authority_stage`）、#190（已有 record 时换
+  profile 不是现有原语支持的转换）。
+- **页面 serving 根单一来源（PR-A / TP6-a）**：新增 `rquant.serving_paths`
+  （`SERVING_ROOT_ENV_VAR` / `DEFAULT_SERVING_ROOT` / `serving_root_from_env()`），
+  `dashboard/app.py` 两处、`nl_canvas.py`、`nl_screen.py`、`panorama_data.py`、`dashboard/lab/app.py`
+  六处读取全部经它解析；`.env.example` 增加 `RQUANT_SERVING_ROOT` 键并写明必须留空。
+
 - **outbox lease 续约搬进独立 helper 进程（WP9 / #169）**：新模块
   `src/rquant/source_broker_v2_heartbeat.py` 是 stdlib-only 的续约执行体，不 import 任何其它
   `rquant` 模块；对外提供连接形状（`open_saga_connection`）、两条续约 SQL 常量、结构层校验
@@ -118,6 +158,22 @@
 
 ### Security
 
+- **TCB-1：`runtime_authority._validate_pyvenv_config` 放宽并收紧（PR-A / TP9 + TP1，S1 §1.4 U-1-R）**：
+  generation 的 `pyvenv.cfg` 从只许一行 `include-system-site-packages = false` 改为接受
+  `python -m venv --copies` 的固定五键集 `{home, include-system-site-packages, version, executable, command}`
+  （3.11.15 / 3.12.13 实测键集相同）——单行形式没有 `home`，物理副本的解释器找不到标准库、起不来。
+  同时新增硬约束：`include-system-site-packages` 逐字 `false`；`home` 必须等于 profile
+  `system_python.path` 的父目录；`executable`（若出现）必须等于 `system_python.path`；`version`
+  形如 `\d+\.\d+\.\d+`；任何值不得含控制字符（C0 / DEL / C1）。属主、mode、nlink、sha256、`\n`
+  结尾与无 `\r` 的既有校验一律不动。发布器 `runtime_authority_stage` 自写确定性三行
+  （`home` / `include-system-site-packages` / `version`，等号两侧各一个空格，wrapper `_verify`
+  逐字符串匹配）。**合入前置门**：`§7 B-5` 在 82.156.0.68 上实跑（RHEL usrmerge 语义 macOS 复现不出）。
+- **TCB-2：`PRODUCTION_ROLE_POLICY` 22 个 kind-backed role 的 `module_arguments` 增加
+  `--authority-runtime`（PR-A / TP9）**：`profile_id = sha256(canonical(body()))`，`body()` 含每个
+  role 的 `payload()`，`payload()` 含 `module_arguments`，所以 `profile_id` 必变。首次发布
+  `previous=None`，没有前代 profile / generation / R07 policy 需要同步换代；此后每次调整策略表都要
+  三件套一起换代（且受 #190 限制）。生产 `profile_id` 由 `runtime-authority-stage` dry-run 的
+  `plan.json` 给出，本文不记录任何数值。
 
 - **TCB 语义变更：legacy shadow export 目录谓词的 owner 集合（TP5 / TCB-3）**：
   `_open_child_directory_at` 在 `allowed_modes` 含 `_SESSION_MODE`（`0o555`）时接受
@@ -182,6 +238,31 @@
   append store 的路径、属主、mode 与安装校验方式。
 
 ### Changed
+
+- **页面 serving 根默认值（PR-A / TP6-a）**：四个页面各自内联的回退路径 `data/serving`
+  （没有任何发布者写过的目录）改为发布者真正写入的 `data/runtime/serving`
+  （`runtime_production_profile` 发布的 `serving_root`）；
+  `deploy/systemd/rquant-{dashboard,nl-screen,canvas,panorama}.service` 各加一行
+  `Environment=RQUANT_SERVING_ROOT=/home/lighthouse/rquant/data/runtime/serving`。systemd 语义是
+  `EnvironmentFile=` 恒覆盖同名 `Environment=`、与行序无关，所以生产 `.env` 的 `RQUANT_SERVING_ROOT`
+  必须留空（`.env.example` 与新增测试的 docstring 都按这条语义写）。已知遗留：
+  `deploy/systemd/rquant-panorama.service:15-16` 有一段 2026-07-06 就存在的注释仍按「行序决定」
+  描述另一个变量 `RQUANT_PANORAMA_FAKE`，改它属 `deploy/systemd/` 变更，需 owner 单独授权，本次未动。
+- **`rquant.config.settings` 的构造时机（PR-A / TP9）**：从「import 模块即构造」改为「第一个读取者
+  触发构造」，之后所有读取者拿到同一个对象；`rquant --help` 与各子命令入口显式调用
+  `get_settings()`，配置缺失仍在启动时 fail-fast，不推迟到业务中途。
+- **kind-backed role 在无 legacy `data/runtime/current` 时的降级（PR-A / TP9，U-12）**：22 个
+  kind-backed role 以 WARNING 日志降级运行（schema 双写与 artifact 生命周期不可用，健康信号里可见
+  `runtime_root_unavailable`），`strategy_live` 保持硬失败。第一关放行判据定稿为
+  「15 个 active（degraded）+ `rquant-runtime-strategy@` failed（设计）+ 10 个未启用」，页面无数据。
+  首次启动前 `data/runtime` 等目录必须由运维按各 unit 的 `ReadWritePaths=` 预建：这些路径全无 `-` 前缀，
+  缺失时 systemd 在挂载命名空间阶段就以 `226/NAMESPACE` 失败，进不到服务进程，所以服务进程内的自建
+  只在稳态重启时管用；预建时不能顺带创建 `data/runtime/current`（#192）。
+- **`DEPLOY.md` 第 11 / 18 条与 `CLAUDE.md`（PR-A）**：跑 `rquant-runtime-exec.pyz` 的 unit 数
+  25→26、既有 unit 改动 21→19；finalizer 环境白名单步骤标注「首次安装场景无从执行」；root 侧
+  `rquant-production-deploy.pyz` 一律 `-I -S`；第一关判据与首次启动前预建 `ReadWritePaths=` 目录的要求
+  （#192）写入第 18 条；
+  `CLAUDE.md`「常用命令」的全量测试规模改为实测口径（约 13.4k 用例、本机约 60 分钟、CI 走分片）。
 
 - **heartbeat 停机语义（WP9 / #169）**：从「`sqlite3_interrupt` + 无超时 `join()`」改为
   「end 帧 → `terminate` → `kill`，每步各有超时」。`sqlite3.connect`、`Connection.close` 的
@@ -325,6 +406,17 @@
   `N abandoned heartbeat(s) still alive` 一并移除。
 
 ### Fixed
+
+- **页面 serving 根不可读时静默空白（PR-A / TP6-b）**：`dashboard/app.py` 读 serving 根的裸
+  `except` 改为显式告警，页面明确显示 serving 根不可读；`nl_screen` 区分「serving 不可达」与
+  「分页游标失效」两种失败，不再混成同一条提示。
+- **`install-runtime-credential-keys.sh verify --prefix` 在 `rotate highwater` 之后必定假报
+  「清单损坏」（PR-A / TP2）**：`rotate` 现在先发布受信公钥环再跑高水位自检（回归测试覆盖四个
+  rotate 目标）；`--dry-run` 下有意的拒绝不再被当作中止。
+- **wrapper 子进程里 `runtime_service_main.run()` 对缺失 runtime root 的判断（PR-A / TP9，M-R1）**：
+  原实现只在 `data/runtime` 目录不存在时降级，目录一旦存在（预建或稳态重启时由首个 role 建出）而
+  `current` 仍缺失，
+  第二次启动就硬失败（稳态全 failed）；现在统一以 legacy `current` 是否存在为准。
 
 - **受控部署器发给 `lab-runtime-prepare` 的 argv 与 CLI 契约不一致（TP3）**：
   `src/rquant/ops/production_deploy.py` 的 `_prepare_job_center_authority()` 沿用

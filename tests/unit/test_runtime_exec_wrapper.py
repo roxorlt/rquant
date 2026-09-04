@@ -1355,7 +1355,11 @@ class TestDerivedModuleArgv:
                 assert str(parsed.manifest).endswith(f"/manifests/{label}.json")
                 assert str(parsed.control_root).endswith(f"/{label}")
                 assert parsed.expected_generation == world.generation_path.name
-                if entry.module_arguments:
+                if entry.module_arguments == ("--authority-runtime",):
+                    # TP9: the 22 kind-backed roles are told to trust the root-owned
+                    # documents for commit and runtime root instead of a git checkout.
+                    assert parsed.authority_runtime is True
+                elif entry.module_arguments:
                     assert parsed.mode == entry.module_arguments[1]
                 if entry.service_kind:
                     assert [kind.value for kind in parsed.expected_kind] == [

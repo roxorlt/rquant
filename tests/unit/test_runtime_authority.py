@@ -310,6 +310,25 @@ def _record(
     )
 
 
+#: What the publisher writes into a generation (S1 §1.4 U-1-R, `acceptance-pra.md` TCB-1):
+#: `home` is the system Python's directory so the copied interpreter still finds its
+#: standard library, `include-system-site-packages = false` is the line the wrapper matches
+#: verbatim, and nothing else — `venv --copies` would also write `executable` and a
+#: `command` line with a build-time path, which breaks byte-identical staging.
+_PUBLISHER_PYVENV_CONFIG = (
+    b"home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.15\n"
+)
+#: The full key set `python -m venv --copies` produces (3.11.15 / 3.12.13 measured), which
+#: the publish-side validator must also accept.
+_VENV_COPIES_PYVENV_CONFIG = (
+    b"home = /usr/bin\n"
+    b"include-system-site-packages = false\n"
+    b"version = 3.11.15\n"
+    b"executable = /usr/bin/python3.11\n"
+    b"command = /usr/bin/python3.11 -m venv --copies /tmp/build/staging\n"
+)
+
+
 def _materialize_generation_slot(
     generation_root: Path,
     marker: str,
@@ -321,7 +340,7 @@ def _materialize_generation_slot(
     manifest_only_files: tuple[str, ...] = (),
     extra_directories: tuple[str, ...] = (),
     omitted_files: tuple[str, ...] = (),
-    pyvenv_payload: bytes = b"include-system-site-packages = false\n",
+    pyvenv_payload: bytes = _PUBLISHER_PYVENV_CONFIG,
 ) -> RuntimeGenerationSlot:
     relative_role = {
         "python_path": "venv/bin/python",
@@ -1624,16 +1643,64 @@ def test_hyb1_p1_08_manifest_entries_exactly_cover_materialized_generation(
     ("omitted_files", "pyvenv_payload", "match"),
     [
         (("pyvenv.cfg",), b"", "pyvenv"),
-        ((), b"include-system-site-packages = true\n", "include-system-site-packages"),
         (
             (),
-            b"include-system-site-packages = false\ninclude-system-site-packages = false\n",
-            "duplicate",
+            b"home = /usr/bin\ninclude-system-site-packages = true\n",
+            "include-system-site-packages",
         ),
         (
             (),
-            b"include-system-site-packages = false\nhome = /tmp/untrusted\n",
+            b"home = /usr/bin\ninclude-system-site-packages = False\n",
+            "include-system-site-packages",
+        ),
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\n"
+            b"include-system-site-packages = false\n",
+            "duplicate",
+        ),
+        # U-1-R: `home` is required and pinned to the profile's system Python directory.
+        ((), b"include-system-site-packages = false\n", "home"),
+        ((), b"include-system-site-packages = false\nhome = /tmp/untrusted\n", "home"),
+        ((), b"include-system-site-packages = false\nhome = /usr/bin/\n", "home"),
+        ((), b"include-system-site-packages = false\nhome = /usr/local/bin\n", "home"),
+        # Only the `venv --copies` key set; anything else is still unknown.
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\nprompt = rquant\n",
             "unknown",
+        ),
+        # `executable`, when present, must be the system Python itself.
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\n"
+            b"executable = /usr/local/bin/python3.11\n",
+            "executable",
+        ),
+        # `version`, when present, is `major.minor.patch`.
+        ((), b"home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11\n", "version"),
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.x\n",
+            "version",
+        ),
+        # No control characters anywhere in a value.
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\ncommand = build\x1b[0m\n",
+            "control",
+        ),
+        ((), b"home = /usr/bin\tinclude-system-site-packages = false\n", "control"),
+        # DEL and a C1 control (U+0085 NEL, UTF-8 c2 85) are control characters too.
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\ncommand = a\x7fb\n",
+            "control",
+        ),
+        (
+            (),
+            b"home = /usr/bin\ninclude-system-site-packages = false\ncommand = a\xc2\x85b\n",
+            "control",
         ),
     ],
 )
@@ -1656,6 +1723,84 @@ def test_rta_01_generation_requires_strict_isolated_pyvenv_config(
     with pytest.raises(RuntimeAuthorityPublishError, match=match):
         publish_runtime_authority(_record_for_slot(slot))
     assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "pyvenv_payload",
+    [_PUBLISHER_PYVENV_CONFIG, _VENV_COPIES_PYVENV_CONFIG],
+    ids=["publisher-three-lines", "venv-copies-five-keys"],
+)
+def test_tcb_1_generation_accepts_a_runnable_pyvenv_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pyvenv_payload: bytes,
+) -> None:
+    """U-1-R: a `home`-bearing pyvenv.cfg — the only kind the copied interpreter can boot from."""
+
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "pyvenv-ok",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        pyvenv_payload=pyvenv_payload,
+    )
+
+    assert publish_runtime_authority(_record_for_slot(slot)).value == "committed"
+    assert path.exists()
+
+
+_SYSTEM_PYTHON = Path("/usr/bin/python3.11")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"home = /usr/bin\ninclude-system-site-packages = false\n",
+        b"home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.12.13\n",
+        b"include-system-site-packages = false\nhome = /usr/bin\n"
+        b"executable = /usr/bin/python3.11\n",
+        _VENV_COPIES_PYVENV_CONFIG,
+    ],
+)
+def test_tcb_1_pyvenv_validator_accepts_the_venv_copies_key_set(payload: bytes) -> None:
+    authority_module._validate_pyvenv_config(payload, system_python=_SYSTEM_PYTHON)
+
+
+def test_tcb_1_pyvenv_home_follows_the_profile_system_python() -> None:
+    """`home` is not a fixed literal: it is the parent of whatever the profile declares."""
+
+    payload = b"home = /opt/python/bin\ninclude-system-site-packages = false\n"
+    authority_module._validate_pyvenv_config(
+        payload, system_python=Path("/opt/python/bin/python3.11")
+    )
+    with pytest.raises(RuntimeAuthorityPublishError, match="home"):
+        authority_module._validate_pyvenv_config(payload, system_python=_SYSTEM_PYTHON)
+
+
+def test_tcb_1_pyvenv_validator_keeps_the_pre_existing_canonical_rules() -> None:
+    for payload, match in (
+        (b"home = /usr/bin\ninclude-system-site-packages = false", "canonical"),
+        (b"home = /usr/bin\r\ninclude-system-site-packages = false\n", "canonical"),
+        (b"home = /usr/bin\ninclude-system-site-packages\n", "malformed"),
+        (b"home = /usr/bin\ninclude-system-site-packages =\n", "malformed"),
+        (b"home = /usr/bin\n= false\n", "malformed"),
+        (b"\xff\xfe\n", "UTF-8"),
+    ):
+        with pytest.raises(RuntimeAuthorityPublishError, match=match):
+            authority_module._validate_pyvenv_config(payload, system_python=_SYSTEM_PYTHON)
+
+
+def test_tcb_1_publish_side_normalizes_spacing_the_wrapper_does_not() -> None:
+    """The asymmetry S-2 pins: the wrapper matches `include-system-site-packages = false`
+    character for character, while this validator strips around `=`. A publisher must
+    therefore write the spaced form; TP1's T-20 asserts that end to end."""
+
+    from rquant.runtime_exec_wrapper._verify import _REQUIRED_PYVENV_LINE
+
+    unspaced = b"home = /usr/bin\ninclude-system-site-packages=false\n"
+    authority_module._validate_pyvenv_config(unspaced, system_python=_SYSTEM_PYTHON)
+    assert _REQUIRED_PYVENV_LINE.encode() not in unspaced
+    assert _REQUIRED_PYVENV_LINE.encode() in _PUBLISHER_PYVENV_CONFIG
 
 
 @pytest.mark.parametrize(

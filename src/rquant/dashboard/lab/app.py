@@ -91,6 +91,7 @@ from rquant.research_run_spec import (
     ResearchJobType,
     ResourceClass,
 )
+from rquant.serving_paths import serving_root_from_env
 from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
@@ -1728,7 +1729,7 @@ def run_strategy_lab_app() -> None:
     global _page_serving_context
     try:
         _page_serving_context = ServingPageRenderContext.open(
-            os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
+            serving_root_from_env()
         )
     except Exception:
         _page_serving_context = None
