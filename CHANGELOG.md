@@ -6,6 +6,21 @@
 
 ### Added
 
+- **root 权威链发布器（PR-A / TP1，S1 §1.3 与 §9）**：新增 `rquant runtime-authority-stage`
+  （`src/rquant/runtime_authority_stage.py`，lighthouse 无特权、不需要 `.env`）从干净 checkout 产出
+  完整 staging（28 role 的 closure profile、镜像布局 `<gen>/src` + `<gen>/scripts/strict_json.py` +
+  整棵 venv site-packages + `bin/python` 物理副本 + 三行 `pyvenv.cfg` + `manifests/<label>.json`）与
+  带全部产物 sha256 的 `plan.json`；缺省 dry-run 只打印 plan，`--apply` 在临时目录物化、与预测逐条
+  比对后 `rename`。`--bootstrap-from-checkout` 无 prior 时从冻结常量派生 25 个 instanced role 的
+  标签与 service manifest（20 个 singleton + 策略 3×2 → `svc-`+sha256；`page_control` 读 unit 字面量；
+  两个 recovery role 共用 `recovery.primary.v1`），全程不读写 `data/runtime`。
+- **`scripts/build-production-deploy-pyz.py`** 构建 stdlib-only、逐字节可复现的
+  `rquant-production-deploy.pyz`；其 `publish --expect-plan-sha256 <sha>`（`src/rquant/runtime_authority_publish.py`）
+  以 root 把 staging 收进 profile `inbox_root`、逐文件重算哈希、chown/chmod、装 profile、原子换代、
+  对 profile 里每个 (role, instance) 跑真实的 `_verify.resolve_launch` 预检，再调既有
+  `publish_runtime_authority`；任一步不符即移入 quarantine 并非零退出；幂等；`rollback --operation-id`
+  做单级回滚。不加 sudoers 条目。
+
 - **outbox lease 续约搬进独立 helper 进程（WP9 / #169）**：新模块
   `src/rquant/source_broker_v2_heartbeat.py` 是 stdlib-only 的续约执行体，不 import 任何其它
   `rquant` 模块；对外提供连接形状（`open_saga_connection`）、两条续约 SQL 常量、结构层校验
