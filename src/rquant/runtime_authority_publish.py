@@ -111,6 +111,17 @@ _PLAN_FIELDS = frozenset(
 )
 _PLAN_MODES = ("bootstrap", "legacy")
 _HASH_CHUNK = 1024 * 1024
+#: Read side of every path the unprivileged staging tree can name (N-6). `O_NOFOLLOW` keeps a
+#: swapped final segment from being followed; `O_NONBLOCK` is what keeps a FIFO left in place
+#: of a planned file from blocking `open()` forever while `publish` already holds
+#: `deployment.lock`. It is a no-op for a regular file, so the `S_ISREG` check on the
+#: descriptor still decides, one syscall later, what this process is allowed to read.
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
 
 DirectoryLinkConvention = Literal["subdirectories", "entries"]
 
@@ -131,8 +142,7 @@ def sha256_bytes(payload: bytes) -> str:
 def sha256_file(path: Path) -> tuple[str, int]:
     """Digest and size of one regular file, opened without following a final symlink."""
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, _READ_FLAGS)
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
@@ -417,8 +427,7 @@ def _write_new_file(path: Path, payload: bytes) -> None:
 def _copy_new_file(source: Path, destination: Path) -> tuple[str, int]:
     """Copy `source` to a new `destination` and return the digest of the bytes written."""
 
-    read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    source_fd = os.open(source, read_flags)
+    source_fd = os.open(source, _READ_FLAGS)
     try:
         info = os.fstat(source_fd)
         if not stat.S_ISREG(info.st_mode):
@@ -750,9 +759,8 @@ class _StagedGeneration:
 
 def _read_staged(staging: Path, relative: str, *, max_bytes: int) -> bytes:
     path = staging / relative
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path, _READ_FLAGS)
     except OSError as exc:
         raise RuntimeAuthorityPublishError(f"staged {relative} is not readable: {exc}") from exc
     try:
