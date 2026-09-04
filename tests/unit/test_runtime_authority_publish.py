@@ -20,7 +20,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -1939,3 +1939,256 @@ def test_blk3_the_plane_comes_from_the_shared_table_not_a_second_copy(
     plan = world.stage("blk3-plane-seam")
     manifests = _staged_manifests(world, plan)
     assert manifests["paper_broker"][0].plane is RuntimeServicePlane.RESEARCH
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): the bootstrap manifests carry grounded settings
+# ---------------------------------------------------------------------------------------
+
+#: The settings model each builder validates its own manifest against, named by the module
+#: that calls `model_validate(dict(manifest.settings))`. This is the acceptance's authority:
+#: a staged manifest is only startable if its settings pass the model of its own builder.
+SETTINGS_MODELS = {
+    "artifact_retention": ("rquant.runtime_builder_retention", "ArtifactRetentionSettings"),
+    "auction_match_source": ("rquant.runtime_service_builtin", "AuctionMatchSourceSettings"),
+    "auction_universe_publisher": (
+        "rquant.runtime_service_builtin",
+        "AuctionUniversePublisherSettings",
+    ),
+    "candidate_publisher": (
+        "rquant.runtime_builder_candidate",
+        "CandidatePublisherRuntimeSettings",
+    ),
+    "daily_close_source": ("rquant.runtime_builder_daily", "DailyCloseSourceSettings"),
+    "daily_pipeline_orchestrator": (
+        "rquant.runtime_builder_daily_orchestrator",
+        "DailyPipelineOrchestratorSettings",
+    ),
+    "feature_live": ("rquant.runtime_builder_feature", "FeatureLiveRuntimeSettings"),
+    "lab_artifact_catalog": ("rquant.runtime_builder_artifact_catalog", "ArtifactCatalogSettings"),
+    "lab_jobs_publisher": ("rquant.runtime_builder_authority", "LabJobsPublisherSettings"),
+    "market_minute_source": ("rquant.runtime_service_builtin", "MarketMinuteSourceSettings"),
+    "notifier": ("rquant.runtime_builder_signal", "NotifierSettings"),
+    "paper_broker": ("rquant.runtime_builder_paper", "PaperBrokerSettings"),
+    "paper_constraint_publisher": (
+        "rquant.runtime_builder_authority",
+        "PaperConstraintRuntimeSettings",
+    ),
+    "promotions_publisher": ("rquant.runtime_builder_authority", "PromotionsPublisherSettings"),
+    "reference_slow_publisher": (
+        "rquant.runtime_service_builtin",
+        "ReferenceSlowPublisherSettings",
+    ),
+    "reference_slow_source": ("rquant.runtime_service_builtin", "ReferenceSlowSourceSettings"),
+    "runtime_health_publisher": (
+        "rquant.runtime_builder_authority",
+        "RuntimeHealthPublisherSettings",
+    ),
+    "serving_publisher": ("rquant.runtime_builder_serving", "ServingRuntimeSettings"),
+    "shadow_session": ("rquant.runtime_builder_shadow", "ShadowSessionSettings"),
+    "signal_router": ("rquant.runtime_builder_signal", "SignalRouterSettings"),
+    "strategy_live": ("rquant.runtime_builder_strategy", "StrategyLiveRuntimeSettings"),
+    "watchlist_quote_source": ("rquant.runtime_service_builtin", "WatchlistQuoteSourceSettings"),
+}
+#: What a first installation cannot know, per role, stated as the validation error the
+#: builder's own model raises. Every one of these is an operator fact that lives outside the
+#: runtime owner root (`ProductionRuntimeProfileInputs.validate_complete_authority_set`
+#: refuses an immutable input inside it) or a signer public key installed under
+#: `/etc/rquant`: the market calendar generation, the sealed candidate documents, the
+#: historical minute snapshot, the definition registry, the routing policy, the recovery and
+#: retention authorities, the artifact location. Route B derives everything else; it does
+#: not invent these, so the missing fact names itself instead of hiding behind a placeholder
+#: (#200). An empty tuple means the role's settings are complete and it can start.
+UNGROUNDED_BOOTSTRAP_FACTS = {
+    "artifact_retention": (
+        "missing:full_recovery_receipt_id",
+        "missing:migration",
+        "missing:recovery_profile_generation",
+        "missing:recovery_publication_root",
+        "missing:recovery_restore_root",
+        "missing:recovery_target_manifest_id",
+        "missing:schema_authority_path",
+        "missing:schema_authority_root",
+        "missing:schema_authority_sha256",
+    ),
+    "auction_match_source": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "auction_universe_publisher": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "candidate_publisher": ("value_error:candidate_input_path is required for sealed_document",),
+    "daily_close_source": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "daily_pipeline_orchestrator": (
+        "missing:receipt_active_key_id",
+        "missing:receipt_active_public_key_pem",
+    ),
+    "feature_live": (
+        "missing:historical_minutes_snapshot_path",
+        "missing:historical_snapshot_id",
+    ),
+    "lab_artifact_catalog": ("missing:failure_domain", "missing:location_id"),
+    "lab_jobs_publisher": (),
+    "market_minute_source": (),
+    "notifier": (),
+    "paper_broker": (),
+    "paper_constraint_publisher": (),
+    "promotions_publisher": (),
+    "reference_slow_publisher": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "reference_slow_source": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "runtime_health_publisher": (),
+    "serving_publisher": (),
+    "shadow_session": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+        "missing:completion_active_key_id",
+        "missing:completion_active_public_key_pem",
+        "missing:report_active_key_id",
+        "missing:report_active_public_key_pem",
+        "missing:runner_manifest_bindings",
+    ),
+    "signal_router": ("missing:routing_policy_fingerprint",),
+    "strategy_live": ("missing:definition_registry_root",),
+    "watchlist_quote_source": (),
+}
+
+
+def _settings_model(role: str) -> Any:
+    import importlib
+
+    module, name = SETTINGS_MODELS[role]
+    return getattr(importlib.import_module(module), name)
+
+
+def _validation_signatures(role: str, settings: Any) -> tuple[str, ...]:
+    from pydantic import ValidationError
+
+    try:
+        _settings_model(role).model_validate(dict(settings))
+    except ValidationError as exc:
+        signatures = set()
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error["loc"])
+            signatures.add(
+                f"missing:{location}" if error["type"] == "missing" else f"{error['type']}:"
+                f"{error['msg'].removeprefix('Value error, ')}"
+            )
+        return tuple(sorted(signatures))
+    return ()
+
+
+@pytest.fixture
+def bootstrap(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[World, stage_module.StagePlan]:
+    """A staged generation whose manifests address a runtime root this host really has.
+
+    The derived settings are the production topology; a test that hands them to the real
+    models and the real builders needs that topology to exist somewhere writable, so the
+    root seam moves and every path moves with it.
+    """
+
+    root = tmp_path / "runtime-root"
+    root.mkdir()
+    monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", root.resolve())
+    return world, world.stage("blk3-bootstrap")
+
+
+def test_blk3_every_kind_backed_manifest_validates_or_names_its_missing_facts(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """#200 acceptance: settings are validated by the real builder model, not a stub."""
+
+    world, plan = bootstrap
+    manifests = _staged_manifests(world, plan)
+    assert set(manifests) == set(SETTINGS_MODELS) == set(UNGROUNDED_BOOTSTRAP_FACTS)
+    for role, staged in sorted(manifests.items()):
+        for manifest in staged:
+            assert _validation_signatures(role, manifest.settings) == (
+                UNGROUNDED_BOOTSTRAP_FACTS[role]
+            ), role
+    startable = {role for role, gaps in UNGROUNDED_BOOTSTRAP_FACTS.items() if not gaps}
+    assert startable == {
+        "lab_jobs_publisher",
+        "market_minute_source",
+        "notifier",
+        "paper_broker",
+        "paper_constraint_publisher",
+        "promotions_publisher",
+        "runtime_health_publisher",
+        "serving_publisher",
+        "watchlist_quote_source",
+    }
+
+
+def test_blk3_derived_settings_stay_inside_the_frozen_production_topology(
+    published: tuple[World, stage_module.StagePlan],
+) -> None:
+    """Every path a bootstrap manifest names is either under the runtime owner root, under
+    its data parent, or one of six frozen constants of this repository. A derived value
+    that escapes those is a guess about the host, not a derivation (#200)."""
+
+    from rquant.runtime_artifact_terminal_lifecycle import operational_database_path
+
+    world, plan = published
+    root = stage_module.production_runtime_root()
+    paths: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str) and value.startswith("/"):
+            paths.add(value)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    manifests = _staged_manifests(world, plan)
+    settings = {
+        manifest.service_id: dict(manifest.settings)
+        for staged in manifests.values()
+        for manifest in staged
+    }
+    walk(settings)
+    assert paths
+    data = root.parent
+    assert {path for path in paths if not path.startswith(f"{root}/")} == {
+        #: the data parent: the operational authorities the runtime reads but does not own
+        str(data / "rquant.duckdb"),
+        str(data / "surge_live"),
+        str(data / "legacy-shadow" / "monitor"),
+        str(data / "legacy-shadow" / "surge"),
+        str(data / "legacy-shadow" / "isolated-runners"),
+        #: frozen constants of `runtime_deployment_profile` and the daily receipt authority
+        "/etc/rquant/daily-receipt-trusted-keys.json",
+        "/home/lighthouse/rquant",
+        "/home/lighthouse/rquant/.venv/bin/python",
+        "/run/rquant/daily-receipt-signer.sock",
+        "/usr/bin/sudo",
+        "/usr/local/libexec/rquant-shadow-report-signer",
+    }
+    assert settings["auction-universe.publisher.v1"]["database_path"] == str(
+        operational_database_path(root)
+    )
+    assert settings["serving.publisher.v1"]["serving_root"] == str(root / "serving")
+    assert settings["paper-constraint.market.v1"]["reference_registry_path"] == str(
+        root / "authorities" / "reference-slow" / "reference.sqlite3"
+    )
