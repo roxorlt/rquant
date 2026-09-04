@@ -42,10 +42,20 @@ PRODUCTION_PROFILE_ANCHOR = Path("/etc/rquant")
 PRODUCTION_PROFILE_OWNER_UID = 0
 PRODUCTION_PROFILE_MODE = 0o444
 PRODUCTION_PROFILE_DIRECTORY_MODE = 0o755
+#: `(owner uid, mode)` per trusted ancestor. A `None` mode says the directory belongs to
+#: the distribution, so its permission bits are the distribution's decision and not
+#: rQuant's: the walk still demands root ownership and refuses any group or other write
+#: bit, but it does not insist on one exact value (#198 BLK-2). OpenCloudOS 9.2 ships `/`
+#: as `0555` with `rpm -V filesystem` clean, Debian ships `0755`, and neither is unsafe.
+#: This is the predicate the runtime-exec wrapper has always applied to its own ancestors
+#: (`runtime_exec_wrapper/_verify.py`, `_require_trusted_directory`) and the one
+#: `authority_path_security._validate_directory` applies to every walk it anchors at `/`;
+#: it is stated here per path so a reader sees exactly which four directories are judged
+#: that way. Every directory the publisher creates keeps its exact mode below.
 _PRODUCTION_PROFILE_DIRECTORY_POLICY = MappingProxyType(
     {
-        Path("/"): (0, 0o755),
-        Path("/etc"): (0, 0o755),
+        Path("/"): (0, None),
+        Path("/etc"): (0, None),
         PRODUCTION_PROFILE_ANCHOR: (0, PRODUCTION_PROFILE_DIRECTORY_MODE),
     }
 )
@@ -439,9 +449,9 @@ RUNTIME_AUTHORITY_TEMP_MODE = 0o600
 RUNTIME_AUTHORITY_DIRECTORY_MODE = 0o755
 _PRODUCTION_RUNTIME_DIRECTORY_POLICY = MappingProxyType(
     {
-        Path("/"): (0, 0o755),
-        Path("/var"): (0, 0o755),
-        Path("/var/lib"): (0, 0o755),
+        Path("/"): (0, None),
+        Path("/var"): (0, None),
+        Path("/var/lib"): (0, None),
         Path("/var/lib/rquant"): (0, 0o755),
         RUNTIME_AUTHORITY_ANCHOR: (0, RUNTIME_AUTHORITY_DIRECTORY_MODE),
         PRODUCTION_GENERATION_ROOT: (0, 0o755),
@@ -1893,15 +1903,24 @@ def _require_directory_stat(
     observed: os.stat_result,
     *,
     owner_uid: int,
-    mode: int,
+    mode: int | None,
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> None:
+    """A trusted directory: real, root-owned, writable by nobody but its owner.
+
+    `mode` is the exact value the publisher chose for a directory it creates itself. It is
+    `None` for the ancestors the distribution owns, whose permission bits rQuant does not
+    get to legislate (#198 BLK-2); everything else in this predicate still applies to them,
+    so an ancestor that is not a directory, is a symlink, is owned by anyone but root, or
+    carries a group or other write bit is refused exactly as before.
+    """
+
     if (
         not stat.S_ISDIR(observed.st_mode)
         or stat.S_ISLNK(observed.st_mode)
         or observed.st_uid != owner_uid
-        or stat.S_IMODE(observed.st_mode) != mode
+        or (mode is not None and stat.S_IMODE(observed.st_mode) != mode)
         or observed.st_mode & 0o022
     ):
         raise error_type(f"{label} is unsafe")
@@ -2011,7 +2030,7 @@ def acquire_runtime_deployment_lock() -> RuntimeDeploymentLock:
 def _open_trusted_parent(
     path: Path,
     *,
-    directory_policy: Mapping[Path, tuple[int, int]],
+    directory_policy: Mapping[Path, tuple[int, int | None]],
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> tuple[list[int], int, str]:
@@ -2030,7 +2049,7 @@ def _open_trusted_parent(
 def _open_trusted_directory(
     path: Path,
     *,
-    directory_policy: Mapping[Path, tuple[int, int]],
+    directory_policy: Mapping[Path, tuple[int, int | None]],
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> tuple[list[int], int]:
@@ -2098,7 +2117,7 @@ def _open_directory_entry(
     named: os.stat_result,
     *,
     owner_uid: int,
-    mode: int,
+    mode: int | None,
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> int:
@@ -2140,7 +2159,7 @@ def _open_directory_entry(
 def _read_trusted_file(
     path: Path,
     *,
-    directory_policy: Mapping[Path, tuple[int, int]],
+    directory_policy: Mapping[Path, tuple[int, int | None]],
     owner_uid: int,
     file_mode: int,
     max_bytes: int,

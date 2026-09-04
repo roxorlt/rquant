@@ -20,6 +20,8 @@ import stat
 import subprocess
 import sys
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -1652,3 +1654,151 @@ def test_blk1_the_plan_records_the_subtrees_walked_and_the_ones_skipped(
 
     assert summary["stdlib_roots"] == [str(walked)]
     assert summary["skipped_stdlib_roots"] == [str(absent)]
+
+
+# ---------------------------------------------------------------------------------------
+# #198 BLK-2: an ancestor the distribution owns, at the mode the distribution ships
+# ---------------------------------------------------------------------------------------
+
+
+@contextmanager
+def _mode(path: Path, mode: int) -> Iterator[None]:
+    original = stat.S_IMODE(path.lstat().st_mode)
+    path.chmod(mode)
+    try:
+        yield
+    finally:
+        path.chmod(original)
+
+
+def _lock_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, dict[Path, tuple[int, int | None]]]:
+    """A stand-in `/` with the authority anchor under it, plus the policy that closes it.
+
+    The returned dict is the very object the module now consults, so a test can relax or
+    tighten one entry after the fact and the next walk sees it.
+    """
+
+    root = tmp_path / "root"
+    anchor = root / "var" / "lib" / "rquant" / "runtime-authority"
+    anchor.mkdir(parents=True)
+    for path in (root, root / "var", root / "var" / "lib", anchor.parent, anchor):
+        path.chmod(0o755)
+    policy: dict[Path, tuple[int, int | None]] = dict(_directory_policy(anchor))
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_ANCHOR", anchor)
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_LOCK_PATH", anchor / "deployment.lock")
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", UID)
+    monkeypatch.setattr(authority_module, "_PRODUCTION_RUNTIME_DIRECTORY_POLICY", policy)
+    return root, anchor, policy
+
+
+def test_blk2_a_distribution_owned_ancestor_at_0555_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenCloudOS 9.2 ships `/` as `dr-xr-xr-x`; `rpm -V filesystem` is clean on that host."""
+
+    root, _anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+
+    with _mode(root, 0o555), authority_module.acquire_runtime_deployment_lock() as lock:
+        lock.assert_current()
+
+
+@pytest.mark.parametrize("mode", (0o757, 0o775), ids=("other-writable", "group-writable"))
+def test_blk2_a_relaxed_ancestor_that_anyone_can_write_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    root, _anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+
+    with _mode(root, mode), pytest.raises(RuntimeAuthorityPublishError, match="ancestor"):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_a_relaxed_ancestor_owned_by_someone_else_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID + 1, None)
+
+    with _mode(root, 0o555), pytest.raises(RuntimeAuthorityPublishError, match="ancestor"):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_a_directory_the_publisher_declares_a_mode_for_stays_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the distribution's own directories were relaxed; rQuant's anchor was not."""
+
+    root, anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+    assert policy[anchor] == (UID, 0o755)
+
+    with (
+        _mode(root, 0o555),
+        _mode(anchor, 0o555),
+        pytest.raises(RuntimeAuthorityPublishError, match="ancestor"),
+    ):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_the_deployment_lock_file_keeps_its_exact_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, anchor, policy = _lock_world(tmp_path, monkeypatch)
+    policy[root] = (UID, None)
+    lock_path = anchor / "deployment.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o644)
+
+    with (
+        _mode(root, 0o555),
+        pytest.raises(RuntimeAuthorityPublishError, match="deployment lock is unsafe"),
+    ):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def test_blk2_only_the_ancestors_the_distribution_owns_are_relaxed() -> None:
+    runtime = authority_module._PRODUCTION_RUNTIME_DIRECTORY_POLICY
+    profile = authority_module._PRODUCTION_PROFILE_DIRECTORY_POLICY
+
+    assert {path for path, (_uid, mode) in runtime.items() if mode is None} == {
+        Path("/"), Path("/var"), Path("/var/lib")
+    }
+    assert {path for path, (_uid, mode) in profile.items() if mode is None} == {
+        Path("/"), Path("/etc")
+    }
+    assert {path: mode for path, (_uid, mode) in runtime.items() if mode is not None} == {
+        Path("/var/lib/rquant"): 0o755,
+        authority_module.RUNTIME_AUTHORITY_ANCHOR: 0o755,
+        authority_module.PRODUCTION_GENERATION_ROOT: 0o755,
+    }
+    assert {path: mode for path, (_uid, mode) in profile.items() if mode is not None} == {
+        authority_module.PRODUCTION_PROFILE_ANCHOR: 0o755,
+    }
+    assert all(uid == 0 for uid, _mode in (*runtime.values(), *profile.values()))
+
+
+def test_blk2_the_publisher_creates_only_the_directories_whose_mode_it_declares(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    declared = root / "rquant"
+    undeclared = root / "distribution-owned"
+    monkeypatch.setattr(
+        authority_module,
+        "_PRODUCTION_RUNTIME_DIRECTORY_POLICY",
+        {undeclared: (UID, None), declared: (UID, 0o755)},
+    )
+    monkeypatch.setattr(authority_module, "_PRODUCTION_PROFILE_DIRECTORY_POLICY", {})
+    monkeypatch.setattr(authority_module, "PRODUCTION_INBOX_ROOT", root / "inbox")
+    monkeypatch.setattr(authority_module, "PRODUCTION_QUARANTINE_ROOT", root / "quarantine")
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", UID)
+    monkeypatch.setattr(publish_module, "PUBLISH_OWNER_GID", GID)
+
+    publish_module._ensure_authority_directories()
+
+    assert declared.is_dir() and stat.S_IMODE(declared.lstat().st_mode) == 0o755
+    assert not undeclared.exists()
