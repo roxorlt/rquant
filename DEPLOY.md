@@ -334,13 +334,14 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
      --staging /home/lighthouse/rquant/var/authority-staging/first          # 先 dry-run：stdout 是 plan.json
    # 再加 --apply 落盘，stderr 打印 plan.json 的 sha256，人工抄给 ②
    # ② root：收进 inbox、逐文件重算哈希、装 profile、原子换代、wrapper 对 32 个 (role, instance) 预检、写 current.json
-   sudo /usr/bin/python3.11 /usr/local/libexec/rquant-production-deploy.pyz publish \
+   sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz publish \
      --staging /home/lighthouse/rquant/var/authority-staging/first --expect-plan-sha256 <①抄下的值> [--dry-run]
    ```
 
    `rquant-production-deploy.pyz` 由 `python scripts/build-production-deploy-pyz.py --repository-root . --output <path>`
    构建（stdlib-only 运行面，连续两次构建逐字节相同，stdout 打印 sha256），装到 `/usr/local/libexec/`
-   `root:root 0555`。发布器不加任何 sudoers 条目（U-5），`publish` 走 owner 交互式 sudo。
+   `root:root 0555`。root 侧一律以 `-I -S` 运行它（与 26 个 unit 的 `ExecStart` 同一口径），`rollback`
+   同理：`sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz rollback --operation-id <32 hex>`。发布器不加任何 sudoers 条目（U-5），`publish` 走 owner 交互式 sudo。
 
    **计数补记**：跑 `rquant-runtime-exec.pyz` 的 unit 是 **26** 个（不是早先写的 25）；其中既有
    unit 改动的是 **19** 个（此 19 是「改了 ExecStart 的既有 unit」计数，与下面的第一关启用集合无关）。
