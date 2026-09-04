@@ -2238,15 +2238,16 @@ def test_blk3_builders_start_from_the_packaged_manifest_on_all_three_planes(
     world, plan = bootstrap
     manifests = _staged_manifests(world, plan)
     registry = _builtin_registry(manifests)
-    roles = {
-        RuntimeServicePlane.LIVE: "paper_constraint_publisher",
-        RuntimeServicePlane.SERVING: "runtime_health_publisher",
-        RuntimeServicePlane.RESEARCH: "lab_jobs_publisher",
-    }
+    roles = (
+        (RuntimeServicePlane.LIVE, "paper_constraint_publisher"),
+        (RuntimeServicePlane.SERVING, "runtime_health_publisher"),
+        (RuntimeServicePlane.SERVING, "serving_publisher"),
+        (RuntimeServicePlane.RESEARCH, "lab_jobs_publisher"),
+    )
     constraint = manifests["paper_constraint_publisher"][0]
     ReferenceRegistry(Path(str(constraint.settings["reference_registry_path"])))
 
-    for plane, role in roles.items():
+    for plane, role in roles:
         manifest = manifests[role][0]
         assert manifest.plane is plane
         step = registry.build(manifest)
@@ -2285,7 +2286,12 @@ def test_blk3_the_two_hardcoded_values_are_what_the_builders_refuse(
         with _pytest.raises(ValueError, match=message):
             registry.build(RuntimeServiceManifest.model_validate(document))
 
-    for role in ("paper_constraint_publisher", "runtime_health_publisher", "lab_jobs_publisher"):
+    for role in (
+        "paper_constraint_publisher",
+        "runtime_health_publisher",
+        "lab_jobs_publisher",
+        "serving_publisher",
+    ):
         document = strict_json_loads(manifests[role][0].model_dump_json().encode("utf-8"))
         assert isinstance(document, dict)
         document["settings"] = {}
