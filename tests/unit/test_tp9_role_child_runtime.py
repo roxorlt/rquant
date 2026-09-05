@@ -192,6 +192,114 @@ def test_t9_10_mirrored_generation_holds_both_file_hop_targets(
 
 
 # ---------------------------------------------------------------------------------------
+# R186 / R188: the modules the two recovery roles reach after their own import
+# ---------------------------------------------------------------------------------------
+
+#: `runtime_recovery_service` imports clean, which is why T9-1's 28/28 said nothing about
+#: the two recovery roles: their real chain is entered at call time, from
+#: `runtime_recovery_production`, and every module on it used to construct `Settings` while
+#: being imported (#186, #188). Probed as its own set so a regression names the module.
+RECOVERY_CALL_TIME_MODULES = (
+    "rquant.dashboard.strategy_lab_data",
+    "rquant.dashboard.strategy_lab_runs",
+    "rquant.formal_smoke_replay",
+    "rquant.runtime_recovery_coordinator",
+    "rquant.runtime_recovery_backup",
+    "rquant.runtime_recovery_production",
+)
+
+
+def test_r186_recovery_call_time_modules_import_in_the_wrapper_child_environment(
+    mirrored_generation: tuple[Path, Path],
+) -> None:
+    """#186 / #188: the recovery chain imports under `-I -S` with three environment names."""
+
+    app_source, cwd = mirrored_generation
+    failures: list[str] = []
+    for module in RECOVERY_CALL_TIME_MODULES:
+        result = import_role_module(module, app_source=app_source, cwd=cwd)
+        if result.returncode != 0:
+            failures.append(f"{module}: {(result.stdout + result.stderr).strip()[:200]}")
+    assert not failures, "recovery chain modules still die in the child environment:\n" + "\n".join(
+        failures
+    )
+
+
+_CLOSURE_PROBE = """
+import sys
+sys.path[:0] = {paths!r}
+__import__({module!r})
+print("MODULES", " ".join(sorted(n for n in sys.modules if n.startswith("rquant."))))
+"""
+
+
+def test_r186_the_probed_chain_is_the_one_the_recovery_roles_actually_walk(
+    mirrored_generation: tuple[Path, Path],
+) -> None:
+    """The probe is worth only as much as the chain it names, so read the chain back out.
+
+    Not a grep over import statements: the child imports `runtime_recovery_backup` and
+    reports the `rquant.*` modules that ended up in `sys.modules`, which is the closure the
+    role actually walks. `dashboard.strategy_lab_data` is on it too — the coordinator's
+    module-level fingerprint reaches five strategy modules, not only `formal_smoke_replay`,
+    and #186's four-module chain therefore understated the fix.
+    """
+
+    app_source, cwd = mirrored_generation
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _CLOSURE_PROBE.format(
+                paths=[str(app_source), site_packages_path()],
+                module="rquant.runtime_recovery_backup",
+            ),
+        ],
+        cwd=str(cwd),
+        env=child_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (result.stdout + result.stderr)[-400:]
+    line = next(line for line in result.stdout.splitlines() if line.startswith("MODULES "))
+    imported = set(line.removeprefix("MODULES ").split())
+    assert set(RECOVERY_CALL_TIME_MODULES) - {"rquant.runtime_recovery_production"} <= imported
+    assert "rquant.dashboard.strategy_lab_data" in imported
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+    recovery = [entry for entry in PRODUCTION_ROLE_POLICY if "recovery" in entry.name]
+    assert len(recovery) == 2
+    assert {entry.module for entry in recovery} == {"rquant.runtime_recovery_service"}
+
+
+def test_r186_no_module_on_the_recovery_chain_reads_settings_at_import() -> None:
+    """The fix, stated as a property of the source rather than of one probe run."""
+
+    source = CHECKOUT_SRC / "rquant"
+    leaves = (
+        "dashboard/strategy_lab_runs.py",
+        "dashboard/strategy_lab_data.py",
+        "formal_smoke_replay.py",
+        "runtime_recovery_coordinator.py",
+        "runtime_recovery_backup.py",
+        "runtime_recovery_production.py",
+    )
+    offenders = []
+    for leaf in leaves:
+        for number, line in enumerate((source / leaf).read_text(encoding="utf-8").splitlines(), 1):
+            #: column 0 only: a deferred read inside a function is exactly the fix.
+            if not line.startswith("from rquant.config import"):
+                continue
+            if "settings" in line and "get_settings" not in line:
+                offenders.append(f"{leaf}:{number}: {line.strip()}")
+    assert not offenders, "module-level settings import is back:\n" + "\n".join(offenders)
+
+
+# ---------------------------------------------------------------------------------------
 # T9-7 / T9-9: the lazy settings object
 # ---------------------------------------------------------------------------------------
 
@@ -227,7 +335,13 @@ def test_t9_7_attribute_mutation_is_visible_through_every_reader(
 
 
 @pytest.mark.parametrize(
-    "module_name", ["rquant.storage.duckdb", "rquant.page_control_service"]
+    "module_name",
+    [
+        "rquant.storage.duckdb",
+        "rquant.page_control_service",
+        "rquant.dashboard.strategy_lab_runs",
+        "rquant.dashboard.strategy_lab_data",
+    ],
 )
 def test_t9_7_lazified_modules_still_expose_the_settings_attribute(
     module_name: str,

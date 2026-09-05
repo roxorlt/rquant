@@ -14,7 +14,6 @@ from typing import Any
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
-from rquant.config import settings
 from rquant.research_manifest import (
     RESEARCH_STATUS_LABELS,
     ResearchManifest,
@@ -58,8 +57,41 @@ class StrategyLabSavedRun(BaseModel):
     markdown_path: Path | None = None
 
 
+def _settings() -> Any:
+    """The process-wide `Settings`, read when a caller needs it and not at import.
+
+    Reading `rquant.config.settings` at module level used to build the object while this
+    module was being imported, and the import chain
+    `runtime_recovery_backup -> runtime_recovery_coordinator -> formal_smoke_replay ->
+    dashboard.strategy_lab_runs` put that construction inside the runtime-exec wrapper's
+    role child, which starts `-I -S` with only `LANG` / `LC_ALL` / `TZ` in its environment.
+    The five required fields are then all missing and the child dies with a pydantic
+    `ValidationError` before any role code runs (#186, #188). Nothing in this module needs
+    the settings unless a caller omits `base_dir`, so the read moved into the one function
+    that has that fallback. A `settings` a test has bound onto this module still wins,
+    exactly as the old module-level name did.
+    """
+
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound
+    from rquant.config import get_settings
+
+    return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`strategy_lab_runs.settings` stays readable, built on first use (PEP 562)."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def strategy_lab_runs_dir(base_dir: Path | None = None) -> Path:
-    return (base_dir or settings.data_dir) / "strategy_lab_runs"
+    return (base_dir or _settings().data_dir) / "strategy_lab_runs"
 
 
 def _slug(value: str) -> str:
