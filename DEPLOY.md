@@ -50,7 +50,30 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
   留到影子窗口前修）
   + **10 个未启用**（7 个等 credstore 密钥、3 个硬依赖旧目录结构；预期状态是「未启用」，不是失败）。
 - 七个常驻服务与四个端口与上线前基线逐项一致。
+- **#200 修完之后，验收判据必须往前走一步：在生产机上真的 `systemctl start` 一个 kind-backed
+  角色并看它持续运行，不能只看 `wrapper_preflight == 32`。** `wrapper_preflight` 只证明 wrapper
+  对 32 个「角色 × 实例」组合逐一预检通过，它**看不到 service manifest 的内容对不对**——#200 就是
+  这样溜过去的：manifest 里 `plane` 全写 `live`、`settings` 全是空对象，preflight 一路绿，
+  角色一启动就被自己的构造器拒收。#200 修完后可用来做这条判据的角色有四个：
+  `paper_constraint_publisher`、`runtime_health_publisher`、`serving_publisher`、`lab_jobs_publisher`
+  （分属 live / serving / research 三个平面）。`daily_pipeline_orchestrator` 与 `strategy_live`
+  这一轮仍然起不来，原因是路线 B 不产出 `<运行根>/current/deployment-profile.json`（issue #201），
+  **不要拿它们当判据**。
 - **明确不承诺**：26 个服务全绿、页面有数据。
+
+### B-6' 的新前置检查（#200 引入，装机前逐条确认）
+
+1. **顺序**：B-6'（`rquant runtime-authority-stage`）现在必须排在 **B-2 → B-3 之后**。stage 会读
+   `/etc/rquant/daily-receipt-trusted-keys.json`，钥匙串不在就明确拒绝并整体失败（不会静默产出空授权）。
+   现有 runbook 顺序本来就满足，这里只是把这条以前不存在的依赖写明。
+2. **钥匙串本身**：`stat -c '%U:%G %a %h' /etc/rquant/daily-receipt-trusted-keys.json` 必须是
+   `root:root 444 1`，且 `/etc/rquant`、`/etc`、`/` 每一级都是 root 属主、无 group/other 写位。
+   打包侧用的就是生产画像那一个严格加载器，判据一分不宽：**mode 必须恰好 0444**，0440 也会被拒。
+3. **openssl**：`openssl version` 需 **3.0 以上**，并且 `openssl pkeyutl -help 2>&1 | grep rawin`
+   要有输出。stage 的 Ed25519 验签是 shell 出去跑 `openssl pkeyutl -verify -pubin -rawin`，
+   查找顺序 `/opt/homebrew/bin/openssl` → `/usr/bin/openssl` → PATH。**缺 openssl 或版本太老时
+   报出来的是 `signature is invalid`**，那是一句会把排查方向带偏的错，先确认这两条能省掉半天。
+   （OpenCloudOS 9.2 自带 3.x，B-2 的凭证备份本来也在用 openssl，现场预期满足。）
 
 ### 已知限制（装机前已登记的 issue，外加装机当场发现的 #198；末列写「已修」的条目已修，其余不修）
 
