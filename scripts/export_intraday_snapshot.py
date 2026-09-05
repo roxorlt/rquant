@@ -36,6 +36,15 @@ Usage on the machine that holds the minute history:
 
 It prints the sha256 to pass to `build_runtime_production_inputs.py` as
 `--minutes-snapshot-sha256`, plus the session and row counts that justify it.
+
+Two guards worth knowing about. The shaped frame is run through the feature engine's own
+`_normalize_frame` before anything is written, so a suspended session's zero-price bars
+fail the export instead of failing `feature_live` at start-up after the profile has
+already recorded the snapshot's sha256. And `--ts-code-file` narrows the export to a
+universe: twenty sessions of the whole market is several million rows, and `feature_live`
+reads the entire parquet into memory on every start and copies it on every batch.
+
+Run it with the checkout's own interpreter (`.venv/bin/python`, or `uv run`).
 """
 
 from __future__ import annotations
@@ -54,7 +63,11 @@ if str(_REPOSITORY_ROOT / "src") not in sys.path:  # pragma: no cover - import b
 
 import pandas as pd  # noqa: E402
 
-from rquant.intraday_feature_engine import INPUT_COLUMNS  # noqa: E402
+from rquant.intraday_feature_engine import (  # noqa: E402
+    INPUT_COLUMNS,
+    IntradayFeatureValidationError,
+    _normalize_frame,
+)
 
 #: `FeatureRuntimeConfig.lookback_sessions` default.
 DEFAULT_SESSIONS = 20
@@ -105,6 +118,7 @@ def read_snapshot_frame(
     freq: str,
     availability_lag_seconds: int,
     allow_primary_database: bool,
+    universe: tuple[str, ...] = (),
 ) -> tuple[pd.DataFrame, tuple[date, ...]]:
     """Read the newest `sessions` trading days of one minute source, newest session last."""
 
@@ -129,10 +143,20 @@ def read_snapshot_frame(
                 f"freq={freq}, fewer than the {sessions} feature_live needs"
             )
         trade_dates = tuple(sorted(_as_date(row[0]) for row in session_rows))
-        frame = connection.execute(
-            _ROWS_QUERY,
-            [source, freq, trade_dates[0], trade_dates[-1]],
-        ).fetch_df()
+        query = _ROWS_QUERY
+        parameters: list[object] = [source, freq, trade_dates[0], trade_dates[-1]]
+        if universe:
+            # The production table holds ~67M minute rows; twenty sessions of the whole
+            # market is several million, and `feature_live` reads the whole parquet into
+            # memory on every start and copies it on every batch. Narrowing to the codes
+            # actually subscribed is the only lever the operator has besides --sessions.
+            placeholders = ", ".join("?" for _ in universe)
+            query = query.replace(
+                "    ORDER BY ts_code, trade_time",
+                f"      AND ts_code IN ({placeholders})\n    ORDER BY ts_code, trade_time",
+            )
+            parameters.extend(universe)
+        frame = connection.execute(query, parameters).fetch_df()
     finally:
         connection.close()
     if frame.empty:
@@ -172,7 +196,34 @@ def _shape_snapshot(frame: pd.DataFrame, *, availability_lag_seconds: int) -> pd
             "the selected minute rows hold more than one bar for a ts_code minute; "
             "check that only one source was selected"
         )
+    _reject_frames_feature_live_would_refuse(ordered)
     return ordered
+
+
+def _reject_frames_feature_live_would_refuse(frame: pd.DataFrame) -> None:
+    """Run the consumer's own admission rules before the snapshot is written.
+
+    `feature_live` hashes this parquet at start-up and then hands it to `live_compute`,
+    whose `_normalize_frame` refuses the whole batch if any row has a non-positive or
+    non-finite price — which is exactly the shape a suspended session's minute bars have
+    in `minute_bar`. Finding that out at start-up means a service that cannot start and a
+    profile that has already recorded the snapshot's sha256; finding it here means an
+    export that did not happen.
+    """
+
+    try:
+        _normalize_frame(frame, label="historical_minutes")
+    except IntradayFeatureValidationError as exc:
+        numeric = frame.loc[:, list(INPUT_COLUMNS[3:])]
+        offenders = frame.loc[
+            (frame[["open", "high", "low", "close"]] <= 0).any(axis=1)
+            | numeric.isna().any(axis=1)
+        ]
+        first = offenders.iloc[0].to_dict() if not offenders.empty else None
+        raise ExportError(
+            "the exported rows are not admissible to feature_live "
+            f"({exc}); first offending row: {first}"
+        ) from exc
 
 
 def write_snapshot(frame: pd.DataFrame, output: Path) -> str:
@@ -213,6 +264,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", default=DEFAULT_SOURCE)
     parser.add_argument("--freq", default=DEFAULT_FREQ)
     parser.add_argument("--availability-lag-seconds", type=int, default=0)
+    parser.add_argument(
+        "--ts-code-file",
+        default=None,
+        help="file of ts_code values, one per line; restricts the export to that universe",
+    )
     parser.add_argument("--allow-primary-database", action="store_true")
     return parser
 
@@ -237,6 +293,17 @@ def _run(arguments: argparse.Namespace) -> int:
     if output.suffix.lower() != ".parquet":
         raise ExportError(f"--output must be a .parquet path: {output}")
 
+    universe: tuple[str, ...] = ()
+    if arguments.ts_code_file is not None:
+        universe_path = Path(arguments.ts_code_file)
+        try:
+            lines = universe_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise ExportError(f"ts_code file is unreadable: {universe_path}") from exc
+        universe = tuple(sorted({line.strip() for line in lines if line.strip()}))
+        if not universe:
+            raise ExportError(f"ts_code file names no codes: {universe_path}")
+
     frame, trade_dates = read_snapshot_frame(
         Path(arguments.database),
         sessions=arguments.sessions,
@@ -244,6 +311,7 @@ def _run(arguments: argparse.Namespace) -> int:
         freq=arguments.freq,
         availability_lag_seconds=arguments.availability_lag_seconds,
         allow_primary_database=arguments.allow_primary_database,
+        universe=universe,
     )
     digest = write_snapshot(frame, output)
 
@@ -258,6 +326,7 @@ def _run(arguments: argparse.Namespace) -> int:
     )
     print(f"source {arguments.source} freq {arguments.freq} (bar_end timestamps)")
     print(f"available_at = trade_time + {arguments.availability_lag_seconds}s")
+    print(f"universe {len(universe) or 'all'} ts_codes")
     return 0
 
 

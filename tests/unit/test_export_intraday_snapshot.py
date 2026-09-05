@@ -41,21 +41,28 @@ def _sessions(count: int) -> list[date]:
     return sorted(days)
 
 
-def _minute_rows(sessions: list[date], *, source: str) -> list[tuple[object, ...]]:
+def _minute_rows(
+    sessions: list[date],
+    *,
+    source: str,
+    freq: str = "1min",
+    price_override: float | None = None,
+    ts_codes: tuple[str, ...] = ("600000.SH", "600001.SH"),
+) -> list[tuple[object, ...]]:
     rows: list[tuple[object, ...]] = []
     for session in sessions:
-        for ts_code in ("600000.SH", "600001.SH"):
+        for ts_code in ts_codes:
             for minute in range(3):
                 trade_time = datetime.combine(session, datetime.min.time()) + timedelta(
                     hours=9,
                     minutes=31 + minute,
                 )
-                price = 10.0 + minute
+                price = 10.0 + minute if price_override is None else price_override
                 rows.append(
                     (
                         ts_code,
                         trade_time,
-                        "1min",
+                        freq,
                         price,
                         price + 0.5,
                         price - 0.5,
@@ -69,7 +76,14 @@ def _minute_rows(sessions: list[date], *, source: str) -> list[tuple[object, ...
     return rows
 
 
-def _write_minute_database(path: Path, *, sessions: int = 22, with_rt_rows: bool = True) -> Path:
+def _write_minute_database(
+    path: Path,
+    *,
+    sessions: int = 22,
+    with_rt_rows: bool = True,
+    with_other_freq: bool = True,
+    suspended_session: bool = False,
+) -> Path:
     connection = duckdb.connect(str(path))
     try:
         connection.execute(
@@ -96,6 +110,19 @@ def _write_minute_database(path: Path, *, sessions: int = 22, with_rt_rows: bool
             # The same minutes under the realtime source: the primary key allows it, and an
             # exporter that forgot to filter would emit two bars for one ts_code minute.
             rows += _minute_rows(days, source="tushare_rt")
+        if with_other_freq:
+            # `minute_bar`'s primary key carries `freq`, so the same source can hold 5min
+            # bars on the same minutes. Without these rows the freq filter is untested.
+            rows += _minute_rows(days, source="tushare", freq="5min")
+        if suspended_session:
+            # One suspended name inside the exported window: its minute bars come back as
+            # zero prices, which is exactly what `_normalize_frame` refuses.
+            rows += _minute_rows(
+                [days[-1]],
+                source="tushare",
+                price_override=0.0,
+                ts_codes=("600002.SH",),
+            )
         connection.executemany(
             "INSERT INTO minute_bar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
@@ -351,3 +378,99 @@ def test_rerunning_the_export_reproduces_the_same_digest(tmp_path: Path) -> None
     second = hashlib.sha256(output.read_bytes()).hexdigest()
 
     assert first == second
+
+
+# --------------------------------------------------------------------------- S-2 / S-3
+
+
+def test_the_freq_filter_keeps_the_five_minute_bars_out(exported: tuple[Path, str]) -> None:
+    """`minute_bar` is keyed by `(ts_code, trade_time, freq, source)`, so the same source
+    can hold a 5min bar on the same minute. Two bars for one ts_code minute is exactly
+    what the feature engine refuses, so the filter has to be real, not incidental."""
+
+    output, _digest = exported
+
+    frame = pd.read_parquet(output)
+
+    assert len(frame) == 2 * 3 * 20
+    assert not frame.duplicated(subset=["ts_code", "trade_time"]).any()
+
+
+def test_a_suspended_session_is_refused_before_the_snapshot_is_written(
+    tmp_path: Path,
+) -> None:
+    """S-2: zero-price bars are what a suspended session looks like in `minute_bar`.
+
+    `feature_live` would hash the parquet at start-up and then refuse the whole batch in
+    `_normalize_frame`; by then the profile has already recorded the sha256. Catching it
+    here means the export simply did not happen.
+    """
+
+    _write_minute_database(tmp_path / "rquant_ro.duckdb", suspended_session=True)
+    output = tmp_path / "minute-history.parquet"
+
+    exit_code = exporter.main(
+        [
+            "--database",
+            str(tmp_path / "rquant_ro.duckdb"),
+            "--output",
+            str(output),
+            "--sessions",
+            "20",
+        ]
+    )
+
+    assert exit_code == 2
+    assert not output.exists()
+
+
+def test_a_universe_file_narrows_the_export(tmp_path: Path) -> None:
+    """The whole market's twenty sessions is several million rows that `feature_live`
+    reads into memory on every start; the subscribed codes are the only other lever."""
+
+    _write_minute_database(tmp_path / "rquant_ro.duckdb")
+    universe = tmp_path / "universe.txt"
+    universe.write_text("600001.SH\n\n600001.SH\n", encoding="utf-8")
+    output = tmp_path / "minute-history.parquet"
+
+    assert (
+        exporter.main(
+            [
+                "--database",
+                str(tmp_path / "rquant_ro.duckdb"),
+                "--output",
+                str(output),
+                "--sessions",
+                "20",
+                "--ts-code-file",
+                str(universe),
+            ]
+        )
+        == 0
+    )
+
+    frame = pd.read_parquet(output)
+    assert set(frame["ts_code"]) == {"600001.SH"}
+    assert len(frame) == 3 * 20
+
+
+def test_an_empty_universe_file_is_refused(tmp_path: Path) -> None:
+    _write_minute_database(tmp_path / "rquant_ro.duckdb")
+    universe = tmp_path / "universe.txt"
+    universe.write_text("\n  \n", encoding="utf-8")
+
+    assert (
+        exporter.main(
+            [
+                "--database",
+                str(tmp_path / "rquant_ro.duckdb"),
+                "--output",
+                str(tmp_path / "minute-history.parquet"),
+                "--sessions",
+                "20",
+                "--ts-code-file",
+                str(universe),
+            ]
+        )
+        == 2
+    )
