@@ -1003,26 +1003,70 @@ def test_the_completion_keyring_is_separate_key_material_from_the_report_keyring
     assert files["completion_private"].read_bytes() != files["shadow_private"].read_bytes()
 
 
-def test_the_completion_manifest_is_accepted_by_a_real_signer_loader(prefix: Path) -> None:
-    """No completion signer helper exists yet, so the canvas helper — the only loader of
-    that manifest shape in the tree — is what proves the document is well formed."""
+_COMPLETION_RUNPY = (
+    "from pathlib import Path; import runpy, sys; "
+    'module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; '
+    'operation.__globals__["PUBLIC_KEYS_FILE"] = Path(sys.argv[3]); '
+    "operation(Path(sys.argv[2]))"
+)
 
-    assert _init(prefix).returncode == 0
 
-    result = subprocess.run(
+def _drive_daily_helper(
+    request: str,
+    keys_file: Path,
+    keyring_file: Path,
+) -> subprocess.CompletedProcess[str]:
+    """Run the daily helper against a caller-named manifest/keyring pair.
+
+    The completion manifest is the daily shape, and the daily helper is zero-argument
+    with module-level paths, so this is the seam both installer scripts use.
+    """
+
+    return subprocess.run(
         [
             SYSTEM_PYTHON,
-            str(CANVAS_HELPER),
-            "--keys-file",
-            str(_expected_files(prefix)["completion_manifest"]),
-            "--validate-key-material",
+            "-I",
+            "-S",
+            "-c",
+            _COMPLETION_RUNPY,
+            str(DAILY_HELPER),
+            str(keys_file),
+            str(keyring_file),
         ],
+        input=request,
         check=False,
         capture_output=True,
         text=True,
     )
 
+
+def test_the_completion_manifest_is_accepted_by_a_real_signer_loader(prefix: Path) -> None:
+    """No completion signer helper exists yet, so the daily helper — the only loader of
+    this manifest shape in the tree — is what proves the document is well formed."""
+
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+
+    result = _drive_daily_helper(
+        '{"operation":"validate-key-material","schema_version":1}',
+        files["completion_manifest"],
+        prefix / "etc" / "rquant" / "shadow-completion-trusted-keys.json",
+    )
+
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_completion_manifest_is_chained_like_the_daily_one(prefix: Path) -> None:
+    """The published keyring carries `generation` and `previous_manifest_hash`, and those
+    can only come from a chained manifest — the canvas shape has neither."""
+
+    assert _init(prefix).returncode == 0
+
+    document = json.loads(_expected_files(prefix)["completion_manifest"].read_bytes())
+
+    assert document["schema_version"] == 2
+    assert document["generation"] == 1
+    assert document["previous_manifest_hash"] == "0" * 64
 
 
 def test_rotating_the_completion_keyring_retires_the_old_public_key(prefix: Path) -> None:
@@ -1297,3 +1341,281 @@ def test_the_capability_manifest_never_appears_in_the_repository() -> None:
 
     assert not [name for name in tracked if name.endswith("runtime-capabilities-keys.json")]
     assert not [name for name in tracked if "/runtime-capabilities/" in name]
+
+
+# --------------------------------------------------------------------------- K-14
+# M-1: adding a credential group to a host that already carries the other four.
+
+BASE_COMMIT = "2db3846"
+
+
+def _base_script(tmp_path: Path) -> Path:
+    """The installer as it stood before this branch, to build a realistic starting state.
+
+    The production host's `/etc/rquant` was written by that version, so a fixture that
+    calls the *new* script to create the "already installed" four would be testing
+    against a tree only the new script can produce.
+    """
+
+    script = tmp_path / "base-install-runtime-credential-keys.sh"
+    script.write_bytes(
+        subprocess.run(
+            ["git", "show", f"{BASE_COMMIT}:scripts/install-runtime-credential-keys.sh"],
+            cwd=str(ROOT),
+            check=True,
+            capture_output=True,
+        ).stdout
+    )
+    return script
+
+
+def _fingerprints(paths: dict[str, Path]) -> dict[str, tuple[bytes, int]]:
+    return {
+        name: (path.read_bytes(), path.lstat().st_mtime_ns)
+        for name, path in paths.items()
+        if path.exists()
+    }
+
+
+@pytest.fixture()
+def four_group_prefix(prefix: Path, tmp_path: Path) -> Path:
+    """A tree holding exactly what B-2 installed: the original nine files."""
+
+    _require_openssl()
+    result = subprocess.run(
+        ["/bin/bash", str(_base_script(tmp_path)), "init", "--prefix", str(prefix)],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return prefix
+
+
+def test_plain_init_still_refuses_a_tree_that_already_holds_the_four(
+    four_group_prefix: Path,
+) -> None:
+    """Without the explicit mode the all-or-nothing refusal is exactly as it was."""
+
+    before = _fingerprints(_expected_files(four_group_prefix))
+    assert len(before) == 9
+
+    result = _run("init", "--prefix", str(four_group_prefix), "--key-suffix", "v2")
+
+    assert result.returncode == 3
+    assert "refusing to overwrite existing key material" in result.stderr
+    assert _fingerprints(_expected_files(four_group_prefix)) == before
+
+
+def test_only_missing_adds_the_new_groups_without_touching_the_installed_ones(
+    four_group_prefix: Path,
+) -> None:
+    """M-1: the point of the mode. Nine bytes-and-mtimes unchanged, four files added.
+
+    Deleting the four to re-run `init` would rotate a receipt chain that is already
+    running and a keyring that a published profile already references, so completing the
+    tree in place is the only acceptable path on the host.
+    """
+
+    installed = _fingerprints(_expected_files(four_group_prefix))
+    assert len(installed) == 9
+    # The four key directories gain no entries, so a changed ctime here means the mode or
+    # owner was rewritten — installed state touched for no reason.
+    etc = four_group_prefix / "etc" / "rquant"
+    directories = {
+        name: etc.joinpath(name).lstat()
+        for name in ("lab-highwater", "canvas-publication", "shadow-report", "daily-receipt")
+    }
+
+    result = _run("init", "--prefix", str(four_group_prefix), "--only-missing")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    for name, before in directories.items():
+        after = etc.joinpath(name).lstat()
+        assert (stat.S_IMODE(after.st_mode), after.st_uid, after.st_gid) == (
+            stat.S_IMODE(before.st_mode),
+            before.st_uid,
+            before.st_gid,
+        ), name
+        assert after.st_ctime_ns == before.st_ctime_ns, name
+
+    files = _expected_files(four_group_prefix)
+    assert len(files) == 13
+    for name, (payload, mtime) in installed.items():
+        assert files[name].read_bytes() == payload, name
+        assert files[name].lstat().st_mtime_ns == mtime, name
+    for name in (
+        "completion_manifest",
+        "completion_private",
+        "capability_manifest",
+        "reference_source_private",
+    ):
+        assert files[name].exists(), name
+        assert stat.S_IMODE(files[name].lstat().st_mode) == 0o600, name
+    assert _verify(four_group_prefix).returncode == 0
+
+
+def test_only_missing_leaves_the_installed_directory_mode_alone(
+    four_group_prefix: Path,
+) -> None:
+    """Whatever the host's `/etc/rquant` mode is, adding a group is not the moment to
+    change it. A mode the operator tightened by hand must survive the addition."""
+
+    etc = four_group_prefix / "etc" / "rquant"
+    etc.chmod(0o750)
+
+    result = _run("init", "--prefix", str(four_group_prefix), "--only-missing")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stat.S_IMODE(etc.lstat().st_mode) == 0o750
+
+
+def test_only_missing_on_a_complete_tree_reports_that_and_writes_nothing(
+    prefix: Path,
+) -> None:
+    assert _init(prefix).returncode == 0
+    before = _fingerprints(_expected_files(prefix))
+
+    result = _run("init", "--prefix", str(prefix), "--only-missing")
+
+    assert result.returncode == 4
+    assert "nothing to create" in result.stderr
+    assert _fingerprints(_expected_files(prefix)) == before
+
+
+def test_only_missing_refuses_a_half_installed_group(four_group_prefix: Path) -> None:
+    """A manifest without its private key (or the reverse) is not completed silently:
+    the manifest names a key path, so rebuilding either half changes what the other
+    half means."""
+
+    _expected_files(four_group_prefix)["shadow_private"].unlink()
+
+    result = _run("init", "--prefix", str(four_group_prefix), "--only-missing")
+
+    assert result.returncode == 3
+    assert "half installed" in result.stderr
+    assert not _expected_files(four_group_prefix)["completion_manifest"].exists()
+
+
+def test_only_missing_dry_run_names_the_groups_without_writing(
+    four_group_prefix: Path,
+) -> None:
+    before = _fingerprints(_expected_files(four_group_prefix))
+
+    result = _run("init", "--prefix", str(four_group_prefix), "--only-missing", "--dry-run")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "would create groups completion,capabilities" in result.stdout
+    assert _fingerprints(_expected_files(four_group_prefix)) == before
+
+
+# --------------------------------------------------------------------------- K-15
+# M-2: the completion trusted keyring, published and read back.
+
+
+def _infra(prefix: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "/bin/bash",
+            str(ROOT / "scripts" / "install-runtime-credential-infra.sh"),
+            "--test-root",
+            str(prefix),
+            *extra,
+        ],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _completion_keyring(prefix: Path) -> Path:
+    return prefix / "etc" / "rquant" / "shadow-completion-trusted-keys.json"
+
+
+def test_the_infra_installer_publishes_the_completion_trusted_keyring(
+    prefix: Path,
+) -> None:
+    """M-2: before this, nothing in the tree wrote this file at all."""
+
+    assert _init(prefix).returncode == 0
+
+    result = _infra(prefix)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    keyring = _completion_keyring(prefix)
+    assert keyring.is_file()
+    assert stat.S_IMODE(keyring.lstat().st_mode) == 0o444
+    document = json.loads(keyring.read_bytes())
+    assert set(document) == {
+        "schema_version",
+        "generation",
+        "previous_manifest_hash",
+        "active_key_id",
+        "active_public_key",
+        "previous_public_keys",
+        "manifest_hash",
+        "signature",
+    }
+    assert document["active_key_id"] == "completion-v1"
+    assert document["active_public_key"].startswith("-----BEGIN PUBLIC KEY-----")
+
+
+def test_the_completion_keyring_is_not_the_report_keyring(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    assert _infra(prefix).returncode == 0
+
+    completion = json.loads(_completion_keyring(prefix).read_bytes())
+    report = json.loads(
+        (prefix / "etc" / "rquant" / "shadow-report-trusted-keys.json").read_bytes()
+    )
+
+    assert completion["active_key_id"] != report["active_key_id"]
+    assert completion["active_public_key"] != report["active_public_key"]
+
+
+def test_only_missing_keyrings_publishes_just_the_absent_one(prefix: Path) -> None:
+    """Route A adds a fifth keyring to a host whose other four are published and whose
+    Daily authority is running; re-running the whole installer to add it would restart
+    that authority and rewrite sudoers for no reason."""
+
+    assert _init(prefix).returncode == 0
+    assert _infra(prefix).returncode == 0
+    published = {
+        path.name: (path.read_bytes(), path.lstat().st_mtime_ns)
+        for path in sorted((prefix / "etc" / "rquant").glob("*trusted-keys.json"))
+    }
+    assert len(published) == 5
+    _completion_keyring(prefix).chmod(0o644)
+    _completion_keyring(prefix).unlink()
+
+    result = _infra(prefix, "--only-missing-keyrings")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "published 1 missing keyring(s)" in result.stdout
+    assert _completion_keyring(prefix).is_file()
+    for name, (payload, mtime) in published.items():
+        if name == _completion_keyring(prefix).name:
+            continue
+        path = prefix / "etc" / "rquant" / name
+        assert path.read_bytes() == payload, name
+        assert path.lstat().st_mtime_ns == mtime, name
+
+
+def test_only_missing_keyrings_on_a_complete_tree_publishes_nothing(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    assert _infra(prefix).returncode == 0
+    published = {
+        path.name: (path.read_bytes(), path.lstat().st_mtime_ns)
+        for path in sorted((prefix / "etc" / "rquant").glob("*trusted-keys.json"))
+    }
+
+    result = _infra(prefix, "--only-missing-keyrings")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "published 0 missing keyring(s)" in result.stdout
+    assert {
+        path.name: (path.read_bytes(), path.lstat().st_mtime_ns)
+        for path in sorted((prefix / "etc" / "rquant").glob("*trusted-keys.json"))
+    } == published

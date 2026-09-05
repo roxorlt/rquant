@@ -8,8 +8,11 @@
 路线 A 加了两块（协调者裁决 2 与 3）：
 
 - **`completion` 钥匙串**：Shadow 完成态证明的签名公钥单独一套，不复用 `shadow` 报告钥匙
-  （一钥一用）。它的清单形状与 canvas 相同（`schema_version` 1、四字段、不成链），因为目前
-  还没有 completion 专属 helper，canvas helper 是树里唯一能校验这个形状的加载器。
+  （一钥一用）。它的清单形状与 **daily-receipt 相同**（`schema_version` 2、成链），因为生产
+  画像要从公钥环里读回这把公钥，读法与 daily receipt 钥匙串同判据——必须是 root 持有的
+  0444、带 `manifest_hash` 与 Ed25519 签名、`generation` 与 `previous_manifest_hash` 自洽，
+  而这两个字段只能来自成链的私有清单。目前还没有 completion 专属 helper，daily helper 是树里
+  唯一能校验并导出这个形状的加载器，两个安装脚本都通过同一个 runpy 接缝驱动它。
 - **六个运行时能力凭证**：`runtime_capabilities.CAPABILITY_KEYS` 里没有归属的那六个值
   （reference-slow 源签名三个、reference 发布 HMAC 两个、artifact retention writer 一个）。
   它们不是钥匙串文件，而是部署器从**进程环境**读的值
@@ -78,6 +81,28 @@ sudo bash scripts/install-runtime-credential-keys.sh init \
 
 `open_dates` 必须严格升序、去重、且落在 `[coverage_start, coverage_end]` 内，否则
 helper 报 `Shadow recovery calendar coverage is invalid`。
+
+## 一之二、往已有的树里补装（`--only-missing`）
+
+生产主机的 `/etc/rquant` 已经装了 B-2 那四套。这种状态下裸跑 `init` 会因为
+`lab-highwater-keys.json` 等已存在整体退出 **3**、一个字节都不写；换 `--key-suffix` 也躲不开，
+清单文件名不带 suffix。**不能靠「删干净重跑」绕过**：daily-receipt 的密钥链已经在跑，
+canvas / shadow-report 的公钥环已经发布并被现役画像引用，删掉重建等于把四套全部轮换一遍。
+
+```bash
+# 只补没装的组，已装的清单与私钥一个字节不碰
+sudo bash scripts/install-runtime-credential-keys.sh init --only-missing --dry-run
+sudo bash scripts/install-runtime-credential-keys.sh init --only-missing
+sudo bash scripts/install-runtime-credential-keys.sh verify        # 13 行 OK
+
+# 公钥环同理：只发布还没发布的那一份，不碰 helper / unit / sudoers
+sudo bash scripts/install-runtime-credential-infra.sh --only-missing-keyrings
+```
+
+组的粒度是「一套钥匙串或能力凭证」：`highwater` / `canvas` / `shadow`（含日历）/
+`completion` / `daily` / `capabilities`。**半装的组会被拒绝而不是补全**（退出 3）——清单里
+写着私钥路径，只补其中一半会让另一半的含义变掉。全都装好时 `--only-missing` 退出 **4** 并
+说明无事可做。
 
 ## 二、首次安装（runbook B-2）
 
@@ -196,6 +221,7 @@ sudo bash scripts/install-runtime-credential-keys.sh verify
 - 生成/轮换/复核脚本：`scripts/install-runtime-credential-keys.sh`
 - 基础设施安装器（装 helper、导出公钥环、写 sudoers）：`scripts/install-runtime-credential-infra.sh`
 - 四个 helper 消费者：`deploy/libexec/rquant-{lab-highwater-authority,canvas-publication-signer,shadow-report-signer,daily-receipt-signer}`
+  （`completion` 没有专属 helper，由 daily helper 通过 runpy 接缝校验与导出）
 - 六个能力凭证的消费者：`src/rquant/live_spool.py` 的 `ReferenceSourceBatchSigner` /
   `ReferenceSourceBatchVerifier`、`src/rquant/reference_data_registry.py` 的
   `ReferencePublicationAuthenticator`、`src/rquant/runtime_builder_retention.py` 的

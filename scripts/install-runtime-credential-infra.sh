@@ -15,6 +15,11 @@ TEST_ROOT=""
 FAIL_STEP=""
 TEST_DAILY_AUTHORITY_SOURCE=""
 TEST_SYSTEMCTL_BIN="${RQUANT_TEST_SYSTEMCTL_BIN:-}"
+#: Publish only the trusted keyrings that are not on disk yet, and nothing else. B-3
+#: already installed the helpers, units and sudoers on the production host; route A adds
+#: a fifth keyring (`shadow-completion`) and re-running the whole installer to publish it
+#: would restart the Daily authority and rewrite sudoers for no reason.
+ONLY_MISSING_KEYRINGS=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,6 +38,10 @@ while [[ $# -gt 0 ]]; do
         --test-systemctl)
             TEST_SYSTEMCTL_BIN="${2:?missing --test-systemctl value}"
             shift 2
+            ;;
+        --only-missing-keyrings)
+            ONLY_MISSING_KEYRINGS=1
+            shift
             ;;
         *)
             printf 'Unknown argument: %s\n' "$1" >&2
@@ -114,6 +123,8 @@ CANVAS_KEYS_FILE="${PREFIX}/etc/rquant/canvas-publication-keys.json"
 CANVAS_PUBLIC_KEYS_FILE="${PREFIX}/etc/rquant/canvas-publication-trusted-keys.json"
 SHADOW_KEYS_FILE="${PREFIX}/etc/rquant/shadow-report-keys.json"
 SHADOW_PUBLIC_KEYS_FILE="${PREFIX}/etc/rquant/shadow-report-trusted-keys.json"
+COMPLETION_KEYS_FILE="${PREFIX}/etc/rquant/shadow-completion-keys.json"
+COMPLETION_PUBLIC_KEYS_FILE="${PREFIX}/etc/rquant/shadow-completion-trusted-keys.json"
 DAILY_KEYS_FILE="${PREFIX}/etc/rquant/daily-receipt-keys.json"
 DAILY_PUBLIC_KEYS_FILE="${PREFIX}/etc/rquant/daily-receipt-trusted-keys.json"
 SUDOERS_DIR="${PREFIX}/etc/sudoers.d"
@@ -130,16 +141,22 @@ if [[ -n "${TEST_ROOT}" ]]; then
     CANVAS_PUBLIC_EXPORT="${CANVAS_PUBLIC_KEYS_FILE}.export.$$"
     SHADOW_PUBLIC_EXPORT="${SHADOW_PUBLIC_KEYS_FILE}.export.$$"
     DAILY_PUBLIC_EXPORT="${DAILY_PUBLIC_KEYS_FILE}.export.$$"
+    COMPLETION_PUBLIC_EXPORT="${COMPLETION_PUBLIC_KEYS_FILE}.export.$$"
 else
     HIGHWATER_PUBLIC_EXPORT="/tmp/rquant-lab-highwater-trusted-keys.$$.json"
     CANVAS_PUBLIC_EXPORT="/tmp/rquant-canvas-publication-trusted-keys.$$.json"
     SHADOW_PUBLIC_EXPORT="/tmp/rquant-shadow-report-trusted-keys.$$.json"
     DAILY_PUBLIC_EXPORT="/tmp/rquant-daily-receipt-trusted-keys.$$.json"
+    COMPLETION_PUBLIC_EXPORT="/tmp/rquant-shadow-completion-trusted-keys.$$.json"
 fi
 HIGHWATER_PUBLIC_STAGING="${HIGHWATER_PUBLIC_KEYS_FILE}.tmp.$$"
 CANVAS_PUBLIC_STAGING="${CANVAS_PUBLIC_KEYS_FILE}.tmp.$$"
 SHADOW_PUBLIC_STAGING="${SHADOW_PUBLIC_KEYS_FILE}.tmp.$$"
 DAILY_PUBLIC_STAGING="${DAILY_PUBLIC_KEYS_FILE}.tmp.$$"
+COMPLETION_PUBLIC_STAGING="${COMPLETION_PUBLIC_KEYS_FILE}.tmp.$$"
+#: `install-runtime-credential-keys.sh` carries the identical literal; both drive the
+#: daily helper against a caller-named manifest/keyring pair.
+COMPLETION_SEAM='from pathlib import Path; import runpy, sys; module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; operation.__globals__["PUBLIC_KEYS_FILE"] = Path(sys.argv[3]); operation(Path(sys.argv[2]))'
 SUDOERS_STAGING="${SUDOERS_TARGET}.tmp.$$"
 SUDOERS_BACKUP="${SUDOERS_TARGET}.backup"
 
@@ -165,6 +182,8 @@ cleanup() {
             "${SHADOW_PUBLIC_STAGING}" \
             "${DAILY_PUBLIC_EXPORT}" \
             "${DAILY_PUBLIC_STAGING}" \
+            "${COMPLETION_PUBLIC_EXPORT}" \
+            "${COMPLETION_PUBLIC_STAGING}" \
             "${SUDOERS_STAGING}"
         /bin/rm -rf "${DAILY_AUTHORITY_STAGE_DIR}"
     else
@@ -181,11 +200,13 @@ cleanup() {
             "${CANVAS_PUBLIC_STAGING}" \
             "${SHADOW_PUBLIC_STAGING}" \
             "${DAILY_PUBLIC_STAGING}" \
+            "${COMPLETION_PUBLIC_STAGING}" \
             "${SUDOERS_STAGING}" || true
         sudo /bin/rm -rf "${DAILY_AUTHORITY_STAGE_DIR}" || true
         /bin/rm -f "${CANVAS_PUBLIC_EXPORT}" || true
         /bin/rm -f "${SHADOW_PUBLIC_EXPORT}" || true
         /bin/rm -f "${DAILY_PUBLIC_EXPORT}" || true
+        /bin/rm -f "${COMPLETION_PUBLIC_EXPORT}" || true
     fi
     return "${status}"
 }
@@ -1404,6 +1425,80 @@ validate_shadow_public_keyring_metadata() {
     fi
 }
 
+validate_completion_key_material() {
+    # The completion manifest is the daily shape, so the daily helper is its loader. That
+    # helper is zero-argument in production (it pins the daily paths at module scope), so
+    # both branches drive it through the same runpy seam the daily `--test-root` path
+    # already uses, with the two completion paths substituted.
+    local request='{"operation":"validate-key-material","schema_version":1}'
+    if [[ -n "${TEST_ROOT}" ]]; then
+        printf '%s' "${request}" | /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+            "${DAILY_HELPER_TARGET}" \
+            "${COMPLETION_KEYS_FILE}" \
+            "${COMPLETION_PUBLIC_KEYS_FILE}" >/dev/null
+    else
+        printf '%s' "${request}" | sudo /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+            "${DAILY_HELPER_TARGET}" \
+            "${COMPLETION_KEYS_FILE}" \
+            "${COMPLETION_PUBLIC_KEYS_FILE}" >/dev/null
+    fi
+}
+
+export_completion_public_keyring() {
+    umask 077
+    local request='{"operation":"export-public-keyring","schema_version":1}'
+    if [[ -n "${TEST_ROOT}" ]]; then
+        printf '%s' "${request}" | /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+            "${DAILY_HELPER_TARGET}" \
+            "${COMPLETION_KEYS_FILE}" \
+            "${COMPLETION_PUBLIC_KEYS_FILE}" >"${COMPLETION_PUBLIC_EXPORT}"
+    else
+        printf '%s' "${request}" | sudo /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+            "${DAILY_HELPER_TARGET}" \
+            "${COMPLETION_KEYS_FILE}" \
+            "${COMPLETION_PUBLIC_KEYS_FILE}" >"${COMPLETION_PUBLIC_EXPORT}"
+    fi
+    /bin/chmod 0444 "${COMPLETION_PUBLIC_EXPORT}"
+}
+
+install_completion_public_keyring() {
+    if [[ -n "${TEST_ROOT}" ]]; then
+        /usr/bin/install -m 0444 "${COMPLETION_PUBLIC_EXPORT}" "${COMPLETION_PUBLIC_STAGING}"
+    else
+        sudo /usr/bin/install \
+            -o root \
+            -g root \
+            -m 0444 \
+            "${COMPLETION_PUBLIC_EXPORT}" \
+            "${COMPLETION_PUBLIC_STAGING}"
+    fi
+}
+
+validate_completion_public_keyring_metadata() {
+    local actual expected_owner
+    if [[ -n "${TEST_ROOT}" ]]; then
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${COMPLETION_PUBLIC_KEYS_FILE}")"
+        expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
+    else
+        actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${COMPLETION_PUBLIC_KEYS_FILE}")"
+        expected_owner="0:0"
+    fi
+    if [[ "${actual%:*}" != "${expected_owner}" || "${actual##*:}" != "444" ]]; then
+        printf 'Unsafe Shadow completion public keyring: %s (expected owner %s and mode 444)\n' \
+            "${actual}" "${expected_owner}" >&2
+        exit 1
+    fi
+}
+
+publish_completion_public_keyring() {
+    run_step completion_key_material validate_completion_key_material
+    run_step completion_public_export export_completion_public_keyring
+    run_step completion_public_install install_completion_public_keyring
+    run_step completion_public_publish privileged /bin/mv -f \
+        "${COMPLETION_PUBLIC_STAGING}" "${COMPLETION_PUBLIC_KEYS_FILE}"
+    validate_completion_public_keyring_metadata
+}
+
 validate_daily_public_keyring_metadata() {
     local actual expected_owner
     if [[ -n "${TEST_ROOT}" ]]; then
@@ -1419,6 +1514,65 @@ validate_daily_public_keyring_metadata() {
         exit 1
     fi
 }
+
+if (( ONLY_MISSING_KEYRINGS == 1 )); then
+    published=0
+    for pair in \
+        "highwater:${HIGHWATER_PUBLIC_KEYS_FILE}" \
+        "canvas:${CANVAS_PUBLIC_KEYS_FILE}" \
+        "shadow:${SHADOW_PUBLIC_KEYS_FILE}" \
+        "completion:${COMPLETION_PUBLIC_KEYS_FILE}" \
+        "daily:${DAILY_PUBLIC_KEYS_FILE}"; do
+        kind="${pair%%:*}"
+        target="${pair#*:}"
+        if [[ -e "${target}" ]]; then
+            printf 'keyring already published, leaving it untouched: %s\n' "${target}"
+            continue
+        fi
+        case "${kind}" in
+            highwater)
+                run_step highwater_key_material validate_highwater_key_material
+                run_step highwater_public_export export_highwater_public_keyring
+                run_step highwater_public_install install_public_keyring
+                run_step highwater_public_publish privileged /bin/mv -f \
+                    "${HIGHWATER_PUBLIC_STAGING}" "${HIGHWATER_PUBLIC_KEYS_FILE}"
+                validate_highwater_public_keyring_metadata
+                ;;
+            canvas)
+                run_step canvas_key_material validate_canvas_key_material
+                run_step canvas_public_export export_canvas_public_keyring
+                run_step canvas_public_install install_canvas_public_keyring
+                run_step canvas_public_publish privileged /bin/mv -f \
+                    "${CANVAS_PUBLIC_STAGING}" "${CANVAS_PUBLIC_KEYS_FILE}"
+                validate_canvas_public_keyring_metadata
+                ;;
+            shadow)
+                run_step shadow_key_material validate_shadow_key_material
+                run_step shadow_public_export export_shadow_public_keyring
+                run_step shadow_public_install install_shadow_public_keyring
+                run_step shadow_public_publish privileged /bin/mv -f \
+                    "${SHADOW_PUBLIC_STAGING}" "${SHADOW_PUBLIC_KEYS_FILE}"
+                validate_shadow_public_keyring_metadata
+                ;;
+            completion)
+                publish_completion_public_keyring
+                ;;
+            daily)
+                run_step daily_key_material validate_daily_key_material
+                run_step daily_public_export export_daily_public_keyring
+                run_step daily_public_install install_file 0444 \
+                    "${DAILY_PUBLIC_EXPORT}" "${DAILY_PUBLIC_STAGING}"
+                run_step daily_public_publish privileged /bin/mv -f \
+                    "${DAILY_PUBLIC_STAGING}" "${DAILY_PUBLIC_KEYS_FILE}"
+                validate_daily_public_keyring_metadata
+                ;;
+        esac
+        published=$((published + 1))
+    done
+    printf 'published %d missing keyring(s); no helper, unit or sudoers was touched\n' \
+        "${published}"
+    exit 0
+fi
 
 validate_daily_authority_ancestor_chain 1
 run_step libexec_dir install_helper_directory "${HELPER_DIR}"
@@ -1484,6 +1638,8 @@ run_step shadow_public_install install_shadow_public_keyring
 run_step shadow_public_publish privileged /bin/mv -f \
     "${SHADOW_PUBLIC_STAGING}" "${SHADOW_PUBLIC_KEYS_FILE}"
 validate_shadow_public_keyring_metadata
+publish_completion_public_keyring
+
 run_step daily_key_material validate_daily_key_material
 run_step daily_public_export export_daily_public_keyring
 run_step daily_public_install install_file 0444 "${DAILY_PUBLIC_EXPORT}" "${DAILY_PUBLIC_STAGING}"

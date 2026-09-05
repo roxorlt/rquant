@@ -4,7 +4,9 @@
 # the credstore seals into each service generation.
 #
 #   init                 creates the thirteen files described in
-#                        docs/operations/runtime-credential-keys.md
+#                        docs/operations/runtime-credential-keys.md; with
+#                        `--only-missing` it adds only the credential groups that are
+#                        not installed yet and does not touch the ones that are
 #   rotate               replaces one active key and folds the retired public key
 #                        into the manifest
 #   verify               re-checks ownership/mode/nlink/schema and runs each
@@ -48,6 +50,7 @@ KEY_SUFFIX="v1"
 NEW_KEY_SUFFIX=""
 ROTATE_TARGET=""
 DRY_RUN=0
+ONLY_MISSING=0
 CALENDAR_COVERAGE_START=""
 CALENDAR_COVERAGE_END=""
 CALENDAR_OPEN_DATES=""
@@ -83,6 +86,7 @@ usage() {
     cat >&2 <<'USAGE'
 usage:
   install-runtime-credential-keys.sh init   [--prefix DIR] [--key-suffix SUFFIX] [--dry-run]
+                                            [--only-missing]
                                             [--calendar-coverage-start YYYY-MM-DD]
                                             [--calendar-coverage-end YYYY-MM-DD]
                                             [--calendar-open-dates YYYY-MM-DD,...]
@@ -177,16 +181,21 @@ KIND_LAYOUT = {
         "chained": False,
     },
     "completion": {
-        # Ruling 3: its own keyring, not the report key reused. The manifest shape is
-        # the canvas one (schema_version 1, unchained) because no completion signer
-        # helper exists yet and the canvas helper is the only validator of that shape;
-        # see `run_consumer_self_checks`.
+        # Ruling 3: its own keyring, not the report key reused. The manifest is the
+        # *daily* shape — schema_version 2, chained — because the production profile
+        # reads this key back through `_load_daily_receipt_trusted_keyring`, which
+        # demands a signed, generation-bound trusted keyring, and that keyring's
+        # `generation` / `previous_manifest_hash` can only come from a chained manifest.
+        # No completion signer helper exists yet (the completion attestation signer is
+        # still to be injected into strategy_live), so the daily helper — the only
+        # loader of this exact shape — is what validates and exports it; see
+        # `run_consumer_self_checks` and `install-runtime-credential-infra.sh`.
         "directory": "shadow-completion",
         "manifest": "shadow-completion-keys.json",
         "keyring": "shadow-completion-trusted-keys.json",
         "key_prefix": "completion",
-        "schema_version": 1,
-        "chained": False,
+        "schema_version": 2,
+        "chained": True,
     },
     "daily": {
         "directory": "daily-receipt",
@@ -331,6 +340,31 @@ def directories(prefix):
         result.append((key_directory(prefix, kind), 0o700))
     result.append((capability_directory(prefix), 0o700))
     return result
+
+
+#: `init --only-missing` works one group at a time. A group is all-or-nothing: a
+#: keyring whose manifest exists but whose private key does not (or the reverse) is a
+#: half-built state this script will not try to complete, because the manifest names a
+#: key path and rebuilding either half silently would change what the other half means.
+GROUP_ORDER = KIND_ORDER + ("capabilities",)
+
+
+def group_files(prefix, group, suffix):
+    if group == "capabilities":
+        return [
+            capability_manifest_path(prefix),
+            reference_source_key_path(prefix, suffix),
+        ]
+    files = [manifest_path(prefix, group), private_key_path(prefix, group, suffix)]
+    if group == "shadow":
+        files.append(calendar_path(prefix))
+    return files
+
+
+def group_directory(prefix, group):
+    if group == "capabilities":
+        return capability_directory(prefix)
+    return key_directory(prefix, group)
 
 
 def planned_files(prefix, suffix):
@@ -643,6 +677,44 @@ def command_check_absent(argv):
     return 3 if existing else 0
 
 
+def command_check_missing_groups(argv):
+    """Classify every group as wholly present or wholly absent, and name the absent ones.
+
+    The production host already carries the four groups B-2 installed, so the all-or-
+    nothing `check-absent` above cannot be used to add a fifth keyring: it refuses on the
+    first file that exists, and no `--key-suffix` avoids that because the manifest names
+    do not carry the suffix. Deleting the four to re-run `init` would rotate key material
+    that a published keyring and a running receipt chain already depend on.
+
+    A group that is half present is reported as a problem rather than completed.
+    """
+
+    prefix, suffix = argv[0], argv[1]
+    missing = []
+    problems = []
+    for group in GROUP_ORDER:
+        files = group_files(prefix, group, suffix)
+        present = [path for path in files if os.path.lexists(path)]
+        if not present:
+            missing.append(group)
+        elif len(present) != len(files):
+            absent = sorted(set(files) - set(present))
+            problems.append(
+                "credential group %s is half installed; present=%s absent=%s"
+                % (group, sorted(present), absent)
+            )
+    for problem in problems:
+        sys.stderr.write("%s\n" % problem)
+    if problems:
+        return 3
+    if not missing:
+        sys.stderr.write("every credential group is already installed; nothing to create\n")
+        return 4
+    for group in missing:
+        sys.stdout.write("%s\n" % group)
+    return 0
+
+
 def load_manifest(prefix, kind):
     path = manifest_path(prefix, kind)
     document, payload = read_json(path)
@@ -740,29 +812,44 @@ def command_rotate_write(argv):
 def command_init_write(argv):
     prefix, suffix, uid, gid = argv[0], argv[1], int(argv[2]), int(argv[3])
     coverage_start, coverage_end, open_dates_csv = argv[4], argv[5], argv[6]
-    pid, public_key_file = argv[7], argv[8]
+    pid, public_key_file, groups_csv = argv[7], argv[8], argv[9]
+    groups = [value for value in groups_csv.split(",") if value] or list(GROUP_ORDER)
+    unknown = sorted(set(groups) - set(GROUP_ORDER))
+    if unknown:
+        raise Failure("unknown credential groups: %s" % unknown)
+    # Refuse before writing anything if a caller asked for a group that is already there.
+    for group in groups:
+        for path in group_files(prefix, group, suffix):
+            if os.path.lexists(path):
+                raise Failure("refusing to overwrite existing key material: %s" % path)
     open_dates = [value for value in open_dates_csv.split(",") if value]
     for kind in KIND_ORDER:
+        if kind not in groups:
+            continue
         temporary = "%s.tmp-%s" % (private_key_path(prefix, kind, suffix), pid)
         finalize_existing(temporary, private_key_path(prefix, kind, suffix), 0o600, uid, gid)
-    calendar = calendar_document(coverage_start, coverage_end, open_dates)
-    atomic_write(calendar_path(prefix), canonical(calendar), 0o600, uid, gid)
+    if "shadow" in groups:
+        calendar = calendar_document(coverage_start, coverage_end, open_dates)
+        atomic_write(calendar_path(prefix), canonical(calendar), 0o600, uid, gid)
     for kind in KIND_ORDER:
+        if kind not in groups:
+            continue
         document = genesis_manifest(prefix, kind, suffix)
         atomic_write(manifest_path(prefix, kind), canonical(document), 0o600, uid, gid)
-    reference_key = reference_source_key_path(prefix, suffix)
-    finalize_existing("%s.tmp-%s" % (reference_key, pid), reference_key, 0o600, uid, gid)
-    with open(public_key_file, "r") as handle:
-        public_key = handle.read()
-    issued_at = datetime.now(timezone.utc).replace(microsecond=0)
-    capabilities = capability_manifest(prefix, suffix, public_key, issued_at)
-    atomic_write(
-        capability_manifest_path(prefix),
-        canonical(capabilities),
-        0o600,
-        uid,
-        gid,
-    )
+    if "capabilities" in groups:
+        reference_key = reference_source_key_path(prefix, suffix)
+        finalize_existing("%s.tmp-%s" % (reference_key, pid), reference_key, 0o600, uid, gid)
+        with open(public_key_file, "r") as handle:
+            public_key = handle.read()
+        issued_at = datetime.now(timezone.utc).replace(microsecond=0)
+        capabilities = capability_manifest(prefix, suffix, public_key, issued_at)
+        atomic_write(
+            capability_manifest_path(prefix),
+            canonical(capabilities),
+            0o600,
+            uid,
+            gid,
+        )
     return 0
 
 
@@ -1097,6 +1184,7 @@ def main(argv):
     handlers = {
         "plan": command_plan,
         "check-absent": command_check_absent,
+        "check-missing-groups": command_check_missing_groups,
         "init-write": command_init_write,
         "rotate-current": command_rotate_current,
         "rotate-write": command_rotate_write,
@@ -1189,6 +1277,19 @@ etc_root() {
     fi
 }
 
+ensure_directory_if_absent() {
+    # `--only-missing` runs on a host whose `/etc/rquant` and four key directories were
+    # installed by B-2. Re-chmod/chown of a directory that already exists is a change to
+    # installed state, so an existing directory is left exactly as it is.
+    local path="$1" mode="$2" uid="$3" gid="$4"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -d "${path}" && ! -L "${path}" ]] \
+            || fail "refusing to use a non-directory credential path: ${path}"
+        return 0
+    fi
+    ensure_directory "${path}" "${mode}" "${uid}" "${gid}"
+}
+
 ensure_directory() {
     local path="$1" mode="$2" uid="$3" gid="$4"
     if [[ -L "${path}" ]]; then
@@ -1235,6 +1336,12 @@ reference_source_key_path() {
     printf '%s/reference-source-%s\n' "$(capability_directory)" "$1"
 }
 
+WANTED_GROUPS=""
+
+wants_group() {
+    [[ ",${WANTED_GROUPS}," == *",$1,"* ]]
+}
+
 command_init() {
     while (( $# > 0 )); do
         parse_common_option "$@"
@@ -1250,6 +1357,10 @@ command_init() {
                 ;;
             --dry-run)
                 DRY_RUN=1
+                shift
+                ;;
+            --only-missing)
+                ONLY_MISSING=1
                 shift
                 ;;
             --calendar-coverage-start)
@@ -1275,9 +1386,31 @@ command_init() {
     validate_suffix "${KEY_SUFFIX}"
     require_privilege
 
-    local status=0
+    local status=0 groups="" group
+    local -a wanted=()
+    if (( ONLY_MISSING == 1 )); then
+        set +e
+        groups="$(run_worker check-missing-groups "${PREFIX}" "${KEY_SUFFIX}")"
+        status=$?
+        set -e
+        if (( status != 0 )); then
+            exit "${status}"
+        fi
+        while IFS= read -r group; do
+            [[ -n "${group}" ]] && wanted+=("${group}")
+        done <<<"${groups}"
+        (( ${#wanted[@]} > 0 )) || fail "no credential group is missing" 4
+        groups="$(IFS=,; printf '%s' "${wanted[*]}")"
+    else
+        wanted=(highwater canvas shadow completion daily capabilities)
+    fi
+
     if (( DRY_RUN == 1 )); then
         run_worker plan "${PREFIX}" "${KEY_SUFFIX}"
+        if (( ONLY_MISSING == 1 )); then
+            printf 'dry run: would create groups %s\n' "${groups}"
+            return 0
+        fi
         run_worker check-absent "${PREFIX}" "${KEY_SUFFIX}" || status=$?
         if (( status != 0 )); then
             exit "${status}"
@@ -1286,9 +1419,11 @@ command_init() {
         return 0
     fi
 
-    run_worker check-absent "${PREFIX}" "${KEY_SUFFIX}" || status=$?
-    if (( status != 0 )); then
-        exit "${status}"
+    if (( ONLY_MISSING == 0 )); then
+        run_worker check-absent "${PREFIX}" "${KEY_SUFFIX}" || status=$?
+        if (( status != 0 )); then
+            exit "${status}"
+        fi
     fi
 
     local uid gid openssl_bin ssh_keygen_bin kind target temporary
@@ -1297,14 +1432,22 @@ command_init() {
     gid="$(owner_gid)"
     openssl_bin="$(openssl_binary)"
     ssh_keygen_bin="$(ssh_keygen_binary)"
+    if [[ -z "${groups}" ]]; then
+        groups="$(IFS=,; printf '%s' "${wanted[*]}")"
+    fi
+    WANTED_GROUPS="${groups}"
 
-    ensure_directory "$(etc_root)" 0755 "${uid}" "${gid}"
+    ensure_directory_if_absent "$(etc_root)" 0755 "${uid}" "${gid}"
     for kind in highwater canvas shadow completion daily; do
-        ensure_directory "$(key_directory "${kind}")" 0700 "${uid}" "${gid}"
+        wants_group "${kind}" || continue
+        ensure_directory_if_absent "$(key_directory "${kind}")" 0700 "${uid}" "${gid}"
     done
-    ensure_directory "$(capability_directory)" 0700 "${uid}" "${gid}"
+    if wants_group capabilities; then
+        ensure_directory_if_absent "$(capability_directory)" 0700 "${uid}" "${gid}"
+    fi
 
     for kind in highwater canvas shadow completion daily; do
+        wants_group "${kind}" || continue
         target="$(private_key_path "${kind}" "${KEY_SUFFIX}")"
         temporary="${target}.tmp-$$"
         TMP_PATHS+=("${temporary}")
@@ -1313,13 +1456,16 @@ command_init() {
 
     # `ssh-keygen -Y sign` (live_spool.ReferenceSourceBatchSigner) needs an OpenSSH
     # private key, so this one key is not an openssl PKCS#8 PEM like the five above.
-    reference_target="$(reference_source_key_path "${KEY_SUFFIX}")"
-    reference_temporary="${reference_target}.tmp-$$"
-    reference_public="${reference_target}.pub-$$"
-    TMP_PATHS+=("${reference_temporary}" "${reference_temporary}.pub" "${reference_public}")
-    "${ssh_keygen_bin}" -q -t ed25519 -N '' -C '' -f "${reference_temporary}" >/dev/null
-    "${ssh_keygen_bin}" -y -f "${reference_temporary}" >"${reference_public}"
-    /bin/chmod 0600 "${reference_public}"
+    reference_public=""
+    if wants_group capabilities; then
+        reference_target="$(reference_source_key_path "${KEY_SUFFIX}")"
+        reference_temporary="${reference_target}.tmp-$$"
+        reference_public="${reference_target}.pub-$$"
+        TMP_PATHS+=("${reference_temporary}" "${reference_temporary}.pub" "${reference_public}")
+        "${ssh_keygen_bin}" -q -t ed25519 -N '' -C '' -f "${reference_temporary}" >/dev/null
+        "${ssh_keygen_bin}" -y -f "${reference_temporary}" >"${reference_public}"
+        /bin/chmod 0600 "${reference_public}"
+    fi
 
     run_worker init-write \
         "${PREFIX}" \
@@ -1330,16 +1476,21 @@ command_init() {
         "${CALENDAR_COVERAGE_END}" \
         "${CALENDAR_OPEN_DATES}" \
         "$$" \
-        "${reference_public}"
-    /bin/rm -f -- "${reference_public}" "${reference_temporary}.pub"
-    TMP_PATHS=()
+        "${reference_public}" \
+        "${groups}"
+    cleanup_temporaries
 
-    printf 'created 13 credential files under %s\n' "$(etc_root)"
+    printf 'created credential groups %s under %s\n' \
+        "${groups:-all}" "$(etc_root)"
 }
 
 DAILY_STDIN_SEAM='from pathlib import Path; import runpy, sys; module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; operation(Path(sys.argv[2]))'
+#: The same seam with the published-keyring global repointed, so the daily helper can be
+#: driven against the completion pair. `install-runtime-credential-infra.sh:1291-1295`
+#: already uses exactly this form for the daily pair under `--test-root`.
+COMPLETION_STDIN_SEAM='from pathlib import Path; import runpy, sys; module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; operation.__globals__["PUBLIC_KEYS_FILE"] = Path(sys.argv[3]); operation(Path(sys.argv[2]))'
 DAILY_VALIDATE_REQUEST='{"operation":"validate-key-material","schema_version":1}'
-readonly DAILY_STDIN_SEAM DAILY_VALIDATE_REQUEST
+readonly DAILY_STDIN_SEAM COMPLETION_STDIN_SEAM DAILY_VALIDATE_REQUEST
 
 resolve_helper_dir() {
     local candidate
@@ -1404,12 +1555,15 @@ run_consumer_self_checks() {
         --keys-file "$(manifest_file canvas)" --validate-key-material >/dev/null
     "${PYTHON_BIN}" "${helper_dir}/rquant-shadow-report-signer" \
         --keys-file "$(manifest_file shadow)" --validate-key-material >/dev/null
-    # The completion keyring has no signer helper of its own yet (the completion
-    # attestation signer is still to be injected into strategy_live), and its manifest
-    # is byte-for-byte the canvas shape — schema_version 1, four fields, unchained —
-    # so the canvas helper is the validator that actually exists for it.
-    "${PYTHON_BIN}" "${helper_dir}/rquant-canvas-publication-signer" \
-        --keys-file "$(manifest_file completion)" --validate-key-material >/dev/null
+    # The completion keyring has no signer helper of its own yet, and its manifest is
+    # byte-for-byte the daily shape — schema_version 2, chained, six fields — so the
+    # daily helper, driven through the same runpy seam with the completion paths, is the
+    # validator that actually exists for it.
+    printf '%s' "${DAILY_VALIDATE_REQUEST}" \
+        | "${PYTHON_BIN}" -I -S -c "${COMPLETION_STDIN_SEAM}" \
+            "${helper_dir}/rquant-daily-receipt-signer" \
+            "$(manifest_file completion)" \
+            "$(keyring_file completion)" >/dev/null
     # A published trusted keyring pins the chain's generation ceiling for the
     # consumer's own export.  install-runtime-credential-infra.sh:1302-1318 always
     # appends --current-keyring when one exists; without it here, the export always

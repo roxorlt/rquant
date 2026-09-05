@@ -28,7 +28,7 @@ from rquant.runtime_production_profile import (
     load_production_runtime_profile_inputs,
 )
 from rquant.runtime_routing_policy import load_frozen_routing_policy
-from rquant.strict_json import strict_canonical_json_loads
+from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 COMMIT = "a" * 40
 SNAPSHOT_ID = "b" * 64
@@ -316,3 +316,261 @@ def test_the_primary_duckdb_is_refused_without_an_explicit_override(tmp_path: Pa
         generator.main(_argv(tmp_path, **{"--calendar-database": str(tmp_path / "rquant.duckdb")}))
         == 2
     )
+
+
+# --------------------------------------------------------------------------- S-1 / S-4
+# The linux-production path: generated documents, the signed completion keyring the
+# credential installers publish, the real strict loader, and the real builder.
+
+import json  # noqa: E402
+import subprocess  # noqa: E402
+
+import rquant.runtime_artifact_terminal_lifecycle as terminal_lifecycle_module  # noqa: E402
+import rquant.runtime_deployment_profile as deployment_profile_module  # noqa: E402
+import rquant.runtime_production_profile as production_profile_module  # noqa: E402
+from tests.unit.test_runtime_production_profile import (  # noqa: E402
+    _daily_keyring_document,
+    _daily_private_key,
+    _mark_daily_keyring_root_owned,
+)
+
+SCRIPTS = generator._REPOSITORY_ROOT / "scripts"
+
+
+def _install_credentials(prefix: Path) -> Path:
+    """Run the two real installers into a test root and hand back the completion keyring.
+
+    Nothing here is a stand-in: `install-runtime-credential-keys.sh` mints the completion
+    key material and `install-runtime-credential-infra.sh` publishes the 0444 signed
+    keyring, which is the file the production profile has to read fields 37-38 from.
+    """
+
+    prefix.mkdir(mode=0o755)
+    for argv in (
+        ["init", "--prefix", str(prefix)],
+        None,
+    ):
+        if argv is None:
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(SCRIPTS / "install-runtime-credential-infra.sh"),
+                    "--test-root",
+                    str(prefix),
+                ],
+                cwd=str(generator._REPOSITORY_ROOT),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            result = subprocess.run(
+                ["/bin/bash", str(SCRIPTS / "install-runtime-credential-keys.sh"), *argv],
+                cwd=str(generator._REPOSITORY_ROOT),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        assert result.returncode == 0, result.stdout + result.stderr
+    return prefix / "etc" / "rquant" / "shadow-completion-trusted-keys.json"
+
+
+def _linux_production_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], Path, Path]:
+    """Everything a linux-production generator run needs, on a symlink-free test host.
+
+    Returns the argv, the published completion keyring and the runtime root the frozen
+    literal was pointed at.
+    """
+
+    # `/home` resolves through an autofs symlink on macOS and the bundle refuses a
+    # symlinked ancestor of the runtime root, so the frozen literal points at a
+    # symlink-free temporary host layout. The `runtime_mode` branch is what is under test.
+    host_root = tmp_path / "host" / "rquant" / "data" / "runtime"
+    for module, name in (
+        (production_profile_module, "LINUX_PRODUCTION_RUNTIME_ROOT"),
+        (deployment_profile_module, "LINUX_PRODUCTION_RUNTIME_ROOT"),
+        (terminal_lifecycle_module, "_LINUX_PRODUCTION_RUNTIME_ROOT"),
+    ):
+        monkeypatch.setattr(module, name, host_root)
+
+    completion_keyring = _install_credentials(tmp_path / "etcroot")
+    _mark_daily_keyring_root_owned(monkeypatch, completion_keyring)
+
+    private_key, public_key = _daily_private_key(tmp_path / "daily", key_id="daily-v1")
+    daily_keyring = tmp_path / "etc" / "rquant" / "daily-receipt-trusted-keys.json"
+    daily_keyring.parent.mkdir(parents=True, mode=0o700)
+    daily_keyring.write_bytes(
+        canonical_json_bytes(
+            _daily_keyring_document(
+                private_key,
+                active_key_id="daily-v1",
+                active_public_key=public_key,
+            )
+        )
+    )
+    daily_keyring.chmod(0o444)
+    _mark_daily_keyring_root_owned(monkeypatch, daily_keyring)
+    monkeypatch.setattr(
+        production_profile_module,
+        "DAILY_RECEIPT_TRUSTED_KEYRING_PATH",
+        daily_keyring,
+    )
+
+    data_root = host_root.parent
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+    argv = [
+        "--producer-commit",
+        COMMIT,
+        "--calendar-database",
+        str(tmp_path / "calendar.duckdb"),
+        "--output-root",
+        str(tmp_path / "inputs"),
+        "--inputs-output",
+        str(tmp_path / "runtime-production-inputs.json"),
+        "--runtime-root",
+        str(host_root),
+        "--operational-database-path",
+        str(data_root / "rquant.duckdb"),
+        "--definition-registry-root",
+        str(tmp_path / "inputs" / "definitions"),
+        "--minutes-snapshot",
+        str(tmp_path / "inputs" / "minute-history.parquet"),
+        "--minutes-snapshot-sha256",
+        SNAPSHOT_ID,
+        "--runtime-mode",
+        "linux-production",
+        "--recovery-backup-config",
+        str(data_root / "recovery" / "backup.json"),
+        "--recovery-credential-file",
+        str(data_root / "recovery" / "credential.json"),
+        "--canvas-active-key-id",
+        "canvas-v1",
+        "--canvas-active-public-key-pem",
+        "canvas-public-test-key",
+        "--shadow-report-active-key-id",
+        "shadow-report-v1",
+        "--shadow-report-active-public-key-pem",
+        "shadow-report-public-test-key",
+        "--shadow-completion-keyring",
+        str(completion_keyring),
+    ]
+
+    return argv, completion_keyring, host_root
+
+
+def test_a_linux_production_document_loads_and_builds_with_the_published_keyring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generate, publish, read: the whole chain the host will walk.
+
+    The completion public key is not passed in as a literal — it comes out of the 0444
+    keyring the credential installers just published, read with the same strict rules the
+    runtime applies to the Daily receipt keyring. Root ownership is the one host fact a
+    test cannot arrange, so both keyrings borrow the production-profile suite's
+    `os.stat`/`os.fstat` seam; every other rule runs for real.
+    """
+
+    argv, completion_keyring, host_root = _linux_production_argv(tmp_path, monkeypatch)
+
+    assert generator.main(argv) == 0
+
+    inputs = load_production_runtime_profile_inputs(
+        tmp_path / "runtime-production-inputs.json",
+        expected_commit=COMMIT,
+        expected_runtime_mode="linux-production",
+    )
+    profile = build_production_runtime_profile(inputs)
+
+    published = strict_canonical_json_loads(completion_keyring.read_bytes())
+    assert isinstance(published, dict)
+    assert inputs.shadow_completion_active_key_id == published["active_key_id"]
+    # `RuntimeContractModel` sets `str_strip_whitespace`, so the contract holds the PEM
+    # without the trailing newline `openssl pkey -pubout` leaves on it. The bytes the
+    # keyring publishes are what the comparison starts from.
+    assert inputs.shadow_completion_active_public_key_pem == (
+        str(published["active_public_key"]).strip()
+    )
+    assert str(published["active_public_key"]).startswith("-----BEGIN PUBLIC KEY-----")
+    assert inputs.runtime_root == host_root
+    assert profile.profile_id is not None
+    assert len(profile.manifests) == 26
+
+
+def test_a_world_readable_completion_keyring_stops_the_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strict rules are the point of reading it this way: 0444 exactly, root owned,
+    signature verified. A lenient JSON read parses this same file happily, so the test
+    goes through the generator's own wiring rather than calling the strict reader.
+
+    A keyring anyone can rewrite must not get to decide what the production profile
+    trusts.
+    """
+
+    argv, completion_keyring, _host_root = _linux_production_argv(tmp_path, monkeypatch)
+    completion_keyring.chmod(0o644)
+
+    assert generator.main(argv) == 2
+    assert not (tmp_path / "runtime-production-inputs.json").exists()
+
+
+def test_a_tampered_completion_keyring_stops_the_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And the signature is checked, not just the mode: an edited public key is refused
+    even though the file is still 0444 and still parses as JSON."""
+
+    argv, completion_keyring, _host_root = _linux_production_argv(tmp_path, monkeypatch)
+    document = json.loads(completion_keyring.read_bytes())
+    document["active_key_id"] = "completion-tampered"
+    completion_keyring.chmod(0o644)
+    completion_keyring.write_bytes(canonical_json_bytes(document))
+    completion_keyring.chmod(0o444)
+
+    assert generator.main(argv) == 2
+
+
+def test_the_strict_reader_refuses_a_world_readable_keyring_directly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completion_keyring = _install_credentials(tmp_path / "etcroot")
+    _mark_daily_keyring_root_owned(monkeypatch, completion_keyring)
+    completion_keyring.chmod(0o644)
+
+    with pytest.raises(generator.GeneratorError, match="signed trusted keyring is unusable"):
+        generator.read_signed_public_keyring(completion_keyring)
+
+
+def test_a_missing_completion_keyring_is_refused_rather_than_defaulted(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(generator.GeneratorError, match="signed trusted keyring is unusable"):
+        generator.read_signed_public_keyring(tmp_path / "absent-trusted-keys.json")
+
+
+def test_linux_production_refuses_a_runtime_root_that_is_not_the_frozen_one(
+    tmp_path: Path,
+) -> None:
+    """S-1: a pure literal comparison the host would make anyway, made before writing."""
+
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+
+    exit_code = generator.main(
+        _argv(
+            tmp_path,
+            **{
+                "--runtime-mode": "linux-production",
+                "--runtime-root": str(tmp_path / "not-the-production-root"),
+            },
+        )
+    )
+
+    assert exit_code == 2
+    assert not (tmp_path / "data" / "runtime-production-inputs.json").exists()

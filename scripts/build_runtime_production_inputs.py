@@ -49,6 +49,15 @@ Usage (the host layout of 82.156.0.68):
         --shadow-report-keyring /etc/rquant/shadow-report-trusted-keys.json \\
         --shadow-completion-keyring /etc/rquant/shadow-completion-trusted-keys.json \\
         --runtime-mode linux-production
+
+Run it with the checkout's own interpreter (`${WT}/.venv/bin/python`, or `uv run`): the
+host's bare `python` has no pydantic, duckdb or pandas. Leave `--checkout` at its default
+— the directory this script lives in — so `producer_commit` is the commit being deployed
+and not whatever the currently serving checkout happens to be at.
+
+`--shadow-completion-keyring` is read with the signed-keyring rules (root-owned, 0444,
+signature verified); the other two keyrings carry the older unsigned export shape and are
+read as plain JSON.
 """
 
 from __future__ import annotations
@@ -86,6 +95,7 @@ from rquant.runtime_market_session import MarketCalendarAuthority  # noqa: E402
 from rquant.runtime_production_profile import (  # noqa: E402
     ProductionRuntimeProfileInputs,
     ProductionStrategyBinding,
+    _load_daily_receipt_trusted_keyring,
 )
 from rquant.runtime_recovery_artifacts import RealRecoveryArtifactKind  # noqa: E402
 from rquant.runtime_routing_policy import RoutingPolicyDocument  # noqa: E402
@@ -597,6 +607,29 @@ def build_recovery_config(
 # ---------------------------------------------------------------------------------------
 
 
+def read_signed_public_keyring(path: Path) -> tuple[str, str]:
+    """The active key id and PEM of a *signed, generation-bound* trusted keyring.
+
+    This is the judgement `_load_daily_receipt_trusted_keyring` makes, borrowed rather
+    than restated: root-owned parent chain with no group or world write bit, a
+    single-linked regular file at exactly 0444 owned by root and at most 64 KiB, canonical
+    JSON with the eight signed fields, `schema_version` 2, the genesis or rotation binding
+    consistent with `generation`, a recomputed manifest hash and a verified Ed25519
+    signature over it.
+
+    The Shadow completion key is read this way because the runtime's own reader of that
+    keyring shape applies exactly these rules, and because the alternative — a lenient
+    JSON read — would let an unsigned or world-writable file decide what the production
+    profile trusts. A missing or unsafe keyring is refused; there is no placeholder.
+    """
+
+    try:
+        active_key_id, active_public_key, _previous = _load_daily_receipt_trusted_keyring(path)
+    except ValueError as exc:
+        raise GeneratorError(f"signed trusted keyring is unusable: {path} ({exc})") from exc
+    return active_key_id, active_public_key
+
+
 def read_active_public_key(path: Path) -> tuple[str, str]:
     """The active key id and PEM of one `/etc/rquant` trusted keyring.
 
@@ -820,9 +853,13 @@ def _resolve_key(
     key_id: str | None,
     public_key: str | None,
     required: bool,
+    signed: bool = False,
 ) -> tuple[str | None, str | None]:
     if keyring is not None:
-        return read_active_public_key(_require_absolute(keyring, label=f"{label} keyring"))
+        path = _require_absolute(keyring, label=f"{label} keyring")
+        if signed:
+            return read_signed_public_keyring(path)
+        return read_active_public_key(path)
     if key_id is not None and public_key is not None:
         return key_id, public_key
     if key_id is not None or public_key is not None:
@@ -850,6 +887,18 @@ def _run(arguments: argparse.Namespace) -> int:
     inputs_output = _require_absolute(arguments.inputs_output, label="inputs output")
     calendar_database = _require_absolute(arguments.calendar_database, label="calendar database")
     coverage_floor = date.fromisoformat(arguments.coverage_floor)
+    if arguments.runtime_mode == "linux-production":
+        # A pure literal comparison the loader will make anyway
+        # (`validate_complete_authority_set`, "Linux production runtime root must be
+        # exactly …"). Making it here costs nothing and turns a document that is refused
+        # on the host into an argument error before anything is written.
+        from rquant import runtime_deployment_profile as _deployment_profile
+
+        frozen_root = _deployment_profile.LINUX_PRODUCTION_RUNTIME_ROOT
+        if runtime_root != frozen_root:
+            raise GeneratorError(
+                f"linux-production runtime root must be exactly {frozen_root}: {runtime_root}"
+            )
 
     prepare_output_root(output_root)
 
@@ -950,6 +999,7 @@ def _run(arguments: argparse.Namespace) -> int:
         key_id=arguments.shadow_completion_active_key_id,
         public_key=arguments.shadow_completion_active_public_key_pem,
         required=True,
+        signed=True,
     )
     assert report_key_id is not None and report_public_key is not None
     assert completion_key_id is not None and completion_public_key is not None
