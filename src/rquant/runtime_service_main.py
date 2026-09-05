@@ -23,6 +23,12 @@ from rquant.runtime_deployment_profile import (
     PRODUCTION_SHADOW_SIGNER_COMMAND,
     load_current_runtime_deployment_profile,
 )
+from rquant.runtime_legacy_generation_binding import (
+    GENERATION_LEGACY_BINDING_NAME,
+    MAX_LEGACY_BINDING_BYTES,
+    LegacyGenerationBindingError,
+    parse_legacy_generation_binding,
+)
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceKind,
     RuntimeServiceManifest,
@@ -191,8 +197,8 @@ def runtime_root_from_control_root(control_root: Path) -> Path:
 _LEGACY_GENERATION_ID = re.compile(r"[0-9a-f]{64}")
 
 
-def legacy_runtime_root_is_current(runtime_root: Path) -> bool:
-    """Whether `<runtime_root>/current` names a generation the legacy chain can serve.
+def legacy_current_generation(runtime_root: Path) -> str | None:
+    """The legacy deployment generation `<runtime_root>/current` names, or `None`.
 
     The existence of the directory says nothing: the first role to publish a heartbeat
     creates `<runtime_root>/control/<kind>/<instance>` with `mkdir(parents=True)`, and with
@@ -202,15 +208,18 @@ def legacy_runtime_root_is_current(runtime_root: Path) -> bool:
     (review M-R1). What the schema-binding path actually needs is the pointer: a symlink
     `current -> generations/<64 hex>` whose target exists. Anything else is "no legacy
     deployment here", and the role degrades exactly as it did on its first start.
+
+    The id itself, not only its presence, is what the schema-binding loader is asking for
+    (#207), so the pointer is read once and the answer carried rather than recomputed.
     """
 
     current = Path(runtime_root) / "current"
     try:
         info = current.lstat()
     except OSError:
-        return False
+        return None
     if not stat.S_ISLNK(info.st_mode):
-        return False
+        return None
     target = Path(os.readlink(current))
     if (
         target.is_absolute()
@@ -218,12 +227,20 @@ def legacy_runtime_root_is_current(runtime_root: Path) -> bool:
         or target.parts[0] != "generations"
         or _LEGACY_GENERATION_ID.fullmatch(target.parts[1]) is None
     ):
-        return False
-    return (Path(runtime_root) / target).is_dir()
+        return None
+    if not (Path(runtime_root) / target).is_dir():
+        return None
+    return target.parts[1]
 
 
-def _read_authority_manifest(path: Path) -> bytes:
-    """Read a manifest out of the immutable generation, one path component at a time.
+def legacy_runtime_root_is_current(runtime_root: Path) -> bool:
+    """Whether `<runtime_root>/current` names a generation the legacy chain can serve."""
+
+    return legacy_current_generation(runtime_root) is not None
+
+
+def _read_authority_document(path: Path, *, label: str = "runtime service manifest") -> bytes:
+    """Read a document out of the immutable generation, one path component at a time.
 
     The old-chain reader (`runtime_service_entrypoint._read_owned_manifest`) requires the
     file to be owned by the running user with mode 0600, which is what the lighthouse-owned
@@ -255,16 +272,16 @@ def _read_authority_manifest(path: Path) -> bytes:
         )
         observed = os.fstat(manifest_descriptor)
         if not stat.S_ISREG(observed.st_mode):
-            raise ValueError("runtime service manifest must be a regular file")
+            raise ValueError(f"{label} must be a regular file")
         if observed.st_uid not in {0, os.geteuid()}:
-            raise ValueError("runtime service manifest is not owned by root or this runtime")
+            raise ValueError(f"{label} is not owned by root or this runtime")
         if stat.S_IMODE(observed.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
-            raise ValueError("runtime service manifest is writable outside its owner")
+            raise ValueError(f"{label} is writable outside its owner")
         with os.fdopen(manifest_descriptor, "rb", closefd=True) as stream:
             manifest_descriptor = -1
             return stream.read()
     except OSError as exc:
-        raise ValueError("runtime service manifest is unavailable or contains a symlink") from exc
+        raise ValueError(f"{label} is unavailable or contains a symlink") from exc
     finally:
         if manifest_descriptor >= 0:
             os.close(manifest_descriptor)
@@ -286,12 +303,8 @@ def load_authority_service_manifest(
     same id it passes as `--expected-generation`.
     """
 
-    resolved = Path(os.path.abspath(path))
-    if resolved.parent.name != AUTHORITY_MANIFEST_DIRECTORY:
-        raise ValueError("runtime service manifest is outside the generation manifest directory")
-    if resolved.parent.parent.name != expected_generation:
-        raise ValueError("runtime service manifest generation does not match runtime environment")
-    payload = _read_authority_manifest(resolved)
+    _authority_generation_directory(path, expected_generation=expected_generation)
+    payload = _read_authority_document(Path(os.path.abspath(path)))
     try:
         manifest = RuntimeServiceManifest.model_validate_json(payload)
     except ValueError as exc:
@@ -301,6 +314,80 @@ def load_authority_service_manifest(
     if manifest.producer_commit != expected_commit:
         raise ValueError("runtime service manifest commit does not match running code")
     return manifest
+
+
+def _authority_generation_directory(path: Path, *, expected_generation: str) -> Path:
+    """`<generation>/manifests/<instance>.json` -> `<generation>`, or refuse.
+
+    This is the authority half of the trust binding, and the only one there was: the
+    wrapper only ever derives this shape, and the generation directory is named by the same
+    id it passes as `--expected-generation`.
+    """
+
+    resolved = Path(os.path.abspath(path))
+    if resolved.parent.name != AUTHORITY_MANIFEST_DIRECTORY:
+        raise ValueError("runtime service manifest is outside the generation manifest directory")
+    if resolved.parent.parent.name != expected_generation:
+        raise ValueError("runtime service manifest generation does not match runtime environment")
+    return resolved.parent.parent
+
+
+def resolve_legacy_schema_generation(
+    manifest_path: Path,
+    *,
+    expected_generation: str,
+    runtime_root: Path,
+    legacy_generation: str,
+) -> str:
+    """The legacy generation this role may load schema bindings against (#207).
+
+    Two id namespaces meet here and never agree by construction: `--expected-generation` is
+    `sha256(<generation>/full-manifest.json)` off the root-owned authority chain, while
+    `<runtime root>/current` names a `runtime_deployment_bundle` hash. Passing the first
+    where the second was wanted is what made every kind-backed role fail closed with
+    `runtime schema service generation is not current` as soon as Route A restored
+    `data/runtime/current`.
+
+    Passing the legacy id instead, on its own, would drop a binding rather than move one:
+    the role would load whatever the pointer happened to name. So both are checked, in the
+    same place, and neither can be skipped:
+
+    * the authority namespace, by the manifest path — the file has to sit in
+      `<generation>/manifests/`, and that generation directory has to be named by
+      `--expected-generation`, which the wrapper took from the chain slot;
+    * the legacy namespace, by `<generation>/legacy-binding.json` — the document
+      `runtime-authority-stage --legacy-runtime-root` wrote, whose sha256 is inside the
+      full manifest whose sha256 *is* the authority generation id, and which the wrapper
+      verified on disk before this process existed. It has to name this runtime root and
+      the generation the pointer currently resolves to.
+
+    A generation staged with `--bootstrap-from-checkout` says so and is refused here: its
+    service manifests came from the checkout's frozen constants, not from this legacy
+    bundle, so there is nothing to claim they describe the same services.
+    """
+
+    generation_directory = _authority_generation_directory(
+        manifest_path, expected_generation=expected_generation
+    )
+    document = generation_directory / GENERATION_LEGACY_BINDING_NAME
+    payload = _read_authority_document(document, label="runtime legacy generation binding")
+    if len(payload) > MAX_LEGACY_BINDING_BYTES:
+        raise ValueError("runtime legacy generation binding exceeds its size bound")
+    try:
+        binding = parse_legacy_generation_binding(payload)
+    except LegacyGenerationBindingError as exc:
+        raise ValueError(f"runtime legacy generation binding is invalid: {exc}") from exc
+    if not binding.is_legacy:
+        raise ValueError(
+            "runtime generation was staged from the checkout and cannot bind a legacy "
+            "deployment"
+        )
+    declared_root = Path(os.path.abspath(str(binding.runtime_root)))
+    if declared_root != Path(os.path.abspath(runtime_root)):
+        raise ValueError("runtime legacy generation binding names another runtime root")
+    if binding.generation_id != legacy_generation:
+        raise ValueError("runtime legacy generation binding does not match the current pointer")
+    return legacy_generation
 
 
 class _StartupDegradedStep:
@@ -574,10 +661,18 @@ def run(args: argparse.Namespace) -> int:
     completion_attestation_signer: CompletionAttestationSigner | None = None
     completion_attestation_active_key_id: str | None = None
     startup_degraded_reasons: tuple[str, ...] = ()
+    schema_generation: str | None = None
     if authority_runtime:
         derived_root = runtime_root_from_control_root(args.control_root)
-        if legacy_runtime_root_is_current(derived_root):
+        legacy_generation = legacy_current_generation(derived_root)
+        if legacy_generation is not None:
             runtime_root = derived_root
+            schema_generation = resolve_legacy_schema_generation(
+                args.manifest,
+                expected_generation=args.expected_generation,
+                runtime_root=derived_root,
+                legacy_generation=legacy_generation,
+            )
         else:
             # Route B publishes no legacy deployment, so the first generation runs
             # without schema dual write and without an artifact terminal lifecycle. That
@@ -599,6 +694,7 @@ def run(args: argparse.Namespace) -> int:
             )
     else:
         runtime_root = _runtime_root_from_current_manifest(args.manifest)
+        schema_generation = args.expected_generation
     if runtime_root is None:
         schema_bindings = ()
     else:
@@ -607,10 +703,12 @@ def run(args: argparse.Namespace) -> int:
                 runtime_root,
                 service_kind=manifest.service_kind,
             )
+        if schema_generation is None:  # pragma: no cover - both branches set it above
+            raise ValueError("runtime schema generation was not resolved")
         schema_bindings = load_runtime_schema_service_bindings(
             runtime_root,
             manifest=manifest,
-            generation_id=args.expected_generation,
+            generation_id=schema_generation,
             observed_at=datetime.now(UTC),
         )
     if manifest.service_kind is RuntimeServiceKind.STRATEGY_LIVE:
@@ -680,10 +778,12 @@ __all__ = [
     "build_runtime_strategy_completion_attestation_signer",
     "build_builtin_registry",
     "build_parser",
+    "legacy_current_generation",
     "legacy_runtime_root_is_current",
     "load_authority_service_manifest",
     "main",
     "resolve_checkout_commit",
+    "resolve_legacy_schema_generation",
     "run",
     "runtime_root_from_control_root",
 ]

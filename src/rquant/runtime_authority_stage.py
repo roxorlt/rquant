@@ -76,6 +76,12 @@ from rquant.runtime_authority_publish import (
     staged_files_for,
 )
 from rquant.runtime_exec_wrapper import _verify
+from rquant.runtime_legacy_generation_binding import (
+    GENERATION_LEGACY_BINDING_NAME,
+    LEGACY_BINDING_MODE_BOOTSTRAP,
+    LEGACY_BINDING_MODE_LEGACY,
+    legacy_generation_binding_bytes,
+)
 from rquant.strict_json import StrictJsonError, canonical_json_bytes, strict_json_loads
 
 #: U-11 (coordinator ruling): the two recovery roles share one frozen service id, hence one
@@ -1167,6 +1173,34 @@ def legacy_generation_directory(legacy_root: Path, generation: str) -> Path:
     return legacy_root / "generations" / generation
 
 
+def legacy_generation_binding(options: StageOptions) -> bytes:
+    """The `legacy-binding.json` this staging run puts inside the generation.
+
+    Route A resolves `--legacy-generation` (usually the literal `current`) down to the
+    64-hex deployment hash it names, so the document records the generation the manifests
+    were actually copied out of rather than the operator's shorthand. A kind-backed role
+    refuses to load schema bindings unless `<runtime root>/current` still resolves to that
+    id, which is what keeps the legacy namespace bound after `runtime_service_main` stopped
+    passing it the authority id (#207).
+
+    Route B has no legacy deployment, and says so rather than omitting the document: an
+    absent file then means "staged before this document existed", which is a different
+    thing and gets a different refusal.
+    """
+
+    if options.bootstrap_from_checkout or options.legacy_runtime_root is None:
+        return legacy_generation_binding_bytes(
+            mode=LEGACY_BINDING_MODE_BOOTSTRAP, runtime_root=None, generation_id=None
+        )
+    legacy_root = Path(os.path.abspath(options.legacy_runtime_root))
+    directory = legacy_generation_directory(legacy_root, options.legacy_generation)
+    return legacy_generation_binding_bytes(
+        mode=LEGACY_BINDING_MODE_LEGACY,
+        runtime_root=legacy_root.as_posix(),
+        generation_id=directory.name,
+    )
+
+
 def legacy_services(
     *,
     legacy_root: Path,
@@ -1448,6 +1482,9 @@ def build_stage_plan(options: StageOptions) -> StagePlan:
     files: dict[str, StagedFile] = {
         GENERATION_PYTHON: StagedFile(EXECUTABLE_MODE, source=system_python),
         GENERATION_PYVENV: StagedFile(FILE_MODE, payload=pyvenv),
+        GENERATION_LEGACY_BINDING_NAME: StagedFile(
+            FILE_MODE, payload=legacy_generation_binding(options)
+        ),
     }
     for relative, source in sources.items():
         files[relative] = StagedFile(FILE_MODE, source=source)
@@ -1725,6 +1762,7 @@ __all__ = [
     "elf_loader_from_readelf",
     "resolved_closure_member",
     "instance_label",
+    "legacy_generation_binding",
     "legacy_services",
     "main",
     "pyvenv_config",
