@@ -10,6 +10,7 @@ arguments of `resolve_launch`. Nothing here needs root.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -19,9 +20,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +46,11 @@ from rquant.runtime_authority import (
 from rquant.runtime_authority_publish import RuntimeAuthorityStageError
 from rquant.runtime_exec_wrapper import _verify
 from rquant.strict_json import canonical_json_bytes, strict_json_loads
+from tests.unit.test_runtime_production_profile import (
+    _daily_keyring_document,
+    _daily_private_key,
+    _mark_daily_keyring_root_owned,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILDER = REPO_ROOT / "scripts" / "build-production-deploy-pyz.py"
@@ -195,6 +203,7 @@ class World:
         self.inbox = self.var / "inbox"
         self.quarantine = self.var / "quarantine"
         self.profile_path = self.etc / "production-runtime-profile.json"
+        self.keyring = self.etc / "daily-receipt-trusted-keys.json"
         self.authority_path = self.var / "current.json"
         self.system_python = self.root / "usr" / "bin" / "python3.11"
         self.runtime_pyz = self.root / "usr" / "local" / "libexec" / "rquant-runtime-exec.pyz"
@@ -233,6 +242,7 @@ class World:
         self.system_python.chmod(0o755)
         self.runtime_pyz.write_bytes(RUNTIME_PYZ_BYTES)
         self.runtime_pyz.chmod(0o555)
+        self.write_keyring()
         self.deploy_pyz_sha256 = _load_builder().build_deploy_pyz(REPO_ROOT, self.deploy_pyz)
         self.staging_root.mkdir()
         (self.staging_root / ".keep").write_text("", encoding="utf-8")
@@ -298,8 +308,14 @@ class World:
         patch(publish_module, "INSTALLED_RUNTIME_PYZ", self.runtime_pyz)
         patch(publish_module, "PUBLISH_OWNER_GID", GID)
         patch(publish_module, "WRAPPER_TRUSTED_ROOT", str(self.root))
+        patch(stage_module, "DAILY_RECEIPT_KEYRING_PATH", self.keyring)
         patch(stage_module, "discover_interpreter_closure", _fake_closure)
         patch(stage_module, "ancestor_policies", _fake_ancestors)
+        #: last, so the directory policies above were recorded from the real `os.stat`
+        _mark_daily_keyring_root_owned(self.monkeypatch, self.keyring)
+
+    def write_keyring(self, *, mode: int = 0o444, **overrides: Any) -> Path:
+        return _write_daily_receipt_keyring(self.keyring, mode=mode, **overrides)
 
     # -- driving ------------------------------------------------------------------
 
@@ -388,6 +404,69 @@ class World:
         target.write_text(target.read_text(encoding="utf-8") + f"# {marker}\n", encoding="utf-8")
         _git(self.checkout, "commit", "-q", "-am", marker)
         self.commit = _git(self.checkout, "rev-parse", "HEAD").strip()
+
+
+_SIGNED_KEYRING: dict[str, object] = {}
+
+
+def _signed_daily_receipt_document() -> dict[str, Any]:
+    """One real Ed25519-signed keyring document, generated once for the session.
+
+    `_load_daily_receipt_trusted_keyring` verifies the signature, so the suite cannot hand it
+    a hand-written stand-in; these are the same helpers the production-profile suite signs
+    its keyring with.
+    """
+
+    if not _SIGNED_KEYRING:
+        root = Path(tempfile.mkdtemp(prefix="pa2-daily-keyring-"))
+        private_key, public_key = _daily_private_key(root, key_id="daily-receipt-v1")
+        _SIGNED_KEYRING["document"] = _daily_keyring_document(
+            private_key,
+            active_key_id="daily-receipt-v1",
+            active_public_key=public_key,
+        )
+    document = _SIGNED_KEYRING["document"]
+    assert isinstance(document, dict)
+    return dict(document)
+
+
+def _write_daily_receipt_keyring(path: Path, *, mode: int = 0o444, **overrides: Any) -> Path:
+    """The `root:root 0444` daily receipt trusted keyring B-3 installs in `/etc/rquant`.
+
+    Genesis shape (generation 1, no retired keys), signed for real, which is what a first
+    installation has. `overrides` is how a case breaks one field on purpose.
+    """
+
+    document = _signed_daily_receipt_document()
+    document.update(overrides)
+    if path.exists():
+        path.chmod(0o644)
+    path.write_bytes(canonical_json_bytes(document))
+    path.chmod(mode)
+    return path
+
+
+def _prepare_keyring_directory(root: Path) -> Path:
+    directory = root / "etc" / "rquant"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _trusted_keyring(monkeypatch: pytest.MonkeyPatch, root: Path, **overrides: Any) -> Path:
+    """A keyring the strict loader accepts: signed, 0444, and root-owned through its parents.
+
+    Ownership is the one thing a test cannot arrange for real, so it borrows the
+    production-profile suite's `os.stat`/`os.fstat` seam — the same one that suite uses to
+    exercise this loader.
+    """
+
+    directory = _prepare_keyring_directory(root)
+    keyring = _write_daily_receipt_keyring(
+        directory / "daily-receipt-trusted-keys.json", **overrides
+    )
+    _mark_daily_keyring_root_owned(monkeypatch, keyring)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", keyring)
+    return keyring
 
 
 def _tamper(path: Path) -> None:
@@ -1392,6 +1471,35 @@ def test_a22_stage_runs_in_a_subprocess_with_no_configuration(world: World, tmp_
         "world = json.loads(os.environ['PA2_WORLD'])\n"
         "authority.PRODUCTION_SYSTEM_PYTHON = Path(world['system_python'])\n"
         "authority.RUNTIME_AUTHORITY_OWNER_UID = os.getuid()\n"
+        "stage.DAILY_RECEIPT_KEYRING_PATH = Path(world['keyring'])\n"
+        # the child cannot own a file as root either, so it wears the same stat seam
+        "import rquant.runtime_production_profile as profile\n"
+        "_keyring = Path(world['keyring'])\n"
+        "_parents = {str(parent) for parent in _keyring.parents}\n"
+        "_real_stat, _real_fstat = os.stat, os.fstat\n"
+        "_identity = (_real_stat(_keyring).st_dev, _real_stat(_keyring).st_ino)\n"
+        "def _as_root(observed, mode=None):\n"
+        "    values = list(tuple(observed))\n"
+        "    values[4] = 0\n"
+        "    if mode is not None:\n"
+        "        values[0] = (observed.st_mode & ~0o777) | mode\n"
+        "    return os.stat_result(values)\n"
+        "def _stat(target, *a, dir_fd=None, follow_symlinks=True):\n"
+        "    observed = _real_stat(target, *a, dir_fd=dir_fd, follow_symlinks=follow_symlinks)\n"
+        "    if dir_fd is not None:\n"
+        "        return observed\n"
+        "    name = str(Path(os.path.abspath(target)))\n"
+        "    if name in _parents:\n"
+        "        return _as_root(observed, 0o755)\n"
+        "    if name == str(_keyring):\n"
+        "        return _as_root(observed)\n"
+        "    return observed\n"
+        "def _fstat(descriptor):\n"
+        "    observed = _real_fstat(descriptor)\n"
+        "    if (observed.st_dev, observed.st_ino) == _identity:\n"
+        "        return _as_root(observed)\n"
+        "    return observed\n"
+        "profile.os.stat, profile.os.fstat = _stat, _fstat\n"
         "def closure(python):\n"
         "    fp = lambda p, d, m: RuntimeFilePolicy(Path(p), d, 0, m)\n"
         "    return stage.InterpreterClosure('3.11.15',"
@@ -1412,6 +1520,7 @@ def test_a22_stage_runs_in_a_subprocess_with_no_configuration(world: World, tmp_
         "RQUANT_DISABLE_DOTENV": "1",
         "PA2_WORLD": json.dumps({
             "system_python": str(world.system_python),
+            "keyring": str(world.keyring),
             "argv": world.argv("a22-sub"),
         }),
     }
@@ -1867,3 +1976,719 @@ def test_blk2_the_publisher_creates_only_the_directories_whose_mode_it_declares(
 
     assert declared.is_dir() and stat.S_IMODE(declared.lstat().st_mode) == 0o755
     assert not undeclared.exists()
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): the bootstrap manifests carry each role's real plane
+# ---------------------------------------------------------------------------------------
+
+
+def _staged_manifests(
+    world: World, plan: stage_module.StagePlan
+) -> dict[str, list[Any]]:
+    """Every kind-backed manifest of a staged generation, parsed by the real contract."""
+
+    from rquant.runtime_service_entrypoint import RuntimeServiceManifest
+
+    generation = plan.options.staging / "generation"
+    mapping = world.instances(plan)
+    manifests: dict[str, list[Any]] = {}
+    for role in KIND_BACKED_ROLES:
+        for label in mapping[role]:
+            payload = (generation / "manifests" / f"{label}.json").read_bytes()
+            manifests.setdefault(role, []).append(
+                RuntimeServiceManifest.model_validate_json(payload)
+            )
+    return manifests
+
+
+def test_blk3_every_kind_backed_manifest_carries_the_role_plane(
+    published: tuple[World, stage_module.StagePlan],
+) -> None:
+    """#200: route B wrote `plane: live` into all 28 manifests, so the seven serving and
+    research builders refused their own manifest on the production host."""
+
+    from rquant.runtime_deployment_bundle import _EXPECTED_PLANE
+    from rquant.runtime_service_control import RuntimeServicePlane
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    world, plan = published
+    manifests = _staged_manifests(world, plan)
+    assert set(manifests) == set(KIND_BACKED_ROLES)
+    observed: dict[str, RuntimeServicePlane] = {}
+    for role, staged in manifests.items():
+        expected = _EXPECTED_PLANE[RuntimeServiceKind(role)]
+        for manifest in staged:
+            assert manifest.plane is expected, role
+        observed[role] = expected
+    assert set(observed.values()) == {
+        RuntimeServicePlane.LIVE,
+        RuntimeServicePlane.SERVING,
+        RuntimeServicePlane.RESEARCH,
+    }
+    assert observed["runtime_health_publisher"] is RuntimeServicePlane.SERVING
+    assert observed["serving_publisher"] is RuntimeServicePlane.SERVING
+    assert observed["daily_pipeline_orchestrator"] is RuntimeServicePlane.RESEARCH
+    assert observed["paper_broker"] is RuntimeServicePlane.LIVE
+
+
+def test_blk3_the_plane_comes_from_the_shared_table_not_a_second_copy(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one authority is `runtime_deployment_bundle._EXPECTED_PLANE`; bend it and the
+    staged manifest bends with it (the `_DISTRIBUTION_OWNED_DIRECTORIES` pattern of #198)."""
+
+    import rquant.runtime_deployment_bundle as bundle
+    from rquant.runtime_service_control import RuntimeServicePlane
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    bent = dict(bundle._EXPECTED_PLANE)
+    bent[RuntimeServiceKind.PAPER_BROKER] = RuntimeServicePlane.RESEARCH
+    monkeypatch.setattr(bundle, "_EXPECTED_PLANE", bent)
+    plan = world.stage("blk3-plane-seam")
+    manifests = _staged_manifests(world, plan)
+    assert manifests["paper_broker"][0].plane is RuntimeServicePlane.RESEARCH
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): the bootstrap manifests carry grounded settings
+# ---------------------------------------------------------------------------------------
+
+#: The settings model each builder validates its own manifest against, named by the module
+#: that calls `model_validate(dict(manifest.settings))`. This is the acceptance's authority:
+#: a staged manifest is only startable if its settings pass the model of its own builder.
+SETTINGS_MODELS = {
+    "artifact_retention": ("rquant.runtime_builder_retention", "ArtifactRetentionSettings"),
+    "auction_match_source": ("rquant.runtime_service_builtin", "AuctionMatchSourceSettings"),
+    "auction_universe_publisher": (
+        "rquant.runtime_service_builtin",
+        "AuctionUniversePublisherSettings",
+    ),
+    "candidate_publisher": (
+        "rquant.runtime_builder_candidate",
+        "CandidatePublisherRuntimeSettings",
+    ),
+    "daily_close_source": ("rquant.runtime_builder_daily", "DailyCloseSourceSettings"),
+    "daily_pipeline_orchestrator": (
+        "rquant.runtime_builder_daily_orchestrator",
+        "DailyPipelineOrchestratorSettings",
+    ),
+    "feature_live": ("rquant.runtime_builder_feature", "FeatureLiveRuntimeSettings"),
+    "lab_artifact_catalog": ("rquant.runtime_builder_artifact_catalog", "ArtifactCatalogSettings"),
+    "lab_jobs_publisher": ("rquant.runtime_builder_authority", "LabJobsPublisherSettings"),
+    "market_minute_source": ("rquant.runtime_service_builtin", "MarketMinuteSourceSettings"),
+    "notifier": ("rquant.runtime_builder_signal", "NotifierSettings"),
+    "paper_broker": ("rquant.runtime_builder_paper", "PaperBrokerSettings"),
+    "paper_constraint_publisher": (
+        "rquant.runtime_builder_authority",
+        "PaperConstraintRuntimeSettings",
+    ),
+    "promotions_publisher": ("rquant.runtime_builder_authority", "PromotionsPublisherSettings"),
+    "reference_slow_publisher": (
+        "rquant.runtime_service_builtin",
+        "ReferenceSlowPublisherSettings",
+    ),
+    "reference_slow_source": ("rquant.runtime_service_builtin", "ReferenceSlowSourceSettings"),
+    "runtime_health_publisher": (
+        "rquant.runtime_builder_authority",
+        "RuntimeHealthPublisherSettings",
+    ),
+    "serving_publisher": ("rquant.runtime_builder_serving", "ServingRuntimeSettings"),
+    "shadow_session": ("rquant.runtime_builder_shadow", "ShadowSessionSettings"),
+    "signal_router": ("rquant.runtime_builder_signal", "SignalRouterSettings"),
+    "strategy_live": ("rquant.runtime_builder_strategy", "StrategyLiveRuntimeSettings"),
+    "watchlist_quote_source": ("rquant.runtime_service_builtin", "WatchlistQuoteSourceSettings"),
+}
+#: What a first installation cannot know, per role, stated as the validation error the
+#: builder's own model raises. Every one of these is an operator fact that lives outside the
+#: runtime owner root (`ProductionRuntimeProfileInputs.validate_complete_authority_set`
+#: refuses an immutable input inside it) or a signer public key installed under
+#: `/etc/rquant`: the market calendar generation, the sealed candidate documents, the
+#: historical minute snapshot, the definition registry, the routing policy, the recovery and
+#: retention authorities, the artifact location. Route B derives everything else; it does
+#: not invent these, so the missing fact names itself instead of hiding behind a placeholder
+#: (#200). An empty tuple means the role's settings are complete and it can start.
+UNGROUNDED_BOOTSTRAP_FACTS = {
+    "artifact_retention": (
+        "missing:full_recovery_receipt_id",
+        "missing:migration",
+        "missing:recovery_profile_generation",
+        "missing:recovery_publication_root",
+        "missing:recovery_restore_root",
+        "missing:recovery_target_manifest_id",
+        "missing:schema_authority_path",
+        "missing:schema_authority_root",
+        "missing:schema_authority_sha256",
+    ),
+    "auction_match_source": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "auction_universe_publisher": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "candidate_publisher": ("value_error:candidate_input_path is required for sealed_document",),
+    "daily_close_source": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "daily_pipeline_orchestrator": (),
+    "feature_live": (
+        "missing:historical_minutes_snapshot_path",
+        "missing:historical_snapshot_id",
+    ),
+    "lab_artifact_catalog": ("missing:failure_domain", "missing:location_id"),
+    "lab_jobs_publisher": (),
+    "market_minute_source": (),
+    "notifier": (),
+    "paper_broker": (),
+    "paper_constraint_publisher": (),
+    "promotions_publisher": (),
+    "reference_slow_publisher": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "reference_slow_source": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+    ),
+    "runtime_health_publisher": (),
+    "serving_publisher": (),
+    "shadow_session": (
+        "missing:calendar_content_sha256",
+        "missing:calendar_expected_commit",
+        "missing:calendar_path",
+        "missing:completion_active_key_id",
+        "missing:completion_active_public_key_pem",
+        "missing:report_active_key_id",
+        "missing:report_active_public_key_pem",
+        "missing:runner_manifest_bindings",
+    ),
+    "signal_router": ("missing:routing_policy_fingerprint",),
+    "strategy_live": ("missing:definition_registry_root",),
+    "watchlist_quote_source": (),
+}
+
+
+def _settings_model(role: str) -> Any:
+    import importlib
+
+    module, name = SETTINGS_MODELS[role]
+    return getattr(importlib.import_module(module), name)
+
+
+def _validation_signatures(role: str, settings: Any) -> tuple[str, ...]:
+    from pydantic import ValidationError
+
+    try:
+        _settings_model(role).model_validate(dict(settings))
+    except ValidationError as exc:
+        signatures = set()
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error["loc"])
+            signatures.add(
+                f"missing:{location}" if error["type"] == "missing" else f"{error['type']}:"
+                f"{error['msg'].removeprefix('Value error, ')}"
+            )
+        return tuple(sorted(signatures))
+    return ()
+
+
+@pytest.fixture
+def bootstrap(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[World, stage_module.StagePlan]:
+    """A staged generation whose manifests address a runtime root this host really has.
+
+    The derived settings are the production topology; a test that hands them to the real
+    models and the real builders needs that topology to exist somewhere writable, so the
+    root seam moves and every path moves with it.
+    """
+
+    root = tmp_path / "runtime-root"
+    root.mkdir()
+    monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", root.resolve())
+    return world, world.stage("blk3-bootstrap")
+
+
+def test_blk3_every_kind_backed_manifest_validates_or_names_its_missing_facts(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """#200 acceptance: settings are validated by the real builder model, not a stub."""
+
+    world, plan = bootstrap
+    manifests = _staged_manifests(world, plan)
+    assert set(manifests) == set(SETTINGS_MODELS) == set(UNGROUNDED_BOOTSTRAP_FACTS)
+    for role, staged in sorted(manifests.items()):
+        for manifest in staged:
+            assert _validation_signatures(role, manifest.settings) == (
+                UNGROUNDED_BOOTSTRAP_FACTS[role]
+            ), role
+    #: Settings-complete is not the same as startable: the default market-minute, watchlist
+    #: and paper-broker builders additionally demand a market or trade calendar their own
+    #: model calls optional, and the daily orchestrator loads a deployment profile document
+    #: route B never writes. The end-to-end case below is what says who really starts.
+    settings_complete = {role for role, gaps in UNGROUNDED_BOOTSTRAP_FACTS.items() if not gaps}
+    assert settings_complete == {
+        "daily_pipeline_orchestrator",
+        "lab_jobs_publisher",
+        "market_minute_source",
+        "notifier",
+        "paper_broker",
+        "paper_constraint_publisher",
+        "promotions_publisher",
+        "runtime_health_publisher",
+        "serving_publisher",
+        "watchlist_quote_source",
+    }
+
+
+def test_blk3_derived_settings_stay_inside_the_frozen_production_topology(
+    published: tuple[World, stage_module.StagePlan],
+) -> None:
+    """Every path a bootstrap manifest names is either under the runtime owner root, under
+    its data parent, or one of six frozen constants of this repository. A derived value
+    that escapes those is a guess about the host, not a derivation (#200)."""
+
+    from rquant.runtime_artifact_terminal_lifecycle import operational_database_path
+
+    world, plan = published
+    root = stage_module.production_runtime_root()
+    paths: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str) and value.startswith("/"):
+            paths.add(value)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    manifests = _staged_manifests(world, plan)
+    settings = {
+        manifest.service_id: dict(manifest.settings)
+        for staged in manifests.values()
+        for manifest in staged
+    }
+    walk(settings)
+    assert paths
+    data = root.parent
+    assert {path for path in paths if not path.startswith(f"{root}/")} == {
+        #: the data parent: the operational authorities the runtime reads but does not own
+        str(data / "rquant.duckdb"),
+        str(data / "surge_live"),
+        str(data / "legacy-shadow" / "monitor"),
+        str(data / "legacy-shadow" / "surge"),
+        str(data / "legacy-shadow" / "isolated-runners"),
+        #: frozen constants of `runtime_deployment_profile` and the daily receipt authority
+        "/etc/rquant/daily-receipt-trusted-keys.json",
+        "/home/lighthouse/rquant",
+        "/home/lighthouse/rquant/.venv/bin/python",
+        "/run/rquant/daily-receipt-signer.sock",
+        "/usr/bin/sudo",
+        "/usr/local/libexec/rquant-shadow-report-signer",
+    }
+    assert settings["auction-universe.publisher.v1"]["database_path"] == str(
+        operational_database_path(root)
+    )
+    assert settings["serving.publisher.v1"]["serving_root"] == str(root / "serving")
+    assert settings["paper-constraint.market.v1"]["reference_registry_path"] == str(
+        root / "authorities" / "reference-slow" / "reference.sqlite3"
+    )
+    #: the two production paths of the daily stage commands are derived from the same frozen
+    #: root, not written a second time (review SF-3)
+    checkout = stage_module.production_checkout_root()
+    assert checkout == root.parent.parent == Path("/home/lighthouse/rquant")
+    command = settings["daily.pipeline.orchestrator.shadow.v1"]["stage_commands"][0]
+    assert command["argv"][0] == str(checkout / ".venv" / "bin" / "python")
+    assert command["working_directory"] == str(checkout)
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): a builder is constructed out of the packaged manifest, one per plane
+# ---------------------------------------------------------------------------------------
+
+
+def _builtin_registry(manifests: dict[str, list[Any]]) -> Any:
+    """The production registry, with only the two capabilities a terminal-owner role needs.
+
+    The lab jobs publisher opens its ledger reader through the registry's artifact terminal
+    lifecycle; the reader is bound to the very path the staged manifest names, so a manifest
+    that pointed somewhere else would fail the builder's own path check.
+    """
+
+    from rquant.lab_jobs import LabJobReader
+    from rquant.runtime_artifact_terminal_lifecycle import ProductionArtifactTerminalLifecycle
+    from rquant.runtime_service_builtin import build_builtin_registry
+
+    lab_jobs_path = Path(str(manifests["lab_jobs_publisher"][0].settings["lab_jobs_path"]))
+
+    def lifecycle() -> Any:
+        return ProductionArtifactTerminalLifecycle(lab_job_reader=LabJobReader(lab_jobs_path))
+
+    return build_builtin_registry(
+        clock=lambda: datetime.now(UTC),
+        artifact_terminal_lifecycle_factory=lifecycle,
+    )
+
+
+def test_blk3_builders_start_from_the_packaged_manifest_on_all_three_planes(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """The gap that let #200 reach the production host: the bootstrap probe only proved the
+    wrapper could resolve a launch, never that a builder accepts the manifest the generation
+    ships. This reads the staged manifest files, hands them to the real registry, and takes
+    one role of each plane all the way to a runtime step.
+    """
+
+    from rquant.reference_data_registry import ReferenceRegistry
+    from rquant.runtime_service_control import RuntimeServicePlane
+
+    world, plan = bootstrap
+    manifests = _staged_manifests(world, plan)
+    registry = _builtin_registry(manifests)
+    roles = (
+        (RuntimeServicePlane.LIVE, "paper_constraint_publisher"),
+        (RuntimeServicePlane.SERVING, "runtime_health_publisher"),
+        (RuntimeServicePlane.SERVING, "serving_publisher"),
+        (RuntimeServicePlane.RESEARCH, "lab_jobs_publisher"),
+    )
+    constraint = manifests["paper_constraint_publisher"][0]
+    ReferenceRegistry(Path(str(constraint.settings["reference_registry_path"])))
+
+    for plane, role in roles:
+        manifest = manifests[role][0]
+        assert manifest.plane is plane
+        step = registry.build(manifest)
+        assert callable(step)
+        closer = getattr(step, "close", None)
+        if closer is not None:
+            closer()
+
+
+def test_blk3_the_two_hardcoded_values_are_what_the_builders_refuse(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """The same three builders, given the manifest route B used to ship: `plane: live` for
+    everyone and an empty settings object. Both halves of #200 must still be refusals, or
+    the test above proves nothing."""
+
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from rquant.reference_data_registry import ReferenceRegistry
+    from rquant.runtime_service_entrypoint import RuntimeServiceManifest
+
+    world, plan = bootstrap
+    manifests = _staged_manifests(world, plan)
+    registry = _builtin_registry(manifests)
+    constraint = manifests["paper_constraint_publisher"][0]
+    ReferenceRegistry(Path(str(constraint.settings["reference_registry_path"])))
+
+    for role, message in (
+        ("runtime_health_publisher", "must run on the serving plane"),
+        ("serving_publisher", "must run on the serving plane"),
+        ("lab_jobs_publisher", "must run on the research plane"),
+    ):
+        document = strict_json_loads(manifests[role][0].model_dump_json().encode("utf-8"))
+        assert isinstance(document, dict)
+        document["plane"] = "live"
+        with _pytest.raises(ValueError, match=message):
+            registry.build(RuntimeServiceManifest.model_validate(document))
+
+    for role in (
+        "paper_constraint_publisher",
+        "runtime_health_publisher",
+        "lab_jobs_publisher",
+        "serving_publisher",
+    ):
+        document = strict_json_loads(manifests[role][0].model_dump_json().encode("utf-8"))
+        assert isinstance(document, dict)
+        document["settings"] = {}
+        with _pytest.raises(ValidationError):
+            registry.build(RuntimeServiceManifest.model_validate(document))
+
+
+def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`build_production_runtime_profile` is the authority for what a manifest says; route B
+    cannot call it, because its inputs are the operator facts a first installation lacks.
+    So the derivation restates the expressions, and this pins the restatement to the
+    original the way `instance_label` is pinned to `_instance_name`: point both at one
+    runtime root, build both, and demand agreement on every field route B derives.
+
+    Five differences are the derivation itself, not drift:
+      * `database_path` / `page_projection_*` come from
+        `runtime_artifact_terminal_lifecycle.operational_database_path`, the frozen function
+        of the root, instead of the profile's operator input;
+      * `stage_commands` names the production interpreter, which the profile only does in
+        `linux-production` mode;
+      * the health publisher's `sources` carry route B's one staleness bound instead of the
+        published profile's per-role cadence — the composition itself is compared below;
+      * the three `receipt_*` keys come from the fixed `/etc/rquant` keyring, which is what
+        the profile itself does in `linux-production` mode and not what this local-test
+        fixture does.
+    """
+
+    from rquant.runtime_production_profile import build_production_runtime_profile
+    from tests.unit.test_runtime_production_profile import _inputs
+
+    inputs = _inputs(tmp_path)
+    profile = build_production_runtime_profile(inputs)
+    monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", inputs.runtime_root)
+    _trusted_keyring(monkeypatch, tmp_path / "keyring")
+    derived = stage_module.bootstrap_settings(inputs.producer_commit)
+    published = {
+        manifest.service_id: json.loads(manifest.model_dump_json())["settings"]
+        for manifest in profile.manifests
+    }
+    assert set(derived) == set(published)
+    #: (service id, key), never a bare key name: `sources` belongs to the health publisher
+    #: and to the signal router, and exempting the name would take the router's three source
+    #: fingerprints out of the comparison with it (review MF-2).
+    input_derived = {
+        #: the operational database comes from the frozen function of the runtime root
+        ("auction-universe.publisher.v1", "database_path"),
+        ("reference-slow.source.v1", "database_path"),
+        ("notifier.admin.shadow.v1", "page_projection_database_path"),
+        ("notifier.admin.shadow.v1", "page_projection_surge_live_root"),
+        #: the interpreter and working directory are production's, which the profile only
+        #: names in `linux-production` mode — compared separately below
+        ("daily.pipeline.orchestrator.shadow.v1", "stage_commands"),
+        #: hydrated from the fixed `/etc/rquant` keyring, which is what the profile does in
+        #: `linux-production` mode; the fixture here leaves the operator input unset, so it
+        #: falls back to the shadow completion key instead
+        ("daily.pipeline.orchestrator.shadow.v1", "receipt_active_key_id"),
+        ("daily.pipeline.orchestrator.shadow.v1", "receipt_active_public_key_pem"),
+        ("daily.pipeline.orchestrator.shadow.v1", "receipt_previous_public_key_pems"),
+        #: route B's single staleness bound; the composition is compared below
+        ("runtime-health.all.v1", "sources"),
+    }
+    compared = 0
+    for service_id, settings in sorted(derived.items()):
+        for key, value in settings.items():
+            assert key in published[service_id], (service_id, key)
+            if (service_id, key) in input_derived:
+                continue
+            assert value == published[service_id][key], (service_id, key)
+            compared += 1
+    assert compared > 200
+    assert derived["signal-router.all-strategies.v1"]["sources"] == (
+        published["signal-router.all-strategies.v1"]["sources"]
+    )
+
+    def composition(sources: Any) -> set[tuple[str, ...]]:
+        return {
+            (
+                str(source["control_root"]),
+                str(source["service_id"]),
+                str(source["plane"]),
+                str(source["producer_commit"]),
+            )
+            for source in sources
+        }
+
+    #: `stage_commands` differs only in the interpreter and working directory, which the
+    #: profile names literally in `linux-production` mode and route B derives from the
+    #: runtime root; every other field of every stage command is compared (review SF-3).
+    orchestrator = "daily.pipeline.orchestrator.shadow.v1"
+    checkout = stage_module.production_checkout_root()
+    interpreter = str(checkout / ".venv" / "bin" / "python")
+    assert derived[orchestrator]["stage_commands"] == [
+        {**command, "argv": [interpreter, *command["argv"][1:]], "working_directory": str(checkout)}
+        for command in published[orchestrator]["stage_commands"]
+    ]
+
+    health = "runtime-health.all.v1"
+    assert composition(derived[health]["sources"]) == composition(published[health]["sources"])
+    assert {source["stale_after_seconds"] for source in derived[health]["sources"]} == {
+        stage_module.MANIFEST_STALE_AFTER_SECONDS
+    }
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): the daily receipt trusted keyring, the stage's one TCB read
+# ---------------------------------------------------------------------------------------
+
+
+def test_blk3_the_keyring_path_is_the_frozen_one_not_a_second_literal() -> None:
+    """One constant names `/etc/rquant/daily-receipt-trusted-keys.json`: the one the
+    production profile hydrates from. The stage seam defaults to it."""
+
+    from rquant.runtime_deployment_profile import PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    from rquant.runtime_production_profile import DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+
+    assert stage_module.DAILY_RECEIPT_KEYRING_PATH is None
+    assert stage_module.daily_receipt_keyring_path() == (
+        PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    )
+    assert PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH == DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    assert str(PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH) == (
+        "/etc/rquant/daily-receipt-trusted-keys.json"
+    )
+
+
+def test_blk3_the_daily_orchestrator_manifest_carries_the_keyring_authority(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """The read is what makes the orchestrator startable: its two receipt fields are the
+    keyring's, and the manifest still names the keyring the runtime verifies against."""
+
+    world, plan = bootstrap
+    settings = dict(_staged_manifests(world, plan)["daily_pipeline_orchestrator"][0].settings)
+    document = strict_json_loads(world.keyring.read_bytes())
+    assert isinstance(document, dict)
+    assert settings["receipt_active_key_id"] == document["active_key_id"]
+    assert settings["receipt_active_public_key_pem"] == document["active_public_key"]
+    assert settings["receipt_previous_public_key_pems"] == document["previous_public_keys"]
+    assert settings["receipt_trusted_keyring_path"] == "/etc/rquant/daily-receipt-trusted-keys.json"
+
+
+def test_blk3_an_absent_or_unsafe_keyring_refuses_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every judgement of the strict loader is a refusal this stage passes on, never a silent
+    empty authority. Ownership, the parent chain, symlinks, hard links, the exact 0444 mode,
+    the size bound and a directory in the file's place are all checked here, because a first
+    draft of this stage judged only some of them (review MF-1, SF-1)."""
+
+    keyring = _trusted_keyring(monkeypatch, tmp_path)
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
+
+    keyring.chmod(0o644)
+    keyring.unlink()
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable") as absent:
+        stage_module.daily_receipt_authority()
+    assert "is unavailable" in str(absent.value)
+
+    _write_daily_receipt_keyring(keyring)
+    #: the file the absent case removed came back with a new inode, so the ownership seam is
+    #: re-armed on it before the remaining judgements are exercised
+    _mark_daily_keyring_root_owned(monkeypatch, keyring)
+    for mode in (0o440, 0o446, 0o644, 0o666):
+        _write_daily_receipt_keyring(keyring, mode=mode)
+        with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+            stage_module.daily_receipt_authority()
+    _write_daily_receipt_keyring(keyring)
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
+
+    hard_link = keyring.parent / "hard-link.json"
+    os.link(keyring, hard_link)
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+    hard_link.unlink()
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
+
+    oversize = _signed_daily_receipt_document()
+    oversize["previous_public_keys"] = {f"retired-{index}": "x" * 512 for index in range(160)}
+    keyring.chmod(0o644)
+    keyring.write_bytes(canonical_json_bytes(oversize))
+    keyring.chmod(0o444)
+    assert keyring.stat().st_size > 64 * 1024
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+
+
+def test_blk3_a_symlinked_or_foreign_owned_keyring_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink to a valid keyring, a directory in its place, and a file whose owner is not
+    root: three ways to point the stage at something it must not trust."""
+
+    real = _write_daily_receipt_keyring(
+        _prepare_keyring_directory(tmp_path / "real") / "daily-receipt-trusted-keys.json"
+    )
+    link = _prepare_keyring_directory(tmp_path / "linked") / "daily-receipt-trusted-keys.json"
+    link.symlink_to(real)
+    _mark_daily_keyring_root_owned(monkeypatch, real)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", link)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable"):
+        stage_module.daily_receipt_authority()
+
+    directory = _prepare_keyring_directory(tmp_path / "directory")
+    placeholder = directory / "daily-receipt-trusted-keys.json"
+    placeholder.mkdir()
+    _mark_daily_keyring_root_owned(monkeypatch, placeholder)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", placeholder)
+    #: a directory opens fine under O_NOFOLLOW, so "is it a regular file" is the judgement
+    #: that stops it — assert that one by name, not just any refusal
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+
+    #: nothing faked at all: the parent chain is this user's, which is the judgement the
+    #: strict loader makes before it ever opens the file
+    unowned = _write_daily_receipt_keyring(
+        _prepare_keyring_directory(tmp_path / "unowned") / "daily-receipt-trusted-keys.json"
+    )
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", unowned)
+    with pytest.raises(RuntimeAuthorityStageError, match="parent must be root-owned"):
+        stage_module.daily_receipt_authority()
+
+    foreign = _write_daily_receipt_keyring(
+        _prepare_keyring_directory(tmp_path / "foreign") / "daily-receipt-trusted-keys.json"
+    )
+    _mark_daily_keyring_root_owned(monkeypatch, foreign, file_root_owned=False)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", foreign)
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+
+
+def test_blk3_an_unsigned_or_tampered_keyring_never_reaches_a_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The residual risk the review found in the first draft: a root-owned 0444 file holding
+    only the three fields this stage consumes — no `manifest_hash`, no `signature` — was
+    accepted and its `active_key_id` published. The strict loader refuses it, and so do a
+    tampered manifest hash, a foreign signature and a broken genesis binding."""
+
+    keyring = _trusted_keyring(monkeypatch, tmp_path)
+    signed = _signed_daily_receipt_document()
+
+    def rewrite(document: Mapping[str, Any]) -> None:
+        keyring.chmod(0o644)
+        keyring.write_bytes(canonical_json_bytes(dict(document)))
+        keyring.chmod(0o444)
+
+    rewrite(
+        {
+            "active_key_id": "evil",
+            "active_public_key": signed["active_public_key"],
+            "previous_public_keys": {},
+        }
+    )
+    with pytest.raises(RuntimeAuthorityStageError, match="shape is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "manifest_hash": "f" * 64})
+    with pytest.raises(RuntimeAuthorityStageError, match="manifest hash is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "active_key_id": "daily-receipt-v2"})
+    with pytest.raises(RuntimeAuthorityStageError, match="manifest hash is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "signature": base64.b64encode(b"forged" * 11).decode("ascii")})
+    with pytest.raises(RuntimeAuthorityStageError, match="signature is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "previous_public_keys": {"retired": "key"}})
+    with pytest.raises(RuntimeAuthorityStageError, match="genesis binding is invalid"):
+        stage_module.daily_receipt_authority()
+
+    keyring.chmod(0o644)
+    keyring.write_bytes(b"not json\n")
+    keyring.chmod(0o444)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable"):
+        stage_module.daily_receipt_authority()
+
+    _write_daily_receipt_keyring(keyring)
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"

@@ -38,6 +38,36 @@
   `runtime_authority_publish.py` 的 `_ensure_authority_directories` 相应改为「没有声明 mode 的目录
   不创建」。详见下面的 Security 一条。
 
+- **路线 B 的 bootstrap service manifest 不再给所有 role 写死 `plane: live` 与 `settings: {}`（#200）**：
+  首次装机时 `rquant runtime-authority-stage` 打出的 22 个 kind-backed service manifest，`plane` 一律
+  写 `live`、`settings` 一律写空对象，于是每个角色都被自己的构造器当场拒收。本次 `plane` 改从
+  `runtime_deployment_bundle._EXPECTED_PLANE` 这份**共享表**派生（`role_plane(role)`）——
+  `validate_runtime_deployment_topology` 和每个 builder 的第一行断言读的就是它，打包侧不再有第二份
+  kind→plane 映射；`settings` 按**每个构造器自己的模型**逐 role 派生：运行根下的真实路径、
+  `operational_database_path()`、`runtime_deployment_profile` 的冻结常量、三个内置策略的指纹与
+  静态特征模式。
+  修复后 **4 个角色能从打包产物真正构造出 builder**（`paper_constraint_publisher`、
+  `runtime_health_publisher`、`serving_publisher`、`lab_jobs_publisher`，live / serving / research
+  三个平面各有覆盖），另有 `promotions_publisher` 与 `notifier` 的 manifest 已被构造器接受、
+  只卡在主机运行期条件。
+  **已知未解决**：`daily_pipeline_orchestrator` 与 `strategy_live` 仍起不来——它们的构造器要读
+  `<运行根>/current/deployment-profile.json`，而路线 B 从不写这个文件（issue #201）；
+  另有 9 个角色仍缺七类操作员事实，那是「15 个服务全起来」的完整路径。
+
+### Added
+
+- **打包阶段读固定的 daily receipt 信任钥匙串（#200）**：`rquant-runtime-authority-stage` 现在以
+  非特权用户 `lighthouse` 读 `/etc/rquant/daily-receipt-trusted-keys.json`（B-3 的
+  `scripts/install-runtime-credential-infra.sh` 以 `root:root 0444` 装在 0755 root:root 的
+  `/etc/rquant` 下），取出 `active_key_id` / `active_public_key` / `previous_public_keys` 写进
+  daily orchestrator 的 service manifest，补齐它此前缺失的三项 receipt 签名授权。
+  **这是打包器新增的一条 TCB 只读输入**：钥匙串不存在或不满足下面 Changed 一条列出的任何一项判据时，
+  stage 明确拒绝并整体失败关闭，**绝不返回空授权**。权限面没有扩大——读的是一个全局可读的公钥文件，
+  不需要提权，没有引入任何可写的信任面。
+- **新增端到端用例：从打包产物的 manifest 字节用真实注册表构造 builder（#200）**：live / serving /
+  research 三个平面各取一个角色。#200 能溜到生产机，缺的就是这一层——原有用例只比对打包器自己的
+  输出结构，从不拿产物去喂真正的构造器。
+
 ### Changed
 
 - **16 个第一关 protected unit 的 `ReadWritePaths=` 补上 `-` 前缀（#192 的一半）**：路径缺失不再让
@@ -45,6 +75,34 @@
   `ProtectSystem=strict` + `ProtectHome=read-only` 下被跳过的路径仍是只读，runbook §3 C-1 的 31 条
   目录照旧要预建；收益是把故障从 systemd 层挪到 wrapper / role 层，便于分辨 `226` / `78` / `1`。
   `[Install]` 段本轮未加，#192 保持打开。
+
+- **daily receipt 钥匙串的校验改为复用生产画像的严格加载器，打包侧不再自写第二套判据（#200 审查 SF-1）**：
+  打包侧原本自写的六条判据整段删除（`_MAX_KEYRING_BYTES` 常量一并删），改为直接调用
+  `runtime_production_profile._load_daily_receipt_trusted_keyring`。打包侧与生产画像侧现在对
+  「什么样的钥匙串可信」是**字面上同一套判断**，不存在第二份、更松的实现：父链每一级 root 属主且无
+  group/other 写位、`O_NOFOLLOW` 打开并在读前读后两次做 `fstat` 与 `lstat` 的 dev/ino 互校（TOCTOU）、
+  单链接（`nlink == 1`）普通文件、属主 uid 0、mode **恰好 0444**、`0 < size ≤ 64 KiB`、
+  字段集合恰好是那八个签名字段的规范 JSON、genesis / rotation 绑定自洽、重算 `manifest_hash` 并
+  **验证 Ed25519 签名**、最后再用 `Ed25519DailyShadowStageReceiptKeyring` 构造一次校验密钥材料可用。
+  任一条不满足抛出的 `ValueError` 被原样包成 `RuntimeAuthorityStageError` 并带上原因文本。
+- **打包阶段新增一条运行依赖 `openssl`（#200）**：上面那次 Ed25519 验签是 shell 出去跑
+  `openssl pkeyutl -verify -pubin -rawin`（`runtime_shadow_validation._verify_ed25519_signature`，
+  5 秒超时），`-rawin` 需要 **OpenSSL 3.0 以上**；`_openssl_binary()` 的查找顺序是
+  `/opt/homebrew/bin/openssl` → `/usr/bin/openssl` → PATH，Linux 生产机命中 root 属主的
+  `/usr/bin/openssl`，PATH 只是兜底，没有 PATH 注入面。OpenCloudOS 9.2 自带 3.x，现场满足。
+  **要留意的失败模式**：openssl 缺失或太老时验签函数走 `except OSError` 返回 False，报出来的是
+  `signature is invalid`——一句会把排查方向带偏的错，所以 DEPLOY.md 的 B-6' 前置检查里加了
+  `openssl version` 与 `openssl pkeyutl -help | grep rawin` 两条。
+- **装机顺序硬依赖：B-6' 必须在 B-2 / B-3 之后（#200）**：钥匙串是打包阶段的输入，不在就明确拒绝。
+  现有 runbook 的顺序（B-2 → B-3 → B-6'）本来就满足，但这条依赖以前不存在。
+- **打包侧的生产 checkout 根改为派生，不再是第二份会漂移的字面量（#200 审查 SF-3）**：
+  `production_checkout_root() = production_runtime_root().parent.parent`，运行根取自冻结常量
+  `LINUX_PRODUCTION_RUNTIME_ROOT`；`stage_commands` 的解释器与工作目录因此退出整键豁免，改为
+  「替换这两项后与生产画像整表比对」。彻底收口——让 `runtime_production_profile` 里
+  `/home/lighthouse/rquant` 与 `/home/lighthouse/rquant/.venv/bin/python` 两个字面量、以及
+  `runtime_artifact_terminal_lifecycle._LINUX_PRODUCTION_RUNTIME_ROOT` 这份同义副本都改成同一处派生
+  ——记在 issue #202；本次绕开只是因为 `runtime_deployment_profile.py` 不在 R07 的 `allowed_diff` 里，
+  改它会当场打红差分门。
 
 ### Security
 

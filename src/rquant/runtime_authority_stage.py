@@ -29,6 +29,7 @@ import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from rquant import runtime_authority as authority
@@ -84,6 +85,11 @@ RECOVERY_SERVICE_ID = "recovery.primary.v1"
 #: placeholder name for the manifest the service never opens (S1 §9.3, C-12).
 PAGE_CONTROL_SERVICE_ID = "page-control.orphan.v1"
 PAGE_CONTROL_UNIT = Path("deploy/systemd/rquant-page-control.service")
+#: The cadence route B gives every derived manifest. Per-role cadence is a property of the
+#: published production profile, not of a first installation (#200 is about plane and
+#: settings); the health publisher reports the same staleness bound it hands its sources.
+MANIFEST_INTERVAL_SECONDS = 60.0
+MANIFEST_STALE_AFTER_SECONDS = 900.0
 #: What the generation mirrors out of the checkout (E-1 layout).
 CHECKOUT_SOURCE_PATHS = ("src/rquant", "scripts/strict_json.py")
 CHECKOUT_CONSUMED_PATHS = (*CHECKOUT_SOURCE_PATHS, "deploy/systemd")
@@ -375,17 +381,684 @@ class ServiceSet:
     manifests: Mapping[str, bytes]
 
 
-def _kind_backed_manifest(role: str, service_id: str, commit: str) -> bytes:
+#: The runtime owner root every derived setting addresses. `None` means the frozen
+#: `runtime_deployment_profile.LINUX_PRODUCTION_RUNTIME_ROOT`; the suite points this at a
+#: temporary directory the same way it points `PRODUCTION_SYSTEM_PYTHON` at a fake
+#: interpreter, so a builder can be constructed out of a staged manifest in a test.
+PRODUCTION_RUNTIME_ROOT: Path | None = None
+#: The v3 cost engine `build_production_runtime_profile` gives the paper broker. It is a
+#: frozen policy of this repository, not an installation fact.
+PAPER_EXECUTION_COST_SPEC: Mapping[str, object] = {
+    "schema_version": 3,
+    "cost_engine_version": "rquant-paper-cost-engine-v3",
+    "instrument_selectors": [
+        {
+            "selector_id": "cn-sse-a-share",
+            "market": "CN",
+            "exchange": "SSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE",
+        },
+        {
+            "selector_id": "cn-szse-a-share",
+            "market": "CN",
+            "exchange": "SZSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE",
+        },
+    ],
+    "commission_rules": [
+        {
+            "rule_id": "commission-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH",
+        },
+        {
+            "rule_id": "commission-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH",
+        },
+    ],
+    "transfer_fee_rules": [
+        {
+            "rule_id": "transfer-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "0",
+            "minimum_amount": "0",
+            "applies_to": "BOTH",
+        },
+        {
+            "rule_id": "transfer-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "0",
+            "minimum_amount": "0",
+            "applies_to": "BOTH",
+        },
+    ],
+    "stamp_duty_rules": [
+        {
+            "rule_id": "stamp-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL",
+        },
+        {
+            "rule_id": "stamp-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL",
+        },
+    ],
+    "fee_notional_basis": "EXECUTED_NOTIONAL",
+    "assessment_unit": "FILL",
+    "slippage": {
+        "owner": "shared_cost_engine",
+        "buy_bps": "5",
+        "sell_bps": "5",
+        "price_tick": "0.0001",
+        "price_rounding": "HALF_UP",
+    },
+    "money": {"quantum": "0.01", "rounding": "HALF_UP"},
+}
+
+
+#: The daily receipt trusted keyring, the one file this stage reads outside the checkout and
+#: the artifacts it was handed (coordinator ruling, 2026-09-05). `root:root 0444`, produced by
+#: `scripts/install-runtime-credential-infra.sh` in B-3 and world-readable, so reading it as
+#: the unprivileged staging user is not a privilege gain and adds no writable trust surface.
+#: `None` means the frozen
+#: `runtime_deployment_profile.PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH` — the same
+#: constant `_hydrate_daily_receipt_authority_from_fixed_keyring` reads, not a second literal;
+#: the suite points this at a temporary file the way it points the runtime root.
+DAILY_RECEIPT_KEYRING_PATH: Path | None = None
+
+
+def daily_receipt_keyring_path() -> Path:
+    """The trusted keyring this stage reads (the module seam above)."""
+
+    if DAILY_RECEIPT_KEYRING_PATH is not None:
+        return DAILY_RECEIPT_KEYRING_PATH
+    from rquant.runtime_deployment_profile import PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+
+    return PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+
+
+def daily_receipt_authority() -> tuple[str, str, dict[str, str]]:
+    """The active daily receipt key id, its public key and the retired ones.
+
+    The judgement belongs to `runtime_production_profile._load_daily_receipt_trusted_keyring`,
+    the loader the production profile itself hydrates from, and this calls it rather than
+    restating it: root-owned parent chain with no group or world write bit, `O_NOFOLLOW` open
+    with the descriptor and the name cross-checked before and after the read, a single-linked
+    regular file at exactly 0444 owned by root and at most 64 KiB, the eight signed fields in
+    canonical JSON, the genesis and rotation bindings, a recomputed manifest hash and a
+    verified Ed25519 signature over it. A first draft of this stage judged only some of that
+    and would have accepted a three-field file with no signature at all (review SF-1).
+
+    Its `ValueError` becomes a `RuntimeAuthorityStageError` carrying the reason, so the stage
+    fails closed with something diagnosable. Nothing here degrades to an empty authority: a
+    manifest naming no key would start a receipt signer with nothing to verify against.
+    """
+
+    from rquant.runtime_production_profile import _load_daily_receipt_trusted_keyring
+
+    path = daily_receipt_keyring_path()
+    try:
+        return _load_daily_receipt_trusted_keyring(path)
+    except ValueError as exc:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring is unusable: {path} ({exc})"
+        ) from exc
+
+
+def production_runtime_root() -> Path:
+    """The runtime owner root the derived settings address (the module seam above)."""
+
+    if PRODUCTION_RUNTIME_ROOT is not None:
+        return PRODUCTION_RUNTIME_ROOT
+    from rquant.runtime_deployment_profile import LINUX_PRODUCTION_RUNTIME_ROOT
+
+    return LINUX_PRODUCTION_RUNTIME_ROOT
+
+
+@lru_cache(maxsize=4)
+def builtin_strategy_facts(commit: str) -> tuple[tuple[object, ...], Mapping[str, object]]:
+    """The three built-in strategies' bindings and static feature schemas, as the checkout
+    computes them for itself. `install_production_runtime_prerequisites` refuses a profile
+    whose bindings differ from this same plan, so these are derivations, not guesses. The
+    cache is keyed by commit because every fingerprint below hashes executable content.
+    """
+
+    from rquant.runtime_definition_bootstrap import plan_builtin_definitions
+    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+
+    strategies = tuple(
+        sorted(
+            plan_builtin_definitions(producer_commit=commit).strategies,
+            key=lambda strategy: strategy.strategy_id,
+        )
+    )
+    evaluators = BuiltinStrategyEvaluatorRegistry(producer_commit=commit)
+    schemas = {
+        strategy.strategy_id: {
+            name: semantic.contract_payload()
+            for name, semantic in evaluators.load_definition(
+                strategy.strategy_id,
+                strategy.strategy_version,
+            ).static_feature_schema.items()
+        }
+        for strategy in strategies
+    }
+    return strategies, schemas
+
+
+def production_checkout_root() -> Path:
+    """`/home/lighthouse/rquant`: the checkout the runtime owner root lives inside.
+
+    `LINUX_PRODUCTION_RUNTIME_ROOT` is `<checkout>/data/runtime`, so the checkout is two
+    levels up and the packaging module needs no second copy of that literal — which is what
+    the daily stage commands used to carry (review SF-3). The suite pins the pair against the
+    stage command list `build_production_runtime_profile` builds.
+    """
+
+    return production_runtime_root().parent.parent
+
+
+def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
+    """The settings of every kind-backed role, by service id (S1 §9.3, #200).
+
+    Route B used to hand every builder an empty settings object, which each of them
+    rejected against its own model. What a first installation *can* know is derived here
+    with the same expressions `build_production_runtime_profile` uses: paths under the
+    runtime owner root, frozen constants of `runtime_deployment_profile`, the operational
+    database location `runtime_artifact_terminal_lifecycle` computes from the root, and the
+    strategy fingerprints and static feature schemas the checkout computes for itself.
+
+    What a first installation cannot know is left out on purpose: the market calendar
+    generation, the sealed candidate documents, the historical minute snapshot, the
+    definition registry, the routing policy, the trade calendar, the recovery and retention
+    authorities, the artifact location and the signer public keys are all operator facts
+    that live outside the runtime owner root (`ProductionRuntimeProfileInputs` refuses an
+    immutable input inside it) or under `/etc/rquant`. A placeholder for any of them would
+    be a lie the builder cannot detect, so the field is absent and the builder's own model
+    names it. The suite pins both halves: what is derived, and what is missing.
+    """
+
+    from rquant.runtime_artifact_terminal_lifecycle import (
+        artifact_retention_state_root,
+        operational_database_path,
+        operational_readonly_database_path,
+    )
+    from rquant.runtime_builder_daily_orchestrator import build_daily_shadow_stage_commands
+    from rquant.runtime_deployment_bundle import strategy_live_producer_version
+    from rquant.runtime_deployment_profile import (
+        PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH,
+        PRODUCTION_DAILY_SIGNER_SOCKET_ENDPOINT,
+        PRODUCTION_SHADOW_INSTANCE_ID,
+        PRODUCTION_SHADOW_SERVICE_ID,
+        PRODUCTION_SHADOW_SIGNER_COMMAND,
+    )
+    from rquant.runtime_production_profile import _control_bucket
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    root = production_runtime_root()
+    checkout = production_checkout_root()
+    (
+        receipt_active_key_id,
+        receipt_active_public_key,
+        receipt_previous_public_keys,
+    ) = daily_receipt_authority()
+    database = operational_database_path(root)
+    research_metadata = operational_readonly_database_path(root)
+    reference_registry = root / "authorities" / "reference-slow" / "reference.sqlite3"
+    reference_spool = root / "live" / "reference-slow"
+    minute_root = root / "live" / "market-minute"
+    quote_root = root / "live" / "watchlist-quote"
+    auction_root = root / "live" / "auction-match"
+    auction_universe_root = root / "authorities" / "auction-universe"
+    signal_root = root / "live" / "signal-bus"
+    signal_spool = signal_root / "spool"
+    feature_root = root / "live" / "features"
+    legacy_shadow_root = root.parent / "legacy-shadow"
+    research_root = root / "research"
+    final_artifacts = research_root / "final-artifacts"
+    lab_jobs_path = research_root / "lab_jobs.sqlite3"
+    experiment_registry = research_root / "experiment_registry.sqlite3"
+    health_authority = root / "control" / "authority-runtime-health"
+    reference_cursor_root = (
+        root
+        / "control"
+        / "reference-slow-publishers"
+        / instance_label("reference-slow.publisher.v1")
+        / "cursors"
+    )
+    broker_root = root / "live" / "paper-brokers" / instance_label("paper-broker.shadow-main.v1")
+    notifier_root = root / "live" / "notifications" / instance_label("notifier.admin.shadow.v1")
+    catalog_root = (
+        research_root / "artifact-catalogs" / instance_label("artifact-catalog.primary.v1")
+    )
+    retention_state_root = artifact_retention_state_root(root)
+
+    strategies, schemas = builtin_strategy_facts(commit)
+
+    def candidate_service_id(strategy_id: str) -> str:
+        return f"candidate.{strategy_id}.v1"
+
+    def strategy_service_id(strategy_id: str) -> str:
+        return f"strategy.{strategy_id}.v1"
+
+    def candidate_root(strategy_id: str) -> Path:
+        return root / "live" / "candidates" / instance_label(candidate_service_id(strategy_id))
+
+    def runner_state_path(strategy_id: str) -> Path:
+        return (
+            root
+            / "live"
+            / "strategies"
+            / instance_label(strategy_service_id(strategy_id))
+            / "runner.sqlite3"
+        )
+
+    candidate_authorities = [
+        {
+            "strategy_id": strategy.strategy_id,
+            "strategy_version": str(strategy.strategy_version),
+            "snapshot_root": str(candidate_root(strategy.strategy_id)),
+            "required": True,
+            "max_age_seconds": 7 * 24 * 60 * 60,
+            "definition_fingerprint": strategy.registration_fingerprint,
+            "executable_fingerprint": strategy.executable_fingerprint,
+            "candidate_schema_fingerprint": strategy.candidate_schema_fingerprint,
+            "static_feature_names": sorted(schemas[strategy.strategy_id]),
+            "static_feature_schema": schemas[strategy.strategy_id],
+        }
+        for strategy in strategies
+    ]
+
+    settings: dict[str, dict[str, object]] = {
+        "reference-slow.source.v1": {
+            "database_path": str(database),
+            "spool_root": str(reference_spool),
+            "quota_path": str(reference_spool / "quota.sqlite3"),
+            "quota_units_per_window": 500,
+            "quota_accounting_mode": "transport",
+            "quota_cost_per_capture": None,
+            "retry_ordinal": 0,
+            "pending_recovery_min_age_seconds": 60,
+            "revision_lookback_sessions": 5,
+            "history_page_size": 64,
+            "limits": {
+                "snapshot_max_bytes": 8 * 1024**3,
+                "snapshot_min_free_bytes": 2 * 1024**3,
+                "snapshot_copy_timeout_seconds": 45.0,
+                "query_chunk_rows": 512,
+                "max_response_rows": 10_000,
+                "max_response_bytes": 8 * 1024**2,
+            },
+            "consumer_cursor_root": str(reference_cursor_root),
+            "retention_consumer_id": "reference-slow-publisher",
+            "retention_hot_batches": 128,
+            "retention_page_size": 32,
+            "producer_version": "reference-slow-source-v1",
+        },
+        "reference-slow.publisher.v1": {
+            "spool_root": str(reference_spool),
+            "registry_path": str(reference_registry),
+            "cursor_root": str(reference_cursor_root),
+            "consumer_id": "reference-slow-publisher",
+            "page_size": 16,
+        },
+        "auction-universe.publisher.v1": {
+            "database_path": str(database),
+            "authority_root": str(auction_universe_root),
+        },
+        "auction-match.source.v1": {
+            "spool_root": str(auction_root),
+            "quota_path": str(auction_root / "quota.sqlite3"),
+            "quota_units_per_window": 500,
+            "quota_cost_per_request": 1,
+            "producer_version": "auction-match-source-v1",
+            "universe_path": str(auction_universe_root / "current.json"),
+            "max_attempts": 3,
+        },
+        "market-minute.source.v1": {
+            "spool_root": str(minute_root),
+            "quota_path": str(minute_root / "quota.sqlite3"),
+            "quota_units_per_window": 500,
+            "quota_cost_per_request": 20,
+            "pending_recovery_min_age_seconds": 60,
+            "max_codes_per_source_call": 300,
+            "producer_version": "market-minute-source-v1",
+            "candidate_authorities": candidate_authorities,
+        },
+        "watchlist-quote.source.v1": {
+            "spool_root": str(quote_root),
+            "quota_path": str(quote_root / "quota.sqlite3"),
+            "quota_units_per_window": 12,
+            "quota_cost_per_request": 1,
+            "producer_version": "watchlist-quote-source-v1",
+            "schema_version": 2,
+            "rollout_mode": "candidate",
+            "minimum_cadence_seconds": 5.0,
+            "request_timeout_seconds": 2.5,
+            "failure_threshold": 3,
+            "circuit_cooldown_seconds": 30.0,
+            "max_backoff_seconds": 60.0,
+            "candidate_authorities": candidate_authorities,
+        },
+        "daily-close.source.v1": {
+            "spool_root": str(root / "live" / "daily-close"),
+            "quota_path": str(root / "live" / "daily-close" / "quota.sqlite3"),
+            "quota_units_per_window": 20,
+            "quota_accounting_mode": "transport",
+            "quota_cost_per_request": None,
+            "pending_recovery_min_age_seconds": 300,
+            "producer_version": "daily-close-source-v1",
+        },
+        "daily.pipeline.orchestrator.shadow.v1": {
+            "storage_root": str(research_root / "daily-pipeline"),
+            "source_spool_root": str(root / "live" / "daily-close"),
+            "deployment_profile_path": str(root / "current" / "deployment-profile.json"),
+            "mode": "shadow",
+            "service_owner": "daily.pipeline.orchestrator.shadow.v1",
+            "stages": [
+                "raw_capture",
+                "validate_candidate",
+                "canonical_publish",
+                "screen",
+                "pool",
+                "summary",
+                "serving_refresh",
+                "replica_sync",
+                "research_ingest",
+                "backup",
+            ],
+            "stage_commands": [
+                command.model_dump(mode="json")
+                for command in build_daily_shadow_stage_commands(
+                    python_executable=checkout / ".venv" / "bin" / "python",
+                    working_directory=checkout,
+                )
+            ],
+            "receipt_active_key_id": receipt_active_key_id,
+            "receipt_active_public_key_pem": receipt_active_public_key,
+            "receipt_previous_public_key_pems": receipt_previous_public_keys,
+            "receipt_signer_socket_endpoint": str(PRODUCTION_DAILY_SIGNER_SOCKET_ENDPOINT),
+            "receipt_trusted_keyring_path": str(PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH),
+            "receipt_signer_timeout_seconds": 5.0,
+            "receipt_signer_test_mode": False,
+        },
+        PRODUCTION_SHADOW_SERVICE_ID: {
+            "report_root": str(research_root / "shadow-reports"),
+            "legacy_monitor_root": str(legacy_shadow_root / "monitor"),
+            "legacy_surge_root": str(legacy_shadow_root / "surge"),
+            "isolated_runner_root": str(legacy_shadow_root / "isolated-runners"),
+            "signer_command": list(PRODUCTION_SHADOW_SIGNER_COMMAND),
+            "report_producer_service_id": PRODUCTION_SHADOW_SERVICE_ID,
+            "report_producer_instance_id": PRODUCTION_SHADOW_INSTANCE_ID,
+            "signer_timeout_seconds": 5.0,
+            "producer_version": "shadow-session-production-v1",
+            "match_tolerance_microseconds": 60_000_000,
+            "mode": "shadow",
+            "strategy_bindings": [
+                {
+                    "strategy_id": strategy.strategy_id,
+                    "strategy_version": strategy.strategy_version,
+                    "definition_fingerprint": strategy.registration_fingerprint,
+                    "executable_fingerprint": strategy.executable_fingerprint,
+                }
+                for strategy in strategies
+                if strategy.strategy_id in {"n_shape", "growth_board_surge"}
+            ],
+        },
+        "feature.intraday-pit.v1": {
+            "raw_spool_root": str(minute_root),
+            "feature_spool_root": str(feature_root),
+            "limit": 128,
+            "consumer_id": "feature-live",
+            "feature_config": {
+                "lookback_sessions": 20,
+                "opening_acceleration_block_minutes": 3,
+                "bar_timestamp_semantics": "bar_end",
+                "contract_id": "intraday-pit",
+                "contract_version": 3,
+                "schema_version": 2,
+            },
+        },
+        "signal-router.all-strategies.v1": {
+            "signal_bus_path": str(signal_root / "signal_bus.sqlite3"),
+            "signal_spool_root": str(signal_spool),
+            "sources": [
+                {
+                    "source_id": strategy_service_id(strategy.strategy_id),
+                    "runner_state_path": str(runner_state_path(strategy.strategy_id)),
+                    "expected_strategy_registration_fingerprint": (
+                        strategy.registration_fingerprint
+                    ),
+                    "expected_strategy_spec_fingerprint": strategy.strategy_spec_fingerprint,
+                    "expected_evaluator_contract_fingerprint": strategy.executable_fingerprint,
+                }
+                for strategy in strategies
+            ],
+            "batch_limit": 256,
+            "paused": False,
+        },
+        "notifier.admin.shadow.v1": {
+            "signal_spool_root": str(signal_spool),
+            "notification_state_path": str(notifier_root / "notification_state.sqlite3"),
+            "worker_id": "notifier-admin-shadow",
+            "batch_limit": 128,
+            "lease_seconds": 30,
+            "serving_authority_root": str(notifier_root / "serving-authority"),
+            "page_projection_database_path": str(database),
+            "page_projection_surge_live_root": str(database.parent / "surge_live"),
+            "paused": True,
+        },
+        "paper-constraint.market.v1": {
+            "minute_spool_root": str(minute_root),
+            "reference_registry_path": str(reference_registry),
+            "authority_root": str(root / "authorities" / "paper-execution"),
+            "quote_ttl_seconds": 120,
+        },
+        "paper-broker.shadow-main.v1": {
+            "account_id": "shadow-main",
+            "execution_lag_seconds": 60,
+            "buy_quantity": 100,
+            "reduce_quantity": 100,
+            "sell_quantity": 100,
+            "signal_spool_root": str(signal_spool),
+            "queue_path": str(broker_root / "queue.sqlite3"),
+            "consumer_state_path": str(broker_root / "consumer.sqlite3"),
+            "broker_path": str(broker_root / "broker.sqlite3"),
+            "initial_cash": "100000",
+            "execution_cost_spec": dict(PAPER_EXECUTION_COST_SPEC),
+            "limit": 128,
+            "serving_authority_root": str(broker_root / "serving-authority"),
+            "paused": False,
+        },
+        "lab-jobs.serving.v1": {
+            "lab_jobs_path": str(lab_jobs_path),
+            "research_metadata_path": str(research_metadata),
+            "authority_root": str(research_root / "serving-authorities" / "lab-jobs"),
+        },
+        "artifact-catalog.primary.v1": {
+            "research_root": str(research_root),
+            "artifact_root": str(final_artifacts),
+            "state_root": str(catalog_root),
+            "lab_jobs_path": str(lab_jobs_path),
+            "dataset_authority_path": str(research_metadata),
+            "experiment_registry_path": str(experiment_registry),
+        },
+        "artifact-retention.primary.v1": {
+            "managed_root": str(final_artifacts),
+            "state_root": str(retention_state_root),
+            "reference_store_path": str(retention_state_root / "references.sqlite3"),
+            "catalog_authority_root": str(retention_state_root / "catalog-authority"),
+            "max_recovery_age": "P30D",
+            "max_bundle_items": 128,
+            "max_bundle_bytes": 8589934592,
+            "retention_policy": {
+                "hot_min_age": "P7D",
+                "warm_min_age": "P30D",
+                "cold_min_age": "P90D",
+                "minimum_verified_copies": 1,
+                "verification_max_age": "P1D",
+                "plan_ttl": "PT1H",
+                "claim_ttl": "PT10M",
+                "rules": [],
+            },
+            "worker": {
+                "batch_items": 16,
+                "batch_bytes": 1073741824,
+                "max_runtime": "PT60S",
+                "lease_ttl": "PT5M",
+                "max_attempts": 3,
+                "retry_delay": "PT1M",
+            },
+        },
+        "promotions.serving.v1": {
+            "experiment_registry_path": str(experiment_registry),
+            "experiment_registry_managed_trust_root": str(research_root),
+            "authority_root": str(research_root / "serving-authorities" / "promotions"),
+        },
+        "serving.publisher.v1": {
+            "serving_root": str(root / "serving"),
+            "schema_version": 3,
+            "source_authorities": [
+                {"dataset_id": "signals", "root": str(notifier_root / "serving-authority")},
+                {"dataset_id": "paper_accounts", "root": str(broker_root / "serving-authority")},
+                {"dataset_id": "runtime_health", "root": str(health_authority)},
+                {
+                    "dataset_id": "lab_jobs",
+                    "root": str(research_root / "serving-authorities" / "lab-jobs"),
+                },
+                {
+                    "dataset_id": "promotions",
+                    "root": str(research_root / "serving-authorities" / "promotions"),
+                },
+                {
+                    "dataset_id": "reference_slow_authority",
+                    "root": str(reference_spool / "serving-authority"),
+                },
+            ],
+        },
+    }
+    for strategy in strategies:
+        settings[candidate_service_id(strategy.strategy_id)] = {
+            "strategy_id": strategy.strategy_id,
+            "strategy_version": strategy.strategy_version,
+            "definition_fingerprint": strategy.registration_fingerprint,
+            "executable_fingerprint": strategy.executable_fingerprint,
+            "candidate_schema_fingerprint": strategy.candidate_schema_fingerprint,
+            "static_feature_schema": schemas[strategy.strategy_id],
+            "snapshot_root": str(candidate_root(strategy.strategy_id)),
+        }
+        service_id = strategy_service_id(strategy.strategy_id)
+        settings[service_id] = {
+            "feature_spool_root": str(feature_root),
+            "runner_state_path": str(runner_state_path(strategy.strategy_id)),
+            "strategy_registration_fingerprint": strategy.registration_fingerprint,
+            "strategy_spec_fingerprint": strategy.strategy_spec_fingerprint,
+            "evaluator_contract_fingerprint": strategy.executable_fingerprint,
+            "strategy_executable_fingerprint": strategy.executable_fingerprint,
+            "candidate_schema_fingerprint": strategy.candidate_schema_fingerprint,
+            "candidate_snapshot_root": str(candidate_root(strategy.strategy_id)),
+            "paper_broker_path": str(broker_root / "broker.sqlite3"),
+            "paper_account_id": "shadow-main",
+            "candidate_max_age_seconds": 7 * 24 * 60 * 60,
+            "strategy_id": strategy.strategy_id,
+            "strategy_version": strategy.strategy_version,
+            "batch_limit": 128,
+            "signal_bus_path": str(signal_root / "signal_bus.sqlite3"),
+            "producer_instance_id": instance_label(service_id),
+            "producer_version": strategy_live_producer_version(
+                service_id=service_id,
+                strategy_version=strategy.strategy_version,
+                producer_commit=commit,
+            ),
+        }
+    #: The health publisher watches every other runtime service, exactly as
+    #: `build_production_runtime_profile` composes it: every kind-backed manifest except
+    #: its own and the serving publisher it feeds.
+    kinds = {
+        service_id: kind
+        for kind, service_id in _singleton_service_ids().items()
+        if kind
+        not in (RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER, RuntimeServiceKind.SERVING_PUBLISHER)
+    }
+    for strategy in strategies:
+        kinds[candidate_service_id(strategy.strategy_id)] = RuntimeServiceKind.CANDIDATE_PUBLISHER
+        kinds[strategy_service_id(strategy.strategy_id)] = RuntimeServiceKind.STRATEGY_LIVE
+    settings["runtime-health.all.v1"] = {
+        "authority_root": str(health_authority),
+        "sources": [
+            {
+                "control_root": str(
+                    root / "control" / _control_bucket(kind) / instance_label(service_id)
+                ),
+                "service_id": service_id,
+                "plane": role_plane(kind.value),
+                "stale_after_seconds": MANIFEST_STALE_AFTER_SECONDS,
+                "producer_commit": commit,
+            }
+            for service_id, kind in sorted(kinds.items())
+        ],
+    }
+    return settings
+
+
+def _singleton_service_ids() -> Mapping[object, str]:
+    from rquant.runtime_production_profile import _SINGLETON_SERVICE_IDS
+
+    return _SINGLETON_SERVICE_IDS
+
+
+def role_plane(role: str) -> str:
+    """The plane `role` runs on, read out of the one table the builders assert against.
+
+    `runtime_deployment_bundle._EXPECTED_PLANE` is that table: `validate_runtime_deployment_
+    topology` refuses a profile whose manifest disagrees with it, and every builder repeats
+    the same expectation as its own first assertion. Route B used to write `live` into all
+    28 manifests (#200), which the seven serving and research builders rejected on sight, so
+    this reads the shared table rather than restating it (the `_DISTRIBUTION_OWNED_
+    DIRECTORIES` rule of #198).
+    """
+
+    from rquant.runtime_deployment_bundle import _EXPECTED_PLANE
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    try:
+        kind = RuntimeServiceKind(role)
+    except ValueError as exc:
+        raise RuntimeAuthorityStageError(f"role names no runtime service kind: {role}") from exc
+    plane = _EXPECTED_PLANE.get(kind)
+    if plane is None:
+        raise RuntimeAuthorityStageError(f"role has no plane in the shared table: {role}")
+    return str(plane.value)
+
+
+def _kind_backed_manifest(
+    role: str,
+    service_id: str,
+    commit: str,
+    settings: Mapping[str, object],
+) -> bytes:
     return canonical_json_bytes(
         {
             "schema_version": 2,
             "service_id": service_id,
             "service_kind": role,
-            "plane": "live",
-            "interval_seconds": 60.0,
-            "stale_after_seconds": 900.0,
+            "plane": role_plane(role),
+            "interval_seconds": MANIFEST_INTERVAL_SECONDS,
+            "stale_after_seconds": MANIFEST_STALE_AFTER_SECONDS,
             "producer_commit": commit,
-            "settings": {},
+            "settings": dict(settings),
         },
         trailing_newline=True,
     )
@@ -449,14 +1122,18 @@ def derive_bootstrap_services(*, page_control_unit: Path, commit: str) -> Servic
     service_ids: dict[str, str] = {}
     manifests: dict[str, bytes] = {}
 
+    derived = bootstrap_settings(commit)
+
     def add(role: str, service_id: str) -> None:
         entry = policy.get(role)
         if entry is None or entry.service_kind != role or not entry.instanced:
             raise RuntimeAuthorityStageError(f"service id {service_id} names no kind-backed role")
+        if service_id not in derived:
+            raise RuntimeAuthorityStageError(f"service id has no derived settings: {service_id}")
         label = instance_label(service_id)
         instances.setdefault(role, []).append(label)
         service_ids[label] = service_id
-        manifests[label] = _kind_backed_manifest(role, service_id, commit)
+        manifests[label] = _kind_backed_manifest(role, service_id, commit, derived[service_id])
 
     for kind, service_id in _SINGLETON_SERVICE_IDS.items():
         add(kind.value, service_id)
