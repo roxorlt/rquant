@@ -15,7 +15,9 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+import rquant.runtime_artifact_terminal_lifecycle as terminal_lifecycle_module
 import rquant.runtime_deployment_bundle as deployment_bundle_module
+import rquant.runtime_deployment_profile as deployment_profile_module
 import rquant.runtime_production_profile as production_profile_module
 from rquant.lab_highwater_authority import PRODUCTION_LAB_HIGHWATER_COMMAND
 from rquant.legacy_shadow_export import LegacyShadowRunnerManifestBinding
@@ -48,7 +50,10 @@ from rquant.runtime_deployment_profile import (
     validate_runtime_recovery_backup_config,
 )
 from rquant.runtime_market_calendar_generation import market_calendar_generation_path
-from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_market_session import (
+    MarketCalendarAuthority,
+    MarketSessionCalendarError,
+)
 from rquant.runtime_production_profile import (
     ProductionRuntimeProfileInputs,
     ProductionStrategyBinding,
@@ -2684,3 +2689,140 @@ def test_profile_publication_rejects_wrong_name_or_existing_content(tmp_path: Pa
     output.chmod(0o600)
     with pytest.raises(ValueError, match="existing|canonical"):
         _publish_profile(profile, output)
+
+
+# --------------------------------------------------------------------------- B-1
+# A linux-production contract has to survive the second validation the builders do.
+
+
+def _linux_production_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ProductionRuntimeProfileInputs:
+    """Load one linux-production contract through the real strict loader.
+
+    The only host fact a test cannot arrange is the root-owned Daily receipt keyring, so
+    it borrows this suite's existing `os.stat`/`os.fstat` seam; every other
+    linux-production validator runs for real.
+    """
+
+    # `/home` is an autofs symlink on macOS and `_absolute_runtime_root` refuses a
+    # symlinked ancestor, so the frozen root literal is pointed at a symlink-free
+    # temporary host layout for the duration. What is under test is the `runtime_mode`
+    # branch, not the literal; every linux-production validator still runs.
+    host_root = tmp_path / "host" / "rquant" / "data" / "runtime"
+    for module, name in (
+        (production_profile_module, "LINUX_PRODUCTION_RUNTIME_ROOT"),
+        (deployment_profile_module, "LINUX_PRODUCTION_RUNTIME_ROOT"),
+        (terminal_lifecycle_module, "_LINUX_PRODUCTION_RUNTIME_ROOT"),
+    ):
+        monkeypatch.setattr(module, name, host_root)
+
+    inputs = _inputs(tmp_path)
+    payload = _relocate_runtime_value(
+        inputs.model_dump(mode="json"),
+        source=inputs.runtime_root.parent,
+        target=host_root.parent,
+    )
+    assert isinstance(payload, dict)
+    payload["runtime_mode"] = "linux-production"
+    payload["recovery"].pop("profile_generation")
+    payload["canvas_publication_active_key_id"] = "canvas-v1"
+    payload["canvas_publication_active_public_key_pem"] = "active-public-key"
+    payload["daily_receipt_active_key_id"] = None
+    payload["daily_receipt_active_public_key_pem"] = None
+    payload["daily_receipt_previous_public_key_pems"] = {}
+
+    active_private, active_public = _daily_private_key(
+        tmp_path / "daily-receipt" / "active",
+        key_id="daily-v1",
+    )
+    keyring = tmp_path / "etc/rquant/daily-receipt-trusted-keys.json"
+    keyring.parent.mkdir(parents=True, mode=0o700)
+    keyring.write_bytes(
+        canonical_json_bytes(
+            _daily_keyring_document(
+                active_private,
+                active_key_id="daily-v1",
+                active_public_key=active_public,
+            )
+        )
+    )
+    keyring.chmod(0o444)
+    _mark_daily_keyring_root_owned(monkeypatch, keyring)
+    monkeypatch.setattr(
+        production_profile_module,
+        "DAILY_RECEIPT_TRUSTED_KEYRING_PATH",
+        keyring,
+    )
+    path = tmp_path / "linux-profile-inputs.json"
+    path.write_bytes(canonical_json_bytes(payload))
+    path.chmod(0o600)
+    return load_production_runtime_profile_inputs(
+        path,
+        expected_commit=COMMIT,
+        expected_runtime_mode="linux-production",
+    )
+
+
+def test_a_linux_production_contract_builds_a_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`build_production_runtime_profile` revalidates its argument, and the
+    linux-production gate asks for a validation context that only the loader can supply.
+
+    Without the context being carried over, every linux-production build died on its own
+    first line — the route A command chain stopped before printing a single target
+    (found by pkgB review B-1). No linux-production test reached a builder before this
+    one, which is why nothing was red.
+    """
+
+    inputs = _linux_production_inputs(tmp_path, monkeypatch)
+
+    profile = build_production_runtime_profile(inputs)
+
+    assert profile.profile_id is not None
+    assert profile.runtime_mode == "linux-production"
+    assert len(profile.manifests) == 26
+
+
+def test_a_linux_production_contract_reaches_the_prerequisite_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same revalidation is the first line of `install_production_runtime_prerequisites`.
+
+    The call still fails here, but on the *market calendar* — the first real host fact it
+    needs — rather than on the contract it was just handed. That is the difference between
+    "step 1 of the chain prints its targets" and "step 1 of the chain cannot start".
+    """
+
+    inputs = _linux_production_inputs(tmp_path, monkeypatch)
+
+    with pytest.raises(MarketSessionCalendarError):
+        install_production_runtime_prerequisites(inputs)
+
+
+def test_a_raw_unhydrated_linux_payload_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """The gate still stands where it was put: a mapping that was never hydrated from the
+    fixed keyring cannot be turned into a contract by handing it to the builder."""
+
+    inputs = _inputs(tmp_path)
+    payload = _relocate_runtime_value(
+        inputs.model_dump(mode="json"),
+        source=inputs.runtime_root.parent,
+        target=LINUX_PRODUCTION_RUNTIME_ROOT.parent,
+    )
+    assert isinstance(payload, dict)
+    payload["runtime_mode"] = "linux-production"
+    payload["recovery"].pop("profile_generation")
+    payload["canvas_publication_active_key_id"] = "canvas-v1"
+    payload["canvas_publication_active_public_key_pem"] = "active-public-key"
+    payload["daily_receipt_active_key_id"] = "daily-v1"
+    payload["daily_receipt_active_public_key_pem"] = "public-key"
+
+    with pytest.raises(ValidationError, match="must be hydrated"):
+        build_production_runtime_profile(payload)  # type: ignore[arg-type]

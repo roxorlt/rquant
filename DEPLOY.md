@@ -233,6 +233,64 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
    报出来的是 `signature is invalid`**，那是一句会把排查方向带偏的错，先确认这两条能省掉半天。
    （OpenCloudOS 9.2 自带 3.x，B-2 的凭证备份本来也在用 openssl，现场预期满足。）
 
+### 路线 A 前置（生产 inputs 与真实画像，本轮 PR 引入，开工前逐条确认）
+
+路线 A 就是「由操作员产出生产 inputs 文档 + 生成一代真实画像」这条路，也是那 9 个「缺操作员
+事实」的角色唯一的出路（见本节末「等你决策」第 4 条）。本轮 PR 补齐了它缺的两个生产者
+（`scripts/build_runtime_production_inputs.py` 与 `scripts/export_intraday_snapshot.py`）
+和凭证侧的增量装法。下面十二条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+
+1. **市场日历的到期日与续期步骤**：生成器的 `--coverage-floor` 默认 `2027-12-31`，日历表覆盖不到
+   这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
+   续期的做法是：扩 `trade_calendar` 表 → 重跑生成器 → 重跑命令链 ①②③④。这是**换一代
+   generation，不换 `profile_id`**。
+2. **`/usr/local/libexec/rquant-runtime-credential-sealer` 必须随本次 tag 重装**（#208：旧版白名单
+   只覆盖七种凭证种类里的两种，第一次真密封会整体中止）。重装前把旧版备份到
+   `/root/rquant-helper-backup-<stamp>/`。
+3. **凭证补装一律用增量模式，绝不裸 `init`**（主机 `/etc/rquant` 已有 B-2 装的四套，裸 `init` 会因
+   5 个已存在文件整体退 3、一个字节不写）：
+
+   ```bash
+   sudo bash scripts/install-runtime-credential-keys.sh init --only-missing --dry-run   # 应只报 completion,capabilities
+   sudo bash scripts/install-runtime-credential-keys.sh init --only-missing
+   sudo bash scripts/install-runtime-credential-keys.sh verify                          # 13 行 OK
+   ```
+
+   **`--key-suffix` 必须等于主机上已装的那个**。「这一组装没装」是按组内文件在不在判的，而私钥
+   文件名带 suffix、清单文件名不带，所以传错 suffix 会把四个装好的组全判成 `half installed` 并退 3
+   ——那句报错指向一个不存在的文件，方向是错的。主机上 B-2 装的是 **`v1`**，也正是脚本默认值，
+   **不传就是对的**；若某一套已经轮换过，先 `ls /etc/rquant/*/` 或读
+   `/etc/rquant/<kind>-keys.json` 的 `active_private_key_path` 确认后显式传那个值。
+4. **随后发布 completion 公钥环**：
+   `sudo bash scripts/install-runtime-credential-infra.sh --only-missing-keyrings`。它只补还没发布的
+   公钥环（本轮就 `shadow-completion-trusted-keys.json` 一份，`root:root 0444`），**不碰 helper、
+   unit 与 sudoers**，因此不会重启 Daily authority。这一步用到的 `sudo /usr/bin/python3` /
+   `/usr/bin/install` / `/bin/mv` **都不在** `deploy/sudoers/rquant-production-deploy` 的六个白名单
+   别名里，所以**需要一个交互式 sudo 会话**，`sudo -n` 跑不了。第 3、4 步跑完立刻做离线加密备份。
+5. **六个能力凭证的注入**：
+   `eval "$(sudo … export-capabilities)" && rquant runtime-deployment-profile …`。这六个
+   `RQ_*` 变量只在那条命令的进程环境里存在，**不落 env 文件**；执行前先 `set +o history`。
+   轮换过凭证之后必须重跑命令链第 ④ 步。
+6. **分钟快照在云端只读副本上导出，`--ts-code-file` 是事实必需项**：导出器写盘前会用 `feature_live`
+   自己的入场校验判一遍，而 A 股任何一个 20 交易日窗口里都必定有停牌标的、它们的分钟线在
+   `minute_bar` 里是零价，**所以不带 universe 的全市场导出几乎一定退 2**（`OHLC prices must be
+   strictly positive`）。正确做法是只导出实际订阅的标的；**「选哪些代码」是操作员决定，要写进
+   runbook**。退 2 时脚本会打印第一条坏行，按它把对应标的剔掉或换一个窗口再跑。顺带的好处是体量：
+   全市场 20 个交易日约 380 万行，而 `feature_live` 每次启动都会整份读进内存。
+7. **封存候选与 `producer_commit` 绑定**：换代码就要重新产出那两份候选文档并重跑生成器。
+8. **路由策略默认三条策略全放行到 admin 的 PushDeer**（裁决 7）。本轮封存候选是合法空清单，
+   不会真推；**换成真候选之前，owner 需要确认是否收窄**。
+9. **retention 的「不自动删除」是靠一条永不命中的哨兵 binding 实现的**（裁决 5）：真去 verify 某个
+   artifact 会失败关闭，不是静默保留。
+10. **回滚**：按 operation id 回到 sequence 2、把 `current.cred` 切回、删掉
+    `data/runtime/current`。
+11. **第 ⑥ 步之前先查软链**：`namei -l /home/lighthouse/rquant/data/runtime` 与
+    `namei -l /home/lighthouse/rquant/data/runtime-production-inputs.json`。`_absolute_runtime_root`
+    拒绝任何软链祖先，而**「这条路径上没有软链」这件事第一次被真正检验就在主机上**——本地测不出来，
+    macOS 的 `/home` 本身就是 autofs 软链。
+12. `/var/lib/systemd/credential.secret` 由第一次 `systemd-creds encrypt` 自动创建
+    （`root:root 0600`）。第一次密封之后 `sudo stat` 确认一次并把结果记下来。
+
 ### 已知限制（装机前已登记的 issue，外加装机当场发现的 #198；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |

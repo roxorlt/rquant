@@ -1,9 +1,23 @@
 # 运行时凭证密钥：生成、轮换与备份
 
-本文覆盖 `/etc/rquant` 下四套 Ed25519 签名密钥的生命周期，工具是
-`scripts/install-runtime-credential-keys.sh`（`init` / `rotate` / `verify`）。
-四个消费者都是 root 持有的 stdlib helper，脚本因此**不 import `rquant`、不碰 venv**，
-全程只用 `openssl` 与系统 `python3`。
+本文覆盖 `/etc/rquant` 下五套 Ed25519 签名密钥与一组运行时能力凭证的生命周期，工具是
+`scripts/install-runtime-credential-keys.sh`（`init` / `rotate` / `verify` /
+`export-capabilities`）。消费者都是 root 持有的 stdlib helper，脚本因此**不 import
+`rquant`、不碰 venv**，全程只用 `openssl`、`ssh-keygen` 与系统 `python3`。
+
+路线 A 加了两块（协调者裁决 2 与 3）：
+
+- **`completion` 钥匙串**：Shadow 完成态证明的签名公钥单独一套，不复用 `shadow` 报告钥匙
+  （一钥一用）。它的清单形状与 **daily-receipt 相同**（`schema_version` 2、成链），因为生产
+  画像要从公钥环里读回这把公钥，读法与 daily receipt 钥匙串同判据——必须是 root 持有的
+  0444、带 `manifest_hash` 与 Ed25519 签名、`generation` 与 `previous_manifest_hash` 自洽，
+  而这两个字段只能来自成链的私有清单。目前还没有 completion 专属 helper，daily helper 是树里
+  唯一能校验并导出这个形状的加载器，两个安装脚本都通过同一个 runpy 接缝驱动它。
+- **六个运行时能力凭证**：`runtime_capabilities.CAPABILITY_KEYS` 里没有归属的那六个值
+  （reference-slow 源签名三个、reference 发布 HMAC 两个、artifact retention writer 一个）。
+  它们不是钥匙串文件，而是部署器从**进程环境**读的值
+  （`runtime_deployment_profile.resolve_profile_capabilities`），所以统一存在一份 0600 清单
+  `/etc/rquant/runtime-capabilities-keys.json` 里，用 `export-capabilities` 现打印现用。
 
 > [!danger] 私钥丢失不可恢复
 > 四份私钥**没有任何备份机制**，也无法从公钥环反推。丢失后 high-water 的水位链与
@@ -13,9 +27,10 @@
 > **`init` 跑完立刻把整个 `/etc/rquant` 做一次离线加密备份**，备份不进 git、不进聊天、
 > 不进任何云盘同步目录。
 
-## 一、九个文件
+## 一、十三个文件
 
-`init` 一次性产出九个文件（四把私钥 + 四份指针清单 + 一份日历）与五个目录。生产环境属主
+`init` 一次性产出十三个文件（五把签名私钥 + 五份指针清单 + 一份日历 + 一把 reference 源
+OpenSSH 私钥 + 一份能力凭证清单）与六个目录。生产环境属主
 一律 `root:root`；带 `--prefix` 的测试根降级为调用者的 uid / 有效 gid（与
 `scripts/install-runtime-credential-infra.sh --test-root` 的 `validate_metadata` 语义一致）。
 
@@ -67,30 +82,70 @@ sudo bash scripts/install-runtime-credential-keys.sh init \
 `open_dates` 必须严格升序、去重、且落在 `[coverage_start, coverage_end]` 内，否则
 helper 报 `Shadow recovery calendar coverage is invalid`。
 
+## 一之二、往已有的树里补装（`--only-missing`）
+
+生产主机的 `/etc/rquant` 已经装了 B-2 那四套。这种状态下裸跑 `init` 会因为
+`lab-highwater-keys.json` 等已存在整体退出 **3**、一个字节都不写；换 `--key-suffix` 也躲不开，
+清单文件名不带 suffix。**不能靠「删干净重跑」绕过**：daily-receipt 的密钥链已经在跑，
+canvas / shadow-report 的公钥环已经发布并被现役画像引用，删掉重建等于把四套全部轮换一遍。
+
+```bash
+# 只补没装的组，已装的清单与私钥一个字节不碰
+sudo bash scripts/install-runtime-credential-keys.sh init --only-missing --dry-run
+sudo bash scripts/install-runtime-credential-keys.sh init --only-missing
+sudo bash scripts/install-runtime-credential-keys.sh verify        # 13 行 OK
+
+# 公钥环同理：只发布还没发布的那一份，不碰 helper / unit / sudoers
+sudo bash scripts/install-runtime-credential-infra.sh --only-missing-keyrings
+```
+
+组的粒度是「一套钥匙串或能力凭证」：`highwater` / `canvas` / `shadow`（含日历）/
+`completion` / `daily` / `capabilities`。**半装的组会被拒绝而不是补全**（退出 3）——清单里
+写着私钥路径，只补其中一半会让另一半的含义变掉。全都装好时 `--only-missing` 退出 **4** 并
+说明无事可做。
+
 ## 二、首次安装（runbook B-2）
 
 ```bash
-# ① 干跑：只列出将创建的 5 个目录与 9 个文件，不写任何东西
+# ① 干跑：只列出将创建的 6 个目录与 13 个文件，不写任何东西
 sudo bash /home/lighthouse/rquant/scripts/install-runtime-credential-keys.sh init --dry-run
 
 # ② 真正创建
 sudo bash /home/lighthouse/rquant/scripts/install-runtime-credential-keys.sh init
 
-# ③ 复核：9 行 OK + 退出码 0
+# ③ 复核：13 行 OK + 退出码 0
 sudo bash /home/lighthouse/rquant/scripts/install-runtime-credential-keys.sh verify
 
 # ④ 立刻离线加密备份 /etc/rquant，再进 B-3 装 helper
 ```
 
-`init` 是幂等的：九个目标文件里**任何一个已存在**就整体拒绝，退出码 **3**，不覆盖、不改动。
+`init` 是幂等的：十三个目标文件里**任何一个已存在**就整体拒绝，退出码 **3**，不覆盖、不改动。
 失败时**不要手工补文件**，先看清楚缺什么，`rm` 干净后重跑 `init`（此时还没有任何东西依赖它们）。
 
 回滚：
 
 ```bash
-sudo rm -rf /etc/rquant/{lab-highwater,canvas-publication,shadow-report,daily-receipt} \
+sudo rm -rf /etc/rquant/{lab-highwater,canvas-publication,shadow-report,shadow-completion,daily-receipt,runtime-capabilities} \
             /etc/rquant/*-keys.json
 ```
+
+## 二之二、六个能力凭证怎么交给部署器
+
+部署链第 ④ 步（`rquant runtime-deployment-profile --apply`）会把
+`profile.capability_environment` 里点名的每个变量从**自己的进程环境**读出来，密封进
+credstore；缺一个就直接报 `runtime capability environment <NAME> is missing`。把它们放进
+环境的唯一受支持做法是现打印现用，**不要落成 env 文件**：
+
+```bash
+# 值只在这条命令的进程环境里存在，退出即消失
+eval "$(sudo bash scripts/install-runtime-credential-keys.sh export-capabilities)" \
+  && rquant runtime-deployment-profile --profile ... --apply
+```
+
+`export-capabilities` 把六个 `NAME=value` 打到 stdout，其中三个是密文
+（`RQ_REFERENCE_SOURCE_PRIVATE_KEY_BASE64`、`RQ_REFERENCE_PUBLICATION_HMAC_SECRET_HEX`、
+`RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL`），**不要把输出粘进聊天或日志**。持久副本只有
+那份 0600 清单。
 
 ## 三、`verify` 的四种调用形式（按 euid 分支）
 
@@ -109,6 +164,14 @@ sudo rm -rf /etc/rquant/{lab-highwater,canvas-publication,shadow-report,daily-re
 脚本会用退出码 2 明确报错，而不是给一个假绿。
 
 ## 四、轮换
+
+轮换目标共八个：五套钥匙串 `highwater|canvas|shadow|completion|daily`，三个能力凭证
+`reference-source|reference-publication|retention-writer`。能力凭证轮换后**必须重新跑
+一次部署链第 ④ 步**，否则 credstore 里还是旧值——credstore 与 generation 绑定，换值就是换代。
+`retention-writer` 轮换会把退役密钥写进 `previous_secret_hex` 并把 `sequence` 加一，这是
+`ArtifactRetentionWriterCredential` 自己支持的重叠窗口；`reference-publication` 的 HMAC
+没有重叠窗口，源与发布者必须在同一次部署里一起换。
+
 
 ```bash
 sudo bash scripts/install-runtime-credential-keys.sh rotate highwater --new-key-suffix v2
@@ -148,7 +211,7 @@ sudo bash scripts/install-runtime-credential-keys.sh verify
 - **时机**：`init` 之后立刻做一次；每次 `rotate` + 重装 helper 之后再做一次。
 - **形式**：离线加密介质。**不进 git、不进聊天、不进云盘同步目录**；仓库里不允许出现任何 PEM
   （`tests/unit/test_runtime_credential_keys.py` 有一条扫描测试盯着这件事）。
-- **恢复**：把备份整目录还原回 `/etc/rquant`，跑 `verify` 确认九个文件元数据与 schema 都对，
+- **恢复**：把备份整目录还原回 `/etc/rquant`，跑 `verify` 确认十三个文件元数据与 schema 都对，
   再跑 `install-runtime-credential-infra.sh` 让公钥环与 helper 重新对齐。
 - **没有备份时**：无解。只能接受链断裂，从 `generation = 1` 重新 `init`，此前所有 receipt 的
   可验证性一并丢失。
@@ -157,6 +220,12 @@ sudo bash scripts/install-runtime-credential-keys.sh verify
 
 - 生成/轮换/复核脚本：`scripts/install-runtime-credential-keys.sh`
 - 基础设施安装器（装 helper、导出公钥环、写 sudoers）：`scripts/install-runtime-credential-infra.sh`
-- 四个消费者：`deploy/libexec/rquant-{lab-highwater-authority,canvas-publication-signer,shadow-report-signer,daily-receipt-signer}`
+- 四个 helper 消费者：`deploy/libexec/rquant-{lab-highwater-authority,canvas-publication-signer,shadow-report-signer,daily-receipt-signer}`
+  （`completion` 没有专属 helper，由 daily helper 通过 runpy 接缝校验与导出）
+- 六个能力凭证的消费者：`src/rquant/live_spool.py` 的 `ReferenceSourceBatchSigner` /
+  `ReferenceSourceBatchVerifier`、`src/rquant/reference_data_registry.py` 的
+  `ReferencePublicationAuthenticator`、`src/rquant/runtime_builder_retention.py` 的
+  `_writer_credential_from_capabilities`；名单权威是 `src/rquant/runtime_capabilities.py`
+  的 `CAPABILITY_KEYS`
 - 唯一的仓内公钥环读者：`src/rquant/lab_highwater_authority.py` 的 `load_highwater_trusted_keys()`
 - 契约测试：`tests/unit/test_runtime_credential_keys.py`
