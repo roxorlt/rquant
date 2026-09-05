@@ -238,7 +238,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 路线 A 就是「由操作员产出生产 inputs 文档 + 生成一代真实画像」这条路，也是那 9 个「缺操作员
 事实」的角色唯一的出路（见本节末「等你决策」第 4 条）。本轮 PR 补齐了它缺的两个生产者
 （`scripts/build_runtime_production_inputs.py` 与 `scripts/export_intraday_snapshot.py`）
-和凭证侧的增量装法。下面十二条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+和凭证侧的增量装法；另一个 PR（#207）修好了「权威 generation 与 legacy generation 是两个命名空间」
+这个结构性阻塞，第 13 条起的六条就是它带来的新前置。下面十八条是照着脚本敲命令时会踩到的东西，
+**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--coverage-floor` 默认 `2027-12-31`，日历表覆盖不到
    这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -290,14 +292,48 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     macOS 的 `/home` 本身就是 autofs 软链。
 12. `/var/lib/systemd/credential.secret` 由第一次 `systemd-creds encrypt` 自动创建
     （`root:root 0600`）。第一次密封之后 `sudo stat` 确认一次并把结果记下来。
+13. **换 legacy 代必须重新 stage + publish 权威链**（#207 之后的硬约束）。只把
+    `/home/lighthouse/rquant/data/runtime/current` 切到新的一代 legacy generation、不换权威 generation，
+    全部 kind-backed 角色拒绝启动，原文
+    `ValueError: runtime legacy generation binding does not match the current pointer`。
+    这是刻意的：否则 `current` 一被挪动，角色就会拿一份和自己 manifest 无关的 bundle 去装 schema bindings。
+14. **stage 时 `--legacy-runtime-root` 必须写字面量 `/home/lighthouse/rquant/data/runtime`**——绝对路径、
+    路径上无软链分量、无尾斜杠。`legacy-binding.json` 记的是 `abspath` 之后的字符串，角色启动时比的
+    也是 `abspath`，两边不一致就报 `... names another runtime root`。
+15. **dry-run 与 apply 之后的核对点**：`plan.json` 的 `staged_files["generation/legacy-binding.json"]`
+    要有摘要；apply 之后 `cat <staging>/generation/legacy-binding.json`，其中 `generation_id` 必须等于
+    `readlink /home/lighthouse/rquant/data/runtime/current` 的目标，`runtime_root` 必须等于第 14 条那个
+    字面量；再确认这份文档出现在 `full-manifest.json` 的 `entries` 里，`mode` 是 `292`（八进制 `0444`）。
+16. **回滚含义**：路线 A 回退（删掉 `data/runtime/current`）之后，同一代权威 generation 的角色会自动
+    回到降级分支（路线 B），**不需要**再换 generation。
+17. **包 C 的两处顺序修正**（覆盖 runbook 原来的第 2、10 步）：
+    - 第 2 步「换 `rquant-runtime-exec.pyz`」**不需要做**：它与 `rquant-production-deploy.pyz` 在 #207
+      的改动前后逐字节相同（`a5d9b3ff…9c5e` / `a41db437…6757`），这一包没碰它们的输入。上面第 2 条
+      那个密封 helper（#208）的重装仍然要做。
+    - **两个 serving unit 要在第 8 步（`deployment-profile --apply`，写出 `current`）之前停**，不是第
+      10 步之前。第 8 步之后它们一旦重启，跑旧代码就会以 `not current` 失败；第 10 步 publish 之后，
+      若这一代不是用带 #207 改动的代码 stage 的，则会以
+      `runtime legacy generation binding is unavailable or contains a symlink` 失败。
+    - 第 11 步「任何 `not current` 出现即停下回报」继续有效，且判据现在更精确：`not current` = 角色跑的
+      是旧代码；`binding is unavailable` = 这一代是旧代码 stage 的；`does not match the current pointer`
+      = 指针与这一代对不上，该重新 stage。
+    - **缺文档的报错措辞**：`runtime generation <64hex> carries no legacy-binding.json: it was staged
+      before that document existed, so stage and publish this generation again with the current code`。
+      它**只在文件真不存在时**出现；软链（哪怕是悬空的）或权限问题仍旧报
+      `... is unavailable or contains a symlink`，不要拿后一句去找一份并不存在的软链。
+18. **R07 与合版方式**：路线 A 这两个 PR（包 B 已合入为 `2238d9e`，包 A 即 #207 这一条）各自把 R07
+    baseline 重冻结到自己合并时 `origin/main` 的 tip，重冻结是各自分支的最后一个 commit；
+    **两个都只能用 "Create a merge commit" 合**
+    ——R07 证据的 merge-provenance 检查要求候选恰有两个 parent，squash 与 rebase 拿不到部署证据。
+    因此部署要取的 tag 指向的是合并后的那个 merge commit，不是分支 tip。
 
 ### 已知限制（装机前已登记的 issue，外加装机当场发现的 #198；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
-| #186 | recovery role 在 wrapper 下起不来：`runtime_recovery_backup` → coordinator → `formal_smoke_replay` → `dashboard/strategy_lab_runs` 这条 import 链在模块级构造 `Settings` | 两个 recovery role 不在第一关的 16 个里，留到影子窗口前修 |
-| #187 | legacy `current` 的 generation id 与 `--expected-generation` 属不同名字空间，权威链下 schema binding 永远不可能是 current | 22 个 kind-backed role 以降级方式运行，健康信号里可见 `runtime_root_unavailable` |
-| #188 | recovery role 在 wrapper 子环境里 import `runtime_recovery_backup` 即死（同为 import 期 `Settings`） | 同 #186 |
+| #186 | recovery role 在 wrapper 下起不来：`runtime_recovery_backup` → coordinator → `formal_smoke_replay` → `dashboard/strategy_lab_runs` 这条 import 链在模块级构造 `Settings` | **已修（PR「fix(runtime): bind schema services to the legacy generation under route A」）**：`strategy_lab_runs.py` 与 `strategy_lab_data.py` 两处都惰性化。issue 写的链是四层，实测是六个模块——只改最深那一处修不好 |
+| #187 | legacy `current` 的 generation id 与 `--expected-generation` 属不同名字空间，权威链下 schema binding 永远不可能是 current | **已修，但走的是 #207 的读法**（同一个 PR）：schema bindings 改按 `<root>/current` 解析出的 legacy generation 装载，权威 generation 那一层的绑定一字未改，另加一道运行期交叉核对。新前置见上面第 13–17 条 |
+| #188 | recovery role 在 wrapper 子环境里 import `runtime_recovery_backup` 即死（同为 import 期 `Settings`） | **已修**，同 #186 一处改动。验收探针不是 grep import 语句，而是在白名单子环境里真 import 之后把 `sys.modules` 里所有 `rquant.*` 读回来断言，以后再多一条边同一条用例就会覆盖到 |
 | #189 | `rquant/logging.py:15` 在 import 期构造 `Settings`，没有 `.env` 时 `rquant` console script 不可用 | **已修（本分支，PR「fix(rollout): prerequisites for the Release A window」）**：`logging.py` 已惰性化，`rquant runtime-authority-stage` 在无 `.env` 的 worktree 里可直接用；`python -m rquant.runtime_authority_stage` 仍然等价，runbook 两种入口都成立。`rquant --help` 按 T9-9 保持 fail-closed，未变 |
 | #190 | 已有 `current.json` 时无法更换 profile（发布原语拿已安装 profile 校验 previous），profile / generation / R07 policy 三件套从第二代起换不了代 | 首次发布 `previous=None`，本次不受影响；第二代起要改 `profile_id` 需 owner 单独授权扩展原语 |
 | #191 | `rquant-lab-claim-finalizer` 与 `rquant-runtime-lab-jobs@` 依赖仓库里根本没有产生者的四份 `/etc/rquant` 输入，外加一个文档明令「不安装」的草案 unit | `lab-jobs@` 用一个空目录绕过；finalizer 本次不启用，判据按上面的应急口径 |
