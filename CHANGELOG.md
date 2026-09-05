@@ -54,6 +54,21 @@
   `<运行根>/current/deployment-profile.json`，而路线 B 从不写这个文件（issue #201）；
   另有 9 个角色仍缺七类操作员事实，那是「15 个服务全起来」的完整路径。
 
+- **linux-production 的画像构建每一次都死在自己的第一行（路线 A 命令链第 ① 步）**：
+  `RuntimeContractModel` 设了 `revalidate_instances="always"`，于是
+  `build_production_runtime_profile` 与 `install_production_runtime_prerequisites` 里那句
+  `ProductionRuntimeProfileInputs.model_validate(inputs)` 会把已经验过的契约再验一遍，而这两处都
+  没带 `context`。linux-production 那道闸门要的正是 `context["daily_receipt_authority_hydrated"]`，
+  只有 `load_production_runtime_profile_inputs` 会给，结果是**命令链第 ① 步在打印任何一个 target
+  之前就停**。以前一直是绿的，是因为 14 条 linux-production 用例只调加载器、58 条 builder 用例
+  全是 local-test 构造的对象，两边从来没接上过。改法是新增私有 `_revalidate_production_inputs()`，
+  **只对已经是本类实例的入参**重述同一个 context；裸 mapping 仍必须走加载器才拿得到那面旗。
+  没有任何一条校验被放宽、删除或加旁路。
+- **密封 helper 的服务种类白名单只覆盖七种里的两种（#208）**：
+  `deploy/libexec/rquant-runtime-credential-sealer` 的白名单写死了两个种类，而真正会被密封的
+  凭证种类有七种，**第一次真密封就会整体中止**。白名单换成恰好等于
+  `runtime_capabilities.CAPABILITY_KEYS` 的键集，与运行期读凭证的那一处同源，不再是第二份手抄清单。
+
 ### Added
 
 - **打包阶段读固定的 daily receipt 信任钥匙串（#200）**：`rquant-runtime-authority-stage` 现在以
@@ -67,6 +82,31 @@
 - **新增端到端用例：从打包产物的 manifest 字节用真实注册表构造 builder（#200）**：live / serving /
   research 三个平面各取一个角色。#200 能溜到生产机，缺的就是这一层——原有用例只比对打包器自己的
   输出结构，从不拿产物去喂真正的构造器。
+- **`scripts/build_runtime_production_inputs.py`：生产 inputs 文档的首个生产者**：路线 A 此前缺的
+  就是这个脚本——`load_production_runtime_profile_inputs` 读的那份文档，以及它点名的五份权威文件
+  （市场日历、PIT 交易日历、路由策略、artifact 描述符 schema、两份封存候选清单），仓库里从来没有
+  任何东西产出过。脚本确定性输出（同输入两次跑出逐字节相同的 inputs 与同一个 `profile_id`，
+  不读墙上时钟）、canonical JSON、私有权限（输出根 0700、各文档 0600，路由策略按其加载器要求 0444）、
+  各文件的 sha256 自算；DuckDB 一律 `read_only=True` 且拒绝直连名为 `rquant.duckdb` 的主库；
+  `--runtime-mode linux-production` 下先比 `runtime_root` 与冻结的 `LINUX_PRODUCTION_RUNTIME_ROOT`，
+  不等就退 2 且什么都不写。
+- **`scripts/export_intraday_snapshot.py`：导出 `feature_live` 读的那份封存历史分钟快照**：
+  从只读 DuckDB 副本导出九列、`bar_end` 口径、至少 20 个交易日、只取 `source='tushare'` 的 1min。
+  写盘前把成型后的帧过一遍 `intraday_feature_engine._normalize_frame`（**与消费者同一个函数、
+  同一个 label**，不是另写一套判据），不通过就退 2 并打印首条坏行；`--ts-code-file` 把导出限定到
+  实际订阅的 universe。
+- **`scripts/install-runtime-credential-keys.sh` 扩到第五套钥匙串与六个运行时能力凭证**：新增成链的
+  `completion` 钥匙串（daily 形状）、`export-capabilities` 子命令，以及 **`init --only-missing`**——
+  往已经装好的 `/etc/rquant` 里**只补缺失的组**，已存在的目录不 chmod 不 chown，半装的组拒而不补
+  （退 3），全都装好时退 4 并说明无事可做；不带这个标志时行为与原来一字不差。`rotate` 的目标
+  由 4 增至 8，`verify` 覆盖 13 个文件。
+- **`scripts/install-runtime-credential-infra.sh` 发布第五份公钥环**：
+  `shadow-completion-trusted-keys.json`（`root:root 0444`，带签名并与代次绑定）此前**全仓没有任何
+  写入方**，生成器在主机上取不到 `shadow_completion_active_public_key_pem`。新增
+  **`--only-missing-keyrings`**：只发布还没发布的公钥环，**不碰 helper、unit 与 sudoers**，
+  因此不会重启 Daily authority。生成器读这份钥匙环用的是运行时对同形钥匙串的同一个严格加载器
+  （root 父链、单硬链、恰好 0444、canonical 八字段、重算 manifest hash、验 Ed25519 签名），
+  缺失或不安全就报错退出，**不给占位值**。
 
 ### Changed
 
@@ -134,6 +174,14 @@
     setuid 对目录在 Linux 上无效；setgid 只影响新建条目的属组，而这四个目录不给 g/o 写位，非 root
     根本无法在里面新建条目，且 publisher 创建目录后会显式 `os.chown(root, PUBLISH_OWNER_GID)`。
     没有可利用的路径；若要收回，在 `mode is None` 分支加 `mode & 0o7000 == 0` 即可。
+
+### Tests
+
+- **新增 71 条用例（合计 245，Python 3.11 与 3.12 各跑一遍全绿）**：含路线 A 与路线 B 两条链产出的
+  实例标签逐字节相等的实证、linux-production 契约的端到端 build（真加载器 → 真 builder → 26 个
+  manifest），以及两个安装脚本在临时根里真跑的全链——`init --only-missing` 的起点用
+  `git show 2db3846:scripts/install-runtime-credential-keys.sh` 造出主机现有的那 9 个文件，
+  逐一断言它们的字节与 mtime 不变。
 
 ## [v0.31.0] — 2026-09-04 — Release A 工具链
 
