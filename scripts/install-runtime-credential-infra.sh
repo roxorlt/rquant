@@ -1432,12 +1432,12 @@ validate_completion_key_material() {
     # already uses, with the two completion paths substituted.
     local request='{"operation":"validate-key-material","schema_version":1}'
     if [[ -n "${TEST_ROOT}" ]]; then
-        printf '%s' "${request}" | /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+        printf '%s' "${request}" | /usr/bin/python3 -I -S -c "${COMPLETION_SEAM}" \
             "${DAILY_HELPER_TARGET}" \
             "${COMPLETION_KEYS_FILE}" \
             "${COMPLETION_PUBLIC_KEYS_FILE}" >/dev/null
     else
-        printf '%s' "${request}" | sudo /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+        printf '%s' "${request}" | sudo /usr/bin/python3 -I -S -c "${COMPLETION_SEAM}" \
             "${DAILY_HELPER_TARGET}" \
             "${COMPLETION_KEYS_FILE}" \
             "${COMPLETION_PUBLIC_KEYS_FILE}" >/dev/null
@@ -1448,12 +1448,12 @@ export_completion_public_keyring() {
     umask 077
     local request='{"operation":"export-public-keyring","schema_version":1}'
     if [[ -n "${TEST_ROOT}" ]]; then
-        printf '%s' "${request}" | /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+        printf '%s' "${request}" | /usr/bin/python3 -I -S -c "${COMPLETION_SEAM}" \
             "${DAILY_HELPER_TARGET}" \
             "${COMPLETION_KEYS_FILE}" \
             "${COMPLETION_PUBLIC_KEYS_FILE}" >"${COMPLETION_PUBLIC_EXPORT}"
     else
-        printf '%s' "${request}" | sudo /usr/bin/python3 -c "${COMPLETION_SEAM}" \
+        printf '%s' "${request}" | sudo /usr/bin/python3 -I -S -c "${COMPLETION_SEAM}" \
             "${DAILY_HELPER_TARGET}" \
             "${COMPLETION_KEYS_FILE}" \
             "${COMPLETION_PUBLIC_KEYS_FILE}" >"${COMPLETION_PUBLIC_EXPORT}"
