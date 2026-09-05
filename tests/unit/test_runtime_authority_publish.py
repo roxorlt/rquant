@@ -10,6 +10,7 @@ arguments of `resolve_launch`. Nothing here needs root.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -19,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import zipfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -44,6 +46,11 @@ from rquant.runtime_authority import (
 from rquant.runtime_authority_publish import RuntimeAuthorityStageError
 from rquant.runtime_exec_wrapper import _verify
 from rquant.strict_json import canonical_json_bytes, strict_json_loads
+from tests.unit.test_runtime_production_profile import (
+    _daily_keyring_document,
+    _daily_private_key,
+    _mark_daily_keyring_root_owned,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILDER = REPO_ROOT / "scripts" / "build-production-deploy-pyz.py"
@@ -304,6 +311,8 @@ class World:
         patch(stage_module, "DAILY_RECEIPT_KEYRING_PATH", self.keyring)
         patch(stage_module, "discover_interpreter_closure", _fake_closure)
         patch(stage_module, "ancestor_policies", _fake_ancestors)
+        #: last, so the directory policies above were recorded from the real `os.stat`
+        _mark_daily_keyring_root_owned(self.monkeypatch, self.keyring)
 
     def write_keyring(self, *, mode: int = 0o444, **overrides: Any) -> Path:
         return _write_daily_receipt_keyring(self.keyring, mode=mode, **overrides)
@@ -397,35 +406,67 @@ class World:
         self.commit = _git(self.checkout, "rev-parse", "HEAD").strip()
 
 
+_SIGNED_KEYRING: dict[str, object] = {}
+
+
+def _signed_daily_receipt_document() -> dict[str, Any]:
+    """One real Ed25519-signed keyring document, generated once for the session.
+
+    `_load_daily_receipt_trusted_keyring` verifies the signature, so the suite cannot hand it
+    a hand-written stand-in; these are the same helpers the production-profile suite signs
+    its keyring with.
+    """
+
+    if not _SIGNED_KEYRING:
+        root = Path(tempfile.mkdtemp(prefix="pa2-daily-keyring-"))
+        private_key, public_key = _daily_private_key(root, key_id="daily-receipt-v1")
+        _SIGNED_KEYRING["document"] = _daily_keyring_document(
+            private_key,
+            active_key_id="daily-receipt-v1",
+            active_public_key=public_key,
+        )
+    document = _SIGNED_KEYRING["document"]
+    assert isinstance(document, dict)
+    return dict(document)
+
+
 def _write_daily_receipt_keyring(path: Path, *, mode: int = 0o444, **overrides: Any) -> Path:
     """The `root:root 0444` daily receipt trusted keyring B-3 installs in `/etc/rquant`.
 
-    Genesis shape (generation 1, no retired keys), which is what a first installation has.
-    `manifest_hash` and `signature` are present because the real file has them; the stage
-    does not verify the signature — the daily orchestrator does, at run time, against the
-    keyring path the manifest names.
+    Genesis shape (generation 1, no retired keys), signed for real, which is what a first
+    installation has. `overrides` is how a case breaks one field on purpose.
     """
 
-    document: dict[str, Any] = {
-        "schema_version": 2,
-        "generation": 1,
-        "previous_manifest_hash": "0" * 64,
-        "active_key_id": "daily-receipt-v1",
-        "active_public_key": (
-            "-----BEGIN PUBLIC KEY-----\n"
-            "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n"
-            "-----END PUBLIC KEY-----\n"
-        ),
-        "previous_public_keys": {},
-        "manifest_hash": "1" * 64,
-        "signature": "pa2-test-signature",
-    }
+    document = _signed_daily_receipt_document()
     document.update(overrides)
     if path.exists():
         path.chmod(0o644)
-    path.write_bytes(canonical_json_bytes(document, trailing_newline=True))
+    path.write_bytes(canonical_json_bytes(document))
     path.chmod(mode)
     return path
+
+
+def _prepare_keyring_directory(root: Path) -> Path:
+    directory = root / "etc" / "rquant"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _trusted_keyring(monkeypatch: pytest.MonkeyPatch, root: Path, **overrides: Any) -> Path:
+    """A keyring the strict loader accepts: signed, 0444, and root-owned through its parents.
+
+    Ownership is the one thing a test cannot arrange for real, so it borrows the
+    production-profile suite's `os.stat`/`os.fstat` seam — the same one that suite uses to
+    exercise this loader.
+    """
+
+    directory = _prepare_keyring_directory(root)
+    keyring = _write_daily_receipt_keyring(
+        directory / "daily-receipt-trusted-keys.json", **overrides
+    )
+    _mark_daily_keyring_root_owned(monkeypatch, keyring)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", keyring)
+    return keyring
 
 
 def _tamper(path: Path) -> None:
@@ -1430,8 +1471,35 @@ def test_a22_stage_runs_in_a_subprocess_with_no_configuration(world: World, tmp_
         "world = json.loads(os.environ['PA2_WORLD'])\n"
         "authority.PRODUCTION_SYSTEM_PYTHON = Path(world['system_python'])\n"
         "authority.RUNTIME_AUTHORITY_OWNER_UID = os.getuid()\n"
-        "authority.PRODUCTION_PROFILE_OWNER_UID = os.getuid()\n"
         "stage.DAILY_RECEIPT_KEYRING_PATH = Path(world['keyring'])\n"
+        # the child cannot own a file as root either, so it wears the same stat seam
+        "import rquant.runtime_production_profile as profile\n"
+        "_keyring = Path(world['keyring'])\n"
+        "_parents = {str(parent) for parent in _keyring.parents}\n"
+        "_real_stat, _real_fstat = os.stat, os.fstat\n"
+        "_identity = (_real_stat(_keyring).st_dev, _real_stat(_keyring).st_ino)\n"
+        "def _as_root(observed, mode=None):\n"
+        "    values = list(tuple(observed))\n"
+        "    values[4] = 0\n"
+        "    if mode is not None:\n"
+        "        values[0] = (observed.st_mode & ~0o777) | mode\n"
+        "    return os.stat_result(values)\n"
+        "def _stat(target, *a, dir_fd=None, follow_symlinks=True):\n"
+        "    observed = _real_stat(target, *a, dir_fd=dir_fd, follow_symlinks=follow_symlinks)\n"
+        "    if dir_fd is not None:\n"
+        "        return observed\n"
+        "    name = str(Path(os.path.abspath(target)))\n"
+        "    if name in _parents:\n"
+        "        return _as_root(observed, 0o755)\n"
+        "    if name == str(_keyring):\n"
+        "        return _as_root(observed)\n"
+        "    return observed\n"
+        "def _fstat(descriptor):\n"
+        "    observed = _real_fstat(descriptor)\n"
+        "    if (observed.st_dev, observed.st_ino) == _identity:\n"
+        "        return _as_root(observed)\n"
+        "    return observed\n"
+        "profile.os.stat, profile.os.fstat = _stat, _fstat\n"
         "def closure(python):\n"
         "    fp = lambda p, d, m: RuntimeFilePolicy(Path(p), d, 0, m)\n"
         "    return stage.InterpreterClosure('3.11.15',"
@@ -2235,6 +2303,13 @@ def test_blk3_derived_settings_stay_inside_the_frozen_production_topology(
     assert settings["paper-constraint.market.v1"]["reference_registry_path"] == str(
         root / "authorities" / "reference-slow" / "reference.sqlite3"
     )
+    #: the two production paths of the daily stage commands are derived from the same frozen
+    #: root, not written a second time (review SF-3)
+    checkout = stage_module.production_checkout_root()
+    assert checkout == root.parent.parent == Path("/home/lighthouse/rquant")
+    command = settings["daily.pipeline.orchestrator.shadow.v1"]["stage_commands"][0]
+    assert command["argv"][0] == str(checkout / ".venv" / "bin" / "python")
+    assert command["working_directory"] == str(checkout)
 
 
 # ---------------------------------------------------------------------------------------
@@ -2320,6 +2395,7 @@ def test_blk3_the_two_hardcoded_values_are_what_the_builders_refuse(
 
     for role, message in (
         ("runtime_health_publisher", "must run on the serving plane"),
+        ("serving_publisher", "must run on the serving plane"),
         ("lab_jobs_publisher", "must run on the research plane"),
     ):
         document = strict_json_loads(manifests[role][0].model_dump_json().encode("utf-8"))
@@ -2369,37 +2445,46 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
     inputs = _inputs(tmp_path)
     profile = build_production_runtime_profile(inputs)
     monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", inputs.runtime_root)
-    monkeypatch.setattr(
-        stage_module,
-        "DAILY_RECEIPT_KEYRING_PATH",
-        _write_daily_receipt_keyring(tmp_path / "daily-receipt-trusted-keys.json"),
-    )
-    monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", UID)
+    _trusted_keyring(monkeypatch, tmp_path / "keyring")
     derived = stage_module.bootstrap_settings(inputs.producer_commit)
     published = {
         manifest.service_id: json.loads(manifest.model_dump_json())["settings"]
         for manifest in profile.manifests
     }
     assert set(derived) == set(published)
+    #: (service id, key), never a bare key name: `sources` belongs to the health publisher
+    #: and to the signal router, and exempting the name would take the router's three source
+    #: fingerprints out of the comparison with it (review MF-2).
     input_derived = {
-        "database_path",
-        "page_projection_database_path",
-        "page_projection_surge_live_root",
-        "stage_commands",
-        "sources",
+        #: the operational database comes from the frozen function of the runtime root
+        ("auction-universe.publisher.v1", "database_path"),
+        ("reference-slow.source.v1", "database_path"),
+        ("notifier.admin.shadow.v1", "page_projection_database_path"),
+        ("notifier.admin.shadow.v1", "page_projection_surge_live_root"),
+        #: the interpreter and working directory are production's, which the profile only
+        #: names in `linux-production` mode — compared separately below
+        ("daily.pipeline.orchestrator.shadow.v1", "stage_commands"),
         #: hydrated from the fixed `/etc/rquant` keyring, which is what the profile does in
         #: `linux-production` mode; the fixture here leaves the operator input unset, so it
         #: falls back to the shadow completion key instead
-        "receipt_active_key_id",
-        "receipt_active_public_key_pem",
-        "receipt_previous_public_key_pems",
+        ("daily.pipeline.orchestrator.shadow.v1", "receipt_active_key_id"),
+        ("daily.pipeline.orchestrator.shadow.v1", "receipt_active_public_key_pem"),
+        ("daily.pipeline.orchestrator.shadow.v1", "receipt_previous_public_key_pems"),
+        #: route B's single staleness bound; the composition is compared below
+        ("runtime-health.all.v1", "sources"),
     }
+    compared = 0
     for service_id, settings in sorted(derived.items()):
         for key, value in settings.items():
             assert key in published[service_id], (service_id, key)
-            if key in input_derived:
+            if (service_id, key) in input_derived:
                 continue
             assert value == published[service_id][key], (service_id, key)
+            compared += 1
+    assert compared > 200
+    assert derived["signal-router.all-strategies.v1"]["sources"] == (
+        published["signal-router.all-strategies.v1"]["sources"]
+    )
 
     def composition(sources: Any) -> set[tuple[str, ...]]:
         return {
@@ -2411,6 +2496,17 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
             )
             for source in sources
         }
+
+    #: `stage_commands` differs only in the interpreter and working directory, which the
+    #: profile names literally in `linux-production` mode and route B derives from the
+    #: runtime root; every other field of every stage command is compared (review SF-3).
+    orchestrator = "daily.pipeline.orchestrator.shadow.v1"
+    checkout = stage_module.production_checkout_root()
+    interpreter = str(checkout / ".venv" / "bin" / "python")
+    assert derived[orchestrator]["stage_commands"] == [
+        {**command, "argv": [interpreter, *command["argv"][1:]], "working_directory": str(checkout)}
+        for command in published[orchestrator]["stage_commands"]
+    ]
 
     health = "runtime-health.all.v1"
     assert composition(derived[health]["sources"]) == composition(published[health]["sources"])
@@ -2457,53 +2553,130 @@ def test_blk3_the_daily_orchestrator_manifest_carries_the_keyring_authority(
     assert settings["receipt_trusted_keyring_path"] == "/etc/rquant/daily-receipt-trusted-keys.json"
 
 
-def test_blk3_an_absent_or_unsafe_keyring_refuses_and_says_why(world: World) -> None:
-    """Never a silent empty authority: absent, foreign-owned or group/world writable each
-    refuse with the observed fact in the message, and the stage as a whole fails closed."""
+def test_blk3_an_absent_or_unsafe_keyring_refuses_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every judgement of the strict loader is a refusal this stage passes on, never a silent
+    empty authority. Ownership, the parent chain, symlinks, hard links, the exact 0444 mode,
+    the size bound and a directory in the file's place are all checked here, because a first
+    draft of this stage judged only some of them (review MF-1, SF-1)."""
 
-    world.keyring.chmod(0o644)
-    world.keyring.unlink()
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unavailable"):
-        stage_module.daily_receipt_authority()
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unavailable"):
-        world.stage("blk3-keyring-absent")
-
-    world.write_keyring()
-    world.monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", UID + 1)
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring owner is unsafe") as owner:
-        stage_module.daily_receipt_authority()
-    assert f"owned by uid {UID}" in str(owner.value)
-    world.monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", UID)
-
-    for mode in (0o646, 0o464, 0o666):
-        world.write_keyring(mode=mode)
-        with pytest.raises(RuntimeAuthorityStageError, match="keyring mode is unsafe") as unsafe:
-            stage_module.daily_receipt_authority()
-        assert f"{mode:04o}" in str(unsafe.value)
-    world.write_keyring(mode=0o440)
+    keyring = _trusted_keyring(monkeypatch, tmp_path)
     assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
 
+    keyring.chmod(0o644)
+    keyring.unlink()
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable") as absent:
+        stage_module.daily_receipt_authority()
+    assert "is unavailable" in str(absent.value)
 
-def test_blk3_a_malformed_keyring_refuses_rather_than_publishing_half_an_authority(
-    world: World,
+    _write_daily_receipt_keyring(keyring)
+    #: the file the absent case removed came back with a new inode, so the ownership seam is
+    #: re-armed on it before the remaining judgements are exercised
+    _mark_daily_keyring_root_owned(monkeypatch, keyring)
+    for mode in (0o440, 0o446, 0o644, 0o666):
+        _write_daily_receipt_keyring(keyring, mode=mode)
+        with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+            stage_module.daily_receipt_authority()
+    _write_daily_receipt_keyring(keyring)
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
+
+    hard_link = keyring.parent / "hard-link.json"
+    os.link(keyring, hard_link)
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+    hard_link.unlink()
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
+
+    oversize = _signed_daily_receipt_document()
+    oversize["previous_public_keys"] = {f"retired-{index}": "x" * 512 for index in range(160)}
+    keyring.chmod(0o644)
+    keyring.write_bytes(canonical_json_bytes(oversize))
+    keyring.chmod(0o444)
+    assert keyring.stat().st_size > 64 * 1024
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+
+
+def test_blk3_a_symlinked_or_foreign_owned_keyring_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Shape is judged here too, because an empty or truncated key would reach the manifest
-    as an authority the receipt signer cannot verify against."""
+    """A symlink to a valid keyring, a directory in its place, and a file whose owner is not
+    root: three ways to point the stage at something it must not trust."""
 
-    world.write_keyring(active_key_id="")
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring shape is invalid"):
+    real = _write_daily_receipt_keyring(
+        _prepare_keyring_directory(tmp_path / "real") / "daily-receipt-trusted-keys.json"
+    )
+    link = _prepare_keyring_directory(tmp_path / "linked") / "daily-receipt-trusted-keys.json"
+    link.symlink_to(real)
+    _mark_daily_keyring_root_owned(monkeypatch, real)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", link)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable"):
         stage_module.daily_receipt_authority()
-    world.write_keyring(previous_public_keys={"retired": ""})
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring shape is invalid"):
+
+    directory = _prepare_keyring_directory(tmp_path / "directory")
+    placeholder = directory / "daily-receipt-trusted-keys.json"
+    placeholder.mkdir()
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", placeholder)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable"):
         stage_module.daily_receipt_authority()
-    world.keyring.chmod(0o644)
-    world.keyring.write_bytes(b"not json\n")
-    world.keyring.chmod(0o444)
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring is not canonical JSON"):
+
+    foreign = _write_daily_receipt_keyring(
+        _prepare_keyring_directory(tmp_path / "foreign") / "daily-receipt-trusted-keys.json"
+    )
+    _mark_daily_keyring_root_owned(monkeypatch, foreign, file_root_owned=False)
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", foreign)
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
         stage_module.daily_receipt_authority()
-    world.write_keyring()
-    world.keyring.chmod(0o644)
-    world.keyring.write_bytes(b"")
-    world.keyring.chmod(0o444)
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring size is unsafe"):
+
+
+def test_blk3_an_unsigned_or_tampered_keyring_never_reaches_a_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The residual risk the review found in the first draft: a root-owned 0444 file holding
+    only the three fields this stage consumes — no `manifest_hash`, no `signature` — was
+    accepted and its `active_key_id` published. The strict loader refuses it, and so do a
+    tampered manifest hash, a foreign signature and a broken genesis binding."""
+
+    keyring = _trusted_keyring(monkeypatch, tmp_path)
+    signed = _signed_daily_receipt_document()
+
+    def rewrite(document: Mapping[str, Any]) -> None:
+        keyring.chmod(0o644)
+        keyring.write_bytes(canonical_json_bytes(dict(document)))
+        keyring.chmod(0o444)
+
+    rewrite(
+        {
+            "active_key_id": "evil",
+            "active_public_key": signed["active_public_key"],
+            "previous_public_keys": {},
+        }
+    )
+    with pytest.raises(RuntimeAuthorityStageError, match="shape is invalid"):
         stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "manifest_hash": "f" * 64})
+    with pytest.raises(RuntimeAuthorityStageError, match="manifest hash is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "active_key_id": "daily-receipt-v2"})
+    with pytest.raises(RuntimeAuthorityStageError, match="manifest hash is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "signature": base64.b64encode(b"forged" * 11).decode("ascii")})
+    with pytest.raises(RuntimeAuthorityStageError, match="signature is invalid"):
+        stage_module.daily_receipt_authority()
+
+    rewrite({**signed, "previous_public_keys": {"retired": "key"}})
+    with pytest.raises(RuntimeAuthorityStageError, match="genesis binding is invalid"):
+        stage_module.daily_receipt_authority()
+
+    keyring.chmod(0o644)
+    keyring.write_bytes(b"not json\n")
+    keyring.chmod(0o444)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable"):
+        stage_module.daily_receipt_authority()
+
+    _write_daily_receipt_keyring(keyring)
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
