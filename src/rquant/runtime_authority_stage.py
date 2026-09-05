@@ -468,6 +468,104 @@ PAPER_EXECUTION_COST_SPEC: Mapping[str, object] = {
 }
 
 
+#: The daily receipt trusted keyring, the one file this stage reads outside the checkout and
+#: the artifacts it was handed (coordinator ruling, 2026-09-05). `root:root 0444`, produced by
+#: `scripts/install-runtime-credential-infra.sh` in B-3 and world-readable, so reading it as
+#: the unprivileged staging user is not a privilege gain and adds no writable trust surface.
+#: `None` means the frozen
+#: `runtime_deployment_profile.PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH` — the same
+#: constant `_hydrate_daily_receipt_authority_from_fixed_keyring` reads, not a second literal;
+#: the suite points this at a temporary file the way it points the runtime root.
+DAILY_RECEIPT_KEYRING_PATH: Path | None = None
+_MAX_KEYRING_BYTES = 64 * 1024
+
+
+def daily_receipt_keyring_path() -> Path:
+    """The trusted keyring this stage reads (the module seam above)."""
+
+    if DAILY_RECEIPT_KEYRING_PATH is not None:
+        return DAILY_RECEIPT_KEYRING_PATH
+    from rquant.runtime_deployment_profile import PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+
+    return PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+
+
+def daily_receipt_authority() -> tuple[str, str, dict[str, str]]:
+    """The active daily receipt key id, its public key and the retired ones.
+
+    The judgement is stated here rather than inherited, because this is a TCB read: the file
+    must exist, be a regular file that is not a symlink and has exactly one link, be owned by
+    the authority owner (`PRODUCTION_PROFILE_OWNER_UID`, root in production) and carry no
+    group or world write bit. Anything else refuses with the observed facts in the message —
+    an absent or unsafe keyring never degrades into an empty authority, because a manifest
+    that named no key would start a receipt signer with nothing to verify against.
+
+    The signature over the keyring is not re-checked here. The manifest carries
+    `receipt_trusted_keyring_path`, and the daily orchestrator verifies the keyring itself at
+    run time; the copy this stage takes is published inside the root transaction and is
+    content-addressed with the rest of the generation.
+    """
+
+    path = daily_receipt_keyring_path()
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring is unavailable: {path} ({exc.strerror})"
+        ) from exc
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring is not a single-linked regular file: {path}"
+        )
+    if observed.st_uid != authority.PRODUCTION_PROFILE_OWNER_UID:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring owner is unsafe: {path} is owned by uid "
+            f"{observed.st_uid}, expected {authority.PRODUCTION_PROFILE_OWNER_UID}"
+        )
+    mode = stat.S_IMODE(observed.st_mode)
+    if mode & 0o022:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring mode is unsafe: {path} is {mode:04o}, "
+            "group and world write are refused"
+        )
+    if not 0 < observed.st_size <= _MAX_KEYRING_BYTES:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring size is unsafe: {path} holds {observed.st_size} bytes"
+        )
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring is unreadable: {path} ({exc.strerror})"
+        ) from exc
+    try:
+        document = strict_json_loads(payload)
+    except StrictJsonError as exc:
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring is not canonical JSON: {path} ({exc})"
+        ) from exc
+    if type(document) is not dict:
+        raise RuntimeAuthorityStageError(f"daily receipt trusted keyring is not an object: {path}")
+    active_key_id = document.get("active_key_id")
+    active_public_key = document.get("active_public_key")
+    previous = document.get("previous_public_keys")
+    if (
+        type(active_key_id) is not str
+        or not active_key_id
+        or type(active_public_key) is not str
+        or not active_public_key
+        or type(previous) is not dict
+        or any(
+            type(key) is not str or not key or type(value) is not str or not value
+            for key, value in previous.items()
+        )
+    ):
+        raise RuntimeAuthorityStageError(
+            f"daily receipt trusted keyring shape is invalid: {path}"
+        )
+    return active_key_id, active_public_key, dict(sorted(previous.items()))
+
+
 def production_runtime_root() -> Path:
     """The runtime owner root the derived settings address (the module seam above)."""
 
@@ -547,6 +645,11 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
     from rquant.runtime_service_entrypoint import RuntimeServiceKind
 
     root = production_runtime_root()
+    (
+        receipt_active_key_id,
+        receipt_active_public_key,
+        receipt_previous_public_keys,
+    ) = daily_receipt_authority()
     database = operational_database_path(root)
     research_metadata = operational_readonly_database_path(root)
     reference_registry = root / "authorities" / "reference-slow" / "reference.sqlite3"
@@ -719,6 +822,9 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
                     working_directory=Path("/home/lighthouse/rquant"),
                 )
             ],
+            "receipt_active_key_id": receipt_active_key_id,
+            "receipt_active_public_key_pem": receipt_active_public_key,
+            "receipt_previous_public_key_pems": receipt_previous_public_keys,
             "receipt_signer_socket_endpoint": str(PRODUCTION_DAILY_SIGNER_SOCKET_ENDPOINT),
             "receipt_trusted_keyring_path": str(PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH),
             "receipt_signer_timeout_seconds": 5.0,

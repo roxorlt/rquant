@@ -196,6 +196,7 @@ class World:
         self.inbox = self.var / "inbox"
         self.quarantine = self.var / "quarantine"
         self.profile_path = self.etc / "production-runtime-profile.json"
+        self.keyring = self.etc / "daily-receipt-trusted-keys.json"
         self.authority_path = self.var / "current.json"
         self.system_python = self.root / "usr" / "bin" / "python3.11"
         self.runtime_pyz = self.root / "usr" / "local" / "libexec" / "rquant-runtime-exec.pyz"
@@ -234,6 +235,7 @@ class World:
         self.system_python.chmod(0o755)
         self.runtime_pyz.write_bytes(RUNTIME_PYZ_BYTES)
         self.runtime_pyz.chmod(0o555)
+        self.write_keyring()
         self.deploy_pyz_sha256 = _load_builder().build_deploy_pyz(REPO_ROOT, self.deploy_pyz)
         self.staging_root.mkdir()
         (self.staging_root / ".keep").write_text("", encoding="utf-8")
@@ -299,8 +301,12 @@ class World:
         patch(publish_module, "INSTALLED_RUNTIME_PYZ", self.runtime_pyz)
         patch(publish_module, "PUBLISH_OWNER_GID", GID)
         patch(publish_module, "WRAPPER_TRUSTED_ROOT", str(self.root))
+        patch(stage_module, "DAILY_RECEIPT_KEYRING_PATH", self.keyring)
         patch(stage_module, "discover_interpreter_closure", _fake_closure)
         patch(stage_module, "ancestor_policies", _fake_ancestors)
+
+    def write_keyring(self, *, mode: int = 0o444, **overrides: Any) -> Path:
+        return _write_daily_receipt_keyring(self.keyring, mode=mode, **overrides)
 
     # -- driving ------------------------------------------------------------------
 
@@ -389,6 +395,37 @@ class World:
         target.write_text(target.read_text(encoding="utf-8") + f"# {marker}\n", encoding="utf-8")
         _git(self.checkout, "commit", "-q", "-am", marker)
         self.commit = _git(self.checkout, "rev-parse", "HEAD").strip()
+
+
+def _write_daily_receipt_keyring(path: Path, *, mode: int = 0o444, **overrides: Any) -> Path:
+    """The `root:root 0444` daily receipt trusted keyring B-3 installs in `/etc/rquant`.
+
+    Genesis shape (generation 1, no retired keys), which is what a first installation has.
+    `manifest_hash` and `signature` are present because the real file has them; the stage
+    does not verify the signature — the daily orchestrator does, at run time, against the
+    keyring path the manifest names.
+    """
+
+    document: dict[str, Any] = {
+        "schema_version": 2,
+        "generation": 1,
+        "previous_manifest_hash": "0" * 64,
+        "active_key_id": "daily-receipt-v1",
+        "active_public_key": (
+            "-----BEGIN PUBLIC KEY-----\n"
+            "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n"
+            "-----END PUBLIC KEY-----\n"
+        ),
+        "previous_public_keys": {},
+        "manifest_hash": "1" * 64,
+        "signature": "pa2-test-signature",
+    }
+    document.update(overrides)
+    if path.exists():
+        path.chmod(0o644)
+    path.write_bytes(canonical_json_bytes(document, trailing_newline=True))
+    path.chmod(mode)
+    return path
 
 
 def _tamper(path: Path) -> None:
@@ -1393,6 +1430,8 @@ def test_a22_stage_runs_in_a_subprocess_with_no_configuration(world: World, tmp_
         "world = json.loads(os.environ['PA2_WORLD'])\n"
         "authority.PRODUCTION_SYSTEM_PYTHON = Path(world['system_python'])\n"
         "authority.RUNTIME_AUTHORITY_OWNER_UID = os.getuid()\n"
+        "authority.PRODUCTION_PROFILE_OWNER_UID = os.getuid()\n"
+        "stage.DAILY_RECEIPT_KEYRING_PATH = Path(world['keyring'])\n"
         "def closure(python):\n"
         "    fp = lambda p, d, m: RuntimeFilePolicy(Path(p), d, 0, m)\n"
         "    return stage.InterpreterClosure('3.11.15',"
@@ -1413,6 +1452,7 @@ def test_a22_stage_runs_in_a_subprocess_with_no_configuration(world: World, tmp_
         "RQUANT_DISABLE_DOTENV": "1",
         "PA2_WORLD": json.dumps({
             "system_python": str(world.system_python),
+            "keyring": str(world.keyring),
             "argv": world.argv("a22-sub"),
         }),
     }
@@ -2028,10 +2068,7 @@ UNGROUNDED_BOOTSTRAP_FACTS = {
         "missing:calendar_expected_commit",
         "missing:calendar_path",
     ),
-    "daily_pipeline_orchestrator": (
-        "missing:receipt_active_key_id",
-        "missing:receipt_active_public_key_pem",
-    ),
+    "daily_pipeline_orchestrator": (),
     "feature_live": (
         "missing:historical_minutes_snapshot_path",
         "missing:historical_snapshot_id",
@@ -2125,8 +2162,13 @@ def test_blk3_every_kind_backed_manifest_validates_or_names_its_missing_facts(
             assert _validation_signatures(role, manifest.settings) == (
                 UNGROUNDED_BOOTSTRAP_FACTS[role]
             ), role
-    startable = {role for role, gaps in UNGROUNDED_BOOTSTRAP_FACTS.items() if not gaps}
-    assert startable == {
+    #: Settings-complete is not the same as startable: the default market-minute, watchlist
+    #: and paper-broker builders additionally demand a market or trade calendar their own
+    #: model calls optional, and the daily orchestrator loads a deployment profile document
+    #: route B never writes. The end-to-end case below is what says who really starts.
+    settings_complete = {role for role, gaps in UNGROUNDED_BOOTSTRAP_FACTS.items() if not gaps}
+    assert settings_complete == {
+        "daily_pipeline_orchestrator",
         "lab_jobs_publisher",
         "market_minute_source",
         "notifier",
@@ -2315,7 +2357,10 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
       * `stage_commands` names the production interpreter, which the profile only does in
         `linux-production` mode;
       * the health publisher's `sources` carry route B's one staleness bound instead of the
-        published profile's per-role cadence — the composition itself is compared below.
+        published profile's per-role cadence — the composition itself is compared below;
+      * the three `receipt_*` keys come from the fixed `/etc/rquant` keyring, which is what
+        the profile itself does in `linux-production` mode and not what this local-test
+        fixture does.
     """
 
     from rquant.runtime_production_profile import build_production_runtime_profile
@@ -2324,6 +2369,12 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
     inputs = _inputs(tmp_path)
     profile = build_production_runtime_profile(inputs)
     monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", inputs.runtime_root)
+    monkeypatch.setattr(
+        stage_module,
+        "DAILY_RECEIPT_KEYRING_PATH",
+        _write_daily_receipt_keyring(tmp_path / "daily-receipt-trusted-keys.json"),
+    )
+    monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", UID)
     derived = stage_module.bootstrap_settings(inputs.producer_commit)
     published = {
         manifest.service_id: json.loads(manifest.model_dump_json())["settings"]
@@ -2336,6 +2387,12 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
         "page_projection_surge_live_root",
         "stage_commands",
         "sources",
+        #: hydrated from the fixed `/etc/rquant` keyring, which is what the profile does in
+        #: `linux-production` mode; the fixture here leaves the operator input unset, so it
+        #: falls back to the shadow completion key instead
+        "receipt_active_key_id",
+        "receipt_active_public_key_pem",
+        "receipt_previous_public_key_pems",
     }
     for service_id, settings in sorted(derived.items()):
         for key, value in settings.items():
@@ -2360,3 +2417,93 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
     assert {source["stale_after_seconds"] for source in derived[health]["sources"]} == {
         stage_module.MANIFEST_STALE_AFTER_SECONDS
     }
+
+
+# ---------------------------------------------------------------------------------------
+# BLK-3 (#200): the daily receipt trusted keyring, the stage's one TCB read
+# ---------------------------------------------------------------------------------------
+
+
+def test_blk3_the_keyring_path_is_the_frozen_one_not_a_second_literal() -> None:
+    """One constant names `/etc/rquant/daily-receipt-trusted-keys.json`: the one the
+    production profile hydrates from. The stage seam defaults to it."""
+
+    from rquant.runtime_deployment_profile import PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    from rquant.runtime_production_profile import DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+
+    assert stage_module.DAILY_RECEIPT_KEYRING_PATH is None
+    assert stage_module.daily_receipt_keyring_path() == (
+        PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    )
+    assert PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH == DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    assert str(PRODUCTION_DAILY_RECEIPT_TRUSTED_KEYRING_PATH) == (
+        "/etc/rquant/daily-receipt-trusted-keys.json"
+    )
+
+
+def test_blk3_the_daily_orchestrator_manifest_carries_the_keyring_authority(
+    bootstrap: tuple[World, stage_module.StagePlan],
+) -> None:
+    """The read is what makes the orchestrator startable: its two receipt fields are the
+    keyring's, and the manifest still names the keyring the runtime verifies against."""
+
+    world, plan = bootstrap
+    settings = dict(_staged_manifests(world, plan)["daily_pipeline_orchestrator"][0].settings)
+    document = strict_json_loads(world.keyring.read_bytes())
+    assert isinstance(document, dict)
+    assert settings["receipt_active_key_id"] == document["active_key_id"]
+    assert settings["receipt_active_public_key_pem"] == document["active_public_key"]
+    assert settings["receipt_previous_public_key_pems"] == document["previous_public_keys"]
+    assert settings["receipt_trusted_keyring_path"] == "/etc/rquant/daily-receipt-trusted-keys.json"
+
+
+def test_blk3_an_absent_or_unsafe_keyring_refuses_and_says_why(world: World) -> None:
+    """Never a silent empty authority: absent, foreign-owned or group/world writable each
+    refuse with the observed fact in the message, and the stage as a whole fails closed."""
+
+    world.keyring.chmod(0o644)
+    world.keyring.unlink()
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unavailable"):
+        stage_module.daily_receipt_authority()
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unavailable"):
+        world.stage("blk3-keyring-absent")
+
+    world.write_keyring()
+    world.monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", UID + 1)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring owner is unsafe") as owner:
+        stage_module.daily_receipt_authority()
+    assert f"owned by uid {UID}" in str(owner.value)
+    world.monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", UID)
+
+    for mode in (0o646, 0o464, 0o666):
+        world.write_keyring(mode=mode)
+        with pytest.raises(RuntimeAuthorityStageError, match="keyring mode is unsafe") as unsafe:
+            stage_module.daily_receipt_authority()
+        assert f"{mode:04o}" in str(unsafe.value)
+    world.write_keyring(mode=0o440)
+    assert stage_module.daily_receipt_authority()[0] == "daily-receipt-v1"
+
+
+def test_blk3_a_malformed_keyring_refuses_rather_than_publishing_half_an_authority(
+    world: World,
+) -> None:
+    """Shape is judged here too, because an empty or truncated key would reach the manifest
+    as an authority the receipt signer cannot verify against."""
+
+    world.write_keyring(active_key_id="")
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring shape is invalid"):
+        stage_module.daily_receipt_authority()
+    world.write_keyring(previous_public_keys={"retired": ""})
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring shape is invalid"):
+        stage_module.daily_receipt_authority()
+    world.keyring.chmod(0o644)
+    world.keyring.write_bytes(b"not json\n")
+    world.keyring.chmod(0o444)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring is not canonical JSON"):
+        stage_module.daily_receipt_authority()
+    world.write_keyring()
+    world.keyring.chmod(0o644)
+    world.keyring.write_bytes(b"")
+    world.keyring.chmod(0o444)
+    with pytest.raises(RuntimeAuthorityStageError, match="keyring size is unsafe"):
+        stage_module.daily_receipt_authority()
