@@ -24,9 +24,10 @@ stubbed on the path under test:
   loop for `serving_publisher` and `paper_constraint_publisher`.
 
 The only seams are the ones the authority suites already own: the module constants that
-name `/etc/rquant`, `/var/lib/rquant` and the system interpreter (`World`), the runtime
-owner root the derived settings address (`stage_module.PRODUCTION_RUNTIME_ROOT`), and the
-`os.stat` hook that lets a non-root test own a 0444 keyring.
+name `/etc/rquant`, `/var/lib/rquant` and the system interpreter (`World`), the `os.stat`
+hook that lets a non-root test own a 0444 keyring, and the two credential-sealing calls
+that need `systemd-creds` under sudo. The production profile itself is the real one, moved
+whole onto a temporary runtime root by `_relocate` and revalidated by its own model.
 """
 
 from __future__ import annotations
@@ -290,9 +291,9 @@ class RouteAWorld:
         `/home/lighthouse/rquant/data/runtime`, and the role derives its runtime root from
         that path by arithmetic (`runtime_root_from_control_root`). A test cannot own
         `/home/lighthouse`, so the frozen prefix is replaced by this world's runtime root —
-        the same substitution `stage_module.PRODUCTION_RUNTIME_ROOT` makes on the staging
-        side, and the only one on this path. `test_the_remap_is_only_the_frozen_prefix`
-        pins that it changes nothing else, and the Linux gate below runs the argv verbatim.
+        the same move `_relocate` makes on the profile inputs, and the only one on this
+        path. `test_the_remap_is_only_the_frozen_control_root_prefix` pins that it changes
+        nothing else, and the Linux gate below runs the argv verbatim.
         """
 
         argv = self.wrapper_argv(role)
