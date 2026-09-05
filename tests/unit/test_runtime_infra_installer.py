@@ -1163,6 +1163,40 @@ def _provision_highwater_key_material(root: Path) -> None:
         )
     )
     shadow_manifest.chmod(0o600)
+    # The infra installer publishes a fifth public keyring, so the fixture host has to
+    # look like one `install-runtime-credential-keys.sh init` produced: the completion
+    # manifest is the *daily* shape (schema_version 2, chained), because the daily helper
+    # is what validates and exports it.
+    completion_dir = root / "etc/rquant/shadow-completion"
+    completion_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    completion_private = completion_dir / "completion-v1.private.pem"
+    subprocess.run(
+        [
+            _fixture_openssl_binary(),
+            "genpkey",
+            "-algorithm",
+            "ED25519",
+            "-out",
+            str(completion_private),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    completion_private.chmod(0o600)
+    completion_manifest = root / "etc/rquant/shadow-completion-keys.json"
+    completion_manifest.write_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": 2,
+                "generation": 1,
+                "previous_manifest_hash": "0" * 64,
+                "active_key_id": "completion-v1",
+                "active_private_key_path": str(completion_private),
+                "previous_public_keys": {},
+            }
+        )
+    )
+    completion_manifest.chmod(0o600)
     daily_dir = root / "etc/rquant/daily-receipt"
     daily_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     daily_private = daily_dir / "daily-v1.private.pem"
