@@ -32,6 +32,12 @@ calendar's `generated_at` defaults to the newest `updated_at` of the SSE rows th
 returned, and the sealed candidate documents take their trade date from the calendar. Pass
 `--generated-at` to pin it explicitly.
 
+The calendar has to reach `--calendar-coverage-floor` (coordinator ruling 8, 2027-12-31) or
+the run refuses. Lowering that value is the supported way to install against a table that
+stops sooner (issue #211): the refusal still applies at the lowered value, and a run that
+lowered it warns on stderr and carries `coverage_floor_override` in its summary, because the
+generation it produced expires with the table it was built from.
+
 Every sha256 in the inputs document is computed here from the bytes this script just wrote,
 except `historical_minutes_snapshot_id`, whose parquet is produced separately by
 `scripts/export_intraday_snapshot.py` on the machine that holds the minute history.
@@ -70,7 +76,8 @@ import stat
 import subprocess
 import sys
 from collections.abc import Sequence
-from datetime import UTC, date, datetime, time
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -114,6 +121,10 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 #: takes whatever further the exchange calendar table can supply. The expiry goes into
 #: DEPLOY.md with a renewal step.
 DEFAULT_COVERAGE_FLOOR = date(2027, 12, 31)
+#: How far ahead of `coverage_end` an install that lowered the floor has to be regenerated.
+#: The runtime reads the calendar authority at build time and never extends it, so the
+#: replacement generation has to be in place well before the last covered date.
+COVERAGE_FLOOR_RENEWAL_LEAD = timedelta(days=30)
 #: Coordinator ruling 4.
 DEFAULT_ARTIFACT_LOCATION_ID = "tencent-lighthouse-82-156-0-68"
 DEFAULT_ARTIFACT_FAILURE_DOMAIN = "tencent-lighthouse-single-host"
@@ -307,6 +318,79 @@ def build_market_calendar_authority(
         coverage_end=coverage_end,
         open_dates=open_dates,
         generated_at=generated_at,
+    )
+
+
+@dataclass(frozen=True)
+class CoverageFloorOverride:
+    """The operator installed against a calendar shorter than ruling 8's floor.
+
+    Issue #211: the production `trade_calendar` stops at 2026-12-31 and extending it writes
+    the production database, which needs the owner's separate authorization. The first
+    route A install lowers the floor instead — which is legitimate, and must not be silent:
+    the generation it produces expires with the table it was built from.
+    """
+
+    floor: date
+    default_floor: date
+    coverage_end: date
+
+    @property
+    def renew_by(self) -> date:
+        return self.coverage_end - COVERAGE_FLOOR_RENEWAL_LEAD
+
+    @property
+    def summary_field(self) -> str:
+        """The line the stdout summary carries so the override is in the run's record."""
+
+        return (
+            f"coverage_floor_override floor={self.floor.isoformat()} "
+            f"default={self.default_floor.isoformat()} "
+            f"coverage_end={self.coverage_end.isoformat()} "
+            f"renew_by={self.renew_by.isoformat()}"
+        )
+
+    @property
+    def warning(self) -> str:
+        return (
+            f"WARNING: calendar coverage floor lowered to {self.floor.isoformat()}, below "
+            f"the default {self.default_floor.isoformat()}: trade_calendar reaches only "
+            f"{self.coverage_end.isoformat()}. Extend the calendar table and regenerate "
+            f"this generation before {self.renew_by.isoformat()} — 30 days before "
+            f"coverage_end — or the runtime runs out of calendar. See issue #211."
+        )
+
+
+def parse_coverage_floor(value: str) -> date:
+    """`date.fromisoformat` raises `ValueError`, which would escape as a traceback."""
+
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise GeneratorError(
+            f"--calendar-coverage-floor must be an ISO date (YYYY-MM-DD): {value!r}"
+        ) from exc
+
+
+def describe_coverage_floor_override(
+    *,
+    coverage_floor: date,
+    coverage_end: date,
+    default_floor: date = DEFAULT_COVERAGE_FLOOR,
+) -> CoverageFloorOverride | None:
+    """`None` when the floor is the default or higher — nothing was overridden.
+
+    Lowering is the only direction that weakens the guarantee, so it is the only direction
+    that reports. Raising the floor only makes `build_market_calendar_authority` refuse
+    more calendars, and that refusal already speaks for itself.
+    """
+
+    if coverage_floor >= default_floor:
+        return None
+    return CoverageFloorOverride(
+        floor=coverage_floor,
+        default_floor=default_floor,
+        coverage_end=coverage_end,
     )
 
 
@@ -819,7 +903,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minutes-snapshot-sha256", required=True)
     parser.add_argument("--runtime-mode", default="linux-production")
     parser.add_argument("--generated-at", default=None)
-    parser.add_argument("--coverage-floor", default=DEFAULT_COVERAGE_FLOOR.isoformat())
+    parser.add_argument(
+        "--calendar-coverage-floor",
+        "--coverage-floor",
+        dest="calendar_coverage_floor",
+        default=DEFAULT_COVERAGE_FLOOR.isoformat(),
+        help=(
+            "the date the market calendar must reach (ruling 8 default "
+            f"{DEFAULT_COVERAGE_FLOOR.isoformat()}). A lower value is an explicit override: "
+            "the run still refuses a calendar shorter than the value, and it warns on "
+            "stderr and records the override in the summary. See issue #211."
+        ),
+    )
     parser.add_argument("--artifact-location-id", default=DEFAULT_ARTIFACT_LOCATION_ID)
     parser.add_argument("--artifact-failure-domain", default=DEFAULT_ARTIFACT_FAILURE_DOMAIN)
     parser.add_argument("--routing-recipient-id", default=DEFAULT_ROUTING_RECIPIENT_ID)
@@ -886,7 +981,7 @@ def _run(arguments: argparse.Namespace) -> int:
     output_root = _require_absolute(arguments.output_root, label="output root")
     inputs_output = _require_absolute(arguments.inputs_output, label="inputs output")
     calendar_database = _require_absolute(arguments.calendar_database, label="calendar database")
-    coverage_floor = date.fromisoformat(arguments.coverage_floor)
+    coverage_floor = parse_coverage_floor(arguments.calendar_coverage_floor)
     if arguments.runtime_mode == "linux-production":
         # A pure literal comparison the loader will make anyway
         # (`validate_complete_authority_set`, "Linux production runtime root must be
@@ -919,6 +1014,10 @@ def _run(arguments: argparse.Namespace) -> int:
         producer_commit=producer_commit,
         generated_at=generated_at,
         coverage_floor=coverage_floor,
+    )
+    coverage_floor_override = describe_coverage_floor_override(
+        coverage_floor=coverage_floor,
+        coverage_end=calendar.coverage_end,
     )
     calendar_path = output_root / "market-calendar-authority.json"
     write_private_file(
@@ -1081,11 +1180,15 @@ def _run(arguments: argparse.Namespace) -> int:
     print(
         f"  open_dates {len(calendar.open_dates)} generated_at {calendar.generated_at.isoformat()}"
     )
+    if coverage_floor_override is not None:
+        print(f"  {coverage_floor_override.summary_field}")
     print(f"trade_calendar {trade_calendar_path} sha256={trade_calendar_sha256}")
     print(f"routing_policy {routing_policy_path} fingerprint={routing_policy_fingerprint}")
     print(f"retention_schema_authority {retention_path} sha256={retention_sha256}")
     print(f"sealed_candidates trade_date={trade_date.isoformat()} n_shape={n_shape_path}")
     print(f"sealed_candidates growth_board_surge={growth_board_path}")
+    if coverage_floor_override is not None:
+        print(coverage_floor_override.warning, file=sys.stderr)
     return 0
 
 
