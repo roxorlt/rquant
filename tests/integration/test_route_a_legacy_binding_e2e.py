@@ -553,7 +553,7 @@ def test_a_manifest_from_another_authority_generation_is_refused(
     argv[argv.index("--manifest") + 1] = str(stranger / manifest.name)
 
     with pytest.raises(ValueError, match="manifest generation does not match runtime environment"):
-        service_main.run(service_main.build_parser().parse_args(argv))
+        route_a.run_role(SERVING_ROLE, argv=argv)
 
 
 def test_a_removed_binding_document_is_refused_rather_than_assumed(
