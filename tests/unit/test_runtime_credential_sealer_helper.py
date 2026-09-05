@@ -218,16 +218,27 @@ def test_root_helper_rejects_retired_paper_consumer_credentials(tmp_path: Path) 
 @pytest.mark.parametrize(
     "service_kind",
     (
-        "paper_constraint_publisher",
-        "runtime_health_publisher",
-        "lab_jobs_publisher",
-        "promotions_publisher",
+        "artifact_retention",
+        "auction_match_source",
+        "daily_close_source",
+        "market_minute_source",
+        "notifier",
+        "reference_slow_publisher",
+        "reference_slow_source",
     ),
 )
-def test_root_helper_accepts_authority_publisher_credentials(
+def test_root_helper_accepts_every_kind_the_bundle_actually_seals(
     tmp_path: Path,
     service_kind: str,
 ) -> None:
+    """Issue #208: five of these were missing, and `begin` is all-or-nothing.
+
+    `install_runtime_deployment_bundle` packs every credential-bearing role of one
+    generation into a single request, so one unrecognised kind aborts the whole seal
+    before anything is written. The first real `runtime-deployment-profile --apply`
+    would have failed here.
+    """
+
     module = runpy.run_path(str(HELPER))
     instance = "svc-" + "a" * 64
 
@@ -241,6 +252,69 @@ def test_root_helper_accepts_authority_publisher_credentials(
 
     assert receipt["operation"] == "begin"
     assert receipt["sealed_instances"] == [instance]
+
+
+def test_the_helper_whitelist_equals_the_runtime_capability_authority() -> None:
+    """The helper cannot import `rquant`, so the seven names are restated in it.
+
+    This is the equality that keeps the copy honest: the whitelist must be exactly the
+    key set of `CAPABILITY_KEYS`, which is exactly the set `runtime_deployment_bundle`
+    builds credential plaintexts for.
+    """
+
+    from rquant.runtime_capabilities import CAPABILITY_KEYS
+
+    module = runpy.run_path(str(HELPER))
+
+    assert module["_SERVICE_KINDS"] == {kind.value for kind in CAPABILITY_KEYS}
+
+
+def test_the_helper_whitelist_equals_the_kinds_the_real_profile_seals_for(
+    tmp_path: Path,
+) -> None:
+    """And that set is what the production profile actually asks to have sealed.
+
+    The predicate is copied from `install_runtime_deployment_bundle`'s own credential
+    comprehension and applied to the real profile's manifests, so this fails if the
+    profile grows a credential-bearing role the root helper would reject.
+    """
+
+    from rquant.runtime_deployment_bundle import _DEDICATED_NO_CAPABILITY_KINDS
+    from rquant.runtime_production_profile import build_production_runtime_profile
+    from rquant.runtime_service_control import RuntimeServicePlane
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+    from tests.unit.test_runtime_production_profile import _inputs
+
+    profile = build_production_runtime_profile(_inputs(tmp_path))
+    sealed = {
+        manifest.service_kind.value
+        for manifest in profile.manifests
+        if (
+            manifest.plane is RuntimeServicePlane.LIVE
+            and manifest.service_kind not in _DEDICATED_NO_CAPABILITY_KINDS
+        )
+        or manifest.service_kind is RuntimeServiceKind.ARTIFACT_RETENTION
+    }
+    module = runpy.run_path(str(HELPER))
+
+    assert module["_SERVICE_KINDS"] == sealed
+
+
+def test_a_kind_the_bundle_never_seals_is_refused(tmp_path: Path) -> None:
+    """`paper_broker` runs on the live plane but is in `_DEDICATED_NO_CAPABILITY_KINDS`,
+    so no credential is ever built for it; the helper must not accept one either."""
+
+    module = runpy.run_path(str(HELPER))
+    instance = "svc-" + "a" * 64
+
+    with pytest.raises(ValueError, match="service kind"):
+        module["process_request"](
+            _request((instance,), service_kind="paper_broker"),
+            store_root=tmp_path / "credstore",
+            owner_uid=os.getuid(),
+            encrypt=lambda payload: b"encrypted:" + payload,
+            decrypt=lambda payload: payload.removeprefix(b"encrypted:"),
+        )
 
 
 def test_root_helper_rollback_restores_multiple_previous_pointers_and_fsyncs(
