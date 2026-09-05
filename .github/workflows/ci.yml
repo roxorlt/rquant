@@ -803,25 +803,29 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen
 
-      - name: Run the Route A legacy binding gate, Linux-only cases included
+      # `-m linux_exact`, not the whole file: the portable cases are in the four full-suite
+      # shards on this same runner image, so running them here would buy no coverage. This
+      # job exists for the one case `addopts` excludes everywhere else.
+      - name: Run the Linux-only Route A legacy binding case
         shell: bash
         run: |
           set -euo pipefail
           junit="${RQUANT_ROUTE_A_ROOT}/test-results/route-a-legacy-binding.xml"
-          uv run python -m pytest -o addopts='' --strict-markers -m 'not network' -rA \
+          uv run python -m pytest -o addopts='' --strict-markers -m linux_exact -rA \
             --basetemp="${RQUANT_ROUTE_A_ROOT}/pytest" \
             --junitxml="${junit}" \
-            tests/integration/test_route_a_legacy_binding_e2e.py \
-            tests/unit/test_runtime_legacy_generation_binding.py
+            tests/integration/test_route_a_legacy_binding_e2e.py
 
-      - name: Verify the gate ran the Linux-only case and skipped nothing
+      - name: Verify the gate ran that one case and skipped nothing
         if: always()
         shell: bash
         run: |
           set -euo pipefail
+          # `--tests 1` also pins the other direction: a portable case that picks up the
+          # `linux_exact` marker by accident would leave the shards and land here.
           uv run python tests/support/assert_junit_contract.py \
             --path "${RQUANT_ROUTE_A_ROOT}/test-results/route-a-legacy-binding.xml" \
-            --suites 1 --tests 39 --failures 0 --errors 0 --skipped 0 --cases 39
+            --suites 1 --tests 1 --failures 0 --errors 0 --skipped 0 --cases 1
           grep -q 'test_the_wrapper_argv_runs_verbatim_against_the_frozen_production_root' \
             "${RQUANT_ROUTE_A_ROOT}/test-results/route-a-legacy-binding.xml"
 
