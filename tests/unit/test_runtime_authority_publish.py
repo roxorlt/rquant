@@ -2617,8 +2617,20 @@ def test_blk3_a_symlinked_or_foreign_owned_keyring_refuses(
     directory = _prepare_keyring_directory(tmp_path / "directory")
     placeholder = directory / "daily-receipt-trusted-keys.json"
     placeholder.mkdir()
+    _mark_daily_keyring_root_owned(monkeypatch, placeholder)
     monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", placeholder)
-    with pytest.raises(RuntimeAuthorityStageError, match="keyring is unusable"):
+    #: a directory opens fine under O_NOFOLLOW, so "is it a regular file" is the judgement
+    #: that stops it — assert that one by name, not just any refusal
+    with pytest.raises(RuntimeAuthorityStageError, match="file is unsafe"):
+        stage_module.daily_receipt_authority()
+
+    #: nothing faked at all: the parent chain is this user's, which is the judgement the
+    #: strict loader makes before it ever opens the file
+    unowned = _write_daily_receipt_keyring(
+        _prepare_keyring_directory(tmp_path / "unowned") / "daily-receipt-trusted-keys.json"
+    )
+    monkeypatch.setattr(stage_module, "DAILY_RECEIPT_KEYRING_PATH", unowned)
+    with pytest.raises(RuntimeAuthorityStageError, match="parent must be root-owned"):
         stage_module.daily_receipt_authority()
 
     foreign = _write_daily_receipt_keyring(
