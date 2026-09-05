@@ -85,8 +85,12 @@ def _expected_files(prefix: Path, suffix: str = "v1") -> dict[str, Path]:
         "shadow_manifest": etc / "shadow-report-keys.json",
         "shadow_private": etc / "shadow-report" / f"shadow-{suffix}.private.pem",
         "shadow_calendar": etc / "shadow-report" / "legacy-recovery-calendar.json",
+        "completion_manifest": etc / "shadow-completion-keys.json",
+        "completion_private": etc / "shadow-completion" / f"completion-{suffix}.private.pem",
         "daily_manifest": etc / "daily-receipt-keys.json",
         "daily_private": etc / "daily-receipt" / f"daily-{suffix}.private.pem",
+        "capability_manifest": etc / "runtime-capabilities-keys.json",
+        "reference_source_private": etc / "runtime-capabilities" / f"reference-source-{suffix}",
     }
 
 
@@ -97,7 +101,9 @@ def _expected_directories(prefix: Path) -> dict[Path, int]:
         etc / "lab-highwater": 0o700,
         etc / "canvas-publication": 0o700,
         etc / "shadow-report": 0o700,
+        etc / "shadow-completion": 0o700,
         etc / "daily-receipt": 0o700,
+        etc / "runtime-capabilities": 0o700,
     }
 
 
@@ -119,7 +125,7 @@ def _init(prefix: Path, *extra: str) -> subprocess.CompletedProcess[str]:
 # --------------------------------------------------------------------------- K-1
 
 
-def test_init_creates_the_nine_files_with_the_expected_metadata(prefix: Path) -> None:
+def test_init_creates_the_thirteen_files_with_the_expected_metadata(prefix: Path) -> None:
     result = _init(prefix)
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -130,7 +136,7 @@ def test_init_creates_the_nine_files_with_the_expected_metadata(prefix: Path) ->
         assert observed.st_uid == os.geteuid(), directory
 
     files = _expected_files(prefix)
-    assert len(files) == 9
+    assert len(files) == 13
     for name, path in files.items():
         observed = path.lstat()
         assert stat.S_ISREG(observed.st_mode), name
@@ -140,10 +146,21 @@ def test_init_creates_the_nine_files_with_the_expected_metadata(prefix: Path) ->
         assert observed.st_gid == os.getegid(), name
         assert observed.st_size > 0, name
 
-    for name in ("highwater_private", "canvas_private", "shadow_private", "daily_private"):
+    for name in (
+        "highwater_private",
+        "canvas_private",
+        "shadow_private",
+        "completion_private",
+        "daily_private",
+    ):
         text = files[name].read_text(encoding="utf-8")
         assert text.startswith("-----BEGIN PRIVATE KEY-----"), name
         assert "END PRIVATE KEY" in text, name
+
+    # The reference source key is the one exception: `ssh-keygen -Y sign` needs an
+    # OpenSSH key, so a PKCS#8 PEM here would fail only at the first real signature.
+    reference = files["reference_source_private"].read_text(encoding="utf-8")
+    assert reference.startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
 
 
 # --------------------------------------------------------------------------- K-2
@@ -543,7 +560,7 @@ def _rewrite(path: Path, document: object) -> None:
     path.chmod(0o600)
 
 
-def test_verify_reports_nine_ok_lines_and_changes_nothing(prefix: Path) -> None:
+def test_verify_reports_thirteen_ok_lines_and_changes_nothing(prefix: Path) -> None:
     assert _init(prefix).returncode == 0
     files = _expected_files(prefix)
     before = {
@@ -553,7 +570,7 @@ def test_verify_reports_nine_ok_lines_and_changes_nothing(prefix: Path) -> None:
     result = _verify(prefix)
     assert result.returncode == 0, result.stdout + result.stderr
     lines = result.stdout.splitlines()
-    assert len(lines) == 9, result.stdout
+    assert len(lines) == 13, result.stdout
     assert all(line.startswith("OK ") for line in lines), result.stdout
     reported = [line.split(" ", 1)[1] for line in lines]
     assert sorted(reported) == sorted(str(path) for path in files.values())
@@ -956,3 +973,327 @@ def test_verify_pins_the_four_root_call_shapes(prefix: Path) -> None:
     assert "--keys-file" not in root_branch
     # ... and the reason the root branch is unreachable under --prefix.
     assert "must run unprivileged" in text
+
+
+# --------------------------------------------------------------------------- K-13
+# Route A: the completion keyring (ruling 3) and the six capability credentials
+# (ruling 2). Every assertion below runs the value through the consumer that will
+# read it in production, not through a restatement of its format.
+
+
+def _capability_assignments(prefix: Path) -> dict[str, str]:
+    result = _run("export-capabilities", "--prefix", str(prefix))
+    assert result.returncode == 0, result.stdout + result.stderr
+    return dict(line.split("=", 1) for line in result.stdout.splitlines())
+
+
+def test_the_completion_keyring_is_separate_key_material_from_the_report_keyring(
+    prefix: Path,
+) -> None:
+    """Ruling 3 is "one key, one use": the two manifests must not share a key."""
+
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+
+    completion = json.loads(files["completion_manifest"].read_bytes())
+    shadow = json.loads(files["shadow_manifest"].read_bytes())
+
+    assert completion["active_key_id"] != shadow["active_key_id"]
+    assert completion["active_private_key_path"] != shadow["active_private_key_path"]
+    assert files["completion_private"].read_bytes() != files["shadow_private"].read_bytes()
+
+
+def test_the_completion_manifest_is_accepted_by_a_real_signer_loader(prefix: Path) -> None:
+    """No completion signer helper exists yet, so the canvas helper — the only loader of
+    that manifest shape in the tree — is what proves the document is well formed."""
+
+    assert _init(prefix).returncode == 0
+
+    result = subprocess.run(
+        [
+            SYSTEM_PYTHON,
+            str(CANVAS_HELPER),
+            "--keys-file",
+            str(_expected_files(prefix)["completion_manifest"]),
+            "--validate-key-material",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_rotating_the_completion_keyring_retires_the_old_public_key(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    before = json.loads(_expected_files(prefix)["completion_manifest"].read_bytes())
+
+    result = _run("rotate", "completion", "--prefix", str(prefix), "--new-key-suffix", "v2")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    after = json.loads(_expected_files(prefix, "v2")["completion_manifest"].read_bytes())
+    assert after["active_key_id"] == "completion-v2"
+    assert set(after["previous_public_keys"]) == {before["active_key_id"]}
+    assert not _expected_files(prefix)["completion_private"].exists()
+    assert _verify(prefix).returncode == 0
+
+
+def test_the_exported_capability_names_are_exactly_the_runtime_ones_without_an_owner() -> None:
+    """The whitelist in the script must track `runtime_capabilities.CAPABILITY_KEYS`.
+
+    Everything that mapping names is either an operator account credential the operator
+    already holds (Tushare tokens, PushDeer/PushPlus) or one of the six this script now
+    produces. A capability added to the runtime with neither owner would otherwise fail
+    only at the deployer's `resolve_profile_capabilities`, on the host, at release time.
+    """
+
+    from rquant.runtime_capabilities import CAPABILITY_KEYS
+
+    runtime_names = {name for names in CAPABILITY_KEYS.values() for name in names}
+    operator_account_names = {
+        "TUSHARE_TOKEN_MAIN",
+        "TUSHARE_TOKEN_BACKUP",
+        "PUSHDEER_KEYS",
+        "PUSHDEER_ENDPOINT",
+        "PUSHDEER_RECIPIENT_IDS",
+        "PUSHPLUS_TOKENS",
+        "PUSHPLUS_ENDPOINT",
+        "PUSHPLUS_RECIPIENT_IDS",
+    }
+    text = SCRIPT.read_text(encoding="utf-8")
+    block = text.split("CAPABILITY_ENVIRONMENT_NAMES = (", 1)[1].split(")", 1)[0]
+    declared = set(re.findall(r'"([A-Z0-9_]+)"', block))
+
+    assert declared == runtime_names - operator_account_names
+    assert declared & operator_account_names == set()
+
+
+def test_the_exported_capability_assignments_match_the_declared_names(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    text = SCRIPT.read_text(encoding="utf-8")
+    block = text.split("CAPABILITY_ENVIRONMENT_NAMES = (", 1)[1].split(")", 1)[0]
+    declared = set(re.findall(r'"([A-Z0-9_]+)"', block))
+
+    assignments = _capability_assignments(prefix)
+
+    assert set(assignments) == declared
+    assert all(value for value in assignments.values())
+
+
+def test_the_reference_source_credential_signs_and_verifies_a_real_payload(
+    prefix: Path,
+) -> None:
+    """The end the runtime cares about: `ssh-keygen -Y sign` with the exported private
+    key must verify against the exported public key under the exported key id."""
+
+    import base64
+
+    from rquant.live_spool import (
+        ReferenceSourceBatchSigner,
+        ReferenceSourceBatchVerifier,
+    )
+
+    assert _init(prefix).returncode == 0
+    assignments = _capability_assignments(prefix)
+
+    signer = ReferenceSourceBatchSigner(
+        key_id=assignments["RQ_REFERENCE_SOURCE_SIGNING_KEY_ID"],
+        private_key=base64.b64decode(
+            assignments["RQ_REFERENCE_SOURCE_PRIVATE_KEY_BASE64"],
+            validate=True,
+        ).decode("ascii"),
+    )
+    verifier = ReferenceSourceBatchVerifier(
+        key_id=assignments["RQ_REFERENCE_SOURCE_SIGNING_KEY_ID"],
+        public_key=assignments["RQ_REFERENCE_SOURCE_PUBLIC_KEY"],
+    )
+
+    signature = signer.sign(b"route-a reference source payload")
+
+    assert verifier.verify(b"route-a reference source payload", signature)
+    assert not verifier.verify(b"a different payload", signature)
+
+
+def test_the_reference_publication_credential_is_accepted_by_its_authenticator(
+    prefix: Path,
+) -> None:
+    from rquant.reference_data_registry import ReferencePublicationAuthenticator
+
+    assert _init(prefix).returncode == 0
+    assignments = _capability_assignments(prefix)
+
+    authenticator = ReferencePublicationAuthenticator(
+        key_id=assignments["RQ_REFERENCE_PUBLICATION_HMAC_KEY_ID"],
+        secret=bytes.fromhex(assignments["RQ_REFERENCE_PUBLICATION_HMAC_SECRET_HEX"]),
+    )
+
+    assert authenticator.key_id == assignments["RQ_REFERENCE_PUBLICATION_HMAC_KEY_ID"]
+
+
+def test_the_retention_writer_credential_is_accepted_by_the_retention_builder(
+    prefix: Path,
+) -> None:
+    from rquant.runtime_builder_retention import _writer_credential_from_capabilities
+
+    assert _init(prefix).returncode == 0
+    assignments = _capability_assignments(prefix)
+
+    credential = _writer_credential_from_capabilities(
+        {"RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL": assignments[
+            "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL"
+        ]}
+    )
+
+    assert credential.sequence == 1
+    assert credential.previous_secret_hex is None
+    assert credential.expires_at > credential.not_before
+
+
+def test_rotating_the_retention_writer_chains_the_retired_secret(prefix: Path) -> None:
+    from rquant.runtime_builder_retention import _writer_credential_from_capabilities
+
+    assert _init(prefix).returncode == 0
+    before = _writer_credential_from_capabilities(
+        {
+            "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL": _capability_assignments(prefix)[
+                "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL"
+            ]
+        }
+    )
+
+    result = _run(
+        "rotate",
+        "retention-writer",
+        "--prefix",
+        str(prefix),
+        "--new-key-suffix",
+        "v2",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    after = _writer_credential_from_capabilities(
+        {
+            "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL": _capability_assignments(prefix)[
+                "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL"
+            ]
+        }
+    )
+    assert after.key_id != before.key_id
+    assert after.sequence == before.sequence + 1
+    assert after.previous_secret_hex == before.secret_hex
+    assert after.secret_hex != before.secret_hex
+    assert _verify(prefix).returncode == 0
+
+
+def test_rotating_the_reference_source_retires_its_public_key_and_unlinks_the_old_one(
+    prefix: Path,
+) -> None:
+    assert _init(prefix).returncode == 0
+    files = _expected_files(prefix)
+    before = json.loads(files["capability_manifest"].read_bytes())
+
+    result = _run(
+        "rotate",
+        "reference-source",
+        "--prefix",
+        str(prefix),
+        "--new-key-suffix",
+        "v2",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    after = json.loads(files["capability_manifest"].read_bytes())
+    assert after["reference_source_key_id"] == "reference-source-v2"
+    assert set(after["reference_source_previous_public_keys"]) == {
+        before["reference_source_key_id"]
+    }
+    assert after["reference_source_public_key"] != before["reference_source_public_key"]
+    assert not files["reference_source_private"].exists()
+    assert _expected_files(prefix, "v2")["reference_source_private"].exists()
+    assert _verify(prefix).returncode == 0
+
+
+def test_rotating_the_reference_publication_secret_changes_only_that_credential(
+    prefix: Path,
+) -> None:
+    assert _init(prefix).returncode == 0
+    before = json.loads(_expected_files(prefix)["capability_manifest"].read_bytes())
+
+    result = _run(
+        "rotate",
+        "reference-publication",
+        "--prefix",
+        str(prefix),
+        "--new-key-suffix",
+        "v2",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    after = json.loads(_expected_files(prefix)["capability_manifest"].read_bytes())
+    assert after["reference_publication_key_id"] == "reference-publication-v2"
+    assert (
+        after["reference_publication_secret_hex"] != before["reference_publication_secret_hex"]
+    )
+    assert after["reference_source_key_id"] == before["reference_source_key_id"]
+    assert after["retention_writer_credential"] == before["retention_writer_credential"]
+    assert _verify(prefix).returncode == 0
+
+
+def test_verify_rejects_a_reference_source_key_that_is_not_an_openssh_key(
+    prefix: Path,
+) -> None:
+    assert _init(prefix).returncode == 0
+    key = _expected_files(prefix)["reference_source_private"]
+    key.chmod(0o600)
+    key.write_bytes(b"-----BEGIN PRIVATE KEY-----\nnot an openssh key\n")
+    key.chmod(0o600)
+
+    result = _verify(prefix)
+
+    assert result.returncode == 1
+    assert "OpenSSH private key" in result.stderr
+
+
+def test_verify_rejects_a_short_publication_secret(prefix: Path) -> None:
+    assert _init(prefix).returncode == 0
+    path = _expected_files(prefix)["capability_manifest"]
+    document = json.loads(path.read_bytes())
+    document["reference_publication_secret_hex"] = "ab" * 8
+
+    _rewrite(path, document)
+
+    result = _verify(prefix)
+    assert result.returncode == 1
+    assert "reference_publication_secret_hex is invalid" in result.stderr
+
+
+def test_verify_rejects_a_capability_manifest_pointing_outside_its_directory(
+    prefix: Path,
+    tmp_path: Path,
+) -> None:
+    assert _init(prefix).returncode == 0
+    path = _expected_files(prefix)["capability_manifest"]
+    document = json.loads(path.read_bytes())
+    document["reference_source_private_key_path"] = str(tmp_path / "elsewhere")
+
+    _rewrite(path, document)
+
+    result = _verify(prefix)
+    assert result.returncode == 1
+    assert "must be normalized inside" in result.stderr
+
+
+def test_the_capability_manifest_never_appears_in_the_repository() -> None:
+    """The secrets this script mints must exist only on the host that minted them."""
+
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        cwd=str(ROOT),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
+    assert not [name for name in tracked if name.endswith("runtime-capabilities-keys.json")]
+    assert not [name for name in tracked if "/runtime-capabilities/" in name]

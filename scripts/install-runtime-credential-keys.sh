@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
-# Generate, rotate and verify the Ed25519 key material consumed by the four
-# root-owned rQuant credential helpers.
+# Generate, rotate and verify the Ed25519 key material consumed by the
+# root-owned rQuant credential helpers, plus the runtime capability credentials
+# the credstore seals into each service generation.
 #
-#   init    creates the nine files described in docs/operations/runtime-credential-keys.md
-#   rotate  replaces one active key and folds the retired public key into the manifest
-#   verify  re-checks ownership/mode/nlink/schema and runs each consumer's own loader
+#   init                 creates the thirteen files described in
+#                        docs/operations/runtime-credential-keys.md
+#   rotate               replaces one active key and folds the retired public key
+#                        into the manifest
+#   verify               re-checks ownership/mode/nlink/schema and runs each
+#                        consumer's own loader
+#   export-capabilities  prints the six RQ_* capability assignments the deployer
+#                        needs in its environment (secrets on stdout, never a file)
+#
+# Route A added two groups (coordinator rulings 2 and 3):
+#
+#   * `completion`, a keyring of its own for the Shadow completion attestation
+#     public key the production profile restates. One key, one use: it is not the
+#     `shadow` report key under another name.
+#   * `capabilities`, the six values `runtime_capabilities.CAPABILITY_KEYS` names
+#     for reference-slow source signing, reference publication HMAC and the
+#     artifact retention writer. These are process-environment credentials the
+#     deployer reads (`runtime_deployment_profile.resolve_profile_capabilities`),
+#     not keyring files, so they live in one private manifest and are printed on
+#     demand rather than left in an env file.
 #
 # Deliberate constraints (see docs/operations/runtime-credential-keys.md):
 #   * no `rquant` import and no virtualenv: only openssl(1) and the system python3
@@ -68,9 +86,12 @@ usage:
                                             [--calendar-coverage-start YYYY-MM-DD]
                                             [--calendar-coverage-end YYYY-MM-DD]
                                             [--calendar-open-dates YYYY-MM-DD,...]
-  install-runtime-credential-keys.sh rotate <highwater|canvas|shadow|daily>
+  install-runtime-credential-keys.sh rotate <highwater|canvas|shadow|completion|daily
+                                            |reference-source|reference-publication
+                                            |retention-writer>
                                             [--prefix DIR] [--new-key-suffix SUFFIX]
   install-runtime-credential-keys.sh verify [--prefix DIR] [--helper-dir DIR]
+  install-runtime-credential-keys.sh export-capabilities [--prefix DIR]
 
 `--root` is accepted as a synonym of `--prefix`.
 USAGE
@@ -102,10 +123,25 @@ openssl_binary() {
     fail "openssl is unavailable"
 }
 
+ssh_keygen_binary() {
+    local candidate
+    # `live_spool._trusted_ssh_keygen_path` pins /usr/bin/ssh-keygen and refuses a
+    # group/world-writable or non-root-owned binary; the reference source key has to be
+    # produced by the same tool that will later sign with it.
+    for candidate in /usr/bin/ssh-keygen /opt/homebrew/bin/ssh-keygen; do
+        if [[ -f "${candidate}" && -x "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    fail "ssh-keygen is unavailable"
+}
+
 PY_HELPER=$(
     cat <<'PYSRC'
 """Stdlib-only JSON/metadata worker for install-runtime-credential-keys.sh."""
 
+import base64
 import hashlib
 import json
 import os
@@ -140,6 +176,18 @@ KIND_LAYOUT = {
         "schema_version": 2,
         "chained": False,
     },
+    "completion": {
+        # Ruling 3: its own keyring, not the report key reused. The manifest shape is
+        # the canvas one (schema_version 1, unchained) because no completion signer
+        # helper exists yet and the canvas helper is the only validator of that shape;
+        # see `run_consumer_self_checks`.
+        "directory": "shadow-completion",
+        "manifest": "shadow-completion-keys.json",
+        "keyring": "shadow-completion-trusted-keys.json",
+        "key_prefix": "completion",
+        "schema_version": 1,
+        "chained": False,
+    },
     "daily": {
         "directory": "daily-receipt",
         "manifest": "daily-receipt-keys.json",
@@ -149,12 +197,56 @@ KIND_LAYOUT = {
         "chained": True,
     },
 }
-KIND_ORDER = ("highwater", "canvas", "shadow", "daily")
+KIND_ORDER = ("highwater", "canvas", "shadow", "completion", "daily")
+CAPABILITY_DIRECTORY = "runtime-capabilities"
+CAPABILITY_MANIFEST = "runtime-capabilities-keys.json"
+CAPABILITY_SCHEMA_VERSION = 1
+#: `runtime_capabilities.CAPABILITY_KEYS` minus the values that already have owners
+#: (`TUSHARE_TOKEN_*`, `PUSHDEER_*`, `PUSHPLUS_*` come from the operator's own
+#: accounts). The suite pins this tuple against that mapping so a new capability
+#: cannot be added to the runtime without a producer here.
+CAPABILITY_ENVIRONMENT_NAMES = (
+    "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL",
+    "RQ_REFERENCE_PUBLICATION_HMAC_KEY_ID",
+    "RQ_REFERENCE_PUBLICATION_HMAC_SECRET_HEX",
+    "RQ_REFERENCE_SOURCE_PRIVATE_KEY_BASE64",
+    "RQ_REFERENCE_SOURCE_PUBLIC_KEY",
+    "RQ_REFERENCE_SOURCE_SIGNING_KEY_ID",
+)
+CAPABILITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "reference_source_key_id",
+        "reference_source_private_key_path",
+        "reference_source_public_key",
+        "reference_source_previous_public_keys",
+        "reference_publication_key_id",
+        "reference_publication_secret_hex",
+        "retention_writer_credential",
+    }
+)
+RETENTION_CREDENTIAL_FIELDS = frozenset(
+    {
+        "key_id",
+        "sequence",
+        "secret_hex",
+        "previous_secret_hex",
+        "not_before",
+        "expires_at",
+        "revoked_at",
+    }
+)
+#: `ArtifactRetentionWriterCredential.secret_hex` and
+#: `ReferencePublicationAuthenticator` both demand at least 32 bytes.
+CAPABILITY_SECRET_BYTES = 32
+CAPABILITY_VALIDITY_DAYS = 365
 CALENDAR_NAME = "legacy-recovery-calendar.json"
 MAX_KEY_FILE_BYTES = 64 * 1024
 MAX_CALENDAR_FILE_BYTES = 4 * 1024 * 1024
 KEY_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 HEX64_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+HEX_SECRET_PATTERN = re.compile(r"^[0-9a-f]{64,}$")
+SSH_PUBLIC_KEY_PREFIX = "ssh-ed25519 "
 ISO_DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
@@ -219,10 +311,25 @@ def calendar_path(prefix):
     return os.path.join(key_directory(prefix, "shadow"), CALENDAR_NAME)
 
 
+def capability_directory(prefix):
+    return os.path.join(etc_root(prefix), CAPABILITY_DIRECTORY)
+
+
+def capability_manifest_path(prefix):
+    return os.path.join(etc_root(prefix), CAPABILITY_MANIFEST)
+
+
+def reference_source_key_path(prefix, suffix):
+    # `ssh-keygen -Y sign` wants an OpenSSH private key, not the PKCS#8 PEM the four
+    # keyring kinds use, so this file deliberately has no `.pem` suffix.
+    return os.path.join(capability_directory(prefix), "reference-source-%s" % suffix)
+
+
 def directories(prefix):
     result = [(etc_root(prefix), 0o755)]
     for kind in KIND_ORDER:
         result.append((key_directory(prefix, kind), 0o700))
+    result.append((capability_directory(prefix), 0o700))
     return result
 
 
@@ -233,6 +340,8 @@ def planned_files(prefix, suffix):
         result.append(private_key_path(prefix, kind, suffix))
         if kind == "shadow":
             result.append(calendar_path(prefix))
+    result.append(capability_manifest_path(prefix))
+    result.append(reference_source_key_path(prefix, suffix))
     return result
 
 
@@ -332,6 +441,174 @@ def calendar_document(coverage_start, coverage_end, open_dates):
         {key: value for key, value in body.items() if key != "content_sha256"}
     )).hexdigest()
     return body
+
+
+def retention_writer_credential(key_id, secret_hex, issued_at, previous_secret_hex=None):
+    """The canonical `RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL` payload.
+
+    `runtime_builder_retention._writer_credential_from_capabilities` validates this
+    against `ArtifactRetentionWriterCredential`, so the field set, the >=32-byte secret
+    and `expires_at > not_before` are the model's requirements, not this script's.
+    """
+
+    expires_at = issued_at + timedelta(days=CAPABILITY_VALIDITY_DAYS)
+    return {
+        "key_id": key_id,
+        "sequence": 1,
+        "secret_hex": secret_hex,
+        "previous_secret_hex": previous_secret_hex,
+        "not_before": issued_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        "revoked_at": None,
+    }
+
+
+def capability_manifest(prefix, suffix, public_key, issued_at):
+    private_key = reference_source_key_path(prefix, suffix)
+    require_normalized(private_key, "reference_source_private_key_path")
+    normalized_public_key = public_key.strip()
+    if not normalized_public_key.startswith(SSH_PUBLIC_KEY_PREFIX):
+        raise Failure("reference source public key is not an ssh-ed25519 key")
+    retention_key_id = "retention-writer-%s" % suffix
+    return {
+        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "reference_source_key_id": "reference-source-%s" % suffix,
+        "reference_source_private_key_path": private_key,
+        "reference_source_public_key": normalized_public_key,
+        "reference_source_previous_public_keys": {},
+        "reference_publication_key_id": "reference-publication-%s" % suffix,
+        "reference_publication_secret_hex": os.urandom(CAPABILITY_SECRET_BYTES).hex(),
+        "retention_writer_credential": retention_writer_credential(
+            retention_key_id,
+            os.urandom(CAPABILITY_SECRET_BYTES).hex(),
+            issued_at,
+        ),
+    }
+
+
+def load_capability_manifest(prefix):
+    path = capability_manifest_path(prefix)
+    document, payload = read_json(path)
+    if not isinstance(document, dict):
+        raise Failure("%s is not a JSON object" % path)
+    if set(document) != CAPABILITY_FIELDS:
+        raise Failure("%s does not have the expected capability field set" % path)
+    if document["schema_version"] != CAPABILITY_SCHEMA_VERSION:
+        raise Failure("%s has an unexpected schema_version" % path)
+    return document, payload
+
+
+def capability_assignments(document):
+    """The six `NAME=value` pairs the deployer needs in its environment."""
+
+    with open(document["reference_source_private_key_path"], "rb") as handle:
+        private_key = handle.read()
+    credential = document["retention_writer_credential"]
+    values = {
+        "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL": canonical(credential).decode("ascii"),
+        "RQ_REFERENCE_PUBLICATION_HMAC_KEY_ID": document["reference_publication_key_id"],
+        "RQ_REFERENCE_PUBLICATION_HMAC_SECRET_HEX": document[
+            "reference_publication_secret_hex"
+        ],
+        "RQ_REFERENCE_SOURCE_PRIVATE_KEY_BASE64": base64.b64encode(private_key).decode(
+            "ascii"
+        ),
+        "RQ_REFERENCE_SOURCE_PUBLIC_KEY": document["reference_source_public_key"],
+        "RQ_REFERENCE_SOURCE_SIGNING_KEY_ID": document["reference_source_key_id"],
+    }
+    if set(values) != set(CAPABILITY_ENVIRONMENT_NAMES):
+        raise Failure("capability assignment set drifted from CAPABILITY_ENVIRONMENT_NAMES")
+    return values
+
+
+def check_capability_manifest(prefix, problems, uid, gid, reported):
+    directory = capability_directory(prefix)
+    inspect_path(directory, 0o700, uid, gid, "capability directory", problems, 0, directory=True)
+    path = capability_manifest_path(prefix)
+    label = "capability manifest"
+    if inspect_path(path, 0o600, uid, gid, label, problems, MAX_KEY_FILE_BYTES) is None:
+        return
+    try:
+        document, payload = load_capability_manifest(prefix)
+    except Failure as exc:
+        problems.append(str(exc))
+        return
+    if canonical(document) != payload:
+        problems.append("%s is not canonical JSON" % label)
+    reported.append(path)
+    for field in ("reference_source_key_id", "reference_publication_key_id"):
+        value = document.get(field)
+        if not isinstance(value, str) or KEY_ID_PATTERN.match(value) is None:
+            problems.append("%s %s is invalid: %r" % (label, field, value))
+    public_key = document.get("reference_source_public_key")
+    if not isinstance(public_key, str) or not public_key.startswith(SSH_PUBLIC_KEY_PREFIX):
+        problems.append("%s reference_source_public_key is not an ssh-ed25519 key" % label)
+    retired = document.get("reference_source_previous_public_keys")
+    if not isinstance(retired, dict):
+        problems.append("%s reference_source_previous_public_keys is invalid" % label)
+    else:
+        for key_id, retired_key in retired.items():
+            if not isinstance(key_id, str) or KEY_ID_PATTERN.match(key_id) is None:
+                problems.append("%s has an invalid retired key id: %r" % (label, key_id))
+            if key_id == document.get("reference_source_key_id"):
+                problems.append("%s lists the active key as retired: %s" % (label, key_id))
+            if not isinstance(retired_key, str) or not retired_key.startswith(
+                SSH_PUBLIC_KEY_PREFIX
+            ):
+                problems.append("%s retired key %s is not ssh-ed25519" % (label, key_id))
+    secret = document.get("reference_publication_secret_hex")
+    if not isinstance(secret, str) or HEX_SECRET_PATTERN.match(secret) is None:
+        problems.append("%s reference_publication_secret_hex is invalid" % label)
+    credential = document.get("retention_writer_credential")
+    if not isinstance(credential, dict) or set(credential) != RETENTION_CREDENTIAL_FIELDS:
+        problems.append("%s retention_writer_credential field set is invalid" % label)
+    else:
+        credential_secret = credential.get("secret_hex")
+        if (
+            not isinstance(credential_secret, str)
+            or HEX_SECRET_PATTERN.match(credential_secret) is None
+        ):
+            problems.append("%s retention writer secret_hex is invalid" % label)
+        if type(credential.get("sequence")) is not int or credential["sequence"] < 1:
+            problems.append("%s retention writer sequence is invalid" % label)
+        if credential.get("key_id") is None or KEY_ID_PATTERN.match(
+            str(credential.get("key_id"))
+        ) is None:
+            problems.append("%s retention writer key_id is invalid" % label)
+        try:
+            not_before = datetime.fromisoformat(str(credential["not_before"]).replace("Z", "+00:00"))
+            expires_at = datetime.fromisoformat(str(credential["expires_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            problems.append("%s retention writer validity window is not ISO-8601" % label)
+        else:
+            if expires_at <= not_before:
+                problems.append("%s retention writer expiry does not follow activation" % label)
+    private_key = document.get("reference_source_private_key_path")
+    expected_directory = capability_directory(prefix)
+    if (
+        not isinstance(private_key, str)
+        or not os.path.isabs(private_key)
+        or private_key != os.path.abspath(private_key)
+        or os.path.dirname(private_key) != expected_directory
+    ):
+        problems.append(
+            "%s reference_source_private_key_path must be normalized inside %s: %r"
+            % (label, expected_directory, private_key)
+        )
+        return
+    key_label = "reference source private key"
+    if (
+        inspect_path(private_key, 0o600, uid, gid, key_label, problems, MAX_KEY_FILE_BYTES)
+        is not None
+    ):
+        with open(private_key, "rb") as handle:
+            head = handle.read(64)
+        if not head.startswith(b"-----BEGIN OPENSSH PRIVATE KEY-----"):
+            problems.append(
+                "%s is not an OpenSSH private key (ssh-keygen -Y sign requires one): %s"
+                % (key_label, private_key)
+            )
+    reported.append(private_key)
 
 
 def public_keyring_manifest_hash(kind, document, active_public_key):
@@ -463,15 +740,120 @@ def command_rotate_write(argv):
 def command_init_write(argv):
     prefix, suffix, uid, gid = argv[0], argv[1], int(argv[2]), int(argv[3])
     coverage_start, coverage_end, open_dates_csv = argv[4], argv[5], argv[6]
+    pid, public_key_file = argv[7], argv[8]
     open_dates = [value for value in open_dates_csv.split(",") if value]
     for kind in KIND_ORDER:
-        temporary = "%s.tmp-%s" % (private_key_path(prefix, kind, suffix), argv[7])
+        temporary = "%s.tmp-%s" % (private_key_path(prefix, kind, suffix), pid)
         finalize_existing(temporary, private_key_path(prefix, kind, suffix), 0o600, uid, gid)
     calendar = calendar_document(coverage_start, coverage_end, open_dates)
     atomic_write(calendar_path(prefix), canonical(calendar), 0o600, uid, gid)
     for kind in KIND_ORDER:
         document = genesis_manifest(prefix, kind, suffix)
         atomic_write(manifest_path(prefix, kind), canonical(document), 0o600, uid, gid)
+    reference_key = reference_source_key_path(prefix, suffix)
+    finalize_existing("%s.tmp-%s" % (reference_key, pid), reference_key, 0o600, uid, gid)
+    with open(public_key_file, "r") as handle:
+        public_key = handle.read()
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0)
+    capabilities = capability_manifest(prefix, suffix, public_key, issued_at)
+    atomic_write(
+        capability_manifest_path(prefix),
+        canonical(capabilities),
+        0o600,
+        uid,
+        gid,
+    )
+    return 0
+
+
+def command_capability_rotate_current(argv):
+    prefix, target = argv[0], argv[1]
+    document, _payload = load_capability_manifest(prefix)
+    if target == "reference-source":
+        sys.stdout.write("%s\n" % document["reference_source_private_key_path"])
+    else:
+        sys.stdout.write("\n")
+    return 0
+
+
+def command_capability_rotate_write(argv):
+    """Rotate one capability credential, keeping the other two byte-identical."""
+
+    prefix, target, suffix = argv[0], argv[1], argv[2]
+    uid, gid, pid = int(argv[3]), int(argv[4]), argv[5]
+    retired_public_key_file = argv[6]
+    document, _payload = load_capability_manifest(prefix)
+    rotated = dict(document)
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    if target == "reference-source":
+        active_key_id = "reference-source-%s" % suffix
+        retired_key_id = document["reference_source_key_id"]
+        if active_key_id == retired_key_id:
+            raise Failure("rotation must change the active key id (%s)" % active_key_id)
+        retired_keys = dict(document["reference_source_previous_public_keys"])
+        if active_key_id in retired_keys:
+            raise Failure("key id %s is already a retired key" % active_key_id)
+        active_private_key = reference_source_key_path(prefix, suffix)
+        require_normalized(active_private_key, "reference_source_private_key_path")
+        if os.path.lexists(active_private_key):
+            raise Failure("refusing to overwrite existing key material: %s" % active_private_key)
+        with open(retired_public_key_file, "r") as handle:
+            retired_public_key = handle.read().strip()
+        if not retired_public_key.startswith(SSH_PUBLIC_KEY_PREFIX):
+            raise Failure("retired reference source key is not an ssh-ed25519 key")
+        retired_keys[retired_key_id] = retired_public_key
+        with open("%s.pub-%s" % (active_private_key, pid), "r") as handle:
+            active_public_key = handle.read().strip()
+        if not active_public_key.startswith(SSH_PUBLIC_KEY_PREFIX):
+            raise Failure("new reference source key is not an ssh-ed25519 key")
+        finalize_existing(
+            "%s.tmp-%s" % (active_private_key, pid),
+            active_private_key,
+            0o600,
+            uid,
+            gid,
+        )
+        retired_private_key = document["reference_source_private_key_path"]
+        rotated["reference_source_key_id"] = active_key_id
+        rotated["reference_source_private_key_path"] = active_private_key
+        rotated["reference_source_public_key"] = active_public_key
+        rotated["reference_source_previous_public_keys"] = retired_keys
+    elif target == "reference-publication":
+        rotated["reference_publication_key_id"] = "reference-publication-%s" % suffix
+        if rotated["reference_publication_key_id"] == document["reference_publication_key_id"]:
+            raise Failure("rotation must change the active key id")
+        rotated["reference_publication_secret_hex"] = os.urandom(CAPABILITY_SECRET_BYTES).hex()
+        retired_private_key = None
+    elif target == "retention-writer":
+        credential = document["retention_writer_credential"]
+        key_id = "retention-writer-%s" % suffix
+        if key_id == credential["key_id"]:
+            raise Failure("rotation must change the active key id")
+        secret = os.urandom(CAPABILITY_SECRET_BYTES).hex()
+        rotated["retention_writer_credential"] = retention_writer_credential(
+            key_id,
+            secret,
+            issued_at,
+            previous_secret_hex=credential["secret_hex"],
+        )
+        rotated["retention_writer_credential"]["sequence"] = int(credential["sequence"]) + 1
+        retired_private_key = None
+    else:
+        raise Failure("unknown capability rotation target: %s" % target)
+
+    atomic_write(capability_manifest_path(prefix), canonical(rotated), 0o600, uid, gid)
+    if retired_private_key is not None:
+        os.unlink(retired_private_key)
+    fsync_directory(capability_directory(prefix))
+    sys.stdout.write("rotated capability %s\n" % target)
+    return 0
+
+
+def command_export_capabilities(argv):
+    document, _payload = load_capability_manifest(argv[0])
+    for name, value in sorted(capability_assignments(document).items()):
+        sys.stdout.write("%s=%s\n" % (name, value))
     return 0
 
 
@@ -696,12 +1078,14 @@ def command_verify_tree(argv):
             check_calendar(prefix, document, problems, uid, gid)
             reported.append(calendar_path(prefix))
 
+    check_capability_manifest(prefix, problems, uid, gid, reported)
+
     if problems:
         for problem in problems:
             sys.stderr.write("%s\n" % problem)
         return 1
-    if len(reported) != 9:
-        sys.stderr.write("expected nine credential files, inspected %d\n" % len(reported))
+    if len(reported) != 13:
+        sys.stderr.write("expected thirteen credential files, inspected %d\n" % len(reported))
         return 1
     for path in reported:
         sys.stdout.write("OK %s\n" % path)
@@ -716,6 +1100,9 @@ def main(argv):
         "init-write": command_init_write,
         "rotate-current": command_rotate_current,
         "rotate-write": command_rotate_write,
+        "capability-rotate-current": command_capability_rotate_current,
+        "capability-rotate-write": command_capability_rotate_write,
+        "export-capabilities": command_export_capabilities,
         "verify-tree": command_verify_tree,
     }
     handler = handlers.get(command)
@@ -819,6 +1206,7 @@ key_directory() {
         highwater) printf '%s/lab-highwater\n' "$(etc_root)" ;;
         canvas) printf '%s/canvas-publication\n' "$(etc_root)" ;;
         shadow) printf '%s/shadow-report\n' "$(etc_root)" ;;
+        completion) printf '%s/shadow-completion\n' "$(etc_root)" ;;
         daily) printf '%s/daily-receipt\n' "$(etc_root)" ;;
         *) fail "unknown credential kind: $1" 2 ;;
     esac
@@ -829,6 +1217,7 @@ key_id_prefix() {
         highwater) printf 'hw\n' ;;
         canvas) printf 'canvas\n' ;;
         shadow) printf 'shadow\n' ;;
+        completion) printf 'completion\n' ;;
         daily) printf 'daily\n' ;;
         *) fail "unknown credential kind: $1" 2 ;;
     esac
@@ -836,6 +1225,14 @@ key_id_prefix() {
 
 private_key_path() {
     printf '%s/%s-%s.private.pem\n' "$(key_directory "$1")" "$(key_id_prefix "$1")" "$2"
+}
+
+capability_directory() {
+    printf '%s/runtime-capabilities\n' "$(etc_root)"
+}
+
+reference_source_key_path() {
+    printf '%s/reference-source-%s\n' "$(capability_directory)" "$1"
 }
 
 command_init() {
@@ -894,22 +1291,35 @@ command_init() {
         exit "${status}"
     fi
 
-    local uid gid openssl_bin kind target temporary
+    local uid gid openssl_bin ssh_keygen_bin kind target temporary
+    local reference_target reference_temporary reference_public
     uid="$(owner_uid)"
     gid="$(owner_gid)"
     openssl_bin="$(openssl_binary)"
+    ssh_keygen_bin="$(ssh_keygen_binary)"
 
     ensure_directory "$(etc_root)" 0755 "${uid}" "${gid}"
-    for kind in highwater canvas shadow daily; do
+    for kind in highwater canvas shadow completion daily; do
         ensure_directory "$(key_directory "${kind}")" 0700 "${uid}" "${gid}"
     done
+    ensure_directory "$(capability_directory)" 0700 "${uid}" "${gid}"
 
-    for kind in highwater canvas shadow daily; do
+    for kind in highwater canvas shadow completion daily; do
         target="$(private_key_path "${kind}" "${KEY_SUFFIX}")"
         temporary="${target}.tmp-$$"
         TMP_PATHS+=("${temporary}")
         "${openssl_bin}" genpkey -algorithm ED25519 -out "${temporary}" >/dev/null
     done
+
+    # `ssh-keygen -Y sign` (live_spool.ReferenceSourceBatchSigner) needs an OpenSSH
+    # private key, so this one key is not an openssl PKCS#8 PEM like the five above.
+    reference_target="$(reference_source_key_path "${KEY_SUFFIX}")"
+    reference_temporary="${reference_target}.tmp-$$"
+    reference_public="${reference_target}.pub-$$"
+    TMP_PATHS+=("${reference_temporary}" "${reference_temporary}.pub" "${reference_public}")
+    "${ssh_keygen_bin}" -q -t ed25519 -N '' -C '' -f "${reference_temporary}" >/dev/null
+    "${ssh_keygen_bin}" -y -f "${reference_temporary}" >"${reference_public}"
+    /bin/chmod 0600 "${reference_public}"
 
     run_worker init-write \
         "${PREFIX}" \
@@ -919,10 +1329,12 @@ command_init() {
         "${CALENDAR_COVERAGE_START}" \
         "${CALENDAR_COVERAGE_END}" \
         "${CALENDAR_OPEN_DATES}" \
-        "$$"
+        "$$" \
+        "${reference_public}"
+    /bin/rm -f -- "${reference_public}" "${reference_temporary}.pub"
     TMP_PATHS=()
 
-    printf 'created 9 credential files under %s\n' "$(etc_root)"
+    printf 'created 13 credential files under %s\n' "$(etc_root)"
 }
 
 DAILY_STDIN_SEAM='from pathlib import Path; import runpy, sys; module = runpy.run_path(sys.argv[1]); operation = module["_stdin_operation"]; operation(Path(sys.argv[2]))'
@@ -949,6 +1361,7 @@ manifest_file() {
         highwater) printf '%s/lab-highwater-keys.json\n' "$(etc_root)" ;;
         canvas) printf '%s/canvas-publication-keys.json\n' "$(etc_root)" ;;
         shadow) printf '%s/shadow-report-keys.json\n' "$(etc_root)" ;;
+        completion) printf '%s/shadow-completion-keys.json\n' "$(etc_root)" ;;
         daily) printf '%s/daily-receipt-keys.json\n' "$(etc_root)" ;;
         *) fail "unknown credential kind: $1" 2 ;;
     esac
@@ -959,6 +1372,7 @@ keyring_file() {
         highwater) printf '%s/lab-highwater-trusted-keys.json\n' "$(etc_root)" ;;
         canvas) printf '%s/canvas-publication-trusted-keys.json\n' "$(etc_root)" ;;
         shadow) printf '%s/shadow-report-trusted-keys.json\n' "$(etc_root)" ;;
+        completion) printf '%s/shadow-completion-trusted-keys.json\n' "$(etc_root)" ;;
         daily) printf '%s/daily-receipt-trusted-keys.json\n' "$(etc_root)" ;;
         *) fail "unknown credential kind: $1" 2 ;;
     esac
@@ -990,6 +1404,12 @@ run_consumer_self_checks() {
         --keys-file "$(manifest_file canvas)" --validate-key-material >/dev/null
     "${PYTHON_BIN}" "${helper_dir}/rquant-shadow-report-signer" \
         --keys-file "$(manifest_file shadow)" --validate-key-material >/dev/null
+    # The completion keyring has no signer helper of its own yet (the completion
+    # attestation signer is still to be injected into strategy_live), and its manifest
+    # is byte-for-byte the canvas shape — schema_version 1, four fields, unchained —
+    # so the canvas helper is the validator that actually exists for it.
+    "${PYTHON_BIN}" "${helper_dir}/rquant-canvas-publication-signer" \
+        --keys-file "$(manifest_file completion)" --validate-key-material >/dev/null
     # A published trusted keyring pins the chain's generation ceiling for the
     # consumer's own export.  install-runtime-credential-infra.sh:1302-1318 always
     # appends --current-keyring when one exists; without it here, the export always
@@ -1033,8 +1453,12 @@ command_rotate() {
     ROTATE_TARGET="$1"
     shift
     case "${ROTATE_TARGET}" in
-        highwater|canvas|shadow|daily) ;;
-        *) fail "rotate target must be one of highwater|canvas|shadow|daily" 2 ;;
+        highwater|canvas|shadow|completion|daily) ;;
+        reference-source|reference-publication|retention-writer) ;;
+        *)
+            fail "rotate target must be one of highwater|canvas|shadow|completion|daily|\
+reference-source|reference-publication|retention-writer" 2
+            ;;
     esac
     while (( $# > 0 )); do
         parse_common_option "$@"
@@ -1056,6 +1480,13 @@ command_rotate() {
     [[ -n "${NEW_KEY_SUFFIX}" ]] || fail "rotate requires --new-key-suffix SUFFIX" 2
     validate_suffix "${NEW_KEY_SUFFIX}"
     require_privilege
+
+    case "${ROTATE_TARGET}" in
+        reference-source|reference-publication|retention-writer)
+            rotate_capability
+            return 0
+            ;;
+    esac
 
     local uid gid openssl_bin retired_private target temporary public_export
     uid="$(owner_uid)"
@@ -1085,6 +1516,54 @@ command_rotate() {
     TMP_PATHS=()
 }
 
+rotate_capability() {
+    local uid gid ssh_keygen_bin retired_private target temporary public_export
+    uid="$(owner_uid)"
+    gid="$(owner_gid)"
+
+    retired_private="$(run_worker capability-rotate-current "${PREFIX}" "${ROTATE_TARGET}")"
+    public_export=""
+    if [[ "${ROTATE_TARGET}" == "reference-source" ]]; then
+        [[ -f "${retired_private}" ]] \
+            || fail "retired reference source key is missing: ${retired_private}"
+        ssh_keygen_bin="$(ssh_keygen_binary)"
+        target="$(reference_source_key_path "${NEW_KEY_SUFFIX}")"
+        temporary="${target}.tmp-$$"
+        public_export="${target}.retired-$$"
+        TMP_PATHS+=("${temporary}" "${temporary}.pub" "${public_export}" "${target}.pub-$$")
+        "${ssh_keygen_bin}" -y -f "${retired_private}" >"${public_export}"
+        /bin/chmod 0600 "${public_export}"
+        "${ssh_keygen_bin}" -q -t ed25519 -N '' -C '' -f "${temporary}" >/dev/null
+        "${ssh_keygen_bin}" -y -f "${temporary}" >"${target}.pub-$$"
+        /bin/chmod 0600 "${target}.pub-$$"
+    fi
+
+    run_worker capability-rotate-write \
+        "${PREFIX}" \
+        "${ROTATE_TARGET}" \
+        "${NEW_KEY_SUFFIX}" \
+        "${uid}" \
+        "${gid}" \
+        "$$" \
+        "${public_export}"
+    cleanup_temporaries
+}
+
+command_export_capabilities() {
+    while (( $# > 0 )); do
+        parse_common_option "$@"
+        if (( CONSUMED > 0 )); then
+            shift "${CONSUMED}"
+            continue
+        fi
+        usage
+    done
+    require_privilege
+    # Secrets go to stdout so the caller can `eval "$(... export-capabilities)"` and never
+    # leave a plaintext env file behind. The durable copy is the 0600 manifest.
+    run_worker export-capabilities "${PREFIX}"
+}
+
 main() {
     (( $# > 0 )) || usage
     COMMAND="$1"
@@ -1093,6 +1572,7 @@ main() {
         init) command_init "$@" ;;
         rotate) command_rotate "$@" ;;
         verify) command_verify "$@" ;;
+        export-capabilities) command_export_capabilities "$@" ;;
         -h|--help|help) usage ;;
         *) usage ;;
     esac
