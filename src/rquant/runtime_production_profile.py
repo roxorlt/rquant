@@ -851,12 +851,41 @@ def _control_bucket(kind: RuntimeServiceKind) -> str:
     }[kind]
 
 
+def _revalidate_production_inputs(
+    inputs: ProductionRuntimeProfileInputs,
+) -> ProductionRuntimeProfileInputs:
+    """Re-run the input validators on an already validated contract.
+
+    `RuntimeContractModel` sets `revalidate_instances="always"`, so handing a model
+    instance to `model_validate` runs every validator again — including the
+    linux-production gate that demands `context["daily_receipt_authority_hydrated"]`.
+    That context is a statement about *how a raw payload was loaded*
+    (`load_production_runtime_profile_inputs` sets it after
+    `_hydrate_daily_receipt_authority_from_fixed_keyring` has filled the three Daily
+    receipt fields from the fixed keyring), so an instance that already exists has by
+    construction passed through it: the only way to build one in linux-production mode
+    is that loader. Re-asserting the flag for an instance therefore restates a fact,
+    while a raw mapping still has to come through the loader to get it.
+
+    Without this, every linux-production call died at the first line of
+    `build_production_runtime_profile` — which is why the route A command chain stopped
+    before printing its first target (found by pkgB review B-1).
+    """
+
+    if isinstance(inputs, ProductionRuntimeProfileInputs):
+        return ProductionRuntimeProfileInputs.model_validate(
+            inputs,
+            context={"daily_receipt_authority_hydrated": True},
+        )
+    return ProductionRuntimeProfileInputs.model_validate(inputs)
+
+
 def build_production_runtime_profile(
     inputs: ProductionRuntimeProfileInputs,
 ) -> RuntimeDeploymentProfile:
     """Build one content-addressed, least-privilege runtime profile."""
 
-    config = ProductionRuntimeProfileInputs.model_validate(inputs)
+    config = _revalidate_production_inputs(inputs)
     _validate_input_strategy_bindings(config)
     builtin_registry = BuiltinStrategyEvaluatorRegistry(producer_commit=config.producer_commit)
     root = config.runtime_root
@@ -1858,7 +1887,7 @@ def install_production_runtime_prerequisites(
 ) -> tuple[Path, ...]:
     """Install immutable authority generations required before service rollout."""
 
-    config = ProductionRuntimeProfileInputs.model_validate(inputs)
+    config = _revalidate_production_inputs(inputs)
     definition_plan = plan_builtin_definitions(producer_commit=config.producer_commit)
     planned_bindings = tuple(
         ProductionStrategyBinding.model_validate(binding.model_dump(mode="python"))
