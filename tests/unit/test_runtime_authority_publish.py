@@ -43,8 +43,12 @@ from rquant.runtime_authority import (
     parse_runtime_authority_record,
     parse_runtime_closure_profile,
 )
-from rquant.runtime_authority_publish import RuntimeAuthorityStageError
+from rquant.runtime_authority_publish import PROFILE_NAME, RuntimeAuthorityStageError
 from rquant.runtime_exec_wrapper import _verify
+from rquant.runtime_legacy_generation_binding import (
+    GENERATION_LEGACY_BINDING_NAME,
+    parse_legacy_generation_binding,
+)
 from rquant.strict_json import canonical_json_bytes, strict_json_loads
 from tests.unit.test_runtime_production_profile import (
     _daily_keyring_document,
@@ -1551,31 +1555,170 @@ def test_a23_deploy_notes_record_the_first_gate_set(world: World) -> None:
 # ---------------------------------------------------------------------------------------
 
 
-def test_legacy_mode_copies_manifests_verbatim_and_yields_the_same_generation(world: World) -> None:
-    bootstrap = world.stage("bootstrap")
-    generation = bootstrap.options.staging / "generation"
+def _mirror_legacy_generation(world: World, plan: Any, *, generation_id: str) -> Path:
+    """A legacy `data/runtime` holding this plan's manifests under `generations/<id>`."""
+
     legacy = world.root / "legacy-runtime"
-    legacy_generation = legacy / "generations" / ("a" * 64)
-    (legacy_generation / "manifests").mkdir(parents=True)
-    mapping = world.instances(bootstrap)
+    directory = legacy / "generations" / generation_id
+    (directory / "manifests").mkdir(parents=True)
+    mapping = world.instances(plan)
     for role in KIND_BACKED_ROLES:
         for label in mapping[role]:
             shutil.copyfile(
-                generation / "manifests" / f"{label}.json",
-                legacy_generation / "manifests" / f"{label}.json",
+                plan.options.staging / "generation" / "manifests" / f"{label}.json",
+                directory / "manifests" / f"{label}.json",
             )
-    os.symlink(f"generations/{'a' * 64}", legacy / "current")
+    current = legacy / "current"
+    if current.is_symlink():
+        current.unlink()
+    os.symlink(f"generations/{generation_id}", current)
+    return legacy
+
+
+def test_legacy_mode_copies_manifests_verbatim_and_records_the_generation_it_came_from(
+    world: World,
+) -> None:
+    """Route A copies the manifests byte for byte and adds exactly one document.
+
+    Before #207 the two modes produced the same generation id from the same manifests,
+    which is precisely the ambiguity the fix removes: an authority generation now says
+    which legacy deployment it was staged from, so a role can refuse when the pointer has
+    moved. `profile_id` is untouched by that document (it is computed from the interpreter
+    closure and the instance labels), which is what keeps #190 out of Route A.
+    """
+
+    bootstrap = world.stage("bootstrap")
+    legacy = _mirror_legacy_generation(world, bootstrap, generation_id="a" * 64)
     legacy_plan = world.stage(
         "legacy", bootstrap_from_checkout=False, legacy_runtime_root=legacy,
         operation_id=bootstrap.options.operation_id,
     )
     assert legacy_plan.plan["mode"] == "legacy"
-    assert legacy_plan.plan["generation_id"] == bootstrap.plan["generation_id"]
     assert legacy_plan.plan["instance_mapping"] == bootstrap.plan["instance_mapping"]
-    assert legacy_plan.manifest_payload == bootstrap.manifest_payload
+    assert legacy_plan.plan["profile_id"] == bootstrap.plan["profile_id"]
+    assert legacy_plan.plan["generation_id"] != bootstrap.plan["generation_id"]
+
+    mapping = world.instances(bootstrap)
+    for role in KIND_BACKED_ROLES:
+        for label in mapping[role]:
+            relative = f"manifests/{label}.json"
+            assert (
+                (legacy_plan.options.staging / "generation" / relative).read_bytes()
+                == (bootstrap.options.staging / "generation" / relative).read_bytes()
+            )
+
+    left = dict(bootstrap.plan["staged_files"])  # type: ignore[arg-type]
+    right = dict(legacy_plan.plan["staged_files"])  # type: ignore[arg-type]
+    document = f"generation/{GENERATION_LEGACY_BINDING_NAME}"
+    assert set(left) == set(right)
+    #: the document, plus the two files that carry the generation id it changes
+    assert [name for name in right if right[name] != left[name]] == [
+        "current.json",
+        f"generation/{authority_module.GENERATION_MANIFEST_NAME}",
+        document,
+    ]
+    assert right[PROFILE_NAME] == left[PROFILE_NAME]
+
+    binding = parse_legacy_generation_binding(
+        (legacy_plan.options.staging / "generation" / GENERATION_LEGACY_BINDING_NAME).read_bytes()
+    )
+    assert binding.mode == "legacy"
+    assert binding.generation_id == "a" * 64
+    assert binding.runtime_root == str(legacy)
+
+    bootstrap_binding = parse_legacy_generation_binding(
+        (bootstrap.options.staging / "generation" / GENERATION_LEGACY_BINDING_NAME).read_bytes()
+    )
+    assert bootstrap_binding.mode == "bootstrap"
+    assert bootstrap_binding.generation_id is None
+    assert bootstrap_binding.runtime_root is None
+
     with pytest.raises(RuntimeAuthorityStageError, match="missing"):
         world.stage("legacy-missing", bootstrap_from_checkout=False,
                     legacy_runtime_root=world.root / "nowhere")
+
+
+def test_legacy_mode_follows_the_current_pointer_exactly_once(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`current` is a symlink the runtime owner can move, so a staging run reads it once.
+
+    Two reads meant two answers were possible: `legacy_services` chose which generation's
+    manifests to copy, `legacy_generation_binding` chose which id to write down. A pointer
+    moved in between would have produced a generation whose document names a deployment its
+    own manifests did not come from — and a role would then start happily on that mismatch,
+    which is the one thing the document exists to prevent.
+    """
+
+    bootstrap = world.stage("bootstrap")
+    legacy = _mirror_legacy_generation(world, bootstrap, generation_id="a" * 64)
+    pointer = str(legacy / "current")
+    follows: list[str] = []
+    real = os.readlink
+
+    def counting_readlink(path: Any, **kwargs: Any) -> Any:
+        if str(path) == pointer:
+            follows.append(str(path))
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(stage_module.os, "readlink", counting_readlink)
+    plan = world.stage(
+        "legacy-once", bootstrap_from_checkout=False, legacy_runtime_root=legacy,
+        operation_id=bootstrap.options.operation_id,
+    )
+    monkeypatch.undo()
+
+    assert follows == [pointer]
+    binding = parse_legacy_generation_binding(
+        (plan.options.staging / "generation" / GENERATION_LEGACY_BINDING_NAME).read_bytes()
+    )
+    assert binding.generation_id == "a" * 64
+    #: and the manifests really came from that same generation
+    mapping = world.instances(plan)
+    for role in KIND_BACKED_ROLES:
+        for label in mapping[role]:
+            relative = f"manifests/{label}.json"
+            assert (
+                (plan.options.staging / "generation" / relative).read_bytes()
+                == (legacy / "generations" / ("a" * 64) / relative).read_bytes()
+            )
+
+
+def test_legacy_mode_resolves_current_and_pins_the_generation_into_the_authority_id(
+    world: World,
+) -> None:
+    """`--legacy-generation current` records the id it resolved to, and that id is inside
+    the authority generation id: the same manifests under a different legacy generation
+    stage to a different authority generation."""
+
+    bootstrap = world.stage("bootstrap")
+    legacy = _mirror_legacy_generation(world, bootstrap, generation_id="a" * 64)
+    from_pointer = world.stage(
+        "legacy-pointer", bootstrap_from_checkout=False, legacy_runtime_root=legacy,
+        operation_id=bootstrap.options.operation_id,
+    )
+    explicit = world.stage(
+        "legacy-explicit", bootstrap_from_checkout=False, legacy_runtime_root=legacy,
+        legacy_generation="a" * 64, operation_id=bootstrap.options.operation_id,
+    )
+    assert from_pointer.plan["generation_id"] == explicit.plan["generation_id"]
+
+    shutil.copytree(
+        legacy / "generations" / ("a" * 64), legacy / "generations" / ("b" * 64)
+    )
+    current = legacy / "current"
+    current.unlink()
+    os.symlink(f"generations/{'b' * 64}", current)
+    after_switch = world.stage(
+        "legacy-switched", bootstrap_from_checkout=False, legacy_runtime_root=legacy,
+        operation_id=bootstrap.options.operation_id,
+    )
+    assert after_switch.plan["generation_id"] != from_pointer.plan["generation_id"]
+    assert after_switch.plan["profile_id"] == from_pointer.plan["profile_id"]
+    binding = parse_legacy_generation_binding(
+        (after_switch.options.staging / "generation" / GENERATION_LEGACY_BINDING_NAME).read_bytes()
+    )
+    assert binding.generation_id == "b" * 64
 
 
 def test_checkout_gate_requires_head_and_a_clean_tree(world: World) -> None:

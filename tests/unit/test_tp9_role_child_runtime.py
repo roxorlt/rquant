@@ -192,6 +192,114 @@ def test_t9_10_mirrored_generation_holds_both_file_hop_targets(
 
 
 # ---------------------------------------------------------------------------------------
+# R186 / R188: the modules the two recovery roles reach after their own import
+# ---------------------------------------------------------------------------------------
+
+#: `runtime_recovery_service` imports clean, which is why T9-1's 28/28 said nothing about
+#: the two recovery roles: their real chain is entered at call time, from
+#: `runtime_recovery_production`, and every module on it used to construct `Settings` while
+#: being imported (#186, #188). Probed as its own set so a regression names the module.
+RECOVERY_CALL_TIME_MODULES = (
+    "rquant.dashboard.strategy_lab_data",
+    "rquant.dashboard.strategy_lab_runs",
+    "rquant.formal_smoke_replay",
+    "rquant.runtime_recovery_coordinator",
+    "rquant.runtime_recovery_backup",
+    "rquant.runtime_recovery_production",
+)
+
+
+def test_r186_recovery_call_time_modules_import_in_the_wrapper_child_environment(
+    mirrored_generation: tuple[Path, Path],
+) -> None:
+    """#186 / #188: the recovery chain imports under `-I -S` with three environment names."""
+
+    app_source, cwd = mirrored_generation
+    failures: list[str] = []
+    for module in RECOVERY_CALL_TIME_MODULES:
+        result = import_role_module(module, app_source=app_source, cwd=cwd)
+        if result.returncode != 0:
+            failures.append(f"{module}: {(result.stdout + result.stderr).strip()[:200]}")
+    assert not failures, "recovery chain modules still die in the child environment:\n" + "\n".join(
+        failures
+    )
+
+
+_CLOSURE_PROBE = """
+import sys
+sys.path[:0] = {paths!r}
+__import__({module!r})
+print("MODULES", " ".join(sorted(n for n in sys.modules if n.startswith("rquant."))))
+"""
+
+
+def test_r186_the_probed_chain_is_the_one_the_recovery_roles_actually_walk(
+    mirrored_generation: tuple[Path, Path],
+) -> None:
+    """The probe is worth only as much as the chain it names, so read the chain back out.
+
+    Not a grep over import statements: the child imports `runtime_recovery_backup` and
+    reports the `rquant.*` modules that ended up in `sys.modules`, which is the closure the
+    role actually walks. `dashboard.strategy_lab_data` is on it too — the coordinator's
+    module-level fingerprint reaches five strategy modules, not only `formal_smoke_replay`,
+    and #186's four-module chain therefore understated the fix.
+    """
+
+    app_source, cwd = mirrored_generation
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _CLOSURE_PROBE.format(
+                paths=[str(app_source), site_packages_path()],
+                module="rquant.runtime_recovery_backup",
+            ),
+        ],
+        cwd=str(cwd),
+        env=child_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (result.stdout + result.stderr)[-400:]
+    line = next(line for line in result.stdout.splitlines() if line.startswith("MODULES "))
+    imported = set(line.removeprefix("MODULES ").split())
+    assert set(RECOVERY_CALL_TIME_MODULES) - {"rquant.runtime_recovery_production"} <= imported
+    assert "rquant.dashboard.strategy_lab_data" in imported
+
+    from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+    recovery = [entry for entry in PRODUCTION_ROLE_POLICY if "recovery" in entry.name]
+    assert len(recovery) == 2
+    assert {entry.module for entry in recovery} == {"rquant.runtime_recovery_service"}
+
+
+def test_r186_no_module_on_the_recovery_chain_reads_settings_at_import() -> None:
+    """The fix, stated as a property of the source rather than of one probe run."""
+
+    source = CHECKOUT_SRC / "rquant"
+    leaves = (
+        "dashboard/strategy_lab_runs.py",
+        "dashboard/strategy_lab_data.py",
+        "formal_smoke_replay.py",
+        "runtime_recovery_coordinator.py",
+        "runtime_recovery_backup.py",
+        "runtime_recovery_production.py",
+    )
+    offenders = []
+    for leaf in leaves:
+        for number, line in enumerate((source / leaf).read_text(encoding="utf-8").splitlines(), 1):
+            #: column 0 only: a deferred read inside a function is exactly the fix.
+            if not line.startswith("from rquant.config import"):
+                continue
+            if "settings" in line and "get_settings" not in line:
+                offenders.append(f"{leaf}:{number}: {line.strip()}")
+    assert not offenders, "module-level settings import is back:\n" + "\n".join(offenders)
+
+
+# ---------------------------------------------------------------------------------------
 # T9-7 / T9-9: the lazy settings object
 # ---------------------------------------------------------------------------------------
 
@@ -227,7 +335,13 @@ def test_t9_7_attribute_mutation_is_visible_through_every_reader(
 
 
 @pytest.mark.parametrize(
-    "module_name", ["rquant.storage.duckdb", "rquant.page_control_service"]
+    "module_name",
+    [
+        "rquant.storage.duckdb",
+        "rquant.page_control_service",
+        "rquant.dashboard.strategy_lab_runs",
+        "rquant.dashboard.strategy_lab_data",
+    ],
 )
 def test_t9_7_lazified_modules_still_expose_the_settings_attribute(
     module_name: str,
@@ -608,11 +722,13 @@ def test_t9_5_existing_runtime_root_is_used_for_schema_bindings(
     control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
     control_root.mkdir(parents=True)
     _install_legacy_current(runtime_root)
+    _write_legacy_binding(tmp_path, runtime_root=runtime_root)
     _forbid_git(monkeypatch)
     observed: dict[str, object] = {}
 
     def fake_bindings(root: Path, **kwargs: object) -> tuple[()]:
         observed["schema_root"] = root
+        observed["generation_id"] = kwargs["generation_id"]
         return ()
 
     monkeypatch.setattr(service_main, "load_runtime_schema_service_bindings", fake_bindings)
@@ -627,6 +743,8 @@ def test_t9_5_existing_runtime_root_is_used_for_schema_bindings(
 
     assert service_main.run(_authority_args(manifest_path, control_root)) == 0
     assert observed["schema_root"] == runtime_root
+    #: the legacy id the pointer names, not `--expected-generation` (#207)
+    assert observed["generation_id"] == LEGACY_GENERATION
     assert "startup_degraded_reasons" not in observed["registry_kwargs"]  # type: ignore[operator]
 
 
@@ -750,6 +868,37 @@ def _install_legacy_current(runtime_root: Path, *, generation: str = LEGACY_GENE
     current = runtime_root / "current"
     current.symlink_to(Path("generations") / generation, target_is_directory=True)
     return current
+
+
+def _write_legacy_binding(
+    root: Path,
+    *,
+    runtime_root: Path | None,
+    generation: str = GENERATION,
+    legacy_generation: str | None = LEGACY_GENERATION,
+    mode: str = "legacy",
+    payload: bytes | None = None,
+    file_mode: int = 0o444,
+) -> Path:
+    """`<root>/generations/<authority generation>/legacy-binding.json`, as staging writes it."""
+
+    from rquant.runtime_legacy_generation_binding import (
+        GENERATION_LEGACY_BINDING_NAME,
+        legacy_generation_binding_bytes,
+    )
+
+    directory = root / "generations" / generation
+    directory.mkdir(parents=True, exist_ok=True)
+    document = directory / GENERATION_LEGACY_BINDING_NAME
+    if payload is None:
+        payload = legacy_generation_binding_bytes(
+            mode=mode,
+            runtime_root=None if runtime_root is None else str(runtime_root),
+            generation_id=legacy_generation,
+        )
+    document.write_bytes(payload)
+    document.chmod(file_mode)
+    return document
 
 
 def _stub_registry_factory(monkeypatch: pytest.MonkeyPatch, kind: str) -> list[dict[str, object]]:
@@ -921,6 +1070,251 @@ def test_t9_6_strategy_live_still_fails_closed_without_a_runtime_root(
 
     with pytest.raises(ValueError, match="strategy-live runtime must use a current deployment"):
         service_main.run(_authority_args(manifest_path, control_root, kind="strategy_live"))
+
+
+# ---------------------------------------------------------------------------------------
+# R207: the two generation id namespaces, each bound, neither skippable
+# ---------------------------------------------------------------------------------------
+
+
+def _r207_world(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    kind: str = "market_minute_source",
+    control_directory: str = "market-minute-sources",
+) -> tuple[Path, Path, Path, dict[str, object]]:
+    """A generation, a legacy root with a `current`, and the two seams `run()` needs."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path = _write_generation_manifest(tmp_path, _kind_manifest(kind))
+    runtime_root = tmp_path / "runtime"
+    control_root = runtime_root / "control" / control_directory / INSTANCE
+    control_root.mkdir(parents=True)
+    _install_legacy_current(runtime_root)
+    _forbid_git(monkeypatch)
+    observed: dict[str, object] = {}
+
+    def fake_bindings(root: Path, **kwargs: object) -> tuple[()]:
+        observed["schema_root"] = root
+        observed["generation_id"] = kwargs["generation_id"]
+        return ()
+
+    monkeypatch.setattr(service_main, "load_runtime_schema_service_bindings", fake_bindings)
+    monkeypatch.setattr(service_main, "build_builtin_registry", lambda **_k: object())
+    monkeypatch.setattr(service_main, "run_runtime_service_manifest", lambda *_a, **_k: object())
+    return manifest_path, runtime_root, control_root, observed
+
+
+def test_r207_schema_bindings_load_against_the_generation_the_pointer_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix, stated positively: the legacy id, never `--expected-generation`."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
+    _write_legacy_binding(tmp_path, runtime_root=runtime_root)
+
+    assert service_main.run(_authority_args(manifest_path, control_root)) == 0
+    assert observed["generation_id"] == LEGACY_GENERATION
+    assert observed["generation_id"] != GENERATION
+
+
+def test_r207_a_generation_without_the_binding_document_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent is not "trust the pointer": a generation staged before the document existed
+    carries no claim about which legacy deployment it belongs to, and gets none."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, _runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError) as refusal:
+        service_main.run(_authority_args(manifest_path, control_root))
+    #: the message names the file and the fix, not a symlink the operator will not find
+    message = str(refusal.value)
+    assert "carries no legacy-binding.json" in message
+    assert "stage and publish this generation again" in message
+    assert GENERATION in message
+    assert "symlink" not in message
+    assert "generation_id" not in observed
+
+
+def test_r207_a_bootstrap_staged_generation_refuses_to_bind_a_legacy_deployment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route B's manifests come from the checkout, so they describe no legacy bundle."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, _runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
+    _write_legacy_binding(
+        tmp_path, runtime_root=None, legacy_generation=None, mode="bootstrap"
+    )
+
+    with pytest.raises(ValueError, match="staged from the checkout"):
+        service_main.run(_authority_args(manifest_path, control_root))
+    assert "generation_id" not in observed
+
+
+def test_r207_a_binding_for_another_runtime_root_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The document names the root it was staged against; this is not that root."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, _runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
+    _write_legacy_binding(tmp_path, runtime_root=tmp_path / "another-runtime")
+
+    with pytest.raises(ValueError, match="names another runtime root"):
+        service_main.run(_authority_args(manifest_path, control_root))
+    assert "generation_id" not in observed
+
+
+def test_r207_a_current_pointer_moved_under_the_generation_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reverse case the ruling asks for: `current` swung to another generation."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
+    _write_legacy_binding(tmp_path, runtime_root=runtime_root, legacy_generation="d" * 64)
+
+    with pytest.raises(ValueError, match="does not match the current pointer"):
+        service_main.run(_authority_args(manifest_path, control_root))
+    assert "generation_id" not in observed
+
+
+def test_r207_the_manifest_path_check_still_binds_the_authority_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half is untouched: a manifest in the wrong generation directory never
+    reaches the legacy document, however well that document is written."""
+
+    import rquant.runtime_service_main as service_main
+
+    _manifest_path, runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
+    other = "e" * 64
+    stranger = _write_generation_manifest(
+        tmp_path, _kind_manifest("market_minute_source"), generation=other
+    )
+    _write_legacy_binding(tmp_path, runtime_root=runtime_root, generation=other)
+
+    with pytest.raises(ValueError, match="manifest generation does not match runtime environment"):
+        service_main.run(_authority_args(stranger, control_root))
+    assert "generation_id" not in observed
+
+
+@pytest.mark.parametrize("file_mode", [0o464, 0o446])
+def test_r207_a_group_or_other_writable_binding_document_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_mode: int,
+) -> None:
+    """Read with the same care as the service manifest: root-owned, not world-writable."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, runtime_root, control_root, _observed = _r207_world(tmp_path, monkeypatch)
+    _write_legacy_binding(tmp_path, runtime_root=runtime_root, file_mode=file_mode)
+
+    with pytest.raises(ValueError, match="legacy generation binding is writable outside"):
+        service_main.run(_authority_args(manifest_path, control_root))
+
+
+def test_r207_a_symlinked_binding_document_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No component of the walk may be a symlink, the manifest reader's rule."""
+
+    import rquant.runtime_service_main as service_main
+    from rquant.runtime_legacy_generation_binding import GENERATION_LEGACY_BINDING_NAME
+
+    manifest_path, runtime_root, control_root, _observed = _r207_world(tmp_path, monkeypatch)
+    real = _write_legacy_binding(tmp_path, runtime_root=runtime_root, generation="f" * 63 + "e")
+    document = tmp_path / "generations" / GENERATION / GENERATION_LEGACY_BINDING_NAME
+    document.symlink_to(real)
+
+    #: this one really is a symlink, and keeps the reader's own wording
+    with pytest.raises(ValueError, match="legacy generation binding is unavailable"):
+        service_main.run(_authority_args(manifest_path, control_root))
+
+
+def test_r207_a_malformed_binding_document_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict JSON, exact field set, canonical bytes — the parser says which one failed."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest_path, runtime_root, control_root, _observed = _r207_world(tmp_path, monkeypatch)
+    _write_legacy_binding(
+        tmp_path, runtime_root=runtime_root, payload=b'{"mode": "legacy"}\n'
+    )
+
+    with pytest.raises(ValueError, match="legacy generation binding is invalid"):
+        service_main.run(_authority_args(manifest_path, control_root))
+
+
+def test_r207_a_degraded_role_never_reads_the_binding_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route B is unchanged: no `current`, no schema bindings, no new refusal."""
+
+    import rquant.runtime_service_main as service_main
+
+    manifest = _kind_manifest("market_minute_source")
+    manifest_path = _write_generation_manifest(tmp_path, manifest)
+    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    _forbid_git(monkeypatch)
+    monkeypatch.setattr(
+        service_main,
+        "resolve_legacy_schema_generation",
+        lambda *_a, **_k: pytest.fail("a degraded role must not read the binding document"),
+    )
+    monkeypatch.setattr(
+        service_main,
+        "load_runtime_schema_service_bindings",
+        lambda *_a, **_k: pytest.fail("schema bindings must not be loaded without a root"),
+    )
+    monkeypatch.setattr(service_main, "build_builtin_registry", lambda **_k: object())
+    monkeypatch.setattr(service_main, "run_runtime_service_manifest", lambda *_a, **_k: object())
+
+    assert service_main.run(_authority_args(manifest_path, control_root)) == 0
+
+
+def test_r207_legacy_current_generation_returns_the_id_the_predicate_only_hinted_at(
+    tmp_path: Path,
+) -> None:
+    """`legacy_runtime_root_is_current` keeps its meaning, expressed through the new reader."""
+
+    from rquant.runtime_service_main import (
+        legacy_current_generation,
+        legacy_runtime_root_is_current,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    assert legacy_current_generation(runtime_root) is None
+    assert legacy_runtime_root_is_current(runtime_root) is False
+
+    _install_legacy_current(runtime_root)
+    assert legacy_current_generation(runtime_root) == LEGACY_GENERATION
+    assert legacy_runtime_root_is_current(runtime_root) is True
 
 
 # ---------------------------------------------------------------------------------------

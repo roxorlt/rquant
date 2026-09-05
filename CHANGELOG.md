@@ -68,6 +68,22 @@
   `deploy/libexec/rquant-runtime-credential-sealer` 的白名单写死了两个种类，而真正会被密封的
   凭证种类有七种，**第一次真密封就会整体中止**。白名单换成恰好等于
   `runtime_capabilities.CAPABILITY_KEYS` 的键集，与运行期读凭证的那一处同源，不再是第二份手抄清单。
+- **路线 A 一打开，每个 kind-backed 角色都硬失败在 `runtime schema service generation is not current`（#207）**：
+  权威 generation id 与 legacy generation id 是两个互不相干的命名空间（前者是 `full-manifest.json` 的
+  sha256，后者由 legacy bundle 自己的 basis 算出），而 `--expected-generation` 一个值被同时当作
+  「这份 service manifest 属于哪一代权威 generation」和「schema bindings 该按哪一代 legacy bundle 装载」，
+  后一层永远不可能相等，于是 `data/runtime/current` 一出现，15 个 kind-backed 角色全部起不来。
+  `src/rquant/runtime_service_main.py` 现在改用 `<runtime root>/current` 解析出的 legacy generation 装载
+  schema bindings；**权威 generation 那一层的绑定一字未改**——manifest 必须坐落在名字等于
+  `--expected-generation` 的目录里那条检查原样保留。这条取代 #187 原来的窄读法。
+- **两个 recovery role 在 runtime-exec wrapper 子环境里 import 期构造 `Settings` 即死（#186、#188）**：
+  `src/rquant/dashboard/strategy_lab_runs.py` 与 `strategy_lab_data.py` 改成函数内 `get_settings()` 加
+  PEP 562 `__getattr__`（与 #189 对 `logging.py` 的处理同形）。issue 里给的 import 链是四层，实测
+  只改最深那一处修不好：`runtime_recovery_coordinator` 模块级还会导入 `strategy_lab_data`，那个模块
+  也在 import 期读四个 settings 路径。两处一起改之后，`runtime_recovery_backup` /
+  `runtime_recovery_coordinator` / `formal_smoke_replay` / `dashboard.strategy_lab_data` /
+  `dashboard.strategy_lab_runs` / `runtime_recovery_production` 六个模块在白名单子环境
+  （`-I -S`，只有 `LANG` / `LC_ALL` / `TZ`）里全部 import 成功。
 
 ### Added
 
@@ -107,6 +123,12 @@
   因此不会重启 Daily authority。生成器读这份钥匙环用的是运行时对同形钥匙串的同一个严格加载器
   （root 父链、单硬链、恰好 0444、canonical 八字段、重算 manifest hash、验 Ed25519 签名），
   缺失或不安全就报错退出，**不给占位值**。
+- **CI job `route-a-legacy-binding-linux`（3.11 / 3.12 各一路）**：在真实的
+  `/home/lighthouse/rquant/data/runtime` 上跑路线 A 的 Linux 端到端验收。它只收 `-m linux_exact` 那一条
+  用例（另外 17 条可移植用例已经在四个 full-suite 分片里，在同一个 runner 镜像上再跑一遍买不到覆盖），
+  JUnit 契约 `--suites 1 --tests 1 --failures 0 --errors 0 --skipped 0 --cases 1` 是零-skip 硬判据；
+  `--tests 1` 同时反向钉住另一件事——哪天有人给一条可移植用例误打 `linux_exact`，它会离开分片落到这里，
+  契约当场变红。
 
 ### Changed
 
@@ -143,6 +165,26 @@
   `runtime_artifact_terminal_lifecycle._LINUX_PRODUCTION_RUNTIME_ROOT` 这份同义副本都改成同一处派生
   ——记在 issue #202；本次绕开只是因为 `runtime_deployment_profile.py` 不在 R07 的 `allowed_diff` 里，
   改它会当场打红差分门。
+
+- **信任绑定语义变更：「这一代 schema 是当前代」的判据换了来源（#207，运维必读）**：改之前这个判据
+  由权威链单方说了算；改之后它由两半合成，两半都不能跳过。前一半是 **staging 当时观察到的 legacy
+  generation**，`rquant runtime-authority-stage` 现在把它写进每一代 generation 根目录下的
+  `generation/legacy-binding.json`（记 legacy runtime root 与那一代 deployment 的 id，路线 B 记
+  `mode: "bootstrap"`），这份文档的 sha256 进 full manifest、因而进权威 generation id，wrapper 在 exec
+  之前逐条核对它，所以它和这一代是一起冻住的；后一半是**角色启动时 `<runtime root>/current` 当前解析到
+  的 legacy generation**，角色在装载 schema bindings 之前把两者交叉核对一次。三条运维含义：
+  - **换 legacy 代必须重新 stage + publish 权威链**。只把 `data/runtime/current` 切到新一代、不换权威
+    generation，所有 kind-backed 角色拒绝启动，报
+    `runtime legacy generation binding does not match the current pointer`。这不是回归，是刻意的：
+    否则 `current` 一被挪动，角色就会拿一份和自己 manifest 无关的 bundle 去装 schema bindings。
+  - **缺这份文档是拒绝，不是放行**。本改动之前 stage 出来的那一代会报
+    `runtime generation <id> carries no legacy-binding.json: it was staged before that document
+    existed, so stage and publish this generation again with the current code`。云端现役的那一代正是
+    这种情况，但它今天跑的是路线 B（没有 `current`），走降级分支，不受影响。
+  - **同一批 service manifest 在 bootstrap 与 legacy 两种模式下不再产生同一个 generation id**。这条歧义
+    本身就是要消掉的：两个不同的 legacy generation 若 manifest 完全相同，从前会 stage 出同一个权威
+    generation，交叉核对也就无从谈起。`profile_id` 不变（它由解释器闭包与实例标签算出，不含这份文档），
+    所以 **#190 不会被路线 A 触发**。
 
 ### Security
 

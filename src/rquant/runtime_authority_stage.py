@@ -76,6 +76,12 @@ from rquant.runtime_authority_publish import (
     staged_files_for,
 )
 from rquant.runtime_exec_wrapper import _verify
+from rquant.runtime_legacy_generation_binding import (
+    GENERATION_LEGACY_BINDING_NAME,
+    LEGACY_BINDING_MODE_BOOTSTRAP,
+    LEGACY_BINDING_MODE_LEGACY,
+    legacy_generation_binding_bytes,
+)
 from rquant.strict_json import StrictJsonError, canonical_json_bytes, strict_json_loads
 
 #: U-11 (coordinator ruling): the two recovery roles share one frozen service id, hence one
@@ -1167,6 +1173,53 @@ def legacy_generation_directory(legacy_root: Path, generation: str) -> Path:
     return legacy_root / "generations" / generation
 
 
+def resolve_legacy_generation(options: StageOptions) -> str | None:
+    """The 64-hex legacy generation this staging run copies from, resolved exactly once.
+
+    `--legacy-generation` is usually the literal `current`, so answering it means following
+    a symlink the runtime owner can move. Two readers meant two answers were possible: one
+    chose which generation's manifests to copy, the other chose which id to write into
+    `legacy-binding.json`. A pointer moved in between would produce a generation whose
+    document names a deployment its own manifests did not come from — and a role would then
+    start happily on that mismatch, which is the one thing the document exists to prevent.
+    So the pointer is read here, once, and both consumers are handed the answer.
+
+    `None` means Route B: staged from the checkout, with no legacy deployment to name.
+    """
+
+    if options.bootstrap_from_checkout or options.legacy_runtime_root is None:
+        return None
+    legacy_root = Path(os.path.abspath(options.legacy_runtime_root))
+    return legacy_generation_directory(legacy_root, options.legacy_generation).name
+
+
+def legacy_generation_binding(options: StageOptions, *, legacy_generation: str | None) -> bytes:
+    """The `legacy-binding.json` this staging run puts inside the generation.
+
+    The document records the generation the manifests were actually copied out of rather
+    than the operator's shorthand. A kind-backed role refuses to load schema bindings unless
+    `<runtime root>/current` still resolves to that id, which is what keeps the legacy
+    namespace bound after `runtime_service_main` stopped passing it the authority id (#207).
+
+    Route B has no legacy deployment, and says so rather than omitting the document: an
+    absent file then means "staged before this document existed", which is a different
+    thing and gets a different refusal.
+    """
+
+    if legacy_generation is None:
+        return legacy_generation_binding_bytes(
+            mode=LEGACY_BINDING_MODE_BOOTSTRAP, runtime_root=None, generation_id=None
+        )
+    if options.legacy_runtime_root is None:  # pragma: no cover - guarded by the resolver
+        raise RuntimeAuthorityStageError("a legacy generation requires a legacy runtime root")
+    legacy_root = Path(os.path.abspath(options.legacy_runtime_root))
+    return legacy_generation_binding_bytes(
+        mode=LEGACY_BINDING_MODE_LEGACY,
+        runtime_root=legacy_root.as_posix(),
+        generation_id=legacy_generation,
+    )
+
+
 def legacy_services(
     *,
     legacy_root: Path,
@@ -1366,7 +1419,9 @@ def _require_regular_file(path: Path, label: str) -> Path:
     return path
 
 
-def collect_services(options: StageOptions) -> ServiceSet:
+def collect_services(options: StageOptions, *, legacy_generation: str | None = None) -> ServiceSet:
+    """`legacy_generation` is the already-resolved id, so `current` is followed once."""
+
     unit = options.page_control_unit
     if not unit.is_absolute():
         unit = options.checkout_root / unit
@@ -1378,7 +1433,9 @@ def collect_services(options: StageOptions) -> ServiceSet:
         )
     return legacy_services(
         legacy_root=options.legacy_runtime_root,
-        generation=options.legacy_generation,
+        generation=(
+            options.legacy_generation if legacy_generation is None else legacy_generation
+        ),
         page_control_unit=unit,
         commit=options.commit,
     )
@@ -1403,7 +1460,8 @@ def build_stage_plan(options: StageOptions) -> StagePlan:
         raise RuntimeAuthorityStageError(f"--staging already exists: {options.staging}")
 
     sources = checkout_sources(options.checkout_root, options.commit)
-    services = collect_services(options)
+    legacy_generation = resolve_legacy_generation(options)
+    services = collect_services(options, legacy_generation=legacy_generation)
     site_packages = venv_site_packages(Path(os.path.abspath(options.venv_source)))
     _log(
         f"sources {len(sources)} files, site-packages {len(site_packages)} files, "
@@ -1448,6 +1506,10 @@ def build_stage_plan(options: StageOptions) -> StagePlan:
     files: dict[str, StagedFile] = {
         GENERATION_PYTHON: StagedFile(EXECUTABLE_MODE, source=system_python),
         GENERATION_PYVENV: StagedFile(FILE_MODE, payload=pyvenv),
+        GENERATION_LEGACY_BINDING_NAME: StagedFile(
+            FILE_MODE,
+            payload=legacy_generation_binding(options, legacy_generation=legacy_generation),
+        ),
     }
     for relative, source in sources.items():
         files[relative] = StagedFile(FILE_MODE, source=source)
@@ -1725,10 +1787,12 @@ __all__ = [
     "elf_loader_from_readelf",
     "resolved_closure_member",
     "instance_label",
+    "legacy_generation_binding",
     "legacy_services",
     "main",
     "pyvenv_config",
     "read_page_control_instance",
+    "resolve_legacy_generation",
     "shared_libraries_from_ldd",
     "venv_site_packages",
 ]

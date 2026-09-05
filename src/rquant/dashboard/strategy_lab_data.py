@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import date, time, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -16,7 +17,6 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 from rquant import strategy_replay_metrics
-from rquant.config import settings
 from rquant.metadata_catalog import ImmutableDuckDBMetadataCatalog
 
 auction_gap_metric_rows = strategy_replay_metrics.auction_gap_metric_rows
@@ -614,14 +614,43 @@ def load_tushare_activity_packages_state(db_path: Path) -> TushareMetadataResult
     )
 
 
+def _settings() -> Any:
+    """The process-wide `Settings`, read by the one function below and not at import.
+
+    This module sits on the recovery roles' call-time import chain
+    (`runtime_recovery_coordinator` builds its executable fingerprint out of
+    `dashboard.strategy_lab_data` among others), so a module-level read made the wrapper's
+    role child die with a pydantic `ValidationError` before any role code ran (#186, #188).
+    A `settings` a test has bound onto this module still wins.
+    """
+
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound
+    from rquant.config import get_settings
+
+    return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`strategy_lab_data.settings` stays readable, built on first use (PEP 562)."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def _open_tushare_metadata_catalog(db_path: Path) -> ImmutableDuckDBMetadataCatalog:
+    resolved = _settings()
     forbidden = tuple(
         path
         for path in (
-            settings.duckdb_path,
-            settings.duckdb_readonly_path,
-            settings.research_db_path_resolved,
-            settings.research_readonly_db_path_resolved,
+            resolved.duckdb_path,
+            resolved.duckdb_readonly_path,
+            resolved.research_db_path_resolved,
+            resolved.research_readonly_db_path_resolved,
         )
         if path is not None
     )
