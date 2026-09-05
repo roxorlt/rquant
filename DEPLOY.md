@@ -5,6 +5,164 @@
 
 ---
 
+## 2026-09-05 · v0.31.3 · Release A 第一关基础设施装机（生产代码未切换）
+
+**状态**：第一关最终口径已达成——发布回执 `wrapper_preflight == 32`，serving 平面两个 kind-backed
+服务持续运行。**生产代码未切换**，仍是 `e4e303b0a4c05d2a4deefbee502718053672fe6f`（v0.28.3）。
+本次只装第一关的基础设施，第二关（切代码 + 换 venv + 重启七个常驻服务）未做。
+
+**tag**：`v0.31.3`（annotated）→ `385aac88752a1fa63b2bc60cc4ec976e48e43a5b`（包版本仍 0.31.0）
+
+**执行**：SSH `lighthouse@82.156.0.68`，2026-09-05 周末窗口分三次：
+
+| 次 | 时间（CST） | 做了什么 | 当次 tag |
+|---|---|---|---|
+| 一 | 01:14–03:05 | A 段：三个 root 制品、arbiter、5 个 slice、19 个既有 unit | `v0.31.1`（`0fb7d95`） |
+| 二 | 06:11–06:50 | B 段：四套凭证、credential 基础设施、权威链首发（sequence 1）；C 段装 unit、建目录 | `v0.31.2`（`a8beb44`） |
+| 三 | 11:41–12:25 | 第二代权威链发布（sequence 2）与服务启动 | `v0.31.3`（`385aac8`） |
+
+### 装了什么
+
+**A 段（第一次执行）**：
+
+- 三个 root 制品 `/usr/local/libexec/rquant-{runtime-exec,production-deploy,signal-family-verifier-v1}.pyz`，
+  全部 `root:root 555 nlink=1`；签名族校验器的内容寻址树在
+  `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`（目录 0555 / 文件 0444 / root:root）。
+- workload arbiter `/usr/local/libexec/rquant-workload-arbiter{,.sha256}`（`755` / `444`）
+  与 `/etc/tmpfiles.d/rquant-workload-isolation.conf`。
+- 5 个 slice（`rquant{,-live,-serving,-research,-maintenance}.slice`）与 19 个既有 unit：
+  16 个纯配置改动，`backup` / `replica-sync` / `research-ingest` 三个的 ExecStart 改经 arbiter。
+  `rquant-replica-sync.service` 经 arbiter 实测跑完 `Result=success`、`ExecMainStatus=0`，
+  只读副本 mtime 已刷新。
+- `/etc/sudoers.d/rquant-production-deploy` 换成 2,416 字节新版，旧版 652 字节备份在
+  `/root/rquant-sudoers-backup-20260905`；32 个 unit 备份在 `/root/rquant-unit-backup-20260905/`。
+
+**B 段（第二次执行）**：
+
+- 四套 Ed25519 凭证（`lab-highwater` / `canvas-publication` / `shadow-report` / `daily-receipt`）：
+  `/etc/rquant` 下 4 个私钥 `0600 root:root`、4 个 `*-trusted-keys.json` `0444 root:root`，
+  `verify` 输出 9 行 `OK` 退 0。
+- **加密备份**：`/home/lighthouse/rquant-credentials-backup/`（0700 lighthouse），
+  密文包 `etc-rquant-20260905-061857.tar.enc`（0600，aes-256-cbc + pbkdf2），
+  口令文件同目录 0600。**口令内容不出服务器，也不写进本文件。**
+  已做解密往返自检，14 个条目与 `/etc/rquant` 逐条对上。**私钥删了不可恢复。**
+- 五个 root helper（0755 root:root）：`runtime-credential-sealer`、`lab-highwater-authority`、
+  `canvas-publication-signer`、`shadow-report-signer`、`daily-receipt-signer`；
+  `rquant-daily-receipt-signer.socket` `active (listening)`。
+- 26 个 protected unit + 3 个新 timer 装好（**一个都没 enable、没 start**）；
+  C-1 按 `systemctl show -p ReadWritePaths` 解析出 35 个目录预建完，
+  `data/runtime` 下共 62 个目录，`data/runtime/current` 确认不存在。
+
+**权威链两代**：
+
+| 代 | sequence | generation | operation_id | producer commit | `wrapper_preflight` | 事务耗时 |
+|---|---|---|---|---|---|---|
+| 一 | 1 | `2bb73c28…7ca6` | `12d1eea29db425d7f3f37673b2a59ceb` | `a8beb44` | **32** | 75 s |
+| 二 | 2 | `ff79b184417a3b80a888a793ab2e8ed50e3aba212f2470e185d51cb25f6e92e4` | `39cf30b0ee2aa849fb5d69bc9417d2c8` | `385aac8` | **32** | 84 s |
+
+两代 `profile_id` 相同（`d2206e53…7ea0`），发布器走的是「同 profile 换 generation」，
+**issue #190 未触发**，没有走回退首发路径。`/etc/rquant/production-runtime-profile.json` 与
+`/var/lib/rquant/runtime-authority/current.json` 都是 `root:root 444 nlink=1`，profile 声明 28 个 role。
+第二代 `result=committed`、`state=active`、`prior_generation_id` = 第一代。
+
+### 结果
+
+- **第一关最终口径**（runbook R-12）：`wrapper_preflight == 32` **且** serving 平面
+  ≥ 2 个 kind-backed 服务持续运行。两条都达成。原判据里的「三个 plane 各至少一个」
+  在路线 B 下不可达（见 #204、#205），改动都在 builder 侧，属 owner 决策。
+- **持续运行的两个 unit**：`rquant-runtime-runtime-health@svc-2a07f3ca….service` 与
+  `rquant-runtime-serving@svc-63af0b41….service`，都在 `rquant-serving.slice`，
+  观察到 12:24:34（分别已运行 18 分 20 秒与 17 分 27 秒），**`NRestarts=0`**、`Result=success`，
+  journal 里各只有一条预期内的 degraded WARNING，没有 traceback 或 `exit-code`。
+  `runtime_health_publisher` 已在 `data/runtime/control/authority-runtime-health/`
+  实际产出 4 份 generation、4 份 publication 与 `current.json`。
+- **issue #200 的修复在生产主机上确认有效**：28 份 service manifest 的 `plane` 已按角色派生
+  （live 18 / serving 2 / research 6 / 两份占位无 plane），`settings` 除两份占位外全部非空。
+- **live 与 research 两个平面 0 个服务**。15 个 kind-backed role 逐个用 wrapper 裸跑取证
+  （不经 systemd，因而不触发告警），起不来的分类：
+
+  | 分类 | 角色 | issue |
+  |---|---|---|
+  | 路线 B 的降级态不构造 artifact terminal lifecycle，research 平面结构性起不来 | 裸跑实测撞这一条的是 `lab_jobs_publisher` 与 `promotions_publisher`；`lab_artifact_catalog`、`artifact_retention` 同属这四个 artifact-terminal owner kind | **#204**（BLK-4） |
+  | 缺 `data/runtime/authorities/reference-slow/` 的 reference registry，由推迟的 credstore 组产出，目录本身不存在 | `paper_constraint_publisher` | **#205**（BLK-5） |
+  | 路线 B 从不写 `current/deployment-profile.json` | `daily_pipeline_orchestrator`、`strategy_live`（后者属设计性失败） | #201 |
+  | 依赖明令不装的 `rquant-external-monotonic-root.service` | `lab_claim_finalizer` | #191 |
+  | 缺装机阶段本来就不存在的操作员事实：交易日历、封存候选文档、历史分钟快照、路由策略指纹、存放地 / 失败域、签名授权 | 其余 9 个，其中 `paper_broker` 与 `notifier` 缺的是上游角色的产出 | — |
+
+- **全程无退出码 78**（wrapper 一次都没拒绝）。
+- #192 未做的那一半仍在：25 个 protected unit 没有 `[Install]` 段，**服务器重启后不会自动启动**。
+
+### 两次事故
+
+1. **02:51–02:57，三个页面 500，约 6 分钟**。A-1 把生产 `.venv` 换成 3.11，
+   `mv .venv` 之后三个 Streamlit 页面立刻从 200 变 500
+   （`FileNotFoundError: …/streamlit/static/index.html`）——Streamlit 每次 HTTP 请求都按绝对路径
+   去 venv 里读前端静态资源，runbook 里「重建期间服务照常」这句不成立。进程本身没有退出
+   （`NRestarts` 仍 0）。当场把 A-1 整体回滚，页面恢复 `200/200/200/302`，三个同窗口停掉的 timer
+   也全部恢复。周六凌晨，无人访问。**A-1 已移出第一关**（runbook R-1），改到第二关的停服窗口做；
+   3.11 的 venv 原地留作 `/home/lighthouse/rquant/.venv.new-3.11`，第二关改名即可用。
+2. **06:33 与 06:35，两条告警推送到 owner 手机**。C-3 探路启动
+   `rquant-runtime-runtime-health@` 与 `rquant-runtime-feature@` 失败，
+   两个 unit 的 `OnFailure=rquant-alert@` 各推了一条 PushDeer「🚨 [RQ] … 失败 — 立即排查」。
+   发现后改用 wrapper 裸跑做剩余角色的取证，此后没有再产生任何推送；
+   第三次执行全程零推送，只 start 了裸跑证明能起的那 2 个。
+
+### 校验器树被 root 写入 .pyc 后清理换代
+
+第一次执行 A-5 的自检命令漏了 `verify` 子命令，以 root 跑出 8 个 `__pycache__` / 47 个 `.pyc`
+（mtime 全为 02:54）写进了内容寻址的校验器树；第二次执行按 `verify` 复检时退 78，
+报 `the artifact tree holds an unmanifested node`。处置：清掉污染，按「换代时旧树永不删、只换入口
+pyz」装 v0.31.2 重建的新树，content_id `7db9c2a9…af771` → `bb571c69…5e1d`，
+入口 pyz `263fd9a3…a3e0b` → `fbd14d60…de50`，旧入口 pyz 备份在
+`/root/rquant-verifier-entry-backup-20260905-v0311.pyz`，旧树保留未删。
+第三次执行没有再以 root 跑自检，未复发。
+
+### 现役零损伤
+
+七个常驻服务 `NRestarts` 全 0（5 个页面 active，`monitor` / `surge-watch` 周末 inactive，
+与开工前逐条相同）；四个端口 `200/200/200/302`；failed unit 仍是基线那 5 个，无新增；
+生产 checkout 仍是 `e4e303b`，`git status` 干净；`.env` 未改（644，1,722 字节，
+也没拷进临时 worktree）；生产 DuckDB 未写（两个新进程 `/proc/<pid>/fd` 里没有 duckdb 句柄，
+`fuser` 无输出）；`backup/` 未动；`data/runtime/current` 不存在；
+三个 slice 的 `memory.events` 里 `oom` / `oom_kill` 全 0；磁盘剩 20 GB。
+
+### 回滚（runbook §0.6）
+
+```bash
+# ① 停本次启动的两个 unit（模板 unit 没有 enable，stop 即回到未运行）
+sudo systemctl stop 'rquant-runtime-runtime-health@*.service' 'rquant-runtime-serving@*.service'
+
+# ② 单级回到第一代（第二代起才有 prior 可回）
+sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz \
+     rollback --operation-id 39cf30b0ee2aa849fb5d69bc9417d2c8
+
+# ③ 整链停用，回到「wrapper 全拒」的安全态
+sudo rm -f /var/lib/rquant/runtime-authority/current.json
+# generation 目录是内容寻址的，两代都保留，永不删除
+```
+
+A / B / C 三段逐层的完整回滚（unit → arbiter → 制品 → sudoers → 凭证）见 runbook §0.6 与本次执行记录。
+**⚠️ 四套私钥删了不可恢复**，回滚前先确认 `/home/lighthouse/rquant-credentials-backup/` 的密文包能解开。
+代码本次未切换，无需代码回滚，锚点 `e4e303b`（服务器上 `/home/lighthouse/rollback-code-sha.txt`）。
+
+完整执行记录（三次窗口的每条命令与输出原文）在 Mac 本地的
+`/Users/roxor/brain/30-projects/rQuant/.worktrees/release-a-cc/.superpowers/sdd/2026-09-03-release-a-rollout/rollout-exec-report.md`，
+没有进仓库。
+
+### 等你决策
+
+1. **第二关**是否开窗口：切生产代码到 Release A、`mv` 换上 3.11 venv、重启七个常驻服务。
+2. **#204（BLK-4）**：research 平面要么改降级分支给四个 artifact-terminal owner kind 一个只读
+   lifecycle，要么走路线 A 补齐操作员事实。两条都要改代码或产出生产 inputs，本轮未做。
+3. **#205（BLK-5）**：live 平面要有服务，先得让 `reference_slow_source` / `reference_slow_publisher`
+   产出 reference registry，这两个 role 在推迟的 credstore 组里，属另一批工作。
+4. **路线 A** 是否启动：由操作员产出生产 inputs 文档 + 生成一代真实画像，
+   这是那 9 个「缺操作员事实」的角色唯一的出路。
+5. **#192 的 `[Install]`**（重启自动启动）与 **#191 的 `external-monotonic-root`** 是否装，
+   都属 `deploy/systemd/` 改动，需要单独授权。
+
+---
+
 ## v0.31.0 Release A 上线目标（尚未部署）
 
 **状态**：等你操作。本节写在装机之前，**不是部署记录**；真正部署完成后按本文件既有格式在它上面
