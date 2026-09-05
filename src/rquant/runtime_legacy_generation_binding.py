@@ -15,14 +15,28 @@ authority one, so once Route A restores `data/runtime/current` every kind-backed
 failed closed with `runtime schema service generation is not current`.
 
 Handing it the legacy id alone would drop a binding rather than fix one: the role would
-then trust whatever `current` happened to point at. So `runtime-authority-stage` writes
-this document into the generation it stages, naming the legacy runtime root and generation
-it copied the service manifests out of, and the role refuses unless the pointer still
-resolves to that same generation. The document is a manifested file, which means its
-sha256 is inside the generation's full manifest, whose sha256 *is* the authority
-generation id, and which the wrapper hashes against the chain slot and then verifies on
-disk entry by entry (`_verify.verify_code_identity`) before the role process exists. Both
-namespaces therefore stay bound, and neither can be skipped.
+then trust whatever `current` happened to point at, and nothing downstream would notice.
+The case that makes this concrete is a **sibling generation** — a second ordinary
+`install_runtime_deployment_profile` on the same root, say after a credential rotation.
+Service manifests carry no capability values, so the two generations' `manifests/` come out
+byte-for-byte identical while `generation-basis.json`, and with it the legacy generation id,
+differs. Every check `load_runtime_schema_service_bindings` makes then passes on the
+sibling: its basis hashes to its own directory name, its manifest fingerprints and producer
+commit are the same ones, and `_current_target(root)` agrees with the id it was handed.
+(A *copied* directory is a different, easier case — its basis still hashes to the directory
+it came from, so the loader catches that one on its own.)
+
+So `runtime-authority-stage` writes this document into the generation it stages, naming the
+legacy runtime root and generation it copied the service manifests out of, and the role
+refuses unless the pointer still resolves to that same generation. The document is a
+manifested file, which means its sha256 is inside the generation's full manifest, whose
+sha256 *is* the authority generation id, and which the wrapper hashes against the chain slot
+and then verifies on disk entry by entry (`_verify.verify_code_identity`) before the role
+process exists. Both namespaces therefore stay bound, and neither can be skipped.
+
+`tests/integration/test_route_a_legacy_binding_e2e.py` builds that sibling out of two real
+installs and holds both halves: with the cross-check the role refuses, without it the loader
+accepts the sibling in silence.
 
 Kept in its own module with no imports beyond the standard library and `strict_json`, so
 the staging tool and the role entrypoint can share it without the role dragging in the

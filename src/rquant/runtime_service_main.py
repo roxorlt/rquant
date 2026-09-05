@@ -349,8 +349,10 @@ def resolve_legacy_schema_generation(
     `data/runtime/current`.
 
     Passing the legacy id instead, on its own, would drop a binding rather than move one:
-    the role would load whatever the pointer happened to name. So both are checked, in the
-    same place, and neither can be skipped:
+    the role would load whatever the pointer happened to name, and the loader would not
+    notice — a sibling generation from a second ordinary install has byte-identical service
+    manifests and a basis that hashes to its own directory, so every check the loader makes
+    passes on it. So both are checked, in the same place, and neither can be skipped:
 
     * the authority namespace, by the manifest path — the file has to sit in
       `<generation>/manifests/`, and that generation directory has to be named by

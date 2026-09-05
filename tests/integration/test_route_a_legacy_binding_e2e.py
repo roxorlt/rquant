@@ -503,23 +503,143 @@ def test_the_control_tree_the_loop_leaves_behind_is_under_the_legacy_root(
 # ---------------------------------------------------------------------------------------
 
 
-def test_a_current_pointer_moved_to_another_generation_is_refused(
+def test_a_current_pointer_moved_to_a_copied_generation_is_refused(
     route_a: RouteAWorld,
 ) -> None:
-    """The whole point of keeping the legacy namespace bound: the pointer moved, so the
-    generation's claim about which deployment it describes is no longer true."""
+    """The pointer moved, so the generation's claim about its deployment is no longer true.
+
+    A `copytree` copy is the cheap version of the case: it is refused by the binding, but
+    the schema loader would have caught it too, because a copied `generation-basis.json`
+    hashes to the directory it came from and not to the one it now sits in. The case below
+    is the one only the binding can see.
+    """
 
     other = "b" * 64
     shutil.copytree(
         route_a.runtime_root / "generations" / route_a.receipt.generation_hash,
         route_a.runtime_root / "generations" / other,
     )
-    current = route_a.runtime_root / "current"
-    current.unlink()
-    current.symlink_to(Path("generations") / other, target_is_directory=True)
+    _swing_current(route_a, other)
 
     with pytest.raises(ValueError, match="does not match the current pointer"):
         route_a.run_role(SERVING_ROLE)
+
+
+def _swing_current(route_a: RouteAWorld, generation: str) -> None:
+    current = route_a.runtime_root / "current"
+    current.unlink()
+    current.symlink_to(Path("generations") / generation, target_is_directory=True)
+
+
+@pytest.fixture
+def recorded_install(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], Any]:
+    """Capture the real install call so a case can repeat it verbatim."""
+
+    import rquant.runtime_deployment_profile as profile_module
+
+    captured: dict[str, Any] = {}
+    real = profile_module.install_runtime_deployment_profile
+
+    def recorder(profile: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        captured["profile"] = profile
+        return real(profile, **kwargs)
+
+    monkeypatch.setattr(profile_module, "install_runtime_deployment_profile", recorder)
+    return captured, real
+
+
+def _second_install(captured: dict[str, Any], real: Any) -> str:
+    """A second real install on the same runtime root: one rotated notify capability.
+
+    The schema registry is already bootstrapped, so no bootstrap reason may be passed.
+    Service manifests carry no capability values, so they come out byte-identical while
+    `generation-basis.json` — and with it the legacy generation id — changes.
+    """
+
+    kwargs = dict(captured)
+    profile = kwargs.pop("profile")
+    kwargs.pop("schema_bootstrap_reason", None)
+    environ = dict(kwargs["environ"])
+    environ["PUSHDEER_KEYS"] = "pushdeer-rotated"
+    kwargs["environ"] = environ
+    return real(profile, **kwargs).generation_hash
+
+
+def test_a_sibling_generation_with_the_same_manifests_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded_install: tuple[dict[str, Any], Any]
+) -> None:
+    """`current` swung to a *legitimately installed* sibling — the case only the document sees.
+
+    A second real `install_runtime_deployment_profile` on the same root (here: one rotated
+    notify credential, an ordinary redeploy) produces a generation whose `manifests/` are
+    byte-for-byte the first one's, because manifests carry no capability values, while
+    `generation-basis.json` — and with it the generation id — differs. Every check the
+    schema loader makes then passes on the sibling: its basis hashes to its own directory
+    name, its manifest fingerprints and producer commit are the same ones, and
+    `_current_target(root)` agrees with the id it was handed. `runtime_service_main.py`'s
+    cross-check is the only thing that knows the authority generation was staged from the
+    other one.
+    """
+
+    captured, real = recorded_install
+    route = _route_a_world(tmp_path, monkeypatch)
+    first = route.receipt.generation_hash
+    route.stage_and_publish()
+    second = _second_install(captured, real)
+    assert second != first
+
+    left = route.runtime_root / "generations" / first / "manifests"
+    right = route.runtime_root / "generations" / second / "manifests"
+    installed = sorted(path.name for path in left.iterdir())
+    assert installed == sorted(path.name for path in right.iterdir())
+    for name in installed:
+        assert (left / name).read_bytes() == (right / name).read_bytes()
+
+    #: the sibling really is self-consistent: its basis names itself
+    basis = json.loads((right.parent / "generation-basis.json").read_text(encoding="utf-8"))
+    assert basis["manifest_sha256"] == json.loads(
+        (left.parent / "generation-basis.json").read_text(encoding="utf-8")
+    )["manifest_sha256"]
+
+    _swing_current(route, second)
+    with pytest.raises(ValueError, match="does not match the current pointer"):
+        route.run_role(SERVING_ROLE)
+
+
+def test_the_schema_loader_alone_would_accept_the_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded_install: tuple[dict[str, Any], Any]
+) -> None:
+    """Why the cross-check is load-bearing and not belt-and-braces.
+
+    Same world, same sibling, with only `resolve_legacy_schema_generation` neutralised into
+    "return whatever the pointer says". The role starts, and the real loader accepts the
+    sibling's id without complaint — which is exactly the silent acceptance the cross-check
+    exists to turn into a refusal.
+    """
+
+    captured, real = recorded_install
+    route = _route_a_world(tmp_path, monkeypatch)
+    route.stage_and_publish()
+    second = _second_install(captured, real)
+    _swing_current(route, second)
+
+    monkeypatch.setattr(
+        service_main,
+        "resolve_legacy_schema_generation",
+        lambda *_a, legacy_generation, **_k: legacy_generation,
+    )
+    observed: dict[str, object] = {}
+    loader = service_main.load_runtime_schema_service_bindings
+
+    def observe(runtime_root: Path, **kwargs: Any) -> Any:
+        observed["generation_id"] = kwargs["generation_id"]
+        return loader(runtime_root, **kwargs)
+
+    monkeypatch.setattr(service_main, "load_runtime_schema_service_bindings", observe)
+
+    assert route.run_role(SERVING_ROLE) == 0
+    assert observed["generation_id"] == second
 
 
 def test_a_bootstrap_staged_generation_over_a_real_current_is_refused(
