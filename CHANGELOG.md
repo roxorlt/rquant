@@ -132,6 +132,16 @@
 
 ### Changed
 
+- **生产 inputs 生成器新增显式的日历覆盖下限开关 `--calendar-coverage-floor`（#211）**：协调者裁决 8
+  把市场日历的覆盖下限定在 `2027-12-31`，而生产库的 `trade_calendar` 只到 `2026-12-31`，补 2027 年
+  日历要往生产库写数据、需要 owner 单独授权，于是首次装机改为显式下调这个下限。
+  `scripts/build_runtime_production_inputs.py` 的新参数带同名默认值 `2027-12-31`，**默认跑法的产物
+  与 stdout 摘要一字未变**（旧拼法 `--coverage-floor` 保留为别名）。传入低于默认的值时：日历比传入
+  值还短照样退 2（下调只是放宽下限，不是取消校验）；成功时在 stderr 打一条 WARNING，写明实际的
+  `coverage_end`、下调后的下限、以及必须在 `coverage_end` 前 30 天之前换代的日期；stdout 摘要多一行
+  `coverage_floor_override` 字段，把这次下调记进这一次运行自己的记录里。参数格式写错现在退 2 并报
+  一句话，不再抛 `ValueError` traceback。`ProductionRuntimeProfileInputs` 的 49 个字段未动。
+
 - **16 个第一关 protected unit 的 `ReadWritePaths=` 补上 `-` 前缀（#192 的一半）**：路径缺失不再让
   systemd 在挂载命名空间搭建阶段以 `226/NAMESPACE` 失败。**这不免除预建目录**——
   `ProtectSystem=strict` + `ProtectHome=read-only` 下被跳过的路径仍是只读，runbook §3 C-1 的 31 条
