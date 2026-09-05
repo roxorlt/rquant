@@ -62,8 +62,10 @@ PAPER_ROLE = "paper_constraint_publisher"
 
 NOT_CURRENT = "runtime schema service generation is not current"
 
-#: The frozen runtime owner root every `PRODUCTION_ROLE_POLICY` control root sits under.
+#: The frozen runtime owner root every `PRODUCTION_ROLE_POLICY` control root sits under,
+#: and the checkout tree the Linux-only case has to create and remove around it.
 PRODUCTION_ROOT = Path("/home/lighthouse/rquant/data/runtime")
+PRODUCTION_CHECKOUT = Path("/home/lighthouse/rquant")
 
 
 def _relocate(inputs: Any, *, runtime_root: Path) -> Any:
@@ -454,10 +456,11 @@ def test_a_kind_backed_role_reaches_its_service_loop_over_a_real_current(
 ) -> None:
     """The bug, gone: the role loads schema bindings and enters `run_runtime_service_manifest`.
 
-    The stop event is pre-set, so the loop is entered and left without executing a step —
-    what is under test is the binding, and a step failure would say nothing about it either
-    way. `run()` returning 0 means the schema bindings loaded, the registry was built and
-    the loop ran.
+    `_StopAfterOneIteration` lets the loop run exactly one step and then stops it from
+    inside its own post-iteration `wait()`, so `run()` returning 0 means the schema bindings
+    loaded, the registry was built, the builder was constructed and one real iteration ran.
+    Whether that step found data is a separate question, answered by
+    `test_the_iteration_the_loop_ran_never_reports_the_binding_failure`.
     """
 
     assert route_a.run_role(role) == 0
@@ -733,14 +736,14 @@ def test_the_iteration_the_loop_ran_never_reports_the_binding_failure(
     text = json.dumps(heartbeat)
     assert NOT_CURRENT not in text
     assert "schema service generation" not in text
-    #: the step failed on the data a fresh host has none of, which is a different sentence
-    #: from the one #207 is about
-    assert heartbeat["last_error"] in {
-        None,
-        "RuntimeError: signals reader failed: ServingSourceAuthorityUnavailableError: "
-        "current authority is unavailable",
-        "RuntimeError: paper constraints require a visible market-minute batch",
-    }
+    #: The step failed on the data a fresh host has none of. Which data error it is depends
+    #: on the umask the loop ran under — `runtime_serving_authority` refuses a group-writable
+    #: path node, so umask 002 turns the serving step's "unavailable" into "unsafe" — so what
+    #: is pinned is the shape: a step error, never a binding one.
+    error = heartbeat["last_error"]
+    assert error is None or error.split(":", 1)[0] in {"RuntimeError"}
+    for forbidden in (NOT_CURRENT, "schema service generation", "legacy generation binding"):
+        assert error is None or forbidden not in error
 
 
 def _control_directory(role: str) -> str:
@@ -785,8 +788,13 @@ def test_the_wrapper_argv_runs_verbatim_against_the_frozen_production_root(
     gate: `PRODUCTION_ROLE_POLICY` freezes that path, and no test can own it anywhere else.
     """
 
-    if PRODUCTION_ROOT.exists():  # pragma: no cover - a real host, not a container
-        raise AssertionError(f"{PRODUCTION_ROOT} already exists; refusing to touch a real host")
+    #: the guard names the whole tree the case creates and deletes, not just the runtime
+    #: root inside it: a leftover `data/external` would otherwise survive into the next run
+    #: and fail it with an unrelated error
+    if PRODUCTION_CHECKOUT.exists():  # pragma: no cover - a real host, not a container
+        raise AssertionError(
+            f"{PRODUCTION_CHECKOUT} already exists; refusing to touch a real host"
+        )
     PRODUCTION_ROOT.parent.mkdir(parents=True, exist_ok=True)
     try:
         route = _route_a_world(tmp_path, monkeypatch, runtime_root=PRODUCTION_ROOT)
@@ -799,4 +807,24 @@ def test_the_wrapper_argv_runs_verbatim_against_the_frozen_production_root(
             assert NOT_CURRENT not in heartbeat
             assert json.loads(heartbeat)["service_id"]
     finally:
-        shutil.rmtree(Path("/home/lighthouse/rquant"), ignore_errors=True)
+        _remove_frozen_tree(PRODUCTION_CHECKOUT)
+    assert not PRODUCTION_CHECKOUT.exists()
+
+
+def _remove_frozen_tree(root: Path) -> None:
+    """Delete a tree that holds 0555 generation directories, and fail if it cannot.
+
+    `rmtree(ignore_errors=True)` swallowed exactly the failure that matters here: the
+    published generations are read-only, so the delete stops half way and the next run on
+    the same machine dies on the leftovers instead of on anything real.
+    """
+
+    if not root.exists():
+        return
+    root.chmod(0o700)
+    for directory, subdirectories, _files in os.walk(root, topdown=True):
+        for name in subdirectories:
+            path = Path(directory) / name
+            if not path.is_symlink():
+                path.chmod(0o700)
+    shutil.rmtree(root)
