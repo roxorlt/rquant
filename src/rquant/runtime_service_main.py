@@ -370,7 +370,21 @@ def resolve_legacy_schema_generation(
         manifest_path, expected_generation=expected_generation
     )
     document = generation_directory / GENERATION_LEGACY_BINDING_NAME
-    payload = _read_authority_document(document, label="runtime legacy generation binding")
+    try:
+        payload = _read_authority_document(document, label="runtime legacy generation binding")
+    except ValueError as exc:
+        # The reader's message is about a symlinked or unsafe path, which is the wrong thing
+        # to go looking for in the one case that will actually happen on the host: a
+        # generation staged before this document existed simply does not have the file. Say
+        # that, and say what to do about it, rather than sending the operator after a
+        # symlink that is not there.
+        if not os.path.lexists(document):
+            raise ValueError(
+                f"runtime generation {expected_generation} carries no "
+                f"{GENERATION_LEGACY_BINDING_NAME}: it was staged before that document "
+                "existed, so stage and publish this generation again with the current code"
+            ) from exc
+        raise
     if len(payload) > MAX_LEGACY_BINDING_BYTES:
         raise ValueError("runtime legacy generation binding exceeds its size bound")
     try:

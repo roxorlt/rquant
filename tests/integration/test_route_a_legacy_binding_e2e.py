@@ -571,7 +571,7 @@ def test_a_removed_binding_document_is_refused_rather_than_assumed(
     finally:
         document.parent.chmod(0o555)
 
-    with pytest.raises(ValueError, match="legacy generation binding is unavailable"):
+    with pytest.raises(ValueError, match="carries no legacy-binding.json"):
         route_a.run_role(SERVING_ROLE, argv=argv)
 
 

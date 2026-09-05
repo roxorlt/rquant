@@ -1134,8 +1134,14 @@ def test_r207_a_generation_without_the_binding_document_is_refused(
 
     manifest_path, _runtime_root, control_root, observed = _r207_world(tmp_path, monkeypatch)
 
-    with pytest.raises(ValueError, match="legacy generation binding is unavailable"):
+    with pytest.raises(ValueError) as refusal:
         service_main.run(_authority_args(manifest_path, control_root))
+    #: the message names the file and the fix, not a symlink the operator will not find
+    message = str(refusal.value)
+    assert "carries no legacy-binding.json" in message
+    assert "stage and publish this generation again" in message
+    assert GENERATION in message
+    assert "symlink" not in message
     assert "generation_id" not in observed
 
 
@@ -1241,6 +1247,7 @@ def test_r207_a_symlinked_binding_document_is_refused(
     document = tmp_path / "generations" / GENERATION / GENERATION_LEGACY_BINDING_NAME
     document.symlink_to(real)
 
+    #: this one really is a symlink, and keeps the reader's own wording
     with pytest.raises(ValueError, match="legacy generation binding is unavailable"):
         service_main.run(_authority_args(manifest_path, control_root))
 
