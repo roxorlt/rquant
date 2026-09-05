@@ -1638,6 +1638,52 @@ def test_legacy_mode_copies_manifests_verbatim_and_records_the_generation_it_cam
                     legacy_runtime_root=world.root / "nowhere")
 
 
+def test_legacy_mode_follows_the_current_pointer_exactly_once(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`current` is a symlink the runtime owner can move, so a staging run reads it once.
+
+    Two reads meant two answers were possible: `legacy_services` chose which generation's
+    manifests to copy, `legacy_generation_binding` chose which id to write down. A pointer
+    moved in between would have produced a generation whose document names a deployment its
+    own manifests did not come from — and a role would then start happily on that mismatch,
+    which is the one thing the document exists to prevent.
+    """
+
+    bootstrap = world.stage("bootstrap")
+    legacy = _mirror_legacy_generation(world, bootstrap, generation_id="a" * 64)
+    pointer = str(legacy / "current")
+    follows: list[str] = []
+    real = os.readlink
+
+    def counting_readlink(path: Any, **kwargs: Any) -> Any:
+        if str(path) == pointer:
+            follows.append(str(path))
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(stage_module.os, "readlink", counting_readlink)
+    plan = world.stage(
+        "legacy-once", bootstrap_from_checkout=False, legacy_runtime_root=legacy,
+        operation_id=bootstrap.options.operation_id,
+    )
+    monkeypatch.undo()
+
+    assert follows == [pointer]
+    binding = parse_legacy_generation_binding(
+        (plan.options.staging / "generation" / GENERATION_LEGACY_BINDING_NAME).read_bytes()
+    )
+    assert binding.generation_id == "a" * 64
+    #: and the manifests really came from that same generation
+    mapping = world.instances(plan)
+    for role in KIND_BACKED_ROLES:
+        for label in mapping[role]:
+            relative = f"manifests/{label}.json"
+            assert (
+                (plan.options.staging / "generation" / relative).read_bytes()
+                == (legacy / "generations" / ("a" * 64) / relative).read_bytes()
+            )
+
+
 def test_legacy_mode_resolves_current_and_pins_the_generation_into_the_authority_id(
     world: World,
 ) -> None:
