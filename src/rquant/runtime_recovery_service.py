@@ -3130,7 +3130,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         cmd_runtime_recovery_production(
             argparse.Namespace(
                 runtime_root=runtime_root_for(arguments.control_root),
-                expected_profile_generation=arguments.expected_generation,
+                # `--expected-generation` is the authority chain's
+                # `sha256(<generation>/full-manifest.json)`. It used to be forwarded as
+                # `expected_profile_generation` and compared with the recovery block's own
+                # content hash, which is a different document's digest and could never be
+                # equal, so both oneshots failed closed on Route A (#218 B). The two values
+                # the pass needs to bind the authority namespace are the manifest path and
+                # that generation id, and both go through under their own names now; only
+                # the manual CLI supplies `expected_profile_generation`.
+                manifest=arguments.manifest,
+                expected_generation=arguments.expected_generation,
+                expected_profile_generation=None,
                 production_recovery_action=arguments.mode,
             )
         )
