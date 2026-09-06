@@ -8,13 +8,12 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import date, datetime
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import pandas as pd
 import tushare as ts
 from loguru import logger
 
-from rquant.config import settings
 from rquant.source_quota_store import (
     SourceQuotaConflictError,
     SourceQuotaExhaustedError,
@@ -27,6 +26,36 @@ _PAGE_SLEEP = 0.35
 _T = TypeVar("_T")
 
 
+def _settings() -> Any:
+    """The process-wide settings, built on first use rather than at import (#215, #189).
+
+    `from rquant.config import settings` at module level runs `rquant.config.__getattr__`,
+    which constructs `Settings` during the import and so makes five environment variables a
+    precondition of importing this module. The runtime-exec wrapper builds a role child from
+    an empty environment and copies only `LANG` / `LC_ALL` / `TZ`, so under that regime the
+    import died with `5 validation errors for Settings` before any role code ran. This is
+    TP9's seam, verbatim: a `settings` a test has bound onto this module still wins, exactly
+    as the old module-level name did.
+    """
+
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound
+    from rquant.config import get_settings
+
+    return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`rquant.adapter.tushare.settings` stays readable — built on first use, like the source."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 class TushareAdapter:
     """Tushare Pro 封装。主 token 失败时自动切备用 token 重试一次。"""
 
@@ -36,9 +65,9 @@ class TushareAdapter:
         backup_token: str | None = None,
         transport_observer: SourceTransportObserver | None = None,
     ) -> None:
-        self._primary_token = token or settings.tushare_token_main
+        self._primary_token = token or _settings().tushare_token_main
         self._backup_token = (
-            backup_token if backup_token is not None else settings.tushare_token_backup
+            backup_token if backup_token is not None else _settings().tushare_token_backup
         )
         self._pro = ts.pro_api(self._primary_token)
         self._using_backup = False
