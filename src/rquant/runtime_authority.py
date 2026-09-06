@@ -79,6 +79,24 @@ PRODUCTION_ALLOWED_OPERATIONS = ("publish", "rollback")
 #: child environment from an empty dictionary and copies only these, so the set is the
 #: complete answer to "what can a unit's own `Environment=` line reach".
 _RUNTIME_ROLE_ENVIRONMENT = ("LANG", "LC_ALL", "TZ")
+#: The same set plus the one name systemd uses to tell a unit where its decrypted
+#: credentials are. Only the seven roles of `runtime_capabilities.CAPABILITY_KEYS` receive
+#: it, because only their units carry `LoadCredentialEncrypted=`; every other role keeps the
+#: three-name set above unchanged.
+#:
+#: Without it the credential never reached the role. systemd decrypts `current.cred` into
+#: `$CREDENTIALS_DIRECTORY/capabilities.json` for the unit's ExecStart, which is the wrapper;
+#: `build_child_environment` then starts from an empty dictionary and copies only allowlisted
+#: names, so `CREDENTIALS_DIRECTORY` was dropped in transit and
+#: `load_systemd_runtime_capabilities` saw no credential directory at all. That is why
+#: daily_close_source refused with `TUSHARE_TOKEN_MAIN capability is required` and
+#: reference_slow_publisher with `requires its isolated publication credential` in the first
+#: Route A window (#215) — nothing was wrong with the seal or with the unit.
+#:
+#: Adding a name to any role's allowlist changes `profile_id`, which is bound into
+#: `current.json`, every generation's full manifest and the R07 policy, so this is a
+#: deliberate profile version step and the next installation has to publish the new profile.
+_CAPABILITY_ROLE_ENVIRONMENT = ("CREDENTIALS_DIRECTORY", *_RUNTIME_ROLE_ENVIRONMENT)
 _RUNTIME_SERVICE_MODULE = "rquant.runtime_service_main"
 #: The argv literal every kind-backed `runtime_service_main` role receives (TP9, S1 §10.4).
 #: Seeing it, the module takes its commit from `--expected-commit` (root-owned `current.json`)
@@ -134,7 +152,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "artifact_retention",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="artifact_retention",
         control_root="/home/lighthouse/rquant/data/runtime/control/artifact-retention",
@@ -144,7 +162,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "auction_match_source",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="auction_match_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/auction-match-sources",
@@ -180,7 +198,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "daily_close_source",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="daily_close_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/daily-close-sources",
@@ -260,7 +278,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "market_minute_source",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="market_minute_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/market-minute-sources",
@@ -270,7 +288,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "notifier",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="notifier",
         control_root="/home/lighthouse/rquant/data/runtime/control/notifiers",
@@ -317,7 +335,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "reference_slow_publisher",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="reference_slow_publisher",
         control_root="/home/lighthouse/rquant/data/runtime/control/reference-slow-publishers",
@@ -327,7 +345,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
     RuntimeRolePolicy(
         "reference_slow_source",
         _RUNTIME_SERVICE_MODULE,
-        _RUNTIME_ROLE_ENVIRONMENT,
+        _CAPABILITY_ROLE_ENVIRONMENT,
         instanced=True,
         service_kind="reference_slow_source",
         control_root="/home/lighthouse/rquant/data/runtime/control/reference-slow-sources",

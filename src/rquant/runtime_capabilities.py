@@ -66,6 +66,15 @@ SECRET_CAPABILITY_KEYS = frozenset(
     }
 )
 _MAX_CAPABILITY_BYTES = 1024 * 1024
+#: The credential id every runtime unit declares on its `LoadCredentialEncrypted=` line and
+#: the `--name=` the root sealer encrypts under. systemd puts the decrypted plaintext at
+#: `$CREDENTIALS_DIRECTORY/<this name>`, so the three places have to agree letter for letter.
+RUNTIME_CAPABILITY_CREDENTIAL_NAME = "capabilities.json"
+#: Where a Linux host says which unit this process belongs to, and where systemd puts the
+#: unit's decrypted credentials. Only ever read to explain a failure, never to find the
+#: credential itself — that address comes from `CREDENTIALS_DIRECTORY` and nowhere else.
+_SYSTEMD_CGROUP_PATH = Path("/proc/self/cgroup")
+_SYSTEMD_CREDENTIALS_ROOT = Path("/run/credentials")
 GenerationHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 InstanceName = Annotated[str, StringConstraints(pattern=r"^svc-[0-9a-f]{64}$")]
 
@@ -144,6 +153,58 @@ def serialize_runtime_credential(
     return canonical_json_bytes(credential.model_dump(mode="json"))
 
 
+def _systemd_unit_name() -> str | None:
+    """The systemd unit this process belongs to, out of its own cgroup, or `None`."""
+
+    try:
+        text = _SYSTEMD_CGROUP_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        leaf = line.rpartition(":")[2].rpartition("/")[2]
+        if leaf.endswith(".service"):
+            return leaf
+    return None
+
+
+def _undelivered_credential_reason() -> str | None:
+    """Why no credential directory reached this systemd unit's role child, or `None`.
+
+    The two causes need different repairs and used to be indistinguishable, which is what
+    made #215 read as "the capability is missing" when the capability had in fact been
+    sealed, delivered and decrypted. systemd exports `CREDENTIALS_DIRECTORY` to the unit's
+    ExecStart, which is the runtime-exec wrapper; the wrapper then builds the role child's
+    environment from an empty dictionary and copies only the names the root-owned profile
+    allowlists for that role, so an unlisted name is dropped without a word. The decrypted
+    file is still on disk under `/run/credentials/<unit>` either way, and that is the
+    evidence that tells the two apart.
+
+    `None` means this process is not running under a systemd unit at all — a bare
+    diagnostic run, or the suite. There is no delivery mechanism to accuse there, so the
+    caller keeps the behaviour it has always had and lets the role's own builder refuse for
+    the capability it actually wanted.
+    """
+
+    unit = _systemd_unit_name()
+    if unit is None:
+        return None
+    delivered = _SYSTEMD_CREDENTIALS_ROOT / unit / RUNTIME_CAPABILITY_CREDENTIAL_NAME
+    try:
+        present = delivered.exists()
+    except OSError:  # pragma: no cover - an unreadable /run/credentials is not the diagnosis
+        present = False
+    if present:
+        return (
+            f"systemd did load it for unit {unit}, so CREDENTIALS_DIRECTORY was dropped "
+            "between the unit and this process: the runtime profile's environment allowlist "
+            "for this role does not carry CREDENTIALS_DIRECTORY"
+        )
+    return (
+        f"systemd loaded no {RUNTIME_CAPABILITY_CREDENTIAL_NAME} for unit {unit}: check the "
+        "unit's LoadCredentialEncrypted= line and the sealed credstore entry for this instance"
+    )
+
+
 def _read_private_credential(path: Path) -> bytes:
     candidate = Path(path)
     if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
@@ -184,20 +245,64 @@ def load_systemd_runtime_capabilities(
     *,
     expected_service_id: str,
     expected_instance: str,
-    expected_generation: str,
+    expected_generation: str | None,
     environ: Mapping[str, str] | None = None,
 ) -> Mapping[str, str]:
+    """The capability values systemd decrypted for this service instance, or refuse.
+
+    `expected_generation` is the **deployment bundle** generation, the only namespace a
+    sealed credential is ever bound to: `runtime_deployment_bundle` stamps its own
+    `generation_hash` into every plaintext it hands the sealer. It is deliberately not the
+    authority chain's generation id, which is what the wrapper forwards as
+    `--expected-generation` and which never equals the bundle hash by construction — passing
+    that one here would refuse every correctly sealed credential (the same two-namespace
+    mistake as #207, and the next wall the credstore roles would have hit after #215).
+
+    `None` means the caller has no deployment bundle at all (Route B publishes none). There
+    is then nothing to bind a credential to, so a kind that needs one refuses, and a kind
+    that does not may still not quietly accept one.
+    """
+
     if not expected_service_id.strip():
         raise ValueError("expected runtime service id must be nonempty")
     if re.fullmatch(r"svc-[0-9a-f]{64}", expected_instance) is None:
         raise ValueError("expected runtime instance is invalid")
-    if re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None:
-        raise ValueError("expected runtime generation must be a lowercase SHA-256")
     target = environ if environ is not None else os.environ
     credential_directory = target.get("CREDENTIALS_DIRECTORY", "").strip()
-    if not credential_directory:
+    required = bool(CAPABILITY_KEYS.get(service_kind, frozenset()))
+    if expected_generation is None:
+        # Nothing to bind a credential to. Refuse the one case that would otherwise use an
+        # unbindable credential; a caller with no credential in reach keeps the degradation
+        # it already had (T9-6), and its builder still refuses for the capability itself.
+        if credential_directory:
+            raise ValueError(
+                "runtime capability credential cannot be bound without a deployment generation"
+            )
         return LoadedRuntimeCapabilities({})
-    payload = _read_private_credential(Path(credential_directory) / "capabilities.json")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None:
+        raise ValueError("expected runtime generation must be a lowercase SHA-256")
+    if not credential_directory:
+        reason = _undelivered_credential_reason() if required else None
+        if reason is not None:
+            # Not "the capability is missing": the capability may well have been sealed and
+            # decrypted. Say which of the two links is broken so the repair is the right one.
+            raise ValueError(
+                f"runtime capability credential was not delivered to "
+                f"{service_kind.value}: {reason}"
+            )
+        return LoadedRuntimeCapabilities({})
+    credential_path = Path(credential_directory) / RUNTIME_CAPABILITY_CREDENTIAL_NAME
+    try:
+        payload = _read_private_credential(credential_path)
+    except ValueError as exc:
+        if not credential_path.exists():
+            raise ValueError(
+                f"the systemd credential directory carries no "
+                f"{RUNTIME_CAPABILITY_CREDENTIAL_NAME}: systemd loaded credentials for this "
+                f"unit but not this one, so the unit's LoadCredentialEncrypted= name does "
+                f"not match what the sealer encrypted under"
+            ) from exc
+        raise
     credential = strict_model_validate_json(RuntimeCapabilityCredential, payload)
     if credential.service_id != expected_service_id:
         raise ValueError("systemd capability credential service does not match runtime")
@@ -208,8 +313,7 @@ def load_systemd_runtime_capabilities(
     if credential.bundle_generation != expected_generation:
         raise ValueError("systemd capability credential generation does not match runtime")
     decoded = credential.capabilities
-    allowed = CAPABILITY_KEYS.get(service_kind, frozenset())
-    unknown = set(decoded) - allowed
+    unknown = set(decoded) - CAPABILITY_KEYS.get(service_kind, frozenset())
     if unknown:
         raise ValueError(
             "systemd capability credential contains keys outside the service allowlist"
@@ -229,6 +333,7 @@ def load_systemd_runtime_capabilities(
 
 __all__ = [
     "CAPABILITY_KEYS",
+    "RUNTIME_CAPABILITY_CREDENTIAL_NAME",
     "LoadedRuntimeCapabilities",
     "RuntimeCapabilityCredential",
     "SECRET_CAPABILITY_KEYS",
