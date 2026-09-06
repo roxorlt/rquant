@@ -333,6 +333,14 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     **两个都只能用 "Create a merge commit" 合**
     ——R07 证据的 merge-provenance 检查要求候选恰有两个 parent，squash 与 rebase 拿不到部署证据。
     因此部署要取的 tag 指向的是合并后的那个 merge commit，不是分支 tip。
+19. **`runtime-production-prerequisites` / `runtime-production-profile` / `runtime-deployment-profile`
+    可以直接在没有 `.env` 的 bootstrap worktree（`/home/lighthouse/rquant-relA`）里跑**（#211，BLK-8）。
+    这三条命令跟 `runtime-authority-stage` 一样，在 `main()` 构造 `Settings` 之前就被分发，
+    命令自己也不读任何配置。**本条只对含这一改动的版本成立**：在此之前的版本里，同样的命令会以
+    `ValidationError: 5 validation errors for Settings` 退出，当时的绕法是在命令前面临时导出五个
+    环境变量（`DATA_DIR` / `DUCKDB_PATH` / `PARQUET_DIR` / `LOG_DIR` / `TUSHARE_TOKEN_MAIN`）；
+    现在**不要再导**，这些变量指向的是生产库路径，在 bootstrap worktree 里给它们赋值只会误导。
+    其余命令（含 `rquant --help`）在这个 worktree 里照旧 fail-closed，那是设计（T9-9）。
 
 ### 已知限制（装机前已登记的 issue，外加装机当场发现的 #198；末列写「已修」的条目已修，其余不修）
 
