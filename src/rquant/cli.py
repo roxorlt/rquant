@@ -23,7 +23,7 @@ from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FrameType, SimpleNamespace, TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -8519,6 +8519,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: BLK-8: the route A install runs these three commands from the same `.env`-less bootstrap
+#: worktree that `runtime-authority-stage` needs (acceptance A22) — `/home/lighthouse/rquant-relA`
+#: on the production host. Their parsers and their handlers read nothing out of `Settings`
+#: (`tests/unit/test_cli_configuration_free_dispatch.py` pins that), so `main()` hands them the
+#: same early dispatch. Every other command keeps failing closed on missing configuration (T9-9);
+#: add a command here only after proving it never reaches `rquant.config`.
+CONFIGURATION_FREE_COMMANDS: Final[dict[str, Callable[[argparse.Namespace], int]]] = {
+    "runtime-deployment-profile": cmd_runtime_deployment_profile,
+    "runtime-production-prerequisites": cmd_runtime_production_prerequisites,
+    "runtime-production-profile": cmd_runtime_production_profile,
+}
+
+
 def main() -> int:
     """CLI 入口函数。一次性命令的异常顶层捕获后推 PushDeer。
 
@@ -8536,6 +8549,13 @@ def main() -> int:
         from rquant.runtime_authority_stage import main as stage_main
 
         return stage_main(sys.argv[2:])
+
+    # BLK-8: the route A production commands share that bootstrap worktree, so they are
+    # dispatched the same way. Only the first positional decides — the argument parsing itself
+    # is the ordinary one, it just happens before the configuration is constructed.
+    if sys.argv[1:2] and sys.argv[1] in CONFIGURATION_FREE_COMMANDS:
+        early_args = build_parser().parse_args()
+        return CONFIGURATION_FREE_COMMANDS[early_args.command](early_args)
 
     from rquant.config import get_settings
 
@@ -8602,9 +8622,7 @@ def main() -> int:
         "preflight": cmd_preflight,
         "external-monotonic-root-serve": cmd_external_monotonic_root_serve,
         "resource-authority-serve": cmd_resource_authority_serve,
-        "runtime-production-prerequisites": cmd_runtime_production_prerequisites,
-        "runtime-production-profile": cmd_runtime_production_profile,
-        "runtime-deployment-profile": cmd_runtime_deployment_profile,
+        **CONFIGURATION_FREE_COMMANDS,
         "runtime-deployment-rollout": cmd_runtime_deployment_rollout,
         "runtime-deployment-rollback": cmd_runtime_deployment_rollback,
         "runtime-schema-retirement": cmd_runtime_schema_retirement,
