@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #203's to PR #206's. It is the merge base of the
+    # main; this one moves it from PR #209's to PR #210's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "2238d9eb4fff4b54cff663e38df5b77ccac31b87"
-    assert BASELINE_TREE_SHA == "84da92f5f2995653999a7854a7aeb943639c4b26"
+    assert BASELINE_COMMIT_SHA == "f7603780e9ffd509e84af44e3f6b4ad241d8f501"
+    assert BASELINE_TREE_SHA == "db1efae9073dca99c2b6ef839b20b10f05d2af04"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``2238d9e`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``f760378`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1481,19 +1481,20 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     architecture_paths = {
         entry.path for entry in policy.allowed_diff if entry.category == "architecture"
     }
-    # Re-aimed twice, and this refreeze is why naming paths here was wrong. Release B dropped
-    # scripts/r07_deploy_gate.py from this spot: it was in the previous baseline's diff only
-    # because that release created it, so a refrozen baseline left the sentence with no truth
-    # value. scripts/r07_ci_evidence.py and .github/workflows/ci.yml were named on the same
-    # false premise and were dropped by the refreeze to 2db3846, across which nothing touched
-    # either file - and under the refreeze to 2238d9e .github/workflows/ci.yml is back in the
-    # diff, because this topic adds a job to it. A named path would have flipped truth value
-    # twice in three refreezes: naming one asserts the shape of one particular diff, and the
-    # shape is not the property. The property - tooling that runs in the production chain but
-    # lives outside the declaration-scanned universe is categorized architecture, never
-    # production - is asserted below against whatever tooling this diff does contain, and the
-    # category rule for those two exact paths is pinned directly, independently of any diff,
-    # by tests/unit/test_r07_policy_regenerate.py::test_diff_category_rules_are_frozen.
+    # Re-aimed twice, and the two refreezes since are why naming paths here was wrong.
+    # Release B dropped scripts/r07_deploy_gate.py from this spot: it was in the previous
+    # baseline's diff only because that release created it, so a refrozen baseline left the
+    # sentence with no truth value. scripts/r07_ci_evidence.py and .github/workflows/ci.yml
+    # were named on the same false premise; the refreeze to 2db3846 dropped them, the refreeze
+    # to 2238d9e put .github/workflows/ci.yml back because that topic added a job to it, and
+    # this refreeze to f760378 takes it out again because this topic touches neither file. A
+    # named path would have flipped truth value three times in four refreezes: naming one
+    # asserts the shape of one particular diff, and the shape is not the property. The
+    # property - tooling that runs in the production chain but lives outside the
+    # declaration-scanned universe is categorized architecture, never production - is asserted
+    # below against whatever tooling this diff does contain, and the category rule for those
+    # two exact paths is pinned directly, independently of any diff, by
+    # tests/unit/test_r07_policy_regenerate.py::test_diff_category_rules_are_frozen.
     tooling = {
         entry.path
         for entry in policy.allowed_diff

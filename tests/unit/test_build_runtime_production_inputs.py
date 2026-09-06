@@ -307,6 +307,77 @@ def test_a_calendar_that_stops_before_the_coverage_floor_is_refused(tmp_path: Pa
     assert generator.main(_argv(tmp_path)) == 2
 
 
+def test_the_default_floor_is_ruling_eights_date_and_a_default_run_says_nothing_about_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The default run is the one ruling 8 describes: no override, no warning, no field."""
+
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+
+    assert generator.DEFAULT_COVERAGE_FLOOR.isoformat() == "2027-12-31"
+    assert generator.main(_argv(tmp_path)) == 0
+
+    captured = capsys.readouterr()
+    assert "coverage_floor_override" not in captured.out
+    assert "WARNING" not in captured.err
+
+
+def test_lowering_the_floor_installs_against_a_short_calendar_and_says_so(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #211: the production table stops at 2026-12-31 and extending it needs the
+    owner. The first install lowers the floor, and the lowering is loud."""
+
+    _write_calendar_database(tmp_path / "calendar.duckdb", coverage_end=date(2026, 12, 31))
+
+    assert generator.main(_argv(tmp_path, **{"--calendar-coverage-floor": "2026-12-31"})) == 0
+
+    calendar = load_market_calendar_authority(
+        tmp_path / "data" / "runtime-inputs" / "market-calendar-authority.json",
+        expected_commit=COMMIT,
+    )
+    assert calendar.coverage_end == date(2026, 12, 31)
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "2026-12-31" in captured.err
+    #: 30 days before coverage_end, the date the operator has to have replaced this by.
+    assert "2026-12-01" in captured.err
+    assert "2027-12-31" in captured.err
+    assert (
+        "coverage_floor_override floor=2026-12-31 default=2027-12-31 "
+        "coverage_end=2026-12-31 renew_by=2026-12-01"
+    ) in captured.out
+
+
+def test_a_lowered_floor_still_refuses_a_calendar_shorter_than_the_lowered_value(
+    tmp_path: Path,
+) -> None:
+    """Overriding relaxes the floor, it does not remove it."""
+
+    _write_calendar_database(tmp_path / "calendar.duckdb", coverage_end=date(2026, 11, 30))
+
+    assert generator.main(_argv(tmp_path, **{"--calendar-coverage-floor": "2026-12-31"})) == 2
+
+
+def test_a_floor_raised_past_what_the_table_holds_is_refused(tmp_path: Path) -> None:
+    """A floor above `coverage_end` is the same refusal whichever direction it came from."""
+
+    _write_calendar_database(tmp_path / "calendar.duckdb", coverage_end=date(2028, 6, 30))
+
+    assert generator.main(_argv(tmp_path, **{"--calendar-coverage-floor": "2029-01-01"})) == 2
+
+
+def test_a_malformed_floor_exits_two_rather_than_raising(tmp_path: Path) -> None:
+    """`date.fromisoformat` raises `ValueError`; the operator gets exit 2 and a message."""
+
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+
+    assert generator.main(_argv(tmp_path, **{"--calendar-coverage-floor": "31-12-2026"})) == 2
+
+
 def test_the_primary_duckdb_is_refused_without_an_explicit_override(tmp_path: Path) -> None:
     """CLAUDE.md's hard rule: readers open the replica, never the write-locked primary."""
 

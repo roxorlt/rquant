@@ -242,10 +242,17 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 这个结构性阻塞，第 13 条起的六条就是它带来的新前置。下面十八条是照着脚本敲命令时会踩到的东西，
 **不是部署记录**。
 
-1. **市场日历的到期日与续期步骤**：生成器的 `--coverage-floor` 默认 `2027-12-31`，日历表覆盖不到
-   这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
+1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
+   覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
    续期的做法是：扩 `trade_calendar` 表 → 重跑生成器 → 重跑命令链 ①②③④。这是**换一代
    generation，不换 `profile_id`**。
+
+   **首次装机显式传 `--calendar-coverage-floor 2026-12-31`**（#211）：生产库的 `trade_calendar`
+   目前只到 `2026-12-31`，补 2027 年的日历要往生产库写数据，属于需要 owner 单独授权的高风险
+   变更，所以首次装机改为显式下调这个下限，先把系统跑起来。下调只是放宽，不是取消——日历
+   比传入值还短照样报错退出；成功时生成器会在 stderr 打一条 WARNING，并在 stdout 摘要里多一行
+   `coverage_floor_override`，两处都写明必须在 `2026-12-01`（`coverage_end` 前 30 天）之前完成
+   续期。续期步骤就是本条上面那一段，续期后**去掉这个参数**，让下限回到默认的 `2027-12-31`。
 2. **`/usr/local/libexec/rquant-runtime-credential-sealer` 必须随本次 tag 重装**（#208：旧版白名单
    只覆盖七种凭证种类里的两种，第一次真密封会整体中止）。重装前把旧版备份到
    `/root/rquant-helper-backup-<stamp>/`。
