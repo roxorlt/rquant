@@ -297,3 +297,45 @@ def test_without_a_deployment_generation_a_role_with_no_credential_degrades(tmp_
     """T9-6's accepted degradation is not turned into a refusal by the check above."""
 
     assert dict(_load({}, generation=None)) == {}
+
+
+# ---------------------------------------------------------------------------------------
+# The one capability the production profile deliberately does not seal
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_minute_source_treats_its_backup_token_as_optional() -> None:
+    """`market_minute_source` may hold two tokens; the profile seals only the primary.
+
+    `CAPABILITY_KEYS` allows `TUSHARE_TOKEN_BACKUP` for this one kind, and
+    `build_production_runtime_profile` declares only `TUSHARE_TOKEN_MAIN`, so nothing seals a
+    backup and the role has to run without one. It does: the factory passes the empty string
+    it read rather than `None`, which keeps the adapter off the settings fallback, and the
+    failover branch is guarded on the token being truthy, so an absent backup is simply never
+    switched to. Were that not so, the missing key would be a seventh way for the credstore
+    group to fail closed, and it belongs on the record either way.
+    """
+
+    from rquant.adapter.tushare import TushareAdapter
+    from rquant.runtime_deployment_profile import _REQUIRED_CAPABILITIES
+    from rquant.runtime_service_builtin import _default_adapter_factory
+
+    kind = RuntimeServiceKind.MARKET_MINUTE_SOURCE
+    assert CAPABILITY_KEYS[kind] == frozenset({"TUSHARE_TOKEN_MAIN", "TUSHARE_TOKEN_BACKUP"})
+    assert _REQUIRED_CAPABILITIES[kind] == frozenset({"TUSHARE_TOKEN_MAIN"})
+
+    adapter = _default_adapter_factory({"TUSHARE_TOKEN_MAIN": "primary-only"})
+
+    assert isinstance(adapter, TushareAdapter)
+    assert adapter._primary_token == "primary-only"
+    assert adapter._backup_token == ""
+    assert adapter._switch_to_backup() is False
+
+
+def test_the_primary_token_is_still_required(under_a_unit: Path) -> None:
+    """Optional is only the backup: without the primary the factory refuses, as it always did."""
+
+    from rquant.runtime_service_builtin import _default_adapter_factory
+
+    with pytest.raises(RuntimeError, match="TUSHARE_TOKEN_MAIN capability is required"):
+        _default_adapter_factory({})

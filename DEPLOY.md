@@ -357,6 +357,50 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #195 | WP9 rendezvous poll 与它自己在等的 SQLite 锁争用，helper 首次续约可能输给 `database is locked` | CI 间歇性红，不影响生产行为；重跑前先按此条判因 |
 | #198 | 2026-09-05 首次装机当场撞到的两处主机形状硬拒绝：**BLK-1** stage 报 `refused: standard library directory is missing: /usr/local/lib64/python3.11`（RHEL 系 `sysconfig` 把 `platstdlib` 指到一个发行版从不创建的目录）；**BLK-2** root publish 报 `RuntimeAuthorityPublishError: deployment lock ancestor / is unsafe`（可信祖先遍历要求 `/` 恰为 `root:root 0755`，OpenCloudOS 9.2 的 `/` 是发行版默认的 `0555`） | **已修（PR「fix(runtime): unblock the Release A first gate on a real RHEL host」，本条的修复分支）**：缺失的 `platstdlib` 移出闭包并在 `plan.json` 的 `closure_summary.skipped_stdlib_roots` 如实记录；`/`、`/etc`、`/var`、`/var/lib` 四个发行版自有目录改按「属主 root + 无 group/other 写位」判定，rQuant 自建目录与所有文件级校验不变（TCB 语义变更，详见 CHANGELOG 的 Security 一条）。**云端验收判据**：B-6' 的 `plan.json` 里 `closure_summary.stdlib_roots == ["/usr/lib64/python3.11"]` 且 `skipped_stdlib_roots == ["/usr/local/lib64/python3.11"]`；B-7 root publish 能取到部署锁；最终 `wrapper_preflight == 32`。**不要**拿 `publish --dry-run` 通过代替 B-7——dry-run 在取锁之前就返回 |
 
+### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
+
+修 #215 要给七个 credstore role 的环境白名单加 `CREDENTIALS_DIRECTORY`
+（`src/rquant/runtime_authority.py` 的 `_CAPABILITY_ROLE_ENVIRONMENT`）。**不加，凭据到不了角色**：
+systemd 把解密后的 `capabilities.json` 放进 `$CREDENTIALS_DIRECTORY`，交给 unit 的 ExecStart 也就是
+wrapper，而 wrapper 从空环境起、只复制 profile 白名单里的名字，没登记的名字被静默丢弃。
+2026-09-07 窗口里 7 个 role 全起不来、进而没有 serving generation，根因就在这一条。
+
+`environment_allowlist` 参与 `profile_id` 的哈希，所以这个改动**必然换 `profile_id`**：
+
+| | 值 |
+|---|---|
+| 角色策略摘要（旧，`origin/main` `695e952`） | `6282aa50fca9cfca113a966379187202bdb975a04072b1beaf9ee5b8bb1ab102` |
+| 角色策略摘要（新，含 `CREDENTIALS_DIRECTORY`） | `681151cbdfa310a83adb5ede906c1970913e1398960d8136b92c0b3114f44167` |
+| 生产 `profile_id`（旧，2026-09-07 sequence 3 在用） | `d2206e53…7ea0` |
+| 生产 `profile_id`（新） | 装机当场由 `runtime-authority-stage` 算出（含主机闭包与实例标签，本地算不了） |
+
+**为什么不能直接发 sequence 4**：`#190`——已有 `current.json` 时，发布原语拿**已安装**的 profile
+校验 record 的每一个 slot，`profile_id` 不同即 `RuntimeAuthorityRecordError: runtime slot profile id
+is not active`；TP1 发布器在动任何 root 路径之前就显式拒绝。本包**不修 #190**（TCB 原语，需 owner
+单独授权）。
+
+**因此下一个窗口按 runbook §0.6「B-8 首次 publish」那条的逆过程走，重新首发**：
+
+```bash
+# ① 停掉全部 runtime unit（模板 unit 无 [Install]，stop 即可；oneshot 等它自己退）
+#    停之前先确认没有 daily/monitor 正在写库
+# ② 备份两份 root 文档（换代出问题时靠它们回到 sequence 3）
+sudo install -d -m 0700 /root/rquant-profile-rollover-$(date +%Y%m%d-%H%M%S)
+sudo cp -p /var/lib/rquant/runtime-authority/current.json  /root/rquant-profile-rollover-*/
+sudo cp -p /etc/rquant/production-runtime-profile.json     /root/rquant-profile-rollover-*/
+# ③ 删掉 current.json —— 权威链回到「wrapper 全拒」的安全态，这一步之后没有服务能起
+sudo rm -f /var/lib/rquant/runtime-authority/current.json
+# ④ 用新代码 stage + publish，previous is None，走首发路径（sequence 回到 1）
+# ⑤ 重启 C 段 unit
+```
+
+**回滚**：把 ② 备份的两份文档原样 `cp -p` 回去（先 `current.json` 后 profile，或反之都行，
+两份必须同时是旧的一代），再重启 unit——旧 generation 目录内容寻址、永不删除，所以旧一代随时可用。
+credstore 的 `.cred` 不受影响：`current.cred` 按 bundle generation 指向，与 profile 无关。
+
+**顺带**：`data/runtime` 的 legacy bundle 不必重装，本次改动不动 bundle generation；
+只有权威链那一层换代。
+
 ### 2026-09-05 首次装机窗口的结果（决定下次从哪起跑）
 
 窗口在 `v0.31.1`（`0fb7d95b16189af5763c8015c87b969ea69f7156`）上执行，**生产代码未切换**，第一关的真判据（`wrapper_preflight == 32`）未取得。
