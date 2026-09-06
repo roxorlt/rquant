@@ -6,6 +6,19 @@
 
 ### Fixed
 
+- **路线 A 的三条生产命令在无 `.env` 的 bootstrap worktree 里跑不起来（#211，BLK-8）**：
+  `runtime-production-prerequisites` / `runtime-production-profile` / `runtime-deployment-profile`
+  由 runbook 在 `/home/lighthouse/rquant-relA` 里执行，而那个 worktree 没有 `.env`，
+  `main()` 又在分发前无条件构造 `Settings`（T9-9），于是三条命令在自己的 parser 还没跑到时就以
+  `ValidationError: 5 validation errors for Settings` 退出（装机第五次执行现场实测）。
+  三条命令的 parser、handler 以及 handler 所导入的模块**都不引用 `rquant.config`**，
+  fail-fast 对它们纯属额外成本，因此按 `runtime-authority-stage` 的既有豁免（验收 A22）
+  同样提前分发：`src/rquant/cli.py` 新增 `CONFIGURATION_FREE_COMMANDS`，
+  `main()` 在 `get_settings()` 之前用普通的 `build_parser()` 解析并直接调用对应 handler。
+  **其余命令（含 `rquant --help`）的 fail-closed 行为一字未改**；
+  `tests/unit/test_cli_configuration_free_dispatch.py` 同时钉住豁免这一侧（三条命令的 `--help`
+  与一次完整 dry-run 在空环境子进程里 rc 0）、fail-closed 那一侧，以及一条静态用例
+  （AST 检查 handler 体内不出现 `get_settings`，加上 handler 所导入模块的 import 期探针）。
 - **`rquant` console script 在无 `.env` 时不可用（#189）**：`src/rquant/logging.py` 不再在 import 期
   经 `from rquant.config import settings` 构造 `Settings`，改为 `_settings()` 加 PEP 562 模块钩子
   （与 TP9 对 `storage/duckdb.py` / `page_control_service.py` 的处理同形）。
