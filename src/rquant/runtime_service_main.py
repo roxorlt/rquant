@@ -489,8 +489,19 @@ def build_runtime_strategy_completion_attestation_signer(
         raise ValueError("strategy completion signer profile commit differs from manifest")
     profile_manifests: list[RuntimeServiceManifest] = []
     for item in getattr(profile, "manifests", ()):
+        # `RuntimeContractModel` sets `revalidate_instances="always"`, so handing a model
+        # instance to `model_validate` runs every validator again — against a value the
+        # loader has already frozen. `RuntimeServiceManifest.settings` is
+        # `Mapping[str, JsonValue]` and `freeze_settings` turns every nested dict into a
+        # `MappingProxyType` and every nested list into a tuple, neither of which is a
+        # `JsonValue`. Nine of the production profile's manifests carry nested settings, so
+        # re-validating the instance failed closed on the host for every strategy service
+        # (#218). Thawing first is what `thaw_prevalidated_manifests` and
+        # `runtime_production_profile._revalidate_production_inputs` already do; the
+        # defensive re-validation of anything that is *not* already a model stays.
+        raw = item.model_dump(mode="json") if isinstance(item, RuntimeServiceManifest) else item
         try:
-            profile_manifests.append(RuntimeServiceManifest.model_validate(item))
+            profile_manifests.append(RuntimeServiceManifest.model_validate(raw))
         except ValueError as exc:
             raise ValueError(
                 "strategy completion signer profile contains invalid manifests"
