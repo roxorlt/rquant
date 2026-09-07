@@ -215,6 +215,17 @@
 
 ### Changed
 
+- **全量测试 CI 由 4 个分片改为 5 个，分片 job 的 `timeout-minutes` 由 75 提到 100（#223）**：
+  路线 A 的几个 e2e 文件加进来之后，`Full suite shard (*, 0)` 在 3.11 与 3.12 上都跑满 75 分钟被
+  GitHub 取消，日志里 0 条 FAILED / ERROR；shard 0 没写出 `junit.xml`，两条
+  `Full suite contract` 因此级联变红。修法是把 `scripts/full_suite_shards.py` 的 `SHARD_COUNT`
+  从 4 改成 5 并重生成 `tests/manifests/full-suite-v1`——用例集合与 approved-skip 映射一字未改
+  （仍是 13904 cases / 55 skips），只是 LPT 重新分配：原 shard 0 上最慢的两个文件
+  （`test_route_a_recovery_binding_e2e.py` 12 分钟、`test_route_a_credstore_roles_e2e.py` 10 分钟）
+  分到了不同分片。
+  按 PR #224 那次 run 的日志逐文件量出的 x64 单文件用时估算，最慢分片由 74 分钟降到 44 分钟
+  （3.11，与实测 4 分片时间对得上），3.12 约 47 分钟。上限提到 100 分钟只是余量，不是修复本身。
+  两个 CI 契约测试不再把分片数写成字面量 4，改为从 `SHARD_COUNT` 派生。
 - **7 个 capability role 的 `environment_allowlist` 新增 `CREDENTIALS_DIRECTORY`，`profile_id` 因此改变
   （#215）**：`environment_allowlist` 参与 `profile_id` 的哈希，而 `profile_id` 绑进 `current.json`、
   每一代的 full manifest 与 R07 policy。这是刻意的 profile 版本演进，不是副作用，但**有装机后果**：
