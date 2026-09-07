@@ -81,18 +81,19 @@ jobs:
   full-suite-shard:
     name: Full suite shard (${{ matrix.python-version }}, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    # Measured on this runner class, not guessed: 3.11 shard 0 finishes in
-    # 39m41s and 3.12 - which runs 20-28% slower on the same files - was
-    # cancelled at the old 45-minute limit while at 87%. A hang is still caught
-    # early by pytest's faulthandler_timeout (600s), so a generous job limit
-    # only buys the slowest shard room to finish. Rebalancing the shard weights
-    # against measured x64 file times is tracked separately.
-    timeout-minutes: 75
+    # Measured on this runner class, not guessed: at four shards the route A test
+    # additions pushed shard 0 to 69m17s on 3.11 and past the old 75-minute limit
+    # on 3.12, where the platform cancelled the job with nothing failed. The fifth
+    # shard is the fix - LPT balances only across the lanes it is given - and the
+    # raised limit is headroom for the next growth step, not the fix itself. A hang
+    # is still caught early by pytest's faulthandler_timeout (600s), so a generous
+    # job limit only buys the slowest shard room to finish.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4]
 
     steps:
       # The full suite contains the R07 repository-identity tests, which resolve the frozen

@@ -19,7 +19,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 
 SCHEMA_VERSION = 1
-SHARD_COUNT = 4
+# Five, not four: at four lanes the slowest one crossed the shard job's wall clock limit
+# on both Python versions, and LPT can only balance across the lanes it is given.
+SHARD_COUNT = 5
 INDEX_NAME = "index.json"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MAX_NODEID_BYTES = 1_100_000
