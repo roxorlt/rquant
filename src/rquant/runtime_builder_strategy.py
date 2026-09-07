@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from pydantic import Field, StrictInt, field_validator, model_validator
@@ -15,6 +15,7 @@ from rquant.definition_registry import (
     DefinitionExecutableIntegrityError,
     ImmutableDefinitionRegistry,
 )
+from rquant.feature_contracts import FeatureFieldStatus, FeatureInstanceEnvelope
 from rquant.feature_spool import FeatureBatchSpool
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
@@ -23,6 +24,7 @@ from rquant.runtime_candidate_universe import (
 )
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.runtime_market_session import load_market_calendar_authority
+from rquant.runtime_peer_artifacts import DeferredPeerArtifact
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
@@ -31,15 +33,94 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceStep,
 )
 from rquant.runtime_shadow_validation import CompletionAttestationSigner
+from rquant.signal_contracts import SignalEnvelopeFamily
 from rquant.signal_router_runtime import ReadonlySignalRouteAuthority
 from rquant.strategy_live_service import (
     StrategyCompletionAttestationConfig,
     run_strategy_live_batch,
 )
 from rquant.strategy_paper_lifecycle import PaperBrokerLifecycleReader
-from rquant.strategy_runner import StrategyEvaluator, StrategyRunnerStore
+from rquant.strategy_runner import (
+    RunnerSignalRouteDrainEvidence,
+    StrategyEvaluator,
+    StrategyRunnerStore,
+)
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _DeferredLifecycleFeatureSource:
+    """`PaperBrokerLifecycleReader`, opened once the paper broker has created its ledger.
+
+    `live/paper-brokers/<instance>/broker.sqlite3` belongs to `paper_broker`, and that
+    role cannot create it until `signal_router` has published the route spool it reads.
+    Holding the strategy's construction hostage to that chain is what made the live
+    plane's start order circular (#220); the ledger is only read when a lifecycle
+    feature is actually resolved, which never happens before the first signal.
+    """
+
+    def __init__(self, artifact: DeferredPeerArtifact[PaperBrokerLifecycleReader]) -> None:
+        self._artifact = artifact
+
+    def resolve(
+        self,
+        *,
+        candidate_id: str,
+        entry_signal: SignalEnvelopeFamily,
+        exit_signals: tuple[SignalEnvelopeFamily, ...],
+        decision_cutoff: datetime,
+        market_features: Mapping[str, object],
+        market_feature_statuses: Mapping[str, FeatureFieldStatus],
+        previous_eligible_high_price_raw: float | None,
+        previous_high_source_event_time: datetime | None,
+        previous_high_available_at: datetime | None,
+    ) -> FeatureInstanceEnvelope:
+        return self._artifact.get().resolve(
+            candidate_id=candidate_id,
+            entry_signal=entry_signal,
+            exit_signals=exit_signals,
+            decision_cutoff=decision_cutoff,
+            market_features=market_features,
+            market_feature_statuses=market_feature_statuses,
+            previous_eligible_high_price_raw=previous_eligible_high_price_raw,
+            previous_high_source_event_time=previous_high_source_event_time,
+            previous_high_available_at=previous_high_available_at,
+        )
+
+
+class _DeferredRouteDrainAuthority:
+    """`ReadonlySignalRouteAuthority`, opened once the router has created the signal bus.
+
+    Only `signal_router` creates `live/signal-bus/signal_bus.sqlite3`, and a strategy's
+    sandbox may write `live/strategies/%i` alone, so a strategy that opens the bus while
+    building its step can never start before the router (#220). The bus is read at one
+    point — the session-close completion attestation — so waiting for it costs the
+    strategy nothing before then, and a missing bus at that point still refuses.
+    """
+
+    def __init__(self, artifact: DeferredPeerArtifact[ReadonlySignalRouteAuthority]) -> None:
+        self._artifact = artifact
+
+    def read_drain_evidence(
+        self,
+        *,
+        source_id: str,
+        runner_generation_id: str,
+        strategy_spec_fingerprint: str,
+        trade_date: date,
+        segment_start_sequence: int,
+        routed_through_sequence: int,
+        observed_at: datetime,
+    ) -> RunnerSignalRouteDrainEvidence:
+        return self._artifact.get().read_drain_evidence(
+            source_id=source_id,
+            runner_generation_id=runner_generation_id,
+            strategy_spec_fingerprint=strategy_spec_fingerprint,
+            trade_date=trade_date,
+            segment_start_sequence=segment_start_sequence,
+            routed_through_sequence=routed_through_sequence,
+            observed_at=observed_at,
+        )
 
 
 class StrategyLiveRuntimeSettings(RuntimeContractModel):
@@ -259,7 +340,43 @@ def strategy_live_builder(
         ):
             raise ValueError("built-in evaluator fingerprint does not match published registration")
 
-        feature_spool = FeatureBatchSpool(settings.feature_spool_root)
+        # The runner database is the only artifact this role owns, and every reader of
+        # the live plane waits on it: `signal_router` refused to start five times in the
+        # 2026-09-08 window because three idle strategies had not created theirs (#232).
+        # It is built here, before anything another role owns is touched, so that the
+        # file exists as soon as the process does — with no signal, outside a session,
+        # and whatever the rest of the plane is doing.
+        runner = StrategyRunnerStore(
+            settings.runner_state_path,
+            spec=spec,
+            evaluator_contract_fingerprint=binding.contract_fingerprint,
+            feature_contract=feature_registration.contract,
+            lifecycle_feature_source=_DeferredLifecycleFeatureSource(
+                DeferredPeerArtifact(
+                    reader="strategy_live",
+                    artifact="paper broker ledger",
+                    path=settings.paper_broker_path,
+                    open_artifact=lambda: PaperBrokerLifecycleReader(
+                        settings.paper_broker_path,
+                        account_id=settings.paper_account_id,
+                    ),
+                )
+            ),
+        )
+        # `live/features` belongs to `feature_live`, which mounts read-only here: the
+        # consumer takes neither the producer's lock nor its cursor directory, and keeps
+        # its own cursors beside its runner database instead (#231).
+        feature_spool = DeferredPeerArtifact(
+            reader="strategy_live",
+            artifact="feature spool",
+            path=settings.feature_spool_root / "source-identity.json",
+            open_artifact=lambda: FeatureBatchSpool(
+                settings.feature_spool_root,
+                cursor_root=settings.runner_state_path.parent / "feature-cursors",
+                read_only=True,
+            ),
+        )
+        feature_spool.probe()
         candidate_universe_loader = RuntimeCandidateUniverseLoader(
             RuntimeCandidateUniverseConfig(
                 expected_commit=manifest.producer_commit,
@@ -282,18 +399,8 @@ def strategy_live_builder(
                 ),
             )
         )
-        runner = StrategyRunnerStore(
-            settings.runner_state_path,
-            spec=spec,
-            evaluator_contract_fingerprint=binding.contract_fingerprint,
-            feature_contract=feature_registration.contract,
-            lifecycle_feature_source=PaperBrokerLifecycleReader(
-                settings.paper_broker_path,
-                account_id=settings.paper_account_id,
-            ),
-        )
         calendar = None
-        route_authority = None
+        route_authority: _DeferredRouteDrainAuthority | None = None
         completion_attestation = None
         if settings.has_completion_authority:
             completion_signer = _require_production_completion_signer(
@@ -303,18 +410,29 @@ def strategy_live_builder(
             assert settings.calendar_path is not None
             assert settings.calendar_expected_commit is not None
             assert settings.calendar_content_sha256 is not None
-            assert settings.signal_bus_path is not None
-            assert settings.routing_policy_fingerprint is not None
+            signal_bus_path = settings.signal_bus_path
+            routing_policy_fingerprint = settings.routing_policy_fingerprint
+            assert signal_bus_path is not None
+            assert routing_policy_fingerprint is not None
             calendar = load_market_calendar_authority(
                 settings.calendar_path,
                 expected_commit=settings.calendar_expected_commit,
             )
             if calendar.content_sha256 != settings.calendar_content_sha256:
                 raise ValueError("strategy calendar content identity does not match settings")
-            route_authority = ReadonlySignalRouteAuthority(
-                path=settings.signal_bus_path,
-                expected_routing_policy_fingerprint=(settings.routing_policy_fingerprint),
+            deferred_bus: DeferredPeerArtifact[ReadonlySignalRouteAuthority] = (
+                DeferredPeerArtifact(
+                    reader="strategy_live",
+                    artifact="signal bus",
+                    path=signal_bus_path,
+                    open_artifact=lambda: ReadonlySignalRouteAuthority(
+                        path=signal_bus_path,
+                        expected_routing_policy_fingerprint=routing_policy_fingerprint,
+                    ),
+                )
             )
+            deferred_bus.probe()
+            route_authority = _DeferredRouteDrainAuthority(deferred_bus)
             completion_attestation = StrategyCompletionAttestationConfig(
                 signer=completion_signer,
                 strategy_registration_fingerprint=registration.fingerprint,
@@ -327,7 +445,7 @@ def strategy_live_builder(
 
         def step() -> RuntimeStepResult:
             summary = run_strategy_live_batch(
-                feature_spool=feature_spool,
+                feature_spool=feature_spool.get(),
                 candidate_universe_loader=candidate_universe_loader,
                 runner=runner,
                 evaluator=binding.evaluator,

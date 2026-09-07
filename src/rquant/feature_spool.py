@@ -374,9 +374,23 @@ class FeatureBatchSpool:
             if self.cursor_root == self.root / "cursors"
             else self.cursor_root / ".cursor.lock"
         )
+        if self.read_only and self._is_inside_producer_root(self.cursor_root):
+            # A consumer of this spool runs under a sandbox that mounts the producer's
+            # directory read-only: `strategy_live` may write `live/strategies/%i` and
+            # nothing else. Cursors left at their default sit in the producer root, and
+            # so does the lock that guards them, which is how one strategy died on
+            # `[Errno 30] Read-only file system: .../live/features/.feature-spool.lock`
+            # (#231). A reader must bring its own cursor root, inside what it owns.
+            raise FeatureSpoolIntegrityError(
+                "read-only feature spool consumer must keep its cursors outside the "
+                f"producer root: {self.cursor_root}"
+            )
         self._thread_lock = RLock()
         self._ensure_private_directories()
         self._source_identity = self._initialize_source_identity()
+
+    def _is_inside_producer_root(self, path: Path) -> bool:
+        return path == self.root or self.root in path.parents
 
     def _ensure_private_directories(self) -> None:
         for path in (self.root, self.batch_root, self.session_root):

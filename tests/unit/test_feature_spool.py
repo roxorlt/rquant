@@ -345,7 +345,11 @@ def test_session_close_marker_freezes_incremental_chain_and_rejects_late_append(
     assert marker.batch_count == 2
     assert len(marker.segment_chain_hash) == 64
     assert (
-        FeatureBatchSpool(tmp_path, read_only=True).session_close_marker(marker.trade_date)
+        FeatureBatchSpool(
+            tmp_path,
+            cursor_root=tmp_path.parent / "consumer-cursors",
+            read_only=True,
+        ).session_close_marker(marker.trade_date)
         == marker
     )
 

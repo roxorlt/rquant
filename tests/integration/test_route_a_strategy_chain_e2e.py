@@ -233,41 +233,33 @@ def test_the_strategy_roles_reach_their_service_loop_over_a_real_current(
     assert all(path.is_file() for path in databases)
 
 
-def test_a_strategy_role_without_the_signal_bus_still_creates_its_runner_database(
+def test_a_strategy_role_starts_before_the_router_and_leaves_its_runner_database(
     route_a: RouteAWorld,
 ) -> None:
     """The startup order the runbook has to use, pinned as behaviour rather than as prose.
 
-    `strategy_live`'s builder opens a *read-only* route authority over
-    `live/signal-bus/signal_bus.sqlite3`, and the only unit that creates that file is
-    `signal_router` — which itself refuses to start until every strategy's
-    `runner.sqlite3` exists (`signal_router_runtime.py`'s runner source check runs before
-    `settings.open_store()`). The two units cannot be ordered against each other, and the
-    systemd sandboxes make it worse: `rquant-runtime-strategy@` may write only
-    `live/strategies/%i`, so it cannot create the bus even if it wanted to.
-
-    What saves the sequence is that the strategy builder constructs its runner store before
-    it opens the route authority, so a strategy that fails on the missing bus has already
-    left the database the router is waiting for. Start the strategies, let them fail, start
-    the router, then start the strategies again.
+    This case used to assert the opposite, and the assertion was the bug: `strategy_live`
+    opened a read-only route authority over `live/signal-bus/signal_bus.sqlite3` while it
+    was building its step, and only `signal_router` creates that file — which in turn
+    refused to start until every strategy's `runner.sqlite3` existed. Neither unit could
+    be ordered against the other, so the runbook told the operator to start the
+    strategies, let all three fail, start the router inside a 50 s window, and start them
+    again (#220). Package J removed the cycle: the bus is read at one point, the
+    session-close attestation, and it is opened there rather than up front.
     """
 
     bus = _signal_bus_path(route_a)
     assert not bus.exists()
 
-    for instance in _instances(route_a, STRATEGY_ROLE):
-        with pytest.raises(ValueError, match="runner source is unavailable") as raised:
-            route_a.run_role(STRATEGY_ROLE, argv=_argv(route_a, STRATEGY_ROLE, instance))
-        assert str(bus) in str(raised.value)
-        assert INVALID_MANIFESTS not in str(raised.value)
+    _start_strategies(route_a)
 
     assert len(_runner_databases(route_a)) == 3
+    assert not bus.exists()
 
-    #: the router now starts, creates the bus, and the strategies come up on the next try
+    #: and the router, started after them, finds the three databases waiting for it
     router = _instances(route_a, ROUTER_ROLE)[0]
     assert route_a.run_role(ROUTER_ROLE, argv=_argv(route_a, ROUTER_ROLE, router)) == 0
     assert bus.is_file()
-    _start_strategies(route_a)
 
 
 def test_the_router_publishes_the_spool_source_document_the_readers_wait_for(

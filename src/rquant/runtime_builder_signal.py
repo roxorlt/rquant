@@ -21,6 +21,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_peer_artifacts import DeferredPeerArtifact
 from rquant.runtime_routing_policy import load_frozen_routing_policy
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -522,6 +523,32 @@ def _publish_signal_authority(
     return pointer.generation_id, snapshot.omitted_signal_count
 
 
+def _runner_source_opener(
+    source_settings: SignalRouterSourceSettings,
+    *,
+    busy_timeout_ms: int,
+) -> Callable[[], RunnerSignalSource]:
+    """The router's own reader for one strategy's runner database, unchanged."""
+
+    runner_state_path = source_settings.runner_state_path
+    spec_fingerprint = source_settings.expected_strategy_spec_fingerprint
+    evaluator_fingerprint = source_settings.expected_evaluator_contract_fingerprint
+    assert runner_state_path is not None
+    assert spec_fingerprint is not None
+    assert evaluator_fingerprint is not None
+
+    def open_source() -> RunnerSignalSource:
+        return ReadonlyStrategyRunnerSignalSource(
+            source_id=source_settings.source_id,
+            path=runner_state_path,
+            expected_strategy_spec_fingerprint=spec_fingerprint,
+            expected_evaluator_contract_fingerprint=evaluator_fingerprint,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+
+    return open_source
+
+
 def signal_router_builder(
     *,
     source_loader: SignalSourceLoader | None = None,
@@ -542,13 +569,26 @@ def signal_router_builder(
         if not injected and not settings.has_manifest_authority:
             raise ValueError("default signal router requires complete manifest authority")
 
+        # The bus, the route spool and the cursor store are this role's own artifacts and
+        # nobody else creates them: `strategy_live` opens the bus read-only and its
+        # sandbox grants it `live/strategies/%i` alone. They are opened before any
+        # strategy's runner database is looked at, so a router that starts first breaks
+        # the cycle instead of dying inside it (#220).
+        bus = settings.open_store()
+        signal_spool = SignalRouteSpool(settings.signal_spool_root)
+        cursors = SignalRouteCursorStore(
+            settings.signal_bus_path,
+            routing_policy_fingerprint=settings.routing_policy_fingerprint,
+            busy_timeout_ms=settings.busy_timeout_ms,
+        )
+
         if injected:
             resolved_source_loader = source_loader
             resolved_target_resolver = target_resolver
         else:
             if settings.routing_policy_path is None:
                 raise ValueError("default signal router authority is unavailable")
-            authoritative_sources: dict[str, RunnerSignalSource] = {}
+            deferred_sources: dict[str, DeferredPeerArtifact[RunnerSignalSource]] = {}
             for source_settings in settings.source_settings:
                 if (
                     source_settings.runner_state_path is None
@@ -556,19 +596,20 @@ def signal_router_builder(
                     or source_settings.expected_evaluator_contract_fingerprint is None
                 ):
                     raise ValueError("default signal router authority is unavailable")
-                authoritative_sources[source_settings.source_id] = (
-                    ReadonlyStrategyRunnerSignalSource(
-                        source_id=source_settings.source_id,
-                        path=source_settings.runner_state_path,
-                        expected_strategy_spec_fingerprint=(
-                            source_settings.expected_strategy_spec_fingerprint
-                        ),
-                        expected_evaluator_contract_fingerprint=(
-                            source_settings.expected_evaluator_contract_fingerprint
-                        ),
+                deferred_sources[source_settings.source_id] = DeferredPeerArtifact(
+                    reader="signal_router",
+                    artifact="runner source",
+                    path=source_settings.runner_state_path,
+                    open_artifact=_runner_source_opener(
+                        source_settings,
                         busy_timeout_ms=settings.busy_timeout_ms,
-                    )
+                    ),
                 )
+            # A runner database that is already on disk is opened and checked now, so a
+            # source that exists and does not match its published identity still refuses
+            # to start. One that is absent is waited for inside the loop instead.
+            for deferred in deferred_sources.values():
+                deferred.probe()
             authoritative_policy = load_frozen_routing_policy(
                 settings.routing_policy_path,
                 routing_policy_fingerprint=settings.routing_policy_fingerprint,
@@ -577,22 +618,16 @@ def signal_router_builder(
 
             def load_authoritative_source(source_id: str) -> RunnerSignalSource:
                 try:
-                    return authoritative_sources[source_id]
+                    deferred = deferred_sources[source_id]
                 except KeyError as exc:
                     raise ValueError("signal source is not in manifest authority") from exc
+                return deferred.get()
 
             resolved_source_loader = load_authoritative_source
             resolved_target_resolver = authoritative_policy
 
         if resolved_source_loader is None or resolved_target_resolver is None:
             raise RuntimeError("signal router dependencies are unavailable")
-        bus = settings.open_store()
-        signal_spool = SignalRouteSpool(settings.signal_spool_root)
-        cursors = SignalRouteCursorStore(
-            settings.signal_bus_path,
-            routing_policy_fingerprint=settings.routing_policy_fingerprint,
-            busy_timeout_ms=settings.busy_timeout_ms,
-        )
 
         def step() -> RuntimeStepResult:
             before_publish = publish_signal_bus_prefix(
