@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -16,8 +19,10 @@ from rquant.runtime_schema_registry import (
     RuntimePhysicalTableSchema,
     RuntimeSchemaChannelContract,
     RuntimeSchemaCompatibilityError,
+    RuntimeSchemaConsumerAckBinding,
     RuntimeSchemaConsumerBinding,
     RuntimeSchemaContractBundle,
+    RuntimeSchemaDualWriteBinding,
     RuntimeSchemaProducerBinding,
     RuntimeSchemaV1LifecycleReview,
     build_runtime_schema_contract_bundle,
@@ -31,8 +36,11 @@ from rquant.schema_compatibility import (
     ConsumerFieldCapability,
     ConsumerSchemaRequirement,
     ProducerSchemaCapability,
+    RolloutPhase,
     SchemaDeclaration,
     SchemaField,
+    SchemaRolloutStateUnavailableError,
+    SchemaRolloutStore,
     UnknownFieldPolicy,
 )
 from rquant.serving_read_models import serving_physical_table_specs_fingerprint
@@ -606,3 +614,247 @@ def test_rollout_plan_and_trusted_consumers_are_derived_from_hash_bound_bundle()
     assert consumer.required_fields == tuple(
         sorted(channel.consumers[0].requirement.required_fields)
     )
+
+
+# ---------------------------------------------------------------------------------------
+# #227: the two service-side rollout opens that happen in the loop, not at admission
+# ---------------------------------------------------------------------------------------
+
+MINUTE_CHANNEL = "runtime.market_minute.batch-envelope"
+SIGNALS_CHANNEL = "runtime.serving.signals"
+ROLLOUT_STARTED_AT = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+
+
+def _prepared_rollout(
+    tmp_path: Path,
+    *,
+    channel_id: str,
+    include_serving_publisher: bool = False,
+) -> tuple[object, object, object, object, Path]:
+    """A created plan on disk, plus the two bundles it was derived from."""
+
+    previous = _bundle(OLD_COMMIT, include_serving_publisher=include_serving_publisher)
+    candidate = _bundle(NEW_COMMIT, include_serving_publisher=include_serving_publisher)
+    plan, registry = runtime_schema_registry.build_runtime_schema_rollout(
+        previous=previous,
+        candidate=candidate,
+        channel_id=channel_id,
+        target_generation_id="4" * 64,
+        started_at=ROLLOUT_STARTED_AT,
+        deadline=ROLLOUT_STARTED_AT + timedelta(hours=1),
+        consumer_ack_max_age_seconds=300,
+    )
+    store_path = tmp_path / "schema-rollouts" / plan.plan_id / "state.sqlite3"
+    store = SchemaRolloutStore(store_path, production_consumer_registry=registry)
+    store.create_plan(plan, now=ROLLOUT_STARTED_AT, operation_id="create")
+    return plan, registry, previous, candidate, store_path
+
+
+def _advance_to_dual_write(store: SchemaRolloutStore, plan: object) -> None:
+    """Walk the plan forward the way the participants and the controller would."""
+
+    state = store.get_state(plan.plan_id)  # type: ignore[attr-defined]
+    for participant in (*plan.producers, *plan.consumers):  # type: ignore[attr-defined]
+        state = store.acknowledge(
+            plan_id=plan.plan_id,  # type: ignore[attr-defined]
+            expected_revision=state.revision,
+            phase=RolloutPhase.PREPARE,
+            participant_id=participant.participant_id,
+            participant_fingerprint=participant.contract_fingerprint,
+            declaration_fingerprint=plan.new_declaration_fingerprint,  # type: ignore[attr-defined]
+            now=ROLLOUT_STARTED_AT + timedelta(minutes=1),
+        )
+    store.advance(
+        plan_id=plan.plan_id,  # type: ignore[attr-defined]
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.DUAL_WRITE,
+        now=ROLLOUT_STARTED_AT + timedelta(minutes=2),
+    )
+
+
+def _writer_binding(
+    *,
+    plan: object,
+    registry: object,
+    previous: object,
+    candidate: object,
+    channel_id: str,
+    store_path: Path,
+) -> RuntimeSchemaDualWriteBinding:
+    return RuntimeSchemaDualWriteBinding(
+        service_id=plan.producers[0].participant_id,  # type: ignore[attr-defined]
+        plan=plan,
+        registry=registry,
+        store_path=store_path,
+        old_declaration=previous.channel(channel_id).declaration,  # type: ignore[attr-defined]
+        new_declaration=candidate.channel(channel_id).declaration,  # type: ignore[attr-defined]
+    )
+
+
+def _advance_to_consumer_ack(
+    store: SchemaRolloutStore,
+    *,
+    plan: object,
+    registry: object,
+    previous: object,
+    candidate: object,
+    channel_id: str,
+    store_path: Path,
+) -> None:
+    """Dual write once — the controller will not leave `dual_write` without evidence."""
+
+    _advance_to_dual_write(store, plan)
+    writer = _writer_binding(
+        plan=plan,
+        registry=registry,
+        previous=previous,
+        candidate=candidate,
+        channel_id=channel_id,
+        store_path=store_path,
+    )
+    prepared = writer.prepare_payload(
+        _declared_values(writer),
+        observed_at=ROLLOUT_STARTED_AT + timedelta(minutes=3),
+    )
+    assert prepared is not None
+    writer.commit_payload(prepared, operation_id="dual-write-evidence")
+    store.advance(
+        plan_id=plan.plan_id,  # type: ignore[attr-defined]
+        expected_revision=store.get_state(plan.plan_id).revision,  # type: ignore[attr-defined]
+        target_phase=RolloutPhase.CONSUMER_ACK,
+        now=ROLLOUT_STARTED_AT + timedelta(minutes=4),
+    )
+
+
+def _dual_write_binding(tmp_path: Path) -> tuple[RuntimeSchemaDualWriteBinding, Path, object]:
+    plan, registry, previous, candidate, store_path = _prepared_rollout(
+        tmp_path, channel_id=MINUTE_CHANNEL
+    )
+    store = SchemaRolloutStore(store_path, production_consumer_registry=registry)
+    _advance_to_dual_write(store, plan)
+    binding = _writer_binding(
+        plan=plan,
+        registry=registry,
+        previous=previous,
+        candidate=candidate,
+        channel_id=MINUTE_CHANNEL,
+        store_path=store_path,
+    )
+    return binding, store_path, plan
+
+
+def _declared_values(binding: RuntimeSchemaDualWriteBinding) -> dict[str, object]:
+    """One placeholder per declared field, so the dual-write contract check has nothing to say.
+
+    The channel's own declaration is the source of the names — hard-coding them would make
+    this case fail for the wrong reason the next time a field is added.
+    """
+
+    return {name: f"value-for-{name}" for name in binding.new_declaration.available_fields()}
+
+
+def _seal(directory: Path) -> None:
+    directory.chmod(0o555)
+
+
+def _unseal(directory: Path) -> None:
+    directory.chmod(0o755)
+
+
+def test_reading_the_rollout_phase_before_publishing_is_a_read_only_open(
+    tmp_path: Path,
+) -> None:
+    """#227's own sentence, on the publish path: the producer must not open this writable.
+
+    `prepare_payload` wants one thing out of the store — the phase — and used to take a
+    writable handle to get it, on a call that runs inside the unit sandbox every time a
+    producer publishes. The store here is WAL, which a read-only handle refuses outright;
+    a writable one would open it, build the wal-index, and hand back a prepared payload.
+    """
+
+    binding, store_path, _plan = _dual_write_binding(tmp_path)
+    connection = sqlite3.connect(store_path, isolation_level=None)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+    finally:
+        connection.close()
+
+    with pytest.raises(SchemaRolloutStateUnavailableError, match="WAL"):
+        binding.prepare_payload(
+            _declared_values(binding),
+            observed_at=ROLLOUT_STARTED_AT + timedelta(minutes=3),
+        )
+
+
+def test_a_dual_write_commit_that_the_sandbox_refuses_names_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    """The commit is a real append and stays a write; only its refusal gets a sentence."""
+
+    if os.geteuid() == 0:
+        pytest.skip("running as root: the mode bits this case relies on are not enforced")
+
+    binding, store_path, _plan = _dual_write_binding(tmp_path)
+    prepared = binding.prepare_payload(
+        _declared_values(binding),
+        observed_at=ROLLOUT_STARTED_AT + timedelta(minutes=3),
+    )
+    assert prepared is not None
+    _seal(store_path.parent)
+    try:
+        with pytest.raises(RuntimeSchemaCompatibilityError) as caught:
+            binding.commit_payload(prepared, operation_id="sandboxed-dual-write")
+    finally:
+        _unseal(store_path.parent)
+
+    message = str(caught.value)
+    assert "minute-source" in message
+    assert str(store_path) in message
+    assert "ReadWritePaths" in message
+    assert "control/schema-rollouts" in message
+
+
+def test_a_serving_generation_receipt_that_the_sandbox_refuses_names_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    """The other loop writer: a serving publisher's own observation of what it published."""
+
+    if os.geteuid() == 0:
+        pytest.skip("running as root: the mode bits this case relies on are not enforced")
+
+    plan, registry, previous, candidate, store_path = _prepared_rollout(
+        tmp_path, channel_id=SIGNALS_CHANNEL, include_serving_publisher=True
+    )
+    store = SchemaRolloutStore(store_path, production_consumer_registry=registry)
+    _advance_to_consumer_ack(
+        store,
+        plan=plan,
+        registry=registry,
+        previous=previous,
+        candidate=candidate,
+        channel_id=SIGNALS_CHANNEL,
+        store_path=store_path,
+    )
+    consumer = next(item for item in registry.consumers if item.requires_serving_generation_ack)
+    binding = RuntimeSchemaConsumerAckBinding(
+        service_id=consumer.service_id,
+        consumer=consumer,
+        plan=plan,
+        registry=registry,
+        store_path=store_path,
+    )
+    _seal(store_path.parent)
+    try:
+        with pytest.raises(RuntimeSchemaCompatibilityError) as caught:
+            binding.acknowledge_published_generation(
+                serving_generation_id="5" * 64,
+                serving_physical_schema_fingerprint=(plan.serving_physical_schema_fingerprint),
+                observed_at=ROLLOUT_STARTED_AT + timedelta(minutes=5),
+            )
+    finally:
+        _unseal(store_path.parent)
+
+    message = str(caught.value)
+    assert consumer.service_id in message
+    assert str(store_path) in message
+    assert "ReadWritePaths" in message

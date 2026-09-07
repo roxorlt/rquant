@@ -1571,6 +1571,38 @@ def test_a_readonly_open_refuses_a_wal_store_even_where_it_could_build_the_index
     assert not path.with_name(path.name + "-wal").exists()
 
 
+def test_a_store_that_stops_being_readable_after_the_open_still_says_why(
+    tmp_path: Path,
+) -> None:
+    """`sqlite3.connect` is lazy, so the open alone does not prove the store is readable.
+
+    A `SchemaRolloutStore` is constructed once per role admission and then read several
+    times — the plan, its receipts, the phase again. If the file stops being a database
+    between those calls, the later reads must give the same fail-closed sentence as the
+    first, naming the path, rather than a bare `sqlite3.DatabaseError` raised out of the
+    middle of `_load`. That is what the probe statement in `_connect_readonly` is for.
+    """
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    writer = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    writer.create_plan(plan, now=started_at, operation_id="create")
+    reader = SchemaRolloutStore(
+        path,
+        production_consumer_registry=_trusted_registry(),
+        read_only=True,
+    )
+    assert reader.get_state(plan.plan_id).phase is RolloutPhase.PREPARE
+
+    path.write_bytes(b"this is no longer an SQLite database")
+
+    with pytest.raises(SchemaRolloutStateUnavailableError) as caught:
+        reader.get_state(plan.plan_id)
+
+    assert str(path) in str(caught.value)
+
+
 def test_an_absent_readonly_store_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(SchemaRolloutStateUnavailableError) as caught:
         SchemaRolloutStore(tmp_path / "missing" / "state.sqlite3", read_only=True)

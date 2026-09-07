@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -154,6 +155,28 @@ class RuntimeSchemaConsumerAcknowledger(Protocol):
     ) -> object: ...
 
 
+@contextmanager
+def _rollout_evidence_write(store_path: Path, *, service_id: str) -> Iterator[None]:
+    """Say why a running service could not append its own rollout evidence.
+
+    The same sentence the startup handshake gets (#227), for the two writes that happen in
+    the service loop rather than at admission. No runtime unit's `ReadWritePaths` covers
+    `control/schema-rollouts`, so on the production host these are refused too — and they
+    are refused here, naming the service, the store and the sandbox setting, rather than as
+    a bare SQLite error raised out of the middle of a publish.
+    """
+
+    try:
+        yield
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeSchemaCompatibilityError(
+            f"runtime schema service {service_id} has to record its own rollout evidence "
+            f"in {store_path} and cannot write it ({exc}); a runtime unit's ReadWritePaths "
+            "does not cover control/schema-rollouts, so a rollout that has reached "
+            "dual_write or consumer_ack cannot be carried by the services themselves"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class RuntimeSchemaDualWriteBinding:
     service_id: str
@@ -227,22 +250,23 @@ class RuntimeSchemaDualWriteBinding:
             raise TypeError("prepared dual-write payload has an invalid identity")
         if prepared.plan_id != self.plan.plan_id:
             raise ValueError("prepared dual-write belongs to a different rollout")
-        store = SchemaRolloutStore(
-            self.store_path,
-            production_consumer_registry=self.registry,
-        )
-        state = store.get_state(self.plan.plan_id)
-        return store.record_dual_write_values(
-            plan_id=self.plan.plan_id,
-            expected_revision=state.revision,
-            old_declaration=prepared.old_declaration,
-            new_declaration=prepared.new_declaration,
-            old_values=prepared.old_values,
-            new_values=prepared.new_values,
-            generation_id=prepared.generation_id,
-            observed_at=prepared.observed_at,
-            operation_id=operation_id,
-        )
+        with _rollout_evidence_write(self.store_path, service_id=self.service_id):
+            store = SchemaRolloutStore(
+                self.store_path,
+                production_consumer_registry=self.registry,
+            )
+            state = store.get_state(self.plan.plan_id)
+            return store.record_dual_write_values(
+                plan_id=self.plan.plan_id,
+                expected_revision=state.revision,
+                old_declaration=prepared.old_declaration,
+                new_declaration=prepared.new_declaration,
+                old_values=prepared.old_values,
+                new_values=prepared.new_values,
+                generation_id=prepared.generation_id,
+                observed_at=prepared.observed_at,
+                operation_id=operation_id,
+            )
 
 
 @dataclass(frozen=True)
@@ -279,21 +303,22 @@ class RuntimeSchemaConsumerAckBinding:
             serving_generation_id=serving_generation_id,
             available_at=observed_at,
         )
-        store = SchemaRolloutStore(
-            self.store_path,
-            production_consumer_registry=self.registry,
-        )
-        state = store.get_state(self.plan.plan_id)
-        return store.acknowledge_consumer(
-            plan_id=self.plan.plan_id,
-            expected_revision=state.revision,
-            receipt=receipt,
-            now=observed_at,
-            operation_id=(
-                f"serving-capability:{self.plan.target_generation_id}:"
-                f"{serving_generation_id}:{self.consumer.consumer_id}"
-            ),
-        )
+        with _rollout_evidence_write(self.store_path, service_id=self.service_id):
+            store = SchemaRolloutStore(
+                self.store_path,
+                production_consumer_registry=self.registry,
+            )
+            state = store.get_state(self.plan.plan_id)
+            return store.acknowledge_consumer(
+                plan_id=self.plan.plan_id,
+                expected_revision=state.revision,
+                receipt=receipt,
+                now=observed_at,
+                operation_id=(
+                    f"serving-capability:{self.plan.target_generation_id}:"
+                    f"{serving_generation_id}:{self.consumer.consumer_id}"
+                ),
+            )
 
 
 RuntimeSchemaServiceBinding = RuntimeSchemaDualWriteBinding | RuntimeSchemaConsumerAckBinding
