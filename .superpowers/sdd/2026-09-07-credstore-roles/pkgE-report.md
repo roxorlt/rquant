@@ -88,6 +88,8 @@ commit 顺序即逻辑顺序，全部在 `cc/20260907-credstore-roles`，base `6
 | `a5d9a04` | 凭据投递（白名单）+ generation 命名空间 + 失败关闭措辞 |
 | `ce9b924` | 六个 role 的端到端验收 + Linux 密封解封门 + DEPLOY 换代要点 |
 | `21070b4` | daily-close adapter 的第二处 `Settings`，以及抓到它的子进程探针 |
+| `1da5750` | 本报告 |
+| （审查后一轮） | route B 失败关闭排序（S-1）、`DEPLOY.md` 备份命令（M-1）、`CHANGELOG.md`（S-4）、`ruff format`（S-2）、报告事实订正（S-3 / N-1 / N-5） |
 
 ### 2.1 源码改动（8 个文件）
 
@@ -98,6 +100,7 @@ commit 顺序即逻辑顺序，全部在 `cc/20260907-credstore-roles`，base `6
 | `src/rquant/notify/log.py` | 同上 | 同一条链上的第三处 |
 | `src/rquant/runtime_authority.py` | 新增 `_CAPABILITY_ROLE_ENVIRONMENT = ("CREDENTIALS_DIRECTORY", "LANG", "LC_ALL", "TZ")`，只给 7 个 capability role 用；其余 20 个 role 与 `lab_claim_finalizer` 一字未动 | wrapper 从空环境起、只复制白名单里的名字，`CREDENTIALS_DIRECTORY` 未登记即被静默丢弃 |
 | `src/rquant/runtime_capabilities.py` | `expected_generation` 放宽到 `str \| None`；capability role 在 systemd unit 下拿不到凭据目录时**明确拒绝**，两种成因分开报；凭据目录里没有 `capabilities.json` 时单独报 | 原来静默返回空映射，症状被下游「capability is required」掩盖 |
+| `src/rquant/runtime_capabilities.py`（审查 S-1） | 把投递诊断**提到** route B 分支之前，两条措辞在两条路线下都可达；route B 下 capability kind **直接拒绝**（不再降级），即使不在 systemd unit 下 | 原排序让裁决 15 与 16 的交叉口漏了：route B + capability kind + 无凭据目录仍是静默降级 |
 | `src/rquant/runtime_service_main.py` | `load_systemd_runtime_capabilities` 从 manifest 加载之后**挪到 generation 解析之后**，`expected_generation` 改用 `schema_generation`（= deployment bundle generation） | 凭据按 bundle generation 密封，原来拿权威链 generation 去比，永远不等 |
 | `src/rquant/runtime_builder_daily.py` | `_tushare_daily_close_fetcher` 显式传 `backup_token=""` | `backup_token=None` 正是「去 `Settings` 取」的信号，daily_close 会在 import 修好之后**换个位置**继续报同一个错 |
 | `src/rquant/runtime_service_control.py` | `read_heartbeat` 新增 supersede 分支 + `_service_lock_is_held` / `_lock_path_for`；`start()` 传 `owns_service_lock=True` | #216 |
@@ -106,7 +109,8 @@ commit 顺序即逻辑顺序，全部在 `cc/20260907-credstore-roles`，base `6
 
 | 文件 | 用例数 | 内容 |
 |---|---|---|
-| `tests/unit/test_credstore_capability_delivery.py`（新） | 16 | 白名单最小授予、wrapper 真放行/真丢弃、两种投递失败的措辞、generation 命名空间正反、Route B 边界、`TUSHARE_TOKEN_BACKUP` 可选性 |
+| `tests/unit/test_credstore_capability_delivery.py`（新） | 19 | 白名单最小授予、wrapper 真放行/真丢弃、两种投递失败的措辞（**route A 与 route B 各一组**）、generation 命名空间正反、route B 下 capability kind 拒绝而非降级、非 capability kind 仍降级、`TUSHARE_TOKEN_BACKUP` 可选性 |
+| `tests/unit/test_tp9_role_child_runtime.py`（改，审查 S-1 连带） | 78（不变） | route B 的 5 个用例（8 条参数化）从 `market_minute_source` 换成 `watchlist_quote_source`——它们测的是降级分支，而 capability kind 在 route B 下按裁决 15 现在直接拒绝；换成同形但无 capability 的 kind，被测性质不变。route A 的用例仍用 `market_minute_source` |
 | `tests/unit/test_credstore_role_child_environment.py`（新） | 4 | PA-1 同款子进程探针：`-I -S` + 只有 `LANG/LC_ALL/TZ` 的子环境里，11 个 call-time 模块逐个 import，再真构造 registry + `TushareAdapter` + 通知 provider，最后断言 `rquant.config._SETTINGS is None`；外加一条「探针能红」的自检 |
 | `tests/unit/test_runtime_heartbeat_supersede.py`（新） | 9 | #216 两种情形 + 锁被持有仍拒 + 未走 `stop()` 仍拒 + 锁不可读算被持有 + 探测不留锁 |
 | `tests/integration/test_route_a_credstore_roles_e2e.py`（新） | 29（含 1 条 `linux_exact`） | 见第 3 节 |
@@ -115,7 +119,17 @@ commit 顺序即逻辑顺序，全部在 `cc/20260907-credstore-roles`，base `6
 
 ### 2.3 文档
 
-`DEPLOY.md` 新增「⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）」，含新旧角色策略摘要、为什么必须首发（#190）、逐条命令与回滚。
+`DEPLOY.md` 新增「⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）」，含新旧角色策略摘要
+（附复算命令，审查 N-5）、为什么必须首发（#190）、逐条命令与回滚。
+
+审查 M-1 之后这一段的命令已改：`STAMP` 固定成变量（不再用 `/root/rquant-profile-rollover-*/` 通配符——
+`lighthouse` 读不了 `/root`，glob 展不开，`cp` 报错，而下一条正是 `rm -f current.json`），
+备份之后加一条 `sudo ls -la` 确认两份都在、**确认之后**才写删除步骤，整段标注「逐条执行、每条看返回码」，
+回滚命令也写全了。另补两句：换代后判据仍是 `wrapper_preflight == 32`（不要拿 `publish --dry-run` 代替），
+runbook R-14 的人工清心跳步骤作废（#216 已在代码里修掉）。
+
+`CHANGELOG.md` 的 `[Unreleased]` 补齐（审查 S-4）：`Fixed` 两条（#215 三个缺陷 + 第四处 adapter、#216），
+`Changed` 两条（白名单与 `profile_id` 后果、generation 命名空间），`Security` 一条（三种失败关闭）。
 
 ---
 
@@ -197,12 +211,30 @@ docker run --rm -v <worktree>:/src:ro -v /Users/roxor/rq-rae-root/linux-gate.sh:
 | Linux 容器 · Python 3.11.16 | 8 个 unit 文件 | **193 passed** |
 | macOS · Python 3.12 (`.venv312`) | 10 个 unit 文件 | **328 passed** |
 
-`ruff check` 对全部改动文件通过。`ruff format --check` 对新文件通过；`runtime_authority.py` /
-`runtime_service_main.py` 在 `origin/main` 上本来就不是 format-clean（已复核，非本次引入），未动。
+**审查后一轮的复跑**（S-1 改动 + 文档三项之后，代码终版）：
+
+| 环境 | 范围 | 结果 |
+|---|---|---|
+| macOS · Python 3.11 | 同上 27 个 unit 文件 | **978 passed** |
+| macOS · Python 3.11 | credstore e2e + 包 A legacy binding e2e | **45 passed, 2 deselected** |
+| Linux 容器 · Python 3.11.16 | `linux_exact` 门 | **1 passed** |
+| Linux 容器 · Python 3.11.16 | credstore e2e 全文件（含门） | **29 passed** |
+| Linux 容器 · Python 3.11.16 | 8 个 unit 文件 | **196 passed** |
+| macOS · Python 3.12 (`.venv312`) | 12 个 unit 文件 | **409 passed** |
+
+`ruff check` 对全部改动文件通过。
+
+`ruff format --check`（审查 S-2 订正后复核）：本次**新增的三个文件**与
+`src/rquant/runtime_capabilities.py` 已 format 干净——`runtime_capabilities.py` 在 base 上是 clean 的，
+本次改动一度让它变 dirty，已跑 `ruff format` 修回。仍不 clean 的四个文件
+（`runtime_authority.py`、`runtime_service_main.py`、`test_route_a_legacy_binding_e2e.py`、
+`test_tp9_role_child_runtime.py`）**在 base `695e952` 上就已经不 clean**，逐个用
+`git show origin/main:<file> | ruff format --check --stdin-filename <file>` 复核过，非本次引入，未动。
+仓库 `ci.yml` 里没有 lint job，这一项不影响 CI。
 
 ---
 
-## 4. 变异表（9 条，逐条原文）
+## 4. 变异表（11 条，逐条原文）
 
 每条：`git` 干净 → 打补丁 → 跑指定用例 → `git checkout -- .` 还原。补丁脚本在
 Mac 本地 `/Users/roxor/rq-rae-root/mut/m*.py`，输出在 `/Users/roxor/rq-rae-root/mut-M*.log`。
@@ -218,6 +250,9 @@ Mac 本地 `/Users/roxor/rq-rae-root/mut/m*.py`，输出在 `/Users/roxor/rq-rae
 | M7 | #216 supersede 放宽为只看 `status=stopped ∧ stopped_at`（去掉锁探测） | `test_runtime_heartbeat_supersede.py` | **2 failed, 7 passed** | `Failed: DID NOT RAISE <class 'ValueError'>`（`..._whose_lock_is_still_held_is_refused`、`..._unreadable_lock_counts_as_held`） |
 | M8 | #216 supersede 收紧回无条件拒绝 | 同上 | **3 failed, 6 passed** | `ValueError: runtime heartbeat does not match the requested service spec` ×3 |
 | M9 | `_tushare_daily_close_fetcher` 恢复 `TushareAdapter(token=token)`（不传 backup） | 子进程探针 + `test_daily_close_gateway.py` | **2 failed, 40 passed** | `ValidationError: 5 validation errors for Settings` / `TypeError: FakeAdapter.__init__() missing 1 required keyword-only argument: 'backup_token'` |
+
+| M10 | 把 route B 分支放回投递诊断**之前**，且 route B 只在「凭据目录在手」时拒绝（= 审查 S-1 指出的原状） | `test_credstore_capability_delivery.py` | **3 failed, 16 passed** | `Failed: DID NOT RAISE <class 'ValueError'>` ×3（`..._capability_role_refuses_outright`、`..._delivery_diagnosis_is_reachable_on_route_b_too`、`..._unloaded_credential_diagnosis_is_reachable_on_route_b_too`） |
+| M11 | 只把 route B 的条件从 `required or credential_directory` 收回 `credential_directory` | 同上 | **1 failed, 18 passed** | `Failed: DID NOT RAISE <class 'ValueError'>`（`..._capability_role_refuses_outright`） |
 
 **M3 是最有说服力的一条**：它逐字复现了生产 2026-09-07 窗口记录的两句报错
 （`TUSHARE_TOKEN_MAIN capability is required` 与
@@ -297,13 +332,27 @@ active`，TP1 发布器在动任何 root 路径之前就拒绝。**本包不修 
 
 ### 5.5 未做的事
 
-- **`tests/manifests/full-suite-v1` 未重生成**：新增 3 个测试文件（29 + 16 + 4 + 9 = 58 条新用例）
-  不在任何 shard 里，CI 全量分片跑不到。按简报「不重生成 manifest」，留给集成阶段统一重生成；
-  重生成时注意 `test_route_a_credstore_roles_e2e.py::test_the_roles_run_off_a_credential_the_real_sealer_encrypted`
-  **不应**进任何 shard（与包 A 的 verbatim 那条、`test_formal_smoke_real_generation_linux_e2e` 同例）。
-- **CI 未接线**：包 A 的 `route-a-legacy-binding-linux` job 只跑它自己那一个文件的 `-m linux_exact`。
-  本包的 Linux 门要么并进那个 job（改成两个文件、契约 `--tests 2 --cases 2`），要么单开一个——
-  但它需要容器里装 `systemd`（约 40 MB apt），比包 A 那条重，建议并进去并在 job 里加一步
-  `sudo apt-get install -y systemd`。**本轮不改 `ci.yml`**，留给集成阶段决定。
+- **`tests/manifests/full-suite-v1` 未重生成 —— 不重生成会让 CI 直接红，不是「跑不到」**
+  （审查 S-3 订正）：`scripts/full_suite_shards.py::validate_manifest` 在 `full-suite-v1` 这个
+  非 subset profile 上会比对「收集到的 nodeid 集合」与 manifest 里的集合，不等即抛
+  `ContractError: full-suite collection differs`，四个 shard job 与 contract job 全挂。
+  默认 `addopts`（`-m 'not network and not linux_exact'`）下新增进 shard 的是 **+60 条**（实测
+  `--collect-only`）：`test_route_a_credstore_roles_e2e.py` 28（29 减 1 条 `linux_exact`）+
+  `test_credstore_capability_delivery.py` 19 + `test_credstore_role_child_environment.py` 4 +
+  `test_runtime_heartbeat_supersede.py` 9。
+  （审查当时实测 +57，那是修 S-1 之前的数字；本轮为 route B 的失败关闭补了 3 条，
+  另把 1 条降级用例改写成 2 条。）
+  `test_daily_close_gateway.py`(38) 与 `test_route_a_legacy_binding_e2e.py`(17) 用例数不变。
+  `test_the_roles_run_off_a_credential_the_real_sealer_encrypted` **不得进任何 shard**
+  （与包 A 的 verbatim 那条、`test_formal_smoke_real_generation_linux_e2e` 同例）。
+  按简报「不重生成 manifest」，留给集成阶段。
+- **CI 未接线；报告上一版给的建议是错的**（审查 N-1 订正）：**不要**并进包 A 的
+  `route-a-legacy-binding-linux`。那个 job 以非 root 的 `runner` 身份跑，而本包这道门的 skip 条件
+  要 root（`systemd-creds encrypt` 要读/建 `/var/lib/systemd/credential.secret`，root:root 0400），
+  装了 systemd 也会 skip，一 skip 就撞它 `--skipped 0` 的 JUnit 契约。
+  正确做法是**单开一个 job 用容器拿到 root**（`container: python:${{ matrix.python-version }}-slim`，
+  步骤里 `apt-get install -y systemd git ca-certificates`，其余照抄包 A 的私有根 / uv / `uv sync --frozen`，
+  契约 `--suites 1 --tests 1 --failures 0 --errors 0 --skipped 0 --cases 1`）。
+  草稿见审查报告「集成输入 §4」。**本轮不改 `ci.yml`**。
 - **`artifact_retention` 没有端到端**：它的 unit 不是 runtime 模板、`once=True`，且被 #217 的
   research 资源门挡着。凭据链路与其余六个共用同一段代码，单元测试覆盖到了，但没有真跑过。

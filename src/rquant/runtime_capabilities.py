@@ -281,8 +281,7 @@ def load_systemd_runtime_capabilities(
             # Not "the capability is missing": the capability may well have been sealed and
             # decrypted. Say which of the two links is broken so the repair is the right one.
             raise ValueError(
-                f"runtime capability credential was not delivered to "
-                f"{service_kind.value}: {reason}"
+                f"runtime capability credential was not delivered to {service_kind.value}: {reason}"
             )
     if expected_generation is None:
         # Route B publishes no deployment bundle, and the bundle generation is the only

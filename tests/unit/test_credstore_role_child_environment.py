@@ -144,9 +144,7 @@ def test_every_credstore_call_time_module_imports_in_the_child_environment(
     failures: list[str] = []
     for module in CREDSTORE_CALL_TIME_MODULES:
         result = _run(
-            _IMPORT_PROBE.format(
-                paths=[str(app_source), site_packages_path()], module=module
-            ),
+            _IMPORT_PROBE.format(paths=[str(app_source), site_packages_path()], module=module),
             app_source=app_source,
             cwd=cwd,
         )

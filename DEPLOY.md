@@ -374,32 +374,80 @@ wrapper，而 wrapper 从空环境起、只复制 profile 白名单里的名字�
 | 生产 `profile_id`（旧，2026-09-07 sequence 3 在用） | `d2206e53…7ea0` |
 | 生产 `profile_id`（新） | 装机当场由 `runtime-authority-stage` 算出（含主机闭包与实例标签，本地算不了） |
 
+「角色策略摘要」是 `PRODUCTION_ROLE_POLICY` 单独做 canonical JSON 之后的 sha256，只用来证明
+「角色这一层确实变了」，不是 `profile_id` 本身（`profile_id` 还含主机闭包与实例标签，本地算不出）。
+复算命令（在仓库根目录，任意 checkout）：
+
+```bash
+uv run python -c '
+import hashlib, json
+from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+body = [
+    {
+        "name": e.name, "module": e.module,
+        "environment_allowlist": list(e.environment_allowlist),
+        "service_kind": e.service_kind, "control_root": e.control_root,
+        "once": e.once, "module_arguments": list(e.module_arguments),
+    }
+    for e in PRODUCTION_ROLE_POLICY
+]
+print(hashlib.sha256(json.dumps(body, separators=(",", ":"), sort_keys=True).encode()).hexdigest())
+'
+```
+
 **为什么不能直接发 sequence 4**：`#190`——已有 `current.json` 时，发布原语拿**已安装**的 profile
 校验 record 的每一个 slot，`profile_id` 不同即 `RuntimeAuthorityRecordError: runtime slot profile id
 is not active`；TP1 发布器在动任何 root 路径之前就显式拒绝。本包**不修 #190**（TCB 原语，需 owner
 单独授权）。
 
-**因此下一个窗口按 runbook §0.6「B-8 首次 publish」那条的逆过程走，重新首发**：
+**因此下一个窗口按 runbook §0.6「B-8 首次 publish」那条的逆过程走，重新首发。**
+
+> ⚠️ **下面每条单独执行、每条看返回码**，不要整段粘贴（没有 `set -e`）。
+> 第 ③ 步删掉 `current.json` 之后就回不到 sequence 3 了，**必须先看到第 ②c 步列出两个文件**再往下走。
+> 不要用 `/root/rquant-profile-rollover-*/` 这种通配符：`/root` 在 OpenCloudOS 是 `dr-xr-x--- root root`，
+> `lighthouse` 的 shell 展不开它，`cp` 会报 `No such file or directory`——而那正是备份没成的时刻。
 
 ```bash
 # ① 停掉全部 runtime unit（模板 unit 无 [Install]，stop 即可；oneshot 等它自己退）
 #    停之前先确认没有 daily/monitor 正在写库
-# ② 备份两份 root 文档（换代出问题时靠它们回到 sequence 3）
-sudo install -d -m 0700 /root/rquant-profile-rollover-$(date +%Y%m%d-%H%M%S)
-sudo cp -p /var/lib/rquant/runtime-authority/current.json  /root/rquant-profile-rollover-*/
-sudo cp -p /etc/rquant/production-runtime-profile.json     /root/rquant-profile-rollover-*/
+
+# ②a 先把时间戳固定成一个变量，后面每条都用它，不再第二次调 date
+STAMP=$(date +%Y%m%d-%H%M%S); echo "${STAMP}"
+
+# ②b 建目录并备份两份 root 文档（换代出问题时靠它们回到 sequence 3）
+sudo install -d -m 0700 "/root/rquant-profile-rollover-${STAMP}"
+sudo cp -p /var/lib/rquant/runtime-authority/current.json  "/root/rquant-profile-rollover-${STAMP}/"
+sudo cp -p /etc/rquant/production-runtime-profile.json     "/root/rquant-profile-rollover-${STAMP}/"
+
+# ②c 确认两份都在，再往下走。看不到这两行就停在这里，不要执行 ③
+sudo ls -la "/root/rquant-profile-rollover-${STAMP}/"
+#    期望：current.json 与 production-runtime-profile.json 各一份，属主 root
+
 # ③ 删掉 current.json —— 权威链回到「wrapper 全拒」的安全态，这一步之后没有服务能起
 sudo rm -f /var/lib/rquant/runtime-authority/current.json
+
 # ④ 用新代码 stage + publish，previous is None，走首发路径（sequence 回到 1）
+#    判据仍是 wrapper_preflight == 32；不要拿 `publish --dry-run` 通过代替真 publish（#198 的教训，
+#    dry-run 在取部署锁之前就返回）
+
 # ⑤ 重启 C 段 unit
 ```
 
-**回滚**：把 ② 备份的两份文档原样 `cp -p` 回去（先 `current.json` 后 profile，或反之都行，
-两份必须同时是旧的一代），再重启 unit——旧 generation 目录内容寻址、永不删除，所以旧一代随时可用。
+**回滚**（换代失败时）：
+
+```bash
+sudo cp -p "/root/rquant-profile-rollover-${STAMP}/production-runtime-profile.json" /etc/rquant/
+sudo cp -p "/root/rquant-profile-rollover-${STAMP}/current.json" /var/lib/rquant/runtime-authority/
+```
+
+两份必须同时是旧的一代（先后顺序不重要，中间态没有服务在跑），再重启 unit——旧 generation
+目录内容寻址、永不删除，所以旧一代随时可用。
 credstore 的 `.cred` 不受影响：`current.cred` 按 bundle generation 指向，与 profile 无关。
 
-**顺带**：`data/runtime` 的 legacy bundle 不必重装，本次改动不动 bundle generation；
-只有权威链那一层换代。
+**顺带两条**：
+- `data/runtime` 的 legacy bundle 不必重装，本次改动不动 bundle generation，只有权威链那一层换代；
+- runbook 的 **R-14（换代前人工把旧心跳文件移走）作废**——#216 已在代码里修掉，
+  `read_heartbeat` 对「已 stopped 且单例锁无人持有」的旧心跳自动 supersede，判据比 R-14 更严。
 
 ### 2026-09-05 首次装机窗口的结果（决定下次从哪起跑）
 

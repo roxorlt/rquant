@@ -97,9 +97,7 @@ def _instance_of(service_id: str) -> str:
 
 def _manifest_for(route: RouteAWorld, role: str) -> Any:
     kind = RuntimeServiceKind(role)
-    manifests = [
-        manifest for manifest in route.profile.manifests if manifest.service_kind is kind
-    ]
+    manifests = [manifest for manifest in route.profile.manifests if manifest.service_kind is kind]
     assert len(manifests) == 1, role
     return manifests[0]
 
@@ -315,9 +313,9 @@ def test_the_six_roles_run_one_after_another_over_the_same_generation(
 
     directories = _credentials_root(credstore, tmp_path / "credentials")
     for role in CREDSTORE_ROLES:
-        _run_role(credstore, role, environment=_launch(credstore, role, directories[role])[
-            "environment"
-        ])
+        _run_role(
+            credstore, role, environment=_launch(credstore, role, directories[role])["environment"]
+        )
 
     reached = {role: _heartbeat(credstore, role) for role in CREDSTORE_ROLES}
     assert all(heartbeat is not None for heartbeat in reached.values())
@@ -351,9 +349,7 @@ def test_a_credstore_role_without_its_credential_refuses(
     assert _heartbeat(credstore, role) is None
     message = str(raised.value)
     assert "validation errors for Settings" not in message
-    assert any(
-        token in message for token in ("capability is required", "credential")
-    ), message
+    assert any(token in message for token in ("capability is required", "credential")), message
 
 
 def test_the_notifier_without_its_credential_delivers_nothing_and_refuses_to_try(
@@ -410,9 +406,7 @@ def test_another_roles_credential_is_refused(
 
     other = next(name for name in CREDSTORE_ROLES if name != role)
     instance = _instance_of(_manifest_for(credstore, other).service_id)
-    directory = _deliver(
-        tmp_path / "crossed" / role, credstore.sealed_credentials[instance]
-    ).parent
+    directory = _deliver(tmp_path / "crossed" / role, credstore.sealed_credentials[instance]).parent
     environment = _launch(credstore, role, directory)["environment"]
 
     with pytest.raises(ValueError, match="does not match runtime"):
@@ -468,9 +462,7 @@ def test_the_roles_run_off_a_credential_the_real_sealer_encrypted(
         sort_keys=True,
     ).encode("utf-8")
 
-    receipt = helper["process_request"](
-        request, store_root=store_root, owner_uid=os.geteuid()
-    )
+    receipt = helper["process_request"](request, store_root=store_root, owner_uid=os.geteuid())
     assert receipt["operation"] == "begin"
     assert set(receipt["sealed_instances"]) == set(credstore.sealed_credentials)
 
