@@ -480,8 +480,13 @@ def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
     snapshot = _snapshot()
 
     class FakeAdapter:
-        def __init__(self, *, token: str) -> None:
+        def __init__(self, *, token: str, backup_token: str) -> None:
             assert token == "not-a-real-token"
+            #: The role is capability-scoped and no backup is ever sealed for it, so the
+            #: empty string has to be passed rather than omitted: omitting it is what sends
+            #: the real adapter into `get_settings()` under the wrapper's child environment
+            #: and back into `5 validation errors for Settings` (#215).
+            assert backup_token == ""
 
         def daily_by_date(self, _trade_date: date) -> pd.DataFrame:
             return pd.DataFrame(snapshot["daily_bar"])

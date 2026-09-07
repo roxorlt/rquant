@@ -31,6 +31,34 @@
   本 runtime root 与 `current` 当前解析到的 generation）。`runtime_recovery_service.main` 现在
   按各自的名字转发 `--manifest` 与 `--expected-generation`；两者都不给的调用方被拒绝，
   **不存在「不绑定就跑」的模式**。
+- **credstore 组 7 个 role 在 wrapper 下全部起不来（#215）**：2026-09-07 路线 A 首次窗口里
+  这七个 role **0/7** 运行，其中 `reference_slow_publisher` 起不来直接导致没有 serving generation、
+  第二关不能排。是三个互相独立的代码缺陷，`deploy/systemd/` 一行没错：
+  ① **投递断在 wrapper 白名单**——systemd 把解封后的凭据放进 `$CREDENTIALS_DIRECTORY` 交给 unit 的
+  ExecStart（也就是 wrapper），而 `build_child_environment` 从空字典起、只复制 profile 白名单里的名字，
+  `_RUNTIME_ROLE_ENVIRONMENT` 里没有 `CREDENTIALS_DIRECTORY`，凭据地址被静默丢弃，症状表现成下游的
+  `TUSHARE_TOKEN_MAIN capability is required` / `requires its isolated publication credential`；
+  现给 7 个 capability role 单列 `_CAPABILITY_ROLE_ENVIRONMENT`（恰好多这一个名字），
+  其余 21 个 role 一字未动并由精确元组断言锁死。
+  ② **generation 命名空间错配**——凭据由 `runtime_deployment_bundle` 按 **deployment bundle** 的
+  generation 密封，而校验拿的是 wrapper 转发的**权威链** generation，两者按构造永不相等
+  （与 #207 同类错）；`load_systemd_runtime_capabilities` 挪到 generation 解析之后，改用
+  `schema_generation`，权威链那道绑定（manifest 路径 + root-owned `legacy-binding.json`）一行未删。
+  ③ **wrapper 白名单环境下仍在 import 期构造 `Settings`**——`adapter/tushare.py`、`notify/api.py`、
+  `notify/log.py` 三处模块级 `from rquant.config import settings`，按 TP9 同款惰性化
+  （`_settings()` + PEP 562 模块钩子，与 #189 同类）；另有第四处是
+  `runtime_builder_daily` 建 `TushareAdapter` 时漏传 `backup_token`，而 `None` 正是
+  「去 `Settings` 取」的信号，已改为显式传入 capability 里的值（本次对每个 role 都是空串）。
+  验收是 Linux 容器里的真 bundle + 真 sealer + 真 `systemd-creds` 密封解封往返，
+  六个 role 在 wrapper 白名单环境下逐个进主循环一次迭代；反向去掉凭据、换代凭据、串门凭据均明确拒绝。
+- **换代残留心跳挡住新一代（#216）**：`runtime_service_control.read_heartbeat` 原来对任何
+  `spec_fingerprint` 不同的心跳无条件拒绝，而每次改动 service spec 的换代都会留下这样的文件，
+  于是发布 sequence 3 之后 `runtime_health_publisher` 与 `serving_publisher` 都以
+  `runtime heartbeat does not match the requested service spec` 起不来，只能人工把文件移走。
+  现对「`status=stopped` **且** `stopped_at` 有值 **且** 服务单例 `flock` 无人持有」的旧指纹心跳
+  按 supersede 处理（读时返回「没有心跳」，下一次 `start()` 覆盖写）；进程仍活着、或从未走到
+  `stop()`（被 kill、主机崩）的心跳继续拒绝。心跳里没有 pid 字段，存活由服务自己的单例锁探测，
+  探针答不出来一律算「被持有」。runbook R-14 的人工清心跳步骤作废。
 
 - **路线 A 的三条生产命令在无 `.env` 的 bootstrap worktree 里跑不起来（#211，BLK-8）**：
   `runtime-production-prerequisites` / `runtime-production-profile` / `runtime-deployment-profile`
@@ -183,6 +211,20 @@
 
 ### Changed
 
+- **7 个 capability role 的 `environment_allowlist` 新增 `CREDENTIALS_DIRECTORY`，`profile_id` 因此改变
+  （#215）**：`environment_allowlist` 参与 `profile_id` 的哈希，而 `profile_id` 绑进 `current.json`、
+  每一代的 full manifest 与 R07 policy。这是刻意的 profile 版本演进，不是副作用，但**有装机后果**：
+  #190 未修，已有 `current.json` 时发布原语拿已安装的 profile 校验每个 slot，`profile_id` 不同即拒绝，
+  所以下一个装机窗口必须按 `DEPLOY.md`「下一个装机窗口的强制前置」那一段，
+  停全部 runtime unit → 备份两份 root 文档 → 删 `current.json` → 以 sequence 1 重新首发。
+  credstore 的 `.cred` 与 `data/runtime` 的 legacy bundle 都不受影响。
+- **capability 凭据的 generation 校验换到 deployment bundle 命名空间（#215）**：
+  `load_systemd_runtime_capabilities` 的 `expected_generation` 从权威链 generation 改为
+  bundle generation（类型放宽到 `str | None`，`None` 表示路线 B 无 bundle）。
+  这不是放弃权威链绑定：`schema_generation` 由 `resolve_legacy_schema_generation`（#207）产出，
+  那一步同时校验 manifest 必须坐在 `--expected-generation` 命名的 generation 目录里、
+  以及 root-owned `legacy-binding.json` 必须指名当前 runtime root 与 `current` 指向的那一代。
+
 - **生产 inputs 生成器新增显式的日历覆盖下限开关 `--calendar-coverage-floor`（#211）**：协调者裁决 8
   把市场日历的覆盖下限定在 `2027-12-31`，而生产库的 `trade_calendar` 只到 `2026-12-31`，补 2027 年
   日历要往生产库写数据、需要 owner 单独授权，于是首次装机改为显式下调这个下限。
@@ -248,6 +290,17 @@
     所以 **#190 不会被路线 A 触发**。
 
 ### Security
+
+- **capability 凭据的三种「拿不到」从静默降级改为明确失败关闭（#215）**：
+  ① 需要凭据的 kind 跑在 systemd unit 下却没收到 `CREDENTIALS_DIRECTORY` —— 拒绝，
+  并按 `/run/credentials/<unit>/capabilities.json` 是否存在把两种成因**分开报**
+  （「systemd 投递了、是 profile 白名单丢的」对「systemd 根本没投递、查 unit 与 credstore」）；
+  跑在 unit 之外（裸诊断、测试）时无投递机制可指认，保持原有降级，由角色自己的 builder 拒绝。
+  ② 凭据目录在、里面没有 `capabilities.json` —— 单独一条拒绝，指向 unit 的
+  `LoadCredentialEncrypted=` 名字与 sealer 的 `--name=` 对不上。
+  ③ 路线 B 无 deployment bundle —— 需要凭据的 kind 直接拒绝（该路线上不可能存在为该实例密封的凭据，
+  是结构性事实而非可诊断问题，因此不在 unit 下也拒绝）；不需要凭据的 18 个 kind 保持既有降级。
+  三条都是收紧，没有一处放宽。
 
 - **信任基线（TCB）语义变更：四个发行版自有目录不再比 mode 相等（#198 BLK-2）**：可信祖先遍历原来的
   判据是「属主是 root **且** 权限位恰好等于 `0755`」，本次**只**去掉「恰好等于」这一条，而且**只对

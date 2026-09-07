@@ -675,12 +675,6 @@ def run(args: argparse.Namespace) -> int:
     instance = args.manifest.stem
     if re.fullmatch(r"svc-[0-9a-f]{64}", instance) is None:
         raise ValueError("runtime manifest filename does not identify a valid service instance")
-    runtime_capabilities = load_systemd_runtime_capabilities(
-        manifest.service_kind,
-        expected_service_id=manifest.service_id,
-        expected_instance=instance,
-        expected_generation=args.expected_generation,
-    )
     retention_schema_resolver = _retention_schema_resolver(manifest)
     artifact_terminal_lifecycle_factory: (
         Callable[[], ProductionArtifactTerminalLifecycle] | None
@@ -722,6 +716,20 @@ def run(args: argparse.Namespace) -> int:
     else:
         runtime_root = _runtime_root_from_current_manifest(args.manifest)
         schema_generation = args.expected_generation
+    # After the generation is resolved, not before. A sealed capability credential carries
+    # the *deployment bundle* generation `runtime_deployment_bundle` stamped into it, while
+    # `--expected-generation` is the authority chain's own id; the two are different
+    # namespaces and never agree, so checking the credential against the chain id refused
+    # every correctly sealed credential (#215, and the same mistake as #207). The bundle id
+    # is exactly what the branches above just worked out for the schema bindings, so it is
+    # read from there rather than derived a second way. `None` is Route B, which has no
+    # bundle at all and therefore nothing a credential can be bound to.
+    runtime_capabilities = load_systemd_runtime_capabilities(
+        manifest.service_kind,
+        expected_service_id=manifest.service_id,
+        expected_instance=instance,
+        expected_generation=schema_generation,
+    )
     if runtime_root is None:
         schema_bindings = ()
     else:

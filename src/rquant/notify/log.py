@@ -16,15 +16,44 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from loguru import logger
 
-from rquant.config import settings
+
+def _settings() -> Any:
+    """The process-wide settings, built on first use rather than at import (#215, #189).
+
+    `from rquant.config import settings` at module level runs `rquant.config.__getattr__`,
+    which constructs `Settings` during the import and so makes five environment variables a
+    precondition of importing this module. The runtime-exec wrapper builds a role child from
+    an empty environment and copies only `LANG` / `LC_ALL` / `TZ`, so under that regime the
+    import died with `5 validation errors for Settings` before any role code ran. This is
+    TP9's seam, verbatim: a `settings` a test has bound onto this module still wins, exactly
+    as the old module-level name did.
+    """
+
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound
+    from rquant.config import get_settings
+
+    return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`rquant.notify.log.settings` stays readable — built on first use, like the source."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _log_path() -> Path:
-    return settings.log_dir / "notification_log.jsonl"
+    return _settings().log_dir / "notification_log.jsonl"
 
 
 def append(

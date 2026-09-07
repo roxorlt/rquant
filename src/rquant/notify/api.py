@@ -2,15 +2,45 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from loguru import logger
 
-from rquant.config import settings
 from rquant.notify.client import PushDeerClient, PushPlusClient
 from rquant.notify.gate import NotificationGate, NotificationLease, error_event_key
 from rquant.notify.log import append as _log_notification
 from rquant.notify.messages import build_message
+
+
+def _settings() -> Any:
+    """The process-wide settings, built on first use rather than at import (#215, #189).
+
+    `from rquant.config import settings` at module level runs `rquant.config.__getattr__`,
+    which constructs `Settings` during the import and so makes five environment variables a
+    precondition of importing this module. The runtime-exec wrapper builds a role child from
+    an empty environment and copies only `LANG` / `LC_ALL` / `TZ`, so under that regime the
+    import died with `5 validation errors for Settings` before any role code ran. This is
+    TP9's seam, verbatim: a `settings` a test has bound onto this module still wins, exactly
+    as the old module-level name did.
+    """
+
+    bound = globals().get("settings")
+    if bound is not None:
+        return bound
+    from rquant.config import get_settings
+
+    return get_settings()
+
+
+def __getattr__(name: str) -> object:
+    """`rquant.notify.api.settings` stays readable — built on first use, like the source."""
+
+    if name == "settings":
+        from rquant.config import get_settings
+
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 Scene = Literal[
     "price_level",
@@ -29,7 +59,7 @@ _PUSHDEER_ONLY_SCENES: frozenset[str] = frozenset({"surge_watch", "pulse_alert"}
 
 
 def _scene_enabled(scene: str) -> bool:
-    return getattr(settings, f"notify_{scene}", True)
+    return getattr(_settings(), f"notify_{scene}", True)
 
 
 def notify(scene: Scene, **kwargs) -> None:
@@ -38,6 +68,7 @@ def notify(scene: Scene, **kwargs) -> None:
     失败写日志，不抛异常，不阻塞业务。各通道独立失败。
     每个 target 的成败记录到 notification_log.jsonl 文件，供 dashboard 显示。
     """
+    settings = _settings()
     if not settings.notify_enabled:
         return
     if not _scene_enabled(scene):
