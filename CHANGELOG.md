@@ -6,6 +6,38 @@
 
 ### Fixed
 
+- **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：
+  2026-09-07 路线 A 第二窗口装的是**第一个有前代的 generation**（`bf2da6d8…` 装在 `7d572c79…`
+  之上），`install_runtime_deployment_profile` 于是为每个「声明指纹变了」的 channel 备好一份
+  rollout——因为声明指纹里带 producer commit，凡是既有生产者又有消费者的 channel 都算变了，
+  一次备了十六份。此后每个 kind-backed role 走到 `load_runtime_schema_service_bindings`，
+  它要遍历 `control/schema-rollouts`，**在还不知道本服务是否是计划参与方之前**就把每份计划的
+  状态库打开；而 `SchemaRolloutStore` 只有一种打开方式：`mkdir(parents=True)` 加一句无条件的
+  `PRAGMA journal_mode = WAL`。runtime unit 跑的是 `ProtectSystem=strict` + `ProtectHome=read-only`，
+  `ReadWritePaths` 从来不含 `control/schema-rollouts`，WAL 要在旁边建的 `-shm` 索引被拒，
+  八个 unit 全部以 `sqlite3.OperationalError: unable to open database file` 反复重启，
+  中继 19 次告警、真实推送 8 条。
+  改法是**读写分离**：`SchemaRolloutStore` 多一条只读打开（`file:<path>?mode=ro`，不 `mkdir`、
+  不建表、不设 journal pragma，任何写在碰 SQLite 之前就被拒），写者则把库留在回滚日志模式而不是
+  WAL——这才是只读打开能成立的前提，两边都实测过：目录 0555、没有 sidecar 时，WAL 库的
+  `mode=ro` 抛 `attempt to write a readonly database`，`journal_mode=delete` 的库则打得开，
+  而且**看得见并发写者随后提交的内容**（`immutable=1` 看不见，所以不用它——rollout 控制器会在
+  服务运行期间推进阶段）。`journal_mode` 记在库头里，旧版写下的库在安装器下一次以写者身份
+  打开时自动转换。
+  只读读者遇到 WAL 库**一律拒绝**，判据取自 SQLite 库头第 18 字节（一次 `read(2)`，不像 open
+  那样会顺手把 `-shm` 建出来）：`mode=ro` 只把库文件标成只读、管不到目录，所以在可写的根上
+  打开 WAL 库会「先成功、进了沙箱再失败」——那正是 #227 拖到生产才暴露的形状。
+  **失败关闭一处没放宽**：读不到状态库仍然明确失败，措辞点名库路径、WAL 与
+  `ReadWritePaths`。
+  服务启动时那三处**确实是追加而非读取**的动作（生产者的 PREPARE / CUTOVER 承认、消费者的
+  能力回执）保留原样，但改为单独申请写句柄，失败时说清是哪个服务、哪个路径、哪条沙箱设置
+  拦下的；**它们在生产沙箱里依然写不了**，因此还停在 PREPARE 的 rollout 必须由安装器或
+  rollout 控制器在 unit 启动前推进，这一条不是本次修改能绕过的。
+  验收是 Linux 端到端：真装两代 bundle（第二代带十六份计划）、把 `control/schema-rollouts`
+  下每个目录的写位摘掉、用 wrapper 自己派生的白名单环境把 `serving_publisher` 与
+  `watchlist_quote_source`（八个反复重启的 unit 中的两个）送进真实服务循环各跑一轮；
+  反向把 v0.33.0 的 WAL 打开改回去，两个 role 立刻回到同一个 `sqlite3.OperationalError`。
+
 - **strategy_live 的完成签名器把已冻结的 profile manifest 又验了一遍（#218 A）**：
   `runtime_service_main.build_runtime_strategy_completion_attestation_signer` 把
   `profile.manifests` 的每一项直接交给 `RuntimeServiceManifest.model_validate`，而那些项已经是
