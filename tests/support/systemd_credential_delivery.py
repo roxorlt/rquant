@@ -36,11 +36,13 @@ from rquant.runtime_capabilities import RUNTIME_CAPABILITY_CREDENTIAL_NAME
 
 #: A unit name of the shape the seven credstore templates instantiate to.
 DEFAULT_UNIT = "rquant-runtime-daily-close@svc-" + "a" * 64 + ".service"
-#: What the production host reports for `/run/credentials/<unit>`: systemd mounts the
-#: workspace `MS_NODEV|MS_NOEXEC|MS_NOSUID` and remounts the finished directory read-only.
+#: What the production host reports for `/run/credentials/<unit>`, and what the reader now
+#: requires in full: systemd mounts the workspace `MS_NODEV|MS_NOEXEC|MS_NOSUID` and
+#: remounts the finished directory read-only before the service sees it
+#: (`credentials_fs_mount_flags(/* ro= */ true)`, systemd 255 `exec-credential.c:869`).
 TMPFS_OPTIONS = "ro,nosuid,nodev,noexec,relatime"
-#: What Docker's own `--tmpfs` reports, and what a root-owned credential is read off in the
-#: Linux gate: the read-only remount is systemd's, and `--tmpfs` does not do it.
+#: The same mount before that remount — a shape systemd never hands a service, and one the
+#: reader refuses.
 WRITABLE_TMPFS_OPTIONS = "rw,nosuid,nodev,noexec,relatime"
 
 
@@ -102,7 +104,7 @@ def install_delivery(
     monkeypatch.setattr(
         capabilities_module,
         "_SYSTEMD_DELIVERY_OWNER",
-        owner if owner is not None else (os.geteuid(), os.stat(root).st_gid),
+        owner if owner is not None else (os.geteuid(), os.getegid()),
     )
     return root
 
@@ -138,6 +140,11 @@ def deliver(
     directory = root / unit
     directory.mkdir(mode=0o700, exist_ok=True)
     directory.chmod(0o700)
+    # macOS gives a new directory its parent's group, Linux gives it the process's. Pinning
+    # it to this process's effective gid makes "the delivering owner" and "this process"
+    # the same pair on both, which is what lets one fixture stand in for systemd's ACL
+    # delivery (root:root) and for its ownership fallback (the service user) alike.
+    os.chown(directory, -1, os.getegid())
     path = directory / name
     # systemd writes each credential into a directory it has just made; a redelivery here
     # would otherwise meet the read-only file the last one left behind.
@@ -160,6 +167,7 @@ def empty_directory(
     install_delivery(monkeypatch, root=root)
     directory = root / unit
     directory.mkdir(mode=0o700, exist_ok=True)
+    os.chown(directory, -1, os.getegid())
     directory.chmod(directory_mode)
     return Delivery(
         root=root,

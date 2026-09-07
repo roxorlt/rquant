@@ -53,6 +53,7 @@ from rquant.runtime_capabilities import (
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from tests.support.systemd_credential_delivery import (
     DEFAULT_UNIT,
+    WRITABLE_TMPFS_OPTIONS,
     Delivery,
     deliver,
     empty_directory,
@@ -221,16 +222,73 @@ def test_a_delivery_that_systemd_would_not_have_made_is_refused(
         _load(delivery.directory)
 
 
-def test_a_directory_systemd_does_not_own_is_refused(
+def test_the_directory_ownership_fallback_is_accepted_on_a_read_only_mount(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The directory belongs to root on every host; a user-owned one is somebody's copy."""
+    """systemd's other delivery: where the filesystem holds no ACL it chowns the directory.
 
-    foreign = (os.geteuid() + 1, os.stat(tmp_path).st_gid)
-    delivery = _delivered(monkeypatch, tmp_path, owner=foreign)
+    `exec-credential.c:738` chowns the directory to the service user exactly as `:206`
+    chowns the file, and systemd 255 reaches that branch on any host whose kernel is older
+    than 6.3, because it then mounts `ramfs` — which has no POSIX ACL support at all
+    (`mount-util.c:1655-1657`). Refusing that shape would be a second #230 one kernel away.
+    """
 
-    with pytest.raises(ValueError, match=r"credential directory as \d+:\d+, observed \d+:\d+"):
+    foreign = (os.geteuid() + 1, os.getegid() + 1)
+    delivery = _delivered(monkeypatch, tmp_path, owner=foreign, mode=0o400)
+
+    assert dict(_load(delivery.directory)) == VALUES
+
+
+def test_the_directory_ownership_fallback_needs_a_read_only_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What makes that fallback safe is the read-only mount, so it is not optional."""
+
+    foreign = (os.geteuid() + 1, os.getegid() + 1)
+    delivery = _delivered(
+        monkeypatch,
+        tmp_path,
+        owner=foreign,
+        mode=0o400,
+        mount_options=WRITABLE_TMPFS_OPTIONS,
+    )
+
+    with pytest.raises(ValueError, match=r"remounts the credential directory read-only"):
+        _load(delivery.directory)
+
+
+def test_a_writable_mount_is_refused_even_for_the_acl_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """systemd always remounts read-only, so a writable credential mount is nobody's."""
+
+    delivery = _delivered(monkeypatch, tmp_path, mode=0o440, mount_options=WRITABLE_TMPFS_OPTIONS)
+
+    with pytest.raises(ValueError, match=r"not read-only, observed "):
+        _load(delivery.directory)
+
+
+def test_a_group_readable_credential_outside_the_delivery_group_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0440 is only ever the ACL mask over a root-owned file, never a shared group.
+
+    Without this, "root wrote a 0440 whose group is lighthouse" reads as a delivery, and
+    every account in that group can read the sealed capability.
+    """
+
+    others = [group for group in os.getgroups() if group != os.getegid()]
+    if not others:
+        pytest.skip("needs a second group to own the credential with; the Linux gate pins it")
+    delivery = _delivered(monkeypatch, tmp_path, mode=0o440)
+    os.chown(delivery.path, -1, others[0])
+
+    expected = rf"which is \d+:\d+; observed \d+:{others[0]}"
+    with pytest.raises(ValueError, match=expected):
         _load(delivery.directory)
 
 

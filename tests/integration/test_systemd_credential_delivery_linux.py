@@ -3,37 +3,39 @@
 Package E's acceptance ran the credstore roles against a credential this process owned, mode
 0400, in a private directory, and called that the delivery. systemd does something else, and
 the difference is the whole of the third break: it decrypts as **root**, writes the file
-0400, then admits the unit's `User=` through a POSIX ACL, so what the service actually finds
-is a root-owned `0440` file in a root-owned `0550` directory on a `nosuid,nodev,noexec`
-memory-backed mount at `/run/credentials/<unit>`. Five units refused to start on a credential
-that had been sealed, delivered and decrypted, and no test on macOS could have seen it,
-because there the delivering uid and the reading uid are the same process.
+0400, then admits the unit's `User=` through a POSIX ACL — on the file and on the directory
+together — so what the service actually finds is a root-owned `0440` file in a root-owned
+`0550` directory on a `nosuid,nodev,noexec` memory-backed mount at `/run/credentials/<unit>`
+that systemd has remounted **read-only**. Five units refused to start on a credential that
+had been sealed, delivered and decrypted, and no test on macOS could have seen it, because
+there the delivering uid and the reading uid are the same process.
 
 Here they are not. This gate runs as root, mounts a real tmpfs where systemd mounts one,
-lays the credential down as root, and reads it back from a real child process running as an
-unprivileged uid with no group in common. It moves none of the seams
-`tests/support/systemd_credential_delivery.py` moves, with the one named exception below.
+lays the credential down as root, remounts read-only the way systemd does, and reads it back
+from a real child process running as an unprivileged uid. It moves none of the seams
+`tests/support/systemd_credential_delivery.py` moves, except where a host cannot hold a
+POSIX ACL on tmpfs — and that is decided by **trying it**, not by assumption, so a host that
+can (a GitHub `ubuntu-latest` runner, the production host) runs the production shape itself.
 
+    docker build -t rquant-credshape:1 <dir with the Dockerfile from the report>
     docker run --rm --cap-add SYS_ADMIN -v <repo>:/repo:ro -w /repo \
-        -e PYTHONPATH=/repo/src:/repo python:3.11-slim \
-        sh -c 'apt-get install -y acl && pip install pytest pydantic pydantic-settings \
-               python-dotenv && python -m pytest \
-               tests/integration/test_systemd_credential_delivery_linux.py -m linux_exact'
+      -e PYTHONPATH=/repo/src:/repo \
+      -e TUSHARE_TOKEN_MAIN=00000000000000000000000000000000placeholder \
+      -e DATA_DIR=/tmp/rq/data -e DUCKDB_PATH=/tmp/rq/data/rquant.duckdb \
+      -e PARQUET_DIR=/tmp/rq/data/parquet -e LOG_DIR=/tmp/rq/logs \
+      rquant-credshape:1 \
+      python -m pytest tests/integration/test_systemd_credential_delivery_linux.py \
+        -m linux_exact -q -p no:cacheprovider
 
-`--cap-add SYS_ADMIN` is what lets this process mount and remount; on the production host
-root has it already. Two degradations are forced by Docker Desktop's kernel, which is built
-without `CONFIG_TMPFS_POSIX_ACL`, so `setfacl` on a tmpfs answers `Operation not supported`:
+The five `Settings` variables are not optional: `tests/conftest.py` has an autouse fixture
+that imports `rquant.config`, and a checkout without a `.env` cannot build `Settings` — the
+whole file errors out before a single case runs. `--cap-add SYS_ADMIN` is what lets this
+process mount and remount; on the production host root has it already.
 
-* the tmpfs cases admit the reader through **group 0** rather than an ACL. Everything the
-  reader checks is identical — a root-owned 0440 file it does not own, on systemd's mount —
-  and only the kernel mechanism behind the grant differs;
-* the ACL cases therefore run on the container's ordinary filesystem, where `setfacl` works,
-  and inject a mount table for that directory (`RQ_TEST_MOUNT_TABLE`, the same seam the
-  macOS suite uses). The path, the ownership, the modes and the grant are all real there;
-  only the mount verification is fed a synthetic table.
-
-On a host whose tmpfs carries ACLs — the production host's does, which is how its credentials
-are delivered at all — both sets collapse into the single real case.
+**Nothing here skips.** A host that cannot mount a tmpfs, or holds no ACL anywhere, fails
+the gate rather than passing it empty — a green run with zero assertions is exactly what let
+the third break through in the first place. Wire it with the repository's usual JUnit
+contract (`tests/support/assert_junit_contract.py … --skipped 0`).
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +72,9 @@ pytestmark = [
 READER_UID = 1000
 #: The gid the ACL cases read under — its own, so that only the ACL can admit them.
 READER_GID = 1000
+#: A third party that is neither systemd nor the service user.
+STRANGER_UID = 65534
+STRANGER_GID = 65534
 
 SERVICE_ID = "source.daily-close"
 INSTANCE = "svc-" + "a" * 64
@@ -93,14 +98,15 @@ EXPECT = json.dumps(
     },
     sort_keys=True,
 )
-#: systemd's own mount for the credential workspace, flag for flag: `mount_nofollow_verbose(
-#: LOG_DEBUG, "ramfs", workspace, "ramfs", MS_NODEV|MS_NOEXEC|MS_NOSUID, "mode=0700")`
-#: (systemd 252, src/core/execute.c, setup_credentials_internal).
+#: systemd's own mount for the credential workspace, flag for flag: `credentials_fs_mount_flags()`
+#: is `MS_NODEV|MS_NOEXEC|MS_NOSUID|ms_nosymfollow_supported()|(ro ? MS_RDONLY : 0)`
+#: (systemd 255 `src/shared/mount-util.c:1643-1645`), and the workspace is mounted writable
+#: (`exec-credential.c:808`) then remounted read-only before the service sees it (`:869`).
 MOUNT_OPTIONS = "nosuid,nodev,noexec,mode=0700"
 
 #: The reader. It calls the real loader with the environment systemd would have set, and
-#: reports what came back — including its own uid and groups, so a case that claims to read
-#: as an unprivileged process without the delivering uid's groups can be held to it.
+#: reports what came back — including its own uid, gid and groups, so a case that claims to
+#: read as an unprivileged process without the delivering uid's groups can be held to it.
 CHILD = """
 import json, os, sys
 from pathlib import Path
@@ -130,11 +136,21 @@ print(json.dumps(report))
 """
 
 
+def _run(command: Sequence[str], *, what: str) -> subprocess.CompletedProcess[str]:
+    """A privileged step that has to work here. If it cannot, the gate is red, never green."""
+
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        pytest.fail(f"{what} failed ({' '.join(command)}): {completed.stderr.strip()}")
+    return completed
+
+
 def _read_as(
     directory: Path,
     *,
     uid: int = READER_UID,
     gid: int = READER_GID,
+    extra_groups: Sequence[int] = (),
     mount_table: Path | None = None,
 ) -> dict[str, Any]:
     """`load_systemd_runtime_capabilities` in a child process running as `uid`:`gid`."""
@@ -157,14 +173,48 @@ def _read_as(
         cwd="/",
         user=uid,
         group=gid,
-        extra_groups=[],
+        extra_groups=list(extra_groups),
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
     report = json.loads(completed.stdout)
     assert (report["uid"], report["gid"]) == (uid, gid)
-    assert report["groups"] == [], report["groups"]
+    assert report["groups"] == sorted(extra_groups), report["groups"]
     return report
+
+
+def _seal(directory: Path) -> None:
+    """systemd's last step: remount the finished credential directory read-only (`:869`)."""
+
+    _run(("mount", "-o", "remount,ro", str(directory)), what="read-only remount")
+
+
+def _tmpfs_holds_acls() -> bool:
+    """Whether a tmpfs on *this* host can carry the delivery ACL — decided by trying it.
+
+    Docker Desktop's LinuxKit kernel is built without `CONFIG_TMPFS_POSIX_ACL`, so `setfacl`
+    there answers `Operation not supported` and the ACL cases have to run on an ordinary
+    filesystem with an injected mount table. A GitHub `ubuntu-latest` runner and the
+    production host both do carry them, and there this probe keeps the ACL cases on the real
+    thing. Assuming either way would make the file lie about what it covers.
+    """
+
+    probe = Path("/run/rquant-acl-probe")
+    probe.mkdir(mode=0o700, exist_ok=True)
+    _run(("mount", "-t", "tmpfs", "-o", "mode=0700", "tmpfs", str(probe)), what="probe tmpfs")
+    try:
+        target = probe / "probe"
+        target.write_bytes(b"probe")
+        held = subprocess.run(
+            ("setfacl", "-m", f"u:{READER_UID}:r", str(target)),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return held.returncode == 0
+    finally:
+        subprocess.run(("umount", str(probe)), capture_output=True, check=False)
+        probe.rmdir()
 
 
 @pytest.fixture
@@ -192,7 +242,7 @@ def injected_mount_table() -> Iterator[Callable[[Path], Path]]:
 
 @pytest.fixture
 def credential_directory() -> Iterator[Callable[..., Path]]:
-    """Make `/run/credentials/<unit>`, on a tmpfs mounted the way systemd mounts it."""
+    """Make `/run/credentials/<unit>`, on a tmpfs mounted the way systemd mounts one."""
 
     root = Path("/run/credentials")
     root.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -204,21 +254,17 @@ def credential_directory() -> Iterator[Callable[..., Path]]:
         directory.mkdir(mode=0o700, exist_ok=True)
         made.append(directory)
         if tmpfs:
-            completed = subprocess.run(
+            _run(
                 ("mount", "-t", "tmpfs", "-o", options, "tmpfs", str(directory)),
-                capture_output=True,
-                text=True,
-                check=False,
+                what="credential tmpfs mount",
             )
-            if completed.returncode != 0:
-                pytest.skip(f"cannot mount a tmpfs here: {completed.stderr.strip()}")
             mounted.append(directory)
         return directory
 
     yield make
 
     for directory in reversed(mounted):
-        subprocess.run(("umount", str(directory)), capture_output=True, check=False)
+        subprocess.run(("umount", "-l", str(directory)), capture_output=True, check=False)
     for directory in reversed(made):
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -231,6 +277,7 @@ def _write(
     gid: int = 0,
     mode: int = 0o440,
     directory_mode: int = 0o550,
+    directory_owner: tuple[int, int] = (0, 0),
     name: str = RUNTIME_CAPABILITY_CREDENTIAL_NAME,
 ) -> Path:
     """Lay the credential down as root, the way systemd's `write_credential` does."""
@@ -240,17 +287,16 @@ def _write(
     os.chown(path, uid, gid)
     path.chmod(mode)
     directory.chmod(directory_mode)
+    os.chown(directory, *directory_owner)
     return path
 
 
 def _setfacl(target: Path, entry: str) -> None:
+    """The grant systemd uses. If this host cannot hold it anywhere, the gate is red."""
+
     if shutil.which("setfacl") is None:
-        pytest.skip("needs setfacl, which is how systemd admits the unit's User=")
-    completed = subprocess.run(
-        ("setfacl", "-m", entry, str(target)), capture_output=True, text=True, check=False
-    )
-    if completed.returncode != 0:
-        pytest.skip(f"this filesystem cannot hold the delivery ACL: {completed.stderr.strip()}")
+        pytest.fail("needs setfacl (package `acl`), which is how systemd admits the unit's User=")
+    _run(("setfacl", "-m", entry, str(target)), what=f"delivery ACL {entry}")
 
 
 # ---------------------------------------------------------------------------------------
@@ -265,6 +311,7 @@ def test_a_root_owned_credential_on_systemds_own_mount_reaches_the_service_user(
 
     directory = credential_directory()
     path = _write(directory)
+    _seal(directory)
 
     report = _read_as(directory, gid=0)
 
@@ -279,30 +326,108 @@ def test_the_delivery_acl_is_what_admits_the_reader(
     credential_directory: Callable[..., Path],
     injected_mount_table: Callable[[Path], Path],
 ) -> None:
-    """The production grant itself: no group in common, only `u:1000:r` on a root-owned file."""
+    """The production grant itself: no group in common, only `u:1000:r` on a root-owned file.
 
-    directory = credential_directory(tmpfs=False)
+    On a host whose tmpfs carries ACLs this is the whole production shape with nothing
+    injected at all; where it does not, the grant is still real and only the mount table is
+    synthetic. Which one ran is asserted, so neither can be mistaken for the other.
+    """
+
+    on_tmpfs = _tmpfs_holds_acls()
+    directory = credential_directory(tmpfs=on_tmpfs)
     path = _write(directory)
     _setfacl(directory, f"u:{READER_UID}:rx")
     _setfacl(path, f"u:{READER_UID}:r")
+    table = None
+    if on_tmpfs:
+        _seal(directory)
+    else:
+        table = injected_mount_table(directory)
 
-    report = _read_as(directory, mount_table=injected_mount_table(directory))
+    report = _read_as(directory, mount_table=table)
+
+    assert report["ok"], report.get("error")
+    assert report["values"] == VALUES
+    assert (table is None) is on_tmpfs
+
+
+def test_the_full_ownership_fallback_is_accepted_on_a_read_only_mount(
+    credential_directory: Callable[..., Path],
+) -> None:
+    """systemd's other delivery, whole: where no ACL can be held it chowns **both**.
+
+    `exec-credential.c:206` chowns the file and `:738` chowns the directory, and systemd 255
+    reaches that branch on any host whose kernel is older than 6.3, because it then mounts
+    `ramfs`, which carries no POSIX ACLs at all (`mount-util.c:1655-1657`). Refusing this
+    shape would be #230 again, one kernel away.
+    """
+
+    directory = credential_directory()
+    _write(
+        directory,
+        uid=READER_UID,
+        gid=READER_GID,
+        mode=0o400,
+        directory_mode=0o500,
+        directory_owner=(READER_UID, READER_GID),
+    )
+    _seal(directory)
+
+    report = _read_as(directory)
 
     assert report["ok"], report.get("error")
     assert report["values"] == VALUES
 
 
-def test_without_the_acl_the_open_itself_fails_and_says_which_uid(
+def test_the_ownership_fallback_is_refused_on_a_writable_mount(
     credential_directory: Callable[..., Path],
 ) -> None:
-    """A wrong `User=` produces exactly this, and "capability is required" used to hide it.
+    """What makes that fallback safe is the read-only remount, so it is not optional."""
 
-    The directory admits the reader (group 0 here, an ACL on the host) and the credential
-    does not, which is the state a unit whose `User=` changed after sealing wakes up in.
-    """
+    directory = credential_directory()
+    _write(
+        directory,
+        uid=READER_UID,
+        gid=READER_GID,
+        mode=0o400,
+        directory_mode=0o500,
+        directory_owner=(READER_UID, READER_GID),
+    )
+
+    report = _read_as(directory)
+
+    assert not report["ok"]
+    assert "remounts the credential directory read-only" in report["error"]
+    assert "not read-only" in report["error"]
+
+
+def test_a_writable_mount_is_refused_even_for_the_acl_delivery(
+    credential_directory: Callable[..., Path],
+) -> None:
+    """systemd always remounts read-only, so a writable credential mount is nobody's."""
+
+    directory = credential_directory()
+    _write(directory)
+
+    report = _read_as(directory, gid=0)
+
+    assert not report["ok"]
+    assert "not read-only" in report["error"]
+
+
+# ---------------------------------------------------------------------------------------
+# Reverse: nothing systemd would not have produced gets in
+# ---------------------------------------------------------------------------------------
+
+
+def test_without_the_acl_on_the_credential_the_open_says_which_uid(
+    credential_directory: Callable[..., Path],
+) -> None:
+    """Directory reachable, credential not: the file's own ACL is what is missing."""
 
     directory = credential_directory()
     _write(directory, mode=0o400)
+    _seal(directory)
 
     report = _read_as(directory, gid=0)
 
@@ -313,39 +438,48 @@ def test_without_the_acl_the_open_itself_fails_and_says_which_uid(
     assert "carries no" not in report["error"]
 
 
-def test_the_ownership_fallback_is_accepted_on_a_read_only_mount(
+def test_without_the_acl_on_the_directory_the_refusal_names_the_directory(
     credential_directory: Callable[..., Path],
 ) -> None:
-    """systemd's other shape: where the fs holds no ACL it chowns, and remounts read-only."""
+    """The real `User=` mistake: systemd adds both ACLs together, so both are missing.
+
+    `acquire_credentials` writes every credential with its own ACL and then adds the
+    directory's (`exec-credential.c:722-731`), so a unit whose `User=` does not match what
+    the credential was loaded for cannot even walk into the directory — `lstat` of the file
+    is denied too. That used to degrade into `systemd credential is unavailable or unsafe`,
+    which names nothing and points nowhere.
+    """
 
     directory = credential_directory()
-    _write(directory, uid=READER_UID, gid=READER_GID, mode=0o400)
-    subprocess.run(("mount", "-o", "remount,ro", str(directory)), capture_output=True, check=True)
+    _write(directory, mode=0o440, directory_mode=0o500)
+    _seal(directory)
 
-    report = _read_as(directory, gid=0)
-
-    assert report["ok"], report.get("error")
-    assert report["values"] == VALUES
-
-
-def test_the_ownership_fallback_is_refused_on_a_writable_mount(
-    credential_directory: Callable[..., Path],
-) -> None:
-    """Without the read-only remount the owner could chmod its way to write access."""
-
-    directory = credential_directory()
-    _write(directory, uid=READER_UID, gid=READER_GID, mode=0o400)
-
-    report = _read_as(directory, gid=0)
+    report = _read_as(directory)
 
     assert not report["ok"]
-    assert "ownership fallback" in report["error"]
-    assert "not read-only" in report["error"]
+    assert f"cannot be entered by {READER_UID}:{READER_GID}" in report["error"]
+    assert "0:0 mode 0o0500" in report["error"]
+    assert "User=" in report["error"]
+    assert "unavailable or unsafe" not in report["error"]
 
 
-# ---------------------------------------------------------------------------------------
-# Reverse: nothing systemd would not have produced gets in
-# ---------------------------------------------------------------------------------------
+def test_a_group_readable_credential_outside_the_delivery_group_is_refused(
+    credential_directory: Callable[..., Path],
+) -> None:
+    """0440 is only ever the ACL mask over a root-owned file, never a shared group.
+
+    Without this, "root wrote a 0440 whose group is the service's" reads as a delivery, and
+    every account in that group can read the sealed capability.
+    """
+
+    directory = credential_directory()
+    _write(directory, uid=0, gid=STRANGER_GID, mode=0o440)
+    _seal(directory)
+
+    report = _read_as(directory, gid=STRANGER_GID, extra_groups=(0,))
+
+    assert not report["ok"]
+    assert f"which is 0:0; observed 0:{STRANGER_GID}" in report["error"]
 
 
 def test_a_credential_owned_by_a_third_party_is_refused(
@@ -354,13 +488,30 @@ def test_a_credential_owned_by_a_third_party_is_refused(
     """Neither root nor the reader: no delivery systemd makes could have left this."""
 
     directory = credential_directory()
-    _write(directory, uid=65534, gid=0, mode=0o440)
+    _write(directory, uid=STRANGER_UID, gid=0, mode=0o440)
+    _seal(directory)
 
     report = _read_as(directory, gid=0)
 
     assert not report["ok"]
     assert "must be owned by uid 0 or by the runtime uid" in report["error"]
-    assert "observed 65534" in report["error"]
+    assert f"observed {STRANGER_UID}" in report["error"]
+
+
+def test_a_directory_owned_by_a_third_party_is_refused(
+    credential_directory: Callable[..., Path],
+) -> None:
+    """The directory has exactly two owners systemd ever gives it; this is neither."""
+
+    directory = credential_directory()
+    _write(directory, directory_owner=(STRANGER_UID, STRANGER_GID))
+    _seal(directory)
+
+    report = _read_as(directory, gid=0, extra_groups=(STRANGER_GID,))
+
+    assert not report["ok"]
+    assert "creates the credential directory as 0:0" in report["error"]
+    assert f"observed {STRANGER_UID}:{STRANGER_GID}" in report["error"]
 
 
 def test_a_world_readable_credential_is_refused(
@@ -370,6 +521,7 @@ def test_a_world_readable_credential_is_refused(
 
     directory = credential_directory()
     _write(directory, mode=0o444)
+    _seal(directory)
 
     report = _read_as(directory, gid=0)
 
@@ -387,29 +539,12 @@ def test_a_hardlinked_credential_is_refused(
     directory.chmod(0o700)
     os.link(path, directory / "kept.json")
     directory.chmod(0o550)
+    _seal(directory)
 
     report = _read_as(directory, gid=0)
 
     assert not report["ok"]
     assert "hardlink count must be one, observed 2" in report["error"]
-
-
-def test_a_directory_the_service_user_owns_is_refused(
-    credential_directory: Callable[..., Path],
-    injected_mount_table: Callable[[Path], Path],
-) -> None:
-    """If the reader owns the directory it can put anything in it, so nothing in it is evidence."""
-
-    directory = credential_directory(tmpfs=False)
-    path = _write(directory)
-    _setfacl(path, f"u:{READER_UID}:r")
-    os.chown(directory, READER_UID, READER_GID)
-
-    report = _read_as(directory, mount_table=injected_mount_table(directory))
-
-    assert not report["ok"]
-    assert "credential directory as 0:0" in report["error"]
-    assert f"observed {READER_UID}:{READER_GID}" in report["error"]
 
 
 def test_a_credential_on_an_ordinary_filesystem_is_refused(
@@ -435,6 +570,7 @@ def test_a_mount_without_the_three_flags_is_refused(
 
     directory = credential_directory(options="mode=0700")
     _write(directory)
+    _seal(directory)
 
     report = _read_as(directory, gid=0)
 

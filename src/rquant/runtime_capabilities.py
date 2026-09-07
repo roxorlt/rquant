@@ -85,18 +85,23 @@ _SYSTEMD_MOUNT_TABLE = Path("/proc/self/mountinfo")
 #: be uid 0 replaces with its own uid. Production never moves it.
 _SYSTEMD_DELIVERY_OWNER: tuple[int, int] = (0, 0)
 #: systemd mounts the per-unit credential directory itself and never leaves it writable to
-#: the unit: 0700 when it is the only reader, 0500/0550 once an ACL admits `User=`.
+#: the unit: 0700 when it is the only reader (`mkdir_label(p, 0700)`, systemd 255
+#: `src/core/exec-credential.c:929`), 0500 once the "w" bit is taken away
+#: (`fd_acl_make_read_only`, `:722`), 0550 once the ACL mask admits `User=` (`:730`).
 _CREDENTIAL_DIRECTORY_MODES = frozenset({0o500, 0o550, 0o700})
-#: 0400 when the unit runs as root and owns its credentials; 0400 or 0440 root-owned with an
-#: ACL for `User=` when it does not. Never a group or world bit beyond that group read.
+#: 0400 as written (`fchmod(fd, 0400)`, `exec-credential.c:189`); 0440 once the file ACL for
+#: `User=` puts a mask on it (`:193`). Never a group or world bit beyond that group read.
 _CREDENTIAL_FILE_MODES = frozenset({0o400, 0o440})
-#: The credential directory is a memory-backed mount that never reaches a disk. systemd has
-#: used both over the versions it has shipped `LoadCredentialEncrypted=`, so both are the
-#: contract; anything else means the path is not the one systemd made.
+#: The credential directory is a memory-backed mount that never reaches a disk. systemd 255
+#: prefers `tmpfs` with `noswap` (kernel >= 6.3), falls back to `ramfs`, then to a plain
+#: `tmpfs` (`src/shared/mount-util.c:1655-1657`; systemd 252 tried ramfs first). Both
+#: filesystems are therefore the contract, and anything else is not a path systemd made.
 _CREDENTIAL_MOUNT_FILESYSTEMS = frozenset({"ramfs", "tmpfs"})
-#: The three mount flags systemd sets on that mount, and the reason a non-root reader can be
-#: trusted with a root-owned file there: nothing under it can gain privilege, become a
-#: device, or be executed.
+#: The three mount flags systemd sets on that mount — `credentials_fs_mount_flags()` is
+#: `MS_NODEV|MS_NOEXEC|MS_NOSUID|ms_nosymfollow_supported()|(ro ? MS_RDONLY : 0)`
+#: (`mount-util.c:1643-1645`) — and the reason a non-root reader can be trusted with a
+#: root-owned file there: nothing under it can gain privilege, become a device, or be
+#: executed. `nosymfollow` is not required here because it is conditional on kernel support.
 _CREDENTIAL_MOUNT_OPTIONS = ("nosuid", "nodev", "noexec")
 GenerationHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 InstanceName = Annotated[str, StringConstraints(pattern=r"^svc-[0-9a-f]{64}$")]
@@ -190,6 +195,24 @@ def _systemd_unit_name() -> str | None:
     return None
 
 
+def _credential_is_absent(path: Path) -> bool:
+    """Whether the credential is provably not there — nothing else counts as absent.
+
+    Only `ENOENT` says "systemd loaded some other id into this directory". Every other
+    answer, `EACCES` above all, is the delivery ACL failing to admit this uid, and reporting
+    that as a missing credential sends the repair to the sealer instead of to `User=`.
+    `Path.exists()` cannot be used here at all: it re-raises `EACCES` rather than answering.
+    """
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _undelivered_credential_reason() -> str | None:
     """Why no credential directory reached this systemd unit's role child, or `None`.
 
@@ -212,11 +235,11 @@ def _undelivered_credential_reason() -> str | None:
     if unit is None:
         return None
     delivered = _SYSTEMD_CREDENTIALS_ROOT / unit / RUNTIME_CAPABILITY_CREDENTIAL_NAME
-    try:
-        present = delivered.exists()
-    except OSError:  # pragma: no cover - an unreadable /run/credentials is not the diagnosis
-        present = False
-    if present:
+    # Not `delivered.exists()`: it re-raises EACCES rather than answering, and swallowing
+    # that into "absent" is worse than the exception — a credential this process may not
+    # stat is still a credential systemd loaded, and calling it missing sends the repair to
+    # the sealer instead of to the unit's environment allowlist.
+    if not _credential_is_absent(delivered):
         return (
             f"systemd did load it for unit {unit}, so CREDENTIALS_DIRECTORY was dropped "
             "between the unit and this process: the runtime profile's environment allowlist "
@@ -317,6 +340,17 @@ def _credential_mount_fault(directory: Path, device: int) -> str | None:
             f"mounts it {','.join(_CREDENTIAL_MOUNT_OPTIONS)}, observed "
             f"{','.join(sorted(entry.options))}"
         )
+    if "ro" not in entry.options:
+        # systemd always remounts the finished credential directory read-only before the
+        # service is allowed to see it — `credentials_fs_mount_flags(/* ro= */ true)`,
+        # systemd 255 `exec-credential.c:869` — and that read-only mount is exactly what
+        # makes the two ownership fallbacks below safe: on it, neither the service user's
+        # directory nor its file can be chmod-ed into something wider.
+        return (
+            f"systemd remounts the credential directory read-only before the service sees "
+            f"it; the mount at {entry.point} is not read-only, observed "
+            f"{','.join(sorted(entry.options))}"
+        )
     return None
 
 
@@ -353,10 +387,22 @@ def _credential_directory_fault(directory: Path) -> str | None:
         return f"the credential directory {directory} cannot be inspected: {exc.strerror}"
     if not stat.S_ISDIR(observed.st_mode):
         return f"the credential directory {directory} is not a directory"
-    if (observed.st_uid, observed.st_gid) != (delivery_uid, delivery_gid):
+    owner = (observed.st_uid, observed.st_gid)
+    if owner not in ((delivery_uid, delivery_gid), (os.geteuid(), os.getegid())):
+        # Two owners, because systemd has two deliveries. Normally it keeps the directory
+        # and adds an ACL for `User=` (`fd_acl_make_read_only` then
+        # `fd_add_uid_acl_permission(dfd, uid, ACL_READ|ACL_EXECUTE)`, systemd 255
+        # `exec-credential.c:722-731`). Where the backing filesystem cannot hold that ACL —
+        # ramfs, which systemd 255 mounts whenever the kernel is older than 6.3 and tmpfs
+        # has no `noswap` (`mount-util.c:1655-1657`) — it chowns the directory to the
+        # service user instead (`:738`), exactly as it chowns the file. That fallback is
+        # safe for the same reason systemd gives for the file: the mount is read-only, so
+        # the owner cannot widen it, and that read-only mount is required above.
         return (
-            f"systemd creates the credential directory as {delivery_uid}:{delivery_gid}, "
-            f"observed {observed.st_uid}:{observed.st_gid} on {directory}"
+            f"systemd creates the credential directory as {delivery_uid}:{delivery_gid}, or "
+            f"hands it to the service user {os.geteuid()}:{os.getegid()} where the "
+            f"filesystem holds no ACL; observed {observed.st_uid}:{observed.st_gid} on "
+            f"{directory}"
         )
     mode = stat.S_IMODE(observed.st_mode)
     if mode not in _CREDENTIAL_DIRECTORY_MODES:
@@ -370,45 +416,44 @@ def _credential_directory_fault(directory: Path) -> str | None:
 def _unopenable_credential_reason(path: Path, error: OSError) -> str:
     """What to say when the credential is where it should be but will not open.
 
-    `EACCES` is the shape #215's third break would have produced next: systemd hands a
-    `User=`-run service a **root-owned** credential and admits that user through a POSIX ACL
-    on the file. If the ACL is not there — wrong `User=`, a hand-copied file, a credential
-    laid down for another service — the open is what fails, and saying so with the observed
-    owner and mode is the difference between one look and another window lost.
+    `EACCES` is the shape a wrong `User=` produces: systemd hands a `User=`-run service a
+    **root-owned** credential and admits that user through a POSIX ACL — on the file
+    (`fd_add_uid_acl_permission(fd, uid, ACL_READ)`, systemd 255 `exec-credential.c:193`)
+    **and on the directory** (`ACL_READ|ACL_EXECUTE`, `:730`). The two are added together,
+    so when they are missing they are missing together, and the first thing to fail is not
+    the read of the file but the walk into the directory — at which point even `lstat` of
+    the file is denied. Reporting "unavailable or unsafe" there names nothing and sends the
+    repair nowhere, which is the very failure mode this package exists to remove. So when
+    the file cannot be inspected, the directory is inspected instead and named: the two
+    faults need different repairs (the unit's `User=`/`Group=` and the directory ACL, versus
+    the credential's own ACL).
     """
 
     if error.errno == errno.ENOENT:
         return f"the systemd credential {path} is absent"
     if error.errno != errno.EACCES:
         return "systemd credential is unavailable or unsafe"
+    runtime = f"{os.geteuid()}:{os.getegid()}"
     try:
         observed = os.lstat(path)
     except OSError:
-        return "systemd credential is unavailable or unsafe"
+        try:
+            parent = os.lstat(path.parent)
+        except OSError:
+            return "systemd credential is unavailable or unsafe"
+        return (
+            f"the systemd credential directory {path.parent} cannot be entered by "
+            f"{runtime}: it is {parent.st_uid}:{parent.st_gid} mode "
+            f"0o{stat.S_IMODE(parent.st_mode):04o} and no access control entry admits this "
+            f"uid; LoadCredentialEncrypted admits the unit's User= through an ACL on the "
+            f"directory as well as on the credential, so check the unit's User=/Group="
+        )
     return (
         f"the systemd credential {path} is not readable by uid {os.geteuid()}: it is "
         f"{observed.st_uid}:{observed.st_gid} mode 0o{stat.S_IMODE(observed.st_mode):04o} and "
         f"no access control entry admits this uid; LoadCredentialEncrypted admits the unit's "
         f"User= through an ACL, so check User=/Group= against the unit systemd loaded it for"
     )
-
-
-def _credential_is_absent(path: Path) -> bool:
-    """Whether the credential is provably not there — nothing else counts as absent.
-
-    Only `ENOENT` says "systemd loaded some other id into this directory". Every other
-    answer, `EACCES` above all, is the delivery ACL failing to admit this uid, and reporting
-    that as a missing credential sends the repair to the sealer instead of to `User=`.
-    `Path.exists()` cannot be used here at all: it re-raises `EACCES` rather than answering.
-    """
-
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return False
 
 
 def _read_private_credential(path: Path) -> bytes:
@@ -418,8 +463,9 @@ def _read_private_credential(path: Path) -> bytes:
     safe-looking file: the directory is `/run/credentials/<this unit>`, root-owned, on
     systemd's memory-backed mount; the file is a regular file with one link, owned by root
     (the ACL delivery, `fd_add_uid_acl_permission(fd, uid, ACL_READ)` over a 0400 file) or
-    by this process (the ownership fallback systemd takes where that ACL cannot be held, and
-    only over a read-only mount); 0400, or 0440 when root owns it and root's group is the
+    by this process (the ownership fallback systemd takes where that ACL cannot be held,
+    which is safe only over the read-only mount the directory check already required);
+    0400, or 0440 when root owns it and root's group is the
     only group the mode admits. The old rule — owner must equal the runtime uid, no group
     bit at all — described only the fallback, which is why five units that had their
     credential sealed, delivered and decrypted refused to start.
@@ -448,21 +494,6 @@ def _read_private_credential(path: Path) -> bytes:
                 f"systemd credential must be owned by uid {delivery_uid} or by the runtime "
                 f"uid {runtime_uid}, observed {observed.st_uid}"
             )
-        if observed.st_uid != delivery_uid:
-            # systemd hands the file's ownership to the service user only where the backing
-            # filesystem cannot hold an ACL, and its own comment says what makes that safe:
-            # "only safe if we can then re-mount the whole thing read-only, so that the user
-            # can no longer chmod() the file to gain write access" (systemd 252,
-            # src/core/execute.c, write_credential). So that is the condition here too —
-            # otherwise this is the one branch in which the owner could widen its own mode.
-            mount = _containing_mount(candidate.parent)
-            if mount is None or "ro" not in mount.options:
-                where = mount.point if mount is not None else str(candidate.parent)
-                raise ValueError(
-                    f"a credential owned by the runtime uid {runtime_uid} is systemd's "
-                    f"ownership fallback, which it only takes on a read-only mount; the "
-                    f"mount at {where} is not read-only"
-                )
         if observed.st_nlink != 1:
             raise ValueError(
                 f"systemd credential hardlink count must be one, observed {observed.st_nlink}"
