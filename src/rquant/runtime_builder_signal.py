@@ -570,8 +570,15 @@ def signal_router_builder(
             raise ValueError("default signal router requires complete manifest authority")
 
         # Whether this manifest describes a router at all is settled before anything is
-        # created: a role that is going to refuse over its own settings must not leave
-        # three artifacts behind on the way out. Nothing here touches the filesystem.
+        # created -- the gate above and these two -- because a role that is going to
+        # refuse over its own settings must leave the directory as it found it. Nothing
+        # here touches the filesystem.
+        #
+        # These two and `has_manifest_authority` above are the same predicate:
+        # `has_manifest_authority` is "a routing policy path and every source complete",
+        # and `SignalRouterSettings` / `SignalRouterSourceSettings` refuse the shapes in
+        # between outright. So each half alone is unobservable, and the mutation for this
+        # ordering has to move both to say anything at all.
         if not injected:
             if settings.routing_policy_path is None:
                 raise ValueError("default signal router authority is unavailable")

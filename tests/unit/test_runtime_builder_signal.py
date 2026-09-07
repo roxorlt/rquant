@@ -1527,3 +1527,22 @@ def test_the_signal_bus_exists_even_when_a_runner_source_refuses(tmp_path: Path)
 
     assert (tmp_path / "signal-bus.sqlite3").is_file()
     assert (tmp_path / "signal-spool").is_dir()
+
+
+def test_a_router_that_refuses_over_its_settings_creates_nothing(tmp_path: Path) -> None:
+    """The bus is created early for the plane's sake, not as a side effect of refusing.
+
+    `signal_router` owns three artifacts nobody else creates, and it builds them before
+    it opens any strategy's runner database so that the live plane's start order stops
+    being a cycle (#220). That is a reason to create them before reading *files*, not
+    before deciding whether this manifest describes a router at all: a role that is going
+    to refuse over its own settings must leave the directory as it found it.
+    """
+
+    manifest = _router_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="authority"):
+        build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+    assert not (tmp_path / "signal-bus.sqlite3").exists()
+    assert not (tmp_path / "signal-spool").exists()
