@@ -66,7 +66,7 @@
 
 ### Fixed
 
-- **五个 credstore unit 拿到了凭证却启动不了：判据描述的不是 systemd 的投递形状（#215 第三处断点）**：
+- **五个 credstore unit 拿到了凭证却启动不了：判据描述的不是 systemd 的投递形状（#230，#215 第三处断点）**：
   2026-09-08 02:04 生产机（systemd 255、`User=lighthouse`）实测，`LoadCredentialEncrypted=`
   交到服务手上的是——`/run/credentials/<unit>/` 一块 `ro,nosuid,nodev,noexec` 的内存挂载，
   目录 `root:root 0550`，`capabilities.json` 是 **`root:root 0440` 外加一条 ACL** 放行 lighthouse。
@@ -102,7 +102,11 @@
   `tests/unit/test_systemd_credential_delivery_shape.py`（28 例）与
   `tests/integration/test_systemd_credential_delivery_linux.py`（Linux root 门禁 15 例：真 tmpfs
   挂载、真只读重挂、root 造投递、非 root 子进程读回，含真 ACL 与真 EACCES；一处 skip 也没有，
-  连「这台机器能不能在 tmpfs 上放 ACL」都是运行期探测出来的）。
+  连「这台机器能不能在 tmpfs 上放 ACL」都是运行期探测出来的）。那 15 例全带 `linux_exact`、
+  不进任何分片，所以新增 CI job `route-a-credential-shape-linux`（3.11 / 3.12 各一路）跑它们：
+  裸 `ubuntu-24.04` runner（不是容器，因为要一块真能放 POSIX ACL 的 tmpfs）、`sudo -E` 取 root、
+  JUnit 契约钉 `--tests 15 --skipped 0`——非 root 会让整份文件 skip 掉，而一个绿着什么都没测的
+  门禁正是第三处断点当初溜过去的方式。
 
 - **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：
   2026-09-07 路线 A 第二窗口装的是**第一个有前代的 generation**（`bf2da6d8…` 装在 `7d572c79…`

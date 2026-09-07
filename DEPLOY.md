@@ -435,8 +435,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 这个结构性阻塞，第 13 条起的六条就是它带来的新前置；第 19 条来自 #213，第 20 条起的八条是
 2026-09-07 第一次真正跑完路线 A 之后的实战订正（runbook R-13…R-18），第 1、5、12 三条也按当时
 的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）；第 30、31 两条来自
-#227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）。
-下面三十一条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+#227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）；第 32 条来自 #230，
+也就是 #215 的第三处断点（凭证的投递形状）。
+下面三十二条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -800,6 +801,48 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     回滚就是 A-7 的回滚：`sudo cp -a /root/rquant-unit-backup-${STAMP}/* /etc/systemd/system/`
     加 `daemon-reload`。
 
+32. **凭证的判据已换成 systemd 自己的投递形状，装机前先核一次那块挂载**（#230，#215 的第三处断点；
+    裁决 19，**需 @roxorlt 知悉**）。#215 有三处断点，前两处（wrapper 白名单缺
+    `CREDENTIALS_DIRECTORY`、七个 role 的环境面）在上一节；第三处是**读者的判据描述的不是 systemd
+    真正投递的东西**。2026-09-08 02:04 第三窗口实测：`/run/credentials/<unit>/` 是一块
+    `ro,nosuid,nodev,noexec` 的内存挂载，目录 `root:root 0550`，`capabilities.json` 是
+    `root:root 0440` 外加一条放行 `lighthouse` 的 POSIX ACL；而旧判据要求
+    `st_uid == os.geteuid()` 且 `mode & 0o077 == 0`，属主与 group 位两条都不满足，五个 unit
+    因此全部起不来。包 E 的 e2e 用「当前用户属主 + 0400」造夹具，那是照着读者写的、不是照着
+    systemd 写的，所以这条一路绿到生产。
+
+    **新判据摘要**（每条都能指到 systemd 255 的出处，本地副本
+    `src/core/exec-credential.c` 与 `src/shared/mount-util.c`）：
+
+    | 面 | 要求 |
+    |---|---|
+    | 路径 | `/run/credentials/<本 unit>.service`；`/proc/self/cgroup` 读得出 `.service` 叶子时还要与本进程所属 unit 一致 |
+    | 目录属主 | `root:root`，**或**本进程 `uid:gid`（ACL 放不下时 systemd 的属主 fallback，`exec-credential.c:735` 一带的 `fchown(dfd, uid, gid)`） |
+    | 目录 mode | ∈ {0500, 0550, 0700} |
+    | 挂载 | tmpfs 或 ramfs、带 `nosuid,nodev,noexec`、**且是只读的**；再拿目录自己的 `st_dev` 到 `/proc/self/mountinfo` 反查，确认选中的确实是这一条 |
+    | 文件 | `O_NOFOLLOW` 打开、正规文件、nlink 1、属主 ∈ {0, 本进程 euid}、mode ∈ {0400, 0440} 且 `mode & 0o007 == 0`、带 group 读位时必须 `root:root`（ACL 投递就是这个形状）、读后 fstat 互校、1 MiB 上限 |
+
+    两处属主 fallback（文件 `exec-credential.c:198-204`、目录 `:735`）共用同一个安全前提，而且
+    是 systemd 自己写在注释里的：属主 fallback「only safe if we can then re-mount the whole thing
+    read-only, so that the user can no longer chmod() the file to gain write access」。systemd 在
+    把工作区移到最终位置之前**恒**重挂只读（`:869` 的 `MS_BIND|MS_REMOUNT` + `MS_MOVE`），所以
+    `ro` 对**每一种**形状都是硬要求，不只对 fallback 那一支。这两条合起来就是裁决 19（D4 放宽 +
+    `ro` 升硬要求），属 TCB 相邻变更，**向 owner @roxorlt 点名**。
+
+    **为什么 fallback 那一支不是远端角落**：`mount_credentials_fs`（`mount-util.c:1648`）的挂载
+    偏好是「tmpfs + `noswap`（需内核 ≥ 6.3）→ ramfs → 普通 tmpfs」，而 ramfs 根本不支持 POSIX ACL。
+    只要主机内核 < 6.3，systemd 就会走 ramfs 加完整属主 fallback（文件与目录都 chown 给服务用户），
+    当前判据接受这种形状——前提正是那块挂载只读。**换主机或换内核之后先核一次
+    `/proc/self/mountinfo` 与 `uname -r`**：两支现在都被接受，所以这次核对是确认，不是排雷。
+    （用瞬时 unit 探一次属生产写操作，**需 owner 单独授权**，本包没做。）
+
+    **同 uid 的角色之间靠两层叠加隔离**，不要只记形状层：形状层是「目录必须是本 unit 自己的」
+    （`/proc/self/cgroup` 读得出才施加），第二层是凭证内容里 `service_id` / `instance_name` /
+    `bundle_generation` 三核。
+
+    这一条**不改 `PRODUCTION_ROLE_POLICY`**，所以上一节那份角色策略摘要
+    （`681151cb…`）与由它推出的换代要求不受影响，**没有新增换代理由**。
+
 ### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，以及修 #218 时查出来的 #220；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
@@ -814,7 +857,7 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #193 | TP1 发布链路两处 `os.open` flag：`ldd` 输出里的 symlink 成员被 `O_NOFOLLOW` 拒（G-2）；`_copy_new_file` 缺 `O_NONBLOCK`，路径被换成 FIFO 可让 root publish 挂死（N-6） | **已修（本分支，同一 PR）**：闭包成员与 loader 按真实路径声明（`resolved_closure_member`），读侧 `_READ_FLAGS` 带 `O_NONBLOCK`。实测本机 `ldd` 报的三个成员都是普通文件，G-2 本来也不会命中；N-6 不再需要 Ctrl-C 兜底 |
 | #195 | WP9 rendezvous poll 与它自己在等的 SQLite 锁争用，helper 首次续约可能输给 `database is locked` | CI 间歇性红，不影响生产行为；重跑前先按此条判因 |
 | #198 | 2026-09-05 首次装机当场撞到的两处主机形状硬拒绝：**BLK-1** stage 报 `refused: standard library directory is missing: /usr/local/lib64/python3.11`（RHEL 系 `sysconfig` 把 `platstdlib` 指到一个发行版从不创建的目录）；**BLK-2** root publish 报 `RuntimeAuthorityPublishError: deployment lock ancestor / is unsafe`（可信祖先遍历要求 `/` 恰为 `root:root 0755`，OpenCloudOS 9.2 的 `/` 是发行版默认的 `0555`） | **已修（PR「fix(runtime): unblock the Release A first gate on a real RHEL host」，本条的修复分支）**：缺失的 `platstdlib` 移出闭包并在 `plan.json` 的 `closure_summary.skipped_stdlib_roots` 如实记录；`/`、`/etc`、`/var`、`/var/lib` 四个发行版自有目录改按「属主 root + 无 group/other 写位」判定，rQuant 自建目录与所有文件级校验不变（TCB 语义变更，详见 CHANGELOG 的 Security 一条）。**云端验收判据**：B-6' 的 `plan.json` 里 `closure_summary.stdlib_roots == ["/usr/lib64/python3.11"]` 且 `skipped_stdlib_roots == ["/usr/local/lib64/python3.11"]`；B-7 root publish 能取到部署锁；最终 `wrapper_preflight == 32`。**不要**拿 `publish --dry-run` 通过代替 B-7——dry-run 在取锁之前就返回 |
-| #215 | credstore 密封了 7 个实例，路线 A 首次安装时逐个 start 过的 6 个 role 一个都没能持续运行：`reference_slow_source` / `market_minute_source` / `auction_match_source` 在 wrapper 白名单子环境里构造 `Settings` 缺 5 个字段（与 #189 同类，只是发生在子环境里）；`daily_close_source` 报 `TUSHARE_TOKEN_MAIN capability is required`；`reference_slow_publisher` 报 `requires its isolated publication credential`；`notifier` 缺 route spool（另涉 #218） | 首次安装时全部 `systemctl stop` + `reset-failed` 防重启风暴，判据记 0/7（前置第 25 条）。**这是第二关的硬前置**——没有 `reference_slow_publisher` 就没有 serving generation，包 D 排不了。已派单独一包修 |
+| #215 | credstore 密封了 7 个实例，路线 A 首次安装时逐个 start 过的 6 个 role 一个都没能持续运行：`reference_slow_source` / `market_minute_source` / `auction_match_source` 在 wrapper 白名单子环境里构造 `Settings` 缺 5 个字段（与 #189 同类，只是发生在子环境里）；`daily_close_source` 报 `TUSHARE_TOKEN_MAIN capability is required`；`reference_slow_publisher` 报 `requires its isolated publication credential`；`notifier` 缺 route spool（另涉 #218） | 首次安装时全部 `systemctl stop` + `reset-failed` 防重启风暴，判据记 0/7（前置第 25 条）。**这是第二关的硬前置**——没有 `reference_slow_publisher` 就没有 serving generation，包 D 排不了。已派单独一包修。**这个号下面一共三处断点**：wrapper 白名单缺 `CREDENTIALS_DIRECTORY`、七个 role 的环境面，以及**读者的凭证判据描述的不是 systemd 真正投递的形状**（另立 #230，见前置第 32 条） |
 | #216 | 换代之后旧实例留下的心跳文件仍在，`spec_fingerprint` 属于旧 spec，新代同一角色启动即报 `runtime heartbeat does not match the requested service spec` | 手工把已停实例的心跳文件移走再启动（前置第 21 条），首次安装时在 `runtime_health_publisher` 与 `serving_publisher` 上各命中一次。正确修法是发布链路自己作废旧代心跳，与 #215 同一包 |
 | #217 | research 平面四个角色（`lab_artifact_catalog` / `promotions_publisher` / `shadow_session` / `lab_jobs_publisher`）启动即 `FAIL research blocked: high-water evidence unavailable or invalid: /var/lib/rquant/workload-isolation/high-water.json` 并退 0。这是 workload arbiter 的资源门，不是崩溃，但这份高水位证据由谁产出、什么时候产出，仓库里没有答案 | 判据按「已启动、被门挡住」记，不计入持续运行数（前置第 27 条）。要让 research 平面真跑起来，得先定这份文件的产生者，本轮不做 |
 | #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | **已修（PR「fix(runtime): unlock the live strategy chain and recovery units under route A」）**：A 完成签名器改成先 `model_dump(mode="json")` 再重验（冻结过的 manifest 不再被自己的 `JsonValue` 断言拒掉）；B 两个 recovery oneshot 改核自己命名空间里的 `recovery_profile_generation`，权威链那道绑定另走 `resolve_legacy_schema_generation`，两者都不给的调用方被拒；C 新增 `scripts/provision_runtime_recovery_credentials.py` 产出那两份从来没有生产者的文档（前置第 29 条）。router / broker / notifier 那条链不是单独的缺陷，是启动顺序，见 #220 与前置第 28 条 |
