@@ -1508,3 +1508,22 @@ def test_a_runner_path_replaced_by_a_symlink_still_fails_closed(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="symlink"):
         build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+
+def test_the_signal_bus_exists_even_when_a_runner_source_refuses(tmp_path: Path) -> None:
+    """Why the bus is created first, and not merely before the routing step.
+
+    Only this role creates `live/signal-bus/signal_bus.sqlite3`, and `strategy_live` opens
+    it read-only while building its own step. A router that refuses because one strategy's
+    database is unreadable must still have left the bus, or that one strategy's state takes
+    every strategy on the plane down with it — the shape of #220.
+    """
+
+    manifest = _without_runner_database(tmp_path)
+    Path(str(manifest.settings["runner_state_path"])).write_bytes(b"not a sqlite database")
+
+    with pytest.raises(ValueError):
+        build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+    assert (tmp_path / "signal-bus.sqlite3").is_file()
+    assert (tmp_path / "signal-spool").is_dir()

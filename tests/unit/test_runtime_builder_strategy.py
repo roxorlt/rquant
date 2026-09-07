@@ -1237,10 +1237,12 @@ def test_the_feature_consumer_writes_nothing_inside_the_producer_root(
         create_paper_broker=False,
     )
     spool_root = Path(str(manifest.settings["feature_spool_root"]))
-    runner_root = Path(str(manifest.settings["runner_state_path"])).parent
     before = tree_state(spool_root)
 
-    with readonly_runtime(tmp_path, writable=[runner_root]) as violations:
+    #: the producer's directory is the whole sandbox here: `_manifest` keeps the runner
+    #: database directly under `tmp_path`, so anything wider would also cover what the
+    #: strategy legitimately owns and the guard would never fire
+    with readonly_runtime(spool_root) as violations:
         step = strategy_live_builder(
             clock=lambda: NOW,
             completion_attestation_signer=signer,
@@ -1327,3 +1329,32 @@ def test_a_signal_bus_that_is_present_and_unsafe_still_fails_closed(
             completion_attestation_active_key_id=key_id,
         )(manifest)
     assert not isinstance(raised.value, PeerArtifactUnavailableError)
+
+
+def test_a_strategy_that_refuses_to_start_still_leaves_its_runner_database(
+    tmp_path: Path,
+) -> None:
+    """Why the runner store is built first, and not merely early.
+
+    `signal_router` reads `live/strategies/<svc>/runner.sqlite3` and no other role can
+    create it. A strategy that refuses to start for any reason of its own — here a feature
+    spool whose producer root anyone could write to — must still leave that file behind,
+    or one broken strategy takes the router down with it, which is what #232 was.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    Path(str(manifest.settings["feature_spool_root"])).chmod(0o755)
+
+    with pytest.raises(FeatureSpoolIntegrityError):
+        strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+
+    assert Path(str(manifest.settings["runner_state_path"])).is_file()
