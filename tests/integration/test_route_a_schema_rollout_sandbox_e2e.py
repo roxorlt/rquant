@@ -361,6 +361,42 @@ def test_a_producer_participant_names_the_sandbox_instead_of_the_sqlite_error(
     assert str(rollout.rollout_root) in message
 
 
+def test_a_wal_store_left_by_the_installed_build_fails_closed_with_a_named_reason(
+    rollout: RolloutWorld,
+) -> None:
+    """The store the second window actually installed is WAL, and this says what happens.
+
+    A build without this fix wrote every rollout state in WAL, so the host's
+    `control/schema-rollouts` holds WAL stores right now. Fixing the reader does not fix
+    those: nothing can read a WAL database without creating a wal-index beside it. The role
+    therefore still refuses — but it says which store, that it is WAL, and which sandbox
+    setting is in the way, which is the sentence that tells an operator to have the
+    installer reopen it rather than to go looking at SQLite.
+    """
+
+    plan_id = rollout.plan_ids()[0]
+    path = rollout.state_path(plan_id)
+    path.parent.chmod(0o755)
+    try:
+        connection = sqlite3.connect(path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+        finally:
+            connection.close()
+    finally:
+        for leftover in path.parent.glob("state.sqlite3-*"):
+            leftover.unlink()
+        path.parent.chmod(0o555)
+
+    with pytest.raises(SchemaRolloutStateUnavailableError) as caught:
+        rollout.run_role_in_wrapper_environment(READ_ONLY_ROLES[0])
+
+    message = str(caught.value)
+    assert "WAL" in message
+    assert "ReadWritePaths" in message
+    assert str(path) in message
+
+
 def test_the_admission_read_itself_fails_closed_on_an_unreadable_store(
     rollout: RolloutWorld,
 ) -> None:
