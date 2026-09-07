@@ -434,9 +434,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 和凭证侧的增量装法；另一个 PR（#207）修好了「权威 generation 与 legacy generation 是两个命名空间」
 这个结构性阻塞，第 13 条起的六条就是它带来的新前置；第 19 条来自 #213，第 20 条起的八条是
 2026-09-07 第一次真正跑完路线 A 之后的实战订正（runbook R-13…R-18），第 1、5、12 三条也按当时
-的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）；第 30 条来自
-#227 的第二包（十六个 unit 的 rollout 写权限与安装器代做的 PREPARE 承认）。
-下面三十条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）；第 30、31 两条来自
+#227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）。
+下面三十一条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -765,6 +765,40 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     - **#228 仍然在**：只要 `changed_runtime_schema_channels` 的指纹里带 `producer_commit`，
       今后每一次纯代码发布都会凭空生出十六份计划，acknowledge 就得每次都跑一遍，
       `control/schema-rollouts` 下的目录数每发一版加十六（没有任何代码清理旧计划目录）。
+
+31. **十六个 runtime unit 文件必须按 A-7 的做法重装一次，否则第 30 条做完 unit 还是写不了**
+    （#227，owner 2026-09-07 授权 A）。第 30 条把计划推到了 DUAL_WRITE，而 DUAL_WRITE 阶段
+    生产者要往计划的哈希链上写双写记录、`rquant-runtime-serving@` 要写 serving generation 回执，
+    两样都要在 `state.sqlite3` 旁边建事务日志——那是**目录**写权限。生产上装着的还是
+    2026-09-05 那一版 unit，`ReadWritePaths` 一个都不含 `control/schema-rollouts`，
+    所以光装新代码不改 unit，DUAL_WRITE 一开始写就撞回 #227 的形状。
+
+    **位置：第 ④ 步装 bundle 之后、第 28 条起 unit 之前**；与第 30 条谁先谁后都行
+    （acknowledge 跑在无 `.env` 的 bootstrap worktree 里，不经过 unit 沙箱）。
+    **这是 `deploy/systemd/` 改动，属高风险变更，要 owner 单独明确授权，不走无人值守发布器。**
+
+    ```bash
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    sudo install -d -m 0700 "/root/rquant-unit-backup-${STAMP}"
+    for f in "${WT}"/deploy/systemd/rquant-runtime-*@.service; do
+      u="$(basename "$f")"
+      grep -q 'control/schema-rollouts' "$f" || continue     # 只重装这次改过的那 16 个
+      sudo cp -a "/etc/systemd/system/${u}" "/root/rquant-unit-backup-${STAMP}/"
+      sudo cp "$f" "/etc/systemd/system/${u}"
+      sudo systemd-analyze verify "/etc/systemd/system/${u}"
+    done
+    sudo systemctl daemon-reload
+    grep -c control/schema-rollouts /etc/systemd/system/rquant-runtime-*@.service | grep -c ':1$'
+    ```
+
+    最后那行应当输出 **16**，且 `systemd-analyze verify` 逐个退 0。
+    **云端语法已经先验过**：协调者 2026-09-07 在 82.156.0.68 的临时目录里对这 16 个文件跑过
+    `systemd-analyze verify`，**16/16 通过**；装到 `/etc/systemd/system/` 之后仍要再验一遍，
+    因为那时才会去解析 `Slice=` 与 drop-in。
+
+    另外七个 runtime unit 一点都不给，不要顺手一起 `cp`——那会把授权面从十六个扩到二十三个。
+    回滚就是 A-7 的回滚：`sudo cp -a /root/rquant-unit-backup-${STAMP}/* /etc/systemd/system/`
+    加 `daemon-reload`。
 
 ### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，以及修 #218 时查出来的 #220；末列写「已修」的条目已修，其余不修）
 
