@@ -32,6 +32,21 @@ from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeService
 COMMIT = "a" * 40
 
 
+def _retention_manifests(generation: str) -> tuple[SimpleNamespace, ...]:
+    """The one manifest setting the recovery unit now checks its own generation against.
+
+    `runtime_production_profile` puts `recovery_profile_generation` on the retention owner's
+    manifest, and that is the bundle's only record of the recovery block's content hash
+    outside the recovery block itself. These stubs used to carry no manifests at all, which
+    is part of why the old cross-namespace comparison went unnoticed (#218 B).
+    """
+
+    return (
+        SimpleNamespace(settings={"managed_root": "/does/not/matter"}),
+        SimpleNamespace(settings={"recovery_profile_generation": generation}),
+    )
+
+
 def _profile(tmp_path: Path) -> RuntimeDeploymentProfile:
     manifest = RuntimeServiceManifest(
         service_id="lab-jobs.serving.v1",
@@ -389,7 +404,11 @@ def test_recovery_production_runner_resolves_every_argument_from_current_profile
             "recovery_service_arguments": lambda self: recovery_arguments,
         },
     )()
-    profile = type("Profile", (), {"recovery": recovery})()
+    profile = type(
+        "Profile",
+        (),
+        {"recovery": recovery, "manifests": _retention_manifests(generation)},
+    )()
     backup_config = object()
     observed: dict[str, object] = {}
     monkeypatch.setattr(
@@ -477,7 +496,7 @@ def test_recovery_rehearsal_skips_idempotently_until_profile_interval_is_due(
         backup_config_path=tmp_path / "backup-config.json",
         recovery_service_arguments=lambda: recovery_arguments,
     )
-    profile = SimpleNamespace(recovery=recovery)
+    profile = SimpleNamespace(recovery=recovery, manifests=_retention_manifests(generation))
     backup_config = object()
     monkeypatch.setattr(
         "rquant.runtime_deployment_profile.load_current_runtime_deployment_profile",
@@ -540,7 +559,8 @@ def test_recovery_production_runner_rejects_stale_unit_generation(
                 "Recovery",
                 (),
                 {"profile_generation": current_generation},
-            )()
+            )(),
+            "manifests": _retention_manifests(current_generation),
         },
     )()
     monkeypatch.setattr(

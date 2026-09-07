@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #213's to PR #219's. It is the merge base of the
+    # main; this one moves it from PR #219's to PR #221's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "a90f9276c1405c186b5a2dda7c79e99d4cfd8e1f"
-    assert BASELINE_TREE_SHA == "14843e03158720d46a285c0ef9491fc75d922ed1"
+    assert BASELINE_COMMIT_SHA == "48bd3d83b69ff093dae808eb81b4808e1e1d8f80"
+    assert BASELINE_TREE_SHA == "4fd0a3642a6e315b860a4cc7614d2bd71ae70fbd"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``a90f927`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``48bd3d8`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1488,9 +1488,10 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # were named on the same false premise; the refreeze to 2db3846 dropped them, the refreeze
     # to 2238d9e put .github/workflows/ci.yml back because that topic added a job to it, the
     # refreeze to f760378 took it out again, the refreezes to 77ddb32 and 695e952 left it out,
-    # and this refreeze to a90f927 puts it back once more, because this topic adds the
-    # credstore container job. A named path would have flipped truth value
-    # four times in seven refreezes: naming one
+    # the refreeze to a90f927 put it back once more because that topic added the credstore
+    # container job, and this refreeze to 48bd3d8 takes it out again, because the strategy
+    # chain touches no workflow. A named path would have flipped truth value
+    # five times in eight refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted

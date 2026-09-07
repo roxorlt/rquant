@@ -393,7 +393,10 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 - **服务状态口径**（协调者 2026-09-04 已接受的应急口径，起因是 #191）：
   **13 个持续运行**（带降级警告，因为旧目录结构还不存在，这是设计）
   + **1 个 oneshot 跑完退 0**
-  + **`rquant-runtime-strategy@` failed（设计，协调者已裁定）**
+  + ~~**`rquant-runtime-strategy@` failed（设计，协调者已裁定）**~~ **这条口径作废（#218 A）**：
+  那次 failed 的真实原因是 completion signer 把已冻结的 profile manifest 又验了一遍，报
+  `strategy completion signer profile contains invalid manifests`，是代码缺陷不是设计。
+  修好之后 `strategy_live` 按前置第 28 条的顺序起两轮即可进服务循环，判据里它算**持续运行**。
   + **`rquant-lab-claim-finalizer` 受阻**（缺仓库外的 `/etc/rquant` 输入，journal 追加到 #191，
   留到影子窗口前修）
   + **10 个未启用**（7 个等 credstore 密钥、3 个硬依赖旧目录结构；预期状态是「未启用」，不是失败）。
@@ -431,7 +434,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 和凭证侧的增量装法；另一个 PR（#207）修好了「权威 generation 与 legacy generation 是两个命名空间」
 这个结构性阻塞，第 13 条起的六条就是它带来的新前置；第 19 条来自 #213，第 20 条起的八条是
 2026-09-07 第一次真正跑完路线 A 之后的实战订正（runbook R-13…R-18），第 1、5、12 三条也按当时
-的实测就地订正过。下面二十七条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）。
+下面二十九条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -604,8 +608,82 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     /var/lib/rquant/workload-isolation/high-water.json`，然后**退 0**（`Result=success`）。
     这是 workload arbiter 的资源门，不是崩溃、也不是 bug；谁在什么时候产出这份文件，
     仓库里还没有答案。判据里 research 平面按「已启动、被门挡住」记，**不计入持续运行数**。
+28. **C-3 的 live 平面按固定顺序起，第一轮 strategy 失败是这条链的一部分，不是事故**（#218 A、#220）。
+    `strategy_live` 的构造器要读 `<运行根>/live/signal-bus/signal_bus.sqlite3`，而 28 个 role 里
+    只有 `signal_router` 会建这个文件；`signal_router` 又在建它之前先要求三份
+    `live/strategies/*/runner.sqlite3` 存在——两边互相等对方（#220，代码层的循环依赖，本轮
+    不修，`deploy/systemd/` 的 `After=` 也没动）。能走通是因为 `strategy_live` 在开 signal bus
+    之前就已经把自己的 `runner.sqlite3` 建好了，所以第一轮失败会留下 router 需要的东西。
+    **按下面四步起，中间用三条探针卡住：**
 
-### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218；末列写「已修」的条目已修，其余不修）
+    ```bash
+    ROOT=/home/lighthouse/rquant/data/runtime
+    ```
+
+    ① 起 `rquant-runtime-strategy@` ×3。**这一轮预期失败**，失败信息必须是
+    `runner source is unavailable: <ROOT>/live/signal-bus/signal_bus.sqlite3`。
+    **如果报的还是 `completion signer profile contains invalid manifests`，说明装的不是本代**
+    （#218 A 的修复没进去），停下来查画像代次，不要往下走。
+
+    ② 探针 1 转 READY（三份 runner 数据库都在）之后再起 `rquant-runtime-signal-router@`：
+
+    ```bash
+    for _ in $(seq 1 30); do
+      [ "$(ls -1 "$ROOT"/live/strategies/*/runner.sqlite3 2>/dev/null | wc -l)" -eq 3 ] && break
+      sleep 2
+    done
+    test "$(ls -1 "$ROOT"/live/strategies/*/runner.sqlite3 2>/dev/null | wc -l)" -eq 3 \
+      && echo READY || echo WAIT
+    ```
+
+    ③ 探针 0（signal bus 已建出）与探针 2（router 至少跑完一个 step）都转 READY 之后，
+    **显式** `systemctl reset-failed` 再重启三个 `rquant-runtime-strategy@`，这一轮返回 0
+    进服务循环：
+
+    ```bash
+    test -f "$ROOT/live/signal-bus/signal_bus.sqlite3" && echo READY || echo ABSENT   # 探针 0
+    test -f "$ROOT/live/signal-bus/spool/source.json" && echo READY || echo WAIT      # 探针 2
+    ```
+
+    **不要指望 `Restart=on-failure` 自愈**：`rquant-runtime-strategy@.service` 是
+    `StartLimitIntervalSec=600s` / `StartLimitBurst=5` / `RestartSec=10s`，第 ① 步失败后
+    大约 50 秒内没完成第 ② 步，三个实例就进 `failed`，那时无论如何都要
+    `systemctl reset-failed` 后手动 `start`。所以 runbook 直接写成显式的第 ③ 步。
+
+    ④ 最后才起 `rquant-runtime-paper-broker@` 与 `rquant-runtime-notifier@`（它们等的
+    route spool 就是探针 2 那份 `source.json` 所在的目录）。
+
+    三条探针的产物在 `tests/integration/test_route_a_strategy_chain_e2e.py` 里都被断言过，
+    路径与生产画像 `runtime_production_profile.py` 一致，不是从代码推出来的。
+29. **bundle 装完、`current` 指向本代之后，在主机上生成 recovery 的两份文档**（#218 C）。
+    `data/recovery/runtime-recovery.json` 与 `runtime-recovery-backup.json` 由已安装画像指定路径，
+    但在此之前**仓库里没有任何脚本、CLI 或文档产出过它们**，两个 recovery oneshot 因此一直缺输入。
+    前置是目录本身：
+
+    ```bash
+    sudo install -d -m 0700 -o lighthouse -g lighthouse /home/lighthouse/rquant/data/recovery
+    ```
+
+    然后跑生成器（replay 窗口是唯一要人判断的输入，**必须落在已发布生产数据集真实覆盖的范围内**）：
+
+    ```bash
+    /home/lighthouse/rquant/.venv/bin/python scripts/provision_runtime_recovery_credentials.py \
+      --runtime-root /home/lighthouse/rquant/data/runtime \
+      --replay-start-date <YYYY-MM-DD> --replay-end-date <YYYY-MM-DD> \
+      --only-missing
+    ```
+
+    - **首次落 `runtime-recovery.json` 属新增生产密钥材料，需 owner 单独明确授权**
+      （受控自动发布模式第 7 条），**不能走无人值守发布器**。HMAC 密钥由脚本现场生成，
+      从不打印，也没有任何传入密钥的参数；两份文档都以 0600 经暂存改名原子落盘。
+    - `--only-missing` 的语义是「已经有就保留」：已存在且是 0600 的普通文件原样不动。
+      **已存在但权限被放宽（例如被 `chmod 0644`）或不是普通文件时，脚本报错退出，不覆盖**——
+      静默换掉密钥会让 publication root 里已签的每一份 receipt 与 pointer 全部验不过。
+      报错里带路径、实测 mode、期望 mode 和该敲的 `chmod 0600 <path>`。
+      **不要为了绕过报错去掉 `--only-missing`**：不带这个参数就是明确要求重新生成，会真的换密钥。
+    - 详细操作说明见 `docs/operations/runtime-recovery-credentials.md`。
+
+### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，以及修 #218 时查出来的 #220；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -622,7 +700,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #215 | credstore 密封了 7 个实例，路线 A 首次安装时逐个 start 过的 6 个 role 一个都没能持续运行：`reference_slow_source` / `market_minute_source` / `auction_match_source` 在 wrapper 白名单子环境里构造 `Settings` 缺 5 个字段（与 #189 同类，只是发生在子环境里）；`daily_close_source` 报 `TUSHARE_TOKEN_MAIN capability is required`；`reference_slow_publisher` 报 `requires its isolated publication credential`；`notifier` 缺 route spool（另涉 #218） | 首次安装时全部 `systemctl stop` + `reset-failed` 防重启风暴，判据记 0/7（前置第 25 条）。**这是第二关的硬前置**——没有 `reference_slow_publisher` 就没有 serving generation，包 D 排不了。已派单独一包修 |
 | #216 | 换代之后旧实例留下的心跳文件仍在，`spec_fingerprint` 属于旧 spec，新代同一角色启动即报 `runtime heartbeat does not match the requested service spec` | 手工把已停实例的心跳文件移走再启动（前置第 21 条），首次安装时在 `runtime_health_publisher` 与 `serving_publisher` 上各命中一次。正确修法是发布链路自己作废旧代心跳，与 #215 同一包 |
 | #217 | research 平面四个角色（`lab_artifact_catalog` / `promotions_publisher` / `shadow_session` / `lab_jobs_publisher`）启动即 `FAIL research blocked: high-water evidence unavailable or invalid: /var/lib/rquant/workload-isolation/high-water.json` 并退 0。这是 workload arbiter 的资源门，不是崩溃，但这份高水位证据由谁产出、什么时候产出，仓库里没有答案 | 判据按「已启动、被门挡住」记，不计入持续运行数（前置第 27 条）。要让 research 平面真跑起来，得先定这份文件的产生者，本轮不做 |
-| #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | 本轮不修，已派只读勘察定根因（signer manifest 为什么无效、依赖链怎么接、`data/recovery/runtime-recovery.json` 的生产者是谁）与分包估算 |
+| #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | **已修（PR「fix(runtime): unlock the live strategy chain and recovery units under route A」）**：A 完成签名器改成先 `model_dump(mode="json")` 再重验（冻结过的 manifest 不再被自己的 `JsonValue` 断言拒掉）；B 两个 recovery oneshot 改核自己命名空间里的 `recovery_profile_generation`，权威链那道绑定另走 `resolve_legacy_schema_generation`，两者都不给的调用方被拒；C 新增 `scripts/provision_runtime_recovery_credentials.py` 产出那两份从来没有生产者的文档（前置第 29 条）。router / broker / notifier 那条链不是单独的缺陷，是启动顺序，见 #220 与前置第 28 条 |
+| #220 | live 平面的启动顺序是代码层的循环依赖：`strategy_live` 要读 `live/signal-bus/signal_bus.sqlite3`，只有 `signal_router` 会建它，而 `signal_router` 又先要求三份 `live/strategies/*/runner.sqlite3` | **不修，用顺序绕过**（前置第 28 条：strategy ×3 起一轮留下 runner 数据库 → router → 显式 `reset-failed` 重启 strategy ×3 → broker / notifier）。根治要么把 router 的建库提到 runner 源检查之前，要么放宽 strategy 的失败关闭（后者不做）；`tests/integration/test_route_a_strategy_chain_e2e.py` 已经把当前行为钉住，改哪一边都会被它接住 |
 
 ### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
 
@@ -1089,10 +1168,14 @@ failure（`https://github.com/roxorlt/rquant/actions/runs/33172825610`）：R07 
    owner 里 `notifier` 与 `reference_slow_publisher` 都在推迟组）。`rquant-runtime-strategy@`
    在启用名单内，但按 U-12 裁决它在无 legacy `data/runtime/current` 时硬失败（PA-1 D-3，协调者已裁定：
    **failed 是设计**，不是事故；路线 A 产出 `current` 之后它仍受 #187 阻塞）。
+   **「failed 是设计」这句到路线 A 为止**：2026-09-07 装机时 `current` 已经在了，`strategy_live`
+   仍然三个全失败，报的是 `completion signer profile contains invalid manifests`（#218 A，代码缺陷）。
+   #218 修好之后，`strategy_live` 在路线 A 下按前置第 28 条的顺序起两轮就进服务循环，不再有
+   「预期 failed」这一档。
 
    **第一关放行判据（定稿，与 runbook 附录 S 一致）**：15 个 kind-backed / oneshot unit `active`
    （degraded：心跳带 `runtime_root_unavailable`，WARNING 日志可见）+ `rquant-runtime-strategy@` failed
-   （设计）+ 10 个「未启用」。**首次启动前必须由运维按各 unit 的 `ReadWritePaths=` 预建目录**（见 issue #192
+   （~~设计~~，#218 A 之后作废，见上一段）+ 10 个「未启用」。**首次启动前必须由运维按各 unit 的 `ReadWritePaths=` 预建目录**（见 issue #192
    与 runbook v2 的 C-1 步骤）：这 16 个 unit 的 `ReadWritePaths=` 现在每条都带 `-` 前缀（#192 的一半已修），
    路径缺失不再让 systemd 在挂载命名空间搭建阶段以 `226/NAMESPACE` 失败。**但预建目录这一步不能省**：
    这些 unit 带 `ProtectSystem=strict` + `ProtectHome=read-only`，被 `-` 忽略掉的路径不会变成可写挂载点，
