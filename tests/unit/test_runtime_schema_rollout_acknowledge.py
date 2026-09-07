@@ -286,6 +286,25 @@ def test_raising_the_ceiling_past_dual_write_is_refused_before_the_plan_moves(
     assert all(rollout.phase(plan_id) is RolloutPhase.PREPARE for plan_id in rollout.plan_ids)
 
 
+def test_a_preview_under_a_raised_ceiling_refuses_instead_of_previewing_it(
+    rollout: Rollout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A preview is what an operator reads before deciding, so it must refuse the same way.
+
+    Without this the dry run of a build whose ceiling had been raised would answer
+    "would advance to cutover" — a plan for something the apply path then refuses, which is
+    the worst of both: it reads like an authorisation and is not one.
+    """
+
+    monkeypatch.setattr(
+        bundle, "SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING", RolloutPhase.CUTOVER, raising=True
+    )
+
+    with pytest.raises(RuntimeSchemaCompatibilityError, match="no further than dual_write"):
+        acknowledge_runtime_schema_rollout_preparation(rollout.root, now=LATER, dry_run=True)
+
+
 def test_a_second_run_records_nothing_and_says_so(rollout: Rollout) -> None:
     """Idempotent by observation, not by replay: the second run finds nothing left to do."""
 

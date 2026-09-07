@@ -2448,6 +2448,23 @@ class RuntimeSchemaRolloutAcknowledgement(RuntimeContractModel):
         return bool(self.acknowledged_producers) or self.advanced
 
 
+def _require_installer_phase_ceiling() -> RolloutPhase:
+    """Refuse to run at all if the ceiling ever says anything but DUAL_WRITE.
+
+    Checked on both paths, and before either of them reads a plan: a preview that reported
+    "would advance to cutover" would be a preview of something this code must never do, and a
+    preview is what an operator reads before deciding.
+    """
+
+    if SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING is not RolloutPhase.DUAL_WRITE:
+        raise RuntimeSchemaCompatibilityError(
+            "the installer may carry a schema rollout no further than dual_write; every "
+            "later phase is signed by evidence only the running producers and the trusted "
+            "consumers can produce"
+        )
+    return SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING
+
+
 def _rollout_acknowledgement_preview(
     root: Path,
     *,
@@ -2456,6 +2473,7 @@ def _rollout_acknowledgement_preview(
 ) -> RuntimeSchemaRolloutAcknowledgement:
     """Read one plan without writing anything, including without converting its journal."""
 
+    ceiling = _require_installer_phase_ceiling()
     path = _schema_rollout_root(root, plan_id) / "state.sqlite3"
     layout = persisted_rollout_journal_layout(path)
     authority = _read_schema_rollout_authority(
@@ -2509,7 +2527,7 @@ def _rollout_acknowledgement_preview(
     fields["acknowledged_producers"] = pending
     fields["already_acknowledged_producers"] = done
     fields["advanced"] = True
-    fields["phase_after"] = SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING
+    fields["phase_after"] = ceiling
     return RuntimeSchemaRolloutAcknowledgement(**fields)
 
 
@@ -2522,6 +2540,7 @@ def _apply_rollout_acknowledgement(
 ) -> RuntimeSchemaRolloutAcknowledgement:
     """Record the producers' PREPARE acknowledgements and stop at the installer's ceiling."""
 
+    ceiling = _require_installer_phase_ceiling()
     rollout_root = _schema_rollout_root(root, plan_id)
     path = rollout_root / "state.sqlite3"
     layout_before = persisted_rollout_journal_layout(path)
@@ -2593,16 +2612,10 @@ def _apply_rollout_acknowledgement(
         recorded.append(participant_id)
     fields["acknowledged_producers"] = tuple(recorded)
     fields["already_acknowledged_producers"] = tuple(already)
-    if SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING is not RolloutPhase.DUAL_WRITE:
-        raise RuntimeSchemaCompatibilityError(
-            "the installer may carry a schema rollout no further than dual_write; every "
-            "later phase is signed by evidence only the running producers and the trusted "
-            "consumers can produce"
-        )
     state = store.advance(
         plan_id=plan_id,
         expected_revision=state.revision,
-        target_phase=SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING,
+        target_phase=ceiling,
         now=now,
         operation_id=f"installer-dual-write:{plan_id}",
     )
