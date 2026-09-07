@@ -636,7 +636,7 @@ wrapper，而 wrapper 从空环境起、只复制 profile 白名单里的名字�
 
 | | 值 |
 |---|---|
-| 角色策略摘要（旧，`origin/main` `695e952`） | `6282aa50fca9cfca113a966379187202bdb975a04072b1beaf9ee5b8bb1ab102` |
+| 角色策略摘要（旧，生产在跑的 `v0.32.2` `695e952`；合并基 `origin/main` `a90f927` 的 `runtime_authority.py` 与它逐字节相同） | `6282aa50fca9cfca113a966379187202bdb975a04072b1beaf9ee5b8bb1ab102` |
 | 角色策略摘要（新，含 `CREDENTIALS_DIRECTORY`） | `681151cbdfa310a83adb5ede906c1970913e1398960d8136b92c0b3114f44167` |
 | 生产 `profile_id`（旧，2026-09-07 sequence 3 在用） | `d2206e53…7ea0` |
 | 生产 `profile_id`（新） | 装机当场由 `runtime-authority-stage` 算出（含主机闭包与实例标签，本地算不了） |
