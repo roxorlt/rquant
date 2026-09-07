@@ -93,7 +93,7 @@ def _production_bundle(
     *,
     producer_commit: str,
     runtime_root: Path | None = None,
-) -> tuple[Any, Any, Any]:
+) -> tuple[Any, Any, Any, dict[str, bytes]]:
     """Install a real production deployment bundle at a temporary runtime root.
 
     The recipe is `test_runtime_production_profile`'s
@@ -102,6 +102,11 @@ def _production_bundle(
     the commit the wrapper will forward. Two seams stay: sealing runtime credentials needs
     `systemd-creds` under sudo, which no test can have, and it is not on the path under
     test.
+
+    The credential plaintexts the bundle built for that seam are kept and returned rather
+    than dropped. They are the real thing — `serialize_runtime_credential` over the real
+    capability values, stamped with this bundle's own generation — and the credstore
+    acceptance (`test_route_a_credstore_roles_e2e`) seals and unseals exactly those.
     """
 
     import base64
@@ -132,6 +137,8 @@ def _production_bundle(
 
         def rollback(self) -> None:
             pass
+
+    sealed: dict[str, bytes] = {}
 
     authority = MarketCalendarAuthority.create(
         schema_version=1,
@@ -206,9 +213,13 @@ def _production_bundle(
         "rquant.runtime_deployment_bundle._recover_runtime_credentials",
         lambda **_kwargs: _NoCredentialRecovery(),
     )
+    def _capture(credentials: dict[str, bytes]) -> _NoCredentialTransaction:
+        sealed.update(credentials)
+        return _NoCredentialTransaction()
+
     monkeypatch.setattr(
         "rquant.runtime_deployment_bundle._seal_runtime_credentials",
-        lambda _credentials: _NoCredentialTransaction(),
+        _capture,
     )
     receipt = install_runtime_deployment_profile(
         profile,
@@ -227,7 +238,7 @@ def _production_bundle(
     registry_path = Path(str(constraint.settings["reference_registry_path"]))
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     ReferenceRegistry(registry_path)
-    return inputs, profile, receipt
+    return inputs, profile, receipt, sealed
 
 
 class _StopAfterOneIteration(Event):
@@ -260,6 +271,8 @@ class RouteAWorld:
         self.profile: Any = None
         self.receipt: Any = None
         self.plan: Any = None
+        #: instance label -> the credential plaintext the bundle sealed for it.
+        self.sealed_credentials: dict[str, bytes] = {}
 
     # -- construction -------------------------------------------------------------
 
@@ -338,12 +351,13 @@ def _route_a_world(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, runtime_root: Path | None = None
 ) -> RouteAWorld:
     world = World(tmp_path / "root", monkeypatch).build()
-    inputs, profile, receipt = _production_bundle(
+    inputs, profile, receipt, sealed = _production_bundle(
         tmp_path, monkeypatch, producer_commit=world.commit, runtime_root=runtime_root
     )
     route = RouteAWorld(world, inputs.runtime_root)
     route.profile = profile
     route.receipt = receipt
+    route.sealed_credentials = sealed
     return route
 
 

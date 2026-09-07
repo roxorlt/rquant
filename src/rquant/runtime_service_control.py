@@ -245,6 +245,39 @@ class RuntimeServiceControl:
         identity = canonical_sha256({"service_id": spec.service_id})
         return Path(root).resolve() / "heartbeats" / f"{identity}.json"
 
+    @classmethod
+    def _lock_path_for(cls, root: Path, spec: RuntimeServiceSpec) -> Path:
+        identity = canonical_sha256({"service_id": spec.service_id})
+        return Path(root).resolve() / "locks" / f"{identity}.lock"
+
+    @classmethod
+    def _service_lock_is_held(cls, root: Path, spec: RuntimeServiceSpec) -> bool:
+        """Whether some process is holding this service's singleton lock right now.
+
+        This is the liveness question the heartbeat itself cannot answer: it records no pid,
+        and a pid would be a stale number the moment it was written. The lock is the same
+        one `start()` takes, so "nobody holds it" is exactly "no process is running this
+        service". Anything that stops the probe from answering counts as held, so an
+        unreadable lock never turns into a licence to overwrite a live service's heartbeat.
+        """
+
+        path = cls._lock_path_for(root, spec)
+        try:
+            descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(descriptor)
+
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:
         descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -306,7 +339,9 @@ class RuntimeServiceControl:
                 f"runtime service {self.spec.service_id} is already running"
             ) from exc
         self._lock_descriptor = descriptor
-        previous = self.read_heartbeat(self.root, self.spec)
+        # This process now holds the singleton lock, so no other process is running this
+        # service and the liveness probe would only find itself.
+        previous = self.read_heartbeat(self.root, self.spec, owns_service_lock=True)
         generation = 1 if previous is None else previous.generation + 1
         now = normalize_aware_utc(self._clock())
         heartbeat = RuntimeServiceHeartbeat(
@@ -417,7 +452,30 @@ class RuntimeServiceControl:
         cls,
         root: Path,
         spec: RuntimeServiceSpec,
+        *,
+        owns_service_lock: bool = False,
     ) -> RuntimeServiceHeartbeat | None:
+        """This service's current heartbeat, `None` if there is none this spec can claim.
+
+        A heartbeat written under a different spec used to be refused unconditionally, which
+        is right while that other instance is still running and wrong once it has stopped.
+        Every generation change that alters a service spec — settings, plane — leaves such a
+        file behind, so publishing sequence 3 in the first Route A window left both serving
+        roles unable to start at all until the files were moved aside by hand (#216).
+
+        A stopped instance's heartbeat is superseded, not a conflict: `stop()` is the only
+        writer of `status=stopped` together with `stopped_at`, and releasing the singleton
+        lock is the last thing it does. So the two facts together — the record says stopped,
+        and nobody holds the lock — say the writer is gone and its file describes a service
+        that no longer exists. It is reported as "no heartbeat", and the next `start()`
+        replaces the file. Anything else keeps failing closed: a spec mismatch whose writer
+        may still be alive, and a heartbeat that never reached `stop()` at all (a kill, a
+        crashed host), both still refuse and still want a human to look.
+
+        `owns_service_lock` is for `start()`, which has already taken the lock and would
+        otherwise see its own hold as somebody else's.
+        """
+
         path = cls._path_for(root, spec)
         if not path.exists():
             return None
@@ -425,8 +483,17 @@ class RuntimeServiceControl:
             heartbeat = RuntimeServiceHeartbeat.model_validate_json(path.read_bytes())
         except (OSError, ValueError) as exc:
             raise ValueError(f"runtime heartbeat is invalid: {spec.service_id}") from exc
-        if heartbeat.service_id != spec.service_id or heartbeat.spec_fingerprint != spec.identity:
+        if heartbeat.service_id != spec.service_id:
             raise ValueError("runtime heartbeat does not match the requested service spec")
+        if heartbeat.spec_fingerprint != spec.identity:
+            superseded = (
+                heartbeat.status is RuntimeServiceStatus.STOPPED
+                and heartbeat.stopped_at is not None
+                and (owns_service_lock or not cls._service_lock_is_held(root, spec))
+            )
+            if not superseded:
+                raise ValueError("runtime heartbeat does not match the requested service spec")
+            return None
         return heartbeat
 
 

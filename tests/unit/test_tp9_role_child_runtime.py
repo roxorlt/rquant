@@ -46,6 +46,15 @@ ROLE_MODULE_COVERAGE: tuple[tuple[str, int], ...] = (
 #: them. Anything else the child needs has to come from the root-owned documents.
 CHILD_ENVIRONMENT_NAMES = ("LANG", "LC_ALL", "TZ")
 
+#: The stand-in kind for the Route B cases below, where the role runs with no legacy
+#: deployment at all. It cannot be a kind that carries a systemd capability: on that route no
+#: deployment bundle exists, so no credential for the instance can have been sealed and none
+#: could be bound if one were handed over, and since #215 such a kind refuses outright rather
+#: than degrading. `watchlist_quote_source` is the same shape — live plane, one instance, a
+#: source — and carries no capability, so it still reaches the degradation branch these cases
+#: are about. The Route A cases keep `market_minute_source`.
+DEGRADING_KIND = "watchlist_quote_source"
+
 _IMPORT_PROBE = """
 import sys
 sys.path[:0] = {paths!r}
@@ -536,9 +545,9 @@ def test_t9_4_authority_runtime_trusts_expected_commit_and_runs_no_git(
 
     import rquant.runtime_service_main as service_main
 
-    manifest = _kind_manifest("market_minute_source")
+    manifest = _kind_manifest(DEGRADING_KIND)
     manifest_path = _write_generation_manifest(tmp_path, manifest)
-    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    control_root = tmp_path / "runtime" / "control" / "watchlist-quote-sources" / INSTANCE
     git_calls = _forbid_git(monkeypatch)
     observed: dict[str, object] = {}
 
@@ -555,7 +564,7 @@ def test_t9_4_authority_runtime_trusts_expected_commit_and_runs_no_git(
     monkeypatch.setattr(service_main, "build_builtin_registry", fake_registry)
     monkeypatch.setattr(service_main, "run_runtime_service_manifest", fake_run)
 
-    args = _authority_args(manifest_path, control_root, kind="market_minute_source")
+    args = _authority_args(manifest_path, control_root, kind=DEGRADING_KIND)
     assert service_main.run(args) == 0
 
     assert git_calls == []
@@ -758,9 +767,9 @@ def test_t9_6_missing_runtime_root_warns_and_marks_the_registry_degraded(
 
     import rquant.runtime_service_main as service_main
 
-    manifest = _kind_manifest("market_minute_source")
+    manifest = _kind_manifest(DEGRADING_KIND)
     manifest_path = _write_generation_manifest(tmp_path, manifest)
-    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    control_root = tmp_path / "runtime" / "control" / "watchlist-quote-sources" / INSTANCE
     assert not (tmp_path / "runtime").exists()
     _forbid_git(monkeypatch)
     monkeypatch.setattr(
@@ -788,7 +797,7 @@ def test_t9_6_missing_runtime_root_warns_and_marks_the_registry_degraded(
     assert len(warnings) == 1
     text = warnings[0]["message"]  # type: ignore[index]
     assert str(tmp_path / "runtime") in text
-    assert "market_minute_source" in text
+    assert DEGRADING_KIND in text
     assert "schema dual write" in text
     kwargs = observed["registry_kwargs"]
     assert kwargs["startup_degraded_reasons"] == (  # type: ignore[index]
@@ -945,14 +954,14 @@ def test_t9_6_degradation_survives_the_root_the_first_run_creates(
 
     import rquant.runtime_service_main as service_main
 
-    manifest = _kind_manifest("market_minute_source")
+    manifest = _kind_manifest(DEGRADING_KIND)
     manifest_path = _write_generation_manifest(tmp_path, manifest)
     runtime_root = tmp_path / "runtime"
-    control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
+    control_root = runtime_root / "control" / "watchlist-quote-sources" / INSTANCE
     assert not runtime_root.exists()
     _forbid_git(monkeypatch)
-    calls = _stub_registry_factory(monkeypatch, "market_minute_source")
-    args = _authority_args(manifest_path, control_root, kind="market_minute_source", once=True)
+    calls = _stub_registry_factory(monkeypatch, DEGRADING_KIND)
+    args = _authority_args(manifest_path, control_root, kind=DEGRADING_KIND, once=True)
 
     records: list[object] = []
     sink = logger.add(lambda message: records.append(message.record), level="WARNING")
@@ -991,10 +1000,10 @@ def test_t9_6_a_root_without_a_usable_current_still_degrades(
 
     import rquant.runtime_service_main as service_main
 
-    manifest = _kind_manifest("market_minute_source")
+    manifest = _kind_manifest(DEGRADING_KIND)
     manifest_path = _write_generation_manifest(tmp_path, manifest)
     runtime_root = tmp_path / "runtime"
-    control_root = runtime_root / "control" / "market-minute-sources" / INSTANCE
+    control_root = runtime_root / "control" / "watchlist-quote-sources" / INSTANCE
     runtime_root.mkdir()
     if shape == "current-regular-file":
         (runtime_root / "current").write_text("generations/" + LEGACY_GENERATION + "\n")
@@ -1009,7 +1018,7 @@ def test_t9_6_a_root_without_a_usable_current_still_degrades(
         "load_runtime_schema_service_bindings",
         lambda *_a, **_k: pytest.fail("schema bindings must not be loaded without a current"),
     )
-    calls = _stub_registry_factory(monkeypatch, "market_minute_source")
+    calls = _stub_registry_factory(monkeypatch, DEGRADING_KIND)
     monkeypatch.setattr(service_main, "run_runtime_service_manifest", lambda *_a, **_k: object())
 
     records: list[object] = []
@@ -1277,9 +1286,9 @@ def test_r207_a_degraded_role_never_reads_the_binding_document(
 
     import rquant.runtime_service_main as service_main
 
-    manifest = _kind_manifest("market_minute_source")
+    manifest = _kind_manifest(DEGRADING_KIND)
     manifest_path = _write_generation_manifest(tmp_path, manifest)
-    control_root = tmp_path / "runtime" / "control" / "market-minute-sources" / INSTANCE
+    control_root = tmp_path / "runtime" / "control" / "watchlist-quote-sources" / INSTANCE
     _forbid_git(monkeypatch)
     monkeypatch.setattr(
         service_main,

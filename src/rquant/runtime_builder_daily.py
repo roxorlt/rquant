@@ -122,10 +122,24 @@ def _tushare_daily_close_fetcher(
         raise RuntimeError("TUSHARE_TOKEN_MAIN capability is required")
     from rquant.adapter.tushare import TushareAdapter
 
+    # The backup is passed even though this role never has one. `TushareAdapter` falls back
+    # to `Settings` for whichever token it is *not* given, and `None` is what asks it to, so
+    # omitting the argument sent this role into `get_settings()` from inside the runtime-exec
+    # wrapper's child environment and back into `5 validation errors for Settings` — the
+    # same failure as #215's import-time one, one call later. The empty string is the honest
+    # answer: `CAPABILITY_KEYS` allows a backup only for `market_minute_source`, and the
+    # production profile seals one for nobody, so a capability-scoped role has none and must
+    # never reach into the process environment for a substitute. An empty backup is simply
+    # never switched to (`_switch_to_backup` is guarded on it being truthy).
+    backup_token = runtime_capabilities.get("TUSHARE_TOKEN_BACKUP", "").strip()
     adapter: DailyCloseRuntimeAdapter = (
-        TushareAdapter(token=token)
+        TushareAdapter(token=token, backup_token=backup_token)
         if transport_observer is None
-        else TushareAdapter(token=token, transport_observer=transport_observer)
+        else TushareAdapter(
+            token=token,
+            backup_token=backup_token,
+            transport_observer=transport_observer,
+        )
     )
 
     def fetch(request: DailyCloseSourceRequest) -> object:
