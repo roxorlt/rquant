@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import tempfile
 import time
@@ -2106,8 +2107,14 @@ def load_runtime_schema_rollout(
     runtime_root: Path,
     *,
     plan_id: str,
+    read_only: bool = False,
 ) -> tuple[RuntimeSchemaRolloutAuthority, SchemaRolloutStore]:
-    """Load a rollout only after re-deriving its immutable bundle authority."""
+    """Load a rollout only after re-deriving its immutable bundle authority.
+
+    `read_only=True` is what a runtime service asks for. Its unit cannot write
+    `control/schema-rollouts` at all, and a writable open there fails on the open itself
+    (#227), which took down roles that were never in the plan.
+    """
 
     root = _absolute_runtime_root(runtime_root)
     rollout_root = _schema_rollout_root(root, plan_id)
@@ -2142,9 +2149,39 @@ def load_runtime_schema_rollout(
     store = SchemaRolloutStore(
         rollout_root / "state.sqlite3",
         production_consumer_registry=expected_registry,
+        read_only=read_only,
     )
     store.get_state(plan_id)
     return authority, store
+
+
+def _schema_rollout_recorder(
+    root: Path,
+    *,
+    plan_id: str,
+    registry: ProductionConsumerRegistry,
+    service_id: str,
+) -> SchemaRolloutStore:
+    """A writable handle for the evidence a starting service still appends itself.
+
+    Admission is read-only (#227). These are not reads: a producer's PREPARE and CUTOVER
+    acknowledgements and a consumer's capability receipt are appended to the plan's hash
+    chain. No runtime unit's `ReadWritePaths` covers `control/schema-rollouts`, so on the
+    production host this open fails — and it fails here, naming the plan, the path and the
+    sandbox, instead of as a bare `unable to open database file` from four frames down.
+    """
+
+    path = _schema_rollout_root(root, plan_id) / "state.sqlite3"
+    try:
+        return SchemaRolloutStore(path, production_consumer_registry=registry)
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeSchemaCompatibilityError(
+            f"runtime schema service {service_id} has to record its own rollout evidence "
+            f"in {path} and cannot open it for writing ({exc}); a runtime unit's "
+            "ReadWritePaths does not cover control/schema-rollouts, so a rollout that "
+            "still needs a startup acknowledgement has to be driven by the installer or "
+            "the rollout controller before the units start"
+        ) from exc
 
 
 def _rollout_event_payloads(store: SchemaRolloutStore, plan_id: str) -> tuple[dict, ...]:
@@ -2219,10 +2256,25 @@ def load_runtime_schema_service_bindings(
         )
     bindings: list[RuntimeSchemaServiceBinding] = []
     for plan_id in _schema_rollout_plan_ids(root):
-        authority, store = load_runtime_schema_rollout(root, plan_id=plan_id)
+        authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
         if authority.target_generation_id != generation_id:
             continue
         state = store.get_state(plan_id)
+        recorder: SchemaRolloutStore | None = None
+
+        def record(
+            *, _plan_id: str = plan_id, _registry: ProductionConsumerRegistry = authority.registry
+        ) -> SchemaRolloutStore:
+            nonlocal recorder
+            if recorder is None:
+                recorder = _schema_rollout_recorder(
+                    root,
+                    plan_id=_plan_id,
+                    registry=_registry,
+                    service_id=manifest.service_id,
+                )
+            return recorder
+
         producer = next(
             (
                 participant
@@ -2238,7 +2290,7 @@ def load_runtime_schema_service_bindings(
                 phase=RolloutPhase.PREPARE,
                 participant_id=manifest.service_id,
             ):
-                state = store.acknowledge(
+                state = record().acknowledge(
                     plan_id=plan_id,
                     expected_revision=state.revision,
                     phase=RolloutPhase.PREPARE,
@@ -2256,7 +2308,7 @@ def load_runtime_schema_service_bindings(
             }
             required = {participant.participant_id for participant in authority.plan.producers}
             if required <= acknowledged:
-                state = store.advance(
+                state = record().advance(
                     plan_id=plan_id,
                     expected_revision=state.revision,
                     target_phase=RolloutPhase.DUAL_WRITE,
@@ -2295,7 +2347,7 @@ def load_runtime_schema_service_bindings(
                 participant_id=manifest.service_id,
             )
         ):
-            store.acknowledge(
+            record().acknowledge(
                 plan_id=plan_id,
                 expected_revision=state.revision,
                 phase=RolloutPhase.CUTOVER,
@@ -2339,7 +2391,7 @@ def load_runtime_schema_service_bindings(
                     serving_generation_id=None,
                     available_at=observed_at,
                 )
-                store.acknowledge_consumer(
+                record().acknowledge_consumer(
                     plan_id=plan_id,
                     expected_revision=store.get_state(plan_id).revision,
                     receipt=receipt,

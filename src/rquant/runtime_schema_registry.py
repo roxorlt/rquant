@@ -173,9 +173,12 @@ class RuntimeSchemaDualWriteBinding:
     ) -> RuntimeSchemaPreparedDualWrite | None:
         if self.plan.target_generation_id is None:
             raise RuntimeError("runtime schema dual-write target generation is unavailable")
+        #: reading the phase is a read: opening it writable is what #227 was, and this call
+        #: is on the producer's publish path, so it runs inside the unit sandbox every time.
         store = SchemaRolloutStore(
             self.store_path,
             production_consumer_registry=self.registry,
+            read_only=True,
         )
         phase = store.get_state(self.plan.plan_id).phase
         if phase in {RolloutPhase.CUTOVER, RolloutPhase.RETIRE}:
