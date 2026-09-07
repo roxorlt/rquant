@@ -17,7 +17,9 @@
   `runtime_production_profile._revalidate_production_inputs` 同款：先 `model_dump(mode="json")`
   再验；**对「本来就不是模型」的项仍然照旧重验**，指纹绑定一字未改。验收是真装机：真实
   `install_runtime_deployment_bundle` 根 + 真实 staged generation + wrapper 自己派生的 argv，
-  三个策略 role 全部进入服务循环。
+  三个策略 role 全部进入服务循环。修好之后露出下一层：`strategy_live` 与 `signal_router`
+  在文件层互相等对方（**#220**，代码层的循环依赖，本次不修），live 平面因此有固定的启动顺序，
+  写在 `DEPLOY.md`「路线 A 前置」第 28 条，连同三条就绪探针。
 - **两个 recovery oneshot 拿自己的内容哈希去比权威链的 generation id（#218 B）**：
   `runtime_recovery_production` 用 `recovery.profile_generation`（recovery 段的内容哈希，每次加载
   重算）比 wrapper 的 `--expected-generation`（`sha256(<generation>/full-manifest.json)`）——两个
@@ -162,10 +164,12 @@
   十二条 role 绑定、deadline），操作员只需给出 replay 窗口；HMAC 密钥用 `secrets.token_hex(64)`
   现场生成，两份文档都以 0600 经暂存改名原子落盘，**密钥从不打印、也没有任何传入密钥的参数**。
   `--only-missing` 保留并核对已存在的凭证而不轮换（轮换会让 publication root 里已签的每一份
-  receipt 失效）。写完立刻用 unit 将要用的同一套加载器读回核对，核不过就退出 1。
-  操作说明见 `docs/operations/runtime-recovery-credentials.md`；首次在生产机落密钥属新增生产密钥
-  材料，需 owner 单独授权。
-
+  receipt 失效）；**已存在但权限被放宽（不是 0600）或不是普通文件时报错退出，不静默改写**——
+  报错里带路径、实测 mode、期望 mode 与该敲的 `chmod`。不带 `--only-missing` 才是明确要求
+  重新生成，那时照旧重写并写成 0600。写完立刻用 unit 将要用的同一套加载器读回核对，
+  核不过就退出 1。操作说明见 `docs/operations/runtime-recovery-credentials.md`；
+  部署步骤见 `DEPLOY.md`「路线 A 前置」第 29 条；首次在生产机落密钥属新增生产密钥材料，
+  需 owner 单独授权。
 - **打包阶段读固定的 daily receipt 信任钥匙串（#200）**：`rquant-runtime-authority-stage` 现在以
   非特权用户 `lighthouse` 读 `/etc/rquant/daily-receipt-trusted-keys.json`（B-3 的
   `scripts/install-runtime-credential-infra.sh` 以 `root:root 0444` 装在 0755 root:root 的
