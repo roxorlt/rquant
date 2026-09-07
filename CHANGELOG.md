@@ -66,6 +66,33 @@
 
 ### Fixed
 
+- **五个 credstore unit 拿到了凭证却启动不了：判据描述的不是 systemd 的投递形状（#215 第三处断点）**：
+  2026-09-08 02:04 生产机（systemd 255、`User=lighthouse`）实测，`LoadCredentialEncrypted=`
+  交到服务手上的是——`/run/credentials/<unit>/` 一块 `ro,nosuid,nodev,noexec` 的内存挂载，
+  目录 `root:root 0550`，`capabilities.json` 是 **`root:root 0440` 外加一条 ACL** 放行 lighthouse。
+  进程 `os.open` 得开，但 `runtime_capabilities._read_private_credential` 要求
+  `st_uid == os.geteuid()` 且 `mode & 0o077 == 0`，于是抛
+  `systemd credential must be owned by the runtime uid`，五个 unit 全部起不来。包 E 的 e2e
+  用「当前用户属主 + 0400」造夹具——那是照着读者写的，不是照着 systemd 写的，所以这条一路绿到生产。
+  改法不是放宽成「任何可读文件都接受」，而是把判据换成 systemd 自己的契约，每条都能指到出处
+  （systemd.exec(5) 的 CREDENTIALS 与 `$CREDENTIALS_DIRECTORY`；systemd 252
+  `src/core/execute.c` 的 `write_credential`、`acquire_credentials`、`setup_credentials_internal`）：
+  目录必须是 `/run/credentials/<本 unit>.service`（读得到 cgroup 时还要与本进程所属 unit 一致）、
+  属 `root:root`、mode ∈ {0500, 0550, 0700}，且它所在的挂载是 tmpfs 或 ramfs 并带
+  `nosuid,nodev,noexec`（读 `/proc/self/mountinfo` 核对，再用目录自己的 `st_dev` 反查选中的
+  确实是这一条）；文件则 `O_NOFOLLOW` 打开、正规文件、nlink 1、属主 ∈ {0, 本进程 euid}、
+  mode ∈ {0400, 0440} 且 `mode & 0o007 == 0`、带 group 读位时必须 `root:root`（那正是 ACL 投递
+  的形状）、读后 fstat 互校、1 MiB 上限。属主是本进程的那一支是 systemd 在文件系统放不下 ACL
+  时的 fallback，它自己的注释写明「只有整块挂载能重挂成只读才安全」，所以这一支额外要求挂载
+  带 `ro`。「只有 systemd 能把文件放到这里」这层保证原先靠「属主 == euid」承担，现在改由
+  「root 属主的目录 + systemd 自己的内存挂载」承担，净效果是加严而不是放宽。
+  凭证读不出来时的措辞一并改了：EACCES 会点名实测的 uid、gid、mode 并指向 `User=` 与那条 ACL，
+  不再被「这个目录里没有 capabilities.json」盖过去——后者只在目录本身合格且文件确实 ENOENT 时才说。
+  夹具同步换成真实投递形状（包 A/E 留下的三处），并新增
+  `tests/unit/test_systemd_credential_delivery_shape.py`（25 例）与
+  `tests/integration/test_systemd_credential_delivery_linux.py`（Linux root 门禁 12 例：真 tmpfs
+  挂载、root 造投递、非 root 子进程读回，含真 ACL 与真 EACCES）。
+
 - **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：
   2026-09-07 路线 A 第二窗口装的是**第一个有前代的 generation**（`bf2da6d8…` 装在 `7d572c79…`
   之上），`install_runtime_deployment_profile` 于是为每个「声明指纹变了」的 channel 备好一份

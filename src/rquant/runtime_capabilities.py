@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NamedTuple
 
 from pydantic import StringConstraints, field_serializer, field_validator
 
@@ -71,10 +72,32 @@ _MAX_CAPABILITY_BYTES = 1024 * 1024
 #: `$CREDENTIALS_DIRECTORY/<this name>`, so the three places have to agree letter for letter.
 RUNTIME_CAPABILITY_CREDENTIAL_NAME = "capabilities.json"
 #: Where a Linux host says which unit this process belongs to, and where systemd puts the
-#: unit's decrypted credentials. Only ever read to explain a failure, never to find the
-#: credential itself — that address comes from `CREDENTIALS_DIRECTORY` and nowhere else.
+#: unit's decrypted credentials. `CREDENTIALS_DIRECTORY` is still the only address the
+#: credential is ever read from; these two say whether that address is one systemd itself
+#: could have produced.
 _SYSTEMD_CGROUP_PATH = Path("/proc/self/cgroup")
 _SYSTEMD_CREDENTIALS_ROOT = Path("/run/credentials")
+#: This process's own mount table, where the credential mount has to show itself.
+_SYSTEMD_MOUNT_TABLE = Path("/proc/self/mountinfo")
+#: The uid and gid systemd runs as when it decrypts a credential and lays it down: root, on
+#: every host, whatever `User=` the unit then executes as. Every check below that means
+#: "root" reads this pair instead of a literal 0, and it is the one seam a test that cannot
+#: be uid 0 replaces with its own uid. Production never moves it.
+_SYSTEMD_DELIVERY_OWNER: tuple[int, int] = (0, 0)
+#: systemd mounts the per-unit credential directory itself and never leaves it writable to
+#: the unit: 0700 when it is the only reader, 0500/0550 once an ACL admits `User=`.
+_CREDENTIAL_DIRECTORY_MODES = frozenset({0o500, 0o550, 0o700})
+#: 0400 when the unit runs as root and owns its credentials; 0400 or 0440 root-owned with an
+#: ACL for `User=` when it does not. Never a group or world bit beyond that group read.
+_CREDENTIAL_FILE_MODES = frozenset({0o400, 0o440})
+#: The credential directory is a memory-backed mount that never reaches a disk. systemd has
+#: used both over the versions it has shipped `LoadCredentialEncrypted=`, so both are the
+#: contract; anything else means the path is not the one systemd made.
+_CREDENTIAL_MOUNT_FILESYSTEMS = frozenset({"ramfs", "tmpfs"})
+#: The three mount flags systemd sets on that mount, and the reason a non-root reader can be
+#: trusted with a root-owned file there: nothing under it can gain privilege, become a
+#: device, or be executed.
+_CREDENTIAL_MOUNT_OPTIONS = ("nosuid", "nodev", "noexec")
 GenerationHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 InstanceName = Annotated[str, StringConstraints(pattern=r"^svc-[0-9a-f]{64}$")]
 
@@ -205,22 +228,259 @@ def _undelivered_credential_reason() -> str | None:
     )
 
 
+class _MountEntry(NamedTuple):
+    """One line of `/proc/self/mountinfo`, reduced to what a credential mount has to prove."""
+
+    point: str
+    device: str
+    filesystem: str
+    options: frozenset[str]
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    """mountinfo octal-escapes the four characters that would otherwise split a field."""
+
+    return (
+        value.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _containing_mount(path: Path) -> _MountEntry | None:
+    """The mount `path` lives on, out of this process's own mount table, or `None`.
+
+    The longest mount point that covers the path wins, and a later line of equal length wins
+    over an earlier one, because that is what an over-mount means. Which entry was chosen is
+    then checked against the directory's own `st_dev` by the caller, so a wrong pick cannot
+    pass for a right one.
+    """
+
+    try:
+        table = _SYSTEMD_MOUNT_TABLE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    candidate = str(path)
+    best: _MountEntry | None = None
+    for line in table.splitlines():
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        tail = right.split()
+        if not separator or len(fields) < 6 or not tail:
+            continue
+        point = _decode_mountinfo_path(fields[4])
+        if candidate != point and not candidate.startswith(point.rstrip("/") + "/"):
+            continue
+        if best is not None and len(point) < len(best.point):
+            continue
+        best = _MountEntry(
+            point=point,
+            device=fields[2],
+            filesystem=tail[0].lower(),
+            options=frozenset(fields[5].split(",")),
+        )
+    return best
+
+
+def _credential_mount_fault(directory: Path, device: int) -> str | None:
+    """Why the mount under the credential directory is not one systemd made, or `None`.
+
+    This is the check that carries the intent the old `st_uid == os.geteuid()` line was
+    standing in for — "only systemd can have put this file here". A unit that runs as
+    `User=lighthouse` never owns its own credentials, so ownership cannot say that any more;
+    what says it is that the file sits on a root-owned directory on a memory-backed mount
+    that is `nosuid,nodev,noexec`, which no unprivileged process can create.
+    """
+
+    entry = _containing_mount(directory)
+    if entry is None:
+        return (
+            f"the credential mount cannot be read from {_SYSTEMD_MOUNT_TABLE}, so nothing "
+            f"vouches for {directory}"
+        )
+    expected = f"{os.major(device)}:{os.minor(device)}"
+    if entry.device != expected:
+        return (
+            f"the mount table disagrees with the credential directory: the mount at "
+            f"{entry.point} is device {entry.device}, {directory} is on device {expected}"
+        )
+    if entry.filesystem not in _CREDENTIAL_MOUNT_FILESYSTEMS:
+        return (
+            f"systemd keeps credentials on a memory-backed mount that never reaches a disk; "
+            f"the mount at {entry.point} is {entry.filesystem}"
+        )
+    missing = tuple(name for name in _CREDENTIAL_MOUNT_OPTIONS if name not in entry.options)
+    if missing:
+        return (
+            f"the credential mount at {entry.point} is missing {', '.join(missing)}: systemd "
+            f"mounts it {','.join(_CREDENTIAL_MOUNT_OPTIONS)}, observed "
+            f"{','.join(sorted(entry.options))}"
+        )
+    return None
+
+
+def _mode_list(modes: frozenset[int]) -> str:
+    return " or ".join(f"0o{value:04o}" for value in sorted(modes))
+
+
+def _credential_directory_fault(directory: Path) -> str | None:
+    """Why this is not the directory systemd delivered this unit's credentials into.
+
+    Five things have to hold at once, and each is one clause of what
+    `LoadCredentialEncrypted=` promises: the address is `/run/credentials/<unit>`; that unit
+    is this one; the directory belongs to root rather than to whoever runs the service; its
+    mode lets nobody but root write; and it sits on systemd's own memory-backed mount rather
+    than on a lookalike an unprivileged user could have made. Nothing here reads the file.
+    """
+
+    delivery_uid, delivery_gid = _SYSTEMD_DELIVERY_OWNER
+    unit = directory.name
+    if directory.parent != _SYSTEMD_CREDENTIALS_ROOT or not unit.endswith(".service"):
+        return (
+            f"a systemd credential directory is {_SYSTEMD_CREDENTIALS_ROOT}/<unit>.service, "
+            f"observed {directory}"
+        )
+    running = _systemd_unit_name()
+    if running is not None and running != unit:
+        return (
+            f"the credential directory belongs to unit {unit} while this process runs under "
+            f"{running}: a unit may only read the credentials systemd loaded for it"
+        )
+    try:
+        observed = os.lstat(directory)
+    except OSError as exc:
+        return f"the credential directory {directory} cannot be inspected: {exc.strerror}"
+    if not stat.S_ISDIR(observed.st_mode):
+        return f"the credential directory {directory} is not a directory"
+    if (observed.st_uid, observed.st_gid) != (delivery_uid, delivery_gid):
+        return (
+            f"systemd creates the credential directory as {delivery_uid}:{delivery_gid}, "
+            f"observed {observed.st_uid}:{observed.st_gid} on {directory}"
+        )
+    mode = stat.S_IMODE(observed.st_mode)
+    if mode not in _CREDENTIAL_DIRECTORY_MODES:
+        return (
+            f"the credential directory mode must be {_mode_list(_CREDENTIAL_DIRECTORY_MODES)}, "
+            f"observed 0o{mode:04o} on {directory}"
+        )
+    return _credential_mount_fault(directory, observed.st_dev)
+
+
+def _unopenable_credential_reason(path: Path, error: OSError) -> str:
+    """What to say when the credential is where it should be but will not open.
+
+    `EACCES` is the shape #215's third break would have produced next: systemd hands a
+    `User=`-run service a **root-owned** credential and admits that user through a POSIX ACL
+    on the file. If the ACL is not there — wrong `User=`, a hand-copied file, a credential
+    laid down for another service — the open is what fails, and saying so with the observed
+    owner and mode is the difference between one look and another window lost.
+    """
+
+    if error.errno == errno.ENOENT:
+        return f"the systemd credential {path} is absent"
+    if error.errno != errno.EACCES:
+        return "systemd credential is unavailable or unsafe"
+    try:
+        observed = os.lstat(path)
+    except OSError:
+        return "systemd credential is unavailable or unsafe"
+    return (
+        f"the systemd credential {path} is not readable by uid {os.geteuid()}: it is "
+        f"{observed.st_uid}:{observed.st_gid} mode 0o{stat.S_IMODE(observed.st_mode):04o} and "
+        f"no access control entry admits this uid; LoadCredentialEncrypted admits the unit's "
+        f"User= through an ACL, so check User=/Group= against the unit systemd loaded it for"
+    )
+
+
+def _credential_is_absent(path: Path) -> bool:
+    """Whether the credential is provably not there — nothing else counts as absent.
+
+    Only `ENOENT` says "systemd loaded some other id into this directory". Every other
+    answer, `EACCES` above all, is the delivery ACL failing to admit this uid, and reporting
+    that as a missing credential sends the repair to the sealer instead of to `User=`.
+    `Path.exists()` cannot be used here at all: it re-raises `EACCES` rather than answering.
+    """
+
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _read_private_credential(path: Path) -> bytes:
+    """The decrypted plaintext at `path`, if everything about its delivery is systemd's.
+
+    The checks are systemd's own contract for `LoadCredentialEncrypted=`, not a guess at a
+    safe-looking file: the directory is `/run/credentials/<this unit>`, root-owned, on
+    systemd's memory-backed mount; the file is a regular file with one link, owned by root
+    (the ACL delivery, `fd_add_uid_acl_permission(fd, uid, ACL_READ)` over a 0400 file) or
+    by this process (the ownership fallback systemd takes where that ACL cannot be held, and
+    only over a read-only mount); 0400, or 0440 when root owns it and root's group is the
+    only group the mode admits. The old rule — owner must equal the runtime uid, no group
+    bit at all — described only the fallback, which is why five units that had their
+    credential sealed, delivered and decrypted refused to start.
+    """
+
     candidate = Path(path)
     if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
         raise ValueError("systemd credential path must be absolute and normalized")
+    fault = _credential_directory_fault(candidate.parent)
+    if fault is not None:
+        raise ValueError(fault)
+    delivery_uid, delivery_gid = _SYSTEMD_DELIVERY_OWNER
+    runtime_uid = os.geteuid()
     descriptor = -1
     try:
-        descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            raise ValueError(_unopenable_credential_reason(candidate, exc)) from exc
         observed = os.fstat(descriptor)
+        mode = stat.S_IMODE(observed.st_mode)
         if not stat.S_ISREG(observed.st_mode):
             raise ValueError("systemd credential must be a regular file")
-        if observed.st_uid != os.geteuid():
-            raise ValueError("systemd credential must be owned by the runtime uid")
+        if observed.st_uid not in (delivery_uid, runtime_uid):
+            raise ValueError(
+                f"systemd credential must be owned by uid {delivery_uid} or by the runtime "
+                f"uid {runtime_uid}, observed {observed.st_uid}"
+            )
+        if observed.st_uid != delivery_uid:
+            # systemd hands the file's ownership to the service user only where the backing
+            # filesystem cannot hold an ACL, and its own comment says what makes that safe:
+            # "only safe if we can then re-mount the whole thing read-only, so that the user
+            # can no longer chmod() the file to gain write access" (systemd 252,
+            # src/core/execute.c, write_credential). So that is the condition here too —
+            # otherwise this is the one branch in which the owner could widen its own mode.
+            mount = _containing_mount(candidate.parent)
+            if mount is None or "ro" not in mount.options:
+                where = mount.point if mount is not None else str(candidate.parent)
+                raise ValueError(
+                    f"a credential owned by the runtime uid {runtime_uid} is systemd's "
+                    f"ownership fallback, which it only takes on a read-only mount; the "
+                    f"mount at {where} is not read-only"
+                )
         if observed.st_nlink != 1:
-            raise ValueError("systemd credential hardlink count must be one")
-        if observed.st_mode & 0o077:
-            raise ValueError("systemd credential must not be group or world accessible")
+            raise ValueError(
+                f"systemd credential hardlink count must be one, observed {observed.st_nlink}"
+            )
+        if mode & 0o007:
+            raise ValueError(
+                f"systemd credential must not be world accessible, observed 0o{mode:04o}"
+            )
+        if mode not in _CREDENTIAL_FILE_MODES:
+            raise ValueError(
+                f"systemd credential mode must be {_mode_list(_CREDENTIAL_FILE_MODES)}, "
+                f"observed 0o{mode:04o}"
+            )
+        if mode & 0o040 and (observed.st_uid, observed.st_gid) != (delivery_uid, delivery_gid):
+            raise ValueError(
+                f"a group-readable systemd credential is the ACL delivery, which is "
+                f"{delivery_uid}:{delivery_gid}; observed {observed.st_uid}:{observed.st_gid}"
+            )
         if observed.st_size <= 0 or observed.st_size > _MAX_CAPABILITY_BYTES:
             raise ValueError("systemd credential size is unsafe")
         payload = os.read(descriptor, _MAX_CAPABILITY_BYTES + 1)
@@ -305,7 +565,12 @@ def load_systemd_runtime_capabilities(
     try:
         payload = _read_private_credential(credential_path)
     except ValueError as exc:
-        if not credential_path.exists():
+        # "systemd made this directory but put some other id in it" is only the diagnosis
+        # when the directory is one systemd could have made. If the directory itself is
+        # wrong, that fault is the answer and this message would bury it.
+        if _credential_directory_fault(credential_path.parent) is None and _credential_is_absent(
+            credential_path
+        ):
             raise ValueError(
                 f"the systemd credential directory carries no "
                 f"{RUNTIME_CAPABILITY_CREDENTIAL_NAME}: systemd loaded credentials for this "

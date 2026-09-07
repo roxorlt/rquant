@@ -10,6 +10,7 @@ from rquant.runtime_capabilities import (
     serialize_runtime_credential,
 )
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
+from tests.support.systemd_credential_delivery import Delivery, deliver
 
 GENERATION = "b" * 64
 SERVICE_ID = "source.market-minute"
@@ -62,30 +63,43 @@ def test_retention_writer_credential_is_scoped_only_to_retention_service() -> No
     )
 
 
-def _credential(root: Path, values: dict[str, str]) -> Path:
-    root.mkdir(mode=0o700)
-    path = root / "capabilities.json"
-    path.write_bytes(
-        serialize_runtime_credential(
+def _credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    values: dict[str, str],
+) -> Delivery:
+    """A credential delivered the way systemd delivers one (#215's third break).
+
+    `directory_mode=0o700` is the mode Docker's own `--tmpfs` and a root-run unit both
+    produce, and the one that leaves this file's mutations able to rewrite the credential
+    in place; the ACL shape (0550 with a root-owned 0440 file) is held next door in
+    `tests/unit/test_systemd_credential_delivery_shape.py`.
+    """
+
+    return deliver(
+        monkeypatch,
+        root=tmp_path / "run-credentials",
+        payload=serialize_runtime_credential(
             service_id=SERVICE_ID,
             service_kind=KIND,
             instance_name=INSTANCE,
             bundle_generation=GENERATION,
             values=values,
-        )
+        ),
+        directory_mode=0o700,
     )
-    path.chmod(0o400)
-    return path
 
 
-def test_loads_only_service_scoped_systemd_credentials(tmp_path: Path) -> None:
-    root = tmp_path / "credentials"
+def test_loads_only_service_scoped_systemd_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     values = {
         "TUSHARE_TOKEN_MAIN": "main-secret",
         "TUSHARE_TOKEN_BACKUP": "backup-secret",
     }
-    _credential(root, values)
-    environ = {"CREDENTIALS_DIRECTORY": str(root)}
+    delivery = _credential(monkeypatch, tmp_path, values)
+    environ = {"CREDENTIALS_DIRECTORY": str(delivery.directory)}
 
     loaded = load_systemd_runtime_capabilities(
         KIND,
@@ -121,17 +135,18 @@ def test_missing_systemd_credential_directory_is_dependency_free() -> None:
 )
 def test_rejects_unsafe_or_cross_service_credentials(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
-    root = tmp_path / "credentials"
     values = {"TUSHARE_TOKEN_MAIN": "main-secret"}
-    path = _credential(root, values)
-    environ = {"CREDENTIALS_DIRECTORY": str(root)}
+    delivery = _credential(monkeypatch, tmp_path, values)
+    path = delivery.path
+    environ = {"CREDENTIALS_DIRECTORY": str(delivery.directory)}
     if mutation == "public":
         path.chmod(0o444)
         message = "group|world"
     elif mutation == "symlink":
-        real = root / "real.json"
+        real = delivery.directory / "real.json"
         path.replace(real)
         path.symlink_to(real)
         message = "unsafe|unavailable"
@@ -165,9 +180,11 @@ def test_rejects_unsafe_or_cross_service_credentials(
         )
 
 
-def test_rejects_credential_from_another_runtime_generation(tmp_path: Path) -> None:
-    root = tmp_path / "credentials"
-    _credential(root, {"TUSHARE_TOKEN_MAIN": "main-secret"})
+def test_rejects_credential_from_another_runtime_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delivery = _credential(monkeypatch, tmp_path, {"TUSHARE_TOKEN_MAIN": "main-secret"})
 
     with pytest.raises(ValueError, match="generation"):
         load_systemd_runtime_capabilities(
@@ -175,7 +192,7 @@ def test_rejects_credential_from_another_runtime_generation(tmp_path: Path) -> N
             expected_service_id=SERVICE_ID,
             expected_instance=INSTANCE,
             expected_generation="c" * 64,
-            environ={"CREDENTIALS_DIRECTORY": str(root)},
+            environ={"CREDENTIALS_DIRECTORY": str(delivery.directory)},
         )
 
 
@@ -189,13 +206,13 @@ def test_rejects_credential_from_another_runtime_generation(tmp_path: Path) -> N
 )
 def test_rejects_credential_bound_to_another_service_identity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     expected_service_id: str,
     expected_kind: RuntimeServiceKind,
     expected_instance: str,
     message: str,
 ) -> None:
-    root = tmp_path / "credentials"
-    _credential(root, {"TUSHARE_TOKEN_MAIN": "main-secret"})
+    delivery = _credential(monkeypatch, tmp_path, {"TUSHARE_TOKEN_MAIN": "main-secret"})
 
     with pytest.raises(ValueError, match=message):
         load_systemd_runtime_capabilities(
@@ -203,5 +220,5 @@ def test_rejects_credential_bound_to_another_service_identity(
             expected_service_id=expected_service_id,
             expected_instance=expected_instance,
             expected_generation=GENERATION,
-            environ={"CREDENTIALS_DIRECTORY": str(root)},
+            environ={"CREDENTIALS_DIRECTORY": str(delivery.directory)},
         )
