@@ -5,6 +5,196 @@
 
 ---
 
+## 2026-09-07 · v0.32.2 · 路线 A 首次安装（权威链 sequence 3，生产代码仍未切换）
+
+**状态**：路线 A——「由操作员产出生产 inputs 文档 + 生成一代真实画像」这条路——第一次真正装到
+生产主机上。权威链发到第三代（sequence 3），`wrapper_preflight == 32`，`data/runtime/current`
+第一次存在，credstore 密封了 7 个实例，**8 个 kind-backed unit 持续运行**（路线 B 下 live 平面
+是 0 个）。**生产代码仍未切换**，还是 `e4e303b0a4c05d2a4deefbee502718053672fe6f`（v0.28.3）；
+第二关（切代码 + 换 3.11 venv + 重启七个常驻服务）没做，而且**现在还排不了**，原因见下面
+「第二关为什么还排不了」。
+
+**tag**：`v0.32.2`（annotated）→ `695e952038aff8b426632233511d351fac2c7353`
+
+**执行**：SSH `lighthouse@82.156.0.68`，2026-09-06 23:10 至 2026-09-07 06:50，分三段：
+
+| 段 | 时间（CST） | 做了什么 | 当时 tag |
+|---|---|---|---|
+| 一 | 09-06 23:10–23:35 | 补两套凭证、发 completion 公钥环、换 sealer helper、生成生产 inputs；第 6 步撞 BLK-8 停下 | `v0.32.1`（`77ddb32`） |
+| 二 | 09-07 00:48–00:56 | 换到 v0.32.2 重做 inputs；prerequisites 与 production-profile 落地 | `v0.32.2`（`695e952`） |
+| 三 | 09-07 01:0x–06:50 | deployment-profile（写 `current` + credstore）、legacy stage、publish、探路、启动、收尾 | `v0.32.2` |
+
+BLK-8 是 `rquant runtime-production-prerequisites` 在没有 `.env` 的 bootstrap worktree 里死在
+`main()` 的 `get_settings()` fail-fast 上——那三条路线 A 命令自己一个配置都不读，只是没有被提前
+分发。修复即 PR #213，合并打 tag `v0.32.2` 之后从第 6 步继续。
+
+### 装了什么
+
+**凭证（一律增量）**：`install-runtime-credential-keys.sh init --only-missing` 补出 completion 与
+capabilities 两组（原有 9 个文件的 sha256 逐字节未变），`verify` 13 行 `OK` 外加
+`consumer self-check passed (root form)`；`install-runtime-credential-infra.sh
+--only-missing-keyrings` 只发布 `shadow-completion-trusted-keys.json`（`root:root 444`），
+helper / unit / sudoers 一律未动。密封 helper
+`/usr/local/libexec/rquant-runtime-credential-sealer` 按 #208 原子换代到 sha256
+`2612a0c705d94617795197a39a953ec8145fbf27b1c230ce5b92d0569005beec`（与仓库一致），
+旧版留在 `/root/rquant-helper-backup-20260906-024504/`。
+
+**加密备份**：`/home/lighthouse/rquant-credentials-backup/etc-rquant-20260906-231708.tar.enc`
+（0600，133,152 B，sha256
+`0d30233a6b93b3e500582682f56d6193c28671a7bb322955787574475b2d5730`），口令文件同目录 0600，
+解密往返自检 25 个条目逐条对上。**这份备份未离机**，口令内容不出服务器、也不写进本文件。
+旧备份保留。
+
+**生产 inputs 与真实画像**：
+
+| 制品 | 位置与摘要 |
+|---|---|
+| inputs 文档 | `data/runtime-production-inputs.json`（0600），sha256 `173f38cdc0c8166f722f12139721cab6292075f759c49c8e4d73dbac55663b49`，`producer_commit 695e952…`；生成器两跑逐字节相同 |
+| 市场日历 | coverage **2020-01-01..2026-12-31**，`open_dates` **1697**，`content_sha256 eceaa714…083f`；显式传了 `--calendar-coverage-floor 2026-12-31`，摘要与 stderr WARNING 都写着 `renew_by=2026-12-01`（#211） |
+| 路由策略 | `signal-routing-policy.json` fingerprint `9f9b5a6e…33ae`（0444） |
+| 生产画像 | `data/runtime-profiles/1e5b5fef….json`（0600，67,694 B，`service_count 26`），sha256 `4bc3142175f6bb5aa86afceb199b582fd60770c7d9b30f51dd7bacb3547178ff` |
+
+`runtime-production-prerequisites --apply` 第一次退 1：`retention state root must be an owned
+directory with mode 0700`——C-1 预建的 `data/runtime/research/**` 是 0755。13 个目录 `chmod 700`
+之后 rc 0，三个 target 落地（市场日历 generation `31264c77…` 0600、`runtime-inputs/definitions`
+0700、`research/artifact-retention/svc-248ba9b2…/catalog-authority/current.json` 0600）。
+
+**`data/runtime/current` 与 credstore**（`runtime-deployment-profile --apply`，06:01 起）：
+
+- `data/runtime/current` → `generations/7d572c7938e3def3d72828c1149049727393f2ccff3e7b05e4df0a31f6495dd6`，
+  **相对 symlink**；`deployment-profile.json` 0600 / 67,694 B。这个指针正是路线 B 从不写的那一份，
+  写出来之后原本走降级分支的角色才有 schema binding 可装。
+- `/etc/credstore.encrypted/rquant-runtime/instances/` 下 **7 个 svc** 各有 `current.cred` 与
+  `generations/`；`/var/lib/systemd/credential.secret` 由 systemd 自建为 **`root:root 0400`**
+  （不是前置第 12 条原先写的 0600，该条已就地订正）。
+- dry-run 首代必须带 `--schema-bootstrap-reason`；六个 `RQ_*` 能力变量与生产 `.env` 里的
+  `TUSHARE_TOKEN_MAIN` / `PUSHDEER_*` / `PUSHPLUS_*` 都要在进程环境里。**读生产 `.env` 是 owner
+  当场单独授权的**，设计上 deployer 就是带 `.env` 跑、把这些密封进 credstore。
+
+**权威链第三代**：
+
+| 项 | 值 |
+|---|---|
+| sequence | **3** |
+| generation | `e850250e40da5b54696bc39f797da8fe2d48035010df49592f4c9ef7a2042b53` |
+| operation_id | `9aa830e45819d8fb6ccad0e170ff89b5` |
+| prior generation | `ff79b184…`（sequence 2） |
+| profile_id | `d2206e53…7ea0`，**与前两代相同**，走「同 profile 换 generation」，#190 未触发 |
+| producer commit | `695e952` |
+| `wrapper_preflight` | **32** |
+| 耗时 | stage apply 17 s；publish **96 s**（正式发布，不是 dry-run） |
+
+stage 走 legacy 模式：`--legacy-runtime-root /home/lighthouse/rquant/data/runtime`（字面量）、
+`--legacy-generation current`；`instance_mapping` 25 role / 29 label，28 份 manifest，
+closure 584/50/105,668，`staged_files` 11,104；`legacy-binding.json`（224 B，`mode` 292，
+sha `2c21a078…dc90`）里 `generation_id` 等于 `readlink current`、`runtime_root` 等于那个字面量，
+并且出现在 `full-manifest.json` 的 `entries` 里；`plan.json` sha256
+`8ee7e5a1b337c6b11af42b3e2aefc2a4ed0ad01ad3a2fc03766576bc635f2cdc`。publish 回执
+`result committed` / `state active`，两个文件都是 `root:root 444 nlink=1`。
+
+### 结果：8 个 unit 持续运行
+
+06:45 复核：**8 个 unit active、`NRestarts` 全 0**，20 分钟 journal 里 0 条 traceback /
+fail-closed / refused，runtime 进程的 `/proc/<pid>/fd` 里没有 duckdb 句柄，三个 slice 的
+`memory.events` 全是 `high 0 / oom_kill 0`：
+
+| 平面 | unit | 起始时刻 |
+|---|---|---|
+| live | `rquant-runtime-auction-universe@` | 06:14:12 |
+| live | `rquant-runtime-candidate@` ×3 | 06:14:15 / 06:14:18 / 06:14:21 |
+| live | `rquant-runtime-feature@` | 06:14:24 |
+| live | `rquant-runtime-watchlist-quote@` | 06:19:10 |
+| serving | `rquant-runtime-runtime-health@` | 06:22:53 |
+| serving | `rquant-runtime-serving@` | 06:22:58 |
+
+`daily_pipeline_orchestrator` 是 oneshot，`ExecMainStatus=0` 正常退出，不计在这 8 个里。
+`data/runtime/current` 复核为相对 symlink，正确。
+
+**换代残留心跳**：`runtime_health_publisher` 与 `serving_publisher` 第一次裸跑退 1，报
+`runtime heartbeat does not match the requested service spec`——sequence 2 停掉的那两个实例在
+`control/<role>/<svc>/heartbeats/<identity>.json` 留下了 `spec_fingerprint` 属于旧 spec 的心跳。
+确认实例确已停（`pid` 为 `None`、`stopped_at` 有值）后把心跳文件移走，两个角色即启动成功。**#216**
+
+**起不来的角色，按原因分类**：
+
+| 原因 | 角色 | issue |
+|---|---|---|
+| research 平面被高水位证据门挡住：启动即打 `FAIL research blocked: high-water evidence unavailable or invalid: /var/lib/rquant/workload-isolation/high-water.json` 然后**退 0**（`Result=success`）。这是 workload arbiter 的资源门，不是崩溃 | `lab_artifact_catalog`、`promotions_publisher`、`shadow_session`、`lab_jobs_publisher` | **#217** |
+| credstore 组：`reference_slow_source` / `market_minute_source` / `auction_match_source` 在 wrapper 白名单子环境里构造 `Settings` 缺 5 个字段；`daily_close_source` 报 `TUSHARE_TOKEN_MAIN capability is required`；`reference_slow_publisher` 报 `requires its isolated publication credential`；`notifier` 缺 route spool。全部 `stop` + `reset-failed` 防重启风暴 | 上述 6 个 | **#215**（`notifier` 另涉 #218） |
+| completion signer / router / broker / recovery 这一串：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`，`signal_router` 缺 runner source，`paper_broker` 缺 route spool，`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | 7 个 | **#218** |
+| 缺 reference registry，要等 `reference_slow_*` 先产出 | `paper_constraint_publisher` | #205 |
+| `rquant-runtime-lab-jobs@` 的 `InaccessiblePaths=/etc/rquant/lab-claim-finalizer-runtime` 没有 `-` 前缀，路径不存在即 `226/NAMESPACE`；建一个空目录才能起（起来之后仍被上面那道 high-water 门挡住） | `lab_jobs_publisher` | #191 |
+
+`page_control` 裸跑能起，但它不是 runtime unit，本次没有 start。
+
+### 第二关为什么还排不了
+
+**credstore 密封了 7 个实例，逐个 start 过的 6 个 role 一个都没能持续运行。**
+`reference_slow_source` 与 `notifier` 在窗口中段曾各自重启一次后短暂 running（当时快照记的是
+9 个 unit），到 06:45 复核时两个都已 failed 并被 stop + reset-failed；另外四个从头就起不来。
+判据按整组记 **0/7**。
+
+**没有 `reference_slow_publisher` 就没有 serving generation，第二关（包 D）不能排。**
+
+判据核对：`wrapper_preflight == 32` ✅；`data/runtime/current` 是相对 symlink ✅；
+credstore 7 份 `.cred` ✅；「≥ 12 个 kind-backed 持续运行」❌（实际 8 个）；
+「credstore 组能起的都起」❌（0/7）。
+
+### 一条告警推送
+
+06:26:34–06:27:44，`notifier` 的 unit 失败触发 `OnFailure=rquant-alert@` 共 5 次；日志显示是同类
+去重告警，owner 手机上大概率只收到 1 条。这是本次窗口唯一的推送。
+
+### 现役零损伤
+
+七个常驻服务 `NRestarts` 全 0；四个端口 `200/200/200/302`；生产 checkout 仍是 `e4e303b`，
+`git status` 干净；生产主库 DuckDB 的 mtime 停在 2026-09-04 17:02:53 未变；bootstrap worktree 里
+`.env` 不存在（第 8 步是把生产 `.env` 读进进程环境，没有拷贝落盘）；磁盘剩 19 GB。
+
+### 回滚
+
+```bash
+# ① 停本次启动的 8 个 unit（模板 unit 没有 enable，stop 即回到未运行）
+sudo systemctl stop 'rquant-runtime-auction-universe@*.service' \
+     'rquant-runtime-candidate@*.service' 'rquant-runtime-feature@*.service' \
+     'rquant-runtime-watchlist-quote@*.service' \
+     'rquant-runtime-runtime-health@*.service' 'rquant-runtime-serving@*.service'
+
+# ② 单级回到 sequence 2
+sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz \
+     rollback --operation-id 9aa830e45819d8fb6ccad0e170ff89b5
+
+# ③ credstore 的 current.cred 切回上一代
+
+# ④ 删掉 current 指针；角色自动回到降级分支（路线 B），不需要再换 generation
+sudo rm /home/lighthouse/rquant/data/runtime/current
+```
+
+`generation` 目录是内容寻址的，三代全部保留，**永不删除**。代码本次未切换，无需代码回滚，
+锚点 `e4e303b`（服务器上 `/home/lighthouse/rollback-code-sha.txt`）。
+**⚠️ 私钥删了不可恢复**，回滚前先确认
+`/home/lighthouse/rquant-credentials-backup/etc-rquant-20260906-231708.tar.enc` 能解开。
+
+完整执行记录（每条命令与输出原文）在 Mac 本地的
+`/Users/roxor/brain/30-projects/rQuant/.worktrees/release-a-cc/.superpowers/sdd/2026-09-03-release-a-rollout/rollout-exec-report.md`
+的「第八次执行」「第八次执行续」「第八次执行终」三节，没有进仓库。
+
+### 等你决策
+
+1. **#215**：credstore 那 6 个 role 在 wrapper 子环境里跑不起来。这是第二关的硬前置，
+   不解决就没有 serving generation。
+2. **#216**：换代残留心跳目前靠手工移文件绕过，应该由发布链路自己作废旧代心跳。
+3. **#217**：`/var/lib/rquant/workload-isolation/high-water.json` 由谁产出、什么时候产出还没定，
+   research 平面四个角色一直被这道门挡着。
+4. **#218**：completion signer 的 manifest 为什么无效，以及 `strategy_live` → `runner.sqlite3`
+   → router → spool → broker/notifier 这条依赖链怎么接上。
+5. **#211 的续期截止是 2026-12-01**：那之前必须把 `trade_calendar` 扩到 2027 年、重跑生成器与
+   整条命令链、去掉 `--calendar-coverage-floor 2026-12-31`。往生产库写数据属高风险变更，需单独授权。
+6. **凭证备份仍未离机**；**#191**（finalizer 的四份输入）与 **#192** 的 `[Install]` 段仍未做，
+   服务器重启后这 8 个 unit 不会自动拉起。
+
+---
+
 ## 2026-09-05 · v0.31.3 · Release A 第一关基础设施装机（生产代码未切换）
 
 **状态**：第一关最终口径已达成——发布回执 `wrapper_preflight == 32`，serving 平面两个 kind-backed
@@ -239,8 +429,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 事实」的角色唯一的出路（见本节末「等你决策」第 4 条）。本轮 PR 补齐了它缺的两个生产者
 （`scripts/build_runtime_production_inputs.py` 与 `scripts/export_intraday_snapshot.py`）
 和凭证侧的增量装法；另一个 PR（#207）修好了「权威 generation 与 legacy generation 是两个命名空间」
-这个结构性阻塞，第 13 条起的六条就是它带来的新前置。下面十八条是照着脚本敲命令时会踩到的东西，
-**不是部署记录**。
+这个结构性阻塞，第 13 条起的六条就是它带来的新前置；第 19 条来自 #213，第 20 条起的八条是
+2026-09-07 第一次真正跑完路线 A 之后的实战订正（runbook R-13…R-18），第 1、5、12 三条也按当时
+的实测就地订正过。下面二十七条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -253,6 +444,12 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
    比传入值还短照样报错退出；成功时生成器会在 stderr 打一条 WARNING，并在 stdout 摘要里多一行
    `coverage_floor_override`，两处都写明必须在 `2026-12-01`（`coverage_end` 前 30 天）之前完成
    续期。续期步骤就是本条上面那一段，续期后**去掉这个参数**，让下限回到默认的 `2027-12-31`。
+
+   **2026-09-07 首次装机实测**：`coverage` 2020-01-01..2026-12-31，也就是 `coverage_end` =
+   `2026-12-31`；`open_dates` **1697** 条；日历文档 `content_sha256 eceaa714…083f`，
+   `generated_at 2026-07-14T10:13:02Z`。摘要里的那行是
+   `coverage_floor_override floor=2026-12-31 default=2027-12-31 renew_by=2026-12-01`。
+   **续期截止 2026-12-01。**
 2. **`/usr/local/libexec/rquant-runtime-credential-sealer` 必须随本次 tag 重装**（#208：旧版白名单
    只覆盖七种凭证种类里的两种，第一次真密封会整体中止）。重装前把旧版备份到
    `/root/rquant-helper-backup-<stamp>/`。
@@ -280,6 +477,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
    `eval "$(sudo … export-capabilities)" && rquant runtime-deployment-profile …`。这六个
    `RQ_*` 变量只在那条命令的进程环境里存在，**不落 env 文件**；执行前先 `set +o history`。
    轮换过凭证之后必须重跑命令链第 ④ 步。
+   ⚠️ **`eval "$(...)"` 这个写法已被证伪（#214），改用下面第 22 条的逐行 `export`**；
+   而且要注入的不止这六个变量，见第 23 条。
 6. **分钟快照在云端只读副本上导出，`--ts-code-file` 是事实必需项**：导出器写盘前会用 `feature_live`
    自己的入场校验判一遍，而 A 股任何一个 20 交易日窗口里都必定有停牌标的、它们的分钟线在
    `minute_bar` 里是零价，**所以不带 universe 的全市场导出几乎一定退 2**（`OHLC prices must be
@@ -297,8 +496,10 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     `namei -l /home/lighthouse/rquant/data/runtime-production-inputs.json`。`_absolute_runtime_root`
     拒绝任何软链祖先，而**「这条路径上没有软链」这件事第一次被真正检验就在主机上**——本地测不出来，
     macOS 的 `/home` 本身就是 autofs 软链。
-12. `/var/lib/systemd/credential.secret` 由第一次 `systemd-creds encrypt` 自动创建
-    （`root:root 0600`）。第一次密封之后 `sudo stat` 确认一次并把结果记下来。
+12. `/var/lib/systemd/credential.secret` 由第一次 `systemd-creds encrypt` 自动创建。
+    第一次密封之后 `sudo stat` 确认一次并把结果记下来。
+    **2026-09-07 首次密封实测是 `root:root 0400`，不是本条原先写的 0600**（systemd 自建的就是
+    0400），按 0600 去核对会误判成异常。
 13. **换 legacy 代必须重新 stage + publish 权威链**（#207 之后的硬约束）。只把
     `/home/lighthouse/rquant/data/runtime/current` 切到新的一代 legacy generation、不换权威 generation，
     全部 kind-backed 角色拒绝启动，原文
@@ -341,8 +542,70 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     环境变量（`DATA_DIR` / `DUCKDB_PATH` / `PARQUET_DIR` / `LOG_DIR` / `TUSHARE_TOKEN_MAIN`）；
     现在**不要再导**，这些变量指向的是生产库路径，在 bootstrap worktree 里给它们赋值只会误导。
     其余命令（含 `rquant --help`）在这个 worktree 里照旧 fail-closed，那是设计（T9-9）。
+20. **C-1 预建的 `data/runtime/research/**` 必须全部 0700**（R-13，把 runbook R-7 里只针对
+    `data/runtime/research` 那一层的要求扩到整棵子树）。`runtime-production-prerequisites --apply`
+    的 retention catalog 那一步要求 state root（`research/artifact-retention/<svc>/`）是 0700 的
+    属主目录，按默认 umask 建成 0755 会退 1，报
+    `retention state root must be an owned directory with mode 0700`。补救：
 
-### 已知限制（装机前已登记的 issue，外加装机当场发现的 #198；末列写「已修」的条目已修，其余不修）
+    ```bash
+    find /home/lighthouse/rquant/data/runtime/research -type d ! -perm 700 -exec chmod 700 {} +
+    ```
+
+    首次装机命中 13 个目录。C-1 每一条预建目录都要显式给 mode，不要依赖 umask，
+    建完 `stat -c '%n %a'` 逐条复核。
+21. **换代之前先把停掉实例的旧心跳移走**（R-14，#216）。停掉旧代实例之后
+    `control/<role>/<svc>/heartbeats/<identity>.json` 还在，里面的 `spec_fingerprint` 属于旧 spec；
+    新代同一角色启动会报 `runtime heartbeat does not match the requested service spec`。
+    做法：确认该实例确已停（心跳文档里 `pid` 为 `None`、`stopped_at` 有值）之后，把这个文件移走
+    再启动。首次装机在 `runtime_health_publisher` 与 `serving_publisher` 上各命中一次。
+    **#216 修好之前这一步得手工做**，修法应当是发布链路自己作废旧代心跳。
+22. **六个 `RQ_*` 能力变量要逐行 `export`，不能 `eval`**（R-18，#214，**取代第 5 条的写法**）。
+    `export-capabilities` 的输出不是 eval-safe——公钥里含空格，`eval "$(...)"` 会当场炸。改用：
+
+    ```bash
+    while IFS= read -r line; do export "$line"; done \
+      < <(sudo bash scripts/install-runtime-credential-keys.sh export-capabilities)
+    ```
+
+    导完先确认六个都在，再往下走。
+23. **`deployment-profile` 的 dry-run 也要完整的 capability environment**（R-18），不是只有
+    `--apply` 才要。除第 22 条那六个 `RQ_*` 之外，`CAPABILITY_KEYS` 还含 `TUSHARE_TOKEN_MAIN` /
+    `TUSHARE_TOKEN_BACKUP` / `PUSHDEER_*` / `PUSHPLUS_*`，这些的来源只有生产 `.env`
+    （设计上 deployer 就是带 `.env` 跑、把它们密封进 credstore），缺一个就报
+    `runtime capability environment <NAME> is missing`。注入方式
+    `set -a; . /home/lighthouse/rquant/.env; set +a`。**读生产 `.env` 需要 owner 单独授权**——
+    首次装机是 owner 当场点头才做的，不要默认自己可以读，也不要把 `.env` 拷进 bootstrap worktree。
+    另外**首代必须传 `--schema-bootstrap-reason`**（审计理由），不传连 dry-run 都过不去。
+24. **stage 在 legacy 模式的参数与耗时**（R-18）：`--legacy-runtime-root` 写字面量
+    `/home/lighthouse/rquant/data/runtime`（第 14 条），`--legacy-generation current`。
+    首次装机 stage apply 约 **17 s**，随后的正式 publish 约 **96 s**（dry-run 不计，它在取部署锁
+    之前就返回）。
+25. **credstore 组的实际状态：密封 7 个实例，逐个 start 过的 6 个 role 一个都没起住**（R-15，#215）。
+    `deployment-profile --apply` 会把 7 个实例密封进
+    `/etc/credstore.encrypted/rquant-runtime/instances/<svc>/`。逐个 `systemctl start` 的结果：
+    `reference_slow_source` 与 `notifier` 各自首次失败、重启一次后曾短暂 running，但到窗口收尾
+    复核时两个都已 failed；`reference_slow_publisher`、`daily_close_source`、`market_minute_source`、
+    `auction_match_source` 从头就起不来。判据记 **0/7**。起不来的立刻
+    `systemctl stop` + `reset-failed` 防重启风暴——`notifier` 的 `OnFailure=rquant-alert@` 会推送。
+    **没有 `reference_slow_publisher` 就没有 serving generation，第二关（包 D）不能排。**
+26. **`rquant-runtime-lab-jobs@` 要先建一个空目录**（R-16，#191）。它的
+    `InaccessiblePaths=/etc/rquant/lab-claim-finalizer-runtime` 没有 `-` 前缀，路径不存在就在挂载
+    命名空间阶段 `226/NAMESPACE`。按 go-no-go 的绕过法：
+
+    ```bash
+    sudo install -d -o root -g root -m 755 /etc/rquant/lab-claim-finalizer-runtime
+    ```
+
+    建完能起，但紧接着会被第 27 条那道门挡住。
+27. **research 平面被高水位证据门挡住**（R-17，#217）。`lab_artifact_catalog` /
+    `promotions_publisher` / `shadow_session` / `lab_jobs_publisher` 启动即打
+    `FAIL research blocked: high-water evidence unavailable or invalid:
+    /var/lib/rquant/workload-isolation/high-water.json`，然后**退 0**（`Result=success`）。
+    这是 workload arbiter 的资源门，不是崩溃、也不是 bug；谁在什么时候产出这份文件，
+    仓库里还没有答案。判据里 research 平面按「已启动、被门挡住」记，**不计入持续运行数**。
+
+### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -356,6 +619,10 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #193 | TP1 发布链路两处 `os.open` flag：`ldd` 输出里的 symlink 成员被 `O_NOFOLLOW` 拒（G-2）；`_copy_new_file` 缺 `O_NONBLOCK`，路径被换成 FIFO 可让 root publish 挂死（N-6） | **已修（本分支，同一 PR）**：闭包成员与 loader 按真实路径声明（`resolved_closure_member`），读侧 `_READ_FLAGS` 带 `O_NONBLOCK`。实测本机 `ldd` 报的三个成员都是普通文件，G-2 本来也不会命中；N-6 不再需要 Ctrl-C 兜底 |
 | #195 | WP9 rendezvous poll 与它自己在等的 SQLite 锁争用，helper 首次续约可能输给 `database is locked` | CI 间歇性红，不影响生产行为；重跑前先按此条判因 |
 | #198 | 2026-09-05 首次装机当场撞到的两处主机形状硬拒绝：**BLK-1** stage 报 `refused: standard library directory is missing: /usr/local/lib64/python3.11`（RHEL 系 `sysconfig` 把 `platstdlib` 指到一个发行版从不创建的目录）；**BLK-2** root publish 报 `RuntimeAuthorityPublishError: deployment lock ancestor / is unsafe`（可信祖先遍历要求 `/` 恰为 `root:root 0755`，OpenCloudOS 9.2 的 `/` 是发行版默认的 `0555`） | **已修（PR「fix(runtime): unblock the Release A first gate on a real RHEL host」，本条的修复分支）**：缺失的 `platstdlib` 移出闭包并在 `plan.json` 的 `closure_summary.skipped_stdlib_roots` 如实记录；`/`、`/etc`、`/var`、`/var/lib` 四个发行版自有目录改按「属主 root + 无 group/other 写位」判定，rQuant 自建目录与所有文件级校验不变（TCB 语义变更，详见 CHANGELOG 的 Security 一条）。**云端验收判据**：B-6' 的 `plan.json` 里 `closure_summary.stdlib_roots == ["/usr/lib64/python3.11"]` 且 `skipped_stdlib_roots == ["/usr/local/lib64/python3.11"]`；B-7 root publish 能取到部署锁；最终 `wrapper_preflight == 32`。**不要**拿 `publish --dry-run` 通过代替 B-7——dry-run 在取锁之前就返回 |
+| #215 | credstore 密封了 7 个实例，路线 A 首次安装时逐个 start 过的 6 个 role 一个都没能持续运行：`reference_slow_source` / `market_minute_source` / `auction_match_source` 在 wrapper 白名单子环境里构造 `Settings` 缺 5 个字段（与 #189 同类，只是发生在子环境里）；`daily_close_source` 报 `TUSHARE_TOKEN_MAIN capability is required`；`reference_slow_publisher` 报 `requires its isolated publication credential`；`notifier` 缺 route spool（另涉 #218） | 首次安装时全部 `systemctl stop` + `reset-failed` 防重启风暴，判据记 0/7（前置第 25 条）。**这是第二关的硬前置**——没有 `reference_slow_publisher` 就没有 serving generation，包 D 排不了。已派单独一包修 |
+| #216 | 换代之后旧实例留下的心跳文件仍在，`spec_fingerprint` 属于旧 spec，新代同一角色启动即报 `runtime heartbeat does not match the requested service spec` | 手工把已停实例的心跳文件移走再启动（前置第 21 条），首次安装时在 `runtime_health_publisher` 与 `serving_publisher` 上各命中一次。正确修法是发布链路自己作废旧代心跳，与 #215 同一包 |
+| #217 | research 平面四个角色（`lab_artifact_catalog` / `promotions_publisher` / `shadow_session` / `lab_jobs_publisher`）启动即 `FAIL research blocked: high-water evidence unavailable or invalid: /var/lib/rquant/workload-isolation/high-water.json` 并退 0。这是 workload arbiter 的资源门，不是崩溃，但这份高水位证据由谁产出、什么时候产出，仓库里没有答案 | 判据按「已启动、被门挡住」记，不计入持续运行数（前置第 27 条）。要让 research 平面真跑起来，得先定这份文件的产生者，本轮不做 |
+| #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | 本轮不修，已派只读勘察定根因（signer manifest 为什么无效、依赖链怎么接、`data/recovery/runtime-recovery.json` 的生产者是谁）与分包估算 |
 
 ### 2026-09-05 首次装机窗口的结果（决定下次从哪起跑）
 
