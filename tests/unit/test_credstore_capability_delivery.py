@@ -293,10 +293,71 @@ def test_without_a_deployment_generation_a_present_credential_is_refused(tmp_pat
         _load({"CREDENTIALS_DIRECTORY": str(directory)}, generation=None)
 
 
-def test_without_a_deployment_generation_a_role_with_no_credential_degrades(tmp_path: Path) -> None:
-    """T9-6's accepted degradation is not turned into a refusal by the check above."""
+def test_without_a_deployment_generation_a_capability_role_refuses_outright(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route B and a kind that needs a credential: refuse, do not degrade.
 
-    assert dict(_load({}, generation=None)) == {}
+    On that route no deployment bundle exists, so no credential for this instance can have
+    been sealed and none could be bound if one were handed over. That is structural rather
+    than diagnosable, which is why it refuses even outside a systemd unit — where the
+    delivery diagnosis has nothing to accuse and stays quiet.
+    """
+
+    monkeypatch.setattr(capabilities_module, "_SYSTEMD_CGROUP_PATH", tmp_path / "absent")
+
+    with pytest.raises(ValueError, match="without a deployment generation"):
+        _load({}, generation=None)
+
+
+def test_without_a_deployment_generation_a_role_needing_nothing_still_degrades() -> None:
+    """T9-6's accepted degradation survives for the eighteen kinds that carry no capability."""
+
+    assert (
+        dict(
+            load_systemd_runtime_capabilities(
+                RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE,
+                expected_service_id="source.watchlist-quote",
+                expected_instance=INSTANCE,
+                expected_generation=None,
+                environ={},
+            )
+        )
+        == {}
+    )
+
+
+def test_the_delivery_diagnosis_is_reachable_on_route_b_too(under_a_unit: Path) -> None:
+    """Ordering: the two messages of the delivery check may not be shadowed by Route B.
+
+    Putting the `expected_generation is None` branch first made both of them unreachable
+    there, so a Route B capability role fell back to the silent degradation #215 is about.
+    """
+
+    delivered = under_a_unit / UNIT
+    delivered.mkdir()
+    (delivered / RUNTIME_CAPABILITY_CREDENTIAL_NAME).write_bytes(b"{}")
+
+    with pytest.raises(ValueError) as raised:
+        _load({}, generation=None)
+
+    message = str(raised.value)
+    assert "was not delivered to daily_close_source" in message
+    assert "environment allowlist" in message
+
+
+def test_the_unloaded_credential_diagnosis_is_reachable_on_route_b_too(
+    under_a_unit: Path,
+) -> None:
+    """The other of the two, same ordering question."""
+
+    with pytest.raises(ValueError) as raised:
+        _load({}, generation=None)
+
+    message = str(raised.value)
+    assert f"systemd loaded no {RUNTIME_CAPABILITY_CREDENTIAL_NAME} for unit {UNIT}" in message
+    assert "LoadCredentialEncrypted" in message
 
 
 # ---------------------------------------------------------------------------------------

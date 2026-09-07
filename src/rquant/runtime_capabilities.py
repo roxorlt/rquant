@@ -270,19 +270,13 @@ def load_systemd_runtime_capabilities(
     target = environ if environ is not None else os.environ
     credential_directory = target.get("CREDENTIALS_DIRECTORY", "").strip()
     required = bool(CAPABILITY_KEYS.get(service_kind, frozenset()))
-    if expected_generation is None:
-        # Nothing to bind a credential to. Refuse the one case that would otherwise use an
-        # unbindable credential; a caller with no credential in reach keeps the degradation
-        # it already had (T9-6), and its builder still refuses for the capability itself.
-        if credential_directory:
-            raise ValueError(
-                "runtime capability credential cannot be bound without a deployment generation"
-            )
-        return LoadedRuntimeCapabilities({})
-    if re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None:
-        raise ValueError("expected runtime generation must be a lowercase SHA-256")
-    if not credential_directory:
-        reason = _undelivered_credential_reason() if required else None
+    if not credential_directory and required:
+        # The delivery diagnosis comes first and applies on both routes. Which of the two
+        # links broke does not depend on whether a deployment bundle exists, and a role
+        # started under a systemd unit that was supposed to carry a credential has a broken
+        # link either way — putting the Route B branch ahead of this made both messages
+        # unreachable there and let the same silent degradation back in.
+        reason = _undelivered_credential_reason()
         if reason is not None:
             # Not "the capability is missing": the capability may well have been sealed and
             # decrypted. Say which of the two links is broken so the repair is the right one.
@@ -290,6 +284,23 @@ def load_systemd_runtime_capabilities(
                 f"runtime capability credential was not delivered to "
                 f"{service_kind.value}: {reason}"
             )
+    if expected_generation is None:
+        # Route B publishes no deployment bundle, and the bundle generation is the only
+        # namespace a credential is ever sealed in, so on this route no credential for this
+        # instance can exist and none could be bound if it did. A kind that needs one
+        # therefore cannot run here at all — that is a structural fact rather than a
+        # diagnosis, which is why it refuses even outside a systemd unit, unlike the branch
+        # above. A kind that needs none may still not quietly accept one.
+        if required or credential_directory:
+            raise ValueError(
+                "runtime capability credential cannot be bound without a deployment generation"
+            )
+        return LoadedRuntimeCapabilities({})
+    if re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None:
+        raise ValueError("expected runtime generation must be a lowercase SHA-256")
+    if not credential_directory:
+        # Route A, nothing delivered, and nothing to accuse: a bare diagnostic run. The
+        # role's own builder refuses for the capability it wanted, exactly as it always did.
         return LoadedRuntimeCapabilities({})
     credential_path = Path(credential_directory) / RUNTIME_CAPABILITY_CREDENTIAL_NAME
     try:
