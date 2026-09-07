@@ -3889,6 +3889,47 @@ def cmd_runtime_deployment_rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_runtime_schema_rollout(args: argparse.Namespace) -> int:
+    """Record the producers' PREPARE acknowledgements and leave every plan at DUAL_WRITE.
+
+    Run this between installing a bundle generation and starting the units. Installing a
+    generation with a predecessor prepares one rollout plan per changed channel, each opening
+    in PREPARE and waiting for an acknowledgement from every one of its producers; a plan with
+    three producers therefore makes its first two instances fail once each on startup, and
+    each failure relays an alert. The acknowledgement carries nothing a producer alone knows,
+    so it is done here instead, once, off the critical path.
+
+    It stops there on purpose. Leaving DUAL_WRITE takes the producers' own dual-write
+    consistency evidence and CUTOVER the trusted consumers' receipts; neither is derivable
+    from the plan, so neither is signed for here.
+    """
+
+    from rquant.runtime_deployment_bundle import (
+        acknowledge_runtime_schema_rollout_preparation,
+    )
+
+    results = acknowledge_runtime_schema_rollout_preparation(
+        Path(args.runtime_root),
+        now=datetime.now(UTC),
+        dry_run=bool(args.dry_run),
+    )
+    changed = tuple(item for item in results if item.changed)
+    print(
+        json.dumps(
+            {
+                "status": "dry_run" if args.dry_run else "applied",
+                "plans": len(results),
+                "changed": len(changed),
+                "acknowledgements": [item.model_dump(mode="json") for item in results],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_runtime_schema_retirement(args: argparse.Namespace) -> int:
     """Inspect or explicitly retire one post-cutover schema plan."""
 
@@ -8173,6 +8214,18 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_rollback_p.add_argument("--audit-root", type=Path)
     runtime_rollback_p.add_argument("--health-timeout-seconds", type=float, default=120.0)
 
+    runtime_schema_rollout_p = sub.add_parser(
+        "runtime-schema-rollout",
+        help="代生产者记录 schema rollout 的 PREPARE 承认并推进到 DUAL_WRITE 为止",
+    )
+    runtime_schema_rollout_sub = runtime_schema_rollout_p.add_subparsers(
+        dest="rollout_action",
+        required=True,
+    )
+    runtime_schema_acknowledge_p = runtime_schema_rollout_sub.add_parser("acknowledge")
+    runtime_schema_acknowledge_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_schema_acknowledge_p.add_argument("--dry-run", action="store_true")
+
     runtime_retirement_p = sub.add_parser(
         "runtime-schema-retirement",
         help="只读检查或显式执行 CUTOVER 后的 schema RETIRE",
@@ -8529,6 +8582,11 @@ CONFIGURATION_FREE_COMMANDS: Final[dict[str, Callable[[argparse.Namespace], int]
     "runtime-deployment-profile": cmd_runtime_deployment_profile,
     "runtime-production-prerequisites": cmd_runtime_production_prerequisites,
     "runtime-production-profile": cmd_runtime_production_profile,
+    # Package H: the acknowledgement runs in the same window, straight after
+    # `runtime-deployment-profile` has prepared the plans and from the same worktree — the
+    # deployed checkout does not carry this command yet, so there is no `.env` to fall back
+    # on. It reads nothing out of `Settings` either.
+    "runtime-schema-rollout": cmd_runtime_schema_rollout,
 }
 
 

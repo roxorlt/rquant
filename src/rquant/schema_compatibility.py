@@ -634,6 +634,24 @@ def validate_dual_write_values(
     )
 
 
+def persisted_rollout_journal_layout(path: Path) -> str:
+    """`"wal"`, `"rollback"` or `"unknown"`, read out of the database header.
+
+    Offset 18 of an SQLite database header is the file format write version: 1 is a rollback
+    journal, 2 is WAL. One `read(2)` answers it, and unlike an `sqlite3` open it cannot create
+    the `-shm` wal-index as a side effect — which matters both to the read-only reader below
+    and to the installer, which has to be able to say what layout a store was in *before* it
+    opened it for writing and converted it.
+    """
+
+    with Path(path).open("rb") as handle:
+        header = handle.read(20)
+    if len(header) < 20 or not header.startswith(b"SQLite format 3\x00"):
+        #: empty, or not a database at all — the caller's open produces the real message
+        return "unknown"
+    return "wal" if header[18] == 2 else "rollback"
+
+
 class SchemaRolloutStateUnavailableError(RuntimeError):
     """A rollout state store could not be opened for the access its caller needs."""
 
@@ -726,30 +744,23 @@ class SchemaRolloutStore:
         return connection
 
     def _persisted_journal_layout(self) -> str:
-        """Read the header byte that says WAL or rollback journal, without opening the file.
+        """The header probe, with this class's fail-closed sentence around an unreadable file.
 
-        Offset 18 of an SQLite database header is the file format write version: 1 is a
-        rollback journal, 2 is WAL. One `read(2)` answers it, and unlike an `sqlite3` open
-        it cannot create the `-shm` wal-index as a side effect. That side effect is the
-        whole reason to look here: `mode=ro` marks the database file read-only, not its
-        directory, so on a root the reader happens to be able to write, opening a WAL store
-        succeeds by building that index — and then fails the first time the same store is
-        read from inside the unit sandbox, which is #227 arriving late instead of at once.
+        Not opening the file is the point: `mode=ro` marks the database read-only, not its
+        directory, so on a root the reader happens to be able to write, an `sqlite3` open of
+        a WAL store succeeds by building the `-shm` index — and then fails the first time the
+        same store is read from inside the unit sandbox, which is #227 arriving late instead
+        of at once.
         """
 
         try:
-            with self.path.open("rb") as handle:
-                header = handle.read(20)
+            return persisted_rollout_journal_layout(self.path)
         except OSError as exc:
             raise SchemaRolloutStateUnavailableError(
                 f"schema rollout state {self.path} cannot be read ({exc}); a runtime "
                 "service reads it with control/schema-rollouts outside its unit's "
                 "ReadWritePaths"
             ) from exc
-        if len(header) < 20 or not header.startswith(b"SQLite format 3\x00"):
-            #: empty, or not a database at all — let the open below produce the message
-            return "unknown"
-        return "wal" if header[18] == 2 else "rollback"
 
     def _verify_readable(self) -> None:
         """Fail closed on a store that is absent, unreadable, or of an unsupported shape."""
@@ -2175,5 +2186,6 @@ __all__ = [
     "SchemaRolloutStore",
     "UnknownFieldPolicy",
     "evaluate_schema_compatibility",
+    "persisted_rollout_journal_layout",
     "validate_dual_write_values",
 ]

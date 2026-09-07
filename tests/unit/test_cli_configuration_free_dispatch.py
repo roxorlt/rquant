@@ -41,12 +41,17 @@ CONFIGURATION_FREE_ENVIRONMENT = {
     "RQUANT_DISABLE_DOTENV": "1",
 }
 
-#: The commands under test, each with a flag its own parser owns — proof that `--help` came
-#: from the subparser rather than from the top-level parser.
+#: The commands under test, each with a name only its own parser knows — a flag it declares,
+#: or the action it declares — proof that `--help` came from the subparser rather than from
+#: the top-level parser, which fails closed below and prints none of these.
 ROUTE_A_COMMANDS = (
     ("runtime-deployment-profile", "--schema-v1-migration-authority"),
     ("runtime-production-prerequisites", "--runtime-mode"),
     ("runtime-production-profile", "--output-dir"),
+    # Package H, 2026-09-07: `runtime-schema-rollout acknowledge` runs in the same window as
+    # the three above and out of the same `.env`-less worktree, because the deployed checkout
+    # does not carry the command yet. Its own parser is the one that knows `acknowledge`.
+    ("runtime-schema-rollout", "acknowledge"),
 )
 
 #: Sibling runtime commands that are *not* config-free: they keep failing closed.
