@@ -15,22 +15,16 @@ import pytest
 from scripts import full_suite_shards as shards
 from tests.support import assert_full_suite_shards as validator
 
-NODEIDS = (
-    "tests/a.py::test_a",
-    "tests/b.py::test_b",
-    "tests/c.py::test_c",
-    "tests/d.py::test_d",
-)
+_SHARD_LETTERS = "abcdefghijklmnopqrstuvwxyz"[: shards.SHARD_COUNT]
 
-APPROVED_SKIP_NODEID = NODEIDS[3]
+# One synthetic case per shard, so the fixtures track the manifest's own shard
+# count instead of restating it: a repartition changes the length here, nothing else.
+NODEIDS = tuple(f"tests/{letter}.py::test_{letter}" for letter in _SHARD_LETTERS)
+
+APPROVED_SKIP_NODEID = NODEIDS[-1]
 APPROVED_SKIP_REASON = "Darwin-only capability gate"
 
-CLEAN_ENV_NODEIDS = (
-    "tests/test_a.py::test_a",
-    "tests/test_b.py::test_b",
-    "tests/test_c.py::test_c",
-    "tests/test_d.py::test_d",
-)
+CLEAN_ENV_NODEIDS = tuple(f"tests/test_{letter}.py::test_{letter}" for letter in _SHARD_LETTERS)
 
 SENTINEL_ENVIRONMENT = {
     "TUSHARE_TOKEN_BACKUP": "tushare-backup-sentinel",
@@ -129,7 +123,7 @@ def _write_artifacts(
     index: dict[str, object],
     *,
     python_version: str = "3.12",
-    shard_with_skip: int | None = 3,
+    shard_with_skip: int | None = shards.SHARD_COUNT - 1,
     outcome: str = "pass",
     skip_reason: str = APPROVED_SKIP_REASON,
     nodeids: tuple[str, ...] = NODEIDS,
@@ -270,8 +264,8 @@ def test_validator_aggregates_real_testcases_and_skips(
     summary = _validate(manifest_root, artifacts, monkeypatch)
 
     assert summary == {
-        "cases": 4,
-        "passed": 3,
+        "cases": len(NODEIDS),
+        "passed": len(NODEIDS) - 1,
         "approved_skips": 1,
         "platform": "linux",
         "python_version": "3.12",
@@ -287,7 +281,7 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
     manifest_root = tmp_path / "manifest"
     _write_approved_skips(
         manifest_root,
-        linux={CLEAN_ENV_NODEIDS[3]: APPROVED_SKIP_REASON},
+        linux={CLEAN_ENV_NODEIDS[-1]: APPROVED_SKIP_REASON},
     )
     index = shards.write_manifest_bundle(
         manifest_root,
@@ -331,8 +325,8 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
     )
 
     assert summary == {
-        "cases": 4,
-        "passed": 3,
+        "cases": len(NODEIDS),
+        "passed": len(NODEIDS) - 1,
         "approved_skips": 1,
         "platform": "linux",
         "python_version": "3.12",
