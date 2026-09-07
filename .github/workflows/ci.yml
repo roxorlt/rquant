@@ -837,6 +837,128 @@ jobs:
           path: ${{ runner.temp }}/rquant-route-a-py${{ matrix.python-version }}/test-results/
           if-no-files-found: error
 
+  route-a-credstore-linux:
+    name: Linux Route A credstore roles (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    # The container is what makes this job possible: `systemd-creds encrypt` reads and, on a
+    # fresh host, creates /var/lib/systemd/credential.secret (root:root 0400), so the case
+    # skips itself for the unprivileged `runner` user. Folding it into
+    # route-a-legacy-binding-linux would therefore have produced a skip, and that job's JUnit
+    # contract refuses skips.
+    container: python:${{ matrix.python-version }}-slim
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      # Before the checkout, which wants git. `systemd` brings /usr/bin/systemd-creds, the one
+      # binary this gate exists to exercise; the world the fixture builds signs with
+      # `ssh-keygen`, which the slim image does not carry.
+      - name: Install systemd and the checkout prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            systemd git ca-certificates openssh-client
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      # Not under RUNNER_TEMP, which is the one place this job differs from
+      # route-a-legacy-binding-linux. `assert_safe_ancestor` walks every ancestor of the
+      # control root up to `/` and refuses one that is not root-owned or carries a group or
+      # other write bit; in a container job RUNNER_TEMP is /__w/_temp, and /__w belongs to the
+      # host's `runner` uid, not to the root this container runs as. A directory straight off
+      # `/` (root:root 0755) has a clean chain. Verified both ways in a local container: /__w
+      # fails with `deployment lock ancestor /__w is unsafe`, this passes.
+      - name: Create the private credstore test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exact_root="/rquant-credstore-py${{ matrix.python-version }}"
+          mkdir -p "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          mkdir -p "${exact_root}/pytest" "${exact_root}/test-results"
+          chmod 700 "${exact_root}" "${exact_root}/data" "${exact_root}/parquet"
+          chmod 700 "${exact_root}/logs" "${exact_root}/pytest" "${exact_root}/test-results"
+          {
+            printf 'RQUANT_CREDSTORE_ROOT=%s\n' "${exact_root}"
+            printf 'DATA_DIR=%s/data\n' "${exact_root}"
+            printf 'DUCKDB_PATH=%s/data/main.duckdb\n' "${exact_root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/readonly.duckdb\n' "${exact_root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${exact_root}"
+            printf 'LOG_DIR=%s/logs\n' "${exact_root}"
+          } >> "${GITHUB_ENV}"
+
+      # No actions/setup-python: the image is the interpreter, and pinning uv to the
+      # container's own python is what keeps the matrix leg honest about its version.
+      - name: Install uv
+        run: python -m pip install --root-user-action=ignore uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Record that the container really is root with a real systemd-creds
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -eq 0
+          /usr/bin/systemd-creds --version | head -1
+          # `partial` on a machine without a TPM, which is also what the production host
+          # reports; the sealer does not need one.
+          systemd-analyze has-tpm2 || true
+
+      # `-m linux_exact`, not the whole file: the other 28 cases are in the four full-suite
+      # shards. This job exists for the one case that seals with the installed root helper and
+      # the real /usr/bin/systemd-creds, then decrypts the credential back and starts the six
+      # roles off those bytes.
+      - name: Run the Linux-only credstore role case
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit="${RQUANT_CREDSTORE_ROOT}/test-results/route-a-credstore.xml"
+          uv run python -m pytest -o addopts='' --strict-markers -m linux_exact -rA \
+            --basetemp="${RQUANT_CREDSTORE_ROOT}/pytest" \
+            --junitxml="${junit}" \
+            tests/integration/test_route_a_credstore_roles_e2e.py
+
+      - name: Verify the gate ran that one case and skipped nothing
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A skip here would mean the container lost root or systemd-creds, which is exactly
+          # the failure mode that made this a separate job.
+          uv run python tests/support/assert_junit_contract.py \
+            --path "${RQUANT_CREDSTORE_ROOT}/test-results/route-a-credstore.xml" \
+            --suites 1 --tests 1 --failures 0 --errors 0 --skipped 0 --cases 1
+          grep -q 'test_the_roles_run_off_a_credential_the_real_sealer_encrypted' \
+            "${RQUANT_CREDSTORE_ROOT}/test-results/route-a-credstore.xml"
+
+      # The private root sits outside the workspace, so the evidence is copied in before the
+      # upload rather than uploaded from an absolute path the action would have to root itself.
+      - name: Collect the JUnit evidence into the workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/ci-evidence"
+          cp -a "${RQUANT_CREDSTORE_ROOT}/test-results/." "${GITHUB_WORKSPACE}/ci-evidence/"
+
+      - name: Upload the Route A credstore JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: route-a-credstore-py${{ matrix.python-version }}
+          path: ci-evidence/
+          if-no-files-found: error
+
   formal-smoke-real-generation-linux:
     name: Linux real generation smoke (${{ matrix.python-version }})
     runs-on: ubuntu-24.04
