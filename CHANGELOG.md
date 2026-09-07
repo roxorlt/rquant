@@ -33,6 +33,11 @@
   能力回执）保留原样，但改为单独申请写句柄，失败时说清是哪个服务、哪个路径、哪条沙箱设置
   拦下的；**它们在生产沙箱里依然写不了**，因此还停在 PREPARE 的 rollout 必须由安装器或
   rollout 控制器在 unit 启动前推进，这一条不是本次修改能绕过的。
+  主循环里那两个写者（生产者的双写记录、serving publisher 的 serving generation 回执）
+  原本没有这层措辞，计划一旦推进到 `DUAL_WRITE` / `CONSUMER_ACK` 就会在发布路径中间抛出
+  和 #227 一样的裸 SQLite 错误——等于把同一个坑从启动挪到主循环；现在两处也点名沙箱。
+  另外 `prepare_payload` 只想读一个阶段却以写模式打开库，而它每次生产者发布都在沙箱里跑，
+  已改成只读并补上回归用例。
   验收是 Linux 端到端：真装两代 bundle（第二代带十六份计划）、把 `control/schema-rollouts`
   下每个目录的写位摘掉、用 wrapper 自己派生的白名单环境把 `serving_publisher` 与
   `watchlist_quote_source`（八个反复重启的 unit 中的两个）送进真实服务循环各跑一轮；
