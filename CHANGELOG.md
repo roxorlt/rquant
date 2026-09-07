@@ -6,7 +6,7 @@
 
 ### Added
 
-- **安装器代生产者记录 schema rollout 的 PREPARE 承认，并把计划推进到 DUAL_WRITE 为止（#227，owner 2026-09-07 授权）**：
+- **`rquant runtime-schema-rollout acknowledge`：转换全部状态库，并代生产者把本代计划推进到 DUAL_WRITE（#227，owner 2026-09-07 授权）**：
   装一代有前代的 bundle 会为每个「声明指纹变了」的 channel 备一份 rollout 计划，每份都停在
   PREPARE 等它的全部生产者各记一条承认。生产画像里有两份计划各带三个生产者
   （`runtime.strategy_candidate.snapshot` 与 `runtime.strategy_signal.envelope`），所以头两个
@@ -14,14 +14,32 @@
   `schema producer startup is waiting for every producer PREPARE ACK`，每失败一次就中继一条告警。
   这一轮承认没有任何只有生产者自己知道的东西：`store.acknowledge` 的每个入参都来自冻结的计划，
   它本身还会拿冻结注册表把入参全部重验一遍，所以搬到安装器不丢信息。
-  新命令 `rquant runtime-schema-rollout acknowledge --runtime-root <root> [--dry-run]` 做这一轮，
-  **只做到 DUAL_WRITE**：`SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING` 就是 DUAL_WRITE，常量一旦被改
-  成别的值，代码在动任何计划之前就抛错停下（离开 DUAL_WRITE 要的是生产者真写过双写记录的一致性
-  证据，CUTOVER 要的是可信消费者的回执，两者都不能由安装器代签）。
-  apply 以写者身份打开每份状态库，这同时把旧版留下的 WAL 库转成回滚日志——unit 的只读准入能读的
-  就是这个布局；每份计划都报告转换前后的 journal 模式。`--dry-run` 走只读打开，因此**不会转换**：
-  遇到 WAL 库它报告「要先 apply 才能读」，而不是替操作者悄悄转掉它要预览的那个改动。
-  命令与三条路线 A 装机命令一样免配置，因为它跑在同一个窗口、同一份无 `.env` 的 bootstrap worktree。
+
+  命令分两趟，顺序是要点：
+  ①**先把 `control/schema-rollouts` 下每一份 `state.sqlite3` 以写者身份打开一次**，
+  库头的 `journal_mode` 就从 WAL 变回回滚日志。**每一份，不分代**——
+  `load_runtime_schema_service_bindings` 是先打开每份计划的库、再判断是不是本代，所以只要有一份
+  上一代留下的 WAL 库，每个 kind-backed role 都会被它挡住，形状与 #227 一模一样；而且代码里
+  没有任何地方删除旧计划目录，叠加 #228 之后旧代计划只会越积越多。转换只改库头，不动阶段，
+  不往哈希链上写任何东西。
+  ②**再对「目标是本代、阶段仍是 PREPARE」的计划做承认**，推进到 **DUAL_WRITE 为止**：
+  `SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING` 就是 DUAL_WRITE，常量一旦被改成别的值，代码在动
+  任何计划之前就抛错停下（离开 DUAL_WRITE 要生产者真写过的双写一致性证据，CUTOVER 要可信
+  消费者的回执，两者都不能由安装器代签）。
+
+  **计划的 deadline 是 `started_at + schema_rollout_stage_timeout_seconds`（生产画像默认 600 秒）**，
+  而窗口里从装 bundle 到承认之间超过十分钟是常态。命令因此在动任何东西之前逐份判 deadline，
+  dry-run 与 apply 判定完全一致；对「目标是本代、阶段是 PREPARE、已过期」的计划，安装器
+  **重开一次**窗口（`now` 加上计划自己的那段时长），作为 `deadline_reopen` 事件记进计划的哈希链，
+  `operation_id` 是 `installer-deadline-reopen:<plan>`。**每份计划只有一次**（第二次由
+  `SchemaRolloutStore.reopen_deadline` 自己拒绝），**已越过 PREPARE 的计划一律不动 deadline**。
+  重开额度用尽还过期的计划报 `skipped_reason: deadline_expired`，报告照样打完整、其余计划照样
+  推进，命令退 2。
+
+  `--dry-run` 一个字节都不写，**也不转换**——转换正是它要预览的那个改动，所以还是 WAL 的库被
+  如实报成 `state_unreadable`（没有任何进程能在不建 wal-index 的前提下读 WAL 库），而不是被
+  预览悄悄转掉。命令与三条路线 A 装机命令一样免配置，因为它跑在同一个窗口、同一份无 `.env` 的
+  bootstrap worktree。
 
 ### Changed
 
@@ -55,8 +73,9 @@
   不建表、不设 journal pragma，任何写在碰 SQLite 之前就被拒），写者则把库留在回滚日志模式而不是
   WAL——这才是只读打开能成立的前提，两边都实测过：目录 0555、没有 sidecar 时，WAL 库的
   `mode=ro` 抛 `attempt to write a readonly database`，`journal_mode=delete` 的库则打得开，
-  而且**看得见并发写者随后提交的内容**（`immutable=1` 看不见，所以不用它——rollout 控制器会在
-  服务运行期间推进阶段）。`journal_mode` 记在库头里，旧版写下的库在安装器下一次以写者身份
+  而且**看得见并发写者随后提交的内容**（`immutable=1` 不能用：它等于向 SQLite 承诺文件不会变，
+  而 rollout 控制器会在服务运行期间改它，那样读到的是上一次 checkpoint 的旧快照，极端情况下
+  连表都看不见）。`journal_mode` 记在库头里，旧版写下的库在安装器下一次以写者身份
   打开时自动转换。
   只读读者遇到 WAL 库**一律拒绝**，判据取自 SQLite 库头第 18 字节（一次 `read(2)`，不像 open
   那样会顺手把 `-shm` 建出来）：`mode=ro` 只把库文件标成只读、管不到目录，所以在可写的根上

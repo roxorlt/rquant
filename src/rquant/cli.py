@@ -3913,13 +3913,15 @@ def cmd_runtime_schema_rollout(args: argparse.Namespace) -> int:
         now=datetime.now(UTC),
         dry_run=bool(args.dry_run),
     )
-    changed = tuple(item for item in results if item.changed)
+    expired = tuple(item for item in results if item.skipped_reason == "deadline_expired")
     print(
         json.dumps(
             {
                 "status": "dry_run" if args.dry_run else "applied",
                 "plans": len(results),
-                "changed": len(changed),
+                "converted": len([item for item in results if item.converted]),
+                "changed": len([item for item in results if item.changed]),
+                "deadline_expired": len(expired),
                 "acknowledgements": [item.model_dump(mode="json") for item in results],
             },
             ensure_ascii=False,
@@ -3927,6 +3929,12 @@ def cmd_runtime_schema_rollout(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
+    #: The report is always complete — every plan gets a line whatever happened to it. The
+    #: exit code is what says a person still has to look: a plan whose window closed and whose
+    #: one reopen is spent cannot be carried by this command at all.
+    if expired:
+        logger.error("schema rollout 有 %d 份计划已过期且重开额度用尽，需人工裁决", len(expired))
+        return 2
     return 0
 
 

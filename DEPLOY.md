@@ -540,8 +540,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     ——R07 证据的 merge-provenance 检查要求候选恰有两个 parent，squash 与 rebase 拿不到部署证据。
     因此部署要取的 tag 指向的是合并后的那个 merge commit，不是分支 tip。
 19. **`runtime-production-prerequisites` / `runtime-production-profile` / `runtime-deployment-profile`
-    可以直接在没有 `.env` 的 bootstrap worktree（`/home/lighthouse/rquant-relA`）里跑**（#211，BLK-8）。
-    这三条命令跟 `runtime-authority-stage` 一样，在 `main()` 构造 `Settings` 之前就被分发，
+    / `runtime-schema-rollout` 可以直接在没有 `.env` 的 bootstrap worktree
+    （`/home/lighthouse/rquant-relA`）里跑**（#211，BLK-8；第四条来自 #227 的第二包）。
+    这四条命令跟 `runtime-authority-stage` 一样，在 `main()` 构造 `Settings` 之前就被分发，
     命令自己也不读任何配置。**本条只对含这一改动的版本成立**：在此之前的版本里，同样的命令会以
     `ValidationError: 5 validation errors for Settings` 退出，当时的绕法是在命令前面临时导出五个
     环境变量（`DATA_DIR` / `DUCKDB_PATH` / `PARQUET_DIR` / `LOG_DIR` / `TUSHARE_TOKEN_MAIN`）；
@@ -684,7 +685,7 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       **不要为了绕过报错去掉 `--only-missing`**：不带这个参数就是明确要求重新生成，会真的换密钥。
     - 详细操作说明见 `docs/operations/runtime-recovery-credentials.md`。
 
-30. **bundle 装完、`current` 指向本代之后、起 unit 之前，跑一次 schema rollout 的 PREPARE 承认**
+30. **bundle 装完、`current` 指向本代之后、起 unit 之前，跑一次 schema rollout 的 acknowledge**
     （#227，owner 2026-09-07 授权）。装一代有前代的 bundle 会为每个「声明指纹变了」的 channel
     备一份 rollout 计划——生产画像上是**十六份**，每份都停在 PREPARE 等它的全部生产者各记一条
     承认。这一步不做的后果不是「慢一点」：两份计划各带三个生产者
@@ -692,49 +693,71 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     启动时必然各以 `schema producer startup is waiting for every producer PREPARE ACK` 失败，
     每次失败都会中继一条 `rquant-alert@` 告警。
 
+    **命令做两件事，顺序固定**：
+
+    - **先转换**：把 `control/schema-rollouts` 下**每一份** `state.sqlite3` 以写者身份打开一次，
+      库头的 `journal_mode` 就从 WAL 变回回滚日志。**每一份，不分代**——生产上现存那十六份是
+      v0.33.0 的写者留下的 WAL，而 `load_runtime_schema_service_bindings` 是**先打开每份计划的库、
+      再判断是不是本代**，所以只要有一份旧代的 WAL 库留着，每个 kind-backed role 都会被它挡住，
+      形状与 #227 一模一样。转换只改库头，不动阶段、不往哈希链上写任何东西。
+    - **再承认**：对「目标是本代、阶段仍是 PREPARE」的计划，代每个生产者记一条 PREPARE 承认，
+      然后推进到 **DUAL_WRITE 为止**（离开 DUAL_WRITE 要生产者真写过的双写一致性证据，
+      CUTOVER 要可信消费者的回执，安装器都代签不了）。
+
     **位置：紧跟第 ④ 步 `runtime-deployment-profile`，在第 ⑤ 步 stage 之前。** 依据三条：
 
     - 它的全部前提就是「计划已落盘」加「`data/runtime/current` 指向计划的目标代」，两者都是
       第 ④ 步的产物；从第 ④ 步到起 unit 之间没有任何一步会动 `data/runtime/current`
       （publish 换的是 `/var/lib/rquant/runtime-authority/current.json`，是另一个文件）。
     - stage 只读 `<legacy root>/generations/<代>/manifests/*.json` 与 `current`，**不读也不写**
-      `control/schema-rollouts`；所以这一步既动不了 stage/publish，stage/publish 也动不了它，
-      放在哪一侧都不会造成「stage 与 publish 之间根被改动」那类拒绝。
-    - **十六份状态库现在是 WAL**（v0.33.0 的写者留下的），只有以写者身份打开一次才能转成回滚
-      日志；这一步顺带完成转换。把它放在 96 s 的 root publish**之前**，是为了让「库能不能打开、
-      能不能转换」这个问题在一条便宜的本地命令里得到答案，而不是在 root 事务跑完之后。
+      `control/schema-rollouts`；所以这一步既动不了 stage/publish，stage/publish 也动不了它。
+    - 把转换放在 96 s 的 root publish **之前**，是为了让「库能不能打开、能不能转换」这个问题
+      在一条便宜的本地命令里得到答案，而不是在 root 事务跑完之后。
 
     ```bash
-    cd "${WT}"                       # 无 .env 的 bootstrap worktree，本命令免配置
+    cd "${WT}"                       # 无 .env 的 bootstrap worktree，本命令免配置（第 19 条）
     ./.venv/bin/rquant runtime-schema-rollout acknowledge \
       --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
     ```
 
-    dry-run **一个字节都不写**（只读打开），先用它确认：`plans` 是 16、每份
-    `phase_before` 是 `prepare`。**十六份现在是 WAL，所以 dry-run 会把它们报成
-    `journal_mode_before: wal` + `phase_before: null` + `skipped_reason` 说要先 apply**——
-    这是预期，不是故障：没有任何进程能在不往旁边建 wal-index 的前提下读 WAL 库。
+    dry-run **一个字节都不写，也不转换**（只读打开）。**生产上十六份现在是 WAL，只读打开读不了
+    WAL 库，所以第一次 dry-run 会把它们全报成 `journal_mode_before: wal` +
+    `skipped_reason: state_unreadable` + `phase_before: null`——这是预期形状，不是故障**：
+    没有任何进程能在不往旁边建 wal-index 的前提下读 WAL 库。dry-run 此时能确认的是
+    `plans` 等于 16、每份的 `target_generation_id` 是本代。
 
     ```bash
     ./.venv/bin/rquant runtime-schema-rollout acknowledge \
       --runtime-root /home/lighthouse/rquant/data/runtime
     ```
 
-    apply 之后逐条核对输出：`changed` 等于本次真正推进的份数，每份
-    `journal_mode_after` 是 `rollback`、`phase_after` 是 `dual_write`，
+    apply 之后逐条核对输出：`converted` 是本次真正转过的份数；每份
+    `journal_mode_after` 是 `rollback`、`phase_after` 是 `dual_write`；
     `control/schema-rollouts` 下没有残留 `state.sqlite3-wal` / `-shm`。
-    **命令幂等**：再跑一次 `changed` 是 0，每份 `skipped_reason` 写
-    `plan is past PREPARE (phase dual_write)`。
+    **命令幂等**：再跑一次 `changed` 是 0，每份 `skipped_reason` 写 `past_prepare`。
+    转换完之后**再跑一次 dry-run**，这次就能读出真实阶段了。
 
-    - **只推进到 DUAL_WRITE，不会更远**，这是硬线：离开 DUAL_WRITE 要的是生产者真写过双写
-      记录的一致性证据，CUTOVER 要的是可信消费者的回执，安装器代签不了。
-    - 这一步是**生产数据库写入**（往每份计划的哈希链上追加事件），按受控自动发布模式第 7 条
-      需要 owner 单独明确授权，不能走无人值守发布器。
+    **关于 deadline（必读）**：计划的 `deadline` 是 `started_at + schema_rollout_stage_timeout_seconds`，
+    生产画像默认 **600 秒**。第 ④ 步到这一步之间超过十分钟是常态，所以：
+
+    - 命令**在动任何东西之前**逐份判 deadline，dry-run 与 apply 判定完全一致；
+    - 对「目标是本代、阶段是 PREPARE、已过期」的计划，安装器**重开一次窗口**
+      （`now` 加上计划自己的那 600 秒），这条重开会作为 `deadline_reopen` 事件记进计划的哈希链，
+      `operation_id` 是 `installer-deadline-reopen:<plan>`，输出里 `deadline_reopened: true`。
+      **每份计划只有一次**；已越过 PREPARE 的计划一律不动 deadline。
+    - 重开额度用尽还过期的计划报 `skipped_reason: deadline_expired`，**报告照样打完整、其余计划
+      照样推进**，命令**退 2**。这时需要人工裁决（重新 `prepare` 是另一次生产写入，要 owner 单独授权）。
+
+    - 这一步是**生产数据库写入**（往计划的哈希链上追加事件），按受控自动发布模式第 7 条
+      需要 owner 单独明确授权，不走无人值守发布器。
     - 若窗口在这一步之后失败并把 `data/runtime/current` 回退到上一代：计划停在 DUAL_WRITE，
-      但因为不再是当前代，之后任何一次 acknowledge 都会把它们跳过（输出写
-      `plan does not target the current generation`），不会被误当成本代的进度。
-    - 第 28 条那条固定启动顺序仍然照旧；这一步只消掉「等其他生产者承认」这一类失败，
-      消不掉 signal bus 的循环依赖。
+      但不再是当前代，之后任何一次 acknowledge 都会跳过它们（`skipped_reason: not_current_generation`），
+      不会被误当成本代的进度；它们的库仍然会被转换，这正是要的。
+    - 第 28 条那条固定启动顺序仍然照旧。acknowledge 只消掉「等其他生产者承认」这一类失败，
+      消不掉 `strategy_live` ↔ `signal_router` 的 signal bus 循环依赖（#220）。
+    - **#228 仍然在**：只要 `changed_runtime_schema_channels` 的指纹里带 `producer_commit`，
+      今后每一次纯代码发布都会凭空生出十六份计划，acknowledge 就得每次都跑一遍，
+      `control/schema-rollouts` 下的目录数每发一版加十六（没有任何代码清理旧计划目录）。
 
 ### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，以及修 #218 时查出来的 #220；末列写「已修」的条目已修，其余不修）
 

@@ -43,9 +43,14 @@ from rquant.runtime_schema_registry import (
     RuntimeSchemaCompatibilityError,
     RuntimeSchemaDualWriteBinding,
 )
-from rquant.schema_compatibility import RolloutPhase, persisted_rollout_journal_layout
+from rquant.schema_compatibility import (
+    RolloutPhase,
+    SchemaRolloutStateUnavailableError,
+    persisted_rollout_journal_layout,
+)
 from tests.integration.test_route_a_legacy_binding_e2e import (
     PRODUCTION_ROOT,
+    _production_bundle,
     _StopAfterOneIteration,
 )
 from tests.integration.test_route_a_schema_rollout_sandbox_e2e import (
@@ -268,12 +273,15 @@ def test_a_wal_store_left_by_the_installed_build_is_converted_by_the_acknowledge
     )
     previewed = next(item for item in preview if item.plan_id == plan_id)
     assert previewed.journal_mode_before == "wal"
+    assert previewed.skipped_reason == "state_unreadable"
     assert previewed.phase_before is None
+    assert previewed.converted is False
     assert persisted_rollout_journal_layout(rollout.state_path(plan_id)) == "wal"
 
     applied = next(item for item in _acknowledge(rollout) if item.plan_id == plan_id)
 
     assert (applied.journal_mode_before, applied.journal_mode_after) == ("wal", "rollback")
+    assert applied.converted is True
     assert applied.phase_after is RolloutPhase.DUAL_WRITE
     assert not list(rollout.rollout_root.glob("*/state.sqlite3-*"))
 
@@ -410,3 +418,74 @@ def test_a_dual_write_commit_under_an_unwritable_rollout_root_still_names_the_sa
     assert str(binding.store_path) in message
     assert "ReadWritePaths" in message
     assert "control/schema-rollouts" in message
+
+
+# ---------------------------------------------------------------------------------------
+# The generation after next: last generation's stores must not stay in WAL
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_previous_generations_wal_store_is_converted_and_stops_blocking_roles(
+    rollout: RolloutWorld,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shape of the window after this one, and why conversion cannot follow the generation.
+
+    Install a third generation and `current` moves on, so this run's sixteen plans stop being
+    the current generation's. They are not deleted — nothing in the codebase ever deletes a
+    plan directory — and `load_runtime_schema_service_bindings` opens every plan's store
+    before it reads the authority that would tell it the plan is for an older generation. So a
+    store left in WAL by a build before #227 keeps stopping every kind-backed role no matter
+    how many generations go by. Converting only the current generation's stores would put that
+    failure straight back the first time a bundle is installed.
+    """
+
+    if os.geteuid() == 0:
+        pytest.skip("running as root: the mode bits this case relies on are not enforced")
+
+    older = rollout.plan_ids()
+    _unseal(rollout.rollout_root)
+    for plan_id in older:
+        path = rollout.state_path(plan_id)
+        connection = sqlite3.connect(path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+        finally:
+            connection.close()
+        for leftover in path.parent.glob("state.sqlite3-*"):
+            leftover.unlink()
+    assert {persisted_rollout_journal_layout(rollout.state_path(p)) for p in older} == {"wal"}
+
+    third_commit = "9" * 40
+    _production_bundle(
+        tmp_path / "third",
+        monkeypatch,
+        producer_commit=third_commit,
+        runtime_root=rollout.runtime_root,
+        schema_bootstrap_reason=None,
+        definition_registry_root=rollout.runtime_root.parent / f"definitions-{third_commit[:7]}",
+    )
+
+    results = acknowledge_runtime_schema_rollout_preparation(
+        rollout.runtime_root, now=datetime.now(UTC)
+    )
+    _seal(rollout.rollout_root)
+
+    stale = [item for item in results if item.plan_id in older]
+    assert len(stale) == len(older)
+    assert {item.skipped_reason for item in stale} == {"not_current_generation"}
+    assert all(item.journal_mode_after == "rollback" for item in stale)
+    assert all(item.converted for item in stale)
+    for plan_id in older:
+        assert persisted_rollout_journal_layout(rollout.state_path(plan_id)) == "rollback"
+    assert not list(rollout.rollout_root.glob("*/state.sqlite3-*"))
+
+    #: the role no longer meets a WAL store on the way in. It still refuses, because the
+    #: published chain names the generation this test just moved off — but that is the
+    #: authority chain talking, which is what should stop it, not #227's SQLite refusal.
+    with pytest.raises(Exception) as caught:  # noqa: PT011 - the point is which one it is not
+        rollout.run_role_in_wrapper_environment(READ_ONLY_ROLES[0])
+
+    assert not isinstance(caught.value, SchemaRolloutStateUnavailableError), caught.value
+    assert "WAL journal mode" not in str(caught.value)

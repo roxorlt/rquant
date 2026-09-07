@@ -23,9 +23,10 @@ boundary. It pins three things a later edit must not move quietly:
 
 Which service ids are participants is not a literal decision: it falls out of the plans
 `install_runtime_deployment_profile` prepares over the real production profile. That
-derivation is asserted against this list in
-`tests/integration/test_route_a_schema_rollout_sandbox_e2e.py`, which installs two bundle
-generations and reads the participants back off the sixteen plans it prepares.
+derivation is asserted against this list by
+`tests/integration/test_route_a_rollout_acknowledge_e2e.py::test_the_granted_units_are_exactly_the_participants_of_the_prepared_plans`,
+which installs two bundle generations and reads the participants back off the sixteen plans it
+prepares.
 """
 
 from __future__ import annotations

@@ -2436,16 +2436,35 @@ class RuntimeSchemaRolloutAcknowledgement(RuntimeContractModel):
     target_generation_id: GenerationHash
     journal_mode_before: Literal["wal", "rollback", "unknown"]
     journal_mode_after: Literal["wal", "rollback", "unknown"]
+    converted: bool
     phase_before: RolloutPhase | None
     phase_after: RolloutPhase | None
+    deadline_reopened: bool
     acknowledged_producers: tuple[str, ...]
     already_acknowledged_producers: tuple[str, ...]
     advanced: bool
-    skipped_reason: str | None
+    #: A closed set, so an operator and a test can both match on it:
+    #: `not_current_generation` — the plan belongs to another generation; its journal is still
+    #: converted, because the units open every plan's store before they know that (#227).
+    #: `past_prepare` — nothing to acknowledge; the plan is waiting on evidence only the
+    #: running services produce.
+    #: `deadline_expired` — expired, and its one reopen is already spent. Needs a person.
+    #: `state_unreadable` — preview only: a WAL store cannot be read without writing beside
+    #: it, so its phase is unknown until an apply converts it.
+    skipped_reason: (
+        Literal["not_current_generation", "past_prepare", "deadline_expired", "state_unreadable"]
+        | None
+    )
+    detail: str | None
 
     @property
     def changed(self) -> bool:
-        return bool(self.acknowledged_producers) or self.advanced
+        return (
+            self.converted
+            or self.deadline_reopened
+            or bool(self.acknowledged_producers)
+            or self.advanced
+        )
 
 
 def _require_installer_phase_ceiling() -> RolloutPhase:
@@ -2465,55 +2484,130 @@ def _require_installer_phase_ceiling() -> RolloutPhase:
     return SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING
 
 
-def _rollout_acknowledgement_preview(
+class _RolloutJournalConversion(RuntimeContractModel):
+    """What the first pass found, and did, to one plan's state database."""
+
+    before: Literal["wal", "rollback", "unknown"]
+    after: Literal["wal", "rollback", "unknown"]
+    converted: bool
+
+
+def _convert_rollout_journal(
+    root: Path,
+    *,
+    plan_id: str,
+    dry_run: bool,
+) -> _RolloutJournalConversion:
+    """Open one plan's store as a writer so its header stops saying WAL.
+
+    Every plan, not only the current generation's. `load_runtime_schema_service_bindings`
+    walks `control/schema-rollouts` and opens each plan's store *before* it knows whether the
+    plan belongs to the current generation, so one WAL store left by an older build stops
+    every kind-backed role — which is #227 exactly, and leaving last generation's plans in WAL
+    would bring it straight back the next time a bundle is installed.
+
+    Nothing but the journal header changes: no phase moves, no event is appended, and the
+    plan is not even read. `journal_mode` lives in the database header, so the writable open
+    itself is the conversion.
+    """
+
+    path = _schema_rollout_root(root, plan_id) / "state.sqlite3"
+    try:
+        before = persisted_rollout_journal_layout(path)
+    except OSError as exc:
+        raise RuntimeSchemaCompatibilityError(
+            f"schema rollout state {path} cannot be read ({exc}); a plan directory without a "
+            "readable state store is not something this command may create or skip past"
+        ) from exc
+    if dry_run or before != "wal":
+        return _RolloutJournalConversion(before=before, after=before, converted=False)
+    SchemaRolloutStore(path)
+    after = persisted_rollout_journal_layout(path)
+    return _RolloutJournalConversion(before=before, after=after, converted=after != before)
+
+
+def _acknowledge_one_plan(
     root: Path,
     *,
     plan_id: str,
     generation_id: str,
+    now: datetime,
+    dry_run: bool,
+    conversion: _RolloutJournalConversion,
 ) -> RuntimeSchemaRolloutAcknowledgement:
-    """Read one plan without writing anything, including without converting its journal."""
+    """Judge one plan, and — unless something says stop — carry it to DUAL_WRITE.
+
+    One function for both modes on purpose: the preview and the apply have to reach the same
+    verdict about the same plan, and the way they stop agreeing is by being written twice.
+    Everything that decides is read-only; `dry_run` only gates the three writes at the end.
+    """
 
     ceiling = _require_installer_phase_ceiling()
-    path = _schema_rollout_root(root, plan_id) / "state.sqlite3"
-    layout = persisted_rollout_journal_layout(path)
-    authority = _read_schema_rollout_authority(
-        _schema_rollout_root(root, plan_id) / "authority.json"
-    )
+    rollout_root = _schema_rollout_root(root, plan_id)
+    authority = _read_schema_rollout_authority(rollout_root / "authority.json")
     fields: dict[str, object] = {
         "plan_id": plan_id,
         "dataset_id": authority.plan.dataset_id,
         "target_generation_id": authority.target_generation_id,
-        "journal_mode_before": layout,
-        "journal_mode_after": layout,
+        "journal_mode_before": conversion.before,
+        "journal_mode_after": conversion.after,
+        "converted": conversion.converted,
         "phase_before": None,
         "phase_after": None,
+        "deadline_reopened": False,
         "acknowledged_producers": (),
         "already_acknowledged_producers": (),
         "advanced": False,
         "skipped_reason": None,
+        "detail": None,
     }
     if authority.target_generation_id != generation_id:
-        fields["skipped_reason"] = "plan does not target the current generation"
-        return RuntimeSchemaRolloutAcknowledgement(**fields)
-    if layout == "wal":
-        #: A build before #227 left the store in WAL, and nothing can read a WAL database
-        #: without creating a wal-index beside it. The preview says so rather than opening it
-        #: for writing, because opening it for writing is the change the operator asked to
-        #: preview. Applying converts it first, and then reads what is really there.
-        fields["skipped_reason"] = (
-            "store is in WAL journal mode and cannot be read without writing beside it; "
-            "applying converts it to a rollback journal first"
+        fields["skipped_reason"] = "not_current_generation"
+        fields["detail"] = (
+            f"plan targets generation {authority.target_generation_id}, and the runtime root "
+            f"currently serves {generation_id}; its journal was still converted, because a "
+            "runtime unit opens every plan's store before it knows which generation it is for"
         )
         return RuntimeSchemaRolloutAcknowledgement(**fields)
-    _authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
+    if conversion.after == "wal":
+        #: Reachable only in a preview: nothing can read a WAL database without creating a
+        #: wal-index beside it, and converting is the very change the preview is previewing.
+        fields["skipped_reason"] = "state_unreadable"
+        fields["detail"] = (
+            "store is in WAL journal mode, so its phase cannot be read without writing "
+            "beside it; applying converts it to a rollback journal first"
+        )
+        return RuntimeSchemaRolloutAcknowledgement(**fields)
+
+    _authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=dry_run)
     state = store.get_state(plan_id)
     fields["phase_before"] = state.phase
     fields["phase_after"] = state.phase
     if state.phase is not RolloutPhase.PREPARE:
-        fields["skipped_reason"] = f"plan is past PREPARE (phase {state.phase.value})"
+        #: Everything below only ever runs on a plan still in PREPARE. This is the line the
+        #: authorisation draws: a plan already at DUAL_WRITE is waiting on its producers'
+        #: dual-write records, and a plan at CONSUMER_ACK on its consumers' receipts.
+        fields["skipped_reason"] = "past_prepare"
+        fields["detail"] = f"plan is in {state.phase.value}; nothing here may act on it"
         return RuntimeSchemaRolloutAcknowledgement(**fields)
+
+    #: Judged before anything is appended, and judged the same way in both modes. A plan whose
+    #: window has closed cannot be acknowledged or advanced — `_validate_time` refuses both —
+    #: so finding that out here is the difference between a report and a half-written run.
+    deadline = store.effective_deadline(plan_id)
+    reopening = now > deadline
+    if reopening and store.deadline_reopened_until(plan_id) is not None:
+        fields["skipped_reason"] = "deadline_expired"
+        fields["detail"] = (
+            f"plan deadline {deadline.isoformat()} has passed and its one installer reopen is "
+            "already spent; nothing here may extend it again, so this plan needs an operator "
+            "decision (re-prepare is a separate production write)"
+        )
+        return RuntimeSchemaRolloutAcknowledgement(**fields)
+
     required = tuple(sorted(item.participant_id for item in authority.plan.producers))
-    done = tuple(
+    producers = {item.participant_id: item for item in authority.plan.producers}
+    already = tuple(
         participant_id
         for participant_id in required
         if _participant_has_ack(
@@ -2523,82 +2617,23 @@ def _rollout_acknowledgement_preview(
             participant_id=participant_id,
         )
     )
-    pending = tuple(participant_id for participant_id in required if participant_id not in done)
+    pending = tuple(participant_id for participant_id in required if participant_id not in already)
     fields["acknowledged_producers"] = pending
-    fields["already_acknowledged_producers"] = done
+    fields["already_acknowledged_producers"] = already
+    fields["deadline_reopened"] = reopening
     fields["advanced"] = True
     fields["phase_after"] = ceiling
-    return RuntimeSchemaRolloutAcknowledgement(**fields)
-
-
-def _apply_rollout_acknowledgement(
-    root: Path,
-    *,
-    plan_id: str,
-    generation_id: str,
-    now: datetime,
-) -> RuntimeSchemaRolloutAcknowledgement:
-    """Record the producers' PREPARE acknowledgements and stop at the installer's ceiling."""
-
-    ceiling = _require_installer_phase_ceiling()
-    rollout_root = _schema_rollout_root(root, plan_id)
-    path = rollout_root / "state.sqlite3"
-    layout_before = persisted_rollout_journal_layout(path)
-    declared = _read_schema_rollout_authority(rollout_root / "authority.json")
-    if declared.target_generation_id != generation_id:
-        #: Checked before the store is opened, so a plan belonging to another generation is
-        #: left exactly as it is — not even its journal layout is touched.
-        return RuntimeSchemaRolloutAcknowledgement(
-            plan_id=plan_id,
-            dataset_id=declared.plan.dataset_id,
-            target_generation_id=declared.target_generation_id,
-            journal_mode_before=layout_before,
-            journal_mode_after=layout_before,
-            phase_before=None,
-            phase_after=None,
-            acknowledged_producers=(),
-            already_acknowledged_producers=(),
-            advanced=False,
-            skipped_reason="plan does not target the current generation",
-        )
-    #: A writable open is what converts a pre-#227 WAL store to a rollback journal, because
-    #: `journal_mode` lives in the database header. Every later reader — the units, whose
-    #: `ReadWritePaths` still may not create a wal-index — depends on that having happened.
-    authority, store = load_runtime_schema_rollout(root, plan_id=plan_id)
-    layout_after = persisted_rollout_journal_layout(path)
-    state = store.get_state(plan_id)
-    fields: dict[str, object] = {
-        "plan_id": plan_id,
-        "dataset_id": authority.plan.dataset_id,
-        "target_generation_id": authority.target_generation_id,
-        "journal_mode_before": layout_before,
-        "journal_mode_after": layout_after,
-        "phase_before": state.phase,
-        "phase_after": state.phase,
-        "acknowledged_producers": (),
-        "already_acknowledged_producers": (),
-        "advanced": False,
-        "skipped_reason": None,
-    }
-    if state.phase is not RolloutPhase.PREPARE:
-        #: Everything below only ever runs on a plan still in PREPARE. This is the line the
-        #: authorisation draws: a plan already at DUAL_WRITE is waiting on its producers'
-        #: dual-write records, and a plan at CONSUMER_ACK on its consumers' receipts.
-        fields["skipped_reason"] = f"plan is past PREPARE (phase {state.phase.value})"
+    if dry_run:
         return RuntimeSchemaRolloutAcknowledgement(**fields)
-    required = tuple(sorted(item.participant_id for item in authority.plan.producers))
-    producers = {item.participant_id: item for item in authority.plan.producers}
-    recorded: list[str] = []
-    already: list[str] = []
-    for participant_id in required:
-        if _participant_has_ack(
-            store,
+
+    if reopening:
+        state = store.reopen_deadline(
             plan_id=plan_id,
-            phase=RolloutPhase.PREPARE,
-            participant_id=participant_id,
-        ):
-            already.append(participant_id)
-            continue
+            expected_revision=state.revision,
+            now=now,
+            operation_id=f"installer-deadline-reopen:{plan_id}",
+        )
+    for participant_id in pending:
         state = store.acknowledge(
             plan_id=plan_id,
             expected_revision=state.revision,
@@ -2609,9 +2644,6 @@ def _apply_rollout_acknowledgement(
             now=now,
             operation_id=f"installer-prepare:{plan_id}:{participant_id}",
         )
-        recorded.append(participant_id)
-    fields["acknowledged_producers"] = tuple(recorded)
-    fields["already_acknowledged_producers"] = tuple(already)
     state = store.advance(
         plan_id=plan_id,
         expected_revision=state.revision,
@@ -2619,12 +2651,6 @@ def _apply_rollout_acknowledgement(
         now=now,
         operation_id=f"installer-dual-write:{plan_id}",
     )
-    if state.phase is not RolloutPhase.DUAL_WRITE:
-        raise RuntimeSchemaCompatibilityError(
-            f"installer acknowledgement left plan {plan_id} at {state.phase.value}, "
-            "which is past dual_write"
-        )
-    fields["advanced"] = True
     fields["phase_after"] = state.phase
     return RuntimeSchemaRolloutAcknowledgement(**fields)
 
@@ -2635,9 +2661,9 @@ def acknowledge_runtime_schema_rollout_preparation(
     now: datetime,
     dry_run: bool = False,
 ) -> tuple[RuntimeSchemaRolloutAcknowledgement, ...]:
-    """Record every producer's PREPARE acknowledgement and stop the plan at DUAL_WRITE.
+    """Convert every rollout store, then carry this generation's prepared plans to DUAL_WRITE.
 
-    The producers cannot do this themselves. A runtime unit's `ReadWritePaths` reaches
+    The producers cannot do either themselves. A runtime unit's `ReadWritePaths` reaches
     `control/schema-rollouts` only as of the 2026-09-07 ruling, and even with that grant a
     plan carrying several producers makes its first instances fail once each — every producer
     raises `schema producer startup is waiting for every producer PREPARE ACK` until the last
@@ -2645,13 +2671,19 @@ def acknowledge_runtime_schema_rollout_preparation(
     and off the critical path, removes that; it does not remove anything else, because the
     installer stops dead at `SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING`.
 
-    Applying opens each store as a writer, which also converts a store an older build left in
-    WAL back to a rollback journal — the layout a unit's read-only admission can read at all.
-    Both layouts are reported per plan, before and after.
+    Two passes, in this order, and the order is the point:
 
-    `dry_run=True` writes nothing, and in particular does not convert: it opens each store
-    read-only, which a WAL store refuses, so such a plan is reported as unreadable-until-
-    applied rather than silently converted by the preview.
+    1. **every** plan's store is opened writable, which is what converts a store an older
+       build left in WAL back to a rollback journal. Every plan, including the generations
+       this run will not touch, because admission opens them all before it knows which
+       generation they belong to;
+    2. this generation's plans still in PREPARE are acknowledged and advanced.
+
+    Splitting them means a plan that stops the second pass cannot leave the others unreadable,
+    and it means the conversion the owner authorised really covers what it says it covers.
+
+    `dry_run=True` writes nothing and converts nothing — converting is the very change it is
+    previewing — so a store still in WAL is reported as unreadable until applied.
     """
 
     root = _absolute_runtime_root(runtime_root)
@@ -2663,19 +2695,22 @@ def acknowledge_runtime_schema_rollout_preparation(
             "bound to the generation the plans target"
         )
     generation_id = target.removeprefix("generations/")
-    results: list[RuntimeSchemaRolloutAcknowledgement] = []
-    for plan_id in _schema_rollout_plan_ids(root):
-        if dry_run:
-            results.append(
-                _rollout_acknowledgement_preview(root, plan_id=plan_id, generation_id=generation_id)
-            )
-            continue
-        results.append(
-            _apply_rollout_acknowledgement(
-                root, plan_id=plan_id, generation_id=generation_id, now=now
-            )
+    plan_ids = _schema_rollout_plan_ids(root)
+    conversions = {
+        plan_id: _convert_rollout_journal(root, plan_id=plan_id, dry_run=dry_run)
+        for plan_id in plan_ids
+    }
+    return tuple(
+        _acknowledge_one_plan(
+            root,
+            plan_id=plan_id,
+            generation_id=generation_id,
+            now=now,
+            dry_run=dry_run,
+            conversion=conversions[plan_id],
         )
-    return tuple(results)
+        for plan_id in plan_ids
+    )
 
 
 def advance_runtime_schema_rollout(

@@ -112,6 +112,9 @@ HANDLER_MODULES = (
     "rquant.runtime_deployment_profile",
     "rquant.runtime_market_calendar_generation",
     "rquant.runtime_production_profile",
+    # Package H: `runtime-schema-rollout acknowledge` imports this one, and until it was named
+    # here it was only covered by accident — `runtime_deployment_profile` happens to import it.
+    "rquant.runtime_deployment_bundle",
 )
 
 

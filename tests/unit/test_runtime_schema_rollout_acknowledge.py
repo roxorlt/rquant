@@ -64,12 +64,21 @@ from tests.unit.test_runtime_deployment_bundle import (
 #: two-sided channel a changed channel — the same reason the production host staged sixteen
 #: plans for a release that changed no schema at all (#228).
 NEXT_COMMIT = "b" * 40
-STARTED_AT = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
-LATER = STARTED_AT + timedelta(minutes=5)
-#: The CLI stamps its own `datetime.now(UTC)`, and `_validate_time` refuses a mutation past a
-#: plan's deadline. A deadline ten years out keeps the plan open for both clocks without any
-#: test having to freeze one.
-DEADLINE = STARTED_AT + timedelta(days=3650)
+
+#: The production profile's own window: `runtime_production_profile.py` defaults
+#: `schema_rollout_stage_timeout_seconds` to 600, and `install_runtime_deployment_profile`
+#: makes every plan's deadline `started_at + that`. Ten minutes is what the host really gives,
+#: and pretending otherwise is what hid the expiry defect the first time round.
+STAGE_TIMEOUT = timedelta(seconds=600)
+#: The CLI stamps its own `datetime.now(UTC)`, so a fixture whose window closed in 2026 would
+#: make every CLI case a deadline case. `STARTED_AT` is therefore anchored to the run's own
+#: clock, and `EXPIRED` is the only thing that steps past the window.
+STARTED_AT = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=30)
+DEADLINE = STARTED_AT + STAGE_TIMEOUT
+#: Inside the window, and after `started_at`: the ordinary case.
+LATER = STARTED_AT + timedelta(seconds=120)
+#: One second past the window: what an operator who took eleven minutes over the step has.
+EXPIRED = DEADLINE + timedelta(seconds=1)
 
 
 def _at_commit(manifest: Any, commit: str) -> Any:
@@ -111,6 +120,25 @@ class Rollout:
     def revision(self, plan_id: str) -> int:
         _authority, store = load_runtime_schema_rollout(self.root, plan_id=plan_id, read_only=True)
         return store.get_state(plan_id).revision
+
+    def revision_unverified(self, plan_id: str) -> int:
+        """The revision straight off the row, for a store the read-only loader cannot open.
+
+        A WAL store refuses a read-only open (#227), and the case that puts one there has to
+        record what the revision was *before* the conversion in order to prove the conversion
+        appended nothing.
+        """
+
+        connection = sqlite3.connect(self.state_path(plan_id))
+        try:
+            row = connection.execute(
+                "SELECT revision FROM schema_rollout WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        for leftover in self.state_path(plan_id).parent.glob("state.sqlite3-*"):
+            leftover.unlink()
+        return int(row[0])
 
     def producers(self, plan_id: str) -> tuple[str, ...]:
         authority, _store = load_runtime_schema_rollout(self.root, plan_id=plan_id, read_only=True)
@@ -322,7 +350,8 @@ def test_a_second_run_records_nothing_and_says_so(rollout: Rollout) -> None:
         assert item.acknowledged_producers == ()
         assert item.phase_before is RolloutPhase.DUAL_WRITE
         assert item.phase_after is RolloutPhase.DUAL_WRITE
-        assert item.skipped_reason == "plan is past PREPARE (phase dual_write)"
+        assert item.skipped_reason == "past_prepare"
+        assert item.detail == "plan is in dual_write; nothing here may act on it"
     assert {plan_id: rollout.revision(plan_id) for plan_id in rollout.plan_ids} == revisions
     assert rollout.digest() == digests
 
@@ -479,8 +508,9 @@ def test_the_dry_run_refuses_to_convert_a_wal_store_just_to_preview_it(
     assert item.journal_mode_after == "wal"
     assert item.phase_before is None
     assert item.advanced is False
-    assert item.skipped_reason is not None
-    assert "WAL" in item.skipped_reason
+    assert item.skipped_reason == "state_unreadable"
+    assert item.detail is not None
+    assert "WAL" in item.detail
     assert persisted_rollout_journal_layout(rollout.state_path(plan_id)) == "wal"
     assert rollout.sidecars() == []
 
@@ -503,11 +533,7 @@ def test_the_dry_run_of_an_already_acknowledged_plan_finds_nothing_to_do(
 # ---------------------------------------------------------------------------------------
 
 
-def test_a_plan_that_targets_another_generation_is_left_alone(rollout: Rollout) -> None:
-    """Generation-bound like the rollout controller: `current` decides which plans apply."""
-
-    plan_id = rollout.plan_ids[0]
-    rollout.make_wal(plan_id)
+def _swing_current_to_the_other_generation(rollout: Rollout) -> None:
     current = rollout.root / "current"
     generations = sorted(
         path.name for path in (rollout.root / "generations").iterdir() if path.is_dir()
@@ -516,14 +542,49 @@ def test_a_plan_that_targets_another_generation_is_left_alone(rollout: Rollout) 
     current.unlink()
     current.symlink_to(f"generations/{other}")
 
+
+def test_a_plan_that_targets_another_generation_keeps_its_phase(rollout: Rollout) -> None:
+    """Generation-bound like the rollout controller: `current` decides which plans advance."""
+
+    revisions = {plan_id: rollout.revision(plan_id) for plan_id in rollout.plan_ids}
+    _swing_current_to_the_other_generation(rollout)
+
     results = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=LATER)
 
-    assert {item.skipped_reason for item in results} == {
-        "plan does not target the current generation"
-    }
-    assert all(item.changed is False for item in results)
-    #: not even the journal layout of the store it skipped
-    assert persisted_rollout_journal_layout(rollout.state_path(plan_id)) == "wal"
+    assert {item.skipped_reason for item in results} == {"not_current_generation"}
+    assert all(item.advanced is False for item in results)
+    assert all(item.acknowledged_producers == () for item in results)
+    assert all(rollout.phase(plan_id) is RolloutPhase.PREPARE for plan_id in rollout.plan_ids)
+    assert {plan_id: rollout.revision(plan_id) for plan_id in rollout.plan_ids} == revisions
+
+
+def test_a_plan_that_targets_another_generation_is_still_converted(rollout: Rollout) -> None:
+    """The other half of #227: a unit opens every plan's store before it knows the generation.
+
+    `load_runtime_schema_service_bindings` walks `control/schema-rollouts` and opens each
+    plan's state store, and only then reads its authority to see whether the plan is for this
+    generation. So one store left in WAL by a previous generation stops every kind-backed
+    role, exactly the way #227 did — leaving last generation's plans unconverted would put the
+    failure straight back. Converting them changes nothing but the journal header.
+    """
+
+    for plan_id in rollout.plan_ids:
+        rollout.make_wal(plan_id)
+    revisions = {plan_id: rollout.revision_unverified(plan_id) for plan_id in rollout.plan_ids}
+    _swing_current_to_the_other_generation(rollout)
+
+    results = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=LATER)
+
+    assert {item.skipped_reason for item in results} == {"not_current_generation"}
+    assert all(item.journal_mode_before == "wal" for item in results)
+    assert all(item.journal_mode_after == "rollback" for item in results)
+    assert all(item.converted for item in results)
+    for plan_id in rollout.plan_ids:
+        assert persisted_rollout_journal_layout(rollout.state_path(plan_id)) == "rollback"
+        #: converted, and nothing else: no event on the chain, no phase moved
+        assert rollout.revision(plan_id) == revisions[plan_id]
+        assert rollout.phase(plan_id) is RolloutPhase.PREPARE
+    assert rollout.sidecars() == []
 
 
 def test_a_runtime_root_without_a_current_generation_is_refused(tmp_path: Path) -> None:
@@ -618,3 +679,235 @@ def test_the_command_reports_the_journal_conversion_per_plan(
 
     assert converted["journal_mode_before"] == "wal"
     assert converted["journal_mode_after"] == "rollback"
+
+
+# ---------------------------------------------------------------------------------------
+# The ten-minute window the production profile really gives (MF1)
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_fixture_uses_the_window_the_production_profile_gives(rollout: Rollout) -> None:
+    """Otherwise none of the cases below mean anything.
+
+    `runtime_production_profile.schema_rollout_stage_timeout_seconds` defaults to 600, and
+    `install_runtime_deployment_profile` makes each plan's deadline `started_at + that`. A
+    fixture with a ten-year deadline hides every expiry path, which is how the first round of
+    this package shipped a command that could not run on the host at all.
+    """
+
+    for plan_id in rollout.plan_ids:
+        authority, _store = load_runtime_schema_rollout(
+            rollout.root, plan_id=plan_id, read_only=True
+        )
+        assert authority.plan.deadline - authority.plan.started_at == STAGE_TIMEOUT
+
+
+def test_an_expired_plan_is_reopened_once_and_then_carried(rollout: Rollout) -> None:
+    """The host's normal case: installing a bundle and acknowledging it takes over ten minutes.
+
+    A plan whose window has closed can be neither acknowledged nor advanced — `_validate_time`
+    refuses both — so without this it is a dead end. The installer restarts the plan's own
+    window once, on the plan's own terms: `now` plus exactly `deadline - started_at`.
+    """
+
+    results = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=EXPIRED)
+
+    for item in results:
+        assert item.skipped_reason is None, item
+        assert item.deadline_reopened is True
+        assert item.phase_after is RolloutPhase.DUAL_WRITE
+    assert all(rollout.phase(plan_id) is RolloutPhase.DUAL_WRITE for plan_id in rollout.plan_ids)
+    for plan_id in rollout.plan_ids:
+        _authority, store = load_runtime_schema_rollout(
+            rollout.root, plan_id=plan_id, read_only=True
+        )
+        reopened = store.deadline_reopened_until(plan_id)
+        assert reopened == EXPIRED + STAGE_TIMEOUT
+        assert store.effective_deadline(plan_id) == reopened
+
+
+def test_the_reopen_is_on_the_hash_chain_and_says_who_did_it(rollout: Rollout) -> None:
+    """Auditable like every acknowledgement around it, and identifiable as the installer's."""
+
+    acknowledge_runtime_schema_rollout_preparation(rollout.root, now=EXPIRED)
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id, read_only=True)
+
+    receipts = store.receipts(plan_id)
+    reopens = [item for item in receipts if item.event_type == "deadline_reopen"]
+
+    assert len(reopens) == 1
+    assert reopens[0].operation_id == f"installer-deadline-reopen:{plan_id}"
+    payload = json.loads(reopens[0].payload_json)
+    assert payload["action"] == "deadline_reopen"
+    assert payload["window_seconds"] == int(STAGE_TIMEOUT.total_seconds())
+    assert payload["resulting_phase"] == RolloutPhase.PREPARE.value
+    #: it is the first event, before any acknowledgement — the clock is restarted, then used
+    assert receipts.index(reopens[0]) < min(
+        index for index, item in enumerate(receipts) if item.event_type == "participant_ack"
+    )
+
+
+def test_the_window_is_restarted_not_removed(rollout: Rollout) -> None:
+    """A reopen buys exactly one more of the profile's own windows, not an open lease."""
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    store.reopen_deadline(
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        now=EXPIRED,
+        operation_id=f"installer-deadline-reopen:{plan_id}",
+    )
+
+    assert store.effective_deadline(plan_id) == EXPIRED + STAGE_TIMEOUT
+    with pytest.raises(ValueError, match="deadline has expired"):
+        store.advance(
+            plan_id=plan_id,
+            expected_revision=store.get_state(plan_id).revision,
+            target_phase=RolloutPhase.DUAL_WRITE,
+            now=EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1),
+            operation_id="past-the-reopened-window",
+        )
+
+
+def test_the_store_itself_allows_only_one_reopen(rollout: Rollout) -> None:
+    """Once is enforced where it cannot be routed around, not in the caller.
+
+    Still in PREPARE, so the phase rule is not what refuses: a second reopen of the same plan
+    is refused on its own terms, which is what keeps this from becoming an open-ended lease.
+    """
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    store.reopen_deadline(
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        now=LATER,
+        operation_id=f"installer-deadline-reopen:{plan_id}",
+    )
+    assert store.get_state(plan_id).phase is RolloutPhase.PREPARE
+
+    with pytest.raises(ValueError, match="already been reopened once"):
+        store.reopen_deadline(
+            plan_id=plan_id,
+            expected_revision=store.get_state(plan_id).revision,
+            now=LATER + timedelta(seconds=1),
+            operation_id="second-reopen",
+        )
+
+
+def test_a_plan_whose_reopen_is_spent_is_reported_not_raised(rollout: Rollout) -> None:
+    """The whole report is printed, every plan gets a line, and the exit code says look."""
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    store.reopen_deadline(
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        now=LATER,
+        operation_id=f"installer-deadline-reopen:{plan_id}",
+    )
+    beyond = LATER + STAGE_TIMEOUT + timedelta(seconds=1)
+
+    results = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=beyond)
+    spent = next(item for item in results if item.plan_id == plan_id)
+
+    assert len(results) == len(rollout.plan_ids), "every plan is still reported"
+    assert spent.skipped_reason == "deadline_expired"
+    assert spent.detail is not None and "reopen is already spent" in spent.detail
+    assert spent.advanced is False
+    assert rollout.phase(plan_id) is RolloutPhase.PREPARE
+    #: and the plans whose one reopen is still available are carried, in the same run
+    others = [item for item in results if item.plan_id != plan_id]
+    assert others and all(item.phase_after is RolloutPhase.DUAL_WRITE for item in others)
+
+
+def test_the_preview_reaches_the_same_verdict_about_an_expired_plan(rollout: Rollout) -> None:
+    """A preview that promised what the apply cannot do is what MF1 was."""
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    store.reopen_deadline(
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        now=LATER,
+        operation_id=f"installer-deadline-reopen:{plan_id}",
+    )
+    beyond = LATER + STAGE_TIMEOUT + timedelta(seconds=1)
+
+    preview = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=beyond, dry_run=True)
+    applied = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=beyond)
+
+    assert [item.skipped_reason for item in preview] == [item.skipped_reason for item in applied]
+    assert [item.deadline_reopened for item in preview] == [
+        item.deadline_reopened for item in applied
+    ]
+    assert [item.advanced for item in preview] == [item.advanced for item in applied]
+
+
+def test_the_preview_of_an_expired_plan_announces_the_reopen(rollout: Rollout) -> None:
+    """And it does not perform it: the plan is untouched afterwards."""
+
+    digests = rollout.digest()
+
+    preview = acknowledge_runtime_schema_rollout_preparation(
+        rollout.root, now=EXPIRED, dry_run=True
+    )
+
+    assert all(item.deadline_reopened for item in preview)
+    assert all(item.advanced for item in preview)
+    assert rollout.digest() == digests
+    for plan_id in rollout.plan_ids:
+        _authority, store = load_runtime_schema_rollout(
+            rollout.root, plan_id=plan_id, read_only=True
+        )
+        assert store.deadline_reopened_until(plan_id) is None
+
+
+def test_the_installer_may_not_reopen_a_plan_that_has_left_prepare(rollout: Rollout) -> None:
+    """The ruling stops at PREPARE: a later phase waits on evidence, not on a clock."""
+
+    acknowledge_runtime_schema_rollout_preparation(rollout.root, now=LATER)
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    assert store.get_state(plan_id).phase is RolloutPhase.DUAL_WRITE
+
+    with pytest.raises(ValueError, match="only a preparing rollout"):
+        store.reopen_deadline(
+            plan_id=plan_id,
+            expected_revision=store.get_state(plan_id).revision,
+            now=EXPIRED,
+            operation_id="reopen-past-prepare",
+        )
+
+
+# ---------------------------------------------------------------------------------------
+# The door the whole "DUAL_WRITE is a safe ceiling" argument rests on
+# ---------------------------------------------------------------------------------------
+
+
+def test_leaving_dual_write_still_needs_the_producers_own_evidence(rollout: Rollout) -> None:
+    """Why stopping at DUAL_WRITE gives nothing away, stated as a failing transition.
+
+    The installer signs the PREPARE round because every argument that round takes comes off
+    the frozen plan. The next step is not like that: `_validate_phase_exit` will not let a
+    plan out of DUAL_WRITE until the store holds dual-write consistency evidence, which only
+    a running producer writes. That door is what makes the ceiling safe, so it is asserted
+    here rather than assumed.
+    """
+
+    acknowledge_runtime_schema_rollout_preparation(rollout.root, now=LATER)
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+
+    with pytest.raises(ValueError, match="dual_write lacks consistency evidence"):
+        store.advance(
+            plan_id=plan_id,
+            expected_revision=store.get_state(plan_id).revision,
+            target_phase=RolloutPhase.CONSUMER_ACK,
+            now=LATER + timedelta(seconds=1),
+            operation_id="advance-without-evidence",
+        )
+
+    assert rollout.phase(plan_id) is RolloutPhase.DUAL_WRITE

@@ -38,6 +38,9 @@ Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 _GENESIS_HASH = "0" * 64
 _REGISTRY_SCHEMA_VERSION = 2
+#: The one event type the installer may append that is not a participant's own
+#: evidence. It restarts a PREPARE plan's window without touching its identity.
+_DEADLINE_REOPEN_EVENT = "deadline_reopen"
 
 
 class RolloutPhase(StrEnum):
@@ -1037,7 +1040,7 @@ class SchemaRolloutStore:
             self._require_revision(row, expected_revision)
             if RolloutPhase(row["phase"]) is not phase:
                 raise ValueError("acknowledgement phase does not match current rollout phase")
-            self._validate_time(plan, row, now)
+            self._validate_time(connection, plan, row, now)
             participants = {
                 item.participant_id: item for item in (*plan.producers, *plan.consumers)
             }
@@ -1067,6 +1070,77 @@ class SchemaRolloutStore:
                 now=now,
             )
 
+    def reopen_deadline(
+        self,
+        *,
+        plan_id: str,
+        expected_revision: int,
+        now: AwareUtcDatetime,
+        operation_id: str,
+    ) -> SchemaRolloutState:
+        """Restart a still-preparing plan's own window once, without changing its identity.
+
+        A plan's `deadline` is `started_at + schema_rollout_stage_timeout_seconds`, ten
+        minutes on the production profile, and it is part of `plan_id` — so it cannot be
+        edited, only recorded around. On the host, installing a bundle and then acknowledging
+        its plans is a sequence of operator steps that routinely takes longer than that, and
+        an expired PREPARE plan is otherwise a dead end: nothing can acknowledge it, advance
+        it, or extend it.
+
+        What this does is narrow on purpose:
+
+        * only in PREPARE — a plan that has left it is waiting on evidence that a restarted
+          clock has no bearing on, and the authorisation does not reach there;
+        * only once — a second reopen is refused, so this cannot become an open-ended lease;
+        * only for the plan's own window — `reopened_until` is `now` plus exactly
+          `deadline - started_at`, so the profile's timeout still decides how long it is;
+        * on the append-only chain, with its own event type, so the reopen is as auditable as
+          every acknowledgement around it and `receipts()` shows who restarted the clock.
+
+        Everything else about the plan — participants, fingerprints, phase — is untouched.
+        """
+
+        now = normalize_aware_utc(now)
+        request = {"action": _DEADLINE_REOPEN_EVENT, "now": now}
+        request_hash = canonical_sha256(request)
+        with self._writer() as connection:
+            row, plan = self._load(connection, plan_id)
+            retried = self._idempotent_retry(
+                connection, row, operation_id=operation_id, request_hash=request_hash
+            )
+            if retried is not None:
+                return retried
+            self._require_revision(row, expected_revision)
+            phase = RolloutPhase(row["phase"])
+            if phase is not RolloutPhase.PREPARE:
+                raise ValueError("only a preparing rollout may have its deadline reopened")
+            if self._deadline_reopened_until(connection, plan_id) is not None:
+                raise ValueError("rollout deadline has already been reopened once")
+            if now < max(plan.started_at, self._state_from_row(row).updated_at):
+                raise ValueError("rollout time cannot precede the current state")
+            reopened_until = now + (plan.deadline - plan.started_at)
+            return self._append_mutation(
+                connection,
+                row=row,
+                plan=plan,
+                operation_id=operation_id,
+                event_type=_DEADLINE_REOPEN_EVENT,
+                request_hash=request_hash,
+                payload={
+                    "action": _DEADLINE_REOPEN_EVENT,
+                    "original_deadline": plan.deadline.isoformat(),
+                    "reopened_until": reopened_until.isoformat(),
+                    "window_seconds": int((plan.deadline - plan.started_at).total_seconds()),
+                    "resulting_phase": phase.value,
+                    "authority_declaration_fingerprint": row["authority_declaration_fingerprint"],
+                    "new_data_preserved": bool(row["new_data_preserved"]),
+                },
+                phase=phase,
+                authority_fingerprint=row["authority_declaration_fingerprint"],
+                new_data_preserved=bool(row["new_data_preserved"]),
+                now=now,
+            )
+
     def record_dual_write_evidence(
         self,
         *,
@@ -1086,7 +1160,7 @@ class SchemaRolloutStore:
             self._require_revision(row, expected_revision)
             if RolloutPhase(row["phase"]) is not RolloutPhase.DUAL_WRITE:
                 raise ValueError("dual-write evidence requires the dual_write phase")
-            self._validate_time(plan, row, evidence.observed_at)
+            self._validate_time(connection, plan, row, evidence.observed_at)
             if evidence.old_declaration_fingerprint != plan.old_declaration_fingerprint:
                 raise ValueError("dual-write old declaration fingerprint does not match plan")
             if evidence.new_declaration_fingerprint != plan.new_declaration_fingerprint:
@@ -1167,7 +1241,7 @@ class SchemaRolloutStore:
             self._require_revision(row, expected_revision)
             if RolloutPhase(row["phase"]) is not RolloutPhase.CONSUMER_ACK:
                 raise ValueError("consumer capability receipt requires consumer_ack phase")
-            self._validate_time(plan, row, now)
+            self._validate_time(connection, plan, row, now)
             self._validate_consumer_receipt(plan, expected, receipt, now=now)
             existing = connection.execute(
                 """
@@ -1256,7 +1330,7 @@ class SchemaRolloutStore:
             current_phase = RolloutPhase(row["phase"])
             if current_phase not in {RolloutPhase.DUAL_WRITE, RolloutPhase.CONSUMER_ACK}:
                 raise ValueError("dual-write values require the dual_write phase")
-            self._validate_time(plan, row, evidence.observed_at)
+            self._validate_time(connection, plan, row, evidence.observed_at)
             if evidence.old_declaration_fingerprint != plan.old_declaration_fingerprint:
                 raise ValueError("dual-write old declaration fingerprint does not match plan")
             if evidence.new_declaration_fingerprint != plan.new_declaration_fingerprint:
@@ -1332,7 +1406,7 @@ class SchemaRolloutStore:
                 raise ValueError("rollout terminal phases cannot advance")
             if _FORWARD_PHASES.index(target_phase) != _FORWARD_PHASES.index(current) + 1:
                 raise ValueError("rollout phases must advance consecutively")
-            self._validate_time(plan, row, now)
+            self._validate_time(connection, plan, row, now)
             self._validate_phase_exit(connection, plan, current=current, now=now)
             authority = (
                 plan.new_declaration_fingerprint
@@ -1685,13 +1759,62 @@ class SchemaRolloutStore:
         return result
 
     @staticmethod
+    def _deadline_reopened_until(
+        connection: sqlite3.Connection,
+        plan_id: str,
+    ) -> datetime | None:
+        """The latest installer-recorded reopen for this plan, or `None` if there is none.
+
+        Read out of the append-only event chain rather than a column: the plan's own
+        `deadline` is part of `plan_id`, so it can never be edited, and the registry schema
+        version must keep matching the stores already on the production host.
+        """
+
+        rows = connection.execute(
+            """
+            SELECT payload_json FROM schema_rollout_event
+            WHERE plan_id = ? AND event_type = ? ORDER BY revision
+            """,
+            (plan_id, _DEADLINE_REOPEN_EVENT),
+        ).fetchall()
+        if not rows:
+            return None
+        return max(_decode_time(json.loads(row[0])["reopened_until"]) for row in rows)
+
+    @staticmethod
+    def _effective_deadline(
+        connection: sqlite3.Connection,
+        plan: LiveSchemaRolloutPlan,
+    ) -> datetime:
+        reopened = SchemaRolloutStore._deadline_reopened_until(connection, plan.plan_id)
+        if reopened is None or reopened <= plan.deadline:
+            return plan.deadline
+        return reopened
+
+    def effective_deadline(self, plan_id: str) -> datetime:
+        """The deadline that governs this plan now, reopen included. Readable read-only."""
+
+        with self._connect() as connection:
+            _row, plan = self._load(connection, plan_id)
+            return self._effective_deadline(connection, plan)
+
+    def deadline_reopened_until(self, plan_id: str) -> datetime | None:
+        """When the installer's single reopen runs out, or `None` if it was never used."""
+
+        with self._connect() as connection:
+            self._load(connection, plan_id)
+            return self._deadline_reopened_until(connection, plan_id)
+
     def _validate_time(
+        self,
+        connection: sqlite3.Connection,
         plan: LiveSchemaRolloutPlan,
         row: sqlite3.Row,
         now: AwareUtcDatetime,
     ) -> None:
         current_phase = RolloutPhase(row["phase"])
-        if now > plan.deadline and current_phase is not RolloutPhase.CUTOVER:
+        deadline = self._effective_deadline(connection, plan)
+        if now > deadline and current_phase is not RolloutPhase.CUTOVER:
             raise ValueError("rollout deadline has expired")
         if now < max(plan.started_at, SchemaRolloutStore._state_from_row(row).updated_at):
             raise ValueError("rollout time cannot precede the current state")
