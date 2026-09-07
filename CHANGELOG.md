@@ -66,6 +66,35 @@
 
 ### Fixed
 
+- **live 平面四个 role 在盘外空闲时全部起不来，一夜推了 10 条告警（#231、#232、#220）**：
+  2026-09-08 路线 A 第三窗口（v0.33.1、权威链 seq 2）的主机上没有任何行情、没有任何信号，
+  四个 role 仍然一个都没起来。
+
+  `strategy_live` ×3 报 `OSError: [Errno 30] Read-only file system:
+  '.../live/features/.feature-spool.lock'`（#231）：消费者用**写模式**打开 feature spool，
+  于是要去生产者目录里拿锁、把游标也放在生产者目录里，而 strategy unit 的 `ReadWritePaths`
+  只有 `live/strategies/%i`。现在消费者改用 `read_only=True` 打开，游标放到自己的
+  `live/strategies/%i/feature-cursors`；`FeatureBatchSpool` 同时**拒绝**「只读消费者的游标根
+  落在生产者根里面」，这个形状再也回不来。写者（feature）侧一个字没改。
+
+  `signal_router` 报 `runner source is unavailable: .../runner.sqlite3` 五次（#232）：
+  三个 strategy 死在 feature spool 那一步，从来没走到建 `runner.sqlite3` 的那一行；而且两边
+  本来就在互等——`signal_bus.sqlite3` 只有 router 会建，router 却在建它之前先查每一份 runner
+  数据库（#220）。
+
+  两边现在都把「**拥有者还没启动**」和「**这份制品坏了**」分开：新的
+  `DeferredPeerArtifact` 在构建 step 时把**已经在盘上的**制品照旧打开、照旧全量校验（存在但
+  不合法仍然拒绝启动，一条校验都没放宽），只对**不存在**的制品改为在主循环里重试，抛
+  `PeerArtifactUnavailableError` 点名在等哪份文件，由 `run_service_loop` 记进 `last_error`，
+  进程不退出、不再触发 `OnFailure` 告警。strategy 现在**先建自己的 `runner.sqlite3`**、
+  再碰任何别人拥有的制品；router 现在**先建 bus、spool 与游标库**，再去找 runner。
+
+  验收是那一夜本身：真实两代 bundle、真实 stage 与发布、wrapper 自己派生的 argv 与子环境、
+  一个只被 feature role 初始化过而没发布过任何批次的 spool、盘外且非交易日的时钟，
+  四个 role 各自跑在**从 `deploy/systemd/` 里逐字读出来的 `ReadWritePaths`** 沙箱里，
+  按 runbook C-3 顺序 strategy×3 → router → broker → notifier 全部进主循环，
+  且四个 role 一次越界写都没有。
+
 - **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：
   2026-09-07 路线 A 第二窗口装的是**第一个有前代的 generation**（`bf2da6d8…` 装在 `7d572c79…`
   之上），`install_runtime_deployment_profile` 于是为每个「声明指纹变了」的 channel 备好一份
