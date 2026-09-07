@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
@@ -37,6 +38,14 @@ Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 _GENESIS_HASH = "0" * 64
 _REGISTRY_SCHEMA_VERSION = 2
+#: The one event type the installer may append that is not a participant's own
+#: evidence. It restarts a PREPARE plan's window without touching its identity.
+_DEADLINE_REOPEN_EVENT = "deadline_reopen"
+#: Only the installer may reopen a window, and it says so in the operation id it signs the
+#: event with. Checked in the store rather than in the caller: the point of the prefix is to
+#: make every reopen identifiable in `receipts()` afterwards, and a rule the caller could
+#: choose to skip would not survive the first other caller.
+_DEADLINE_REOPEN_OPERATION_PREFIX = "installer-deadline-reopen:"
 
 
 class RolloutPhase(StrEnum):
@@ -633,27 +642,164 @@ def validate_dual_write_values(
     )
 
 
+def persisted_rollout_journal_layout(path: Path) -> str:
+    """`"wal"`, `"rollback"` or `"unknown"`, read out of the database header.
+
+    Offset 18 of an SQLite database header is the file format write version: 1 is a rollback
+    journal, 2 is WAL. One `read(2)` answers it, and unlike an `sqlite3` open it cannot create
+    the `-shm` wal-index as a side effect — which matters both to the read-only reader below
+    and to the installer, which has to be able to say what layout a store was in *before* it
+    opened it for writing and converted it.
+    """
+
+    with Path(path).open("rb") as handle:
+        header = handle.read(20)
+    if len(header) < 20 or not header.startswith(b"SQLite format 3\x00"):
+        #: empty, or not a database at all — the caller's open produces the real message
+        return "unknown"
+    return "wal" if header[18] == 2 else "rollback"
+
+
+class SchemaRolloutStateUnavailableError(RuntimeError):
+    """A rollout state store could not be opened for the access its caller needs."""
+
+
+class SchemaRolloutStateReadOnlyError(RuntimeError):
+    """A mutation was attempted on a store that was deliberately opened read-only."""
+
+
 class SchemaRolloutStore:
-    """Persist a hash-chained schema rollout with trusted consumer receipts."""
+    """Persist a hash-chained schema rollout with trusted consumer receipts.
+
+    Two opens, because two kinds of caller reach this file. The installer and the rollout
+    controller own the plan and write it; a runtime service only ever needs to read it, and
+    runs under a unit whose `ReadWritePaths` does not include `control/schema-rollouts`
+    (`ProtectSystem=strict` + `ProtectHome=read-only`). A writable open needs to create the
+    journal beside the database, so it fails there with `unable to open database file` —
+    which is #227, and it took down every kind-backed role, participant or not, because the
+    admission path opens the store before it knows whether this service is in the plan.
+
+    `read_only=True` opens `file:<path>?mode=ro`: no `mkdir`, no schema creation, no journal
+    pragma, and SQLite itself refuses any write on the handle. That works only because the
+    writer keeps the database in rollback-journal mode. A WAL database cannot be read
+    without write access to its `-shm` wal-index — measured, not assumed: with the directory
+    at 0555 and no sidecars, `mode=ro` on a WAL database raises `attempt to write a readonly
+    database`, while the same open on a `journal_mode=delete` database succeeds. `immutable=1`
+    would also open a WAL database, and is wrong here: the rollout controller advances phases
+    while services run, and an immutable reader is pinned to the snapshot it opened. A
+    rollback-journal reader sees a concurrent writer's commits, which is what admission needs.
+    """
 
     def __init__(
         self,
         path: Path,
         *,
         production_consumer_registry: ProductionConsumerRegistry | None = None,
+        read_only: bool = False,
     ) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
         self.production_consumer_registry = production_consumer_registry
+        if self.read_only:
+            self._verify_readable()
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
+    def _readonly_uri(self) -> str:
+        return "file:" + urllib.parse.quote(str(self.path)) + "?mode=ro"
+
     def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            return self._connect_readonly()
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA journal_mode = WAL")
+        # Rollback journal, not WAL: a reader with no write access to the directory can open
+        # this file only in this mode. `PRAGMA journal_mode` is persisted in the database
+        # header, so a store written by an older build converts on the first writer open.
+        connection.execute("PRAGMA journal_mode = DELETE")
         return connection
+
+    def _unavailable(self, exc: sqlite3.Error) -> SchemaRolloutStateUnavailableError:
+        return SchemaRolloutStateUnavailableError(
+            f"schema rollout state {self.path} cannot be opened read-only ({exc}); "
+            "a runtime service runs with control/schema-rollouts outside its unit's "
+            "ReadWritePaths, so the store has to be readable without creating anything "
+            "beside it, which a WAL-mode store or a hot rollback journal is not"
+        )
+
+    def _connect_readonly(self) -> sqlite3.Connection:
+        try:
+            connection = sqlite3.connect(
+                self._readonly_uri(),
+                timeout=30,
+                isolation_level=None,
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 30000")
+            #: `mode=ro` is the only thing refusing a write on this handle. `PRAGMA
+            #: query_only` would refuse one too, and having both would mean neither could
+            #: be removed without the other silently covering for it.
+            #: `sqlite3.connect` is lazy, and a WAL database under a directory the reader
+            #: may not write refuses at the first statement rather than at the open. Take
+            #: that statement here so every caller gets the same fail-closed message.
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error as exc:
+            raise self._unavailable(exc) from exc
+        return connection
+
+    def _persisted_journal_layout(self) -> str:
+        """The header probe, with this class's fail-closed sentence around an unreadable file.
+
+        Not opening the file is the point: `mode=ro` marks the database read-only, not its
+        directory, so on a root the reader happens to be able to write, an `sqlite3` open of
+        a WAL store succeeds by building the `-shm` index — and then fails the first time the
+        same store is read from inside the unit sandbox, which is #227 arriving late instead
+        of at once.
+        """
+
+        try:
+            return persisted_rollout_journal_layout(self.path)
+        except OSError as exc:
+            raise SchemaRolloutStateUnavailableError(
+                f"schema rollout state {self.path} cannot be read ({exc}); a runtime "
+                "service reads it with control/schema-rollouts outside its unit's "
+                "ReadWritePaths"
+            ) from exc
+
+    def _verify_readable(self) -> None:
+        """Fail closed on a store that is absent, unreadable, or of an unsupported shape."""
+
+        if self._persisted_journal_layout() == "wal":
+            raise SchemaRolloutStateUnavailableError(
+                f"schema rollout state {self.path} is in WAL journal mode, which cannot "
+                "be read without creating a wal-index beside it; a runtime unit's "
+                "ReadWritePaths does not cover control/schema-rollouts, so the installer "
+                "or the rollout controller has to reopen the store for writing, which "
+                "converts it to a rollback journal"
+            )
+        with self._connect() as connection:
+            try:
+                existing = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+            except sqlite3.Error as exc:
+                raise self._unavailable(exc) from exc
+            if "schema_rollout" in existing and "schema_registry_meta" not in existing:
+                raise RuntimeError(
+                    "legacy v1 schema rollout registry requires explicit migration; fail closed"
+                )
+            row = connection.execute(
+                "SELECT registry_schema_version FROM schema_registry_meta WHERE singleton = 1"
+            ).fetchone()
+            if row is None or row[0] != _REGISTRY_SCHEMA_VERSION:
+                raise RuntimeError("unsupported schema rollout registry version; fail closed")
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -761,6 +907,11 @@ class SchemaRolloutStore:
 
     @contextmanager
     def _writer(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise SchemaRolloutStateReadOnlyError(
+                f"schema rollout state {self.path} is open read-only and cannot record "
+                "rollout evidence; only the installer and the rollout controller write it"
+            )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -894,7 +1045,7 @@ class SchemaRolloutStore:
             self._require_revision(row, expected_revision)
             if RolloutPhase(row["phase"]) is not phase:
                 raise ValueError("acknowledgement phase does not match current rollout phase")
-            self._validate_time(plan, row, now)
+            self._validate_time(connection, plan, row, now)
             participants = {
                 item.participant_id: item for item in (*plan.producers, *plan.consumers)
             }
@@ -924,6 +1075,98 @@ class SchemaRolloutStore:
                 now=now,
             )
 
+    def reopen_deadline(
+        self,
+        *,
+        plan_id: str,
+        expected_revision: int,
+        now: AwareUtcDatetime,
+        operation_id: str,
+    ) -> SchemaRolloutState:
+        """Restart a still-preparing plan's own window once, without changing its identity.
+
+        A plan's `deadline` is `started_at + schema_rollout_stage_timeout_seconds`, ten
+        minutes on the production profile, and it is part of `plan_id` — so it cannot be
+        edited, only recorded around. On the host, installing a bundle and then acknowledging
+        its plans is a sequence of operator steps that routinely takes longer than that, and
+        an expired PREPARE plan is otherwise a dead end: nothing can acknowledge it, advance
+        it, or extend it.
+
+        What this does is narrow on purpose:
+
+        * only in PREPARE — a plan that has left it is waiting on evidence that a restarted
+          clock has no bearing on, and the authorisation does not reach there;
+        * only once — a second reopen is refused, so this cannot become an open-ended lease;
+        * only when the window has actually closed — reopening an open one would hand the plan
+          more than one window while still spending the single use;
+        * only under an installer operation id, so every reopen is identifiable in
+          `receipts()` as the installer's and not mistaken for a participant's own event;
+        * only for the plan's own window — `reopened_until` is `now` plus exactly
+          `deadline - started_at`, so the profile's timeout still decides how long it is;
+        * on the append-only chain, with its own event type, so the reopen is as auditable as
+          every acknowledgement around it and `receipts()` shows who restarted the clock.
+
+        Everything else about the plan — participants, fingerprints, phase — is untouched.
+
+        One consequence to be clear about: `_validate_time` gates *every* later mutation of
+        this plan, so a reopen moves the whole remaining rollout — the producers' dual-write
+        records at DUAL_WRITE and the consumers' receipts at CONSUMER_ACK — later by the same
+        one window. It restarts the plan's clock, it does not carve out an exception for the
+        acknowledgement alone.
+        """
+
+        now = normalize_aware_utc(now)
+        if not operation_id.startswith(_DEADLINE_REOPEN_OPERATION_PREFIX):
+            raise ValueError(
+                "a rollout deadline reopen must be signed with an "
+                f"{_DEADLINE_REOPEN_OPERATION_PREFIX!r} operation id"
+            )
+        request = {"action": _DEADLINE_REOPEN_EVENT, "now": now}
+        request_hash = canonical_sha256(request)
+        with self._writer() as connection:
+            row, plan = self._load(connection, plan_id)
+            retried = self._idempotent_retry(
+                connection, row, operation_id=operation_id, request_hash=request_hash
+            )
+            if retried is not None:
+                return retried
+            self._require_revision(row, expected_revision)
+            phase = RolloutPhase(row["phase"])
+            if phase is not RolloutPhase.PREPARE:
+                raise ValueError("only a preparing rollout may have its deadline reopened")
+            if self._deadline_reopened_until(connection, plan_id) is not None:
+                raise ValueError("rollout deadline has already been reopened once")
+            deadline = self._effective_deadline(connection, plan)
+            if now <= deadline:
+                #: A window that is still open needs nothing, and reopening it early would
+                #: quietly hand the plan more than one window — which is the one thing the
+                #: single-use rule exists to prevent.
+                raise ValueError("rollout deadline has not expired, so it cannot be reopened")
+            if now < max(plan.started_at, self._state_from_row(row).updated_at):
+                raise ValueError("rollout time cannot precede the current state")
+            reopened_until = now + (plan.deadline - plan.started_at)
+            return self._append_mutation(
+                connection,
+                row=row,
+                plan=plan,
+                operation_id=operation_id,
+                event_type=_DEADLINE_REOPEN_EVENT,
+                request_hash=request_hash,
+                payload={
+                    "action": _DEADLINE_REOPEN_EVENT,
+                    "original_deadline": plan.deadline.isoformat(),
+                    "reopened_until": reopened_until.isoformat(),
+                    "window_seconds": int((plan.deadline - plan.started_at).total_seconds()),
+                    "resulting_phase": phase.value,
+                    "authority_declaration_fingerprint": row["authority_declaration_fingerprint"],
+                    "new_data_preserved": bool(row["new_data_preserved"]),
+                },
+                phase=phase,
+                authority_fingerprint=row["authority_declaration_fingerprint"],
+                new_data_preserved=bool(row["new_data_preserved"]),
+                now=now,
+            )
+
     def record_dual_write_evidence(
         self,
         *,
@@ -943,7 +1186,7 @@ class SchemaRolloutStore:
             self._require_revision(row, expected_revision)
             if RolloutPhase(row["phase"]) is not RolloutPhase.DUAL_WRITE:
                 raise ValueError("dual-write evidence requires the dual_write phase")
-            self._validate_time(plan, row, evidence.observed_at)
+            self._validate_time(connection, plan, row, evidence.observed_at)
             if evidence.old_declaration_fingerprint != plan.old_declaration_fingerprint:
                 raise ValueError("dual-write old declaration fingerprint does not match plan")
             if evidence.new_declaration_fingerprint != plan.new_declaration_fingerprint:
@@ -1024,7 +1267,7 @@ class SchemaRolloutStore:
             self._require_revision(row, expected_revision)
             if RolloutPhase(row["phase"]) is not RolloutPhase.CONSUMER_ACK:
                 raise ValueError("consumer capability receipt requires consumer_ack phase")
-            self._validate_time(plan, row, now)
+            self._validate_time(connection, plan, row, now)
             self._validate_consumer_receipt(plan, expected, receipt, now=now)
             existing = connection.execute(
                 """
@@ -1113,7 +1356,7 @@ class SchemaRolloutStore:
             current_phase = RolloutPhase(row["phase"])
             if current_phase not in {RolloutPhase.DUAL_WRITE, RolloutPhase.CONSUMER_ACK}:
                 raise ValueError("dual-write values require the dual_write phase")
-            self._validate_time(plan, row, evidence.observed_at)
+            self._validate_time(connection, plan, row, evidence.observed_at)
             if evidence.old_declaration_fingerprint != plan.old_declaration_fingerprint:
                 raise ValueError("dual-write old declaration fingerprint does not match plan")
             if evidence.new_declaration_fingerprint != plan.new_declaration_fingerprint:
@@ -1189,7 +1432,7 @@ class SchemaRolloutStore:
                 raise ValueError("rollout terminal phases cannot advance")
             if _FORWARD_PHASES.index(target_phase) != _FORWARD_PHASES.index(current) + 1:
                 raise ValueError("rollout phases must advance consecutively")
-            self._validate_time(plan, row, now)
+            self._validate_time(connection, plan, row, now)
             self._validate_phase_exit(connection, plan, current=current, now=now)
             authority = (
                 plan.new_declaration_fingerprint
@@ -1542,13 +1785,62 @@ class SchemaRolloutStore:
         return result
 
     @staticmethod
+    def _deadline_reopened_until(
+        connection: sqlite3.Connection,
+        plan_id: str,
+    ) -> datetime | None:
+        """The latest installer-recorded reopen for this plan, or `None` if there is none.
+
+        Read out of the append-only event chain rather than a column: the plan's own
+        `deadline` is part of `plan_id`, so it can never be edited, and the registry schema
+        version must keep matching the stores already on the production host.
+        """
+
+        rows = connection.execute(
+            """
+            SELECT payload_json FROM schema_rollout_event
+            WHERE plan_id = ? AND event_type = ? ORDER BY revision
+            """,
+            (plan_id, _DEADLINE_REOPEN_EVENT),
+        ).fetchall()
+        if not rows:
+            return None
+        return max(_decode_time(json.loads(row[0])["reopened_until"]) for row in rows)
+
+    @staticmethod
+    def _effective_deadline(
+        connection: sqlite3.Connection,
+        plan: LiveSchemaRolloutPlan,
+    ) -> datetime:
+        reopened = SchemaRolloutStore._deadline_reopened_until(connection, plan.plan_id)
+        if reopened is None or reopened <= plan.deadline:
+            return plan.deadline
+        return reopened
+
+    def effective_deadline(self, plan_id: str) -> datetime:
+        """The deadline that governs this plan now, reopen included. Readable read-only."""
+
+        with self._connect() as connection:
+            _row, plan = self._load(connection, plan_id)
+            return self._effective_deadline(connection, plan)
+
+    def deadline_reopened_until(self, plan_id: str) -> datetime | None:
+        """When the installer's single reopen runs out, or `None` if it was never used."""
+
+        with self._connect() as connection:
+            self._load(connection, plan_id)
+            return self._deadline_reopened_until(connection, plan_id)
+
     def _validate_time(
+        self,
+        connection: sqlite3.Connection,
         plan: LiveSchemaRolloutPlan,
         row: sqlite3.Row,
         now: AwareUtcDatetime,
     ) -> None:
         current_phase = RolloutPhase(row["phase"])
-        if now > plan.deadline and current_phase is not RolloutPhase.CUTOVER:
+        deadline = self._effective_deadline(connection, plan)
+        if now > deadline and current_phase is not RolloutPhase.CUTOVER:
             raise ValueError("rollout deadline has expired")
         if now < max(plan.started_at, SchemaRolloutStore._state_from_row(row).updated_at):
             raise ValueError("rollout time cannot precede the current state")
@@ -2038,8 +2330,11 @@ __all__ = [
     "SchemaRequiredTransition",
     "SchemaRolloutReceipt",
     "SchemaRolloutState",
+    "SchemaRolloutStateReadOnlyError",
+    "SchemaRolloutStateUnavailableError",
     "SchemaRolloutStore",
     "UnknownFieldPolicy",
     "evaluate_schema_compatibility",
+    "persisted_rollout_journal_layout",
     "validate_dual_write_values",
 ]

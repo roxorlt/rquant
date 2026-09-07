@@ -38,7 +38,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/market-minute-sources/%i /home/lighthouse/rquant/data/runtime/live/market-minute
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/market-minute-sources/%i /home/lighthouse/rquant/data/runtime/live/market-minute -/home/lighthouse/rquant/data/runtime/control/schema-rollouts
 
 StandardOutput=journal
 StandardError=journal

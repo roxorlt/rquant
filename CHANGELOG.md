@@ -4,7 +4,105 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`rquant runtime-schema-rollout acknowledge`：转换全部状态库，并代生产者把本代计划推进到 DUAL_WRITE（#227，owner 2026-09-07 授权）**：
+  装一代有前代的 bundle 会为每个「声明指纹变了」的 channel 备一份 rollout 计划，每份都停在
+  PREPARE 等它的全部生产者各记一条承认。生产画像里有两份计划各带三个生产者
+  （`runtime.strategy_candidate.snapshot` 与 `runtime.strategy_signal.envelope`），所以头两个
+  实例启动时必然各失败一次——`load_runtime_schema_service_bindings` 会抛
+  `schema producer startup is waiting for every producer PREPARE ACK`，每失败一次就中继一条告警。
+  这一轮承认没有任何只有生产者自己知道的东西：`store.acknowledge` 的每个入参都来自冻结的计划，
+  它本身还会拿冻结注册表把入参全部重验一遍，所以搬到安装器不丢信息。
+
+  命令分两趟，顺序是要点：
+  ①**先把 `control/schema-rollouts` 下每一份 `state.sqlite3` 以写者身份打开一次**，
+  库头的 `journal_mode` 就从 WAL 变回回滚日志。**每一份，不分代**——
+  `load_runtime_schema_service_bindings` 是先打开每份计划的库、再判断是不是本代，所以只要有一份
+  上一代留下的 WAL 库，每个 kind-backed role 都会被它挡住，形状与 #227 一模一样；而且代码里
+  没有任何地方删除旧计划目录，叠加 #228 之后旧代计划只会越积越多。转换只改库头，不动阶段，
+  不往哈希链上写任何东西。
+  ②**再对「目标是本代、阶段仍是 PREPARE」的计划做承认**，推进到 **DUAL_WRITE 为止**：
+  `SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING` 就是 DUAL_WRITE，常量一旦被改成别的值，代码在动
+  任何计划之前就抛错停下（离开 DUAL_WRITE 要生产者真写过的双写一致性证据，CUTOVER 要可信
+  消费者的回执，两者都不能由安装器代签）。
+
+  **计划的 deadline 是 `started_at + schema_rollout_stage_timeout_seconds`（生产画像默认 600 秒）**，
+  而窗口里从装 bundle 到承认之间超过十分钟是常态。命令因此在动任何东西之前逐份判 deadline，
+  dry-run 与 apply 判定完全一致；对「目标是本代、阶段是 PREPARE、已过期」的计划，安装器
+  **重开一次**窗口（`now` 加上计划自己的那段时长），作为 `deadline_reopen` 事件记进计划的哈希链，
+  `operation_id` 是 `installer-deadline-reopen:<plan>`。四条边界都由
+  `SchemaRolloutStore.reopen_deadline` 自己守、调用方绕不过去：**每份计划只有一次**、
+  **已越过 PREPARE 的计划一律不动 deadline**、**窗口还没关的不许提前重开**（否则等于白花那一次）、
+  **签名的 `operation_id` 必须带 `installer-deadline-reopen:` 前缀**（这样每次重开在 `receipts()`
+  里都认得出是安装器干的，不会被误当成参与方自己的事件）。
+  重开额度用尽还过期的计划报 `skipped_reason: deadline_expired`，报告照样打完整、其余计划照样
+  推进，命令退 2。
+
+  **要清楚的一个后果**：`_validate_time` 管着一份计划**此后所有**的变更，所以重开一次之后，
+  这份计划**后续 DUAL_WRITE / CONSUMER_ACK 的窗口也同步后移一个窗口长度**——生产者写双写记录、
+  消费者写回执，用的都是重开之后的那个 deadline。重开是把整份计划的时钟往后拨一个窗口，
+  不是只给承认这一步开口子。
+
+  `--dry-run` 一个字节都不写，**也不转换**——转换正是它要预览的那个改动，所以还是 WAL 的库被
+  如实报成 `state_unreadable`（没有任何进程能在不建 wal-index 的前提下读 WAL 库），而不是被
+  预览悄悄转掉。命令与三条路线 A 装机命令一样免配置，因为它跑在同一个窗口、同一份无 `.env` 的
+  bootstrap worktree。
+
+### Changed
+
+- **十六个 runtime unit 的 `ReadWritePaths` 加上 `control/schema-rollouts`（#227，owner 2026-09-07 授权）**：
+  计划里的生产者要往计划的哈希链上追加自己的 PREPARE / CUTOVER 承认，消费者要追加能力回执，
+  而追加事务必须在库旁边建日志文件——那是**目录**权限，不是文件权限。此前二十三个 runtime unit
+  没有一个的 `ReadWritePaths` 覆盖这个目录，所以生产上任何参与方都完不成自己那一半。
+  这次按 owner 授权的最小宽度放开：真正是参与方的十六个 unit（十五个生产者 + 消费者
+  `rquant-runtime-serving@`）拿到 `control/schema-rollouts`，另外七个 runtime unit 一点都不给。
+  给的是**整个目录**，因为 `plan_id` 是计划的内容哈希、每一代都变，静态 unit 文件追不上；
+  per-plan 粒度只能靠安装器生成 drop-in，那是另一次授权。每个 unit 只多一条 `-/` 前缀的条目
+  （缺失即忽略，#192），执行行、Slice、只读授权一字未动。
+  哪十六个不是抄来的清单：端到端用例从真实两代装机备下的十六份计划里把参与方推导出来，
+  再与 unit 文件里钉住的清单比对。
+  **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
+
 ### Fixed
+
+- **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：
+  2026-09-07 路线 A 第二窗口装的是**第一个有前代的 generation**（`bf2da6d8…` 装在 `7d572c79…`
+  之上），`install_runtime_deployment_profile` 于是为每个「声明指纹变了」的 channel 备好一份
+  rollout——因为声明指纹里带 producer commit，凡是既有生产者又有消费者的 channel 都算变了，
+  一次备了十六份。此后每个 kind-backed role 走到 `load_runtime_schema_service_bindings`，
+  它要遍历 `control/schema-rollouts`，**在还不知道本服务是否是计划参与方之前**就把每份计划的
+  状态库打开；而 `SchemaRolloutStore` 只有一种打开方式：`mkdir(parents=True)` 加一句无条件的
+  `PRAGMA journal_mode = WAL`。runtime unit 跑的是 `ProtectSystem=strict` + `ProtectHome=read-only`，
+  `ReadWritePaths` 从来不含 `control/schema-rollouts`，WAL 要在旁边建的 `-shm` 索引被拒，
+  八个 unit 全部以 `sqlite3.OperationalError: unable to open database file` 反复重启，
+  中继 19 次告警、真实推送 8 条。
+  改法是**读写分离**：`SchemaRolloutStore` 多一条只读打开（`file:<path>?mode=ro`，不 `mkdir`、
+  不建表、不设 journal pragma，任何写在碰 SQLite 之前就被拒），写者则把库留在回滚日志模式而不是
+  WAL——这才是只读打开能成立的前提，两边都实测过：目录 0555、没有 sidecar 时，WAL 库的
+  `mode=ro` 抛 `attempt to write a readonly database`，`journal_mode=delete` 的库则打得开，
+  而且**看得见并发写者随后提交的内容**（`immutable=1` 不能用：它等于向 SQLite 承诺文件不会变，
+  而 rollout 控制器会在服务运行期间改它，那样读到的是上一次 checkpoint 的旧快照，极端情况下
+  连表都看不见）。`journal_mode` 记在库头里，旧版写下的库在安装器下一次以写者身份
+  打开时自动转换。
+  只读读者遇到 WAL 库**一律拒绝**，判据取自 SQLite 库头第 18 字节（一次 `read(2)`，不像 open
+  那样会顺手把 `-shm` 建出来）：`mode=ro` 只把库文件标成只读、管不到目录，所以在可写的根上
+  打开 WAL 库会「先成功、进了沙箱再失败」——那正是 #227 拖到生产才暴露的形状。
+  **失败关闭一处没放宽**：读不到状态库仍然明确失败，措辞点名库路径、WAL 与
+  `ReadWritePaths`。
+  服务启动时那三处**确实是追加而非读取**的动作（生产者的 PREPARE / CUTOVER 承认、消费者的
+  能力回执）保留原样，但改为单独申请写句柄，失败时说清是哪个服务、哪个路径、哪条沙箱设置
+  拦下的；**它们在生产沙箱里依然写不了**，因此还停在 PREPARE 的 rollout 必须由安装器或
+  rollout 控制器在 unit 启动前推进，这一条不是本次修改能绕过的。
+  主循环里那两个写者（生产者的双写记录、serving publisher 的 serving generation 回执）
+  原本没有这层措辞，计划一旦推进到 `DUAL_WRITE` / `CONSUMER_ACK` 就会在发布路径中间抛出
+  和 #227 一样的裸 SQLite 错误——等于把同一个坑从启动挪到主循环；现在两处也点名沙箱。
+  另外 `prepare_payload` 只想读一个阶段却以写模式打开库，而它每次生产者发布都在沙箱里跑，
+  已改成只读并补上回归用例。
+  验收是 Linux 端到端：真装两代 bundle（第二代带十六份计划）、把 `control/schema-rollouts`
+  下每个目录的写位摘掉、用 wrapper 自己派生的白名单环境把 `serving_publisher` 与
+  `watchlist_quote_source`（八个反复重启的 unit 中的两个）送进真实服务循环各跑一轮；
+  反向把 v0.33.0 的 WAL 打开改回去，两个 role 立刻回到同一个 `sqlite3.OperationalError`。
 
 - **strategy_live 的完成签名器把已冻结的 profile manifest 又验了一遍（#218 A）**：
   `runtime_service_main.build_runtime_strategy_completion_attestation_signer` 把

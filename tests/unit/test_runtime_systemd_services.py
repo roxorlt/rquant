@@ -40,6 +40,13 @@ TEMPLATES = (
 RUNTIME_ROOT = "/home/lighthouse/rquant/data/runtime"
 CURRENT_ROOT = f"{RUNTIME_ROOT}/current"
 CONTROL_ROOT = f"{RUNTIME_ROOT}/control"
+#: Owner ruling 2026-09-07 (#227): a template that is a participant in a schema rollout plan
+#: writes its own acknowledgement into that plan's state store, so it needs the rollout root.
+#: Which templates that is — sixteen of the twenty-three — and that the other seven still may
+#: not write it, is `tests/unit/test_runtime_systemd_schema_rollout_paths.py`. Here it appears
+#: in a grant set only where the unit really carries it, so each set below stays the exact
+#: statement of what one unit may write that it already was.
+SCHEMA_ROLLOUT_ROOT = f"{CONTROL_ROOT}/schema-rollouts"
 CREDENTIAL_FILE = "/etc/credstore.encrypted/rquant-runtime/instances/%i/current.cred"
 #: Codex round-2 P1-3: every protected runtime unit now executes the fixed root-owned
 #: wrapper instead of a checkout interpreter, and takes nothing from the unit but a role
@@ -728,6 +735,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         "serving": {
             f"{CONTROL_ROOT}/serving-publishers/%i",
             f"{RUNTIME_ROOT}/serving",
+            SCHEMA_ROLLOUT_ROOT,
         },
     }
 
@@ -741,6 +749,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
     assert _granted_paths(_load("market-minute")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/market-minute-sources/%i",
         f"{RUNTIME_ROOT}/live/market-minute",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert _granted_paths(_load("watchlist-quote")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
@@ -749,14 +758,17 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
     assert _granted_paths(_load("auction-match")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/auction-match-sources/%i",
         f"{RUNTIME_ROOT}/live/auction-match",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert _granted_paths(_load("auction-universe")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/auction-universe-publishers/%i",
         f"{RUNTIME_ROOT}/authorities/auction-universe",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert _granted_paths(_load("reference-slow-source")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/reference-slow-sources/%i",
         f"{RUNTIME_ROOT}/live/reference-slow",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert set(_load("reference-slow-source")["Service"]["ReadOnlyPaths"].split()) == {
         "-/home/lighthouse/rquant/data/rquant_ro.duckdb",
@@ -767,6 +779,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
     assert _granted_paths(_load("reference-slow-publisher")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/reference-slow-publishers/%i",
         f"{RUNTIME_ROOT}/authorities/reference-slow",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert set(_load("reference-slow-publisher")["Service"]["ReadOnlyPaths"].split()) == {
         f"-{RUNTIME_ROOT}/authorities/market-calendar",
@@ -775,12 +788,14 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
     assert _granted_paths(_load("feature")["Service"]["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/features/%i",
         f"{RUNTIME_ROOT}/live/features",
+        SCHEMA_ROLLOUT_ROOT,
     }
 
     candidate_writable = _granted_paths(_load("candidate")["Service"]["ReadWritePaths"])
     assert candidate_writable == {
         f"{CONTROL_ROOT}/candidates/%i",
         f"{RUNTIME_ROOT}/live/candidates/%i",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert f"{RUNTIME_ROOT}/live" not in candidate_writable
 
@@ -788,6 +803,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
     assert strategy_writable == {
         f"{CONTROL_ROOT}/strategies/%i",
         f"{RUNTIME_ROOT}/live/strategies/%i",
+        SCHEMA_ROLLOUT_ROOT,
     }
     assert f"{RUNTIME_ROOT}/live" not in strategy_writable
 
@@ -795,26 +811,32 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         "signal-router": {
             f"{CONTROL_ROOT}/signal-routers/%i",
             f"{RUNTIME_ROOT}/live/signal-bus",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "notifier": {
             f"{CONTROL_ROOT}/notifiers/%i",
             f"{RUNTIME_ROOT}/live/notifications/%i",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "paper-broker": {
             f"{CONTROL_ROOT}/paper-brokers/%i",
             f"{RUNTIME_ROOT}/live/paper-brokers/%i",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "paper-constraint": {
             f"{CONTROL_ROOT}/paper-constraints/%i",
             f"{RUNTIME_ROOT}/authorities/paper-execution",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "runtime-health": {
             f"{CONTROL_ROOT}/runtime-health-publishers/%i",
             f"{CONTROL_ROOT}/authority-runtime-health",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "lab-jobs": {
             f"{CONTROL_ROOT}/lab-jobs-publishers/%i",
             f"{RUNTIME_ROOT}/research/serving-authorities/lab-jobs",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "artifact-catalog": {
             f"{CONTROL_ROOT}/artifact-catalogs/%i",
@@ -827,6 +849,7 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         "promotions": {
             f"{CONTROL_ROOT}/promotions-publishers/%i",
             f"{RUNTIME_ROOT}/research/serving-authorities/promotions",
+            SCHEMA_ROLLOUT_ROOT,
         },
         "shadow": {
             f"{CONTROL_ROOT}/shadow-sessions/%i",
@@ -1036,6 +1059,7 @@ def test_serving_publisher_reads_owner_authorities_without_writing_owner_state()
     assert _granted_paths(service["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/serving-publishers/%i",
         f"{RUNTIME_ROOT}/serving",
+        SCHEMA_ROLLOUT_ROOT,
     }
 
 

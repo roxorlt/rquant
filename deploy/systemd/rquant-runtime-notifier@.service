@@ -38,7 +38,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/notifiers/%i /home/lighthouse/rquant/data/runtime/live/notifications/%i
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/notifiers/%i /home/lighthouse/rquant/data/runtime/live/notifications/%i -/home/lighthouse/rquant/data/runtime/control/schema-rollouts
 ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/live/signal-bus/spool -/home/lighthouse/rquant/data/runtime/serving/page-control -/home/lighthouse/rquant/data/runtime/control/page-control.sqlite3
 
 StandardOutput=journal

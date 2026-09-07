@@ -93,6 +93,8 @@ def _production_bundle(
     *,
     producer_commit: str,
     runtime_root: Path | None = None,
+    schema_bootstrap_reason: str | None = "route A legacy binding acceptance",
+    definition_registry_root: Path | None = None,
 ) -> tuple[Any, Any, Any, dict[str, bytes]]:
     """Install a real production deployment bundle at a temporary runtime root.
 
@@ -102,6 +104,12 @@ def _production_bundle(
     the commit the wrapper will forward. Two seams stay: sealing runtime credentials needs
     `systemd-creds` under sudo, which no test can have, and it is not on the path under
     test.
+
+    `schema_bootstrap_reason` is the caller's, because it is only allowed on the first
+    install into an empty root; the rollout acceptance installs a second generation over
+    this one and has to pass `None` there. `definition_registry_root` is the caller's for
+    the same reason: one root cannot hold two commits' definitions (#225), and production
+    gives each commit its own `definitions-<commit>`.
 
     The credential plaintexts the bundle built for that seam are kept and returned rather
     than dropped. They are the real thing — `serialize_runtime_credential` over the real
@@ -150,7 +158,7 @@ def _production_bundle(
         generated_at=datetime(2025, 12, 31, 8, tzinfo=UTC),
     )
     inputs = _inputs(tmp_path)
-    inputs.historical_minutes_snapshot_path.parent.mkdir(parents=True)
+    inputs.historical_minutes_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         columns=(
             "ts_code",
@@ -182,7 +190,9 @@ def _production_bundle(
     if runtime_root is not None:
         inputs = _relocate(inputs, runtime_root=runtime_root)
         assert inputs.runtime_root == runtime_root
-    inputs.market_calendar_authority_path.parent.mkdir(parents=True)
+    if definition_registry_root is not None:
+        inputs = inputs.model_copy(update={"definition_registry_root": definition_registry_root})
+    inputs.market_calendar_authority_path.parent.mkdir(parents=True, exist_ok=True)
     inputs.market_calendar_authority_path.write_text(
         authority.model_dump_json(), encoding="utf-8"
     )
@@ -225,7 +235,7 @@ def _production_bundle(
         profile,
         runtime_root=inputs.runtime_root,
         environ=capabilities,
-        schema_bootstrap_reason="route A legacy binding acceptance",
+        schema_bootstrap_reason=schema_bootstrap_reason,
     )
     #: the paper constraint builder opens this registry while it is being built, so the
     #: file has to exist before the role starts — on the host the reference-slow publisher
