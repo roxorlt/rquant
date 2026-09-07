@@ -714,7 +714,9 @@ class SchemaRolloutStore:
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 30000")
-            connection.execute("PRAGMA query_only = ON")
+            #: `mode=ro` is the only thing refusing a write on this handle. `PRAGMA
+            #: query_only` would refuse one too, and having both would mean neither could
+            #: be removed without the other silently covering for it.
             #: `sqlite3.connect` is lazy, and a WAL database under a directory the reader
             #: may not write refuses at the first statement rather than at the open. Take
             #: that statement here so every caller gets the same fail-closed message.
@@ -723,9 +725,43 @@ class SchemaRolloutStore:
             raise self._unavailable(exc) from exc
         return connection
 
+    def _persisted_journal_layout(self) -> str:
+        """Read the header byte that says WAL or rollback journal, without opening the file.
+
+        Offset 18 of an SQLite database header is the file format write version: 1 is a
+        rollback journal, 2 is WAL. One `read(2)` answers it, and unlike an `sqlite3` open
+        it cannot create the `-shm` wal-index as a side effect. That side effect is the
+        whole reason to look here: `mode=ro` marks the database file read-only, not its
+        directory, so on a root the reader happens to be able to write, opening a WAL store
+        succeeds by building that index — and then fails the first time the same store is
+        read from inside the unit sandbox, which is #227 arriving late instead of at once.
+        """
+
+        try:
+            with self.path.open("rb") as handle:
+                header = handle.read(20)
+        except OSError as exc:
+            raise SchemaRolloutStateUnavailableError(
+                f"schema rollout state {self.path} cannot be read ({exc}); a runtime "
+                "service reads it with control/schema-rollouts outside its unit's "
+                "ReadWritePaths"
+            ) from exc
+        if len(header) < 20 or not header.startswith(b"SQLite format 3\x00"):
+            #: empty, or not a database at all — let the open below produce the message
+            return "unknown"
+        return "wal" if header[18] == 2 else "rollback"
+
     def _verify_readable(self) -> None:
         """Fail closed on a store that is absent, unreadable, or of an unsupported shape."""
 
+        if self._persisted_journal_layout() == "wal":
+            raise SchemaRolloutStateUnavailableError(
+                f"schema rollout state {self.path} is in WAL journal mode, which cannot "
+                "be read without creating a wal-index beside it; a runtime unit's "
+                "ReadWritePaths does not cover control/schema-rollouts, so the installer "
+                "or the rollout controller has to reopen the store for writing, which "
+                "converts it to a rollback journal"
+            )
         with self._connect() as connection:
             try:
                 existing = {

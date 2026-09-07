@@ -1505,6 +1505,72 @@ def test_a_wal_store_under_a_readonly_directory_fails_closed_and_names_the_sandb
         _unseal(path)
 
 
+def test_the_readonly_handle_is_read_only_at_the_sqlite_layer_too(tmp_path: Path) -> None:
+    """The `_writer` guard refuses first, so this is the case that pins the layer under it.
+
+    The file and its directory are both writable here, so nothing but the connection's own
+    mode can refuse the statement — which is what makes `read_only=True` a property of the
+    handle rather than of wherever it happens to be pointed.
+    """
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    writer = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    writer.create_plan(plan, now=started_at, operation_id="create")
+    assert path.stat().st_mode & 0o200
+    assert path.parent.stat().st_mode & 0o200
+
+    reader = SchemaRolloutStore(
+        path,
+        production_consumer_registry=_trusted_registry(),
+        read_only=True,
+    )
+    connection = reader._connect()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute(
+                "UPDATE schema_rollout SET phase = ? WHERE plan_id = ?",
+                (RolloutPhase.CUTOVER.value, plan.plan_id),
+            )
+    finally:
+        connection.close()
+
+    assert writer.get_state(plan.plan_id).phase is RolloutPhase.PREPARE
+
+
+def test_a_readonly_open_refuses_a_wal_store_even_where_it_could_build_the_index(
+    tmp_path: Path,
+) -> None:
+    """A reader must never bring a WAL store up, on any directory it happens to land on.
+
+    The directory here is writable, so an open that is read-only in name only would succeed
+    by creating the `-shm` wal-index — and would then fail the moment the same store is read
+    from inside the unit sandbox, which is #227 arriving late instead of at the first
+    opportunity. A reader declared read-only refuses wherever it runs, and leaves nothing
+    behind when it does.
+    """
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    store = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    store.create_plan(plan, now=started_at, operation_id="create")
+    _set_journal_mode(path, "WAL")
+    assert path.parent.stat().st_mode & 0o200
+    assert path.stat().st_mode & 0o200
+
+    with pytest.raises(SchemaRolloutStateUnavailableError, match="WAL"):
+        SchemaRolloutStore(
+            path,
+            production_consumer_registry=_trusted_registry(),
+            read_only=True,
+        )
+
+    assert not path.with_name(path.name + "-shm").exists()
+    assert not path.with_name(path.name + "-wal").exists()
+
+
 def test_an_absent_readonly_store_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(SchemaRolloutStateUnavailableError) as caught:
         SchemaRolloutStore(tmp_path / "missing" / "state.sqlite3", read_only=True)
