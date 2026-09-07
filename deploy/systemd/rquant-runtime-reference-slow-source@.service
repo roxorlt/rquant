@@ -43,7 +43,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
 ReadOnlyPaths=-/home/lighthouse/rquant/data/rquant_ro.duckdb -/home/lighthouse/rquant/data/runtime/authorities/market-calendar -/home/lighthouse/rquant/data/runtime/control/reference-slow-publishers/svc-62c9061740150340b1f1e3a8a54323e26794caf9616d34047546383cdc027abd/cursors
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/reference-slow-sources/%i /home/lighthouse/rquant/data/runtime/live/reference-slow
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/reference-slow-sources/%i /home/lighthouse/rquant/data/runtime/live/reference-slow -/home/lighthouse/rquant/data/runtime/control/schema-rollouts
 
 StandardOutput=journal
 StandardError=journal

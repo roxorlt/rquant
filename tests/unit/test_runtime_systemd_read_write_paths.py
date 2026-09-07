@@ -24,6 +24,12 @@ SYSTEMD = ROOT / "deploy" / "systemd"
 RUNTIME_ROOT = "/home/lighthouse/rquant/data/runtime"
 CONTROL_ROOT = f"{RUNTIME_ROOT}/control"
 RETENTION_INSTANCE = "svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349"
+#: Owner ruling 2026-09-07 (#227): the rollout root a schema rollout participant appends its
+#: own acknowledgement to. Whole directory, because a `plan_id` is a content hash and changes
+#: every generation, so a static unit file cannot name one. Which units carry it is pinned in
+#: `tests/unit/test_runtime_systemd_schema_rollout_paths.py`; here it is only part of the
+#: literal grant tuple of the first-gate units that are participants.
+SCHEMA_ROLLOUT_ROOT = f"{CONTROL_ROOT}/schema-rollouts"
 WRAPPER = "/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role"
 ARBITER = "/usr/local/libexec/rquant-workload-arbiter research -- "
 
@@ -49,10 +55,12 @@ FIRST_GATE_WRITABLE_PATHS: dict[str, tuple[str, ...]] = {
     "rquant-runtime-auction-universe@.service": (
         f"{CONTROL_ROOT}/auction-universe-publishers/%i",
         f"{RUNTIME_ROOT}/authorities/auction-universe",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-candidate@.service": (
         f"{CONTROL_ROOT}/candidates/%i",
         f"{RUNTIME_ROOT}/live/candidates/%i",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-daily-orchestrator@.service": (
         f"{CONTROL_ROOT}/daily-orchestrators/%i",
@@ -61,30 +69,37 @@ FIRST_GATE_WRITABLE_PATHS: dict[str, tuple[str, ...]] = {
     "rquant-runtime-feature@.service": (
         f"{CONTROL_ROOT}/features/%i",
         f"{RUNTIME_ROOT}/live/features",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-lab-jobs@.service": (
         f"{CONTROL_ROOT}/lab-jobs-publishers/%i",
         f"{RUNTIME_ROOT}/research/serving-authorities/lab-jobs",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-paper-broker@.service": (
         f"{CONTROL_ROOT}/paper-brokers/%i",
         f"{RUNTIME_ROOT}/live/paper-brokers/%i",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-paper-constraint@.service": (
         f"{CONTROL_ROOT}/paper-constraints/%i",
         f"{RUNTIME_ROOT}/authorities/paper-execution",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-promotions@.service": (
         f"{CONTROL_ROOT}/promotions-publishers/%i",
         f"{RUNTIME_ROOT}/research/serving-authorities/promotions",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-runtime-health@.service": (
         f"{CONTROL_ROOT}/runtime-health-publishers/%i",
         f"{CONTROL_ROOT}/authority-runtime-health",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-serving@.service": (
         f"{CONTROL_ROOT}/serving-publishers/%i",
         f"{RUNTIME_ROOT}/serving",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-shadow@.service": (
         f"{CONTROL_ROOT}/shadow-sessions/%i",
@@ -93,10 +108,12 @@ FIRST_GATE_WRITABLE_PATHS: dict[str, tuple[str, ...]] = {
     "rquant-runtime-signal-router@.service": (
         f"{CONTROL_ROOT}/signal-routers/%i",
         f"{RUNTIME_ROOT}/live/signal-bus",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-strategy@.service": (
         f"{CONTROL_ROOT}/strategies/%i",
         f"{RUNTIME_ROOT}/live/strategies/%i",
+        SCHEMA_ROLLOUT_ROOT,
     ),
     "rquant-runtime-watchlist-quote@.service": (
         f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
