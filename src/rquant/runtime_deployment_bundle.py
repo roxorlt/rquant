@@ -12,9 +12,10 @@ import stat
 import tempfile
 import time
 from base64 import b64encode, urlsafe_b64encode
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Literal
@@ -2155,32 +2156,28 @@ def load_runtime_schema_rollout(
     return authority, store
 
 
-def _schema_rollout_recorder(
-    root: Path,
-    *,
-    plan_id: str,
-    registry: ProductionConsumerRegistry,
-    service_id: str,
-) -> SchemaRolloutStore:
-    """A writable handle for the evidence a starting service still appends itself.
+@contextmanager
+def _service_rollout_write(root: Path, *, plan_id: str, service_id: str) -> Iterator[None]:
+    """Say why a starting service could not append its own rollout evidence.
 
     Admission is read-only (#227). These are not reads: a producer's PREPARE and CUTOVER
     acknowledgements and a consumer's capability receipt are appended to the plan's hash
-    chain. No runtime unit's `ReadWritePaths` covers `control/schema-rollouts`, so on the
-    production host this open fails — and it fails here, naming the plan, the path and the
-    sandbox, instead of as a bare `unable to open database file` from four frames down.
+    chain, and appending needs a journal beside the database. No runtime unit's
+    `ReadWritePaths` covers `control/schema-rollouts`, so on the production host both the
+    open and the append are refused — and they are refused here, naming the service, the
+    path and the sandbox setting, instead of as a bare SQLite error four frames down.
     """
 
     path = _schema_rollout_root(root, plan_id) / "state.sqlite3"
     try:
-        return SchemaRolloutStore(path, production_consumer_registry=registry)
+        yield
     except (OSError, sqlite3.Error) as exc:
         raise RuntimeSchemaCompatibilityError(
             f"runtime schema service {service_id} has to record its own rollout evidence "
-            f"in {path} and cannot open it for writing ({exc}); a runtime unit's "
-            "ReadWritePaths does not cover control/schema-rollouts, so a rollout that "
-            "still needs a startup acknowledgement has to be driven by the installer or "
-            "the rollout controller before the units start"
+            f"in {path} and cannot write it ({exc}); a runtime unit's ReadWritePaths does "
+            "not cover control/schema-rollouts, so a rollout still waiting on a startup "
+            "acknowledgement has to be driven by the installer or the rollout controller "
+            "before the units start"
         ) from exc
 
 
@@ -2265,15 +2262,22 @@ def load_runtime_schema_service_bindings(
         def record(
             *, _plan_id: str = plan_id, _registry: ProductionConsumerRegistry = authority.registry
         ) -> SchemaRolloutStore:
+            """The writable handle, opened only where this service must append something."""
+
             nonlocal recorder
             if recorder is None:
-                recorder = _schema_rollout_recorder(
-                    root,
-                    plan_id=_plan_id,
-                    registry=_registry,
-                    service_id=manifest.service_id,
+                recorder = SchemaRolloutStore(
+                    _schema_rollout_root(root, _plan_id) / "state.sqlite3",
+                    production_consumer_registry=_registry,
                 )
             return recorder
+
+        writing = partial(
+            _service_rollout_write,
+            root,
+            plan_id=plan_id,
+            service_id=manifest.service_id,
+        )
 
         producer = next(
             (
@@ -2290,16 +2294,17 @@ def load_runtime_schema_service_bindings(
                 phase=RolloutPhase.PREPARE,
                 participant_id=manifest.service_id,
             ):
-                state = record().acknowledge(
-                    plan_id=plan_id,
-                    expected_revision=state.revision,
-                    phase=RolloutPhase.PREPARE,
-                    participant_id=manifest.service_id,
-                    participant_fingerprint=producer.contract_fingerprint,
-                    declaration_fingerprint=authority.plan.new_declaration_fingerprint,
-                    now=observed_at,
-                    operation_id=f"service-prepare:{generation_id}:{manifest.service_id}",
-                )
+                with writing():
+                    state = record().acknowledge(
+                        plan_id=plan_id,
+                        expected_revision=state.revision,
+                        phase=RolloutPhase.PREPARE,
+                        participant_id=manifest.service_id,
+                        participant_fingerprint=producer.contract_fingerprint,
+                        declaration_fingerprint=authority.plan.new_declaration_fingerprint,
+                        now=observed_at,
+                        operation_id=f"service-prepare:{generation_id}:{manifest.service_id}",
+                    )
             acknowledged = {
                 payload.get("participant_id")
                 for payload in _rollout_event_payloads(store, plan_id)
@@ -2308,13 +2313,14 @@ def load_runtime_schema_service_bindings(
             }
             required = {participant.participant_id for participant in authority.plan.producers}
             if required <= acknowledged:
-                state = record().advance(
-                    plan_id=plan_id,
-                    expected_revision=state.revision,
-                    target_phase=RolloutPhase.DUAL_WRITE,
-                    now=observed_at,
-                    operation_id=f"service-dual-write:{generation_id}",
-                )
+                with writing():
+                    state = record().advance(
+                        plan_id=plan_id,
+                        expected_revision=state.revision,
+                        target_phase=RolloutPhase.DUAL_WRITE,
+                        now=observed_at,
+                        operation_id=f"service-dual-write:{generation_id}",
+                    )
             else:
                 raise RuntimeSchemaCompatibilityError(
                     "schema producer startup is waiting for every producer PREPARE ACK"
@@ -2347,16 +2353,17 @@ def load_runtime_schema_service_bindings(
                 participant_id=manifest.service_id,
             )
         ):
-            record().acknowledge(
-                plan_id=plan_id,
-                expected_revision=state.revision,
-                phase=RolloutPhase.CUTOVER,
-                participant_id=manifest.service_id,
-                participant_fingerprint=producer.contract_fingerprint,
-                declaration_fingerprint=authority.plan.new_declaration_fingerprint,
-                now=observed_at,
-                operation_id=f"service-cutover:{generation_id}:{manifest.service_id}",
-            )
+            with writing():
+                record().acknowledge(
+                    plan_id=plan_id,
+                    expected_revision=state.revision,
+                    phase=RolloutPhase.CUTOVER,
+                    participant_id=manifest.service_id,
+                    participant_fingerprint=producer.contract_fingerprint,
+                    declaration_fingerprint=authority.plan.new_declaration_fingerprint,
+                    now=observed_at,
+                    operation_id=f"service-cutover:{generation_id}:{manifest.service_id}",
+                )
         if state.phase is RolloutPhase.CONSUMER_ACK:
             for consumer in authority.registry.consumers:
                 if consumer.service_id != manifest.service_id or _consumer_has_receipt(
@@ -2391,13 +2398,14 @@ def load_runtime_schema_service_bindings(
                     serving_generation_id=None,
                     available_at=observed_at,
                 )
-                record().acknowledge_consumer(
-                    plan_id=plan_id,
-                    expected_revision=store.get_state(plan_id).revision,
-                    receipt=receipt,
-                    now=observed_at,
-                    operation_id=(f"service-capability:{generation_id}:{consumer.consumer_id}"),
-                )
+                with writing():
+                    record().acknowledge_consumer(
+                        plan_id=plan_id,
+                        expected_revision=store.get_state(plan_id).revision,
+                        receipt=receipt,
+                        now=observed_at,
+                        operation_id=(f"service-capability:{generation_id}:{consumer.consumer_id}"),
+                    )
     return tuple(bindings)
 
 
