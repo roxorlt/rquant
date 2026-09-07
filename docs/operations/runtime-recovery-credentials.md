@@ -58,6 +58,19 @@ install -d -m 0700 -o lighthouse -g lighthouse /home/lighthouse/rquant/data/reco
 换掉 `runtime-recovery.json` 里的密钥会让 publication root 里已经签过的每一份 receipt 和
 pointer 全部验不过。
 
+**已存在但权限不是 0600（或不是普通文件）的文档会被拒绝，不会被替换**，报错里带上实测到的
+mode，例如：
+
+```
+error: recovery document /home/lighthouse/rquant/data/recovery/runtime-recovery.json
+already exists with mode 0o0644, not 0o0600, and --only-missing will not replace it:
+restore the mode with `chmod 0600 ...` (or remove the file if it is meant to be
+regenerated) and run again
+```
+
+按提示 `chmod 0600` 之后再复跑即可；**不要**为了绕过这个报错去掉 `--only-missing`——那会
+直接铸一把新密钥覆盖掉正在用的那把。
+
 需要轮换密钥时才去掉 `--only-missing`，并且要按密钥轮换流程单独取得授权——这属于
 CLAUDE.md「生产密钥落盘 / 密钥轮换」一类的高风险变更，不走无人值守发布器。
 

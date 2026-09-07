@@ -23,7 +23,9 @@ summary carries the path, the key id and the byte length, never the value. There
 `--print-secret` and there is no way to supply one, so no secret ever passes through a shell
 history, an argv or a terminal. `--only-missing` makes the run idempotent: an existing
 credential is verified and kept rather than rotated, because replacing it invalidates every
-signature already in the publication root.
+signature already in the publication root. A document that exists but is not a 0600 regular
+file is **refused** under `--only-missing`, with the mode that was observed — replacing it
+would be the silent rotation that flag exists to prevent.
 
 Usage (the host layout of 82.156.0.68), with the checkout's own interpreter:
 
@@ -118,12 +120,52 @@ def write_private_document(path: Path, payload: bytes) -> None:
         os.close(directory)
 
 
-def _is_private_regular_file(path: Path) -> bool:
+def _classify_existing_document(path: Path) -> tuple[str, int | None]:
+    """`("absent", None)`, `("private", mode)` or `("insecure", mode)`.
+
+    `--only-missing` has to tell the last two apart. A single "is it a private regular
+    file?" predicate answers no to both a file that is not there and a file that is there
+    with the wrong mode, which made `--only-missing` mint a new secret over a credential
+    that was already signing (package F review, must-fix M-1).
+    """
+
     try:
         observed = path.lstat()
-    except OSError:
+    except FileNotFoundError:
+        return "absent", None
+    except OSError as exc:
+        raise ProvisionError(f"recovery document is unreadable: {path}") from exc
+    mode = stat.S_IMODE(observed.st_mode)
+    if not stat.S_ISREG(observed.st_mode) or mode & 0o077:
+        return "insecure", mode
+    return "private", mode
+
+
+def _should_write(path: Path, *, only_missing: bool) -> bool:
+    """Whether the producer writes this path, refusing rather than replacing in doubt.
+
+    Without `--only-missing` the operator has asked for a fresh document and gets one. With
+    it, the only thing that may be replaced is a document that is not there: anything that
+    exists but is not a 0600 regular file is refused with the mode that was observed, so the
+    operator fixes the mode and runs again rather than discovering afterwards that the key
+    every published receipt was signed with is gone.
+    """
+
+    if not only_missing:
+        return True
+    state, mode = _classify_existing_document(path)
+    if state == "absent":
+        return True
+    if state == "private":
         return False
-    return stat.S_ISREG(observed.st_mode) and not stat.S_IMODE(observed.st_mode) & 0o077
+    if mode is None:  # pragma: no cover - `_classify_existing_document` always pairs them
+        raise ProvisionError(f"recovery document {path} is unsafe and will not be replaced")
+    raise ProvisionError(
+        f"recovery document {path} already exists with mode 0o{mode:04o}, not 0o0600, "
+        "and --only-missing will not replace it: restore the mode with "
+        f"`chmod 0600 {path}` (or remove the file if it is meant to be regenerated) "
+        "and run again"
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -155,10 +197,8 @@ def provision_recovery_credential(
 
     from rquant.runtime_recovery_backup import RecoveryBackupAuthenticator
 
-    created = True
-    if only_missing and _is_private_regular_file(path):
-        created = False
-    else:
+    created = _should_write(path, only_missing=only_missing)
+    if created:
         document = build_recovery_credential_document(key_id, secret_hex=secret_hex)
         write_private_document(path, document)
     authenticator = RecoveryBackupAuthenticator.from_file(path)
@@ -253,10 +293,11 @@ def provision_recovery_backup_config(
     from rquant.runtime_recovery_backup import load_recovery_backup_config
 
     path = Path(profile.recovery.backup_config_path)
-    created = True
-    if only_missing and _is_private_regular_file(path):
-        created = False
-    else:
+    #: same rule as the credential even though this document is derived rather than secret:
+    #: `--only-missing` means "keep what is there", and a run that quietly rewrote it would
+    #: also change its `config_id`
+    created = _should_write(path, only_missing=only_missing)
+    if created:
         config = build_recovery_backup_config(
             profile,
             as_of=as_of,
@@ -356,7 +397,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "keep and verify a document that already exists instead of replacing it; "
-            "rotating the credential invalidates every signature already published"
+            "rotating the credential invalidates every signature already published. "
+            "A document that exists but is not a 0600 regular file is refused, not "
+            "replaced — fix its mode and run again"
         ),
     )
     return parser

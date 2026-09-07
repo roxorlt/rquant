@@ -127,6 +127,100 @@ def test_only_missing_keeps_the_credential_that_is_already_signing(profile) -> N
     assert path.read_bytes() == first
 
 
+def test_only_missing_refuses_a_credential_whose_mode_was_widened(profile) -> None:
+    """The must-fix (package F review M-1): "not private" is not "not there".
+
+    A credential that is already signing but whose mode someone widened to 0644 used to
+    fail the single "is it a private regular file?" predicate, fall into the write branch,
+    and be replaced by a freshly minted secret — silently, under the very flag that exists
+    to stop that. It has to be refused, with the mode that was observed, so the operator
+    restores the mode instead of discovering afterwards that every published signature is
+    dead.
+    """
+
+    recovery = profile.recovery
+    path = Path(recovery.credential_file)
+    provision_recovery_credential(path, key_id=recovery.signer_key_id, only_missing=False)
+    before = path.read_bytes()
+    path.chmod(0o644)
+
+    with pytest.raises(ProvisionError) as raised:
+        provision_recovery_credential(path, key_id=recovery.signer_key_id, only_missing=True)
+
+    message = str(raised.value)
+    assert "0o0644" in message
+    assert "0o0600" in message
+    assert str(path) in message
+    #: the secret is untouched, and the refusal did not print it
+    assert path.read_bytes() == before
+    assert json.loads(before)["secret_hex"] not in message
+
+
+def test_only_missing_refuses_a_backup_config_whose_mode_was_widened(profile) -> None:
+    """The derived document follows the same rule: `--only-missing` keeps or refuses."""
+
+    path = Path(profile.recovery.backup_config_path)
+    provision_recovery_backup_config(
+        profile,
+        as_of=AS_OF,
+        replay_start_date=REPLAY_START,
+        replay_end_date=REPLAY_END,
+        only_missing=False,
+    )
+    before = path.read_bytes()
+    path.chmod(0o644)
+
+    with pytest.raises(ProvisionError, match="0o0644"):
+        provision_recovery_backup_config(
+            profile,
+            as_of=AS_OF,
+            replay_start_date=REPLAY_START,
+            replay_end_date=REPLAY_END,
+            only_missing=True,
+        )
+
+    assert path.read_bytes() == before
+
+
+def test_only_missing_refuses_a_credential_path_that_is_not_a_regular_file(
+    profile,
+    tmp_path: Path,
+) -> None:
+    """A symlink parked at the credential path is not something to overwrite in silence."""
+
+    recovery = profile.recovery
+    path = Path(recovery.credential_file)
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_bytes(b"{}")
+    path.symlink_to(elsewhere)
+
+    with pytest.raises(ProvisionError, match="will not replace it"):
+        provision_recovery_credential(path, key_id=recovery.signer_key_id, only_missing=True)
+
+    assert path.is_symlink()
+    assert elsewhere.read_bytes() == b"{}"
+
+
+def test_without_only_missing_a_widened_credential_is_replaced_and_reprivatised(
+    profile,
+) -> None:
+    """Refusing is `--only-missing`'s rule, not the producer's: an explicit run still writes."""
+
+    recovery = profile.recovery
+    path = Path(recovery.credential_file)
+    provision_recovery_credential(path, key_id=recovery.signer_key_id, only_missing=False)
+    before = path.read_bytes()
+    path.chmod(0o644)
+
+    summary = provision_recovery_credential(
+        path, key_id=recovery.signer_key_id, only_missing=False
+    )
+
+    assert summary["created"] is True
+    assert path.read_bytes() != before
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_a_kept_credential_naming_another_key_is_refused(profile) -> None:
     """`--only-missing` verifies what it keeps; a leftover from another key id is not it."""
 
