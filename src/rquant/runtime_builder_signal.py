@@ -569,6 +569,20 @@ def signal_router_builder(
         if not injected and not settings.has_manifest_authority:
             raise ValueError("default signal router requires complete manifest authority")
 
+        # Whether this manifest describes a router at all is settled before anything is
+        # created: a role that is going to refuse over its own settings must not leave
+        # three artifacts behind on the way out. Nothing here touches the filesystem.
+        if not injected:
+            if settings.routing_policy_path is None:
+                raise ValueError("default signal router authority is unavailable")
+            for source_settings in settings.source_settings:
+                if (
+                    source_settings.runner_state_path is None
+                    or source_settings.expected_strategy_spec_fingerprint is None
+                    or source_settings.expected_evaluator_contract_fingerprint is None
+                ):
+                    raise ValueError("default signal router authority is unavailable")
+
         # The bus, the route spool and the cursor store are this role's own artifacts and
         # nobody else creates them: `strategy_live` opens the bus read-only and its
         # sandbox grants it `live/strategies/%i` alone. They are opened before any
@@ -586,16 +600,9 @@ def signal_router_builder(
             resolved_source_loader = source_loader
             resolved_target_resolver = target_resolver
         else:
-            if settings.routing_policy_path is None:
-                raise ValueError("default signal router authority is unavailable")
+            assert settings.routing_policy_path is not None
             deferred_sources: dict[str, DeferredPeerArtifact[RunnerSignalSource]] = {}
             for source_settings in settings.source_settings:
-                if (
-                    source_settings.runner_state_path is None
-                    or source_settings.expected_strategy_spec_fingerprint is None
-                    or source_settings.expected_evaluator_contract_fingerprint is None
-                ):
-                    raise ValueError("default signal router authority is unavailable")
                 deferred_sources[source_settings.source_id] = DeferredPeerArtifact(
                     reader="signal_router",
                     artifact="runner source",

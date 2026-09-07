@@ -16,13 +16,15 @@ still could not start:
 
 Every one of those exits fired `OnFailure=rquant-alert@%n.service`.
 
-So the test is the window: a real two-generation bundle, a real staged and published
-authority chain, the wrapper's own argv and child environment, an empty feature spool
-that the feature role has initialised and nothing has published into, a clock outside
-market hours on a date the bundle's calendar does not open, and each role running under
-its own unit's `ReadWritePaths` — read verbatim out of `deploy/systemd/`, so the sandbox
-this test applies is the one the host applies, and a role that writes outside it fails
-here for the same reason it would fail there.
+So the test is the window: two real installed generations, the second over the first --
+which is also the install that prepares the schema rollout plans every kind-backed role
+opens on its way in, acknowledged here the way the runbook acknowledges them (#229) -- a
+real staged and published authority chain, the wrapper's own argv and child environment,
+an empty feature spool that the feature role has initialised and nothing has published
+into, a clock outside market hours on a date the bundle's calendar does not open, and
+each role running under its own unit's `ReadWritePaths` — read verbatim out of
+`deploy/systemd/`, so the sandbox this test applies is the one the host applies, and a
+role that writes outside it fails here for the same reason it would fail there.
 
 The order is the runbook's C-3 order, and it is now the natural one: strategy x3, then
 `signal_router`, then `paper_broker`, then `notifier`.
@@ -44,6 +46,7 @@ import rquant.runtime_service_builtin as builtin_module
 import rquant.runtime_service_main as service_main
 from rquant.feature_spool import FeatureBatchSpool
 from rquant.runtime_capabilities import RUNTIME_CAPABILITY_CREDENTIAL_NAME
+from rquant.runtime_deployment_bundle import acknowledge_runtime_schema_rollout_preparation
 from rquant.runtime_exec_wrapper import _verify
 from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_control import RuntimeServiceControl, RuntimeServiceStatus
@@ -51,13 +54,13 @@ from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeService
 from tests.integration.test_route_a_legacy_binding_e2e import (
     PRODUCTION_ROOT,
     RouteAWorld,
-    _route_a_world,
+    _production_bundle,
     _StopAfterOneIteration,
 )
 from tests.integration.test_route_a_strategy_chain_e2e import _routing_policy_payload
 from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
 from tests.shadow_ed25519_support import create_shadow_ed25519_test_authority
-from tests.unit.test_runtime_authority_publish import UID
+from tests.unit.test_runtime_authority_publish import UID, World
 
 pytestmark = pytest.mark.integration
 
@@ -83,6 +86,9 @@ def _idle_clock() -> datetime:
 
 
 FROZEN_NOW = _idle_clock()
+
+#: the generation this window's bundle was installed over, as in the third Route A window
+PREVIOUS_COMMIT = "1e2d3c4b5a69788796a5b4c3d2e1f00918273645"
 
 STRATEGY_ROLE = "strategy_live"
 ROUTER_ROLE = "signal_router"
@@ -263,7 +269,14 @@ def runner_databases(route: RouteAWorld) -> list[Path]:
 
 @pytest.fixture
 def cold_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RouteAWorld:
-    """A published Route A chain on which no live-plane role has ever run.
+    """Two installed generations, acknowledged, and no live-plane role ever run.
+
+    Two, because the 2026-09-08 window was the second generation installed over the
+    first, and because installing over a previous generation is what prepares the schema
+    rollout plans — the state stores every kind-backed role opens on its way in (#227,
+    #229). A one-generation world would leave that whole surface out of the chain this
+    file is about. The PREPARE round is acknowledged the way the installer's own command
+    does it, which is the runbook step between B-7 and C-3.
 
     Package F's fixture for the same world creates the paper broker's ledger up front,
     "because on a real host the paper-broker service owns it and the strategy only reads
@@ -308,8 +321,51 @@ def cold_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RouteAWorld:
         )
 
     monkeypatch.setattr(profile_fixtures, "_inputs", real_shadow_and_policy_inputs)
-    route = _route_a_world(tmp_path, monkeypatch)
+
+    world = World(tmp_path / "root", monkeypatch).build()
+    runtime_root = tmp_path / "host" / "data" / "runtime"
+    _production_bundle(
+        tmp_path / "previous",
+        monkeypatch,
+        producer_commit=PREVIOUS_COMMIT,
+        runtime_root=runtime_root,
+        schema_bootstrap_reason="#231 acceptance bootstrap",
+    )
+    inputs, profile, receipt, sealed = _production_bundle(
+        tmp_path / "target",
+        monkeypatch,
+        producer_commit=world.commit,
+        runtime_root=runtime_root,
+        #: only the first install into an empty root may carry a bootstrap reason, and
+        #: the second install without one is what prepares the rollout plans
+        schema_bootstrap_reason=None,
+        #: one registry root cannot hold two commits' definitions (#225)
+        definition_registry_root=runtime_root.parent / f"definitions-{world.commit[:7]}",
+    )
+    assert receipt.previous_generation_hash is not None
+    assert receipt.schema_rollout_plan_ids
+
+    #: `_production_bundle` relocates every external input under `<runtime root>/../external`
+    #: when it is given a runtime root, and the roles read the relocated paths. The two
+    #: documents the profile only records a hash of have to be written there too — the
+    #: same bytes, so the hashes the profile carries still match.
+    for path, payload, mode in (
+        (Path(inputs.routing_policy_path), policy_payload, 0o444),
+        (Path(inputs.trade_calendar_path), trade_calendar_payload, 0o600),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(mode)
+
+    route = RouteAWorld(world, inputs.runtime_root)
+    route.profile = profile
+    route.receipt = receipt
+    route.sealed_credentials = sealed
     route.stage_and_publish()
+    #: `rquant runtime-schema-rollout acknowledge`, which the runbook runs after the
+    #: install and before the units: without it every kind-backed role refuses with
+    #: `schema producer startup is waiting for every producer PREPARE ACK` (#229)
+    acknowledge_runtime_schema_rollout_preparation(route.runtime_root, now=FROZEN_NOW)
     return route
 
 
@@ -334,6 +390,37 @@ def idle_chain(cold_chain: RouteAWorld) -> RouteAWorld:
 # ---------------------------------------------------------------------------------------
 # The chain, in the runbook's order, with no signal anywhere
 # ---------------------------------------------------------------------------------------
+
+
+def test_the_world_is_the_second_generation_installed_over_the_first(
+    idle_chain: RouteAWorld,
+) -> None:
+    """The premise, asserted before anything is asserted about the roles.
+
+    The window this file is built out of was the second generation installed over the
+    first, which is also the install that prepares the schema rollout plans every
+    kind-backed role opens on its way in. A one-generation world would quietly leave
+    that surface out.
+    """
+
+    generations = sorted(
+        path.name
+        for path in (idle_chain.runtime_root / "generations").iterdir()
+        if path.is_dir()
+    )
+    assert len(generations) == 2, generations
+    assert idle_chain.receipt.previous_generation_hash in generations
+    assert idle_chain.receipt.generation_hash in generations
+    assert (idle_chain.runtime_root / "current").is_symlink()
+    assert Path(os.readlink(idle_chain.runtime_root / "current")).name == (
+        idle_chain.receipt.generation_hash
+    )
+
+    rollouts = idle_chain.runtime_root / "control" / "schema-rollouts"
+    assert sorted(path.name for path in rollouts.iterdir()) == sorted(
+        idle_chain.receipt.schema_rollout_plan_ids
+    )
+
 
 
 def test_the_whole_live_chain_starts_idle_in_the_runbook_order(
@@ -430,6 +517,15 @@ def test_the_router_started_first_creates_the_bus_and_waits_by_name(
     assert heartbeat.total_failures == 1
     assert PeerArtifactUnavailableError.__name__ in (heartbeat.last_error or "")
     assert "runner.sqlite3" in (heartbeat.last_error or "")
+
+    #: and the wait is on the heartbeat as data, not only as prose: which file, since
+    #: when, and for how long. Without a failure threshold this is the only thing that
+    #: distinguishes "waiting for a peer that has not started" from "wedged".
+    assert heartbeat.waiting_for is not None
+    assert heartbeat.waiting_for.endswith("runner.sqlite3")
+    assert heartbeat.waiting_since is not None
+    assert heartbeat.waited_seconds is not None
+    assert heartbeat.waited_seconds >= 0
 
     #: and the strategies, started after it, come up against the bus it left
     for instance in instances_of(idle_chain, STRATEGY_ROLE):

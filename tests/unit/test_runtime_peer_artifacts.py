@@ -139,3 +139,38 @@ def test_the_reader_and_artifact_names_are_required(tmp_path: Path) -> None:
             path=tmp_path / "runner.sqlite3",
             open_artifact=lambda: "never",
         )
+
+
+@pytest.mark.parametrize("kind", ("parent-symlink-loop", "file-as-parent"))
+def test_a_path_that_cannot_be_stat_ed_is_present_not_missing(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """`FileNotFoundError` is the only answer that means "the owner has not written it".
+
+    Everything else `lstat` can raise describes something that is there and wrong: a
+    symlink loop where the artifact belongs, a parent segment somebody replaced with a
+    file. Counting those as "not created yet" would turn a substituted artifact into a
+    silent, permanent wait, which is the fail-closed boundary this package must not move.
+    """
+
+    if kind == "parent-symlink-loop":
+        #: ELOOP: `lstat` does not follow the last component, so the loop has to be in a
+        #: parent segment to be the thing that raises
+        (tmp_path / "strategies").symlink_to(tmp_path / "live")
+        (tmp_path / "live").symlink_to(tmp_path / "strategies")
+        path = tmp_path / "strategies" / "runner.sqlite3"
+    else:
+        (tmp_path / "strategies").write_bytes(b"not a directory")
+        path = tmp_path / "strategies" / "runner.sqlite3"
+
+    with pytest.raises(OSError) as observed:
+        path.lstat()
+    assert not isinstance(observed.value, FileNotFoundError)
+
+    artifact = _artifact(path, fail_with=ValueError("runner source is unusable"))
+    assert artifact.exists is True
+    with pytest.raises(ValueError, match="unusable"):
+        artifact.probe()
+    with pytest.raises(ValueError, match="unusable"):
+        artifact.get()

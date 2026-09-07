@@ -1358,3 +1358,69 @@ def test_a_strategy_that_refuses_to_start_still_leaves_its_runner_database(
         )(manifest)
 
     assert Path(str(manifest.settings["runner_state_path"])).is_file()
+
+
+def test_a_paper_broker_ledger_that_is_present_and_unreadable_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The fourth peer artifact, and the one deferral could quietly have loosened.
+
+    Before this package the strategy built `PaperBrokerLifecycleReader` eagerly, and that
+    constructor is a full audit: a regular file, then nine tables, `schema_version == 5`
+    and a long list of required columns. Deferring the open without probing it would have
+    moved all of that to the first candidate that actually resolves a lifecycle feature
+    -- which on an idle host outside market hours never happens, so a corrupted ledger
+    would have started clean and stayed clean until the next trading day.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    #: `_manifest` builds a real ledger and the store that built it is still holding the
+    #: connection, so corrupting that file in place only gets written back over. The
+    #: manifest keeps the path; the file under it is replaced.
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    ledger = Path(str(manifest.settings["paper_broker_path"]))
+    for sibling in sorted(ledger.parent.glob(f"{ledger.name}-*")):
+        sibling.unlink()
+    ledger.write_bytes(b"this is not a paper broker ledger")
+
+    with pytest.raises(Exception) as raised:
+        strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+
+    #: and the refusal still leaves the file `signal_router` waits for
+    assert Path(str(manifest.settings["runner_state_path"])).is_file()
+
+
+def test_an_absent_paper_broker_ledger_is_waited_for_rather_than_refused(
+    tmp_path: Path,
+) -> None:
+    """The other half of the same rule: the broker cannot start before the router.
+
+    `paper_broker` opens the router's route spool while building its own step, so on a
+    cold plane its ledger does not exist yet. Probing an absent ledger is a no-op, which
+    is what keeps the strategy from joining that queue.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    assert not Path(str(manifest.settings["paper_broker_path"])).exists()
+
+    step = strategy_live_builder(
+        clock=lambda: NOW,
+        completion_attestation_signer=signer,
+        completion_attestation_active_key_id=key_id,
+    )(manifest)
+
+    assert step().processed_count == 0

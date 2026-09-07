@@ -346,23 +346,28 @@ def strategy_live_builder(
         # It is built here, before anything another role owns is touched, so that the
         # file exists as soon as the process does — with no signal, outside a session,
         # and whatever the rest of the plane is doing.
+        paper_ledger: DeferredPeerArtifact[PaperBrokerLifecycleReader] = DeferredPeerArtifact(
+            reader="strategy_live",
+            artifact="paper broker ledger",
+            path=settings.paper_broker_path,
+            open_artifact=lambda: PaperBrokerLifecycleReader(
+                settings.paper_broker_path,
+                account_id=settings.paper_account_id,
+            ),
+        )
         runner = StrategyRunnerStore(
             settings.runner_state_path,
             spec=spec,
             evaluator_contract_fingerprint=binding.contract_fingerprint,
             feature_contract=feature_registration.contract,
-            lifecycle_feature_source=_DeferredLifecycleFeatureSource(
-                DeferredPeerArtifact(
-                    reader="strategy_live",
-                    artifact="paper broker ledger",
-                    path=settings.paper_broker_path,
-                    open_artifact=lambda: PaperBrokerLifecycleReader(
-                        settings.paper_broker_path,
-                        account_id=settings.paper_account_id,
-                    ),
-                )
-            ),
+            lifecycle_feature_source=_DeferredLifecycleFeatureSource(paper_ledger),
         )
+        # Probed after the runner store and not before it, so a ledger that is present
+        # and unreadable still refuses to start -- as it did before this role deferred
+        # anything -- without taking `runner.sqlite3` down with it.
+        # `PaperBrokerLifecycleReader` opens the ledger read-only and runs its whole
+        # schema audit here: nine tables, the v5 ledger schema, every required column.
+        paper_ledger.probe()
         # `live/features` belongs to `feature_live`, which mounts read-only here: the
         # consumer takes neither the producer's lock nor its cursor directory, and keeps
         # its own cursors beside its runner database instead (#231).
