@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #224's to PR #226's. It is the merge base of the
+    # main; this one moves it from PR #226's to PR #229's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "e474efd2831553218c64784250127cd076451c71"
-    assert BASELINE_TREE_SHA == "f57cded06667857cd04ab106b5cd7e033a6bfcdf"
+    assert BASELINE_COMMIT_SHA == "a0bbb4c291797eb086fb2f2a9fc50a91cc264095"
+    assert BASELINE_TREE_SHA == "f8f4930dab1d6d5aedffedde198c6979919f3125"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``e474efd`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``a0bbb4c`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1491,11 +1491,12 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # the refreeze to a90f927 put it back once more because that topic added the credstore
     # container job, the refreeze to 48bd3d8 took it out again because the strategy chain
     # touched no workflow, the refreeze to 9e38541 put it back because that topic changed
-    # the shard matrix in it, and this refreeze to e474efd takes it out again, because the
-    # schema rollout store and the installer acknowledgement need no new job: neither
-    # package marks a case ``linux_exact``, so the two Linux gates keep their contracts and
-    # every new case rides the shards. A named path would have flipped truth value
-    # seven times in ten refreezes: naming one
+    # the shard matrix in it, the refreeze to e474efd took it out again because the schema
+    # rollout store and the installer acknowledgement needed no new job, and this refreeze to
+    # a0bbb4c puts it back once more, because the credential shape topic marks fifteen cases
+    # ``linux_exact`` that no shard collects and gives them a rooted container job of their own.
+    # A named path would have flipped truth value
+    # eight times in eleven refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted
