@@ -19,6 +19,8 @@ from rquant.schema_compatibility import (
     SchemaField,
     SchemaParticipant,
     SchemaRequiredTransition,
+    SchemaRolloutStateReadOnlyError,
+    SchemaRolloutStateUnavailableError,
     SchemaRolloutStore,
     UnknownFieldPolicy,
     evaluate_schema_compatibility,
@@ -1280,3 +1282,247 @@ def test_strict_rollout_reopen_requires_the_same_trusted_registry(tmp_path: Path
             path,
             production_consumer_registry=wrong_registry,
         ).get_state(plan.plan_id)
+
+
+# ---------------------------------------------------------------------------------------
+# #227: a runtime service reads this store from inside a sandbox that cannot write it
+# ---------------------------------------------------------------------------------------
+
+
+def _journal_mode(path: Path) -> str:
+    connection = sqlite3.connect(path)
+    try:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _set_journal_mode(path: Path, mode: str) -> None:
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        connection.execute(f"PRAGMA journal_mode = {mode}")
+    finally:
+        connection.close()
+
+
+def _sealed_plan(root: Path) -> tuple[Path, LiveSchemaRolloutPlan, datetime]:
+    """One created plan, then the directory made read-only the way the unit sandbox is."""
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = root / "schema-rollouts" / plan.plan_id / "state.sqlite3"
+    store = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    store.create_plan(plan, now=started_at, operation_id="create")
+    for entry in path.parent.iterdir():
+        entry.chmod(0o444)
+    path.parent.chmod(0o555)
+    return path, plan, started_at
+
+
+def _unseal(path: Path) -> None:
+    path.parent.chmod(0o755)
+    for entry in path.parent.iterdir():
+        entry.chmod(0o644)
+
+
+def test_the_writer_leaves_the_rollout_store_in_rollback_journal_mode(tmp_path: Path) -> None:
+    """WAL is what #227 was: it needs a `-shm` the reader has no permission to create."""
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    store = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    store.create_plan(plan, now=started_at, operation_id="create")
+
+    assert _journal_mode(path) == "delete"
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["rollout.sqlite3"]
+
+
+def test_a_store_left_in_wal_by_an_older_build_converts_on_the_next_writer_open(
+    tmp_path: Path,
+) -> None:
+    """The production store installed before this fix is WAL; the installer converts it."""
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    store = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    store.create_plan(plan, now=started_at, operation_id="create")
+    _set_journal_mode(path, "WAL")
+    assert _journal_mode(path) == "wal"
+
+    SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+
+    assert _journal_mode(path) == "delete"
+
+
+def test_a_readonly_store_reads_a_plan_it_has_no_permission_to_write(tmp_path: Path) -> None:
+    """The whole point: admission works with `control/schema-rollouts` mounted read-only."""
+
+    path, plan, _started_at = _sealed_plan(tmp_path)
+    try:
+        reader = SchemaRolloutStore(
+            path,
+            production_consumer_registry=_trusted_registry(),
+            read_only=True,
+        )
+
+        assert reader.get_state(plan.plan_id).phase is RolloutPhase.PREPARE
+        assert len(reader.receipts(plan.plan_id)) == 1
+        assert reader.consumer_capability_receipts(plan.plan_id) == ()
+        assert reader.dual_write_records(plan.plan_id) == ()
+        #: no journal, no wal-index — nothing was created beside a file it may not create
+        assert sorted(item.name for item in path.parent.iterdir()) == ["state.sqlite3"]
+    finally:
+        _unseal(path)
+
+
+def test_a_readonly_store_refuses_every_mutation(tmp_path: Path) -> None:
+    """Fail closed, before SQLite is asked, and say who is allowed to write instead."""
+
+    path, plan, started_at = _sealed_plan(tmp_path)
+    try:
+        reader = SchemaRolloutStore(
+            path,
+            production_consumer_registry=_trusted_registry(),
+            read_only=True,
+        )
+        state = reader.get_state(plan.plan_id)
+
+        with pytest.raises(SchemaRolloutStateReadOnlyError, match="installer"):
+            reader.create_plan(plan, now=started_at, operation_id="second-create")
+        with pytest.raises(SchemaRolloutStateReadOnlyError, match="read-only"):
+            reader.acknowledge(
+                plan_id=plan.plan_id,
+                expected_revision=state.revision,
+                phase=RolloutPhase.PREPARE,
+                participant_id=plan.producers[0].participant_id,
+                participant_fingerprint=plan.producers[0].contract_fingerprint,
+                declaration_fingerprint=plan.new_declaration_fingerprint,
+                now=started_at + timedelta(minutes=1),
+            )
+        with pytest.raises(SchemaRolloutStateReadOnlyError):
+            reader.advance(
+                plan_id=plan.plan_id,
+                expected_revision=state.revision,
+                target_phase=RolloutPhase.DUAL_WRITE,
+                now=started_at + timedelta(minutes=1),
+            )
+        with pytest.raises(SchemaRolloutStateReadOnlyError):
+            reader.rollback(
+                plan_id=plan.plan_id,
+                expected_revision=state.revision,
+                reason="not this caller",
+                now=started_at + timedelta(minutes=1),
+                operation_id="readonly-rollback",
+            )
+        with pytest.raises(SchemaRolloutStateReadOnlyError):
+            reader.expire(
+                plan_id=plan.plan_id,
+                expected_revision=state.revision,
+                now=plan.deadline + timedelta(seconds=1),
+                operation_id="readonly-expire",
+            )
+        with pytest.raises(SchemaRolloutStateReadOnlyError):
+            reader.acknowledge_consumer(
+                plan_id=plan.plan_id,
+                expected_revision=state.revision,
+                receipt=_consumer_receipt(
+                    consumer_id=plan.consumers[0].participant_id,
+                    service_id="feature.live",
+                    available_at=started_at,
+                ),
+                now=started_at + timedelta(minutes=1),
+                operation_id="readonly-consumer",
+            )
+        #: and the state is exactly what it was
+        assert reader.get_state(plan.plan_id) == state
+        assert len(reader.receipts(plan.plan_id)) == 1
+    finally:
+        _unseal(path)
+
+
+def test_a_readonly_reader_sees_a_later_commit_by_the_rollout_controller(
+    tmp_path: Path,
+) -> None:
+    """Why `immutable=1` is not the answer: the controller advances phases while roles run."""
+
+    started_at = datetime(2026, 9, 7, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    writer = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    state = writer.create_plan(plan, now=started_at, operation_id="create")
+    reader = SchemaRolloutStore(
+        path,
+        production_consumer_registry=_trusted_registry(),
+        read_only=True,
+    )
+    assert reader.get_state(plan.plan_id).phase is RolloutPhase.PREPARE
+
+    for participant in plan.producers:
+        state = writer.acknowledge(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            phase=RolloutPhase.PREPARE,
+            participant_id=participant.participant_id,
+            participant_fingerprint=participant.contract_fingerprint,
+            declaration_fingerprint=plan.new_declaration_fingerprint,
+            now=started_at + timedelta(minutes=1),
+        )
+    state = writer.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.DUAL_WRITE,
+        now=started_at + timedelta(minutes=2),
+    )
+
+    assert reader.get_state(plan.plan_id).phase is RolloutPhase.DUAL_WRITE
+    assert len(reader.receipts(plan.plan_id)) == len(writer.receipts(plan.plan_id))
+
+
+def test_a_wal_store_under_a_readonly_directory_fails_closed_and_names_the_sandbox(
+    tmp_path: Path,
+) -> None:
+    """#227 itself, as a unit: WAL plus no write permission is refused, not degraded."""
+
+    path, _plan, _started_at = _sealed_plan(tmp_path)
+    _unseal(path)
+    _set_journal_mode(path, "WAL")
+    for entry in path.parent.iterdir():
+        entry.chmod(0o444)
+    path.parent.chmod(0o555)
+    try:
+        with pytest.raises(SchemaRolloutStateUnavailableError) as caught:
+            SchemaRolloutStore(
+                path,
+                production_consumer_registry=_trusted_registry(),
+                read_only=True,
+            )
+        message = str(caught.value)
+        assert str(path) in message
+        assert "ReadWritePaths" in message
+    finally:
+        _unseal(path)
+
+
+def test_an_absent_readonly_store_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(SchemaRolloutStateUnavailableError) as caught:
+        SchemaRolloutStore(tmp_path / "missing" / "state.sqlite3", read_only=True)
+
+    assert "missing" in str(caught.value)
+    assert not (tmp_path / "missing").exists()
+
+
+def test_a_readonly_store_refuses_a_legacy_v1_registry(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(legacy, isolation_level=None)
+    try:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.execute(
+            "CREATE TABLE schema_rollout (plan_id TEXT PRIMARY KEY, plan_json TEXT NOT NULL)"
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="legacy v1"):
+        SchemaRolloutStore(legacy, read_only=True)

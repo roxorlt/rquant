@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
@@ -633,27 +634,117 @@ def validate_dual_write_values(
     )
 
 
+class SchemaRolloutStateUnavailableError(RuntimeError):
+    """A rollout state store could not be opened for the access its caller needs."""
+
+
+class SchemaRolloutStateReadOnlyError(RuntimeError):
+    """A mutation was attempted on a store that was deliberately opened read-only."""
+
+
 class SchemaRolloutStore:
-    """Persist a hash-chained schema rollout with trusted consumer receipts."""
+    """Persist a hash-chained schema rollout with trusted consumer receipts.
+
+    Two opens, because two kinds of caller reach this file. The installer and the rollout
+    controller own the plan and write it; a runtime service only ever needs to read it, and
+    runs under a unit whose `ReadWritePaths` does not include `control/schema-rollouts`
+    (`ProtectSystem=strict` + `ProtectHome=read-only`). A writable open needs to create the
+    journal beside the database, so it fails there with `unable to open database file` —
+    which is #227, and it took down every kind-backed role, participant or not, because the
+    admission path opens the store before it knows whether this service is in the plan.
+
+    `read_only=True` opens `file:<path>?mode=ro`: no `mkdir`, no schema creation, no journal
+    pragma, and SQLite itself refuses any write on the handle. That works only because the
+    writer keeps the database in rollback-journal mode. A WAL database cannot be read
+    without write access to its `-shm` wal-index — measured, not assumed: with the directory
+    at 0555 and no sidecars, `mode=ro` on a WAL database raises `attempt to write a readonly
+    database`, while the same open on a `journal_mode=delete` database succeeds. `immutable=1`
+    would also open a WAL database, and is wrong here: the rollout controller advances phases
+    while services run, and an immutable reader is pinned to the snapshot it opened. A
+    rollback-journal reader sees a concurrent writer's commits, which is what admission needs.
+    """
 
     def __init__(
         self,
         path: Path,
         *,
         production_consumer_registry: ProductionConsumerRegistry | None = None,
+        read_only: bool = False,
     ) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
         self.production_consumer_registry = production_consumer_registry
+        if self.read_only:
+            self._verify_readable()
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
+    def _readonly_uri(self) -> str:
+        return "file:" + urllib.parse.quote(str(self.path)) + "?mode=ro"
+
     def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            return self._connect_readonly()
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA journal_mode = WAL")
+        # Rollback journal, not WAL: a reader with no write access to the directory can open
+        # this file only in this mode. `PRAGMA journal_mode` is persisted in the database
+        # header, so a store written by an older build converts on the first writer open.
+        connection.execute("PRAGMA journal_mode = DELETE")
         return connection
+
+    def _unavailable(self, exc: sqlite3.Error) -> SchemaRolloutStateUnavailableError:
+        return SchemaRolloutStateUnavailableError(
+            f"schema rollout state {self.path} cannot be opened read-only ({exc}); "
+            "a runtime service runs with control/schema-rollouts outside its unit's "
+            "ReadWritePaths, so the store has to be readable without creating anything "
+            "beside it, which a WAL-mode store or a hot rollback journal is not"
+        )
+
+    def _connect_readonly(self) -> sqlite3.Connection:
+        try:
+            connection = sqlite3.connect(
+                self._readonly_uri(),
+                timeout=30,
+                isolation_level=None,
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("PRAGMA query_only = ON")
+            #: `sqlite3.connect` is lazy, and a WAL database under a directory the reader
+            #: may not write refuses at the first statement rather than at the open. Take
+            #: that statement here so every caller gets the same fail-closed message.
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error as exc:
+            raise self._unavailable(exc) from exc
+        return connection
+
+    def _verify_readable(self) -> None:
+        """Fail closed on a store that is absent, unreadable, or of an unsupported shape."""
+
+        with self._connect() as connection:
+            try:
+                existing = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+            except sqlite3.Error as exc:
+                raise self._unavailable(exc) from exc
+            if "schema_rollout" in existing and "schema_registry_meta" not in existing:
+                raise RuntimeError(
+                    "legacy v1 schema rollout registry requires explicit migration; fail closed"
+                )
+            row = connection.execute(
+                "SELECT registry_schema_version FROM schema_registry_meta WHERE singleton = 1"
+            ).fetchone()
+            if row is None or row[0] != _REGISTRY_SCHEMA_VERSION:
+                raise RuntimeError("unsupported schema rollout registry version; fail closed")
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -761,6 +852,11 @@ class SchemaRolloutStore:
 
     @contextmanager
     def _writer(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise SchemaRolloutStateReadOnlyError(
+                f"schema rollout state {self.path} is open read-only and cannot record "
+                "rollout evidence; only the installer and the rollout controller write it"
+            )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2038,6 +2134,8 @@ __all__ = [
     "SchemaRequiredTransition",
     "SchemaRolloutReceipt",
     "SchemaRolloutState",
+    "SchemaRolloutStateReadOnlyError",
+    "SchemaRolloutStateUnavailableError",
     "SchemaRolloutStore",
     "UnknownFieldPolicy",
     "evaluate_schema_compatibility",
