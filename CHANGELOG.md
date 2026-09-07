@@ -4,6 +4,40 @@
 
 ## [Unreleased]
 
+### Added
+
+- **安装器代生产者记录 schema rollout 的 PREPARE 承认，并把计划推进到 DUAL_WRITE 为止（#227，owner 2026-09-07 授权）**：
+  装一代有前代的 bundle 会为每个「声明指纹变了」的 channel 备一份 rollout 计划，每份都停在
+  PREPARE 等它的全部生产者各记一条承认。生产画像里有两份计划各带三个生产者
+  （`runtime.strategy_candidate.snapshot` 与 `runtime.strategy_signal.envelope`），所以头两个
+  实例启动时必然各失败一次——`load_runtime_schema_service_bindings` 会抛
+  `schema producer startup is waiting for every producer PREPARE ACK`，每失败一次就中继一条告警。
+  这一轮承认没有任何只有生产者自己知道的东西：`store.acknowledge` 的每个入参都来自冻结的计划，
+  它本身还会拿冻结注册表把入参全部重验一遍，所以搬到安装器不丢信息。
+  新命令 `rquant runtime-schema-rollout acknowledge --runtime-root <root> [--dry-run]` 做这一轮，
+  **只做到 DUAL_WRITE**：`SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING` 就是 DUAL_WRITE，常量一旦被改
+  成别的值，代码在动任何计划之前就抛错停下（离开 DUAL_WRITE 要的是生产者真写过双写记录的一致性
+  证据，CUTOVER 要的是可信消费者的回执，两者都不能由安装器代签）。
+  apply 以写者身份打开每份状态库，这同时把旧版留下的 WAL 库转成回滚日志——unit 的只读准入能读的
+  就是这个布局；每份计划都报告转换前后的 journal 模式。`--dry-run` 走只读打开，因此**不会转换**：
+  遇到 WAL 库它报告「要先 apply 才能读」，而不是替操作者悄悄转掉它要预览的那个改动。
+  命令与三条路线 A 装机命令一样免配置，因为它跑在同一个窗口、同一份无 `.env` 的 bootstrap worktree。
+
+### Changed
+
+- **十六个 runtime unit 的 `ReadWritePaths` 加上 `control/schema-rollouts`（#227，owner 2026-09-07 授权）**：
+  计划里的生产者要往计划的哈希链上追加自己的 PREPARE / CUTOVER 承认，消费者要追加能力回执，
+  而追加事务必须在库旁边建日志文件——那是**目录**权限，不是文件权限。此前二十三个 runtime unit
+  没有一个的 `ReadWritePaths` 覆盖这个目录，所以生产上任何参与方都完不成自己那一半。
+  这次按 owner 授权的最小宽度放开：真正是参与方的十六个 unit（十五个生产者 + 消费者
+  `rquant-runtime-serving@`）拿到 `control/schema-rollouts`，另外七个 runtime unit 一点都不给。
+  给的是**整个目录**，因为 `plan_id` 是计划的内容哈希、每一代都变，静态 unit 文件追不上；
+  per-plan 粒度只能靠安装器生成 drop-in，那是另一次授权。每个 unit 只多一条 `-/` 前缀的条目
+  （缺失即忽略，#192），执行行、Slice、只读授权一字未动。
+  哪十六个不是抄来的清单：端到端用例从真实两代装机备下的十六份计划里把参与方推导出来，
+  再与 unit 文件里钉住的清单比对。
+  **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
+
 ### Fixed
 
 - **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：

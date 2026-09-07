@@ -434,8 +434,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 和凭证侧的增量装法；另一个 PR（#207）修好了「权威 generation 与 legacy generation 是两个命名空间」
 这个结构性阻塞，第 13 条起的六条就是它带来的新前置；第 19 条来自 #213，第 20 条起的八条是
 2026-09-07 第一次真正跑完路线 A 之后的实战订正（runbook R-13…R-18），第 1、5、12 三条也按当时
-的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）。
-下面二十九条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）；第 30 条来自
+#227 的第二包（十六个 unit 的 rollout 写权限与安装器代做的 PREPARE 承认）。
+下面三十条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -682,6 +683,58 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       报错里带路径、实测 mode、期望 mode 和该敲的 `chmod 0600 <path>`。
       **不要为了绕过报错去掉 `--only-missing`**：不带这个参数就是明确要求重新生成，会真的换密钥。
     - 详细操作说明见 `docs/operations/runtime-recovery-credentials.md`。
+
+30. **bundle 装完、`current` 指向本代之后、起 unit 之前，跑一次 schema rollout 的 PREPARE 承认**
+    （#227，owner 2026-09-07 授权）。装一代有前代的 bundle 会为每个「声明指纹变了」的 channel
+    备一份 rollout 计划——生产画像上是**十六份**，每份都停在 PREPARE 等它的全部生产者各记一条
+    承认。这一步不做的后果不是「慢一点」：两份计划各带三个生产者
+    （`runtime.strategy_candidate.snapshot` 与 `runtime.strategy_signal.envelope`），头两个实例
+    启动时必然各以 `schema producer startup is waiting for every producer PREPARE ACK` 失败，
+    每次失败都会中继一条 `rquant-alert@` 告警。
+
+    **位置：紧跟第 ④ 步 `runtime-deployment-profile`，在第 ⑤ 步 stage 之前。** 依据三条：
+
+    - 它的全部前提就是「计划已落盘」加「`data/runtime/current` 指向计划的目标代」，两者都是
+      第 ④ 步的产物；从第 ④ 步到起 unit 之间没有任何一步会动 `data/runtime/current`
+      （publish 换的是 `/var/lib/rquant/runtime-authority/current.json`，是另一个文件）。
+    - stage 只读 `<legacy root>/generations/<代>/manifests/*.json` 与 `current`，**不读也不写**
+      `control/schema-rollouts`；所以这一步既动不了 stage/publish，stage/publish 也动不了它，
+      放在哪一侧都不会造成「stage 与 publish 之间根被改动」那类拒绝。
+    - **十六份状态库现在是 WAL**（v0.33.0 的写者留下的），只有以写者身份打开一次才能转成回滚
+      日志；这一步顺带完成转换。把它放在 96 s 的 root publish**之前**，是为了让「库能不能打开、
+      能不能转换」这个问题在一条便宜的本地命令里得到答案，而不是在 root 事务跑完之后。
+
+    ```bash
+    cd "${WT}"                       # 无 .env 的 bootstrap worktree，本命令免配置
+    ./.venv/bin/rquant runtime-schema-rollout acknowledge \
+      --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
+    ```
+
+    dry-run **一个字节都不写**（只读打开），先用它确认：`plans` 是 16、每份
+    `phase_before` 是 `prepare`。**十六份现在是 WAL，所以 dry-run 会把它们报成
+    `journal_mode_before: wal` + `phase_before: null` + `skipped_reason` 说要先 apply**——
+    这是预期，不是故障：没有任何进程能在不往旁边建 wal-index 的前提下读 WAL 库。
+
+    ```bash
+    ./.venv/bin/rquant runtime-schema-rollout acknowledge \
+      --runtime-root /home/lighthouse/rquant/data/runtime
+    ```
+
+    apply 之后逐条核对输出：`changed` 等于本次真正推进的份数，每份
+    `journal_mode_after` 是 `rollback`、`phase_after` 是 `dual_write`，
+    `control/schema-rollouts` 下没有残留 `state.sqlite3-wal` / `-shm`。
+    **命令幂等**：再跑一次 `changed` 是 0，每份 `skipped_reason` 写
+    `plan is past PREPARE (phase dual_write)`。
+
+    - **只推进到 DUAL_WRITE，不会更远**，这是硬线：离开 DUAL_WRITE 要的是生产者真写过双写
+      记录的一致性证据，CUTOVER 要的是可信消费者的回执，安装器代签不了。
+    - 这一步是**生产数据库写入**（往每份计划的哈希链上追加事件），按受控自动发布模式第 7 条
+      需要 owner 单独明确授权，不能走无人值守发布器。
+    - 若窗口在这一步之后失败并把 `data/runtime/current` 回退到上一代：计划停在 DUAL_WRITE，
+      但因为不再是当前代，之后任何一次 acknowledge 都会把它们跳过（输出写
+      `plan does not target the current generation`），不会被误当成本代的进度。
+    - 第 28 条那条固定启动顺序仍然照旧；这一步只消掉「等其他生产者承认」这一类失败，
+      消不掉 signal bus 的循环依赖。
 
 ### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，以及修 #218 时查出来的 #220；末列写「已修」的条目已修，其余不修）
 
