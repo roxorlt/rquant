@@ -31,10 +31,18 @@
   而窗口里从装 bundle 到承认之间超过十分钟是常态。命令因此在动任何东西之前逐份判 deadline，
   dry-run 与 apply 判定完全一致；对「目标是本代、阶段是 PREPARE、已过期」的计划，安装器
   **重开一次**窗口（`now` 加上计划自己的那段时长），作为 `deadline_reopen` 事件记进计划的哈希链，
-  `operation_id` 是 `installer-deadline-reopen:<plan>`。**每份计划只有一次**（第二次由
-  `SchemaRolloutStore.reopen_deadline` 自己拒绝），**已越过 PREPARE 的计划一律不动 deadline**。
+  `operation_id` 是 `installer-deadline-reopen:<plan>`。四条边界都由
+  `SchemaRolloutStore.reopen_deadline` 自己守、调用方绕不过去：**每份计划只有一次**、
+  **已越过 PREPARE 的计划一律不动 deadline**、**窗口还没关的不许提前重开**（否则等于白花那一次）、
+  **签名的 `operation_id` 必须带 `installer-deadline-reopen:` 前缀**（这样每次重开在 `receipts()`
+  里都认得出是安装器干的，不会被误当成参与方自己的事件）。
   重开额度用尽还过期的计划报 `skipped_reason: deadline_expired`，报告照样打完整、其余计划照样
   推进，命令退 2。
+
+  **要清楚的一个后果**：`_validate_time` 管着一份计划**此后所有**的变更，所以重开一次之后，
+  这份计划**后续 DUAL_WRITE / CONSUMER_ACK 的窗口也同步后移一个窗口长度**——生产者写双写记录、
+  消费者写回执，用的都是重开之后的那个 deadline。重开是把整份计划的时钟往后拨一个窗口，
+  不是只给承认这一步开口子。
 
   `--dry-run` 一个字节都不写，**也不转换**——转换正是它要预览的那个改动，所以还是 WAL 的库被
   如实报成 `state_unreadable`（没有任何进程能在不建 wal-index 的前提下读 WAL 库），而不是被

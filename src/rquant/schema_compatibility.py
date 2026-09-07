@@ -41,6 +41,11 @@ _REGISTRY_SCHEMA_VERSION = 2
 #: The one event type the installer may append that is not a participant's own
 #: evidence. It restarts a PREPARE plan's window without touching its identity.
 _DEADLINE_REOPEN_EVENT = "deadline_reopen"
+#: Only the installer may reopen a window, and it says so in the operation id it signs the
+#: event with. Checked in the store rather than in the caller: the point of the prefix is to
+#: make every reopen identifiable in `receipts()` afterwards, and a rule the caller could
+#: choose to skip would not survive the first other caller.
+_DEADLINE_REOPEN_OPERATION_PREFIX = "installer-deadline-reopen:"
 
 
 class RolloutPhase(StrEnum):
@@ -1092,15 +1097,30 @@ class SchemaRolloutStore:
         * only in PREPARE — a plan that has left it is waiting on evidence that a restarted
           clock has no bearing on, and the authorisation does not reach there;
         * only once — a second reopen is refused, so this cannot become an open-ended lease;
+        * only when the window has actually closed — reopening an open one would hand the plan
+          more than one window while still spending the single use;
+        * only under an installer operation id, so every reopen is identifiable in
+          `receipts()` as the installer's and not mistaken for a participant's own event;
         * only for the plan's own window — `reopened_until` is `now` plus exactly
           `deadline - started_at`, so the profile's timeout still decides how long it is;
         * on the append-only chain, with its own event type, so the reopen is as auditable as
           every acknowledgement around it and `receipts()` shows who restarted the clock.
 
         Everything else about the plan — participants, fingerprints, phase — is untouched.
+
+        One consequence to be clear about: `_validate_time` gates *every* later mutation of
+        this plan, so a reopen moves the whole remaining rollout — the producers' dual-write
+        records at DUAL_WRITE and the consumers' receipts at CONSUMER_ACK — later by the same
+        one window. It restarts the plan's clock, it does not carve out an exception for the
+        acknowledgement alone.
         """
 
         now = normalize_aware_utc(now)
+        if not operation_id.startswith(_DEADLINE_REOPEN_OPERATION_PREFIX):
+            raise ValueError(
+                "a rollout deadline reopen must be signed with an "
+                f"{_DEADLINE_REOPEN_OPERATION_PREFIX!r} operation id"
+            )
         request = {"action": _DEADLINE_REOPEN_EVENT, "now": now}
         request_hash = canonical_sha256(request)
         with self._writer() as connection:
@@ -1116,6 +1136,12 @@ class SchemaRolloutStore:
                 raise ValueError("only a preparing rollout may have its deadline reopened")
             if self._deadline_reopened_until(connection, plan_id) is not None:
                 raise ValueError("rollout deadline has already been reopened once")
+            deadline = self._effective_deadline(connection, plan)
+            if now <= deadline:
+                #: A window that is still open needs nothing, and reopening it early would
+                #: quietly hand the plan more than one window — which is the one thing the
+                #: single-use rule exists to prevent.
+                raise ValueError("rollout deadline has not expired, so it cannot be reopened")
             if now < max(plan.started_at, self._state_from_row(row).updated_at):
                 raise ValueError("rollout time cannot precede the current state")
             reopened_until = now + (plan.deadline - plan.started_at)

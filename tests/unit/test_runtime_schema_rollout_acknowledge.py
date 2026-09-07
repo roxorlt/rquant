@@ -633,11 +633,16 @@ def test_the_read_only_store_is_what_the_preview_opens(rollout: Rollout) -> None
 # ---------------------------------------------------------------------------------------
 
 
-def _run_cli(argv: list[str], capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+def _run_cli(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+    *,
+    expected_code: int = 0,
+) -> dict[str, Any]:
     from rquant.cli import build_parser, cmd_runtime_schema_rollout
 
     arguments = build_parser().parse_args(argv)
-    assert cmd_runtime_schema_rollout(arguments) == 0
+    assert cmd_runtime_schema_rollout(arguments) == expected_code
     return json.loads(capsys.readouterr().out)
 
 
@@ -783,7 +788,7 @@ def test_the_store_itself_allows_only_one_reopen(rollout: Rollout) -> None:
     store.reopen_deadline(
         plan_id=plan_id,
         expected_revision=store.get_state(plan_id).revision,
-        now=LATER,
+        now=EXPIRED,
         operation_id=f"installer-deadline-reopen:{plan_id}",
     )
     assert store.get_state(plan_id).phase is RolloutPhase.PREPARE
@@ -792,8 +797,8 @@ def test_the_store_itself_allows_only_one_reopen(rollout: Rollout) -> None:
         store.reopen_deadline(
             plan_id=plan_id,
             expected_revision=store.get_state(plan_id).revision,
-            now=LATER + timedelta(seconds=1),
-            operation_id="second-reopen",
+            now=EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1),
+            operation_id=f"installer-deadline-reopen:{plan_id}:again",
         )
 
 
@@ -805,10 +810,10 @@ def test_a_plan_whose_reopen_is_spent_is_reported_not_raised(rollout: Rollout) -
     store.reopen_deadline(
         plan_id=plan_id,
         expected_revision=store.get_state(plan_id).revision,
-        now=LATER,
+        now=EXPIRED,
         operation_id=f"installer-deadline-reopen:{plan_id}",
     )
-    beyond = LATER + STAGE_TIMEOUT + timedelta(seconds=1)
+    beyond = EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1)
 
     results = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=beyond)
     spent = next(item for item in results if item.plan_id == plan_id)
@@ -831,10 +836,10 @@ def test_the_preview_reaches_the_same_verdict_about_an_expired_plan(rollout: Rol
     store.reopen_deadline(
         plan_id=plan_id,
         expected_revision=store.get_state(plan_id).revision,
-        now=LATER,
+        now=EXPIRED,
         operation_id=f"installer-deadline-reopen:{plan_id}",
     )
-    beyond = LATER + STAGE_TIMEOUT + timedelta(seconds=1)
+    beyond = EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1)
 
     preview = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=beyond, dry_run=True)
     applied = acknowledge_runtime_schema_rollout_preparation(rollout.root, now=beyond)
@@ -878,7 +883,7 @@ def test_the_installer_may_not_reopen_a_plan_that_has_left_prepare(rollout: Roll
             plan_id=plan_id,
             expected_revision=store.get_state(plan_id).revision,
             now=EXPIRED,
-            operation_id="reopen-past-prepare",
+            operation_id=f"installer-deadline-reopen:{plan_id}",
         )
 
 
@@ -911,3 +916,125 @@ def test_leaving_dual_write_still_needs_the_producers_own_evidence(rollout: Roll
         )
 
     assert rollout.phase(plan_id) is RolloutPhase.DUAL_WRITE
+
+
+def test_the_command_exits_two_when_a_plan_is_out_of_reopens(
+    rollout: Rollout, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exit code is the only part of the output a shell reads, so it has to be right.
+
+    A plan whose window closed and whose one reopen is spent cannot be carried by this
+    command at all — a person has to decide. The report is still complete and the other plans
+    are still carried; what says "look at this" is the exit code.
+    """
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    store.reopen_deadline(
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        now=EXPIRED,
+        operation_id=f"installer-deadline-reopen:{plan_id}",
+    )
+    beyond = EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1)
+
+    class _Clock:
+        @staticmethod
+        def now(tz: Any = None) -> datetime:  # noqa: ARG004 - the CLI always passes UTC
+            return beyond
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("rquant.cli.datetime", _Clock)
+        report = _run_cli(
+            ["runtime-schema-rollout", "acknowledge", "--runtime-root", str(rollout.root)],
+            capsys,
+            expected_code=2,
+        )
+
+    assert report["deadline_expired"] == 1
+    assert report["plans"] == len(rollout.plan_ids), "every plan is still reported"
+    assert len(report["acknowledgements"]) == len(rollout.plan_ids)
+    spent = next(item for item in report["acknowledgements"] if item["plan_id"] == plan_id)
+    assert spent["skipped_reason"] == "deadline_expired"
+    #: the rest of the run still happened
+    others = [item for item in report["acknowledgements"] if item["plan_id"] != plan_id]
+    assert others and all(item["phase_after"] == "dual_write" for item in others)
+
+
+def test_a_reopen_signed_with_someone_elses_operation_id_is_refused(rollout: Rollout) -> None:
+    """The prefix is what makes a reopen identifiable in `receipts()` afterwards.
+
+    Enforced in the store, not in the caller: a rule the caller could choose to skip would
+    not survive the first other caller, and then the chain would carry a deadline change
+    nobody could attribute.
+    """
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    revision = store.get_state(plan_id).revision
+
+    with pytest.raises(ValueError, match="installer-deadline-reopen"):
+        store.reopen_deadline(
+            plan_id=plan_id,
+            expected_revision=revision,
+            now=EXPIRED,
+            operation_id=f"service-prepare:{plan_id}",
+        )
+
+    assert store.get_state(plan_id).revision == revision
+    assert store.deadline_reopened_until(plan_id) is None
+
+
+def test_reopening_a_window_that_is_still_open_is_refused(rollout: Rollout) -> None:
+    """Spending the single use early would hand the plan more than one window."""
+
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    revision = store.get_state(plan_id).revision
+
+    with pytest.raises(ValueError, match="has not expired"):
+        store.reopen_deadline(
+            plan_id=plan_id,
+            expected_revision=revision,
+            now=LATER,
+            operation_id=f"installer-deadline-reopen:{plan_id}",
+        )
+
+    assert store.get_state(plan_id).revision == revision
+    assert store.deadline_reopened_until(plan_id) is None
+    assert store.effective_deadline(plan_id) == DEADLINE
+
+
+def test_a_reopen_moves_the_later_phases_windows_too(rollout: Rollout) -> None:
+    """Stated because it is a consequence an operator has to know, not a side effect.
+
+    `_validate_time` gates every later mutation of the plan, so restarting the clock moves
+    the whole remaining rollout — the producers' dual-write records and the consumers'
+    receipts — later by the same one window.
+    """
+
+    acknowledge_runtime_schema_rollout_preparation(rollout.root, now=EXPIRED)
+    plan_id = rollout.plan_ids[0]
+    _authority, store = load_runtime_schema_rollout(rollout.root, plan_id=plan_id)
+    assert store.get_state(plan_id).phase is RolloutPhase.DUAL_WRITE
+
+    #: past the plan's own deadline, inside the reopened one: a DUAL_WRITE write is accepted
+    #: as far as its own rules take it, and is not stopped by the clock
+    with pytest.raises(ValueError, match="dual_write lacks consistency evidence"):
+        store.advance(
+            plan_id=plan_id,
+            expected_revision=store.get_state(plan_id).revision,
+            target_phase=RolloutPhase.CONSUMER_ACK,
+            now=EXPIRED + timedelta(seconds=60),
+            operation_id="inside-the-reopened-window",
+        )
+
+    #: past the reopened one, the clock is what stops it again
+    with pytest.raises(ValueError, match="deadline has expired"):
+        store.advance(
+            plan_id=plan_id,
+            expected_revision=store.get_state(plan_id).revision,
+            target_phase=RolloutPhase.CONSUMER_ACK,
+            now=EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1),
+            operation_id="past-the-reopened-window",
+        )
