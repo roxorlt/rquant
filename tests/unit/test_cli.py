@@ -5740,6 +5740,7 @@ class TestLabWorkerCli:
             RuntimeServiceHeartbeat,
             RuntimeServicePlane,
             RuntimeServiceStatus,
+            project_heartbeat,
         )
         from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
         from rquant.runtime_serving_snapshot import RuntimeHealthPayload, SourceReadResult
@@ -5768,7 +5769,7 @@ class TestLabWorkerCli:
                     status=RuntimeServiceStatus.RUNNING,
                     stale=False,
                     observed_at=observed_at - timedelta(seconds=1),
-                    heartbeat=heartbeat,
+                    heartbeat=project_heartbeat(heartbeat),
                 ),
             )
         )
