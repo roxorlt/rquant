@@ -10,8 +10,9 @@ import re
 import stat
 from bisect import bisect_right
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -791,10 +792,34 @@ class StrategyCandidateGenerationIndex(RuntimeContractModel):
         return value
 
 
+@dataclass(frozen=True)
+class CandidateAuthorityRebind:
+    """One candidate root carried across a release by its own owner (#248)."""
+
+    previous_generation_id: str
+    previous_definition_fingerprint: str
+    previous_executable_fingerprint: str
+    archive_root: Path
+    archived_generations: int
+
+    @property
+    def event(self) -> str:
+        return f"candidate_authority_rebound:{self.previous_generation_id}"
+
+
+#: `authority.json as found on disk -> the generation of ours that created it`
+PreviousGenerationOfBinding = Callable[[StrategyCandidateAuthorityBinding], "str | None"]
+
+
 class StrategyCandidateSnapshotSpool:
     """Publish and resolve immutable point-in-time candidate generations."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        previous_generation_of_binding: PreviousGenerationOfBinding | None = None,
+    ) -> None:
         candidate = Path(root)
         if not candidate.is_absolute():
             raise ValueError("strategy candidate snapshot root must be absolute")
@@ -817,6 +842,9 @@ class StrategyCandidateSnapshotSpool:
         self.authority_path = self.root / "authority.json"
         self.current_path = self.root / "current.json"
         self._lock_path = self.root / ".publish.lock"
+        #: only the owner rebinds, and only while it holds the publish lock (#248)
+        self._previous_generation_of_binding = previous_generation_of_binding
+        self.authority_rebind: CandidateAuthorityRebind | None = None
         self._thread_lock = RLock()
         self._generation_cache: OrderedDict[
             str,
@@ -938,6 +966,103 @@ class StrategyCandidateSnapshotSpool:
             rows=rows,
         )
 
+    #: everything a binding pins that a release does *not* move. `content_sha256` is a
+    #: hash over all of it, so it follows the two fingerprints and is compared through them.
+    _BINDING_INVARIANTS = (
+        "schema_version",
+        "strategy_id",
+        "strategy_version",
+        "candidate_schema_fingerprint",
+        "static_feature_names",
+        "static_feature_schema",
+    )
+
+    def _rebind_previous_generation_authority(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        expected: StrategyCandidateAuthorityBinding | None,
+    ) -> None:
+        """Carry one candidate root across a release, or leave it a refusal (#248).
+
+        `authority.json` is create-only and pins the strategy's definition and executable
+        fingerprints, both of which are derived from the producer commit. So every release
+        gives the publisher a binding it cannot match and cannot replace, and on 2026-09-09
+        both candidate roots had to be moved aside by hand.
+
+        The rebind is allowed on exactly one shape: every field the binding pins other than
+        those two fingerprints is unchanged, and the pair on disk is one our own previous
+        generation published. Anything else — a different strategy, a different candidate
+        schema, a fingerprint pair nobody here published — refuses in
+        `_validate_authority_binding` exactly as before.
+
+        The published generations are **archived with the binding, not relabelled**. The
+        schema rules require every generation under a bound root to carry the root's
+        `content_sha256` (`bound authority generations do not match root identity`), and
+        the honest way to satisfy that is to leave last release's rows with last release's
+        binding: they are evidence about the executable that produced them, and rewriting
+        their index entry would claim the new executable produced them. The archive is the
+        window's manual move-aside, done by the owner, under its own lock, named after the
+        generation it belongs to.
+        """
+
+        if expected is None or self._previous_generation_of_binding is None:
+            return
+        if not self._entry_exists(root_fd, "authority.json"):
+            return
+        observed = self._read_authority_binding(root_fd)
+        if observed == expected:
+            return
+        if any(
+            getattr(observed, field) != getattr(expected, field)
+            for field in self._BINDING_INVARIANTS
+        ):
+            return
+        generation_id = self._previous_generation_of_binding(observed)
+        if generation_id is None:
+            return
+        archive_name = f"rotated-{generation_id}"
+        if self._entry_exists(root_fd, archive_name):
+            raise StrategyCandidateSnapshotIntegrityError(
+                f"strategy candidate authority archive already exists: {archive_name}"
+            )
+        os.mkdir(archive_name, _PRIVATE_DIRECTORY_MODE, dir_fd=root_fd)
+        archive_fd = self._open_child_directory(root_fd, archive_name)
+        try:
+            os.mkdir("generations", _PRIVATE_DIRECTORY_MODE, dir_fd=archive_fd)
+            archived_generations_fd = self._open_child_directory(archive_fd, "generations")
+            try:
+                archived = 0
+                with os.scandir(generations_fd) as entries:
+                    names = sorted(entry.name for entry in entries)
+                for name in names:
+                    os.rename(
+                        name,
+                        name,
+                        src_dir_fd=generations_fd,
+                        dst_dir_fd=archived_generations_fd,
+                    )
+                    archived += 1
+                os.fsync(archived_generations_fd)
+            finally:
+                os.close(archived_generations_fd)
+            for name in ("authority.json", "generation-index.json", "current.json"):
+                if self._entry_exists(root_fd, name):
+                    os.rename(name, name, src_dir_fd=root_fd, dst_dir_fd=archive_fd)
+            os.fsync(archive_fd)
+        finally:
+            os.close(archive_fd)
+        os.fsync(generations_fd)
+        os.fsync(root_fd)
+        self.authority_rebind = CandidateAuthorityRebind(
+            previous_generation_id=generation_id,
+            previous_definition_fingerprint=str(observed.definition_fingerprint),
+            previous_executable_fingerprint=str(observed.executable_fingerprint),
+            archive_root=self.root / archive_name,
+            archived_generations=archived,
+        )
+
     def _publish_records_request(
         self,
         validated_request: StrategyCandidateSnapshot,
@@ -947,6 +1072,11 @@ class StrategyCandidateSnapshotSpool:
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
             self._cleanup_stale_temporaries(root_fd)
+            self._rebind_previous_generation_authority(
+                root_fd,
+                generations_fd,
+                expected=authority_binding,
+            )
             generations = self._read_generation_index(
                 root_fd,
                 generations_fd,
