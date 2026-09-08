@@ -279,8 +279,11 @@ def test_every_strategy_archives_and_recreates_its_runner_database(
 
     for service_id, entry in state["runners"].items():
         path = entry["path"]
-        archived = path.with_name(f"{path.name}.{previous}.archived")
-        assert archived.is_file(), service_id
+        #: `<name>.<rotation sequence>.<generation>.archived` -- the sequence is what
+        #: pruning orders by, so it is part of the name (review SF-7)
+        candidates = sorted(path.parent.glob(f"{path.name}.*.{previous}.archived"))
+        assert len(candidates) == 1, service_id
+        archived = candidates[0]
         assert _persisted_spec_fingerprint(archived) == entry["spec_fingerprint"]
         current = next(
             item
@@ -328,7 +331,9 @@ def test_every_candidate_publisher_rebinds_its_authority(
         assert "bound to a different identity" not in (run.last_error or "")
 
     for service_id, entry in state["candidates"].items():
-        archive = entry["root"] / f"rotated-{previous}"
+        rotated = sorted(entry["root"].glob(f"rotated-*-{previous}"))
+        assert len(rotated) == 1, service_id
+        archive = rotated[0]
         assert archive.is_dir(), service_id
         assert (archive / "authority.json").is_file()
         binding = json.loads((entry["root"] / "authority.json").read_text(encoding="utf-8"))
