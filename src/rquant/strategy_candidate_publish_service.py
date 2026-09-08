@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
@@ -58,6 +58,8 @@ class CandidatePublishSummary(RuntimeContractModel):
     snapshot_sequence: int = Field(ge=0)
     snapshot_content_sha256: Sha256
     published: bool
+    #: set once, on the publish that carried the root across a generation change (#248)
+    authority_rebind_event: str | None = None
 
 
 def _require_expected_commit(
@@ -77,6 +79,7 @@ def publish_candidate_batch(
     executable_fingerprint: str,
     candidate_schema_fingerprint: str,
     static_feature_schema: Mapping[str, object],
+    previous_generation_of_binding: Callable[[object], str | None] | None = None,
 ) -> CandidatePublishSummary:
     if _COMMIT_PATTERN.fullmatch(expected_commit) is None:
         raise ValueError("expected commit must be a full lowercase Git SHA")
@@ -108,7 +111,11 @@ def publish_candidate_batch(
         raise TypeError("batch must be a typed candidate publish batch")
 
     authority = validated.authority
-    result = StrategyCandidateSnapshotSpool(snapshot_root).publish_strategy_records(
+    spool = StrategyCandidateSnapshotSpool(
+        snapshot_root,
+        previous_generation_of_binding=previous_generation_of_binding,
+    )
+    result = spool.publish_strategy_records(
         strategy_id=strategy_id,
         strategy_version="1",
         source_snapshot_ids={"candidate_input": authority.authority_snapshot_id},
@@ -131,6 +138,9 @@ def publish_candidate_batch(
         snapshot_sequence=result.snapshot.sequence,
         snapshot_content_sha256=result.snapshot.content_sha256,
         published=result.published,
+        authority_rebind_event=(
+            None if spool.authority_rebind is None else spool.authority_rebind.event
+        ),
     )
 
 

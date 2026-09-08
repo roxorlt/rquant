@@ -42,18 +42,39 @@ import hashlib
 import os
 import re
 import stat
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from rquant.runtime_contracts import canonical_sha256
-from rquant.runtime_deployment_bundle import (
-    _current_target,
-    _instance_name,
-    _parse_generation_basis,
-    _read_owned_generation_file,
-)
-from rquant.runtime_schema_registry import RuntimeSchemaCompatibilityError
 from rquant.runtime_service_entrypoint import RuntimeServiceManifest
+
+
+def _bundle_readers() -> tuple[object, object, object, object, type[Exception]]:
+    """The installer's own readers, imported where they are used, not at module import.
+
+    `runtime_deployment_bundle` pulls in `rquant.storage.duckdb` (and therefore duckdb
+    itself) transitively, and `test_default_registry_does_not_import_optional_evaluators_
+    or_production_storage` holds the line that building the builtin registry does not.
+    Every role imports this module through its builder, so the import has to stay inside
+    the functions that actually walk the generation tree.
+    """
+
+    from rquant.runtime_deployment_bundle import (
+        _current_target,
+        _instance_name,
+        _parse_generation_basis,
+        _read_owned_generation_file,
+    )
+    from rquant.runtime_schema_registry import RuntimeSchemaCompatibilityError
+
+    return (
+        _current_target,
+        _instance_name,
+        _parse_generation_basis,
+        _read_owned_generation_file,
+        RuntimeSchemaCompatibilityError,
+    )
 
 _GENERATION_ID = re.compile(r"^[0-9a-f]{64}$")
 
@@ -167,9 +188,10 @@ class RuntimeGenerationTree:
 def load_runtime_generation_tree(runtime_root: Path) -> RuntimeGenerationTree:
     """Resolve `current` and enumerate the generation directories beside it."""
 
+    current_target, _, _, _, _ = _bundle_readers()
     root = Path(os.path.abspath(Path(runtime_root)))
     try:
-        target = _current_target(root)
+        target = current_target(root)
     except (OSError, ValueError) as exc:
         raise RuntimeGenerationLineageError("runtime current generation is unusable") from exc
     if target is None:
@@ -203,9 +225,135 @@ def load_runtime_generation_lineage(
     return load_runtime_generation_tree(runtime_root).lineage(service_id)
 
 
+def _lineage_or_none(
+    runtime_root: Path | None,
+    *,
+    service_id: str,
+) -> RuntimeGenerationLineage | None:
+    """The lineage, or `None` when this deployment cannot say what it installed.
+
+    Route B publishes no legacy bundle at all, and a role can be exercised with no
+    runtime root. Both answer "no previous generation of ours is known", which leaves
+    every one of the four checks exactly as strict as it was before #248.
+    """
+
+    if runtime_root is None:
+        return None
+    try:
+        return load_runtime_generation_lineage(runtime_root, service_id=service_id)
+    except RuntimeGenerationLineageError:
+        return None
+
+
+def strategy_runner_identity_lineage(
+    runtime_root: Path | None,
+    *,
+    service_id: str,
+) -> Callable[[str, str], str | None] | None:
+    """Shape (1): `(spec fingerprint, evaluator fingerprint) -> our generation that used it`."""
+
+    lineage = _lineage_or_none(runtime_root, service_id=service_id)
+    if lineage is None:
+        return None
+
+    def resolve(spec_fingerprint: str, evaluator_fingerprint: str) -> str | None:
+        record = lineage.previous_with_settings(
+            strategy_spec_fingerprint=spec_fingerprint,
+            evaluator_contract_fingerprint=evaluator_fingerprint,
+        )
+        return None if record is None else record.generation_id
+
+
+    return resolve
+
+
+def strategy_runner_identity_lineage_for_instance(
+    runtime_root: Path | None,
+    *,
+    instance: str,
+) -> Callable[[str, str], str | None] | None:
+    """The same, for a reader that knows a strategy only by its instance directory.
+
+    `signal_router` is handed `<root>/live/strategies/<instance>/runner.sqlite3` and never
+    the strategy's service id; the current generation's basis is what maps one to the other.
+    """
+
+    if runtime_root is None:
+        return None
+    try:
+        tree = load_runtime_generation_tree(runtime_root)
+    except RuntimeGenerationLineageError:
+        return None
+    service_id = tree.service_id_for_instance(instance)
+    if service_id is None:
+        return None
+    return strategy_runner_identity_lineage(runtime_root, service_id=service_id)
+
+
+def previous_strategy_spec_generations(
+    runtime_root: Path | None,
+    *,
+    service_ids: Sequence[str],
+) -> dict[str, str]:
+    """Shape (2): `strategy spec fingerprint -> our generation that published it`."""
+
+    generations: dict[str, str] = {}
+    for service_id in service_ids:
+        lineage = _lineage_or_none(runtime_root, service_id=service_id)
+        if lineage is None:
+            continue
+        for record in lineage.previous:
+            fingerprint = record.setting("strategy_spec_fingerprint")
+            if isinstance(fingerprint, str):
+                generations.setdefault(fingerprint, record.generation_id)
+    return generations
+
+
+def candidate_authority_lineage(
+    runtime_root: Path | None,
+    *,
+    service_id: str,
+) -> Callable[[object], str | None] | None:
+    """Shape (3): an `authority.json` on disk -> our generation that created it."""
+
+    lineage = _lineage_or_none(runtime_root, service_id=service_id)
+    if lineage is None:
+        return None
+
+    def resolve(binding: object) -> str | None:
+        record = lineage.previous_with_settings(
+            definition_fingerprint=getattr(binding, "definition_fingerprint", None),
+            executable_fingerprint=getattr(binding, "executable_fingerprint", None),
+        )
+        return None if record is None else record.generation_id
+
+    return resolve
+
+
+def previous_spec_identities(
+    runtime_root: Path | None,
+    *,
+    service_ids: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    """Shape (4): `service id -> the spec fingerprints our earlier generations ran under`."""
+
+    identities: dict[str, tuple[str, ...]] = {}
+    for service_id in service_ids:
+        lineage = _lineage_or_none(runtime_root, service_id=service_id)
+        if lineage is None:
+            continue
+        found = tuple(
+            dict.fromkeys(record.spec_identity for record in lineage.previous)
+        )
+        if found:
+            identities[service_id] = found
+    return identities
+
+
 def _verified_basis(runtime_root: Path, generation_id: str) -> object | None:
     """The generation's own basis, or `None` when it does not authenticate itself."""
 
+    _, _, parse_generation_basis, read_owned_generation_file, schema_error = _bundle_readers()
     if _GENERATION_ID.fullmatch(generation_id) is None:
         return None
     generation = runtime_root / "generations" / generation_id
@@ -221,13 +369,13 @@ def _verified_basis(runtime_root: Path, generation_id: str) -> object | None:
     ):
         return None
     try:
-        basis = _parse_generation_basis(
-            _read_owned_generation_file(
+        basis = parse_generation_basis(
+            read_owned_generation_file(
                 generation / "generation-basis.json",
                 label="runtime generation hash-bound basis",
             )
         )
-    except (OSError, ValueError, RuntimeSchemaCompatibilityError):
+    except (OSError, ValueError, schema_error):
         return None
     if canonical_sha256(basis.model_dump(mode="python")) != generation_id:
         return None
@@ -239,19 +387,20 @@ def _verified_record(
     generation_id: str,
     service_id: str,
 ) -> RuntimeGenerationRecord | None:
+    _, instance_name, _, read_owned_generation_file, schema_error = _bundle_readers()
     basis = _verified_basis(runtime_root, generation_id)
     if basis is None:
         return None
     expected_sha256 = basis.manifest_sha256.get(service_id)
     instance = basis.instance_mapping.get(service_id)
-    if expected_sha256 is None or instance is None or instance != _instance_name(service_id):
+    if expected_sha256 is None or instance is None or instance != instance_name(service_id):
         return None
     manifest_path = (
         runtime_root / "generations" / generation_id / "manifests" / f"{instance}.json"
     )
     try:
-        payload = _read_owned_generation_file(manifest_path, label=f"runtime manifest {service_id}")
-    except (OSError, ValueError, RuntimeSchemaCompatibilityError):
+        payload = read_owned_generation_file(manifest_path, label=f"runtime manifest {service_id}")
+    except (OSError, ValueError, schema_error):
         return None
     if hashlib.sha256(payload).hexdigest() != expected_sha256:
         return None
@@ -266,6 +415,11 @@ def _verified_record(
 
 __all__ = [
     "RuntimeGenerationLineage",
+    "candidate_authority_lineage",
+    "previous_spec_identities",
+    "previous_strategy_spec_generations",
+    "strategy_runner_identity_lineage",
+    "strategy_runner_identity_lineage_for_instance",
     "RuntimeGenerationLineageError",
     "RuntimeGenerationRecord",
     "RuntimeGenerationTree",

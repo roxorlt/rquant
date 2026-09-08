@@ -23,6 +23,7 @@ from rquant.runtime_candidate_universe import (
     RuntimeCandidateUniverseLoader,
 )
 from rquant.runtime_contracts import RuntimeContractModel
+from rquant.runtime_generation_lineage import strategy_runner_identity_lineage
 from rquant.runtime_market_session import load_market_calendar_authority
 from rquant.runtime_peer_artifacts import DeferredPeerArtifact
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
@@ -262,6 +263,7 @@ def strategy_live_builder(
     evaluator_loader: StrategyEvaluatorLoader | None = None,
     completion_attestation_signer: CompletionAttestationSigner | None = None,
     completion_attestation_active_key_id: str | None = None,
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     """Build one stateful strategy step without dynamic imports or production I/O."""
 
@@ -361,6 +363,12 @@ def strategy_live_builder(
             evaluator_contract_fingerprint=binding.contract_fingerprint,
             feature_contract=feature_registration.contract,
             lifecycle_feature_source=_DeferredLifecycleFeatureSource(paper_ledger),
+            # A runner database written by our own previous generation is archived here
+            # and recreated, instead of taking the unit into a Restart= loop (#248).
+            previous_generation_of_identity=strategy_runner_identity_lineage(
+                runtime_root,
+                service_id=manifest.service_id,
+            ),
         )
         # Probed after the runner store and not before it, so a ledger that is present
         # and unreadable still refuses to start -- as it did before this role deferred
@@ -482,6 +490,9 @@ def strategy_live_builder(
                     "runner_signal": runner.source_generation_id,
                 },
             )
+
+        if runner.identity_rotation is not None:
+            step.generation_events = (runner.identity_rotation.event,)
 
         return step
 

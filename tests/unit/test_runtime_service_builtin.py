@@ -1110,8 +1110,17 @@ def test_builtin_registry_preserves_injected_strategy_evaluator_loader(
     def injected_loader(*_args: object) -> object:
         return object()
 
-    def recording_builder(*, evaluator_loader: object, clock: object) -> object:
-        observed.update(evaluator_loader=evaluator_loader, clock=clock)
+    def recording_builder(
+        *,
+        evaluator_loader: object,
+        clock: object,
+        runtime_root: object = None,
+    ) -> object:
+        observed.update(
+            evaluator_loader=evaluator_loader,
+            clock=clock,
+            runtime_root=runtime_root,
+        )
         return lambda _manifest: lambda: None
 
     monkeypatch.setattr(

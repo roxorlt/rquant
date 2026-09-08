@@ -49,12 +49,24 @@ def _normalized_absolute_path(path: Path) -> Path:
 
 
 def _validate_snapshot_stat(value: os.stat_result) -> None:
+    """What actually protects this read, rather than a mode no candidate file can have.
+
+    The snapshot is the five-minute read-only replica `rquant_ro.duckdb`, which
+    `scripts/sync-readonly-replica.sh` recreates at 0644 (#249). Demanding 0600 refused it
+    on every iteration and would have gone on refusing it, because chmod-ing a file that
+    is replaced every five minutes is not a fix and chmod-ing the production main database
+    is not something a runtime window may do. What the check is for is that nobody outside
+    the runtime can have written what this role is about to trust: the file is ours, and
+    neither group nor other can write it. 0600 and 0400 still pass, so nothing that was
+    accepted before is refused now.
+    """
+
     if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
         raise AuctionUniverseSourceError("daily snapshot is a symlink or unsafe file")
     if value.st_uid != os.geteuid():
         raise AuctionUniverseSourceError("daily snapshot owner does not match the process")
-    if stat.S_IMODE(value.st_mode) != 0o600:
-        raise AuctionUniverseSourceError("daily snapshot must have mode 0600")
+    if stat.S_IMODE(value.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+        raise AuctionUniverseSourceError("daily snapshot must not be group or other writable")
     if value.st_nlink != 1:
         raise AuctionUniverseSourceError("daily snapshot must have one hard link")
 

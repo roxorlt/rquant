@@ -1149,6 +1149,7 @@ def build_builtin_registry(
     ) = None,
     completion_attestation_signer: CompletionAttestationSigner | None = None,
     completion_attestation_active_key_id: str | None = None,
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceRegistry:
     from rquant.runtime_builder_authority import (
         lab_jobs_publisher_builder,
@@ -1249,6 +1250,7 @@ def build_builtin_registry(
             candidate_input_loader=candidate_input_loader,
             auction_input_loader=auction_candidate_input_loader,
             clock=resolved_clock,
+            runtime_root=runtime_root,
         ),
     )
     registry.register(
@@ -1258,6 +1260,7 @@ def build_builtin_registry(
     strategy_builder_kwargs: dict[str, object] = {
         "evaluator_loader": evaluator_loader,
         "clock": resolved_clock,
+        "runtime_root": runtime_root,
     }
     if completion_attestation_signer is not None:
         strategy_builder_kwargs["completion_attestation_signer"] = completion_attestation_signer
@@ -1276,6 +1279,7 @@ def build_builtin_registry(
             source_loader=signal_source_loader,
             target_resolver=target_resolver,
             clock=resolved_clock,
+            runtime_root=runtime_root,
         )(manifest)
 
     registry.register(RuntimeServiceKind.SIGNAL_ROUTER, build_signal_router)
@@ -1304,7 +1308,7 @@ def build_builtin_registry(
     )
     registry.register(
         RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER,
-        runtime_health_publisher_builder(clock=resolved_clock),
+        runtime_health_publisher_builder(clock=resolved_clock, runtime_root=runtime_root),
     )
     registry.register(
         RuntimeServiceKind.LAB_JOBS_PUBLISHER,

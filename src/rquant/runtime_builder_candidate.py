@@ -29,6 +29,7 @@ from rquant.live_contracts import BatchQualityStatus
 from rquant.live_spool import LiveBatchSpool
 from rquant.reference_data_registry import ReadonlyReferenceRegistry
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
+from rquant.runtime_generation_lineage import candidate_authority_lineage
 from rquant.runtime_market_session import load_market_calendar_authority
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -45,6 +46,7 @@ from rquant.strategy_candidate_publish_service import (
     publish_candidate_batch,
 )
 from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateSnapshotSpool,
     StrategyCandidateStaticFeatureSemantic,
     strategy_candidate_schema_fingerprint,
 )
@@ -456,6 +458,7 @@ def candidate_publisher_builder(
     candidate_input_loader: CandidateInputLoader | None = None,
     auction_input_loader: AuctionCandidateInputLoader | None = None,
     clock: Callable[[], datetime] = _utc_now,
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     loader: CandidateInputLoader = candidate_input_loader or load_candidate_input
     live_auction_loader = auction_input_loader or load_live_auction_candidate_input
@@ -466,6 +469,27 @@ def candidate_publisher_builder(
         if manifest.plane is not RuntimeServicePlane.LIVE:
             raise ValueError("candidate publisher must run on the live plane")
         settings = CandidatePublisherRuntimeSettings.model_validate(dict(manifest.settings))
+        # `authority.json` is create-only and pins two commit-derived fingerprints, so
+        # every release leaves the publisher a binding it cannot match. This is what lets
+        # the owner re-bind its own previous generation's root instead of going DEGRADED
+        # on every iteration (#248 shape 3).
+        previous_generation_of_binding = candidate_authority_lineage(
+            runtime_root,
+            service_id=manifest.service_id,
+        )
+        rebind = None
+        if previous_generation_of_binding is not None:
+            rebind = StrategyCandidateSnapshotSpool(
+                settings.snapshot_root,
+                previous_generation_of_binding=previous_generation_of_binding,
+            ).rebind_previous_generation_authority(
+                strategy_id=settings.strategy_id,
+                strategy_version=str(settings.strategy_version),
+                definition_fingerprint=settings.definition_fingerprint,
+                executable_fingerprint=settings.executable_fingerprint,
+                candidate_schema_fingerprint=settings.candidate_schema_fingerprint,
+                static_feature_schema=settings.static_feature_schema,
+            )
 
         def step() -> RuntimeStepResult:
             if settings.input_mode == "auction_live":
@@ -518,6 +542,7 @@ def candidate_publisher_builder(
                 executable_fingerprint=settings.executable_fingerprint,
                 candidate_schema_fingerprint=settings.candidate_schema_fingerprint,
                 static_feature_schema=settings.static_feature_schema,
+                previous_generation_of_binding=previous_generation_of_binding,
             )
             return RuntimeStepResult(
                 output_sequence=summary.snapshot_sequence,
@@ -528,6 +553,9 @@ def candidate_publisher_builder(
                     "strategy_candidate": summary.snapshot_content_sha256,
                 },
             )
+
+        if rebind is not None:
+            step.generation_events = (rebind.event,)
 
         return step
 

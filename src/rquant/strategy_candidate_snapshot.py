@@ -966,6 +966,44 @@ class StrategyCandidateSnapshotSpool:
             rows=rows,
         )
 
+    def rebind_previous_generation_authority(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        definition_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        static_feature_schema: Mapping[str, object],
+    ) -> CandidateAuthorityRebind | None:
+        """Run the generation handover once, at startup, before anything is published.
+
+        The publish path runs the same check with the same lock, so this is not where
+        correctness lives; it is where *observability* lives. The rebind is a startup
+        event, and the heartbeat is stamped with a role's startup events by
+        `run_service_loop` before the first iteration, so the publisher has to have done
+        it by then for the event to appear (#248).
+        """
+
+        expected = StrategyCandidateAuthorityBinding.create(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            definition_fingerprint=definition_fingerprint,
+            executable_fingerprint=executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            static_feature_schema=static_feature_schema,
+        )
+        if not self.authority_path.exists():
+            return None
+        self._initialize_for_publish()
+        with self._locked(exclusive=True) as (root_fd, generations_fd):
+            self._rebind_previous_generation_authority(
+                root_fd,
+                generations_fd,
+                expected=expected,
+            )
+        return self.authority_rebind
+
     #: everything a binding pins that a release does *not* move. `content_sha256` is a
     #: hash over all of it, so it follows the two fingerprints and is compared through them.
     _BINDING_INVARIANTS = (
@@ -1054,6 +1092,10 @@ class StrategyCandidateSnapshotSpool:
         finally:
             os.close(archive_fd)
         os.fsync(generations_fd)
+        # The new binding is created here, in the same locked section, so the root is
+        # never observably unbound: a publisher whose first iteration waits on its input
+        # would otherwise leave `authority.json` absent for as long as the wait lasts.
+        self._atomic_create_authority_binding(root_fd, self._authority_binding_bytes(expected))
         os.fsync(root_fd)
         self.authority_rebind = CandidateAuthorityRebind(
             previous_generation_id=generation_id,

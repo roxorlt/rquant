@@ -21,6 +21,12 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_generation_lineage import (
+    RuntimeGenerationLineageError,
+    load_runtime_generation_tree,
+    previous_strategy_spec_generations,
+    strategy_runner_identity_lineage_for_instance,
+)
 from rquant.runtime_peer_artifacts import DeferredPeerArtifact
 from rquant.runtime_routing_policy import load_frozen_routing_policy
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
@@ -92,13 +98,18 @@ class _SignalBusSettings(RuntimeContractModel):
             raise ValueError("retry_max_seconds must be at least retry_base_seconds")
         return self
 
-    def open_store(self) -> SignalBusStore:
+    def open_store(
+        self,
+        *,
+        previous_generation_of_strategy_spec: Mapping[str, str] | None = None,
+    ) -> SignalBusStore:
         return SignalBusStore(
             self.signal_bus_path,
             busy_timeout_ms=self.busy_timeout_ms,
             retry_base_delay=timedelta(seconds=self.retry_base_seconds),
             retry_max_delay=timedelta(seconds=self.retry_max_seconds),
             max_attempts=self.max_attempts,
+            previous_generation_of_strategy_spec=previous_generation_of_strategy_spec,
         )
 
 
@@ -523,10 +534,23 @@ def _publish_signal_authority(
     return pointer.generation_id, snapshot.omitted_signal_count
 
 
+def _strategy_service_id(runner_state_path: Path | None, runtime_root: Path | None) -> str | None:
+    """`live/strategies/<instance>/runner.sqlite3` -> the strategy service it belongs to."""
+
+    if runner_state_path is None or runtime_root is None:
+        return None
+    try:
+        tree = load_runtime_generation_tree(runtime_root)
+    except RuntimeGenerationLineageError:
+        return None
+    return tree.service_id_for_instance(runner_state_path.parent.name)
+
+
 def _runner_source_opener(
     source_settings: SignalRouterSourceSettings,
     *,
     busy_timeout_ms: int,
+    runtime_root: Path | None = None,
 ) -> Callable[[], RunnerSignalSource]:
     """The router's own reader for one strategy's runner database, unchanged."""
 
@@ -537,6 +561,15 @@ def _runner_source_opener(
     assert spec_fingerprint is not None
     assert evaluator_fingerprint is not None
 
+    # `live/strategies/<instance>/runner.sqlite3`: the instance directory is all the
+    # router knows about whose database this is, and the current generation's basis maps
+    # it back to a service id so a runner still carrying our own previous generation's
+    # identity is waited for rather than refused (#248).
+    previous_generation_of_identity = strategy_runner_identity_lineage_for_instance(
+        runtime_root,
+        instance=runner_state_path.parent.name,
+    )
+
     def open_source() -> RunnerSignalSource:
         return ReadonlyStrategyRunnerSignalSource(
             source_id=source_settings.source_id,
@@ -544,6 +577,7 @@ def _runner_source_opener(
             expected_strategy_spec_fingerprint=spec_fingerprint,
             expected_evaluator_contract_fingerprint=evaluator_fingerprint,
             busy_timeout_ms=busy_timeout_ms,
+            previous_generation_of_identity=previous_generation_of_identity,
         )
 
     return open_source
@@ -554,6 +588,7 @@ def signal_router_builder(
     source_loader: SignalSourceLoader | None = None,
     target_resolver: TargetResolver | None = None,
     clock: Callable[[], datetime],
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     if (source_loader is None) != (target_resolver is None):
         raise ValueError("signal router dependencies must be provided together")
@@ -595,7 +630,23 @@ def signal_router_builder(
         # sandbox grants it `live/strategies/%i` alone. They are opened before any
         # strategy's runner database is looked at, so a router that starts first breaks
         # the cycle instead of dying inside it (#220).
-        bus = settings.open_store()
+        # The strategy spec fingerprints our own earlier generations published, so the
+        # route ledger can carry one source row across a release instead of conflicting
+        # on it every iteration (#248 shape 2). Route B, or a router with no manifest
+        # authority, gets an empty map and the old refusal.
+        bus = settings.open_store(
+            previous_generation_of_strategy_spec=previous_strategy_spec_generations(
+                runtime_root,
+                service_ids=tuple(
+                    service_id
+                    for service_id in (
+                        _strategy_service_id(source_settings.runner_state_path, runtime_root)
+                        for source_settings in settings.source_settings
+                    )
+                    if service_id is not None
+                ),
+            )
+        )
         signal_spool = SignalRouteSpool(settings.signal_spool_root)
         cursors = SignalRouteCursorStore(
             settings.signal_bus_path,
@@ -617,6 +668,7 @@ def signal_router_builder(
                     open_artifact=_runner_source_opener(
                         source_settings,
                         busy_timeout_ms=settings.busy_timeout_ms,
+                        runtime_root=runtime_root,
                     ),
                 )
             # A runner database that is already on disk is opened and checked now, so a

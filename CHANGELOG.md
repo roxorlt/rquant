@@ -151,6 +151,55 @@
 
 ### Fixed
 
+- **换代之后不再需要人工把任何状态挪到一边（#248、#249）**：**这次发布之后，换代不需要移走任何状态**。
+  2026-09-09 第六窗口装 `20d948d1…` 覆盖 `3cf6160c…` 时，四份持久状态被新一代自己的 role 拒收，
+  四种形状各有各的表现，窗口里全靠人手挪走：
+  - **策略 runner 库**：`live/strategies/<svc>/runner.sqlite3` 里记着上一代的
+    `strategy_spec_fingerprint` / `evaluator_contract_fingerprint`（两者都含 producer commit，
+    每次发版必变），三个 `rquant-runtime-strategy@` 跑约 2 分钟后以
+    `strategy spec does not match persisted runner identity` 退出、`Restart=` 循环、推送 3 条真实告警。
+    现在启动时把它改名成 `runner.sqlite3.<上一代>.archived`（连 `-wal` / `-shm` 一起），
+    建一份带当前身份的新库，并在心跳上记 `runner_identity_rotated:<上一代>`。
+    `signal_router` 读同一个文件但不拥有它，看到上一代身份改为**等待拥有者轮换**
+    （`PeerArtifactUnavailableError`，与 #232 同一条等待规则），不再拒绝启动。
+  - **路由台账的 source 行**：新 runner 库会新铸一个随机 `source_generation_id`，
+    `signal_route_source` 还留着旧的，`bind_route_source` 每次迭代抛
+    `SignalRouteConflictError: source '…' generation changed`。现在当**存量**的 strategy spec
+    指纹属于我们自己上一代、而新来的不属于任何上一代时把这一行接过来；旧一代**已经签发的回执**
+    整体挪到一个归档 source id 之下（顺带把序号命名空间腾出来给从 1 重新开始的新 runner），
+    **旧一代尚未路由的信号一律不再路由**——它们的载荷在刚归档的 runner 库里，新的 evaluator
+    从来没有做过那些决策；未路由条数记进轮换行并出现在心跳上。
+  - **候选权威绑定**：`live/candidates/<svc>/authority.json` 只创建不改写，钉着两个由 producer
+    commit 派生的指纹，两个候选发布器每次迭代 DEGRADED（`strategy candidate authority is bound
+    to a different identity`）。现在当差别**只有**这两个指纹、且盘上那一对是我们自己上一代发布过的
+    时候，由拥有者在自己的发布锁里重新绑定；旧绑定连同它下面已发布的 generation 一起归档进
+    `rotated-<上一代>/`，**不做改标**——schema 规则要求 bound root 下每个 generation 携带该 root
+    的 content hash，把新哈希盖到上一代的行上等于宣称新可执行体产出了它们。
+  - **换代残留心跳**：研究 role 在 #217 下立刻退出，留下带上一代 spec 指纹的 stopped 心跳，
+    `RuntimeHealthAuthorityIntegrityError` 直接让**整份**健康载荷失败，serving 跟着降级。
+    现在这类心跳被判为 superseded：心跳本身不进载荷，载荷里以 `superseded:<service>` 点名，
+    载荷照常发布；指纹不匹配但**仍然活着**的心跳依旧是真冲突（裁决 14 / #216）。
+    另外，与代际无关的一条：**任何单个 source 的读取失败不再让整份载荷失败**，
+    该服务的条目变成 DEGRADED 并以 `unreadable:<service>` 点名，其余 24 个 role 照常发布。
+  四种形状「是不是我们自己上一代」的判据是同一个，来自安装器留在 runtime root 下的代际树
+  （`generations/<id>/generation-basis.json` 的 canonical sha256 **就是**目录名，basis 里按 service_id
+  记着每份 manifest 的 sha256）——目录自证其名、manifest 自证其字节，改动任何一处它就不再算我们的，
+  外来或损坏的状态一律照旧 fail-closed。服务健康载荷 `RuntimeHealthPayload` 与包 K 冻结的心跳投影
+  **一个字段都没动**（`tests/unit/test_runtime_schema_release_snapshot.py` 改前改后皆绿）；
+  新增的 `generation_events` 只在心跳**文件**模型上。
+- **auction_universe 读生产主库且要求 0600（#249）**：安装的 manifest 把
+  `database_path` 指向 `/home/lighthouse/rquant/data/rquant.duckdb`（生产主库），而
+  `rquant-monitor` 盘中 09:25–15:00 持写锁、DuckDB 期间拒绝一切新连接（含只读），
+  这个 source 恰好会在它要服务的那段时间失败；0600 这个 mode 两个候选文件都给不了
+  （副本每 5 分钟由 `sync-readonly-replica.sh` 以 0644 重建，主库的 mode 是没人该在窗口里改的生产配置），
+  于是它在每一个窗口的每一次迭代都 DEGRADED，而且因为 #235 没有任何人被叫醒。
+  现在生产 profile 新增输入 `readonly_replica_database_path`（生成器默认
+  `/home/lighthouse/rquant/data/rquant_ro.duckdb`），auction_universe 读它；
+  输入契约拒绝任何等于 operational 主库或名为 `rquant.duckdb` 的副本路径。
+  `auction_universe_source` 的 mode 判据改成「属主是运行时 uid，且 group / other 不可写」
+  （0644 / 0640 / 0600 / 0400 通过，0664 / 0666 拒绝）。
+  **下一个窗口必须重新生成 inputs 与 profile**：`readonly_replica_database_path` 是必填字段。
+
 - **paper_constraint_publisher 在 unit 沙箱里打不开 reference registry（#242）**：
   2026-09-08 第五窗口，`rquant-runtime-paper-constraint@svc-dc7b9b33…` 每次启动都在构造期倒下
   （5 次重启、6 次 `OnFailure` 中继、1 条真实推送），裸跑却能进主循环。定因：
