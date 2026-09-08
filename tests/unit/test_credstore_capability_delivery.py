@@ -36,6 +36,7 @@ from rquant.runtime_capabilities import (
 )
 from rquant.runtime_exec_wrapper import _verify
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
+from tests.support.systemd_credential_delivery import Delivery, deliver
 
 BUNDLE_GENERATION = "b" * 64
 AUTHORITY_GENERATION = "e" * 64
@@ -227,15 +228,22 @@ def test_a_role_that_needs_no_capability_never_refuses(under_a_unit: Path) -> No
     )
 
 
-def test_a_credential_directory_without_the_named_credential_says_so(tmp_path: Path) -> None:
+def test_a_credential_directory_without_the_named_credential_says_so(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """systemd made the directory but loaded some other id into it."""
 
-    directory = tmp_path / "credentials"
-    directory.mkdir(mode=0o700)
-    (directory / "something-else.json").write_bytes(b"{}")
+    delivery = deliver(
+        monkeypatch,
+        root=tmp_path / "run-credentials",
+        payload=b"{}",
+        unit=UNIT,
+        name="something-else.json",
+    )
 
     with pytest.raises(ValueError) as raised:
-        _load({"CREDENTIALS_DIRECTORY": str(directory)})
+        _load({"CREDENTIALS_DIRECTORY": str(delivery.directory)})
 
     assert "carries no capabilities.json" in str(raised.value)
     assert "LoadCredentialEncrypted= name does not match" in str(raised.value)
@@ -246,51 +254,74 @@ def test_a_credential_directory_without_the_named_credential_says_so(tmp_path: P
 # ---------------------------------------------------------------------------------------
 
 
-def _sealed(directory: Path, *, generation: str = BUNDLE_GENERATION) -> Path:
-    directory.mkdir(mode=0o700, exist_ok=True)
-    path = directory / RUNTIME_CAPABILITY_CREDENTIAL_NAME
-    path.write_bytes(
-        serialize_runtime_credential(
+def _sealed(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    *,
+    generation: str = BUNDLE_GENERATION,
+) -> Delivery:
+    """The credential in the shape systemd delivers it: root-owned 0440 under `/run/credentials`.
+
+    Package E wrote it as a file this process owns, mode 0400, in a private directory. That
+    passed the reader as it then was and matched nothing systemd does, which is why five
+    units still refused to start with a credential that had been sealed, delivered and
+    decrypted (#215, third break).
+    """
+
+    return deliver(
+        monkeypatch,
+        root=root,
+        unit=UNIT,
+        mode=0o440,
+        payload=serialize_runtime_credential(
             service_id=SERVICE_ID,
             service_kind=KIND,
             instance_name=INSTANCE,
             bundle_generation=generation,
             values={"TUSHARE_TOKEN_MAIN": "sealed-token"},
-        )
+        ),
     )
-    path.chmod(0o400)
-    return path
 
 
-def test_the_credential_is_read_against_the_deployment_bundle_generation(tmp_path: Path) -> None:
+def test_the_credential_is_read_against_the_deployment_bundle_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The namespace the sealer used is the namespace the reader has to use (#215, #207)."""
 
-    directory = tmp_path / "credentials"
-    _sealed(directory)
+    delivery = _sealed(monkeypatch, tmp_path / "run-credentials")
 
-    loaded = _load({"CREDENTIALS_DIRECTORY": str(directory)}, generation=BUNDLE_GENERATION)
+    loaded = _load(
+        {"CREDENTIALS_DIRECTORY": str(delivery.directory)}, generation=BUNDLE_GENERATION
+    )
 
     assert dict(loaded) == {"TUSHARE_TOKEN_MAIN": "sealed-token"}
 
 
-def test_the_authority_chain_generation_is_still_refused(tmp_path: Path) -> None:
+def test_the_authority_chain_generation_is_still_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Passing the wrong namespace must keep failing closed, not start being tolerated."""
 
-    directory = tmp_path / "credentials"
-    _sealed(directory)
+    delivery = _sealed(monkeypatch, tmp_path / "run-credentials")
 
     with pytest.raises(ValueError, match="generation does not match"):
-        _load({"CREDENTIALS_DIRECTORY": str(directory)}, generation=AUTHORITY_GENERATION)
+        _load(
+            {"CREDENTIALS_DIRECTORY": str(delivery.directory)}, generation=AUTHORITY_GENERATION
+        )
 
 
-def test_without_a_deployment_generation_a_present_credential_is_refused(tmp_path: Path) -> None:
+def test_without_a_deployment_generation_a_present_credential_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Route B has no bundle, so a credential in reach is one nothing can bind."""
 
-    directory = tmp_path / "credentials"
-    _sealed(directory)
+    delivery = _sealed(monkeypatch, tmp_path / "run-credentials")
 
     with pytest.raises(ValueError, match="without a deployment generation"):
-        _load({"CREDENTIALS_DIRECTORY": str(directory)}, generation=None)
+        _load({"CREDENTIALS_DIRECTORY": str(delivery.directory)}, generation=None)
 
 
 def test_without_a_deployment_generation_a_capability_role_refuses_outright(

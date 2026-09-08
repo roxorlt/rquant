@@ -61,6 +61,7 @@ from rquant.runtime_service_main import (
 )
 from rquant.strict_json import canonical_json_bytes
 from tests.integration.lab_runtime_e2e_support import create_real_sealed_lab_job
+from tests.support.systemd_credential_delivery import deliver
 
 # The real runtime builder owns its clock; terminal evidence must therefore be
 # safely in the past for this end-to-end invocation instead of a fixture future.
@@ -476,11 +477,17 @@ def test_runtime_main_applies_catalog_ipc_and_terminal_hooks_exactly_once(
 
     instance = manifest_path.stem
     writer_credential = _credential()
-    credential_directory = tmp_path / "credentials"
-    credential_directory.mkdir(mode=0o700)
-    credential_directory.chmod(0o700)
-    credential_directory.joinpath("capabilities.json").write_bytes(
-        serialize_runtime_credential(
+    # The delivery shape is systemd's, not a plausible one: a root-owned 0440 credential in
+    # a root-owned directory on systemd's own mount under `/run/credentials/<unit>`. The
+    # 0600 file in a private directory this used to write is a shape systemd never produces,
+    # and fixtures like it are why #215's third break survived a green suite.
+    credentials_root = tmp_path / "run-credentials"
+    delivery = deliver(
+        monkeypatch,
+        root=credentials_root,
+        unit="rquant-artifact-retention.service",
+        mode=0o440,
+        payload=serialize_runtime_credential(
             service_id=manifest.service_id,
             service_kind=manifest.service_kind,
             instance_name=instance,
@@ -490,10 +497,9 @@ def test_runtime_main_applies_catalog_ipc_and_terminal_hooks_exactly_once(
                     writer_credential.model_dump(mode="json")
                 ).decode("utf-8")
             },
-        )
+        ),
     )
-    credential_directory.joinpath("capabilities.json").chmod(0o600)
-    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credential_directory))
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(delivery.directory))
     monkeypatch.setattr("rquant.runtime_service_main.resolve_checkout_commit", lambda: COMMIT)
     monkeypatch.setattr(
         "rquant.runtime_service_main.load_runtime_schema_service_bindings",
@@ -509,9 +515,6 @@ def test_runtime_main_applies_catalog_ipc_and_terminal_hooks_exactly_once(
             / service_manifest.service_kind.value.replace("_", "-")
             / service_instance
         )
-        service_credentials = tmp_path / f"credentials-{service_manifest.service_kind.value}"
-        service_credentials.mkdir(mode=0o700, exist_ok=True)
-        service_credentials.chmod(0o700)
         values = (
             {
                 _WRITER_CREDENTIAL_CAPABILITY: canonical_json_bytes(
@@ -521,17 +524,23 @@ def test_runtime_main_applies_catalog_ipc_and_terminal_hooks_exactly_once(
             if service_manifest.service_kind is RuntimeServiceKind.ARTIFACT_RETENTION
             else {}
         )
-        service_credentials.joinpath("capabilities.json").write_bytes(
-            serialize_runtime_credential(
+        service_delivery = deliver(
+            monkeypatch,
+            root=credentials_root,
+            unit=(
+                f"rquant-runtime-{service_manifest.service_kind.value.replace('_', '-')}"
+                f"@{service_instance}.service"
+            ),
+            mode=0o440,
+            payload=serialize_runtime_credential(
                 service_id=service_manifest.service_id,
                 service_kind=service_manifest.service_kind,
                 instance_name=service_instance,
                 bundle_generation=GENERATION,
                 values=values,
-            )
+            ),
         )
-        service_credentials.joinpath("capabilities.json").chmod(0o600)
-        monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(service_credentials))
+        monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(service_delivery.directory))
         args = build_parser().parse_args(
             [
                 "--manifest",

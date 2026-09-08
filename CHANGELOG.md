@@ -105,6 +105,48 @@
   按 runbook C-3 顺序 strategy×3 → router → broker → notifier 全部进主循环，
   且四个 role 一次越界写都没有。
 
+- **五个 credstore unit 拿到了凭证却启动不了：判据描述的不是 systemd 的投递形状（#230，#215 第三处断点）**：
+  2026-09-08 02:04 生产机（systemd 255、`User=lighthouse`）实测，`LoadCredentialEncrypted=`
+  交到服务手上的是——`/run/credentials/<unit>/` 一块 `ro,nosuid,nodev,noexec` 的内存挂载，
+  目录 `root:root 0550`，`capabilities.json` 是 **`root:root 0440` 外加一条 ACL** 放行 lighthouse。
+  进程 `os.open` 得开，但 `runtime_capabilities._read_private_credential` 要求
+  `st_uid == os.geteuid()` 且 `mode & 0o077 == 0`，于是抛
+  `systemd credential must be owned by the runtime uid`，五个 unit 全部起不来。包 E 的 e2e
+  用「当前用户属主 + 0400」造夹具——那是照着读者写的，不是照着 systemd 写的，所以这条一路绿到生产。
+  改法不是放宽成「任何可读文件都接受」，而是把判据换成 systemd 自己的契约，每条都能指到出处
+  （systemd.exec(5) 的 CREDENTIALS 与 `$CREDENTIALS_DIRECTORY`；systemd 252
+  `src/core/execute.c` 的 `write_credential`、`acquire_credentials`、`setup_credentials_internal`）：
+  目录必须是 `/run/credentials/<本 unit>.service`（读得到 cgroup 时还要与本进程所属 unit 一致）、
+  属 `root:root` **或（文件系统放不下 ACL 时 systemd 会把目录 chown 给服务用户）属本进程**、
+  mode ∈ {0500, 0550, 0700}，且它所在的挂载是 tmpfs 或 ramfs、带 `nosuid,nodev,noexec`、
+  **并且是只读的**（读 `/proc/self/mountinfo` 核对，再用目录自己的 `st_dev` 反查选中的确实是
+  这一条）；文件则 `O_NOFOLLOW` 打开、正规文件、nlink 1、属主 ∈ {0, 本进程 euid}、
+  mode ∈ {0400, 0440} 且 `mode & 0o007 == 0`、带 group 读位时必须 `root:root`（那正是 ACL 投递
+  的形状）、读后 fstat 互校、1 MiB 上限。
+  两条属主 fallback（文件 `exec-credential.c:206`、目录 `:738`）共用同一个安全前提，也是
+  systemd 自己给的理由——「只有整块挂载能重挂成只读才安全，否则属主能给自己 chmod 出写权限」，
+  而 systemd 在把工作区移到最终位置前**恒**重挂只读（`:869`），所以 `ro` 直接升成对每种形状的
+  硬要求。**这一支不是可有可无的远端角落**：systemd 255 的挂载偏好是「tmpfs+noswap（内核 ≥6.3）
+  → ramfs → 普通 tmpfs」，而 ramfs 根本不支持 POSIX ACL，只要主机内核 < 6.3 就会走属主 fallback。
+  「只有 systemd 能把文件放到这里」这层保证原先靠「属主 == euid」承担，现在改由「root（或只读
+  挂载上的服务用户）属主的目录 + systemd 自己的内存挂载」承担，净效果是加严而不是放宽。
+  凭证读不出来时的措辞一并改了：EACCES 会点名实测的 uid、gid、mode 并指向 `User=` 与那条 ACL。
+  systemd 的文件 ACL 与目录 ACL 是一起加的，`User=` 配错时两者一起没有，于是连 `lstat` 文件都
+  被拒——这时改报**目录**的实测属主与 mode，而不是退回「unavailable or unsafe」这种一个值都不
+  点名的串。「这个目录里没有 capabilities.json」只在目录本身合格且文件确实 ENOENT 时才说；
+  判断「确实没有」只认 ENOENT，因为 `Path.exists()` 对 EACCES 是重新抛出而不是回答
+  （同一个坑在 `_undelivered_credential_reason` 里也一并修了：它原本会把「systemd 已经装载的
+  凭证」报成「从来没装载」，把修理指向密封器）。
+  夹具同步换成真实投递形状（包 A/E 留下的三处），并新增
+  `tests/unit/test_systemd_credential_delivery_shape.py`（28 例）与
+  `tests/integration/test_systemd_credential_delivery_linux.py`（Linux root 门禁 15 例：真 tmpfs
+  挂载、真只读重挂、root 造投递、非 root 子进程读回，含真 ACL 与真 EACCES；一处 skip 也没有，
+  连「这台机器能不能在 tmpfs 上放 ACL」都是运行期探测出来的）。那 15 例全带 `linux_exact`、
+  不进任何分片，所以新增 CI job `route-a-credential-shape-linux`（3.11 / 3.12 各一路）跑它们：
+  裸 `ubuntu-24.04` runner（不是容器，因为要一块真能放 POSIX ACL 的 tmpfs）、`sudo -E` 取 root、
+  JUnit 契约钉 `--tests 15 --skipped 0`——非 root 会让整份文件 skip 掉，而一个绿着什么都没测的
+  门禁正是第三处断点当初溜过去的方式。
+
 - **第二代 bundle 一带 schema rollout，八个 kind-backed role 全部反复重启（#227）**：
   2026-09-07 路线 A 第二窗口装的是**第一个有前代的 generation**（`bf2da6d8…` 装在 `7d572c79…`
   之上），`install_runtime_deployment_profile` 于是为每个「声明指纹变了」的 channel 备好一份

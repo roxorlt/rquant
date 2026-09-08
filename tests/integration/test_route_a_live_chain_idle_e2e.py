@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,7 @@ from tests.integration.test_route_a_legacy_binding_e2e import (
 from tests.integration.test_route_a_strategy_chain_e2e import _routing_policy_payload
 from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
 from tests.shadow_ed25519_support import create_shadow_ed25519_test_authority
+from tests.support.systemd_credential_delivery import deliver
 from tests.unit.test_runtime_authority_publish import UID, World
 
 pytestmark = pytest.mark.integration
@@ -176,19 +178,37 @@ def _relocated(route: RouteAWorld, module_argv: list[str]) -> list[str]:
     return argv
 
 
-def deliver_credential(directory: Path, plaintext: bytes) -> Path:
-    """Lay the capability credential out the way `LoadCredentialEncrypted` does."""
+def deliver_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    route: RouteAWorld,
+    root: Path,
+    plaintext: bytes,
+) -> Path:
+    """Lay the capability credential out the way `LoadCredentialEncrypted` really does.
 
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory.chmod(0o700)
-    path = directory / RUNTIME_CAPABILITY_CREDENTIAL_NAME
-    path.write_bytes(plaintext)
-    path.chmod(0o400)
-    observed = path.lstat()
-    assert observed.st_uid == os.geteuid()
+    Not "a file this process owns, mode 0400, in a private directory" — that shape is what
+    #230 showed the reader had been describing to itself, and it is not what systemd hands
+    a `User=` unit. What lands is a **root-owned 0440** `capabilities.json`, admitted to the
+    service user through a POSIX ACL, inside a root-owned 0550 directory at
+    `/run/credentials/<unit>.service` on systemd's own read-only memory-backed mount.
+    `tests/support/systemd_credential_delivery` moves the three facts a non-root test on any
+    platform cannot produce (the credentials root, the delivering uid/gid, the mount table)
+    and nothing else; the notifier is the one role on this chain that carries a credential.
+    """
+
+    instance = instances_of(route, NOTIFIER_ROLE)[0]
+    delivery = deliver(
+        monkeypatch,
+        root=root,
+        unit=f"rquant-runtime-notifier@{instance}.service",
+        payload=plaintext,
+        mode=0o440,
+    )
+    observed = delivery.path.lstat()
+    assert stat.S_IMODE(observed.st_mode) == 0o440
     assert observed.st_nlink == 1
-    assert observed.st_mode & 0o077 == 0
-    return directory
+    assert delivery.path.name == RUNTIME_CAPABILITY_CREDENTIAL_NAME
+    return delivery.directory
 
 
 def run_role(
@@ -426,6 +446,7 @@ def test_the_world_is_the_second_generation_installed_over_the_first(
 def test_the_whole_live_chain_starts_idle_in_the_runbook_order(
     idle_chain: RouteAWorld,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """strategy x3 -> signal_router -> paper_broker -> notifier, every one in its loop."""
 
@@ -472,7 +493,9 @@ def test_the_whole_live_chain_starts_idle_in_the_runbook_order(
 
     notifier = instances_of(idle_chain, NOTIFIER_ROLE)[0]
     credentials = deliver_credential(
-        tmp_path / "credentials" / NOTIFIER_ROLE,
+        monkeypatch,
+        idle_chain,
+        tmp_path / "credentials",
         idle_chain.sealed_credentials[notifier],
     )
     code, violations, heartbeat = run_role(

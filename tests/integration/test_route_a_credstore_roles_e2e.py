@@ -33,6 +33,7 @@ import hashlib
 import os
 import runpy
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -58,6 +59,7 @@ from tests.integration.test_route_a_legacy_binding_e2e import (
     _route_a_world,
     _StopAfterOneIteration,
 )
+from tests.support.systemd_credential_delivery import deliver
 from tests.unit.test_runtime_authority_publish import UID
 
 pytestmark = pytest.mark.integration
@@ -76,6 +78,18 @@ CREDSTORE_ROLES: tuple[str, ...] = (
     "daily_close_source",
     "notifier",
 )
+
+#: The unit each of those roles is started as, from the templates in `deploy/systemd`. The
+#: credential directory is `/run/credentials/<unit>` and the reader checks that shape, so a
+#: fixture that invents a directory name is no longer a fixture for this delivery.
+UNIT_TEMPLATES: dict[str, str] = {
+    "reference_slow_source": "rquant-runtime-reference-slow-source",
+    "reference_slow_publisher": "rquant-runtime-reference-slow-publisher",
+    "market_minute_source": "rquant-runtime-market-minute",
+    "auction_match_source": "rquant-runtime-auction-match",
+    "daily_close_source": "rquant-runtime-daily-close",
+    "notifier": "rquant-runtime-notifier",
+}
 
 #: 09:30 Shanghai on 2026-08-04. The bundle's calendar opens exactly one date, 2026-08-03, so
 #: every source role's step takes its "not an open date" branch and no adapter call is made.
@@ -134,35 +148,61 @@ def _relocated_argv(route: RouteAWorld, module_argv: list[str]) -> list[str]:
     return argv
 
 
-def _deliver(directory: Path, plaintext: bytes) -> Path:
-    """Lay a decrypted credential out the way `LoadCredentialEncrypted` does.
+def _unit_of(route: RouteAWorld, role: str) -> str:
+    """`rquant-runtime-daily-close@svc-<64 hex>.service`, as systemd instantiates it."""
 
-    systemd puts each loaded credential in the unit's own credentials directory as a regular
-    file named by the credential id, owned by the unit's user, mode 0400, one link. Those are
-    the four properties `_read_private_credential` insists on, so they are the four this
-    fixture reproduces.
+    return f"{UNIT_TEMPLATES[role]}@{_instance_of(_manifest_for(route, role).service_id)}.service"
+
+
+def _deliver(
+    monkeypatch: pytest.MonkeyPatch,
+    route: RouteAWorld,
+    role: str,
+    root: Path,
+    plaintext: bytes,
+) -> Path:
+    """Lay a decrypted credential out the way `LoadCredentialEncrypted` really does.
+
+    This fixture used to write "a file this process owns, mode 0400, in a private directory"
+    and call that the delivery. It is not: systemd decrypts as root and admits the unit's
+    `User=` through an ACL, so what lands is a **root-owned 0440** file in a root-owned 0550
+    directory on systemd's own non-swappable mount under `/run/credentials/<unit>`. Modelling
+    the reader instead of systemd is why this suite was green through a window in which every
+    credstore unit refused to start (#215, third break).
+
+    `tests/support/systemd_credential_delivery` moves the three facts a non-root test cannot
+    produce — the credentials root, the delivering uid/gid, the mount table — and nothing
+    else. The Linux gate in `tests/integration/test_systemd_credential_delivery_linux.py`
+    moves none of them.
     """
 
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory.chmod(0o700)
-    path = directory / RUNTIME_CAPABILITY_CREDENTIAL_NAME
-    path.write_bytes(plaintext)
-    path.chmod(0o400)
-    observed = path.lstat()
-    assert observed.st_uid == os.geteuid()
+    delivery = deliver(
+        monkeypatch,
+        root=root,
+        unit=_unit_of(route, role),
+        payload=plaintext,
+        mode=0o440,
+    )
+    observed = delivery.path.lstat()
+    assert stat.S_IMODE(observed.st_mode) == 0o440
     assert observed.st_nlink == 1
-    assert observed.st_mode & 0o077 == 0
-    return path
+    assert delivery.path.name == RUNTIME_CAPABILITY_CREDENTIAL_NAME
+    return delivery.directory
 
 
-def _credentials_root(route: RouteAWorld, root: Path) -> dict[str, Path]:
+def _credentials_root(
+    monkeypatch: pytest.MonkeyPatch,
+    route: RouteAWorld,
+    root: Path,
+) -> dict[str, Path]:
     """One credentials directory per credstore role, each holding that role's plaintext."""
 
     directories: dict[str, Path] = {}
     for role in CREDSTORE_ROLES:
         instance = _instance_of(_manifest_for(route, role).service_id)
-        plaintext = route.sealed_credentials[instance]
-        directories[role] = _deliver(root / role, plaintext).parent
+        directories[role] = _deliver(
+            monkeypatch, route, role, root, route.sealed_credentials[instance]
+        )
     return directories
 
 
@@ -288,11 +328,12 @@ def test_a_role_outside_the_credstore_group_is_still_denied_the_address(
 def test_a_credstore_role_reaches_its_loop_with_its_delivered_credential(
     credstore: RouteAWorld,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     role: str,
 ) -> None:
     """One iteration, and none of #215's five failures on the way there."""
 
-    directories = _credentials_root(credstore, tmp_path / "credentials")
+    directories = _credentials_root(monkeypatch, credstore, tmp_path / "run-credentials")
     environment = _launch(credstore, role, directories[role])["environment"]
 
     _run_role(credstore, role, environment=environment)
@@ -308,10 +349,11 @@ def test_a_credstore_role_reaches_its_loop_with_its_delivered_credential(
 def test_the_six_roles_run_one_after_another_over_the_same_generation(
     credstore: RouteAWorld,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The window's real question: can the credstore group come up together, not one by one."""
 
-    directories = _credentials_root(credstore, tmp_path / "credentials")
+    directories = _credentials_root(monkeypatch, credstore, tmp_path / "run-credentials")
     for role in CREDSTORE_ROLES:
         _run_role(
             credstore, role, environment=_launch(credstore, role, directories[role])["environment"]
@@ -378,6 +420,7 @@ def test_the_notifier_without_its_credential_delivers_nothing_and_refuses_to_try
 def test_a_credential_sealed_for_another_generation_is_refused(
     credstore: RouteAWorld,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     role: str,
 ) -> None:
     """The bundle binding is load-bearing, not decoration: a foreign generation fails closed."""
@@ -389,7 +432,7 @@ def test_a_credential_sealed_for_another_generation_is_refused(
     assert legacy is not None
     foreign = plaintext.replace(legacy.encode("ascii"), b"c" * 64)
     assert foreign != plaintext
-    directory = _deliver(tmp_path / "foreign" / role, foreign).parent
+    directory = _deliver(monkeypatch, credstore, role, tmp_path / "foreign", foreign)
     environment = _launch(credstore, role, directory)["environment"]
 
     with pytest.raises(ValueError, match="generation does not match"):
@@ -400,13 +443,16 @@ def test_a_credential_sealed_for_another_generation_is_refused(
 def test_another_roles_credential_is_refused(
     credstore: RouteAWorld,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     role: str,
 ) -> None:
     """Delivery to the wrong door is not a way in either."""
 
     other = next(name for name in CREDSTORE_ROLES if name != role)
     instance = _instance_of(_manifest_for(credstore, other).service_id)
-    directory = _deliver(tmp_path / "crossed" / role, credstore.sealed_credentials[instance]).parent
+    directory = _deliver(
+        monkeypatch, credstore, role, tmp_path / "crossed", credstore.sealed_credentials[instance]
+    )
     environment = _launch(credstore, role, directory)["environment"]
 
     with pytest.raises(ValueError, match="does not match runtime"):
@@ -432,6 +478,7 @@ def _systemd_creds_available() -> bool:
 def test_the_roles_run_off_a_credential_the_real_sealer_encrypted(
     credstore: RouteAWorld,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Seal with the root helper, decrypt with systemd-creds, then start the six roles.
 
@@ -489,7 +536,7 @@ def test_the_roles_run_off_a_credential_the_real_sealer_encrypted(
             check=True,
         ).stdout
         assert unsealed == credstore.sealed_credentials[instance]
-        directories[role] = _deliver(delivered_root / role, unsealed).parent
+        directories[role] = _deliver(monkeypatch, credstore, role, delivered_root, unsealed)
 
     for role in CREDSTORE_ROLES:
         environment = _launch(credstore, role, directories[role])["environment"]
