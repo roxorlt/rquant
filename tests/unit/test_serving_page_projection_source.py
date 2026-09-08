@@ -1755,3 +1755,80 @@ def test_lab_page_projection_serializes_research_gate_metadata() -> None:
     assert projection.table_name == "research_gate_metadata"
     assert projection.rows[0]["coverage_ratios_json"] == '{"minute":0.9}'
     assert '"sample_warning"' in str(projection.rows[0]["failures_json"])
+
+
+# ---------------------------------------------------------------------------------------
+# #241: the PageControl audit reader inside the notifier unit's sandbox
+# ---------------------------------------------------------------------------------------
+#
+# `rquant-runtime-notifier@svc-f2518f7a….service` was DEGRADED on every iteration of the
+# 2026-09-08 Route A window:
+#
+#     OSError: [Errno 30] Read-only file system:
+#         '…/data/runtime/control/.page-control.sqlite3.0975d9…b2.b3xxs1w1'
+#
+# That name is this class's own: `snapshot()` binds the exact generation it is about to
+# read by hard-linking the outbox into a temporary directory it creates *beside* the
+# outbox. The outbox belongs to the page-control service -- `rquant-page-control.service`
+# is the only unit whose `ReadWritePaths` covers `…/data/runtime/control` -- and the
+# notifier's own unit lists `control/page-control.sqlite3` under `ReadOnlyPaths`. So the
+# reader has to pin its generation somewhere the reading role owns.
+
+
+def test_the_audit_reader_binds_its_generation_outside_the_outbox_directory(
+    tmp_path: Path,
+) -> None:
+    """A snapshot with the outbox's whole directory read-only, as the notifier has it."""
+
+    from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
+
+    control = tmp_path / "control"
+    control.mkdir()
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    outbox, catalog, _command, _receipt, authority = _save_signed_canvas_catalog_record(
+        control,
+        command_id="sandboxed-canvas",
+    )
+    binds = tmp_path / "live" / "notifications" / "svc-1" / "page-control-generations"
+    binds.mkdir(parents=True)
+    source = DuckDBSignalPageProjectionSource(
+        database,
+        canvas_catalog_root=catalog,
+        canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
+        canvas_publication_keyring=authority.keyring,
+        page_control_outbox=outbox,
+        page_control_bind_root=binds,
+    )
+    before = tree_state(control)
+
+    with readonly_runtime(tmp_path, writable=(binds,)) as violations:
+        snapshot = source(NOW)
+
+    assert violations == [], violations
+    assert tree_state(control) == before
+    assert snapshot.canvas_hits is not None
+    assert sorted(binds.iterdir()) == []
+
+
+def test_a_bind_root_inside_the_audit_directory_is_refused(tmp_path: Path) -> None:
+    """The invariant, so #241's shape cannot come back through a different caller."""
+
+    control = tmp_path / "control"
+    control.mkdir()
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    outbox, catalog, _command, _receipt, authority = _save_signed_canvas_catalog_record(
+        control,
+        command_id="inside-bind-root",
+    )
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="bind root"):
+        DuckDBSignalPageProjectionSource(
+            database,
+            canvas_catalog_root=catalog,
+            canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
+            canvas_publication_keyring=authority.keyring,
+            page_control_outbox=outbox,
+            page_control_bind_root=control / "generations",
+        )
