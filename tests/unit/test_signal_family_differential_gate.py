@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #229's to PR #234's. It is the merge base of the
+    # main; this one moves it from PR #234's to PR #236's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "aca0dd8e8d72e49390b55ac16ce85a4596de0731"
-    assert BASELINE_TREE_SHA == "a0a86c5f3c1ee45fe8c46092f2b6304434afd4c1"
+    assert BASELINE_COMMIT_SHA == "fa6a295fea6ed200083fdd02e008bd7f00facbb2"
+    assert BASELINE_TREE_SHA == "b6cb9dbb7b3072561283b7c08d2af58e8be8ca4c"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``aca0dd8`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``fa6a295`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1495,10 +1495,12 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # rollout store and the installer acknowledgement needed no new job, the refreeze to
     # a0bbb4c put it back once more because the credential shape topic marked fifteen cases
     # ``linux_exact`` that no shard collects and gave them a rooted container job of their own,
-    # and this refreeze to aca0dd8 takes it out again: the idle live chain topic marks nothing
-    # ``linux_exact``, adds no job, and leaves that workflow untouched.
-    # A named path would have flipped truth value
-    # nine times in twelve refreezes: naming one
+    # the refreeze to aca0dd8 took it out again because the idle live chain topic marked
+    # nothing ``linux_exact`` and added no job, and this refreeze to fa6a295 leaves it out for
+    # the same reason: the health contract projection topic marks nothing ``linux_exact``,
+    # adds no job, and leaves that workflow untouched - the first refreeze in four that does
+    # not flip it. A named path would have flipped truth value
+    # nine times in thirteen refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted
