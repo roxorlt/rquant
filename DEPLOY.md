@@ -5,6 +5,122 @@
 
 ---
 
+## 2026-09-08 · 待安装 · 主机资源包络（#243，owner 裁决 21）
+
+**状态**：**尚未安装**。本条是安装说明，不是部署记录；真正装上去之后请在本条下面补
+执行时间、`systemd-analyze` 输出和验收结果。
+
+**为什么必须手工装**：改动落在 `deploy/systemd/`，受控发布器
+（`scripts/deploy-production.sh`）按设计拒绝任何含该目录的 diff（见
+`docs/production-release.md`「自动拒绝」），CLAUDE.md 第 7 条也把 `deploy/systemd/` 列为需要
+owner 单独明确授权的高风险变更。因此代码可以照常走发布器，**unit 文件这部分要 owner 点头后
+按下面的步骤人工安装**。
+
+**改了哪 5 个文件**：`rquant-backup.timer`（盘中 5min → 30min）、`rquant-backup.service`
+（`TimeoutStartSec` 20min、新增 `TimeoutStopSec=2min`）、`rquant-live.slice`（`CPUQuota=60%`）、
+`rquant-serving.slice`（`CPUQuota=30%`）、`rquant-maintenance.slice`（`CPUWeight=300`）。
+`rquant.slice` 与 `rquant-research.slice` 未改，但下面的 verify 一并跑一遍不吃亏。
+
+### 1. 装之前先在云端验语法（mac 上验不了）
+
+```bash
+cd /home/lighthouse/rquant && git fetch --tags && git checkout <tag>
+tmp="$(mktemp -d)"
+cp deploy/systemd/rquant-backup.service deploy/systemd/rquant-backup.timer \
+   deploy/systemd/rquant-live.slice deploy/systemd/rquant-serving.slice \
+   deploy/systemd/rquant-maintenance.slice deploy/systemd/rquant.slice \
+   deploy/systemd/rquant-research.slice "${tmp}/"
+systemd-analyze verify "${tmp}"/rquant-backup.service "${tmp}"/rquant-backup.timer \
+    "${tmp}"/rquant-live.slice "${tmp}"/rquant-serving.slice \
+    "${tmp}"/rquant-maintenance.slice "${tmp}"/rquant.slice "${tmp}"/rquant-research.slice
+echo "verify rc=$?"      # 期望 0，且不打印任何 warning
+systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/30' --iterations 5
+systemd-analyze calendar 'Mon..Fri 17:30' --iterations 5
+rm -rf "${tmp}"
+```
+
+`9..15:0/30` 期望：`Normalized form: Mon..Fri *-*-* 09,10,11,12,13,14,15:00,30:00`，5 个
+iteration **间隔 30 分钟**（不是 30 秒）。看到 `Invalid argument` 或秒级步进就**停下不要装**。
+
+### 2. 安装
+
+```bash
+sudo cp deploy/systemd/rquant-backup.service deploy/systemd/rquant-backup.timer \
+        deploy/systemd/rquant-live.slice deploy/systemd/rquant-serving.slice \
+        deploy/systemd/rquant-maintenance.slice /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-backup.timer      # timer 必须重启才按新 calendar 排期
+systemctl list-timers rquant-backup.timer       # 下一次触发应落在 :00 或 :30
+```
+
+### 3. slice 改动怎么对**已经在跑**的 unit 生效（重点）
+
+`daemon-reload` 只让 systemd 重读文件，**不会把新的资源属性推给已经 active 的 slice**；
+slice 的 cgroup 属性是在它被创建（第一个成员启动）时写下的。两条路，二选一：
+
+- **推荐（不重启任何服务）**：用 `--runtime` 就地下发，重启后自然回落到 unit 文件的值。
+  ```bash
+  sudo systemctl set-property --runtime rquant-live.slice CPUQuota=60%
+  sudo systemctl set-property --runtime rquant-serving.slice CPUQuota=30%
+  sudo systemctl set-property --runtime rquant-maintenance.slice CPUWeight=300
+  ```
+  **一定要带 `--runtime`**：不带的话 systemd 会在 `/etc/systemd/system.control/` 里写永久
+  drop-in，从此**盖住**仓库里的 unit 文件，以后改 git 不再生效，且悄悄与仓库分叉。
+- **或者**：等下一次这些 slice 里的 unit 全部停过再起（盘后窗口），slice 重新创建时按文件生效。
+
+核对（cgroup 里的真值，不看 systemd 自己的缓存）：
+
+```bash
+systemctl show -p CPUQuotaPerSecUSec -p CPUWeight rquant-live.slice rquant-serving.slice \
+    rquant-maintenance.slice
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/cpu.max        # 期望 60000 100000
+cat /sys/fs/cgroup/rquant.slice/rquant-serving.slice/cpu.max     # 期望 30000 100000
+cat /sys/fs/cgroup/rquant.slice/rquant-maintenance.slice/cpu.weight   # 期望 300
+```
+
+**忘了这一步会被验收抓住**：`scripts/verify-workload-isolation.sh` 会把 cgroup 里的
+`CPUWeight` 与仓库的 `WORKLOAD_SLICE_LIMITS` 逐字段对比，maintenance 还是 50 时会直接报
+`rquant-maintenance.slice: cgroup CPUWeight='50', expected '300'`。
+
+### 4. 装完的验收
+
+```bash
+sudo bash scripts/verify-workload-isolation.sh          # 只读，不改任何状态
+sudo systemctl start rquant-backup.service              # 盘后手工跑一次
+journalctl -u rquant-backup.service -n 40 --no-pager    # 期望 Result=success，无超时
+tail -5 /home/lighthouse/rquant/logs/backup-snapshot.log
+ls -lA /home/lighthouse/rquant/backup/                  # 期望没有新的 .latest.* 残留
+```
+
+### 5. 68 GB 孤儿文件是**另一件事**
+
+`backup/` 里 2026-08-03..05 留下的 `.latest.duckdb.<pid>` / `.latest.duckdb.<pid>.gz`
+共约 68 GB（磁盘 120 GB，只剩 16–18 GB）。**本次改动不删它们**：新脚本的开头清扫只在**下一次
+备份运行时**才会碰到这些文件，而清理 68 GB 是一次单独的、需要 owner 明确点头的生产操作。
+装完之后如果 owner 还没点头，请留意第一次备份运行会把它们一次性扫掉（它们都远超 1 天），
+所以**要么先取得授权、要么在装之前把这批文件挪走留证**。删除前建议先记一份清单：
+
+```bash
+ls -lA /home/lighthouse/rquant/backup/.latest.* > /home/lighthouse/orphans-20260908.txt
+du -ch /home/lighthouse/rquant/backup/.latest.* | tail -1
+```
+
+### 回滚
+
+```bash
+cd /home/lighthouse/rquant && git checkout <上一个 tag> -- deploy/systemd
+sudo cp deploy/systemd/rquant-backup.{service,timer} deploy/systemd/rquant-{live,serving,maintenance}.slice \
+        /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl restart rquant-backup.timer
+sudo systemctl set-property --runtime rquant-live.slice CPUQuota=
+sudo systemctl set-property --runtime rquant-serving.slice CPUQuota=
+sudo systemctl set-property --runtime rquant-maintenance.slice CPUWeight=50
+```
+
+`CPUQuota=`（空值）就是取消限额。脚本改动（trap 与开头清扫）没有生产状态，回滚即回滚代码。
+
+---
+
 ## 2026-09-07 · v0.32.2 · 路线 A 首次安装（权威链 sequence 3，生产代码仍未切换）
 
 **状态**：路线 A——「由操作员产出生产 inputs 文档 + 生成一代真实画像」这条路——第一次真正装到
