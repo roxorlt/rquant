@@ -228,7 +228,7 @@ def test_backup_timer_leaves_a_quiet_window_between_intraday_snapshots() -> None
         if line.startswith("OnCalendar=")
     ]
 
-    assert calendars == ["Mon..Fri *-*-* 9..15:0/30", "Mon..Fri 17:30"]
+    assert calendars == ["Mon..Fri *-*-* 9..15:0/15", "Mon..Fri 17:30"]
 
 
 @pytest.mark.parametrize(

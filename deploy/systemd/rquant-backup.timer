@@ -2,17 +2,24 @@
 Description=Trigger rQuant backup snapshot
 
 [Timer]
-# 盘中 09:00-15:30 每 30 分钟。
+# 盘中 09:00-15:45 每 15 分钟。
 # v0.11.3 修：原 `09:30..15:05/5` 被 systemd 拒收（Invalid argument），
 # 整段 OnCalendar 静默丢弃 → v0.7.0 起 intraday backup 从未跑过，本地
 # sync 一直拉日终 17:30 那份 .gz。改用 v0.11.2 已验证的 `H:M/N` 语法
 # （显式起点 `0/N`；`*/N` 与跨小时分钟范围都被拒收）。
 # #243 / owner 裁决 21（2026-09-08）：单次快照实测 8m16s–8m50s，5 分钟 cadence
 # 下 systemd 一轮没跑完下一轮就已排队，盘中 gzip 等于一直占着一个核；20 个运行时
-# unit 同时在跑时两次撞 10 分钟超时。改成 30 分钟后，一次运行完仍留 ≥21 分钟静默窗口。
-# 09:00-09:25 / 15:05-15:30 是冗余触发，但 backup 脚本是 idempotent
+# unit 同时在跑时两次撞 10 分钟超时。
+# **为什么是 15 分钟而不是 30**（协调者 2026-09-08 裁定）：`scripts/backup-snapshot.sh`
+# 每跑一次就发一次 recovery bundle，而 `preflight.py` 的 `runtime_recovery` 闸按
+# 已装 profile 的 `max_rpo_seconds=1800`（30 分钟）判 `backup_age`。发布落在每轮开始
+# 后约 9 分钟，所以最坏 age = 触发间隔 + 单次时长：30 + 8.83 = 38.8min = 2330s > 1800s
+# 会破闸；15 + 8.83 = 23.8min = 1430s，留 370s（21%）余量。
+# 代价是每周期只剩 15 − 8.83 ≈ 6.2 分钟静默、gzip 占空比约 59%（5 分钟节奏是 100%，
+# 30 分钟是 29%）。盘中触发 84 次/天 → 28 次/天。
+# 09:00-09:25 / 15:05-15:45 是冗余触发，但 backup 脚本是 idempotent
 # `cp + gzip + atomic mv`，无副作用。
-OnCalendar=Mon..Fri *-*-* 9..15:0/30
+OnCalendar=Mon..Fri *-*-* 9..15:0/15
 # 日终 17:30 一次（流水线 17:00 跑完后）
 OnCalendar=Mon..Fri 17:30
 
