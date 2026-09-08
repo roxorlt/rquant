@@ -157,8 +157,13 @@
   `sources/<channel>.json`，消费者游标也默认落在生产者根的 `cursors/` 下，而
   `rquant-runtime-feature@.service` 把 `live/market-minute` 列在 `ReadOnlyPaths`。
   改为 `source_read_only=True` 且游标根落在本 role 拥有的 `live/features/raw-cursors`。
-  **不丢状态**：旧游标位置从来就不在这个 unit 的授权里，所以这个 role 在 systemd 下
-  从来没成功写进去过一条游标；这一改是让它从「每个盘中批次都失败」变成能用。
+  **不丢状态，但有一个前提要在上线前查**：旧游标位置从来就不在这个 unit 的授权里，
+  所以这个 role **在 systemd 下**从来没成功写进去过一条游标。**裸跑不受沙箱约束**——
+  runbook R-20 的排查是用 `runtime-exec.pyz` 直接起 role、没有 unit，那一路是可能在旧位置
+  写下过游标的。所以下一个窗口之前要看一眼
+  `<runtime>/live/market-minute/cursors/`：里面若有 feature 消费者的那一份，
+  这个 role 换根之后会**从 sequence -1 重放**（对幂等的 feature 发布是安全的，
+  但要预期到那一轮的处理量）。
 
 - **v0.33.2 安装器在第三代生产机上被自己的 schema 兼容闸拦下（#237）**：
   2026-09-08 在第三代（producer_commit `a0bbb4c`、v0.33.1）上跑

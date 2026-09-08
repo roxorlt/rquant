@@ -469,13 +469,22 @@ class _ReadonlyPageControlAuditReader:
         },
     }
 
-    #: #241: `snapshot()` pins the generation it reads. It used to do that with a hard
+    #: #241: `snapshot()` holds the generation it reads. It used to do that with a hard
     #: link, beside the outbox -- a directory that belongs to `rquant-page-control.service`
     #: and is read-only in every other unit, so on the host the notifier got `EROFS` every
     #: iteration. Moving the link into a directory the notifier owns does not fix it:
     #: systemd builds each granted path as its own bind mount and Linux `link()` refuses
-    #: across mounts, so that is `EXDEV` instead. A descriptor pins the same generation and
-    #: creates nothing anywhere, which is the only shape that holds under this unit model.
+    #: across mounts, so that is `EXDEV` instead. An open descriptor needs no target at
+    #: all, and creates nothing anywhere, which is the only shape that holds here.
+    #:
+    #: What the descriptor buys is exact, and less than "pins the inode": the *open*
+    #: connection reads the generation it opened, and `os.fstat` on the descriptor answers
+    #: for that generation however the name moves. But sqlite resolves
+    #: `/proc/self/fd/<n>` **by name**, so once the outbox has been replaced a *later*
+    #: open through it is `unable to open database file`. That is fail-closed, never a
+    #: silent mix of two generations -- and the revalidation below reports the rotation
+    #: from the identity comparison rather than from that open, so the wording names the
+    #: generation that moved. (DuckDB re-opens the inode, so its reader does pin.)
     def __init__(self, path: Path) -> None:
         self.path = Path(os.path.abspath(path))
         self._snapshot_connection: sqlite3.Connection | None = None
