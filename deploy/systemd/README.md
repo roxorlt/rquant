@@ -33,7 +33,8 @@
 
 | 分类 | unit | Slice |
 |---|---|---|
-| live | monitor、monitor-watchdog、surge-watch、daily、daily-report、morning-pulse、midday-report、KPL snapshot、pre-market check、token reminder、OnFailure alert，以及实时 source/feature/strategy/router/notifier/paper runtime | `rquant-live.slice` |
+| live（常驻） | monitor、monitor-watchdog、surge-watch、daily、daily-report、morning-pulse、midday-report、KPL snapshot、pre-market check、token reminder、OnFailure alert —— 共 11 个 | `rquant-live.slice` |
+| live（运行时 role） | 实时 source/feature/strategy/router/notifier/paper/auction/watchlist/daily-close/reference 等 14 个 `rquant-runtime-*@` 模板 | `rquant-live-runtime.slice`（live 的子 slice） |
 | serving | dashboard、panorama、panorama-auth、NL screen、canvas、page-control、候选 workload sampler，以及 serving/runtime-health publisher | `rquant-serving.slice` |
 | research | research-ingest、artifact retention、shadow、lab jobs、artifact catalog、promotions、recovery/rehearsal、daily-orchestrator | `rquant-research.slice` |
 | maintenance | backup、replica-sync | `rquant-maintenance.slice`，并发预算求和；不修改各自 timer 或假定互斥 |
@@ -48,19 +49,29 @@ live、serving、maintenance 或父级硬上限，因此父级/live/serving 只�
 | 边界 | CPU / IO | MemoryLow | MemoryHigh | MemoryMax |
 |---|---:|---:|---:|---:|
 | `rquant.slice` | 100 / 100 | 3072 MiB | 6144 MiB | 不设 |
-| live | 1000 / 1000，`CPUQuota=60%` | 3072 MiB | 3840 MiB | 不设 |
+| live | 1000 / 1000，**不设 `CPUQuota`** | 3072 MiB | 3840 MiB | 不设 |
+| live-runtime（live 的子 slice） | 100 / 100，`CPUQuota=60%` | 0 | 1536 MiB | 不设 |
 | serving | 500 / 500，`CPUQuota=30%` | 0 | 512 MiB | 不设 |
 | research | 100 / 100，`CPUQuota=100%` | 0 | 512 MiB | 768 MiB |
 | maintenance | 300 / 50，不设 `CPUQuota` | 0 | **待校准，不设** | 不设 |
 
-CPU 一列的 quota 与 maintenance 权重是 #243 / owner 裁决 21（2026-09-08）加的。2 vCPU 主机
-上「能与备份同时运行」的两个面 live 60% + serving 30% = 90%，不超过一个核；research 仍是
-精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane 互斥，永远不会和备份重叠。
-maintenance 在 `rquant.slice` 内部的权重从 50 提到 300（全部可运行时的份额 3.0% → 15.8%），
-仍低于 live/serving，但备份不再被运行时工作面饿死。**内存一列没有跟着改**：live 面里住着
-`rquant-monitor.service`，实测 cgroup peak 2814 MiB，`MemoryLow` 又是 3072 MiB，任何低于
-3838 MiB 的 live `MemoryHigh` 都会先掐监控自己（详见 `verify_workload_memory_admission` 里
-「live 至少高出 monitor peak 1024 MiB」这条 fail-closed 断言）。
+CPU 一列的 quota 与 maintenance 权重是 #243 / owner 裁决 21（2026-09-08）加的，**闸门压在
+`rquant-live-runtime.slice` 而不是 live 面本身**：live 面里住着 11 个常驻生产服务，而 cgroup v2
+的 quota 是整面封顶、面内按权重平分（面内所有 unit 都是默认 `CPUWeight=100`），压在 live 上会
+让 20 个 role 把 monitor / daily / alert@ 稀释到 60/21 = 2.9% 一核，`rquant-alert@` 的
+`TimeoutStartSec=30` 会被击穿。挪到子 slice 之后，14 个 role 合起来在 live 内部只算「一个同侪」，
+最坏情况下 alert@ 仍能拿到约 90% 一核（详见包 M 报告的算术）。
+「能与备份同时运行」的两个受限面 live-runtime 60% + serving 30% = 90%，不超过一个核；
+research 仍是精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane 互斥，永远不会和备份
+重叠。maintenance 在 `rquant.slice` 内部的权重从 50 提到 300（备份跑时 research 必然不在跑，
+真实分母是 1800，份额 3.2% → 16.7%），仍低于 live/serving。
+
+内存一列里 **live / 父级的 `MemoryHigh` 没有改**：live 面里的 `rquant-monitor.service` 实测
+cgroup peak 2814 MiB，`MemoryLow` 又是 3072 MiB，任何低于 3838 MiB 的 live `MemoryHigh` 都会
+先掐监控自己（`verify_workload_memory_admission` 里「live 至少高出 monitor peak 1024 MiB」
+那条 fail-closed 断言）。新增的 `live-runtime` `MemoryHigh=1536M` 是**从 live 的 3840M 里
+切给 role 的**，不是额外增加：19 个 role 实测合计 2800 MiB，与 monitor peak 相加是 5614 MiB、
+早已超顶，加了子 slice 的上限之后回收先打在 role 身上而不是 monitor 身上。
 
 `MemoryHigh` 不是 reservation，不能用它证明 backup/replica 并发安全。正常 research 运行态的
 静态上界为 live 3840 + serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB，

@@ -156,6 +156,7 @@ def test_only_research_has_a_memory_hard_cap() -> None:
     assert "MemoryMax" not in PARENT_SLICE_LIMITS
     for slice_name in (
         "rquant-live.slice",
+        "rquant-live-runtime.slice",
         "rquant-serving.slice",
         "rquant-maintenance.slice",
     ):
@@ -163,6 +164,53 @@ def test_only_research_has_a_memory_hard_cap() -> None:
     assert WORKLOAD_SLICE_LIMITS["rquant-research.slice"]["MemoryMax"] == "768M"
     assert WORKLOAD_SLICE_LIMITS["rquant-research.slice"]["CPUQuota"] == "100%"
     assert "MemoryHigh" not in WORKLOAD_SLICE_LIMITS["rquant-maintenance.slice"]
+
+
+def test_the_runtime_role_plane_is_a_child_slice_and_resident_services_stay_outside_it() -> None:
+    """#243 review M-1.
+
+    `CPUQuota=` on `rquant-live.slice` would have capped eleven resident production
+    services together with the fourteen runtime role templates that share the plane, and
+    a quota is a ceiling for the whole slice, not an ordering inside it: with every member
+    at the default `CPUWeight=100`, twenty busy roles would have left `rquant-monitor` and
+    `rquant-alert@` 60/21 = 2.9% of a core each. The quota therefore lives on a child
+    slice that holds only the roles.
+    """
+
+    from rquant.workload_isolation import (
+        WORKLOAD_SLICE_LIMITS,
+        WORKLOAD_UNIT_SLICES,
+        verify_workload_unit_declarations,
+    )
+
+    runtime_plane = "rquant-live-runtime.slice"
+    roles = {
+        unit for unit, slice_name in WORKLOAD_UNIT_SLICES.items() if slice_name == runtime_plane
+    }
+    residents = {
+        unit
+        for unit, slice_name in WORKLOAD_UNIT_SLICES.items()
+        if slice_name == "rquant-live.slice"
+    }
+
+    assert len(roles) == 14
+    assert all(unit.startswith("rquant-runtime-") for unit in roles)
+    assert len(residents) == 11
+    assert not any(unit.startswith("rquant-runtime-") for unit in residents)
+    assert {"rquant-monitor.service", "rquant-daily.service", "rquant-alert@.service"} <= residents
+
+    for unit in roles:
+        content = (SYSTEMD / unit).read_text(encoding="utf-8")
+        assert f"Slice={runtime_plane}\n" in content, unit
+    for unit in residents:
+        content = (SYSTEMD / unit).read_text(encoding="utf-8")
+        assert "Slice=rquant-live.slice\n" in content, unit
+
+    # The ceiling is on the roles; the plane the resident services share has none.
+    assert WORKLOAD_SLICE_LIMITS[runtime_plane]["CPUQuota"] == "60%"
+    assert "CPUQuota" not in WORKLOAD_SLICE_LIMITS["rquant-live.slice"]
+    # And the checked-in declarations still satisfy the static verifier with the new slice.
+    assert verify_workload_unit_declarations(SYSTEMD).status == "warn"
 
 
 def test_static_contract_rejects_a_live_hard_cap(tmp_path: Path) -> None:
@@ -429,6 +477,13 @@ def test_missing_or_stale_high_water_is_warn_relaxed_and_fail_strict(tmp_path: P
     assert "stale" in stale_result.summary
 
 
+def _systemd_slice_cgroup(name: str) -> str:
+    """The cgroup path systemd derives from a slice name (dashes are the hierarchy)."""
+
+    parts = name.removesuffix(".slice").split("-")
+    return "/" + "/".join("-".join(parts[: depth + 1]) + ".slice" for depth in range(len(parts)))
+
+
 def _write_slice_cgroup(
     cgroup_root: Path,
     control_group: str,
@@ -470,8 +525,8 @@ def test_runtime_enumerates_instances_and_uses_resolved_control_groups(
     cgroup_root.mkdir()
     (cgroup_root / "cgroup.controllers").write_text("cpu io memory pids\n", encoding="utf-8")
     control_groups = {
-        "rquant.slice": "/rquant.slice",
-        **{name: f"/rquant.slice/{name}" for name in WORKLOAD_SLICE_LIMITS},
+        name: _systemd_slice_cgroup(name)
+        for name in ("rquant.slice", *WORKLOAD_SLICE_LIMITS)
     }
     _write_slice_cgroup(cgroup_root, control_groups["rquant.slice"], dict(PARENT_SLICE_LIMITS))
     for slice_name, limits in WORKLOAD_SLICE_LIMITS.items():
@@ -483,8 +538,9 @@ def test_runtime_enumerates_instances_and_uses_resolved_control_groups(
             "/rquant.slice/rquant-live.slice/rquant-monitor.service",
         ),
         "rquant-runtime-feature@svc-live.service": (
-            "rquant-live.slice",
-            "/rquant.slice/rquant-live.slice/rquant-runtime-feature@svc-live.service",
+            "rquant-live-runtime.slice",
+            "/rquant.slice/rquant-live.slice/rquant-live-runtime.slice"
+            "/rquant-runtime-feature@svc-live.service",
         ),
         "rquant-runtime-lab-jobs@svc-lab.service": (
             "rquant-research.slice",

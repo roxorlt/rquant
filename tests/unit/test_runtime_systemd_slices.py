@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "deploy" / "systemd"
-SLICE_NAMES = ("live", "serving", "research", "maintenance")
+SLICE_NAMES = ("live", "live-runtime", "serving", "research", "maintenance")
 
 
 def _load_slice(name: str) -> configparser.ConfigParser:
@@ -90,12 +90,14 @@ def test_plane_priority_descends_from_live_to_serving_to_background() -> None:
         > int(research["IOWeight"])
         > int(maintenance["IOWeight"])
     )
-    # The two planes that can run at the same time as a maintenance job together
-    # hold at most one of the host's two cores. Research is quota'd separately at
-    # exactly one core and is mutually exclusive with maintenance through the
-    # arbiter, so it never overlaps a backup. Maintenance itself stays unquoted:
-    # a bounded batch job should be able to use whatever the caps leave behind.
-    assert _percent(live["CPUQuota"]) + _percent(serving["CPUQuota"]) <= 100
+    # The quota that caps the runtime work planes sits on rquant-live-runtime.slice,
+    # never on rquant-live.slice itself: eleven resident production services share the
+    # live plane, and a quota there would be split evenly with the roles instead of
+    # giving the resident services priority (#243 review M-1).
+    live_runtime = _load_slice("live-runtime")["Slice"]
+    assert "CPUQuota" not in live
+    assert _percent(live_runtime["CPUQuota"]) + _percent(serving["CPUQuota"]) <= 100
+    assert int(live_runtime["CPUWeight"]) < int(live["CPUWeight"])
     assert "CPUQuota" not in maintenance
     assert "MemoryLow" in live
     assert _memory_bytes(live["MemoryLow"]) > 0
