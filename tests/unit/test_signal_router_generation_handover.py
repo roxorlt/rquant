@@ -387,3 +387,56 @@ def test_the_old_generations_receipts_are_archived_not_dropped(tmp_path: Path) -
     assert bus.route_cursor("strategy/growth").last_sequence == 0
     assert archived_source["generation_id"] == "1" * 64
     assert archived_source["last_sequence"] == 2
+
+
+def test_the_ledger_keeps_two_archived_generations_and_prunes_the_third(
+    tmp_path: Path,
+) -> None:
+    """The retention role has no write path into `live/`, so the rotation bounds itself."""
+
+    commits = ["1" * 40, "4" * 40, "5" * 40, "6" * 40]
+    specs = [_spec(producer_commit=commit).spec_fingerprint for commit in commits]
+    generations = ["a" * 64, "b" * 64, "c" * 64]
+    path = tmp_path / "signal_bus.sqlite3"
+
+    bus = SignalBusStore(path)
+    bus.bind_route_source(
+        _descriptor(generation="0" * 64, spec_fingerprint=specs[0]),
+        routing_policy_fingerprint=ROUTING_POLICY,
+        observed_at=NOW,
+    )
+    for index, generation in enumerate(generations):
+        rotating = SignalBusStore(
+            path,
+            previous_generation_of_strategy_spec={specs[index]: generation},
+        )
+        rotating.bind_route_source(
+            _descriptor(
+                generation=str(index + 1) * 64,
+                spec_fingerprint=specs[index + 1],
+            ),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW,
+        )
+
+    rotations = bus.route_source_rotations("strategy/growth")
+    assert [item.previous_generation_id for item in rotations] == generations
+    #: every rotation is still on the record; only the oldest archived ledger is gone
+    assert [item.archived_source_pruned for item in rotations] == [True, False, False]
+
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.row_factory = sqlite3.Row
+    try:
+        remaining = {
+            str(row["source_id"])
+            for row in reader.execute(
+                "SELECT source_id FROM signal_route_source"
+            ).fetchall()
+        }
+    finally:
+        reader.close()
+    assert remaining == {
+        "strategy/growth",
+        f"strategy/growth#rotated-{'1' * 64}",
+        f"strategy/growth#rotated-{'2' * 64}",
+    }

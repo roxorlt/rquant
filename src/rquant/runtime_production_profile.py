@@ -313,6 +313,10 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
                 raise ValueError(f"production strategy {attribute} values must be unique")
         immutable_inputs = (
             self.operational_database_path,
+            # The installer refuses a `database_path` inside the runtime root on its own
+            # side; this is the same refusal one layer earlier, so a replica pointed at a
+            # runtime-owned path never reaches it (review SF-5).
+            self.readonly_replica_database_path,
             self.definition_registry_root,
             self.n_shape_candidate_input_path,
             self.growth_board_candidate_input_path,

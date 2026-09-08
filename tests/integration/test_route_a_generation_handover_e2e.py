@@ -322,6 +322,9 @@ def test_every_candidate_publisher_rebinds_its_authority(
     for instance in instance_of(route, CANDIDATE_ROLE):
         run = run_role(route, CANDIDATE_ROLE, instance=instance)
         assert run.entered, f"{instance}: {run.refusal!r}\n{run.traceback}"
+        #: the rebind builds a whole subtree under the candidate root, which is exactly
+        #: what package L's out-of-sandbox guard is there to catch (review SF-4)
+        assert run.violations == []
         assert "bound to a different identity" not in (run.last_error or "")
 
     for service_id, entry in state["candidates"].items():

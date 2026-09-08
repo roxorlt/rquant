@@ -84,6 +84,15 @@ class RouteDecisionKind(StrEnum):
     NO_TARGET = "no_target"
 
 
+#: How many generations' archived route ledgers one source keeps. The live source row is
+#: not one of them, so the two previous generations' receipts stay queryable and the third
+#: is pruned by the rotation that creates the fourth (#248). The signals themselves are
+#: never touched -- `signal_envelope` and `delivery_outbox` hang off `signal_id`, not off
+#: the source -- so what a prune removes is the older routing receipts, and the rotation
+#: row stays behind to say it happened.
+ARCHIVED_GENERATIONS_KEPT = 2
+
+
 class SignalRouteSourceRotation(RuntimeContractModel):
     """One generation handover the route ledger carried for a strategy source (#248)."""
 
@@ -94,6 +103,8 @@ class SignalRouteSourceRotation(RuntimeContractModel):
     archived_source_id: str = Field(min_length=1)
     routed_through_sequence: int = Field(ge=0)
     abandoned_sequences: int = Field(ge=0)
+    #: whether the archived source row and its receipts have since been pruned
+    archived_source_pruned: bool = False
 
     @property
     def event(self) -> str:
@@ -666,6 +677,8 @@ class SignalBusStore:
                     routed_through_sequence INTEGER NOT NULL CHECK(routed_through_sequence >= 0),
                     abandoned_sequences INTEGER NOT NULL CHECK(abandoned_sequences >= 0),
                     rotated_at TEXT NOT NULL,
+                    archived_source_pruned INTEGER NOT NULL DEFAULT 0
+                        CHECK(archived_source_pruned IN (0, 1)),
                     PRIMARY KEY(source_id, previous_source_generation_id)
                 );
                 """
@@ -1411,6 +1424,7 @@ class SignalBusStore:
                 now_text,
             ),
         )
+        self._prune_rotated_sources(connection, descriptor.source_id)
         self._before_commit(connection)
         rotated = connection.execute(
             "SELECT * FROM signal_route_source WHERE source_id = ?",
@@ -1419,6 +1433,44 @@ class SignalBusStore:
         if rotated is None:  # pragma: no cover - the insert above just wrote it
             raise SignalRouteConflictError("rotated route source is unavailable")
         return rotated
+
+    @staticmethod
+    def _prune_rotated_sources(connection: sqlite3.Connection, source_id: str) -> None:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archived ledgers for one source.
+
+        Nothing else prunes them: the retention role's unit grants it no path into
+        `live/`, so a ledger that is not bounded here grows one archived source row plus
+        all its receipts per release, forever. What goes is the *routing receipt* of a
+        generation older than the last two; the signal envelopes and everything in the
+        delivery outbox are keyed by `signal_id` and are not touched.
+        """
+
+        rows = connection.execute(
+            """
+            SELECT previous_source_generation_id, archived_source_id
+            FROM signal_route_source_rotation
+            WHERE source_id = ? AND archived_source_pruned = 0
+            ORDER BY rotated_at DESC, previous_source_generation_id DESC
+            """,
+            (source_id,),
+        ).fetchall()
+        for row in rows[ARCHIVED_GENERATIONS_KEPT:]:
+            archived_source_id = str(row["archived_source_id"])
+            connection.execute(
+                "DELETE FROM signal_route_receipt WHERE source_id = ?",
+                (archived_source_id,),
+            )
+            connection.execute(
+                "DELETE FROM signal_route_source WHERE source_id = ?",
+                (archived_source_id,),
+            )
+            connection.execute(
+                """
+                UPDATE signal_route_source_rotation SET archived_source_pruned = 1
+                WHERE source_id = ? AND previous_source_generation_id = ?
+                """,
+                (source_id, str(row["previous_source_generation_id"])),
+            )
 
     def route_source_rotations(self, source_id: str) -> tuple[SignalRouteSourceRotation, ...]:
         """Every generation handover this ledger has carried for one source."""
@@ -1442,6 +1494,7 @@ class SignalBusStore:
                 archived_source_id=str(row["archived_source_id"]),
                 routed_through_sequence=int(row["routed_through_sequence"]),
                 abandoned_sequences=int(row["abandoned_sequences"]),
+                archived_source_pruned=bool(row["archived_source_pruned"]),
             )
             for row in rows
         )

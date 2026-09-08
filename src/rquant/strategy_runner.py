@@ -8,6 +8,7 @@ import math
 import re
 import secrets
 import sqlite3
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -896,6 +897,8 @@ class RunnerIdentityRotation:
     previous_strategy_spec_fingerprint: str
     previous_evaluator_contract_fingerprint: str
     archived_path: Path
+    #: archives this rotation removed because they were older than the two it keeps
+    pruned_archives: tuple[str, ...] = ()
 
     @property
     def event(self) -> str:
@@ -904,6 +907,14 @@ class RunnerIdentityRotation:
 
 #: `(persisted spec fingerprint, persisted evaluator fingerprint) -> previous generation id`
 PreviousGenerationOfIdentity = Callable[[str, str], str | None]
+
+#: How many archived runner databases one strategy directory keeps. The live database is
+#: not one of them, so the two previous generations stay recoverable and the third is
+#: removed by the rotation that creates the fourth (#248). Nothing else removes them:
+#: `rquant-artifact-retention` has no write path into `live/` at all.
+ARCHIVED_GENERATIONS_KEPT = 2
+
+_RUNNER_ARCHIVE = re.compile(r"\.([0-9a-f]{64})\.archived$")
 
 
 class StrategyRunnerStore:
@@ -1052,7 +1063,38 @@ class StrategyRunnerStore:
             previous_strategy_spec_fingerprint=spec_fingerprint,
             previous_evaluator_contract_fingerprint=evaluator_fingerprint,
             archived_path=archived,
+            pruned_archives=self._prune_archived_runners(),
         )
+
+    def _prune_archived_runners(self) -> tuple[str, ...]:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
+
+        Newest by mtime, which the rename that created each archive set once and nothing
+        touches afterwards. Only this role writes in this directory, so that ordering is
+        produced here rather than guessed at.
+        """
+
+        archives: list[tuple[int, Path]] = []
+        for item in self.path.parent.iterdir():
+            if not item.name.startswith(f"{self.path.name}."):
+                continue
+            if _RUNNER_ARCHIVE.search(item.name) is None:
+                continue
+            observed = item.lstat()
+            if not stat.S_ISREG(observed.st_mode):
+                continue
+            archives.append((observed.st_mtime_ns, item))
+        if len(archives) <= ARCHIVED_GENERATIONS_KEPT:
+            return ()
+        archives.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+        pruned: list[str] = []
+        for _, path in archives[ARCHIVED_GENERATIONS_KEPT:]:
+            for suffix in ("", *self._SQLITE_SIDECARS):
+                sidecar = path.with_name(f"{path.name}{suffix}")
+                if sidecar.exists() and not sidecar.is_symlink():
+                    sidecar.unlink()
+            pruned.append(path.name)
+        return tuple(sorted(pruned))
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

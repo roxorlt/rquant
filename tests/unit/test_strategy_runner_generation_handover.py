@@ -195,3 +195,42 @@ def test_an_archive_that_already_exists_is_not_overwritten(tmp_path: Path) -> No
             ),
         )
     assert (path.parent / f"runner.sqlite3.{'f' * 64}.archived").read_bytes() == b"earlier archive"
+
+
+def test_a_strategy_directory_keeps_two_archives_and_prunes_the_third(
+    tmp_path: Path,
+) -> None:
+    """`rquant-artifact-retention` cannot reach `live/`, so the rotation bounds itself."""
+
+    path = tmp_path / "runner.sqlite3"
+    commits = ["1" * 40, "4" * 40, "5" * 40, "6" * 40]
+    generations = ["a" * 64, "b" * 64, "c" * 64]
+    pruned_by: list[tuple[str, ...]] = []
+
+    _write_previous_runner(path, commit=commits[0], evaluator=PREVIOUS_EVALUATOR)
+    for index, generation in enumerate(generations):
+        previous = _spec(producer_commit=commits[index]).spec_fingerprint
+        store = StrategyRunnerStore(
+            path,
+            spec=_spec(producer_commit=commits[index + 1]),
+            evaluator_contract_fingerprint=PREVIOUS_EVALUATOR,
+            previous_generation_of_identity=_previous_generation(
+                {(previous, PREVIOUS_EVALUATOR): generation}
+            ),
+        )
+        assert store.identity_rotation is not None, generation
+        pruned_by.append(store.identity_rotation.pruned_archives)
+
+    archived = sorted(
+        item.name for item in path.parent.iterdir() if item.name.endswith(".archived")
+    )
+    assert archived == [
+        f"runner.sqlite3.{generations[1]}.archived",
+        f"runner.sqlite3.{generations[2]}.archived",
+    ]
+    #: the sidecars of the pruned archive go with it, not after it
+    assert not any(
+        item.name.startswith(f"runner.sqlite3.{generations[0]}.archived")
+        for item in path.parent.iterdir()
+    )
+    assert pruned_by == [(), (), (f"runner.sqlite3.{generations[0]}.archived",)]

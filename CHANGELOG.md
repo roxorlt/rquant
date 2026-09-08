@@ -152,6 +152,11 @@
 ### Fixed
 
 - **换代之后不再需要人工把任何状态挪到一边（#248、#249）**：**这次发布之后，换代不需要移走任何状态**。
+  两件会改变盘上东西的事先说：**每个 role 最多保留 2 代归档，更旧的在下一次轮换时被删掉**
+  （策略的 `.archived` runner 库、路由台账里的 `#rotated-` 行与它的回执、候选根下的
+  `rotated-<代>/`）——`rquant-artifact-retention` 的 unit 根本没有写 `live/` 的路径，
+  不在轮换时自己收口就没有任何东西会收；**旧一代已产出但未路由的信号一律被放弃**
+  （条数记在 `abandoned_sequences` 与心跳上，信号本身与已排队的投递不受影响）。
   2026-09-09 第六窗口装 `20d948d1…` 覆盖 `3cf6160c…` 时，四份持久状态被新一代自己的 role 拒收，
   四种形状各有各的表现，窗口里全靠人手挪走：
   - **策略 runner 库**：`live/strategies/<svc>/runner.sqlite3` 里记着上一代的
@@ -175,6 +180,10 @@
     时候，由拥有者在自己的发布锁里重新绑定；旧绑定连同它下面已发布的 generation 一起归档进
     `rotated-<上一代>/`，**不做改标**——schema 规则要求 bound root 下每个 generation 携带该 root
     的 content hash，把新哈希盖到上一代的行上等于宣称新可执行体产出了它们。
+    归档先搬进 `rotated-<上一代>.partial/`（**根文档在前、generation 条目在后**，
+    因为 `authority.json` 一走根就是「未绑定」这个已知状态），最后用**一次 rename**
+    把它变成 `rotated-<上一代>/`；中途被杀会留下 `.partial`，**下次启动自己接着做完**，
+    不需要任何人工修复。
   - **换代残留心跳**：研究 role 在 #217 下立刻退出，留下带上一代 spec 指纹的 stopped 心跳，
     `RuntimeHealthAuthorityIntegrityError` 直接让**整份**健康载荷失败，serving 跟着降级。
     现在这类心跳被判为 superseded：心跳本身不进载荷，载荷里以 `superseded:<service>` 点名，

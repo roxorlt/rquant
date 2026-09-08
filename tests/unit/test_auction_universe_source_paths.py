@@ -141,3 +141,18 @@ def test_a_replica_path_named_rquant_duckdb_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="read-only replica"):
         ProductionRuntimeProfileInputs.model_validate(payload)
+
+
+def test_a_replica_inside_the_runtime_root_is_refused_at_the_input_layer(
+    tmp_path: Path,
+) -> None:
+    """Defense in depth: the installer refuses this too, one layer further in."""
+
+    from rquant.runtime_production_profile import ProductionRuntimeProfileInputs
+
+    inputs = _profile_inputs(tmp_path)
+    payload = inputs.model_dump(mode="python")
+    payload["readonly_replica_database_path"] = inputs.runtime_root / "rquant_ro.duckdb"
+
+    with pytest.raises(ValueError, match="outside the runtime owner root"):
+        ProductionRuntimeProfileInputs.model_validate(payload)

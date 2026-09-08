@@ -45,6 +45,17 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _MAX_GENERATIONS = 4_096
+
+#: `rotated-<generation>` while it is being published, `rotated-<generation>` once it is.
+_ROTATION_ARCHIVE = re.compile(r"^rotated-([0-9a-f]{64})$")
+_ROTATION_STAGING = re.compile(r"^rotated-([0-9a-f]{64})\.partial$")
+
+#: How many previous generations' archives one candidate root keeps. The current
+#: generation is not one of them, so two releases' worth of published candidates stay
+#: readable, and the third is pruned by the rotation that creates the fourth (#248).
+#: Nothing else on this host removes them: `rquant-artifact-retention` cannot reach
+#: `live/` at all, so if the owner does not bound this, nothing does.
+ARCHIVED_GENERATIONS_KEPT = 2
 _MAX_AUTHORITY_BYTES = 16 * 1024 * 1024
 _GENERATION_CACHE_MAX_ITEMS = 4
 _GENERATION_CACHE_MAX_BYTES = 32 * 1024 * 1024
@@ -801,6 +812,10 @@ class CandidateAuthorityRebind:
     previous_executable_fingerprint: str
     archive_root: Path
     archived_generations: int
+    #: archives this rotation removed because they were older than the two it keeps
+    pruned_archives: tuple[str, ...] = ()
+    #: whether this rotation finished one an earlier process had been killed in the middle of
+    resumed: bool = False
 
     @property
     def event(self) -> str:
@@ -993,7 +1008,13 @@ class StrategyCandidateSnapshotSpool:
             candidate_schema_fingerprint=candidate_schema_fingerprint,
             static_feature_schema=static_feature_schema,
         )
-        if not self.authority_path.exists():
+        # Not just "is there a binding to rotate": an interrupted rotation has already
+        # taken the binding away, and that is exactly the state that has to be finished.
+        interrupted = any(
+            _ROTATION_STAGING.fullmatch(item.name) is not None
+            for item in self.root.iterdir()
+        ) if self.root.is_dir() else False
+        if not self.authority_path.exists() and not interrupted:
             return None
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
@@ -1047,6 +1068,12 @@ class StrategyCandidateSnapshotSpool:
 
         if expected is None or self._previous_generation_of_binding is None:
             return
+        # An interrupted rotation is finished before anything else is looked at. The root
+        # it leaves behind is *unbound with generations still in it*, and every other path
+        # in this class refuses that shape -- so if this is not done here, first, the root
+        # needs a human, which is the one thing this package exists to remove.
+        if self._finish_interrupted_rotation(root_fd, generations_fd, expected=expected):
+            return
         if not self._entry_exists(root_fd, "authority.json"):
             return
         observed = self._read_authority_binding(root_fd)
@@ -1065,13 +1092,103 @@ class StrategyCandidateSnapshotSpool:
             raise StrategyCandidateSnapshotIntegrityError(
                 f"strategy candidate authority archive already exists: {archive_name}"
             )
-        os.mkdir(archive_name, _PRIVATE_DIRECTORY_MODE, dir_fd=root_fd)
-        archive_fd = self._open_child_directory(root_fd, archive_name)
+        staging_name = f"{archive_name}.partial"
+        os.mkdir(staging_name, _PRIVATE_DIRECTORY_MODE, dir_fd=root_fd)
+        self._publish_rotation(
+            root_fd,
+            generations_fd,
+            staging_name=staging_name,
+            archive_name=archive_name,
+            generation_id=generation_id,
+            previous=observed,
+            expected=expected,
+            resumed=False,
+        )
+
+    def _finish_interrupted_rotation(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        expected: StrategyCandidateAuthorityBinding,
+    ) -> bool:
+        """Carry a `rotated-<generation>.partial` the rest of the way, or report nothing to do.
+
+        Every move this class makes into a staging directory is idempotent -- each one is
+        guarded by "is it still in the root" -- so finishing is the same code as starting,
+        entered from wherever the kill happened.
+        """
+
+        staged: list[tuple[str, str]] = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                matched = _ROTATION_STAGING.fullmatch(entry.name)
+                if matched is not None:
+                    staged.append((entry.name, matched.group(1)))
+        if not staged:
+            return False
+        if len(staged) > 1:
+            # One exclusive lock, one rotation: two staging directories is not a crash,
+            # it is somebody else writing in here.
+            raise StrategyCandidateSnapshotIntegrityError(
+                "strategy candidate root holds more than one interrupted rotation"
+            )
+        staging_name, generation_id = staged[0]
+        self._publish_rotation(
+            root_fd,
+            generations_fd,
+            staging_name=staging_name,
+            archive_name=f"rotated-{generation_id}",
+            generation_id=generation_id,
+            previous=None,
+            expected=expected,
+            resumed=True,
+        )
+        return True
+
+    def _publish_rotation(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        staging_name: str,
+        archive_name: str,
+        generation_id: str,
+        previous: StrategyCandidateAuthorityBinding | None,
+        expected: StrategyCandidateAuthorityBinding,
+        resumed: bool,
+    ) -> None:
+        """Move the bound state into staging, then publish it with one rename.
+
+        Order matters and is the reverse of the obvious one: the three root documents go
+        first, `authority.json` first of all, because that single file is what makes the
+        root *bound*. Moving the generation entries first would leave a root whose index
+        names files that are no longer there -- a state nothing can read and nothing can
+        finish. Once the root is unbound, the leftover entries are just files, and the
+        `.partial` name says whose they are.
+
+        `rename(staging -> archive)` is the one step that means "this archive is whole".
+        Before it, a kill leaves `.partial` and the next start finishes the job; after it,
+        a kill leaves an unbound root with an empty `generations/`, which the publish path
+        already binds on its own.
+        """
+
+        if self._entry_exists(root_fd, archive_name):
+            raise StrategyCandidateSnapshotIntegrityError(
+                f"strategy candidate authority archive already exists: {archive_name}"
+            )
+        staging_fd = self._open_child_directory(root_fd, staging_name)
         try:
-            os.mkdir("generations", _PRIVATE_DIRECTORY_MODE, dir_fd=archive_fd)
-            archived_generations_fd = self._open_child_directory(archive_fd, "generations")
+            if not self._entry_exists(staging_fd, "generations"):
+                os.mkdir("generations", _PRIVATE_DIRECTORY_MODE, dir_fd=staging_fd)
+            staged_generations_fd = self._open_child_directory(staging_fd, "generations")
             try:
-                archived = 0
+                if previous is None and self._entry_exists(staging_fd, "authority.json"):
+                    previous = self._read_authority_binding(staging_fd)
+                for name in ("authority.json", "current.json", "generation-index.json"):
+                    if self._entry_exists(root_fd, name):
+                        os.rename(name, name, src_dir_fd=root_fd, dst_dir_fd=staging_fd)
+                os.fsync(root_fd)
                 with os.scandir(generations_fd) as entries:
                     names = sorted(entry.name for entry in entries)
                 for name in names:
@@ -1079,31 +1196,105 @@ class StrategyCandidateSnapshotSpool:
                         name,
                         name,
                         src_dir_fd=generations_fd,
-                        dst_dir_fd=archived_generations_fd,
+                        dst_dir_fd=staged_generations_fd,
                     )
-                    archived += 1
-                os.fsync(archived_generations_fd)
+                os.fsync(staged_generations_fd)
+                archived = len(
+                    [
+                        entry.name
+                        for entry in os.scandir(staged_generations_fd)  # noqa: PTH208
+                    ]
+                )
+                os.fsync(generations_fd)
             finally:
-                os.close(archived_generations_fd)
-            for name in ("authority.json", "generation-index.json", "current.json"):
-                if self._entry_exists(root_fd, name):
-                    os.rename(name, name, src_dir_fd=root_fd, dst_dir_fd=archive_fd)
-            os.fsync(archive_fd)
+                os.close(staged_generations_fd)
+            os.fsync(staging_fd)
         finally:
-            os.close(archive_fd)
-        os.fsync(generations_fd)
+            os.close(staging_fd)
+        if previous is None:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "interrupted rotation carries no previous authority binding"
+            )
+        os.rename(staging_name, archive_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
         # The new binding is created here, in the same locked section, so the root is
-        # never observably unbound: a publisher whose first iteration waits on its input
-        # would otherwise leave `authority.json` absent for as long as the wait lasts.
-        self._atomic_create_authority_binding(root_fd, self._authority_binding_bytes(expected))
+        # never observably unbound for longer than one rotation: a publisher whose first
+        # iteration waits on its input would otherwise leave `authority.json` absent for
+        # as long as the wait lasts.
+        if not self._entry_exists(root_fd, "authority.json"):
+            self._atomic_create_authority_binding(
+                root_fd,
+                self._authority_binding_bytes(expected),
+            )
+        pruned = self._prune_rotated_archives(root_fd)
         os.fsync(root_fd)
         self.authority_rebind = CandidateAuthorityRebind(
             previous_generation_id=generation_id,
-            previous_definition_fingerprint=str(observed.definition_fingerprint),
-            previous_executable_fingerprint=str(observed.executable_fingerprint),
+            previous_definition_fingerprint=str(previous.definition_fingerprint),
+            previous_executable_fingerprint=str(previous.executable_fingerprint),
             archive_root=self.root / archive_name,
             archived_generations=archived,
+            pruned_archives=pruned,
+            resumed=resumed,
         )
+
+    def _prune_rotated_archives(self, root_fd: int) -> tuple[str, ...]:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
+
+        Newest by the archive directory's own mtime, which this code sets exactly once --
+        at the `rename` that published it -- and never touches again. Nothing outside this
+        class writes in here, so that mtime is a real ordering, not a guess.
+        """
+
+        archives: list[tuple[int, str]] = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                if _ROTATION_ARCHIVE.fullmatch(entry.name) is None:
+                    continue
+                observed = os.stat(entry.name, dir_fd=root_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(observed.st_mode):
+                    raise StrategyCandidateSnapshotIntegrityError(
+                        "strategy candidate rotation archive is not a directory"
+                    )
+                archives.append((observed.st_mtime_ns, entry.name))
+        if len(archives) <= ARCHIVED_GENERATIONS_KEPT:
+            return ()
+        archives.sort(reverse=True)
+        pruned = tuple(sorted(name for _, name in archives[ARCHIVED_GENERATIONS_KEPT:]))
+        for name in pruned:
+            self._remove_rotated_archive(root_fd, name)
+        os.fsync(root_fd)
+        return pruned
+
+    @classmethod
+    def _remove_rotated_archive(cls, root_fd: int, name: str) -> None:
+        """Remove one archive, and only the exact shape this class puts in one."""
+
+        archive_fd = cls._open_child_directory(root_fd, name)
+        try:
+            if cls._entry_exists(archive_fd, "generations"):
+                generations_fd = cls._open_child_directory(archive_fd, "generations")
+                try:
+                    cls._unlink_regular_files(generations_fd)
+                finally:
+                    os.close(generations_fd)
+                os.rmdir("generations", dir_fd=archive_fd)
+            cls._unlink_regular_files(archive_fd)
+        finally:
+            os.close(archive_fd)
+        os.rmdir(name, dir_fd=root_fd)
+
+    @staticmethod
+    def _unlink_regular_files(parent_fd: int) -> None:
+        with os.scandir(parent_fd) as entries:
+            names = [entry.name for entry in entries]
+        for name in names:
+            observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy candidate rotation archive holds an unexpected entry"
+                )
+            os.unlink(name, dir_fd=parent_fd)
 
     def _publish_records_request(
         self,
