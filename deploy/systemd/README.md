@@ -48,10 +48,19 @@ live、serving、maintenance 或父级硬上限，因此父级/live/serving 只�
 | 边界 | CPU / IO | MemoryLow | MemoryHigh | MemoryMax |
 |---|---:|---:|---:|---:|
 | `rquant.slice` | 100 / 100 | 3072 MiB | 6144 MiB | 不设 |
-| live | 1000 / 1000 | 3072 MiB | 3840 MiB | 不设 |
-| serving | 500 / 500 | 0 | 512 MiB | 不设 |
+| live | 1000 / 1000，`CPUQuota=60%` | 3072 MiB | 3840 MiB | 不设 |
+| serving | 500 / 500，`CPUQuota=30%` | 0 | 512 MiB | 不设 |
 | research | 100 / 100，`CPUQuota=100%` | 0 | 512 MiB | 768 MiB |
-| maintenance | 50 / 50 | 0 | **待校准，不设** | 不设 |
+| maintenance | 300 / 50，不设 `CPUQuota` | 0 | **待校准，不设** | 不设 |
+
+CPU 一列的 quota 与 maintenance 权重是 #243 / owner 裁决 21（2026-09-08）加的。2 vCPU 主机
+上「能与备份同时运行」的两个面 live 60% + serving 30% = 90%，不超过一个核；research 仍是
+精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane 互斥，永远不会和备份重叠。
+maintenance 在 `rquant.slice` 内部的权重从 50 提到 300（全部可运行时的份额 3.0% → 15.8%），
+仍低于 live/serving，但备份不再被运行时工作面饿死。**内存一列没有跟着改**：live 面里住着
+`rquant-monitor.service`，实测 cgroup peak 2814 MiB，`MemoryLow` 又是 3072 MiB，任何低于
+3838 MiB 的 live `MemoryHigh` 都会先掐监控自己（详见 `verify_workload_memory_admission` 里
+「live 至少高出 monitor peak 1024 MiB」这条 fail-closed 断言）。
 
 `MemoryHigh` 不是 reservation，不能用它证明 backup/replica 并发安全。正常 research 运行态的
 静态上界为 live 3840 + serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB，

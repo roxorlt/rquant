@@ -74,11 +74,15 @@ def test_plane_priority_descends_from_live_to_serving_to_background() -> None:
     research = _load_slice("research")["Slice"]
     maintenance = _load_slice("maintenance")["Slice"]
 
+    # CPU weights: maintenance sits above research since #243. A 10 GB snapshot
+    # took 8m16s-8m50s and twice missed its 10min timeout at CPUWeight=50, which
+    # is 3.0% of the parent's runnable share; it is 15.8% at 300, still behind
+    # the two planes that serve the market.
     assert (
         int(live["CPUWeight"])
         > int(serving["CPUWeight"])
-        > int(research["CPUWeight"])
         > int(maintenance["CPUWeight"])
+        > int(research["CPUWeight"])
     )
     assert (
         int(live["IOWeight"])
@@ -86,8 +90,13 @@ def test_plane_priority_descends_from_live_to_serving_to_background() -> None:
         > int(research["IOWeight"])
         > int(maintenance["IOWeight"])
     )
-    assert "CPUQuota" not in live
-    assert "CPUQuota" not in serving
+    # The two planes that can run at the same time as a maintenance job together
+    # hold at most one of the host's two cores. Research is quota'd separately at
+    # exactly one core and is mutually exclusive with maintenance through the
+    # arbiter, so it never overlaps a backup. Maintenance itself stays unquoted:
+    # a bounded batch job should be able to use whatever the caps leave behind.
+    assert _percent(live["CPUQuota"]) + _percent(serving["CPUQuota"]) <= 100
+    assert "CPUQuota" not in maintenance
     assert "MemoryLow" in live
     assert _memory_bytes(live["MemoryLow"]) > 0
     assert "MemoryLow" not in serving

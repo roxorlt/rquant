@@ -67,6 +67,7 @@ PARENT_SLICE_LIMITS: Mapping[str, str] = {
 WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
     "rquant-live.slice": {
         "CPUWeight": "1000",
+        "CPUQuota": "60%",
         "IOWeight": "1000",
         "MemoryLow": "3072M",
         "MemoryHigh": "3840M",
@@ -74,6 +75,7 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
     },
     "rquant-serving.slice": {
         "CPUWeight": "500",
+        "CPUQuota": "30%",
         "IOWeight": "500",
         "MemoryHigh": "512M",
         "TasksMax": "256",
@@ -87,7 +89,7 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
         "TasksMax": "128",
     },
     "rquant-maintenance.slice": {
-        "CPUWeight": "50",
+        "CPUWeight": "300",
         "IOWeight": "50",
         "TasksMax": "128",
     },

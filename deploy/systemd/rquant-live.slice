@@ -4,6 +4,11 @@ Description=rQuant Live Workload Plane
 [Slice]
 CPUAccounting=true
 CPUWeight=1000
+# 2 vCPU 主机上给运行时工作面留一个核：live 60% + serving 30% = 90% ≤ 100%（#243，
+# owner 裁决 21，2026-09-08）。8 个基线 runtime role 空转各 3–5%（合计约 40%），再留
+# 约 20% 给 monitor / daily 的突发；20 个 role 全开（约 100%）会被这条限流，这正是
+# 目的——role 是空转循环，可以被限，常驻备份不能被饿死。
+CPUQuota=60%
 IOAccounting=true
 IOWeight=1000
 MemoryAccounting=true
