@@ -566,6 +566,15 @@ class _ReadonlyPageControlAuditReader:
         try:
             after = os.lstat(self.path)
             bound_after = os.fstat(descriptor)
+            if _file_identity(after) != _file_identity(before):
+                #: The generation rotated under us. Say so from the identity comparison
+                #: rather than from the re-open below: on Linux `/proc/self/fd/<n>` re-opens
+                #: through the descriptor's *name*, and once that name has been replaced the
+                #: re-open is `ENOENT` -- fail-closed either way, but with wording about
+                #: opening a file rather than about the generation that moved.
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl audit generation changed or entered in-flight state"
+                )
             with self._connect(bound_path) as current:
                 inflight = current.execute(
                     """
@@ -584,6 +593,8 @@ class _ReadonlyPageControlAuditReader:
                 integrity_error = PageProjectionSourceIntegrityError(
                     "PageControl audit generation changed or entered in-flight state"
                 )
+        except PageProjectionSourceIntegrityError as exc:
+            integrity_error = exc
         except (OSError, sqlite3.Error) as exc:
             integrity_error = PageProjectionSourceIntegrityError(
                 f"PageControl audit generation cannot be revalidated: {exc}"
