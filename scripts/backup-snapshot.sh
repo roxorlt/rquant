@@ -31,6 +31,77 @@ mkdir -p "${BACKUP_DIR}" "$(dirname -- "${LOG}")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG}"; }
 cleanup() { rm -f "${TMP_DB}" "${TMP_DB}.wal" "${TMP_GZ}" "${TMP_JSON}"; }
+# 被信号打断时先删私有代际再写日志：备份跑在 rquant-workload-arbiter 下，arbiter 在转发
+# SIGTERM 后 5s 就 SIGKILL 整个子进程组（--preempt-grace-seconds 默认 5.0），清理预算只有
+# 那 5 秒。EXIT trap 在 bash 收到 SIGTERM 时其实也会跑（Linux bash 5.2 实测），但那依赖
+# bash 的致命信号实现细节；显式 handler 让退出码是确定的 128+signum，并留下一条日志。
+on_signal() {
+    local name=$1
+    local number=$2
+    trap - EXIT INT TERM HUP ERR
+    cleanup
+    log "ABORT: SIG${name} received; removed this run's private generation"
+    exit $(( 128 + number ))
+}
+# SIGKILL（超时后的强杀、OOM、主机重启）没有 trap 可言，只能靠下面的开机清扫兜底。
+sweep_stale_generations() {
+    # 只扫本脚本自己的临时命名（.latest.duckdb.<pid>[.wal|.gz]、.latest.json.<pid>），
+    # 且只删 mtime 超过 1 天的；latest.duckdb.gz / latest.json 与 v*-preview-* 不在模式内。
+    local swept
+    swept=$(
+        find "${BACKUP_DIR}" -maxdepth 1 -type f -mtime +0 \
+            \( -name '.latest.duckdb.*' -o -name '.latest.json.*' \) \
+            -print -delete 2>/dev/null | wc -l | tr -d ' '
+    ) || swept=0
+    if [[ "${swept}" != "0" ]]; then
+        log "swept ${swept} stale temporary file(s) left by an earlier killed run"
+    fi
+}
+# 低优先级前缀：cp/gzip 是常驻服务之外的批处理，不该跟盘中 monitor 抢 CPU/IO。
+# 注意 cgroup v2 下跨 slice 的调度由 CPUWeight 决定，nice 只在同一 cgroup 内生效；
+# 这是不花钱的兜底，真正的闸门是 deploy/systemd/rquant-*.slice 里的 CPUQuota/CPUWeight。
+#
+# ionice 的类别要看磁盘调度器（#243 评审 S-3）：
+#   - **BFQ** 会真的兑现 idle 类（`-c3`）= 只在磁盘空闲时才给 IO。10 GB 的 cp 正是
+#     IO 密集段，idle 类会把它拖慢，与「放宽超时让备份跑完」的方向相反 ⇒ 用
+#     best-effort 最低优先级 `-c2 -n7`：仍然让路给盘中服务，但不会被无限期饿着。
+#   - **none / mq-deadline / kyber**（云主机 virtio 的常见默认）根本不看 ionice 类别，
+#     `-c3` 与 `-c2 -n7` 效果相同。
+# `auto` 读 /sys/block/*/queue/scheduler 自己判；装机时可以先跑
+# `cat /sys/block/vda/queue/scheduler` 核对，必要时用 RQUANT_BACKUP_IONICE 显式覆盖。
+IONICE_MODE="${RQUANT_BACKUP_IONICE:-auto}"
+case "${IONICE_MODE}" in
+    auto|idle|best-effort|none) ;;
+    *)
+        log "ERROR: RQUANT_BACKUP_IONICE must be auto, idle, best-effort, or none"
+        exit 2
+        ;;
+esac
+NICE_BIN="$(command -v nice || true)"
+IONICE_BIN="$(command -v ionice || true)"
+IONICE_ARGS=()
+if [[ -n "${IONICE_BIN}" && "${IONICE_MODE}" != "none" ]]; then
+    if [[ "${IONICE_MODE}" == "auto" ]]; then
+        if grep -q '\[bfq\]' /sys/block/*/queue/scheduler 2>/dev/null; then
+            IONICE_MODE=best-effort
+        else
+            IONICE_MODE=idle
+        fi
+    fi
+    case "${IONICE_MODE}" in
+        idle) IONICE_ARGS=(-c3) ;;
+        best-effort) IONICE_ARGS=(-c2 -n7) ;;
+    esac
+fi
+low_priority() {
+    if [[ -n "${NICE_BIN}" && ${#IONICE_ARGS[@]} -gt 0 ]]; then
+        "${NICE_BIN}" -n 19 "${IONICE_BIN}" "${IONICE_ARGS[@]}" "$@"
+    elif [[ -n "${NICE_BIN}" ]]; then
+        "${NICE_BIN}" -n 19 "$@"
+    else
+        "$@"
+    fi
+}
 on_error() {
     local rc=$?
     trap - ERR
@@ -54,7 +125,12 @@ generation_mtime() {
 }
 
 trap cleanup EXIT
+trap 'on_signal INT 2' INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1' HUP
 trap on_error ERR
+
+sweep_stale_generations
 
 case "${SOURCE_MODE}" in
     main) SOURCE_FILE="${MAIN_FILE}" ;;
@@ -135,9 +211,9 @@ fi
 # Scheduled backups read the independently verified replica. If its WAL exists,
 # copy the pair and consolidate it only in the private temporary generation.
 if [[ "${SOURCE_MODE}" == "replica" ]]; then
-    cp -- "${SOURCE_FILE}" "${TMP_DB}"
+    low_priority cp -- "${SOURCE_FILE}" "${TMP_DB}"
     if [[ -f "${SOURCE_FILE}.wal" ]]; then
-        cp -- "${SOURCE_FILE}.wal" "${TMP_DB}.wal"
+        low_priority cp -- "${SOURCE_FILE}.wal" "${TMP_DB}.wal"
     fi
 fi
 chmod u+w "${TMP_DB}"
@@ -169,8 +245,8 @@ PY
 )
 
 src_size=$(file_size "${TMP_DB}")
-gzip -c -- "${TMP_DB}" > "${TMP_GZ}"
-gzip -t -- "${TMP_GZ}"
+low_priority gzip -c -- "${TMP_DB}" > "${TMP_GZ}"
+low_priority gzip -t -- "${TMP_GZ}"
 gz_size=$(file_size "${TMP_GZ}")
 snapshot_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 

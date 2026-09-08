@@ -63,7 +63,8 @@ def test_run_all_checks_passes_receipt_bound_quote_advisory_to_real_workload_pro
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "LoadState=loaded\nActiveState=failed\nSlice=rquant-live.slice\nControlGroup=\n"
+                    "LoadState=loaded\nActiveState=failed\n"
+                    "Slice=rquant-live-runtime.slice\nControlGroup=\n"
                 ),
                 stderr="",
             )

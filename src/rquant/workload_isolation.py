@@ -72,8 +72,19 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
         "MemoryHigh": "3840M",
         "TasksMax": "512",
     },
+    # The runtime role plane. It is a child of rquant-live.slice so the eleven resident
+    # production services in the live plane keep their own share: the quota caps the roles
+    # collectively instead of capping the plane they share with monitor/daily/alert@.
+    "rquant-live-runtime.slice": {
+        "CPUWeight": "100",
+        "CPUQuota": "60%",
+        "IOWeight": "100",
+        "MemoryHigh": "1536M",
+        "TasksMax": "256",
+    },
     "rquant-serving.slice": {
         "CPUWeight": "500",
+        "CPUQuota": "30%",
         "IOWeight": "500",
         "MemoryHigh": "512M",
         "TasksMax": "256",
@@ -87,7 +98,7 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
         "TasksMax": "128",
     },
     "rquant-maintenance.slice": {
-        "CPUWeight": "50",
+        "CPUWeight": "300",
         "IOWeight": "50",
         "TasksMax": "128",
     },
@@ -149,28 +160,28 @@ WORKLOAD_UNIT_SLICES: Mapping[str, str] = {
     "rquant-research-ingest.service": "rquant-research.slice",
     "rquant-resource-authority.service": _SYSTEM_SLICE,
     "rquant-runtime-artifact-catalog@.service": "rquant-research.slice",
-    "rquant-runtime-auction-match@.service": "rquant-live.slice",
-    "rquant-runtime-auction-universe@.service": "rquant-live.slice",
-    "rquant-runtime-candidate@.service": "rquant-live.slice",
-    "rquant-runtime-daily-close@.service": "rquant-live.slice",
+    "rquant-runtime-auction-match@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-auction-universe@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-candidate@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-daily-close@.service": "rquant-live-runtime.slice",
     "rquant-runtime-daily-orchestrator@.service": "rquant-research.slice",
-    "rquant-runtime-feature@.service": "rquant-live.slice",
+    "rquant-runtime-feature@.service": "rquant-live-runtime.slice",
     "rquant-runtime-lab-jobs@.service": "rquant-research.slice",
-    "rquant-runtime-market-minute@.service": "rquant-live.slice",
-    "rquant-runtime-notifier@.service": "rquant-live.slice",
-    "rquant-runtime-paper-broker@.service": "rquant-live.slice",
-    "rquant-runtime-paper-constraint@.service": "rquant-live.slice",
+    "rquant-runtime-market-minute@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-notifier@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-paper-broker@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-paper-constraint@.service": "rquant-live-runtime.slice",
     "rquant-runtime-promotions@.service": "rquant-research.slice",
     "rquant-runtime-recovery-rehearsal@.service": "rquant-research.slice",
     "rquant-runtime-recovery@.service": "rquant-research.slice",
-    "rquant-runtime-reference-slow-publisher@.service": "rquant-live.slice",
-    "rquant-runtime-reference-slow-source@.service": "rquant-live.slice",
+    "rquant-runtime-reference-slow-publisher@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-reference-slow-source@.service": "rquant-live-runtime.slice",
     "rquant-runtime-runtime-health@.service": "rquant-serving.slice",
     "rquant-runtime-serving@.service": "rquant-serving.slice",
     "rquant-runtime-shadow@.service": "rquant-research.slice",
-    "rquant-runtime-signal-router@.service": "rquant-live.slice",
-    "rquant-runtime-strategy@.service": "rquant-live.slice",
-    "rquant-runtime-watchlist-quote@.service": "rquant-live.slice",
+    "rquant-runtime-signal-router@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-strategy@.service": "rquant-live-runtime.slice",
+    "rquant-runtime-watchlist-quote@.service": "rquant-live-runtime.slice",
     "rquant-surge-watch.service": "rquant-live.slice",
     "rquant-tushare-token-reminder.service": "rquant-live.slice",
     "rquant-workload-sample.service": "rquant-serving.slice",
@@ -748,9 +759,14 @@ def check_workload_runtime(
         if properties.get("LoadState") != "loaded":
             record_unit_issue(unit, f"LoadState={properties.get('LoadState')!r}")
         if properties.get("Slice") != expected_slice:
+            # `Slice=` is fixed when the unit starts, so a unit file that moved a service
+            # into another slice only takes effect on the next start. Name the remedy:
+            # this is the one failure an operator resolves by restarting the unit, and the
+            # check stays fail-closed while any instance is still in the old slice (#243).
             record_unit_issue(
                 unit,
-                f"Slice={properties.get('Slice')!r}, expected {expected_slice!r}",
+                f"Slice={properties.get('Slice')!r}, expected {expected_slice!r}; "
+                f"restart {unit} to move it into {expected_slice}",
             )
         resolved_exec = properties.get("ExecStart", "")
         if expected_slice in {"rquant-research.slice", "rquant-maintenance.slice"}:

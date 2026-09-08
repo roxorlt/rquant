@@ -310,7 +310,7 @@ def test_daily_close_source_is_a_dedicated_least_privilege_live_unit() -> None:
     parser.read_string(path.read_text(encoding="utf-8"))
     service = parser["Service"]
     assert service["Type"] == "simple"
-    assert service["Slice"] == "rquant-live.slice"
+    assert service["Slice"] == "rquant-live-runtime.slice"
     assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_close_source --instance %i")
     assert _granted_paths(service["ReadWritePaths"]) == {
         f"{CONTROL_ROOT}/daily-close-sources/%i",
@@ -329,7 +329,7 @@ def test_watchlist_quote_has_an_independent_least_privilege_live_unit() -> None:
     parser.read_string(path.read_text(encoding="utf-8"))
     service = parser["Service"]
 
-    assert service["Slice"] == "rquant-live.slice"
+    assert service["Slice"] == "rquant-live-runtime.slice"
     assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} watchlist_quote_source --instance %i")
     assert "LoadCredentialEncrypted" not in service
     assert _granted_paths(service["ReadWritePaths"]) == {
@@ -548,7 +548,15 @@ def test_runtime_template_runs_the_fixed_root_owned_wrapper(plane: str) -> None:
         if plane in DEDICATED_RESEARCH_TEMPLATES
         else plane
     )
-    assert service["Slice"] == f"rquant-{expected_plane}.slice"
+    # #243 review M-1: the live-plane role templates live in a child slice of
+    # rquant-live.slice, so the eleven resident production services that share the live
+    # plane (monitor, daily, alert@, ...) are not capped together with the roles.
+    expected_slice = (
+        "rquant-live-runtime.slice"
+        if expected_plane == "live"
+        else f"rquant-{expected_plane}.slice"
+    )
+    assert service["Slice"] == expected_slice
 
     command = service["ExecStart"]
     if plane in DEDICATED_RESEARCH_TEMPLATES:

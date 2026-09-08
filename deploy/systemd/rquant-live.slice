@@ -4,6 +4,12 @@ Description=rQuant Live Workload Plane
 [Slice]
 CPUAccounting=true
 CPUWeight=1000
+# 这个面里住着 11 个常驻生产服务（monitor / monitor-watchdog / daily / daily-report /
+# morning-pulse / midday-report / pre-market-check / kpl-snapshot / surge-watch /
+# alert@ / token-reminder），所以**本 slice 不设 CPUQuota**：quota 是整面封顶、面内平分，
+# 压在这里会把常驻服务和 role 一起限死（20 个 role 时每个成员只剩 60/21 = 2.9% 一核，
+# alert@ 的 TimeoutStartSec=30 会被击穿）。运行时 role 的闸门在子 slice
+# rquant-live-runtime.slice 上（#243 / owner 裁决 21，2026-09-08）。
 IOAccounting=true
 IOWeight=1000
 MemoryAccounting=true

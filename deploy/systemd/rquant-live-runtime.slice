@@ -1,0 +1,25 @@
+[Unit]
+Description=rQuant Live Runtime Role Plane
+
+[Slice]
+CPUAccounting=true
+# 与 live 面里每个常驻 unit 的默认权重相同（100）：14 个 role 模板合起来只算 live 内部的
+# 「一个同侪」，而不是 20 个。加上下面的 quota，monitor / daily / alert@ 不会被 role 数量稀释。
+CPUWeight=100
+# 裁决 21 要限的「运行时工作面」就是这些 role，闸门下沉到这个子 slice：
+# 2 vCPU = 200%，live-runtime 60% + serving 30% = 90% ≤ 一个核；8 个基线 role 空转
+# 各 3–5%（合计 24–40%）跑得开，20 个 role（60–100%）会被限流——这正是目的。
+# 限额压在 role 身上，live 面本身不设 quota，常驻服务因此保持优先。
+CPUQuota=60%
+IOAccounting=true
+IOWeight=100
+MemoryAccounting=true
+# 从 live 的 3840M 里切给 role 的份额，不是额外增加：monitor 实测 cgroup peak 2814 MiB，
+# 19 个 role 实测合计 2800 MiB（≈147 MiB/个），两者相加 5614 MiB 早已超出 live 的 3840M，
+# 也就是说今天回收压力会落到 monitor 头上。1536M 覆盖当前 8 个基线 role 的估算用量
+# （2800 − 11×147 ≈ 1183 MiB）并留约 30% 余量，同时把 20 role 状态（≈2950 MiB）压到一半，
+# 回收先打在 role 上。更严的取法是 1024M（3840 − 2814 = 1026，live 永不超顶），
+# 但那会让今天就在跑的基线 role 长期处于回收态，且本机 swap 已满，故未采用（见包 M 报告）。
+MemoryHigh=1536M
+TasksAccounting=true
+TasksMax=256

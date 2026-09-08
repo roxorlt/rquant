@@ -17,6 +17,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP_UNIT = ROOT / "deploy" / "systemd" / "rquant-backup.service"
+BACKUP_TIMER = ROOT / "deploy" / "systemd" / "rquant-backup.timer"
 
 
 def _project(tmp_path: Path) -> Path:
@@ -45,6 +46,27 @@ RQUANT_WORKLOAD_ARBITER_HELD=maintenance exec "$@"
     return project
 
 
+def _priority_shims(directory: Path) -> Path:
+    """`nice`/`ionice` stand-ins that record their own flags and exec the rest."""
+
+    shim_dir = directory / "priority-bin"
+    shim_dir.mkdir(exist_ok=True)
+    for name in ("nice", "ionice"):
+        shim = shim_dir / name
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "{name} %s\\n" "$*" >> "${{RQUANT_TEST_PRIORITY_LOG}}"\n'
+            'while [[ "${1:-}" == -* ]]; do\n'
+            '    if [[ "$1" == "-n" ]]; then shift 2; else shift; fi\n'
+            "done\n"
+            'exec "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+    return shim_dir
+
+
+
 def _write_db(path: Path, marker: str) -> None:
     conn = duckdb.connect(str(path))
     conn.execute("CREATE TABLE marker (value VARCHAR)")
@@ -66,6 +88,8 @@ def _run(
     recovery_profile_generation: str | None = None,
     recovery_signer_key_id: str | None = None,
     runtime_root: Path | None = None,
+    ionice_mode: str | None = None,
+    priority_log: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for name in (
@@ -99,6 +123,12 @@ def _run(
         env["RQUANT_RECOVERY_SIGNER_KEY_ID"] = recovery_signer_key_id
     if runtime_root is not None:
         env["RQUANT_RUNTIME_ROOT"] = str(runtime_root)
+    env.pop("RQUANT_BACKUP_IONICE", None)
+    if ionice_mode is not None:
+        env["RQUANT_BACKUP_IONICE"] = ionice_mode
+    if priority_log is not None:
+        env["RQUANT_TEST_PRIORITY_LOG"] = str(priority_log)
+        env["PATH"] = f"{_priority_shims(priority_log.parent)}:{env['PATH']}"
     return subprocess.run(
         [str(project / "scripts" / "backup-snapshot.sh")],
         cwd=project,
@@ -216,11 +246,75 @@ def test_backup_unit_allows_large_snapshot_compression_to_finish() -> None:
     unit = ConfigParser(interpolation=None, strict=True)
     unit.read_string(BACKUP_UNIT.read_text(encoding="utf-8"))
 
-    assert unit.get("Service", "TimeoutStartSec") == "10min"
+    assert unit.get("Service", "TimeoutStartSec") == "20min"
+    assert unit.get("Service", "TimeoutStopSec") == "2min"
 
 
+def test_backup_timer_leaves_a_quiet_window_between_intraday_snapshots() -> None:
+    calendars = [
+        line.split("=", 1)[1].strip()
+        for line in BACKUP_TIMER.read_text(encoding="utf-8").splitlines()
+        if line.startswith("OnCalendar=")
+    ]
+
+    assert calendars == ["Mon..Fri *-*-* 9..15:0/15", "Mon..Fri 17:30"]
+
+
+@pytest.mark.parametrize(
+    ("ionice_mode", "expected_ionice_flags"),
+    [
+        (None, "-c3"),
+        ("idle", "-c3"),
+        ("best-effort", "-c2 -n7"),
+        ("none", None),
+    ],
+    ids=["auto-without-bfq", "idle", "best-effort", "disabled"],
+)
+def test_copy_and_compress_run_at_the_selected_io_priority(
+    tmp_path: Path,
+    ionice_mode: str | None,
+    expected_ionice_flags: str | None,
+) -> None:
+    """#243 review S-3.
+
+    `ionice -c3` is honoured literally by BFQ, where "idle" means "only when the disk is
+    free" - the wrong class for a 10 GB `cp`. `auto` picks best-effort's lowest priority
+    when it sees BFQ and idle otherwise; the host can override either way.
+    """
+
+    project = _project(tmp_path)
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    priority_log = tmp_path / "priority.log"
+    priority_log.write_text("", encoding="utf-8")
+
+    result = _run(
+        project,
+        source="main",
+        ionice_mode=ionice_mode,
+        priority_log=priority_log,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = priority_log.read_text(encoding="utf-8").splitlines()
+    nice_calls = [line for line in lines if line.startswith("nice ")]
+    ionice_calls = [line for line in lines if line.startswith("ionice ")]
+    assert nice_calls, lines
+    assert all(line.startswith("nice -n 19 ") for line in nice_calls)
+    if expected_ionice_flags is None:
+        assert ionice_calls == []
+    else:
+        assert ionice_calls
+        assert all(line.startswith(f"ionice {expected_ionice_flags} ") for line in ionice_calls)
+
+
+@pytest.mark.parametrize(
+    "signal_number",
+    [signal.SIGTERM, signal.SIGINT, signal.SIGHUP],
+    ids=["term", "int", "hup"],
+)
 def test_terminated_backup_cleans_private_generation(
     tmp_path: Path,
+    signal_number: signal.Signals,
 ) -> None:
     project = _project(tmp_path)
     _write_db(project / "data" / "rquant.duckdb", "main")
@@ -255,7 +349,7 @@ def test_terminated_backup_cleans_private_generation(
             time.sleep(0.05)
         assert entered.exists()
 
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signal_number)
         process.communicate(timeout=10)
     finally:
         if process.poll() is None:
@@ -263,9 +357,44 @@ def test_terminated_backup_cleans_private_generation(
                 os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=10)
 
-    assert process.returncode != 0
+    # The script's own handler ran (128+signum), rather than bash dying from the
+    # signal, which would report a negative returncode and leave the generation.
+    assert process.returncode == 128 + int(signal_number)
     assert not tuple((project / "backup").glob(".latest.*"))
     assert (project / "backup" / "latest.duckdb.gz").read_bytes() == previous
+
+
+def test_startup_sweep_removes_only_this_scripts_killed_generations(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    backup = project / "backup"
+    backup.mkdir()
+    stale = (
+        backup / ".latest.duckdb.4242",
+        backup / ".latest.duckdb.4242.wal",
+        backup / ".latest.duckdb.4242.gz",
+        backup / ".latest.json.4242",
+    )
+    kept = (
+        backup / "latest.duckdb.gz.keep",
+        backup / "v0.33.3-preview-20260901.duckdb.gz",
+        backup / ".latest.duckdb.9999",
+    )
+    for path in (*stale, *kept):
+        path.write_bytes(b"orphan")
+    two_days_ago = time.time() - 2 * 24 * 3600
+    for path in (*stale, *kept[:2]):
+        os.utime(path, (two_days_ago, two_days_ago))
+
+    result = _run(project, source="main")
+
+    assert result.returncode == 0, result.stderr
+    assert [path for path in stale if path.exists()] == []
+    assert [path for path in kept if not path.exists()] == []
+    log = (project / "logs" / "backup-snapshot.log").read_text(encoding="utf-8")
+    assert "swept 4 stale temporary file(s)" in log
 
 
 @pytest.mark.parametrize("recovery_enabled", [True, False], ids=["explicit", "profile-auto"])

@@ -4,6 +4,9 @@ Description=rQuant Serving Workload Plane
 [Slice]
 CPUAccounting=true
 CPUWeight=500
+# 见 rquant-live.slice：serving 面全是请求驱动的 dashboard/panorama/canvas/page-control
+# 与 serving publisher，绝大多数时间空转，30% 一核足够渲染突发，且 60+30=90% ≤ 100%。
+CPUQuota=30%
 IOAccounting=true
 IOWeight=500
 MemoryAccounting=true

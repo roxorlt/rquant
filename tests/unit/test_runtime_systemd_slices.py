@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "deploy" / "systemd"
-SLICE_NAMES = ("live", "serving", "research", "maintenance")
+SLICE_NAMES = ("live", "live-runtime", "serving", "research", "maintenance")
 
 
 def _load_slice(name: str) -> configparser.ConfigParser:
@@ -74,11 +74,15 @@ def test_plane_priority_descends_from_live_to_serving_to_background() -> None:
     research = _load_slice("research")["Slice"]
     maintenance = _load_slice("maintenance")["Slice"]
 
+    # CPU weights: maintenance sits above research since #243. A 10 GB snapshot
+    # took 8m16s-8m50s and twice missed its 10min timeout at CPUWeight=50, which
+    # is 3.0% of the parent's runnable share; it is 15.8% at 300, still behind
+    # the two planes that serve the market.
     assert (
         int(live["CPUWeight"])
         > int(serving["CPUWeight"])
-        > int(research["CPUWeight"])
         > int(maintenance["CPUWeight"])
+        > int(research["CPUWeight"])
     )
     assert (
         int(live["IOWeight"])
@@ -86,8 +90,15 @@ def test_plane_priority_descends_from_live_to_serving_to_background() -> None:
         > int(research["IOWeight"])
         > int(maintenance["IOWeight"])
     )
+    # The quota that caps the runtime work planes sits on rquant-live-runtime.slice,
+    # never on rquant-live.slice itself: eleven resident production services share the
+    # live plane, and a quota there would be split evenly with the roles instead of
+    # giving the resident services priority (#243 review M-1).
+    live_runtime = _load_slice("live-runtime")["Slice"]
     assert "CPUQuota" not in live
-    assert "CPUQuota" not in serving
+    assert _percent(live_runtime["CPUQuota"]) + _percent(serving["CPUQuota"]) <= 100
+    assert int(live_runtime["CPUWeight"]) < int(live["CPUWeight"])
+    assert "CPUQuota" not in maintenance
     assert "MemoryLow" in live
     assert _memory_bytes(live["MemoryLow"]) > 0
     assert "MemoryLow" not in serving
