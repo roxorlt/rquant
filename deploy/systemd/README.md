@@ -24,9 +24,11 @@
 ## Workload isolation cloud gate
 
 `rquant-live.slice`、`rquant-serving.slice`、`rquant-research.slice` 和
-`rquant-maintenance.slice` 是
-`rquant.slice` 的子级资源边界。systemd 的 dash 命名会把它们解析为
-`/rquant.slice/rquant-*.slice`，运行时验收始终读取 `ControlGroup`，不拼接假定路径。
+`rquant-maintenance.slice` 是 `rquant.slice` 的子级资源边界，
+**`rquant-live-runtime.slice` 再低一层**（#243：live 面里 14 个运行时 role 模板的限额边界）。
+systemd 的 dash 命名按短横线逐段派生层级，所以前四个解析为 `/rquant.slice/rquant-*.slice`，
+而 live-runtime 是 `/rquant.slice/rquant-live.slice/rquant-live-runtime.slice`；
+运行时验收始终读取 `ControlGroup`，不拼接假定路径。
 这些 slice
 不是业务 authority 的迁移工具。legacy unit 的 `ExecStart`、timer calendar、启停和写入权威
 均保持不变；本轮仅为既有进程声明资源归属。
@@ -61,7 +63,13 @@ CPU 一列的 quota 与 maintenance 权重是 #243 / owner 裁决 21（2026-09-0
 让 20 个 role 把 monitor / daily / alert@ 稀释到 60/21 = 2.9% 一核，`rquant-alert@` 的
 `TimeoutStartSec=30` 会被击穿。挪到子 slice 之后，14 个 role 合起来在 live 内部只算「一个同侪」，
 最坏情况下 alert@ 仍能拿到约 90% 一核（详见包 M 报告的算术）。
-「能与备份同时运行」的两个受限面 live-runtime 60% + serving 30% = 90%，不超过一个核；
+「能与备份同时运行」的两个受限面 live-runtime 60% + serving 30% = 90%，不超过一个核。
+**注意这不等于「备份一定拿得到剩下那个核」**：live 面本身不设 quota（常驻服务住在里面），
+所以常驻服务一忙，live 可以涨到 150%、maintenance 按权重只剩 45%，一轮备份会拉长到
+约 13–16 分钟，撞上 15 分钟的触发间隔（systemd 不并发启动，这一跳等于被跳过 ⇒ 有效节奏
+退化成 30 分钟 ⇒ 最坏 RPO age ≈ 45 分钟 > 1800 秒）。现有实测负载（19 role + gzip 同跑时
+整机 load ≈1.9）离这个场景很远，但**装机后必须记录每轮实际时长**，见 DEPLOY.md 的观察项。
+
 research 仍是精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane 互斥，永远不会和备份
 重叠。maintenance 在 `rquant.slice` 内部的权重从 50 提到 300（备份跑时 research 必然不在跑，
 真实分母是 1800，份额 3.2% → 16.7%），仍低于 live/serving。
@@ -98,7 +106,8 @@ oneshot；systemd 会合并与 timer 同时提交的同名 service job。require
 
 `rquant-morning-pulse.*` 与 `rquant-midday-report.*` 是本分支对 origin/main
 `9699827be09ca22479f6741e820722399fe40244` 的临时整合，原始引入 commit 为
-`5bb641ab23efa9595100070ff77282e18c14d170`。service 只增加 `Slice=rquant-live.slice`，
+`5bb641ab23efa9595100070ff77282e18c14d170`。这两个是常驻服务，仍然只增加
+`Slice=rquant-live.slice`（运行时 role 模板才改指 `rquant-live-runtime.slice`），
 `ExecStart` 与 timer 内容逐字保留。后续正式合并 main 时必须执行 three-way/三方审计，确认上游
 在这两个 commit 之后的变更没有被这次临时整合覆盖。
 
@@ -178,10 +187,18 @@ bash /home/lighthouse/rquant/scripts/verify-workload-isolation.sh
 systemctl show rquant-monitor.service rquant-surge-watch.service --no-pager \
   --property=ActiveState,Result,NRestarts,Slice,ControlGroup
 live_cgroup=$(systemctl show rquant-live.slice --value --property=ControlGroup)
+runtime_cgroup=$(systemctl show rquant-live-runtime.slice --value --property=ControlGroup)
 research_cgroup=$(systemctl show rquant-research.slice --value --property=ControlGroup)
 cat "/sys/fs/cgroup${live_cgroup}/memory.events"
+cat "/sys/fs/cgroup${runtime_cgroup}/memory.events"      # role 的 high 计数只出现在这一层
 cat "/sys/fs/cgroup${research_cgroup}/memory.events"
 ```
+
+**`rquant-live-runtime.slice` 那一份不能省**（#243）：role 搬进子 slice 之后，它们撞
+`MemoryHigh=1536M` 产生的 `high` 计数**不会**出现在 `rquant-live.slice` 那一层。
+`MemoryHigh` 是节流不是硬顶——不 OOM-kill，只是把分配拖慢并强制回收，而这台机 swap 已满、
+role 又几乎全是匿名页，所以满编 soak 的表现是**role 变慢/卡住而不是响亮地失败**。
+`high` 计数持续增长就是唯一的可见信号。
 
 验收记录必须同时保存运行时 health authority 的 live p95（分钟批次 <10s、发布到信号 <5s、
 信号到首次通知 <5s）、上述三次输出及压力 scope 的退出状态。只有全程 live 无 failed/restart、

@@ -182,7 +182,34 @@ journalctl -u rquant-backup.service -n 40 --no-pager    # 期望 Result=success�
 tail -5 /home/lighthouse/rquant/logs/backup-snapshot.log
 ls -lA /home/lighthouse/rquant/backup/                  # 期望没有新的 .latest.* 残留
 df -h /home/lighthouse                                  # 记一下清扫前后的可用空间
+
+# role 的内存节流只在子 slice 那一层可见（撞 MemoryHigh=1536M 会让 high 计数增长）：
+runtime_cgroup=$(systemctl show rquant-live-runtime.slice --value --property=ControlGroup)
+cat "/sys/fs/cgroup${runtime_cgroup}/memory.events"     # 关注 high 的增量
+cat "/sys/fs/cgroup${runtime_cgroup}/memory.current"
 ```
+
+### 4.1 头几个交易日必须记录：每轮备份的实际时长
+
+```bash
+systemctl show rquant-backup.service \
+    -p Result -p ExecMainStartTimestamp -p ExecMainExitTimestamp     # 最近一轮
+# 最近三天每一轮的时长（分钟），一行一轮：
+journalctl -u rquant-backup.service --since '-3 days' -o short-unix --no-pager \
+    | awk '/Starting/{s=$1} /Finished/{if(s){printf "%.1f min\n", ($1-s)/60; s=0}}'
+```
+
+**阈值与算术**：盘中触发间隔 15 分钟，最坏 RPO age = 间隔 + 单轮时长，闸是 1800 秒。
+
+| 单轮时长 | 最坏 age | 结论 |
+|---|---|---|
+| 8.8 分钟（当前实测） | 23.8min = 1430s | 正常，余 21% |
+| **> 12 分钟** | ≥ 27min = 1620s | **预警**：只剩 10% 余量，回头重新标定节奏 |
+| > 15 分钟 | 下一次触发被跳过（systemd 不并发启动）⇒ 有效节奏退化成 30 分钟 ⇒ age ≈ 45min = 2700s | **破闸**，必须改节奏或改 RPO |
+
+会把时长推上去的是 CPU 竞争：`rquant-live.slice` 本身**没有** quota（常驻服务住在里面），
+所以常驻服务一忙，live 可以按权重涨到 150%，maintenance 只剩 45% 一核，gzip 段大约拉长 1.8 倍。
+现有实测负载（19 role + gzip 同跑时整机 load ≈1.9）离这个场景很远，所以这是观察项不是阻塞项。
 
 ### 5. 回滚（**不要动生产 checkout 的工作区**）
 
