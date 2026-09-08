@@ -2946,7 +2946,8 @@ while (( $# > 0 )); do
 done
 if [[ -n "${output}" ]]; then
     if [[ "${args}" == *"latest.json"* ]]; then
-        printf '{"snapshot_at":"2026-07-14T09:00:00Z"}\\n' > "${output}"
+        printf '{"snapshot_at":"%s"}\\n' \
+            "${SYNC_TEST_SNAPSHOT_AT:-2026-07-14T09:00:00Z}" > "${output}"
     else
         printf 'compressed-placeholder\\n' > "${output}"
     fi
@@ -3003,6 +3004,19 @@ exec /bin/mv "$@"
     _write_executable(
         fake_bin / "date",
         """#!/usr/bin/env bash
+if [[ "${SYNC_TEST_INTRADAY_WINDOW:-0}" == "1" ]]; then
+    # 10:05 local, and a fixed epoch of 2026-07-14T06:40:00Z so snapshot ages are exact.
+    case "${1:-}" in
+        +%H) printf '10\\n' ;;
+        +%M) printf '05\\n' ;;
+        +%u) printf '2\\n' ;;
+        '+%Y-%m-%d') printf '2026-07-14\\n' ;;
+        +%s) printf '1784011200\\n' ;;
+        '+%Y-%m-%d %H:%M:%S') printf '2026-07-14 10:05:00\\n' ;;
+        *) exec /bin/date "$@" ;;
+    esac
+    exit 0
+fi
 if [[ "${SYNC_TEST_DAILY_WINDOW:-0}" != "1" ]]; then
     exec /bin/date "$@"
 fi
@@ -3066,6 +3080,54 @@ class TestSyncFromCloudFlags:
         ]
         assert "baseline snapshot_at=" in result.stdout
         assert Path(env["SYNC_TEST_COMPLETION_FILE"]).read_text().strip() == "2026-07-14"
+
+    #: Fixed clock in the fake `date`: 2026-07-14T06:40:00Z. `snapshot_at` values below are
+    #: that minus the age under test.
+    @pytest.mark.parametrize(
+        ("snapshot_at", "age_minutes", "expect_alert"),
+        [
+            ("2026-07-14T06:20:00Z", 20, False),
+            ("2026-07-14T05:45:00Z", 55, True),
+        ],
+        ids=["within-the-allowed-age", "older-than-the-allowed-age"],
+    )
+    def test_intraday_stale_alert_follows_the_cloud_backup_cadence(
+        self,
+        tmp_path: Path,
+        snapshot_at: str,
+        age_minutes: int,
+        expect_alert: bool,
+    ) -> None:
+        """#243: the cloud timer now fires every 15 minutes, this script every 5.
+
+        An unchanged `snapshot_at` between two local ticks is therefore normal and must not
+        push. Only an age above `2 x interval + 10min = 40min` means the cloud backup
+        actually stopped.
+        """
+
+        script, env, _calls = _prepare_sync_script(tmp_path)
+        env["SYNC_TEST_INTRADAY_WINDOW"] = "1"
+        env["SYNC_TEST_SNAPSHOT_AT"] = snapshot_at
+        state = script.parents[1] / "data"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / ".last-sync-snapshot-at").write_text(f"{snapshot_at}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        curl_calls = Path(env["SYNC_TEST_CURL_CALLS"]).read_text(encoding="utf-8")
+        assert ("pushkey=test-key" in curl_calls) is expect_alert
+        assert f"已 {age_minutes}min" in result.stdout
+        if expect_alert:
+            assert "intraday backup 可能已停" in result.stdout
+        else:
+            assert "intraday backup 可能已停" not in result.stdout
+
 
     def test_force_without_skip_runs_all_post_sync_captures(self, tmp_path: Path) -> None:
         script, env, calls_path = _prepare_sync_script(tmp_path)
