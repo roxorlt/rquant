@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -887,6 +888,24 @@ def _validate_sha256(value: str, *, label: str) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class RunnerIdentityRotation:
+    """One runner database moved aside because our own previous generation wrote it."""
+
+    previous_generation_id: str
+    previous_strategy_spec_fingerprint: str
+    previous_evaluator_contract_fingerprint: str
+    archived_path: Path
+
+    @property
+    def event(self) -> str:
+        return f"runner_identity_rotated:{self.previous_generation_id}"
+
+
+#: `(persisted spec fingerprint, persisted evaluator fingerprint) -> previous generation id`
+PreviousGenerationOfIdentity = Callable[[str, str], str | None]
+
+
 class StrategyRunnerStore:
     """Own one exact strategy spec, candidate states, and its signal sequence."""
 
@@ -899,6 +918,7 @@ class StrategyRunnerStore:
         feature_contract: FeatureContract | None = None,
         lifecycle_feature_source: StrategyLifecycleFeatureSource | None = None,
         busy_timeout_ms: int = 5_000,
+        previous_generation_of_identity: PreviousGenerationOfIdentity | None = None,
     ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
@@ -929,6 +949,9 @@ class StrategyRunnerStore:
             (transition.from_state, transition.event): transition.to_state
             for transition in spec.transitions
         }
+        self.identity_rotation = self._rotate_previous_generation_runner(
+            previous_generation_of_identity
+        )
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -943,6 +966,93 @@ class StrategyRunnerStore:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
+
+    #: SQLite derives both sidecar names from the database name, so an archive keeps its
+    #: own pair and stays openable; a stray `-wal` left beside the new database would be
+    #: read as the new one's write-ahead log.
+    _SQLITE_SIDECARS = ("-wal", "-shm")
+
+    def _read_identity_for_rotation(self) -> tuple[str, str] | None:
+        """The persisted identity, read read-only, or `None` when there is nothing to read.
+
+        Anything that is present and unreadable — not a database, no `runner_metadata`,
+        a half-written row — returns `None` and is left to `_initialize`, which refuses
+        it the way it always has. This method only ever answers "whose identity is this".
+        """
+
+        if not self.path.is_file():
+            return None
+        try:
+            connection = sqlite3.connect(
+                f"file:{self.path}?mode=ro",
+                uri=True,
+                timeout=self.busy_timeout_ms / 1_000,
+                isolation_level=None,
+            )
+        except sqlite3.Error:
+            return None
+        try:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT strategy_spec_fingerprint, evaluator_contract_fingerprint
+                FROM runner_metadata WHERE singleton = 1
+                """
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return (
+            str(row["strategy_spec_fingerprint"]),
+            str(row["evaluator_contract_fingerprint"]),
+        )
+
+    def _rotate_previous_generation_runner(
+        self,
+        previous_generation_of_identity: PreviousGenerationOfIdentity | None,
+    ) -> RunnerIdentityRotation | None:
+        """Archive a runner database our own previous generation wrote (#248).
+
+        Both fingerprints have to name the *same* previous generation: the caller answers
+        for the pair, not for either half, so a spec fingerprint from one generation and
+        an evaluator fingerprint from another is not a handover and still refuses.
+        """
+
+        if previous_generation_of_identity is None:
+            return None
+        identity = self._read_identity_for_rotation()
+        if identity is None:
+            return None
+        spec_fingerprint, evaluator_fingerprint = identity
+        if (
+            spec_fingerprint == self.spec.spec_fingerprint
+            and evaluator_fingerprint == self.evaluator_contract_fingerprint
+        ):
+            return None
+        generation_id = previous_generation_of_identity(spec_fingerprint, evaluator_fingerprint)
+        if generation_id is None:
+            return None
+        archived = self.path.with_name(f"{self.path.name}.{generation_id}.archived")
+        if archived.exists() or archived.is_symlink():
+            raise ValueError(f"runner identity archive already exists: {archived}")
+        for suffix in self._SQLITE_SIDECARS:
+            sidecar = self.path.with_name(f"{self.path.name}{suffix}")
+            if sidecar.exists() and (archived.with_name(f"{archived.name}{suffix}")).exists():
+                raise ValueError(f"runner identity archive already exists: {archived}{suffix}")
+        self.path.rename(archived)
+        for suffix in self._SQLITE_SIDECARS:
+            sidecar = self.path.with_name(f"{self.path.name}{suffix}")
+            if sidecar.exists():
+                sidecar.rename(archived.with_name(f"{archived.name}{suffix}"))
+        return RunnerIdentityRotation(
+            previous_generation_id=generation_id,
+            previous_strategy_spec_fingerprint=spec_fingerprint,
+            previous_evaluator_contract_fingerprint=evaluator_fingerprint,
+            archived_path=archived,
+        )
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
