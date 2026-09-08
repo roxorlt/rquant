@@ -79,10 +79,10 @@ def test_a_runner_from_our_own_previous_generation_is_archived_and_recreated(
         ),
     )
 
-    archived = path.parent / f"runner.sqlite3.{'f' * 64}.archived"
+    archived = path.parent / f"runner.sqlite3.000000.{'f' * 64}.archived"
     assert archived.is_file()
-    assert (path.parent / f"runner.sqlite3.{'f' * 64}.archived-wal").is_file()
-    assert (path.parent / f"runner.sqlite3.{'f' * 64}.archived-shm").is_file()
+    assert (path.parent / f"runner.sqlite3.000000.{'f' * 64}.archived-wal").is_file()
+    assert (path.parent / f"runner.sqlite3.000000.{'f' * 64}.archived-shm").is_file()
     assert _persisted_identity(archived) == (previous_fingerprint, PREVIOUS_EVALUATOR)
     assert _persisted_identity(path) == (current.spec_fingerprint, EVALUATOR_FINGERPRINT)
     assert store.identity_rotation is not None
@@ -183,7 +183,7 @@ def test_an_archive_that_already_exists_is_not_overwritten(tmp_path: Path) -> No
         commit=PREVIOUS_COMMIT,
         evaluator=PREVIOUS_EVALUATOR,
     )
-    (path.parent / f"runner.sqlite3.{'f' * 64}.archived").write_bytes(b"earlier archive")
+    (path.parent / f"runner.sqlite3.000000.{'f' * 64}.archived").write_bytes(b"earlier archive")
 
     with pytest.raises(ValueError, match="archive already exists"):
         StrategyRunnerStore(
@@ -194,7 +194,9 @@ def test_an_archive_that_already_exists_is_not_overwritten(tmp_path: Path) -> No
                 {(previous_fingerprint, PREVIOUS_EVALUATOR): "f" * 64}
             ),
         )
-    assert (path.parent / f"runner.sqlite3.{'f' * 64}.archived").read_bytes() == b"earlier archive"
+    assert (
+        path.parent / f"runner.sqlite3.000000.{'f' * 64}.archived"
+    ).read_bytes() == b"earlier archive"
 
 
 def test_a_strategy_directory_keeps_two_archives_and_prunes_the_third(
@@ -204,7 +206,9 @@ def test_a_strategy_directory_keeps_two_archives_and_prunes_the_third(
 
     path = tmp_path / "runner.sqlite3"
     commits = ["1" * 40, "4" * 40, "5" * 40, "6" * 40]
-    generations = ["a" * 64, "b" * 64, "c" * 64]
+    #: deliberately in reverse lexicographic order, so a prune that sorts by *name*
+    #: instead of by the rotation sequence keeps the wrong two (review SF-8)
+    generations = ["c" * 64, "b" * 64, "a" * 64]
     pruned_by: list[tuple[str, ...]] = []
 
     _write_previous_runner(path, commit=commits[0], evaluator=PREVIOUS_EVALUATOR)
@@ -225,12 +229,66 @@ def test_a_strategy_directory_keeps_two_archives_and_prunes_the_third(
         item.name for item in path.parent.iterdir() if item.name.endswith(".archived")
     )
     assert archived == [
-        f"runner.sqlite3.{generations[1]}.archived",
-        f"runner.sqlite3.{generations[2]}.archived",
+        f"runner.sqlite3.000001.{generations[1]}.archived",
+        f"runner.sqlite3.000002.{generations[2]}.archived",
     ]
     #: the sidecars of the pruned archive go with it, not after it
     assert not any(
-        item.name.startswith(f"runner.sqlite3.{generations[0]}.archived")
-        for item in path.parent.iterdir()
+        generations[0] in item.name for item in path.parent.iterdir()
     )
-    assert pruned_by == [(), (), (f"runner.sqlite3.{generations[0]}.archived",)]
+    assert pruned_by == [(), (), (f"runner.sqlite3.000000.{generations[0]}.archived",)]
+
+
+def test_back_dating_the_newest_runner_archive_does_not_make_the_prune_take_it(
+    tmp_path: Path,
+) -> None:
+    """The ordering must come from the rotation, not from the filesystem (review SF-7)."""
+
+    import os
+
+    path = tmp_path / "runner.sqlite3"
+    commits = ["1" * 40, "4" * 40, "5" * 40, "6" * 40]
+    generations = ["c" * 64, "b" * 64, "a" * 64]
+
+    _write_previous_runner(path, commit=commits[0], evaluator=PREVIOUS_EVALUATOR)
+    for index, generation in enumerate(generations):
+        StrategyRunnerStore(
+            path,
+            spec=_spec(producer_commit=commits[index + 1]),
+            evaluator_contract_fingerprint=PREVIOUS_EVALUATOR,
+            previous_generation_of_identity=_previous_generation(
+                {
+                    (
+                        _spec(producer_commit=commits[index]).spec_fingerprint,
+                        PREVIOUS_EVALUATOR,
+                    ): generation
+                }
+            ),
+        )
+
+    newest = path.parent / f"runner.sqlite3.000002.{generations[2]}.archived"
+    oldest = path.parent / f"runner.sqlite3.000001.{generations[1]}.archived"
+    assert newest.is_file() and oldest.is_file()
+    stale = oldest.lstat().st_mtime - 7 * 24 * 3600
+    os.utime(newest, (stale, stale))
+
+    store = StrategyRunnerStore(
+        path,
+        spec=_spec(producer_commit=CURRENT_COMMIT),
+        evaluator_contract_fingerprint=PREVIOUS_EVALUATOR,
+        previous_generation_of_identity=_previous_generation(
+            {
+                (
+                    _spec(producer_commit=commits[3]).spec_fingerprint,
+                    PREVIOUS_EVALUATOR,
+                ): "d" * 64
+            }
+        ),
+    )
+
+    assert store.identity_rotation is not None
+    assert store.identity_rotation.pruned_archives == (
+        f"runner.sqlite3.000001.{generations[1]}.archived",
+    )
+    assert newest.is_file(), "the back-dated archive is still the second newest"
+    assert not oldest.exists()

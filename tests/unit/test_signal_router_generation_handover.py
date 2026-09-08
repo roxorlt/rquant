@@ -19,7 +19,7 @@ generation's; every other difference stays a conflict.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -396,7 +396,9 @@ def test_the_ledger_keeps_two_archived_generations_and_prunes_the_third(
 
     commits = ["1" * 40, "4" * 40, "5" * 40, "6" * 40]
     specs = [_spec(producer_commit=commit).spec_fingerprint for commit in commits]
-    generations = ["a" * 64, "b" * 64, "c" * 64]
+    #: deliberately in reverse lexicographic order, so a prune that sorts by generation
+    #: id instead of by the ledger's own insertion order keeps the wrong two (review SF-8)
+    generations = ["c" * 64, "b" * 64, "a" * 64]
     path = tmp_path / "signal_bus.sqlite3"
 
     bus = SignalBusStore(path)
@@ -440,3 +442,51 @@ def test_the_ledger_keeps_two_archived_generations_and_prunes_the_third(
         f"strategy/growth#rotated-{'1' * 64}",
         f"strategy/growth#rotated-{'2' * 64}",
     }
+
+
+def test_a_clock_that_steps_backwards_does_not_make_the_prune_take_the_newest(
+    tmp_path: Path,
+) -> None:
+    """The ledger orders by its own insertion, not by the wall clock (review SF-7).
+
+    `rotated_at` is whatever clock the caller handed in. A host whose clock steps back --
+    an NTP correction, a restored VM -- makes the rotation that just happened look like
+    the oldest one, and a prune reading the ordering off it deletes the archive it has
+    just created. Live routing state is untouched either way; the loss would be audit
+    history, and it is avoidable.
+    """
+
+    commits = ["1" * 40, "4" * 40, "5" * 40, "6" * 40]
+    specs = [_spec(producer_commit=commit).spec_fingerprint for commit in commits]
+    path = tmp_path / "signal_bus.sqlite3"
+    earlier = NOW - timedelta(days=7)
+
+    bus = SignalBusStore(path)
+    bus.bind_route_source(
+        _descriptor(generation="0" * 64, spec_fingerprint=specs[0]),
+        routing_policy_fingerprint=ROUTING_POLICY,
+        observed_at=NOW,
+    )
+    for index in range(3):
+        #: the last rotation is the one whose clock has stepped a week backwards
+        observed = earlier if index == 2 else NOW
+        SignalBusStore(
+            path,
+            previous_generation_of_strategy_spec={specs[index]: f"{index}" * 64},
+        ).bind_route_source(
+            _descriptor(
+                generation=str(index + 1) * 64,
+                spec_fingerprint=specs[index + 1],
+            ),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=observed,
+        )
+
+    rotations = bus.route_source_rotations("strategy/growth")
+    #: still in insertion order, and still the first one that was pruned
+    assert [item.previous_source_generation_id for item in rotations] == [
+        "0" * 64,
+        "1" * 64,
+        "2" * 64,
+    ]
+    assert [item.archived_source_pruned for item in rotations] == [True, False, False]

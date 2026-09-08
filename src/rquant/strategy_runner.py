@@ -914,7 +914,10 @@ PreviousGenerationOfIdentity = Callable[[str, str], str | None]
 #: `rquant-artifact-retention` has no write path into `live/` at all.
 ARCHIVED_GENERATIONS_KEPT = 2
 
-_RUNNER_ARCHIVE = re.compile(r"\.([0-9a-f]{64})\.archived$")
+#: `<name>.<rotation sequence>.<generation>.archived`. The sequence is what pruning
+#: orders by: the alternative, the archive's mtime, is an outside signal that a restore,
+#: a `touch` or an mtime-replaying sync tool can reorder (review SF-7).
+_RUNNER_ARCHIVE = re.compile(r"\.([0-9]{6})\.([0-9a-f]{64})\.archived$")
 
 
 class StrategyRunnerStore:
@@ -1046,13 +1049,16 @@ class StrategyRunnerStore:
         generation_id = previous_generation_of_identity(spec_fingerprint, evaluator_fingerprint)
         if generation_id is None:
             return None
-        archived = self.path.with_name(f"{self.path.name}.{generation_id}.archived")
+        sequence, existing = self._archive_sequences()
+        if generation_id in {archived for _, archived, _ in existing}:
+            raise ValueError(
+                f"runner identity archive already exists: {self.path.name}.{generation_id}"
+            )
+        archived = self.path.with_name(
+            f"{self.path.name}.{sequence:06d}.{generation_id}.archived"
+        )
         if archived.exists() or archived.is_symlink():
             raise ValueError(f"runner identity archive already exists: {archived}")
-        for suffix in self._SQLITE_SIDECARS:
-            sidecar = self.path.with_name(f"{self.path.name}{suffix}")
-            if sidecar.exists() and (archived.with_name(f"{archived.name}{suffix}")).exists():
-                raise ValueError(f"runner identity archive already exists: {archived}{suffix}")
         self.path.rename(archived)
         for suffix in self._SQLITE_SIDECARS:
             sidecar = self.path.with_name(f"{self.path.name}{suffix}")
@@ -1066,24 +1072,34 @@ class StrategyRunnerStore:
             pruned_archives=self._prune_archived_runners(),
         )
 
-    def _prune_archived_runners(self) -> tuple[str, ...]:
-        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
+    def _archive_sequences(self) -> tuple[int, tuple[tuple[int, str, Path], ...]]:
+        """The next rotation number for this directory, and the archives already in it.
 
-        Newest by mtime, which the rename that created each archive set once and nothing
-        touches afterwards. Only this role writes in this directory, so that ordering is
-        produced here rather than guessed at.
+        Counted from the highest number present rather than from how many are present:
+        pruning removes the oldest, so a count would hand out a number already used.
         """
 
-        archives: list[tuple[int, Path]] = []
+        seen: list[tuple[int, str, Path]] = []
         for item in self.path.parent.iterdir():
             if not item.name.startswith(f"{self.path.name}."):
                 continue
-            if _RUNNER_ARCHIVE.search(item.name) is None:
+            matched = _RUNNER_ARCHIVE.search(item.name)
+            if matched is None or not stat.S_ISREG(item.lstat().st_mode):
                 continue
-            observed = item.lstat()
-            if not stat.S_ISREG(observed.st_mode):
-                continue
-            archives.append((observed.st_mtime_ns, item))
+            seen.append((int(matched.group(1)), matched.group(2), item))
+        return (max((number for number, _, _ in seen), default=-1) + 1, tuple(seen))
+
+    def _prune_archived_runners(self) -> tuple[str, ...]:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
+
+        Newest by the **rotation sequence in the archive's own name**, which this class
+        hands out. Ordering by mtime instead would build "prune the oldest" on an outside
+        signal -- a restore or a `touch` reorders it, and then the newest archive is the
+        one that goes (review SF-7).
+        """
+
+        _, entries = self._archive_sequences()
+        archives = [(number, path) for number, _, path in entries]
         if len(archives) <= ARCHIVED_GENERATIONS_KEPT:
             return ()
         archives.sort(key=lambda item: (item[0], item[1].name), reverse=True)

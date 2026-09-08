@@ -46,9 +46,13 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _MAX_GENERATIONS = 4_096
 
-#: `rotated-<generation>` while it is being published, `rotated-<generation>` once it is.
-_ROTATION_ARCHIVE = re.compile(r"^rotated-([0-9a-f]{64})$")
-_ROTATION_STAGING = re.compile(r"^rotated-([0-9a-f]{64})\.partial$")
+#: `rotated-<sequence>-<generation>`, and the same name plus `.partial` while it is being
+#: published. The sequence is this root's own rotation counter: pruning has to know which
+#: archive is oldest, and the only orderings available on disk otherwise are file mtimes
+#: and wall clocks -- both of which a restore, a `touch` or an mtime-replaying sync tool
+#: can reorder, which would prune the newest archive instead of the oldest.
+_ROTATION_ARCHIVE = re.compile(r"^rotated-([0-9]{6})-([0-9a-f]{64})$")
+_ROTATION_STAGING = re.compile(r"^rotated-([0-9]{6})-([0-9a-f]{64})\.partial$")
 
 #: How many previous generations' archives one candidate root keeps. The current
 #: generation is not one of them, so two releases' worth of published candidates stay
@@ -1087,11 +1091,12 @@ class StrategyCandidateSnapshotSpool:
         generation_id = self._previous_generation_of_binding(observed)
         if generation_id is None:
             return
-        archive_name = f"rotated-{generation_id}"
-        if self._entry_exists(root_fd, archive_name):
+        sequence, existing = self._rotation_sequences(root_fd)
+        if generation_id in {archived for _, archived in existing}:
             raise StrategyCandidateSnapshotIntegrityError(
-                f"strategy candidate authority archive already exists: {archive_name}"
+                f"strategy candidate authority archive already exists: rotated-{generation_id}"
             )
+        archive_name = f"rotated-{sequence:06d}-{generation_id}"
         staging_name = f"{archive_name}.partial"
         os.mkdir(staging_name, _PRIVATE_DIRECTORY_MODE, dir_fd=root_fd)
         self._publish_rotation(
@@ -1104,6 +1109,24 @@ class StrategyCandidateSnapshotSpool:
             expected=expected,
             resumed=False,
         )
+
+    @staticmethod
+    def _rotation_sequences(root_fd: int) -> tuple[int, tuple[tuple[int, str], ...]]:
+        """The next rotation number for this root, and what is already in it.
+
+        Counted from the highest number present, not from how many are present: pruning
+        removes the oldest, so a count would hand out a number that has already been used.
+        """
+
+        seen: list[tuple[int, str]] = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                matched = _ROTATION_ARCHIVE.fullmatch(
+                    entry.name
+                ) or _ROTATION_STAGING.fullmatch(entry.name)
+                if matched is not None:
+                    seen.append((int(matched.group(1)), matched.group(2)))
+        return (max((number for number, _ in seen), default=-1) + 1, tuple(seen))
 
     def _finish_interrupted_rotation(
         self,
@@ -1119,12 +1142,12 @@ class StrategyCandidateSnapshotSpool:
         entered from wherever the kill happened.
         """
 
-        staged: list[tuple[str, str]] = []
+        staged: list[tuple[str, int, str]] = []
         with os.scandir(root_fd) as entries:
             for entry in entries:
                 matched = _ROTATION_STAGING.fullmatch(entry.name)
                 if matched is not None:
-                    staged.append((entry.name, matched.group(1)))
+                    staged.append((entry.name, int(matched.group(1)), matched.group(2)))
         if not staged:
             return False
         if len(staged) > 1:
@@ -1133,12 +1156,12 @@ class StrategyCandidateSnapshotSpool:
             raise StrategyCandidateSnapshotIntegrityError(
                 "strategy candidate root holds more than one interrupted rotation"
             )
-        staging_name, generation_id = staged[0]
+        staging_name, sequence, generation_id = staged[0]
         self._publish_rotation(
             root_fd,
             generations_fd,
             staging_name=staging_name,
-            archive_name=f"rotated-{generation_id}",
+            archive_name=f"rotated-{sequence:06d}-{generation_id}",
             generation_id=generation_id,
             previous=None,
             expected=expected,
@@ -1183,8 +1206,16 @@ class StrategyCandidateSnapshotSpool:
                 os.mkdir("generations", _PRIVATE_DIRECTORY_MODE, dir_fd=staging_fd)
             staged_generations_fd = self._open_child_directory(staging_fd, "generations")
             try:
-                if previous is None and self._entry_exists(staging_fd, "authority.json"):
-                    previous = self._read_authority_binding(staging_fd)
+                if previous is None:
+                    if self._entry_exists(staging_fd, "authority.json"):
+                        previous = self._read_authority_binding(staging_fd)
+                    elif self._entry_exists(root_fd, "authority.json"):
+                        # Killed after `mkdir(.partial)` and before the first root document
+                        # moved: staging is empty and the root is still fully bound, so the
+                        # binding to archive is the one still sitting in the root. Without
+                        # this, that one start failed -- and a failed start on these units
+                        # is `Restart=` plus a real push (review SF-6).
+                        previous = self._read_authority_binding(root_fd)
                 for name in ("authority.json", "current.json", "generation-index.json"):
                     if self._entry_exists(root_fd, name):
                         os.rename(name, name, src_dir_fd=root_fd, dst_dir_fd=staging_fd)
@@ -1237,22 +1268,26 @@ class StrategyCandidateSnapshotSpool:
     def _prune_rotated_archives(self, root_fd: int) -> tuple[str, ...]:
         """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
 
-        Newest by the archive directory's own mtime, which this code sets exactly once --
-        at the `rename` that published it -- and never touches again. Nothing outside this
-        class writes in here, so that mtime is a real ordering, not a guess.
+        Newest by the **rotation sequence in the archive's own name**, which this class
+        hands out and nothing else can change. The obvious alternative -- the directory's
+        mtime -- is an outside signal: a restore, a `touch`, or a sync tool that replays
+        mtimes can make the newest archive look oldest, and then pruning removes the wrong
+        one (review SF-7). It would only cost audit history, never live state, but there
+        is no reason to build "correct" on "nobody touched the mtimes".
         """
 
         archives: list[tuple[int, str]] = []
         with os.scandir(root_fd) as entries:
             for entry in entries:
-                if _ROTATION_ARCHIVE.fullmatch(entry.name) is None:
+                matched = _ROTATION_ARCHIVE.fullmatch(entry.name)
+                if matched is None:
                     continue
                 observed = os.stat(entry.name, dir_fd=root_fd, follow_symlinks=False)
                 if not stat.S_ISDIR(observed.st_mode):
                     raise StrategyCandidateSnapshotIntegrityError(
                         "strategy candidate rotation archive is not a directory"
                     )
-                archives.append((observed.st_mtime_ns, entry.name))
+                archives.append((int(matched.group(1)), entry.name))
         if len(archives) <= ARCHIVED_GENERATIONS_KEPT:
             return ()
         archives.sort(reverse=True)

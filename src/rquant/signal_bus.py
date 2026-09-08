@@ -1445,12 +1445,17 @@ class SignalBusStore:
         delivery outbox are keyed by `signal_id` and are not touched.
         """
 
+        # `rowid DESC` is this table's own insertion order. Ordering by `rotated_at`
+        # instead would put the decision on the wall clock: a clock that steps backwards
+        # makes the rotation that just happened look oldest, and the prune then removes
+        # the newest archive rather than the oldest (review SF-7). Only audit history is
+        # at stake either way, but the ledger already knows the order it wrote these in.
         rows = connection.execute(
             """
             SELECT previous_source_generation_id, archived_source_id
             FROM signal_route_source_rotation
             WHERE source_id = ? AND archived_source_pruned = 0
-            ORDER BY rotated_at DESC, previous_source_generation_id DESC
+            ORDER BY rowid DESC
             """,
             (source_id,),
         ).fetchall()
@@ -1479,7 +1484,7 @@ class SignalBusStore:
             rows = connection.execute(
                 """
                 SELECT * FROM signal_route_source_rotation
-                WHERE source_id = ? ORDER BY rotated_at, previous_source_generation_id
+                WHERE source_id = ? ORDER BY rowid
                 """,
                 (source_id,),
             ).fetchall()
