@@ -98,6 +98,14 @@ from rquant.serving_read_models import (
 from rquant.storage.duckdb import DuckDBStore
 from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 
+
+def _generation_binds(outbox: object) -> Path:
+    """#241: the reading role's own scratch, never the outbox's own directory."""
+
+    path = Path(getattr(outbox, "path", outbox))
+    return path.parent / "generation-binds"
+
+
 NOW = datetime(2026, 8, 2, 3, 0, tzinfo=UTC)
 COMMIT = "a" * 40
 CURSOR_SIGNING_KEY = bytes(range(32))
@@ -1147,6 +1155,7 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
             canvas_receipt_root=page_data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=page_authority.keyring,
             page_control_outbox=page_outbox,
+            generation_bind_root=_generation_binds(page_outbox),
         ),
         store=notification_store,
         companion_projections=tuple(

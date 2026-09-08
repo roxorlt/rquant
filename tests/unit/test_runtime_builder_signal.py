@@ -1578,9 +1578,13 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
         command_id="notifier-canvas",
     )
     public_key = authority.keyring._keys[authority.keyring.active_key_id].decode("utf-8")
+    #: the canvas catalog record and its publication receipt are stamped by the real
+    #: PageControl service while this test runs, and the projection refuses evidence
+    #: dated after the instant it is asked for, so the step has to observe the present
+    observed = datetime.now(UTC) + timedelta(minutes=1)
     step = notifier_builder(
         provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
-        clock=lambda: NOW,
+        clock=lambda: observed,
     )(
         _notifier_manifest(
             notifications,
@@ -1602,4 +1606,4 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
 
     assert violations == [], violations
     assert tree_state(control) == before
-    assert result.degraded == ()
+    assert result.degraded_reasons == ()

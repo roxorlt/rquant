@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -240,11 +241,24 @@ def _database_timestamp(value: object) -> datetime:
 class _StableReadonlyDuckDB:
     """Open one regular immutable-generation file and reject pointer rotation mid-read."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, bind_root: Path | None = None) -> None:
         normalized = Path(os.path.abspath(path))
         if not normalized.is_absolute():
             raise ValueError("projection database path must be absolute")
         self.path = normalized
+        #: #241: binding a generation means creating a directory and a hard link. Beside
+        #: the database is where that used to happen, and for a role whose unit grants
+        #: the database read-only it is `EROFS`. `None` keeps the old place for the
+        #: unsandboxed readers (dashboard, CLI); a sandboxed role passes its own root.
+        self.bind_root = None if bind_root is None else Path(os.path.abspath(bind_root))
+        #: equality, not containment: the runtime root a role owns is routinely a
+        #: descendant of the directory the replica sits in, and the unit is what decides
+        #: which descendants it owns. What is never right is binding beside the file.
+        if self.bind_root is not None and self.bind_root == self.path.parent:
+            raise PageProjectionSourceIntegrityError(
+                f"projection database bind root {self.bind_root} is the database's own "
+                f"directory, which the reading role does not own"
+            )
         self._before: os.stat_result | None = None
         self._bound_directory: Path | None = None
         self._bound_path: Path | None = None
@@ -258,12 +272,19 @@ class _StableReadonlyDuckDB:
                 "projection database must be a regular non-symlink file"
             )
         self._before = before
-        bound_directory = Path(
-            mkdtemp(
-                prefix=f".{self.path.name}.{uuid4().hex}.",
-                dir=self.path.parent,
+        bind_root = self.path.parent if self.bind_root is None else self.bind_root
+        try:
+            if self.bind_root is not None:
+                os.makedirs(self.bind_root, mode=0o700, exist_ok=True)
+            bound_directory = Path(
+                mkdtemp(prefix=f".{self.path.name}.{uuid4().hex}.", dir=bind_root)
             )
-        )
+        except OSError as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"projection database generation cannot be bound in {bind_root} "
+                f"(errno {exc.errno} {errno.errorcode.get(exc.errno or 0, '?')} "
+                f"{exc.strerror})"
+            ) from exc
         os.chmod(bound_directory, 0o700)
         bound_path = bound_directory / "generation.duckdb"
         try:
@@ -365,8 +386,20 @@ class _ReadonlyPageControlAuditReader:
         },
     }
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, bind_root: Path) -> None:
         self.path = Path(os.path.abspath(path))
+        #: #241: `snapshot()` pins the generation it reads by hard-linking the database,
+        #: and it used to do that beside the database. The PageControl outbox belongs to
+        #: the page-control service -- `rquant-page-control.service` is the only unit
+        #: whose `ReadWritePaths` covers `…/data/runtime/control` -- so on the host the
+        #: notifier got `EROFS` for a temporary directory next to it, every iteration.
+        #: The reading role has to supply a directory of its own instead.
+        self.bind_root = Path(os.path.abspath(bind_root))
+        if self.bind_root == self.path.parent:
+            raise PageProjectionSourceIntegrityError(
+                f"PageControl audit bind root {self.bind_root} is the outbox's own "
+                f"directory, which belongs to the page-control service"
+            )
         self._snapshot_connection: sqlite3.Connection | None = None
         validated = self._validate_schema()
         self._validated_node_identity = (validated.st_dev, validated.st_ino)
@@ -405,16 +438,26 @@ class _ReadonlyPageControlAuditReader:
             raise PageProjectionSourceIntegrityError(
                 "PageControl audit database rotated or is not a regular non-symlink file"
             )
-        bound_directory = Path(
-            mkdtemp(
-                prefix=f".{self.path.name}.{uuid4().hex}.",
-                dir=self.path.parent,
+        try:
+            os.makedirs(self.bind_root, mode=0o700, exist_ok=True)
+            bound_directory = Path(
+                mkdtemp(
+                    prefix=f".{self.path.name}.{uuid4().hex}.",
+                    dir=self.bind_root,
+                )
             )
-        )
+        except OSError as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"PageControl audit generation cannot be bound in {self.bind_root} "
+                f"(errno {exc.errno} {errno.errorcode.get(exc.errno or 0, '?')} "
+                f"{exc.strerror})"
+            ) from exc
         os.chmod(bound_directory, 0o700)
         bound_path = bound_directory / "generation.sqlite3"
         connection: sqlite3.Connection | None = None
         try:
+            #: the hard link needs the same filesystem as the outbox, which every runtime
+            #: root satisfies; `EXDEV` here is a misconfigured bind root, not a rotation
             os.link(self.path, bound_path, follow_symlinks=False)
             bound = os.lstat(bound_path)
             after_link = os.lstat(self.path)
@@ -675,6 +718,7 @@ class DuckDBSignalPageProjectionSource:
         canvas_receipt_root: Path | None = None,
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
+        generation_bind_root: Path | None = None,
         surge_live_root: Path | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
@@ -685,6 +729,9 @@ class DuckDBSignalPageProjectionSource:
             None if canvas_receipt_root is None else Path(os.path.abspath(canvas_receipt_root))
         )
         self.canvas_publication_keyring = canvas_publication_keyring
+        self.generation_bind_root = (
+            None if generation_bind_root is None else Path(os.path.abspath(generation_bind_root))
+        )
         self.surge_live_root = (
             None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
         )
@@ -696,7 +743,15 @@ class DuckDBSignalPageProjectionSource:
                 if isinstance(page_control_outbox, PageControlOutbox)
                 else Path(page_control_outbox)
             )
-            self.page_control_outbox = _ReadonlyPageControlAuditReader(audit_path)
+            if generation_bind_root is None:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl audit authority requires a bind root the reading role owns"
+                )
+            self.page_control_outbox = _ReadonlyPageControlAuditReader(
+                audit_path,
+                bind_root=generation_bind_root,
+            )
+
         if self.canvas_catalog_root is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
                 "configured canvas catalog requires readonly PageControl audit authority"
@@ -717,7 +772,10 @@ class DuckDBSignalPageProjectionSource:
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         cutoff = _local_naive(observed)
-        with _StableReadonlyDuckDB(self.database_path) as connection:
+        with _StableReadonlyDuckDB(
+            self.database_path,
+            bind_root=self.generation_bind_root,
+        ) as connection:
             self._require_tables(connection)
             screen_rows = connection.execute(
                 """
@@ -1317,12 +1375,15 @@ class DuckDBSignalPageProjectionSource:
 class DuckDBLabPageProjectionSource:
     """Project formal research gate metadata from one stable research replica."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, generation_bind_root: Path | None = None) -> None:
         self.database_path = Path(os.path.abspath(database_path))
+        self.generation_bind_root = (
+            None if generation_bind_root is None else Path(os.path.abspath(generation_bind_root))
+        )
 
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
-        stable = _StableReadonlyDuckDB(self.database_path)
+        stable = _StableReadonlyDuckDB(self.database_path, bind_root=self.generation_bind_root)
         with stable as connection:
             self._require_tables(connection)
             candidates = connection.execute(

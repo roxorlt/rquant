@@ -43,6 +43,19 @@ from tests.canvas_ed25519_support import (
     create_rotating_canvas_ed25519_test_authority,
 )
 
+
+def _generation_binds(outbox: object) -> Path:
+    """A directory the reading role owns, which is never the outbox's own directory.
+
+    #241: `snapshot()` pins the generation it reads with a hard link, and it used to do
+    that beside the outbox -- a directory that belongs to the page-control service and is
+    read-only in every other unit. Every reader now says where its own scratch goes.
+    """
+
+    path = Path(getattr(outbox, "path", outbox))
+    return path.parent / "generation-binds"
+
+
 NOW = datetime(2026, 8, 3, 8, 0, tzinfo=UTC)
 COMMIT = "a" * 40
 _CATALOG_AUTHORITIES: dict[Path, object] = {}
@@ -122,6 +135,7 @@ def _canvas_source(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox,
+        generation_bind_root=_generation_binds(outbox),
     )
 
 
@@ -615,6 +629,7 @@ def test_signal_source_rejects_catalog_and_outbox_tamper_even_when_hashes_recomp
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
+            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -664,6 +679,7 @@ def test_signal_source_rejects_tampered_canvas_publication_receipt(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
+            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -720,6 +736,7 @@ def test_signal_source_rejects_previous_key_signed_canvas_publication_receipt(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
+            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -750,6 +767,7 @@ def test_signal_source_rejects_canvas_publication_receipt_symlink(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
+            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -786,6 +804,7 @@ def test_signal_source_rejects_malformed_or_oversized_canvas_catalog_records(
             canvas_receipt_root=tmp_path / "malformed-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -820,6 +839,7 @@ def test_signal_source_rejects_canvas_record_without_page_control_identity(
             canvas_receipt_root=tmp_path / "legacy-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -860,6 +880,7 @@ def test_signal_source_readonly_audit_refuses_missing_path_without_creating_it(
         DuckDBSignalPageProjectionSource(
             tmp_path / "unused.duckdb",
             page_control_outbox=missing,
+            generation_bind_root=_generation_binds(missing),
         )
 
     assert not missing.exists()
@@ -877,6 +898,7 @@ def test_signal_source_readonly_audit_refuses_invalid_schema_without_mutation(
         DuckDBSignalPageProjectionSource(
             tmp_path / "unused.duckdb",
             page_control_outbox=legacy,
+            generation_bind_root=_generation_binds(legacy),
         )
 
     assert legacy.read_bytes() == before
@@ -912,6 +934,7 @@ def test_signal_source_readonly_audit_refuses_near_valid_unconstrained_schema(
         DuckDBSignalPageProjectionSource(
             tmp_path / "unused.duckdb",
             page_control_outbox=near_valid,
+            generation_bind_root=_generation_binds(near_valid),
         )
 
     assert near_valid.read_bytes() == before
@@ -941,6 +964,7 @@ def test_signal_source_readonly_audit_refuses_any_inflight_command(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -961,6 +985,7 @@ def test_signal_source_readonly_audit_rejects_path_replacement_after_constructio
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
+        generation_bind_root=_generation_binds(outbox.path),
     )
     trusted = tmp_path / f"trusted-{replacement}.sqlite3"
     alternate = tmp_path / f"alternate-{replacement}.sqlite3"
@@ -1011,6 +1036,7 @@ def test_signal_source_readonly_audit_allows_same_inode_completed_mutation(
         canvas_receipt_root=data_dir / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
+        generation_bind_root=_generation_binds(outbox.path),
     )
     second = service.submit(
         SaveCanvas(
@@ -1058,6 +1084,7 @@ def test_signal_source_requires_matching_succeeded_page_control_effect(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1084,6 +1111,7 @@ def test_signal_source_ignores_non_authoritative_page_control_result_json(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
+        generation_bind_root=_generation_binds(outbox.path),
     )(NOW)
 
     definitions = {projection.table_name: projection for projection in snapshot.projections}[
@@ -1108,6 +1136,7 @@ def test_signal_source_detects_command_entering_inflight_during_projection(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
+        generation_bind_root=_generation_binds(outbox.path),
     )
     original = source._canvas_definitions
 
@@ -1157,6 +1186,7 @@ def test_signal_source_rejects_canvas_catalog_symlink(tmp_path: Path) -> None:
             canvas_receipt_root=tmp_path / "symlink-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1276,6 +1306,7 @@ def test_signal_source_rejects_replayed_old_signed_canvas_version(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
+            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -1343,6 +1374,7 @@ def test_signal_source_rejects_full_mutable_authority_rollback(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox_path,
+            generation_bind_root=_generation_binds(outbox_path),
         )(NOW)
 
 
@@ -1391,6 +1423,7 @@ def test_signal_source_rejects_future_signed_delete_receipt_and_normal_rebuild(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox_path,
+            generation_bind_root=_generation_binds(outbox_path),
         )(NOW)
 
     normal_clock_service = PageControlService(
@@ -1437,6 +1470,7 @@ def test_signal_source_rejects_removed_catalog_and_head_authority(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1510,6 +1544,7 @@ def test_canvas_head_suffix_deletion_blocks_projection_and_subsequent_update(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
     update = service.submit(
         SaveCanvas(
@@ -1578,6 +1613,7 @@ def test_signal_source_configured_canvas_root_requires_complete_receipt_authorit
                 None if missing_authority == "keyring" else authority.keyring
             ),
             page_control_outbox=outbox.path,
+            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1798,7 +1834,7 @@ def test_the_audit_reader_binds_its_generation_outside_the_outbox_directory(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox,
-        page_control_bind_root=binds,
+        generation_bind_root=binds,
     )
     before = tree_state(control)
 
@@ -1807,11 +1843,11 @@ def test_the_audit_reader_binds_its_generation_outside_the_outbox_directory(
 
     assert violations == [], violations
     assert tree_state(control) == before
-    assert snapshot.canvas_hits is not None
+    assert "canvas_definition" in {item.table_name for item in snapshot.projections}
     assert sorted(binds.iterdir()) == []
 
 
-def test_a_bind_root_inside_the_audit_directory_is_refused(tmp_path: Path) -> None:
+def test_a_bind_root_beside_the_audit_database_is_refused(tmp_path: Path) -> None:
     """The invariant, so #241's shape cannot come back through a different caller."""
 
     control = tmp_path / "control"
@@ -1830,5 +1866,5 @@ def test_a_bind_root_inside_the_audit_directory_is_refused(tmp_path: Path) -> No
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
-            page_control_bind_root=control / "generations",
+            generation_bind_root=control,
         )

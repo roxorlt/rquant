@@ -903,6 +903,17 @@ def notifier_builder(
                         canvas_receipt_root=settings.page_projection_canvas_receipt_root,
                         canvas_publication_keyring=canvas_keyring,
                         page_control_outbox=(settings.page_projection_page_control_outbox_path),
+                        #: #241: the PageControl outbox is the page-control service's file
+                        #: and its directory is read-only here, so the generation the
+                        #: reader pins is bound under the one root this unit owns --
+                        #: `live/notifications/%i`, which is where the notification state
+                        #: itself lives. Derived rather than declared: a new manifest
+                        #: setting would have to come from the profile generator and the
+                        #: stage, and those are frozen.
+                        generation_bind_root=(
+                            settings.notification_state_path.parent
+                            / "page-control-generations"
+                        ),
                     ),
                     store=store,
                 )
