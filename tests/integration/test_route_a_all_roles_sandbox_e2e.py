@@ -21,9 +21,23 @@ market hours on a date the bundle's calendar does not open, so no role reaches f
 session or a network.
 
 Every role's `ReadWritePaths`, `ReadOnlyPaths` and `InaccessiblePaths` are read verbatim
-out of `deploy/systemd/`, which means the sandbox this file applies is the one the host
-applies -- and that a role which starts writing outside its unit fails here before it
-fails there.
+out of `deploy/systemd/`, so the *path set* this file applies is the host's path set, and
+a role that starts writing outside its unit fails here before it fails there.
+
+The sandbox itself is not the host's. It is a Python-level simulation (`os.*` and
+`builtins.open`), and three things it cannot do are worth naming rather than glossing:
+
+* a write made from C -- SQLite's wal-index, DuckDB, pyarrow, a subprocess -- never
+  reaches those wrappers. `tree_state` around every directory the role does not own is
+  the end-state check that covers them, and #242's own case needed a real `chmod 0500`
+  because the write that mattered came from libsqlite3;
+* writes *outside* the runtime root are recorded (`RoleRun.outside`) and not refused, even
+  though `ProtectSystem=strict` refuses them on a host, because a test process must be
+  able to write its own temporary directory and venv;
+* systemd drops a `-` prefixed grant entirely when the path does not exist at start, while
+  this harness lets a role create it. `rquant-runtime-artifact-catalog@.service` is the
+  live example: its outbox directory has to exist before the unit starts, and "start
+  retention first" does not guarantee that.
 """
 
 from __future__ import annotations
@@ -31,6 +45,8 @@ from __future__ import annotations
 import errno
 import os
 import re
+import sys
+import tempfile
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,7 +73,7 @@ from tests.integration.test_route_a_live_chain_idle_e2e import (
     _instance_name,
     cold_chain,
 )
-from tests.runtime_readonly_sandbox import readonly_runtime
+from tests.runtime_readonly_sandbox import SandboxViolation, readonly_runtime, tree_state
 from tests.support.systemd_credential_delivery import deliver
 from tests.unit.test_runtime_authority_publish import UID
 
@@ -66,7 +82,8 @@ __all__ = ["cold_chain"]
 
 pytestmark = pytest.mark.integration
 
-_UNIT_ROOT = Path(__file__).resolve().parents[2] / "deploy" / "systemd"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_UNIT_ROOT = REPO_ROOT / "deploy" / "systemd"
 
 #: role -> the unit file whose sandbox it runs under. 25 roles, 25 units: 22 are
 #: `@`-templates instantiated with the role's own `svc-<64 hex>` label, and three are
@@ -237,6 +254,10 @@ class RoleRun:
         self.last_error: str | None = None
         self.refusal: BaseException | None = None
         self.traceback: str | None = None
+        #: writes the host would refuse because they are outside the runtime root
+        self.outside: list[Any] = []
+        #: directories the role does not own whose contents changed around the run
+        self.changed_trees: tuple[str, ...] = ()
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
@@ -275,12 +296,32 @@ def run_role(
     builtin_module.build_builtin_registry = (  # type: ignore[assignment]
         lambda **kwargs: real_registry(clock=lambda: FROZEN_NOW, **kwargs)
     )
+    #: the end-state proof package J added and this file was missing: the syscall wrappers
+    #: cannot see a write made from C (SQLite's wal-index, DuckDB, pyarrow, a subprocess),
+    #: so every directory the role does not own is compared byte-for-byte around the run
+    unowned = tuple(
+        child
+        for parent in (route.runtime_root / "live", route.runtime_root / "authorities")
+        if parent.is_dir()
+        for child in sorted(parent.iterdir())
+        if child.is_dir()
+        #: a producer subtree this role neither owns nor holds a grant inside of
+        and not any(
+            granted == child or granted in child.parents or child in granted.parents
+            for granted in writable
+        )
+    )
+    trees_before = {path: tree_state(path) for path in unowned}
+    outside: list[SandboxViolation] = []
     try:
         with (
             readonly_runtime(
                 route.runtime_root,
                 writable=writable,
                 inaccessible=sandbox["InaccessiblePaths"],
+                #: what a test process must be allowed to write wherever it runs
+                outside_exempt=(Path(tempfile.gettempdir()), Path(sys.prefix), REPO_ROOT),
+                outside=outside,
             ) as violations,
             mock.patch.dict(os.environ, dict(resolved["environment"]), clear=True),
         ):
@@ -304,6 +345,12 @@ def run_role(
         service_main.Event = real_event  # type: ignore[assignment]
         builtin_module.build_builtin_registry = real_registry  # type: ignore[assignment]
         run.violations = list(violations)
+        run.outside = list(outside)
+        run.changed_trees = tuple(
+            str(path.relative_to(route.runtime_root))
+            for path, before in trees_before.items()
+            if tree_state(path) != before
+        )
 
     if resolved["module"] == "rquant.runtime_service_main":
         control_root = Path(argv[argv.index("--control-root") + 1])
@@ -507,15 +554,28 @@ CANNOT_BUILD: dict[str, str] = {
     "artifact_retention": "No such file or directory",
 }
 
-#: One write outside a unit that this package found and did not fix, recorded exactly.
-#: `feature_live` opens the minute spool in write mode (`runtime_builder_feature.py:139`)
-#: and the spool writes the producer's own `sources/<channel>.json` and keeps the
-#: consumer cursor in the producer's `cursors/` -- #231's shape, in a fifth place. It is
-#: not fixed here because the fix moves a live-plane consumer's durable cursor, which is a
-#: production state decision, and because the package's own two issues are #242 and #241.
-#: The report carries the one-line diff and the argument that it loses nothing.
-KNOWN_OUT_OF_SANDBOX: dict[str, str] = {
-    "feature_live": "live/market-minute/sources/market_minute.json",
+#: Writes outside a unit that are known and not yet fixed, recorded exactly so a *new*
+#: one fails this file. Empty is the intended state: `feature_live` was the last entry and
+#: is fixed (`runtime_builder_feature.py`, #231's fifth site). The widening guard below no
+#: longer depends on this being non-empty -- that was review S-3.
+KNOWN_OUT_OF_SANDBOX: dict[str, str] = {}
+
+#: Writes into another role's directory that only `tree_state` can see, because SQLite
+#: makes them from C and the syscall wrappers never observe them (review S-4). Both are
+#: the #227/#242 shape in a third artifact: **opening a WAL database read-only creates the
+#: `-shm` wal-index next to it**, and these two readers do that in a producer's directory.
+#: On a host that is `EROFS` the moment the producer's `-shm` is not already there.
+#: Recorded, not fixed: the runner and broker stores are WAL because their owners need
+#: WAL, so the fix is a journal-mode decision for two more authorities and belongs with
+#: its own acceptance -- the report carries the argument. A *new* entry fails this file.
+#: `signal_router` always appears: it opens all three `runner.sqlite3` files and none of
+#: them has a `-shm` yet. `notifier` appears only when the paper broker's own sidecars are
+#: not already on disk from an earlier role in the same pass, which is why the assertion
+#: below is a containment: a *new* role here is a regression, a missing one is a starting
+#: state, and the entry that must never be absent is asserted on its own.
+KNOWN_C_LEVEL_WRITES: dict[str, tuple[str, ...]] = {
+    "signal_router": ("live/strategies",),
+    "notifier": ("live/paper-brokers",),
 }
 
 
@@ -556,6 +616,13 @@ def test_every_role_starts_under_its_own_unit_and_writes_nowhere_else(
     for role, expected in KNOWN_OUT_OF_SANDBOX.items():
         assert len(outside[role]) == 1, outside[role]
         assert outside[role][0].endswith(expected), outside[role]
+    #: the end-state check the syscall wrappers cannot make: no directory a role does not
+    #: own changed while it ran, including through writes made from C
+    touched = {run.role: run.changed_trees for run in runs if run.changed_trees}
+    assert set(touched) <= set(KNOWN_C_LEVEL_WRITES), touched
+    for role, subtrees in touched.items():
+        assert subtrees == KNOWN_C_LEVEL_WRITES[role], (role, subtrees)
+    assert "signal_router" in touched, touched
 
     refused = {run.role: repr(run.refusal) for run in runs if run.refusal is not None}
     assert set(refused) == set(CANNOT_BUILD), refused
@@ -712,29 +779,46 @@ def test_the_notifier_writes_nothing_in_the_page_control_root(
 def test_a_role_given_the_whole_runtime_root_is_not_what_this_file_measures(
     cold_chain: RouteAWorld,
 ) -> None:
-    """The guard on the harness itself: a widened sandbox must stop proving anything.
+    """The guard on the harness itself, with a write of its own to prove it.
 
-    If `writable` were the whole runtime root, every assertion above would hold for a
-    role that wrote anywhere it liked. This runs one role both ways and shows the two
-    are not the same measurement.
+    Review S-3: the first version of this guard only asserted "the granted set is not the
+    whole root" and "the widened run has no violations", both of which stay true if
+    `run_role` is widened. It was the unfixed `feature_live` write that made the widening
+    mutation red -- so the day that write is fixed, the widening would have gone unnoticed.
+
+    This makes the guard self-sufficient: a synthetic write into a directory no unit grants
+    is refused under the role's own path set and admitted under the widened one. It needs
+    no role to misbehave, so it keeps working when `KNOWN_OUT_OF_SANDBOX` is empty.
     """
 
     role = "feature_live"
     instance = instance_of(cold_chain, role)[0]
     granted = sandbox_of(role, instance=instance, runtime_root=cold_chain.runtime_root)
-
     assert granted["ReadWritePaths"] != (cold_chain.runtime_root,)
     assert all(
         path != cold_chain.runtime_root for path in granted["ReadWritePaths"]
     ), granted["ReadWritePaths"]
-    #: and the widened one really does admit writes the unit's own set would refuse
-    wide = run_role(
-        cold_chain,
-        role,
-        instance=instance,
-        writable_override=(cold_chain.runtime_root,),
-    )
-    assert wide.violations == []
+
+    #: `authorities/` is granted to no role's `ReadWritePaths` under this instance
+    probe = cold_chain.runtime_root / "authorities" / "pkgl-sandbox-probe"
+
+    with readonly_runtime(
+        cold_chain.runtime_root,
+        writable=granted["ReadWritePaths"],
+    ) as narrow_violations, pytest.raises(OSError) as refused:
+        probe.mkdir()
+    assert refused.value.errno == errno.EROFS
+    assert [violation.path for violation in narrow_violations] == [str(probe)]
+    assert not probe.exists()
+
+    with readonly_runtime(
+        cold_chain.runtime_root,
+        writable=(cold_chain.runtime_root,),
+    ) as wide_violations:
+        probe.mkdir()
+    assert wide_violations == []
+    assert probe.is_dir()
+    probe.rmdir()
 
 
 #: the two units that declare no `InaccessiblePaths` at all. `ProtectHome=read-only` still
@@ -852,4 +936,5 @@ def test_the_recovery_oneshots_reach_their_payload_inside_their_sandbox(
         assert run.refusal is None, run
         assert run.exit_code == 0, run
         assert run.violations == [], run.violations
-        assert not (cold_chain.runtime_root / "control" / "recovery").exists() or True
+        #: the one directory these two units may write, and the only one they touched
+        assert run.changed_trees == (), run.changed_trees

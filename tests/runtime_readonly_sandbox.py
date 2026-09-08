@@ -69,6 +69,7 @@ class _ReadOnlyRuntime:
         root: Path,
         writable: Sequence[Path],
         inaccessible: Sequence[Path] = (),
+        outside_exempt: Sequence[Path] = (),
     ) -> None:
         self.root = Path(os.path.abspath(root))
         self.writable = tuple(Path(os.path.abspath(path)) for path in writable)
@@ -78,6 +79,9 @@ class _ReadOnlyRuntime:
         #: reading a secret its own generation did not hand it.
         self.inaccessible = tuple(Path(os.path.abspath(path)) for path in inaccessible)
         self.violations: list[SandboxViolation] = []
+        #: writes the host would also refuse, outside `root`. Recorded, never refused.
+        self.outside: list[SandboxViolation] = []
+        self.outside_exempt = tuple(Path(os.path.abspath(path)) for path in outside_exempt)
 
     def _hidden(self, target: object) -> Path | None:
         if isinstance(target, int) or not self.inaccessible:
@@ -107,6 +111,16 @@ class _ReadOnlyRuntime:
         except TypeError:
             return None
         if candidate != self.root and self.root not in candidate.parents:
+            #: `ProtectSystem=strict` makes the *whole* filesystem read-only, not just the
+            #: runtime root, so a write to `/home/lighthouse/rquant/logs`, `/var/lib/rquant`
+            #: or anywhere else is `EROFS` on a host too. `outside` records those without
+            #: refusing them, because a test process legitimately writes to its own pytest
+            #: temporary directory, its venv and `TMPDIR`; a caller that wants the host's
+            #: answer for a particular tree passes it in `root` or reads `outside`.
+            for exempt in self.outside_exempt:
+                if candidate == exempt or exempt in candidate.parents:
+                    return None
+            self.outside.append(SandboxViolation(operation="write", path=str(candidate)))
             return None
         for writable in self.writable:
             if candidate == writable or writable in candidate.parents:
@@ -136,6 +150,8 @@ def readonly_runtime(
     *,
     writable: Sequence[Path] = (),
     inaccessible: Sequence[Path] = (),
+    outside_exempt: Sequence[Path] = (),
+    outside: list[SandboxViolation] | None = None,
 ) -> Iterator[list[SandboxViolation]]:
     """Make everything under `root` read-only except `writable`, as the unit does.
 
@@ -143,9 +159,18 @@ def readonly_runtime(
     the read-only default: reads of those paths fail too, wherever they live -- every
     runtime unit hides `/home/lighthouse/rquant/.env` that way, and that path is outside
     the runtime root, so it is checked against the list rather than against `root`.
+
+    Writes *outside* `root` are recorded in `outside` rather than refused. On a host
+    `ProtectSystem=strict` refuses those too, but a test process has to write to its own
+    pytest temporary directory and venv, so the honest thing is to surface them and let
+    the caller decide, not to pretend this simulation is the host's mount namespace.
     """
 
-    guard = _ReadOnlyRuntime(root, writable, inaccessible)
+    guard = _ReadOnlyRuntime(root, writable, inaccessible, outside_exempt)
+    if outside is not None:
+        #: the caller's list, so a test can see the writes the host would refuse outside
+        #: `root` without this simulation having to refuse them here
+        guard.outside = outside
     originals: dict[str, object] = {}
 
     def install(name: str, replacement: object) -> None:

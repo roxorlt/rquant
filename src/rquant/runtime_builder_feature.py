@@ -136,7 +136,18 @@ def feature_live_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBuil
             settings.historical_minutes_snapshot_path,
             snapshot_id=settings.historical_snapshot_id,
         )
-        raw_spool = LiveBatchSpool(settings.raw_spool_root)
+        #: #231's fifth site. The minute spool belongs to `market_minute_source`; this
+        #: unit lists it under `ReadOnlyPaths`. A write-mode spool writes the producer's
+        #: own `sources/<channel>.json` and keeps the consumer cursor in the producer's
+        #: `cursors/`. Neither has ever succeeded under this unit -- `live/market-minute`
+        #: is not in its `ReadWritePaths`, so no cursor this role wrote can exist there --
+        #: which is why moving the cursor into the directory this role does own loses
+        #: nothing and starts working instead of failing every intraday batch.
+        raw_spool = LiveBatchSpool(
+            settings.raw_spool_root,
+            source_read_only=True,
+            cursor_root=settings.feature_spool_root / "raw-cursors",
+        )
         feature_spool = FeatureBatchSpool(settings.feature_spool_root)
         config = settings.feature_config.bind_to_manifest(manifest)
 
