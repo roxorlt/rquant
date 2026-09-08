@@ -1015,9 +1015,16 @@ def test_rollback_switches_pointer_without_mutating_manifests(tmp_path: Path) ->
     assert ReferenceRegistry(registry.path).current_pointer() == pointer
 
 
-def test_registry_reopens_with_wal_full_and_detects_manifest_tampering(
+def test_registry_reopens_synchronous_full_and_detects_manifest_tampering(
     tmp_path: Path,
 ) -> None:
+    """#242 moved the journal layout; the durability setting and the hash check did not.
+
+    The writer used to demand WAL. It now demands a rollback journal, because a WAL
+    database is one no read-only reader can open at all, and every reader of this
+    authority is one.
+    """
+
     path = tmp_path / "reference.sqlite"
     registry = ReferenceRegistry(path)
     registry.append(_record())
@@ -1026,7 +1033,7 @@ def test_registry_reopens_with_wal_full_and_detects_manifest_tampering(
     reopened = ReferenceRegistry(path)
     assert reopened.current_manifest() == manifest
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         connection.execute(
             "UPDATE reference_generation SET row_count = row_count + 1 WHERE generation_id = ?",
