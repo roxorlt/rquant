@@ -56,14 +56,26 @@ fail_once() {
         return 1
     fi
 }
+# systemd derives the slice hierarchy from the dashes in the unit name, so
+# rquant-live-runtime.slice sits one level below rquant-live.slice.
+slice_cgroup() {
+    local stem=${1%.slice}
+    local path="" prefix="" part
+    local IFS='-'
+    for part in ${stem}; do
+        prefix="${prefix:+${prefix}-}${part}"
+        path="${path}/${prefix}.slice"
+    done
+    printf '%s' "${path}"
+}
 case "${1:-}" in
   list-units)
     printf '%s loaded active running legacy\n' 'rquant-runtime-live@svc-old.service'
     ;;
   show)
     unit=${2:-}
-    if [[ "${unit}" == 'rquant-live.slice' || "${unit}" == 'rquant-research.slice' ]]; then
-        printf '/rquant.slice/%s\n' "${unit}"
+    if [[ "${unit}" == *.slice ]]; then
+        printf '%s\n' "$(slice_cgroup "${unit}")"
     elif [[ "${unit}" == 'rquant-runtime-feature@svc-new.service' ]]; then
         fail_once replacement_show
         replacement_count=0
@@ -81,7 +93,8 @@ case "${1:-}" in
         printf '%s\n' \
           'LoadState=loaded' "ActiveState=${replacement_active}" 'UnitFileState=enabled' \
           "Slice=${replacement_slice}" \
-          "ControlGroup=/rquant.slice/${replacement_slice}/rquant-runtime-feature@svc-new.service"
+          "ControlGroup=$(slice_cgroup "${replacement_slice}")\
+/rquant-runtime-feature@svc-new.service"
     elif [[ "${unit}" == 'rquant-runtime-live@svc-old.service' ]]; then
         if [[ "${RQUANT_MIGRATION_FAULT:-}" == snapshot_show ]]; then
             if [[ -e "${state}/seen-old-show" ]]; then
@@ -478,10 +491,25 @@ def test_accept_preflight_fault_never_starts_mutation(
     assert "disable" not in (state / "calls").read_text(encoding="utf-8")
 
 
-def test_accept_removes_legacy_only_after_verified_replacement(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "replacement_slice",
+    (None, "rquant-live.slice", "rquant-live-runtime.slice", "rquant-serving.slice"),
+    ids=("default", "live", "live-runtime", "serving"),
+)
+def test_accept_removes_legacy_only_after_verified_replacement(
+    tmp_path: Path,
+    replacement_slice: str | None,
+) -> None:
+    """Every slice a replacement may legitimately declare is accepted.
+
+    `rquant-live-runtime.slice` is the one added by #243: the fourteen live-plane role
+    templates moved into it, so a replacement instance now reports it and the migration
+    would otherwise stop with `invalid Slice=` (review D-2).
+    """
+
     root, unit_dir, state = _fixture(tmp_path)
 
-    result = _run(root, accept=True)
+    result = _run(root, accept=True, replacement_slice=replacement_slice)
 
     assert result.returncode == 0, result.stderr
     assert not (unit_dir / LEGACY_TEMPLATE).exists()
