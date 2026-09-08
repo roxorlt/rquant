@@ -1251,3 +1251,48 @@ def test_a_registry_that_cannot_be_opened_names_the_path_and_the_errno(
     assert str(registry.path) in message
     assert "EACCES" in message or "13" in message
     assert str(authority) in message
+
+
+def test_a_frozen_copy_is_read_immutably_and_its_wal_header_is_not_a_refusal(
+    tmp_path: Path,
+) -> None:
+    """#242's blast radius on the recovery subsystem, closed by naming the two cases.
+
+    SQLite's backup API copies the source's journal-mode byte, so every recovery backup
+    captured before the publisher converts the live authority still has a WAL header. A
+    frozen copy has no writer, so it is opened `immutable=1` -- no wal-index, no writes,
+    no directory requirement -- and the header says nothing about whether it can be read.
+    The live reader is unchanged: it still refuses.
+    """
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    published = registry.publish(published_at=BASE + timedelta(hours=2))
+    backup = tmp_path / "backups" / "reference.sqlite"
+    backup.parent.mkdir()
+    with closing(sqlite3.connect(registry.path)) as source, closing(
+        sqlite3.connect(backup)
+    ) as destination:
+        source.backup(destination)
+    #: the copy the backup API produced, with the journal mode the source had
+    with closing(sqlite3.connect(backup, isolation_level=None)) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+    for suffix in ("-wal", "-shm"):
+        sidecar = backup.with_name(backup.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    backup.chmod(0o600)
+    assert _journal_layout_byte(backup) == 2
+
+    if os.geteuid() != 0:
+        os.chmod(backup.parent, 0o500)
+    try:
+        frozen = ReadonlyReferenceRegistry(backup, frozen_artifact=True)
+
+        assert frozen.current_manifest() == published
+        with pytest.raises(ReferenceDataIntegrityError, match="WAL journal mode"):
+            ReadonlyReferenceRegistry(backup)
+    finally:
+        os.chmod(backup.parent, 0o700)
+
+    assert sorted(path.name for path in backup.parent.iterdir()) == [backup.name]

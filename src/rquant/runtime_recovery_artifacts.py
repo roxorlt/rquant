@@ -2012,7 +2012,12 @@ def _contract_for_path(
         finally:
             connection.close()
         try:
-            registry = ReadonlyReferenceRegistry(path)
+            #: #242: this is a frozen copy, not the live authority. SQLite's backup API
+            #: carries the source's journal-mode byte into the copy, so every generation
+            #: captured before the publisher converted the live authority still has a WAL
+            #: header; a copy has no writer, so it is read immutably and the header is not
+            #: a reason to refuse it.
+            registry = ReadonlyReferenceRegistry(path, frozen_artifact=True)
             pointer = registry.current_pointer()
             manifest = registry.current_manifest()
         except Exception as exc:
