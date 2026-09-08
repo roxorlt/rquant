@@ -151,7 +151,11 @@ def build_production_artifact_terminal_lifecycle(
     research_root = Path(runtime_root) / "research"
 
     if service_kind is RuntimeServiceKind.LAB_ARTIFACT_CATALOG:
-        state_root = _private_state_root(runtime_root)
+        #: the retention state root belongs to `artifact_retention`, and this unit's
+        #: `ReadWritePaths` grants exactly one directory inside it: the registration
+        #: outbox. `_private_state_root` creates *and chmods* the root itself, which is a
+        #: write into another role's directory and `EROFS` under this unit's sandbox.
+        state_root = artifact_retention_state_root(runtime_root)
         return ProductionArtifactTerminalLifecycle(
             catalog_registration_sink=ArtifactCatalogRegistrationSink(
                 ArtifactCatalogRegistrationOutbox(state_root / "catalog-registration-outbox")

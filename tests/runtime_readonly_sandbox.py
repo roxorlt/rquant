@@ -51,6 +51,8 @@ _RENAME_FUNCTIONS = ("rename", "replace")
 #: `os` functions whose *second* argument is the entry being created.
 _DESTINATION_FUNCTIONS = ("symlink", "link")
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+#: `os` functions that merely look; only an `InaccessiblePaths=` entry denies these
+_READ_FUNCTIONS = ("stat", "lstat", "listdir", "scandir", "readlink", "access")
 
 
 @dataclass(frozen=True)
@@ -62,10 +64,39 @@ class SandboxViolation:
 
 
 class _ReadOnlyRuntime:
-    def __init__(self, root: Path, writable: Sequence[Path]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        writable: Sequence[Path],
+        inaccessible: Sequence[Path] = (),
+    ) -> None:
         self.root = Path(os.path.abspath(root))
         self.writable = tuple(Path(os.path.abspath(path)) for path in writable)
+        #: `InaccessiblePaths=` in the unit. systemd over-mounts an empty, permission-less
+        #: node there, so the path is not merely unwritable: reading it is `EACCES` too.
+        #: The one every runtime unit carries is `.env`, and a role that reads it is
+        #: reading a secret its own generation did not hand it.
+        self.inaccessible = tuple(Path(os.path.abspath(path)) for path in inaccessible)
         self.violations: list[SandboxViolation] = []
+
+    def _hidden(self, target: object) -> Path | None:
+        if isinstance(target, int) or not self.inaccessible:
+            return None
+        try:
+            candidate = Path(os.path.abspath(os.fspath(target)))
+        except TypeError:
+            return None
+        for hidden in self.inaccessible:
+            if candidate == hidden or hidden in candidate.parents:
+                return candidate
+        return None
+
+    def refuse_access(self, operation: str, target: object) -> None:
+        hidden = self._hidden(target)
+        if hidden is None:
+            return
+        self.violations.append(SandboxViolation(operation=operation, path=str(hidden)))
+        raise OSError(errno.EACCES, "Permission denied", str(hidden))
 
     def _protects(self, target: object) -> Path | None:
         if isinstance(target, int):
@@ -83,6 +114,7 @@ class _ReadOnlyRuntime:
         return candidate
 
     def refuse(self, operation: str, target: object) -> None:
+        self.refuse_access(operation, target)
         protected = self._protects(target)
         if protected is None:
             return
@@ -103,10 +135,17 @@ def readonly_runtime(
     root: Path,
     *,
     writable: Sequence[Path] = (),
+    inaccessible: Sequence[Path] = (),
 ) -> Iterator[list[SandboxViolation]]:
-    """Make everything under `root` read-only except `writable`, as the unit does."""
+    """Make everything under `root` read-only except `writable`, as the unit does.
 
-    guard = _ReadOnlyRuntime(root, writable)
+    `inaccessible` is the unit's `InaccessiblePaths=`, which is a stronger denial than
+    the read-only default: reads of those paths fail too, wherever they live -- every
+    runtime unit hides `/home/lighthouse/rquant/.env` that way, and that path is outside
+    the runtime root, so it is checked against the list rather than against `root`.
+    """
+
+    guard = _ReadOnlyRuntime(root, writable, inaccessible)
     originals: dict[str, object] = {}
 
     def install(name: str, replacement: object) -> None:
@@ -146,16 +185,29 @@ def readonly_runtime(
     original_open = os.open
 
     def guarded_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        guard.refuse_access("open", path)
         if flags & _WRITE_FLAGS:
             guard.refuse("open", path)
         return original_open(path, flags, *args, **kwargs)
 
     install("open", guarded_open)
 
+    for name in _READ_FUNCTIONS:
+        if not hasattr(os, name):
+            continue
+        original_read = getattr(os, name)
+
+        def guarded_read(path, *args, _original=original_read, _name=name, **kwargs):  # type: ignore[no-untyped-def]
+            guard.refuse_access(_name, path)
+            return _original(path, *args, **kwargs)
+
+        install(name, guarded_read)
+
     original_io_open = io.open
     original_builtin_open = builtins.open
 
     def guarded_io_open(file, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        guard.refuse_access("io.open", file)
         if any(character in mode for character in "wxa+"):
             guard.refuse("io.open", file)
         return original_io_open(file, mode, *args, **kwargs)
