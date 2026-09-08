@@ -569,13 +569,17 @@ KNOWN_OUT_OF_SANDBOX: dict[str, str] = {}
 #: WAL, so the fix is a journal-mode decision for two more authorities and belongs with
 #: its own acceptance -- the report carries the argument. A *new* entry fails this file.
 #: `signal_router` always appears: it opens all three `runner.sqlite3` files and none of
-#: them has a `-shm` yet. `notifier` appears only when the paper broker's own sidecars are
-#: not already on disk from an earlier role in the same pass, which is why the assertion
-#: below is a containment: a *new* role here is a regression, a missing one is a starting
-#: state, and the entry that must never be absent is asserted on its own.
+#: them has a `-shm` yet. The other two appear only when the peer's own sidecars are not
+#: already on disk from an earlier role in the same pass -- `reference_slow_publisher`
+#: showed up on Linux and not on macOS for exactly that reason -- which is why the
+#: assertion below is a containment: a *new* role here is a regression, a missing one is a
+#: starting state, and the entry that must never be absent is asserted on its own.
 KNOWN_C_LEVEL_WRITES: dict[str, tuple[str, ...]] = {
     "signal_router": ("live/strategies",),
     "notifier": ("live/paper-brokers",),
+    #: the source spool's own quota database, in `market_minute_source`'s sibling
+    #: directory: `live/reference-slow` is `ReadOnlyPaths` for the publisher's unit
+    "reference_slow_publisher": ("live/reference-slow",),
 }
 
 
