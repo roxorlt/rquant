@@ -2492,6 +2492,7 @@ def test_blk3_builders_start_from_the_packaged_manifest_on_all_three_planes(
     one role of each plane all the way to a runtime step.
     """
 
+    from rquant.live_spool import LiveBatchSpool
     from rquant.reference_data_registry import ReferenceRegistry
     from rquant.runtime_service_control import RuntimeServicePlane
 
@@ -2506,6 +2507,13 @@ def test_blk3_builders_start_from_the_packaged_manifest_on_all_three_planes(
     )
     constraint = manifests["paper_constraint_publisher"][0]
     ReferenceRegistry(Path(str(constraint.settings["reference_registry_path"])))
+    #: Both of the producers this role reads have to have run once, for the same reason:
+    #: the builder opens their artifacts and neither one creates anything in a directory it
+    #: does not own. The registry above is `reference_slow_publisher`'s; the minute spool is
+    #: `market_minute_source`'s, and this reader now opens it with `source_read_only=True`
+    #: (#231), which fails closed on a missing root instead of making one inside the
+    #: producer's tree. Writing the producer's side here is what the host does by running it.
+    LiveBatchSpool(Path(str(constraint.settings["minute_spool_root"])))
 
     for plane, role in roles:
         manifest = manifests[role][0]
