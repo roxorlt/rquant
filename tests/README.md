@@ -62,6 +62,26 @@ v1 manifest 的 selector 固定为空列表。index 与 JSONL 必须是无重复
 canonical JSON；nodeid 文件部分只能指向仓库内非符号链接的 `tests/**/*.py`。单 nodeid
 上限 1,100,000 bytes、单 JSONL 行上限 1,100,032 bytes、manifest 总量上限 4 MiB。
 
+## 跨版本 schema 快照
+
+`tests/fixtures/runtime-schema-contracts/v0.33.1.json` 是生产第三代（producer_commit
+`a0bbb4c`、21 条 channel）真实写下的 `schema-contracts.json`。仓库里其他 schema 转换用例的
+两侧都由工作树里的同一份代码生成，改了载荷形状之后「前代」也跟着改，转换永远是绿的；安装器
+比的却是新代码生成的 bundle 与**已装那一代**留下的这份文件。这份快照是全套用例里唯一一个
+代码改不动的「前代」，`tests/unit/test_runtime_schema_release_snapshot.py` 与
+`tests/unit/test_runtime_deployment_bundle.py::test_installer_accepts_the_generation_production_actually_published`
+读它。
+
+**快照由集成者在每个发布 tag 上刷新，节奏与上面的全集清单一致。** 刷新时放进来的必须是那一刻
+**生产上实际装着**的那一代的 `schema-contracts.json`（从
+`<runtime_root>/current/schema-contracts.json` 取），不是本地生成的 bundle。
+
+用例红了只有两条合法出路，改快照本身不是其中之一：
+
+1. 服务侧载荷又内嵌了会变的模型 —— 恢复冻结投影（这就是 #237）。
+2. 真的要给那条 channel 升 `schema_version`，并且这次升版是走完整 rollout
+   （PREPARE → DUAL_WRITE → …）的 —— 那么在那次发布里由集成者换上新一代的快照。
+
 ## 约定
 
 - **不联网测试打 `@pytest.mark.network`**：默认被 `addopts = -m 'not network'` 跳过

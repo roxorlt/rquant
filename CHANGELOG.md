@@ -6,6 +6,19 @@
 
 ### Added
 
+- **跨版本 schema 快照闸：拿生产真实发布过的一代当「前代」（#237）**：
+  仓库里此前每一条 schema 转换用例的两侧都由工作树里的同一份代码生成，所以改了载荷形状之后
+  「前代」也跟着被改写，转换永远是绿的；而安装器比的是**新代码生成的 bundle** 与**已装那一代
+  写下的 `schema-contracts.json`**，这个差别就是 #237 逃过 CI 的原因。
+  现在把第三代生产环境真实的 `schema-contracts.json`（producer_commit `a0bbb4c`、21 条
+  channel）作为 `tests/fixtures/runtime-schema-contracts/v0.33.1.json` 入库，两道闸门读它：
+  一道比对 `runtime.serving.runtime-health` 九个字段的哈希是否与快照逐个相等，
+  一道跑 `validate_runtime_schema_transition`（快照 → HEAD）覆盖全部 21 条 channel。
+  另有一条安装器用例把这份快照塞回已装那一代的目录下、重新与 generation basis 绑定，
+  再装一代上去——走的就是 2026-09-08 那天失败的那条代码路径。
+  **快照由集成者在每个发布 tag 上刷新**，节奏与 `tests/manifests/full-suite-v1` 清单一致：
+  刷新时用的是那一刻**生产上实际装着**的那一代的 `schema-contracts.json`，不是本地生成的。
+
 - **`rquant runtime-schema-rollout acknowledge`：转换全部状态库，并代生产者把本代计划推进到 DUAL_WRITE（#227，owner 2026-09-07 授权）**：
   装一代有前代的 bundle 会为每个「声明指纹变了」的 channel 备一份 rollout 计划，每份都停在
   PREPARE 等它的全部生产者各记一条承认。生产画像里有两份计划各带三个生产者
@@ -65,6 +78,30 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **v0.33.2 安装器在第三代生产机上被自己的 schema 兼容闸拦下（#237）**：
+  2026-09-08 在第三代（producer_commit `a0bbb4c`、v0.33.1）上跑
+  `rquant runtime-deployment-profile`，dry-run 与 `--apply` 都抛
+  `RuntimeSchemaCompatibilityError: new producer -> old consumer is incompatible on
+  runtime.serving.runtime-health`，`runtime.serving.runtime-health` 这个 channel 的九个字段
+  全部报「同一版本内出现语义变更」。九个字段没有一个被人动过。
+
+  原因是这条 channel 的载荷 `RuntimeHealthPayload` 直接内嵌了心跳文件模型
+  `RuntimeServiceHeartbeat`：`_field_schema_hashes` 给每个字段算哈希时，把载荷**整个
+  `$defs`** 一起算进去，所以任何一个被内嵌的嵌套模型多一个字段，这条 channel 的每个字段哈希
+  都会变。上一个包给心跳加了 `waiting_for` / `waiting_since` / `waited_seconds` 三个字段
+  （#231），于是九个哈希一起动，而 `schema_version` 仍然是 1——兼容闸按约定拒绝安装。
+
+  现在服务侧发布的是**冻结投影** `RuntimeServiceHeartbeatProjection`：字段集就是 v0.33.1 的
+  那 23 个，`runtime_health_authority` 与 `inspect_runtime_health` 在构造
+  `RuntimeServiceHealth` 时做转换，把文件模型直接塞给服务健康会被明确拒绝并提示改用
+  `project_heartbeat()`。投影**没有文档字符串**，因为 pydantic 会把 `__doc__` 作为 `$defs`
+  的 `description` 发布出去，光是写一段说明也会让九个哈希全变；说明改成 `#:` 注释。投影的
+  发布名保持 `RuntimeServiceHeartbeat`（`$defs` 的键与 title 都取类名，这个名字属于 v0.33.1
+  已经发布的契约），这就是那层命名空间类的用途。
+
+  三个 waiting 字段**留在心跳文件模型里**，runbook 里用 jq 读心跳文件的探针照常工作。
+  要把它们发布到服务健康载荷上，必须真正给这条 channel 升版本并走一遍 rollout，不在本次范围内。
 
 - **live 平面四个 role 在盘外空闲时全部起不来，一夜推了 10 条告警（#231、#232、#220）**：
   2026-09-08 路线 A 第三窗口（v0.33.1、权威链 seq 2）的主机上没有任何行情、没有任何信号，
