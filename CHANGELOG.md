@@ -96,7 +96,8 @@
   DEGRADED 下去而不告诉任何人。所以心跳新增三个字段
   `waiting_for` / `waiting_since` / `waited_seconds`（同组发布、换一份制品就重新计时、
   任何一次成功迭代清零），让 runbook 探针与将来的告警规则有结构化的东西可读，而不是去 grep
-  `last_error` 的散文。本次不加阈值，也不加告警规则。
+  `last_error` 的散文。本次不加阈值，也不加告警规则——「同一份对端制品等待超过 N 分钟要不要
+  告警」由 issue #235 单独决定（Refs #235）。
 
   验收是那一夜本身：**第二代 bundle 装在第一代之上**（这也是准备 schema rollout 计划的那一次
   安装，PREPARE 按 runbook 的口径承认过）、真实 stage 与发布、wrapper 自己派生的 argv

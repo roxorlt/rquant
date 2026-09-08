@@ -160,6 +160,13 @@ sudo systemctl stop 'rquant-runtime-auction-universe@*.service' \
      'rquant-runtime-watchlist-quote@*.service' \
      'rquant-runtime-runtime-health@*.service' 'rquant-runtime-serving@*.service'
 
+# ①b 回滚到「#231/#232 那一代之前」的任何一代之前，先把心跳文件挪走（见下方说明）
+STAMP=$(date +%Y%m%d-%H%M%S)
+sudo install -d -m 0700 "/home/lighthouse/rquant-heartbeats-aside-${STAMP}"
+sudo find /home/lighthouse/rquant/data/runtime/control -mindepth 3 -maxdepth 4 \
+     -path '*/heartbeats/*.json' \
+     -exec mv -t "/home/lighthouse/rquant-heartbeats-aside-${STAMP}/" {} +
+
 # ② 单级回到 sequence 2
 sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz \
      rollback --operation-id 9aa830e45819d8fb6ccad0e170ff89b5
@@ -169,6 +176,16 @@ sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz \
 # ④ 删掉 current 指针；角色自动回到降级分支（路线 B），不需要再换 generation
 sudo rm /home/lighthouse/rquant/data/runtime/current
 ```
+
+**①b 为什么是必须的（#231/#232 那一包引入，与 #216 同一类）**：`RuntimeServiceHeartbeat` 是
+`extra="forbid"` 的，心跳文件又**不按 generation 分目录**——`<control-root>/heartbeats/<sha256>.json`
+一个 role 一份，换代之后还在原地。那一包给心跳加了 `waiting_for` / `waiting_since` /
+`waited_seconds` 三个字段，方向是单向的：**新二进制读旧心跳**没问题（三个字段缺省为 `None`），
+**旧二进制读新心跳**直接拒——`read_heartbeat` 把解析失败变成
+`ValueError: runtime heartbeat is invalid: <service_id>`，打中的是 `start()`、健康面
+（`runtime_health_authority` 的读取与 `inspect_runtime_health`）以及 rollout reader 三处。
+所以**回滚到那一包之前的任何一代，都要先停 unit、再把 `$ROOT/control/*/*/heartbeats/*.json`
+挪走**，挪走的文件留档不要删（前置第 21 条是同一类操作，那次是 #216 的 spec 变更）。
 
 `generation` 目录是内容寻址的，三代全部保留，**永不删除**。代码本次未切换，无需代码回滚，
 锚点 `e4e303b`（服务器上 `/home/lighthouse/rollback-code-sha.txt`）。
@@ -393,10 +410,12 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 - **服务状态口径**（协调者 2026-09-04 已接受的应急口径，起因是 #191）：
   **13 个持续运行**（带降级警告，因为旧目录结构还不存在，这是设计）
   + **1 个 oneshot 跑完退 0**
-  + ~~**`rquant-runtime-strategy@` failed（设计，协调者已裁定）**~~ **这条口径作废（#218 A）**：
+  + ~~**`rquant-runtime-strategy@` failed（设计，协调者已裁定）**~~ **这条口径作废（#218 A、#232）**：
   那次 failed 的真实原因是 completion signer 把已冻结的 profile manifest 又验了一遍，报
   `strategy completion signer profile contains invalid manifests`，是代码缺陷不是设计。
-  修好之后 `strategy_live` 按前置第 28 条的顺序起两轮即可进服务循环，判据里它算**持续运行**。
+  修好之后（再加上 #231/#232 那一包）`rquant-runtime-strategy@` **必须是 active**：它一启动就
+  建自己的 `runner.sqlite3`、进服务循环，**不再需要「先起一轮失败」**（前置第 28 条），
+  判据里它算**持续运行**。
   + **`rquant-lab-claim-finalizer` 受阻**（缺仓库外的 `/etc/rquant` 输入，journal 追加到 #191，
   留到影子窗口前修）
   + **10 个未启用**（7 个等 credstore 密钥、3 个硬依赖旧目录结构；预期状态是「未启用」，不是失败）。
@@ -434,7 +453,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 和凭证侧的增量装法；另一个 PR（#207）修好了「权威 generation 与 legacy generation 是两个命名空间」
 这个结构性阻塞，第 13 条起的六条就是它带来的新前置；第 19 条来自 #213，第 20 条起的八条是
 2026-09-07 第一次真正跑完路线 A 之后的实战订正（runbook R-13…R-18），第 1、5、12 三条也按当时
-的实测就地订正过；第 28、29 两条来自 #218 的修复包（#220 的启动顺序与 recovery 凭证的生成器）；第 30、31 两条来自
+的实测就地订正过；第 29 条来自 #218 的修复包（recovery 凭证的生成器），第 28 条原本也是
+（#220 的启动顺序），2026-09-08 已被 #231/#232/#220 的修复包整条改写；第 30、31 两条来自
 #227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）；第 32 条来自 #230，
 也就是 #215 的第三处断点（凭证的投递形状）。
 下面三十二条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
@@ -611,53 +631,89 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     /var/lib/rquant/workload-isolation/high-water.json`，然后**退 0**（`Result=success`）。
     这是 workload arbiter 的资源门，不是崩溃、也不是 bug；谁在什么时候产出这份文件，
     仓库里还没有答案。判据里 research 平面按「已启动、被门挡住」记，**不计入持续运行数**。
-28. **C-3 的 live 平面按固定顺序起，第一轮 strategy 失败是这条链的一部分，不是事故**（#218 A、#220）。
-    `strategy_live` 的构造器要读 `<运行根>/live/signal-bus/signal_bus.sqlite3`，而 28 个 role 里
-    只有 `signal_router` 会建这个文件；`signal_router` 又在建它之前先要求三份
-    `live/strategies/*/runner.sqlite3` 存在——两边互相等对方（#220，代码层的循环依赖，本轮
-    不修，`deploy/systemd/` 的 `After=` 也没动）。能走通是因为 `strategy_live` 在开 signal bus
-    之前就已经把自己的 `runner.sqlite3` 建好了，所以第一轮失败会留下 router 需要的东西。
-    **按下面四步起，中间用三条探针卡住：**
+28. **C-3 的 live 平面按固定顺序起，全部软依赖；「先起 strategy 一轮失败」这一步作废**
+    （#231、#232、#220，2026-09-08 第三窗口的修复包）。第三窗口的实况是四个 role 一个都没起来：
+    三个 `strategy_live` 报 `OSError: [Errno 30] Read-only file system:
+    <ROOT>/live/features/.feature-spool.lock`（#231，消费者用写模式开 feature spool，锁在生产者
+    目录里，而 strategy unit 的 `ReadWritePaths` 只有 `live/strategies/%i`），`signal_router`
+    报五次 `runner source is unavailable: .../runner.sqlite3`（#232），`paper_broker` 与
+    `notifier` 等 router 的 spool（#220）。每一次退出都触发一条 `OnFailure=rquant-alert@`。
+    现在消费者只读打开 spool、游标放自己目录；`strategy_live` **一启动就建**
+    `runner.sqlite3`，`signal_router` **一启动就建** bus 与 spool，缺对端制品的一方在主循环里
+    等而不是退出。**两个方向都能起，顺序不再是硬约束**；下面这条顺序只是为了让每个 role
+    一上来就是 RUNNING 而不是 DEGRADED。
 
     ```bash
     ROOT=/home/lighthouse/rquant/data/runtime
     ```
 
-    ① 起 `rquant-runtime-strategy@` ×3。**这一轮预期失败**，失败信息必须是
-    `runner source is unavailable: <ROOT>/live/signal-bus/signal_bus.sqlite3`。
-    **如果报的还是 `completion signer profile contains invalid manifests`，说明装的不是本代**
-    （#218 A 的修复没进去），停下来查画像代次，不要往下走。
-
-    ② 探针 1 转 READY（三份 runner 数据库都在）之后再起 `rquant-runtime-signal-router@`：
-
-    ```bash
-    for _ in $(seq 1 30); do
-      [ "$(ls -1 "$ROOT"/live/strategies/*/runner.sqlite3 2>/dev/null | wc -l)" -eq 3 ] && break
-      sleep 2
-    done
-    test "$(ls -1 "$ROOT"/live/strategies/*/runner.sqlite3 2>/dev/null | wc -l)" -eq 3 \
-      && echo READY || echo WAIT
+    ```
+    ① rquant-runtime-runtime-health      （探路，不变）
+    ② rquant-runtime-serving             （不变）
+    ③ rquant-runtime-feature             ← 软前置：只有它会写 live/features/source-identity.json；
+                                            先起它只是让 strategy 一上来就是 RUNNING 而不是 DEGRADED
+       探针 0： test -f $ROOT/live/features/source-identity.json
+    ④ rquant-runtime-strategy@ × 3
+       探针 1： [ "$(ls -1 $ROOT/live/strategies/*/runner.sqlite3 2>/dev/null | wc -l)" -eq 3 ]
+    ⑤ rquant-runtime-signal-router@
+       探针 2： test -f $ROOT/live/signal-bus/spool/source.json
+    ⑥ rquant-runtime-paper-broker@ → rquant-runtime-notifier@
+    ⑦ 其余 unit（顺序无关）
     ```
 
-    ③ 探针 0（signal bus 已建出）与探针 2（router 至少跑完一个 step）都转 READY 之后，
-    **显式** `systemctl reset-failed` 再重启三个 `rquant-runtime-strategy@`，这一轮返回 0
-    进服务循环：
+    三条探针的产物在 `tests/integration/test_route_a_live_chain_idle_e2e.py` 里都是被断言过的
+    真实文件，路径与生产画像 `runtime_production_profile.py` 一致，不是从代码推出来的。
+
+    **探针要当判据用，不是提示。** 服务循环没有连续失败阈值——这正是本次要的，一个还没启动的
+    对端不再让进程退出、不再触发 `OnFailure`——**代价是把「告警风暴」换成了「静默」**：等不到
+    对端的 role 在面板上只是 DEGRADED，没有任何东西会主动找人。所以心跳多了
+    `waiting_for` / `waiting_since` / `waited_seconds` 三个字段，每条探针都有对应的判据：
 
     ```bash
-    test -f "$ROOT/live/signal-bus/signal_bus.sqlite3" && echo READY || echo ABSENT   # 探针 0
-    test -f "$ROOT/live/signal-bus/spool/source.json" && echo READY || echo WAIT      # 探针 2
+    CONTROL=$ROOT/control
+    # 某个 role 在等谁、等了多久。心跳是 role 自己按
+    # <control-root>/heartbeats/<sha256({"service_id":…})>.json 写的 0600 文件，一个 role 一份，
+    # 所以按目录通配即可
+    jq -r '[.service_id, .status, .waiting_for // "-", .waited_seconds // 0] | @tsv' \
+      "$CONTROL"/strategies/*/heartbeats/*.json \
+      "$CONTROL"/signal-routers/*/heartbeats/*.json \
+      "$CONTROL"/paper-brokers/*/heartbeats/*.json \
+      "$CONTROL"/notifiers/*/heartbeats/*.json
     ```
 
-    **不要指望 `Restart=on-failure` 自愈**：`rquant-runtime-strategy@.service` 是
-    `StartLimitIntervalSec=600s` / `StartLimitBurst=5` / `RestartSec=10s`，第 ① 步失败后
-    大约 50 秒内没完成第 ② 步，三个实例就进 `failed`，那时无论如何都要
-    `systemctl reset-failed` 后手动 `start`。所以 runbook 直接写成显式的第 ③ 步。
+    - **放行判据**：本步涉及的 role 都是 `waiting_for == null`（即 RUNNING，或者 DEGRADED 但原因
+      不是等对端）。
+    - **卡住判据**：`status == "degraded"` **且** `waiting_for != null`，且在 `waiting_for` 不变的
+      前提下 `waited_seconds` 持续增长——说明**那一份文件的拥有者没起来**，按文件名回到它的 unit，
+      而不是重启正在等的这一个。**两个条件都要看**：崩溃停机的记录里 `waiting_for` 也会留着
+      （`last_error` 描述的是那次崩溃），只看 `waiting_for` 会把人指向错误的文件。
+    - 三个字段同组发布、换一份制品就重新计时、任何一次成功迭代清零，所以 `waited_seconds`
+      回答的是「在这份文件上卡了多久」。
 
-    ④ 最后才起 `rquant-runtime-paper-broker@` 与 `rquant-runtime-notifier@`（它们等的
-    route spool 就是探针 2 那份 `source.json` 所在的目录）。
+    **本轮不加阈值、不加告警规则**：「同一份对端制品等待超过 N 分钟要不要告警」是 **issue #235**，
+    由它单独决定，那是 runbook 与告警面的事。
 
-    三条探针的产物在 `tests/integration/test_route_a_strategy_chain_e2e.py` 里都被断言过，
-    路径与生产画像 `runtime_production_profile.py` 一致，不是从代码推出来的。
+    **开窗前先看一眼旧游标**：消费者游标从 `live/features/cursors/` 搬到了
+    `live/strategies/<svc>/feature-cursors/`，旧位置不会再被读到。
+
+    ```bash
+    ls -A "$ROOT"/live/features/cursors    # 期望：空
+    ```
+
+    丢游标本身不危险（从 sequence -1 重放，`runner.replay_source_batch` 会把已处理的批次认成重放、
+    不重复发信号），但第三窗口三个 strategy 都死在构造期，理论上不该留下任何游标；非空说明更早的
+    窗口里真的消费过，把那几份游标的语义交代清楚再往下走。
+
+    **两个预期之内的 DEGRADED**，都在主循环里、都不是 #220 复发，不要当成回归：
+
+    - `paper_broker`：在 `paper_constraint_publisher` 发布出 `authorities/paper-execution` 的
+      current 指针之前，每一轮 `PaperExecutionConstraintUnavailableError: current pointer is
+      unavailable`。**进程是活的**。整晚都不发布的话那是另一条要开的 issue。
+    - `notifier`：`last_error` 是操作库路径的
+      `FileNotFoundError: [Errno 2] No such file or directory: '…/rquant_ro.duckdb'`。
+      主机上这一条取决于 serving 面自身的状态。
+
+
 29. **bundle 装完、`current` 指向本代之后，在主机上生成 recovery 的两份文档**（#218 C）。
     `data/recovery/runtime-recovery.json` 与 `runtime-recovery-backup.json` 由已安装画像指定路径，
     但在此之前**仓库里没有任何脚本、CLI 或文档产出过它们**，两个 recovery oneshot 因此一直缺输入。
@@ -761,8 +817,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     - 若窗口在这一步之后失败并把 `data/runtime/current` 回退到上一代：计划停在 DUAL_WRITE，
       但不再是当前代，之后任何一次 acknowledge 都会跳过它们（`skipped_reason: not_current_generation`），
       不会被误当成本代的进度；它们的库仍然会被转换，这正是要的。
-    - 第 28 条那条固定启动顺序仍然照旧。acknowledge 只消掉「等其他生产者承认」这一类失败，
-      消不掉 `strategy_live` ↔ `signal_router` 的 signal bus 循环依赖（#220）。
+    - 第 28 条那条启动顺序仍然照走。acknowledge 只消掉「等其他生产者承认」这一类失败；
+      `strategy_live` ↔ `signal_router` 那个互等已经由 #231/#232/#220 那一包在代码里拆掉，
+      两边现在都在主循环里等对端制品，不再退出。
     - **#228 仍然在**：只要 `changed_runtime_schema_channels` 的指纹里带 `producer_commit`，
       今后每一次纯代码发布都会凭空生出十六份计划，acknowledge 就得每次都跑一遍，
       `control/schema-rollouts` 下的目录数每发一版加十六（没有任何代码清理旧计划目录）。
@@ -860,8 +917,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #215 | credstore 密封了 7 个实例，路线 A 首次安装时逐个 start 过的 6 个 role 一个都没能持续运行：`reference_slow_source` / `market_minute_source` / `auction_match_source` 在 wrapper 白名单子环境里构造 `Settings` 缺 5 个字段（与 #189 同类，只是发生在子环境里）；`daily_close_source` 报 `TUSHARE_TOKEN_MAIN capability is required`；`reference_slow_publisher` 报 `requires its isolated publication credential`；`notifier` 缺 route spool（另涉 #218） | 首次安装时全部 `systemctl stop` + `reset-failed` 防重启风暴，判据记 0/7（前置第 25 条）。**这是第二关的硬前置**——没有 `reference_slow_publisher` 就没有 serving generation，包 D 排不了。已派单独一包修。**这个号下面一共三处断点**：wrapper 白名单缺 `CREDENTIALS_DIRECTORY`、七个 role 的环境面，以及**读者的凭证判据描述的不是 systemd 真正投递的形状**（另立 #230，见前置第 32 条） |
 | #216 | 换代之后旧实例留下的心跳文件仍在，`spec_fingerprint` 属于旧 spec，新代同一角色启动即报 `runtime heartbeat does not match the requested service spec` | 手工把已停实例的心跳文件移走再启动（前置第 21 条），首次安装时在 `runtime_health_publisher` 与 `serving_publisher` 上各命中一次。正确修法是发布链路自己作废旧代心跳，与 #215 同一包 |
 | #217 | research 平面四个角色（`lab_artifact_catalog` / `promotions_publisher` / `shadow_session` / `lab_jobs_publisher`）启动即 `FAIL research blocked: high-water evidence unavailable or invalid: /var/lib/rquant/workload-isolation/high-water.json` 并退 0。这是 workload arbiter 的资源门，不是崩溃，但这份高水位证据由谁产出、什么时候产出，仓库里没有答案 | 判据按「已启动、被门挡住」记，不计入持续运行数（前置第 27 条）。要让 research 平面真跑起来，得先定这份文件的产生者，本轮不做 |
-| #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | **已修（PR「fix(runtime): unlock the live strategy chain and recovery units under route A」）**：A 完成签名器改成先 `model_dump(mode="json")` 再重验（冻结过的 manifest 不再被自己的 `JsonValue` 断言拒掉）；B 两个 recovery oneshot 改核自己命名空间里的 `recovery_profile_generation`，权威链那道绑定另走 `resolve_legacy_schema_generation`，两者都不给的调用方被拒；C 新增 `scripts/provision_runtime_recovery_credentials.py` 产出那两份从来没有生产者的文档（前置第 29 条）。router / broker / notifier 那条链不是单独的缺陷，是启动顺序，见 #220 与前置第 28 条 |
-| #220 | live 平面的启动顺序是代码层的循环依赖：`strategy_live` 要读 `live/signal-bus/signal_bus.sqlite3`，只有 `signal_router` 会建它，而 `signal_router` 又先要求三份 `live/strategies/*/runner.sqlite3` | **不修，用顺序绕过**（前置第 28 条：strategy ×3 起一轮留下 runner 数据库 → router → 显式 `reset-failed` 重启 strategy ×3 → broker / notifier）。根治要么把 router 的建库提到 runner 源检查之前，要么放宽 strategy 的失败关闭（后者不做）；`tests/integration/test_route_a_strategy_chain_e2e.py` 已经把当前行为钉住，改哪一边都会被它接住 |
+| #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | **已修（PR「fix(runtime): unlock the live strategy chain and recovery units under route A」）**：A 完成签名器改成先 `model_dump(mode="json")` 再重验（冻结过的 manifest 不再被自己的 `JsonValue` 断言拒掉）；B 两个 recovery oneshot 改核自己命名空间里的 `recovery_profile_generation`，权威链那道绑定另走 `resolve_legacy_schema_generation`，两者都不给的调用方被拒；C 新增 `scripts/provision_runtime_recovery_credentials.py` 产出那两份从来没有生产者的文档（前置第 29 条）。router / broker / notifier 那条链不是单独的缺陷，是启动顺序，见 #220 与前置第 28 条（那条互等已由 #231/#232/#220 那一包修掉） |
+| #220 | live 平面的启动顺序是代码层的循环依赖：`strategy_live` 要读 `live/signal-bus/signal_bus.sqlite3`，只有 `signal_router` 会建它，而 `signal_router` 又先要求三份 `live/strategies/*/runner.sqlite3` | **已修（PR「fix(runtime): let the live strategy chain start idle under the sandbox」，与 #231、#232 同一包）**：`strategy_live` 一启动就建自己的 `runner.sqlite3`、`signal_router` 一启动就建 bus 与 spool，缺对端制品的一方在主循环里等而不是退出，两个方向都能起。原来那条「起一轮失败留下 runner 数据库」的绕过法作废，前置第 28 条已整条改写；代价是等对端时只有 DEGRADED 没有告警（阈值见 #235） |
 
 ### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
 
