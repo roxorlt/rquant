@@ -20,6 +20,12 @@
   `LINUX_PRODUCTION_RUNTIME_ROOT`），这一条被断言成事实而不是绕过去。
   `tests/runtime_readonly_sandbox.py` 同时增加了 `InaccessiblePaths` 的**读**拒绝
   （systemd 在那些路径上盖一个无权限的空节点，不只是不可写）。
+  **口径要准确**：逐字读自 unit 的是**路径集合**，沙箱本身是 Python 层（`os.*` 与
+  `builtins.open`）的模拟，**不是**主机的 mount namespace。三条覆盖不到的东西已经写进文件头并
+  各有对策：C 层的写（SQLite 建 wal-index、DuckDB、子进程）由每个 role 跑前跑后的 `tree_state`
+  比对兜底；runtime root **之外**的写只记录不拒绝（主机上 `ProtectSystem=strict` 会拒，
+  但测试进程必须能写自己的临时目录与 venv）；systemd 对启动时不存在的 `-` 前缀授权**整条丢弃**，
+  而这个 harness 允许 role 把它建出来。
 
 - **跨版本 schema 快照闸：拿生产真实发布过的一代当「前代」（#237）**：
   仓库里此前每一条 schema 转换用例的两侧都由工作树里的同一份代码生成，所以改了载荷形状之后
@@ -110,25 +116,49 @@
   同一个 role 还有第二处越界写：它以**写模式**打开 `market_minute_source` 的分钟 spool
   （`LiveBatchSpool(minute_spool_root)`），会在生产者目录里建 `batches/<channel>/`——
   这是 #231 的形状，主机上只因为生产者已经把目录建好了才没炸。已改为只读打开。
+  **并发口径变了，不是等价替换**：WAL 下读写互不阻塞，回滚日志下写事务提交期间读者要等、
+  读者持锁期间写者要等，两边都靠 `busy_timeout = 5000` 兜着；这个权威写很稀、读很短，
+  可以接受。持久性没变（`synchronous = FULL` 没动）。
+  转换本身**要独占**：有别的连接持有该库时 SQLite 只回一句 `database is locked`，
+  现在被包成一句点名文件、说清要先停哪些持有者的拒绝。
+  **恢复子系统另算**：SQLite 的 backup API 会把源库的 journal 模式字节带进备份，所以转换之前
+  捕获的每一代 recovery 备份里那份注册表拷贝仍然是 WAL 头。备份是**冻结制品**、没有写者，
+  所以按 `frozen_artifact=True` 以 `immutable=1` 打开——不建 sidecar、不写目录、不取发布锁——
+  WAL 头对它不是拒绝理由；**活的权威**照旧无条件拒。哪一种由调用方指明，不看环境。
 
 - **notifier 每轮 DEGRADED：往 page-control 的 control 根里写（#241）**：
   `rquant-runtime-notifier@svc-f2518f7a…` active 但每次迭代都
   `OSError: [Errno 30] Read-only file system: '<runtime root>/control/.page-control.sqlite3.<uuid>.<tmp>'`。
-  那个名字是读者自己的：`_ReadonlyPageControlAuditReader.snapshot()` 用硬链接把要读的那一代
+  那个名字是读者自己的：`_ReadonlyPageControlAuditReader.snapshot()` 用**硬链接**把要读的那一代
   钉住，而临时目录建在 **outbox 旁边**。outbox 归 page-control 服务
   （`rquant-page-control.service` 是唯一 `ReadWritePaths` 覆盖 `…/data/runtime/control` 的 unit，
-  notifier 的 unit 把 `control/page-control.sqlite3` 列在 `ReadOnlyPaths`），所以归属很清楚：
-  **notifier 只读，钉代的临时目录必须落在自己拥有的目录里**，现在派生自
-  `notification_state_path` 的父目录（`live/notifications/%i`），不新增 manifest 设置。
-  同一个 `snapshot` 形状在 DuckDB 只读副本读者（`_StableReadonlyDuckDB`）上还有一份，
-  page-control 那处修好之后就会轮到它，一并改掉；两处都拒绝「bind root 等于被读文件所在目录」，
-  绑定失败时点名路径与 errno。
+  notifier 的 unit 把 `control/page-control.sqlite3` 列在 `ReadOnlyPaths`）。
+  **把硬链接挪到 notifier 自己的目录里不是修好，只是换一种失败**：systemd 把 unit 的每一条
+  `ReadWritePaths` / `ReadOnlyPaths` 都做成**独立的 bind mount**，而 Linux 的 `link()` 比的是
+  **mount** 不是 superblock（`do_linkat` 先判 `old_path.mnt != new_path.mnt`），所以主机上那一步
+  回的是 `EXDEV`（errno 18）。在带 `--privileged` 的容器里用真实 bind mount 实测：`os.link`
+  从 outbox 链到 `live/notifications/<svc>/…` 与链到它自己旁边**都是 errno 18**。
+  **真正的修法是不再用硬链接**：两个只读读者改用**已打开的描述符**钉代——
+  `file:/proc/self/fd/<n>?mode=ro&immutable=1`——它打开的是描述符持有的 inode，
+  改名换不掉，而且**什么都不创建**。同一套 bind mount 下实测：两个读者都读成功，
+  `opened_through = descriptor`，outbox 目录与副本目录**逐字节未变**。
+  DuckDB 在 macOS 上拒绝 `/dev/fd/<n>`（它会拿描述符的真实名字重建路径），
+  所以副本读者保留原有的「在库旁边建硬链接」分支给不接受描述符的引擎，
+  走了哪一支被记录并断言，不是运行期惊喜。
 
 - **lab_artifact_catalog 建并 chmod 了 artifact_retention 的状态根**：
   `build_production_artifact_terminal_lifecycle` 在 `LAB_ARTIFACT_CATALOG` 分支上调
   `_private_state_root`，它对 `research/artifact-retention/<svc>` 做 `mkdir` **加无条件 chmod**；
   catalog 的 unit 只授权那里面的一个子目录（`catalog-registration-outbox`），所以这条 chmod 在
   沙箱下每次启动都是 `EROFS`。改为只取路径、不创建也不改权限。
+
+- **feature_live 以写模式打开分钟 spool（#231 的第五处）**：
+  `runtime_builder_feature.py` 里 `LiveBatchSpool(raw_spool_root)` 是写模式，会写生产者自己的
+  `sources/<channel>.json`，消费者游标也默认落在生产者根的 `cursors/` 下，而
+  `rquant-runtime-feature@.service` 把 `live/market-minute` 列在 `ReadOnlyPaths`。
+  改为 `source_read_only=True` 且游标根落在本 role 拥有的 `live/features/raw-cursors`。
+  **不丢状态**：旧游标位置从来就不在这个 unit 的授权里，所以这个 role 在 systemd 下
+  从来没成功写进去过一条游标；这一改是让它从「每个盘中批次都失败」变成能用。
 
 - **v0.33.2 安装器在第三代生产机上被自己的 schema 兼容闸拦下（#237）**：
   2026-09-08 在第三代（producer_commit `a0bbb4c`、v0.33.1）上跑
