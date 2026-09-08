@@ -17,6 +17,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP_UNIT = ROOT / "deploy" / "systemd" / "rquant-backup.service"
+BACKUP_TIMER = ROOT / "deploy" / "systemd" / "rquant-backup.timer"
 
 
 def _project(tmp_path: Path) -> Path:
@@ -216,7 +217,18 @@ def test_backup_unit_allows_large_snapshot_compression_to_finish() -> None:
     unit = ConfigParser(interpolation=None, strict=True)
     unit.read_string(BACKUP_UNIT.read_text(encoding="utf-8"))
 
-    assert unit.get("Service", "TimeoutStartSec") == "10min"
+    assert unit.get("Service", "TimeoutStartSec") == "20min"
+    assert unit.get("Service", "TimeoutStopSec") == "2min"
+
+
+def test_backup_timer_leaves_a_quiet_window_between_intraday_snapshots() -> None:
+    calendars = [
+        line.split("=", 1)[1].strip()
+        for line in BACKUP_TIMER.read_text(encoding="utf-8").splitlines()
+        if line.startswith("OnCalendar=")
+    ]
+
+    assert calendars == ["Mon..Fri *-*-* 9..15:0/30", "Mon..Fri 17:30"]
 
 
 def test_terminated_backup_cleans_private_generation(
