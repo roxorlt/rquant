@@ -46,6 +46,27 @@ RQUANT_WORKLOAD_ARBITER_HELD=maintenance exec "$@"
     return project
 
 
+def _priority_shims(directory: Path) -> Path:
+    """`nice`/`ionice` stand-ins that record their own flags and exec the rest."""
+
+    shim_dir = directory / "priority-bin"
+    shim_dir.mkdir(exist_ok=True)
+    for name in ("nice", "ionice"):
+        shim = shim_dir / name
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "{name} %s\\n" "$*" >> "${{RQUANT_TEST_PRIORITY_LOG}}"\n'
+            'while [[ "${1:-}" == -* ]]; do\n'
+            '    if [[ "$1" == "-n" ]]; then shift 2; else shift; fi\n'
+            "done\n"
+            'exec "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+    return shim_dir
+
+
+
 def _write_db(path: Path, marker: str) -> None:
     conn = duckdb.connect(str(path))
     conn.execute("CREATE TABLE marker (value VARCHAR)")
@@ -67,6 +88,8 @@ def _run(
     recovery_profile_generation: str | None = None,
     recovery_signer_key_id: str | None = None,
     runtime_root: Path | None = None,
+    ionice_mode: str | None = None,
+    priority_log: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for name in (
@@ -100,6 +123,12 @@ def _run(
         env["RQUANT_RECOVERY_SIGNER_KEY_ID"] = recovery_signer_key_id
     if runtime_root is not None:
         env["RQUANT_RUNTIME_ROOT"] = str(runtime_root)
+    env.pop("RQUANT_BACKUP_IONICE", None)
+    if ionice_mode is not None:
+        env["RQUANT_BACKUP_IONICE"] = ionice_mode
+    if priority_log is not None:
+        env["RQUANT_TEST_PRIORITY_LOG"] = str(priority_log)
+        env["PATH"] = f"{_priority_shims(priority_log.parent)}:{env['PATH']}"
     return subprocess.run(
         [str(project / "scripts" / "backup-snapshot.sh")],
         cwd=project,
@@ -229,6 +258,53 @@ def test_backup_timer_leaves_a_quiet_window_between_intraday_snapshots() -> None
     ]
 
     assert calendars == ["Mon..Fri *-*-* 9..15:0/15", "Mon..Fri 17:30"]
+
+
+@pytest.mark.parametrize(
+    ("ionice_mode", "expected_ionice_flags"),
+    [
+        (None, "-c3"),
+        ("idle", "-c3"),
+        ("best-effort", "-c2 -n7"),
+        ("none", None),
+    ],
+    ids=["auto-without-bfq", "idle", "best-effort", "disabled"],
+)
+def test_copy_and_compress_run_at_the_selected_io_priority(
+    tmp_path: Path,
+    ionice_mode: str | None,
+    expected_ionice_flags: str | None,
+) -> None:
+    """#243 review S-3.
+
+    `ionice -c3` is honoured literally by BFQ, where "idle" means "only when the disk is
+    free" - the wrong class for a 10 GB `cp`. `auto` picks best-effort's lowest priority
+    when it sees BFQ and idle otherwise; the host can override either way.
+    """
+
+    project = _project(tmp_path)
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    priority_log = tmp_path / "priority.log"
+    priority_log.write_text("", encoding="utf-8")
+
+    result = _run(
+        project,
+        source="main",
+        ionice_mode=ionice_mode,
+        priority_log=priority_log,
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = priority_log.read_text(encoding="utf-8").splitlines()
+    nice_calls = [line for line in lines if line.startswith("nice ")]
+    ionice_calls = [line for line in lines if line.startswith("ionice ")]
+    assert nice_calls, lines
+    assert all(line.startswith("nice -n 19 ") for line in nice_calls)
+    if expected_ionice_flags is None:
+        assert ionice_calls == []
+    else:
+        assert ionice_calls
+        assert all(line.startswith(f"ionice {expected_ionice_flags} ") for line in ionice_calls)
 
 
 @pytest.mark.parametrize(

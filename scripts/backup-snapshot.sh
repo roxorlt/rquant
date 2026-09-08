@@ -58,14 +58,44 @@ sweep_stale_generations() {
     fi
 }
 # 低优先级前缀：cp/gzip 是常驻服务之外的批处理，不该跟盘中 monitor 抢 CPU/IO。
-# 注意 cgroup v2 下跨 slice 的调度由 CPUWeight 决定，nice 只在同一 cgroup 内生效，
-# ionice 的 idle 类也只有 BFQ 调度器认；这两个是不花钱的兜底，真正的闸门是
-# deploy/systemd/rquant-*.slice 里的 CPUQuota/CPUWeight。
+# 注意 cgroup v2 下跨 slice 的调度由 CPUWeight 决定，nice 只在同一 cgroup 内生效；
+# 这是不花钱的兜底，真正的闸门是 deploy/systemd/rquant-*.slice 里的 CPUQuota/CPUWeight。
+#
+# ionice 的类别要看磁盘调度器（#243 评审 S-3）：
+#   - **BFQ** 会真的兑现 idle 类（`-c3`）= 只在磁盘空闲时才给 IO。10 GB 的 cp 正是
+#     IO 密集段，idle 类会把它拖慢，与「放宽超时让备份跑完」的方向相反 ⇒ 用
+#     best-effort 最低优先级 `-c2 -n7`：仍然让路给盘中服务，但不会被无限期饿着。
+#   - **none / mq-deadline / kyber**（云主机 virtio 的常见默认）根本不看 ionice 类别，
+#     `-c3` 与 `-c2 -n7` 效果相同。
+# `auto` 读 /sys/block/*/queue/scheduler 自己判；装机时可以先跑
+# `cat /sys/block/vda/queue/scheduler` 核对，必要时用 RQUANT_BACKUP_IONICE 显式覆盖。
+IONICE_MODE="${RQUANT_BACKUP_IONICE:-auto}"
+case "${IONICE_MODE}" in
+    auto|idle|best-effort|none) ;;
+    *)
+        log "ERROR: RQUANT_BACKUP_IONICE must be auto, idle, best-effort, or none"
+        exit 2
+        ;;
+esac
 NICE_BIN="$(command -v nice || true)"
 IONICE_BIN="$(command -v ionice || true)"
+IONICE_ARGS=()
+if [[ -n "${IONICE_BIN}" && "${IONICE_MODE}" != "none" ]]; then
+    if [[ "${IONICE_MODE}" == "auto" ]]; then
+        if grep -q '\[bfq\]' /sys/block/*/queue/scheduler 2>/dev/null; then
+            IONICE_MODE=best-effort
+        else
+            IONICE_MODE=idle
+        fi
+    fi
+    case "${IONICE_MODE}" in
+        idle) IONICE_ARGS=(-c3) ;;
+        best-effort) IONICE_ARGS=(-c2 -n7) ;;
+    esac
+fi
 low_priority() {
-    if [[ -n "${NICE_BIN}" && -n "${IONICE_BIN}" ]]; then
-        "${NICE_BIN}" -n 19 "${IONICE_BIN}" -c3 "$@"
+    if [[ -n "${NICE_BIN}" && ${#IONICE_ARGS[@]} -gt 0 ]]; then
+        "${NICE_BIN}" -n 19 "${IONICE_BIN}" "${IONICE_ARGS[@]}" "$@"
     elif [[ -n "${NICE_BIN}" ]]; then
         "${NICE_BIN}" -n 19 "$@"
     else
