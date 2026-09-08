@@ -47,6 +47,48 @@ _PUBLICATION_LOCK_STATE = local()
 _SQLITE_CONNECT_IDENTITY_LOCK = Lock()
 _FD_DIRECTORY_CANDIDATES = ("/proc/self/fd", "/dev/fd")
 _FD_ATTESTATION_MAX_ENTRIES = 4096
+#: byte 18 of the SQLite header: 1 is a rollback journal, 2 is WAL
+_HEADER_JOURNAL_LAYOUT_OFFSET = 18
+_ROLLBACK_JOURNAL_LAYOUT = 1
+_WAL_JOURNAL_LAYOUT = 2
+#: the sidecars either journal layout can leave next to the database
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _persisted_journal_layout(descriptor: int) -> int | None:
+    """The journal layout recorded in the database header, without opening it.
+
+    Asking SQLite would defeat the purpose: opening a WAL database is exactly the act
+    that creates the `-shm` wal-index beside it, which is what #242 could not do. One
+    `pread` of the header on a descriptor already held answers the same question and
+    creates nothing.
+    """
+
+    try:
+        header = os.pread(descriptor, _HEADER_JOURNAL_LAYOUT_OFFSET + 1, 0)
+    except OSError:
+        return None
+    if len(header) <= _HEADER_JOURNAL_LAYOUT_OFFSET:
+        return None
+    return header[_HEADER_JOURNAL_LAYOUT_OFFSET]
+
+
+def _directory_write_refusal(directory: Path) -> str:
+    """Why this directory refuses new entries, named as an errno, or "" if it does not.
+
+    `ProtectSystem=strict` denies with `EROFS`, because systemd builds a read-only mount;
+    a mode-denied directory reports `EACCES`. Both are answered without attempting a
+    write, so asking never leaves a file behind in an authority directory.
+    """
+
+    try:
+        if os.statvfs(directory).f_flag & getattr(os, "ST_RDONLY", 1):
+            return f"errno {errno.EROFS} EROFS {os.strerror(errno.EROFS)}"
+    except OSError:
+        return ""
+    if not os.access(directory, os.W_OK):
+        return f"errno {errno.EACCES} EACCES {os.strerror(errno.EACCES)}"
+    return ""
 
 
 def _open_descriptor_directory() -> int:
@@ -703,7 +745,7 @@ class ReferenceRegistry:
 
     def _validate_sqlite_sidecars(self) -> frozenset[tuple[int, int]]:
         identities: set[tuple[int, int]] = set()
-        for suffix in ("-wal", "-shm"):
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
             path = Path(f"{self.path}{suffix}")
             try:
                 observed = path.lstat()
@@ -734,6 +776,12 @@ class ReferenceRegistry:
     def publication_commit_lock(self, *, exclusive: bool = True) -> Iterator[None]:
         """Serialize the registry/cursor commit protocol across readers and writers."""
 
+        if getattr(self, "frozen_artifact", False):
+            #: #242: a frozen copy has no publisher, so there is no commit to serialize
+            #: against -- and taking the lock would mean creating a file next to an
+            #: artifact the reader must not touch (a backup root is immutable by design).
+            yield
+            return
         lock_key = str(self._publication_lock_path)
         with _PUBLICATION_LOCKS_GUARD:
             thread_lock = _PUBLICATION_LOCKS.setdefault(lock_key, RLock())
@@ -816,10 +864,28 @@ class ReferenceRegistry:
                 connection.row_factory = sqlite3.Row
                 connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
                 connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA synchronous = FULL")
-                mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-                if str(mode).lower() != "wal":
-                    raise ReferenceDataIntegrityError("reference registry requires WAL mode")
+                try:
+                    #: both of these take locks, and on a held database the first one to
+                    #: ask is the one that reports -- which was `synchronous`, not the
+                    #: journal-mode line, so the wrapper covers the whole preamble
+                    connection.execute("PRAGMA synchronous = FULL")
+                    mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+                except sqlite3.OperationalError as exc:
+                    #: #242: converting a WAL database to a rollback journal takes an
+                    #: exclusive lock. Any other connection -- a recovery backup in
+                    #: progress, an old reader -- makes SQLite answer "database is locked",
+                    #: which on its own says neither which file nor what to do about it.
+                    raise ReferenceDataIntegrityError(
+                        f"reference registry {self.path} cannot be opened for writing "
+                        f"({exc}); setting its journal mode needs exclusive access, so stop "
+                        f"every other holder first (lsof {self.path}; the paper-constraint "
+                        f"and auction_gap candidate readers, and any running backup) and "
+                        f"start this writer alone"
+                    ) from exc
+                if str(mode).lower() != "delete":
+                    raise ReferenceDataIntegrityError(
+                        "reference registry requires rollback journal mode"
+                    )
                 connection.execute("PRAGMA schema_version").fetchone()
                 path_identity = self._validate_database_file(
                     self.path,
@@ -845,9 +911,14 @@ class ReferenceRegistry:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-            if str(mode).lower() != "wal":
-                raise ReferenceDataIntegrityError("reference registry requires WAL mode")
+            #: #242: a WAL database cannot be opened at all -- not even `mode=ro` -- without
+            #: creating the `-shm` wal-index beside it, and every reader of this authority
+            #: runs under a unit whose `ReadWritePaths` covers only the publisher's.
+            mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+            if str(mode).lower() != "delete":
+                raise ReferenceDataIntegrityError(
+                    "reference registry requires rollback journal mode"
+                )
             self._validate_sqlite_sidecars()
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -2475,9 +2546,28 @@ class ReadonlyReferenceRegistry(ReferenceRegistry):
         *,
         busy_timeout_ms: int = 5_000,
         publication_authenticator: ReferencePublicationAuthenticator | None = None,
+        frozen_artifact: bool = False,
     ) -> None:
+        """Read an authority, or -- with `frozen_artifact` -- a frozen copy of one.
+
+        The two are different problems and #242 only constrains the first. A reader of the
+        **live** authority has to see the publisher's commits as they land, so it cannot
+        use `immutable=1`, and without it SQLite must create the `-shm` wal-index next to
+        a WAL database -- which no unit but the publisher's may do. That is why a WAL live
+        authority is refused outright.
+
+        A **frozen artifact** -- a recovery backup or a restore candidate -- has no writer
+        by construction, so `immutable=1` is exactly right for it, needs no sidecar, and
+        works on a WAL header. Refusing those too would have failed every recovery
+        generation captured before the publisher converted the live authority, because
+        SQLite's backup API copies the source's journal-mode byte into the copy (measured
+        on both platforms). The caller says which of the two it is; nothing is inferred
+        from the environment, which is the part #227 and #242 both got wrong.
+        """
+
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
+        self.frozen_artifact = frozen_artifact
         candidate = Path(os.path.abspath(Path(path)))
         try:
             observed = candidate.lstat()
@@ -2497,10 +2587,75 @@ class ReadonlyReferenceRegistry(ReferenceRegistry):
             publication_authenticator or ReferencePublicationAuthenticator.from_environment()
         )
         self._database_identity = (observed.st_dev, observed.st_ino)
+        self._refuse_unreadable_journal_layout()
         try:
             self._validate_integrity()
         except sqlite3.DatabaseError as exc:
-            raise ReferenceDataIntegrityError("reference registry is invalid") from exc
+            raise ReferenceDataIntegrityError(self._unreadable_reason(exc)) from exc
+
+    def _refuse_unreadable_journal_layout(self) -> None:
+        """#242: refuse a WAL registry here, where the reason can still be named.
+
+        SQLite cannot open a WAL database without creating the `-shm` wal-index beside
+        it, and `mode=ro` does not change that -- it marks the *file* read-only and says
+        nothing about the directory. Every reader of this authority runs under a unit
+        whose `ReadWritePaths` covers only `rquant-runtime-reference-slow-publisher@`,
+        so on the host the open failed with `sqlite3.OperationalError: unable to open
+        database file` and the reader turned that into `reference registry is invalid`.
+
+        Refusing before the open, from the header alone, is deliberate: it fails the
+        same way whether or not the directory happens to be writable, so a developer's
+        writable root cannot hide the state a production root refuses.
+        """
+
+        if self.frozen_artifact:
+            return
+        descriptor = -1
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            raise ReferenceDataUnavailableError("reference registry is unavailable") from None
+        except OSError as exc:
+            raise ReferenceDataIntegrityError(
+                f"reference registry {self.path} cannot be read "
+                f"(errno {exc.errno} {errno.errorcode.get(exc.errno, '?')} {exc.strerror})"
+            ) from exc
+        try:
+            #: Note 1 of the review: close the window between the `lstat` in `__init__` and
+            #: this open by comparing the descriptor's own identity, rather than trusting
+            #: that the name still leads to the file that was validated.
+            if (
+                lambda observed: (observed.st_dev, observed.st_ino) != self._database_identity
+            )(os.fstat(descriptor)):
+                raise ReferenceDataIntegrityError(
+                    f"reference registry {self.path} changed between validation and open"
+                )
+            layout = _persisted_journal_layout(descriptor)
+        finally:
+            os.close(descriptor)
+        if layout != _WAL_JOURNAL_LAYOUT:
+            return
+        refusal = _directory_write_refusal(self.path.parent)
+        raise ReferenceDataIntegrityError(
+            f"reference registry {self.path} is in WAL journal mode, which cannot be opened "
+            f"without creating {self.path.name}-shm in {self.path.parent}"
+            + (f" ({refusal})" if refusal else "")
+            + "; a reader's unit grants that directory read-only, so reference_slow_publisher "
+            "has to reopen the registry for writing, which converts it to a rollback journal"
+        )
+
+    def _unreadable_reason(self, exc: sqlite3.DatabaseError) -> str:
+        """The refusal the host needed: the path, the directory and the errno."""
+
+        refusal = _directory_write_refusal(self.path.parent)
+        detail = f"{type(exc).__name__}: {exc}"
+        name = getattr(exc, "sqlite_errorname", None)
+        if name:
+            detail = f"{detail} [{name}]"
+        return (
+            f"reference registry {self.path} is invalid ({detail})"
+            + (f"; {self.path.parent} refuses new entries ({refusal})" if refusal else "")
+        )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -2527,7 +2682,8 @@ class ReadonlyReferenceRegistry(ReferenceRegistry):
             identities_before_connect = _regular_descriptor_identities()
             try:
                 connection = sqlite3.connect(
-                    f"{self.path.as_uri()}?mode=ro",
+                    f"{self.path.as_uri()}?mode=ro"
+                    + ("&immutable=1" if self.frozen_artifact else ""),
                     uri=True,
                     timeout=self.busy_timeout_ms / 1_000,
                     isolation_level=None,

@@ -160,7 +160,15 @@ def paper_execution_constraint_publisher_builder(
         if manifest.plane is not RuntimeServicePlane.LIVE:
             raise ValueError("paper constraint publisher must run on the live plane")
         settings = PaperConstraintRuntimeSettings.model_validate(dict(manifest.settings))
-        spool = LiveBatchSpool(settings.minute_spool_root)
+        #: the minute spool belongs to `market_minute_source`; this unit's `ReadOnlyPaths`
+        #: names it, and a write-mode spool creates directories and cursors inside it
+        #: (#231's shape: on the host it survives only while the producer has already made
+        #: every one of them). This role reads batches and keeps no cursor.
+        spool = LiveBatchSpool(
+            settings.minute_spool_root,
+            read_only=True,
+            source_read_only=True,
+        )
         registry = ReadonlyReferenceRegistry(settings.reference_registry_path)
         publisher = PaperExecutionConstraintPublisher(
             root=settings.authority_root,

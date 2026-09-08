@@ -98,6 +98,14 @@ from rquant.serving_read_models import (
 from rquant.storage.duckdb import DuckDBStore
 from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 
+
+def _generation_binds(outbox: object) -> Path:
+    """#241: the reading role's own scratch, never the outbox's own directory."""
+
+    path = Path(getattr(outbox, "path", outbox))
+    return path.parent / "generation-binds"
+
+
 NOW = datetime(2026, 8, 2, 3, 0, tzinfo=UTC)
 COMMIT = "a" * 40
 CURSOR_SIGNING_KEY = bytes(range(32))

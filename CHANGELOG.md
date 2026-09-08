@@ -6,6 +6,28 @@
 
 ### Added
 
+- **25 个 role 各自在自己 unit 的沙箱里起一次的 e2e（`tests/integration/test_route_a_all_roles_sandbox_e2e.py`）**：
+  Route A 的裸跑排查（runbook R-20）用 `runtime-exec.pyz` 起 role，**完全没有沙箱**，所以
+  「这个 role 往哪儿写」这一整类缺陷它一条也看不见——#242 与 #241 都是这一类。包 J 的 e2e 把
+  逐 unit 的真实路径集合用在了 live 链的 6 个 role 上，本文件把它扩到
+  `PRODUCTION_ROLE_POLICY` 里全部 **25 个 instanced role**：真装两代 bundle（第二代才会备下
+  每个 kind-backed role 启动时要读的 schema rollout 计划）、真 stage 并发布权威链、wrapper 自己
+  派生的 argv 与子环境、按 `LoadCredentialEncrypted` 的真实形状投递 7 个 credstore role 的凭据、
+  盘外时钟且日历不开盘。每个 role 的 `ReadWritePaths` / `ReadOnlyPaths` / `InaccessiblePaths`
+  **逐字读自 `deploy/systemd/`**，所以每个 role 被授权的路径集合与主机逐字一致
+  （package M 只改了这十四个模板的 `Slice=` 一行，三条路径指令一字未动，路径集合不受影响）。
+  25 个里 24 个能从 wrapper 的 argv 起来；`page_control` 的入口点从冻结常量取 runtime root
+  而不是从 argv 取（`page_control_service.main` → `_serve(runtime_root=None)` →
+  `LINUX_PRODUCTION_RUNTIME_ROOT`），这一条被断言成事实而不是绕过去。
+  `tests/runtime_readonly_sandbox.py` 同时增加了 `InaccessiblePaths` 的**读**拒绝
+  （systemd 在那些路径上盖一个无权限的空节点，不只是不可写）。
+  **口径要准确**：逐字读自 unit 的是**路径集合**，沙箱本身是 Python 层（`os.*` 与
+  `builtins.open`）的模拟，**不是**主机的 mount namespace。三条覆盖不到的东西已经写进文件头并
+  各有对策：C 层的写（SQLite 建 wal-index、DuckDB、子进程）由每个 role 跑前跑后的 `tree_state`
+  比对兜底；runtime root **之外**的写只记录不拒绝（主机上 `ProtectSystem=strict` 会拒，
+  但测试进程必须能写自己的临时目录与 venv）；systemd 对启动时不存在的 `-` 前缀授权**整条丢弃**，
+  而这个 harness 允许 role 把它建出来。
+
 - **跨版本 schema 快照闸：拿生产真实发布过的一代当「前代」（#237）**：
   仓库里此前每一条 schema 转换用例的两侧都由工作树里的同一份代码生成，所以改了载荷形状之后
   「前代」也跟着被改写，转换永远是绿的；而安装器比的是**新代码生成的 bundle** 与**已装那一代
@@ -128,6 +150,76 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **paper_constraint_publisher 在 unit 沙箱里打不开 reference registry（#242）**：
+  2026-09-08 第五窗口，`rquant-runtime-paper-constraint@svc-dc7b9b33…` 每次启动都在构造期倒下
+  （5 次重启、6 次 `OnFailure` 中继、1 条真实推送），裸跑却能进主循环。定因：
+  `authorities/reference-slow/reference.sqlite3` **是 WAL 库**，而 SQLite 打开 WAL 库
+  （`mode=ro` 也一样）必须在库旁边建 `-shm` wal-index；这个目录只有
+  `rquant-runtime-reference-slow-publisher@.service` 的 `ReadWritePaths` 覆盖，别的 unit 在
+  `ProtectSystem=strict` 下拿到的是**只读挂载**，于是内核回 `EROFS`、SQLite 回
+  `SQLITE_CANTOPEN`，读者把它吞成一句 `reference registry is invalid`。**不是路径不可见**：
+  unit 的 `ReadOnlyPaths` 点了这个目录的名，`ProtectHome=read-only` 也留着读权限。
+  改法：写者改用回滚日志（`PRAGMA journal_mode = DELETE`，库头第 18 字节从 2 变 1，旧库在
+  publisher 下次以写者身份打开时自动转换）；只读读者在**打开之前**用一次 `pread` 读库头判断，
+  遇到 WAL 库直接失败关闭，措辞点名文件、目录、要建的 `-shm` 和目录拒绝新条目的 errno；
+  其他打不开的情形也一并点名路径、SQLite 的 errorname 与 errno。
+  同一个 role 还有第二处越界写：它以**写模式**打开 `market_minute_source` 的分钟 spool
+  （`LiveBatchSpool(minute_spool_root)`），会在生产者目录里建 `batches/<channel>/`——
+  这是 #231 的形状，主机上只因为生产者已经把目录建好了才没炸。已改为只读打开。
+  **并发口径变了，不是等价替换**：WAL 下读写互不阻塞，回滚日志下写事务提交期间读者要等、
+  读者持锁期间写者要等，两边都靠 `busy_timeout = 5000` 兜着；这个权威写很稀、读很短，
+  可以接受。持久性没变（`synchronous = FULL` 没动）。
+  转换本身**要独占**：有别的连接持有该库时 SQLite 只回一句 `database is locked`，
+  现在被包成一句点名文件、说清要先停哪些持有者的拒绝。
+  **恢复子系统另算**：SQLite 的 backup API 会把源库的 journal 模式字节带进备份，所以转换之前
+  捕获的每一代 recovery 备份里那份注册表拷贝仍然是 WAL 头。备份是**冻结制品**、没有写者，
+  所以按 `frozen_artifact=True` 以 `immutable=1` 打开——不建 sidecar、不写目录、不取发布锁——
+  WAL 头对它不是拒绝理由；**活的权威**照旧无条件拒。哪一种由调用方指明，不看环境。
+
+- **notifier 每轮 DEGRADED：往 page-control 的 control 根里写（#241）**：
+  `rquant-runtime-notifier@svc-f2518f7a…` active 但每次迭代都
+  `OSError: [Errno 30] Read-only file system: '<runtime root>/control/.page-control.sqlite3.<uuid>.<tmp>'`。
+  那个名字是读者自己的：`_ReadonlyPageControlAuditReader.snapshot()` 用**硬链接**把要读的那一代
+  钉住，而临时目录建在 **outbox 旁边**。outbox 归 page-control 服务
+  （`rquant-page-control.service` 是唯一 `ReadWritePaths` 覆盖 `…/data/runtime/control` 的 unit，
+  notifier 的 unit 把 `control/page-control.sqlite3` 列在 `ReadOnlyPaths`）。
+  **把硬链接挪到 notifier 自己的目录里不是修好，只是换一种失败**：systemd 把 unit 的每一条
+  `ReadWritePaths` / `ReadOnlyPaths` 都做成**独立的 bind mount**，而 Linux 的 `link()` 比的是
+  **mount** 不是 superblock（`do_linkat` 先判 `old_path.mnt != new_path.mnt`），所以主机上那一步
+  回的是 `EXDEV`（errno 18）。在带 `--privileged` 的容器里用真实 bind mount 实测：`os.link`
+  从 outbox 链到 `live/notifications/<svc>/…` 与链到它自己旁边**都是 errno 18**。
+  **真正的修法是不再用硬链接**：两个只读读者改用**已打开的描述符**——
+  `file:/proc/self/fd/<n>?mode=ro&immutable=1`——**什么都不创建**。
+  同一套 bind mount 下实测：两个读者都读成功，`opened_through = descriptor`，
+  outbox 目录与副本目录**逐字节未变**。
+  **两个引擎的语义要说准，别一句「钉住 inode」带过**（实测）：描述符**持有**它打开的那一代；
+  **SQLite 按名字解析** `/proc/self/fd/<n>`（`unixFullPathname` 自己解符号链接再按名字 open），
+  所以 outbox 被换代之后它再打开会拿到 `unable to open database file`，加上 `snapshot()`
+  收尾的身份比对，读者**失败关闭**、不会静默混代（代价是罕见竞争下多一次 DEGRADED 迭代）；
+  **DuckDB 则真的重开描述符持有的 inode**，副本读者是钉住的。
+  DuckDB 在 macOS 上拒绝 `/dev/fd/<n>`（它会拿描述符的真实名字重建路径），
+  所以副本读者保留原有的「在库旁边建硬链接」分支给不接受描述符的引擎，
+  走了哪一支被记录并断言，不是运行期惊喜。
+
+- **lab_artifact_catalog 建并 chmod 了 artifact_retention 的状态根**：
+  `build_production_artifact_terminal_lifecycle` 在 `LAB_ARTIFACT_CATALOG` 分支上调
+  `_private_state_root`，它对 `research/artifact-retention/<svc>` 做 `mkdir` **加无条件 chmod**；
+  catalog 的 unit 只授权那里面的一个子目录（`catalog-registration-outbox`），所以这条 chmod 在
+  沙箱下每次启动都是 `EROFS`。改为只取路径、不创建也不改权限。
+
+- **feature_live 以写模式打开分钟 spool（#231 的第五处）**：
+  `runtime_builder_feature.py` 里 `LiveBatchSpool(raw_spool_root)` 是写模式，会写生产者自己的
+  `sources/<channel>.json`，消费者游标也默认落在生产者根的 `cursors/` 下，而
+  `rquant-runtime-feature@.service` 把 `live/market-minute` 列在 `ReadOnlyPaths`。
+  改为 `source_read_only=True` 且游标根落在本 role 拥有的 `live/features/raw-cursors`。
+  **不丢状态，但有一个前提要在上线前查**：旧游标位置从来就不在这个 unit 的授权里，
+  所以这个 role **在 systemd 下**从来没成功写进去过一条游标。**裸跑不受沙箱约束**——
+  runbook R-20 的排查是用 `runtime-exec.pyz` 直接起 role、没有 unit，那一路是可能在旧位置
+  写下过游标的。所以下一个窗口之前要看一眼
+  `<runtime>/live/market-minute/cursors/`：里面若有 feature 消费者的那一份，
+  这个 role 换根之后会**从 sequence -1 重放**（对幂等的 feature 发布是安全的，
+  但要预期到那一轮的处理量）。
 
 - **备份被强杀后留在 `backup/` 里的临时代际（#243）**：
   生产机 `backup/` 里堆着 2026-08-03..05 的 `.latest.duckdb.<pid>` 与

@@ -1546,3 +1546,69 @@ def test_a_router_that_refuses_over_its_settings_creates_nothing(tmp_path: Path)
 
     assert not (tmp_path / "signal-bus.sqlite3").exists()
     assert not (tmp_path / "signal-spool").exists()
+
+
+def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) -> None:
+    """#241: the notifier reads the outbox; the page-control service owns the directory.
+
+    `rquant-runtime-notifier@.service` grants `control/notifiers/%i`,
+    `live/notifications/%i` and `-control/schema-rollouts`, and lists
+    `control/page-control.sqlite3` under `ReadOnlyPaths`. `rquant-page-control.service`
+    is the one unit whose `ReadWritePaths` covers `…/data/runtime/control`.
+
+    The first attempt at this made the scratch directory land in `live/notifications/%i`
+    and this test passed, because a test runs in one temporary directory. On a host it
+    would not have: systemd makes every granted path its own bind mount and Linux
+    `link()` refuses across mounts, so the notifier would have traded `EROFS` for `EXDEV`.
+    The reader now pins with a descriptor and writes nothing, so this asserts the stronger
+    thing -- the step writes nowhere under the runtime root at all.
+    """
+
+    from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
+    from tests.unit.test_serving_page_projection_source import (
+        _save_signed_canvas_catalog_record,
+        _signal_projection_database,
+    )
+
+    runtime_root = tmp_path / "runtime"
+    control = runtime_root / "control"
+    notifications = runtime_root / "live" / "notifications" / "svc-1"
+    control.mkdir(parents=True)
+    notifications.mkdir(parents=True)
+    _seed_outbox(notifications)
+    replica = (tmp_path / "rquant_ro.duckdb").resolve()
+    _signal_projection_database(replica)
+    outbox, catalog, _command, _receipt, authority = _save_signed_canvas_catalog_record(
+        control,
+        command_id="notifier-canvas",
+    )
+    public_key = authority.keyring._keys[authority.keyring.active_key_id].decode("utf-8")
+    #: the canvas catalog record and its publication receipt are stamped by the real
+    #: PageControl service while this test runs, and the projection refuses evidence
+    #: dated after the instant it is asked for, so the step has to observe the present
+    observed = datetime.now(UTC) + timedelta(minutes=1)
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: observed,
+    )(
+        _notifier_manifest(
+            notifications,
+            serving_authority_root=str(notifications / "serving-authority"),
+            page_projection_database_path=str(replica),
+            page_projection_canvas_catalog_root=str(catalog),
+            page_projection_canvas_receipt_root=str(
+                catalog.parent / "canvas-publication-receipts"
+            ),
+            page_projection_page_control_outbox_path=str(outbox.path),
+            page_projection_canvas_active_key_id=authority.keyring.active_key_id,
+            page_projection_canvas_active_public_key_pem=public_key,
+        )
+    )
+    before = tree_state(control)
+
+    with readonly_runtime(runtime_root, writable=()) as violations:
+        result = step()
+
+    assert violations == [], violations
+    assert tree_state(control) == before
+    assert result.degraded_reasons == ()

@@ -849,6 +849,56 @@ def test_reference_payload_json_is_rejected_before_oversized_parse(tmp_path: Pat
         )
 
 
+def test_a_wal_header_reference_backup_still_verifies_as_a_frozen_artifact(
+    tmp_path: Path,
+) -> None:
+    """#242 S-1: the recovery path must read a copy the backup API left in WAL mode.
+
+    SQLite's backup API carries the source's journal-mode byte into the copy, so every
+    recovery generation captured before the publisher converted the live authority still
+    has a WAL header. `ReadonlyReferenceRegistry` refuses a WAL *live* authority outright
+    -- it would have to create a wal-index in a directory only the publisher may write --
+    and if this call site did not say the artifact is frozen, that refusal would land on
+    every historical backup, i.e. on target build and restore verification alike.
+
+    This is the case that makes dropping `frozen_artifact=True` fail: the flag is what
+    lets the copy be read `immutable=1`, which needs no sidecar and does not care about
+    the header.
+    """
+
+    import rquant.runtime_recovery_artifacts as artifact_module
+
+    source = tmp_path / "wal-backup-source"
+    reference = source / "reference.sqlite3"
+    generation = _create_reference_registry(reference)
+    #: what the backup API produces from a source that has not been converted yet
+    connection = sqlite3.connect(reference, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = reference.with_name(reference.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    with reference.open("rb") as stream:
+        assert stream.read(19)[18] == 2, "the fixture must carry the WAL header byte"
+
+    evidence, contract = artifact_module._isolated_contract_for_path(
+        path=reference,
+        kind=RealRecoveryArtifactKind.REFERENCE_SLOW_SQLITE,
+        relations=(),
+        generation_id=generation,
+        price_basis="raw_session",
+        meter=artifact_module._VerificationMeter(
+            RecoveryVerificationBudget(deadline_seconds=60, max_json_bytes=64 * 1024)
+        ),
+    )
+
+    assert contract["generation_id"] == generation
+    assert evidence == ()
+
+
 def test_duckdb_relation_row_budget_is_checked_before_ordered_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
