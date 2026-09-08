@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -311,11 +312,17 @@ def _heartbeat_name(spec: RuntimeServiceSpec) -> str:
     return f"{identity}.json"
 
 
+#: What `_read_heartbeat` returns when the file belongs to a generation of ours that has
+#: already stopped: not a heartbeat, and not "nothing there either".
+SUPERSEDED_HEARTBEAT = object()
+
+
 def _read_heartbeat(
     source: RuntimeHealthControlSource,
     *,
     max_bytes: int,
-) -> RuntimeServiceHeartbeat | None:
+    previous_spec_identities: tuple[str, ...] = (),
+) -> RuntimeServiceHeartbeat | None | object:
     chain = _open_directory_chain(source.control_root)
     if chain is None:
         return None
@@ -371,6 +378,21 @@ def _read_heartbeat(
             heartbeat.service_id != source.spec.service_id
             or heartbeat.spec_fingerprint != source.spec.identity
         ):
+            # A generation change that alters a service spec leaves the previous
+            # generation's stopped heartbeat under the same identity path, and #217 makes
+            # the research roles exit fast enough that there is always one. That file is
+            # our own, its owner is gone, and it says so: `stopped` with a `stopped_at`
+            # (ruling 14 / #216). It is superseded, not a conflict. A heartbeat that is
+            # still live under a fingerprint that is not the current spec's is a second
+            # instance of somebody, and stays a refusal.
+            superseded = (
+                heartbeat.service_id == source.spec.service_id
+                and heartbeat.spec_fingerprint in previous_spec_identities
+                and heartbeat.status is RuntimeServiceStatus.STOPPED
+                and heartbeat.stopped_at is not None
+            )
+            if superseded:
+                return SUPERSEDED_HEARTBEAT
             raise RuntimeHealthAuthorityIntegrityError(
                 f"runtime heartbeat does not match service spec: {source.spec.service_id}"
             )
@@ -421,6 +443,7 @@ class RuntimeHealthSourceReader:
         sources: tuple[RuntimeHealthControlSource, ...],
         serving_service_id: str,
         max_heartbeat_bytes: int = _DEFAULT_MAX_BYTES,
+        previous_spec_identities: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         if not serving_service_id.strip():
             raise ValueError("serving_service_id cannot be empty")
@@ -441,6 +464,13 @@ class RuntimeHealthSourceReader:
             raise ValueError("runtime health sources must have exclusive control roots")
         self.sources = tuple(sorted(visible, key=lambda source: source.spec.service_id))
         self.max_heartbeat_bytes = max_heartbeat_bytes
+        #: service id -> the `RuntimeServiceSpec` identities our own earlier generations
+        #: published for it, so a stopped heartbeat left by one can be told from a
+        #: foreign one (#248 shape 4)
+        self.previous_spec_identities = {
+            service_id: tuple(identities)
+            for service_id, identities in (previous_spec_identities or {}).items()
+        }
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
@@ -449,29 +479,66 @@ class RuntimeHealthSourceReader:
         event_times: list[datetime] = []
         source_receipts: dict[str, str] = {}
         for source in self.sources:
-            heartbeat = _read_heartbeat(source, max_bytes=self.max_heartbeat_bytes)
+            # One source may not take the other twenty-four with it. Before #248 any
+            # unsafe file, invalid document, mismatched fingerprint or inconsistent
+            # timestamp came straight out of `__call__`, so nothing at all was published
+            # and the serving plane degraded behind one stopped research role.
+            failure: str | None = None
+            heartbeat: RuntimeServiceHeartbeat | None | object
+            try:
+                heartbeat = _read_heartbeat(
+                    source,
+                    max_bytes=self.max_heartbeat_bytes,
+                    previous_spec_identities=self.previous_spec_identities.get(
+                        source.spec.service_id,
+                        (),
+                    ),
+                )
+                if isinstance(heartbeat, RuntimeServiceHeartbeat):
+                    _validate_heartbeat_time(heartbeat, observed_at=observed)
+            except (RuntimeHealthAuthorityIntegrityError, OSError, ValueError) as error:
+                failure = type(error).__name__
+                heartbeat = None
+            summary: object
+            if failure is not None:
+                summary = {"unreadable": failure}
+            elif heartbeat is SUPERSEDED_HEARTBEAT:
+                summary = {"superseded": True}
+            elif heartbeat is None:
+                summary = None
+            else:
+                summary = heartbeat.model_dump(mode="json")
             source_receipts[source.spec.service_id] = canonical_sha256(
                 {
                     "contract": "runtime-health-source-receipt/v1",
                     "control_root": str(source.control_root),
                     "spec": source.spec.model_dump(mode="json"),
-                    "heartbeat": (None if heartbeat is None else heartbeat.model_dump(mode="json")),
+                    "heartbeat": summary,
                     "observed_at": observed,
                 }
             )
-            if heartbeat is None:
+            if failure is not None or heartbeat is SUPERSEDED_HEARTBEAT or heartbeat is None:
+                if failure is not None:
+                    status = RuntimeServiceStatus.DEGRADED
+                    reason = f"unreadable:{source.spec.service_id}"
+                elif heartbeat is SUPERSEDED_HEARTBEAT:
+                    status = RuntimeServiceStatus.MISSING
+                    reason = f"superseded:{source.spec.service_id}"
+                else:
+                    status = RuntimeServiceStatus.MISSING
+                    reason = f"missing:{source.spec.service_id}"
                 services.append(
                     RuntimeServiceHealth(
                         service_id=source.spec.service_id,
                         plane=source.spec.plane,
-                        status=RuntimeServiceStatus.MISSING,
+                        status=status,
                         stale=True,
                         observed_at=observed,
                     )
                 )
-                reasons.append(f"missing:{source.spec.service_id}")
+                reasons.append(reason)
                 continue
-            _validate_heartbeat_time(heartbeat, observed_at=observed)
+            assert isinstance(heartbeat, RuntimeServiceHeartbeat)
             stale = observed - heartbeat.heartbeat_at > source.spec.stale_after
             status = RuntimeServiceStatus.DEGRADED if stale else heartbeat.status
             services.append(

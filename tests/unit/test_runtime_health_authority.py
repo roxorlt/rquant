@@ -156,15 +156,36 @@ def test_reader_excludes_current_serving_service_instead_of_self_certifying(tmp_
     assert result.status is FreshnessStatus.FRESH
 
 
+def _degraded_entry(root: Path, service_id: str) -> object:
+    """What the reader now reports for a source whose own read refused (#248).
+
+    The refusal itself is unchanged and asserted at `_read_heartbeat` beside each of
+    these; what changed is that it no longer comes out of `__call__` and takes every
+    other service's entry with it.
+    """
+
+    result = RuntimeHealthSourceReader(
+        sources=(_source(root, service_id),),
+        serving_service_id="serving",
+    )(NOW)
+    assert result.reason is not None and f"unreadable:{service_id}" in result.reason
+    entry = result.payload.runtime_services[0]
+    assert entry.service_id == service_id
+    assert entry.status is RuntimeServiceStatus.DEGRADED
+    assert entry.heartbeat is None
+    return entry
+
+
 def test_reader_rejects_future_heartbeat_evidence(tmp_path: Path) -> None:
     root = tmp_path / "control" / "features" / "feature"
     _running(root, "feature", NOW + timedelta(microseconds=1))
 
     with pytest.raises(RuntimeHealthAuthorityIntegrityError, match="future evidence"):
-        RuntimeHealthSourceReader(
-            sources=(_source(root, "feature"),),
-            serving_service_id="serving",
-        )(NOW)
+        health_module._validate_heartbeat_time(
+            health_module._read_heartbeat(_source(root, "feature"), max_bytes=1_000_000),
+            observed_at=NOW,
+        )
+    _degraded_entry(root, "feature")
 
 
 def test_reader_rejects_corrupt_and_symlinked_heartbeat(tmp_path: Path) -> None:
@@ -175,20 +196,16 @@ def test_reader_rejects_corrupt_and_symlinked_heartbeat(tmp_path: Path) -> None:
     path.chmod(0o600)
 
     with pytest.raises(RuntimeHealthAuthorityIntegrityError, match="invalid"):
-        RuntimeHealthSourceReader(
-            sources=(_source(corrupt_root, "corrupt"),),
-            serving_service_id="serving",
-        )(NOW)
+        health_module._read_heartbeat(_source(corrupt_root, "corrupt"), max_bytes=1_000_000)
+    _degraded_entry(corrupt_root, "corrupt")
 
     real_root = tmp_path / "control" / "features" / "real"
     linked_root = tmp_path / "control" / "features" / "linked"
     _running(real_root, "linked")
     linked_root.symlink_to(real_root)
     with pytest.raises(RuntimeHealthAuthorityIntegrityError, match="symlink|unsafe"):
-        RuntimeHealthSourceReader(
-            sources=(_source(linked_root, "linked"),),
-            serving_service_id="serving",
-        )(NOW)
+        health_module._read_heartbeat(_source(linked_root, "linked"), max_bytes=1_000_000)
+    _degraded_entry(linked_root, "linked")
 
     heartbeat_link_root = tmp_path / "control" / "features" / "heartbeat-link"
     heartbeat_path = RuntimeServiceControl._path_for(
@@ -198,10 +215,11 @@ def test_reader_rejects_corrupt_and_symlinked_heartbeat(tmp_path: Path) -> None:
     heartbeat_path.parent.mkdir(parents=True)
     heartbeat_path.symlink_to(RuntimeServiceControl._path_for(real_root, _spec("linked")))
     with pytest.raises(RuntimeHealthAuthorityIntegrityError, match="symlink|unsafe"):
-        RuntimeHealthSourceReader(
-            sources=(_source(heartbeat_link_root, "heartbeat-link"),),
-            serving_service_id="serving",
-        )(NOW)
+        health_module._read_heartbeat(
+            _source(heartbeat_link_root, "heartbeat-link"),
+            max_bytes=1_000_000,
+        )
+    _degraded_entry(heartbeat_link_root, "heartbeat-link")
 
 
 def test_reader_rejects_heartbeat_replaced_during_read(
@@ -228,10 +246,9 @@ def test_reader_rejects_heartbeat_replaced_during_read(
     monkeypatch.setattr(health_module, "_read_descriptor_bytes", replace_after_read)
 
     with pytest.raises(RuntimeHealthAuthorityIntegrityError, match="changed during read"):
-        RuntimeHealthSourceReader(
-            sources=(_source(root, "feature"),),
-            serving_service_id="serving",
-        )(NOW)
+        health_module._read_heartbeat(_source(root, "feature"), max_bytes=1_000_000)
+    replaced = False
+    _degraded_entry(root, "feature")
 
 
 def test_reader_rejects_ambiguous_sources_and_relative_roots(tmp_path: Path) -> None:
