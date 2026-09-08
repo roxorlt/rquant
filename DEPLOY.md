@@ -692,8 +692,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 （#220 的启动顺序），2026-09-08 已被 #231/#232/#220 的修复包整条改写；第 30、31 两条来自
 #227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）；第 32 条来自 #230，
 也就是 #215 的第三处断点（凭证的投递形状）；第 33 条来自 #237，也就是「v0.33.2 装不上第三代」
-这件事本身。
-下面三十三条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+这件事本身；第 34 条来自 #242 与 #241 的修复包（沙箱路径缺陷），它是那两个修复在主机上的操作面。
+下面三十四条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -1166,7 +1166,82 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     `rquant runtime-health` 这类经由服务健康载荷的路径上，必须给这条 channel 升
     `schema_version` 并走完整 rollout，见 #239。
 
-### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239；末列写「已修」的条目已修，其余不修）
+34. **#242 的转换窗口顺序、`signal_router` 的 `-shm` 活性耦合、描述符机制的前提**（#242、#241，
+    本轮 PR 引入）。这三段是包 L 的修复在主机上的操作面，**顺序不能跳步**。
+
+    **(a) 把 reference registry 从 WAL 转成回滚日志的窗口顺序。**
+    `authorities/reference-slow/reference.sqlite3` 现在还是 WAL 库，只有
+    `rquant-runtime-reference-slow-publisher@` 的 `ReadWritePaths` 覆盖那个目录，所以别的 role
+    以 `mode=ro` 打开它时建不出 `-shm`，内核回 `EROFS`（这就是 #242）。转换由 publisher 自己在
+    下一次以写者身份打开时完成，但**它要独占**，所以窗口要照下面的顺序走：
+
+    ```bash
+    ROOT=/home/lighthouse/rquant/data/runtime
+    REG=$ROOT/authorities/reference-slow/reference.sqlite3
+
+    # 1. 现状（只读）：库头第 18 字节 2 = WAL，1 = 回滚日志
+    sudo -u lighthouse ls -l $ROOT/authorities/reference-slow/
+    sudo -u lighthouse dd if=$REG bs=1 skip=18 count=1 2>/dev/null | od -An -tu1
+
+    # 2. 确认没有别的进程持有它（转换要独占），并避开备份 / 恢复 timer
+    sudo lsof $REG
+    systemctl list-timers | grep -Ei 'backup|recovery'
+
+    # 3. 先停两个读者（它们今天本来就在崩溃重启，停掉是为了转换期间不刷 OnFailure）
+    sudo systemctl stop rquant-runtime-paper-constraint@<svc>.service
+    sudo systemctl stop rquant-runtime-candidate@<auction_gap svc>.service
+
+    # 4. 单独重启 publisher，然后复验
+    sudo systemctl restart rquant-runtime-reference-slow-publisher@<svc>.service
+    sudo -u lighthouse dd if=$REG bs=1 skip=18 count=1 2>/dev/null | od -An -tu1   # 期望 1
+    sudo -u lighthouse ls $ROOT/authorities/reference-slow/                        # 没有 -wal / -shm
+    sudo journalctl -u rquant-runtime-reference-slow-publisher@<svc> -n 50 | grep -i lock
+
+    # 5. 再启两个读者
+    ```
+
+    **撞上 `database is locked` 不要盲目重试**——回第 2 步找持有者。本包之后这句拒绝会点名文件、
+    说 `needs exclusive access` 并给出 `lsof` 命令。转换之后 publisher 提交期间短暂出现
+    `reference.sqlite3-journal` 是正常的；publisher 停着时它**长期**存在说明上一次提交崩在中途，
+    重启一次 publisher 让它收拾。
+    **回滚是对称的**：装回 v0.33.4 之前的任何一代都会把库头转回 WAL（同样要独占），#242 随之回来。
+    **转换之前捕获的 recovery 备份仍是 WAL 头**（SQLite 的 backup API 会把 journal 模式字节带进
+    备份），本包已经让它可读——冻结制品按 `immutable=1` 打开，不建 sidecar、不写目录、不取发布锁，
+    所以不再需要「转换之后才能做恢复演练」这条限制；下一次演练时确认一遍即可。
+
+    **(b) `-shm` 活性耦合：只针对 `signal_router`。**
+    `live/strategies/<svc>/runner.sqlite3` 是 WAL 库，`signal_router` 只读打开它时 SQLite 会先试
+    以读写方式打开 `-shm`；**只要那个 wal-index 已经被别的连接初始化过**，它就退到只读 shm、
+    什么都不建。所以：
+
+    - **可以起 `signal_router`**，前提是**先起并保持** 3 个 `strategy_live`（C-3 本来就是这个顺序）。
+      生产者常驻持库 ⇒ sidecar 一直在 ⇒ 读者零写入，这就是第五窗口它能跑几分钟的原因。
+    - **停的顺序要倒过来：先停 router，再停 strategy。** 生产者干净关闭时 SQLite 会删掉
+      `-wal`/`-shm`，之后 router 下一次打开 `runner.sqlite3` 会拿到 `unable to open database file`
+      ——#242 的同一句，在第三份制品上。
+    - **永久解法是 owner 对 `runner.sqlite3` 的 journal 模式决定**：换成回滚日志，读者就不再需要
+      wal-index，耦合消失；代价与 #242 一样（读写不再互不阻塞），而 strategy runner 是高频写者，
+      **必须单独验收**，不能顺手带。
+    - **`notifier` 与 `reference_slow_publisher` 没有这个耦合，不需要任何启停约束。** e2e 的
+      `KNOWN_C_LEVEL_WRITES` 里另外两条是**同进程 harness 的假象**：那不是创建而是删除，
+      来源是同一趟里更早那个 role 留下的未关闭 SQLite 连接被回收时顺带 checkpoint 删了 sidecar。
+      主机上每个 role 是独立进程，且 publisher 的 manifest 里根本没有 quota 路径、它已经在没有
+      `live/reference-slow` 写权限的情况下发布过好几代。
+
+    **(c) 描述符机制的前提，以及窗口前要查的那个游标目录。**
+    #241 的新钉代方式要读 `/proc/self/fd/<n>`，也就是 **unit 里必须挂着 `/proc`**。已实测：
+    `ProtectProc=invisible`（23 个 runtime unit 全有）与更严的 `ProcSubset=pid` **都不影响**，
+    它们限制的是看**别的**进程，`/proc/self/fd` 照常。将来若有人给某个 unit 加 `PrivateMounts`
+    之类把 `/proc` 拿掉的设置，读者会以一句点名
+    `this platform publishes neither /proc/self/fd nor /dev/fd` 的拒绝**失败关闭**，不会静默降级。
+
+    **窗口开始前查一次 `<runtime>/live/market-minute/cursors/`**：`feature_live` 的消费者游标已经
+    从生产者根搬到本 role 自己的 `live/features/raw-cursors`。这个 role **在 systemd 下**从来没
+    成功写进旧位置过（不在它的授权里），但 **runbook R-20 的裸跑没有沙箱**，那一路是可能在旧位置
+    写下过游标的。目录非空就看里面有没有 feature 消费者的那一份；**有的话这个 role 换根之后会从
+    sequence -1 重放**（对幂等的 feature 发布是安全的，但要预期到那一轮的处理量）。
+
+### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -1187,6 +1262,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #220 | live 平面的启动顺序是代码层的循环依赖：`strategy_live` 要读 `live/signal-bus/signal_bus.sqlite3`，只有 `signal_router` 会建它，而 `signal_router` 又先要求三份 `live/strategies/*/runner.sqlite3` | **已修（PR「fix(runtime): let the live strategy chain start idle under the sandbox」，与 #231、#232 同一包）**：`strategy_live` 一启动就建自己的 `runner.sqlite3`、`signal_router` 一启动就建 bus 与 spool，缺对端制品的一方在主循环里等而不是退出，两个方向都能起。原来那条「起一轮失败留下 runner 数据库」的绕过法作废，前置第 28 条已整条改写；代价是等对端时只有 DEGRADED 没有告警（阈值见 #235） |
 | #238 | `_field_schema_hashes` 给每个字段算哈希时把载荷**整个 `$defs`** 一起算进去，所以任何一个被内嵌的嵌套模型多一个字段，这条 channel 每个字段的哈希都会跟着变；报错却逐字段说「type changed / semantic meaning changed」，指向的是一个都没被改过的字段，真正的变更点（哪个嵌套模型、哪个字段）在消息里一个字都没有 | 不修。#237 的冻结投影只挡住 `runtime.serving.runtime-health` 这一条 channel；另外 20 条里凡是内嵌了「不是为发布而写」的模型的（`ServingProjectionPayload` 6 条、`BatchQualityStatus` 5 条、`LiveChannel` 5 条、`JsonValue` 4 条），同样的形状仍可能再来一次。跨版本快照闸会在装机前把这类改动拦在 CI 里，装机时按前置第 33 条处理 |
 | #239 | #231 给心跳文件模型加的 `waiting_for` / `waiting_since` / `waited_seconds` 只在心跳文件里，`rquant runtime-health` 这类经服务健康载荷的路径看不到 | 不修。冻结投影上多一个字段就会让九个哈希全变，等于重演 #237；要发布这三个字段必须给 `runtime.serving.runtime-health` 升 `schema_version` 并走完整 rollout（PREPARE → 生产者承认 → DUAL_WRITE → 消费者回执 → CUTOVER），且在那次装机窗口里刷新跨版本快照。本轮照旧用 runbook 的 jq 探针直接读心跳文件 |
+| #245 | `src/rquant/source_quota_store.py:133` 的 `SourceQuotaStore._connect()` 返回裸 `sqlite3.Connection`，十几个调用点写成 `with self._connect() as connection:`——`sqlite3.Connection.__exit__` 只提交或回滚事务、**不关闭连接**，所以每调用一次就漏一个打开的连接，直到 GC 才回收 | 不修（不在本包碰过的代码里）。**长驻的 source 类 role 会持续累积句柄**，值得作为句柄泄漏单独查一次。包 L 的 e2e 里 `notifier` 与 `reference_slow_publisher` 那两条「越界写」就是它的副作用（回收时顺带 checkpoint、删掉别人的 `-shm`/`-wal`），**主机上每个 role 是独立进程，不会发生** |
+| — | `signal_router` 只读打开 3 份 WAL 的 `live/strategies/<svc>/runner.sqlite3`，SQLite 要在旁边建 wal-index，而它的 unit 对那个目录只有读权限 | 不修，**靠启停顺序绕开**：先起并保持 3 个 `strategy_live` 再起 router，停的时候先停 router 再停 strategy（前置第 34 条 (b)）。永久解法是 owner 对 `runner.sqlite3` 的 journal 模式决定，代价与 #242 相同、而 strategy runner 是高频写者，必须单独验收。e2e 已把这一条钉进 `KNOWN_C_LEVEL_WRITES`，**新增一条就会红** |
 
 ### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
 

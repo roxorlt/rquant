@@ -14,7 +14,8 @@
   每个 kind-backed role 启动时要读的 schema rollout 计划）、真 stage 并发布权威链、wrapper 自己
   派生的 argv 与子环境、按 `LoadCredentialEncrypted` 的真实形状投递 7 个 credstore role 的凭据、
   盘外时钟且日历不开盘。每个 role 的 `ReadWritePaths` / `ReadOnlyPaths` / `InaccessiblePaths`
-  **逐字读自 `deploy/systemd/`**，所以测试用的沙箱就是主机用的沙箱。
+  **逐字读自 `deploy/systemd/`**，所以每个 role 被授权的路径集合与主机逐字一致
+  （package M 只改了这十四个模板的 `Slice=` 一行，三条路径指令一字未动，路径集合不受影响）。
   25 个里 24 个能从 wrapper 的 argv 起来；`page_control` 的入口点从冻结常量取 runtime root
   而不是从 argv 取（`page_control_service.main` → `_serve(runtime_root=None)` →
   `LINUX_PRODUCTION_RUNTIME_ROOT`），这一条被断言成事实而不是绕过去。
@@ -188,10 +189,15 @@
   **mount** 不是 superblock（`do_linkat` 先判 `old_path.mnt != new_path.mnt`），所以主机上那一步
   回的是 `EXDEV`（errno 18）。在带 `--privileged` 的容器里用真实 bind mount 实测：`os.link`
   从 outbox 链到 `live/notifications/<svc>/…` 与链到它自己旁边**都是 errno 18**。
-  **真正的修法是不再用硬链接**：两个只读读者改用**已打开的描述符**钉代——
-  `file:/proc/self/fd/<n>?mode=ro&immutable=1`——它打开的是描述符持有的 inode，
-  改名换不掉，而且**什么都不创建**。同一套 bind mount 下实测：两个读者都读成功，
-  `opened_through = descriptor`，outbox 目录与副本目录**逐字节未变**。
+  **真正的修法是不再用硬链接**：两个只读读者改用**已打开的描述符**——
+  `file:/proc/self/fd/<n>?mode=ro&immutable=1`——**什么都不创建**。
+  同一套 bind mount 下实测：两个读者都读成功，`opened_through = descriptor`，
+  outbox 目录与副本目录**逐字节未变**。
+  **两个引擎的语义要说准，别一句「钉住 inode」带过**（实测）：描述符**持有**它打开的那一代；
+  **SQLite 按名字解析** `/proc/self/fd/<n>`（`unixFullPathname` 自己解符号链接再按名字 open），
+  所以 outbox 被换代之后它再打开会拿到 `unable to open database file`，加上 `snapshot()`
+  收尾的身份比对，读者**失败关闭**、不会静默混代（代价是罕见竞争下多一次 DEGRADED 迭代）；
+  **DuckDB 则真的重开描述符持有的 inode**，副本读者是钉住的。
   DuckDB 在 macOS 上拒绝 `/dev/fd/<n>`（它会拿描述符的真实名字重建路径），
   所以副本读者保留原有的「在库旁边建硬链接」分支给不接受描述符的引擎，
   走了哪一支被记录并断言，不是运行期惊喜。
