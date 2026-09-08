@@ -960,6 +960,164 @@ jobs:
           path: ci-evidence/
           if-no-files-found: error
 
+  route-a-credential-shape-linux:
+    name: Linux systemd credential delivery (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    # A container, and for two reasons that only a real runner could show. The gate builds
+    # /run/credentials/<unit> itself, and one case leaves it *off* a memory-backed mount to
+    # watch the reader refuse it — which needs `/` to be an ordinary filesystem. On a systemd
+    # host `/run` is already a tmpfs, so on a bare runner that case lands on a memory mount
+    # after all and gets refused for the next reason instead. The other is D2: a bare runner
+    # job lives inside `hosted-compute-agent.service`, and the reader, which reads the
+    # `.service` leaf of /proc/self/cgroup, then refuses every directory as belonging to
+    # another unit. A container is `0::/` with an overlay root — the environment these
+    # fifteen cases were written against.
+    #
+    # The kernel is the host's either way, which is the thing that actually decides whether
+    # tmpfs can hold the delivery ACL: `CONFIG_TMPFS_POSIX_ACL` is a kernel option, not a
+    # container one. Docker Desktop's LinuxKit kernel lacks it and every local replay fell
+    # back to an injected mount table; a bare-runner probe on this image reported kernel
+    # 6.17.0-1022-azure and `setfacl` on tmpfs succeeding, so here the ACL case runs the
+    # production shape itself.
+    container:
+      image: python:${{ matrix.python-version }}-slim
+      # SYS_ADMIN to mount and remount the tmpfs where systemd mounts one. AppArmor's
+      # docker-default profile denies mount outright regardless of capabilities, and it is
+      # the one thing the local Docker Desktop replays could not have surfaced, because that
+      # host runs no AppArmor at all.
+      options: --cap-add=SYS_ADMIN --security-opt apparmor=unconfined
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      # Before the checkout, which wants git. `acl` carries setfacl — the grant systemd uses to
+      # admit the unit's `User=`, and the gate fails rather than skips without it. `mount` and
+      # `util-linux` carry mount/umount, which is how the tmpfs gets built and sealed read-only.
+      - name: Install the mount and ACL tools and the checkout prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            acl mount util-linux git ca-certificates
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      # Straight off `/`, the way route-a-credstore-linux does it, rather than RUNNER_TEMP:
+      # in a container job that is /__w/_temp, and /__w belongs to the host runner's uid
+      # rather than to the root this container runs as.
+      - name: Create the private test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exact_root="/rquant-cred-shape-py${{ matrix.python-version }}"
+          mkdir -p "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          mkdir -p "${exact_root}/pytest" "${exact_root}/test-results"
+          chmod 700 "${exact_root}" "${exact_root}/data" "${exact_root}/parquet"
+          chmod 700 "${exact_root}/logs" "${exact_root}/pytest" "${exact_root}/test-results"
+          {
+            printf 'RQUANT_CRED_SHAPE_ROOT=%s\n' "${exact_root}"
+            printf 'DATA_DIR=%s/data\n' "${exact_root}"
+            printf 'DUCKDB_PATH=%s/data/main.duckdb\n' "${exact_root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/readonly.duckdb\n' "${exact_root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${exact_root}"
+            printf 'LOG_DIR=%s/logs\n' "${exact_root}"
+          } >> "${GITHUB_ENV}"
+
+      # No actions/setup-python: the image is the interpreter, and pinning uv to the
+      # container's own python is what keeps the matrix leg honest about its version.
+      - name: Install uv
+        run: python -m pip install --root-user-action=ignore uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      # The three environment facts the gate depends on, recorded rather than assumed: it runs
+      # as root, its cgroup carries no unit name so the reader's unit-identity check does not
+      # apply, and — the one thing no local host could answer — whether this kernel's tmpfs
+      # can hold the delivery ACL. The ACL case asserts its own branch either way; this is the
+      # readable record of which branch the run took.
+      - name: Record the root, the cgroup and whether this tmpfs holds POSIX ACLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -eq 0
+          uname -r
+          cat /proc/self/cgroup
+          probe=/rquant-acl-probe
+          mkdir -p "${probe}"
+          mount -t tmpfs -o mode=0700 tmpfs "${probe}"
+          touch "${probe}/probe"
+          if setfacl -m u:1000:r "${probe}/probe"; then
+            echo "tmpfs holds POSIX ACLs here: the ACL case runs the production shape"
+          else
+            echo "tmpfs refuses POSIX ACLs here: the ACL case falls back to an injected table"
+          fi
+          umount "${probe}"
+          rmdir "${probe}"
+
+      # `-m linux_exact`, not the whole file: every case in it carries the marker, and the
+      # portable half of this topic is the 28 cases in
+      # tests/unit/test_systemd_credential_delivery_shape.py, which ride the five shards.
+      # `umask 022` is systemd's own, and pinned rather than inherited: the fixture creates
+      # /run/credentials with `Path.mkdir(mode=0o755)`, which the process umask masks, and
+      # under the private root's 077 the directory would come out 0700 and the unprivileged
+      # reader could not enter it.
+      - name: Run the systemd credential delivery gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          junit="${RQUANT_CRED_SHAPE_ROOT}/test-results/route-a-credential-shape.xml"
+          uv run python -m pytest -o addopts='' --strict-markers -m linux_exact -rA \
+            -p no:cacheprovider \
+            --basetemp="${RQUANT_CRED_SHAPE_ROOT}/pytest" \
+            --junitxml="${junit}" \
+            tests/integration/test_systemd_credential_delivery_linux.py
+
+      - name: Verify the gate ran all fifteen cases and skipped nothing
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--skipped 0` is the load-bearing half. The file's own `skipif` fires whenever the
+          # process is not root on Linux, so a container that lost root would otherwise report
+          # fifteen skips and a green job — and a green gate that asserted nothing is exactly
+          # how the third break reached production. `--tests 15` pins the other direction: a
+          # portable case that picks up `linux_exact` by accident would leave the shards and
+          # land here.
+          uv run python tests/support/assert_junit_contract.py \
+            --path "${RQUANT_CRED_SHAPE_ROOT}/test-results/route-a-credential-shape.xml" \
+            --suites 1 --tests 15 --failures 0 --errors 0 --skipped 0 --cases 15
+          grep -q 'test_the_delivery_acl_is_what_admits_the_reader' \
+            "${RQUANT_CRED_SHAPE_ROOT}/test-results/route-a-credential-shape.xml"
+
+      # The private root sits outside the workspace, so the evidence is copied in before the
+      # upload rather than uploaded from an absolute path the action would have to root itself.
+      - name: Collect the JUnit evidence into the workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/cred-shape-evidence"
+          cp -a "${RQUANT_CRED_SHAPE_ROOT}/test-results/." "${GITHUB_WORKSPACE}/cred-shape-evidence/"
+
+      - name: Upload the systemd credential delivery JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: route-a-credential-shape-py${{ matrix.python-version }}
+          path: cred-shape-evidence/
+          if-no-files-found: error
+
   formal-smoke-real-generation-linux:
     name: Linux real generation smoke (${{ matrix.python-version }})
     runs-on: ubuntu-24.04
