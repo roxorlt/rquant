@@ -1554,9 +1554,14 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
     `rquant-runtime-notifier@.service` grants `control/notifiers/%i`,
     `live/notifications/%i` and `-control/schema-rollouts`, and lists
     `control/page-control.sqlite3` under `ReadOnlyPaths`. `rquant-page-control.service`
-    is the one unit whose `ReadWritePaths` covers `…/data/runtime/control`. So every
-    write the notifier's page projection needs has to land in a directory the notifier
-    itself owns, and this runs the real step with nothing else writable.
+    is the one unit whose `ReadWritePaths` covers `…/data/runtime/control`.
+
+    The first attempt at this made the scratch directory land in `live/notifications/%i`
+    and this test passed, because a test runs in one temporary directory. On a host it
+    would not have: systemd makes every granted path its own bind mount and Linux
+    `link()` refuses across mounts, so the notifier would have traded `EROFS` for `EXDEV`.
+    The reader now pins with a descriptor and writes nothing, so this asserts the stronger
+    thing -- the step writes nowhere under the runtime root at all.
     """
 
     from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
@@ -1601,7 +1606,7 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
     )
     before = tree_state(control)
 
-    with readonly_runtime(runtime_root, writable=(notifications,)) as violations:
+    with readonly_runtime(runtime_root, writable=()) as violations:
         result = step()
 
     assert violations == [], violations

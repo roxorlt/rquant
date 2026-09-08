@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -36,6 +37,7 @@ from rquant.serving_page_projection_source import (
     ScreenBoundsProjectionRow,
     SignalPageProjectionProducer,
     SignalPageProjectionSnapshot,
+    _ReadonlyPageControlAuditReader,
 )
 from rquant.storage.duckdb import DuckDBStore
 from tests.canvas_ed25519_support import (
@@ -135,7 +137,6 @@ def _canvas_source(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox,
-        generation_bind_root=_generation_binds(outbox),
     )
 
 
@@ -629,7 +630,6 @@ def test_signal_source_rejects_catalog_and_outbox_tamper_even_when_hashes_recomp
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
-            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -679,7 +679,6 @@ def test_signal_source_rejects_tampered_canvas_publication_receipt(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
-            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -736,7 +735,6 @@ def test_signal_source_rejects_previous_key_signed_canvas_publication_receipt(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
-            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -767,7 +765,6 @@ def test_signal_source_rejects_canvas_publication_receipt_symlink(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
-            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -804,7 +801,6 @@ def test_signal_source_rejects_malformed_or_oversized_canvas_catalog_records(
             canvas_receipt_root=tmp_path / "malformed-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -839,7 +835,6 @@ def test_signal_source_rejects_canvas_record_without_page_control_identity(
             canvas_receipt_root=tmp_path / "legacy-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -880,7 +875,6 @@ def test_signal_source_readonly_audit_refuses_missing_path_without_creating_it(
         DuckDBSignalPageProjectionSource(
             tmp_path / "unused.duckdb",
             page_control_outbox=missing,
-            generation_bind_root=_generation_binds(missing),
         )
 
     assert not missing.exists()
@@ -898,7 +892,6 @@ def test_signal_source_readonly_audit_refuses_invalid_schema_without_mutation(
         DuckDBSignalPageProjectionSource(
             tmp_path / "unused.duckdb",
             page_control_outbox=legacy,
-            generation_bind_root=_generation_binds(legacy),
         )
 
     assert legacy.read_bytes() == before
@@ -934,7 +927,6 @@ def test_signal_source_readonly_audit_refuses_near_valid_unconstrained_schema(
         DuckDBSignalPageProjectionSource(
             tmp_path / "unused.duckdb",
             page_control_outbox=near_valid,
-            generation_bind_root=_generation_binds(near_valid),
         )
 
     assert near_valid.read_bytes() == before
@@ -964,7 +956,6 @@ def test_signal_source_readonly_audit_refuses_any_inflight_command(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -985,7 +976,6 @@ def test_signal_source_readonly_audit_rejects_path_replacement_after_constructio
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
-        generation_bind_root=_generation_binds(outbox.path),
     )
     trusted = tmp_path / f"trusted-{replacement}.sqlite3"
     alternate = tmp_path / f"alternate-{replacement}.sqlite3"
@@ -1036,7 +1026,6 @@ def test_signal_source_readonly_audit_allows_same_inode_completed_mutation(
         canvas_receipt_root=data_dir / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
-        generation_bind_root=_generation_binds(outbox.path),
     )
     second = service.submit(
         SaveCanvas(
@@ -1084,7 +1073,6 @@ def test_signal_source_requires_matching_succeeded_page_control_effect(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1111,7 +1099,6 @@ def test_signal_source_ignores_non_authoritative_page_control_result_json(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
-        generation_bind_root=_generation_binds(outbox.path),
     )(NOW)
 
     definitions = {projection.table_name: projection for projection in snapshot.projections}[
@@ -1136,7 +1123,6 @@ def test_signal_source_detects_command_entering_inflight_during_projection(
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox.path,
-        generation_bind_root=_generation_binds(outbox.path),
     )
     original = source._canvas_definitions
 
@@ -1186,7 +1172,6 @@ def test_signal_source_rejects_canvas_catalog_symlink(tmp_path: Path) -> None:
             canvas_receipt_root=tmp_path / "symlink-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1306,7 +1291,6 @@ def test_signal_source_rejects_replayed_old_signed_canvas_version(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox,
-            generation_bind_root=_generation_binds(outbox),
         )(NOW)
 
 
@@ -1374,7 +1358,6 @@ def test_signal_source_rejects_full_mutable_authority_rollback(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox_path,
-            generation_bind_root=_generation_binds(outbox_path),
         )(NOW)
 
 
@@ -1423,7 +1406,6 @@ def test_signal_source_rejects_future_signed_delete_receipt_and_normal_rebuild(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox_path,
-            generation_bind_root=_generation_binds(outbox_path),
         )(NOW)
 
     normal_clock_service = PageControlService(
@@ -1470,7 +1452,6 @@ def test_signal_source_rejects_removed_catalog_and_head_authority(
             canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1544,7 +1525,6 @@ def test_canvas_head_suffix_deletion_blocks_projection_and_subsequent_update(
             canvas_receipt_root=data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=authority.keyring,
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
     update = service.submit(
         SaveCanvas(
@@ -1613,7 +1593,6 @@ def test_signal_source_configured_canvas_root_requires_complete_receipt_authorit
                 None if missing_authority == "keyring" else authority.keyring
             ),
             page_control_outbox=outbox.path,
-            generation_bind_root=_generation_binds(outbox.path),
         )(NOW)
 
 
@@ -1803,20 +1782,57 @@ def test_lab_page_projection_serializes_research_gate_metadata() -> None:
 #     OSError: [Errno 30] Read-only file system:
 #         '…/data/runtime/control/.page-control.sqlite3.0975d9…b2.b3xxs1w1'
 #
-# That name is this class's own: `snapshot()` binds the exact generation it is about to
-# read by hard-linking the outbox into a temporary directory it creates *beside* the
-# outbox. The outbox belongs to the page-control service -- `rquant-page-control.service`
-# is the only unit whose `ReadWritePaths` covers `…/data/runtime/control` -- and the
-# notifier's own unit lists `control/page-control.sqlite3` under `ReadOnlyPaths`. So the
-# reader has to pin its generation somewhere the reading role owns.
+# That name was this class's own: `snapshot()` pinned the generation it was about to read
+# by hard-linking the outbox into a temporary directory it created *beside* the outbox,
+# and the outbox belongs to `rquant-page-control.service`.
+#
+# Moving that scratch directory into a directory the notifier owns is NOT the fix, and
+# this file is where that was first believed. systemd builds every `ReadWritePaths=` and
+# `ReadOnlyPaths=` entry as its own bind mount, and Linux `link()` refuses across mounts
+# (`do_linkat` compares `mnt`, not the superblock), so the same call would have come back
+# as `EXDEV` on the host while passing in a test that runs in one temporary directory.
+# The reader now pins with an open descriptor and writes nothing at all, which is the only
+# shape that survives a unit model where "the file I read" and "the directory I may write"
+# are always two different mounts.
 
 
-def test_the_audit_reader_binds_its_generation_outside_the_outbox_directory(
-    tmp_path: Path,
-) -> None:
-    """A snapshot with the outbox's whole directory read-only, as the notifier has it."""
+def test_the_audit_reader_writes_nothing_anywhere(tmp_path: Path) -> None:
+    """The property that makes the mount topology irrelevant: no writes, at all.
+
+    Not "no writes in the outbox's directory" -- nowhere. A reader that creates nothing
+    cannot be defeated by which mount its scratch would have landed on, and this is the
+    assertion neither hard-link version could have passed on a host: beside the outbox is
+    `EROFS`, and into a directory the notifier owns is `EXDEV`, because systemd makes every
+    granted path its own bind mount.
+    """
 
     from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
+
+    control = tmp_path / "control"
+    control.mkdir()
+    outbox, _catalog, _command, _receipt, _authority = _save_signed_canvas_catalog_record(
+        control,
+        command_id="sandboxed-canvas",
+    )
+    reader = _ReadonlyPageControlAuditReader(Path(outbox.path))
+    before = tree_state(tmp_path)
+
+    #: nothing is writable -- not the outbox's directory, not a scratch root, nothing
+    with readonly_runtime(tmp_path, writable=()) as violations, reader.snapshot():
+        mutations = reader.canvas_mutations()
+
+    assert violations == [], violations
+    assert tree_state(tmp_path) == before
+    assert mutations is not None
+
+
+def test_the_audit_reader_never_links_the_outbox(tmp_path: Path) -> None:
+    """#241's real shape, guarded where a test without mount namespaces can see it.
+
+    `os.link` is what returned `EXDEV` on the host. The reader must not call it -- not
+    beside the outbox, not into a directory of its own, not anywhere -- because there is
+    no target on a runtime host that is on the same mount as the file it reads.
+    """
 
     control = tmp_path / "control"
     control.mkdir()
@@ -1824,47 +1840,116 @@ def test_the_audit_reader_binds_its_generation_outside_the_outbox_directory(
     _signal_projection_database(database)
     outbox, catalog, _command, _receipt, authority = _save_signed_canvas_catalog_record(
         control,
-        command_id="sandboxed-canvas",
+        command_id="never-links",
     )
-    binds = tmp_path / "live" / "notifications" / "svc-1" / "page-control-generations"
-    binds.mkdir(parents=True)
     source = DuckDBSignalPageProjectionSource(
         database,
         canvas_catalog_root=catalog,
         canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
         canvas_publication_keyring=authority.keyring,
         page_control_outbox=outbox,
-        generation_bind_root=binds,
     )
-    before = tree_state(control)
+    del source
+    reader = _ReadonlyPageControlAuditReader(Path(outbox.path))
+    attempted: list[tuple[str, str]] = []
+    real_link = os.link
 
-    with readonly_runtime(tmp_path, writable=(binds,)) as violations:
-        snapshot = source(NOW)
+    def refuse_link(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+        attempted.append((str(src), str(dst)))
+        raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
 
-    assert violations == [], violations
-    assert tree_state(control) == before
-    assert "canvas_definition" in {item.table_name for item in snapshot.projections}
-    assert sorted(binds.iterdir()) == []
+    os.link = refuse_link  # type: ignore[assignment]
+    try:
+        with reader.snapshot():
+            mutations = reader.canvas_mutations()
+    finally:
+        os.link = real_link  # type: ignore[assignment]
+
+    assert attempted == []
+    assert mutations is not None
 
 
-def test_a_bind_root_beside_the_audit_database_is_refused(tmp_path: Path) -> None:
-    """The invariant, so #241's shape cannot come back through a different caller."""
+def test_the_pinned_generation_is_the_one_the_reader_opened(tmp_path: Path) -> None:
+    """A rotation under the reader's feet does not change the bytes it already reads.
+
+    This is what the hard link was for. The descriptor gives the same guarantee: the
+    connection holds the inode, so replacing the *name* leaves the open read alone -- and
+    the reader still refuses the snapshot, because a generation that rotated mid-read is
+    not the quiescent one it promised to project.
+    """
 
     control = tmp_path / "control"
     control.mkdir()
+    outbox, _catalog, _command, _receipt, _authority = _save_signed_canvas_catalog_record(
+        control,
+        command_id="rotating-canvas",
+    )
+    reader = _ReadonlyPageControlAuditReader(Path(outbox.path))
+    replacement = control / "replacement.sqlite3"
+    shutil.copyfile(outbox.path, replacement)
+
+    with (
+        pytest.raises(PageProjectionSourceIntegrityError, match="changed or entered"),
+        reader.snapshot(),
+    ):
+        #: the same rows are still readable through the pinned descriptor
+        assert reader.canvas_mutations() is not None
+        os.replace(replacement, outbox.path)
+
+
+
+def test_the_duckdb_reader_pins_through_a_descriptor_where_the_engine_takes_one(
+    tmp_path: Path,
+) -> None:
+    """Both openers, asserted -- which one runs is a platform fact, not a surprise.
+
+    On Linux `duckdb.connect("/proc/self/fd/<n>")` opens the inode the descriptor holds,
+    so the reader pins the generation and creates nothing: that is the branch a runtime
+    host takes, and the only one that can work there. macOS DuckDB rebuilds the path from
+    the descriptor's real name and refuses, so the link-beside-the-database branch runs and
+    the class keeps the generation pinning it has always had. #241's own reader (the
+    PageControl audit sqlite one) needs no such split: sqlite takes the descriptor on both.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+    from tests.runtime_readonly_sandbox import tree_state
+
     database = tmp_path / "rquant_ro.duckdb"
     _signal_projection_database(database)
-    outbox, catalog, _command, _receipt, authority = _save_signed_canvas_catalog_record(
-        control,
-        command_id="inside-bind-root",
-    )
+    before = tree_state(tmp_path)
+    reader = _StableReadonlyDuckDB(database)
 
-    with pytest.raises(PageProjectionSourceIntegrityError, match="bind root"):
-        DuckDBSignalPageProjectionSource(
-            database,
-            canvas_catalog_root=catalog,
-            canvas_receipt_root=catalog.parent / "canvas-publication-receipts",
-            canvas_publication_keyring=authority.keyring,
-            page_control_outbox=outbox,
-            generation_bind_root=control,
-        )
+    with reader as connection:
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        opened_through = reader.opened_through
+        inside = tree_state(tmp_path)
+
+    assert opened_through in {"descriptor", "link"}
+    if opened_through == "descriptor":
+        assert inside == before, "the descriptor branch must create nothing"
+    else:
+        assert len(inside) > len(before), "the link branch creates exactly its own scratch"
+    #: either way nothing survives the read
+    assert tree_state(tmp_path) == before
+
+
+def test_the_lab_page_source_pins_the_same_way(tmp_path: Path) -> None:
+    """#241's third site: the lab jobs role reads a replica under a read-only `research/`.
+
+    `runtime_builder_authority` builds `DuckDBLabPageProjectionSource` for
+    `lab_jobs_publisher`, whose unit grants `control/lab-jobs-publishers/%i` and its
+    serving authority and nothing else -- `research/` is read-only. The reader used to
+    create its scratch beside the replica there; it now takes the same descriptor path as
+    the signal reader, so on a host it writes nothing.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "research_ro.duckdb"
+    with DuckDBStore(database):
+        pass
+    source = DuckDBLabPageProjectionSource(database)
+
+    assert not hasattr(source, "generation_bind_root")
+    with _StableReadonlyDuckDB(database) as connection:
+        assert connection.execute("SELECT 1").fetchone() == (1,)

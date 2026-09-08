@@ -238,31 +238,45 @@ def _database_timestamp(value: object) -> datetime:
     return value.astimezone(UTC)
 
 
+#: Where a still-open descriptor can be re-opened by name. Linux publishes `/proc/self/fd`
+#: and the BSDs `/dev/fd`; opening an entry there re-opens the *inode* the descriptor holds,
+#: not the path it was reached through, so it pins a generation without creating anything.
+_DESCRIPTOR_DIRECTORIES = ("/proc/self/fd", "/dev/fd")
+
+
+def _descriptor_path(descriptor: int) -> str | None:
+    """The name that re-opens exactly this descriptor's inode, or None if the OS has none."""
+
+    for directory in _DESCRIPTOR_DIRECTORIES:
+        if os.path.isdir(directory):
+            return f"{directory}/{descriptor}"
+    return None
+
+
 class _StableReadonlyDuckDB:
     """Open one regular immutable-generation file and reject pointer rotation mid-read."""
 
-    def __init__(self, path: Path, *, bind_root: Path | None = None) -> None:
+    #: #241: this used to pin the generation with a hard link into a scratch directory.
+    #: There is no directory on a runtime host where that can work: systemd builds every
+    #: `ReadWritePaths=` and `ReadOnlyPaths=` entry as its own bind mount, and Linux
+    #: `link()` refuses across mounts (`do_linkat` compares `mnt`, not the superblock), so
+    #: beside the database is `EROFS` and anywhere the role may write is `EXDEV`. A
+    #: descriptor pins the same generation and creates nothing at all.
+    def __init__(self, path: Path) -> None:
         normalized = Path(os.path.abspath(path))
         if not normalized.is_absolute():
             raise ValueError("projection database path must be absolute")
         self.path = normalized
-        #: #241: binding a generation means creating a directory and a hard link. Beside
-        #: the database is where that used to happen, and for a role whose unit grants
-        #: the database read-only it is `EROFS`. `None` keeps the old place for the
-        #: unsandboxed readers (dashboard, CLI); a sandboxed role passes its own root.
-        self.bind_root = None if bind_root is None else Path(os.path.abspath(bind_root))
-        #: equality, not containment: the runtime root a role owns is routinely a
-        #: descendant of the directory the replica sits in, and the unit is what decides
-        #: which descendants it owns. What is never right is binding beside the file.
-        if self.bind_root is not None and self.bind_root == self.path.parent:
-            raise PageProjectionSourceIntegrityError(
-                f"projection database bind root {self.bind_root} is the database's own "
-                f"directory, which the reading role does not own"
-            )
         self._before: os.stat_result | None = None
+        self._descriptor = -1
+        self._generation_path: str | None = None
         self._bound_directory: Path | None = None
         self._bound_path: Path | None = None
-        self._bound_identity: os.stat_result | None = None
+        #: which opener took: `"descriptor"` (no writes; the branch a runtime host takes)
+        #: or `"link"` (the pre-existing mechanism, kept for engines that refuse a
+        #: descriptor path). Recorded so both branches can be asserted rather than
+        #: discovered at run time.
+        self.opened_through: str | None = None
         self.connection: duckdb.DuckDBPyConnection | None = None
 
     def __enter__(self) -> duckdb.DuckDBPyConnection:
@@ -272,56 +286,132 @@ class _StableReadonlyDuckDB:
                 "projection database must be a regular non-symlink file"
             )
         self._before = before
-        bind_root = self.path.parent if self.bind_root is None else self.bind_root
         try:
-            if self.bind_root is not None:
-                os.makedirs(self.bind_root, mode=0o700, exist_ok=True)
-            bound_directory = Path(
-                mkdtemp(prefix=f".{self.path.name}.{uuid4().hex}.", dir=bind_root)
-            )
+            self._descriptor = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except OSError as exc:
             raise PageProjectionSourceIntegrityError(
-                f"projection database generation cannot be bound in {bind_root} "
-                f"(errno {exc.errno} {errno.errorcode.get(exc.errno or 0, '?')} "
-                f"{exc.strerror})"
+                f"projection database {self.path} cannot be opened "
+                f"(errno {exc.errno} {errno.errorcode.get(exc.errno or 0, '?')} {exc.strerror})"
             ) from exc
-        os.chmod(bound_directory, 0o700)
-        bound_path = bound_directory / "generation.duckdb"
         try:
-            os.link(self.path, bound_path, follow_symlinks=False)
-            bound = os.lstat(bound_path)
-            after_link = os.lstat(self.path)
-            if _file_identity(bound) != _file_identity(before) or _file_identity(
-                after_link
-            ) != _file_identity(before):
+            opened = os.fstat(self._descriptor)
+            if _file_identity(opened) != _file_identity(before):
                 raise PageProjectionSourceIntegrityError(
-                    "projection database rotated while binding its opened generation"
+                    "projection database rotated while its generation was being opened"
                 )
-            self._bound_directory = bound_directory
-            self._bound_path = bound_path
-            self._bound_identity = bound
-            self.connection = duckdb.connect(str(bound_path), read_only=True)
-        except Exception:
-            with suppress(FileNotFoundError):
-                os.unlink(bound_path)
-            with suppress(FileNotFoundError):
-                os.rmdir(bound_directory)
+            descriptor_path = _descriptor_path(self._descriptor)
+            self.connection = self._connect_generation(descriptor_path)
+            after_open = os.fstat(self._descriptor)
+            if _file_identity(after_open) != _file_identity(before):
+                raise PageProjectionSourceIntegrityError(
+                    "projection database rotated while the generation was being opened"
+                )
+        except BaseException:
+            self._release()
             raise
         return self.connection
 
+    def _connect_generation(self, descriptor_path: str | None) -> duckdb.DuckDBPyConnection:
+        """Open the exact generation this descriptor holds, writing nothing if possible.
+
+        Two openers, in this order, and the reason the order matters is #241:
+
+        1. **the descriptor** — `duckdb.connect("/proc/self/fd/<n>")` opens the inode the
+           descriptor holds, so a `rename()` over the name during the open cannot swap the
+           generation, and nothing is created anywhere. This is the branch a runtime host
+           takes, and it is the only branch that works there: every granted path in a unit
+           is its own bind mount, so a hard link out of the database's directory is
+           `EXDEV` and one inside it is `EROFS`.
+        2. **a hard link beside the database** — the mechanism this class shipped with. It
+           gives the same generation pinning and needs the database's own directory to be
+           writable, which is true for the unsandboxed readers (dashboard, CLI, the macOS
+           lane) and false on a runtime host. DuckDB rejects `/dev/fd/<n>` on macOS (it
+           rebuilds the path from the descriptor's real name), so this branch is what
+           keeps `test_duckdb_signal_source_binds_generation_opened_during_connect`
+           meaningful off Linux rather than quietly weakening it.
+
+        There is no third branch that opens the bare path: that would read whatever the
+        name points at when the engine gets to it, which is the guarantee this class exists
+        to provide.
+        """
+
+        if descriptor_path is not None:
+            try:
+                connection = duckdb.connect(descriptor_path, read_only=True)
+            except Exception:  # noqa: BLE001 - the engine decides; both branches are tested
+                pass
+            else:
+                self.opened_through = "descriptor"
+                self._generation_path = descriptor_path
+                return connection
+        bound_directory: Path | None = None
+        try:
+            bound_directory = Path(
+                mkdtemp(prefix=f".{self.path.name}.{uuid4().hex}.", dir=self.path.parent)
+            )
+            os.chmod(bound_directory, 0o700)
+            bound_path = bound_directory / "generation.duckdb"
+            os.link(self.path, bound_path, follow_symlinks=False)
+        except OSError as exc:
+            if bound_directory is not None:
+                with suppress(OSError):
+                    os.rmdir(bound_directory)
+            raise PageProjectionSourceIntegrityError(
+                f"projection database {self.path} cannot be pinned: this engine refused "
+                f"the descriptor {descriptor_path}, and linking it inside "
+                f"{self.path.parent} failed (errno {exc.errno} "
+                f"{errno.errorcode.get(exc.errno or 0, '?')} {exc.strerror})"
+            ) from exc
+        bound = os.lstat(bound_path)
+        if _file_identity(bound) != _file_identity(os.fstat(self._descriptor)):
+            self._discard_link(bound_directory, bound_path)
+            raise PageProjectionSourceIntegrityError(
+                "projection database rotated while binding its opened generation"
+            )
+        try:
+            connection = duckdb.connect(str(bound_path), read_only=True)
+        except BaseException:
+            self._discard_link(bound_directory, bound_path)
+            raise
+        self.opened_through = "link"
+        self._generation_path = str(bound_path)
+        self._bound_directory = bound_directory
+        self._bound_path = bound_path
+        return connection
+
+    @staticmethod
+    def _discard_link(directory: Path | None, path: Path | None) -> None:
+        if path is not None:
+            with suppress(FileNotFoundError):
+                os.unlink(path)
+        if directory is not None:
+            with suppress(FileNotFoundError):
+                os.rmdir(directory)
+
     @property
-    def bound_path(self) -> Path:
-        if self._bound_path is None or self.connection is None:
-            raise RuntimeError("projection database generation is not currently bound")
-        return self._bound_path
+    def generation_path(self) -> str:
+        """The name a second reader can use to open the very same pinned generation."""
+
+        if self._generation_path is None or self.connection is None:
+            raise RuntimeError("projection database generation is not currently open")
+        return self._generation_path
+
+    def _release(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        self._discard_link(self._bound_directory, self._bound_path)
+        self._bound_directory = None
+        self._bound_path = None
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
 
     def __exit__(self, *_error: object) -> None:
         assert self._before is not None
         try:
-            assert self._bound_path is not None
-            assert self._bound_identity is not None
-            bound_after = os.lstat(self._bound_path)
-            if _file_identity(bound_after) != _file_identity(self._bound_identity):
+            opened = os.fstat(self._descriptor)
+            if _file_identity(opened) != _file_identity(self._before):
                 raise PageProjectionSourceIntegrityError(
                     "projection database opened generation rotated while read"
                 )
@@ -331,14 +421,7 @@ class _StableReadonlyDuckDB:
                     "projection database rotated while the snapshot was being read"
                 )
         finally:
-            if self.connection is not None:
-                self.connection.close()
-            if self._bound_path is not None:
-                with suppress(FileNotFoundError):
-                    os.unlink(self._bound_path)
-            if self._bound_directory is not None:
-                with suppress(FileNotFoundError):
-                    os.rmdir(self._bound_directory)
+            self._release()
 
 
 @dataclass(frozen=True)
@@ -386,26 +469,21 @@ class _ReadonlyPageControlAuditReader:
         },
     }
 
-    def __init__(self, path: Path, *, bind_root: Path) -> None:
+    #: #241: `snapshot()` pins the generation it reads. It used to do that with a hard
+    #: link, beside the outbox -- a directory that belongs to `rquant-page-control.service`
+    #: and is read-only in every other unit, so on the host the notifier got `EROFS` every
+    #: iteration. Moving the link into a directory the notifier owns does not fix it:
+    #: systemd builds each granted path as its own bind mount and Linux `link()` refuses
+    #: across mounts, so that is `EXDEV` instead. A descriptor pins the same generation and
+    #: creates nothing anywhere, which is the only shape that holds under this unit model.
+    def __init__(self, path: Path) -> None:
         self.path = Path(os.path.abspath(path))
-        #: #241: `snapshot()` pins the generation it reads by hard-linking the database,
-        #: and it used to do that beside the database. The PageControl outbox belongs to
-        #: the page-control service -- `rquant-page-control.service` is the only unit
-        #: whose `ReadWritePaths` covers `…/data/runtime/control` -- so on the host the
-        #: notifier got `EROFS` for a temporary directory next to it, every iteration.
-        #: The reading role has to supply a directory of its own instead.
-        self.bind_root = Path(os.path.abspath(bind_root))
-        if self.bind_root == self.path.parent:
-            raise PageProjectionSourceIntegrityError(
-                f"PageControl audit bind root {self.bind_root} is the outbox's own "
-                f"directory, which belongs to the page-control service"
-            )
         self._snapshot_connection: sqlite3.Connection | None = None
         validated = self._validate_schema()
         self._validated_node_identity = (validated.st_dev, validated.st_ino)
 
-    def _connect(self, path: Path | None = None) -> sqlite3.Connection:
-        database_path = self.path if path is None else path
+    def _connect(self, path: Path | str | None = None) -> sqlite3.Connection:
+        database_path = self.path if path is None else Path(path)
         uri = f"{database_path.as_uri()}?mode=ro&immutable=1"
         try:
             connection = sqlite3.connect(uri, uri=True, timeout=0)
@@ -439,27 +517,23 @@ class _ReadonlyPageControlAuditReader:
                 "PageControl audit database rotated or is not a regular non-symlink file"
             )
         try:
-            os.makedirs(self.bind_root, mode=0o700, exist_ok=True)
-            bound_directory = Path(
-                mkdtemp(
-                    prefix=f".{self.path.name}.{uuid4().hex}.",
-                    dir=self.bind_root,
-                )
-            )
+            descriptor = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except OSError as exc:
             raise PageProjectionSourceIntegrityError(
-                f"PageControl audit generation cannot be bound in {self.bind_root} "
-                f"(errno {exc.errno} {errno.errorcode.get(exc.errno or 0, '?')} "
-                f"{exc.strerror})"
+                f"PageControl audit {self.path} cannot be opened "
+                f"(errno {exc.errno} {errno.errorcode.get(exc.errno or 0, '?')} {exc.strerror})"
             ) from exc
-        os.chmod(bound_directory, 0o700)
-        bound_path = bound_directory / "generation.sqlite3"
+        bound_path = _descriptor_path(descriptor)
+        if bound_path is None:
+            os.close(descriptor)
+            raise PageProjectionSourceIntegrityError(
+                f"PageControl audit {self.path} cannot be pinned: this platform publishes "
+                f"neither {' nor '.join(_DESCRIPTOR_DIRECTORIES)}, and a reader that may not "
+                f"write anywhere has no other way to hold one generation"
+            )
         connection: sqlite3.Connection | None = None
         try:
-            #: the hard link needs the same filesystem as the outbox, which every runtime
-            #: root satisfies; `EXDEV` here is a misconfigured bind root, not a rotation
-            os.link(self.path, bound_path, follow_symlinks=False)
-            bound = os.lstat(bound_path)
+            bound = os.fstat(descriptor)
             after_link = os.lstat(self.path)
             if _file_identity(bound) != _file_identity(before) or _file_identity(
                 after_link
@@ -481,10 +555,7 @@ class _ReadonlyPageControlAuditReader:
             if connection is not None:
                 connection.rollback()
                 connection.close()
-            with suppress(FileNotFoundError):
-                os.unlink(bound_path)
-            with suppress(FileNotFoundError):
-                os.rmdir(bound_directory)
+            os.close(descriptor)
             raise
         else:
             self._snapshot_connection = None
@@ -494,7 +565,7 @@ class _ReadonlyPageControlAuditReader:
         integrity_error: PageProjectionSourceIntegrityError | None = None
         try:
             after = os.lstat(self.path)
-            bound_after = os.lstat(bound_path)
+            bound_after = os.fstat(descriptor)
             with self._connect(bound_path) as current:
                 inflight = current.execute(
                     """
@@ -518,10 +589,7 @@ class _ReadonlyPageControlAuditReader:
                 f"PageControl audit generation cannot be revalidated: {exc}"
             )
         finally:
-            with suppress(FileNotFoundError):
-                os.unlink(bound_path)
-            with suppress(FileNotFoundError):
-                os.rmdir(bound_directory)
+            os.close(descriptor)
         if integrity_error is not None:
             raise integrity_error
 
@@ -718,7 +786,6 @@ class DuckDBSignalPageProjectionSource:
         canvas_receipt_root: Path | None = None,
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
-        generation_bind_root: Path | None = None,
         surge_live_root: Path | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
@@ -729,9 +796,6 @@ class DuckDBSignalPageProjectionSource:
             None if canvas_receipt_root is None else Path(os.path.abspath(canvas_receipt_root))
         )
         self.canvas_publication_keyring = canvas_publication_keyring
-        self.generation_bind_root = (
-            None if generation_bind_root is None else Path(os.path.abspath(generation_bind_root))
-        )
         self.surge_live_root = (
             None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
         )
@@ -743,14 +807,7 @@ class DuckDBSignalPageProjectionSource:
                 if isinstance(page_control_outbox, PageControlOutbox)
                 else Path(page_control_outbox)
             )
-            if generation_bind_root is None:
-                raise PageProjectionSourceIntegrityError(
-                    "PageControl audit authority requires a bind root the reading role owns"
-                )
-            self.page_control_outbox = _ReadonlyPageControlAuditReader(
-                audit_path,
-                bind_root=generation_bind_root,
-            )
+            self.page_control_outbox = _ReadonlyPageControlAuditReader(audit_path)
 
         if self.canvas_catalog_root is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
@@ -772,10 +829,7 @@ class DuckDBSignalPageProjectionSource:
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         cutoff = _local_naive(observed)
-        with _StableReadonlyDuckDB(
-            self.database_path,
-            bind_root=self.generation_bind_root,
-        ) as connection:
+        with _StableReadonlyDuckDB(self.database_path) as connection:
             self._require_tables(connection)
             screen_rows = connection.execute(
                 """
@@ -1375,15 +1429,12 @@ class DuckDBSignalPageProjectionSource:
 class DuckDBLabPageProjectionSource:
     """Project formal research gate metadata from one stable research replica."""
 
-    def __init__(self, database_path: Path, *, generation_bind_root: Path | None = None) -> None:
+    def __init__(self, database_path: Path) -> None:
         self.database_path = Path(os.path.abspath(database_path))
-        self.generation_bind_root = (
-            None if generation_bind_root is None else Path(os.path.abspath(generation_bind_root))
-        )
 
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
-        stable = _StableReadonlyDuckDB(self.database_path, bind_root=self.generation_bind_root)
+        stable = _StableReadonlyDuckDB(self.database_path)
         with stable as connection:
             self._require_tables(connection)
             candidates = connection.execute(
@@ -1411,7 +1462,7 @@ class DuckDBLabPageProjectionSource:
                     "research gates exceed the bounded projection limit"
                 )
             rows: list[ResearchGateProjectionRow] = []
-            with DuckDBStore(stable.bound_path, read_only=True) as store:
+            with DuckDBStore(stable.generation_path, read_only=True) as store:
                 for (
                     snapshot_id,
                     strategy_name,

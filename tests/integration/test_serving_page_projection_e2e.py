@@ -1155,7 +1155,6 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
             canvas_receipt_root=page_data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=page_authority.keyring,
             page_control_outbox=page_outbox,
-            generation_bind_root=_generation_binds(page_outbox),
         ),
         store=notification_store,
         companion_projections=tuple(
