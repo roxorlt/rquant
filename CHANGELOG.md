@@ -103,6 +103,14 @@
     1024 MiB = 3838 MiB。父级降到 4096M 则低于三个子面上限之和（3840+512+768 = 5120），
     最先被节流的是 monitor 与备份自己的 page cache。真正的内存现实（盘中 monitor 2814 MiB
     与 19 个 role 的 2.8 GB 共用一个 3840M 的面）写进了包报告交 owner 决策。
+  - `src/rquant/workload_isolation.py` 的镜像同步跟上：新增 `rquant-live-runtime.slice` 的限额、
+    十四个 role 模板的期望 slice 改指子 slice、serving 加 `CPUQuota`、maintenance 权重改 300。
+    `check_workload_runtime` 的 `Slice=` 不匹配错误现在点名补救办法
+    （`restart <unit> to move it into rquant-live-runtime.slice`）——`Slice=` 在 unit 启动时定死，
+    改文件加 `daemon-reload` 不会把已经在跑的实例搬进新 slice，这是唯一一类靠重启就能消掉的失败。
+    检查本身**没有放松**：只要还有实例停在旧 slice，它就一直是红的。
+  - `scripts/migrate-legacy-runtime-slices.sh` 的接受清单加上 `rquant-live-runtime.slice`。
+    替换 unit 现在报的就是这个子 slice，不加的话迁移守卫会把一次正常迁移判成越界。
   - `deploy/systemd/` 改动不进受控发布器（它按设计拒绝含该目录的 diff），必须由 owner 单独
     授权、按 `DEPLOY.md` 顶部条目手工安装并在云端 `systemd-analyze verify`。
 
