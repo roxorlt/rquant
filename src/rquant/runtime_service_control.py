@@ -124,6 +124,15 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     degraded_reasons: tuple[str, ...] = ()
     last_error: str | None = None
     stop_reason: str | None = None
+    #: Set while every iteration is failing on one artifact another role has not created
+    #: yet. Without a failure threshold -- deliberately, so that a peer that has not
+    #: started stops taking the process down and firing `OnFailure` -- "waiting" and
+    #: "wedged" look the same on a dashboard: DEGRADED, forever. These three say which
+    #: file, since when, and for how long, so a readiness probe or a later alerting rule
+    #: has something to read other than the prose in `last_error`.
+    waiting_for: str | None = None
+    waiting_since: AwareUtcDatetime | None = None
+    waited_seconds: StepDuration | None = None
 
     @field_validator("source_generations")
     @classmethod
@@ -169,6 +178,19 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
             expected_p95 = _nearest_rank_p95(durations)
             if self.p95_step_duration_seconds != expected_p95:
                 raise ValueError("p95 step duration does not match the duration window")
+        waiting = (self.waiting_for, self.waiting_since, self.waited_seconds)
+        if any(value is not None for value in waiting) and not all(
+            value is not None for value in waiting
+        ):
+            raise ValueError("waiting fields must be published as one group")
+        if self.waiting_since is not None:
+            if self.waiting_since < self.started_at:
+                raise ValueError("waiting_since cannot precede service start")
+            if self.waiting_since > self.heartbeat_at:
+                raise ValueError("waiting_since cannot follow the heartbeat")
+            expected = (self.heartbeat_at - self.waiting_since).total_seconds()
+            if self.waited_seconds != expected:
+                raise ValueError("waited_seconds must equal heartbeat_at minus waiting_since")
         return self
 
 
@@ -210,6 +232,39 @@ def _duration_updates(
         "last_step_duration_seconds": duration,
         "p95_step_duration_seconds": _nearest_rank_p95(window),
         "recent_step_durations_seconds": window,
+    }
+
+
+def _waiting_updates(
+    current: RuntimeServiceHeartbeat,
+    error: BaseException,
+    *,
+    now: datetime,
+) -> dict[str, object]:
+    """How long this service has been failing on one absent peer artifact, if it is.
+
+    The clock starts at the first iteration that named this artifact and keeps running
+    while it keeps naming the same one; anything else -- a different artifact, a
+    different kind of failure, a success -- clears it. So `waited_seconds` answers "how
+    long has this been stuck on this file", which is what an operator and a readiness
+    probe both want, and which `consecutive_failures` cannot answer once a service has
+    waited for two different peers in one run.
+    """
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    if not isinstance(error, PeerArtifactUnavailableError):
+        return {"waiting_for": None, "waiting_since": None, "waited_seconds": None}
+    waiting_for = str(error.path)
+    since = (
+        current.waiting_since
+        if current.waiting_for == waiting_for and current.waiting_since is not None
+        else now
+    )
+    return {
+        "waiting_for": waiting_for,
+        "waiting_since": since,
+        "waited_seconds": (now - since).total_seconds(),
     }
 
 
@@ -398,6 +453,9 @@ class RuntimeServiceControl:
                 source_generations=result.source_generations,
                 degraded_reasons=result.degraded_reasons,
                 last_error=None,
+                waiting_for=None,
+                waiting_since=None,
+                waited_seconds=None,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -409,15 +467,17 @@ class RuntimeServiceControl:
         duration_seconds: float | None = None,
     ) -> RuntimeServiceHeartbeat:
         current = self._require_active()
+        now = normalize_aware_utc(self._clock())
         return self._publish(
             self._validated_update(
                 current,
                 status=RuntimeServiceStatus.DEGRADED,
-                heartbeat_at=normalize_aware_utc(self._clock()),
+                heartbeat_at=now,
                 consecutive_failures=current.consecutive_failures + 1,
                 total_failures=current.total_failures + 1,
                 degraded_reasons=(),
                 last_error=_error_text(error),
+                **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -440,6 +500,12 @@ class RuntimeServiceControl:
                 stopped_at=now,
                 stop_reason=reason,
                 last_error=_error_text(error) if error is not None else current.last_error,
+                #: the wait is still the same wait; only the clock moved
+                waited_seconds=(
+                    None
+                    if current.waiting_since is None
+                    else (now - current.waiting_since).total_seconds()
+                ),
             )
         )
         fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)

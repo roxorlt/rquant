@@ -24,6 +24,7 @@ from rquant.runtime_notification_providers import (
     NotificationTransportResult,
     build_environment_notification_provider_loader,
 )
+from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_builtin import build_builtin_registry
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import (
@@ -1401,3 +1402,147 @@ def test_signal_runtime_builders_require_live_plane_and_exact_kind(
     )
     with pytest.raises(ValueError, match="kind"):
         builder(wrong_kind)
+
+
+# ---------------------------------------------------------------------------------------
+# Starting before the strategies have written anything (#232, #220)
+# ---------------------------------------------------------------------------------------
+
+
+def _without_runner_database(tmp_path: Path) -> RuntimeServiceManifest:
+    """A real router authority whose one strategy has not created its database yet."""
+
+    manifest, store = _authoritative_router_manifest(tmp_path)
+    for path in sorted(store.path.parent.glob(f"{store.path.name}*")):
+        path.unlink()
+    assert not store.path.exists()
+    return manifest
+
+
+def test_the_router_creates_its_own_artifacts_before_it_looks_for_a_runner(
+    tmp_path: Path,
+) -> None:
+    """#220: only this role creates the bus, and it used to die before doing so.
+
+    `strategy_live` opens `live/signal-bus/signal_bus.sqlite3` read-only and its sandbox
+    grants it `live/strategies/%i` alone, so the plane could not start in either order:
+    the router checked every runner database first and exited, and the strategies were
+    waiting for the bus that check stood in front of.
+    """
+
+    manifest = _without_runner_database(tmp_path)
+
+    step = build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+    assert (tmp_path / "signal-bus.sqlite3").is_file()
+    assert (tmp_path / "signal-spool").is_dir()
+
+    #: and the wait says which file, on every iteration, without leaving the loop
+    with pytest.raises(PeerArtifactUnavailableError, match="runner source") as raised:
+        step()
+    assert str(Path(str(manifest.settings["runner_state_path"]))) in str(raised.value)
+
+
+def test_the_route_spool_source_document_is_published_before_the_wait(
+    tmp_path: Path,
+) -> None:
+    """`paper_broker` and `notifier` need `spool/source.json`, not a routed signal."""
+
+    manifest = _without_runner_database(tmp_path)
+    step = build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+    with pytest.raises(PeerArtifactUnavailableError):
+        step()
+
+    spool = tmp_path / "signal-spool"
+    assert (spool / "records").is_dir()
+    assert (spool / "source.json").is_file()
+
+
+def test_a_runner_database_that_appears_later_is_routed_from(tmp_path: Path) -> None:
+    """The waiting is a wait, not a permanent state: the next iteration picks it up."""
+
+    manifest = _without_runner_database(tmp_path)
+    runner_path = Path(str(manifest.settings["runner_state_path"]))
+
+    step = build_builtin_registry(clock=lambda: NOW).build(manifest)
+    with pytest.raises(PeerArtifactUnavailableError):
+        step()
+
+    #: the strategy starts and does what it now does first of all
+    restarted = StrategyRunnerStore(
+        runner_path,
+        spec=_strategy_spec(),
+        evaluator_contract_fingerprint=EVALUATOR,
+    )
+    result = step()
+
+    assert result.source_generations["n-shape-v1"] == restarted.source_generation_id
+
+
+def test_a_runner_database_that_exists_and_is_unreadable_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Absence defers. A file that is there and is not a runner database refuses, now."""
+
+    manifest = _without_runner_database(tmp_path)
+    Path(str(manifest.settings["runner_state_path"])).write_bytes(b"not a sqlite database")
+
+    with pytest.raises(ValueError, match="runner source") as raised:
+        build_builtin_registry(clock=lambda: NOW).build(manifest)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+
+
+def test_a_runner_path_replaced_by_a_symlink_still_fails_closed(tmp_path: Path) -> None:
+    """The substitution `_require_safe_path` exists to catch, over the deferred open."""
+
+    manifest = _without_runner_database(tmp_path)
+    runner_path = Path(str(manifest.settings["runner_state_path"]))
+    elsewhere = tmp_path / "elsewhere.sqlite3"
+    StrategyRunnerStore(
+        elsewhere,
+        spec=_strategy_spec(),
+        evaluator_contract_fingerprint=EVALUATOR,
+    )
+    runner_path.symlink_to(elsewhere)
+
+    with pytest.raises(ValueError, match="symlink"):
+        build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+
+def test_the_signal_bus_exists_even_when_a_runner_source_refuses(tmp_path: Path) -> None:
+    """Why the bus is created first, and not merely before the routing step.
+
+    Only this role creates `live/signal-bus/signal_bus.sqlite3`, and `strategy_live` opens
+    it read-only while building its own step. A router that refuses because one strategy's
+    database is unreadable must still have left the bus, or that one strategy's state takes
+    every strategy on the plane down with it — the shape of #220.
+    """
+
+    manifest = _without_runner_database(tmp_path)
+    Path(str(manifest.settings["runner_state_path"])).write_bytes(b"not a sqlite database")
+
+    with pytest.raises(ValueError):
+        build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+    assert (tmp_path / "signal-bus.sqlite3").is_file()
+    assert (tmp_path / "signal-spool").is_dir()
+
+
+def test_a_router_that_refuses_over_its_settings_creates_nothing(tmp_path: Path) -> None:
+    """The bus is created early for the plane's sake, not as a side effect of refusing.
+
+    `signal_router` owns three artifacts nobody else creates, and it builds them before
+    it opens any strategy's runner database so that the live plane's start order stops
+    being a cycle (#220). That is a reason to create them before reading *files*, not
+    before deciding whether this manifest describes a router at all: a role that is going
+    to refuse over its own settings must leave the directory as it found it.
+    """
+
+    manifest = _router_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="authority"):
+        build_builtin_registry(clock=lambda: NOW).build(manifest)
+
+    assert not (tmp_path / "signal-bus.sqlite3").exists()
+    assert not (tmp_path / "signal-spool").exists()

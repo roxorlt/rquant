@@ -345,7 +345,11 @@ def test_session_close_marker_freezes_incremental_chain_and_rejects_late_append(
     assert marker.batch_count == 2
     assert len(marker.segment_chain_hash) == 64
     assert (
-        FeatureBatchSpool(tmp_path, read_only=True).session_close_marker(marker.trade_date)
+        FeatureBatchSpool(
+            tmp_path,
+            cursor_root=tmp_path.parent / "consumer-cursors",
+            read_only=True,
+        ).session_close_marker(marker.trade_date)
         == marker
     )
 
@@ -523,3 +527,29 @@ def test_session_close_marker_rejects_deep_json_before_model_validation(
 
     with pytest.raises(FeatureSpoolIntegrityError, match="depth budget"):
         spool.session_close_marker(marker.trade_date)
+
+
+def test_a_readonly_consumer_may_not_keep_its_cursors_in_the_producer_root(
+    tmp_path: Path,
+) -> None:
+    """#231 as an invariant: a reader's lock and cursors belong to the reader.
+
+    `strategy_live` may write `live/strategies/%i` and nothing else, so a consumer whose
+    cursor root defaults into `live/features` takes the producer's lock and dies on
+    `[Errno 30] Read-only file system: .../live/features/.feature-spool.lock`. The default
+    is refused outright rather than left to each consumer to remember.
+    """
+
+    producer = FeatureBatchSpool(tmp_path / "features")
+    assert producer.cursor_root == tmp_path / "features" / "cursors"
+
+    for cursor_root in (None, tmp_path / "features" / "consumers"):
+        with pytest.raises(FeatureSpoolIntegrityError, match="outside the producer root"):
+            FeatureBatchSpool(tmp_path / "features", cursor_root=cursor_root, read_only=True)
+
+    outside = FeatureBatchSpool(
+        tmp_path / "features",
+        cursor_root=tmp_path / "strategy" / "feature-cursors",
+        read_only=True,
+    )
+    assert outside.cursor_root == tmp_path / "strategy" / "feature-cursors"

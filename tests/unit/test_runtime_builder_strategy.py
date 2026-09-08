@@ -26,7 +26,7 @@ from rquant.feature_contracts import (
     FeatureDefinition,
     FeatureFieldStatus,
 )
-from rquant.feature_spool import FeatureBatchSpool
+from rquant.feature_spool import FeatureBatchSpool, FeatureSpoolIntegrityError
 from rquant.paper_broker import (
     BrokerExecutionContext,
     PaperBrokerStore,
@@ -38,6 +38,7 @@ from rquant.runtime_builder_strategy import (
 )
 from rquant.runtime_candidate_universe import RuntimeCandidateUniverseIntegrityError
 from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
 from rquant.runtime_shadow_validation import HmacCompletionAttestationAuthority
@@ -62,6 +63,7 @@ from rquant.strategy_runner import (
 )
 from rquant.strategy_spec import StrategyLifecycleState, StrategySpec
 from tests.paper_cost_fixtures import paper_cost_policy, paper_instrument_context
+from tests.runtime_readonly_sandbox import readonly_runtime, tree_state
 from tests.shadow_ed25519_support import (
     create_rotating_shadow_ed25519_test_authority,
     create_shadow_ed25519_test_authority,
@@ -1117,3 +1119,308 @@ def test_strategy_builder_rejects_symlinked_definition_registry_root(tmp_path: P
 
     with pytest.raises(DefinitionIntegrityError, match="symlink|unsafe|registry"):
         strategy_live_builder(clock=lambda: NOW)(manifest)
+
+
+# ---------------------------------------------------------------------------------------
+# Starting with nothing else on the live plane running (#231, #232, #220)
+# ---------------------------------------------------------------------------------------
+
+
+def _strategy_signer(tmp_path: Path):
+    """The Ed25519 completion signer the production role builds, for a live manifest."""
+
+    authority = create_shadow_ed25519_test_authority(tmp_path / "completion-keys")
+    return authority.signer, authority.keyring.active_key_id
+
+
+def _idle_live_manifest(
+    tmp_path: Path,
+    *,
+    initialize_feature_spool: bool,
+    create_paper_broker: bool,
+) -> RuntimeServiceManifest:
+    """A completion-authority manifest whose peers have created only what is asked for.
+
+    `feature_live` owns `features/`, `paper_broker` owns the ledger, `signal_router` owns
+    the bus. On a host outside market hours the strategy is started before all three have
+    written anything, and `_manifest` builds the ledger eagerly, so it is removed here.
+    """
+
+    manifest = _manifest(tmp_path, completion_authority=True)
+    broker_path = Path(str(manifest.settings["paper_broker_path"]))
+    if not create_paper_broker:
+        broker_path.unlink()
+    if initialize_feature_spool:
+        #: exactly what the feature role's own builder does, and nothing more
+        FeatureBatchSpool(Path(str(manifest.settings["feature_spool_root"])))
+    assert not Path(str(manifest.settings["signal_bus_path"])).exists()
+    return manifest
+
+
+def test_the_runner_database_exists_before_any_peer_role_has_started(
+    tmp_path: Path,
+) -> None:
+    """#232: `signal_router` waits for this file, and an idle strategy used to withhold it.
+
+    The window's three strategies died on the feature spool's lock before they reached
+    the runner store, so `live/strategies/<svc>/` stayed empty all night and the router
+    failed five times against it. The store is now built before anything another role
+    owns is opened, so the file is there as soon as the process is.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=False,
+        create_paper_broker=False,
+    )
+
+    step = strategy_live_builder(
+        clock=lambda: NOW,
+        completion_attestation_signer=signer,
+        completion_attestation_active_key_id=key_id,
+    )(manifest)
+
+    runner_path = Path(str(manifest.settings["runner_state_path"]))
+    assert runner_path.is_file()
+    with sqlite3.connect(runner_path) as connection:
+        assert connection.execute(
+            "SELECT source_generation_id FROM runner_source_identity WHERE singleton = 1"
+        ).fetchone() is not None
+
+    #: and with no feature spool published yet the step waits by name instead of exiting
+    with pytest.raises(PeerArtifactUnavailableError, match="feature spool") as raised:
+        step()
+    assert str(Path(str(manifest.settings["feature_spool_root"]))) in str(raised.value)
+
+
+def test_an_idle_strategy_iterates_with_the_bus_and_the_ledger_still_absent(
+    tmp_path: Path,
+) -> None:
+    """#220: the plane's start order was circular; only the router creates the bus."""
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+
+    step = strategy_live_builder(
+        clock=lambda: NOW,
+        completion_attestation_signer=signer,
+        completion_attestation_active_key_id=key_id,
+    )(manifest)
+    result = step()
+
+    assert result.processed_count == 0
+    assert result.input_sequence == -1
+    assert result.degraded_reasons == ()
+    assert not Path(str(manifest.settings["signal_bus_path"])).exists()
+
+
+def test_the_feature_consumer_writes_nothing_inside_the_producer_root(
+    tmp_path: Path,
+) -> None:
+    """#231: `[Errno 30] Read-only file system: .../live/features/.feature-spool.lock`.
+
+    The strategy's sandbox grants `live/strategies/%i` and nothing else, so every byte
+    the consumer used to put in the producer's directory — the lock and the cursor — was
+    a write the kernel refused. The producer root is compared byte-mode for byte-mode
+    across a full build and one iteration.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    spool_root = Path(str(manifest.settings["feature_spool_root"]))
+    before = tree_state(spool_root)
+
+    #: the producer's directory is the whole sandbox here: `_manifest` keeps the runner
+    #: database directly under `tmp_path`, so anything wider would also cover what the
+    #: strategy legitimately owns and the guard would never fire
+    with readonly_runtime(spool_root) as violations:
+        step = strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+        step()
+
+    assert violations == []
+    assert tree_state(spool_root) == before
+
+
+def test_the_feature_consumer_keeps_its_cursors_beside_its_runner_database(
+    tmp_path: Path,
+) -> None:
+    """Where the consumer's own state goes: inside the one directory it may write."""
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    spool_root = Path(str(manifest.settings["feature_spool_root"]))
+    runner_root = Path(str(manifest.settings["runner_state_path"])).parent
+
+    strategy_live_builder(
+        clock=lambda: NOW,
+        completion_attestation_signer=signer,
+        completion_attestation_active_key_id=key_id,
+    )(manifest)
+
+    cursors = runner_root / "feature-cursors"
+    assert cursors.is_dir()
+    assert oct(cursors.lstat().st_mode & 0o777) == "0o700"
+    assert tuple((spool_root / "cursors").iterdir()) == ()
+    assert not (runner_root / ".feature-spool.lock").exists()
+
+
+def test_a_feature_spool_that_is_present_and_unsafe_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Absence defers; a producer root anyone could write to refuses, as it always did."""
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    Path(str(manifest.settings["feature_spool_root"])).chmod(0o755)
+
+    with pytest.raises(FeatureSpoolIntegrityError, match="unsafe read-only"):
+        strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+
+
+def test_a_signal_bus_that_is_present_and_unsafe_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The bus is waited for only while it is absent, never while it is unsafe.
+
+    `ReadonlyStrategyRunnerSignalSource._require_safe_path` is what the route authority
+    checks the path with, and a symlink standing where the router's database belongs is
+    the substitution it exists to refuse.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    elsewhere = tmp_path / "elsewhere.sqlite3"
+    SignalBusStore(elsewhere)
+    Path(str(manifest.settings["signal_bus_path"])).symlink_to(elsewhere)
+
+    with pytest.raises(ValueError, match="symlink") as raised:
+        strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+
+
+def test_a_strategy_that_refuses_to_start_still_leaves_its_runner_database(
+    tmp_path: Path,
+) -> None:
+    """Why the runner store is built first, and not merely early.
+
+    `signal_router` reads `live/strategies/<svc>/runner.sqlite3` and no other role can
+    create it. A strategy that refuses to start for any reason of its own — here a feature
+    spool whose producer root anyone could write to — must still leave that file behind,
+    or one broken strategy takes the router down with it, which is what #232 was.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    Path(str(manifest.settings["feature_spool_root"])).chmod(0o755)
+
+    with pytest.raises(FeatureSpoolIntegrityError):
+        strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+
+    assert Path(str(manifest.settings["runner_state_path"])).is_file()
+
+
+def test_a_paper_broker_ledger_that_is_present_and_unreadable_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The fourth peer artifact, and the one deferral could quietly have loosened.
+
+    Before this package the strategy built `PaperBrokerLifecycleReader` eagerly, and that
+    constructor is a full audit: a regular file, then nine tables, `schema_version == 5`
+    and a long list of required columns. Deferring the open without probing it would have
+    moved all of that to the first candidate that actually resolves a lifecycle feature
+    -- which on an idle host outside market hours never happens, so a corrupted ledger
+    would have started clean and stayed clean until the next trading day.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    #: `_manifest` builds a real ledger and the store that built it is still holding the
+    #: connection, so corrupting that file in place only gets written back over. The
+    #: manifest keeps the path; the file under it is replaced.
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    ledger = Path(str(manifest.settings["paper_broker_path"]))
+    for sibling in sorted(ledger.parent.glob(f"{ledger.name}-*")):
+        sibling.unlink()
+    ledger.write_bytes(b"this is not a paper broker ledger")
+
+    with pytest.raises(Exception) as raised:
+        strategy_live_builder(
+            clock=lambda: NOW,
+            completion_attestation_signer=signer,
+            completion_attestation_active_key_id=key_id,
+        )(manifest)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+
+    #: and the refusal still leaves the file `signal_router` waits for
+    assert Path(str(manifest.settings["runner_state_path"])).is_file()
+
+
+def test_an_absent_paper_broker_ledger_is_waited_for_rather_than_refused(
+    tmp_path: Path,
+) -> None:
+    """The other half of the same rule: the broker cannot start before the router.
+
+    `paper_broker` opens the router's route spool while building its own step, so on a
+    cold plane its ledger does not exist yet. Probing an absent ledger is a no-op, which
+    is what keeps the strategy from joining that queue.
+    """
+
+    signer, key_id = _strategy_signer(tmp_path)
+    manifest = _idle_live_manifest(
+        tmp_path,
+        initialize_feature_spool=True,
+        create_paper_broker=False,
+    )
+    assert not Path(str(manifest.settings["paper_broker_path"])).exists()
+
+    step = strategy_live_builder(
+        clock=lambda: NOW,
+        completion_attestation_signer=signer,
+        completion_attestation_active_key_id=key_id,
+    )(manifest)
+
+    assert step().processed_count == 0

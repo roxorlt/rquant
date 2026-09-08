@@ -66,6 +66,46 @@
 
 ### Fixed
 
+- **live 平面四个 role 在盘外空闲时全部起不来，一夜推了 10 条告警（#231、#232、#220）**：
+  2026-09-08 路线 A 第三窗口（v0.33.1、权威链 seq 2）的主机上没有任何行情、没有任何信号，
+  四个 role 仍然一个都没起来。
+
+  `strategy_live` ×3 报 `OSError: [Errno 30] Read-only file system:
+  '.../live/features/.feature-spool.lock'`（#231）：消费者用**写模式**打开 feature spool，
+  于是要去生产者目录里拿锁、把游标也放在生产者目录里，而 strategy unit 的 `ReadWritePaths`
+  只有 `live/strategies/%i`。现在消费者改用 `read_only=True` 打开，游标放到自己的
+  `live/strategies/%i/feature-cursors`；`FeatureBatchSpool` 同时**拒绝**「只读消费者的游标根
+  落在生产者根里面」，这个形状再也回不来。写者（feature）侧一个字没改。
+
+  `signal_router` 报 `runner source is unavailable: .../runner.sqlite3` 五次（#232）：
+  三个 strategy 死在 feature spool 那一步，从来没走到建 `runner.sqlite3` 的那一行；而且两边
+  本来就在互等——`signal_bus.sqlite3` 只有 router 会建，router 却在建它之前先查每一份 runner
+  数据库（#220）。
+
+  两边现在都把「**拥有者还没启动**」和「**这份制品坏了**」分开：新的
+  `DeferredPeerArtifact` 在构建 step 时对**四类对端制品逐一 `probe()`**——feature spool、
+  paper broker 台账、signal bus、每一份 runner 源——路径上有东西就当场打开、当场跑完它自己
+  那套校验，**存在但不合法仍然拒绝启动，一条校验都没放宽**；只有**不存在**的制品改为在主
+  循环里重试，抛 `PeerArtifactUnavailableError` 点名在等哪份文件，由 `run_service_loop`
+  记进 `last_error`，进程不退出、不再触发 `OnFailure` 告警。「不存在」的判据只有
+  `FileNotFoundError` 一种：父段不是目录、符号链接成环这些都算在场，交给打开器去拒。
+  strategy 现在**先建自己的 `runner.sqlite3`**、再碰任何别人拥有的制品；router 现在
+  **先按设置判该不该起**（判完一个文件都还没建），**再建 bus、spool 与游标库**，最后才找 runner。
+
+  **代价是把「告警风暴」换成了「静默」**：服务循环没有连续失败阈值，等不到对端的 role 会一直
+  DEGRADED 下去而不告诉任何人。所以心跳新增三个字段
+  `waiting_for` / `waiting_since` / `waited_seconds`（同组发布、换一份制品就重新计时、
+  任何一次成功迭代清零），让 runbook 探针与将来的告警规则有结构化的东西可读，而不是去 grep
+  `last_error` 的散文。本次不加阈值，也不加告警规则——「同一份对端制品等待超过 N 分钟要不要
+  告警」由 issue #235 单独决定（Refs #235）。
+
+  验收是那一夜本身：**第二代 bundle 装在第一代之上**（这也是准备 schema rollout 计划的那一次
+  安装，PREPARE 按 runbook 的口径承认过）、真实 stage 与发布、wrapper 自己派生的 argv
+  与子环境、一个只被 feature role 初始化过而没发布过任何批次的 spool、盘外且非交易日的时钟，
+  四个 role 各自跑在**从 `deploy/systemd/` 里逐字读出来的 `ReadWritePaths`** 沙箱里，
+  按 runbook C-3 顺序 strategy×3 → router → broker → notifier 全部进主循环，
+  且四个 role 一次越界写都没有。
+
 - **五个 credstore unit 拿到了凭证却启动不了：判据描述的不是 systemd 的投递形状（#230，#215 第三处断点）**：
   2026-09-08 02:04 生产机（systemd 255、`User=lighthouse`）实测，`LoadCredentialEncrypted=`
   交到服务手上的是——`/run/credentials/<unit>/` 一块 `ro,nosuid,nodev,noexec` 的内存挂载，

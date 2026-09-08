@@ -6,9 +6,11 @@ from threading import Event
 
 import pytest
 
+from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_control import (
     RuntimeServiceAlreadyRunningError,
     RuntimeServiceControl,
+    RuntimeServiceHeartbeat,
     RuntimeServicePlane,
     RuntimeServiceSpec,
     RuntimeServiceStatus,
@@ -222,3 +224,129 @@ def test_base_exception_escapes_loop_after_stopped_heartbeat(tmp_path: Path) -> 
     assert heartbeat is not None
     assert heartbeat.status is RuntimeServiceStatus.STOPPED
     assert heartbeat.last_error == "SimulatedCrash"
+
+
+# ---------------------------------------------------------------------------------------
+# How long a service has been waiting on one peer artifact (#231, #232, #220)
+# ---------------------------------------------------------------------------------------
+
+
+def _waiting(path: str) -> PeerArtifactUnavailableError:
+    return PeerArtifactUnavailableError(
+        reader="signal_router",
+        artifact="runner source",
+        path=Path(path),
+    )
+
+
+def test_a_wait_on_one_peer_artifact_is_timed_from_the_iteration_that_named_it(
+    tmp_path: Path,
+) -> None:
+    """The live plane deliberately has no failure threshold any more, so it needs a clock.
+
+    A role whose peer never starts now stays alive and DEGRADED for as long as that
+    lasts, which is the point -- an absent producer stopped taking the process down and
+    firing `OnFailure`. The cost is that "waiting" and "wedged" look identical on a
+    dashboard, and `consecutive_failures` cannot tell them apart either once a service
+    has waited on two different peers in one run. These three fields can.
+    """
+
+    moment = [NOW]
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: moment[0])
+    control.start()
+
+    first = control.record_failure(_waiting("/runtime/live/strategies/svc-1/runner.sqlite3"))
+    assert first.waiting_for == "/runtime/live/strategies/svc-1/runner.sqlite3"
+    assert first.waiting_since == NOW
+    assert first.waited_seconds == 0.0
+
+    moment[0] = NOW + timedelta(minutes=7)
+    same = control.record_failure(_waiting("/runtime/live/strategies/svc-1/runner.sqlite3"))
+    assert same.waiting_since == NOW
+    assert same.waited_seconds == 420.0
+    assert same.consecutive_failures == 2
+
+    control.stop(reason="test complete")
+
+
+def test_waiting_on_a_different_artifact_or_failing_otherwise_restarts_the_clock(
+    tmp_path: Path,
+) -> None:
+    moment = [NOW]
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: moment[0])
+    control.start()
+    control.record_failure(_waiting("/runtime/live/strategies/svc-1/runner.sqlite3"))
+
+    moment[0] = NOW + timedelta(minutes=3)
+    moved = control.record_failure(_waiting("/runtime/live/signal-bus/signal_bus.sqlite3"))
+    assert moved.waiting_for == "/runtime/live/signal-bus/signal_bus.sqlite3"
+    assert moved.waiting_since == moment[0]
+    assert moved.waited_seconds == 0.0
+
+    #: a failure that is not a wait says nothing about how long a wait has lasted
+    other = control.record_failure(RuntimeError("provider unavailable"))
+    assert other.waiting_for is None
+    assert other.waiting_since is None
+    assert other.waited_seconds is None
+
+    control.stop(reason="test complete")
+
+
+def test_one_successful_iteration_clears_the_wait(tmp_path: Path) -> None:
+    moment = [NOW]
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: moment[0])
+    control.start()
+    control.record_failure(_waiting("/runtime/live/strategies/svc-1/runner.sqlite3"))
+
+    moment[0] = NOW + timedelta(minutes=1)
+    running = control.record_success(RuntimeStepResult())
+
+    assert running.status is RuntimeServiceStatus.RUNNING
+    assert running.waiting_for is None
+    assert running.waiting_since is None
+    assert running.waited_seconds is None
+
+    control.stop(reason="test complete")
+
+
+def test_a_stopped_service_keeps_the_wait_and_the_seconds_stay_consistent(
+    tmp_path: Path,
+) -> None:
+    """`stop()` moves `heartbeat_at`, and the two fields have to move with it."""
+
+    moment = [NOW]
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: moment[0])
+    control.start()
+    control.record_failure(_waiting("/runtime/live/strategies/svc-1/runner.sqlite3"))
+
+    moment[0] = NOW + timedelta(minutes=2)
+    stopped = control.stop(reason="loop completed")
+
+    assert stopped.waiting_for == "/runtime/live/strategies/svc-1/runner.sqlite3"
+    assert stopped.waiting_since == NOW
+    assert stopped.waited_seconds == 120.0
+
+
+def test_the_three_waiting_fields_are_published_as_one_group(tmp_path: Path) -> None:
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    published = control.start()
+    control.stop(reason="test complete")
+    payload = published.model_dump(mode="json")
+
+    for partial in (
+        {"waiting_for": "/runtime/live/strategies/svc-1/runner.sqlite3"},
+        {"waiting_since": NOW.isoformat().replace("+00:00", "Z")},
+        {"waited_seconds": 3.0},
+    ):
+        with pytest.raises(ValueError, match="one group"):
+            RuntimeServiceHeartbeat.model_validate({**payload, **partial})
+
+    with pytest.raises(ValueError, match="waited_seconds must equal"):
+        RuntimeServiceHeartbeat.model_validate(
+            {
+                **payload,
+                "waiting_for": "/runtime/live/strategies/svc-1/runner.sqlite3",
+                "waiting_since": NOW.isoformat().replace("+00:00", "Z"),
+                "waited_seconds": 3.0,
+            }
+        )
