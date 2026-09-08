@@ -568,17 +568,33 @@ KNOWN_OUT_OF_SANDBOX: dict[str, str] = {}
 #: Recorded, not fixed: the runner and broker stores are WAL because their owners need
 #: WAL, so the fix is a journal-mode decision for two more authorities and belongs with
 #: its own acceptance -- the report carries the argument. A *new* entry fails this file.
-#: `signal_router` always appears: it opens all three `runner.sqlite3` files and none of
-#: them has a `-shm` yet. The other two appear only when the peer's own sidecars are not
-#: already on disk from an earlier role in the same pass -- `reference_slow_publisher`
-#: showed up on Linux and not on macOS for exactly that reason -- which is why the
-#: assertion below is a containment: a *new* role here is a regression, a missing one is a
-#: starting state, and the entry that must never be absent is asserted on its own.
+#: Only the first of these is a write by the role named. The per-role `tree_state` diffs
+#: separate them:
+#:
+#: * `signal_router` -- `created=[runner.sqlite3-shm, runner.sqlite3-wal] x3`. A real
+#:   write into a directory its unit grants read-only: it opens each strategy's WAL
+#:   `runner.sqlite3` and SQLite creates the wal-index beside it. **This is the entry the
+#:   runbook's `-shm` start-order rule is about, and it is about `signal_router` alone.**
+#: * `notifier` -- `created=[] removed=[broker.sqlite3-shm, broker.sqlite3-wal]
+#:   modified=[broker.sqlite3]`, and `reference_slow_publisher` -- the same shape over
+#:   `live/reference-slow/quota.sqlite3`. **Harness artifact, not a write by this role**:
+#:   an earlier role in the *same test process* left a SQLite connection open (see the
+#:   `SourceQuotaStore._connect` note in the package report), and the interpreter collected
+#:   and checkpointed it inside this role's measurement window, which deletes the sidecars.
+#:   `reference_slow_publisher` has no quota path in its manifest at all and never touches
+#:   that directory; on the host it has published several generations without a write grant
+#:   there. Under systemd each role is its own process, so neither can happen.
+#:
+#: All three stay as tripwires -- a *new* role appearing here is a regression worth
+#: reading -- but the assertion is a containment, because whether a peer's sidecars are
+#: already on disk depends on when the producer in the same pass closed its connection
+#: (`reference_slow_publisher` showed up on Linux and not on macOS for exactly that
+#: reason). The one entry that must never be absent is asserted on its own.
 KNOWN_C_LEVEL_WRITES: dict[str, tuple[str, ...]] = {
+    #: a real out-of-sandbox write
     "signal_router": ("live/strategies",),
+    #: harness artifacts: a same-process producer connection closed during the window
     "notifier": ("live/paper-brokers",),
-    #: the source spool's own quota database, in `market_minute_source`'s sibling
-    #: directory: `live/reference-slow` is `ReadOnlyPaths` for the publisher's unit
     "reference_slow_publisher": ("live/reference-slow",),
 }
 
