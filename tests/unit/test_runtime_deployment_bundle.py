@@ -3000,3 +3000,73 @@ def test_rejects_symlinked_plane_path_that_escapes_its_owner(tmp_path: Path) -> 
 
     assert not (root / "current").exists()
     assert not tuple(outside.iterdir())
+
+
+def test_installer_accepts_the_generation_production_actually_published(tmp_path: Path) -> None:
+    """The install path #237 broke, with the real third-generation contract underneath.
+
+    Every other transition test here installs generation one from the same code that
+    builds generation two, so a payload change rewrites both sides and the preflight
+    never sees a cross-release difference. This one swaps the released
+    `schema-contracts.json` under the installed generation -- rebinding it to its basis
+    the way the legacy-v1 test does -- and installs over it. Before the heartbeat
+    projection, this raised the RuntimeSchemaCompatibilityError that stopped the v0.33.2
+    rollout on every host.
+    """
+
+    from rquant import runtime_deployment_bundle as module
+
+    released_bytes = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "runtime-schema-contracts"
+        / "v0.33.1.json"
+    ).read_bytes()
+    released = json.loads(released_bytes)
+
+    root = tmp_path / "runtime"
+    manifests, capabilities = _bundle_inputs(root)
+    first = _install_runtime_deployment_bundle(
+        root,
+        producer_commit=COMMIT,
+        manifests=manifests,
+        capability_env=capabilities,
+        schema_bootstrap_reason="first reviewed bootstrap",
+    )
+
+    generation = root / "generations" / first.generation_hash
+    # The basis keys every one of its four service maps on the same ids, and the
+    # preflight compares the manifest ids against the contract's. So the released
+    # roster has to be carried across; only the instance and unit names are synthetic,
+    # because a sandbox has no systemd.
+    released_service_ids = tuple(sorted(released["manifest_fingerprints"]))
+    instances = {service_id: _service_instance(service_id) for service_id in released_service_ids}
+    basis = json.loads((generation / "generation-basis.json").read_text())
+    basis["producer_commit"] = released["producer_commit"]
+    basis["manifest_sha256"] = dict(released["manifest_fingerprints"])
+    basis["instance_mapping"] = instances
+    basis["unit_mapping"] = {
+        service_id: f"rquant-runtime-feature@{instance}.service"
+        for service_id, instance in instances.items()
+    }
+    basis["capability_sha256"] = {}
+    basis["schema_contract_sha256"] = hashlib.sha256(released_bytes).hexdigest()
+    basis["schema_bootstrap_sha256"] = None
+    rebound = module._RuntimeGenerationBasis.model_validate(basis)
+    released_hash = canonical_sha256(rebound.model_dump(mode="python"))
+    (generation / "schema-contracts.json").write_bytes(released_bytes)
+    (generation / "schema-bootstrap.json").unlink()
+    (generation / "generation-basis.json").write_bytes(module._canonical_model_payload(rebound))
+    generation.rename(root / "generations" / released_hash)
+    (root / "current").unlink()
+    (root / "current").symlink_to(Path("generations") / released_hash)
+
+    second = _install_runtime_deployment_bundle(
+        root,
+        producer_commit=COMMIT,
+        manifests=manifests,
+        capability_env=capabilities,
+    )
+
+    assert second.previous_generation_hash == released_hash
+    assert os.readlink(root / "current") == f"generations/{second.generation_hash}"

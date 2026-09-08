@@ -31,8 +31,8 @@ uv run pytest --cov=rquant --cov-report=term-missing
 ## Full Suite CI 分片
 
 默认非网络、非 `linux_exact` 全集由
-`tests/manifests/full-suite-v1/index.json` 固定为 **14137 cases / 55 skips**，并以
-`0437aaba7ed17b06a95eddc44f8ea2d6a4e6fae869e76dff777d42054f78cc01` 绑定完整 nodeid
+`tests/manifests/full-suite-v1/index.json` 固定为 **14147 cases / 55 skips**，并以
+`4e0c08e7f5c93672c1093af9335d039163646017d699e622524703043af80845` 绑定完整 nodeid
 集合。五个 JSONL shard 必须并集精确等于该集合、彼此不重叠；不要手改 nodeid 或 digest。
 分片数是 `scripts/full_suite_shards.py` 里的 `SHARD_COUNT`：改这个常量再重生成清单，
 CI 矩阵 `shard: [0, 1, 2, 3, 4]` 要同步。
@@ -61,6 +61,26 @@ shard runner 与 contract aggregator 通过同一个 stdlib 环境准备入口�
 v1 manifest 的 selector 固定为空列表。index 与 JSONL 必须是无重复 key、无未知字段的
 canonical JSON；nodeid 文件部分只能指向仓库内非符号链接的 `tests/**/*.py`。单 nodeid
 上限 1,100,000 bytes、单 JSONL 行上限 1,100,032 bytes、manifest 总量上限 4 MiB。
+
+## 跨版本 schema 快照
+
+`tests/fixtures/runtime-schema-contracts/v0.33.1.json` 是生产第三代（producer_commit
+`a0bbb4c`、21 条 channel）真实写下的 `schema-contracts.json`。仓库里其他 schema 转换用例的
+两侧都由工作树里的同一份代码生成，改了载荷形状之后「前代」也跟着改，转换永远是绿的；安装器
+比的却是新代码生成的 bundle 与**已装那一代**留下的这份文件。这份快照是全套用例里唯一一个
+代码改不动的「前代」，`tests/unit/test_runtime_schema_release_snapshot.py` 与
+`tests/unit/test_runtime_deployment_bundle.py::test_installer_accepts_the_generation_production_actually_published`
+读它。
+
+**快照由集成者在每个发布 tag 上刷新，节奏与上面的全集清单一致。** 刷新时放进来的必须是那一刻
+**生产上实际装着**的那一代的 `schema-contracts.json`（从
+`<runtime_root>/current/schema-contracts.json` 取），不是本地生成的 bundle。
+
+用例红了只有两条合法出路，改快照本身不是其中之一：
+
+1. 服务侧载荷又内嵌了会变的模型 —— 恢复冻结投影（这就是 #237）。
+2. 真的要给那条 channel 升 `schema_version`，并且这次升版是走完整 rollout
+   （PREPARE → DUAL_WRITE → …）的 —— 那么在那次发布里由集成者换上新一代的快照。
 
 ## 约定
 

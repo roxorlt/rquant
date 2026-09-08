@@ -457,7 +457,7 @@ def test_runtime_health_authority_reports_missing_p95_instead_of_fabricating_zer
     )
     from rquant.runtime_service_control import (
         RuntimeServiceHealth,
-        RuntimeServiceHeartbeat,
+        RuntimeServiceHeartbeatProjection,
         RuntimeServicePlane,
         RuntimeServiceStatus,
     )
@@ -481,7 +481,7 @@ def test_runtime_health_authority_reports_missing_p95_instead_of_fabricating_zer
                     status=RuntimeServiceStatus.RUNNING,
                     stale=False,
                     observed_at=now - timedelta(seconds=1),
-                    heartbeat=RuntimeServiceHeartbeat(
+                    heartbeat=RuntimeServiceHeartbeatProjection(
                         service_id="feature-live",
                         spec_fingerprint="b" * 64,
                         run_id="c" * 64,
@@ -523,6 +523,7 @@ def test_runtime_health_authority_aggregates_live_service_slo(tmp_path: Path) ->
         RuntimeServiceHeartbeat,
         RuntimeServicePlane,
         RuntimeServiceStatus,
+        project_heartbeat,
     )
     from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
     from rquant.runtime_serving_snapshot import RuntimeHealthPayload, SourceReadResult
@@ -552,7 +553,7 @@ def test_runtime_health_authority_aggregates_live_service_slo(tmp_path: Path) ->
             status=RuntimeServiceStatus.RUNNING,
             stale=False,
             observed_at=now - timedelta(seconds=1),
-            heartbeat=heartbeat,
+            heartbeat=project_heartbeat(heartbeat),
         )
 
     payload = RuntimeHealthPayload(
@@ -603,6 +604,7 @@ def test_runtime_health_authority_accepts_equivalent_microsecond_slo_values(
         RuntimeServiceHeartbeat,
         RuntimeServicePlane,
         RuntimeServiceStatus,
+        project_heartbeat,
     )
     from rquant.runtime_serving_snapshot import RuntimeHealthPayload
     from rquant.serving_contracts import FreshnessStatus
@@ -627,7 +629,7 @@ def test_runtime_health_authority_accepts_equivalent_microsecond_slo_values(
         status=RuntimeServiceStatus.RUNNING,
         stale=False,
         observed_at=observed_at,
-        heartbeat=heartbeat,
+        heartbeat=project_heartbeat(heartbeat),
     )
     payload = RuntimeHealthPayload.model_construct(
         runtime_services=(service,),
@@ -836,6 +838,7 @@ def test_runtime_health_authority_marks_stale_or_non_running_live_service_unheal
         RuntimeServiceHeartbeat,
         RuntimeServicePlane,
         RuntimeServiceStatus,
+        project_heartbeat,
     )
     from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
     from rquant.runtime_serving_snapshot import RuntimeHealthPayload, SourceReadResult
@@ -864,7 +867,7 @@ def test_runtime_health_authority_marks_stale_or_non_running_live_service_unheal
                 status=service_status,
                 stale=stale,
                 observed_at=now - timedelta(seconds=1),
-                heartbeat=heartbeat,
+                heartbeat=project_heartbeat(heartbeat),
             ),
         )
     )
@@ -907,6 +910,7 @@ def test_runtime_health_authority_rejects_missing_last_success(tmp_path: Path) -
         RuntimeServiceHeartbeat,
         RuntimeServicePlane,
         RuntimeServiceStatus,
+        project_heartbeat,
     )
     from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
     from rquant.runtime_serving_snapshot import RuntimeHealthPayload, SourceReadResult
@@ -933,7 +937,7 @@ def test_runtime_health_authority_rejects_missing_last_success(tmp_path: Path) -
                 status=RuntimeServiceStatus.RUNNING,
                 stale=False,
                 observed_at=now - timedelta(seconds=1),
-                heartbeat=heartbeat,
+                heartbeat=project_heartbeat(heartbeat),
             ),
         )
     )

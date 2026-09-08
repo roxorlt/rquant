@@ -194,13 +194,159 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
         return self
 
 
+class _PublishedSchemaNames:
+    """A namespace whose only job is to keep a published schema name off the module.
+
+    `runtime.serving.runtime-health` hashes each of its nine fields against the whole
+    `$defs` of `RuntimeHealthPayload`, and a `$defs` entry is keyed and titled by the
+    Python class name. `RuntimeServiceHeartbeat` is therefore part of what that channel
+    published in v0.33.1, not merely an internal identifier -- renaming the class the
+    payload embeds is as breaking as renaming a field. Nesting keeps that published name
+    while the module-level alias below says what the model is.
+
+    Nesting is also what keeps the *class* resolvable. The other way to pin the published
+    name is to rewrite `__qualname__` on a module-level model and rebuild it; `pickle`
+    then looks the class up by module and qualname, finds the heartbeat file model there
+    instead, and refuses with "it's not the same object as
+    rquant.runtime_service_control.RuntimeServiceHeartbeat". Nothing here pickles a
+    heartbeat -- instances of these models cannot be pickled either way, because
+    `source_generations` is a `mappingproxy` -- but a class that lies about where it
+    lives is not worth the three lines it saves.
+    """
+
+    #: The serving projection of a heartbeat: the v0.33.1 field set, frozen.
+    #:
+    #: The health payload used to embed `RuntimeServiceHeartbeat` itself, so every field
+    #: added to the heartbeat file model rewrote the serving contract. Package J added
+    #: three (#231) and the v0.33.2 installer then refused every host running the
+    #: generation before it (#237). This model is the wire shape; the file model is free
+    #: to grow, and a field only reaches serving when somebody adds it here and drives a
+    #: schema version bump through a rollout.
+    #:
+    #: No docstring, deliberately: pydantic publishes `__doc__` as the `$defs`
+    #: description, so prose here would move all nine field hashes of the channel.
+    class RuntimeServiceHeartbeat(RuntimeContractModel):
+        service_id: str = Field(min_length=1)
+        spec_fingerprint: Sha256
+        run_id: Sha256
+        generation: int = Field(ge=1)
+        status: RuntimeServiceStatus
+        started_at: AwareUtcDatetime
+        heartbeat_at: AwareUtcDatetime
+        last_success_at: AwareUtcDatetime | None = None
+        stopped_at: AwareUtcDatetime | None = None
+        input_sequence: int = Field(default=-1, ge=-1)
+        output_sequence: int = Field(default=-1, ge=-1)
+        processed_count: int = Field(default=0, ge=0)
+        backlog_count: int = Field(default=0, ge=0)
+        consecutive_failures: int = Field(default=0, ge=0)
+        total_failures: int = Field(default=0, ge=0)
+        total_successes: int = Field(default=0, ge=0)
+        last_step_duration_seconds: StepDuration | None = None
+        p95_step_duration_seconds: StepDuration | None = None
+        recent_step_durations_seconds: tuple[StepDuration, ...] = Field(
+            default=(),
+            max_length=_STEP_DURATION_WINDOW,
+        )
+        source_generations: Mapping[str, Sha256] = Field(default_factory=dict)
+        degraded_reasons: tuple[str, ...] = ()
+        last_error: str | None = None
+        stop_reason: str | None = None
+
+        @field_validator("source_generations")
+        @classmethod
+        def freeze_source_generations(cls, value: Mapping[str, str]) -> Mapping[str, str]:
+            if any(not key for key in value):
+                raise ValueError("source generation names cannot be empty")
+            return MappingProxyType(dict(sorted(value.items())))
+
+        @field_serializer("source_generations")
+        def serialize_source_generations(self, value: Mapping[str, str]) -> dict[str, str]:
+            return dict(value)
+
+        @field_validator("degraded_reasons")
+        @classmethod
+        def validate_degraded_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+            if any(not reason for reason in value):
+                raise ValueError("degraded reasons cannot be empty")
+            if len(value) != len(set(value)):
+                raise ValueError("degraded reasons must be unique")
+            return tuple(sorted(value))
+
+        @model_validator(mode="after")
+        def validate_status(self) -> Self:
+            if self.status is RuntimeServiceStatus.MISSING:
+                raise ValueError("persisted heartbeat cannot have missing status")
+            if self.status is RuntimeServiceStatus.STOPPED:
+                if self.stopped_at is None or self.stop_reason is None:
+                    raise ValueError("stopped heartbeat requires stopped_at and stop_reason")
+            elif self.stopped_at is not None or self.stop_reason is not None:
+                raise ValueError("active heartbeat cannot contain stop fields")
+            if self.last_success_at is not None and self.last_success_at < self.started_at:
+                raise ValueError("last_success_at cannot precede service start")
+            durations = self.recent_step_durations_seconds
+            if not durations:
+                if (
+                    self.last_step_duration_seconds is not None
+                    or self.p95_step_duration_seconds is not None
+                ):
+                    raise ValueError("step latency summaries require a duration window")
+            else:
+                if self.last_step_duration_seconds != durations[-1]:
+                    raise ValueError("last step duration must match the duration window tail")
+                expected_p95 = _nearest_rank_p95(durations)
+                if self.p95_step_duration_seconds != expected_p95:
+                    raise ValueError("p95 step duration does not match the duration window")
+            return self
+
+        @classmethod
+        def from_heartbeat(
+            cls,
+            heartbeat: RuntimeServiceHeartbeat,
+        ) -> RuntimeServiceHeartbeatProjection:
+            """Carry every projected field across; drop whatever serving does not publish.
+
+            Driven off `model_fields` rather than a written-out argument list so that a
+            field added here cannot be forgotten on this side, and so the only way to
+            stop publishing a field is to delete it from the model -- which the release
+            snapshot gate then refuses.
+            """
+
+            return cls.model_validate({name: getattr(heartbeat, name) for name in cls.model_fields})
+
+
+RuntimeServiceHeartbeatProjection = _PublishedSchemaNames.RuntimeServiceHeartbeat
+
+
+def project_heartbeat(
+    heartbeat: RuntimeServiceHeartbeat | None,
+) -> RuntimeServiceHeartbeatProjection | None:
+    if heartbeat is None:
+        return None
+    return RuntimeServiceHeartbeatProjection.from_heartbeat(heartbeat)
+
+
 class RuntimeServiceHealth(RuntimeContractModel):
     service_id: str = Field(min_length=1)
     plane: RuntimeServicePlane
     status: RuntimeServiceStatus
     stale: bool
     observed_at: AwareUtcDatetime
-    heartbeat: RuntimeServiceHeartbeat | None = None
+    #: The projection, never the file model: this field is published on
+    #: `runtime.serving.runtime-health`, so its shape is a contract (#237).
+    heartbeat: RuntimeServiceHeartbeatProjection | None = None
+
+    @field_validator("heartbeat", mode="before")
+    @classmethod
+    def reject_unprojected_heartbeat(cls, value: object) -> object:
+        # Both models are named RuntimeServiceHeartbeat on the wire, so pydantic's own
+        # "input should be an instance of RuntimeServiceHeartbeat" reads as nonsense here.
+        if isinstance(value, RuntimeServiceHeartbeat):
+            raise ValueError(
+                "serving health carries the heartbeat projection, not the heartbeat file "
+                "model; convert with project_heartbeat() (#237)"
+            )
+        return value
 
 
 Clock = Callable[[], datetime]
@@ -621,7 +767,7 @@ def inspect_runtime_health(
                 status=status,
                 stale=stale,
                 observed_at=observed,
-                heartbeat=heartbeat,
+                heartbeat=project_heartbeat(heartbeat),
             )
         )
     return tuple(health)
@@ -632,10 +778,12 @@ __all__ = [
     "RuntimeServiceControl",
     "RuntimeServiceHealth",
     "RuntimeServiceHeartbeat",
+    "RuntimeServiceHeartbeatProjection",
     "RuntimeServicePlane",
     "RuntimeServiceSpec",
     "RuntimeServiceStatus",
     "RuntimeStepResult",
     "inspect_runtime_health",
+    "project_heartbeat",
     "run_service_loop",
 ]

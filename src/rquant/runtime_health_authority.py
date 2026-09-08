@@ -17,6 +17,7 @@ from rquant.runtime_service_control import (
     RuntimeServiceHeartbeat,
     RuntimeServiceSpec,
     RuntimeServiceStatus,
+    project_heartbeat,
 )
 from rquant.runtime_serving_authority import (
     ServingSourceAuthorityPointer,
@@ -480,7 +481,7 @@ class RuntimeHealthSourceReader:
                     status=status,
                     stale=stale,
                     observed_at=observed,
-                    heartbeat=heartbeat,
+                    heartbeat=project_heartbeat(heartbeat),
                 )
             )
             event_times.append(heartbeat.heartbeat_at)

@@ -10,12 +10,15 @@ from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_control import (
     RuntimeServiceAlreadyRunningError,
     RuntimeServiceControl,
+    RuntimeServiceHealth,
     RuntimeServiceHeartbeat,
+    RuntimeServiceHeartbeatProjection,
     RuntimeServicePlane,
     RuntimeServiceSpec,
     RuntimeServiceStatus,
     RuntimeStepResult,
     inspect_runtime_health,
+    project_heartbeat,
     run_service_loop,
 )
 
@@ -350,3 +353,118 @@ def test_the_three_waiting_fields_are_published_as_one_group(tmp_path: Path) -> 
                 "waited_seconds": 3.0,
             }
         )
+
+
+#: The field set `runtime.serving.runtime-health` published in v0.33.1, in order. The
+#: release snapshot gate hashes it; this list says the same thing where a reader of the
+#: model will look. Adding a name here without bumping the channel's schema version and
+#: refreshing the snapshot is #237 happening again.
+PUBLISHED_HEARTBEAT_FIELDS = (
+    "service_id",
+    "spec_fingerprint",
+    "run_id",
+    "generation",
+    "status",
+    "started_at",
+    "heartbeat_at",
+    "last_success_at",
+    "stopped_at",
+    "input_sequence",
+    "output_sequence",
+    "processed_count",
+    "backlog_count",
+    "consecutive_failures",
+    "total_failures",
+    "total_successes",
+    "last_step_duration_seconds",
+    "p95_step_duration_seconds",
+    "recent_step_durations_seconds",
+    "source_generations",
+    "degraded_reasons",
+    "last_error",
+    "stop_reason",
+)
+
+
+def _waiting_heartbeat() -> RuntimeServiceHeartbeat:
+    """Every field populated, including the three the serving payload must not carry."""
+
+    return RuntimeServiceHeartbeat(
+        service_id="feature-live",
+        spec_fingerprint="b" * 64,
+        run_id="c" * 64,
+        generation=3,
+        status=RuntimeServiceStatus.DEGRADED,
+        started_at=NOW - timedelta(minutes=5),
+        heartbeat_at=NOW,
+        last_success_at=NOW - timedelta(minutes=1),
+        input_sequence=11,
+        output_sequence=9,
+        processed_count=7,
+        backlog_count=2,
+        consecutive_failures=4,
+        total_failures=6,
+        total_successes=8,
+        last_step_duration_seconds=0.5,
+        p95_step_duration_seconds=0.5,
+        recent_step_durations_seconds=(0.1, 0.5),
+        source_generations={"upstream": "d" * 64},
+        degraded_reasons=("peer-artifact-missing",),
+        last_error="PeerArtifactUnavailableError: runner.sqlite3",
+        waiting_for="/runtime/live/strategies/svc-1/runner.sqlite3",
+        waiting_since=NOW - timedelta(seconds=90),
+        waited_seconds=90.0,
+    )
+
+
+def test_the_serving_projection_declares_the_published_field_set() -> None:
+    assert tuple(RuntimeServiceHeartbeatProjection.model_fields) == PUBLISHED_HEARTBEAT_FIELDS
+
+
+def test_projecting_a_heartbeat_carries_every_published_value_and_drops_the_rest() -> None:
+    heartbeat = _waiting_heartbeat()
+
+    projected = project_heartbeat(heartbeat)
+
+    assert projected is not None
+    for name in PUBLISHED_HEARTBEAT_FIELDS:
+        assert getattr(projected, name) == getattr(heartbeat, name), name
+    dumped = projected.model_dump(mode="json")
+    assert set(dumped) == set(PUBLISHED_HEARTBEAT_FIELDS)
+    assert not {"waiting_for", "waiting_since", "waited_seconds"} & set(dumped)
+
+
+def test_projecting_nothing_stays_nothing() -> None:
+    assert project_heartbeat(None) is None
+
+
+def test_serving_health_refuses_the_heartbeat_file_model() -> None:
+    with pytest.raises(ValueError, match="project_heartbeat"):
+        RuntimeServiceHealth(
+            service_id="feature-live",
+            plane=RuntimeServicePlane.LIVE,
+            status=RuntimeServiceStatus.DEGRADED,
+            stale=False,
+            observed_at=NOW,
+            heartbeat=_waiting_heartbeat(),
+        )
+
+
+def test_health_reader_publishes_the_projection_not_the_file_model(tmp_path: Path) -> None:
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    control.record_failure(_waiting(str(tmp_path / "runner.sqlite3")))
+
+    health = inspect_runtime_health(
+        tmp_path,
+        specs=(control.spec,),
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    control.stop(reason="test complete")
+
+    published = health[0].heartbeat
+    assert isinstance(published, RuntimeServiceHeartbeatProjection)
+    assert not isinstance(published, RuntimeServiceHeartbeat)
+    on_disk = RuntimeServiceControl.read_heartbeat(tmp_path, control.spec)
+    assert on_disk is not None
+    assert on_disk.waiting_for is not None
