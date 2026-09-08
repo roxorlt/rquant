@@ -111,15 +111,23 @@ def test_the_auction_universe_reads_the_replica_and_not_the_main_database(
 
 
 def test_a_replica_path_that_is_the_main_database_is_refused(tmp_path: Path) -> None:
+    """Named anything at all: if it *is* the operational database, it is refused.
+
+    The two halves of the rule are separated on purpose — this case is not also caught by
+    the `rquant.duckdb` name check, so it can only be the identity check that rejects it.
+    """
+
+    from rquant.runtime_production_profile import ProductionRuntimeProfileInputs
+
     inputs = _profile_inputs(tmp_path)
+    shared = inputs.readonly_replica_database_path
+    assert shared.name != "rquant.duckdb"
+    payload = inputs.model_dump(mode="python")
+    payload["operational_database_path"] = shared
+    payload["readonly_replica_database_path"] = shared
 
     with pytest.raises(ValueError, match="read-only replica"):
-        inputs.model_copy(
-            update={"readonly_replica_database_path": inputs.operational_database_path},
-        ).model_validate(
-            inputs.model_dump(mode="python")
-            | {"readonly_replica_database_path": inputs.operational_database_path}
-        )
+        ProductionRuntimeProfileInputs.model_validate(payload)
 
 
 def test_a_replica_path_named_rquant_duckdb_is_refused(tmp_path: Path) -> None:

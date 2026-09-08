@@ -417,43 +417,77 @@ def test_a_foreign_source_generation_still_stops_the_router(
     )
 
 
-def test_a_foreign_candidate_binding_still_stops_the_publisher(
+def test_a_foreign_candidate_binding_is_left_alone_and_still_refuses(
     released_over: tuple[RouteAWorld, dict[str, Any]],
 ) -> None:
+    """The publisher does not re-bind what it did not write, and publishing still refuses.
+
+    Two halves, because the role has two moments. At *startup* it looks at the binding on
+    disk and, finding fingerprints no generation of ours published, does nothing at all —
+    which is what it must do: it may not archive somebody else's state. At *publish* the
+    refusal is exactly the one the host reported, unchanged.
+    """
+
     route, state = released_over
     service_id, entry = next(iter(state["candidates"].items()))
     root = entry["root"]
+    previous = first_generation_manifest(route, service_id)
+    current = next(
+        item
+        for item in manifests_of(route, RuntimeServiceKind.CANDIDATE_PUBLISHER)
+        if item.service_id == service_id
+    )
     #: a binding whose fingerprints belong to no generation of ours
     for child in (root / "generations").iterdir():
         child.unlink()
-    (root / "generation-index.json").unlink()
-    (root / "current.json").unlink()
-    (root / "authority.json").unlink()
+    for name in ("generation-index.json", "current.json", "authority.json"):
+        (root / name).unlink()
     StrategyCandidateSnapshotSpool(root).publish_strategy_records(
-        strategy_id=str(
-            first_generation_manifest(route, service_id).settings["strategy_id"]
-        ),
+        strategy_id=str(previous.settings["strategy_id"]),
         strategy_version="1",
         definition_fingerprint=FOREIGN,
         executable_fingerprint="d" * 64,
-        candidate_schema_fingerprint=str(
-            first_generation_manifest(route, service_id).settings["candidate_schema_fingerprint"]
-        ),
-        static_feature_schema=dict(
-            first_generation_manifest(route, service_id).settings["static_feature_schema"]
-        ),
+        candidate_schema_fingerprint=str(previous.settings["candidate_schema_fingerprint"]),
+        static_feature_schema=dict(previous.settings["static_feature_schema"]),
         source_snapshot_ids={"candidate_input": "2" * 64},
         trade_date=TRADE_DATE,
         captured_at=FROZEN_NOW,
-        producer_commit=first_generation_manifest(route, service_id).producer_commit,
+        producer_commit=previous.producer_commit,
         rows=(),
     )
 
-    run = run_role(route, CANDIDATE_ROLE, instance=_instance_name(service_id))
+    run_role(route, CANDIDATE_ROLE, instance=_instance_name(service_id))
 
-    assert isinstance(run.refusal, StrategyCandidateSnapshotIntegrityError) or (
-        "bound to a different identity" in (run.last_error or "")
+    assert not any(item.name.startswith("rotated-") for item in root.iterdir())
+    binding = json.loads((root / "authority.json").read_text(encoding="utf-8"))
+    assert binding["definition_fingerprint"] == FOREIGN
+
+    from rquant.runtime_generation_lineage import candidate_authority_lineage
+
+    spool = StrategyCandidateSnapshotSpool(
+        root,
+        previous_generation_of_binding=candidate_authority_lineage(
+            route.runtime_root,
+            service_id=service_id,
+        ),
     )
+    with pytest.raises(
+        StrategyCandidateSnapshotIntegrityError,
+        match="bound to a different identity",
+    ):
+        spool.publish_strategy_records(
+            strategy_id=str(current.settings["strategy_id"]),
+            strategy_version="1",
+            definition_fingerprint=str(current.settings["definition_fingerprint"]),
+            executable_fingerprint=str(current.settings["executable_fingerprint"]),
+            candidate_schema_fingerprint=str(current.settings["candidate_schema_fingerprint"]),
+            static_feature_schema=dict(current.settings["static_feature_schema"]),
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=FROZEN_NOW,
+            producer_commit=current.producer_commit,
+            rows=(),
+        )
     assert not any(item.name.startswith("rotated-") for item in root.iterdir())
 
 

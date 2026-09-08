@@ -207,8 +207,15 @@ def test_a_source_generation_written_by_our_own_previous_generation_rotates(
 
 
 def test_a_foreign_source_generation_is_still_a_conflict(tmp_path: Path) -> None:
+    """The *stored* fingerprint decides, and this one belongs to no generation of ours.
+
+    Both fingerprints here are outside the lineage — the stored one and the incoming one —
+    so nothing but "is the stored one ours" can carry this row across, and it is not.
+    """
+
     previous_spec = _spec(producer_commit=PREVIOUS_COMMIT).spec_fingerprint
     foreign_spec = _spec(producer_commit=FOREIGN_COMMIT).spec_fingerprint
+    current_spec = _spec(producer_commit=CURRENT_COMMIT).spec_fingerprint
     bus = _bus(
         tmp_path,
         previous_generation_of_strategy_spec={previous_spec: PREVIOUS_GENERATION},
@@ -221,10 +228,11 @@ def test_a_foreign_source_generation_is_still_a_conflict(tmp_path: Path) -> None
 
     with pytest.raises(SignalRouteConflictError, match="generation changed"):
         bus.bind_route_source(
-            _descriptor(generation="2" * 64, spec_fingerprint=previous_spec),
+            _descriptor(generation="2" * 64, spec_fingerprint=current_spec),
             routing_policy_fingerprint=ROUTING_POLICY,
             observed_at=NOW,
         )
+    assert bus.route_source_rotations("strategy/growth") == ()
 
 
 def test_a_generation_that_changes_with_the_same_strategy_spec_is_still_a_conflict(

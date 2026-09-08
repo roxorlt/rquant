@@ -103,14 +103,30 @@ def test_three_installs_leave_two_previous_generations(tmp_path: Path) -> None:
 
 
 def test_a_generation_whose_basis_was_edited_is_not_ours(two_generations: Path) -> None:
-    """A basis that no longer hashes to its own directory name authenticates nothing."""
+    """A basis that no longer hashes to its own directory name authenticates nothing.
+
+    The edit is written back through the installer's own canonical serializer, so the
+    document is still a valid, canonical basis and the *only* thing that rejects it is
+    `canonical_sha256(basis) == <directory name>`. A tamper that merely broke the JSON
+    would be caught by the parser and would say nothing about the hash binding.
+    """
+
+    from rquant.runtime_deployment_bundle import (
+        _canonical_model_payload,
+        _parse_generation_basis,
+    )
 
     tree = load_runtime_generation_tree(two_generations)
     previous_id = tree.lineage(CANDIDATE_SERVICE).previous[0].generation_id
     basis = two_generations / "generations" / previous_id / "generation-basis.json"
-    payload = json.loads(basis.read_bytes())
-    payload["producer_commit"] = THIRD_COMMIT
-    basis.write_bytes(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    parsed = _parse_generation_basis(basis.read_bytes())
+    #: `schema_contract_sha256` is chosen because nothing downstream cross-checks it
+    #: against the manifest we then read, so the hash-to-directory-name binding is the
+    #: only thing standing between this document and being believed
+    edited = parsed.model_copy(update={"schema_contract_sha256": "9" * 64})
+    basis.write_bytes(_canonical_model_payload(edited))
+    #: the document itself is still canonical: only its hash no longer names its directory
+    assert _parse_generation_basis(basis.read_bytes()).schema_contract_sha256 == "9" * 64
 
     assert load_runtime_generation_tree(two_generations).lineage(CANDIDATE_SERVICE).previous == ()
 
