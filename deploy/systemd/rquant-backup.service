@@ -13,7 +13,13 @@ Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 ExecStart=/usr/local/libexec/rquant-workload-arbiter maintenance -- /home/lighthouse/rquant/scripts/backup-snapshot.sh
 
-TimeoutStartSec=10min
+# 10 GB DuckDB 的 cp + gzip 实测 8m16s–8m50s；20 个运行时 unit 同时在跑时超过 10min
+# 被杀两次（#243）。20min = 最慢一次成功运行 9m36s 的两倍余量。
+TimeoutStartSec=20min
+# 超时被杀时脚本要在 SIGTERM 后跑完 trap（rm 掉 .latest.duckdb.<pid> 私有代际），
+# 否则 backup/ 里会留下 10 GB 级孤儿文件。arbiter 自己在转发 SIGTERM 后 5s 就会
+# SIGKILL 子进程组，所以真正的清理预算是那 5 秒，这里只保证 systemd 不会更早下手。
+TimeoutStopSec=2min
 StandardOutput=journal
 StandardError=journal
 

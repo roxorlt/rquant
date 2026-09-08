@@ -122,7 +122,11 @@ FIRST_GATE_WRITABLE_PATHS: dict[str, tuple[str, ...]] = {
 }
 
 #: unit -> (`Slice=`, `ExecStart=`). The prefix change must leave both untouched: this is
-#: what makes the diff reviewable as "only `-` characters were added".
+#: what makes the diff reviewable as "only `-` characters were added". The live-plane role
+#: templates now name `rquant-live-runtime.slice` instead of `rquant-live.slice` (#243
+#: review M-1: the runtime plane got its own child slice so the eleven resident production
+#: services in the live plane are not capped together with the roles); `ExecStart=` and
+#: every grant below are still character for character what they were.
 FIRST_GATE_EXECUTION: dict[str, tuple[str, str]] = {
     "rquant-lab-claim-finalizer.service": (
         "rquant-research.slice",
@@ -133,11 +137,11 @@ FIRST_GATE_EXECUTION: dict[str, tuple[str, str]] = {
         f"{ARBITER}{WRAPPER} lab_artifact_catalog --instance %i",
     ),
     "rquant-runtime-auction-universe@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} auction_universe_publisher --instance %i",
     ),
     "rquant-runtime-candidate@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} candidate_publisher --instance %i",
     ),
     "rquant-runtime-daily-orchestrator@.service": (
@@ -145,7 +149,7 @@ FIRST_GATE_EXECUTION: dict[str, tuple[str, str]] = {
         f"{ARBITER}{WRAPPER} daily_pipeline_orchestrator --instance %i",
     ),
     "rquant-runtime-feature@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} feature_live --instance %i",
     ),
     "rquant-runtime-lab-jobs@.service": (
@@ -153,11 +157,11 @@ FIRST_GATE_EXECUTION: dict[str, tuple[str, str]] = {
         f"{ARBITER}{WRAPPER} lab_jobs_publisher --instance %i",
     ),
     "rquant-runtime-paper-broker@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} paper_broker --instance %i",
     ),
     "rquant-runtime-paper-constraint@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} paper_constraint_publisher --instance %i",
     ),
     "rquant-runtime-promotions@.service": (
@@ -177,15 +181,15 @@ FIRST_GATE_EXECUTION: dict[str, tuple[str, str]] = {
         f"{ARBITER}{WRAPPER} shadow_session --instance %i",
     ),
     "rquant-runtime-signal-router@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} signal_router --instance %i",
     ),
     "rquant-runtime-strategy@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} strategy_live --instance %i",
     ),
     "rquant-runtime-watchlist-quote@.service": (
-        "rquant-live.slice",
+        "rquant-live-runtime.slice",
         f"{WRAPPER} watchlist_quote_source --instance %i",
     ),
 }

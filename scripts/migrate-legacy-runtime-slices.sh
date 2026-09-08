@@ -400,7 +400,11 @@ verify_replacement_runtime() {
     slice=$(property_value "${replacement_state}" Slice)
     control_group=$(property_value "${replacement_state}" ControlGroup)
     case "${slice}" in
-        rquant-live.slice|rquant-serving.slice) ;;
+        # rquant-live-runtime.slice is the live plane's runtime-role child slice
+        # (#243 review D-2): the fourteen rquant-runtime-*@ templates name it since
+        # the CPU/memory ceiling moved off rquant-live.slice, so a replacement unit
+        # reports it and must be accepted here.
+        rquant-live.slice|rquant-live-runtime.slice|rquant-serving.slice) ;;
         rquant-research.slice)
             printf 'replacement %s is blocked: maintenance memory pending calibration\n' \
                 "${replacement}" >&2

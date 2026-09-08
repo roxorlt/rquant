@@ -5,6 +5,241 @@
 
 ---
 
+## 2026-09-08 · 待安装 · 主机资源包络（#243，owner 裁决 21）
+
+**状态**：**尚未安装**。本条是安装说明，不是部署记录；真正装上去之后请在本条下面补
+执行时间、`systemd-analyze` 输出和验收结果。
+
+**为什么必须手工装**：改动落在 `deploy/systemd/`，受控发布器
+（`scripts/deploy-production.sh`）按设计拒绝任何含该目录的 diff（见
+`docs/production-release.md`「自动拒绝」），CLAUDE.md 第 7 条也把 `deploy/systemd/` 列为需要
+owner 单独明确授权的高风险变更。
+
+**改了哪些 unit 文件**（共 20 个）：
+
+| 文件 | 改动 |
+|---|---|
+| `rquant-backup.timer` | 盘中 5min → **15min**（`9..15:0/15`），17:30 保留 |
+| `rquant-backup.service` | `TimeoutStartSec` 10min → 20min，新增 `TimeoutStopSec=2min` |
+| `rquant-live-runtime.slice` | **新文件**：运行时 role 的子 slice，`CPUQuota=60%` / `MemoryHigh=1536M` |
+| `rquant-live.slice` | **去掉** `CPUQuota`（常驻服务住在这个面里，不能封顶） |
+| `rquant-serving.slice` | 新增 `CPUQuota=30%` |
+| `rquant-maintenance.slice` | `CPUWeight` 50 → 300 |
+| 14 个 `rquant-runtime-*@.service` | **只改 `Slice=` 一行**：`rquant-live.slice` → `rquant-live-runtime.slice`，其余一字未动 |
+
+**为什么盘中是 15 分钟而不是 30**：脚本每跑一次就发一次 recovery bundle，`preflight` 的
+`runtime_recovery` 闸按已装 profile 的 `max_rpo_seconds=1800` 判 `backup_age`；bundle 落在每轮
+开始后约 9 分钟，所以最坏 age = 间隔 + 单次时长。30 分钟 → 30 + 8.83 = 38.8min = **2330s，破闸**；
+15 分钟 → 15 + 8.83 = 23.8min = **1430s，留 370s（21%）余量**。盘中触发 84 次/天 → **28 次/天**，
+gzip 占空比 100% → 59%。
+
+### 0. 装之前必须满足的三个前提（**顺序不能反**）
+
+1. **不能有任何运行时 role 实例是 active 的**——这是硬前提，不是建议：
+
+   ```bash
+   systemctl list-units 'rquant-runtime-*' --state=active --no-legend    # 必须是空的
+   ```
+
+   非空就先停掉再装（本机的运维约定 R-25 本来就是「安装窗口之外所有 role 实例保持停止」，
+   所以正常情况下这一条是自动满足的）。
+
+   **为什么是硬前提**：`Slice=` 在 unit **启动时**就定死了，改文件加 `daemon-reload`
+   **不会**把已经在跑的实例搬进新 slice。只要还有一个 role 实例停在
+   `rquant-live.slice`，`check_workload_runtime` 每个这样的实例会报 **3 条硬错误**
+   （`Slice=... expected 'rquant-live-runtime.slice'` / `ControlGroup ... expected
+   descendant of resolved None` / `rquant-live-runtime.slice: active but ControlGroup is
+   unresolved`），于是：
+
+   - `scripts/verify-workload-isolation.sh` 红；
+   - **`rquant preflight` 的 `workload_runtime` 红**，受控发布器的双 preflight 会**挡住所有
+     自动发布**，直到每个实例都重启过；
+   - `rquant health` 的 workload 快照也报 fail。
+
+   **这是设计如此（fail closed），不是可以忽略的软告警**：验证器不会被放松，因为一个「绿」
+   会让发布装到一个实际上没有被隔离的工作面上。错误文案里已经点名补救办法
+   （`restart <unit> to move it into rquant-live-runtime.slice`）。
+   照第 0 步做就根本不会进入这个中间态。
+
+2. **owner 就 `backup/` 里那 68 GB 孤儿表态**。新脚本开头会清扫 `backup/` 下 mtime 超过 1 天的
+   `.latest.duckdb.*` / `.latest.json.*`，2026-08-03..05 那批 `.latest.duckdb.<pid>`(.gz)
+   **两个条件都满足，第一次运行就会被一次性删光**。所以要么先拿到清理授权，要么装之前先把这批
+   文件挪走留证：
+
+   ```bash
+   ls -lA /home/lighthouse/rquant/backup/.latest.* > /home/lighthouse/orphans-20260908.txt
+   du -ch /home/lighthouse/rquant/backup/.latest.* | tail -1
+   # 需要留证时（不删，只挪走）：
+   mkdir -p /home/lighthouse/rquant-orphans-20260908
+   mv /home/lighthouse/rquant/backup/.latest.duckdb.* \
+      /home/lighthouse/rquant/backup/.latest.json.* \
+      /home/lighthouse/rquant-orphans-20260908/
+   ```
+
+   **在这一步有结论之前不要装 `scripts/backup-snapshot.sh`，也不要手工跑 backup.service。**
+3. **确认磁盘调度器**，决定 `ionice` 用哪一档：
+
+   ```bash
+   cat /sys/block/vda/queue/scheduler
+   ```
+
+   括号里是 `bfq` → 脚本的 `auto` 会自动改用 `-c2 -n7`（best-effort 最低优先级），不需要额外
+   配置；是 `none` / `mq-deadline` / `kyber` → `auto` 用 `-c3`，两者等效。要强制可以在
+   `.env` 里写 `RQUANT_BACKUP_IONICE=idle|best-effort|none`。
+
+### 1. 语法验证（mac 上验不了）
+
+```bash
+cd /home/lighthouse/rquant && git fetch --tags && git checkout <tag>
+tmp="$(mktemp -d)"
+cp deploy/systemd/rquant-backup.service deploy/systemd/rquant-backup.timer \
+   deploy/systemd/rquant-live.slice deploy/systemd/rquant-live-runtime.slice \
+   deploy/systemd/rquant-serving.slice deploy/systemd/rquant-maintenance.slice \
+   deploy/systemd/rquant.slice deploy/systemd/rquant-research.slice \
+   deploy/systemd/rquant-runtime-*@.service "${tmp}/"
+systemd-analyze verify "${tmp}"/*.service "${tmp}"/*.timer "${tmp}"/*.slice
+echo "verify rc=$?"      # 期望 0，且不打印本仓库 unit 的 warning
+systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/15' --iterations 5
+systemd-analyze calendar 'Mon..Fri 17:30' --iterations 5
+rm -rf "${tmp}"
+```
+
+`9..15:0/15` 期望：归一化成 `Mon..Fri *-*-* 09..15:00/15:00` 一类形状，5 个 iteration
+**两两相差 15 分钟**（不是 15 秒）。看到 `Invalid argument` 或秒级步进就**停下不要装**。
+
+协调者 2026-09-08 在主机上跑过这两条：`systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/15'`
+迭代出 09:15 → 09:30 → 09:45，**相邻两次相差 15 分钟**（不是 15 秒），日历这一条到此为止已经
+确定；同一天七个 unit 文件的 `systemd-analyze verify` 全部 rc 0，打印出来的 warning 都是
+tat_agent / ip6tables 这类系统 unit 的既有告警，与本仓库无关。**但那次 verify 覆盖的是当时改过的
+七个文件，晚于它加进来的 `rquant-live-runtime.slice` 与十四个模板的 `Slice=` 行不在里面**，
+所以装机窗口里这一步照跑不误：按上面的命令把全部 20 个文件一起验一遍，不要拿这条记录当已验。
+
+### 2. 安装（先备份现有 unit，回滚就靠它）
+
+```bash
+backup_dir="/home/lighthouse/rquant-units-backup-$(date +%Y%m%d-%H%M%S)"
+sudo mkdir -p "${backup_dir}"
+for f in rquant-backup.service rquant-backup.timer rquant-live.slice \
+         rquant-serving.slice rquant-maintenance.slice \
+         rquant-runtime-*@.service; do
+    [[ -e "/etc/systemd/system/${f}" ]] && sudo cp -a "/etc/systemd/system/${f}" "${backup_dir}/"
+done
+ls -l "${backup_dir}"          # 记下这个目录，回滚要用
+
+sudo cp deploy/systemd/rquant-backup.service deploy/systemd/rquant-backup.timer \
+        deploy/systemd/rquant-live.slice deploy/systemd/rquant-live-runtime.slice \
+        deploy/systemd/rquant-serving.slice deploy/systemd/rquant-maintenance.slice \
+        deploy/systemd/rquant-runtime-*@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-backup.timer      # timer 必须重启才按新 calendar 排期
+systemctl list-timers rquant-backup.timer       # 下一次触发应落在 :00/:15/:30/:45
+```
+
+**关于运行时 role 实例**：`Slice=` 是启动时决定的，所以第 0 步要求它们全部处于停止状态——
+按顺序做的话，装完 unit 文件之后它们下一次启动就直接落进 `rquant-live-runtime.slice`，
+不存在中间态。
+
+如果因为任何原因在**还有实例在跑**的时候装了（不该发生），那么在把每个实例都重启一遍之前，
+`verify-workload-isolation.sh` 与 `rquant preflight` 必然是红的，**期间不得执行任何自动发布**
+（受控发布器的双 preflight 本来也会挡住）。判断依据：错误里只出现
+`Slice=... expected 'rquant-live-runtime.slice'; restart ... to move it into ...` 与
+`active but ControlGroup is unresolved` 这两类，才是这个中间态；出现别的错误说明是真故障。
+**无论如何都不要在盘中（09:25–15:00）重启 role 实例**，等盘后窗口。
+
+### 3. slice 改动怎么对**已经在跑**的 unit 生效（重点）
+
+`daemon-reload` 只让 systemd 重读文件，**不会**把新的资源属性推给已经 active 的 slice。两条路：
+
+- **推荐（不重启任何服务）**：用 `--runtime` 就地下发，重启后自然回落到 unit 文件的值。
+  ```bash
+  sudo systemctl set-property --runtime rquant-live.slice CPUQuota=
+  sudo systemctl set-property --runtime rquant-serving.slice CPUQuota=30%
+  sudo systemctl set-property --runtime rquant-maintenance.slice CPUWeight=300
+  # rquant-live-runtime.slice 是新 slice，第一个成员启动时才会存在，无需 set-property
+  ```
+  **一定要带 `--runtime`**：不带的话 systemd 会在 `/etc/systemd/system.control/` 里写永久
+  drop-in，从此**盖住**仓库里的 unit 文件，以后改 git 不再生效，且悄悄与仓库分叉。
+- **或者**：等下一次这些 slice 里的 unit 全部停过再起（盘后窗口），slice 重新创建时按文件生效。
+
+核对（读 cgroup 真值，不看 systemd 缓存）：
+
+```bash
+systemctl show -p CPUQuotaPerSecUSec -p CPUWeight rquant-live.slice rquant-serving.slice \
+    rquant-maintenance.slice rquant-live-runtime.slice
+cat /sys/fs/cgroup/rquant.slice/rquant-serving.slice/cpu.max          # 期望 30000 100000
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/cpu.max             # 期望 max 100000（不设限）
+cat /sys/fs/cgroup/rquant.slice/rquant-maintenance.slice/cpu.weight   # 期望 300
+# 下面这个要等第一个 role 实例在新 slice 里起来之后才存在：
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.max
+                                                                      # 期望 60000 100000
+systemctl show -p TimeoutStartUSec -p TimeoutStopUSec rquant-backup.service   # 20min / 2min
+```
+
+**`verify-workload-isolation.sh` 抓不住 quota**：它只比对 slice 的
+`CPUWeight`/`IOWeight`/`TasksMax`/`Memory*`，`cpu.max` 只对 research 检查（评审 S-6）。
+所以上面这几行 `cat` 必须真的跑，不能只看它全绿。
+
+### 4. 装完的验收
+
+```bash
+sudo bash scripts/verify-workload-isolation.sh          # 只读，不改任何状态
+# 只有在第 0 步已经有结论之后再跑这一条（它会触发开头清扫）：
+sudo systemctl start rquant-backup.service
+journalctl -u rquant-backup.service -n 40 --no-pager    # 期望 Result=success，无超时
+tail -5 /home/lighthouse/rquant/logs/backup-snapshot.log
+ls -lA /home/lighthouse/rquant/backup/                  # 期望没有新的 .latest.* 残留
+df -h /home/lighthouse                                  # 记一下清扫前后的可用空间
+
+# role 的内存节流只在子 slice 那一层可见（撞 MemoryHigh=1536M 会让 high 计数增长）：
+runtime_cgroup=$(systemctl show rquant-live-runtime.slice --value --property=ControlGroup)
+cat "/sys/fs/cgroup${runtime_cgroup}/memory.events"     # 关注 high 的增量
+cat "/sys/fs/cgroup${runtime_cgroup}/memory.current"
+```
+
+### 4.1 头几个交易日必须记录：每轮备份的实际时长
+
+```bash
+systemctl show rquant-backup.service \
+    -p Result -p ExecMainStartTimestamp -p ExecMainExitTimestamp     # 最近一轮
+# 最近三天每一轮的时长（分钟），一行一轮：
+journalctl -u rquant-backup.service --since '-3 days' -o short-unix --no-pager \
+    | awk '/Starting/{s=$1} /Finished/{if(s){printf "%.1f min\n", ($1-s)/60; s=0}}'
+```
+
+**阈值与算术**：盘中触发间隔 15 分钟，最坏 RPO age = 间隔 + 单轮时长，闸是 1800 秒。
+
+| 单轮时长 | 最坏 age | 结论 |
+|---|---|---|
+| 8.8 分钟（当前实测） | 23.8min = 1430s | 正常，余 21% |
+| **> 12 分钟** | ≥ 27min = 1620s | **预警**：只剩 10% 余量，回头重新标定节奏 |
+| > 15 分钟 | 下一次触发被跳过（systemd 不并发启动）⇒ 有效节奏退化成 30 分钟 ⇒ age ≈ 45min = 2700s | **破闸**，必须改节奏或改 RPO |
+
+会把时长推上去的是 CPU 竞争：`rquant-live.slice` 本身**没有** quota（常驻服务住在里面），
+所以常驻服务一忙，live 可以按权重涨到 150%，maintenance 只剩 45% 一核，gzip 段大约拉长 1.8 倍。
+现有实测负载（19 role + gzip 同跑时整机 load ≈1.9）离这个场景很远，所以这是观察项不是阻塞项。
+
+### 5. 回滚（**不要动生产 checkout 的工作区**）
+
+受控发布器只接受干净的 tracked worktree，所以**回滚不能用 `git checkout <tag> -- deploy/systemd`**
+——那会把工作区弄脏，挡住后续所有自动发布。从第 2 步备份的目录复制回去：
+
+```bash
+backup_dir=/home/lighthouse/rquant-units-backup-<你在第 2 步记下的时间戳>
+sudo cp -a "${backup_dir}"/. /etc/systemd/system/
+sudo rm -f /etc/systemd/system/rquant-live-runtime.slice   # 新文件，回滚时删掉
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-backup.timer
+sudo systemctl set-property --runtime rquant-serving.slice CPUQuota=
+sudo systemctl set-property --runtime rquant-maintenance.slice CPUWeight=50
+git -C /home/lighthouse/rquant status --porcelain          # 必须是空的
+```
+
+`CPUQuota=`（空值）就是取消限额。已经在 `rquant-live-runtime.slice` 里跑着的 role 实例会在
+下次重启时回到 `rquant-live.slice`；盘中不要为回滚重启它们。脚本改动（trap、开头清扫、
+`nice`/`ionice`）没有生产状态，回滚即回滚代码。
+
+---
+
 ## 2026-09-07 · v0.32.2 · 路线 A 首次安装（权威链 sequence 3，生产代码仍未切换）
 
 **状态**：路线 A——「由操作员产出生产 inputs 文档 + 生成一代真实画像」这条路——第一次真正装到

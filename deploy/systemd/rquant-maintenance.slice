@@ -3,7 +3,12 @@ Description=rQuant Maintenance Workload Plane
 
 [Slice]
 CPUAccounting=true
-CPUWeight=50
+# 50 → 300：rquant.slice 内部权重 live 1000 / serving 500 / research 100 / maintenance，
+# 全部可运行时 maintenance 原来只拿 50/1650 = 3.0%，10 GB 快照因此被 live 饿死到
+# 8m16s–8m50s，20 个 role 同时跑时两次撞超时（#243）。改成 300 后是 300/1900 = 15.8%，
+# 仍低于 live/serving（盘中告警与页面优先），但不再是可以忽略的零头。
+# 不设 CPUQuota：备份是有限时长的批处理，需要吃掉 live/serving 限流后剩下的整核。
+CPUWeight=300
 IOAccounting=true
 IOWeight=50
 MemoryAccounting=true
