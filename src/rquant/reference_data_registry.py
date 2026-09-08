@@ -864,8 +864,11 @@ class ReferenceRegistry:
                 connection.row_factory = sqlite3.Row
                 connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
                 connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA synchronous = FULL")
                 try:
+                    #: both of these take locks, and on a held database the first one to
+                    #: ask is the one that reports -- which was `synchronous`, not the
+                    #: journal-mode line, so the wrapper covers the whole preamble
+                    connection.execute("PRAGMA synchronous = FULL")
                     mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
                 except sqlite3.OperationalError as exc:
                     #: #242: converting a WAL database to a rollback journal takes an
