@@ -1119,3 +1119,128 @@ def test_concurrent_publish_converges_and_survives_reopen(tmp_path: Path) -> Non
     assert len(set(generation_ids)) == 1
     reopened = ReferenceRegistry(path)
     assert reopened.current_pointer().generation_id == generation_ids[0]
+
+
+# ---------------------------------------------------------------------------------------
+# #242: the read-only reader inside the paper-constraint unit's sandbox
+# ---------------------------------------------------------------------------------------
+#
+# `rquant-runtime-paper-constraint@svc-dc7b9b33….service` failed at build time on every
+# start of the 2026-09-08 Route A window:
+#
+#     runtime_builder_authority.py:164  ReadonlyReferenceRegistry(reference_registry_path)
+#     reference_data_registry.py:2542   connection.execute("PRAGMA schema_version")
+#     sqlite3.OperationalError: unable to open database file
+#     ReferenceDataIntegrityError: reference registry is invalid
+#
+# The registry lives at `authorities/reference-slow/reference.sqlite3`. That path is
+# *visible* to the unit -- `ReadOnlyPaths=-…/authorities/reference-slow`, and
+# `ProtectHome=read-only` leaves it readable anyway -- but it is not in the unit's
+# `ReadWritePaths`, which only `rquant-runtime-reference-slow-publisher@.service` has.
+# The database was in WAL journal mode, and SQLite cannot open a WAL database at all,
+# not even `mode=ro`, without creating the `-shm` wal-index next to it. So the failure is
+# the #227 shape, not a path-visibility one, and the reader has to refuse it by name.
+
+
+def _journal_layout_byte(path: Path) -> int:
+    with open(path, "rb") as handle:
+        return handle.read(19)[18]
+
+
+def test_the_writer_publishes_a_registry_a_read_only_reader_can_open(tmp_path: Path) -> None:
+    """Byte 18 of the header is 1 (rollback journal), not 2 (WAL).
+
+    This is the half of #242 that has to be true on disk: a WAL registry is unreadable
+    from any unit that is not the publisher's, whatever the reader does.
+    """
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    registry.publish(published_at=BASE + timedelta(hours=2))
+
+    assert _journal_layout_byte(registry.path) == 1
+    assert not registry.path.with_name(registry.path.name + "-wal").exists()
+    assert not registry.path.with_name(registry.path.name + "-shm").exists()
+
+
+def test_a_read_only_authority_directory_still_admits_the_reader(tmp_path: Path) -> None:
+    """The paper-constraint sandbox: the registry readable, its directory not writable."""
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    published = registry.publish(published_at=BASE + timedelta(hours=2))
+    authority = registry.path.parent
+    os.chmod(authority, 0o500)
+    try:
+        readonly = ReadonlyReferenceRegistry(registry.path)
+
+        assert readonly.current_manifest() == published
+    finally:
+        os.chmod(authority, 0o700)
+
+    assert sorted(path.name for path in authority.iterdir()) == [
+        f".{registry.path.name}.publication.lock",
+        registry.path.name,
+    ]
+
+
+def test_a_wal_registry_is_refused_by_name_instead_of_by_sqlite(tmp_path: Path) -> None:
+    """A registry left in WAL mode by an older build: refused, with the path and the rule.
+
+    `ReferenceDataIntegrityError("reference registry is invalid")` was the whole message
+    the host got; it named neither the file, nor the directory, nor why SQLite wanted to
+    write in a directory the unit only grants read-only.
+    """
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    registry.publish(published_at=BASE + timedelta(hours=2))
+    with closing(sqlite3.connect(registry.path, isolation_level=None)) as connection:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    for suffix in ("-wal", "-shm"):
+        sidecar = registry.path.with_name(registry.path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    assert _journal_layout_byte(registry.path) == 2
+
+    with pytest.raises(ReferenceDataIntegrityError) as raised:
+        ReadonlyReferenceRegistry(registry.path)
+
+    message = str(raised.value)
+    assert str(registry.path) in message
+    assert "WAL" in message
+    assert f"{registry.path.name}-shm" in message
+    assert "reference_slow_publisher" in message
+
+
+def test_a_registry_that_cannot_be_opened_names_the_path_and_the_errno(
+    tmp_path: Path,
+) -> None:
+    """Whatever else stops the open, the refusal carries the path and the errno.
+
+    The host's traceback carried neither. `EACCES` is what a mode-denied directory
+    reports; a read-only *mount*, which is what `ProtectSystem=strict` builds, reports
+    `EROFS` -- the Linux gate covers that one.
+    """
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the directory mode this case denies")
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    registry.publish(published_at=BASE + timedelta(hours=2))
+    #: a registry whose header says rollback journal but whose pages are not a database
+    with open(registry.path, "r+b") as handle:
+        handle.seek(100)
+        handle.write(b"\x00" * 512)
+    authority = registry.path.parent
+    os.chmod(authority, 0o500)
+    try:
+        with pytest.raises(ReferenceDataIntegrityError) as raised:
+            ReadonlyReferenceRegistry(registry.path)
+    finally:
+        os.chmod(authority, 0o700)
+
+    message = str(raised.value)
+    assert str(registry.path) in message
+    assert "EACCES" in message or "13" in message
+    assert str(authority) in message
