@@ -538,7 +538,11 @@ class RuntimeHealthSourceReader:
                 )
                 reasons.append(reason)
                 continue
-            assert isinstance(heartbeat, RuntimeServiceHeartbeat)
+            if not isinstance(heartbeat, RuntimeServiceHeartbeat):  # pragma: no cover
+                raise RuntimeHealthAuthorityIntegrityError(
+                    f"runtime heartbeat read returned an unusable value: "
+                    f"{source.spec.service_id}"
+                )
             stale = observed - heartbeat.heartbeat_at > source.spec.stale_after
             status = RuntimeServiceStatus.DEGRADED if stale else heartbeat.status
             services.append(
