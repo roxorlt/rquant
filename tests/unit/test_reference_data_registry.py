@@ -1296,3 +1296,32 @@ def test_a_frozen_copy_is_read_immutably_and_its_wal_header_is_not_a_refusal(
         os.chmod(backup.parent, 0o700)
 
     assert sorted(path.name for path in backup.parent.iterdir()) == [backup.name]
+
+
+def test_a_held_registry_names_the_holders_instead_of_saying_database_is_locked(
+    tmp_path: Path,
+) -> None:
+    """#242's conversion needs exclusive access, and SQLite's own words do not help.
+
+    Setting the journal mode takes an exclusive lock. Any other connection -- a recovery
+    backup in progress, an old reader -- makes SQLite answer `database is locked`, which
+    names neither the file nor what to stop. That is the same class of message #242 was
+    filed about, so the writer says which file and which holders.
+    """
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    registry.publish(published_at=BASE + timedelta(hours=2))
+    holder = sqlite3.connect(registry.path, isolation_level=None, timeout=0)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+
+        with pytest.raises(ReferenceDataIntegrityError) as raised:
+            ReferenceRegistry(registry.path, publication_authenticator=_publication_authenticator())
+    finally:
+        holder.close()
+
+    message = str(raised.value)
+    assert str(registry.path) in message
+    assert "exclusive access" in message
+    assert "lsof" in message
