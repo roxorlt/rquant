@@ -28,6 +28,7 @@ fails there.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import traceback
@@ -762,6 +763,41 @@ def test_the_units_that_hide_the_dotenv_and_the_generation_secrets_are_23_of_25(
         text = (_UNIT_ROOT / ROLE_UNITS[role]).read_text(encoding="utf-8")
         assert not re.search(r"^InaccessiblePaths=", text, flags=re.MULTILINE), role
         assert "ProtectHome=read-only" in text, role
+
+
+def test_the_inaccessible_paths_a_unit_declares_really_deny_a_read(
+    cold_chain: RouteAWorld,
+    tmp_path: Path,
+) -> None:
+    """The sandbox's third denial, exercised on its own.
+
+    No role in this world reads `.env` or `current/secrets`, so the `InaccessiblePaths`
+    list the runs above install protects nothing observable -- a sandbox clause with no
+    case behind it is a clause that can be deleted without a test noticing. This is that
+    case: the notifier's own list, and a read of one of the paths in it.
+    """
+
+    instance = instance_of(cold_chain, "notifier")[0]
+    sandbox = sandbox_of("notifier", instance=instance, runtime_root=cold_chain.runtime_root)
+    hidden = sandbox["InaccessiblePaths"]
+    assert hidden, sandbox
+    secrets = next(path for path in hidden if path.name == "secrets")
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.mkdir(exist_ok=True)
+    (secrets / "sealed.json").write_text("{}", encoding="utf-8")
+
+    with readonly_runtime(
+        cold_chain.runtime_root,
+        writable=sandbox["ReadWritePaths"],
+        inaccessible=hidden,
+    ) as violations:
+        with pytest.raises(OSError) as raised:
+            (secrets / "sealed.json").read_text(encoding="utf-8")
+        #: and a path outside the list is still readable
+        assert (cold_chain.runtime_root / "current").exists()
+
+    assert raised.value.errno == errno.EACCES
+    assert [violation.path for violation in violations] == [str(secrets / "sealed.json")]
 
 
 def _role_evidence(runs: list[RoleRun]) -> str:  # pragma: no cover - report helper
