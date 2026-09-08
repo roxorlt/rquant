@@ -6,6 +6,21 @@
 
 ### Added
 
+- **25 个 role 各自在自己 unit 的沙箱里起一次的 e2e（`tests/integration/test_route_a_all_roles_sandbox_e2e.py`）**：
+  Route A 的裸跑排查（runbook R-20）用 `runtime-exec.pyz` 起 role，**完全没有沙箱**，所以
+  「这个 role 往哪儿写」这一整类缺陷它一条也看不见——#242 与 #241 都是这一类。包 J 的 e2e 把
+  逐 unit 的真实路径集合用在了 live 链的 6 个 role 上，本文件把它扩到
+  `PRODUCTION_ROLE_POLICY` 里全部 **25 个 instanced role**：真装两代 bundle（第二代才会备下
+  每个 kind-backed role 启动时要读的 schema rollout 计划）、真 stage 并发布权威链、wrapper 自己
+  派生的 argv 与子环境、按 `LoadCredentialEncrypted` 的真实形状投递 7 个 credstore role 的凭据、
+  盘外时钟且日历不开盘。每个 role 的 `ReadWritePaths` / `ReadOnlyPaths` / `InaccessiblePaths`
+  **逐字读自 `deploy/systemd/`**，所以测试用的沙箱就是主机用的沙箱。
+  25 个里 24 个能从 wrapper 的 argv 起来；`page_control` 的入口点从冻结常量取 runtime root
+  而不是从 argv 取（`page_control_service.main` → `_serve(runtime_root=None)` →
+  `LINUX_PRODUCTION_RUNTIME_ROOT`），这一条被断言成事实而不是绕过去。
+  `tests/runtime_readonly_sandbox.py` 同时增加了 `InaccessiblePaths` 的**读**拒绝
+  （systemd 在那些路径上盖一个无权限的空节点，不只是不可写）。
+
 - **跨版本 schema 快照闸：拿生产真实发布过的一代当「前代」（#237）**：
   仓库里此前每一条 schema 转换用例的两侧都由工作树里的同一份代码生成，所以改了载荷形状之后
   「前代」也跟着被改写，转换永远是绿的；而安装器比的是**新代码生成的 bundle** 与**已装那一代
@@ -78,6 +93,42 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **paper_constraint_publisher 在 unit 沙箱里打不开 reference registry（#242）**：
+  2026-09-08 第五窗口，`rquant-runtime-paper-constraint@svc-dc7b9b33…` 每次启动都在构造期倒下
+  （5 次重启、6 次 `OnFailure` 中继、1 条真实推送），裸跑却能进主循环。定因：
+  `authorities/reference-slow/reference.sqlite3` **是 WAL 库**，而 SQLite 打开 WAL 库
+  （`mode=ro` 也一样）必须在库旁边建 `-shm` wal-index；这个目录只有
+  `rquant-runtime-reference-slow-publisher@.service` 的 `ReadWritePaths` 覆盖，别的 unit 在
+  `ProtectSystem=strict` 下拿到的是**只读挂载**，于是内核回 `EROFS`、SQLite 回
+  `SQLITE_CANTOPEN`，读者把它吞成一句 `reference registry is invalid`。**不是路径不可见**：
+  unit 的 `ReadOnlyPaths` 点了这个目录的名，`ProtectHome=read-only` 也留着读权限。
+  改法：写者改用回滚日志（`PRAGMA journal_mode = DELETE`，库头第 18 字节从 2 变 1，旧库在
+  publisher 下次以写者身份打开时自动转换）；只读读者在**打开之前**用一次 `pread` 读库头判断，
+  遇到 WAL 库直接失败关闭，措辞点名文件、目录、要建的 `-shm` 和目录拒绝新条目的 errno；
+  其他打不开的情形也一并点名路径、SQLite 的 errorname 与 errno。
+  同一个 role 还有第二处越界写：它以**写模式**打开 `market_minute_source` 的分钟 spool
+  （`LiveBatchSpool(minute_spool_root)`），会在生产者目录里建 `batches/<channel>/`——
+  这是 #231 的形状，主机上只因为生产者已经把目录建好了才没炸。已改为只读打开。
+
+- **notifier 每轮 DEGRADED：往 page-control 的 control 根里写（#241）**：
+  `rquant-runtime-notifier@svc-f2518f7a…` active 但每次迭代都
+  `OSError: [Errno 30] Read-only file system: '<runtime root>/control/.page-control.sqlite3.<uuid>.<tmp>'`。
+  那个名字是读者自己的：`_ReadonlyPageControlAuditReader.snapshot()` 用硬链接把要读的那一代
+  钉住，而临时目录建在 **outbox 旁边**。outbox 归 page-control 服务
+  （`rquant-page-control.service` 是唯一 `ReadWritePaths` 覆盖 `…/data/runtime/control` 的 unit，
+  notifier 的 unit 把 `control/page-control.sqlite3` 列在 `ReadOnlyPaths`），所以归属很清楚：
+  **notifier 只读，钉代的临时目录必须落在自己拥有的目录里**，现在派生自
+  `notification_state_path` 的父目录（`live/notifications/%i`），不新增 manifest 设置。
+  同一个 `snapshot` 形状在 DuckDB 只读副本读者（`_StableReadonlyDuckDB`）上还有一份，
+  page-control 那处修好之后就会轮到它，一并改掉；两处都拒绝「bind root 等于被读文件所在目录」，
+  绑定失败时点名路径与 errno。
+
+- **lab_artifact_catalog 建并 chmod 了 artifact_retention 的状态根**：
+  `build_production_artifact_terminal_lifecycle` 在 `LAB_ARTIFACT_CATALOG` 分支上调
+  `_private_state_root`，它对 `research/artifact-retention/<svc>` 做 `mkdir` **加无条件 chmod**；
+  catalog 的 unit 只授权那里面的一个子目录（`catalog-registration-outbox`），所以这条 chmod 在
+  沙箱下每次启动都是 `EROFS`。改为只取路径、不创建也不改权限。
 
 - **v0.33.2 安装器在第三代生产机上被自己的 schema 兼容闸拦下（#237）**：
   2026-09-08 在第三代（producer_commit `a0bbb4c`、v0.33.1）上跑
