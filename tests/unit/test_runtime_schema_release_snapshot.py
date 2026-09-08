@@ -23,6 +23,7 @@ import pytest
 
 from rquant.runtime_schema_registry import (
     _SUPPORTED_KINDS,
+    RuntimeSchemaCompatibilityError,
     RuntimeSchemaContractBundle,
     build_runtime_schema_contract_bundle,
     parse_runtime_schema_contract_bundle,
@@ -52,11 +53,13 @@ _RESEARCH_KINDS = frozenset(
 )
 
 _REFRESH_HINT = """
-Two -- and only two -- changes are allowed to move these hashes:
+Two -- and only two -- changes are allowed to move a published field hash:
 
-  1. The serving payload started embedding a mutable model again. Restore the frozen
-     projection so the published shape stops tracking an internal model. This is what
-     #237 was; it is almost certainly what just happened.
+  1. The channel's payload started embedding a model that grows on its own -- one written
+     for a service's own use rather than for publication. A field added to that model
+     rewrites the whole channel, because a field's hash covers the payload's entire
+     $defs. Restore (or add) a frozen projection so the published shape stops tracking
+     it. This is what #237 was; it is the likeliest thing to have just happened.
   2. The channel's schema_version was deliberately bumped and the change is being driven
      through a real rollout (PREPARE -> DUAL_WRITE -> ...), with the installed generation
      able to read what the new producer writes. In that case the integrator refreshes
@@ -154,10 +157,16 @@ def test_every_channel_transitions_from_the_released_snapshot(
     anything is installed.
     """
 
-    validate_runtime_schema_transition(
-        previous=released_bundle,
-        candidate=head_bundle,
-    )
+    try:
+        validate_runtime_schema_transition(
+            previous=released_bundle,
+            candidate=head_bundle,
+        )
+    except RuntimeSchemaCompatibilityError as exc:
+        # The registry names the channel and lists the hashes; it has no way to say what
+        # a developer should do about it. The nine-hash test above carries that guidance
+        # for the one channel it watches -- the other twenty get it here.
+        pytest.fail(f"{exc}\n{_REFRESH_HINT}")
 
 
 def test_released_snapshot_covers_the_whole_channel_catalog(

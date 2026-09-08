@@ -202,8 +202,16 @@ class _PublishedSchemaNames:
     Python class name. `RuntimeServiceHeartbeat` is therefore part of what that channel
     published in v0.33.1, not merely an internal identifier -- renaming the class the
     payload embeds is as breaking as renaming a field. Nesting keeps that published name
-    while the module-level alias below says what the model is; it also keeps the name
-    unambiguous for `pickle`, which resolves a class through `__qualname__`.
+    while the module-level alias below says what the model is.
+
+    Nesting is also what keeps the *class* resolvable. The other way to pin the published
+    name is to rewrite `__qualname__` on a module-level model and rebuild it; `pickle`
+    then looks the class up by module and qualname, finds the heartbeat file model there
+    instead, and refuses with "it's not the same object as
+    rquant.runtime_service_control.RuntimeServiceHeartbeat". Nothing here pickles a
+    heartbeat -- instances of these models cannot be pickled either way, because
+    `source_generations` is a `mappingproxy` -- but a class that lies about where it
+    lives is not worth the three lines it saves.
     """
 
     #: The serving projection of a heartbeat: the v0.33.1 field set, frozen.
