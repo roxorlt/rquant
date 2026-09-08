@@ -1199,12 +1199,8 @@ class StrategyCandidateSnapshotSpool:
                         dst_dir_fd=staged_generations_fd,
                     )
                 os.fsync(staged_generations_fd)
-                archived = len(
-                    [
-                        entry.name
-                        for entry in os.scandir(staged_generations_fd)  # noqa: PTH208
-                    ]
-                )
+                with os.scandir(staged_generations_fd) as staged:
+                    archived = sum(1 for _ in staged)
                 os.fsync(generations_fd)
             finally:
                 os.close(staged_generations_fd)
