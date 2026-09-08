@@ -70,18 +70,32 @@
   下一轮就已排队，盘中 gzip 等于一直占着一个核；20 个运行时 unit 同时跑时两次撞
   `TimeoutStartSec=10min` 被杀，各推一条失败告警。
 
-  - `rquant-backup.timer`：盘中 `Mon..Fri *-*-* 9..15:0/5` → `9..15:0/30`（每天 84 次 → 14 次），
-    17:30 那次保留。写法用 CLAUDE.md 记过的唯一可用形状（显式起点 `0/N`；`*/N` 与跨小时
-    分钟范围都被 systemd 拒收，`HH:MM..HH:MM/N` 里的 `/N` 是秒）。
+  - `rquant-backup.timer`：盘中 `Mon..Fri *-*-* 9..15:0/5` → `9..15:0/15`（每天 84 次 → 28 次），
+    17:30 那次保留。**为什么是 15 分钟而不是 30**：脚本每跑一次就发一次 recovery bundle，
+    `preflight` 的 `runtime_recovery` 闸按已装 profile 的 `max_rpo_seconds=1800` 判
+    `backup_age`，bundle 落在每轮开始后约 9 分钟，最坏 age = 间隔 + 单次时长：
+    30 + 8.83 = 38.8min = 2330s **破闸**；15 + 8.83 = 23.8min = 1430s，留 21% 余量。
+    代价是每周期静默窗口只剩 6.2 分钟、gzip 占空比 59%（现状 100%）。写法用 CLAUDE.md 记过的
+    唯一可用形状（显式起点 `0/N`；`*/N` 与跨小时分钟范围都被 systemd 拒收，
+    `HH:MM..HH:MM/N` 里的 `/N` 是秒）。
   - `rquant-backup.service`：`TimeoutStartSec` 10min → 20min（= 最慢一次成功运行 9m36s 的
     两倍余量），新增 `TimeoutStopSec=2min` 给脚本的信号 trap 留出清理时间。
-  - `rquant-live.slice` `CPUQuota=60%`、`rquant-serving.slice` `CPUQuota=30%`：这两个面是
-    唯一会与备份同时运行的工作面，合计 90% ≤ 一个核；剩下的 110% 留给 maintenance 与
-    `system.slice`，实测吃 83% 一核的 gzip 因此能拿到整核。`rquant-research.slice` 的
-    `CPUQuota=100%` 不动——它由 arbiter 与 maintenance 跨 plane 互斥，永远不和备份重叠，
-    而且 `verify_workload_isolation` 要求它的 `cpu.max` 恰好等于一个核。
-  - `rquant-maintenance.slice` `CPUWeight` 50 → 300（`rquant.slice` 内部全部可运行时的份额
-    3.0% → 15.8%），仍低于 live 1000 / serving 500；不给 maintenance 设 `CPUQuota`。
+  - **新增 `rquant-live-runtime.slice`（`rquant-live.slice` 的子 slice）**，14 个
+    `rquant-runtime-*@.service` 只改 `Slice=` 一行搬进去；限额压在它身上
+    （`CPUQuota=60%`、`MemoryHigh=1536M`），**`rquant-live.slice` 本身不设 quota**。
+    原因：live 面里住着 11 个常驻生产服务，而 cgroup v2 的 quota 是整面封顶、面内按权重平分
+    （面内所有 unit 都是默认 `CPUWeight=100`），压在 live 上会让 20 个 role 把 monitor /
+    daily / alert@ 稀释到 60/21 = 2.9% 一核，`rquant-alert@` 的 `TimeoutStartSec=30` 会被击穿。
+    挪到子 slice 之后，14 个 role 合起来在 live 内部只算一个同侪，最坏情况下 alert@ 仍有
+    约 90% 一核。`MemoryHigh=1536M` 是从 live 的 3840M 里切出来的，不是额外增加：
+    monitor peak 2814 MiB + 19 个 role 2800 MiB = 5614 MiB 早已超顶，加了子 slice 上限之后
+    回收先打在 role 身上而不是 monitor 身上。
+  - `rquant-serving.slice` `CPUQuota=30%`：与 live-runtime 的 60% 合计 90% ≤ 一个核；
+    剩下的 110% 留给 maintenance 与 `system.slice`，实测吃 83% 一核的 gzip 因此能拿到整核。
+    `rquant-research.slice` 的 `CPUQuota=100%` 不动——它由 arbiter 与 maintenance 跨 plane
+    互斥，永远不和备份重叠，而且 `verify_workload_isolation` 要求它的 `cpu.max` 恰好一个核。
+  - `rquant-maintenance.slice` `CPUWeight` 50 → 300（备份跑时 research 必然不在跑，真实分母
+    1800，份额 3.2% → 16.7%），仍低于 live 1000 / serving 500；不给 maintenance 设 `CPUQuota`。
   - **内存一列没动**，这是对裁决的一处有依据的偏离：`rquant-monitor.service` 就住在
     `rquant-live.slice` 里（实测 cgroup peak 2814 MiB），live 的 `MemoryLow` 又是 3072 MiB，
     所以 live `MemoryHigh` 降到 2560M 会让节流线掉到保护线以下、并先掐监控自己；
@@ -122,10 +136,22 @@
     （涵盖 `.wal` 与 `.gz` 变体），`latest.duckdb.gz`、`latest.json` 与 `v*-preview-*` 都不在
     模式内，1 天的门槛也保证并发的另一次 maintenance 运行不会被误删——这是唯一能从 SIGKILL
     里恢复的手段；
-  - `cp` / `gzip` 走 `nice -n 19 ionice -c3`（两个二进制都存在时）。放在脚本里而不是 unit 的
-    arbiter 调用上，因为后者会连短促的 CHECKPOINT/verify 与 recovery bundle 一起降级，而
-    release worktree 也直接调用这个脚本。
+  - `cp` / `gzip` 走 `nice -n 19` 加一档由磁盘调度器决定的 `ionice`：`RQUANT_BACKUP_IONICE`
+    默认 `auto`，读 `/sys/block/*/queue/scheduler`，**BFQ 用 `-c2 -n7`**（BFQ 会真的兑现
+    idle 类「只在磁盘空闲时给 IO」，那会拖慢 10 GB 的 `cp`），其他调度器用 `-c3`；
+    也可显式写 `idle` / `best-effort` / `none`。放在脚本里而不是 unit 的 arbiter 调用上，
+    因为后者会连短促的 CHECKPOINT/verify 与 recovery bundle 一起降级，而 release worktree
+    也直接调用这个脚本。
   **生产上现存的 68 GB 孤儿本包不删**，那是 owner 单独点头后的动作。
+
+- **本地热备脚本按新节奏判 stale，不再每半小时误报一次（#243）**：
+  `scripts/sync-from-cloud.sh`（跑在 mac 上，launchd 每 5 分钟一次）此前把「`snapshot_at`
+  跟上一轮一样」直接当成「云端 backup 卡住」推 PushDeer。云端改成 15 分钟一轮之后，三次本地
+  轮询里有两次会看到同一个值，30 分钟冷却一到就推一条，每交易日约 10–12 条误报，正文还写着
+  「应每 5min 步进」。现在改成判**年龄**：`BACKUP_INTRADAY_INTERVAL_MIN=15`（唯一来源是
+  `deploy/systemd/rquant-backup.timer` 的 `OnCalendar`），阈值 `2×间隔 + 10 = 40 分钟`；
+  `snapshot_at` 解析不出来时只记日志不告警。告警正文改成报实际年龄、间隔与阈值。
+  这个文件在 mac 上、不在本包 owner 授权范围内，是协调者要求一并改的，会单独跟 owner 报备。
 
 - **v0.33.2 安装器在第三代生产机上被自己的 schema 兼容闸拦下（#237）**：
   2026-09-08 在第三代（producer_commit `a0bbb4c`、v0.33.1）上跑

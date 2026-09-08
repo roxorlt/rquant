@@ -13,111 +13,164 @@
 **为什么必须手工装**：改动落在 `deploy/systemd/`，受控发布器
 （`scripts/deploy-production.sh`）按设计拒绝任何含该目录的 diff（见
 `docs/production-release.md`「自动拒绝」），CLAUDE.md 第 7 条也把 `deploy/systemd/` 列为需要
-owner 单独明确授权的高风险变更。因此代码可以照常走发布器，**unit 文件这部分要 owner 点头后
-按下面的步骤人工安装**。
+owner 单独明确授权的高风险变更。
 
-**改了哪 5 个文件**：`rquant-backup.timer`（盘中 5min → 30min）、`rquant-backup.service`
-（`TimeoutStartSec` 20min、新增 `TimeoutStopSec=2min`）、`rquant-live.slice`（`CPUQuota=60%`）、
-`rquant-serving.slice`（`CPUQuota=30%`）、`rquant-maintenance.slice`（`CPUWeight=300`）。
-`rquant.slice` 与 `rquant-research.slice` 未改，但下面的 verify 一并跑一遍不吃亏。
+**改了哪些 unit 文件**（共 20 个）：
 
-### 1. 装之前先在云端验语法（mac 上验不了）
+| 文件 | 改动 |
+|---|---|
+| `rquant-backup.timer` | 盘中 5min → **15min**（`9..15:0/15`），17:30 保留 |
+| `rquant-backup.service` | `TimeoutStartSec` 10min → 20min，新增 `TimeoutStopSec=2min` |
+| `rquant-live-runtime.slice` | **新文件**：运行时 role 的子 slice，`CPUQuota=60%` / `MemoryHigh=1536M` |
+| `rquant-live.slice` | **去掉** `CPUQuota`（常驻服务住在这个面里，不能封顶） |
+| `rquant-serving.slice` | 新增 `CPUQuota=30%` |
+| `rquant-maintenance.slice` | `CPUWeight` 50 → 300 |
+| 14 个 `rquant-runtime-*@.service` | **只改 `Slice=` 一行**：`rquant-live.slice` → `rquant-live-runtime.slice`，其余一字未动 |
+
+**为什么盘中是 15 分钟而不是 30**：脚本每跑一次就发一次 recovery bundle，`preflight` 的
+`runtime_recovery` 闸按已装 profile 的 `max_rpo_seconds=1800` 判 `backup_age`；bundle 落在每轮
+开始后约 9 分钟，所以最坏 age = 间隔 + 单次时长。30 分钟 → 30 + 8.83 = 38.8min = **2330s，破闸**；
+15 分钟 → 15 + 8.83 = 23.8min = **1430s，留 370s（21%）余量**。盘中触发 84 次/天 → **28 次/天**，
+gzip 占空比 100% → 59%。
+
+### 0. 装之前必须先定的两件事（**顺序不能反**）
+
+1. **owner 就 `backup/` 里那 68 GB 孤儿表态**。新脚本开头会清扫 `backup/` 下 mtime 超过 1 天的
+   `.latest.duckdb.*` / `.latest.json.*`，2026-08-03..05 那批 `.latest.duckdb.<pid>`(.gz)
+   **两个条件都满足，第一次运行就会被一次性删光**。所以要么先拿到清理授权，要么装之前先把这批
+   文件挪走留证：
+
+   ```bash
+   ls -lA /home/lighthouse/rquant/backup/.latest.* > /home/lighthouse/orphans-20260908.txt
+   du -ch /home/lighthouse/rquant/backup/.latest.* | tail -1
+   # 需要留证时（不删，只挪走）：
+   mkdir -p /home/lighthouse/rquant-orphans-20260908
+   mv /home/lighthouse/rquant/backup/.latest.duckdb.* \
+      /home/lighthouse/rquant/backup/.latest.json.* \
+      /home/lighthouse/rquant-orphans-20260908/
+   ```
+
+   **在这一步有结论之前不要装 `scripts/backup-snapshot.sh`，也不要手工跑 backup.service。**
+2. **确认磁盘调度器**，决定 `ionice` 用哪一档：
+
+   ```bash
+   cat /sys/block/vda/queue/scheduler
+   ```
+
+   括号里是 `bfq` → 脚本的 `auto` 会自动改用 `-c2 -n7`（best-effort 最低优先级），不需要额外
+   配置；是 `none` / `mq-deadline` / `kyber` → `auto` 用 `-c3`，两者等效。要强制可以在
+   `.env` 里写 `RQUANT_BACKUP_IONICE=idle|best-effort|none`。
+
+### 1. 语法验证（mac 上验不了）
 
 ```bash
 cd /home/lighthouse/rquant && git fetch --tags && git checkout <tag>
 tmp="$(mktemp -d)"
 cp deploy/systemd/rquant-backup.service deploy/systemd/rquant-backup.timer \
-   deploy/systemd/rquant-live.slice deploy/systemd/rquant-serving.slice \
-   deploy/systemd/rquant-maintenance.slice deploy/systemd/rquant.slice \
-   deploy/systemd/rquant-research.slice "${tmp}/"
-systemd-analyze verify "${tmp}"/rquant-backup.service "${tmp}"/rquant-backup.timer \
-    "${tmp}"/rquant-live.slice "${tmp}"/rquant-serving.slice \
-    "${tmp}"/rquant-maintenance.slice "${tmp}"/rquant.slice "${tmp}"/rquant-research.slice
-echo "verify rc=$?"      # 期望 0，且不打印任何 warning
-systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/30' --iterations 5
+   deploy/systemd/rquant-live.slice deploy/systemd/rquant-live-runtime.slice \
+   deploy/systemd/rquant-serving.slice deploy/systemd/rquant-maintenance.slice \
+   deploy/systemd/rquant.slice deploy/systemd/rquant-research.slice \
+   deploy/systemd/rquant-runtime-*@.service "${tmp}/"
+systemd-analyze verify "${tmp}"/*.service "${tmp}"/*.timer "${tmp}"/*.slice
+echo "verify rc=$?"      # 期望 0，且不打印本仓库 unit 的 warning
+systemd-analyze calendar 'Mon..Fri *-*-* 9..15:0/15' --iterations 5
 systemd-analyze calendar 'Mon..Fri 17:30' --iterations 5
 rm -rf "${tmp}"
 ```
 
-`9..15:0/30` 期望：`Normalized form: Mon..Fri *-*-* 09,10,11,12,13,14,15:00,30:00`，5 个
-iteration **间隔 30 分钟**（不是 30 秒）。看到 `Invalid argument` 或秒级步进就**停下不要装**。
+`9..15:0/15` 期望：归一化成 `Mon..Fri *-*-* 09..15:00/15:00` 一类形状，5 个 iteration
+**两两相差 15 分钟**（不是 15 秒）。看到 `Invalid argument` 或秒级步进就**停下不要装**。
 
-### 2. 安装
+### 2. 安装（先备份现有 unit，回滚就靠它）
 
 ```bash
+backup_dir="/home/lighthouse/rquant-units-backup-$(date +%Y%m%d-%H%M%S)"
+sudo mkdir -p "${backup_dir}"
+for f in rquant-backup.service rquant-backup.timer rquant-live.slice \
+         rquant-serving.slice rquant-maintenance.slice \
+         rquant-runtime-*@.service; do
+    [[ -e "/etc/systemd/system/${f}" ]] && sudo cp -a "/etc/systemd/system/${f}" "${backup_dir}/"
+done
+ls -l "${backup_dir}"          # 记下这个目录，回滚要用
+
 sudo cp deploy/systemd/rquant-backup.service deploy/systemd/rquant-backup.timer \
-        deploy/systemd/rquant-live.slice deploy/systemd/rquant-serving.slice \
-        deploy/systemd/rquant-maintenance.slice /etc/systemd/system/
+        deploy/systemd/rquant-live.slice deploy/systemd/rquant-live-runtime.slice \
+        deploy/systemd/rquant-serving.slice deploy/systemd/rquant-maintenance.slice \
+        deploy/systemd/rquant-runtime-*@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl restart rquant-backup.timer      # timer 必须重启才按新 calendar 排期
-systemctl list-timers rquant-backup.timer       # 下一次触发应落在 :00 或 :30
+systemctl list-timers rquant-backup.timer       # 下一次触发应落在 :00/:15/:30/:45
 ```
+
+**运行时 role 实例不需要（也不应该）为此重启**：`Slice=` 是启动时决定的，已经在跑的
+`rquant-runtime-*@svc-*.service` 会**留在 `rquant-live.slice` 里直到它们下次重启**。
+这个中间态是安全的——`rquant-live.slice` 本身没有 quota，所以那些实例的行为跟今天完全一样；
+等 Release A 下一次重启它们时自然落进 `rquant-live-runtime.slice`。**不要在盘中重启它们。**
 
 ### 3. slice 改动怎么对**已经在跑**的 unit 生效（重点）
 
-`daemon-reload` 只让 systemd 重读文件，**不会把新的资源属性推给已经 active 的 slice**；
-slice 的 cgroup 属性是在它被创建（第一个成员启动）时写下的。两条路，二选一：
+`daemon-reload` 只让 systemd 重读文件，**不会**把新的资源属性推给已经 active 的 slice。两条路：
 
 - **推荐（不重启任何服务）**：用 `--runtime` 就地下发，重启后自然回落到 unit 文件的值。
   ```bash
-  sudo systemctl set-property --runtime rquant-live.slice CPUQuota=60%
+  sudo systemctl set-property --runtime rquant-live.slice CPUQuota=
   sudo systemctl set-property --runtime rquant-serving.slice CPUQuota=30%
   sudo systemctl set-property --runtime rquant-maintenance.slice CPUWeight=300
+  # rquant-live-runtime.slice 是新 slice，第一个成员启动时才会存在，无需 set-property
   ```
   **一定要带 `--runtime`**：不带的话 systemd 会在 `/etc/systemd/system.control/` 里写永久
   drop-in，从此**盖住**仓库里的 unit 文件，以后改 git 不再生效，且悄悄与仓库分叉。
 - **或者**：等下一次这些 slice 里的 unit 全部停过再起（盘后窗口），slice 重新创建时按文件生效。
 
-核对（cgroup 里的真值，不看 systemd 自己的缓存）：
+核对（读 cgroup 真值，不看 systemd 缓存）：
 
 ```bash
 systemctl show -p CPUQuotaPerSecUSec -p CPUWeight rquant-live.slice rquant-serving.slice \
-    rquant-maintenance.slice
-cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/cpu.max        # 期望 60000 100000
-cat /sys/fs/cgroup/rquant.slice/rquant-serving.slice/cpu.max     # 期望 30000 100000
+    rquant-maintenance.slice rquant-live-runtime.slice
+cat /sys/fs/cgroup/rquant.slice/rquant-serving.slice/cpu.max          # 期望 30000 100000
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/cpu.max             # 期望 max 100000（不设限）
 cat /sys/fs/cgroup/rquant.slice/rquant-maintenance.slice/cpu.weight   # 期望 300
+# 下面这个要等第一个 role 实例在新 slice 里起来之后才存在：
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.max
+                                                                      # 期望 60000 100000
+systemctl show -p TimeoutStartUSec -p TimeoutStopUSec rquant-backup.service   # 20min / 2min
 ```
 
-**忘了这一步会被验收抓住**：`scripts/verify-workload-isolation.sh` 会把 cgroup 里的
-`CPUWeight` 与仓库的 `WORKLOAD_SLICE_LIMITS` 逐字段对比，maintenance 还是 50 时会直接报
-`rquant-maintenance.slice: cgroup CPUWeight='50', expected '300'`。
+**`verify-workload-isolation.sh` 抓不住 quota**：它只比对 slice 的
+`CPUWeight`/`IOWeight`/`TasksMax`/`Memory*`，`cpu.max` 只对 research 检查（评审 S-6）。
+所以上面这几行 `cat` 必须真的跑，不能只看它全绿。
 
 ### 4. 装完的验收
 
 ```bash
 sudo bash scripts/verify-workload-isolation.sh          # 只读，不改任何状态
-sudo systemctl start rquant-backup.service              # 盘后手工跑一次
+# 只有在第 0 步已经有结论之后再跑这一条（它会触发开头清扫）：
+sudo systemctl start rquant-backup.service
 journalctl -u rquant-backup.service -n 40 --no-pager    # 期望 Result=success，无超时
 tail -5 /home/lighthouse/rquant/logs/backup-snapshot.log
 ls -lA /home/lighthouse/rquant/backup/                  # 期望没有新的 .latest.* 残留
+df -h /home/lighthouse                                  # 记一下清扫前后的可用空间
 ```
 
-### 5. 68 GB 孤儿文件是**另一件事**
+### 5. 回滚（**不要动生产 checkout 的工作区**）
 
-`backup/` 里 2026-08-03..05 留下的 `.latest.duckdb.<pid>` / `.latest.duckdb.<pid>.gz`
-共约 68 GB（磁盘 120 GB，只剩 16–18 GB）。**本次改动不删它们**：新脚本的开头清扫只在**下一次
-备份运行时**才会碰到这些文件，而清理 68 GB 是一次单独的、需要 owner 明确点头的生产操作。
-装完之后如果 owner 还没点头，请留意第一次备份运行会把它们一次性扫掉（它们都远超 1 天），
-所以**要么先取得授权、要么在装之前把这批文件挪走留证**。删除前建议先记一份清单：
+受控发布器只接受干净的 tracked worktree，所以**回滚不能用 `git checkout <tag> -- deploy/systemd`**
+——那会把工作区弄脏，挡住后续所有自动发布。从第 2 步备份的目录复制回去：
 
 ```bash
-ls -lA /home/lighthouse/rquant/backup/.latest.* > /home/lighthouse/orphans-20260908.txt
-du -ch /home/lighthouse/rquant/backup/.latest.* | tail -1
-```
-
-### 回滚
-
-```bash
-cd /home/lighthouse/rquant && git checkout <上一个 tag> -- deploy/systemd
-sudo cp deploy/systemd/rquant-backup.{service,timer} deploy/systemd/rquant-{live,serving,maintenance}.slice \
-        /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl restart rquant-backup.timer
-sudo systemctl set-property --runtime rquant-live.slice CPUQuota=
+backup_dir=/home/lighthouse/rquant-units-backup-<你在第 2 步记下的时间戳>
+sudo cp -a "${backup_dir}"/. /etc/systemd/system/
+sudo rm -f /etc/systemd/system/rquant-live-runtime.slice   # 新文件，回滚时删掉
+sudo systemctl daemon-reload
+sudo systemctl restart rquant-backup.timer
 sudo systemctl set-property --runtime rquant-serving.slice CPUQuota=
 sudo systemctl set-property --runtime rquant-maintenance.slice CPUWeight=50
+git -C /home/lighthouse/rquant status --porcelain          # 必须是空的
 ```
 
-`CPUQuota=`（空值）就是取消限额。脚本改动（trap 与开头清扫）没有生产状态，回滚即回滚代码。
+`CPUQuota=`（空值）就是取消限额。已经在 `rquant-live-runtime.slice` 里跑着的 role 实例会在
+下次重启时回到 `rquant-live.slice`；盘中不要为回滚重启它们。脚本改动（trap、开头清扫、
+`nice`/`ionice`）没有生产状态，回滚即回滚代码。
 
 ---
 
