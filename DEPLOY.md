@@ -456,8 +456,9 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 的实测就地订正过；第 29 条来自 #218 的修复包（recovery 凭证的生成器），第 28 条原本也是
 （#220 的启动顺序），2026-09-08 已被 #231/#232/#220 的修复包整条改写；第 30、31 两条来自
 #227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）；第 32 条来自 #230，
-也就是 #215 的第三处断点（凭证的投递形状）。
-下面三十二条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+也就是 #215 的第三处断点（凭证的投递形状）；第 33 条来自 #237，也就是「v0.33.2 装不上第三代」
+这件事本身。
+下面三十三条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -900,7 +901,37 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     这一条**不改 `PRODUCTION_ROLE_POLICY`**，所以上一节那份角色策略摘要
     （`681151cb…`）与由它推出的换代要求不受影响，**没有新增换代理由**。
 
-### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，以及修 #218 时查出来的 #220；末列写「已修」的条目已修，其余不修）
+33. **v0.33.2 不要装在第三代之上；第五窗口直接以 v0.33.3 装第四代**（#237）。2026-09-08 在
+    第三代（producer_commit `a0bbb4c`，也就是 v0.33.1）上跑 `rquant runtime-deployment-profile`，
+    dry-run 与 `--apply` 都抛 `RuntimeSchemaCompatibilityError: new producer -> old consumer
+    is incompatible on runtime.serving.runtime-health for serving.publisher.v1`，
+    `runtime.serving.runtime-health` 这条 channel 的九个字段全部报「同一版本内出现语义变更」，
+    而这九个字段没有一个被人动过（变的是被内嵌的心跳文件模型，报错为什么指错地方见 #238）。
+
+    **直接在第三代上装 v0.33.3**：`bash scripts/deploy-production.sh --target v0.33.3`。
+    v0.33.3 发布到 `runtime.serving.runtime-health` 的声明是**逐字段还原**的 v0.33.1 那一份，
+    九个哈希与第三代逐个相同、序列化后的健康载荷与 v0.33.1 逐字节相同（都已实测），
+    **所以服务健康这条 channel 不需要 rollout 计划、也不需要消费者回执**——第 30 条那趟
+    acknowledge 的计划清单里不会多出它。
+
+    **回滚目标是 v0.33.1，不要回滚到 v0.33.2**：v0.33.2 装不上第三代，也就不存在任何一代是
+    由它装出来的。回滚本身仍按第 21 条先把已停实例的旧心跳文件移走。
+
+    **快照的刷新责任在集成者**：`tests/fixtures/runtime-schema-contracts/` 下的那份
+    `schema-contracts.json` **在每个发布 tag 上刷新一次**，节奏与 `tests/manifests/full-suite-v1`
+    的全集清单一致；放进去的必须是那一刻**生产上实际装着**的那一代的
+    `<runtime_root>/current/schema-contracts.json`，不是本地生成的 bundle。现在入库的
+    `v0.33.1.json` 就是生产第三代的原件（producer_commit `a0bbb4c`、21 条 channel）。
+    文件按它对应的 tag 命名，旧的那份可以删——闸门只读一份。规则同时写在 `tests/README.md`。
+    装上 v0.33.3 之后，下一次刷新放的是 v0.33.3 那一代的文件；由于这条 channel 的九个哈希不变，
+    那次刷新不会改变闸门的判定。
+
+    `waiting_for` / `waiting_since` / `waited_seconds` 三个字段仍然**只在心跳文件里**，
+    runbook 里用 jq 读心跳文件的探针照常工作（第 28 条的三条判据不受影响）；要让它们出现在
+    `rquant runtime-health` 这类经由服务健康载荷的路径上，必须给这条 channel 升
+    `schema_version` 并走完整 rollout，见 #239。
+
+### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -919,6 +950,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #217 | research 平面四个角色（`lab_artifact_catalog` / `promotions_publisher` / `shadow_session` / `lab_jobs_publisher`）启动即 `FAIL research blocked: high-water evidence unavailable or invalid: /var/lib/rquant/workload-isolation/high-water.json` 并退 0。这是 workload arbiter 的资源门，不是崩溃，但这份高水位证据由谁产出、什么时候产出，仓库里没有答案 | 判据按「已启动、被门挡住」记，不计入持续运行数（前置第 27 条）。要让 research 平面真跑起来，得先定这份文件的产生者，本轮不做 |
 | #218 | completion signer / router / broker / recovery 这一串起不来：`strategy_live` ×3 报 `completion signer profile contains invalid manifests`；`signal_router` 缺 runner source，`paper_broker` 与 `notifier` 缺 route spool（依赖 `strategy_live` → `runner.sqlite3` → router → spool 这条链）；`runtime_recovery` 与 `rehearsal` 报 `profile generation is stale` | **已修（PR「fix(runtime): unlock the live strategy chain and recovery units under route A」）**：A 完成签名器改成先 `model_dump(mode="json")` 再重验（冻结过的 manifest 不再被自己的 `JsonValue` 断言拒掉）；B 两个 recovery oneshot 改核自己命名空间里的 `recovery_profile_generation`，权威链那道绑定另走 `resolve_legacy_schema_generation`，两者都不给的调用方被拒；C 新增 `scripts/provision_runtime_recovery_credentials.py` 产出那两份从来没有生产者的文档（前置第 29 条）。router / broker / notifier 那条链不是单独的缺陷，是启动顺序，见 #220 与前置第 28 条（那条互等已由 #231/#232/#220 那一包修掉） |
 | #220 | live 平面的启动顺序是代码层的循环依赖：`strategy_live` 要读 `live/signal-bus/signal_bus.sqlite3`，只有 `signal_router` 会建它，而 `signal_router` 又先要求三份 `live/strategies/*/runner.sqlite3` | **已修（PR「fix(runtime): let the live strategy chain start idle under the sandbox」，与 #231、#232 同一包）**：`strategy_live` 一启动就建自己的 `runner.sqlite3`、`signal_router` 一启动就建 bus 与 spool，缺对端制品的一方在主循环里等而不是退出，两个方向都能起。原来那条「起一轮失败留下 runner 数据库」的绕过法作废，前置第 28 条已整条改写；代价是等对端时只有 DEGRADED 没有告警（阈值见 #235） |
+| #238 | `_field_schema_hashes` 给每个字段算哈希时把载荷**整个 `$defs`** 一起算进去，所以任何一个被内嵌的嵌套模型多一个字段，这条 channel 每个字段的哈希都会跟着变；报错却逐字段说「type changed / semantic meaning changed」，指向的是一个都没被改过的字段，真正的变更点（哪个嵌套模型、哪个字段）在消息里一个字都没有 | 不修。#237 的冻结投影只挡住 `runtime.serving.runtime-health` 这一条 channel；另外 20 条里凡是内嵌了「不是为发布而写」的模型的（`ServingProjectionPayload` 6 条、`BatchQualityStatus` 5 条、`LiveChannel` 5 条、`JsonValue` 4 条），同样的形状仍可能再来一次。跨版本快照闸会在装机前把这类改动拦在 CI 里，装机时按前置第 33 条处理 |
+| #239 | #231 给心跳文件模型加的 `waiting_for` / `waiting_since` / `waited_seconds` 只在心跳文件里，`rquant runtime-health` 这类经服务健康载荷的路径看不到 | 不修。冻结投影上多一个字段就会让九个哈希全变，等于重演 #237；要发布这三个字段必须给 `runtime.serving.runtime-health` 升 `schema_version` 并走完整 rollout（PREPARE → 生产者承认 → DUAL_WRITE → 消费者回执 → CUTOVER），且在那次装机窗口里刷新跨版本快照。本轮照旧用 runbook 的 jq 探针直接读心跳文件 |
 
 ### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
 

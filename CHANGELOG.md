@@ -89,7 +89,7 @@
   原因是这条 channel 的载荷 `RuntimeHealthPayload` 直接内嵌了心跳文件模型
   `RuntimeServiceHeartbeat`：`_field_schema_hashes` 给每个字段算哈希时，把载荷**整个
   `$defs`** 一起算进去，所以任何一个被内嵌的嵌套模型多一个字段，这条 channel 的每个字段哈希
-  都会变。上一个包给心跳加了 `waiting_for` / `waiting_since` / `waited_seconds` 三个字段
+  都会变，报错也因此逐字段指向一个都没被改过的字段（这个误伤面与误导性报错另立 #238）。上一个包给心跳加了 `waiting_for` / `waiting_since` / `waited_seconds` 三个字段
   （#231），于是九个哈希一起动，而 `schema_version` 仍然是 1——兼容闸按约定拒绝安装。
 
   现在服务侧发布的是**冻结投影** `RuntimeServiceHeartbeatProjection`：字段集就是 v0.33.1 的
@@ -101,7 +101,10 @@
   已经发布的契约），这就是那层命名空间类的用途。
 
   三个 waiting 字段**留在心跳文件模型里**，runbook 里用 jq 读心跳文件的探针照常工作。
-  要把它们发布到服务健康载荷上，必须真正给这条 channel 升版本并走一遍 rollout，不在本次范围内。
+  要把它们发布到服务健康载荷上，必须真正给这条 channel 升版本并走一遍 rollout，不在本次范围内（#239）。
+
+  **运维后果**：v0.33.2 不可安装到比它旧的任何一代之上，改发 v0.33.3；第三代（v0.33.1）上
+  直接装 v0.33.3，回滚目标是 v0.33.1 而不是 v0.33.2。装机口径见 DEPLOY.md 路线 A 前置第 33 条。
 
 - **live 平面四个 role 在盘外空闲时全部起不来，一夜推了 10 条告警（#231、#232、#220）**：
   2026-09-08 路线 A 第三窗口（v0.33.1、权威链 seq 2）的主机上没有任何行情、没有任何信号，
