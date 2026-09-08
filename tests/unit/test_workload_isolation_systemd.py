@@ -510,10 +510,22 @@ def _write_slice_cgroup(
         (path / "cpu.max").write_text("100000 100000\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize("interim", [False, True], ids=["after-restart", "interim"])
 def test_runtime_enumerates_instances_and_uses_resolved_control_groups(
     tmp_path: Path,
     monkeypatch,
+    interim: bool,
 ) -> None:
+    """`interim` is the state between installing the units and restarting the instances.
+
+    `Slice=` is fixed when a unit starts, so a role instance that has not been restarted
+    still reports `rquant-live.slice` while the unit file already names the child slice.
+    The check must stay red there - it is called from verify-workload-isolation.sh,
+    preflight.run_all_checks and health.get_workload_isolation_snapshot, and a green
+    answer would let a release install against a plane that is not actually isolated
+    (#243 review D-1) - and it must name the remedy.
+    """
+
     from rquant.workload_isolation import (
         PARENT_SLICE_LIMITS,
         WORKLOAD_SLICE_LIMITS,
@@ -538,9 +550,13 @@ def test_runtime_enumerates_instances_and_uses_resolved_control_groups(
             "/rquant.slice/rquant-live.slice/rquant-monitor.service",
         ),
         "rquant-runtime-feature@svc-live.service": (
-            "rquant-live-runtime.slice",
-            "/rquant.slice/rquant-live.slice/rquant-live-runtime.slice"
-            "/rquant-runtime-feature@svc-live.service",
+            "rquant-live.slice" if interim else "rquant-live-runtime.slice",
+            (
+                "/rquant.slice/rquant-live.slice/rquant-runtime-feature@svc-live.service"
+                if interim
+                else "/rquant.slice/rquant-live.slice/rquant-live-runtime.slice"
+                "/rquant-runtime-feature@svc-live.service"
+            ),
         ),
         "rquant-runtime-lab-jobs@svc-lab.service": (
             "rquant-research.slice",
@@ -606,6 +622,14 @@ def test_runtime_enumerates_instances_and_uses_resolved_control_groups(
         arbiter_expected_uid=os.getuid(),
     )
 
+    if interim:
+        assert result.status == "fail"
+        assert any(
+            "restart rquant-runtime-feature@svc-live.service to move it into "
+            "rquant-live-runtime.slice" in detail
+            for detail in result.details
+        ), result.details
+        return
     assert result.status == "ok", result.details
     assert any("list-units" in call for call in calls)
     queried = {call[2] for call in calls if len(call) > 2 and call[1] == "show"}

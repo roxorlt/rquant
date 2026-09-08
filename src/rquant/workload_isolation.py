@@ -759,9 +759,14 @@ def check_workload_runtime(
         if properties.get("LoadState") != "loaded":
             record_unit_issue(unit, f"LoadState={properties.get('LoadState')!r}")
         if properties.get("Slice") != expected_slice:
+            # `Slice=` is fixed when the unit starts, so a unit file that moved a service
+            # into another slice only takes effect on the next start. Name the remedy:
+            # this is the one failure an operator resolves by restarting the unit, and the
+            # check stays fail-closed while any instance is still in the old slice (#243).
             record_unit_issue(
                 unit,
-                f"Slice={properties.get('Slice')!r}, expected {expected_slice!r}",
+                f"Slice={properties.get('Slice')!r}, expected {expected_slice!r}; "
+                f"restart {unit} to move it into {expected_slice}",
             )
         resolved_exec = properties.get("ExecStart", "")
         if expected_slice in {"rquant-research.slice", "rquant-maintenance.slice"}:

@@ -33,9 +33,35 @@ owner 单独明确授权的高风险变更。
 15 分钟 → 15 + 8.83 = 23.8min = **1430s，留 370s（21%）余量**。盘中触发 84 次/天 → **28 次/天**，
 gzip 占空比 100% → 59%。
 
-### 0. 装之前必须先定的两件事（**顺序不能反**）
+### 0. 装之前必须满足的三个前提（**顺序不能反**）
 
-1. **owner 就 `backup/` 里那 68 GB 孤儿表态**。新脚本开头会清扫 `backup/` 下 mtime 超过 1 天的
+1. **不能有任何运行时 role 实例是 active 的**——这是硬前提，不是建议：
+
+   ```bash
+   systemctl list-units 'rquant-runtime-*' --state=active --no-legend    # 必须是空的
+   ```
+
+   非空就先停掉再装（本机的运维约定 R-25 本来就是「安装窗口之外所有 role 实例保持停止」，
+   所以正常情况下这一条是自动满足的）。
+
+   **为什么是硬前提**：`Slice=` 在 unit **启动时**就定死了，改文件加 `daemon-reload`
+   **不会**把已经在跑的实例搬进新 slice。只要还有一个 role 实例停在
+   `rquant-live.slice`，`check_workload_runtime` 每个这样的实例会报 **3 条硬错误**
+   （`Slice=... expected 'rquant-live-runtime.slice'` / `ControlGroup ... expected
+   descendant of resolved None` / `rquant-live-runtime.slice: active but ControlGroup is
+   unresolved`），于是：
+
+   - `scripts/verify-workload-isolation.sh` 红；
+   - **`rquant preflight` 的 `workload_runtime` 红**，受控发布器的双 preflight 会**挡住所有
+     自动发布**，直到每个实例都重启过；
+   - `rquant health` 的 workload 快照也报 fail。
+
+   **这是设计如此（fail closed），不是可以忽略的软告警**：验证器不会被放松，因为一个「绿」
+   会让发布装到一个实际上没有被隔离的工作面上。错误文案里已经点名补救办法
+   （`restart <unit> to move it into rquant-live-runtime.slice`）。
+   照第 0 步做就根本不会进入这个中间态。
+
+2. **owner 就 `backup/` 里那 68 GB 孤儿表态**。新脚本开头会清扫 `backup/` 下 mtime 超过 1 天的
    `.latest.duckdb.*` / `.latest.json.*`，2026-08-03..05 那批 `.latest.duckdb.<pid>`(.gz)
    **两个条件都满足，第一次运行就会被一次性删光**。所以要么先拿到清理授权，要么装之前先把这批
    文件挪走留证：
@@ -51,7 +77,7 @@ gzip 占空比 100% → 59%。
    ```
 
    **在这一步有结论之前不要装 `scripts/backup-snapshot.sh`，也不要手工跑 backup.service。**
-2. **确认磁盘调度器**，决定 `ionice` 用哪一档：
+3. **确认磁盘调度器**，决定 `ionice` 用哪一档：
 
    ```bash
    cat /sys/block/vda/queue/scheduler
@@ -102,10 +128,16 @@ sudo systemctl restart rquant-backup.timer      # timer 必须重启才按新 ca
 systemctl list-timers rquant-backup.timer       # 下一次触发应落在 :00/:15/:30/:45
 ```
 
-**运行时 role 实例不需要（也不应该）为此重启**：`Slice=` 是启动时决定的，已经在跑的
-`rquant-runtime-*@svc-*.service` 会**留在 `rquant-live.slice` 里直到它们下次重启**。
-这个中间态是安全的——`rquant-live.slice` 本身没有 quota，所以那些实例的行为跟今天完全一样；
-等 Release A 下一次重启它们时自然落进 `rquant-live-runtime.slice`。**不要在盘中重启它们。**
+**关于运行时 role 实例**：`Slice=` 是启动时决定的，所以第 0 步要求它们全部处于停止状态——
+按顺序做的话，装完 unit 文件之后它们下一次启动就直接落进 `rquant-live-runtime.slice`，
+不存在中间态。
+
+如果因为任何原因在**还有实例在跑**的时候装了（不该发生），那么在把每个实例都重启一遍之前，
+`verify-workload-isolation.sh` 与 `rquant preflight` 必然是红的，**期间不得执行任何自动发布**
+（受控发布器的双 preflight 本来也会挡住）。判断依据：错误里只出现
+`Slice=... expected 'rquant-live-runtime.slice'; restart ... to move it into ...` 与
+`active but ControlGroup is unresolved` 这两类，才是这个中间态；出现别的错误说明是真故障。
+**无论如何都不要在盘中（09:25–15:00）重启 role 实例**，等盘后窗口。
 
 ### 3. slice 改动怎么对**已经在跑**的 unit 生效（重点）
 
