@@ -151,6 +151,55 @@
 
 ### Fixed
 
+- **候选库的发布锁改由发布者在构建时创建，两个 source role 不再把「还没发布过的库」当成损坏（#254）**：
+  第七个 Route A 窗口里 `market-minute.source.v1` 与 `watchlist-quote.source.v1` 每一轮都
+  DEGRADED，报 `auction_gap@1: snapshot authority is damaged: strategy candidate snapshot
+  lock is missing or unsafe`，整条 live 链停在它们后面。**读者这一侧一个字都没改过**：
+  `_locked` 与 `read_strategy_as_of` 在 v0.33.4 与 v0.33.5 之间逐字节相同（`git diff` 可验），
+  它们从这个库诞生那天起就要在 `.publish.lock` 上加共享锁。变的是**谁创建这个文件**：
+  安装器 `_ensure_owned_descendant` 会给每个候选发布者建出 0700 的
+  `live/candidates/<instance>/` 但里面什么都不放，而这个锁此前**只有一次真正的发布**才会创建；
+  包 N 加的那个构建期重绑对**没有 `authority.json` 的库直接提前 return**，正好绕过了创建锁的那
+  一步。于是「发布者还没发布过」的库对每一个读者都是「已损坏」。现在发布者在**构建时**创建并
+  校验自己的锁（`StrategyCandidateSnapshotSpool.initialize_publisher_root`），与策略在任何人读
+  之前就建好 `runner.sqlite3` 是同一条规矩（#232）。**校验一条都没放宽**：锁必须是本人所有、
+  单链接、0600 的普通文件，根必须是本人所有的 0700 目录，否则照旧拒绝。
+
+- **serving 发布者接住上一代写下的 signals 权威 current pointer（#253）**：
+  `serving.publisher.v1` 每一轮报 `ServingSourceAuthorityIntegrityError: current pointer
+  producer_commit does not match expected commit`。这个 `current.json` 归 notifier 所有，
+  发布一次新版本之后 notifier 还没再发布过，指针上带的仍是**上一代的 producer_commit**——
+  这是每次发布的必经状态，不是损坏（#248 的第五种形状）。serving 侧**改不了这个指针**：
+  `deploy/systemd/rquant-runtime-serving@.service` 把 `control/` 与 `live/notifications/`
+  都挂成只读。所以读者按血统规则**接住**它：指针上的 commit 若是本 runtime root 里我们自己
+  某一前代装过的（`runtime_generation_lineage.producer_commit_lineage`，第五种形状），就用那个
+  commit 自洽地校验指针与它的不可变文档——与历史发布分支早就在做的事完全一样；血统不认识的
+  commit 照旧拒绝。指针由它的所有者在下一次发布时改写，心跳里记一条
+  `serving source authority <dataset>: current pointer of generation <代> carried across`。
+
+- **策略把「broker 没在跑」当成等待，不再当成台账损坏（#252）**：
+  先起三个 `rquant-runtime-strategy@` 再起 `rquant-runtime-paper-broker@`，其中两个在构造期
+  就以 `sqlite3.OperationalError: unable to open database file` 退出 1，`Restart=` 反复拉起，
+  `OnFailure` 推了 **3 条真实告警**。`broker.sqlite3` 是 WAL 库：broker 在跑时它自己的连接把
+  `-wal`/`-shm` 留在旁边，只读打开就能成功；broker 干净停止后 SQLite 把两个 sidecar 都删了，
+  而策略的 unit 把 `live/paper-brokers/` 挂成只读，只读打开一个 WAL 库需要**创建** `-shm`，
+  创建不了。这个状态是「所有者没在跑」，与文件不存在是同一件事，现在按
+  `PeerArtifactUnavailableError` 延后到后面的轮次（#232、#248）。**只有这一种精确形状会等**：
+  文件头必须真的是 SQLite 的、必须真的写着 WAL、两个 sidecar 必须真的都不在、目录必须真的
+  写不了；文件头被截断或改坏、少表、schema 不是 v5、或者在一个**能写**的目录里打开失败，
+  全部照旧 `PaperLifecycleIntegrityError` 拒绝。
+
+- **DuckDB 拒绝描述符路径时不再往库旁边打硬链接（#255）**：
+  `notifier.admin.shadow.v1` 每一轮报 `projection database ... cannot be pinned: this engine
+  refused the descriptor /proc/self/fd/6, and linking it inside ... failed (errno 30 EROFS)`。
+  包 L 只假设 macOS 的 DuckDB 会拒绝描述符路径，为这种引擎留了「在库旁边打硬链接」的分支；
+  生产主机（Linux）上的 DuckDB **同样拒绝**，而那个目录对这个 unit 是只读的。硬链接这个分支
+  已经删掉，换成两条：能拷贝时把这一代**拷进读者自己的 control root**（notifier 是
+  `live/notifications/%i`，它本来就在写的唯一目录），拷贝前后比对 fstat 身份与大小；
+  超过 `_MAX_PINNED_COPY_BYTES`（256 MiB）时**就地读、不钉代**，读完由 `__exit__` 既有的
+  身份比对负责把「读的过程中被换掉」报出来。主机上那份只读副本约 10 GB，比上限大两个数量级，
+  所以走的就是就地读这条——这也正是它存在的理由。**库自己的目录一个字节都不会被写**。
+
 - **换代之后不再需要人工把任何状态挪到一边（#248、#249）**：**这次发布之后，换代不需要移走任何状态**。
   两件会改变盘上东西的事先说：**每个 role 最多保留 2 代归档，更旧的在下一次轮换时被删掉**
   （策略的 `.archived` runner 库、路由台账里的 `#rotated-` 行与它的回执、候选根下的
