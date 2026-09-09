@@ -26,6 +26,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -365,3 +366,55 @@ def test_the_generator_refuses_the_primary_duckdb_unconditionally(tmp_path: Path
 
     with pytest.raises(generator.GeneratorError, match="refusing to open the primary"):
         generator.read_sse_calendar(tmp_path / "rquant.duckdb")
+
+
+# ---------------------------------------------------------------------------------------
+# Ruling 24.3: open, read, close inside one iteration — never held across a replacement
+# ---------------------------------------------------------------------------------------
+
+
+def _replica_with(path: Path, *, volume: float, trade_dates: tuple[Any, ...]) -> None:
+    import duckdb
+
+    if path.exists():
+        path.unlink()
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            "CREATE TABLE daily_bar(ts_code VARCHAR, trade_date DATE, vol DOUBLE)"
+        )
+        connection.executemany(
+            "INSERT INTO daily_bar VALUES (?, ?, ?)",
+            [("300001.SZ", trade_date, volume) for trade_date in trade_dates],
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    path.chmod(0o644)
+
+
+def test_the_auction_gap_reader_reopens_the_replica_on_every_read(tmp_path: Path) -> None:
+    """The replica is replaced by `mv` every five minutes; a held connection would miss it.
+
+    Two reads with an atomic replacement between them return the two files' contents, which
+    only a reader that opened and closed inside each read can do.
+    """
+
+    from datetime import date
+
+    from rquant.auction_gap_candidate_input import _daily_volume_rows
+
+    dates = (date(2026, 8, 10),)
+    replica = tmp_path / "rquant_ro.duckdb"
+    _replica_with(replica, volume=1_000.0, trade_dates=dates)
+
+    first, _first_at = _daily_volume_rows(replica, ts_codes=("300001.SZ",), trade_dates=dates)
+
+    staging = tmp_path / "rquant_ro.duckdb.tmp"
+    _replica_with(staging, volume=2_000.0, trade_dates=dates)
+    os.replace(staging, replica)
+
+    second, _second_at = _daily_volume_rows(replica, ts_codes=("300001.SZ",), trade_dates=dates)
+
+    assert [row[2] for row in first] == [1_000.0]
+    assert [row[2] for row in second] == [2_000.0]
