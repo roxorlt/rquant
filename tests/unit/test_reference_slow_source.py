@@ -4,6 +4,7 @@ import base64
 import inspect
 import os
 import subprocess
+import tempfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import duckdb
 import pandas as pd
 import pytest
 
+import rquant.readside_replica_gate as readside_replica_gate
 import rquant.reference_slow_source as reference_slow_source_module
 from rquant.reference_slow_source import (
     ReferenceAdjustmentSourceFact,
@@ -184,91 +186,166 @@ def _source_limits(**overrides: object):
     return reference_slow_source_module.ReferenceSlowSourceLimits(**values)
 
 
-def test_verified_snapshot_enforces_size_and_free_space_headroom(
+def _engine_accepts_the_descriptor_path(tmp_path: Path) -> bool:
+    """Whether this platform's duckdb opens `/proc/self/fd/<n>` -- Linux yes, macOS no."""
+
+    probe_directory = tmp_path / "probe"
+    probe_directory.mkdir(exist_ok=True)
+    descriptor = os.open(_database(probe_directory), os.O_RDONLY)
+    try:
+        reopen = readside_replica_gate.descriptor_reopen_path(descriptor)
+        if reopen is None:
+            return False
+        try:
+            duckdb.connect(reopen, read_only=True).close()
+        except Exception:  # noqa: BLE001 - the answer is exactly "it refused"
+            return False
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def test_the_read_takes_the_pinned_descriptor_where_the_engine_accepts_it(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """#256: on the production host nothing is copied, and the copy is only the fallback.
+
+    Both outcomes are asserted rather than one of them skipped: the engine either accepts
+    the descriptor path -- Linux, the runtime host -- and the read pins the inode and
+    copies nothing, or it refuses it and the read falls back to the private copy this
+    function still keeps for small databases.
+    """
+
+    database = _database(tmp_path)
+    pinned = _engine_accepts_the_descriptor_path(tmp_path)
+
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as opened:
+        assert opened.opened_through == ("descriptor" if pinned else "copy")
+        if pinned:
+            assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
+        assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+
+
+def test_a_generation_over_the_copy_budget_is_read_in_place_and_copied_nowhere(
+    tmp_path: Path,
+) -> None:
+    """The production replica is about 10 GB against an 8 GiB budget (package P MF-2).
+
+    Before this package that combination was `exceeds maximum byte budget` on every
+    iteration. Now the budget only decides whether a copy is worth taking, and a
+    generation over it is read where it lies -- with no copy in the temporary directory
+    while the read is in flight.
+    """
+
     database = _database(tmp_path)
     size = database.stat().st_size
 
-    with (
-        pytest.raises(ReferenceSlowSourceError, match="maximum byte budget"),
-        reference_slow_source_module._verified_database_snapshot(
-            database,
-            limits=_source_limits(snapshot_max_bytes=size - 1),
-            monotonic_deadline=10.0,
-            monotonic_clock=lambda: 0.0,
-        ),
-    ):
-        pass
-
-    monkeypatch.setattr(
-        reference_slow_source_module.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=size * 2, used=size, free=size),
-    )
-    with (
-        pytest.raises(ReferenceSlowSourceError, match="free-space headroom"),
-        reference_slow_source_module._verified_database_snapshot(
-            database,
-            limits=_source_limits(snapshot_min_free_bytes=1),
-            monotonic_deadline=10.0,
-            monotonic_clock=lambda: 0.0,
-        ),
-    ):
-        pass
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(snapshot_max_bytes=size - 1),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as opened:
+        assert opened.opened_through in {"descriptor", "in_place"}
+        assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
+        assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
 
 
-def test_verified_snapshot_enforces_monotonic_copy_deadline(
-    tmp_path: Path,
-) -> None:
-    database = _database(tmp_path)
-    ticks = iter((0.0, 0.5, 1.01))
-
-    with (
-        pytest.raises(ReferenceSlowSourceError, match="copy deadline"),
-        reference_slow_source_module._verified_database_snapshot(
-            database,
-            limits=_source_limits(),
-            monotonic_deadline=1.0,
-            monotonic_clock=lambda: next(ticks),
-        ),
-    ):
-        pass
-
-
-def test_verified_snapshot_rejects_transient_wal_during_copy(
+def test_a_database_over_the_old_copy_budget_is_read_instead_of_refused(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The production replica is about 10 GB and the copy budget was 8 GiB (#256, package P MF-2).
+
+    Both gates the copy needed are gone, and neither can refuse the read any more: a
+    database larger than `snapshot_max_bytes`, on a filesystem with no free space at all.
+    """
+
+    database = _database(tmp_path)
+    size = database.stat().st_size
+    monkeypatch.setattr(
+        reference_slow_source_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=size, used=size, free=0),
+    )
+
+    rows = reference_slow_source_module._load_prior_daily(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        limits=_source_limits(snapshot_max_bytes=size - 1, snapshot_min_free_bytes=size * 4),
+    )
+
+    assert rows == (("300001.SZ", 20.0, 1.0), ("600000.SH", 10.0, 1.0))
+
+
+def test_verified_read_enforces_the_monotonic_deadline_before_it_opens(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+
+    with (
+        pytest.raises(ReferenceSlowSourceError, match="read deadline"),
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=1.0,
+            monotonic_clock=lambda: 1.01,
+        ),
+    ):
+        pass
+
+
+def test_verified_read_rejects_a_transient_wal_during_the_read(
+    tmp_path: Path,
+) -> None:
+    """The WAL that appears and goes while the queries run is still refused.
+
+    The copy loop used to be where this was seen; now there is no loop, so the injection
+    point is the read itself. What catches it is the pair the copy also relied on: the
+    sidecar check after the read, and the database directory's own fingerprint.
+    """
+
     database = _database(tmp_path)
     wal_path = Path(f"{database}.wal")
-    original_read = reference_slow_source_module.os.read
-    injected = False
-
-    def read_with_transient_wal(descriptor: int, size: int) -> bytes:
-        nonlocal injected
-        chunk = original_read(descriptor, size)
-        if chunk and not injected:
-            injected = True
-            wal_path.write_bytes(b"transient")
-            wal_path.unlink()
-        return chunk
-
-    monkeypatch.setattr(reference_slow_source_module.os, "read", read_with_transient_wal)
 
     with (
         pytest.raises(ReferenceSlowSourceError, match="WAL|directory changed"),
-        reference_slow_source_module._verified_database_snapshot(
+        reference_slow_source_module._verified_database_read(
             database,
             limits=_source_limits(),
             monotonic_deadline=100.0,
             monotonic_clock=lambda: 1.0,
         ),
     ):
-        pass
+        wal_path.write_bytes(b"transient")
+        wal_path.unlink()
 
-    assert injected is True
+
+def test_verified_read_rejects_a_database_replaced_under_the_read(
+    tmp_path: Path,
+) -> None:
+    """A `rename()` over the name mid-read is what the replica sync does every five minutes."""
+
+    database = _database(tmp_path)
+    replacement_dir = tmp_path / "next"
+    replacement_dir.mkdir()
+    replacement = _database(replacement_dir)
+
+    with (
+        pytest.raises(ReferenceSlowSourceError, match="changed while reading"),
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ),
+    ):
+        os.replace(replacement, database)
 
 
 def test_prior_daily_query_streams_and_fails_closed_at_row_limit(tmp_path: Path) -> None:

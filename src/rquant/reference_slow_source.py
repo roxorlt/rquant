@@ -10,16 +10,18 @@ import stat
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import Field, field_validator
 
+from rquant.readside_replica_gate import descriptor_reopen_path, is_write_lock_error
 from rquant.reference_slow_publisher import (
     ReferenceDailyFact,
     ReferenceSecurityFact,
@@ -31,6 +33,9 @@ from rquant.security_status import normalize_name
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionPayload
 from rquant.strict_json import canonical_json_bytes
 from rquant.suspension import normalize_suspend_d_snapshot
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import duckdb
 
 _TS_CODE_PATTERN = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -324,14 +329,65 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
+@dataclass(frozen=True, slots=True)
+class _OpenedDatabase:
+    """The connection one verified read got, and which of the three openers gave it."""
+
+    connection: duckdb.DuckDBPyConnection
+    #: `"descriptor"` (the inode is pinned and nothing is copied -- what a Linux runtime
+    #: host gets), `"copy"` (a private byte copy inside this role's own `PrivateTmp`, the
+    #: fallback for an engine that refuses the descriptor path, capped by
+    #: `snapshot_max_bytes`), or `"in_place"` (the name is re-opened; the identity checks
+    #: around the read are what say the generation did not move).
+    opened_through: str
+
+
 @contextmanager
-def _verified_database_snapshot(
+def _verified_database_read(
     database_path: Path,
     *,
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_deadline: float,
     monotonic_clock: Callable[[], float],
-) -> Iterator[Path]:
+) -> Iterator[_OpenedDatabase]:
+    """Read one generation of the read-only replica, without copying 10 GB to do it (#256).
+
+    Until v0.33.6 this copied the whole database into `PrivateTmp` and queried the copy.
+    That was never reached before #250 pointed this source at the replica, and once it was,
+    it could not succeed: the production replica is about 10 GB against a `snapshot_max_bytes`
+    of 8 GiB, so the source was DEGRADED every iteration with
+    `exceeds maximum byte budget` (package P review MF-2) -- and the two iterations that a
+    smaller database *did* let through moved 10 GB through the page cache while the 17:00
+    daily pipeline was trying to scan the main database (#256).
+
+    So the copy is now the *fallback*, not the path. The order is
+    `serving_page_projection_source._StableReadonlyDuckDB`'s, for the reasons written out
+    there:
+
+    1. **the pinned descriptor** -- `duckdb.connect("/proc/self/fd/<n>")` opens the inode
+       this function already validated, so a `rename()` over the name cannot swap the
+       generation under the read, and not one byte is copied. The pinned duckdb 1.5.2
+       accepts this on Linux, which is the production host.
+    2. **a private copy in `PrivateTmp`** -- for an engine that refuses that path (macOS
+       resolves `/dev/fd/<n>` to a name it then cannot open). Bounded exactly as before by
+       `snapshot_max_bytes`, `snapshot_min_free_bytes` and the deadline; safe here because
+       the replica is replaced by `mv` and this function refuses it outright if it has a
+       WAL sidecar, so there is no live writer whose last checkpoint could be served.
+    3. **the database in place** -- when the copy is refused because the generation is
+       larger than the budget or the disk has no headroom. Nothing is pinned, and this
+       does not pretend otherwise: what stands is the identity of the descriptor and of
+       the name, compared before and after the read, exactly as `auction_gap_candidate_input`
+       and the notifier's projection already do against this same file.
+
+    Every check that was here is still here, in the same order and with the same refusals:
+    mode, owner, link count, the open-race identity, the WAL sidecar before and after, the
+    descriptor's and the name's identity after the read, and the database directory's own
+    fingerprint. Only the words "snapshot"/"copy" leave the messages, because for the
+    branch a runtime host takes there is no longer either.
+    """
+
+    import duckdb
+
     limits = ReferenceSlowSourceLimits.model_validate(limits)
     descriptor = -1
     parent_descriptor = -1
@@ -351,8 +407,6 @@ def _verified_database_snapshot(
         _validate_database(opened)
         if _identity(before) != _identity(opened):
             raise ReferenceSlowSourceError("reference source database changed while opening")
-        if opened.st_size > limits.snapshot_max_bytes:
-            raise ReferenceSlowSourceError("reference source database exceeds maximum byte budget")
     except OSError as exc:
         if descriptor >= 0:
             os.close(descriptor)
@@ -367,94 +421,155 @@ def _verified_database_snapshot(
         raise
 
     wal_path = Path(f"{database_path}.wal")
+    connection = None
+    copy_directory = None
     try:
         if wal_path.exists() or wal_path.is_symlink():
             raise ReferenceSlowSourceError("reference source database has an unsealed WAL sidecar")
-        temporary_root = Path(tempfile.gettempdir())
-        free_bytes = shutil.disk_usage(temporary_root).free
-        if free_bytes < opened.st_size + limits.snapshot_min_free_bytes:
-            raise ReferenceSlowSourceError("reference source snapshot lacks free-space headroom")
         if monotonic_clock() > monotonic_deadline:
-            raise ReferenceSlowSourceError("reference source snapshot copy deadline expired")
-        with TemporaryDirectory(prefix="rquant-reference-source-") as temporary_directory:
-            temporary_path = Path(temporary_directory)
-            temporary_path.chmod(0o700)
-            snapshot_path = temporary_path / "evidence.duckdb"
-            snapshot_descriptor = os.open(
-                snapshot_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            copied = 0
+            raise ReferenceSlowSourceError("reference source read deadline expired")
+        opened_through = "in_place"
+        reopen = descriptor_reopen_path(descriptor)
+        if reopen is not None:
             try:
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                while True:
-                    if monotonic_clock() > monotonic_deadline:
-                        raise ReferenceSlowSourceError(
-                            "reference source snapshot copy deadline expired"
-                        )
-                    chunk = os.read(descriptor, 1024 * 1024)
-                    if not chunk:
-                        break
-                    _write_all(snapshot_descriptor, chunk)
-                    copied += len(chunk)
-                os.fsync(snapshot_descriptor)
-                if monotonic_clock() > monotonic_deadline:
+                connection = duckdb.connect(reopen, read_only=True)
+            except Exception as exc:  # noqa: BLE001 - classified, then refused or passed
+                if is_write_lock_error(exc):
                     raise ReferenceSlowSourceError(
-                        "reference source snapshot copy deadline expired"
-                    )
-            finally:
-                os.close(snapshot_descriptor)
-
-            after_copy = os.fstat(descriptor)
-            _validate_database(after_copy)
-            if _identity(opened) != _identity(after_copy) or copied != opened.st_size:
-                raise ReferenceSlowSourceError(
-                    "reference source database changed while snapshotting"
-                )
+                        "reference source database query failed"
+                    ) from exc
+            else:
+                opened_through = "descriptor"
+        if connection is None:
+            copied = _private_copy_of_generation(
+                descriptor,
+                opened,
+                limits=limits,
+                monotonic_deadline=monotonic_deadline,
+                monotonic_clock=monotonic_clock,
+            )
+            if copied is not None:
+                copy_directory, copy_path = copied
+                opened_through = "copy"
+                target: str = str(copy_path)
+            else:
+                target = str(database_path)
             try:
-                current = database_path.lstat()
-            except OSError as exc:
-                raise ReferenceSlowSourceError(
-                    "reference source database changed while snapshotting"
-                ) from exc
-            _validate_database(current)
-            if _identity(opened) != _identity(current):
-                raise ReferenceSlowSourceError(
-                    "reference source database changed while snapshotting"
-                )
-            if wal_path.exists() or wal_path.is_symlink():
-                raise ReferenceSlowSourceError(
-                    "reference source database has an unsealed WAL sidecar"
-                )
-            parent_after = os.fstat(parent_descriptor)
-            if (
-                parent_after.st_dev,
-                parent_after.st_ino,
-                parent_after.st_mtime_ns,
-                parent_after.st_ctime_ns,
-            ) != (
-                parent_before.st_dev,
-                parent_before.st_ino,
-                parent_before.st_mtime_ns,
-                parent_before.st_ctime_ns,
-            ):
-                raise ReferenceSlowSourceError(
-                    "reference source database directory changed while snapshotting"
-                )
-            snapshot = snapshot_path.stat()
-            if (
-                not stat.S_ISREG(snapshot.st_mode)
-                or snapshot.st_uid != os.geteuid()
-                or snapshot.st_nlink != 1
-                or stat.S_IMODE(snapshot.st_mode) != 0o600
-                or snapshot.st_size != copied
-            ):
-                raise ReferenceSlowSourceError("reference source snapshot is unsafe")
-            yield snapshot_path
+                connection = duckdb.connect(target, read_only=True)
+            except duckdb.Error as exc:
+                raise ReferenceSlowSourceError("reference source database query failed") from exc
+        yield _OpenedDatabase(connection=connection, opened_through=opened_through)
+        if monotonic_clock() > monotonic_deadline:
+            raise ReferenceSlowSourceError("reference source read deadline expired")
+
+        after_read = os.fstat(descriptor)
+        #: identity before validity, so that a generation replaced under the read is named
+        #: as that rather than as "must have one hard link" -- an unlinked inode fails the
+        #: link count first, and the link count is not what an operator needs to be told.
+        if _identity(opened) != _identity(after_read):
+            raise ReferenceSlowSourceError("reference source database changed while reading")
+        _validate_database(after_read)
+        try:
+            current = database_path.lstat()
+        except OSError as exc:
+            raise ReferenceSlowSourceError(
+                "reference source database changed while reading"
+            ) from exc
+        if _identity(opened) != _identity(current):
+            raise ReferenceSlowSourceError("reference source database changed while reading")
+        _validate_database(current)
+        if wal_path.exists() or wal_path.is_symlink():
+            raise ReferenceSlowSourceError("reference source database has an unsealed WAL sidecar")
+        parent_after = os.fstat(parent_descriptor)
+        if (
+            parent_after.st_dev,
+            parent_after.st_ino,
+            parent_after.st_mtime_ns,
+            parent_after.st_ctime_ns,
+        ) != (
+            parent_before.st_dev,
+            parent_before.st_ino,
+            parent_before.st_mtime_ns,
+            parent_before.st_ctime_ns,
+        ):
+            raise ReferenceSlowSourceError(
+                "reference source database directory changed while reading"
+            )
     finally:
+        if connection is not None:
+            connection.close()
+        if copy_directory is not None:
+            copy_directory.cleanup()
         os.close(descriptor)
         os.close(parent_descriptor)
+
+
+def _private_copy_of_generation(
+    descriptor: int,
+    opened: os.stat_result,
+    *,
+    limits: ReferenceSlowSourceLimits,
+    monotonic_deadline: float,
+    monotonic_clock: Callable[[], float],
+) -> tuple[TemporaryDirectory[str], Path] | None:
+    """A 0600 byte copy of the pinned inode, or None when it is not worth taking.
+
+    Only reached when the engine refused the descriptor path. `None` -- the generation is
+    larger than `snapshot_max_bytes`, or the temporary filesystem has no headroom -- means
+    "read it where it lies" rather than "refuse", which is the whole of #256: the
+    production replica is 10 GB and must be *read*, not copied and not refused.
+    """
+
+    if opened.st_size > limits.snapshot_max_bytes:
+        return None
+    temporary_root = Path(tempfile.gettempdir())
+    if shutil.disk_usage(temporary_root).free < opened.st_size + limits.snapshot_min_free_bytes:
+        return None
+    if monotonic_clock() > monotonic_deadline:
+        raise ReferenceSlowSourceError("reference source read deadline expired")
+
+    directory = TemporaryDirectory(prefix="rquant-reference-source-")
+    try:
+        temporary_path = Path(directory.name)
+        temporary_path.chmod(0o700)
+        copy_path = temporary_path / "evidence.duckdb"
+        copy_descriptor = os.open(
+            copy_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        copied = 0
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                if monotonic_clock() > monotonic_deadline:
+                    raise ReferenceSlowSourceError("reference source read deadline expired")
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                _write_all(copy_descriptor, chunk)
+                copied += len(chunk)
+            os.fsync(copy_descriptor)
+        finally:
+            os.close(copy_descriptor)
+
+        after_copy = os.fstat(descriptor)
+        _validate_database(after_copy)
+        if _identity(opened) != _identity(after_copy) or copied != opened.st_size:
+            raise ReferenceSlowSourceError("reference source database changed while reading")
+        copy = copy_path.stat()
+        if (
+            not stat.S_ISREG(copy.st_mode)
+            or copy.st_uid != os.geteuid()
+            or copy.st_nlink != 1
+            or stat.S_IMODE(copy.st_mode) != 0o600
+            or copy.st_size != copied
+        ):
+            raise ReferenceSlowSourceError("reference source private copy is unsafe")
+    except BaseException:
+        directory.cleanup()
+        raise
+    return directory, copy_path
 
 
 def _projection_scalar(value: object) -> str | int | float | bool | None:
@@ -495,15 +610,14 @@ def _load_database_reference_evidence(
     normalized: list[tuple[str, float, float]] = []
     response_bytes = 0
     projections: dict[str, tuple[dict[str, str | int | float | bool | None], ...]] = {}
-    with _verified_database_snapshot(
+    with _verified_database_read(
         database_path,
         limits=limits,
         monotonic_deadline=monotonic_deadline,
         monotonic_clock=monotonic_clock,
-    ) as snapshot_path:
-        connection = None
+    ) as opened:
+        connection = opened.connection
         try:
-            connection = duckdb.connect(str(snapshot_path), read_only=True)
             cursor = connection.execute(
                 """
                 SELECT daily.ts_code, daily.close, adjustment.adj_factor
@@ -519,7 +633,7 @@ def _load_database_reference_evidence(
             while True:
                 if monotonic_clock() > monotonic_deadline:
                     raise ReferenceSlowSourceError(
-                        "reference source snapshot query deadline expired"
+                        "reference source read deadline expired"
                     )
                 rows = cursor.fetchmany(limits.query_chunk_rows)
                 if not rows:
@@ -834,9 +948,6 @@ def _load_database_reference_evidence(
                 )
         except duckdb.Error as exc:
             raise ReferenceSlowSourceError("reference source database query failed") from exc
-        finally:
-            if connection is not None:
-                connection.close()
 
     result = tuple(normalized)
     if not result:
