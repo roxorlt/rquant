@@ -339,18 +339,41 @@ def test_verified_read_enforces_the_monotonic_deadline_before_it_opens(
         pass
 
 
-def test_verified_read_rejects_a_transient_wal_during_the_read(
-    tmp_path: Path,
-) -> None:
-    """The WAL that appears and goes while the queries run is still refused.
+def _read_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the by-name branches (private copy, then in place) on any platform."""
 
-    The copy loop used to be where this was seen; now there is no loop, so the injection
-    point is the read itself. What catches it is the pair the copy also relied on: the
-    sidecar check after the read, and the database directory's own fingerprint.
+    monkeypatch.setattr(reference_slow_source_module, "descriptor_reopen_path", lambda _fd: None)
+
+
+def _read_through_a_descriptor(monkeypatch: pytest.MonkeyPatch, database: Path) -> None:
+    """Force the pinned-descriptor branch on any platform.
+
+    The name handed back is the database's own, because macOS's duckdb refuses
+    `/dev/fd/<n>`; what is being exercised is the branch, not the kernel's descriptor
+    directory, and the branch is what ruling 26 keys the directory fingerprint off.
+    """
+
+    monkeypatch.setattr(
+        reference_slow_source_module,
+        "descriptor_reopen_path",
+        lambda _fd: str(database),
+    )
+
+
+def test_a_wal_appearing_and_going_during_a_by_name_read_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read that reaches the database by name is guarded by the directory fingerprint.
+
+    The sidecar checks before and after cannot see a WAL that came and went in between;
+    the directory's own `mtime`/`ctime` can, and on the copy and in-place branches it
+    still does.
     """
 
     database = _database(tmp_path)
     wal_path = Path(f"{database}.wal")
+    _read_by_name(monkeypatch)
 
     with (
         pytest.raises(ReferenceSlowSourceError, match="WAL|directory changed"),
@@ -363,6 +386,65 @@ def test_verified_read_rejects_a_transient_wal_during_the_read(
     ):
         wal_path.write_bytes(b"transient")
         wal_path.unlink()
+
+
+def test_a_sibling_file_in_the_data_directory_fails_a_by_name_read_and_not_a_pinned_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling 26: the directory fingerprint guards the reads that go through the name.
+
+    `scripts/sync-readonly-replica.sh` mutates the data directory four times per run
+    (create `.tmp.$$`, `mv`, `rm -f *.wal`, `mv` the sidecar) and its timer fires at 09:20
+    and 09:25 -- both ends of this source's capture window. A read that holds the pinned
+    inode cannot be misled by that, so it is no longer refused for it; a read that goes
+    through the name still is.
+    """
+
+    database = _database(tmp_path)
+    sibling = database.parent / f"{database.name}.tmp.1"
+
+    def read_while_the_sync_works() -> None:
+        with reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ) as opened:
+            assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+            sibling.write_bytes(b"replica sync staging")
+            sibling.unlink()
+
+    _read_through_a_descriptor(monkeypatch, database)
+    read_while_the_sync_works()
+
+    _read_by_name(monkeypatch)
+    with pytest.raises(ReferenceSlowSourceError, match="directory changed while reading"):
+        read_while_the_sync_works()
+
+
+def test_the_pinned_read_still_refuses_a_generation_that_moved_under_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling 26 drops one guard, not the guarantee: the file's own identity still stands."""
+
+    database = _database(tmp_path)
+    replacement_directory = tmp_path / "next"
+    replacement_directory.mkdir()
+    replacement = _database(replacement_directory)
+    _read_through_a_descriptor(monkeypatch, database)
+
+    with (
+        pytest.raises(ReferenceSlowSourceError, match="changed while reading"),
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ),
+    ):
+        os.replace(replacement, database)
 
 
 def test_verified_read_rejects_a_database_replaced_under_the_read(

@@ -383,11 +383,14 @@ def _verified_database_read(
        the name, compared before and after the read, exactly as `auction_gap_candidate_input`
        and the notifier's projection already do against this same file.
 
-    Every check that was here is still here, in the same order and with the same refusals:
-    mode, owner, link count, the open-race identity, the WAL sidecar before and after, the
-    descriptor's and the name's identity after the read, and the database directory's own
-    fingerprint. Only the words "snapshot"/"copy" leave the messages, because for the
-    branch a runtime host takes there is no longer either.
+    Every check that was here is still here, with the same refusals: mode, owner, link
+    count, the open-race identity, the WAL sidecar before and after, and the descriptor's
+    and the name's identity after the read. Two things moved. The messages say "reading"
+    rather than "snapshotting", because for the branch a runtime host takes there is no
+    snapshot. And the **database directory's fingerprint now guards the two by-name
+    branches only** (ruling 26): a read that holds the inode cannot be misled by another
+    file in the same directory changing, and that directory is where the replica sync
+    works four times a run, twice inside this source's capture window.
     """
 
     import duckdb
@@ -482,21 +485,36 @@ def _verified_database_read(
         _validate_database(current)
         if wal_path.exists() or wal_path.is_symlink():
             raise ReferenceSlowSourceError("reference source database has an unsealed WAL sidecar")
-        parent_after = os.fstat(parent_descriptor)
-        if (
-            parent_after.st_dev,
-            parent_after.st_ino,
-            parent_after.st_mtime_ns,
-            parent_after.st_ctime_ns,
-        ) != (
-            parent_before.st_dev,
-            parent_before.st_ino,
-            parent_before.st_mtime_ns,
-            parent_before.st_ctime_ns,
-        ):
-            raise ReferenceSlowSourceError(
-                "reference source database directory changed while reading"
-            )
+        if opened_through != "descriptor":
+            #: **Ruling 26.** The directory fingerprint is a guard for a read that reaches
+            #: the database *by name*: the private copy and the in-place branch both do,
+            #: so anything that rewrites the directory under them could have changed what
+            #: they are reading. The pinned-descriptor branch does not -- it holds the
+            #: inode this function validated, a `rename()` cannot swap it, and the
+            #: pre/post `fstat` plus the post-read name-identity check already say the
+            #: generation did not move. What the fingerprint adds *there* is a refusal
+            #: whenever anybody touches any other file in the same directory, and that is
+            #: `scripts/sync-readonly-replica.sh` doing its normal job: it mutates
+            #: `data/` four times per run (create `.tmp.$$`, `mv`, `rm -f *.wal`, `mv` the
+            #: sidecar) and its timer fires at 09:20 and 09:25 -- both ends of this
+            #: source's 09:20-09:25 capture window. Keeping it on the pinned path would
+            #: have made the replica sync the most likely cause of a DEGRADED
+            #: reference-slow (package Q review SF-2).
+            parent_after = os.fstat(parent_descriptor)
+            if (
+                parent_after.st_dev,
+                parent_after.st_ino,
+                parent_after.st_mtime_ns,
+                parent_after.st_ctime_ns,
+            ) != (
+                parent_before.st_dev,
+                parent_before.st_ino,
+                parent_before.st_mtime_ns,
+                parent_before.st_ctime_ns,
+            ):
+                raise ReferenceSlowSourceError(
+                    "reference source database directory changed while reading"
+                )
     finally:
         if connection is not None:
             connection.close()
