@@ -685,6 +685,70 @@ def test_the_backoff_is_a_file_field_and_reaches_no_published_payload() -> None:
     assert "failure_kind" not in RuntimeServiceHeartbeatProjection.model_fields
 
 
+def test_the_replica_cost_is_a_file_field_and_reaches_no_published_payload() -> None:
+    """#237's line again, for the two fields #256 adds."""
+
+    assert "replica_opened" in RuntimeServiceHeartbeat.model_fields
+    assert "replica_read_bytes" in RuntimeServiceHeartbeat.model_fields
+    assert "replica_opened" not in RuntimeServiceHeartbeatProjection.model_fields
+    assert "replica_read_bytes" not in RuntimeServiceHeartbeatProjection.model_fields
+
+
+def test_a_successful_iteration_carries_what_it_did_with_the_replica(tmp_path: Path) -> None:
+    """An iteration that opened the database, then one that recognised the generation."""
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        opened = control.record_success(
+            RuntimeStepResult(replica_opened=True, replica_read_bytes=4096)
+        )
+        reused = control.record_success(
+            RuntimeStepResult(replica_opened=False, replica_read_bytes=0)
+        )
+    finally:
+        control.stop(reason="test complete")
+
+    assert (opened.replica_opened, opened.replica_read_bytes) == (True, 4096)
+    assert (reused.replica_opened, reused.replica_read_bytes) == (False, 0)
+
+
+def test_a_role_that_reads_no_replica_reports_nothing_rather_than_zero(
+    tmp_path: Path,
+) -> None:
+    """Twenty-one of the twenty-five roles never open it; "0 bytes" would be a claim."""
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        heartbeat = control.record_success(RuntimeStepResult())
+    finally:
+        control.stop(reason="test complete")
+
+    assert heartbeat.replica_opened is None
+    assert heartbeat.replica_read_bytes is None
+
+
+def test_a_failed_iteration_does_not_keep_the_previous_read_s_numbers(
+    tmp_path: Path,
+) -> None:
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        control.record_success(RuntimeStepResult(replica_opened=True, replica_read_bytes=4096))
+        failed = control.record_failure(RuntimeError("the replica moved under the read"))
+    finally:
+        control.stop(reason="test complete")
+
+    assert failed.replica_opened is None
+    assert failed.replica_read_bytes is None
+
+
+def test_a_negative_read_is_refused() -> None:
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        RuntimeStepResult(replica_opened=True, replica_read_bytes=-1)
+
+
 def test_a_long_wait_is_cut_short_by_a_stop_within_one_poll_slice() -> None:
     """The wait itself, at the 60-second cap, stopped from another thread.
 

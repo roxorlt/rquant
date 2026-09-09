@@ -75,6 +75,10 @@ class RuntimeStepResult(RuntimeContractModel):
     backlog_count: int = Field(default=0, ge=0)
     source_generations: Mapping[str, Sha256] = Field(default_factory=dict)
     degraded_reasons: tuple[str, ...] = ()
+    #: Whether this iteration opened the read-only replica, and what the read cost. `None`
+    #: for a role that does not read it at all, which is 21 of the 25 (#256).
+    replica_opened: bool | None = None
+    replica_read_bytes: int | None = Field(default=None, ge=0)
 
     @field_validator("source_generations")
     @classmethod
@@ -152,6 +156,18 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: `<exception type>` plus the artifact a peer wait names. A different failure resets
     #: the backoff, because a loop that alternates between two faults is not idle.
     failure_kind: str | None = None
+    #: What this iteration did with the 10 GB read-only replica. On 2026-09-08 and
+    #: 2026-09-09 the 17:00 daily pipeline stalled in its `daily_state` stage while these
+    #: roles were running and finished a minute after they were stopped; memory was not
+    #: the constraint (9 GB free), the page cache was -- four roles scanned the replica
+    #: every iteration, the notifier's every two seconds. `replica_opened` is False on an
+    #: iteration that recognised the generation it already read and did not open the
+    #: database at all; `replica_read_bytes` is what this process read from the filesystem
+    #: while the loader ran, from `/proc/self/io` `rchar` where the platform will say and
+    #: `None` where it will not. `None`/`None` for the 21 roles that never read it (#256).
+    #: Both are *file* fields, for the reason `generation_events` gives above.
+    replica_opened: bool | None = None
+    replica_read_bytes: int | None = Field(default=None, ge=0)
 
     @field_validator("failure_kind")
     @classmethod
@@ -640,6 +656,8 @@ class RuntimeServiceControl:
                 waited_seconds=None,
                 failure_backoff_seconds=None,
                 failure_kind=None,
+                replica_opened=result.replica_opened,
+                replica_read_bytes=result.replica_read_bytes,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -665,6 +683,10 @@ class RuntimeServiceControl:
                 last_error=_error_text(error),
                 failure_backoff_seconds=backoff_seconds,
                 failure_kind=failure_kind,
+                #: an iteration that raised did not finish a read, so it has no cost to
+                #: report; the previous iteration's numbers would read as this one's
+                replica_opened=None,
+                replica_read_bytes=None,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
