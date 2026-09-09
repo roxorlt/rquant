@@ -5,6 +5,43 @@
 
 ---
 
+## 2026-09-09 · 待安装 · 第七窗口四缺口（#254 #253 #252 #255）— **装上之后现场仍会红，这是预期**
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**装上之后当场会看到什么**（不写这一条，窗口当天会被误判成装机失败）：
+
+| role | 装之前 | 装之后 |
+|---|---|---|
+| `market-minute.source.v1` / `watchlist-quote.source.v1` | 盘中每轮 `snapshot authority is damaged: … snapshot lock is missing or unsafe` | **盘中仍然每轮红**，换成 `auction_gap@1: required authority has no not_visible snapshot` |
+| `notifier.admin.shadow.v1` | 盘中每轮 `cannot be pinned … errno 30 EROFS` | **盘中仍然每轮红**，换成 DuckDB 的写锁 IOException（现在会照实说是锁） |
+| 三个 `rquant-runtime-strategy@` | 先于 broker 起会退出 1、`Restart=` 循环、推告警 | **可以先于 broker 起**，进主循环等待 |
+| `serving.publisher.v1` | 每轮 `current pointer producer_commit does not match expected commit` | **恢复** |
+
+**为什么前两行还是红的**：`auction_gap` 候选发布器唯一的发布窗口是 **09:26–09:30**
+（`runtime_builder_candidate.py:70-71`），它的输入是**生产主库**，而 `rquant-monitor.timer`
+从 **09:25:00** 起把主库写锁占到收盘——发布窗口整段在写锁窗口里，所以它一代都发布不出来；
+notifier 读的也是主库（`runtime_production_profile.py:1521`）。
+**要恢复 market-minute → paper-constraint → broker → serving 这条链，必须先修 #250**
+（把这几个 role 的输入改到只读副本 `rquant_ro.duckdb`）。
+
+**这次发版当场买到的**：那些失败循环从此**很便宜**——同种完整性失败按 2→4→8→16→**20 秒**退避
+（peer 等待不退避），主机 load 不会再被顶到 11–12，15 分钟备份不会再从 8 分钟变 14 分钟，
+`monitor-watchdog` 不会再被挤到超时；**停这些 unit 不会再超 `TimeoutStopSec`、不会再被 SIGKILL、
+不会再留 `failed`**。
+
+**启动顺序**：`broker → strategy → router` 这条硬顺序**可以撤掉**，**停止也不需要反序**。
+保留一条弱建议：`rquant-runtime-signal-router@` 不要早于 `rquant-runtime-strategy@` 起——
+不是怕失败（router 会按名字等），是避免 router 在策略的只读目录里建 runner 库的 wal-index
+（包 L 记录的 `KNOWN_C_LEVEL_WRITES["signal_router"]`，未修）。
+**副作用一条**：顺序不再影响正确性，但影响收敛速度——不过 peer 等待不退避，所以每条边仍是一个
+interval，不是一个退避。
+
+**回滚**：本包只改 `src/` 与 `tests/`，没有 `deploy/` 改动，按 `scripts/deploy-production.sh`
+的常规回滚（`--target <上一个 tag>`）即可。
+
+---
+
 ## 2026-09-08 · 待安装 · 主机资源包络（#243，owner 裁决 21）
 
 **状态**：**尚未安装**。本条是安装说明，不是部署记录；真正装上去之后请在本条下面补
