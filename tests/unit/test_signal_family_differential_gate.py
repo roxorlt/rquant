@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #246's to PR #247's. It is the merge base of the
+    # main; this one moves it from PR #247's to PR #251's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "7b98e8054532feb16351d3f17f3df11e16eb1c52"
-    assert BASELINE_TREE_SHA == "c51c39936d1db86814a52d0f53beb79ab8203259"
+    assert BASELINE_COMMIT_SHA == "3cdfa22fa23d5103eaaade276cbd937fccf4381b"
+    assert BASELINE_TREE_SHA == "76577fe8af13a56c2d01828f1833109981f0e4c6"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``7b98e80`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``3cdfa22`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1501,14 +1501,16 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # no job, and left that workflow untouched - the refreeze to d2ff3b1 left it out on the
     # plainest reading yet, the host resource envelope topic containing no CI change at all,
     # the refreeze to 64ea140 left it out for that same plainest reason - the sandbox path
-    # gap topic containing no CI change at all - and this refreeze to 7b98e80 leaves it out
-    # once more on the same reading: the generation handover topic changes seventeen modules
-    # under src/rquant/ and one script, adds one integration file and six unit files, marks
-    # nothing ``linux_exact``, adds no job, and does not touch .github/workflows/ci.yml. It
-    # does regenerate the shard manifest, which is a test artifact and not that workflow;
-    # the matrix in it is unchanged at five shards, so the one thing that has ever made this
-    # path true has not happened. That is four refreezes in a row without a flip. A named
-    # path would have flipped truth value nine times in sixteen refreezes: naming one
+    # gap topic containing no CI change at all - the refreeze to 7b98e80 left it out once
+    # more because the generation handover topic added no job, and this refreeze to 3cdfa22
+    # leaves it out on the same reading: the seventh-window gap topic changes eleven modules
+    # under src/rquant/ and no script, adds one integration file and touches one more, edits
+    # seven unit files, marks nothing ``linux_exact``, adds no job, and does not touch
+    # .github/workflows/ci.yml. It does regenerate the shard manifest, which is a test
+    # artifact and not that workflow; the matrix in it is unchanged at five shards, so the
+    # one thing that has ever made this path true has not happened. That is five refreezes
+    # in a row without a flip. A named path would have flipped truth value nine times in
+    # seventeen refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted

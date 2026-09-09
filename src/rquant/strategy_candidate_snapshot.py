@@ -871,6 +871,29 @@ class StrategyCandidateSnapshotSpool:
         ] = OrderedDict()
         self._generation_cache_bytes = 0
 
+    def initialize_publisher_root(self) -> None:
+        """Create the root, `generations/` and `.publish.lock` before the first publish.
+
+        `.publish.lock` is the file every reader of this store takes a shared lock on
+        (`_locked`), and until #254 only a *publish* ever created it: a candidate root
+        that its owner has not yet published into carried no lock, and every reader of it
+        failed closed with `snapshot lock is missing or unsafe`. The two bound roots hid
+        this because package N's re-bind runs at build time and initializes on the way in;
+        the one unbound root returns from the re-bind before that, and its publisher had
+        nothing to publish in the 2026-09-09 window (its input is the production main
+        DuckDB, which `rquant-monitor` write-locks 09:25-15:00), so the lock was never
+        created and the two source readers of it were DEGRADED every iteration.
+
+        Nothing here is a relaxation: `_ensure_lock_file` still refuses a lock that is not
+        a private regular file of ours with one link and mode 0600, and a root that is not
+        a 0700 directory of ours is still refused before that. What changes is only *when*
+        the owner creates its own lock -- at build, like the runner database the strategy
+        creates before anything reads it (#232) -- so a reader never sees a root that is
+        merely young and calls it damaged.
+        """
+
+        self._initialize_for_publish()
+
     def publish_legacy_for_migration(
         self,
         snapshot: StrategyCandidateSnapshot,

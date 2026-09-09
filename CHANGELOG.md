@@ -151,6 +151,89 @@
 
 ### Fixed
 
+- **候选库的发布锁改由发布者在构建时创建，两个 source role 不再把「还没发布过的库」当成损坏（#254）**：
+  第七个 Route A 窗口里 `market-minute.source.v1` 与 `watchlist-quote.source.v1` 每一轮都
+  DEGRADED，报 `auction_gap@1: snapshot authority is damaged: strategy candidate snapshot
+  lock is missing or unsafe`，整条 live 链停在它们后面。**读者这一侧一个字都没改过**：
+  `_locked` 与 `read_strategy_as_of` 在 v0.33.4 与 v0.33.5 之间逐字节相同（`git diff` 可验），
+  它们从这个库诞生那天起就要在 `.publish.lock` 上加共享锁。变的是**谁创建这个文件**：
+  安装器 `_ensure_owned_descendant` 会给每个候选发布者建出 0700 的
+  `live/candidates/<instance>/` 但里面什么都不放，而这个锁**只有一次真正的发布**才会创建。
+  **这不是任何一次发版引入的回归**：`auction_gap` 发布器唯一的发布窗口是 09:26–09:30
+  （`runtime_builder_candidate.py:70-71`），装机以来一代都没发布过，读者从来就会拒它；
+  之前几个窗口看着是好的，只是因为那两个 source role **在盘外根本不读候选库**
+  （`decide_market_session(...).may_fetch_market_minute`），第七个窗口是第一个开在盘中的窗口。
+  现在发布者在**构建时**创建并校验自己的锁
+  （`StrategyCandidateSnapshotSpool.initialize_publisher_root`），与策略在任何人读之前就建好
+  `runner.sqlite3` 是同一条规矩（#232）。**校验一条都没放宽**：锁必须是本人所有、单链接、
+  0600 的普通文件，根必须是本人所有的 0700 目录，否则照旧拒绝。
+  ⚠️ **这次发版不解除 market-minute 链路的阻塞**：根被初始化了但里面一代都没有，而三个候选权威
+  都是 `required`，所以两个 source role 盘中仍然每轮失败，只是错误从「已损坏」变成
+  `required authority has no not_visible snapshot`。`auction_gap` 的发布窗口 09:26–09:30
+  整段落在 `rquant-monitor` 的主库写锁窗口（09:25 起）里，**要等 #250** 把它的输入改到只读副本。
+
+- **失败重复出现时按指数退避，并且停止不再需要 SIGKILL（#254）**：
+  同一天下午（14:00–14:35）的现场证据：两个 source role 每一轮都在同一个完整性错误上失败，
+  而失败路径每次都要把候选库重新走一遍、重新算哈希，循环又没有任何退避——4 vCPU 的主机
+  load 冲到 11–12、system CPU 约 47%，15 分钟一次的备份从 8 分钟变成 14 分钟，生产
+  monitor-watchdog 的 oneshot 超时一次（又一条真实告警推送）。把这两个 role 停掉，两分钟内
+  load 掉回 2.8。而**在这个循环里停 `watchlist-quote` 超过了 `TimeoutStopSec`、被 SIGKILL、
+  unit 留在 `failed`**（再一条推送）。
+  现在：**同一种失败第二次开始退避**，从 interval 翻倍、**上限 20 秒**（画像里最紧的
+  `stale_after_seconds` 是 30，退避就是两次心跳之间的间隔，上限高于它会让一个正按要求做事的
+  role 在健康面上变成 `stale`）；**peer 等待完全不退避**——等 peer 不烧主机，而启动顺序已经
+  不再要求，整条链冷启动的最坏时间就是这些等待之和。换一种失败或者成功一次立刻归零。
+  「同一种」= 异常类型 +（peer 等待时）它等的那个文件路径，**不看错误消息**——
+  消息里带时间戳和序号，每轮都会看着像新的。当前退避秒数与它在数的那种失败写进心跳，
+  **只写文件模型**：serving 发布的是 `RuntimeServiceHeartbeatProjection`，它按自己的
+  `model_fields` 取字段，所以这两个字段一个都不会进已发布 schema（#237），快照闸前后都绿。
+  等待本身按 0.25 秒切片：`Event.set()` 从信号处理器调用时跑在**正在等待的那个线程上**，
+  要拿事件自己的锁才能把消息递过去——这正是停止会晚于 unit 超时的那条路径。切片在退避期间
+  每秒多 4 次唤醒，代价可以忽略，换来的是**停止延迟有上界、且不依赖那条路径**。
+
+- **serving 发布者接住上一代写下的 signals 权威 current pointer（#253）**：
+  `serving.publisher.v1` 每一轮报 `ServingSourceAuthorityIntegrityError: current pointer
+  producer_commit does not match expected commit`。这个 `current.json` 归 notifier 所有，
+  发布一次新版本之后 notifier 还没再发布过，指针上带的仍是**上一代的 producer_commit**——
+  这是每次发布的必经状态，不是损坏（#248 的第五种形状）。serving 侧**改不了这个指针**：
+  `deploy/systemd/rquant-runtime-serving@.service` 把 `control/` 与 `live/notifications/`
+  都挂成只读。所以读者按血统规则**接住**它：指针上的 commit 若是本 runtime root 里我们自己
+  某一前代装过的（`runtime_generation_lineage.producer_commit_lineage`，第五种形状），就用那个
+  commit 自洽地校验指针与它的不可变文档——与历史发布分支早就在做的事完全一样；血统不认识的
+  commit 照旧拒绝。指针由它的所有者在下一次发布时改写，心跳里记一条
+  `serving source authority <dataset>: current pointer of generation <代> carried across`。
+
+- **策略把「broker 没在跑」当成等待，不再当成台账损坏（#252）**：
+  先起三个 `rquant-runtime-strategy@` 再起 `rquant-runtime-paper-broker@`，其中两个在构造期
+  就以 `sqlite3.OperationalError: unable to open database file` 退出 1，`Restart=` 反复拉起，
+  `OnFailure` 推了 **3 条真实告警**。`broker.sqlite3` 是 WAL 库：broker 在跑时它自己的连接把
+  `-wal`/`-shm` 留在旁边，只读打开就能成功；broker 干净停止后 SQLite 把两个 sidecar 都删了，
+  而策略的 unit 把 `live/paper-brokers/` 挂成只读，只读打开一个 WAL 库需要**创建** `-shm`，
+  创建不了。这个状态是「所有者没在跑」，与文件不存在是同一件事，现在按
+  `PeerArtifactUnavailableError` 延后到后面的轮次（#232、#248）。**只有这一种精确形状会等**：
+  文件头必须真的是 SQLite 的、必须真的写着 WAL、两个 sidecar 必须真的都不在、目录必须真的
+  写不了；文件头被截断或改坏、少表、schema 不是 v5、或者在一个**能写**的目录里打开失败，
+  全部照旧 `PaperLifecycleIntegrityError` 拒绝。
+
+- **DuckDB 拒绝描述符路径时不再往库旁边打硬链接（#255）**：
+  `notifier.admin.shadow.v1` 每一轮报 `projection database ... cannot be pinned: this engine
+  refused the descriptor /proc/self/fd/6, and linking it inside ... failed (errno 30 EROFS)`。
+  包 L 为「拒绝描述符路径的引擎」留了「在库旁边打硬链接」的分支，而那个目录对这个 unit 是只读的。
+  **但那句话里的定因是未证实的**：用 `uv.lock` 钉死的 duckdb 1.5.2 在 Linux 上**接受**
+  `/proc/self/fd/<n>`；**被别的进程写锁占住时**才失败（`Could not set lock on file …`），
+  而旧代码对描述符那一步是 `except Exception: pass`，把两件事吞成同一件，再落到硬链接分支拼出
+  那句话。这个 role 读的是**生产主库**（`runtime_production_profile.py:1521`），
+  09:25–15:00 正被 `rquant-monitor` 写锁占着——**写锁才是更可能的第一因（#250）**。
+  现在：那个 `except` 收窄，**锁就报成锁**；硬链接分支删掉；读者有自己的 control root、
+  这一代在 `_MAX_PINNED_COPY_BYTES`（256 MiB）以内、**并且调用方声明该产物由 `rename()` 整体
+  替换**（`atomically_published`）时才拷贝，库旁有 `.wal` 直接拒，拷贝前后比对
+  `(dev, ino, size, mtime_ns, ctime_ns)`；否则**就地读、不钉代**，由 `__exit__` 既有的身份比对
+  把「读的过程中被换掉」报出来。这三道是为了堵住一个新风险：硬链接与原库同 inode、遇到活写者
+  会失败关闭，而**字节拷贝会打开成功并返回上一次 checkpoint 的旧数据**。
+  **notifier 仍然不给 control root、就地读**，所以 #241 立下的「这一步在 runtime root 底下什么
+  都不写」原样保住。⚠️ **这次发版同样不解除 notifier 的盘中失败**：它仍然读主库，错误从
+  `cannot be pinned … EROFS` 变成 DuckDB 的写锁 IOException，**要等 #250**。
+
 - **换代之后不再需要人工把任何状态挪到一边（#248、#249）**：**这次发布之后，换代不需要移走任何状态**。
   两件会改变盘上东西的事先说：**每个 role 最多保留 2 代归档，更旧的在下一次轮换时被删掉**
   （策略的 `.archived` runner 库、路由台账里的 `#rotated-` 行与它的回执、候选根下的

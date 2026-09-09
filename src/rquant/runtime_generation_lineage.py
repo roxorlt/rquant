@@ -330,6 +330,35 @@ def candidate_authority_lineage(
     return resolve
 
 
+def producer_commit_lineage(
+    runtime_root: Path | None,
+    *,
+    service_id: str,
+) -> Callable[[str], str | None] | None:
+    """Shape (5): a `producer_commit` found on disk -> our generation that stamped it.
+
+    Every role in one bundle carries the same `producer_commit`, so the lineage of any
+    service we install answers "was this commit ours, one release ago?". `serving.
+    publisher.v1` asks it about the `current.json` of each source authority it reads: the
+    pointer is written by that authority's owner, and after a release the owner has not
+    republished yet, so the pointer still carries the previous generation's commit and the
+    reader refused it every iteration (#253). A commit no generation of ours ever ran
+    resolves to `None` here and is still refused.
+    """
+
+    lineage = _lineage_or_none(runtime_root, service_id=service_id)
+    if lineage is None:
+        return None
+
+    def resolve(producer_commit: str) -> str | None:
+        for record in lineage.previous:
+            if record.manifest.producer_commit == producer_commit:
+                return record.generation_id
+        return None
+
+    return resolve
+
+
 def previous_spec_identities(
     runtime_root: Path | None,
     *,
@@ -417,6 +446,7 @@ __all__ = [
     "RuntimeGenerationLineage",
     "candidate_authority_lineage",
     "previous_spec_identities",
+    "producer_commit_lineage",
     "previous_strategy_spec_generations",
     "strategy_runner_identity_lineage",
     "strategy_runner_identity_lineage_for_instance",
