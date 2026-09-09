@@ -2473,3 +2473,62 @@ def test_what_is_not_in_the_replica_is_still_read_every_iteration(
     assert opens[0] == 1
     assert "pulse_alert" not in {item.table_name for item in before.projections}
     assert "pulse_alert" in {item.table_name for item in after.projections}
+
+
+def test_one_generation_spanning_local_midnight_is_read_again_on_the_new_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-3: the calendar granularity this projection publishes is the *local* date.
+
+    `rquant-replica-sync.timer`'s last run of the day is 17:30 and the next is 09:00, so
+    one generation of the replica spans local midnight -- 15.5 hours during which the file
+    does not change and every `trade_date <= ?` predicate below does. Reuse across that
+    boundary would serve `trade_date <= yesterday` after midnight, and the UTC date does
+    not move there (23:59 and 00:01 Asia/Shanghai are 15:59 and 16:01 the same UTC day),
+    so only the local date in the gate's key can refuse it.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=datetime(2026, 8, 3, 9, 30, tzinfo=UTC))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+    before_midnight = datetime(2026, 8, 3, 15, 59, tzinfo=UTC)
+    after_midnight = datetime(2026, 8, 3, 16, 1, tzinfo=UTC)
+
+    assert before_midnight.date() == after_midnight.date()
+    source(before_midnight)
+    source(before_midnight + timedelta(seconds=2))
+    source(after_midnight)
+
+    assert opens[0] == 2
+
+
+def test_the_projection_reports_this_iteration_and_not_the_last_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MF-1: `begin_replica_iteration()` scopes the report without dropping the cache."""
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    assert source.replica_iteration_summary() == (False, 0)
+
+    source.begin_replica_iteration()
+    source(NOW)
+    opened = source.replica_iteration_summary()
+
+    source.begin_replica_iteration()
+    source(NOW + timedelta(seconds=2))
+    reused = source.replica_iteration_summary()
+
+    source.begin_replica_iteration()
+    silent = source.replica_iteration_summary()
+
+    assert opened[0] is True
+    assert reused == (False, 0)
+    assert silent == (False, 0)
+    assert opens[0] == 1

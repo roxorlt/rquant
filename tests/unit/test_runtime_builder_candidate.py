@@ -232,6 +232,80 @@ def test_candidate_publisher_binds_static_strategy_semantics(tmp_path: Path) -> 
     assert snapshot.authority_binding.candidate_schema_fingerprint == candidate_schema_fingerprint
 
 
+def test_an_auction_iteration_outside_its_window_says_it_read_nothing(
+    tmp_path: Path,
+) -> None:
+    """Review MF-1: this publisher acts for four minutes and idles for the rest of the day.
+
+    At its five-second interval that is about a thousand idle iterations, and each one
+    must report "opened nothing, read nothing" rather than the window's last real read.
+    """
+
+    root = tmp_path / "live" / "auction-gap"
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(tmp_path / "operational-ro.duckdb"),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(root),
+        },
+    )
+    #: 18:30 Asia/Shanghai, far outside 09:26-09:30
+    step = candidate_publisher_builder(
+        auction_input_loader=lambda **_: _batch("auction_gap"),
+        clock=lambda: datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
+    )(manifest)
+
+    result = step()
+
+    assert result.processed_count == 0
+    assert result.replica_opened is False
+    assert result.replica_read_bytes == 0
+
+
+def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path) -> None:
+    """The other two strategies read a sealed document, so they report nothing, not zero."""
+
+    root = tmp_path / "live" / "n-shape"
+    path = tmp_path / "n-shape.json"
+    path.write_bytes(serialize_candidate_input(_batch("n_shape")))
+    path.chmod(0o600)
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.n_shape.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "n_shape",
+            "strategy_version": 1,
+            **_exact_strategy_settings("n_shape"),
+            "candidate_input_path": str(path),
+            "snapshot_root": str(root),
+        },
+    )
+    step = candidate_publisher_builder(clock=lambda: CAPTURED_AT)(manifest)
+
+    result = step()
+
+    assert result.replica_opened is None
+    assert result.replica_read_bytes is None
+
+
 def test_auction_candidate_publisher_builds_live_input_during_auction_window(
     tmp_path: Path,
 ) -> None:

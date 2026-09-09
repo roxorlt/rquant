@@ -11,7 +11,7 @@ generation.
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -185,19 +185,92 @@ def test_a_point_in_time_read_is_reused_only_after_the_generation_was_written(
     assert loader.calls == 2
 
 
-def test_a_point_in_time_read_is_not_reused_across_a_local_date(tmp_path: Path) -> None:
-    """`trade_date <= ?` is a date predicate, so a new date is a new question."""
+def test_calendar_granularity_is_the_caller_s_and_it_lives_in_the_key(
+    tmp_path: Path,
+) -> None:
+    """The gate compares instants and knows nothing about anybody's local zone (SF-3).
+
+    It used to compare `cutoff.date()` as well -- the **UTC** date -- while three
+    docstrings called it the local one. That was true by accident for the only caller,
+    whose `key` already carried the local date, and would have been a trap for the next.
+    A caller whose predicates are written against a date puts the date in `key`, and the
+    gate then refuses to answer one date's question with another date's answer.
+    """
 
     replica = _replica(tmp_path / "rquant_ro.duckdb", synced_at=SYNCED_AT)
     gate: ReplicaReadGate[object] = ReplicaReadGate(replica)
     loader = _Loader()
+    #: 23:59:50 and 00:01 Asia/Shanghai, which is one UTC day either side of local midnight
+    before_midnight = datetime(2026, 8, 11, 15, 59, 50, tzinfo=UTC)
+    after_midnight = datetime(2026, 8, 11, 16, 1, tzinfo=UTC)
 
-    gate.read(loader, cutoff=datetime(2026, 8, 11, 23, 59, 50, tzinfo=UTC))
-    same_day = gate.read(loader, cutoff=datetime(2026, 8, 11, 23, 59, 59, tzinfo=UTC))
-    next_day = gate.read(loader, cutoff=datetime(2026, 8, 12, 0, 0, 1, tzinfo=UTC))
+    gate.read(loader, key=("page", date(2026, 8, 11)), cutoff=before_midnight)
+    same_local_day = gate.read(
+        loader, key=("page", date(2026, 8, 11)), cutoff=before_midnight
+    )
+    next_local_day = gate.read(loader, key=("page", date(2026, 8, 12)), cutoff=after_midnight)
 
-    assert (same_day.opened, next_day.opened) == (False, True)
+    assert (same_local_day.opened, next_local_day.opened) == (False, True)
     assert loader.calls == 2
+    #: and without the date in the key the gate happily reuses, because the instant rule
+    #: alone is satisfied -- which is exactly why the caller must supply it
+    bare: ReplicaReadGate[object] = ReplicaReadGate(replica)
+    bare_loader = _Loader()
+    bare.read(bare_loader, cutoff=before_midnight)
+    assert bare.read(bare_loader, cutoff=after_midnight).opened is False
+
+
+def test_an_iteration_that_never_asked_reports_that_rather_than_the_last_one(
+    tmp_path: Path,
+) -> None:
+    """Review MF-1: `last_read` answers a different question from "what did this iteration do".
+
+    Four of `capture_reference_slow_batch`'s paths return before the loader is reached, and
+    the auction-gap publisher returns outside 09:26-09:30; without a per-iteration scope
+    those iterations reported the last real read, and reference-slow's heartbeat would have
+    said `replica_opened=true` from 09:25 until the next day.
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    gate: ReplicaReadGate[object] = ReplicaReadGate(replica)
+    loader = _Loader()
+
+    #: an iteration that has not asked anything at all
+    assert gate.iteration_summary() == (False, 0)
+
+    gate.begin_iteration()
+    gate.read(loader)
+    opened_summary = gate.iteration_summary()
+
+    gate.begin_iteration()
+    gate.read(loader)
+    reused_summary = gate.iteration_summary()
+
+    gate.begin_iteration()
+    silent_summary = gate.iteration_summary()
+
+    assert opened_summary[0] is True
+    assert reused_summary == (False, 0)
+    assert silent_summary == (False, 0)
+    assert loader.calls == 1
+
+
+def test_beginning_an_iteration_clears_the_report_and_not_the_cache(
+    tmp_path: Path,
+) -> None:
+    """The cache has to survive the boundary or the gate would open once per iteration."""
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    gate: ReplicaReadGate[object] = ReplicaReadGate(replica)
+    loader = _Loader()
+
+    gate.read(loader)
+    gate.begin_iteration()
+    assert gate.last_read is None
+    reused = gate.read(loader)
+
+    assert reused.opened is False
+    assert loader.calls == 1
 
 
 def test_a_cutoff_that_goes_backwards_is_not_served_from_a_later_answer(

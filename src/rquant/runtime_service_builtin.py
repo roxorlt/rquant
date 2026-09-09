@@ -382,6 +382,11 @@ def reference_slow_source_builder(
         replica_gate: ReplicaReadGate[Any] = ReplicaReadGate(settings.database_path)
 
         def step() -> RuntimeStepResult:
+            #: this iteration's own scope, so an iteration that never reaches the capture
+            #: -- outside 09:20-09:25, or after today's batch is already sealed -- reports
+            #: "opened nothing, read nothing" instead of the last capture's numbers (#256
+            #: review MF-1). Four such early returns live in `capture_reference_slow_batch`.
+            replica_gate.begin_iteration()
             observed_at = clock()
             decision = decide_market_session(calendar, observed_at)
 
@@ -449,17 +454,9 @@ def reference_slow_source_builder(
                         max_batches=settings.retention_page_size,
                         retired_at=clock(),
                     )
-            read = replica_gate.last_read
-            if read is None:
-                #: nothing asked the replica this iteration -- the capture window is
-                #: closed, or the batch was already sealed. Not the same as "opened it
-                #: and read nothing", so it is reported as nothing.
-                return result
+            opened, read_bytes = replica_gate.iteration_summary()
             return result.model_copy(
-                update={
-                    "replica_opened": read.opened,
-                    "replica_read_bytes": read.read_bytes,
-                }
+                update={"replica_opened": opened, "replica_read_bytes": read_bytes}
             )
 
         return step
@@ -602,7 +599,16 @@ def auction_universe_publisher_builder(
         #: one `lstat` per iteration instead of a scan of the replica's `daily_bar` (#256)
         replica_gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(settings.database_path)
 
+        def _replica_cost() -> dict[str, object]:
+            opened, read_bytes = replica_gate.iteration_summary()
+            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
+
         def step() -> RuntimeStepResult:
+            #: 09:15-15:10 is this publisher's protection window and it returns below
+            #: without asking the gate; so does an iteration that finds today's universe
+            #: already published. Both report "opened nothing" rather than the last
+            #: publication's numbers (#256 review MF-1, SF-5).
+            replica_gate.begin_iteration()
             observed_at = clock()
             calendar_evidence = {"market_calendar": calendar.content_sha256}
             try:
@@ -612,7 +618,10 @@ def auction_universe_publisher_builder(
             except AuctionUniverseSourceError as exc:
                 if "protection window" not in str(exc):
                     raise
-                return RuntimeStepResult(source_generations=calendar_evidence)
+                return RuntimeStepResult(
+                    source_generations=calendar_evidence,
+                    **_replica_cost(),
+                )
 
             current_path = settings.authority_root / "current.json"
             try:
@@ -630,7 +639,8 @@ def auction_universe_publisher_builder(
                         **calendar_evidence,
                         "daily_bar": current.source_snapshot_id,
                         "auction_universe": current.content_sha256,
-                    }
+                    },
+                    **_replica_cost(),
                 )
 
             receipt = publish_auction_universe_from_daily_snapshot(
@@ -641,7 +651,6 @@ def auction_universe_publisher_builder(
                 producer_commit=manifest.producer_commit,
                 read_gate=replica_gate,
             )
-            read = replica_gate.last_read
             return RuntimeStepResult(
                 processed_count=receipt.code_count if receipt.published else 0,
                 source_generations={
@@ -649,8 +658,7 @@ def auction_universe_publisher_builder(
                     "daily_bar": receipt.source_snapshot_id,
                     "auction_universe": receipt.content_sha256,
                 },
-                replica_opened=None if read is None else read.opened,
-                replica_read_bytes=None if read is None else read.read_bytes,
+                **_replica_cost(),
             )
 
         return step

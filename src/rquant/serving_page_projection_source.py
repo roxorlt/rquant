@@ -998,6 +998,16 @@ class DuckDBSignalPageProjectionSource:
 
         return self._replica_gate.last_read
 
+    def begin_replica_iteration(self) -> None:
+        """Start a new loop iteration's accounting (review MF-1)."""
+
+        self._replica_gate.begin_iteration()
+
+    def replica_iteration_summary(self) -> tuple[bool, int | None]:
+        """`(opened, read_bytes)` for this iteration, for the heartbeat."""
+
+        return self._replica_gate.iteration_summary()
+
     def __call__(self, observed_at: datetime, /) -> SignalPageProjectionSnapshot:
         if self.page_control_outbox is None:
             return self._build_snapshot(observed_at)
@@ -1011,9 +1021,18 @@ class DuckDBSignalPageProjectionSource:
         #: has not already been read (#256). This role's interval is two seconds and the
         #: replica is replaced every five minutes, so before this it scanned all of
         #: `minute_bar` in a 10 GB file about a hundred and fifty times per generation.
-        #: `key` carries the *local* date because that is the granularity the predicates
-        #: below use; `cutoff` carries the instant, so an answer is reused only when it
-        #: was taken at or after the generation's own mtime -- every row in the file was
+        #:
+        #: `key` carries `cutoff.date()`, which is the **local** date (`_local_naive` is
+        #: this module's own Asia/Shanghai conversion), because that is the granularity
+        #: every predicate below is written against; the gate itself compares instants and
+        #: knows nothing about a local zone (review SF-3). This matters in production
+        #: rather than in theory: `rquant-replica-sync.timer`'s last run of the day is
+        #: 17:30 and the next is 09:00, so one generation spans local midnight, and
+        #: without the date in the key a projection taken at 23:59 would still be served
+        #: at 00:01 with `trade_date <= yesterday`.
+        #:
+        #: `cutoff=observed` carries the instant, so an answer is reused only when it was
+        #: taken at or after the generation's own mtime -- every row in the file was
         #: written before the file was, so a later cutoff admits exactly the same rows.
         read = self._replica_gate.read(
             lambda: self._read_database_projection(cutoff),

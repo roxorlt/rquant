@@ -1013,6 +1013,62 @@ def test_runtime_reference_source_and_publisher_are_independent_and_idempotent(
     assert (tmp_path / "quota" / "reference.sqlite3").is_file()
 
 
+def test_each_iteration_reports_what_it_did_with_the_replica_not_what_the_last_one_did(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MF-1: this source captures for five minutes a day and idles for the rest.
+
+    `capture_reference_slow_batch` has four paths that return before the loader is reached
+    (not an open session, outside 09:20-09:25, today's batch already recorded and it is not
+    yet 09:24, every look-back date already swept). Before this fix those iterations
+    reported the last real capture's numbers, so from 09:25 the heartbeat read
+    `replica_opened=true` all day -- the exact signal §9.2 tells the operator to
+    investigate.
+    """
+
+    adapter = _Adapter()
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    observed_at = datetime(2026, 7, 31, 1, 20, tzinfo=UTC)
+    monkeypatch.setattr(
+        "rquant.reference_slow_runtime._utc_now",
+        lambda: observed_at.replace(minute=24, second=40),
+    )
+    step = reference_slow_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: observed_at,
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    captured = step()
+    idled = step()
+
+    assert captured.processed_count == 1
+    assert captured.replica_opened is True
+    #: the second iteration takes the "already recorded" early return and never asks
+    assert idled.processed_count == 0
+    assert idled.replica_opened is False
+    assert idled.replica_read_bytes == 0
+
+
+def test_an_iteration_outside_the_capture_window_reports_no_read(tmp_path: Path) -> None:
+    """The other 23 hours 55 minutes of the day, at this role's 30-second interval."""
+
+    adapter = _Adapter()
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    step = reference_slow_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: datetime(2026, 7, 31, 1, 26, tzinfo=UTC),
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    result = step()
+
+    assert result.replica_opened is False
+    assert result.replica_read_bytes == 0
+    assert adapter.calls == []
+
+
 def test_runtime_reference_source_is_quiet_after_decision_cutoff(tmp_path: Path) -> None:
     adapter = _Adapter()
     source_manifest, _publisher_manifest = _runtime_manifests(tmp_path)

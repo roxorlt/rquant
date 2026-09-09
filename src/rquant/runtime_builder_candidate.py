@@ -505,26 +505,37 @@ def candidate_publisher_builder(
             )
 
         #: this publisher's memory of the replica generation it already read (#256).
-        #: Built on first use rather than at build time, because only `auction_live`
-        #: has a `daily_database_path` at all.
-        replica_gate: ReplicaReadGate[Any] | None = None
+        #: Only `auction_live` reads a replica at all; the two document-driven strategies
+        #: have no `daily_database_path`, so they report nothing rather than a zero.
+        replica_gate: ReplicaReadGate[Any] | None = (
+            None
+            if settings.daily_database_path is None
+            else ReplicaReadGate(settings.daily_database_path)
+        )
 
         def _replica_cost() -> dict[str, object]:
-            """What this iteration did with the replica, for the heartbeat (#256)."""
+            """What **this** iteration did with the replica, for the heartbeat (#256).
 
-            if replica_gate is None or replica_gate.last_read is None:
+            Empty for a publisher that has no replica to read. For the auction-gap
+            publisher it is always present: outside 09:26-09:30, and on the degraded
+            iterations where the auction spool has no batch yet, this reports "opened
+            nothing, read nothing" rather than the last real read's numbers (review MF-1).
+            """
+
+            if replica_gate is None:
                 return {}
-            read = replica_gate.last_read
-            return {"replica_opened": read.opened, "replica_read_bytes": read.read_bytes}
+            opened, read_bytes = replica_gate.iteration_summary()
+            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
 
         def step() -> RuntimeStepResult:
-            nonlocal replica_gate
+            if replica_gate is not None:
+                replica_gate.begin_iteration()
             if settings.input_mode == "auction_live":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
                 local_time = local.timetz().replace(tzinfo=None)
                 if not _AUCTION_INPUT_START <= local_time <= _AUCTION_INPUT_END:
-                    return RuntimeStepResult()
+                    return RuntimeStepResult(**_replica_cost())
                 if (
                     settings.auction_spool_root is None
                     or settings.daily_database_path is None
@@ -534,8 +545,6 @@ def candidate_publisher_builder(
                     or settings.calendar_content_sha256 is None
                 ):
                     raise RuntimeError("validated auction live paths disappeared")
-                if replica_gate is None:
-                    replica_gate = ReplicaReadGate(settings.daily_database_path)
                 try:
                     loaded = live_auction_loader(
                         auction_spool_root=settings.auction_spool_root,

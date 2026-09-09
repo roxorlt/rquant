@@ -113,6 +113,41 @@ def test_runtime_publisher_is_quiet_inside_protection_window(tmp_path: Path) -> 
     assert not (tmp_path / "auction-universe" / "current.json").exists()
 
 
+def test_every_iteration_says_what_it_did_with_the_replica(tmp_path: Path) -> None:
+    """Review MF-1 / SF-5: all three of this step's return paths report, and only two ask.
+
+    The publishing iteration opens the replica; the one after it returns on the authority
+    it just wrote, and an iteration inside 09:15-15:10 returns on the protection window --
+    neither asks the gate, and both must say "opened nothing, read nothing" rather than
+    leave the field unset or repeat the publication's numbers.
+    """
+
+    observed_at = datetime(2026, 7, 31, 10, 30, tzinfo=UTC)
+    manifest = _manifest(tmp_path)
+    step = auction_universe_publisher_builder(clock=lambda: observed_at)(manifest)
+
+    published = step()
+    already_published = step()
+
+    assert published.replica_opened is True
+    assert (already_published.replica_opened, already_published.replica_read_bytes) == (
+        False,
+        0,
+    )
+
+
+def test_an_iteration_inside_the_protection_window_reports_no_read(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    step = auction_universe_publisher_builder(
+        clock=lambda: datetime(2026, 7, 31, 2, 0, tzinfo=UTC),
+    )(manifest)
+
+    result = step()
+
+    assert result.replica_opened is False
+    assert result.replica_read_bytes == 0
+
+
 def test_runtime_publisher_rejects_wrong_kind_or_plane(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     builder = auction_universe_publisher_builder(

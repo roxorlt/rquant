@@ -184,8 +184,23 @@ class ReplicaReadGate(Generic[T]):
     projection is `f(contents, now)`, and `now` advances every two seconds. Reuse there is
     allowed only when the cached answer was taken at a point in time at or after the
     generation's own `mtime` -- every row in the file was written before the file was, so
-    a later cutoff admits exactly the same rows -- and inside the same local date, which
-    is the granularity the projection's `trade_date <= ?` predicates use.
+    a later cutoff admits exactly the same rows -- and never backwards.
+
+    **Calendar granularity is the caller's, and it belongs in `key`.** This class compares
+    instants and knows nothing about anybody's local zone; a reader whose predicates are
+    written against a *date* (`trade_date <= ?`) has to put that date in `key`, in the zone
+    its own code already uses. Until the package Q review this method also compared
+    `cutoff.date()`, which is the **UTC** date, while three docstrings claimed it was the
+    local one -- true-by-accident for the only caller (its `key` carried the local date)
+    and misleading for the next one. The comparison is gone rather than corrected: two
+    mechanisms for one rule is how the wrong one gets relied on.
+
+    `begin_iteration()` / `iteration_summary()` are the *per-iteration* scope the heartbeat
+    needs. `last_read` alone answers "what did the most recent `read()` do", which is not
+    the same question: a role whose loop iteration returns before asking the gate at all --
+    reference-slow outside its 09:20-09:25 capture window, the auction-gap publisher
+    outside 09:26-09:30 -- would otherwise report the last *real* read forever, and
+    reference-slow's heartbeat would read `replica_opened=true` all day (review MF-1).
     """
 
     def __init__(
@@ -205,9 +220,33 @@ class ReplicaReadGate(Generic[T]):
 
     @property
     def last_read(self) -> ReplicaRead[T] | None:
-        """What the most recent `read()` did, for the heartbeat to report."""
+        """What the most recent `read()` did -- since `begin_iteration()`, if it was called."""
 
         return self._last
+
+    def begin_iteration(self) -> None:
+        """Start a new loop iteration: forget what the last one did, keep what it read.
+
+        The cache is deliberately untouched. What is cleared is only the *report*, so that
+        an iteration which never reaches a `read()` says so instead of repeating the last
+        one that did.
+        """
+
+        self._last = None
+
+    def iteration_summary(self) -> tuple[bool, int | None]:
+        """`(opened, read_bytes)` for this iteration, for the heartbeat.
+
+        `(False, 0)` when this iteration never asked -- it opened nothing and read nothing,
+        which is a fact rather than an absence. `(False, 0)` again when it asked and
+        recognised the generation. `(True, bytes)` when it opened the database, with
+        `bytes` `None` on a platform that will not say (see `_process_read_bytes`).
+        """
+
+        read = self._last
+        if read is None:
+            return False, 0
+        return read.opened, read.read_bytes
 
     def forget(self) -> None:
         self._cached = False
@@ -227,11 +266,7 @@ class ReplicaReadGate(Generic[T]):
             return self._cutoff is None
         if self._cutoff is None:
             return False
-        return (
-            self._cutoff >= current.modified_at
-            and cutoff >= self._cutoff
-            and cutoff.date() == self._cutoff.date()
-        )
+        return self._cutoff >= current.modified_at and cutoff >= self._cutoff
 
     def read(
         self,
