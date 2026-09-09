@@ -15,6 +15,7 @@ import pytest
 
 import rquant.readside_replica_gate as readside_replica_gate
 import rquant.reference_slow_source as reference_slow_source_module
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_slow_source import (
     ReferenceAdjustmentSourceFact,
     ReferenceDailySourceFact,
@@ -362,7 +363,7 @@ def test_prior_daily_query_streams_and_fails_closed_at_row_limit(tmp_path: Path)
 
 
 def test_nl_universe_capture_has_no_prevalidation_limit() -> None:
-    source = inspect.getsource(reference_slow_source_module._load_database_reference_evidence)
+    source = inspect.getsource(reference_slow_source_module._query_database_reference_evidence)
 
     nl_query = source[source.index('"nl_screen_universe"') :]
     assert "LIMIT 8000" not in nl_query
@@ -1040,3 +1041,89 @@ def test_builtin_registry_registers_reference_source_and_publisher(
         "adj_factor",
         "suspend_d",
     ]
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times this source actually opened the replica (#256).
+
+    Counted at the verified read rather than at `duckdb.connect`, because one read is
+    two connects on a platform whose engine refuses the descriptor path.
+    """
+
+    reads = [0]
+    original = reference_slow_source_module._verified_database_read
+
+    def counted(*args: object, **kwargs: object) -> object:
+        reads[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reference_slow_source_module, "_verified_database_read", counted)
+    return reads
+
+
+def test_one_replica_generation_is_read_once_however_many_sessions_are_asked_for(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#256: one iteration asks up to six times -- the target session and five look-backs.
+
+    Each ask used to be a whole-database copy. Now the same question against the same
+    generation is answered once, and a different session still opens the database.
+    """
+
+    database = _database(tmp_path)
+    gate: ReplicaReadGate[object] = ReplicaReadGate(database)
+    reads = _count_reads(monkeypatch)
+
+    first = reference_slow_source_module._load_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        limits=_source_limits(),
+        read_gate=gate,
+    )
+    again = reference_slow_source_module._load_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        limits=_source_limits(),
+        read_gate=gate,
+    )
+    other_session = reference_slow_source_module._load_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        projection_as_of_date=TARGET_DATE,
+        limits=_source_limits(),
+        read_gate=gate,
+    )
+
+    assert reads[0] == 2
+    assert first == again
+    assert other_session[0] == first[0]
+    assert gate.last_read is not None and gate.last_read.opened is True
+
+
+def test_a_replaced_replica_is_read_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _database(tmp_path)
+    replacement_directory = tmp_path / "next"
+    replacement_directory.mkdir()
+    replacement = _database(replacement_directory)
+    gate: ReplicaReadGate[object] = ReplicaReadGate(database)
+    reads = _count_reads(monkeypatch)
+
+    def load() -> object:
+        return reference_slow_source_module._load_database_reference_evidence(
+            database,
+            prior_trade_date=PRIOR_DATE,
+            limits=_source_limits(),
+            read_gate=gate,
+        )
+
+    load()
+    load()
+    os.replace(replacement, database)
+    load()
+    load()
+
+    assert reads[0] == 2

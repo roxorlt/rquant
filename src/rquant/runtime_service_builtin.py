@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -33,6 +33,7 @@ from rquant.live_spool import (
 )
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
 from rquant.market_minute_source_service import capture_market_minute_step
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
     RuntimeCandidateUniverseConfig,
@@ -193,6 +194,7 @@ def _capture_reference_with_quota(
     producer_commit: str,
     retry_ordinal: int = 0,
     transport_observer: QuotaBoundTransportObserver | None = None,
+    read_gate: ReplicaReadGate[Any] | None = None,
 ) -> ReferenceSlowSourceSnapshot | ReferenceSlowQuotaCapture:
     from rquant.reference_slow_source import capture_reference_slow_source_snapshot
 
@@ -233,6 +235,7 @@ def _capture_reference_with_quota(
                 completion_clock=completion_clock,
                 producer_commit=producer_commit,
                 limits=settings.limits.model_dump(mode="python"),
+                read_gate=read_gate,
             )
             receipts = transport_observer.current_receipts()
         return ReferenceSlowQuotaCapture(
@@ -285,6 +288,7 @@ def _capture_reference_with_quota(
             completion_clock=completion_clock,
             producer_commit=producer_commit,
             limits=settings.limits.model_dump(mode="python"),
+            read_gate=read_gate,
         )
     except Exception:
         quota_store.commit_attempt(
@@ -373,6 +377,9 @@ def reference_slow_source_builder(
                 source_verifier=source_verifier,
             )
         )
+        #: one `lstat` per ask instead of a whole read of the replica, and one read for
+        #: the target session plus five revision look-backs rather than six (#256)
+        replica_gate: ReplicaReadGate[Any] = ReplicaReadGate(settings.database_path)
 
         def step() -> RuntimeStepResult:
             observed_at = clock()
@@ -390,6 +397,7 @@ def reference_slow_source_builder(
                     producer_commit=manifest.producer_commit,
                     retry_ordinal=settings.retry_ordinal,
                     transport_observer=transport_observer,
+                    read_gate=replica_gate,
                 )
                 return (
                     captured.snapshot
@@ -409,6 +417,7 @@ def reference_slow_source_builder(
                     producer_commit=manifest.producer_commit,
                     retry_ordinal=settings.retry_ordinal + 1,
                     transport_observer=transport_observer,
+                    read_gate=replica_gate,
                 )
                 return (
                     captured.snapshot
@@ -440,7 +449,18 @@ def reference_slow_source_builder(
                         max_batches=settings.retention_page_size,
                         retired_at=clock(),
                     )
-            return result
+            read = replica_gate.last_read
+            if read is None:
+                #: nothing asked the replica this iteration -- the capture window is
+                #: closed, or the batch was already sealed. Not the same as "opened it
+                #: and read nothing", so it is reported as nothing.
+                return result
+            return result.model_copy(
+                update={
+                    "replica_opened": read.opened,
+                    "replica_read_bytes": read.read_bytes,
+                }
+            )
 
         return step
 
@@ -579,6 +599,8 @@ def auction_universe_publisher_builder(
         )
         if calendar.content_sha256 != settings.calendar_content_sha256:
             raise ValueError("auction universe calendar content identity mismatch")
+        #: one `lstat` per iteration instead of a scan of the replica's `daily_bar` (#256)
+        replica_gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(settings.database_path)
 
         def step() -> RuntimeStepResult:
             observed_at = clock()
@@ -617,7 +639,9 @@ def auction_universe_publisher_builder(
                 calendar=calendar,
                 observed_at=observed_at,
                 producer_commit=manifest.producer_commit,
+                read_gate=replica_gate,
             )
+            read = replica_gate.last_read
             return RuntimeStepResult(
                 processed_count=receipt.code_count if receipt.published else 0,
                 source_generations={
@@ -625,6 +649,8 @@ def auction_universe_publisher_builder(
                     "daily_bar": receipt.source_snapshot_id,
                     "auction_universe": receipt.content_sha256,
                 },
+                replica_opened=None if read is None else read.opened,
+                replica_read_bytes=None if read is None else read.read_bytes,
             )
 
         return step

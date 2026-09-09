@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from rquant import runtime_builder_candidate as candidate_module
 from rquant.live_contracts import BatchQualityStatus
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_builder_candidate import (
     CandidatePublisherRuntimeSettings,
     candidate_publisher_builder,
@@ -270,6 +271,11 @@ def test_auction_candidate_publisher_builds_live_input_during_auction_window(
     )(manifest)()
 
     assert len(calls) == 1
+    #: the publisher hands the loader its own memory of the replica generation (#256):
+    #: one object for the life of the run, pointed at the database this manifest names
+    read_gate = calls[0].pop("read_gate")
+    assert isinstance(read_gate, ReplicaReadGate)
+    assert read_gate.path == tmp_path / "operational-ro.duckdb"
     assert calls[0] == {
         "auction_spool_root": tmp_path / "auction-spool",
         "daily_database_path": tmp_path / "operational-ro.duckdb",

@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Literal, Protocol, TypeAlias
+from typing import Annotated, Any, Literal, Protocol, TypeAlias
 from zoneinfo import ZoneInfo
 
 from pydantic import (
@@ -27,6 +27,7 @@ from rquant.auction_gap_candidate_input import (
 )
 from rquant.live_contracts import BatchQualityStatus
 from rquant.live_spool import LiveBatchSpool
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_data_registry import ReadonlyReferenceRegistry
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_generation_lineage import candidate_authority_lineage
@@ -188,6 +189,7 @@ class AuctionCandidateInputLoader(Protocol):
         trade_date: date,
         observed_at: datetime,
         producer_commit: str,
+        read_gate: ReplicaReadGate[Any] | None = None,
     ) -> CandidatePublishBatch: ...
 
 
@@ -431,6 +433,7 @@ def load_live_auction_candidate_input(
     trade_date: date,
     observed_at: datetime,
     producer_commit: str,
+    read_gate: ReplicaReadGate[Any] | None = None,
 ) -> CandidatePublishBatch:
     calendar = load_market_calendar_authority(
         calendar_path,
@@ -446,6 +449,7 @@ def load_live_auction_candidate_input(
         trade_date=trade_date,
         observed_at=observed_at,
         producer_commit=producer_commit,
+        read_gate=read_gate,
     )
 
 
@@ -500,7 +504,21 @@ def candidate_publisher_builder(
                 static_feature_schema=settings.static_feature_schema,
             )
 
+        #: this publisher's memory of the replica generation it already read (#256).
+        #: Built on first use rather than at build time, because only `auction_live`
+        #: has a `daily_database_path` at all.
+        replica_gate: ReplicaReadGate[Any] | None = None
+
+        def _replica_cost() -> dict[str, object]:
+            """What this iteration did with the replica, for the heartbeat (#256)."""
+
+            if replica_gate is None or replica_gate.last_read is None:
+                return {}
+            read = replica_gate.last_read
+            return {"replica_opened": read.opened, "replica_read_bytes": read.read_bytes}
+
         def step() -> RuntimeStepResult:
+            nonlocal replica_gate
             if settings.input_mode == "auction_live":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
@@ -516,6 +534,8 @@ def candidate_publisher_builder(
                     or settings.calendar_content_sha256 is None
                 ):
                     raise RuntimeError("validated auction live paths disappeared")
+                if replica_gate is None:
+                    replica_gate = ReplicaReadGate(settings.daily_database_path)
                 try:
                     loaded = live_auction_loader(
                         auction_spool_root=settings.auction_spool_root,
@@ -527,9 +547,13 @@ def candidate_publisher_builder(
                         trade_date=local.date(),
                         observed_at=observed_at,
                         producer_commit=manifest.producer_commit,
+                        read_gate=replica_gate,
                     )
                 except AuctionGapCandidateInputError:
-                    return RuntimeStepResult(degraded_reasons=("auction_gap_input_unavailable",))
+                    return RuntimeStepResult(
+                        degraded_reasons=("auction_gap_input_unavailable",),
+                        **_replica_cost(),
+                    )
             else:
                 if settings.candidate_input_path is None:
                     raise RuntimeError("validated candidate_input_path disappeared")
@@ -561,6 +585,7 @@ def candidate_publisher_builder(
                     "candidate_input": summary.authority_snapshot_id,
                     "strategy_candidate": summary.snapshot_content_sha256,
                 },
+                **_replica_cost(),
             )
 
         if rebind is not None:

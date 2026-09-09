@@ -21,7 +21,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from pydantic import Field, field_validator
 
-from rquant.readside_replica_gate import descriptor_reopen_path, is_write_lock_error
+from rquant.readside_replica_gate import (
+    ReplicaReadGate,
+    descriptor_reopen_path,
+    is_write_lock_error,
+)
 from rquant.reference_slow_publisher import (
     ReferenceDailyFact,
     ReferenceSecurityFact,
@@ -591,6 +595,12 @@ def _projection_scalar(value: object) -> str | int | float | bool | None:
     return str(value)
 
 
+_ReferenceEvidence = tuple[
+    tuple[tuple[str, float, float], ...],
+    dict[str, tuple[dict[str, str | int | float | bool | None], ...]],
+]
+
+
 def _load_database_reference_evidence(
     database_path: Path,
     *,
@@ -599,10 +609,47 @@ def _load_database_reference_evidence(
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_deadline: float = float("inf"),
     monotonic_clock: Callable[[], float] = monotonic,
-) -> tuple[
-    tuple[tuple[str, float, float], ...],
-    dict[str, tuple[dict[str, str | int | float | bool | None], ...]],
-]:
+    read_gate: ReplicaReadGate[_ReferenceEvidence] | None = None,
+) -> _ReferenceEvidence:
+    """Everything this source takes out of the replica, read only when it changed (#256).
+
+    One iteration can ask for this up to six times -- the target session plus five
+    revision look-backs -- and each ask used to be a whole-database copy. The gate's key
+    is the pair of dates the queries are bound to, so a different session always reopens
+    and the same session inside one replica generation does not.
+    """
+
+    if read_gate is None:
+        return _query_database_reference_evidence(
+            database_path,
+            prior_trade_date=prior_trade_date,
+            projection_as_of_date=projection_as_of_date,
+            limits=limits,
+            monotonic_deadline=monotonic_deadline,
+            monotonic_clock=monotonic_clock,
+        )
+    return read_gate.read(
+        lambda: _query_database_reference_evidence(
+            database_path,
+            prior_trade_date=prior_trade_date,
+            projection_as_of_date=projection_as_of_date,
+            limits=limits,
+            monotonic_deadline=monotonic_deadline,
+            monotonic_clock=monotonic_clock,
+        ),
+        key=("reference-slow-evidence", prior_trade_date, projection_as_of_date),
+    ).value
+
+
+def _query_database_reference_evidence(
+    database_path: Path,
+    *,
+    prior_trade_date: date,
+    projection_as_of_date: date | None = None,
+    limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
+    monotonic_deadline: float = float("inf"),
+    monotonic_clock: Callable[[], float] = monotonic,
+) -> _ReferenceEvidence:
     import duckdb
 
     limits = ReferenceSlowSourceLimits.model_validate(limits)
@@ -1160,6 +1207,7 @@ def capture_reference_slow_source_snapshot(
     producer_commit: str,
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_clock: Callable[[], float] = monotonic,
+    read_gate: ReplicaReadGate[_ReferenceEvidence] | None = None,
 ) -> ReferenceSlowSourceSnapshot:
     """Capture all current source responses once and seal their relevant facts."""
 
@@ -1185,18 +1233,19 @@ def capture_reference_slow_source_snapshot(
         time(9, 25),
         tzinfo=_SHANGHAI,
     )
-    copy_seconds = min(
+    read_seconds = min(
         limits.snapshot_copy_timeout_seconds,
         max(0.0, (decision_cutoff - started).total_seconds()),
     )
-    copy_deadline = monotonic_clock() + copy_seconds
+    read_deadline = monotonic_clock() + read_seconds
     prior_rows, database_projections = _load_database_reference_evidence(
         _normalized_absolute_path(database_path),
         prior_trade_date=prior_trade_date,
         projection_as_of_date=target_trade_date,
         limits=limits,
-        monotonic_deadline=copy_deadline,
+        monotonic_deadline=read_deadline,
         monotonic_clock=monotonic_clock,
+        read_gate=read_gate,
     )
     codes = tuple(code for code, _close, _factor in prior_rows)
     stock_st_frame = adapter.stock_st_raw(target_trade_date)

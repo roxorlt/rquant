@@ -15,6 +15,7 @@ from rquant.auction_universe_publisher import (
     AuctionUniversePublicationError,
     publish_auction_universe_authority,
 )
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.runtime_market_session import MarketCalendarAuthority
 
@@ -109,7 +110,29 @@ def auction_universe_publication_dates(
     return effective, reference
 
 
-def _load_codes(database_path: Path, *, reference_trade_date: date) -> tuple[str, ...]:
+def _load_codes(
+    database_path: Path,
+    *,
+    reference_trade_date: date,
+    read_gate: ReplicaReadGate[tuple[str, ...]] | None = None,
+) -> tuple[str, ...]:
+    """The prior open session's universe, read from the replica only when it changed (#256).
+
+    The gate is the caller's, because it has to outlive one iteration to be worth
+    anything: it remembers `(dev, ino, size, mtime_ns)` and the date this answer was for,
+    and the replica is replaced rather than rewritten, so an identical identity is an
+    identical answer. Without a gate the read happens as it always did.
+    """
+
+    if read_gate is None:
+        return _query_codes(database_path, reference_trade_date=reference_trade_date)
+    return read_gate.read(
+        lambda: _query_codes(database_path, reference_trade_date=reference_trade_date),
+        key=("auction-universe", reference_trade_date),
+    ).value
+
+
+def _query_codes(database_path: Path, *, reference_trade_date: date) -> tuple[str, ...]:
     import duckdb
 
     try:
@@ -159,13 +182,14 @@ def publish_auction_universe_from_daily_snapshot(
     calendar: MarketCalendarAuthority,
     observed_at: datetime,
     producer_commit: str,
+    read_gate: ReplicaReadGate[tuple[str, ...]] | None = None,
 ) -> AuctionUniverseSourceReceipt:
     """Publish the next open day's expected auction coverage from prior daily bars."""
 
     observed = normalize_aware_utc(observed_at)
     effective, reference = auction_universe_publication_dates(calendar, observed)
     snapshot_path = _normalized_absolute_path(database_path)
-    codes = _load_codes(snapshot_path, reference_trade_date=reference)
+    codes = _load_codes(snapshot_path, reference_trade_date=reference, read_gate=read_gate)
     source_snapshot_id = canonical_sha256(
         {
             "contract": "auction-universe-source/v1",
