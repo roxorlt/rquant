@@ -17,8 +17,8 @@ DuckDB connection holding the main database in write mode for the whole test**, 
 what `rquant-monitor` is. Any role that reaches for the main file fails here for exactly
 the reason it failed on the host.
 
-The order is the chain's own: the publisher at 09:26 inside its window, then the two
-sources at 09:35, in the morning phase, reading what it published.
+The order is the chain's own: the publisher at 09:26:30, inside its window, then the two
+sources at 09:31, in the morning phase, reading what it published.
 """
 
 from __future__ import annotations
