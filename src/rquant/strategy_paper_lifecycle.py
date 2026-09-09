@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 from collections.abc import Mapping
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -28,6 +30,7 @@ from rquant.paper_contracts import (
 )
 from rquant.research_run_spec import ExecutionCostSpec
 from rquant.runtime_contracts import normalize_aware_utc
+from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.signal_contracts import (
     CurrentSignalEnvelope,
     SignalAction,
@@ -37,6 +40,8 @@ from rquant.signal_contracts import (
 )
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_SQLITE_HEADER_BYTES = 20
 _REQUIRED_TABLES = frozenset(
     {
         "broker_account",
@@ -106,133 +111,145 @@ class PaperBrokerLifecycleReader:
             raise ValueError("paper account_id cannot be empty or padded")
         self.account_id = account_id
         self._validate_file()
-        with self._connect() as connection:
-            tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
+        # The audit is inside the same guard as the open on purpose: python-sqlite3
+        # does not touch the database file until the first real statement, so a
+        # ledger whose `-shm` cannot be created reports `unable to open database
+        # file` from the `sqlite_master` query, not from `connect()` (#252).
+        try:
+            with self._connect() as connection:
+                self._audit_ledger(connection)
+        except sqlite3.OperationalError as error:
+            self._refuse_or_wait(error)
+
+    def _audit_ledger(self, connection: sqlite3.Connection) -> None:
+        """Nine tables, the v5 ledger schema, every PIT/provenance column, unchanged."""
+
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        missing = _REQUIRED_TABLES - tables
+        if missing:
+            raise PaperLifecycleIntegrityError(
+                "paper broker schema is missing: " + ", ".join(sorted(missing))
+            )
+        schema = connection.execute(
+            "SELECT * FROM paper_ledger_schema WHERE singleton = 1"
+        ).fetchone()
+        if schema is None or int(schema["schema_version"]) != 5:
+            raise PaperLifecycleIntegrityError(
+                "paper broker ledger schema requires explicit v5 migration"
+            )
+        required_columns = {
+            "paper_intent": {
+                "signal_id",
+                "entry_signal_id",
+                "initial_execution_id",
+                "initial_execution_request_fingerprint",
+            },
+            "paper_order": {"entry_signal_id"},
+            "broker_account": {
+                "cost_spec_id",
+                "cost_spec_schema_version",
+                "cost_provenance_state",
+            },
+            "paper_fill": {
+                "execution_id",
+                "persisted_at",
+                "transfer_fee",
+                "total_fees",
+                "cost_spec_id",
+                "cost_spec_schema_version",
+                "cost_context_fingerprint",
+                "cost_provenance_state",
+            },
+            "paper_lot": {"entry_signal_id", "persisted_at"},
+            "paper_lot_consumption": {"persisted_at"},
+            "paper_execution_receipt": {
+                "execution_id",
+                "intent_id",
+                "order_id",
+                "request_fingerprint",
+                "request_json",
+                "receipt_json",
+                "persisted_at",
+                "transfer_fee",
+                "total_fees",
+                "cost_spec_id",
+                "cost_spec_schema_version",
+                "cost_context_fingerprint",
+                "cost_provenance_state",
+            },
+        }
+        for table, expected in required_columns.items():
+            columns = {
+                str(row[1])
+                for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
             }
-            missing = _REQUIRED_TABLES - tables
-            if missing:
+            if not expected.issubset(columns):
                 raise PaperLifecycleIntegrityError(
-                    "paper broker schema is missing: " + ", ".join(sorted(missing))
+                    f"paper broker {table} lacks PIT/provenance columns"
                 )
-            schema = connection.execute(
-                "SELECT * FROM paper_ledger_schema WHERE singleton = 1"
-            ).fetchone()
-            if schema is None or int(schema["schema_version"]) != 5:
-                raise PaperLifecycleIntegrityError(
-                    "paper broker ledger schema requires explicit v5 migration"
-                )
-            required_columns = {
-                "paper_intent": {
-                    "signal_id",
-                    "entry_signal_id",
-                    "initial_execution_id",
-                    "initial_execution_request_fingerprint",
-                },
-                "paper_order": {"entry_signal_id"},
-                "broker_account": {
-                    "cost_spec_id",
-                    "cost_spec_schema_version",
-                    "cost_provenance_state",
-                },
-                "paper_fill": {
-                    "execution_id",
-                    "persisted_at",
-                    "transfer_fee",
-                    "total_fees",
-                    "cost_spec_id",
-                    "cost_spec_schema_version",
-                    "cost_context_fingerprint",
-                    "cost_provenance_state",
-                },
-                "paper_lot": {"entry_signal_id", "persisted_at"},
-                "paper_lot_consumption": {"persisted_at"},
-                "paper_execution_receipt": {
-                    "execution_id",
-                    "intent_id",
-                    "order_id",
-                    "request_fingerprint",
-                    "request_json",
-                    "receipt_json",
-                    "persisted_at",
-                    "transfer_fee",
-                    "total_fees",
-                    "cost_spec_id",
-                    "cost_spec_schema_version",
-                    "cost_context_fingerprint",
-                    "cost_provenance_state",
-                },
-            }
-            for table, expected in required_columns.items():
-                columns = {
-                    str(row[1])
-                    for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
-                }
-                if not expected.issubset(columns):
-                    raise PaperLifecycleIntegrityError(
-                        f"paper broker {table} lacks PIT/provenance columns"
-                    )
-            account = connection.execute(
-                """
-                SELECT cost_spec_id, cost_spec_schema_version, cost_provenance_state
-                FROM broker_account WHERE account_id = ?
-                """,
-                (self.account_id,),
-            ).fetchone()
-            if account is None:
-                raise PaperLifecycleIntegrityError("paper broker account is unavailable")
-            if (
-                account["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
-                or account["cost_spec_schema_version"] != 3
-                or account["cost_spec_id"] is None
-            ):
-                raise PaperLifecycleIntegrityError(
-                    "paper broker account is audit-only because cost provenance is unknown"
-                )
-            authority = connection.execute(
-                """
-                SELECT schema_version, canonical_json
-                FROM paper_cost_spec WHERE cost_spec_id = ?
-                """,
-                (account["cost_spec_id"],),
-            ).fetchone()
-            if authority is None or authority["schema_version"] != 3:
-                raise PaperLifecycleIntegrityError("paper broker v3 cost authority is unavailable")
-            try:
-                cost_spec = ExecutionCostSpec.from_canonical_json(authority["canonical_json"])
-            except (TypeError, ValueError) as exc:
-                raise PaperLifecycleIntegrityError(
-                    "paper broker v3 cost authority is invalid"
-                ) from exc
-            if (
-                not cost_spec.is_alignment_eligible
-                or cost_spec.cost_spec_id != account["cost_spec_id"]
-                or cost_spec.slippage is None
-            ):
-                raise PaperLifecycleIntegrityError(
-                    "paper broker v3 cost authority does not bind account"
-                )
-            self._price_tick = cost_spec.slippage.price_tick
-            legacy_cost_rows = connection.execute(
-                """
-                SELECT
-                    (SELECT COUNT(*) FROM paper_fill AS f
-                     JOIN paper_order AS o ON o.order_id = f.order_id
-                     WHERE o.account_id = ?
-                       AND f.cost_provenance_state IS NOT 'KNOWN_V3')
-                    +
-                    (SELECT COUNT(*) FROM paper_execution_receipt
-                     WHERE account_id = ? AND cost_provenance_state IS NOT 'KNOWN_V3')
-                """,
-                (self.account_id, self.account_id),
-            ).fetchone()[0]
-            if int(legacy_cost_rows) != 0:
-                raise PaperLifecycleIntegrityError(
-                    "paper broker account has unknown execution cost provenance"
-                )
+        account = connection.execute(
+            """
+            SELECT cost_spec_id, cost_spec_schema_version, cost_provenance_state
+            FROM broker_account WHERE account_id = ?
+            """,
+            (self.account_id,),
+        ).fetchone()
+        if account is None:
+            raise PaperLifecycleIntegrityError("paper broker account is unavailable")
+        if (
+            account["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
+            or account["cost_spec_schema_version"] != 3
+            or account["cost_spec_id"] is None
+        ):
+            raise PaperLifecycleIntegrityError(
+                "paper broker account is audit-only because cost provenance is unknown"
+            )
+        authority = connection.execute(
+            """
+            SELECT schema_version, canonical_json
+            FROM paper_cost_spec WHERE cost_spec_id = ?
+            """,
+            (account["cost_spec_id"],),
+        ).fetchone()
+        if authority is None or authority["schema_version"] != 3:
+            raise PaperLifecycleIntegrityError("paper broker v3 cost authority is unavailable")
+        try:
+            cost_spec = ExecutionCostSpec.from_canonical_json(authority["canonical_json"])
+        except (TypeError, ValueError) as exc:
+            raise PaperLifecycleIntegrityError(
+                "paper broker v3 cost authority is invalid"
+            ) from exc
+        if (
+            not cost_spec.is_alignment_eligible
+            or cost_spec.cost_spec_id != account["cost_spec_id"]
+            or cost_spec.slippage is None
+        ):
+            raise PaperLifecycleIntegrityError(
+                "paper broker v3 cost authority does not bind account"
+            )
+        self._price_tick = cost_spec.slippage.price_tick
+        legacy_cost_rows = connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM paper_fill AS f
+                 JOIN paper_order AS o ON o.order_id = f.order_id
+                 WHERE o.account_id = ?
+                   AND f.cost_provenance_state IS NOT 'KNOWN_V3')
+                +
+                (SELECT COUNT(*) FROM paper_execution_receipt
+                 WHERE account_id = ? AND cost_provenance_state IS NOT 'KNOWN_V3')
+            """,
+            (self.account_id, self.account_id),
+        ).fetchone()[0]
+        if int(legacy_cost_rows) != 0:
+            raise PaperLifecycleIntegrityError(
+                "paper broker account has unknown execution cost provenance"
+            )
 
     def _validate_file(self) -> None:
         try:
@@ -241,6 +258,66 @@ class PaperBrokerLifecycleReader:
             raise PaperLifecycleIntegrityError("paper broker database is unavailable") from exc
         if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
             raise PaperLifecycleIntegrityError("paper broker database must be a regular file")
+
+    def _refuse_or_wait(self, error: sqlite3.OperationalError) -> NoReturn:
+        """A stopped broker is a peer to wait for; anything else is still a refusal.
+
+        `broker.sqlite3` is a WAL database. While the paper broker runs, its own open
+        connection keeps `-wal` and `-shm` beside it and this read-only open succeeds.
+        After a clean stop SQLite removes both, and a read-only open of a WAL database
+        then has to *create* `-shm` -- which this role cannot do, because
+        `deploy/systemd/rquant-runtime-strategy@.service` grants it
+        `live/paper-brokers/` read-only. SQLite reports that as
+        `unable to open database file`, indistinguishable at the API from a real fault.
+
+        Starting the three strategies before the broker in the 2026-09-09 window is what
+        this cost: two of them exited 1 at construction, `Restart=` looped them and
+        `OnFailure` sent three real pushes (#252). The state is not "present and invalid",
+        it is "its owner is not running" -- the same thing an absent file means, which is
+        what `PeerArtifactUnavailableError` says everywhere else on this plane (#232, #248).
+
+        Nothing else moves: the header must actually be SQLite's, it must actually say
+        WAL, both sidecars must actually be absent, and the directory must actually be
+        one this process cannot write. A truncated or corrupt header, a missing table, a
+        ledger at the wrong schema version, or a failure in a directory this role *can*
+        write all still raise `PaperLifecycleIntegrityError`.
+        """
+
+        if self._dormant_wal_ledger():
+            raise PeerArtifactUnavailableError(
+                reader="strategy_live",
+                artifact="paper broker ledger",
+                path=self.path,
+                reason=(
+                    "it is a WAL ledger with no -wal/-shm sidecars in a directory this "
+                    "role cannot write, which is what a stopped paper broker leaves"
+                ),
+            ) from error
+        raise PaperLifecycleIntegrityError("paper broker database cannot be opened") from error
+
+    def _dormant_wal_ledger(self) -> bool:
+        """Exactly the shape a cleanly stopped broker leaves, and nothing wider."""
+
+        try:
+            with open(self.path, "rb") as handle:
+                header = handle.read(_SQLITE_HEADER_BYTES)
+        except OSError:
+            return False
+        if len(header) < _SQLITE_HEADER_BYTES or not header.startswith(_SQLITE_MAGIC):
+            return False
+        #: bytes 18 and 19 are the write and read file format versions; 2 is WAL
+        if header[18] != 2 or header[19] != 2:
+            return False
+        parent = self.path.parent
+        for sidecar in (f"{self.path.name}-wal", f"{self.path.name}-shm"):
+            try:
+                (parent / sidecar).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            return False
+        return not os.access(parent, os.W_OK)
 
     def _connect(self) -> sqlite3.Connection:
         uri = f"file:{quote(str(self.path), safe='/')}?mode=ro"

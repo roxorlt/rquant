@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -831,3 +832,146 @@ def test_unknown_legacy_fill_availability_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(PaperLifecycleIntegrityError, match="availability|persisted_at"):
         _resolve(path, entry, cutoff=BUY_AT + timedelta(seconds=1))
+
+
+# ---------------------------------------------------------------------------------------
+# #252: a stopped broker leaves a WAL ledger with no sidecars in a directory we cannot write
+# ---------------------------------------------------------------------------------------
+
+
+def _stopped_broker_ledger(tmp_path: Path) -> Path:
+    """A real ledger, cleanly closed, in a directory this process cannot write.
+
+    That is what `deploy/systemd/rquant-runtime-strategy@.service` hands the strategy:
+    `live/paper-brokers/` is read-only for it, and after the paper broker's clean stop
+    SQLite has removed `broker.sqlite3-wal` and `-shm`.
+    """
+
+    directory = tmp_path / "paper-brokers" / "svc"
+    directory.mkdir(parents=True)
+    path = directory / "broker.sqlite3"
+    broker = _broker(path)
+    _submit_buy(broker, _entry_signal())
+    del broker
+    gc.collect()
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+    #: SQLite removes both sidecars when the *last* connection closes, which is exactly
+    #: what the paper broker's clean stop does
+    assert not (directory / "broker.sqlite3-wal").exists()
+    assert not (directory / "broker.sqlite3-shm").exists()
+    return path
+
+
+def test_a_stopped_broker_is_a_peer_to_wait_for_not_an_invalid_ledger(
+    tmp_path: Path,
+) -> None:
+    """#252: three real `OnFailure` pushes came out of calling this state invalid.
+
+    Starting the strategies before the paper broker made two of the three exit 1 at
+    construction with `sqlite3.OperationalError: unable to open database file`, which
+    `Restart=` then looped. The ledger is not damaged: its owner is simply not running,
+    and the strategy has to wait for it exactly as it waits for an absent file.
+    """
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    path = _stopped_broker_ledger(tmp_path)
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(PeerArtifactUnavailableError) as raised:
+            PaperBrokerLifecycleReader(path, account_id="paper-main")
+    finally:
+        path.parent.chmod(0o700)
+    assert raised.value.path == path
+    assert "wal" in str(raised.value).lower()
+
+
+def test_the_same_ledger_opens_normally_once_its_directory_is_writable(
+    tmp_path: Path,
+) -> None:
+    """The wait is about the sandbox, not about the file: nothing else changed."""
+
+    path = _stopped_broker_ledger(tmp_path)
+    reader = PaperBrokerLifecycleReader(path, account_id="paper-main")
+    assert reader.path == path
+
+
+@pytest.mark.parametrize("damage", ("header", "truncated"))
+def test_a_damaged_ledger_in_the_same_read_only_directory_still_refuses(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    """The negative half: only the exact stopped-broker shape waits, everything else refuses."""
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    path = _stopped_broker_ledger(tmp_path)
+    if damage == "header":
+        payload = bytearray(path.read_bytes())
+        payload[:16] = b"NotSQLite fmt 3\x00"
+        path.write_bytes(bytes(payload))
+    else:
+        path.write_bytes(path.read_bytes()[:8])
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(Exception) as raised:  # noqa: PT011 - the type is the assertion
+            PaperBrokerLifecycleReader(path, account_id="paper-main")
+    finally:
+        path.parent.chmod(0o700)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError), raised.value
+
+
+def test_a_rollback_journal_ledger_opens_in_the_same_read_only_directory(
+    tmp_path: Path,
+) -> None:
+    """The write-side option the owner still has open, measured rather than argued.
+
+    #242 fixed the reference registry by publishing it in rollback-journal mode. The same
+    ledger, same read-only directory, same reader: with `journal_mode=DELETE` there is no
+    `-shm` to create and the read-only open simply works. That is what switching
+    `broker.sqlite3` would buy, and it is the reason this package's read-side fix does not
+    prejudge that decision -- both are complete on their own.
+    """
+
+    path = _stopped_broker_ledger(tmp_path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode = DELETE")
+    finally:
+        connection.close()
+    path.parent.chmod(0o500)
+    try:
+        assert PaperBrokerLifecycleReader(path, account_id="paper-main").path == path
+    finally:
+        path.parent.chmod(0o700)
+
+
+def test_a_ledger_missing_its_tables_still_refuses_even_where_it_could_wait(
+    tmp_path: Path,
+) -> None:
+    """A WAL database with no sidecars that is *not* a paper ledger is still a refusal."""
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    directory = tmp_path / "paper-brokers" / "svc"
+    directory.mkdir(parents=True)
+    path = directory / "broker.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("CREATE TABLE unrelated (a INTEGER)")
+    with pytest.raises(PaperLifecycleIntegrityError, match="schema is missing"):
+        PaperBrokerLifecycleReader(path, account_id="paper-main")
+    #: and the same file in the read-only directory waits, because the open is what fails
+    #: there -- the audit never runs. What must never happen is the reverse: a schema the
+    #: audit rejects being reported as a peer to wait for.
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises((PeerArtifactUnavailableError, PaperLifecycleIntegrityError)):
+            PaperBrokerLifecycleReader(path, account_id="paper-main")
+    finally:
+        path.parent.chmod(0o700)
+
