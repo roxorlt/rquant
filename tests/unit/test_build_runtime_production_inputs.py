@@ -380,8 +380,12 @@ def test_a_malformed_floor_exits_two_rather_than_raising(tmp_path: Path) -> None
     assert generator.main(_argv(tmp_path, **{"--calendar-coverage-floor": "31-12-2026"})) == 2
 
 
-def test_the_primary_duckdb_is_refused_without_an_explicit_override(tmp_path: Path) -> None:
-    """CLAUDE.md's hard rule: readers open the replica, never the write-locked primary."""
+def test_the_primary_duckdb_is_refused_and_there_is_no_override(tmp_path: Path) -> None:
+    """CLAUDE.md's hard rule: readers open the replica, never the write-locked primary.
+
+    Ruling 24 (#250) removed `--allow-primary-database`, so this refusal has no way out;
+    `test_readside_replica_bindings` pins that the option is gone from the parser.
+    """
 
     _write_calendar_database(tmp_path / "rquant.duckdb")
 

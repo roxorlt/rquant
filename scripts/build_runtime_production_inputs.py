@@ -86,6 +86,8 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPOSITORY_ROOT / "src") not in sys.path:  # pragma: no cover - import bootstrap
     sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
 
+from pydantic import ValidationError  # noqa: E402
+
 from rquant.live_contracts import BatchQualityStatus  # noqa: E402
 from rquant.runtime_builder_candidate import serialize_candidate_input  # noqa: E402
 from rquant.runtime_builder_retention import (  # noqa: E402
@@ -230,23 +232,26 @@ def prepare_output_root(root: Path) -> None:
 # ---------------------------------------------------------------------------------------
 
 
-def read_sse_calendar(
-    database: Path,
-    *,
-    allow_primary_database: bool,
-) -> tuple[tuple[date, bool, datetime], ...]:
+def read_sse_calendar(database: Path) -> tuple[tuple[date, bool, datetime], ...]:
     """Read every SSE row of `trade_calendar`, newest `updated_at` last.
 
-    The connection is read-only and the primary database is refused by default. DuckDB takes
-    a single file lock: while `rquant-monitor` holds the write lock, *any* new connection to
-    the primary fails, `read_only=True` included (CLAUDE.md, the 2026-05-20 incident). The
-    replica `rquant_ro.duckdb` is the supported reader path.
+    The connection is read-only and the primary database is refused, with no override.
+    DuckDB takes a single file lock: while `rquant-monitor` holds the write lock, *any* new
+    connection to the primary fails, `read_only=True` included (CLAUDE.md, the 2026-05-20
+    incident). The replica `rquant_ro.duckdb` is the supported reader path.
+
+    The `--allow-primary-database` flag that used to lift this was removed by ruling 24
+    (#250): it governed only this one read, it could not have made a role binding legal,
+    and an operator reading `--help` could reasonably take it for permission to point a
+    live role at the write-locked main file. The one production binding that still names
+    the main database is the recovery artifact role, which is not affected by any flag
+    here.
     """
 
-    if database.name == "rquant.duckdb" and not allow_primary_database:
+    if database.name == "rquant.duckdb":
         raise GeneratorError(
             "refusing to open the primary DuckDB; point --calendar-database at the "
-            "read-only replica (rquant_ro.duckdb) or pass --allow-primary-database"
+            "read-only replica (rquant_ro.duckdb)"
         )
     import duckdb
 
@@ -748,6 +753,27 @@ def _instance_name(service_id: str) -> str:
     return "svc-" + hashlib.sha256(service_id.encode("utf-8")).hexdigest()
 
 
+def _validated_inputs(**fields: Any) -> ProductionRuntimeProfileInputs:
+    """Build the inputs model, reporting a refusal the way this script reports every other.
+
+    Everything else in this script raises `GeneratorError`, which `main` prints as
+    `error: <message>` and turns into exit code 2. A model refusal used to escape as a
+    pydantic `ValidationError`, so the operator got a stack trace whose last line held the
+    sentence they needed — including the #250 refusal of a replica that resolves to the
+    main database (review SF-6). The pydantic message is kept verbatim; only its shape
+    changes.
+    """
+
+    try:
+        return ProductionRuntimeProfileInputs(**fields)
+    except ValidationError as exc:
+        reasons = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or '<document>'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise GeneratorError(f"the inputs document is invalid: {reasons}") from exc
+
+
 def build_inputs_payload(
     *,
     producer_commit: str,
@@ -798,7 +824,7 @@ def build_inputs_payload(
         ProductionStrategyBinding.model_validate(binding.model_dump(mode="python"))
         for binding in plan_builtin_definitions(producer_commit=producer_commit).strategies
     )
-    inputs = ProductionRuntimeProfileInputs(
+    inputs = _validated_inputs(
         producer_commit=producer_commit,
         runtime_mode="local-test",
         runtime_root=runtime_root,
@@ -889,7 +915,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkout", default=str(_REPOSITORY_ROOT))
     parser.add_argument("--producer-commit", default=None)
     parser.add_argument("--calendar-database", required=True)
-    parser.add_argument("--allow-primary-database", action="store_true")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--inputs-output", required=True)
     parser.add_argument("--runtime-root", default="/home/lighthouse/rquant/data/runtime")
@@ -1007,10 +1032,7 @@ def _run(arguments: argparse.Namespace) -> int:
 
     prepare_output_root(output_root)
 
-    rows = read_sse_calendar(
-        calendar_database,
-        allow_primary_database=arguments.allow_primary_database,
-    )
+    rows = read_sse_calendar(calendar_database)
     if arguments.generated_at is None:
         generated_at = max(row[2] for row in rows)
     else:

@@ -95,6 +95,8 @@ def _production_bundle(
     runtime_root: Path | None = None,
     schema_bootstrap_reason: str | None = "route A legacy binding acceptance",
     definition_registry_root: Path | None = None,
+    market_calendar_open_dates: tuple[Any, ...] | None = None,
+    schema_rollout_started_at: Any = None,
 ) -> tuple[Any, Any, Any, dict[str, bytes]]:
     """Install a real production deployment bundle at a temporary runtime root.
 
@@ -107,9 +109,16 @@ def _production_bundle(
 
     `schema_bootstrap_reason` is the caller's, because it is only allowed on the first
     install into an empty root; the rollout acceptance installs a second generation over
-    this one and has to pass `None` there. `definition_registry_root` is the caller's for
-    the same reason: one root cannot hold two commits' definitions (#225), and production
-    gives each commit its own `definitions-<commit>`.
+    this one and has to pass `None` there. `market_calendar_open_dates` is the caller's
+    because one open date is enough for a world that never trades, and not enough for one
+    that does: the `auction_gap` candidate publisher reads the five sessions before the
+    one it publishes for (#250). `schema_rollout_started_at` is the installer's own
+    parameter, forwarded for the same reason: a world whose roles run at a market clock
+    has to stamp the rollout window at that clock, because a producer's dual-write is
+    recorded with the service's clock and refused outside the window.
+    `definition_registry_root` is the caller's for the same reason: one root cannot hold
+    two commits' definitions (#225), and production gives each commit its own
+    `definitions-<commit>`.
 
     The credential plaintexts the bundle built for that seam are kept and returned rather
     than dropped. They are the real thing — `serialize_runtime_credential` over the real
@@ -154,7 +163,7 @@ def _production_bundle(
         producer_commit=producer_commit,
         coverage_start=date(2026, 1, 1),
         coverage_end=date(2026, 12, 31),
-        open_dates=(date(2026, 8, 3),),
+        open_dates=(market_calendar_open_dates or (date(2026, 8, 3),)),
         generated_at=datetime(2025, 12, 31, 8, tzinfo=UTC),
     )
     inputs = _inputs(tmp_path)
@@ -236,6 +245,7 @@ def _production_bundle(
         runtime_root=inputs.runtime_root,
         environ=capabilities,
         schema_bootstrap_reason=schema_bootstrap_reason,
+        schema_rollout_started_at=schema_rollout_started_at,
     )
     #: the paper constraint builder opens this registry while it is being built, so the
     #: file has to exist before the role starts — on the host the reference-slow publisher

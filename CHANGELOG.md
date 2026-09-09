@@ -151,6 +151,39 @@
 
 ### Fixed
 
+- **三个读侧 role 从生产主库改读五分钟只读副本（#250）**：`rquant-monitor` 盘中 09:25–15:00
+  一直持有 `data/rquant.duckdb` 的写锁，DuckDB 在写锁期间**拒绝任何新连接，`read_only=True` 也一样**
+  （CLAUDE.md 强制条款）。包 N 把竞价 universe 改到了副本（#249），剩下三处仍指着主库：
+  - **`candidate.auction_gap.v1` 的 `daily_database_path`**：这个发布者只在 09:26–09:30 之间
+    发布（`runtime_builder_candidate.py`），整段都落在写锁窗口里，所以它**一次也发不出来**；
+    `market-minute.source.v1` 与 `watchlist-quote.source.v1` 于是每轮都以
+    `required authority has no not_visible snapshot` 失败，整条 live 链停在盘前。
+    它读的是**上一交易日往前五个交易日**的 `daily_bar` 成交量（`_prior_five_dates` 只取
+    `< trade_date` 的开盘日），这些行前一天 17:00 的 daily 跑完就在库里，副本晚间同步之后就带着，
+    所以副本 ≤ 5 分钟的延迟对这个窗口没有影响，不需要当日盘中数据。
+  - **`reference-slow.source.v1` 的 `database_path`**：它先把整个库拷成私有快照再查，
+    而且**拒绝带未收口 `.wal` sidecar 的库**——主库只要有写者打开就带 WAL。
+  - **notifier 的 `page_projection_database_path`**（每 2 秒一轮，#255 的一半——
+    另一半是钉代时在库旁边建硬链接失败，由包 O 修，两个包必须同一代上线）。
+    `page_projection_surge_live_root` 跟着投影库走（bundle 要求它必须是投影库的同级 `surge_live`），
+    生产上两个库在同一个 data 目录，所以这一项的取值没有变；它读的是 JSONL/JSON 文件，
+    本来就不经过 DuckDB 锁。
+
+  **recovery 绑定按设计仍指主库**（它是被备份的对象，不是被读的库），并在生成器/画像里显式豁免。
+  画像新增拒绝规则：读侧 role 的数据库字段必须是副本，并且**每个 manifest 的每一个字符串设置**
+  只要会打开主库就报错并点名 role 与字段。判的是**值**不是字段名：列表元素与嵌套 mapping 的值
+  一并走到，解析符号链接后路径相等**或** `(st_dev, st_ino)` 相同（硬链接冒充副本）都算命中；
+  相对值**一律不解析**——按构建进程的工作目录解析会让同一份文档在不同目录下含义不同——
+  改为拒绝拼写成主库文件名的相对值，四条点名的读侧绑定另外要求绝对路径。
+  inputs 文档自身也拒绝解析到主库、或与主库同 inode 的副本路径（生成器只跑到这一层）。
+  两个读者的 mode 规则改为 #249 的规则——属主是运行时 uid、无 group/other 写位（0644 通过）——
+  因为副本每五分钟由 `sync-readonly-replica.sh` 以 0644 重建；读者维持
+  每轮开→读→关，不跨副本替换持有连接。生成器的 `--allow-primary-database` 已删除：
+  它只作用于生成器自己那一次日历读取，却像是在给 role 放行。
+  **下一个窗口必须重新生成 inputs 与重出 profile**：这个窗口共有**四个** manifest 的 settings 变了
+  （#249 的 `auction-universe.publisher.v1` 一个，加本条的三个），
+  `profile_id` 会变、bundle generation 跟着变，权威链按既有约定走。
+
 - **候选库的发布锁改由发布者在构建时创建，两个 source role 不再把「还没发布过的库」当成损坏（#254）**：
   第七个 Route A 窗口里 `market-minute.source.v1` 与 `watchlist-quote.source.v1` 每一轮都
   DEGRADED，报 `auction_gap@1: snapshot authority is damaged: strategy candidate snapshot
