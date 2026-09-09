@@ -440,6 +440,20 @@ def test_candidate_publisher_reloads_an_injected_loader_on_every_step(
     ]
 
 
+def _unpublished(root: Path) -> bool:
+    """The owner's empty scaffolding and nothing else: no generation, no current pointer."""
+
+    return (
+        root.is_dir()
+        and (root / ".publish.lock").is_file()
+        and (root / "generations").is_dir()
+        and not any((root / "generations").iterdir())
+        and not (root / "current.json").exists()
+        and not (root / "generation-index.json").exists()
+        and not (root / "authority.json").exists()
+    )
+
+
 def test_candidate_publisher_fails_closed_on_input_commit_or_strategy_drift(
     tmp_path: Path,
 ) -> None:
@@ -464,7 +478,10 @@ def test_candidate_publisher_fails_closed_on_input_commit_or_strategy_drift(
                     snapshot_root=root,
                 )
             )()
-        assert not root.exists()
+        #: #254: the root, its `generations/` and `.publish.lock` are created by the
+        #: owner at build, because that lock is what every reader of this store takes a
+        #: shared lock on. What a refused step must not leave is a *publication*.
+        assert _unpublished(root)
 
 
 @pytest.mark.parametrize(
@@ -825,4 +842,101 @@ def test_injected_loader_cannot_cross_strategy_authority(tmp_path: Path) -> None
             _manifest(tmp_path, snapshot_root=root)
         )()
 
-    assert not root.exists()
+    assert _unpublished(root)
+
+
+# ---------------------------------------------------------------------------------------
+# #254: the reader's shared lock is the publisher's to create, and only a publish made it
+# ---------------------------------------------------------------------------------------
+
+
+def _legacy_unbound_root(root: Path) -> None:
+    """`live/candidates/<svc>/` as the host had it: generations, no `authority.json`."""
+
+    StrategyCandidateSnapshotSpool(root).publish_legacy_records_for_migration(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT,
+        rows=(),
+    )
+    assert not (root / "authority.json").exists()
+
+
+def test_the_publisher_creates_its_readers_lock_at_build_not_at_first_publish(
+    tmp_path: Path,
+) -> None:
+    """#254: two source roles read this store, and both refused it for a whole window.
+
+    `market-minute.source.v1` and `watchlist-quote.source.v1` failed every iteration with
+    `snapshot authority is damaged: strategy candidate snapshot lock is missing or
+    unsafe`. The reader has taken a shared lock on `.publish.lock` since the store was
+    introduced -- that requirement did not move -- but only a *publish* ever created the
+    file, and the auction_gap publisher published nothing in that window. The build is
+    where the owner now creates it, whatever else it finds.
+    """
+
+    root = tmp_path / "live" / "candidates" / "svc-auction-gap"
+    _legacy_unbound_root(root)
+    #: the state the host was in: generations on disk, no lock beside them
+    (root / ".publish.lock").unlink()
+    reader = StrategyCandidateSnapshotSpool(root)
+    with pytest.raises(Exception, match="lock is missing or unsafe"):
+        reader.read_legacy_for_migration(CAPTURED_AT)
+
+    candidate_publisher_builder()(_manifest(tmp_path, snapshot_root=root))
+
+    assert (root / ".publish.lock").is_file()
+    assert reader.read_legacy_for_migration(CAPTURED_AT) is not None
+
+
+def test_the_build_creates_the_root_of_a_publisher_that_has_never_published(
+    tmp_path: Path,
+) -> None:
+    """A store no batch has reached yet is young, not damaged, and readable as empty."""
+
+    root = tmp_path / "live" / "candidates" / "svc-fresh"
+    candidate_publisher_builder()(_manifest(tmp_path, snapshot_root=root))
+
+    assert _unpublished(root)
+    assert StrategyCandidateSnapshotSpool(root).read_as_of(CAPTURED_AT) is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    (
+        (0o666, "not a private regular file"),
+        ("symlink", "lock"),
+    ),
+)
+def test_a_damaged_lock_is_still_refused_at_build(
+    tmp_path: Path,
+    mode: object,
+    message: str,
+) -> None:
+    """The negative half: creating the lock is not accepting whatever is at its name."""
+
+    import os
+
+    root = tmp_path / "live" / "candidates" / "svc-damaged"
+    _legacy_unbound_root(root)
+    lock = root / ".publish.lock"
+    if mode == "symlink":
+        lock.unlink()
+        os.symlink(root / "current.json", lock)
+    else:
+        lock.chmod(mode)  # type: ignore[arg-type]
+
+    with pytest.raises(Exception, match=message):
+        candidate_publisher_builder()(_manifest(tmp_path, snapshot_root=root))
+
+
+def test_a_root_that_is_not_private_is_still_refused_at_build(tmp_path: Path) -> None:
+    """And the directory the lock lives in has to be ours and 0700, as it always did."""
+
+    root = tmp_path / "live" / "candidates" / "svc-open"
+    _legacy_unbound_root(root)
+    root.chmod(0o755)
+
+    with pytest.raises(Exception, match="directory"):
+        candidate_publisher_builder()(_manifest(tmp_path, snapshot_root=root))
+

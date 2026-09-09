@@ -477,12 +477,21 @@ def candidate_publisher_builder(
             runtime_root,
             service_id=manifest.service_id,
         )
+        spool = StrategyCandidateSnapshotSpool(
+            settings.snapshot_root,
+            previous_generation_of_binding=previous_generation_of_binding,
+        )
+        # The owner creates its own lock here, at build, whatever it finds -- bound root,
+        # unbound legacy root, or nothing at all. `.publish.lock` is what every reader of
+        # this store takes a shared lock on, and before #254 only a publish created it, so
+        # a root whose publisher had not managed a batch yet read as *damaged* to the two
+        # source roles that depend on it. This is the same rule the strategy already
+        # follows for `runner.sqlite3` (#232): the artifact other roles wait on exists as
+        # soon as its owner's process does.
+        spool.initialize_publisher_root()
         rebind = None
         if previous_generation_of_binding is not None:
-            rebind = StrategyCandidateSnapshotSpool(
-                settings.snapshot_root,
-                previous_generation_of_binding=previous_generation_of_binding,
-            ).rebind_previous_generation_authority(
+            rebind = spool.rebind_previous_generation_authority(
                 strategy_id=settings.strategy_id,
                 strategy_version=str(settings.strategy_version),
                 definition_fingerprint=settings.definition_fingerprint,
