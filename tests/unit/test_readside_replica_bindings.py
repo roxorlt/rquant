@@ -443,3 +443,172 @@ def test_the_auction_gap_reader_reopens_the_replica_on_every_read(tmp_path: Path
 
     assert [row[2] for row in first] == [1_000.0]
     assert [row[2] for row in second] == [2_000.0]
+
+
+# ---------------------------------------------------------------------------------------
+# Review SF-1/SF-2/SF-3: what the sweep looks at, and what "the main database" means
+# ---------------------------------------------------------------------------------------
+
+
+def _doctored(profile: object, service_id: str, **settings: object) -> object:
+    manifest = _manifest(profile, service_id)
+    return manifest.model_copy(
+        update={"settings": {**dict(manifest.settings), **settings}}
+    )
+
+
+def _refuse(inputs: ProductionRuntimeProfileInputs, manifest: object) -> str:
+    from rquant.runtime_production_profile import _validate_read_side_database_bindings
+
+    with pytest.raises(ValueError) as error:
+        _validate_read_side_database_bindings(
+            (manifest,),
+            operational_database_path=inputs.operational_database_path,
+            readonly_replica_database_path=inputs.readonly_replica_database_path,
+        )
+    return str(error.value)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        #: not a `*_database_path` name at all, and two manifests already carry a DuckDB
+        #: under exactly this key (`artifact-catalog.primary.v1`, `lab-jobs.serving.v1`)
+        "dataset_authority_path",
+        #: the plural, which the suffix test also missed
+        "extra_database_paths",
+        #: and a name that says nothing about databases
+        "somewhere_else",
+    ],
+)
+def test_the_main_database_is_refused_under_any_setting_name(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    """Filtering by key name only refuses the mistakes that spell themselves out (SF-1)."""
+
+    inputs = _inputs(tmp_path)
+    profile = build_production_runtime_profile(inputs)
+    doctored = _doctored(
+        profile,
+        "auction-universe.publisher.v1",
+        **{field: str(inputs.operational_database_path)},
+    )
+
+    message = _refuse(inputs, doctored)
+    assert "auction-universe.publisher.v1" in message
+    assert field in message
+
+
+def test_the_main_database_is_refused_inside_a_list_and_inside_a_nested_mapping(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    profile = build_production_runtime_profile(inputs)
+    main = str(inputs.operational_database_path)
+
+    assert "in_a_list" in _refuse(
+        inputs,
+        _doctored(profile, "auction-universe.publisher.v1", in_a_list=["/tmp/fine", main]),
+    )
+    assert "in_a_mapping" in _refuse(
+        inputs,
+        _doctored(
+            profile,
+            "auction-universe.publisher.v1",
+            in_a_mapping=[{"label": "authority", "path": main}],
+        ),
+    )
+
+
+def test_a_relative_setting_is_never_resolved_against_the_building_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same document must not mean two things depending on where it was built (SF-2).
+
+    `os.path.realpath` resolves a relative value against the *process* working directory,
+    so `rquant.duckdb` was refused when the profile happened to be built in the data
+    directory and accepted anywhere else. A relative value is never resolved now; one that
+    spells the main database's own file name is refused wherever the build runs.
+    """
+
+    inputs = _inputs(tmp_path)
+    profile = build_production_runtime_profile(inputs)
+    inputs.operational_database_path.parent.mkdir(parents=True, exist_ok=True)
+    doctored = _doctored(
+        profile,
+        "auction-universe.publisher.v1",
+        relative_database_path=inputs.operational_database_path.name,
+    )
+
+    for directory in (tmp_path, inputs.operational_database_path.parent):
+        monkeypatch.chdir(directory)
+        assert "relative_database_path" in _refuse(inputs, doctored)
+
+
+def test_a_hard_link_to_the_main_database_is_refused(tmp_path: Path) -> None:
+    """`realpath` sees two different names; the inode sees one file (SF-3)."""
+
+    inputs = _inputs(tmp_path)
+    profile = build_production_runtime_profile(inputs)
+    inputs.operational_database_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs.operational_database_path.write_bytes(b"")
+    linked = inputs.operational_database_path.parent / "second-name.duckdb"
+    os.link(inputs.operational_database_path, linked)
+    assert os.path.realpath(linked) != os.path.realpath(inputs.operational_database_path)
+
+    doctored = _doctored(
+        profile,
+        "auction-universe.publisher.v1",
+        hard_linked_path=str(linked),
+    )
+
+    assert "hard_linked_path" in _refuse(inputs, doctored)
+
+
+def test_a_hard_linked_replica_is_refused_at_the_inputs_layer(tmp_path: Path) -> None:
+    """A replica whose name is its own but whose inode is the main database's (SF-3)."""
+
+    inputs = _inputs(tmp_path)
+    inputs.operational_database_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs.operational_database_path.write_bytes(b"")
+    replica = inputs.readonly_replica_database_path
+    replica.unlink(missing_ok=True)
+    os.link(inputs.operational_database_path, replica)
+    payload = inputs.model_dump(mode="python")
+
+    with pytest.raises(ValueError, match="resolve to the main database"):
+        ProductionRuntimeProfileInputs.model_validate(payload)
+
+
+def test_the_generator_reports_a_symlinked_replica_without_a_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The operator reads `error: ...` on stderr, not a pydantic stack (SF-6)."""
+
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    import build_runtime_production_inputs as generator
+
+    from tests.unit.test_build_runtime_production_inputs import (
+        _argv,
+        _write_calendar_database,
+    )
+
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+    data_root = tmp_path / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
+    main = data_root / "rquant.duckdb"
+    main.write_bytes(b"")
+    replica = data_root / "rquant_ro.duckdb"
+    replica.symlink_to(main)
+
+    code = generator.main(_argv(tmp_path))
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "read-only replica cannot resolve to the main database" in captured.err
+    assert "Traceback" not in captured.err

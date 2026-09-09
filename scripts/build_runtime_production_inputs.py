@@ -86,6 +86,8 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPOSITORY_ROOT / "src") not in sys.path:  # pragma: no cover - import bootstrap
     sys.path.insert(0, str(_REPOSITORY_ROOT / "src"))
 
+from pydantic import ValidationError  # noqa: E402
+
 from rquant.live_contracts import BatchQualityStatus  # noqa: E402
 from rquant.runtime_builder_candidate import serialize_candidate_input  # noqa: E402
 from rquant.runtime_builder_retention import (  # noqa: E402
@@ -751,6 +753,27 @@ def _instance_name(service_id: str) -> str:
     return "svc-" + hashlib.sha256(service_id.encode("utf-8")).hexdigest()
 
 
+def _validated_inputs(**fields: Any) -> ProductionRuntimeProfileInputs:
+    """Build the inputs model, reporting a refusal the way this script reports every other.
+
+    Everything else in this script raises `GeneratorError`, which `main` prints as
+    `error: <message>` and turns into exit code 2. A model refusal used to escape as a
+    pydantic `ValidationError`, so the operator got a stack trace whose last line held the
+    sentence they needed — including the #250 refusal of a replica that resolves to the
+    main database (review SF-6). The pydantic message is kept verbatim; only its shape
+    changes.
+    """
+
+    try:
+        return ProductionRuntimeProfileInputs(**fields)
+    except ValidationError as exc:
+        reasons = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or '<document>'}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise GeneratorError(f"the inputs document is invalid: {reasons}") from exc
+
+
 def build_inputs_payload(
     *,
     producer_commit: str,
@@ -801,7 +824,7 @@ def build_inputs_payload(
         ProductionStrategyBinding.model_validate(binding.model_dump(mode="python"))
         for binding in plan_builtin_definitions(producer_commit=producer_commit).strategies
     )
-    inputs = ProductionRuntimeProfileInputs(
+    inputs = _validated_inputs(
         producer_commit=producer_commit,
         runtime_mode="local-test",
         runtime_root=runtime_root,

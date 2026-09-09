@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -226,11 +226,14 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
         if replica.name == "rquant.duckdb":
             raise ValueError("auction universe read-only replica cannot be the main rquant.duckdb")
         #: #250: neither of the two checks above sees a replica that is *named*
-        #: `rquant_ro.duckdb` and is a symlink to the main database. What matters is the
-        #: file the open lands on, so the generator resolves the link before comparing.
-        if Path(os.path.realpath(replica)) == Path(
-            os.path.realpath(self.operational_database_path)
-        ):
+        #: `rquant_ro.duckdb` and is the main database — as a symlink, or (review SF-3) as
+        #: a hard link, whose name `realpath` cannot see through at all. What matters is
+        #: the file the open lands on, so the generator compares both the resolved name
+        #: and the inode before accepting it.
+        if _resolved_path(replica) == _resolved_path(self.operational_database_path):
+            raise ValueError("read-only replica cannot resolve to the main database")
+        main_identity = _regular_file_identity(self.operational_database_path)
+        if main_identity is not None and _regular_file_identity(replica) == main_identity:
             raise ValueError("read-only replica cannot resolve to the main database")
         return self
 
@@ -882,15 +885,70 @@ READ_SIDE_DATABASE_BINDINGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     }
 )
 
-#: Any other manifest setting whose name ends this way is a database binding too, and no
-#: manifest may point one at the main database even if it is not in the table above.
-_DATABASE_SETTING_SUFFIX = "database_path"
-
-
 def _resolved_path(path: Path) -> Path:
     """`realpath`, so a replica that is a symlink to the main database is still the main one."""
 
     return Path(os.path.realpath(os.fspath(path)))
+
+
+def _regular_file_identity(path: Path) -> tuple[int, int] | None:
+    """`(st_dev, st_ino)` of the file a path lands on, or `None` if it is not one.
+
+    `realpath` compares *names*, and two hard links to one inode have different names
+    (review SF-3). A replica that is a hard link to the main database passes every
+    name-based check while being, byte for byte, the file `rquant-monitor` locks.
+    """
+
+    try:
+        observed = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(observed.st_mode):
+        return None
+    return (observed.st_dev, observed.st_ino)
+
+
+def _setting_strings(value: object) -> Iterator[str]:
+    """Every string anywhere inside one manifest setting, lists and mappings included.
+
+    Filtering by field name (`*_database_path`) only refused the mistakes that spell
+    themselves out: `dataset_authority_path` already holds a DuckDB path in two manifests,
+    the plural `*_database_paths` was invisible, and so was a path inside a list (review
+    SF-1). Walking the value costs nothing and needs no list of blessed names.
+    """
+
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _setting_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _setting_strings(item)
+
+
+def _names_the_main_database(
+    value: str,
+    *,
+    main: Path,
+    main_identity: tuple[int, int] | None,
+) -> bool:
+    """Whether this string would open the production main database.
+
+    A relative value is **never** resolved: `os.path.realpath` would resolve it against the
+    working directory of whichever process built the profile, so the same document meant
+    two different things depending on where it was built (review SF-2). What is refused
+    instead is a relative value that spells the main database's own file name.
+    """
+
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return candidate.name == main.name
+    if _resolved_path(candidate) == main:
+        return True
+    if main_identity is None:
+        return False
+    return _regular_file_identity(candidate) == main_identity
 
 
 def _validate_read_side_database_bindings(
@@ -911,6 +969,7 @@ def _validate_read_side_database_bindings(
     """
 
     main = _resolved_path(operational_database_path)
+    main_identity = _regular_file_identity(operational_database_path)
     replica = _resolved_path(readonly_replica_database_path)
     by_id = {manifest.service_id: manifest for manifest in manifests}
     for service_id, fields in READ_SIDE_DATABASE_BINDINGS.items():
@@ -919,22 +978,30 @@ def _validate_read_side_database_bindings(
             continue
         for field in fields:
             value = manifest.settings.get(field)
-            if not isinstance(value, str) or _resolved_path(Path(value)) != replica:
+            if (
+                not isinstance(value, str)
+                or not Path(value).is_absolute()
+                or _resolved_path(Path(value)) != replica
+            ):
                 raise ValueError(
                     f"read-side role {service_id} field {field} must be the read-only "
                     f"replica {readonly_replica_database_path}, not {value!r}"
                 )
     for manifest in manifests:
-        for field, value in sorted(manifest.settings.items()):
-            if not field.endswith(_DATABASE_SETTING_SUFFIX) or not isinstance(value, str):
-                continue
-            if _resolved_path(Path(value)) == main:
+        for field, setting in sorted(manifest.settings.items()):
+            for value in _setting_strings(setting):
+                if not _names_the_main_database(
+                    value,
+                    main=main,
+                    main_identity=main_identity,
+                ):
+                    continue
                 raise ValueError(
-                    f"runtime role {manifest.service_id} field {field} resolves to the "
-                    f"production main database {main}; live readers open the replica "
-                    f"{readonly_replica_database_path} (the recovery binding is the only "
-                    "binding in a production profile that may name the main database, and "
-                    "it is not a manifest)"
+                    f"runtime role {manifest.service_id} setting {field} names the "
+                    f"production main database {main} (value {value!r}); live readers open "
+                    f"the replica {readonly_replica_database_path} (the recovery binding is "
+                    "the only binding in a production profile that may name the main "
+                    "database, and it is not a manifest)"
                 )
 
 
