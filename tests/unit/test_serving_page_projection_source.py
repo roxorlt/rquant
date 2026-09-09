@@ -556,7 +556,14 @@ def test_duckdb_signal_source_binds_generation_opened_during_connect(
 
     monkeypatch.setattr(duckdb, "connect", swap_only_during_connect)
 
-    snapshot = DuckDBSignalPageProjectionSource(database)(NOW)
+    #: what the notifier's unit gives it: `live/notifications/%i`, the one directory it
+    #: may write. On Linux the descriptor pins the generation and this is never touched;
+    #: where the engine refuses the descriptor (macOS, and the production host -- #255)
+    #: the pinned inode is copied here and the swap below cannot reach the copy.
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        control_root=tmp_path / "notifier-state",
+    )(NOW)
 
     screen_bounds = {
         str(row["preset_name"])
@@ -1904,33 +1911,35 @@ def test_the_duckdb_reader_pins_through_a_descriptor_where_the_engine_takes_one(
     """Both openers, asserted -- which one runs is a platform fact, not a surprise.
 
     On Linux `duckdb.connect("/proc/self/fd/<n>")` opens the inode the descriptor holds,
-    so the reader pins the generation and creates nothing: that is the branch a runtime
-    host takes, and the only one that can work there. macOS DuckDB rebuilds the path from
-    the descriptor's real name and refuses, so the link-beside-the-database branch runs and
-    the class keeps the generation pinning it has always had. #241's own reader (the
-    PageControl audit sqlite one) needs no such split: sqlite takes the descriptor on both.
+    so the reader pins the generation and creates nothing: that is the branch package L
+    expected a runtime host to take. macOS DuckDB rebuilds the path from the descriptor's
+    real name and refuses -- and so does the build on the production host (#255), which is
+    why the fallback may no longer write beside the database. It writes a private copy in
+    the reader's own control root instead, and never in the database's directory.
     """
 
     from rquant.serving_page_projection_source import _StableReadonlyDuckDB
     from tests.runtime_readonly_sandbox import tree_state
 
-    database = tmp_path / "rquant_ro.duckdb"
+    replica = tmp_path / "replica"
+    replica.mkdir()
+    control = tmp_path / "control"
+    database = replica / "rquant_ro.duckdb"
     _signal_projection_database(database)
-    before = tree_state(tmp_path)
-    reader = _StableReadonlyDuckDB(database)
+    before = tree_state(replica)
+    reader = _StableReadonlyDuckDB(database, control_root=control)
 
     with reader as connection:
         assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
         opened_through = reader.opened_through
-        inside = tree_state(tmp_path)
+        inside = tree_state(replica)
 
-    assert opened_through in {"descriptor", "link"}
-    if opened_through == "descriptor":
-        assert inside == before, "the descriptor branch must create nothing"
-    else:
-        assert len(inside) > len(before), "the link branch creates exactly its own scratch"
-    #: either way nothing survives the read
-    assert tree_state(tmp_path) == before
+    assert opened_through in {"descriptor", "copy"}
+    #: whichever branch ran, the database's own directory is untouched throughout
+    assert inside == before, "nothing may be created beside the database"
+    assert tree_state(replica) == before
+    #: and the copy, if there was one, does not survive the read either
+    assert not control.exists() or not any(control.iterdir())
 
 
 def test_the_lab_page_source_pins_the_same_way(tmp_path: Path) -> None:
@@ -1953,3 +1962,135 @@ def test_the_lab_page_source_pins_the_same_way(tmp_path: Path) -> None:
     assert not hasattr(source, "generation_bind_root")
     with _StableReadonlyDuckDB(database) as connection:
         assert connection.execute("SELECT 1").fetchone() == (1,)
+
+
+# ---------------------------------------------------------------------------------------
+# #255: the engine on the production host refuses the descriptor path too
+# ---------------------------------------------------------------------------------------
+
+
+def _engine_that_refuses_descriptors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The DuckDB build on the production host (and on macOS): no `/proc/self/fd/<n>`."""
+
+    original = duckdb.connect
+
+    def refuse_descriptor_paths(path: str, *args: object, **kwargs: object):
+        if str(path).startswith(("/proc/self/fd/", "/dev/fd/")):
+            raise duckdb.IOException(f"cannot open {path}")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", refuse_descriptor_paths)
+
+
+def test_a_refused_descriptor_copies_into_the_readers_own_control_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#255: `notifier.admin.shadow.v1` DEGRADED every iteration on `errno 30 EROFS`.
+
+    Package L kept a link-beside-the-database branch for engines that refuse the
+    descriptor, on the assumption that only macOS does. The build on the host refuses it
+    too, and `data/` is read-only for that unit, so the link failed on every iteration.
+    The copy goes where the role already writes its own state and nothing at all is
+    created beside the database.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+    from tests.runtime_readonly_sandbox import tree_state
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "notifications" / "svc"
+    before = tree_state(replica)
+
+    reader = _StableReadonlyDuckDB(database, control_root=control)
+    with reader as connection:
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        assert reader.opened_through == "copy"
+        assert Path(reader.generation_path).is_relative_to(control)
+        assert tree_state(replica) == before, "nothing may be created beside the database"
+
+    assert tree_state(replica) == before
+    assert not any(control.iterdir()), "the copy does not survive the read"
+
+
+def test_a_generation_over_the_copy_cap_is_read_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ~10 GB production replica: copying it is not a pinning mechanism, it is a stall.
+
+    `max_copy_bytes` is what says so. Above it the reader opens the database where it is,
+    pins nothing, and leans on the identity check `__exit__` already performs.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+    from tests.runtime_readonly_sandbox import tree_state
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "notifications" / "svc"
+    before = tree_state(replica)
+
+    reader = _StableReadonlyDuckDB(database, control_root=control, max_copy_bytes=1)
+    with reader as connection:
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        assert reader.opened_through == "in_place"
+        assert reader.generation_path == str(database)
+
+    assert tree_state(replica) == before
+    assert not control.exists() or not any(control.iterdir())
+
+
+def test_an_in_place_read_reports_a_generation_that_moved_under_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pinning is not no check: a replaced generation is named, not quietly served."""
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    replacement = replica / "next.duckdb"
+    _signal_projection_database(database)
+    _signal_projection_database(replacement)
+
+    reader = _StableReadonlyDuckDB(database, control_root=None)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="rotated"), reader as connection:
+        assert reader.opened_through == "in_place"
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        os.replace(replacement, database)
+
+
+def test_nothing_is_ever_linked_beside_the_database_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch #255 is about is gone, not merely unused: `os.link` is never called."""
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+
+    def refuse_link(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the reader must never hard-link a generation")
+
+    monkeypatch.setattr(os, "link", refuse_link)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+
+    for control in (tmp_path / "control", None):
+        with _StableReadonlyDuckDB(database, control_root=control) as connection:
+            assert connection.execute("SELECT 1").fetchone() == (1,)
+
