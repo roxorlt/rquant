@@ -960,12 +960,15 @@ def notifier_builder(
                         #: anywhere, so this role needs no scratch directory of its own.
                         page_control_outbox=(settings.page_projection_page_control_outbox_path),
                         #: #255: the DuckDB build on the production host refuses
-                        #: `/proc/self/fd/<n>` as well, and the branch that ran instead
-                        #: hard-linked beside the database -- `EROFS`, every iteration.
-                        #: This is the one directory this unit may write
-                        #: (`live/notifications/%i`), so a generation small enough to copy
-                        #: is pinned here; the ~10 GB replica is read in place instead.
-                        control_root=settings.notification_state_path.parent,
+                        #: `/proc/self/fd/<n>` as well, and the branch that used to run
+                        #: instead hard-linked beside the database -- `EROFS`, every
+                        #: iteration. This role is deliberately given **no** control root
+                        #: to copy into, so it reads the generation in place and checks
+                        #: its identity afterwards: the projection it is pointed at is the
+                        #: production read-only replica (about 10 GB, #250), two orders of
+                        #: magnitude over `_MAX_PINNED_COPY_BYTES`, so a copy could never
+                        #: be taken anyway -- and #241's stronger property holds, that this
+                        #: step writes nothing anywhere under the runtime root.
                     ),
                     store=store,
                 )

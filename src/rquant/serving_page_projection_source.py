@@ -371,7 +371,7 @@ class _StableReadonlyDuckDB:
                 self.opened_through = "descriptor"
                 self._generation_path = descriptor_path
                 return connection
-        copied = self._connect_through_copy(descriptor_path)
+        copied = self._connect_through_copy()
         if copied is not None:
             return copied
         connection = duckdb.connect(str(self.path), read_only=True)
@@ -379,10 +379,7 @@ class _StableReadonlyDuckDB:
         self._generation_path = str(self.path)
         return connection
 
-    def _connect_through_copy(
-        self,
-        descriptor_path: str | None,
-    ) -> duckdb.DuckDBPyConnection | None:
+    def _connect_through_copy(self) -> duckdb.DuckDBPyConnection | None:
         """A copy of the pinned inode in this reader's own root, or `None` if it cannot be."""
 
         if self.control_root is None:
@@ -420,8 +417,6 @@ class _StableReadonlyDuckDB:
             connection = duckdb.connect(str(bound_path), read_only=True)
         except BaseException:
             self._discard_copy(bound_directory, bound_path)
-            if descriptor_path is None:
-                raise
             return None
         self.opened_through = "copy"
         self._generation_path = str(bound_path)
