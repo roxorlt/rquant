@@ -329,7 +329,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
     while offset < len(payload):
         written = os.write(descriptor, payload[offset:])
         if written < 1:
-            raise ReferenceSlowSourceError("reference source snapshot write stalled")
+            raise ReferenceSlowSourceError("reference source private copy write stalled")
         offset += written
 
 
@@ -445,6 +445,7 @@ def _verified_database_read(
             else:
                 opened_through = "descriptor"
         if connection is None:
+            target = database_path
             copied = _private_copy_of_generation(
                 descriptor,
                 opened,
@@ -453,13 +454,10 @@ def _verified_database_read(
                 monotonic_clock=monotonic_clock,
             )
             if copied is not None:
-                copy_directory, copy_path = copied
+                copy_directory, target = copied
                 opened_through = "copy"
-                target: str = str(copy_path)
-            else:
-                target = str(database_path)
             try:
-                connection = duckdb.connect(target, read_only=True)
+                connection = duckdb.connect(str(target), read_only=True)
             except duckdb.Error as exc:
                 raise ReferenceSlowSourceError("reference source database query failed") from exc
         yield _OpenedDatabase(connection=connection, opened_through=opened_through)
