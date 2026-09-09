@@ -1299,9 +1299,22 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       `candidate.auction_gap.v1` 的 `daily_database_path`、`reference-slow.source.v1` 的
       `database_path`、`notifier.admin.shadow.v1` 的 `page_projection_database_path` 与
       `page_projection_surge_live_root`（后者取值不变，两个库同目录，只是改成对着副本表达）。
-      recovery 绑定按设计仍指主库。**其余 21 个 manifest 的 settings 一字未改。**
+      recovery 绑定按设计仍指主库。画像共 **26 个 manifest**（25 个是实例化 role），
+      #249 改 1 个、#250 改 3 个，**其余 22 个 manifest 的 settings 一字未改**。
       另：生成器的 `--allow-primary-database` 已删除，命令里如果还带着会以
       `unrecognized arguments` 退出；`--calendar-database` 指主库现在无条件被拒。
+    - **包 O 与包 P 必须同一代上线**。notifier 盘中变红有两个原因，两个包各修一半：
+      路径指主库（#250，本包修）与钉代时在库旁边建硬链接失败
+      （#255 现场报的是 `this engine refused the descriptor /proc/self/fd/N, and linking it
+      inside /home/lighthouse/rquant/data failed (errno 30 EROFS)`，包 O 修）。
+      副本与主库在**同一个目录**，所以只装 P 的话硬链接回退照样 EROFS，notifier 仍然红。
+    - **`reference-slow.source.v1` 不在本次「应当变绿」的名单里**：本包解除的是它的
+      mode（0600）与 `.wal` sidecar 两道门，门后紧接着是**整库字节拷贝**，而画像写死
+      `snapshot_max_bytes = 8 GiB`、`snapshot_copy_timeout_seconds = 45`。
+      **装机前先量一次**：`stat -c %s /home/lighthouse/rquant/data/rquant_ro.duckdb`，
+      **不小于 8 GiB 这个 role 就会继续红**，只是错误换成
+      `reference source database exceeds maximum byte budget`。详见下面「窗口里要预期到的」
+      与 #256（拷贝方式的重做归包 Q）。
 
     **窗口里要预期到的两件事**：健康载荷的 `status` 仍然是 DEGRADED（`superseded:` 和 `missing:`
     一样会进 `reason`，只要有 reason 就是 DEGRADED）——改进的是「载荷发得出来、serving 不再被一个
