@@ -252,6 +252,8 @@ class RoleRun:
         self.violations: list[Any] = []
         self.status: str | None = None
         self.last_error: str | None = None
+        #: the peer artifact this role's last iteration was waiting on, if it was (#232)
+        self.waiting_for: str | None = None
         self.refusal: BaseException | None = None
         self.traceback: str | None = None
         #: writes the host would refuse because they are outside the runtime root
@@ -262,7 +264,8 @@ class RoleRun:
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
             f"RoleRun(role={self.role!r}, entered={self.entered}, code={self.exit_code}, "
-            f"status={self.status}, violations={self.violations}, "
+            f"status={self.status}, waiting_for={self.waiting_for!r}, "
+            f"violations={self.violations}, "
             f"last_error={self.last_error!r}, refusal={self.refusal!r})"
         )
 
@@ -363,6 +366,7 @@ def run_role(
         if heartbeat is not None:
             run.status = heartbeat.status.value
             run.last_error = heartbeat.last_error
+            run.waiting_for = heartbeat.waiting_for
     return run
 
 

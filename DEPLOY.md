@@ -5,6 +5,48 @@
 
 ---
 
+## 2026-09-09 · 待安装 · 第七窗口四缺口（#254 #253 #252 #255）— **装上之后现场仍会红，这是预期**
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**装上之后当场会看到什么**（不写这一条，窗口当天会被误判成装机失败）：
+
+| role | 装之前 | 装之后 |
+|---|---|---|
+| `market-minute.source.v1` / `watchlist-quote.source.v1` | 盘中每轮 `snapshot authority is damaged: … snapshot lock is missing or unsafe` | **盘中仍然每轮红**，换成 `auction_gap@1: required authority has no not_visible snapshot` |
+| `notifier.admin.shadow.v1` | 盘中每轮 `cannot be pinned … errno 30 EROFS` | **盘中仍然每轮红**，换成 DuckDB 的写锁 IOException（现在会照实说是锁） |
+| 三个 `rquant-runtime-strategy@` | 先于 broker 起会退出 1、`Restart=` 循环、推告警 | **可以先于 broker 起**，进主循环等待 |
+| `serving.publisher.v1` | 每轮 `current pointer producer_commit does not match expected commit` | **恢复** |
+
+**为什么前两行还是红的**：`auction_gap` 候选发布器唯一的发布窗口是 **09:26–09:30**
+（`runtime_builder_candidate.py:70-71`），它的输入是**生产主库**，而 `rquant-monitor.timer`
+从 **09:25:00** 起把主库写锁占到收盘——发布窗口整段在写锁窗口里，所以它一代都发布不出来；
+notifier 读的也是主库（`runtime_production_profile.py:1521`）。
+**要恢复 market-minute → paper-constraint → broker → serving 这条链，必须先修 #250**
+（把这几个 role 的输入改到只读副本 `rquant_ro.duckdb`）。
+
+**这次发版当场买到的**：那些失败循环从此**很便宜**——同种完整性失败按 2→4→8→16→**20 秒**退避
+（peer 等待不退避），主机 load 不会再被顶到 11–12，15 分钟备份不会再从 8 分钟变 14 分钟，
+`monitor-watchdog` 不会再被挤到超时；**停这些 unit 不会再超 `TimeoutStopSec`、不会再被 SIGKILL、
+不会再留 `failed`**。
+
+**启动顺序**：`broker → strategy → router` 这条硬顺序**可以撤掉**，**停止也不需要反序**。
+保留一条弱建议：`rquant-runtime-signal-router@` 不要早于 `rquant-runtime-strategy@` 起——
+不是怕失败（router 会按名字等），是避免 router 在策略的只读目录里建 runner 库的 wal-index
+（包 L 记录的 `KNOWN_C_LEVEL_WRITES["signal_router"]`，未修）。
+**副作用一条**：顺序不再影响正确性，但影响收敛速度——不过 peer 等待不退避，所以每条边仍是一个
+interval，不是一个退避。
+
+**回滚**：本包只改 `src/` 与 `tests/`，没有 `deploy/` 改动，按 `scripts/deploy-production.sh`
+的常规回滚（`--target <上一个 tag>`）即可。
+
+**停机与窗口纪律**：见路线 A 前置第 36 条——停 unit 之前先确认没有 D 状态进程、`vmstat` 的 `b` 列为 0，
+**一次只停一个**、用阻塞的 `systemctl stop`、随后 `reset-failed`（runbook R-29）；**#256 修好之前
+runtime unit 不要跨 09:25 与 17:00 运行**（R-25 恢复生效）。本轮的退避与 0.25 秒切片等待让正常情况下的
+停止有上界，但磁盘卡住时的 D 状态谁都打断不了。
+
+---
+
 ## 2026-09-08 · 待安装 · 主机资源包络（#243，owner 裁决 21）
 
 **状态**：**尚未安装**。本条是安装说明，不是部署记录；真正装上去之后请在本条下面补
@@ -1326,7 +1368,53 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     （第五代 `20d948d1…`）自己写的——第六窗口把上一代的挪走之后，当前代重新建了一份。
     下一次装新一代时 `20d948d1…` 变成「上一代」，四种形状的判据全部命中。
 
-### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合，以及包 N 追出全部范围的 #250 与它交回给 #235 的那处告警回退；末列写「已修」的条目已修，其余不修）
+36. **启动顺序的硬规则撤掉，停机纪律换成 R-29（#254、#253、#252、#255，本轮 PR 引入；取代第 28 条
+    与第 34 条 (b) 里作为「硬顺序」的那部分）。**
+
+    第 28 条那条 `broker → strategy → router`、以及「停止时反序」这条**都不再是要求**。五条边
+    各自的理由不一样，撤掉哪一条看的是各自的理由：
+
+    | 边 | 之前为什么要排顺序 | 本轮之后 |
+    |---|---|---|
+    | broker → strategy | 策略构造期打开 broker 的 WAL 台账，broker 没跑就 `unable to open database file` ⇒ 退出 1 ⇒ `Restart=` ⇒ `OnFailure` 真推送（#252） | **不需要**：台账不在、且它所在目录本角色写不了，按 peer 等待处理，策略进主循环等；台账真损坏仍然退出 |
+    | strategy → router | router 要读每个策略的 `runner.sqlite3`，策略没跑过就没有这个文件 | **早就不需要**（#220、#232）：策略在构建期就把 runner 库建出来，router 找不到时按名字等 |
+    | candidate publisher → 两个 source role | source role 读候选库，发布器没创建发布锁就判「已损坏」（#254） | **不需要**：锁在发布器**构建期**创建，而 source role 的这类失败是每轮降级、不退出 |
+    | notifier → serving publisher | serving 读 notifier 的 signals 权威 pointer，换代后判成外来（#253） | **不需要**：读者按血统接住上一代的 pointer，所有者下一次发布时自己改写回来 |
+    | 停止反序 | 怕停 `watchlist-quote` 这类 role 卡住 | **不需要**：失败循环绝大多数时间坐在可中断的等待里，等待按 0.25 秒切片，停止延迟有上界（真 SIGTERM 的端到端用例钉住了这一条） |
+
+    **唯一保留的是一条弱建议**：`rquant-runtime-signal-router@` 不要早于三个
+    `rquant-runtime-strategy@` 起。理由不是怕失败（router 会等），是避免 router 在策略的只读目录里
+    建 runner 库的 wal-index（第 34 条 (b) 那条已知越界写，`KNOWN_C_LEVEL_WRITES["signal_router"]`，
+    未修）。等 owner 把 `runner.sqlite3` 换成回滚日志，这条建议也可以撤。
+    第 34 条 (b) 里「停的时候先停 router 再停 strategy」这句**只在「策略要重启、router 继续跑」
+    的时候还有意义**（生产者干净关闭会删掉 `-wal`/`-shm`）；整机停机时两边都要停，不必再排顺序。
+
+    **顺序不再影响收敛速度**：peer 等待**不退避**，每条边仍然是一个 interval，不是一个退避。
+
+    **盘中仍然会红的三个 role，这是预期**（本文顶部 2026-09-09 那条已列表）：
+    `market-minute.source.v1` / `watchlist-quote.source.v1` 每轮报
+    `auction_gap@1: required authority has no not_visible snapshot`，
+    `notifier.admin.shadow.v1` 每轮报 DuckDB 写锁的 IOException。
+    **要让这条链恢复必须先修 #250**（把 `auction_gap` 的 `daily_database_path`、notifier 的
+    `page_projection_database_path`、`reference_slow_source` 的 `database_path` 改到只读副本）。
+
+    **停机纪律（runbook R-29，来自 #256 那两天的实况）**：
+
+    - **停之前先确认主机没有卡在 I/O 上**：`ps -eo state,pid,comm | awk '$1 ~ /^D/'` 没有输出、
+      `vmstat 1 3` 的 `b` 列是 0。有 D 状态进程就先等它过去，不要在这个时候停 unit。
+    - **一次只停一个 unit**，用**阻塞的** `systemctl stop <unit>`（不加 `--no-block`），等它真的退出
+      再停下一个。
+    - 每停完一个 `systemctl reset-failed <unit>`。
+    - 理由：主机 I/O 卡住时批量停会撞 `TimeoutStopSec` ⇒ SIGKILL ⇒ `failed` ⇒ `OnFailure`。
+      2026-09-09 17:08 就是这样一次推了 14 条告警。本轮的退避与切片等待让**正常情况下**的停止
+      有上界，但**磁盘卡住时**的 D 状态仍然是内核态，谁都打断不了，所以这条纪律照旧。
+
+    **#256 修好之前，runtime unit 不要跨 09:25 和 17:00 运行**（R-25 恢复生效：安装窗口之外所有
+    role 实例保持停止）。09:25 起 `rquant-monitor` 持生产主库写锁到收盘；17:00 起 `rquant-daily`
+    的 `daily_state` 阶段要扫主库，而 role 每轮读 10 GB 只读副本会把 page cache 挤掉，这个阶段从
+    1.5 分钟涨到 9–60 分钟（2026-09-08 与 09-09 各观察到一次）。装机与验收放在这两个窗口之外做。
+
+### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合，以及包 N 追出全部范围的 #250 与它交回给 #235 的那处告警回退，再加上第七窗口 17:00 两次卡住 `rquant-daily` 之后立的 #256；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -1351,6 +1439,7 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | — | `signal_router` 只读打开 3 份 WAL 的 `live/strategies/<svc>/runner.sqlite3`，SQLite 要在旁边建 wal-index，而它的 unit 对那个目录只有读权限 | 不修，**靠启停顺序绕开**：先起并保持 3 个 `strategy_live` 再起 router，停的时候先停 router 再停 strategy（前置第 34 条 (b)）。永久解法是 owner 对 `runner.sqlite3` 的 journal 模式决定，代价与 #242 相同、而 strategy runner 是高频写者，必须单独验收。e2e 已把这一条钉进 `KNOWN_C_LEVEL_WRITES`，**新增一条就会红** |
 | #250 | 生产 profile 里仍有**三个 LIVE role** 的 manifest 指向生产主库 `rquant.duckdb`：`reference_slow_source` 的 `database_path`（30 s 一轮）、`auction_gap` 候选发布器的 `daily_database_path`、`notifier` 的 `page_projection_database_path` 与 `page_projection_surge_live_root`（**`interval_seconds=2`，每 2 秒撞一次**）。按 CLAUDE.md 的单写者规则，盘中 09:25–15:00 `rquant-monitor` 持写锁期间 DuckDB 拒绝一切新连接，含只读，所以这三个 role 在它们要服务的那段时间必然 DEGRADED | 本轮只改了第四处（`auction_universe` 已改读 `rquant_ro.duckdb`，见前置第 35 条），**这三处不修**，窗口里按 DEGRADED 预期。issue 正文原先只写了 `reference_slow_source` 一处，另两处要补进去。**recovery 的绑定不算在内**：`_validate_recovery_artifact_bindings` 要求 recovery 的生产制品角色就是主库，恢复链路要恢复的就是主库本身，**这是设计，下一个包不要顺手改掉** |
 | #235 | 本轮把「心跳被换过 / 是符号链接 / 超长 / 时间不一致」这类真篡改信号（`RuntimeHealthAuthorityIntegrityError`）从「整份健康载荷失败」降成「该条目 DEGRADED + `unreadable:<service>` 点名」，其余 24 个 role 照常发布。这是裁决 22 明确要求的，但在 #235（DEGRADED 静默、无 `OnFailure`）之下**篡改信号从此没有人会被叫醒**——以前它会让健康发布器整体失败、触发 `OnFailure` 中继、推一条真告警 | **本轮唯一一处告警回退，必须有人认领**。不修（阈值与告警规则属于 #235 自己的裁决），建议在 #235 里加一条：runtime-health 载荷的 `reason` 里出现 `unreadable:` 时要告警。窗口里的临时办法是把这一份载荷的 `reason` 纳入人工核对项 |
+| #256 | 16 个 runtime role **每轮**读 10 GB 的只读副本 `rquant_ro.duckdb`，加上 15 分钟一次的 10 GB 主库备份（`cp` + `gzip`）与 5 分钟一次的副本刷新，16 GB 主机的 page cache 装不下这两个库；`rquant-daily` 的 `daily_state` 阶段扫主库因此落到磁盘，从 1.5 分钟涨到 9–60 分钟（2026-09-08 8 GB 主机 / 8 role、2026-09-09 16 GB 主机 / 16 role 各观察到一次；09-09 17:07 停掉全部 role 之后该阶段 2 分钟内跑完）。主机 I/O 卡住时停 unit 会撞 `TimeoutStopSec` ⇒ SIGKILL ⇒ `failed` ⇒ `OnFailure`，09-09 17:08 一次推了 14 条 | **不修**（读侧改读副本是 #250 那一包的事，「读得便宜」是 #256 自己：按 generation / mtime 变化才读、缓存切片或改读每角色抽取，外加 runtime slice 的 `IOWeight`）。窗口纪律见前置第 36 条：**#256 修好之前 runtime unit 不跨 09:25 与 17:00 运行**（R-25 恢复生效），停机按 R-29 逐个阻塞 `systemctl stop` + `reset-failed`，停之前先确认没有 D 状态进程 |
 
 ### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
 

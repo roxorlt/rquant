@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -8,6 +9,7 @@ import pytest
 
 from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_control import (
+    MAX_FAILURE_BACKOFF_SECONDS,
     RuntimeServiceAlreadyRunningError,
     RuntimeServiceControl,
     RuntimeServiceHealth,
@@ -468,3 +470,402 @@ def test_health_reader_publishes_the_projection_not_the_file_model(tmp_path: Pat
     on_disk = RuntimeServiceControl.read_heartbeat(tmp_path, control.spec)
     assert on_disk is not None
     assert on_disk.waiting_for is not None
+
+
+# ---------------------------------------------------------------------------------------
+# #254 follow-up: a DEGRADED loop must be cheap, and a stop must never need SIGKILL
+# ---------------------------------------------------------------------------------------
+
+
+def _record_delays(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every delay the loop asks to wait, without waiting any of them.
+
+    The loop's own wait is sliced so a stop is never late (see `_wait_for_stop`), so
+    counting slices would measure the slicing rather than the backoff. What matters here
+    is the delay the loop *chose*.
+    """
+
+    from rquant import runtime_service_control as control_module
+
+    delays: list[float] = []
+
+    def record(stop_event: Event, delay: float, **_kwargs: object) -> bool:
+        delays.append(delay)
+        return stop_event.is_set()
+
+    monkeypatch.setattr(control_module, "_wait_for_stop", record)
+    return delays
+
+
+def _failing_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    error: Callable[[int], Exception],
+    iterations: int,
+    interval_seconds: float = 2.0,
+    max_failure_backoff_seconds: float = MAX_FAILURE_BACKOFF_SECONDS,
+) -> tuple[RuntimeServiceHeartbeat, list[float]]:
+    delays = _record_delays(monkeypatch)
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    attempt = iter(range(1, iterations + 1))
+
+    def step() -> RuntimeStepResult:
+        raise error(next(attempt))
+
+    final = run_service_loop(
+        control,
+        step=step,
+        stop_event=Event(),
+        interval_seconds=interval_seconds,
+        max_iterations=iterations,
+        max_failure_backoff_seconds=max_failure_backoff_seconds,
+    )
+    return final, delays
+
+
+def test_the_same_failure_backs_off_instead_of_retrying_every_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#254's second cost: the failing loop itself, not the failure.
+
+    `market-minute.source.v1` and `watchlist-quote.source.v1` re-walked and re-hashed a
+    candidate store they could not read every two seconds for a whole morning. A 4-vCPU
+    host sat at load 11-12 with ~47% system time, the 15-minute backups went from 8 to 14
+    minutes, and the monitor watchdog timed out once -- one more real push. The first
+    failure of a kind is still free; from the second it doubles, up to a minute.
+    """
+
+    final, delays = _failing_loop(
+        tmp_path,
+        monkeypatch,
+        error=lambda _attempt: RuntimeError("candidate store is damaged"),
+        iterations=8,
+    )
+
+    #: the first failure waits the plain interval, then 4, 8, 16, and the 20 s cap
+    assert delays[:4] == [2.0, 4.0, 8.0, 16.0]
+    assert all(delay == MAX_FAILURE_BACKOFF_SECONDS for delay in delays[5:])
+    assert final.failure_kind == "builtins.RuntimeError"
+
+
+def test_a_different_failure_resets_the_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loop alternating between two faults is not idle and must not be slowed like one."""
+
+    _final, delays = _failing_loop(
+        tmp_path,
+        monkeypatch,
+        error=lambda attempt: (
+            RuntimeError("one") if attempt % 2 else ValueError("another")
+        ),
+        iterations=5,
+    )
+
+    assert delays == [2.0, 2.0, 2.0, 2.0]
+
+
+def test_a_peer_wait_is_never_backed_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A role waiting for a peer is not burning the host, and slowing it costs a cold start.
+
+    With `broker -> strategy -> router` no longer an ordered start (#252), the chain's
+    worst-case convergence is a sum of these waits. Backing each one off to twenty seconds
+    would trade a fixed start order for a slow one. What #254 is about is the other kind
+    of failure -- one whose path re-walks and re-hashes a store every iteration.
+    """
+
+    _final, delays = _failing_loop(
+        tmp_path,
+        monkeypatch,
+        error=lambda _attempt: PeerArtifactUnavailableError(
+            reader="strategy_live",
+            artifact="paper broker ledger",
+            path=Path("/runtime/live/paper-brokers/svc/broker.sqlite3"),
+        ),
+        iterations=6,
+    )
+
+    assert delays == [2.0, 2.0, 2.0, 2.0, 2.0]
+
+
+def test_the_backoff_cap_stays_under_the_tightest_stale_after_in_the_profile() -> None:
+    """A heartbeat is written once per failure, so the backoff *is* the gap between them.
+
+    A cap above a role's `stale_after` would put it on the health plane as `stale` while
+    it is doing exactly what it was told to do -- a second, invented symptom on top of the
+    real one. The tightest value in the production profile is read out of the profile
+    itself rather than copied here, so raising the cap without looking at it fails.
+    """
+
+    import re
+
+    from rquant.runtime_service_control import MAX_FAILURE_BACKOFF_SECONDS
+
+    profile = Path("src/rquant/runtime_production_profile.py").read_text()
+    stale_after = [
+        float(value.replace("_", ""))
+        for value in re.findall(r"stale_after_seconds=([0-9_]+)\b", profile)
+    ]
+    assert stale_after, "the profile must declare stale_after_seconds"
+    assert min(stale_after) > MAX_FAILURE_BACKOFF_SECONDS, (
+        min(stale_after),
+        MAX_FAILURE_BACKOFF_SECONDS,
+    )
+
+
+def test_two_peers_waited_on_are_two_kinds_even_at_the_same_exception(
+    tmp_path: Path,
+) -> None:
+    """`PeerArtifactUnavailableError` for two different files is two waits, not one."""
+
+    from rquant.runtime_service_control import failure_kind_of
+
+    first = PeerArtifactUnavailableError(
+        reader="strategy_live",
+        artifact="paper broker ledger",
+        path=Path("/runtime/live/paper-brokers/a/broker.sqlite3"),
+    )
+    second = PeerArtifactUnavailableError(
+        reader="strategy_live",
+        artifact="paper broker ledger",
+        path=Path("/runtime/live/paper-brokers/b/broker.sqlite3"),
+    )
+    assert failure_kind_of(first) != failure_kind_of(second)
+    assert failure_kind_of(first).endswith("/a/broker.sqlite3")
+
+
+def test_one_success_clears_the_backoff_from_the_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The field says what this iteration is doing, so a recovery has to erase it."""
+
+    delays = _record_delays(monkeypatch)
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    outcomes: list[object] = [
+        RuntimeError("again"),
+        RuntimeError("again"),
+        RuntimeStepResult(input_sequence=1, output_sequence=1),
+    ]
+    ticks = iter(outcomes)
+
+    def step() -> RuntimeStepResult:
+        outcome = next(ticks)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert isinstance(outcome, RuntimeStepResult)
+        return outcome
+
+    final = run_service_loop(
+        control,
+        step=step,
+        stop_event=Event(),
+        interval_seconds=2.0,
+        max_iterations=3,
+    )
+
+    assert delays == [2.0, 4.0]
+    assert final.failure_backoff_seconds is None
+    assert final.failure_kind is None
+    assert final.total_successes == 1
+
+
+def test_the_backoff_is_a_file_field_and_reaches_no_published_payload() -> None:
+    """#237's line: adding to the heartbeat file model must not add to what serving publishes."""
+
+    assert "failure_backoff_seconds" in RuntimeServiceHeartbeat.model_fields
+    assert "failure_kind" in RuntimeServiceHeartbeat.model_fields
+    assert "failure_backoff_seconds" not in RuntimeServiceHeartbeatProjection.model_fields
+    assert "failure_kind" not in RuntimeServiceHeartbeatProjection.model_fields
+
+
+def test_a_long_wait_is_cut_short_by_a_stop_within_one_poll_slice() -> None:
+    """The wait itself, at the 60-second cap, stopped from another thread.
+
+    `#254`'s third cost was that stopping `watchlist-quote` inside its failing loop
+    exceeded `TimeoutStopSec`, took `SIGKILL`, and left the unit `failed` -- one more real
+    push. Slicing the wait bounds the stop latency whether or not `Event.set()` wakes the
+    wait: the handler that sets it runs on this very thread, and having to take the
+    event's own lock to hand the news over is exactly how a stop ends up late.
+    """
+
+    import threading
+    import time as real_time
+
+    from rquant.runtime_service_control import MAX_FAILURE_BACKOFF_SECONDS, _wait_for_stop
+
+    stop = Event()
+    threading.Timer(0.05, stop.set).start()
+    started = real_time.monotonic()
+    stopped = _wait_for_stop(
+        stop,
+        MAX_FAILURE_BACKOFF_SECONDS,
+        monotonic_clock=real_time.monotonic,
+    )
+    elapsed = real_time.monotonic() - started
+
+    assert stopped is True
+    assert elapsed < 1.0, elapsed
+
+
+def test_no_single_wait_blocks_longer_than_the_poll_slice() -> None:
+    """The property that bounds the stop latency without depending on the event at all.
+
+    `Event.set()` from another *thread* wakes `Event.wait()` at once, so a test that stops
+    the loop that way cannot tell a sliced wait from a single 60-second one. What
+    production does is different: the handler runs on the waiting thread, and it has to
+    take the event's own lock to hand the news over. So the contract asserted here is the
+    one that holds either way -- the loop never blocks longer than one slice without
+    looking at the stop event again.
+    """
+
+    import time as real_time
+
+    from rquant.runtime_service_control import _STOP_POLL_SECONDS, _wait_for_stop
+
+    class _RecordingEvent(Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self.timeouts: list[float | None] = []
+
+        def wait(self, timeout: float | None = None) -> bool:
+            self.timeouts.append(timeout)
+            return False
+
+    stop = _RecordingEvent()
+    clock = iter([0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 60.0])
+    assert _wait_for_stop(stop, 60.0, monotonic_clock=lambda: next(clock)) is False
+    assert stop.timeouts, "the wait has to consult the stop event"
+    assert all(
+        timeout is not None and timeout <= _STOP_POLL_SECONDS for timeout in stop.timeouts
+    ), stop.timeouts
+    #: and a delay inside one slice is still handed over whole, so a short interval is
+    #: driven exactly as it was before
+    short = _RecordingEvent()
+    assert _wait_for_stop(short, 0.05, monotonic_clock=real_time.monotonic) is False
+    assert short.timeouts == [0.05]
+
+
+def test_a_real_sigterm_during_a_backoff_stops_the_process_without_a_kill(
+    tmp_path: Path,
+) -> None:
+    """End to end, the way `systemd` does it: SIGTERM to a process inside its backoff.
+
+    This is the failure the window actually saw -- `watchlist-quote` exceeded
+    `TimeoutStopSec`, was killed, and left its unit `failed`. The child runs the real loop
+    with a failing step and a 60-second cap, and has to be gone well inside any stop
+    timeout, with a clean exit rather than a signal.
+    """
+
+    import subprocess
+    import sys
+    import time as real_time
+
+    program = f"""
+import os, signal, sys, time
+from pathlib import Path
+from threading import Event
+from datetime import UTC, datetime, timedelta
+from rquant.runtime_service_control import (
+    RuntimeServiceControl, RuntimeServicePlane, RuntimeServiceSpec, RuntimeStepResult,
+    run_service_loop,
+)
+spec = RuntimeServiceSpec(
+    service_id="watchlist-quote",
+    plane=RuntimeServicePlane.LIVE,
+    stale_after=timedelta(seconds=10),
+    producer_commit="a" * 40,
+)
+control = RuntimeServiceControl(Path({str(tmp_path)!r}), spec=spec)
+stop = Event()
+def request_stop(_signum, _frame):
+    stop.set()
+signal.signal(signal.SIGTERM, request_stop)
+attempts = 0
+def step():
+    global attempts
+    attempts += 1
+    if attempts == 2:
+        print("backing-off", flush=True)
+    raise RuntimeError("candidate store is damaged")
+run_service_loop(
+    control, step=step, stop_event=stop, interval_seconds=30.0,
+    max_failure_backoff_seconds=60.0,
+)
+print("clean-exit", flush=True)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        #: the first failure's own wait is 30 s, which is already long enough to measure
+        real_time.sleep(0.5)
+        started = real_time.monotonic()
+        child.terminate()
+        stdout, stderr = child.communicate(timeout=15)
+        elapsed = real_time.monotonic() - started
+    finally:
+        if child.poll() is None:  # pragma: no cover - only on a failure
+            child.kill()
+            child.communicate()
+
+    assert child.returncode == 0, (child.returncode, stderr)
+    assert "clean-exit" in stdout, stdout
+    assert elapsed < 5.0, elapsed
+
+
+def test_a_stop_during_the_loop_s_own_wait_never_needs_to_be_killed(
+    tmp_path: Path,
+) -> None:
+    """The same thing through the loop: a 30-second wait, and a stop that lands in it.
+
+    The delay the loop hands that wait is the backoff whenever one is in force -- which is
+    what `test_the_same_failure_backs_off_instead_of_retrying_every_interval` pins -- so a
+    stop during a 60-second backoff comes out of exactly this path.
+    """
+
+    import threading
+    import time as real_time
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    stop = Event()
+    waiting = Event()
+    attempts = 0
+
+    def step() -> RuntimeStepResult:
+        nonlocal attempts
+        attempts += 1
+        waiting.set()
+        raise RuntimeError("candidate store is damaged")
+
+    def stopper() -> None:
+        assert waiting.wait(10.0)
+        real_time.sleep(0.05)
+        stop.set()
+
+    watcher = threading.Thread(target=stopper)
+    watcher.start()
+    started = real_time.monotonic()
+    final = run_service_loop(
+        control,
+        step=step,
+        stop_event=stop,
+        interval_seconds=30.0,
+    )
+    elapsed = real_time.monotonic() - started
+    watcher.join(5.0)
+
+    assert final.status is RuntimeServiceStatus.STOPPED
+    assert final.stop_reason == "loop completed"
+    assert attempts == 1, attempts
+    assert elapsed < 3.0, elapsed

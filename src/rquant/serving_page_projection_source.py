@@ -188,6 +188,18 @@ def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
 
 
+def _copy_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    """The same, plus `st_ctime_ns`, for the window a byte copy is exposed to.
+
+    `_file_identity` answers "is this still the file I opened", which is what a rename
+    changes. A copy has to answer the narrower question "was this file touched *at all*
+    while I was reading it", and an in-place write that leaves the size alone moves
+    `st_ctime_ns` even where a filesystem's mtime granularity hides it (review SF-1).
+    """
+
+    return (*_file_identity(value), value.st_ctime_ns)
+
+
 def _read_bound_optional_file(
     binding: _BoundReadonlyDirectory,
     name: str,
@@ -243,6 +255,17 @@ def _database_timestamp(value: object) -> datetime:
 #: not the path it was reached through, so it pins a generation without creating anything.
 _DESCRIPTOR_DIRECTORIES = ("/proc/self/fd", "/dev/fd")
 
+#: How large a generation may be before copying it stops being a way to pin it. The
+#: production replica the notifier is pointed at (`data/rquant_ro.duckdb`, #250) is about
+#: 10 GB -- two orders of magnitude over this -- so on that host the copy branch is never
+#: taken and the in-place branch is what runs, which is exactly why it exists. A serving
+#: or research projection is a few tens of MB, well inside it.
+_MAX_PINNED_COPY_BYTES = 256 * 1024 * 1024
+
+#: What DuckDB says when another process holds the write lock, lowercased. Two markers,
+#: because the wording differs across builds and only the first half is stable.
+_WRITE_LOCK_MARKERS = ("could not set lock", "conflicting lock")
+
 
 def _descriptor_path(descriptor: int) -> str | None:
     """The name that re-opens exactly this descriptor's inode, or None if the OS has none."""
@@ -262,20 +285,43 @@ class _StableReadonlyDuckDB:
     #: `link()` refuses across mounts (`do_linkat` compares `mnt`, not the superblock), so
     #: beside the database is `EROFS` and anywhere the role may write is `EXDEV`. A
     #: descriptor pins the same generation and creates nothing at all.
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        control_root: Path | None = None,
+        max_copy_bytes: int = _MAX_PINNED_COPY_BYTES,
+        atomically_published: bool = False,
+    ) -> None:
         normalized = Path(os.path.abspath(path))
         if not normalized.is_absolute():
             raise ValueError("projection database path must be absolute")
         self.path = normalized
+        #: a directory this reader owns and may write, used only when the engine refuses
+        #: the descriptor path: the copy goes here, never beside the database (#255).
+        self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
+        if not isinstance(max_copy_bytes, int) or isinstance(max_copy_bytes, bool):
+            raise TypeError("max_copy_bytes must be an integer")
+        if max_copy_bytes < 0:
+            raise ValueError("max_copy_bytes cannot be negative")
+        self.max_copy_bytes = max_copy_bytes
+        #: the caller states that this artifact's owner replaces it with `rename()` and
+        #: never writes it in place. Without that, copying it can serve the last
+        #: checkpoint of a database somebody is writing (review SF-1), so the copy branch
+        #: is off unless it is said out loud.
+        if not isinstance(atomically_published, bool):
+            raise TypeError("atomically_published must be a bool")
+        self.atomically_published = atomically_published
         self._before: os.stat_result | None = None
         self._descriptor = -1
         self._generation_path: str | None = None
         self._bound_directory: Path | None = None
         self._bound_path: Path | None = None
-        #: which opener took: `"descriptor"` (no writes; the branch a runtime host takes)
-        #: or `"link"` (the pre-existing mechanism, kept for engines that refuse a
-        #: descriptor path). Recorded so both branches can be asserted rather than
-        #: discovered at run time.
+        #: which opener took: `"descriptor"` (no writes; the branch a runtime host takes),
+        #: `"copy"` (a private copy of the pinned inode inside this reader's own control
+        #: root) or `"in_place"` (no pinning; the identity check after the read is what
+        #: says the generation did not move). Recorded so every branch can be asserted
+        #: rather than discovered at run time.
         self.opened_through: str | None = None
         self.connection: duckdb.DuckDBPyConnection | None = None
 
@@ -314,73 +360,154 @@ class _StableReadonlyDuckDB:
     def _connect_generation(self, descriptor_path: str | None) -> duckdb.DuckDBPyConnection:
         """Open the exact generation this descriptor holds, writing nothing if possible.
 
-        Two openers, in this order, and the reason the order matters is #241:
+        Three openers, in this order, and the order is the whole point (#241, #255):
 
-        1. **the descriptor** — `duckdb.connect("/proc/self/fd/<n>")` opens the inode the
+        1. **the descriptor** -- `duckdb.connect("/proc/self/fd/<n>")` opens the inode the
            descriptor holds, so a `rename()` over the name during the open cannot swap the
-           generation, and nothing is created anywhere. This is the branch a runtime host
-           takes, and it is the only branch that works there: every granted path in a unit
-           is its own bind mount, so a hard link out of the database's directory is
-           `EXDEV` and one inside it is `EROFS`.
-        2. **a hard link beside the database** — the mechanism this class shipped with. It
-           gives the same generation pinning and needs the database's own directory to be
-           writable, which is true for the unsandboxed readers (dashboard, CLI, the macOS
-           lane) and false on a runtime host. DuckDB rejects `/dev/fd/<n>` on macOS (it
-           rebuilds the path from the descriptor's real name), so this branch is what
-           keeps `test_duckdb_signal_source_binds_generation_opened_during_connect`
-           meaningful off Linux rather than quietly weakening it.
+           generation, and nothing is created anywhere. **A failure here is not one thing.**
+           Package L's message said "this engine refused the descriptor", and the v0.33.5
+           code reached it through a bare `except Exception` -- so a database another
+           process holds the write lock on produced exactly the same sentence as an engine
+           that does not understand the path. With the pinned duckdb 1.5.2 on Linux the
+           descriptor path *is* accepted, so on the production host the far likelier cause
+           of #255 is the write lock `rquant-monitor` holds on the main database from
+           09:25 (#250). A lock is therefore reported as a lock and stops the read here;
+           only a genuine "this path means nothing to me" falls through.
+        2. **a private copy inside this reader's own control root** -- for artifacts whose
+           publisher replaces them by `rename()`, and only those (`atomically_published`).
+           The pinned inode is copied out through the descriptor itself, its identity
+           checked before and after. A live writer must never reach this branch: DuckDB's
+           uncommitted state lives in a `.wal` beside the database, so a byte copy of the
+           main file alone would open *successfully* and serve the last checkpoint --
+           older data, with nothing to say it is old. The hard link this replaced failed
+           closed there, because it shared the inode and so shared the lock.
+        3. **the database in place, unpinned** -- a generation too large to copy, or a
+           reader with no control root. There is no pinning and the class does not pretend
+           otherwise: `__exit__` compares the descriptor's inode and the name's inode
+           against the ones this read started with, so a generation replaced by `rename()`
+           under the read is *reported*, after the fact, rather than silently mixed. An
+           in-place rewrite of the same inode is outside what that can see.
 
-        There is no third branch that opens the bare path: that would read whatever the
-        name points at when the engine gets to it, which is the guarantee this class exists
-        to provide.
+        What is gone is the branch #255 is about: a hard link beside the database. On a
+        runtime host every granted path is its own bind mount, so a link out of the
+        database's directory is `EXDEV` and one inside it is `EROFS`.
         """
 
         if descriptor_path is not None:
             try:
                 connection = duckdb.connect(descriptor_path, read_only=True)
-            except Exception:  # noqa: BLE001 - the engine decides; both branches are tested
-                pass
+            except Exception as error:  # noqa: BLE001 - classified, then re-raised or passed
+                self._refuse_if_write_locked(error, opened_path=descriptor_path)
             else:
                 self.opened_through = "descriptor"
                 self._generation_path = descriptor_path
                 return connection
+        copied = self._connect_through_copy()
+        if copied is not None:
+            return copied
+        connection = duckdb.connect(str(self.path), read_only=True)
+        self.opened_through = "in_place"
+        self._generation_path = str(self.path)
+        return connection
+
+    @staticmethod
+    def _refuse_if_write_locked(error: BaseException, *, opened_path: str) -> None:
+        """Re-raise a "somebody else holds the write lock" as itself, not as a path refusal.
+
+        DuckDB says `IO Error: Could not set lock on file "...": Conflicting lock is held
+        in <exe> (PID n)`. Swallowing that into the same silence as "the engine does not
+        understand this path" is what made #255's message name the wrong cause for a whole
+        window, and it is also what would let the copy branch below quietly serve the last
+        checkpoint of a database somebody is writing.
+        """
+
+        text = str(error).lower()
+        if any(marker in text for marker in _WRITE_LOCK_MARKERS):
+            raise PageProjectionSourceIntegrityError(
+                f"projection database {opened_path} is held by another process's write "
+                f"lock: {error}"
+            ) from error
+
+    def _connect_through_copy(self) -> duckdb.DuckDBPyConnection | None:
+        """A copy of the pinned inode in this reader's own root, or `None` if it cannot be.
+
+        Two conditions the caller has to earn, because getting either wrong turns a
+        fail-closed read into a silently stale one (review SF-1):
+
+        * `atomically_published` -- the owner replaces this artifact with `rename()` and
+          never writes it in place. Anything else may have a writer in it right now.
+        * no `.wal` beside it -- DuckDB keeps uncommitted state there, and a byte copy of
+          the main file alone would drop it and open cleanly on the previous checkpoint.
+        """
+
+        if self.control_root is None or not self.atomically_published:
+            return None
+        if self.path.with_name(f"{self.path.name}.wal").exists():
+            raise PageProjectionSourceIntegrityError(
+                f"projection database {self.path} has an uncommitted write-ahead log "
+                "beside it; a copy of the database alone would serve its last checkpoint"
+            )
+        opened = os.fstat(self._descriptor)
+        if opened.st_size > self.max_copy_bytes:
+            return None
         bound_directory: Path | None = None
+        bound_path: Path | None = None
         try:
+            self.control_root.mkdir(parents=True, exist_ok=True)
             bound_directory = Path(
-                mkdtemp(prefix=f".{self.path.name}.{uuid4().hex}.", dir=self.path.parent)
+                mkdtemp(prefix=f".{self.path.name}.{uuid4().hex}.", dir=self.control_root)
             )
             os.chmod(bound_directory, 0o700)
             bound_path = bound_directory / "generation.duckdb"
-            os.link(self.path, bound_path, follow_symlinks=False)
-        except OSError as exc:
-            if bound_directory is not None:
-                with suppress(OSError):
-                    os.rmdir(bound_directory)
+            self._copy_descriptor(bound_path, size=opened.st_size)
+        except OSError:
+            self._discard_copy(bound_directory, bound_path)
+            return None
+        #: the same inode *and the same content* all the way through. Size alone is not
+        #: enough: a writer that replaces a page in place leaves the size where it was, and
+        #: the copy would then be a mixture of before and after. `st_mtime_ns` /
+        #: `st_ctime_ns` are what says the file was touched at all (review SF-1).
+        after = os.fstat(self._descriptor)
+        if _copy_identity(after) != _copy_identity(opened):
+            self._discard_copy(bound_directory, bound_path)
             raise PageProjectionSourceIntegrityError(
-                f"projection database {self.path} cannot be pinned: this engine refused "
-                f"the descriptor {descriptor_path}, and linking it inside "
-                f"{self.path.parent} failed (errno {exc.errno} "
-                f"{errno.errorcode.get(exc.errno or 0, '?')} {exc.strerror})"
-            ) from exc
-        bound = os.lstat(bound_path)
-        if _file_identity(bound) != _file_identity(os.fstat(self._descriptor)):
-            self._discard_link(bound_directory, bound_path)
+                "projection database changed while its generation was being copied"
+            )
+        if os.lstat(bound_path).st_size != opened.st_size:
+            self._discard_copy(bound_directory, bound_path)
             raise PageProjectionSourceIntegrityError(
-                "projection database rotated while binding its opened generation"
+                "projection database copy does not match the opened generation"
             )
         try:
             connection = duckdb.connect(str(bound_path), read_only=True)
         except BaseException:
-            self._discard_link(bound_directory, bound_path)
-            raise
-        self.opened_through = "link"
+            self._discard_copy(bound_directory, bound_path)
+            return None
+        self.opened_through = "copy"
         self._generation_path = str(bound_path)
         self._bound_directory = bound_directory
         self._bound_path = bound_path
         return connection
 
+    def _copy_descriptor(self, destination: Path, *, size: int) -> None:
+        """Copy the bytes the descriptor holds, reading only through the descriptor."""
+
+        os.lseek(self._descriptor, 0, os.SEEK_SET)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        target = os.open(destination, flags, 0o600)
+        try:
+            remaining = size
+            while remaining > 0:
+                chunk = os.read(self._descriptor, min(remaining, 4 * 1024 * 1024))
+                if not chunk:
+                    break
+                os.write(target, chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(target)
+
     @staticmethod
-    def _discard_link(directory: Path | None, path: Path | None) -> None:
+    def _discard_copy(directory: Path | None, path: Path | None) -> None:
         if path is not None:
             with suppress(FileNotFoundError):
                 os.unlink(path)
@@ -400,7 +527,7 @@ class _StableReadonlyDuckDB:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
-        self._discard_link(self._bound_directory, self._bound_path)
+        self._discard_copy(self._bound_directory, self._bound_path)
         self._bound_directory = None
         self._bound_path = None
         if self._descriptor >= 0:
@@ -807,8 +934,16 @@ class DuckDBSignalPageProjectionSource:
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
         surge_live_root: Path | None = None,
+        control_root: Path | None = None,
+        atomically_published: bool = False,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
+        #: this role's own state directory, the only place it may write. Used solely as
+        #: the destination for a pinned copy when the engine refuses the descriptor
+        #: path (#255); nothing is ever written beside the database.
+        self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
+        #: whether this database's owner replaces it with `rename()` (review SF-1)
+        self.atomically_published = atomically_published
         self.canvas_catalog_root = (
             None if canvas_catalog_root is None else Path(os.path.abspath(canvas_catalog_root))
         )
@@ -849,7 +984,11 @@ class DuckDBSignalPageProjectionSource:
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         cutoff = _local_naive(observed)
-        with _StableReadonlyDuckDB(self.database_path) as connection:
+        with _StableReadonlyDuckDB(
+            self.database_path,
+            control_root=self.control_root,
+            atomically_published=self.atomically_published,
+        ) as connection:
             self._require_tables(connection)
             screen_rows = connection.execute(
                 """
@@ -1449,12 +1588,14 @@ class DuckDBSignalPageProjectionSource:
 class DuckDBLabPageProjectionSource:
     """Project formal research gate metadata from one stable research replica."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, control_root: Path | None = None) -> None:
         self.database_path = Path(os.path.abspath(database_path))
+        #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
+        self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
 
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
-        stable = _StableReadonlyDuckDB(self.database_path)
+        stable = _StableReadonlyDuckDB(self.database_path, control_root=self.control_root)
         with stable as connection:
             self._require_tables(connection)
             candidates = connection.execute(
