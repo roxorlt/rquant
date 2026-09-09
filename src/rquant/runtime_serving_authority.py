@@ -1581,7 +1581,12 @@ def serving_source_pointer_handover(reader: ServingSourceAuthorityReader) -> str
 
     try:
         chain = _open_existing_directory_chain(reader.root)
-    except (OSError, ValueError):
+    except (
+        OSError,
+        ValueError,
+        ServingSourceAuthorityIntegrityError,
+        ServingSourceAuthorityUnavailableError,
+    ):
         return None
     try:
         payload = _read_regular_file_at(

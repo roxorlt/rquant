@@ -1213,6 +1213,29 @@ def test_handover_event_names_the_generation_the_pointer_came_from(tmp_path: Pat
     assert serving_source_pointer_handover(_lineage_reader(root)) is None
 
 
+def test_handover_says_nothing_when_the_path_itself_is_untrustworthy(tmp_path: Path) -> None:
+    """An untrustworthy path is the read's refusal to make, not the build's (#253).
+
+    `_open_existing_directory_chain` refuses any component that is group- or
+    world-writable, and it refuses with `ServingSourceAuthorityIntegrityError`, which is a
+    `RuntimeError` and so fell outside this function's `except`. Where the umask leaves
+    directories group-writable -- CI's Route A legacy binding job is one such place -- the
+    handover, which is read once at build and is never load-bearing, took the whole
+    serving role down with it before it ever reached a read. The refusal itself is
+    unchanged and still belongs to the read below.
+    """
+
+    from rquant.runtime_serving_authority import serving_source_pointer_handover
+
+    root = tmp_path / "authority"
+    _publisher(root, producer_commit=PREVIOUS_COMMIT).publish(_result())
+    tmp_path.chmod(0o775)
+
+    assert serving_source_pointer_handover(_lineage_reader(root)) is None
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="unsafe"):
+        _lineage_reader(root)(NOW)
+
+
 def test_carried_pointer_still_has_to_match_its_own_immutable_document(
     tmp_path: Path,
 ) -> None:
