@@ -28,7 +28,6 @@ from unittest import mock
 import pytest
 
 import rquant.auction_gap_candidate_input as auction_gap_module
-import rquant.auction_universe_source as auction_universe_module
 import rquant.runtime_service_builtin as builtin_module
 import rquant.runtime_service_main as service_main
 from rquant.runtime_service_control import RuntimeServiceControl
@@ -51,9 +50,6 @@ from tests.integration.test_route_a_readside_replica_e2e import (
 __all__ = ["locked_main_database", "session_world"]
 
 pytestmark = pytest.mark.integration
-
-AUCTION_UNIVERSE_SERVICE_ID = "auction-universe.publisher.v1"
-UNIVERSE_ROLE = "auction_universe_publisher"
 
 #: the four roles the production profile binds to the replica (#250)
 READ_SIDE_ROLES = (
@@ -143,22 +139,23 @@ def _run_iterations(
 
 @pytest.fixture
 def counted_replica_reads(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """Every place a read-side role actually opens the replica, counted."""
+    """Where the auction-gap publisher actually opens the replica, counted.
 
-    counts = {"auction_gap": 0, "auction_universe": 0}
+    Only this role: package P's world sits at 09:26:30, and `auction-universe.publisher.v1`
+    refuses to act at all between 09:15 and 15:10 (its protection window), so in this world
+    it never reaches a read and counting it would assert nothing. That role's gate is
+    covered in `tests/unit/test_auction_universe_source.py`, where three publishes over one
+    generation open the database once and a replacement opens it a second time.
+    """
+
+    counts = {"auction_gap": 0}
     original_gap = auction_gap_module._query_daily_volume_rows
-    original_universe = auction_universe_module._query_codes
 
     def counted_gap(*args: object, **kwargs: object) -> object:
         counts["auction_gap"] += 1
         return original_gap(*args, **kwargs)
 
-    def counted_universe(*args: object, **kwargs: object) -> object:
-        counts["auction_universe"] += 1
-        return original_universe(*args, **kwargs)
-
     monkeypatch.setattr(auction_gap_module, "_query_daily_volume_rows", counted_gap)
-    monkeypatch.setattr(auction_universe_module, "_query_codes", counted_universe)
     return counts
 
 
@@ -238,29 +235,6 @@ def test_an_atomic_replacement_costs_exactly_one_more_read(
     assert heartbeat.total_successes == 6
     assert heartbeat.degraded_reasons == ()
     assert heartbeat.replica_opened is False
-
-
-def test_the_auction_universe_publisher_reads_the_replica_once_over_three_iterations(
-    session_world: ReplicaWorld,
-    locked_main_database: Any,
-    counted_replica_reads: dict[str, int],
-) -> None:
-    """The second read-side publisher, at its own thirty-second interval."""
-
-    instance = _instance_name(AUCTION_UNIVERSE_SERVICE_ID)
-    code, heartbeat = _run_iterations(
-        session_world,
-        UNIVERSE_ROLE,
-        instance=instance,
-        now=PUBLISH_AT,
-        iterations=3,
-    )
-
-    assert code == 0
-    assert counted_replica_reads["auction_universe"] <= 1
-    assert heartbeat is not None
-    assert heartbeat.total_successes == 3
-    assert heartbeat.last_error is None
 
 
 def test_the_heartbeat_says_what_the_last_iteration_did_with_the_replica(
