@@ -51,6 +51,7 @@ from rquant.page_control import (
     PageControlStatus,
     read_canvas_current_head,
 )
+from rquant.readside_replica_gate import ReplicaRead, ReplicaReadGate
 from rquant.research_gate import (
     ResearchGateFailure,
     ResearchGateRequest,
@@ -922,6 +923,18 @@ class _ReadonlyPageControlAuditReader:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _DatabaseProjection:
+    """Everything one page projection takes out of the replica, in one open (#256)."""
+
+    screen_bounds: tuple[ScreenBoundsProjectionRow, ...]
+    minute_coverage: tuple[MinuteCoverageProjectionRow, ...]
+    latest_trade_date: date | None
+    canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
+    canvas_hits: tuple[CanvasHitProjectionRow, ...]
+    available_at: datetime
+
+
 class DuckDBSignalPageProjectionSource:
     """Build bounded point-in-time page projections from an atomic read replica."""
 
@@ -974,6 +987,16 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError(
                 "configured canvas catalog requires receipt root and keyring authority"
             )
+        #: this reader's memory of which replica generation it has already read (#256)
+        self._replica_gate: ReplicaReadGate[_DatabaseProjection] = ReplicaReadGate(
+            self.database_path
+        )
+
+    @property
+    def last_replica_read(self) -> ReplicaRead[_DatabaseProjection] | None:
+        """What the most recent projection did with the replica, for the heartbeat."""
+
+        return self._replica_gate.last_read
 
     def __call__(self, observed_at: datetime, /) -> SignalPageProjectionSnapshot:
         if self.page_control_outbox is None:
@@ -984,6 +1007,62 @@ class DuckDBSignalPageProjectionSource:
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         cutoff = _local_naive(observed)
+        #: One `lstat`, and the database is opened only if this generation of the replica
+        #: has not already been read (#256). This role's interval is two seconds and the
+        #: replica is replaced every five minutes, so before this it scanned all of
+        #: `minute_bar` in a 10 GB file about a hundred and fifty times per generation.
+        #: `key` carries the *local* date because that is the granularity the predicates
+        #: below use; `cutoff` carries the instant, so an answer is reused only when it
+        #: was taken at or after the generation's own mtime -- every row in the file was
+        #: written before the file was, so a later cutoff admits exactly the same rows.
+        read = self._replica_gate.read(
+            lambda: self._read_database_projection(cutoff),
+            key=("signal-page-projection", cutoff.date()),
+            cutoff=observed,
+        )
+        database = read.value
+        screen_bounds = database.screen_bounds
+        minute_coverage = database.minute_coverage
+        latest_date = database.latest_trade_date
+        diagnostics = database.canvas_diagnostics
+        hits = database.canvas_hits
+        available = database.available_at
+        canvas_definitions = self._canvas_definitions(observed=observed)
+        pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
+            self.surge_live_root,
+            observed=observed,
+        )
+        if canvas_definitions:
+            available = max(
+                available,
+                max(item.updated_at for item in canvas_definitions),
+            )
+        return SignalPageProjectionSnapshot.create(
+            available_at=available,
+            screen_bounds=screen_bounds,
+            minute_coverage=minute_coverage,
+            canvas_diagnostics=diagnostics,
+            canvas_latest_trade_date=(
+                None
+                if latest_date is None
+                else CanvasLatestTradeDateProjectionRow(trade_date=latest_date)
+            ),
+            canvas_hits=hits,
+            canvas_definitions=canvas_definitions,
+            pulse_history=pulse_history,
+            pulse_alerts=pulse_alerts,
+            surge_runtime_config=runtime_config,
+        )
+
+    def _read_database_projection(self, cutoff: datetime) -> _DatabaseProjection:
+        """Everything this projection takes out of the replica, in one open.
+
+        Split out of `_build_snapshot` so the gate above has something to remember. What
+        stays outside it is what does not live in the replica and changes on its own: the
+        canvas catalog, the PageControl audit, and the `surge_live` JSONL -- caching those
+        with the database would delay a canvas by up to a replica period.
+        """
+
         with _StableReadonlyDuckDB(
             self.database_path,
             control_root=self.control_root,
@@ -1099,32 +1178,13 @@ class DuckDBSignalPageProjectionSource:
             ).fetchone()
         if available_row is None or available_row[0] is None:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
-        available = _database_timestamp(available_row[0])
-        canvas_definitions = self._canvas_definitions(observed=observed)
-        pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
-            self.surge_live_root,
-            observed=observed,
-        )
-        if canvas_definitions:
-            available = max(
-                available,
-                max(item.updated_at for item in canvas_definitions),
-            )
-        return SignalPageProjectionSnapshot.create(
-            available_at=available,
+        return _DatabaseProjection(
             screen_bounds=screen_bounds,
             minute_coverage=minute_coverage,
+            latest_trade_date=latest_date,
             canvas_diagnostics=diagnostics,
-            canvas_latest_trade_date=(
-                None
-                if latest_date is None
-                else CanvasLatestTradeDateProjectionRow(trade_date=latest_date)
-            ),
             canvas_hits=hits,
-            canvas_definitions=canvas_definitions,
-            pulse_history=pulse_history,
-            pulse_alerts=pulse_alerts,
-            surge_runtime_config=runtime_config,
+            available_at=_database_timestamp(available_row[0]),
         )
 
     def _canvas_definitions(

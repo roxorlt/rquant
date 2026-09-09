@@ -985,6 +985,23 @@ def notifier_builder(
         else:
             resolved_provider_loader = provider_loader
 
+        def _replica_cost() -> dict[str, object]:
+            """What this iteration did with the read-only replica, for the heartbeat (#256).
+
+            Empty for a notifier with no page projection configured, so a role that never
+            opens the replica reports `None` rather than a fabricated zero.
+            """
+
+            if page_projection_producer is None:
+                return {}
+            read = page_projection_producer.source.last_replica_read
+            if read is None:
+                return {}
+            return {
+                "replica_opened": read.opened,
+                "replica_read_bytes": read.read_bytes,
+            }
+
         def step() -> RuntimeStepResult:
             descriptor = source.source_descriptor()
             cursor = store.replication_cursor()
@@ -1018,6 +1035,7 @@ def notifier_builder(
                     ),
                     source_generations=source_generations,
                     degraded_reasons=tuple(degraded),
+                    **_replica_cost(),
                 )
 
             observed_at = clock()
@@ -1102,6 +1120,7 @@ def notifier_builder(
                 ),
                 source_generations=source_generations,
                 degraded_reasons=tuple(degraded),
+                **_replica_cost(),
             )
 
         return step

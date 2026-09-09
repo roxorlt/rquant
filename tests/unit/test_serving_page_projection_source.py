@@ -2337,3 +2337,139 @@ def test_a_source_whose_only_changed_stamp_is_ctime_is_still_refused(
     assert after.st_ctime_ns != before.st_ctime_ns
     assert not any(control.iterdir())
 
+
+
+def _count_database_opens(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times the page projection actually opened the replica (#256)."""
+
+    import rquant.serving_page_projection_source as module
+
+    opens = [0]
+    original = module._StableReadonlyDuckDB.__enter__
+
+    def counted(self: object) -> object:
+        opens[0] += 1
+        return original(self)
+
+    monkeypatch.setattr(module._StableReadonlyDuckDB, "__enter__", counted)
+    return opens
+
+
+def _synced_replica(path: Path, *, synced_at: datetime) -> None:
+    """The replica as the five-minute timer leaves it: written before anyone reads it."""
+
+    _signal_projection_database(path)
+    stamp = synced_at.timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+def test_an_unchanged_replica_is_not_opened_again_by_the_page_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#256: the notifier's interval is two seconds and the replica changes every five minutes.
+
+    Every iteration used to scan all of `minute_bar` in a 10 GB file. Three iterations
+    over one generation now open it once, and the answer is the same one.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    snapshots = [source(NOW + timedelta(seconds=2 * index)) for index in range(3)]
+
+    assert opens[0] == 1
+    assert source.last_replica_read is not None
+    assert source.last_replica_read.opened is False
+    assert {snapshot.content_sha256 for snapshot in snapshots} == {snapshots[0].content_sha256}
+
+
+def test_the_page_projection_opens_exactly_once_more_after_the_replica_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `mv` over the name is what `sync-readonly-replica.sh` does every five minutes."""
+
+    database = tmp_path / "rquant_ro.duckdb"
+    replacement = tmp_path / "rquant_ro.duckdb.tmp.1"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=6))
+    _synced_replica(replacement, synced_at=NOW - timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    source(NOW)
+    source(NOW + timedelta(seconds=2))
+    os.replace(replacement, database)
+    after = [source(NOW + timedelta(seconds=4 + 2 * index)) for index in range(3)]
+
+    assert opens[0] == 2
+    assert len(after) == 3
+    assert source.last_replica_read is not None
+    assert source.last_replica_read.opened is False
+
+
+def test_an_answer_taken_before_the_generation_was_written_is_never_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse rule is "at or after the file's own mtime", and it is load-bearing.
+
+    A replica written after this iteration started may hold rows this iteration's cutoff
+    excluded; the next one must ask again rather than be served the narrower answer.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW + timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    source(NOW)
+    source(NOW + timedelta(seconds=2))
+
+    assert opens[0] == 2
+
+
+def test_what_is_not_in_the_replica_is_still_read_every_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What is cached is the replica's part, not the projection.
+
+    `surge_live`, the canvas catalog and the PageControl audit are files that change on
+    their own; freezing them with the database would delay them by up to a replica period.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=1))
+    live_root = tmp_path / "surge_live"
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database, surge_live_root=live_root)
+
+    before = source(NOW)
+    live_root.mkdir()
+    alerts = live_root / "pulse_alerts-2026-08-03.jsonl"
+    alerts.write_text(
+        json.dumps(
+            {
+                "t": "10:15",
+                "kind": "broken_surge",
+                "kind_label": "炸板潮",
+                "before": 2.0,
+                "after": 6.0,
+                "window_minutes": 10,
+                "message": "炸板异动",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(alerts, (stamp, stamp))
+    after = source(NOW + timedelta(seconds=2))
+
+    assert opens[0] == 1
+    assert "pulse_alert" not in {item.table_name for item in before.projections}
+    assert "pulse_alert" in {item.table_name for item in after.projections}
