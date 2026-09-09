@@ -165,6 +165,22 @@
   之前就建好 `runner.sqlite3` 是同一条规矩（#232）。**校验一条都没放宽**：锁必须是本人所有、
   单链接、0600 的普通文件，根必须是本人所有的 0700 目录，否则照旧拒绝。
 
+- **失败重复出现时按指数退避，并且停止不再需要 SIGKILL（#254）**：
+  同一天下午（14:00–14:35）的现场证据：两个 source role 每一轮都在同一个完整性错误上失败，
+  而失败路径每次都要把候选库重新走一遍、重新算哈希，循环又没有任何退避——4 vCPU 的主机
+  load 冲到 11–12、system CPU 约 47%，15 分钟一次的备份从 8 分钟变成 14 分钟，生产
+  monitor-watchdog 的 oneshot 超时一次（又一条真实告警推送）。把这两个 role 停掉，两分钟内
+  load 掉回 2.8。而**在这个循环里停 `watchlist-quote` 超过了 `TimeoutStopSec`、被 SIGKILL、
+  unit 留在 `failed`**（再一条推送）。
+  现在：**同一种失败第二次开始退避**，从 interval 翻倍、上限 60 秒；换一种失败或者成功一次
+  立刻归零。「同一种」= 异常类型 +（peer 等待时）它等的那个文件路径，**不看错误消息**——
+  消息里带时间戳和序号，每轮都会看着像新的。当前退避秒数与它在数的那种失败写进心跳，
+  **只写文件模型**：serving 发布的是 `RuntimeServiceHeartbeatProjection`，它按自己的
+  `model_fields` 取字段，所以这两个字段一个都不会进已发布 schema（#237），快照闸前后都绿。
+  等待本身按 0.25 秒切片：`Event.set()` 从信号处理器调用时跑在**正在等待的那个线程上**，
+  要拿事件自己的锁才能把消息递过去——这正是停止会晚于 unit 超时的那条路径。切片在退避期间
+  每秒多 4 次唤醒，代价可以忽略，换来的是**停止延迟有上界、且不依赖那条路径**。
+
 - **serving 发布者接住上一代写下的 signals 权威 current pointer（#253）**：
   `serving.publisher.v1` 每一轮报 `ServingSourceAuthorityIntegrityError: current pointer
   producer_commit does not match expected commit`。这个 `current.json` 归 notifier 所有，
