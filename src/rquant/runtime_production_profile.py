@@ -8,10 +8,11 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Annotated, Literal
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -224,6 +225,13 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
             )
         if replica.name == "rquant.duckdb":
             raise ValueError("auction universe read-only replica cannot be the main rquant.duckdb")
+        #: #250: neither of the two checks above sees a replica that is *named*
+        #: `rquant_ro.duckdb` and is a symlink to the main database. What matters is the
+        #: file the open lands on, so the generator resolves the link before comparing.
+        if Path(os.path.realpath(replica)) == Path(
+            os.path.realpath(self.operational_database_path)
+        ):
+            raise ValueError("read-only replica cannot resolve to the main database")
         return self
 
     @field_validator("historical_minutes_snapshot_path")
@@ -856,6 +864,79 @@ def _validate_recovery_artifact_bindings(
         raise ValueError("recovery paper ledger role differs from production broker")
 
 
+#: Every manifest field that names a database a *read-side* live role opens, and the one
+#: value each may hold: the five-minute read-only replica (#249, #250). None of these roles
+#: writes anything into DuckDB; all four of them run before or during the session, which is
+#: exactly when `rquant-monitor` holds the main database's write lock and DuckDB refuses
+#: every new connection to it, `read_only=True` included (CLAUDE.md's single-writer rule).
+#:
+#: The main database is named in exactly one place in a production profile — the recovery
+#: binding (`_validate_recovery_artifact_bindings`), which backs the file up rather than
+#: reading it — and that is the only exemption from this rule.
+READ_SIDE_DATABASE_BINDINGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "auction-universe.publisher.v1": ("database_path",),
+        "candidate.auction_gap.v1": ("daily_database_path",),
+        "notifier.admin.shadow.v1": ("page_projection_database_path",),
+        "reference-slow.source.v1": ("database_path",),
+    }
+)
+
+#: Any other manifest setting whose name ends this way is a database binding too, and no
+#: manifest may point one at the main database even if it is not in the table above.
+_DATABASE_SETTING_SUFFIX = "database_path"
+
+
+def _resolved_path(path: Path) -> Path:
+    """`realpath`, so a replica that is a symlink to the main database is still the main one."""
+
+    return Path(os.path.realpath(os.fspath(path)))
+
+
+def _validate_read_side_database_bindings(
+    manifests: Sequence[RuntimeServiceManifest],
+    *,
+    operational_database_path: Path,
+    readonly_replica_database_path: Path,
+) -> None:
+    """Refuse a read-side role that would open the production main database (#250).
+
+    Two statements, because two different mistakes put a role back on the main file. The
+    table above says which field of which role must hold the replica and nothing else, so
+    a binding quietly moved elsewhere is named rather than discovered in a window; the
+    sweep says no manifest anywhere may name the main database, so a *new* role added with
+    a `..._database_path` setting is refused before it is installed instead of inheriting
+    the defect. Both resolve symlinks first: the path that matters is the file the open
+    lands on, not the name in the document.
+    """
+
+    main = _resolved_path(operational_database_path)
+    replica = _resolved_path(readonly_replica_database_path)
+    by_id = {manifest.service_id: manifest for manifest in manifests}
+    for service_id, fields in READ_SIDE_DATABASE_BINDINGS.items():
+        manifest = by_id.get(service_id)
+        if manifest is None:
+            continue
+        for field in fields:
+            value = manifest.settings.get(field)
+            if not isinstance(value, str) or _resolved_path(Path(value)) != replica:
+                raise ValueError(
+                    f"read-side role {service_id} field {field} must be the read-only "
+                    f"replica {readonly_replica_database_path}, not {value!r}"
+                )
+    for manifest in manifests:
+        for field, value in sorted(manifest.settings.items()):
+            if not field.endswith(_DATABASE_SETTING_SUFFIX) or not isinstance(value, str):
+                continue
+            if _resolved_path(Path(value)) == main:
+                raise ValueError(
+                    f"read-side role {manifest.service_id} field {field} resolves to the "
+                    f"production main database {main}; live readers open the replica "
+                    f"{readonly_replica_database_path} (the recovery binding is the only "
+                    "role that may name the main database)"
+                )
+
+
 def _control_bucket(kind: RuntimeServiceKind) -> str:
     return {
         RuntimeServiceKind.REFERENCE_SLOW_SOURCE: "reference-slow-sources",
@@ -1030,7 +1111,12 @@ def build_production_runtime_profile(
             interval_seconds=30,
             stale_after_seconds=180,
             settings={
-                "database_path": str(config.operational_database_path),
+                #: The replica, never the main database (#250). This source copies the
+                #: file it is given before querying the copy, and refuses a database with
+                #: an unsealed `.wal` sidecar — which the main database has whenever a
+                #: writer holds it. `sync-readonly-replica.sh` checkpoints the replica and
+                #: removes its WAL, so the replica is the only file this reader can accept.
+                "database_path": str(config.readonly_replica_database_path),
                 "calendar_path": str(calendar),
                 "calendar_expected_commit": config.market_calendar_producer_commit,
                 "calendar_content_sha256": config.market_calendar_content_sha256,
@@ -1419,7 +1505,14 @@ def build_production_runtime_profile(
             settings.update(
                 input_mode="auction_live",
                 auction_spool_root=str(root / "live" / "auction-match"),
-                daily_database_path=str(config.operational_database_path),
+                #: The replica, never the main database (#250). This publisher runs only
+                #: inside 09:26-09:30 Asia/Shanghai, which is entirely inside the window
+                #: `rquant-monitor` holds the main database's write lock, so on the main
+                #: file it could never publish — and market-minute and watchlist-quote
+                #: then failed every iteration for want of its snapshot. What it reads is
+                #: the five prior sessions' `daily_bar` volumes, which the replica has
+                #: carried since the previous evening's daily run.
+                daily_database_path=str(config.readonly_replica_database_path),
                 reference_registry_path=str(reference_registry),
                 calendar_path=str(calendar),
                 calendar_expected_commit=config.market_calendar_producer_commit,
@@ -1518,9 +1611,17 @@ def build_production_runtime_profile(
                 "batch_limit": 128,
                 "lease_seconds": 30,
                 "serving_authority_root": str(notifier_root / "serving-authority"),
-                "page_projection_database_path": str(config.operational_database_path),
+                #: The replica, never the main database (#250, #255). The notifier's
+                #: interval is two seconds, so pointed at the main file it opened a
+                #: connection against the monitor's write lock every two seconds of the
+                #: session. `surge_live` is a directory of JSONL/JSON files, not a DuckDB
+                #: database, so no lock was ever involved there; it moves with the
+                #: projection database because `runtime_deployment_bundle` requires it to
+                #: be that database's own sibling, and in production both files live in
+                #: the same data directory, so the value itself does not change.
+                "page_projection_database_path": str(config.readonly_replica_database_path),
                 "page_projection_surge_live_root": str(
-                    config.operational_database_path.parent / "surge_live"
+                    config.readonly_replica_database_path.parent / "surge_live"
                 ),
                 **(
                     {
@@ -1911,6 +2012,11 @@ def build_production_runtime_profile(
     _validate_profile_strategy_bindings(
         profile,
         production_runtime_root=root,
+    )
+    _validate_read_side_database_bindings(
+        profile.manifests,
+        operational_database_path=config.operational_database_path,
+        readonly_replica_database_path=config.readonly_replica_database_path,
     )
     return profile
 

@@ -280,12 +280,24 @@ def _normalized_absolute_path(path: Path) -> Path:
 
 
 def _validate_database(value: os.stat_result) -> None:
+    """The mode rule the file this source is given can actually satisfy (#249, #250).
+
+    Since #250 this source reads the five-minute read-only replica `rquant_ro.duckdb`,
+    which `scripts/sync-readonly-replica.sh` recreates at 0644 every five minutes, so a
+    0600 requirement refused it on every iteration. What protects the read is that the
+    file is owned by the runtime and neither group nor other can write it; 0600 and 0400
+    still pass. This validates the *source* database only — the private copy this module
+    makes of it is created 0600 and checked by its own path.
+    """
+
     if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
         raise ReferenceSlowSourceError("reference source database is a symlink or unsafe file")
     if value.st_uid != os.geteuid():
         raise ReferenceSlowSourceError("reference source database owner does not match")
-    if stat.S_IMODE(value.st_mode) != 0o600:
-        raise ReferenceSlowSourceError("reference source database must have mode 0600")
+    if stat.S_IMODE(value.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ReferenceSlowSourceError(
+            "reference source database must not be group or other writable"
+        )
     if value.st_nlink != 1:
         raise ReferenceSlowSourceError("reference source database must have one hard link")
 
