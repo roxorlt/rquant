@@ -754,10 +754,14 @@ class RuntimeServiceControl:
         return heartbeat
 
 
-#: The longest a role may sit between retries of one failure it keeps getting. Long
-#: enough that a DEGRADED loop costs nothing, short enough that the recovery an operator
-#: makes is picked up within a minute (#254).
-MAX_FAILURE_BACKOFF_SECONDS = 60.0
+#: The longest a role may sit between retries of one failure it keeps getting. Bounded
+#: from above by the tightest `stale_after_seconds` in the production profile, which is
+#: **30** (`runtime_production_profile.py:991`, and it is the two source roles this whole
+#: package is about): a heartbeat is written once per failure, so a backoff longer than
+#: `stale_after` would put the role on the health plane as `stale` -- a second, invented
+#: symptom on top of the real one. Twenty seconds still takes a two-second loop from 1800
+#: iterations an hour to about 190, which is the whole point (#254).
+MAX_FAILURE_BACKOFF_SECONDS = 20.0
 
 #: How long a single wait may block before the loop looks at `stop_event` again. The event
 #: already wakes the wait on its own; this bounds the stop latency anyway, because the
@@ -776,12 +780,27 @@ def failure_kind_of(error: BaseException) -> str:
     those carry timestamps and sequence numbers, and would make every iteration look new.
     """
 
+    kind = f"{type(error).__module__}.{type(error).__qualname__}"
+    if is_peer_wait(error):
+        return f"{kind}:{error.path}"  # type: ignore[attr-defined]
+    return kind
+
+
+def is_peer_wait(error: BaseException) -> bool:
+    """Whether this failure is "the owner has not got here yet" rather than a fault.
+
+    Peer waits are **not** backed off. A role waiting for a peer is not burning the host
+    -- it is failing on a `lstat` -- and slowing it down would put the whole cold start's
+    convergence at one backoff per edge: with `broker -> strategy -> router` no longer an
+    ordered start (#252), the chain's worst case is exactly a sum of these waits, and
+    making each one twenty seconds would trade a fixed order for a slow one. The expensive
+    loop #254 is about is the other kind: an integrity failure whose path re-walks and
+    re-hashes a store every iteration.
+    """
+
     from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 
-    kind = f"{type(error).__module__}.{type(error).__qualname__}"
-    if isinstance(error, PeerArtifactUnavailableError):
-        return f"{kind}:{error.path}"
-    return kind
+    return isinstance(error, PeerArtifactUnavailableError)
 
 
 def _failure_backoff_seconds(
@@ -789,6 +808,7 @@ def _failure_backoff_seconds(
     interval_seconds: float,
     consecutive: int,
     cap: float,
+    peer_wait: bool = False,
 ) -> float | None:
     """`None` on the first failure of a kind, then doubling from the interval up to `cap`.
 
@@ -796,10 +816,10 @@ def _failure_backoff_seconds(
     From the second on it doubles, which is what makes an all-day DEGRADED loop cost
     nothing: on 2026-09-09 the two source roles retried a store they could not read every
     two seconds all morning, and re-walking and re-hashing it each time put a 4-vCPU host
-    at load 11-12 (#254).
+    at load 11-12 (#254). A peer wait is never backed off -- see `is_peer_wait`.
     """
 
-    if consecutive < 2:
+    if peer_wait or consecutive < 2:
         return None
     base = max(interval_seconds, _STOP_POLL_SECONDS)
     delay = min(base * float(2 ** min(consecutive - 1, 32)), cap)
@@ -872,6 +892,7 @@ def run_service_loop(
                     interval_seconds=interval_seconds,
                     consecutive=repeated_count,
                     cap=max_failure_backoff_seconds,
+                    peer_wait=is_peer_wait(error),
                 )
                 control.record_failure(
                     error,
@@ -935,6 +956,7 @@ __all__ = [
     "RuntimeStepResult",
     "failure_kind_of",
     "inspect_runtime_health",
+    "is_peer_wait",
     "project_heartbeat",
     "run_service_loop",
 ]

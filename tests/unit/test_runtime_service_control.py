@@ -544,8 +544,8 @@ def test_the_same_failure_backs_off_instead_of_retrying_every_interval(
         iterations=8,
     )
 
-    #: the first failure waits the plain interval, then 4, 8, 16, 32, and the 60 s cap
-    assert delays[:5] == [2.0, 4.0, 8.0, 16.0, 32.0]
+    #: the first failure waits the plain interval, then 4, 8, 16, and the 20 s cap
+    assert delays[:4] == [2.0, 4.0, 8.0, 16.0]
     assert all(delay == MAX_FAILURE_BACKOFF_SECONDS for delay in delays[5:])
     assert final.failure_kind == "builtins.RuntimeError"
 
@@ -566,6 +566,57 @@ def test_a_different_failure_resets_the_backoff(
     )
 
     assert delays == [2.0, 2.0, 2.0, 2.0]
+
+
+def test_a_peer_wait_is_never_backed_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A role waiting for a peer is not burning the host, and slowing it costs a cold start.
+
+    With `broker -> strategy -> router` no longer an ordered start (#252), the chain's
+    worst-case convergence is a sum of these waits. Backing each one off to twenty seconds
+    would trade a fixed start order for a slow one. What #254 is about is the other kind
+    of failure -- one whose path re-walks and re-hashes a store every iteration.
+    """
+
+    _final, delays = _failing_loop(
+        tmp_path,
+        monkeypatch,
+        error=lambda _attempt: PeerArtifactUnavailableError(
+            reader="strategy_live",
+            artifact="paper broker ledger",
+            path=Path("/runtime/live/paper-brokers/svc/broker.sqlite3"),
+        ),
+        iterations=6,
+    )
+
+    assert delays == [2.0, 2.0, 2.0, 2.0, 2.0]
+
+
+def test_the_backoff_cap_stays_under_the_tightest_stale_after_in_the_profile() -> None:
+    """A heartbeat is written once per failure, so the backoff *is* the gap between them.
+
+    A cap above a role's `stale_after` would put it on the health plane as `stale` while
+    it is doing exactly what it was told to do -- a second, invented symptom on top of the
+    real one. The tightest value in the production profile is read out of the profile
+    itself rather than copied here, so raising the cap without looking at it fails.
+    """
+
+    import re
+
+    from rquant.runtime_service_control import MAX_FAILURE_BACKOFF_SECONDS
+
+    profile = Path("src/rquant/runtime_production_profile.py").read_text()
+    stale_after = [
+        float(value.replace("_", ""))
+        for value in re.findall(r"stale_after_seconds=([0-9_]+)\b", profile)
+    ]
+    assert stale_after, "the profile must declare stale_after_seconds"
+    assert min(stale_after) > MAX_FAILURE_BACKOFF_SECONDS, (
+        min(stale_after),
+        MAX_FAILURE_BACKOFF_SECONDS,
+    )
 
 
 def test_two_peers_waited_on_are_two_kinds_even_at_the_same_exception(
