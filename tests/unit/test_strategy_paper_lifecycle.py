@@ -925,6 +925,81 @@ def test_a_damaged_ledger_in_the_same_read_only_directory_still_refuses(
     assert not isinstance(raised.value, PeerArtifactUnavailableError), raised.value
 
 
+@pytest.mark.parametrize(
+    "shape",
+    ("stopped_broker", "not_sqlite", "rollback_journal", "sidecars_present", "writable_directory"),
+)
+def test_only_the_stopped_broker_shape_is_ever_treated_as_a_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """The classifier's whole contract, with the failure it classifies held constant.
+
+    `unable to open database file` is what SQLite says for the stopped broker *and* for
+    several things that are genuinely wrong, and the API gives no way to tell them apart.
+    So the error is injected here -- that one fact, verbatim from the host -- and only the
+    shape on disk varies. Everything except the exact stopped-broker shape must still
+    refuse; without that, "wait instead of refuse" would quietly swallow real faults.
+    """
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    path = _stopped_broker_ledger(tmp_path)
+    if shape == "not_sqlite":
+        payload = bytearray(path.read_bytes())
+        payload[:16] = b"NotSQLite fmt 3\x00"
+        path.write_bytes(bytes(payload))
+    elif shape == "rollback_journal":
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("PRAGMA journal_mode = DELETE")
+        finally:
+            connection.close()
+    elif shape == "sidecars_present":
+        path.with_name(f"{path.name}-shm").write_bytes(b"")
+
+    def refuse_to_open(_self: object) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(PaperBrokerLifecycleReader, "_connect", refuse_to_open)
+    if shape != "writable_directory":
+        path.parent.chmod(0o500)
+    try:
+        with pytest.raises((PeerArtifactUnavailableError, PaperLifecycleIntegrityError)) as raised:
+            PaperBrokerLifecycleReader(path, account_id="paper-main")
+    finally:
+        path.parent.chmod(0o700)
+
+    waited = isinstance(raised.value, PeerArtifactUnavailableError)
+    assert waited is (shape == "stopped_broker"), (shape, raised.value)
+
+
+def test_an_unreadable_ledger_is_a_refusal_even_in_a_read_only_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A header this process cannot read says nothing about whose fault it is: refuse."""
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    path = _stopped_broker_ledger(tmp_path)
+    path.chmod(0o000)
+
+    def refuse_to_open(_self: object) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(PaperBrokerLifecycleReader, "_connect", refuse_to_open)
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(PaperLifecycleIntegrityError) as raised:
+            PaperBrokerLifecycleReader(path, account_id="paper-main")
+    finally:
+        path.parent.chmod(0o700)
+        path.chmod(0o600)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+
+
 def test_a_rollback_journal_ledger_opens_in_the_same_read_only_directory(
     tmp_path: Path,
 ) -> None:
