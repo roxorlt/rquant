@@ -168,6 +168,44 @@ def test_the_candidate_root_without_its_lock_is_what_stopped_the_two_source_role
         assert LOCK_REFUSAL in (run.last_error or ""), run
 
 
+def test_the_host_s_own_shape_is_a_root_that_was_never_published_into(
+    cold_chain: RouteAWorld,  # noqa: F811
+    credentials_root: dict[str, Path],  # noqa: F811
+    relocated_minute_snapshot: None,  # noqa: F811
+    in_session: None,
+) -> None:
+    """What this release actually buys on the host, measured rather than claimed.
+
+    The lock is created before any generation is, by every path that writes one, so a root
+    with no lock is a root **no publish has ever run against** -- it has no generations
+    either. That is the auction_gap root: its publisher's only window is 09:26-09:30
+    (`runtime_builder_candidate.py:70-71`) and that window lies entirely inside the write
+    lock `rquant-monitor` holds on the main database it reads, from 09:25 (#250).
+
+    So after this package the two source roles stop saying "damaged" and start saying
+    "there is no snapshot" -- which is true, and still a failure every in-session
+    iteration, because all three candidate authorities are `required`
+    (`runtime_production_profile.py:1124`). **The chain stays blocked until #250.** What
+    the release does buy is that the failing loop is now cheap and stoppable (review MF-2).
+    """
+
+    roots = tuple(
+        Path(str(manifest.settings["snapshot_root"]))
+        for manifest in manifests_of(cold_chain, RuntimeServiceKind.CANDIDATE_PUBLISHER)
+    )
+    for instance in instance_of(cold_chain, CANDIDATE_ROLE):
+        run_role(cold_chain, CANDIDATE_ROLE, instance=instance)
+    for root in roots:
+        assert sorted(item.name for item in root.iterdir()) == [".publish.lock", "generations"]
+        assert not any((root / "generations").iterdir())
+
+    for run in source_runs(cold_chain, credentials_root):
+        assert run.entered, run
+        error = run.last_error or ""
+        assert LOCK_REFUSAL not in error, run
+        assert "required authority has no not_visible snapshot" in error, run
+
+
 def test_the_owner_creates_the_lock_at_build_and_both_source_roles_read_again(
     cold_chain: RouteAWorld,  # noqa: F811
     credentials_root: dict[str, Path],  # noqa: F811
@@ -495,11 +533,12 @@ def test_the_notifier_never_writes_beside_the_projection_database(
     """#255: the branch that ran when the descriptor was refused wrote where it may not.
 
     Package L kept a hard link beside the database for engines that refuse
-    `/proc/self/fd/<n>`, believing only macOS does. The build on the production host
-    refuses it too, `data/` is read-only for this unit, and the link failed with
-    `errno 30 EROFS` on every iteration. The reader now copies into
-    `live/notifications/%i` -- the one directory this unit may write -- or, for a
-    generation too large to copy, reads in place and checks the identity afterwards.
+    `/proc/self/fd/<n>`. Whatever made the descriptor open fail on the host -- and the
+    likelier cause is the write lock `rquant-monitor` holds on the main database from
+    09:25, not the engine (#250, review MF-3) -- `data/` is read-only for this unit and
+    the link failed with `errno 30 EROFS` on every iteration. That branch is gone: this
+    role is given no control root at all and reads the generation in place, so it writes
+    nothing anywhere under the runtime root, which is the stronger property #241 set.
     """
 
     from tests.runtime_readonly_sandbox import tree_state
