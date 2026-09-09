@@ -232,6 +232,44 @@ def test_the_read_takes_the_pinned_descriptor_where_the_engine_accepts_it(
         assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
 
 
+def test_with_the_descriptor_refused_the_budget_decides_copy_or_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback branch, forced, on every platform.
+
+    On Linux the engine accepts the descriptor path and the copy is never reached, so
+    the branch that decides between a private copy and an in-place read would otherwise
+    only ever be exercised on macOS. What must hold there is that a generation over
+    `snapshot_max_bytes` is **read** rather than refused -- that refusal is what left
+    `reference-slow.source.v1` DEGRADED on every iteration against a 10 GB replica.
+    """
+
+    database = _database(tmp_path)
+    size = database.stat().st_size
+    monkeypatch.setattr(reference_slow_source_module, "descriptor_reopen_path", lambda _fd: None)
+
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(snapshot_max_bytes=size * 4),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as copied:
+        assert copied.opened_through == "copy"
+
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(snapshot_max_bytes=size - 1),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as read_in_place:
+        assert read_in_place.opened_through == "in_place"
+        assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
+        assert (
+            read_in_place.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+        )
+
+
 def test_a_generation_over_the_copy_budget_is_read_in_place_and_copied_nowhere(
     tmp_path: Path,
 ) -> None:
