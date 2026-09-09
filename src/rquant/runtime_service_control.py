@@ -133,6 +133,22 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     waiting_for: str | None = None
     waiting_since: AwareUtcDatetime | None = None
     waited_seconds: StepDuration | None = None
+    #: What this process had to move aside on the way in, once per run: the strategy's
+    #: archived runner database, the route ledger's rotated source, the candidate
+    #: authority's re-bind (#248). Stamped by `start()` and carried unchanged for the
+    #: life of the run. It is a *file* field on purpose -- the serving payload embeds
+    #: `RuntimeServiceHeartbeatProjection`, which is frozen at the v0.33.1 field set
+    #: (#237), so nothing here reaches a published schema.
+    generation_events: tuple[str, ...] = ()
+
+    @field_validator("generation_events")
+    @classmethod
+    def validate_generation_events(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not event.strip() for event in value):
+            raise ValueError("generation events cannot be empty")
+        if len(value) != len(set(value)):
+            raise ValueError("generation events must be unique")
+        return tuple(sorted(value))
 
     @field_validator("source_generations")
     @classmethod
@@ -524,7 +540,7 @@ class RuntimeServiceControl:
         payload.update(updates)
         return RuntimeServiceHeartbeat.model_validate(payload)
 
-    def start(self) -> RuntimeServiceHeartbeat:
+    def start(self, *, generation_events: tuple[str, ...] = ()) -> RuntimeServiceHeartbeat:
         if self._lock_descriptor >= 0:
             raise RuntimeServiceAlreadyRunningError("runtime service control is already started")
         descriptor = os.open(
@@ -560,6 +576,7 @@ class RuntimeServiceControl:
             status=RuntimeServiceStatus.STARTING,
             started_at=now,
             heartbeat_at=now,
+            generation_events=generation_events,
         )
         return self._publish(heartbeat)
 
@@ -722,7 +739,11 @@ def run_service_loop(
         raise ValueError("interval_seconds cannot be negative")
     if max_iterations is not None and max_iterations < 1:
         raise ValueError("max_iterations must be positive")
-    control.start()
+    # The rotations a role performs happen while its step is being built, before this
+    # control exists, so the step is what carries them out to the heartbeat (#248). One
+    # stamp at start is enough: they describe this run, not this iteration.
+    events = getattr(step, "generation_events", ())
+    control.start(generation_events=tuple(events))
     completed = 0
     try:
         while not stop_event.is_set() and (max_iterations is None or completed < max_iterations):

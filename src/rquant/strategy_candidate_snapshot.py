@@ -10,8 +10,9 @@ import re
 import stat
 from bisect import bisect_right
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -44,6 +45,21 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _MAX_GENERATIONS = 4_096
+
+#: `rotated-<sequence>-<generation>`, and the same name plus `.partial` while it is being
+#: published. The sequence is this root's own rotation counter: pruning has to know which
+#: archive is oldest, and the only orderings available on disk otherwise are file mtimes
+#: and wall clocks -- both of which a restore, a `touch` or an mtime-replaying sync tool
+#: can reorder, which would prune the newest archive instead of the oldest.
+_ROTATION_ARCHIVE = re.compile(r"^rotated-([0-9]{6})-([0-9a-f]{64})$")
+_ROTATION_STAGING = re.compile(r"^rotated-([0-9]{6})-([0-9a-f]{64})\.partial$")
+
+#: How many previous generations' archives one candidate root keeps. The current
+#: generation is not one of them, so two releases' worth of published candidates stay
+#: readable, and the third is pruned by the rotation that creates the fourth (#248).
+#: Nothing else on this host removes them: `rquant-artifact-retention` cannot reach
+#: `live/` at all, so if the owner does not bound this, nothing does.
+ARCHIVED_GENERATIONS_KEPT = 2
 _MAX_AUTHORITY_BYTES = 16 * 1024 * 1024
 _GENERATION_CACHE_MAX_ITEMS = 4
 _GENERATION_CACHE_MAX_BYTES = 32 * 1024 * 1024
@@ -791,10 +807,38 @@ class StrategyCandidateGenerationIndex(RuntimeContractModel):
         return value
 
 
+@dataclass(frozen=True)
+class CandidateAuthorityRebind:
+    """One candidate root carried across a release by its own owner (#248)."""
+
+    previous_generation_id: str
+    previous_definition_fingerprint: str
+    previous_executable_fingerprint: str
+    archive_root: Path
+    archived_generations: int
+    #: archives this rotation removed because they were older than the two it keeps
+    pruned_archives: tuple[str, ...] = ()
+    #: whether this rotation finished one an earlier process had been killed in the middle of
+    resumed: bool = False
+
+    @property
+    def event(self) -> str:
+        return f"candidate_authority_rebound:{self.previous_generation_id}"
+
+
+#: `authority.json as found on disk -> the generation of ours that created it`
+PreviousGenerationOfBinding = Callable[[StrategyCandidateAuthorityBinding], "str | None"]
+
+
 class StrategyCandidateSnapshotSpool:
     """Publish and resolve immutable point-in-time candidate generations."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        previous_generation_of_binding: PreviousGenerationOfBinding | None = None,
+    ) -> None:
         candidate = Path(root)
         if not candidate.is_absolute():
             raise ValueError("strategy candidate snapshot root must be absolute")
@@ -817,6 +861,9 @@ class StrategyCandidateSnapshotSpool:
         self.authority_path = self.root / "authority.json"
         self.current_path = self.root / "current.json"
         self._lock_path = self.root / ".publish.lock"
+        #: only the owner rebinds, and only while it holds the publish lock (#248)
+        self._previous_generation_of_binding = previous_generation_of_binding
+        self.authority_rebind: CandidateAuthorityRebind | None = None
         self._thread_lock = RLock()
         self._generation_cache: OrderedDict[
             str,
@@ -938,6 +985,348 @@ class StrategyCandidateSnapshotSpool:
             rows=rows,
         )
 
+    def rebind_previous_generation_authority(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        definition_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        static_feature_schema: Mapping[str, object],
+    ) -> CandidateAuthorityRebind | None:
+        """Run the generation handover once, at startup, before anything is published.
+
+        The publish path runs the same check with the same lock, so this is not where
+        correctness lives; it is where *observability* lives. The rebind is a startup
+        event, and the heartbeat is stamped with a role's startup events by
+        `run_service_loop` before the first iteration, so the publisher has to have done
+        it by then for the event to appear (#248).
+        """
+
+        expected = StrategyCandidateAuthorityBinding.create(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            definition_fingerprint=definition_fingerprint,
+            executable_fingerprint=executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            static_feature_schema=static_feature_schema,
+        )
+        # Not just "is there a binding to rotate": an interrupted rotation has already
+        # taken the binding away, and that is exactly the state that has to be finished.
+        interrupted = any(
+            _ROTATION_STAGING.fullmatch(item.name) is not None
+            for item in self.root.iterdir()
+        ) if self.root.is_dir() else False
+        if not self.authority_path.exists() and not interrupted:
+            return None
+        self._initialize_for_publish()
+        with self._locked(exclusive=True) as (root_fd, generations_fd):
+            self._rebind_previous_generation_authority(
+                root_fd,
+                generations_fd,
+                expected=expected,
+            )
+        return self.authority_rebind
+
+    #: everything a binding pins that a release does *not* move. `content_sha256` is a
+    #: hash over all of it, so it follows the two fingerprints and is compared through them.
+    _BINDING_INVARIANTS = (
+        "schema_version",
+        "strategy_id",
+        "strategy_version",
+        "candidate_schema_fingerprint",
+        "static_feature_names",
+        "static_feature_schema",
+    )
+
+    def _rebind_previous_generation_authority(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        expected: StrategyCandidateAuthorityBinding | None,
+    ) -> None:
+        """Carry one candidate root across a release, or leave it a refusal (#248).
+
+        `authority.json` is create-only and pins the strategy's definition and executable
+        fingerprints, both of which are derived from the producer commit. So every release
+        gives the publisher a binding it cannot match and cannot replace, and on 2026-09-09
+        both candidate roots had to be moved aside by hand.
+
+        The rebind is allowed on exactly one shape: every field the binding pins other than
+        those two fingerprints is unchanged, and the pair on disk is one our own previous
+        generation published. Anything else — a different strategy, a different candidate
+        schema, a fingerprint pair nobody here published — refuses in
+        `_validate_authority_binding` exactly as before.
+
+        The published generations are **archived with the binding, not relabelled**. The
+        schema rules require every generation under a bound root to carry the root's
+        `content_sha256` (`bound authority generations do not match root identity`), and
+        the honest way to satisfy that is to leave last release's rows with last release's
+        binding: they are evidence about the executable that produced them, and rewriting
+        their index entry would claim the new executable produced them. The archive is the
+        window's manual move-aside, done by the owner, under its own lock, named after the
+        generation it belongs to.
+        """
+
+        if expected is None or self._previous_generation_of_binding is None:
+            return
+        # An interrupted rotation is finished before anything else is looked at. The root
+        # it leaves behind is *unbound with generations still in it*, and every other path
+        # in this class refuses that shape -- so if this is not done here, first, the root
+        # needs a human, which is the one thing this package exists to remove.
+        if self._finish_interrupted_rotation(root_fd, generations_fd, expected=expected):
+            return
+        if not self._entry_exists(root_fd, "authority.json"):
+            return
+        observed = self._read_authority_binding(root_fd)
+        if observed == expected:
+            return
+        if any(
+            getattr(observed, field) != getattr(expected, field)
+            for field in self._BINDING_INVARIANTS
+        ):
+            return
+        generation_id = self._previous_generation_of_binding(observed)
+        if generation_id is None:
+            return
+        sequence, existing = self._rotation_sequences(root_fd)
+        if generation_id in {archived for _, archived in existing}:
+            raise StrategyCandidateSnapshotIntegrityError(
+                f"strategy candidate authority archive already exists: rotated-{generation_id}"
+            )
+        archive_name = f"rotated-{sequence:06d}-{generation_id}"
+        staging_name = f"{archive_name}.partial"
+        os.mkdir(staging_name, _PRIVATE_DIRECTORY_MODE, dir_fd=root_fd)
+        self._publish_rotation(
+            root_fd,
+            generations_fd,
+            staging_name=staging_name,
+            archive_name=archive_name,
+            generation_id=generation_id,
+            previous=observed,
+            expected=expected,
+            resumed=False,
+        )
+
+    @staticmethod
+    def _rotation_sequences(root_fd: int) -> tuple[int, tuple[tuple[int, str], ...]]:
+        """The next rotation number for this root, and what is already in it.
+
+        Counted from the highest number present, not from how many are present: pruning
+        removes the oldest, so a count would hand out a number that has already been used.
+        """
+
+        seen: list[tuple[int, str]] = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                matched = _ROTATION_ARCHIVE.fullmatch(
+                    entry.name
+                ) or _ROTATION_STAGING.fullmatch(entry.name)
+                if matched is not None:
+                    seen.append((int(matched.group(1)), matched.group(2)))
+        return (max((number for number, _ in seen), default=-1) + 1, tuple(seen))
+
+    def _finish_interrupted_rotation(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        expected: StrategyCandidateAuthorityBinding,
+    ) -> bool:
+        """Carry a `rotated-<generation>.partial` the rest of the way, or report nothing to do.
+
+        Every move this class makes into a staging directory is idempotent -- each one is
+        guarded by "is it still in the root" -- so finishing is the same code as starting,
+        entered from wherever the kill happened.
+        """
+
+        staged: list[tuple[str, int, str]] = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                matched = _ROTATION_STAGING.fullmatch(entry.name)
+                if matched is not None:
+                    staged.append((entry.name, int(matched.group(1)), matched.group(2)))
+        if not staged:
+            return False
+        if len(staged) > 1:
+            # One exclusive lock, one rotation: two staging directories is not a crash,
+            # it is somebody else writing in here.
+            raise StrategyCandidateSnapshotIntegrityError(
+                "strategy candidate root holds more than one interrupted rotation"
+            )
+        staging_name, sequence, generation_id = staged[0]
+        self._publish_rotation(
+            root_fd,
+            generations_fd,
+            staging_name=staging_name,
+            archive_name=f"rotated-{sequence:06d}-{generation_id}",
+            generation_id=generation_id,
+            previous=None,
+            expected=expected,
+            resumed=True,
+        )
+        return True
+
+    def _publish_rotation(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        staging_name: str,
+        archive_name: str,
+        generation_id: str,
+        previous: StrategyCandidateAuthorityBinding | None,
+        expected: StrategyCandidateAuthorityBinding,
+        resumed: bool,
+    ) -> None:
+        """Move the bound state into staging, then publish it with one rename.
+
+        Order matters and is the reverse of the obvious one: the three root documents go
+        first, `authority.json` first of all, because that single file is what makes the
+        root *bound*. Moving the generation entries first would leave a root whose index
+        names files that are no longer there -- a state nothing can read and nothing can
+        finish. Once the root is unbound, the leftover entries are just files, and the
+        `.partial` name says whose they are.
+
+        `rename(staging -> archive)` is the one step that means "this archive is whole".
+        Before it, a kill leaves `.partial` and the next start finishes the job; after it,
+        a kill leaves an unbound root with an empty `generations/`, which the publish path
+        already binds on its own.
+        """
+
+        if self._entry_exists(root_fd, archive_name):
+            raise StrategyCandidateSnapshotIntegrityError(
+                f"strategy candidate authority archive already exists: {archive_name}"
+            )
+        staging_fd = self._open_child_directory(root_fd, staging_name)
+        try:
+            if not self._entry_exists(staging_fd, "generations"):
+                os.mkdir("generations", _PRIVATE_DIRECTORY_MODE, dir_fd=staging_fd)
+            staged_generations_fd = self._open_child_directory(staging_fd, "generations")
+            try:
+                if previous is None:
+                    if self._entry_exists(staging_fd, "authority.json"):
+                        previous = self._read_authority_binding(staging_fd)
+                    elif self._entry_exists(root_fd, "authority.json"):
+                        # Killed after `mkdir(.partial)` and before the first root document
+                        # moved: staging is empty and the root is still fully bound, so the
+                        # binding to archive is the one still sitting in the root. Without
+                        # this, that one start failed -- and a failed start on these units
+                        # is `Restart=` plus a real push (review SF-6).
+                        previous = self._read_authority_binding(root_fd)
+                for name in ("authority.json", "current.json", "generation-index.json"):
+                    if self._entry_exists(root_fd, name):
+                        os.rename(name, name, src_dir_fd=root_fd, dst_dir_fd=staging_fd)
+                os.fsync(root_fd)
+                with os.scandir(generations_fd) as entries:
+                    names = sorted(entry.name for entry in entries)
+                for name in names:
+                    os.rename(
+                        name,
+                        name,
+                        src_dir_fd=generations_fd,
+                        dst_dir_fd=staged_generations_fd,
+                    )
+                os.fsync(staged_generations_fd)
+                with os.scandir(staged_generations_fd) as staged:
+                    archived = sum(1 for _ in staged)
+                os.fsync(generations_fd)
+            finally:
+                os.close(staged_generations_fd)
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
+        if previous is None:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "interrupted rotation carries no previous authority binding"
+            )
+        os.rename(staging_name, archive_name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+        # The new binding is created here, in the same locked section, so the root is
+        # never observably unbound for longer than one rotation: a publisher whose first
+        # iteration waits on its input would otherwise leave `authority.json` absent for
+        # as long as the wait lasts.
+        if not self._entry_exists(root_fd, "authority.json"):
+            self._atomic_create_authority_binding(
+                root_fd,
+                self._authority_binding_bytes(expected),
+            )
+        pruned = self._prune_rotated_archives(root_fd)
+        os.fsync(root_fd)
+        self.authority_rebind = CandidateAuthorityRebind(
+            previous_generation_id=generation_id,
+            previous_definition_fingerprint=str(previous.definition_fingerprint),
+            previous_executable_fingerprint=str(previous.executable_fingerprint),
+            archive_root=self.root / archive_name,
+            archived_generations=archived,
+            pruned_archives=pruned,
+            resumed=resumed,
+        )
+
+    def _prune_rotated_archives(self, root_fd: int) -> tuple[str, ...]:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
+
+        Newest by the **rotation sequence in the archive's own name**, which this class
+        hands out and nothing else can change. The obvious alternative -- the directory's
+        mtime -- is an outside signal: a restore, a `touch`, or a sync tool that replays
+        mtimes can make the newest archive look oldest, and then pruning removes the wrong
+        one (review SF-7). It would only cost audit history, never live state, but there
+        is no reason to build "correct" on "nobody touched the mtimes".
+        """
+
+        archives: list[tuple[int, str]] = []
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                matched = _ROTATION_ARCHIVE.fullmatch(entry.name)
+                if matched is None:
+                    continue
+                observed = os.stat(entry.name, dir_fd=root_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(observed.st_mode):
+                    raise StrategyCandidateSnapshotIntegrityError(
+                        "strategy candidate rotation archive is not a directory"
+                    )
+                archives.append((int(matched.group(1)), entry.name))
+        if len(archives) <= ARCHIVED_GENERATIONS_KEPT:
+            return ()
+        archives.sort(reverse=True)
+        pruned = tuple(sorted(name for _, name in archives[ARCHIVED_GENERATIONS_KEPT:]))
+        for name in pruned:
+            self._remove_rotated_archive(root_fd, name)
+        os.fsync(root_fd)
+        return pruned
+
+    @classmethod
+    def _remove_rotated_archive(cls, root_fd: int, name: str) -> None:
+        """Remove one archive, and only the exact shape this class puts in one."""
+
+        archive_fd = cls._open_child_directory(root_fd, name)
+        try:
+            if cls._entry_exists(archive_fd, "generations"):
+                generations_fd = cls._open_child_directory(archive_fd, "generations")
+                try:
+                    cls._unlink_regular_files(generations_fd)
+                finally:
+                    os.close(generations_fd)
+                os.rmdir("generations", dir_fd=archive_fd)
+            cls._unlink_regular_files(archive_fd)
+        finally:
+            os.close(archive_fd)
+        os.rmdir(name, dir_fd=root_fd)
+
+    @staticmethod
+    def _unlink_regular_files(parent_fd: int) -> None:
+        with os.scandir(parent_fd) as entries:
+            names = [entry.name for entry in entries]
+        for name in names:
+            observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy candidate rotation archive holds an unexpected entry"
+                )
+            os.unlink(name, dir_fd=parent_fd)
+
     def _publish_records_request(
         self,
         validated_request: StrategyCandidateSnapshot,
@@ -947,6 +1336,11 @@ class StrategyCandidateSnapshotSpool:
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
             self._cleanup_stale_temporaries(root_fd)
+            self._rebind_previous_generation_authority(
+                root_fd,
+                generations_fd,
+                expected=authority_binding,
+            )
             generations = self._read_generation_index(
                 root_fd,
                 generations_fd,

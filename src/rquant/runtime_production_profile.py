@@ -112,6 +112,11 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
     runtime_mode: RuntimeMode = "local-test"
     runtime_root: Path
     operational_database_path: Path
+    #: The five-minute read-only replica. Live roles that only read may not open the main
+    #: database: `rquant-monitor` holds its write lock 09:25-15:00 and DuckDB refuses every
+    #: new connection while it does, read-only included, so a reader pointed at the main
+    #: file fails exactly during the session (#249, CLAUDE.md's single-writer rule).
+    readonly_replica_database_path: Path
     definition_registry_root: Path
     n_shape_candidate_input_path: Path
     growth_board_candidate_input_path: Path
@@ -181,6 +186,7 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
     @field_validator(
         "runtime_root",
         "operational_database_path",
+        "readonly_replica_database_path",
         "definition_registry_root",
         "n_shape_candidate_input_path",
         "growth_board_candidate_input_path",
@@ -199,6 +205,26 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
         if not value.is_absolute() or value != normalized:
             raise ValueError("production runtime paths must be absolute and normalized")
         return value
+
+    @model_validator(mode="after")
+    def require_a_real_readonly_replica(self) -> ProductionRuntimeProfileInputs:
+        """The replica may not be the main database under any spelling (#249).
+
+        The installed manifest for `auction-universe.publisher.v1` carried
+        `/home/lighthouse/rquant/data/rquant.duckdb`, which `rquant-monitor` locks for
+        writing 09:25-15:00 and DuckDB then refuses to open at all, read-only included.
+        Two checks, because the two mistakes are different: naming the operational
+        database, and naming any file called `rquant.duckdb`.
+        """
+
+        replica = self.readonly_replica_database_path
+        if replica == self.operational_database_path:
+            raise ValueError(
+                "auction universe read-only replica cannot be the operational database"
+            )
+        if replica.name == "rquant.duckdb":
+            raise ValueError("auction universe read-only replica cannot be the main rquant.duckdb")
+        return self
 
     @field_validator("historical_minutes_snapshot_path")
     @classmethod
@@ -287,6 +313,10 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
                 raise ValueError(f"production strategy {attribute} values must be unique")
         immutable_inputs = (
             self.operational_database_path,
+            # The installer refuses a `database_path` inside the runtime root on its own
+            # side; this is the same refusal one layer earlier, so a replica pointed at a
+            # runtime-owned path never reaches it (review SF-5).
+            self.readonly_replica_database_path,
             self.definition_registry_root,
             self.n_shape_candidate_input_path,
             self.growth_board_candidate_input_path,
@@ -1054,7 +1084,10 @@ def build_production_runtime_profile(
             interval_seconds=30,
             stale_after_seconds=180,
             settings={
-                "database_path": str(config.operational_database_path),
+                # The replica, never the main database: this source runs before and during
+                # the session, which is exactly when `rquant-monitor` holds the write lock
+                # and DuckDB refuses every new connection (#249).
+                "database_path": str(config.readonly_replica_database_path),
                 "calendar_path": str(calendar),
                 "calendar_expected_commit": config.market_calendar_producer_commit,
                 "calendar_content_sha256": config.market_calendar_content_sha256,

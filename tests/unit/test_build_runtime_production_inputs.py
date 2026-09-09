@@ -88,6 +88,8 @@ def _argv(tmp_path: Path, **overrides: str) -> list[str]:
         "--inputs-output": str(data_root / "runtime-production-inputs.json"),
         "--runtime-root": str(data_root / "runtime"),
         "--operational-database-path": str(data_root / "rquant.duckdb"),
+        #: live readers get the five-minute replica, never the main database (#249)
+        "--readonly-replica-database-path": str(data_root / "rquant_ro.duckdb"),
         "--definition-registry-root": str(data_root / "runtime-inputs" / "definitions"),
         "--minutes-snapshot": str(data_root / "runtime-inputs" / "minute-history.parquet"),
         "--minutes-snapshot-sha256": SNAPSHOT_ID,
@@ -505,6 +507,8 @@ def _linux_production_argv(
         str(host_root),
         "--operational-database-path",
         str(data_root / "rquant.duckdb"),
+        "--readonly-replica-database-path",
+        str(data_root / "rquant_ro.duckdb"),
         "--definition-registry-root",
         str(tmp_path / "inputs" / "definitions"),
         "--minutes-snapshot",

@@ -24,6 +24,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_shadow_validation import ShadowSourceCompletionReceipt
 from rquant.signal_bus import (
     RouteDecisionKind,
@@ -43,6 +44,7 @@ from rquant.signal_contracts import (
     parse_signal_envelope,
 )
 from rquant.strategy_runner import (
+    PreviousGenerationOfIdentity,
     RunnerSignalRecord,
     RunnerSignalRouteDrainEvidence,
     StrategyRunnerStore,
@@ -398,6 +400,44 @@ class StrategyRunnerSignalSource:
 class ReadonlyStrategyRunnerSignalSource:
     """Read one live runner spool through SQLite's read-only URI contract."""
 
+    def _require_current_generation_identity(
+        self,
+        spec_fingerprint: str,
+        evaluator_fingerprint: str,
+    ) -> None:
+        """Wait, rather than refuse, while the owner has not rotated its runner (#248).
+
+        The strategy owns `runner.sqlite3` and archives-and-recreates it on start when it
+        finds our own previous generation's identity in it. The router reads the same file
+        and, until that has happened, sees the previous generation's fingerprints. That is
+        not a mismatch to refuse: it is the owner not being finished, which is what
+        `PeerArtifactUnavailableError` already means everywhere else on this plane (#232).
+        Anything the lineage does not recognise falls through to the refusals below.
+        """
+
+        if self._previous_generation_of_identity is None:
+            return
+        if (
+            spec_fingerprint == self.expected_strategy_spec_fingerprint
+            and evaluator_fingerprint == self.expected_evaluator_contract_fingerprint
+        ):
+            return
+        generation_id = self._previous_generation_of_identity(
+            spec_fingerprint,
+            evaluator_fingerprint,
+        )
+        if generation_id is None:
+            return
+        raise PeerArtifactUnavailableError(
+            reader="signal_router",
+            artifact="runner source",
+            path=self.path,
+            reason=(
+                "its persisted identity belongs to generation "
+                f"{generation_id}, which the strategy rotates on start"
+            ),
+        )
+
     def __init__(
         self,
         *,
@@ -410,6 +450,7 @@ class ReadonlyStrategyRunnerSignalSource:
         max_raw_bytes: int = _DEFAULT_MAX_RAW_BYTES,
         max_record_bytes: int = _DEFAULT_MAX_RECORD_BYTES,
         fetch_size: int = _DEFAULT_FETCH_SIZE,
+        previous_generation_of_identity: PreviousGenerationOfIdentity | None = None,
     ) -> None:
         normalized_source_id = source_id.strip()
         if not normalized_source_id:
@@ -431,6 +472,7 @@ class ReadonlyStrategyRunnerSignalSource:
         self.expected_strategy_spec_fingerprint = expected_strategy_spec_fingerprint
         self.expected_evaluator_contract_fingerprint = expected_evaluator_contract_fingerprint
         self.busy_timeout_ms = busy_timeout_ms
+        self._previous_generation_of_identity = previous_generation_of_identity
         self._read_budget = _validate_read_budget(
             max_records=max_records,
             max_raw_bytes=max_raw_bytes,
@@ -508,6 +550,7 @@ class ReadonlyStrategyRunnerSignalSource:
         spec_fingerprint = str(metadata["strategy_spec_fingerprint"])
         evaluator_fingerprint = str(metadata["evaluator_contract_fingerprint"])
         generation_id = str(source["source_generation_id"])
+        self._require_current_generation_identity(spec_fingerprint, evaluator_fingerprint)
         if spec_fingerprint != self.expected_strategy_spec_fingerprint:
             raise ValueError("runner source strategy spec identity does not match")
         if evaluator_fingerprint != self.expected_evaluator_contract_fingerprint:
@@ -658,6 +701,10 @@ class ReadonlyStrategyRunnerSignalSource:
         )
 
     def _validate_identity(self, identity: _SourceIdentitySnapshot) -> None:
+        self._require_current_generation_identity(
+            identity.strategy_spec_fingerprint,
+            identity.evaluator_contract_fingerprint,
+        )
         if identity.strategy_spec_fingerprint != self.expected_strategy_spec_fingerprint:
             raise ValueError("runner source strategy spec identity does not match")
         if identity.evaluator_contract_fingerprint != self.expected_evaluator_contract_fingerprint:

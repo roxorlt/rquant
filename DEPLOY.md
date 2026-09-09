@@ -823,6 +823,7 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     做法：确认该实例确已停（心跳文档里 `pid` 为 `None`、`stopped_at` 有值）之后，把这个文件移走
     再启动。首次装机在 `runtime_health_publisher` 与 `serving_publisher` 上各命中一次。
     **#216 修好之前这一步得手工做**，修法应当是发布链路自己作废旧代心跳。
+    **本轮 PR 之后这一步作废**：健康权威自己把已停实例的上一代心跳判为 superseded，不用再挪（见第 35 条）。
 22. **六个 `RQ_*` 能力变量要逐行 `export`，不能 `eval`**（R-18，#214，**取代第 5 条的写法**）。
     `export-capabilities` 的输出不是 eval-safe——公钥里含空格，`eval "$(...)"` 会当场炸。改用：
 
@@ -1241,7 +1242,71 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     写下过游标的。目录非空就看里面有没有 feature 消费者的那一份；**有的话这个 role 换根之后会从
     sequence -1 重放**（对幂等的 feature 发布是安全的，但要预期到那一轮的处理量）。
 
-### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合；末列写「已修」的条目已修，其余不修）
+35. **换代时不用再把任何持久状态挪到一边了（#248、#249，本轮 PR 引入，取代第 21 条的手工步骤）。**
+
+    2026-09-09 第六窗口为了让实例跑起来，人手挪走了四份状态：三份 `runner.sqlite3`
+    （`rquant-runner-aside-20260909-030637/`）、整个 `live/signal-bus/`
+    （`rquant-signal-bus-aside-20260909-031829/`）、两个候选根
+    （`rquant-candidate-aside-20260909-034659/`）、五份旧心跳
+    （`rquant-stale-heartbeats-aside-20260909-034453/`）。**这四步全部作废**，本轮之后由角色自己做：
+
+    | 盘上的东西 | 这一代自己怎么处理 | 只读怎么确认 |
+    |---|---|---|
+    | `live/strategies/<svc>/runner.sqlite3` | 改名成 `runner.sqlite3.<六位轮换序号>.<上一代>.archived`（连 `-wal` / `-shm`），另建一份当前身份的新库 | `ls live/strategies/*/` 各出现一份 `.archived`；心跳里 `runner_identity_rotated:` |
+    | `signal_route_source` 里上一代的行 | 旧行与它已签发的回执整体挪到 `<source_id>#rotated-<旧代>`，新行接着写 | 查 `signal_route_source_rotation`；心跳里 `source_generation_rotated:` |
+    | `live/candidates/<svc>/authority.json` | 拥有者在自己的发布锁里重新绑定，旧绑定与它下面的 generation 收进 `rotated-<六位轮换序号>-<上一代>/` | `ls live/candidates/*/` 各出现一个 `rotated-…` 目录；心跳里 `candidate_authority_rebound:` |
+    | 已停实例留下的上一代心跳 | 健康权威判为 superseded，心跳不进载荷、载荷里 `superseded:<service>` 点名，**载荷照常发布** | `rquant runtime-health` 的 `reason` 里是 `superseded:` 而不是整份缺失 |
+
+    `signal_router` 读 runner 库但不拥有它，看到上一代身份改为**等待拥有者轮换**
+    （与 #232 同一条等待规则），不再拒绝启动。三类轮换事件都写在心跳的 `generation_events` 上：
+    `jq .generation_events <control root>/<kind>/<instance>/heartbeats/*.json`。
+
+    **仍然出现拒绝，就是真的外来或损坏的状态**——按拒绝处理，不要再挪。本轮把「我们自己的上一代」
+    这一类单独放行了（判据是安装器留在 runtime root 下的代际树：`generations/<id>/generation-basis.json`
+    的 canonical sha256 就是目录名，basis 里按 service_id 记着每份 manifest 的 sha256），
+    剩下还被拒的都是应该被拒的。
+
+    **看到 `rotated-<序号>-<代>.partial/` 不要动它，也不要手工删。** 那是上一次轮换被杀在中途留下的，
+    下一次启动会自己接着做完（被杀在 `mkdir` 之后、第一份根文档搬走之前时它是空的，续做改从根自己的
+    绑定读，同样不需要人工）。真正要人看的只有一种：同一个候选根下**同时出现两个** `.partial`，
+    那时这个 role 会明确拒绝并说 `more than one interrupted rotation`——那不是崩溃留下的，
+    是有别的东西在往这个目录里写。
+
+    **不要 `touch` 归档，也不要在窗口里把系统时钟往回调。** 剪枝现在按轮换自己的序号排
+    （归档名里那六位，取盘上最大值加一；台账那一侧按 `rowid DESC`），已经不吃 mtime 和墙钟了，
+    但这条纪律照旧留着——外部信号一旦被弄乱，能损失的是**归档**的审计记录，没有必要去试。
+
+    **归档按每个 role 保留 2 代收口**：第 3 代在下一次轮换时删掉，删了哪些记在轮换记录里
+    （`pruned_archives` / `archived_source_pruned`）。必须由轮换自己收，是因为
+    `rquant-artifact-retention.service` 的 `ReadWritePaths` 里没有任何一条能写 `live/`。
+    第三次发版之后，`live/strategies/*/` 下始终只有两份 `.archived`、候选根下始终只有两个
+    `rotated-…/`；看到第三个说明这段逻辑没跑。**被删掉的是更早两代之前的归档路由回执**
+    （`signal_route_receipt` 与 `signal_route_source` 两张表），
+    `signal_envelope` 与 `delivery_outbox` 一行都不动。
+
+    **唯一一处会静静少东西的地方**：上一代**已产出但未路由**的信号不再路由，条数记在轮换行的
+    `abandoned_sequences` 与心跳上。收盘后发版时它应当是 0。
+
+    **本轮窗口必须先做的两件事，不做装不上（#249）**：
+    - 重跑 `scripts/build_runtime_production_inputs.py`，带
+      `--readonly-replica-database-path /home/lighthouse/rquant/data/rquant_ro.duckdb`
+      （这是默认值，显式写进部署命令便于事后核对）。`readonly_replica_database_path` 是**必填**输入，
+      用旧 inputs 会在 `ProductionRuntimeProfileInputs` 校验期直接被拒。
+    - 用新 inputs 重新生成 profile 再装 bundle。`auction-universe.publisher.v1` 的 manifest
+      `database_path` 从 `rquant.duckdb` 改成 `rquant_ro.duckdb`，**`profile_id` 会变**、bundle
+      generation 跟着变，权威链按第 13–17 条的既有约定走。**其余 24 个 manifest 的 settings 一字未改。**
+
+    **窗口里要预期到的两件事**：健康载荷的 `status` 仍然是 DEGRADED（`superseded:` 和 `missing:`
+    一样会进 `reason`，只要有 reason 就是 DEGRADED）——改进的是「载荷发得出来、serving 不再被一个
+    停掉的 research role 拖住」，不是「载荷变 FRESH」；superseded 的条目**不会自己消失**，
+    那份心跳文件没人删，role 只要下次启动写一份当前指纹的心跳就自动清掉，彻底不跑的 role
+    要清就人工删那一个文件（这是换代之后唯一还需要人手的一处，而且不是装机必需）。
+
+    **下一个窗口就是这四种形状的第一次真实检验，不是再下一个**：主机现在盘上的四份状态是当前代
+    （第五代 `20d948d1…`）自己写的——第六窗口把上一代的挪走之后，当前代重新建了一份。
+    下一次装新一代时 `20d948d1…` 变成「上一代」，四种形状的判据全部命中。
+
+### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合，以及包 N 追出全部范围的 #250 与它交回给 #235 的那处告警回退；末列写「已修」的条目已修，其余不修）
 
 | 号 | 是什么 | 本次窗口怎么办 |
 |---|---|---|
@@ -1264,6 +1329,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 | #239 | #231 给心跳文件模型加的 `waiting_for` / `waiting_since` / `waited_seconds` 只在心跳文件里，`rquant runtime-health` 这类经服务健康载荷的路径看不到 | 不修。冻结投影上多一个字段就会让九个哈希全变，等于重演 #237；要发布这三个字段必须给 `runtime.serving.runtime-health` 升 `schema_version` 并走完整 rollout（PREPARE → 生产者承认 → DUAL_WRITE → 消费者回执 → CUTOVER），且在那次装机窗口里刷新跨版本快照。本轮照旧用 runbook 的 jq 探针直接读心跳文件 |
 | #245 | `src/rquant/source_quota_store.py:133` 的 `SourceQuotaStore._connect()` 返回裸 `sqlite3.Connection`，十几个调用点写成 `with self._connect() as connection:`——`sqlite3.Connection.__exit__` 只提交或回滚事务、**不关闭连接**，所以每调用一次就漏一个打开的连接，直到 GC 才回收 | 不修（不在本包碰过的代码里）。**长驻的 source 类 role 会持续累积句柄**，值得作为句柄泄漏单独查一次。包 L 的 e2e 里 `notifier` 与 `reference_slow_publisher` 那两条「越界写」就是它的副作用（回收时顺带 checkpoint、删掉别人的 `-shm`/`-wal`），**主机上每个 role 是独立进程，不会发生** |
 | — | `signal_router` 只读打开 3 份 WAL 的 `live/strategies/<svc>/runner.sqlite3`，SQLite 要在旁边建 wal-index，而它的 unit 对那个目录只有读权限 | 不修，**靠启停顺序绕开**：先起并保持 3 个 `strategy_live` 再起 router，停的时候先停 router 再停 strategy（前置第 34 条 (b)）。永久解法是 owner 对 `runner.sqlite3` 的 journal 模式决定，代价与 #242 相同、而 strategy runner 是高频写者，必须单独验收。e2e 已把这一条钉进 `KNOWN_C_LEVEL_WRITES`，**新增一条就会红** |
+| #250 | 生产 profile 里仍有**三个 LIVE role** 的 manifest 指向生产主库 `rquant.duckdb`：`reference_slow_source` 的 `database_path`（30 s 一轮）、`auction_gap` 候选发布器的 `daily_database_path`、`notifier` 的 `page_projection_database_path` 与 `page_projection_surge_live_root`（**`interval_seconds=2`，每 2 秒撞一次**）。按 CLAUDE.md 的单写者规则，盘中 09:25–15:00 `rquant-monitor` 持写锁期间 DuckDB 拒绝一切新连接，含只读，所以这三个 role 在它们要服务的那段时间必然 DEGRADED | 本轮只改了第四处（`auction_universe` 已改读 `rquant_ro.duckdb`，见前置第 35 条），**这三处不修**，窗口里按 DEGRADED 预期。issue 正文原先只写了 `reference_slow_source` 一处，另两处要补进去。**recovery 的绑定不算在内**：`_validate_recovery_artifact_bindings` 要求 recovery 的生产制品角色就是主库，恢复链路要恢复的就是主库本身，**这是设计，下一个包不要顺手改掉** |
+| #235 | 本轮把「心跳被换过 / 是符号链接 / 超长 / 时间不一致」这类真篡改信号（`RuntimeHealthAuthorityIntegrityError`）从「整份健康载荷失败」降成「该条目 DEGRADED + `unreadable:<service>` 点名」，其余 24 个 role 照常发布。这是裁决 22 明确要求的，但在 #235（DEGRADED 静默、无 `OnFailure`）之下**篡改信号从此没有人会被叫醒**——以前它会让健康发布器整体失败、触发 `OnFailure` 中继、推一条真告警 | **本轮唯一一处告警回退，必须有人认领**。不修（阈值与告警规则属于 #235 自己的裁决），建议在 #235 里加一条：runtime-health 载荷的 `reason` 里出现 `unreadable:` 时要告警。窗口里的临时办法是把这一份载荷的 `reason` 纳入人工核对项 |
 
 ### ⚠️ 下一个装机窗口的强制前置：必须换一代 profile（#215 修复引入）
 

@@ -274,7 +274,7 @@ def test_run_loads_exact_manifest_and_limits_once_mode(
     registry = _Registry()
     monkeypatch.setattr(
         "rquant.runtime_service_main.build_builtin_registry",
-        lambda *, runtime_capabilities: (
+        lambda *, runtime_capabilities, **_kwargs: (
             observed.update(runtime_capabilities=dict(runtime_capabilities)) or registry
         ),
     )
@@ -632,6 +632,7 @@ def test_run_injects_lazy_terminal_lifecycle_into_standard_owner_assembly(
         *,
         runtime_capabilities: object,
         artifact_terminal_lifecycle_factory: object,
+        **_kwargs: object,
     ) -> object:
         assert runtime_capabilities == {}
         assert callable(artifact_terminal_lifecycle_factory)
@@ -703,6 +704,7 @@ def test_run_injects_manifest_bound_descriptor_schema_resolver_for_retention(
         runtime_capabilities: object,
         artifact_retention_schema_resolver: object,
         artifact_terminal_lifecycle_factory: object,
+        **_kwargs: object,
     ) -> object:
         observed["capabilities"] = runtime_capabilities
         observed["resolver"] = artifact_retention_schema_resolver
@@ -958,7 +960,7 @@ def test_run_loads_scoped_systemd_capabilities_after_manifest_admission(
     )
     monkeypatch.setattr(
         "rquant.runtime_service_main.build_builtin_registry",
-        lambda *, runtime_capabilities: (
+        lambda *, runtime_capabilities, **_kwargs: (
             events.append(("registry", dict(runtime_capabilities))) or object()
         ),
     )

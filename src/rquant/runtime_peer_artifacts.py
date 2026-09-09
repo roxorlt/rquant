@@ -34,13 +34,24 @@ ArtifactT = TypeVar("ArtifactT")
 
 
 class PeerArtifactUnavailableError(ValueError):
-    """The role that owns this artifact has not created it yet."""
+    """The role that owns this artifact has not created it, or not yet rotated it."""
 
-    def __init__(self, *, reader: str, artifact: str, path: Path) -> None:
+    def __init__(
+        self,
+        *,
+        reader: str,
+        artifact: str,
+        path: Path,
+        reason: str | None = None,
+    ) -> None:
         self.reader = reader
         self.artifact = artifact
         self.path = Path(path)
-        super().__init__(f"{reader} is waiting for the {artifact} its owner creates: {self.path}")
+        self.reason = reason
+        detail = "" if reason is None else f" ({reason})"
+        super().__init__(
+            f"{reader} is waiting for the {artifact} its owner creates: {self.path}{detail}"
+        )
 
 
 class DeferredPeerArtifact(Generic[ArtifactT]):
@@ -66,6 +77,7 @@ class DeferredPeerArtifact(Generic[ArtifactT]):
         self.path = candidate
         self._open_artifact = open_artifact
         self._opened: ArtifactT | None = None
+        self._pending_reason: str | None = None
 
     @property
     def exists(self) -> bool:
@@ -86,10 +98,24 @@ class DeferredPeerArtifact(Generic[ArtifactT]):
         return True
 
     def probe(self) -> ArtifactT | None:
-        """Open the artifact if it is there, else leave it for a later iteration."""
+        """Open the artifact if it is there, else leave it for a later iteration.
+
+        An opener may itself answer "present, but its owner has not finished with it":
+        a strategy runner database that still carries the previous generation's identity
+        is on disk and will be archived and recreated the moment the strategy starts
+        (#248). That is the same kind of wait as an absent file, so the opener raises
+        `PeerArtifactUnavailableError` and it is kept for the next iteration rather than
+        taking the reader down. Every other error still comes straight out: an artifact
+        that is present and wrong is a fault, and stays one.
+        """
 
         if self._opened is None and self.exists:
-            self._opened = self._open_artifact()
+            try:
+                self._opened = self._open_artifact()
+            except PeerArtifactUnavailableError as pending:
+                self._pending_reason = pending.reason
+                return None
+            self._pending_reason = None
         return self._opened
 
     def get(self) -> ArtifactT:
@@ -101,6 +127,7 @@ class DeferredPeerArtifact(Generic[ArtifactT]):
                 reader=self.reader,
                 artifact=self.artifact,
                 path=self.path,
+                reason=self._pending_reason,
             )
         return opened
 

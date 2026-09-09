@@ -166,7 +166,7 @@ def _inputs(tmp_path: Path) -> ProductionRuntimeProfileInputs:
             RuntimeRecoveryArtifactRoleBinding(
                 logical_role="production",
                 kind=RealRecoveryArtifactKind.PRODUCTION_DUCKDB,
-                source_path="external/rquant_ro.duckdb",
+                source_path="external/rquant.duckdb",
                 restore_path="production/rquant.duckdb",
                 schema_version="v1",
                 relations=("auction_bar", "daily_bar", "minute_bar"),
@@ -276,7 +276,9 @@ def _inputs(tmp_path: Path) -> ProductionRuntimeProfileInputs:
     return ProductionRuntimeProfileInputs(
         producer_commit=COMMIT,
         runtime_root=runtime_root,
-        operational_database_path=external / "rquant_ro.duckdb",
+        operational_database_path=external / "rquant.duckdb",
+        #: what every live reader is pointed at instead of the main database (#249)
+        readonly_replica_database_path=external / "rquant_ro.duckdb",
         definition_registry_root=external / "definitions",
         n_shape_candidate_input_path=external / "candidates" / "n-shape.json",
         growth_board_candidate_input_path=(external / "candidates" / "growth-board-surge.json"),

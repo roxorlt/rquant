@@ -39,14 +39,14 @@ from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 # The frozen baseline is the merge base of the two commits an R07 run states, so
 # baseline..candidate is the complete pull request merge face rather than a branch-local
 # subset. It is refrozen by each pull request to the merge commit its predecessor left on
-# main; this sandbox path gap topic moves it from PR #240's merge commit to
-# PR #246's, which is what origin/main is when this candidate is cut. Which two commits
+# main; this generation handover topic moves it from PR #246's merge commit to
+# PR #247's, which is what origin/main is when this candidate is cut. Which two commits
 # meet here is decided by resolve_baseline_context below, from explicit endpoints; it used to
 # be rediscovered as merge_base(origin/main, candidate), and that stopped having an answer the
 # moment the merge that froze it landed, because origin/main then *was* the candidate.
 # Refreezing this pair and regenerating the policy is the last commit of every pull request.
-BASELINE_COMMIT_SHA = "64ea1407ad4a41eb756bf6784b42419ec5fb9bb8"
-BASELINE_TREE_SHA = "acae364f0d53e925c6007d4b886735d53b5e839a"
+BASELINE_COMMIT_SHA = "7b98e8054532feb16351d3f17f3df11e16eb1c52"
+BASELINE_TREE_SHA = "c51c39936d1db86814a52d0f53beb79ab8203259"
 # The pre-amendment baseline. It is not an origin/main ancestor, so it can no longer anchor
 # the diff, but the Git hard constraint requires it to stay reachable from every candidate.
 HISTORICAL_BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"

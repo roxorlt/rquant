@@ -754,6 +754,7 @@ def build_inputs_payload(
     runtime_mode: str,
     runtime_root: Path,
     operational_database_path: Path,
+    readonly_replica_database_path: Path,
     definition_registry_root: Path,
     n_shape_candidate_input_path: Path,
     growth_board_candidate_input_path: Path,
@@ -802,6 +803,7 @@ def build_inputs_payload(
         runtime_mode="local-test",
         runtime_root=runtime_root,
         operational_database_path=operational_database_path,
+        readonly_replica_database_path=readonly_replica_database_path,
         definition_registry_root=definition_registry_root,
         n_shape_candidate_input_path=n_shape_candidate_input_path,
         growth_board_candidate_input_path=growth_board_candidate_input_path,
@@ -894,6 +896,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--operational-database-path",
         default="/home/lighthouse/rquant/data/rquant.duckdb",
+    )
+    #: Live roles that only read must not open the main database: `rquant-monitor` holds
+    #: its write lock 09:25-15:00 and DuckDB refuses every new connection while it does,
+    #: read-only included (#249). `rquant-replica-sync.timer` refreshes this file every
+    #: five minutes.
+    parser.add_argument(
+        "--readonly-replica-database-path",
+        default="/home/lighthouse/rquant/data/rquant_ro.duckdb",
     )
     parser.add_argument(
         "--definition-registry-root",
@@ -1128,6 +1138,10 @@ def _run(arguments: argparse.Namespace) -> int:
         operational_database_path=_require_absolute(
             arguments.operational_database_path,
             label="operational database path",
+        ),
+        readonly_replica_database_path=_require_absolute(
+            arguments.readonly_replica_database_path,
+            label="read-only replica database path",
         ),
         definition_registry_root=_require_absolute(
             arguments.definition_registry_root,

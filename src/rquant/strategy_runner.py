@@ -8,7 +8,9 @@ import math
 import re
 import secrets
 import sqlite3
+import stat
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -887,6 +889,37 @@ def _validate_sha256(value: str, *, label: str) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class RunnerIdentityRotation:
+    """One runner database moved aside because our own previous generation wrote it."""
+
+    previous_generation_id: str
+    previous_strategy_spec_fingerprint: str
+    previous_evaluator_contract_fingerprint: str
+    archived_path: Path
+    #: archives this rotation removed because they were older than the two it keeps
+    pruned_archives: tuple[str, ...] = ()
+
+    @property
+    def event(self) -> str:
+        return f"runner_identity_rotated:{self.previous_generation_id}"
+
+
+#: `(persisted spec fingerprint, persisted evaluator fingerprint) -> previous generation id`
+PreviousGenerationOfIdentity = Callable[[str, str], str | None]
+
+#: How many archived runner databases one strategy directory keeps. The live database is
+#: not one of them, so the two previous generations stay recoverable and the third is
+#: removed by the rotation that creates the fourth (#248). Nothing else removes them:
+#: `rquant-artifact-retention` has no write path into `live/` at all.
+ARCHIVED_GENERATIONS_KEPT = 2
+
+#: `<name>.<rotation sequence>.<generation>.archived`. The sequence is what pruning
+#: orders by: the alternative, the archive's mtime, is an outside signal that a restore,
+#: a `touch` or an mtime-replaying sync tool can reorder (review SF-7).
+_RUNNER_ARCHIVE = re.compile(r"\.([0-9]{6})\.([0-9a-f]{64})\.archived$")
+
+
 class StrategyRunnerStore:
     """Own one exact strategy spec, candidate states, and its signal sequence."""
 
@@ -899,6 +932,7 @@ class StrategyRunnerStore:
         feature_contract: FeatureContract | None = None,
         lifecycle_feature_source: StrategyLifecycleFeatureSource | None = None,
         busy_timeout_ms: int = 5_000,
+        previous_generation_of_identity: PreviousGenerationOfIdentity | None = None,
     ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
@@ -929,6 +963,9 @@ class StrategyRunnerStore:
             (transition.from_state, transition.event): transition.to_state
             for transition in spec.transitions
         }
+        self.identity_rotation = self._rotate_previous_generation_runner(
+            previous_generation_of_identity
+        )
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -943,6 +980,137 @@ class StrategyRunnerStore:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
+
+    #: SQLite derives both sidecar names from the database name, so an archive keeps its
+    #: own pair and stays openable; a stray `-wal` left beside the new database would be
+    #: read as the new one's write-ahead log.
+    _SQLITE_SIDECARS = ("-wal", "-shm")
+
+    def _read_identity_for_rotation(self) -> tuple[str, str] | None:
+        """The persisted identity, read read-only, or `None` when there is nothing to read.
+
+        Anything that is present and unreadable — not a database, no `runner_metadata`,
+        a half-written row — returns `None` and is left to `_initialize`, which refuses
+        it the way it always has. This method only ever answers "whose identity is this".
+        """
+
+        if not self.path.is_file():
+            return None
+        try:
+            connection = sqlite3.connect(
+                f"file:{self.path}?mode=ro",
+                uri=True,
+                timeout=self.busy_timeout_ms / 1_000,
+                isolation_level=None,
+            )
+        except sqlite3.Error:
+            return None
+        try:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT strategy_spec_fingerprint, evaluator_contract_fingerprint
+                FROM runner_metadata WHERE singleton = 1
+                """
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return (
+            str(row["strategy_spec_fingerprint"]),
+            str(row["evaluator_contract_fingerprint"]),
+        )
+
+    def _rotate_previous_generation_runner(
+        self,
+        previous_generation_of_identity: PreviousGenerationOfIdentity | None,
+    ) -> RunnerIdentityRotation | None:
+        """Archive a runner database our own previous generation wrote (#248).
+
+        Both fingerprints have to name the *same* previous generation: the caller answers
+        for the pair, not for either half, so a spec fingerprint from one generation and
+        an evaluator fingerprint from another is not a handover and still refuses.
+        """
+
+        if previous_generation_of_identity is None:
+            return None
+        identity = self._read_identity_for_rotation()
+        if identity is None:
+            return None
+        spec_fingerprint, evaluator_fingerprint = identity
+        if (
+            spec_fingerprint == self.spec.spec_fingerprint
+            and evaluator_fingerprint == self.evaluator_contract_fingerprint
+        ):
+            return None
+        generation_id = previous_generation_of_identity(spec_fingerprint, evaluator_fingerprint)
+        if generation_id is None:
+            return None
+        sequence, existing = self._archive_sequences()
+        if generation_id in {archived for _, archived, _ in existing}:
+            raise ValueError(
+                f"runner identity archive already exists: {self.path.name}.{generation_id}"
+            )
+        archived = self.path.with_name(
+            f"{self.path.name}.{sequence:06d}.{generation_id}.archived"
+        )
+        if archived.exists() or archived.is_symlink():
+            raise ValueError(f"runner identity archive already exists: {archived}")
+        self.path.rename(archived)
+        for suffix in self._SQLITE_SIDECARS:
+            sidecar = self.path.with_name(f"{self.path.name}{suffix}")
+            if sidecar.exists():
+                sidecar.rename(archived.with_name(f"{archived.name}{suffix}"))
+        return RunnerIdentityRotation(
+            previous_generation_id=generation_id,
+            previous_strategy_spec_fingerprint=spec_fingerprint,
+            previous_evaluator_contract_fingerprint=evaluator_fingerprint,
+            archived_path=archived,
+            pruned_archives=self._prune_archived_runners(),
+        )
+
+    def _archive_sequences(self) -> tuple[int, tuple[tuple[int, str, Path], ...]]:
+        """The next rotation number for this directory, and the archives already in it.
+
+        Counted from the highest number present rather than from how many are present:
+        pruning removes the oldest, so a count would hand out a number already used.
+        """
+
+        seen: list[tuple[int, str, Path]] = []
+        for item in self.path.parent.iterdir():
+            if not item.name.startswith(f"{self.path.name}."):
+                continue
+            matched = _RUNNER_ARCHIVE.search(item.name)
+            if matched is None or not stat.S_ISREG(item.lstat().st_mode):
+                continue
+            seen.append((int(matched.group(1)), matched.group(2), item))
+        return (max((number for number, _, _ in seen), default=-1) + 1, tuple(seen))
+
+    def _prune_archived_runners(self) -> tuple[str, ...]:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archives and remove the rest.
+
+        Newest by the **rotation sequence in the archive's own name**, which this class
+        hands out. Ordering by mtime instead would build "prune the oldest" on an outside
+        signal -- a restore or a `touch` reorders it, and then the newest archive is the
+        one that goes (review SF-7).
+        """
+
+        _, entries = self._archive_sequences()
+        archives = [(number, path) for number, _, path in entries]
+        if len(archives) <= ARCHIVED_GENERATIONS_KEPT:
+            return ()
+        archives.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+        pruned: list[str] = []
+        for _, path in archives[ARCHIVED_GENERATIONS_KEPT:]:
+            for suffix in ("", *self._SQLITE_SIDECARS):
+                sidecar = path.with_name(f"{path.name}{suffix}")
+                if sidecar.exists() and not sidecar.is_symlink():
+                    sidecar.unlink()
+            pruned.append(path.name)
+        return tuple(sorted(pruned))
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

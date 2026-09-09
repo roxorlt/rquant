@@ -223,6 +223,7 @@ def paper_execution_constraint_publisher_builder(
 def runtime_health_publisher_builder(
     *,
     clock: Callable[[], datetime],
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         if manifest.service_kind is not RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER:
@@ -230,13 +231,23 @@ def runtime_health_publisher_builder(
         if manifest.plane is not RuntimeServicePlane.SERVING:
             raise ValueError("runtime health publisher must run on the serving plane")
         settings = RuntimeHealthPublisherSettings.model_validate(dict(manifest.settings))
+        from rquant.runtime_generation_lineage import previous_spec_identities
         from rquant.runtime_health_authority import RuntimeHealthSourceReader
         from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
         from rquant.runtime_serving_snapshot import RUNTIME_HEALTH_DATASET_ID
 
+        sources = tuple(source.source() for source in settings.sources)
         reader = RuntimeHealthSourceReader(
-            sources=tuple(source.source() for source in settings.sources),
+            sources=sources,
             serving_service_id=manifest.service_id,
+            # A role that exits under #217 leaves a stopped heartbeat carrying the spec
+            # fingerprint of the generation it ran under. These are the fingerprints our
+            # own earlier generations published, so such a heartbeat can be superseded
+            # instead of failing the whole payload (#248 shape 4, #216).
+            previous_spec_identities=previous_spec_identities(
+                runtime_root,
+                service_ids=tuple(item.spec.service_id for item in sources),
+            ),
         )
         publisher = ServingSourceAuthorityPublisher(
             root=settings.authority_root,

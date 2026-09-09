@@ -153,6 +153,7 @@ def build_builtin_registry(
     completion_attestation_signer: CompletionAttestationSigner | None = None,
     completion_attestation_active_key_id: str | None = None,
     startup_degraded_reasons: tuple[str, ...] = (),
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceRegistry:
     from rquant.runtime_service_builtin import build_builtin_registry as factory
 
@@ -160,6 +161,7 @@ def build_builtin_registry(
         "runtime_capabilities": runtime_capabilities,
         "artifact_retention_schema_resolver": artifact_retention_schema_resolver,
         "artifact_terminal_lifecycle_factory": artifact_terminal_lifecycle_factory,
+        "runtime_root": runtime_root,
     }
     if completion_attestation_signer is not None:
         kwargs["completion_attestation_signer"] = completion_attestation_signer
@@ -770,6 +772,9 @@ def run(args: argparse.Namespace) -> int:
         with runtime_schema_dual_write_context(schema_bindings):
             registry_kwargs: dict[str, object] = {
                 "runtime_capabilities": runtime_capabilities,
+                # The generation tree under this root is what tells a role's own
+                # previous generation's durable state from a foreign one (#248).
+                "runtime_root": runtime_root,
             }
             if startup_degraded_reasons:
                 registry_kwargs["startup_degraded_reasons"] = startup_degraded_reasons

@@ -84,6 +84,33 @@ class RouteDecisionKind(StrEnum):
     NO_TARGET = "no_target"
 
 
+#: How many generations' archived route ledgers one source keeps. The live source row is
+#: not one of them, so the two previous generations' receipts stay queryable and the third
+#: is pruned by the rotation that creates the fourth (#248). The signals themselves are
+#: never touched -- `signal_envelope` and `delivery_outbox` hang off `signal_id`, not off
+#: the source -- so what a prune removes is the older routing receipts, and the rotation
+#: row stays behind to say it happened.
+ARCHIVED_GENERATIONS_KEPT = 2
+
+
+class SignalRouteSourceRotation(RuntimeContractModel):
+    """One generation handover the route ledger carried for a strategy source (#248)."""
+
+    source_id: str = Field(min_length=1)
+    previous_generation_id: Sha256
+    previous_source_generation_id: Sha256
+    previous_strategy_spec_fingerprint: Sha256
+    archived_source_id: str = Field(min_length=1)
+    routed_through_sequence: int = Field(ge=0)
+    abandoned_sequences: int = Field(ge=0)
+    #: whether the archived source row and its receipts have since been pruned
+    archived_source_pruned: bool = False
+
+    @property
+    def event(self) -> str:
+        return f"source_generation_rotated:{self.source_id}"
+
+
 class RouteSourceDescriptor(RuntimeContractModel):
     source_id: str = Field(min_length=1)
     generation_id: Sha256
@@ -450,6 +477,7 @@ class SignalBusStore:
         retry_base_delay: timedelta = timedelta(seconds=5),
         retry_max_delay: timedelta = timedelta(minutes=5),
         max_attempts: int = 5,
+        previous_generation_of_strategy_spec: Mapping[str, str] | None = None,
     ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
@@ -468,6 +496,11 @@ class SignalBusStore:
             retry_base_delay,
             retry_max_delay,
             max_attempts,
+        )
+        #: strategy spec fingerprint -> the deployment generation that published it, for
+        #: every generation of this service that is not the current one (#248 shape 2)
+        self._previous_generation_of_strategy_spec = dict(
+            previous_generation_of_strategy_spec or {}
         )
         self._initialize()
 
@@ -634,6 +667,20 @@ class SignalBusStore:
 
                 CREATE INDEX IF NOT EXISTS idx_signal_route_receipt_source
                 ON signal_route_receipt(source_id, source_sequence);
+
+                CREATE TABLE IF NOT EXISTS signal_route_source_rotation (
+                    source_id TEXT NOT NULL,
+                    previous_generation_id TEXT NOT NULL,
+                    previous_source_generation_id TEXT NOT NULL,
+                    previous_strategy_spec_fingerprint TEXT NOT NULL,
+                    archived_source_id TEXT NOT NULL,
+                    routed_through_sequence INTEGER NOT NULL CHECK(routed_through_sequence >= 0),
+                    abandoned_sequences INTEGER NOT NULL CHECK(abandoned_sequences >= 0),
+                    rotated_at TEXT NOT NULL,
+                    archived_source_pruned INTEGER NOT NULL DEFAULT 0
+                        CHECK(archived_source_pruned IN (0, 1)),
+                    PRIMARY KEY(source_id, previous_source_generation_id)
+                );
                 """
             )
             connection.execute(_WATERMARK_RECOVERY_TABLE)
@@ -1246,6 +1293,217 @@ class SignalBusStore:
             row = self._bind_route_source_in_transaction(connection, request)
             return self._route_cursor_from_row(row)
 
+    def _rotate_previous_generation_source(
+        self,
+        connection: sqlite3.Connection,
+        request: _RouteSourceBindingRequest,
+        *,
+        row: sqlite3.Row,
+    ) -> sqlite3.Row | None:
+        """Carry one source row across a generation change, or leave it a conflict (#248).
+
+        Every release gives the strategy a new `runner.sqlite3` — the previous one is
+        archived under its own generation id — and the new database mints a fresh random
+        `source_generation_id`. The ledger still holds the old one, so `bind_route_source`
+        refused on every iteration of the 2026-09-09 window with
+        `source '...' generation changed`.
+
+        The rotation is allowed on exactly one shape: the **stored** strategy spec
+        fingerprint is one our own previous generations published, the incoming one is
+        not (so this is a step forward, never back), and everything else about the source
+        — its routing policy and its first sequence — is unchanged. A generation id that
+        moves while the strategy spec stays put is a runner database that was recreated
+        without a release, and stays a conflict.
+
+        **Unconsumed signals of the old generation are abandoned, and this is the
+        conservative choice.** Their payloads live in the runner database the strategy
+        just archived, and the new generation must not open it; re-routing them would
+        attribute decisions to an evaluator contract that never made them. Deleting the
+        receipts the old generation *did* issue would be worse still — those are the audit
+        record of what was actually delivered — so they are moved, whole and unedited,
+        under an archived source id, which also frees the sequence namespace the new
+        generation restarts at 1. The count that was never routed
+        (`observed_high_watermark - last_sequence`) is recorded in the rotation row and
+        surfaced on the heartbeat, so the gap is visible rather than silent.
+        """
+
+        descriptor = request.descriptor
+        stored_generation = str(row["generation_id"])
+        stored_spec = str(row["strategy_spec_fingerprint"])
+        if stored_generation == descriptor.generation_id:
+            return None
+        previous_generation_id = self._previous_generation_of_strategy_spec.get(stored_spec)
+        if previous_generation_id is None:
+            return None
+        if descriptor.strategy_spec_fingerprint in self._previous_generation_of_strategy_spec:
+            return None
+        if (
+            str(row["routing_policy_fingerprint"]) != request.routing_policy_fingerprint
+            or int(row["first_sequence"]) != descriptor.first_sequence
+        ):
+            return None
+        archived_source_id = f"{descriptor.source_id}#rotated-{stored_generation}"
+        clash = connection.execute(
+            "SELECT 1 FROM signal_route_source WHERE source_id = ?",
+            (archived_source_id,),
+        ).fetchone()
+        if clash is not None:
+            raise SignalRouteConflictError(
+                f"source {descriptor.source_id!r} generation archive already exists"
+            )
+        routed_through = int(row["last_sequence"])
+        abandoned = max(int(row["observed_high_watermark"]) - routed_through, 0)
+        now_text = _encode_time(request.observed_at)
+        connection.execute(
+            """
+            INSERT INTO signal_route_source(
+                source_id, generation_id, strategy_spec_fingerprint,
+                routing_policy_fingerprint, first_sequence,
+                observed_high_watermark, last_sequence, last_signal_id,
+                registered_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                archived_source_id,
+                stored_generation,
+                stored_spec,
+                str(row["routing_policy_fingerprint"]),
+                int(row["first_sequence"]),
+                int(row["observed_high_watermark"]),
+                routed_through,
+                row["last_signal_id"],
+                str(row["registered_at"]),
+                now_text,
+            ),
+        )
+        connection.execute(
+            "UPDATE signal_route_receipt SET source_id = ? WHERE source_id = ?",
+            (archived_source_id, descriptor.source_id),
+        )
+        connection.execute(
+            "DELETE FROM signal_route_source WHERE source_id = ?",
+            (descriptor.source_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO signal_route_source_rotation(
+                source_id, previous_generation_id, previous_source_generation_id,
+                previous_strategy_spec_fingerprint, archived_source_id,
+                routed_through_sequence, abandoned_sequences, rotated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                descriptor.source_id,
+                previous_generation_id,
+                stored_generation,
+                stored_spec,
+                archived_source_id,
+                routed_through,
+                abandoned,
+                now_text,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO signal_route_source(
+                source_id, generation_id, strategy_spec_fingerprint,
+                routing_policy_fingerprint, first_sequence,
+                observed_high_watermark, last_sequence, last_signal_id,
+                registered_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                descriptor.source_id,
+                descriptor.generation_id,
+                descriptor.strategy_spec_fingerprint,
+                request.routing_policy_fingerprint,
+                descriptor.first_sequence,
+                descriptor.high_watermark,
+                descriptor.first_sequence - 1,
+                now_text,
+                now_text,
+            ),
+        )
+        self._prune_rotated_sources(connection, descriptor.source_id)
+        self._before_commit(connection)
+        rotated = connection.execute(
+            "SELECT * FROM signal_route_source WHERE source_id = ?",
+            (descriptor.source_id,),
+        ).fetchone()
+        if rotated is None:  # pragma: no cover - the insert above just wrote it
+            raise SignalRouteConflictError("rotated route source is unavailable")
+        return rotated
+
+    @staticmethod
+    def _prune_rotated_sources(connection: sqlite3.Connection, source_id: str) -> None:
+        """Keep the newest `ARCHIVED_GENERATIONS_KEPT` archived ledgers for one source.
+
+        Nothing else prunes them: the retention role's unit grants it no path into
+        `live/`, so a ledger that is not bounded here grows one archived source row plus
+        all its receipts per release, forever. What goes is the *routing receipt* of a
+        generation older than the last two; the signal envelopes and everything in the
+        delivery outbox are keyed by `signal_id` and are not touched.
+        """
+
+        # `rowid DESC` is this table's own insertion order. Ordering by `rotated_at`
+        # instead would put the decision on the wall clock: a clock that steps backwards
+        # makes the rotation that just happened look oldest, and the prune then removes
+        # the newest archive rather than the oldest (review SF-7). Only audit history is
+        # at stake either way, but the ledger already knows the order it wrote these in.
+        rows = connection.execute(
+            """
+            SELECT previous_source_generation_id, archived_source_id
+            FROM signal_route_source_rotation
+            WHERE source_id = ? AND archived_source_pruned = 0
+            ORDER BY rowid DESC
+            """,
+            (source_id,),
+        ).fetchall()
+        for row in rows[ARCHIVED_GENERATIONS_KEPT:]:
+            archived_source_id = str(row["archived_source_id"])
+            connection.execute(
+                "DELETE FROM signal_route_receipt WHERE source_id = ?",
+                (archived_source_id,),
+            )
+            connection.execute(
+                "DELETE FROM signal_route_source WHERE source_id = ?",
+                (archived_source_id,),
+            )
+            connection.execute(
+                """
+                UPDATE signal_route_source_rotation SET archived_source_pruned = 1
+                WHERE source_id = ? AND previous_source_generation_id = ?
+                """,
+                (source_id, str(row["previous_source_generation_id"])),
+            )
+
+    def route_source_rotations(self, source_id: str) -> tuple[SignalRouteSourceRotation, ...]:
+        """Every generation handover this ledger has carried for one source."""
+
+        with self._read_snapshot() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM signal_route_source_rotation
+                WHERE source_id = ? ORDER BY rowid
+                """,
+                (source_id,),
+            ).fetchall()
+        return tuple(
+            SignalRouteSourceRotation(
+                source_id=str(row["source_id"]),
+                previous_generation_id=str(row["previous_generation_id"]),
+                previous_source_generation_id=str(row["previous_source_generation_id"]),
+                previous_strategy_spec_fingerprint=str(
+                    row["previous_strategy_spec_fingerprint"]
+                ),
+                archived_source_id=str(row["archived_source_id"]),
+                routed_through_sequence=int(row["routed_through_sequence"]),
+                abandoned_sequences=int(row["abandoned_sequences"]),
+                archived_source_pruned=bool(row["archived_source_pruned"]),
+            )
+            for row in rows
+        )
+
     def _bind_route_source_in_transaction(
         self,
         connection: sqlite3.Connection,
@@ -1294,6 +1552,13 @@ class SignalBusStore:
                 ),
                 ("first_sequence", descriptor.first_sequence, "first sequence"),
             )
+            rotated = self._rotate_previous_generation_source(
+                connection,
+                request,
+                row=row,
+            )
+            if rotated is not None:
+                return rotated
             for column, expected, label in immutable_fields:
                 if row[column] != expected:
                     raise SignalRouteConflictError(
