@@ -5,6 +5,58 @@
 
 ---
 
+## 2026-09-10 · 待安装 · 读侧 role 的 I/O 代价（#256）— **回滚前必须先挪心跳文件**
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**这一包做了什么**：四个读侧 role（`notifier.admin.shadow.v1`、`reference-slow.source.v1`、
+`auction-universe.publisher.v1`、`candidate.auction_gap.v1`）每轮先 `stat` 只读副本，
+认得出这一代就整轮不开库；`reference-slow.source.v1` 不再把整个数据库拷进 `PrivateTmp`。
+`deploy/` 一个字未改。
+
+**装上之后 17:00 该看到什么**：`rquant-replica-sync.timer` 盘中最后一次同步是 **15:55**、
+下一次是 **17:30**，`rquant-backup.timer` 是 **15:45** 与 **17:30**。所以
+**17:00–17:15 那一段里四个读侧 role 一次也不应该打开副本**——它们认得 15:55 那一代。
+判据是这四个 role 的心跳在整段窗口里 `replica_opened=false`；出现 `true` 只有两种解释：
+role 进程在这段时间里重启过（看 `started_at`），或者有人手工跑了 `sync-readonly-replica.sh`。
+
+**⚠️ 回滚（D-2 那一类，必读）**：本包给心跳**文件模型**加了 `replica_opened` 与
+`replica_read_bytes` 两个字段。`RuntimeServiceHeartbeat` 是 `extra="forbid"` 的，
+`read_heartbeat` 解析失败直接抛 `ValueError: runtime heartbeat is invalid: <service_id>`，
+所以**新二进制读旧心跳没问题，旧二进制读新心跳会拒**——与 #231/#232、#216 完全同一类。
+**回滚到 v0.33.7 或更早之前，先停 unit、再把这四个 role 的心跳文件挪走**：
+
+```bash
+# ① 先停这四个 role（模板 unit 没有 enable，stop 即回到未运行）
+sudo systemctl stop 'rquant-runtime-notifier@*.service' \
+     'rquant-runtime-reference-slow-source@*.service' \
+     'rquant-runtime-auction-universe@*.service' \
+     'rquant-runtime-candidate@*.service'
+
+# ② 把这四个 role 的心跳挪走（instance 目录名是 svc-<service_id 的 sha256>）
+ROOT=/home/lighthouse/rquant/data/runtime
+STAMP=$(date +%Y%m%d-%H%M%S)
+sudo install -d -m 0700 "/home/lighthouse/rquant-heartbeats-aside-${STAMP}"
+for sid in notifier.admin.shadow.v1 reference-slow.source.v1 \
+           auction-universe.publisher.v1 candidate.auction_gap.v1; do
+  inst="svc-$(printf %s "$sid" | sha256sum | cut -d' ' -f1)"
+  sudo find "${ROOT}/control" -mindepth 2 -maxdepth 4 -path "*/${inst}/heartbeats/*.json" \
+       -exec mv -t "/home/lighthouse/rquant-heartbeats-aside-${STAMP}/" {} +
+done
+
+# ③ 再按 scripts/deploy-production.sh --target <上一个 tag> 常规回滚
+```
+
+**挪走的文件留档不要删**。稳妥起见也可以直接沿用 #231/#232 那一条的做法，把
+`$ROOT/control/*/*/heartbeats/*.json` 整批挪走——多挪几个 role 的心跳没有副作用，
+下一次 `start()` 会重新写；漏挪这四个里的任何一个，旧二进制起不来。
+
+**已发布投影没有变化**：`RuntimeServiceHeartbeatProjection` 一字未改，
+`runtime.serving.runtime-health` 仍是 v0.33.1 的九个字段（#237），所以
+**serving 这一侧不需要任何回滚动作**。
+
+---
+
 ## 2026-09-09 · 待安装 · 第七窗口四缺口（#254 #253 #252 #255）— **装上之后现场仍会红，这是预期**
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。

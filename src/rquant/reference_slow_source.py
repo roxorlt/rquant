@@ -629,10 +629,17 @@ def _load_database_reference_evidence(
 ) -> _ReferenceEvidence:
     """Everything this source takes out of the replica, read only when it changed (#256).
 
-    One iteration can ask for this up to six times -- the target session plus five
-    revision look-backs -- and each ask used to be a whole-database copy. The gate's key
-    is the pair of dates the queries are bound to, so a different session always reopens
-    and the same session inside one replica generation does not.
+    **One iteration asks at most once** -- `capture_reference_slow_batch` calls either the
+    snapshot loader or the revision loader, and the revision loader is given a single date.
+    The target session and the five revision look-backs are six *iterations* carrying six
+    different gate keys, and the gate cannot and does not merge them (review MF-2).
+
+    What the gate is worth here is the retry: the capture window is 09:20-09:25, about ten
+    iterations at this role's thirty-second interval, and roughly eight of them ask the
+    *same* key. When a capture succeeds those eight take an early return and never read at
+    all; when it keeps failing -- quota, credential, and until this package the copy budget
+    -- every one of them used to re-read the replica from scratch. Now the first one reads
+    and the rest recognise the generation.
     """
 
     if read_gate is None:
