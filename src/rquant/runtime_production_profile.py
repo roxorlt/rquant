@@ -885,6 +885,7 @@ READ_SIDE_DATABASE_BINDINGS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     }
 )
 
+
 def _resolved_path(path: Path) -> Path:
     """`realpath`, so a replica that is a symlink to the main database is still the main one."""
 
