@@ -162,7 +162,11 @@ def test_the_refusal_resolves_symlinks(tmp_path: Path) -> None:
     """A replica *named* `rquant_ro.duckdb` that is a symlink to the main database.
 
     Neither of package N's two input checks catches this: the paths are not equal and the
-    name is not `rquant.duckdb`. Only resolving the link does.
+    name is not `rquant.duckdb`. Only resolving the link does, and it has to be resolved at
+    the inputs layer, because that is the only layer the generator runs
+    (`test_the_inputs_document_alone_refuses_a_symlinked_replica` is the same rule without
+    a profile at all; the deployment topology's own symlink refusal is a third net, one
+    layer further in).
     """
 
     inputs = _inputs(tmp_path)
@@ -174,6 +178,27 @@ def test_the_refusal_resolves_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="main database"):
         build_production_runtime_profile(inputs)
+
+
+def test_the_inputs_document_alone_refuses_a_symlinked_replica(tmp_path: Path) -> None:
+    """The generator's own layer, which never builds a profile (#250, ruling 24.2).
+
+    `scripts/build_runtime_production_inputs.py` validates the document and writes it; the
+    profile is built later, on the host. So the refusal has to exist here too, or a
+    document naming the main database through a link is written, reviewed and installed
+    before anything notices.
+    """
+
+    inputs = _inputs(tmp_path)
+    inputs.operational_database_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs.operational_database_path.write_bytes(b"")
+    replica = inputs.readonly_replica_database_path
+    replica.unlink(missing_ok=True)
+    replica.symlink_to(inputs.operational_database_path)
+    payload = inputs.model_dump(mode="python")
+
+    with pytest.raises(ValueError, match="resolve to the main database"):
+        ProductionRuntimeProfileInputs.model_validate(payload)
 
 
 def test_every_read_side_binding_is_checked_by_name(tmp_path: Path) -> None:

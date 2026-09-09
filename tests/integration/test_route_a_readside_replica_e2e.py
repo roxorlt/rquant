@@ -122,7 +122,13 @@ def _instance_name(service_id: str) -> str:
 # ---------------------------------------------------------------------------------------
 
 
-def _write_replica(path: Path, *, trade_dates: tuple[date, ...], synced_at: datetime) -> None:
+def _write_replica(
+    path: Path,
+    *,
+    trade_dates: tuple[date, ...],
+    synced_at: datetime,
+    volume: float = 1_000.0,
+) -> None:
     """The file `scripts/sync-readonly-replica.sh` leaves behind, with its mode and no WAL.
 
     The script copies the main database, checkpoints the copy, verifies it opens read-only
@@ -141,7 +147,7 @@ def _write_replica(path: Path, *, trade_dates: tuple[date, ...], synced_at: date
         )
         connection.executemany(
             "INSERT INTO daily_bar VALUES (?, ?, ?)",
-            [(CODE, trade_date, 1_000.0) for trade_date in trade_dates],
+            [(CODE, trade_date, volume) for trade_date in trade_dates],
         )
         connection.execute("CHECKPOINT")
     finally:
@@ -668,6 +674,27 @@ def test_the_publisher_survives_an_atomic_replica_replacement_between_iterations
     assert second.last_error is None
     assert second.degraded_reasons == ()
     assert second.processed_count == 1
+
+    #: and it is reading the new file rather than a pinned one: the third generation is
+    #: short by one prior session, which the publisher refuses. A connection held across
+    #: the `rename(2)` would keep answering out of the unlinked inode and publish again.
+    short = replica.with_name(f"{replica.name}.tmp.short.{os.getpid()}")
+    _write_replica(
+        short,
+        trade_dates=PRIOR_DATES[1:],
+        synced_at=REPLICA_SYNCED_AT + timedelta(minutes=4),
+    )
+    os.replace(short, replica)
+
+    third_code, third = session_world.run(
+        CANDIDATE_ROLE,
+        instance=instance,
+        now=PUBLISH_AT + timedelta(seconds=120),
+    )
+
+    assert third_code == 0
+    assert third is not None
+    assert third.degraded_reasons == ("auction_gap_input_unavailable",)
 
 
 def test_the_generator_refuses_a_read_side_role_on_the_main_database(
