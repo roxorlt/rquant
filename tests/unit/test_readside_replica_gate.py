@@ -142,6 +142,37 @@ def test_a_generation_that_moves_under_the_read_is_not_remembered(tmp_path: Path
     assert calls == 2
 
 
+def test_a_generation_that_moved_under_the_read_is_not_remembered_under_the_old_one(
+    tmp_path: Path,
+) -> None:
+    """The stricter half of the rule, with a scripted observer so it can actually be seen.
+
+    `test_a_generation_that_moves_under_the_read_is_not_remembered` uses a real
+    replacement, so the next iteration observes the *new* generation and re-reads whether
+    or not the torn read was cached -- it cannot tell the two apart. This one scripts the
+    observations: the read starts on G1, ends on G2, and the iteration after it is back on
+    G1 (a sequence a sync that staged, moved, and rolled back would produce). Caching the
+    torn read under G1 would serve G2's answer as G1's; the rule is that a read whose
+    generation moved is simply not remembered.
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    first = ReplicaGeneration(device=1, inode=7, size=10, mtime_ns=100)
+    second = ReplicaGeneration(device=1, inode=8, size=11, mtime_ns=200)
+    observations = iter((first, second, first, first))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica, observer=lambda _path: next(observations)
+    )
+    loader = _Loader()
+
+    torn = gate.read(loader)
+    again = gate.read(loader)
+
+    assert torn.opened is True
+    assert again.opened is True
+    assert loader.calls == 2
+
+
 def test_a_replica_that_is_not_there_is_never_remembered(tmp_path: Path) -> None:
     gate: ReplicaReadGate[object] = ReplicaReadGate(tmp_path / "absent.duckdb")
     loader = _Loader()
