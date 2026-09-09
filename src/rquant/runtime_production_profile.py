@@ -930,10 +930,11 @@ def _validate_read_side_database_bindings(
                 continue
             if _resolved_path(Path(value)) == main:
                 raise ValueError(
-                    f"read-side role {manifest.service_id} field {field} resolves to the "
+                    f"runtime role {manifest.service_id} field {field} resolves to the "
                     f"production main database {main}; live readers open the replica "
                     f"{readonly_replica_database_path} (the recovery binding is the only "
-                    "role that may name the main database)"
+                    "binding in a production profile that may name the main database, and "
+                    "it is not a manifest)"
                 )
 
 
