@@ -163,7 +163,8 @@
     所以副本 ≤ 5 分钟的延迟对这个窗口没有影响，不需要当日盘中数据。
   - **`reference-slow.source.v1` 的 `database_path`**：它先把整个库拷成私有快照再查，
     而且**拒绝带未收口 `.wal` sidecar 的库**——主库只要有写者打开就带 WAL。
-  - **notifier 的 `page_projection_database_path`**（每 2 秒一轮，#255）。
+  - **notifier 的 `page_projection_database_path`**（每 2 秒一轮，#255 的一半——
+    另一半是钉代时在库旁边建硬链接失败，由包 O 修，两个包必须同一代上线）。
     `page_projection_surge_live_root` 跟着投影库走（bundle 要求它必须是投影库的同级 `surge_live`），
     生产上两个库在同一个 data 目录，所以这一项的取值没有变；它读的是 JSONL/JSON 文件，
     本来就不经过 DuckDB 锁。
