@@ -140,6 +140,25 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: `RuntimeServiceHeartbeatProjection`, which is frozen at the v0.33.1 field set
     #: (#237), so nothing here reaches a published schema.
     generation_events: tuple[str, ...] = ()
+    #: How long this iteration is waiting before retrying, when the same failure keeps
+    #: coming back. A DEGRADED loop with no backoff is not free: on 2026-09-09 the two
+    #: source roles that could not read a candidate store re-walked and re-hashed it every
+    #: two seconds, and a 4-vCPU host sat at load 11-12 with ~47% system time -- the
+    #: 15-minute backups went from 8 to 14 minutes and the monitor watchdog timed out
+    #: (#254). `None` while the loop is healthy or on the first failure of a kind. Also a
+    #: *file* field, for the reason `generation_events` gives above.
+    failure_backoff_seconds: StepDuration | None = None
+    #: What the backoff is counting: the failure this loop keeps getting, as
+    #: `<exception type>` plus the artifact a peer wait names. A different failure resets
+    #: the backoff, because a loop that alternates between two faults is not idle.
+    failure_kind: str | None = None
+
+    @field_validator("failure_kind")
+    @classmethod
+    def validate_failure_kind(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("failure kind cannot be blank")
+        return value
 
     @field_validator("generation_events")
     @classmethod
@@ -619,6 +638,8 @@ class RuntimeServiceControl:
                 waiting_for=None,
                 waiting_since=None,
                 waited_seconds=None,
+                failure_backoff_seconds=None,
+                failure_kind=None,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -628,6 +649,8 @@ class RuntimeServiceControl:
         error: Exception,
         *,
         duration_seconds: float | None = None,
+        backoff_seconds: float | None = None,
+        failure_kind: str | None = None,
     ) -> RuntimeServiceHeartbeat:
         current = self._require_active()
         now = normalize_aware_utc(self._clock())
@@ -640,6 +663,8 @@ class RuntimeServiceControl:
                 total_failures=current.total_failures + 1,
                 degraded_reasons=(),
                 last_error=_error_text(error),
+                failure_backoff_seconds=backoff_seconds,
+                failure_kind=failure_kind,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
@@ -669,6 +694,9 @@ class RuntimeServiceControl:
                     if current.waiting_since is None
                     else (now - current.waiting_since).total_seconds()
                 ),
+                #: a stopped run is not backing off any more; `failure_kind` stays, because
+                #: it is what the last failure was, which is worth reading after the fact
+                failure_backoff_seconds=None,
             )
         )
         fcntl.flock(self._lock_descriptor, fcntl.LOCK_UN)
@@ -726,6 +754,86 @@ class RuntimeServiceControl:
         return heartbeat
 
 
+#: The longest a role may sit between retries of one failure it keeps getting. Long
+#: enough that a DEGRADED loop costs nothing, short enough that the recovery an operator
+#: makes is picked up within a minute (#254).
+MAX_FAILURE_BACKOFF_SECONDS = 60.0
+
+#: How long a single wait may block before the loop looks at `stop_event` again. The event
+#: already wakes the wait on its own; this bounds the stop latency anyway, because the
+#: handler that sets it runs in the main thread and the process must never need `SIGKILL`
+#: (2026-09-09: stopping `watchlist-quote` inside its failing loop exceeded
+#: `TimeoutStopSec`, was killed, and left the unit `failed` -- one more real push).
+_STOP_POLL_SECONDS = 0.25
+
+
+def failure_kind_of(error: BaseException) -> str:
+    """What "the same failure again" means for the backoff.
+
+    The exception type, plus the artifact a peer wait names -- two roles waiting on two
+    different files are not the same wait, and a loop that alternates between two faults
+    is not idle and must not be slowed down as if it were. Deliberately *not* the message:
+    those carry timestamps and sequence numbers, and would make every iteration look new.
+    """
+
+    from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+
+    kind = f"{type(error).__module__}.{type(error).__qualname__}"
+    if isinstance(error, PeerArtifactUnavailableError):
+        return f"{kind}:{error.path}"
+    return kind
+
+
+def _failure_backoff_seconds(
+    *,
+    interval_seconds: float,
+    consecutive: int,
+    cap: float,
+) -> float | None:
+    """`None` on the first failure of a kind, then doubling from the interval up to `cap`.
+
+    The first failure of any kind is free, so a single blip never slows a healthy loop.
+    From the second on it doubles, which is what makes an all-day DEGRADED loop cost
+    nothing: on 2026-09-09 the two source roles retried a store they could not read every
+    two seconds all morning, and re-walking and re-hashing it each time put a 4-vCPU host
+    at load 11-12 (#254).
+    """
+
+    if consecutive < 2:
+        return None
+    base = max(interval_seconds, _STOP_POLL_SECONDS)
+    delay = min(base * float(2 ** min(consecutive - 1, 32)), cap)
+    return None if delay <= interval_seconds else delay
+
+
+def _wait_for_stop(
+    stop_event: Event,
+    delay: float,
+    *,
+    monotonic_clock: Callable[[], float],
+) -> bool:
+    """Wait `delay`, or until a stop is requested. `True` means stop now.
+
+    One `wait()` for a delay inside a poll slice, so a role whose interval is short is
+    driven exactly as it was before. Longer than that, the wait is sliced: `Event.set()`
+    called from a signal handler runs on this very thread, and a handler that has to take
+    the event's own lock to hand the news over is the one way this can be slower than the
+    unit's `TimeoutStopSec`. Slicing costs four wake-ups a second while a role is backing
+    off and bounds the stop latency without depending on that at all.
+    """
+
+    if delay <= 0:
+        return stop_event.is_set()
+    if delay <= _STOP_POLL_SECONDS:
+        return stop_event.wait(delay) or stop_event.is_set()
+    deadline = monotonic_clock() + delay
+    while True:
+        if stop_event.wait(_STOP_POLL_SECONDS) or stop_event.is_set():
+            return True
+        if monotonic_clock() >= deadline:
+            return False
+
+
 def run_service_loop(
     control: RuntimeServiceControl,
     *,
@@ -734,35 +842,55 @@ def run_service_loop(
     interval_seconds: float,
     max_iterations: int | None = None,
     monotonic_clock: Callable[[], float] = time.monotonic,
+    max_failure_backoff_seconds: float = MAX_FAILURE_BACKOFF_SECONDS,
 ) -> RuntimeServiceHeartbeat:
     if interval_seconds < 0:
         raise ValueError("interval_seconds cannot be negative")
     if max_iterations is not None and max_iterations < 1:
         raise ValueError("max_iterations must be positive")
+    if max_failure_backoff_seconds < 0:
+        raise ValueError("max_failure_backoff_seconds cannot be negative")
     # The rotations a role performs happen while its step is being built, before this
     # control exists, so the step is what carries them out to the heartbeat (#248). One
     # stamp at start is enough: they describe this run, not this iteration.
     events = getattr(step, "generation_events", ())
     control.start(generation_events=tuple(events))
     completed = 0
+    repeated_kind: str | None = None
+    repeated_count = 0
     try:
         while not stop_event.is_set() and (max_iterations is None or completed < max_iterations):
             started = monotonic_clock()
+            delay = interval_seconds
             try:
                 result = step()
             except Exception as error:
+                kind = failure_kind_of(error)
+                repeated_count = repeated_count + 1 if kind == repeated_kind else 1
+                repeated_kind = kind
+                backoff = _failure_backoff_seconds(
+                    interval_seconds=interval_seconds,
+                    consecutive=repeated_count,
+                    cap=max_failure_backoff_seconds,
+                )
                 control.record_failure(
                     error,
                     duration_seconds=monotonic_clock() - started,
+                    backoff_seconds=backoff,
+                    failure_kind=kind,
                 )
+                if backoff is not None:
+                    delay = backoff
             else:
+                repeated_kind = None
+                repeated_count = 0
                 control.record_success(
                     result,
                     duration_seconds=monotonic_clock() - started,
                 )
             completed += 1
             if max_iterations is None or completed < max_iterations:
-                stop_event.wait(interval_seconds)
+                _wait_for_stop(stop_event, delay, monotonic_clock=monotonic_clock)
     except BaseException as error:
         control.stop(reason="unhandled service crash", error=error)
         raise
@@ -795,6 +923,7 @@ def inspect_runtime_health(
 
 
 __all__ = [
+    "MAX_FAILURE_BACKOFF_SECONDS",
     "RuntimeServiceAlreadyRunningError",
     "RuntimeServiceControl",
     "RuntimeServiceHealth",
@@ -804,6 +933,7 @@ __all__ = [
     "RuntimeServiceSpec",
     "RuntimeServiceStatus",
     "RuntimeStepResult",
+    "failure_kind_of",
     "inspect_runtime_health",
     "project_heartbeat",
     "run_service_loop",
