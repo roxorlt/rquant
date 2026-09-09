@@ -1611,42 +1611,58 @@ class DuckDBSignalPageProjectionSource:
         *,
         cutoff: datetime,
     ) -> tuple[MinuteCoverageProjectionRow, ...]:
+        """Per-source and total 1-minute coverage, in **one** pass over `minute_bar` (#256).
+
+        This projection was, and after this package still is, the whole of what the
+        notifier reads from the replica -- 44,052,711 of 44,052,711 bytes on the package Q
+        measurement replica. It used to run *two* independent aggregates over the same
+        table, one grouped by source and one ungrouped, so every generation was scanned
+        twice. `GROUPING SETS ((COALESCE(source,'unknown')), ())` computes both from one
+        `SEQ_SCAN`, and `COUNT(DISTINCT ...)` is evaluated per grouping set, so the numbers
+        are the same numbers (review SF-1).
+
+        **Nothing about the published projection changes**: same rows, same values, same
+        order (the total first, then the sources ascending), and an empty table still
+        yields no rows at all -- the `()` grouping set does produce one row there, with
+        `COUNT(*) = 0`, and the same `> 0` guard as before drops it.
+
+        The row limit keeps its meaning too. `_MAX_MINUTE_SOURCES + 2` is fetched because
+        the total shares the result set; ordering by the grouping flag first puts the
+        source rows ahead of it, so more sources than the budget still overflows the count
+        and still refuses.
+        """
+
         rows = connection.execute(
             """
-            SELECT COALESCE(source, 'unknown'), COUNT(*), COUNT(DISTINCT ts_code),
+            SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
+                   COALESCE(source, 'unknown') AS source_label,
+                   COUNT(*), COUNT(DISTINCT ts_code),
                    COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
             FROM minute_bar
             WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
-            GROUP BY COALESCE(source, 'unknown')
-            ORDER BY COALESCE(source, 'unknown')
+            GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
+            ORDER BY is_total, source_label
             LIMIT ?
             """,
-            (cutoff, cutoff, _MAX_MINUTE_SOURCES + 1),
+            (cutoff, cutoff, _MAX_MINUTE_SOURCES + 2),
         ).fetchall()
-        if len(rows) > _MAX_MINUTE_SOURCES:
+        grouped = [row for row in rows if not int(row[0])]
+        if len(grouped) > _MAX_MINUTE_SOURCES:
             raise PageProjectionSourceIntegrityError(
                 "minute sources exceed the bounded projection limit"
             )
-        total = connection.execute(
-            """
-            SELECT COUNT(*), COUNT(DISTINCT ts_code),
-                   COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
-            FROM minute_bar
-            WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
-            """,
-            (cutoff, cutoff),
-        ).fetchone()
+        total = next((row for row in rows if int(row[0])), None)
         values: list[MinuteCoverageProjectionRow] = []
-        if total is not None and int(total[0]) > 0:
+        if total is not None and int(total[2]) > 0:
             values.append(
                 MinuteCoverageProjectionRow(
                     is_total=True,
                     source="all",
-                    rows_count=int(total[0]),
-                    codes_count=int(total[1]),
-                    trade_dates=int(total[2]),
-                    min_time=_database_timestamp(total[3]),
-                    max_time=_database_timestamp(total[4]),
+                    rows_count=int(total[2]),
+                    codes_count=int(total[3]),
+                    trade_dates=int(total[4]),
+                    min_time=_database_timestamp(total[5]),
+                    max_time=_database_timestamp(total[6]),
                 )
             )
         values.extend(
@@ -1659,7 +1675,7 @@ class DuckDBSignalPageProjectionSource:
                 min_time=_database_timestamp(minimum),
                 max_time=_database_timestamp(maximum),
             )
-            for source, count, codes, trade_dates, minimum, maximum in rows
+            for _flag, source, count, codes, trade_dates, minimum, maximum in grouped
         )
         return tuple(values)
 
