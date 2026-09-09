@@ -86,15 +86,30 @@ def _private_snapshot_identity(path: Path) -> tuple[os.stat_result, Path]:
         observed = path.lstat()
     except OSError as exc:
         raise AuctionGapCandidateInputError("daily snapshot is unavailable") from exc
-    if (
-        stat.S_ISLNK(observed.st_mode)
-        or not stat.S_ISREG(observed.st_mode)
-        or observed.st_uid != os.geteuid()
-        or stat.S_IMODE(observed.st_mode) != 0o600
-        or observed.st_nlink != 1
-    ):
-        raise AuctionGapCandidateInputError("daily snapshot path is unsafe")
+    _validate_snapshot_stat(observed)
     return observed, path
+
+
+def _validate_snapshot_stat(value: os.stat_result) -> None:
+    """The mode rule the file this reader is given can actually satisfy (#249, #250).
+
+    Since #250 the snapshot is the five-minute read-only replica `rquant_ro.duckdb`, which
+    `scripts/sync-readonly-replica.sh` recreates at 0644 every five minutes. Demanding
+    0600 refused it on every iteration, and chmod-ing a file that is replaced every five
+    minutes is not a fix. What the check is for is that nobody outside the runtime can
+    have written what this publisher is about to trust: the file is ours, and neither
+    group nor other can write it. 0600 and 0400 still pass, so nothing that was accepted
+    before is refused now.
+    """
+
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        raise AuctionGapCandidateInputError("daily snapshot is a symlink or unsafe file")
+    if value.st_uid != os.geteuid():
+        raise AuctionGapCandidateInputError("daily snapshot owner does not match the process")
+    if stat.S_IMODE(value.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+        raise AuctionGapCandidateInputError("daily snapshot must not be group or other writable")
+    if value.st_nlink != 1:
+        raise AuctionGapCandidateInputError("daily snapshot must have one hard link")
 
 
 def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
