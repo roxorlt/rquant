@@ -2287,3 +2287,53 @@ def test_a_source_touched_during_the_copy_is_refused_rather_than_served(
         pass  # pragma: no cover - the open is what raises
     assert not any(control.iterdir())
 
+
+def test_a_source_whose_only_changed_stamp_is_ctime_is_still_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-7: the previous case moved mtime too, so it could not see `st_ctime_ns` work.
+
+    A writer that rewrites a page in place leaves the size and the inode alone, and mtime
+    can be put back -- deliberately by a tool that preserves timestamps, or accidentally
+    by a filesystem whose mtime granularity is coarser than the write. `st_ctime_ns` is
+    the stamp no unprivileged caller can restore, and it is the reason it is in
+    `_copy_identity` at all. Here everything else is held identical and only ctime moves.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "control"
+    before = database.lstat()
+    reader = _StableReadonlyDuckDB(database, control_root=control, atomically_published=True)
+
+    real_copy = _StableReadonlyDuckDB._copy_descriptor
+
+    def copy_then_move_only_ctime(self: object, destination: Path, *, size: int) -> None:
+        real_copy(self, destination, size=size)
+        #: the same bytes into the same inode, then mtime handed back -- so `st_dev`,
+        #: `st_ino`, `st_size` and `st_mtime_ns` are all exactly what they were
+        database.write_bytes(database.read_bytes())
+        os.utime(database, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    monkeypatch.setattr(_StableReadonlyDuckDB, "_copy_descriptor", copy_then_move_only_ctime)
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="changed while"), reader:
+        pass  # pragma: no cover - the open is what raises
+
+    after = database.lstat()
+    #: the premise of the case: only `st_ctime_ns` moved
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert after.st_ctime_ns != before.st_ctime_ns
+    assert not any(control.iterdir())
+
