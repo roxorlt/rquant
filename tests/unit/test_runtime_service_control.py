@@ -663,6 +663,116 @@ def test_a_long_wait_is_cut_short_by_a_stop_within_one_poll_slice() -> None:
     assert elapsed < 1.0, elapsed
 
 
+def test_no_single_wait_blocks_longer_than_the_poll_slice() -> None:
+    """The property that bounds the stop latency without depending on the event at all.
+
+    `Event.set()` from another *thread* wakes `Event.wait()` at once, so a test that stops
+    the loop that way cannot tell a sliced wait from a single 60-second one. What
+    production does is different: the handler runs on the waiting thread, and it has to
+    take the event's own lock to hand the news over. So the contract asserted here is the
+    one that holds either way -- the loop never blocks longer than one slice without
+    looking at the stop event again.
+    """
+
+    import time as real_time
+
+    from rquant.runtime_service_control import _STOP_POLL_SECONDS, _wait_for_stop
+
+    class _RecordingEvent(Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self.timeouts: list[float | None] = []
+
+        def wait(self, timeout: float | None = None) -> bool:
+            self.timeouts.append(timeout)
+            return False
+
+    stop = _RecordingEvent()
+    clock = iter([0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 60.0])
+    assert _wait_for_stop(stop, 60.0, monotonic_clock=lambda: next(clock)) is False
+    assert stop.timeouts, "the wait has to consult the stop event"
+    assert all(
+        timeout is not None and timeout <= _STOP_POLL_SECONDS for timeout in stop.timeouts
+    ), stop.timeouts
+    #: and a delay inside one slice is still handed over whole, so a short interval is
+    #: driven exactly as it was before
+    short = _RecordingEvent()
+    assert _wait_for_stop(short, 0.05, monotonic_clock=real_time.monotonic) is False
+    assert short.timeouts == [0.05]
+
+
+def test_a_real_sigterm_during_a_backoff_stops_the_process_without_a_kill(
+    tmp_path: Path,
+) -> None:
+    """End to end, the way `systemd` does it: SIGTERM to a process inside its backoff.
+
+    This is the failure the window actually saw -- `watchlist-quote` exceeded
+    `TimeoutStopSec`, was killed, and left its unit `failed`. The child runs the real loop
+    with a failing step and a 60-second cap, and has to be gone well inside any stop
+    timeout, with a clean exit rather than a signal.
+    """
+
+    import subprocess
+    import sys
+    import time as real_time
+
+    program = f"""
+import os, signal, sys, time
+from pathlib import Path
+from threading import Event
+from datetime import UTC, datetime, timedelta
+from rquant.runtime_service_control import (
+    RuntimeServiceControl, RuntimeServicePlane, RuntimeServiceSpec, RuntimeStepResult,
+    run_service_loop,
+)
+spec = RuntimeServiceSpec(
+    service_id="watchlist-quote",
+    plane=RuntimeServicePlane.LIVE,
+    stale_after=timedelta(seconds=10),
+    producer_commit="a" * 40,
+)
+control = RuntimeServiceControl(Path({str(tmp_path)!r}), spec=spec)
+stop = Event()
+def request_stop(_signum, _frame):
+    stop.set()
+signal.signal(signal.SIGTERM, request_stop)
+attempts = 0
+def step():
+    global attempts
+    attempts += 1
+    if attempts == 2:
+        print("backing-off", flush=True)
+    raise RuntimeError("candidate store is damaged")
+run_service_loop(
+    control, step=step, stop_event=stop, interval_seconds=30.0,
+    max_failure_backoff_seconds=60.0,
+)
+print("clean-exit", flush=True)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        #: the first failure's own wait is 30 s, which is already long enough to measure
+        real_time.sleep(0.5)
+        started = real_time.monotonic()
+        child.terminate()
+        stdout, stderr = child.communicate(timeout=15)
+        elapsed = real_time.monotonic() - started
+    finally:
+        if child.poll() is None:  # pragma: no cover - only on a failure
+            child.kill()
+            child.communicate()
+
+    assert child.returncode == 0, (child.returncode, stderr)
+    assert "clean-exit" in stdout, stdout
+    assert elapsed < 5.0, elapsed
+
+
 def test_a_stop_during_the_loop_s_own_wait_never_needs_to_be_killed(
     tmp_path: Path,
 ) -> None:
