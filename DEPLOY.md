@@ -1294,7 +1294,14 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       用旧 inputs 会在 `ProductionRuntimeProfileInputs` 校验期直接被拒。
     - 用新 inputs 重新生成 profile 再装 bundle。`auction-universe.publisher.v1` 的 manifest
       `database_path` 从 `rquant.duckdb` 改成 `rquant_ro.duckdb`，**`profile_id` 会变**、bundle
-      generation 跟着变，权威链按第 13–17 条的既有约定走。**其余 24 个 manifest 的 settings 一字未改。**
+      generation 跟着变，权威链按第 13–17 条的既有约定走。
+    - **#250 在同一个窗口里又改了三个 manifest**（读侧 role 一律读副本）：
+      `candidate.auction_gap.v1` 的 `daily_database_path`、`reference-slow.source.v1` 的
+      `database_path`、`notifier.admin.shadow.v1` 的 `page_projection_database_path` 与
+      `page_projection_surge_live_root`（后者取值不变，两个库同目录，只是改成对着副本表达）。
+      recovery 绑定按设计仍指主库。**其余 21 个 manifest 的 settings 一字未改。**
+      另：生成器的 `--allow-primary-database` 已删除，命令里如果还带着会以
+      `unrecognized arguments` 退出；`--calendar-database` 指主库现在无条件被拒。
 
     **窗口里要预期到的两件事**：健康载荷的 `status` 仍然是 DEGRADED（`superseded:` 和 `missing:`
     一样会进 `reason`，只要有 reason 就是 DEGRADED）——改进的是「载荷发得出来、serving 不再被一个
