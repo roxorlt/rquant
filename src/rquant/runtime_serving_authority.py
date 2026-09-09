@@ -299,6 +299,7 @@ class ServingSourceAuthorityReader:
         max_bytes: int = 8 * 1024 * 1024,
         history_scan_limit: int = 1_024,
         trusted_historical_producer_commits: tuple[str, ...] = (),
+        previous_generation_of_producer_commit: Callable[[str], str | None] | None = None,
     ) -> None:
         self.root = _validated_root(root)
         _require_digest(
@@ -328,8 +329,44 @@ class ServingSourceAuthorityReader:
             _require_digest(commit, length=40, name="trusted_historical_producer_commit")
             trusted.add(commit)
         self.trusted_historical_producer_commits = frozenset(trusted)
+        # `current.json` is written by the authority's *owner*, and after a release the
+        # owner has not republished yet, so the pointer still carries our own previous
+        # generation's commit. Refusing it took `serving.publisher.v1` DEGRADED on every
+        # iteration of the 2026-09-09 window (#253). This predicate is what tells that
+        # pointer from a foreign one; without it the check is exactly what it was.
+        if previous_generation_of_producer_commit is not None and not callable(
+            previous_generation_of_producer_commit
+        ):
+            raise TypeError("previous_generation_of_producer_commit must be callable")
+        self._previous_generation_of_producer_commit = previous_generation_of_producer_commit
         self._watermark_lock = threading.Lock()
         self._last_observation: tuple[datetime, datetime, int, str] | None = None
+
+    def accepted_pointer_commit(self, producer_commit: str) -> str:
+        """The commit this read validates the current pointer against.
+
+        Our own commit, always, unless the pointer carries one that the lineage recognises
+        as a generation of ours that ran before this one -- then the pointer and its
+        immutable document are checked against *that* commit, self-consistently, exactly
+        as `_read_historical_result` already checks an archived publication. Anything the
+        lineage does not recognise comes back as our own commit and is refused by
+        `_validate_pointer_owner` with the message it always raised.
+        """
+
+        return (
+            self.expected_producer_commit
+            if self.handover_generation(producer_commit) is None
+            else producer_commit
+        )
+
+    def handover_generation(self, producer_commit: str) -> str | None:
+        """Our generation that stamped this commit, or `None` when it is not one of ours."""
+
+        if producer_commit == self.expected_producer_commit:
+            return None
+        if self._previous_generation_of_producer_commit is None:
+            return None
+        return self._previous_generation_of_producer_commit(producer_commit)
 
     def __call__(self, as_of: datetime, /) -> SourceReadResult:
         observed_at = _normalize_as_of(as_of)
@@ -356,9 +393,10 @@ class ServingSourceAuthorityReader:
             )
             assert pointer_bytes is not None
             pointer = _parse_pointer(pointer_bytes)
+            accepted_commit = self.accepted_pointer_commit(pointer.producer_commit)
             _validate_pointer_owner(
                 pointer,
-                expected_producer_commit=self.expected_producer_commit,
+                expected_producer_commit=accepted_commit,
                 expected_dataset_id=self.expected_dataset_id,
                 expected_payload_kind=self.expected_payload_kind,
             )
@@ -372,7 +410,7 @@ class ServingSourceAuthorityReader:
             result = _read_pointer_result(
                 generations_fd=generations_fd,
                 pointer=pointer,
-                expected_producer_commit=self.expected_producer_commit,
+                expected_producer_commit=accepted_commit,
                 expected_dataset_id=self.expected_dataset_id,
                 expected_payload_kind=self.expected_payload_kind,
                 max_bytes=self.max_bytes,
@@ -403,7 +441,9 @@ class ServingSourceAuthorityReader:
                     newer_pointer=pointer,
                     newer_result=result,
                     observed_at=observed_at,
-                    trusted_producer_commits=self.trusted_historical_producer_commits,
+                    trusted_producer_commits=(
+                        self.trusted_historical_producer_commits | {accepted_commit}
+                    ),
                     expected_dataset_id=self.expected_dataset_id,
                     expected_payload_kind=self.expected_payload_kind,
                     max_bytes=self.max_bytes,
@@ -1528,6 +1568,53 @@ def _same_observation(first: os.stat_result, second: os.stat_result) -> bool:
     )
 
 
+def serving_source_pointer_handover(reader: ServingSourceAuthorityReader) -> str | None:
+    """The one-line event a serving publisher stamps for a pointer it takes over (#253).
+
+    Read once, at build, and never load-bearing: the acceptance itself lives in
+    `ServingSourceAuthorityReader.accepted_pointer_commit` and is re-decided on every read
+    against the pointer actually on disk. This only names what the run started out
+    finding, so the heartbeat says which generation's pointer this run inherited instead
+    of leaving the handover invisible. Anything unreadable here answers `None` -- the read
+    that follows is what refuses.
+    """
+
+    try:
+        chain = _open_existing_directory_chain(reader.root)
+    except (
+        OSError,
+        ValueError,
+        ServingSourceAuthorityIntegrityError,
+        ServingSourceAuthorityUnavailableError,
+    ):
+        return None
+    try:
+        payload = _read_regular_file_at(
+            chain[-1][0],
+            "current.json",
+            max_bytes=reader.max_bytes,
+            label="current pointer",
+            missing_unavailable=True,
+        )
+    except (OSError, ServingSourceAuthorityIntegrityError, ServingSourceAuthorityUnavailableError):
+        return None
+    finally:
+        _close_directory_chain(chain)
+    if payload is None:
+        return None
+    try:
+        pointer = _parse_pointer(payload)
+    except ServingSourceAuthorityIntegrityError:
+        return None
+    generation = reader.handover_generation(pointer.producer_commit)
+    if generation is None:
+        return None
+    return (
+        f"serving source authority {reader.expected_dataset_id}: current pointer of "
+        f"generation {generation} carried across"
+    )
+
+
 __all__ = [
     "ServingSourceAuthorityDocument",
     "ServingSourceAuthorityIntegrityError",
@@ -1535,4 +1622,5 @@ __all__ = [
     "ServingSourceAuthorityPublisher",
     "ServingSourceAuthorityReader",
     "ServingSourceAuthorityUnavailableError",
+    "serving_source_pointer_handover",
 ]

@@ -1135,3 +1135,120 @@ def test_reader_rejects_ambiguous_historical_generations_at_same_rank(
 
     with pytest.raises(ServingSourceAuthorityIntegrityError, match="ambiguous"):
         _reader(root)(NOW)
+
+
+# ---------------------------------------------------------------------------------------
+# #253: the current pointer after a release still carries the previous generation's commit
+# ---------------------------------------------------------------------------------------
+
+
+PREVIOUS_COMMIT = "b" * 40
+PREVIOUS_GENERATION = "9" * 64
+
+
+def _lineage_reader(root: Path) -> ServingSourceAuthorityReader:
+    """The reader `serving_publisher_builder` builds when the runtime root knows its past."""
+
+    return ServingSourceAuthorityReader(
+        root=root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+        previous_generation_of_producer_commit=(
+            lambda commit: PREVIOUS_GENERATION if commit == PREVIOUS_COMMIT else None
+        ),
+    )
+
+
+def test_reader_carries_the_previous_generations_current_pointer(tmp_path: Path) -> None:
+    """#253: the owner has not republished yet, and its pointer is not a foreign one.
+
+    `serving.publisher.v1` went DEGRADED on every iteration of the 2026-09-09 window with
+    `current pointer producer_commit does not match expected commit`: the signals
+    authority's `current.json` is written by the notifier, which after a release has not
+    published again yet, so the pointer still names the commit of the generation before
+    this one. That is the expected state of every release, not damage.
+    """
+
+    root = tmp_path / "authority"
+    _publisher(root, producer_commit=PREVIOUS_COMMIT).publish(_result())
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="producer_commit"):
+        _reader(root)(NOW)
+
+    result = _lineage_reader(root)(NOW)
+    assert result.dataset_id == SIGNALS_DATASET_ID
+    assert result.sequence == 7
+
+
+def test_reader_still_refuses_a_pointer_from_a_generation_that_is_not_ours(
+    tmp_path: Path,
+) -> None:
+    """The other half: a commit the lineage does not recognise is refused exactly as before."""
+
+    root = tmp_path / "authority"
+    _publisher(root, producer_commit="c" * 40).publish(_result())
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="producer_commit"):
+        _lineage_reader(root)(NOW)
+
+
+def test_handover_event_names_the_generation_the_pointer_came_from(tmp_path: Path) -> None:
+    """What the heartbeat says about a run that inherited a pointer, and when it says nothing."""
+
+    from rquant.runtime_serving_authority import serving_source_pointer_handover
+
+    root = tmp_path / "authority"
+    assert serving_source_pointer_handover(_lineage_reader(root)) is None
+
+    _publisher(root, producer_commit=PREVIOUS_COMMIT).publish(_result())
+    event = serving_source_pointer_handover(_lineage_reader(root))
+    assert event is not None
+    assert PREVIOUS_GENERATION in event
+    assert SIGNALS_DATASET_ID in event
+    #: a reader with no lineage, and a pointer of our own, both say nothing
+    assert serving_source_pointer_handover(_reader(root)) is None
+
+    _publisher(root, producer_commit=COMMIT).publish(_result(sequence=8))
+    assert serving_source_pointer_handover(_lineage_reader(root)) is None
+
+
+def test_handover_says_nothing_when_the_path_itself_is_untrustworthy(tmp_path: Path) -> None:
+    """An untrustworthy path is the read's refusal to make, not the build's (#253).
+
+    `_open_existing_directory_chain` refuses any component that is group- or
+    world-writable, and it refuses with `ServingSourceAuthorityIntegrityError`, which is a
+    `RuntimeError` and so fell outside this function's `except`. Where the umask leaves
+    directories group-writable -- CI's Route A legacy binding job is one such place -- the
+    handover, which is read once at build and is never load-bearing, took the whole
+    serving role down with it before it ever reached a read. The refusal itself is
+    unchanged and still belongs to the read below.
+    """
+
+    from rquant.runtime_serving_authority import serving_source_pointer_handover
+
+    root = tmp_path / "authority"
+    _publisher(root, producer_commit=PREVIOUS_COMMIT).publish(_result())
+    tmp_path.chmod(0o775)
+
+    assert serving_source_pointer_handover(_lineage_reader(root)) is None
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="unsafe"):
+        _lineage_reader(root)(NOW)
+
+
+def test_carried_pointer_still_has_to_match_its_own_immutable_document(
+    tmp_path: Path,
+) -> None:
+    """Accepting the previous generation's commit is not accepting an unbound pointer."""
+
+    root = tmp_path / "authority"
+    pointer = _publisher(root, producer_commit=PREVIOUS_COMMIT).publish(_result())
+    generation = root / "generations" / f"{pointer.generation_id}.json"
+    document = json.loads(generation.read_bytes())
+    document["producer_commit"] = "d" * 40
+    generation.chmod(0o600)
+    generation.write_bytes(_canonical_json(document))
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError):
+        _lineage_reader(root)(NOW)
+

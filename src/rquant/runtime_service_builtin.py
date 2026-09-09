@@ -1353,6 +1353,7 @@ def build_builtin_registry(
         return serving_publisher_builder(
             snapshot_loader=serving_snapshot_loader,
             clock=resolved_clock,
+            runtime_root=runtime_root,
         )(manifest)
 
     registry.register(RuntimeServiceKind.SERVING_PUBLISHER, build_serving)

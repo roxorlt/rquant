@@ -204,6 +204,7 @@ def serving_publisher_builder(
     *,
     snapshot_loader: ServingSnapshotLoader | None,
     clock: Callable[[], datetime],
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     """Build a serving step from owner authorities or an explicit test loader."""
 
@@ -222,12 +223,30 @@ def serving_publisher_builder(
         if snapshot_loader is not None and settings.source_authorities:
             raise ValueError("injected snapshot_loader cannot be combined with source authorities")
         resolved_snapshot_loader = snapshot_loader
+        build_events: tuple[str, ...] = ()
         if resolved_snapshot_loader is None:
             if not settings.source_authorities:
                 raise ValueError("default serving publisher requires six source authorities")
-            from rquant.runtime_serving_authority import ServingSourceAuthorityReader
+            from rquant.runtime_generation_lineage import producer_commit_lineage
+            from rquant.runtime_serving_authority import (
+                ServingSourceAuthorityReader,
+                serving_source_pointer_handover,
+            )
             from rquant.runtime_serving_snapshot import ServingSnapshotAssembler
 
+            # Each of the six `current.json` files belongs to a role this one only reads,
+            # and none of them is republished until its owner runs again, so after a
+            # release every one of them still carries the previous generation's commit.
+            # `signals` is the one the 2026-09-09 window failed on (#253); the rule is the
+            # same for all six, and a commit no generation of ours ran is still refused.
+            # The pointer cannot be rewritten from here: `deploy/systemd/
+            # rquant-runtime-serving@.service` mounts `control/` and
+            # `live/notifications/` read-only for this role, so the owner rewrites it on
+            # its own next publish and this side accepts it until then.
+            previous_generation_of_producer_commit = producer_commit_lineage(
+                runtime_root,
+                service_id=manifest.service_id,
+            )
             readers = {
                 authority.dataset_id: ServingSourceAuthorityReader(
                     root=authority.root,
@@ -235,9 +254,20 @@ def serving_publisher_builder(
                     expected_dataset_id=authority.dataset_id,
                     expected_payload_kind=_SOURCE_PAYLOAD_KINDS[authority.dataset_id],
                     max_bytes=authority.max_bytes,
+                    previous_generation_of_producer_commit=(
+                        previous_generation_of_producer_commit
+                    ),
                 )
                 for authority in settings.source_authorities
             }
+            handover_events = tuple(
+                event
+                for event in (
+                    serving_source_pointer_handover(readers[dataset_id])
+                    for dataset_id in sorted(readers)
+                )
+                if event is not None
+            )
             assembler = ServingSnapshotAssembler(
                 signal_reader=readers["signals"],
                 paper_accounts_reader=readers["paper_accounts"],
@@ -247,6 +277,7 @@ def serving_publisher_builder(
                 reference_slow_reader=readers[_REFERENCE_SLOW_AUTHORITY_DATASET_ID],
             )
             resolved_snapshot_loader = assembler.assemble
+            build_events = handover_events
         publisher = ServingPublisher(
             settings.serving_root,
             producer_commit=manifest.producer_commit,
@@ -297,6 +328,9 @@ def serving_publisher_builder(
                 },
                 degraded_reasons=_degraded_reasons(snapshot.watermarks),
             )
+
+        if build_events:
+            step.generation_events = build_events
 
         return step
 

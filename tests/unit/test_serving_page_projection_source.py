@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -556,7 +558,17 @@ def test_duckdb_signal_source_binds_generation_opened_during_connect(
 
     monkeypatch.setattr(duckdb, "connect", swap_only_during_connect)
 
-    snapshot = DuckDBSignalPageProjectionSource(database)(NOW)
+    #: what the notifier's unit gives it: `live/notifications/%i`, the one directory it
+    #: may write. On Linux the descriptor pins the generation and this is never touched;
+    #: where the engine refuses the descriptor (macOS, and the production host -- #255)
+    #: the pinned inode is copied here and the swap below cannot reach the copy.
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        control_root=tmp_path / "notifier-state",
+        #: the read-only replica is replaced by `rename()` (`sync-readonly-replica.sh`),
+        #: which is the only shape the copy branch is allowed on (review SF-1)
+        atomically_published=True,
+    )(NOW)
 
     screen_bounds = {
         str(row["preset_name"])
@@ -1904,33 +1916,35 @@ def test_the_duckdb_reader_pins_through_a_descriptor_where_the_engine_takes_one(
     """Both openers, asserted -- which one runs is a platform fact, not a surprise.
 
     On Linux `duckdb.connect("/proc/self/fd/<n>")` opens the inode the descriptor holds,
-    so the reader pins the generation and creates nothing: that is the branch a runtime
-    host takes, and the only one that can work there. macOS DuckDB rebuilds the path from
-    the descriptor's real name and refuses, so the link-beside-the-database branch runs and
-    the class keeps the generation pinning it has always had. #241's own reader (the
-    PageControl audit sqlite one) needs no such split: sqlite takes the descriptor on both.
+    so the reader pins the generation and creates nothing: that is the branch package L
+    expected a runtime host to take. macOS DuckDB rebuilds the path from the descriptor's
+    real name and refuses -- and so does the build on the production host (#255), which is
+    why the fallback may no longer write beside the database. It writes a private copy in
+    the reader's own control root instead, and never in the database's directory.
     """
 
     from rquant.serving_page_projection_source import _StableReadonlyDuckDB
     from tests.runtime_readonly_sandbox import tree_state
 
-    database = tmp_path / "rquant_ro.duckdb"
+    replica = tmp_path / "replica"
+    replica.mkdir()
+    control = tmp_path / "control"
+    database = replica / "rquant_ro.duckdb"
     _signal_projection_database(database)
-    before = tree_state(tmp_path)
-    reader = _StableReadonlyDuckDB(database)
+    before = tree_state(replica)
+    reader = _StableReadonlyDuckDB(database, control_root=control, atomically_published=True)
 
     with reader as connection:
         assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
         opened_through = reader.opened_through
-        inside = tree_state(tmp_path)
+        inside = tree_state(replica)
 
-    assert opened_through in {"descriptor", "link"}
-    if opened_through == "descriptor":
-        assert inside == before, "the descriptor branch must create nothing"
-    else:
-        assert len(inside) > len(before), "the link branch creates exactly its own scratch"
-    #: either way nothing survives the read
-    assert tree_state(tmp_path) == before
+    assert opened_through in {"descriptor", "copy"}
+    #: whichever branch ran, the database's own directory is untouched throughout
+    assert inside == before, "nothing may be created beside the database"
+    assert tree_state(replica) == before
+    #: and the copy, if there was one, does not survive the read either
+    assert not control.exists() or not any(control.iterdir())
 
 
 def test_the_lab_page_source_pins_the_same_way(tmp_path: Path) -> None:
@@ -1953,3 +1967,373 @@ def test_the_lab_page_source_pins_the_same_way(tmp_path: Path) -> None:
     assert not hasattr(source, "generation_bind_root")
     with _StableReadonlyDuckDB(database) as connection:
         assert connection.execute("SELECT 1").fetchone() == (1,)
+
+
+# ---------------------------------------------------------------------------------------
+# #255: the engine on the production host refuses the descriptor path too
+# ---------------------------------------------------------------------------------------
+
+
+def _engine_that_refuses_descriptors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The DuckDB build on the production host (and on macOS): no `/proc/self/fd/<n>`."""
+
+    original = duckdb.connect
+
+    def refuse_descriptor_paths(path: str, *args: object, **kwargs: object):
+        if str(path).startswith(("/proc/self/fd/", "/dev/fd/")):
+            raise duckdb.IOException(f"cannot open {path}")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", refuse_descriptor_paths)
+
+
+def test_a_refused_descriptor_copies_into_the_readers_own_control_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#255: `notifier.admin.shadow.v1` DEGRADED every iteration on `errno 30 EROFS`.
+
+    Package L kept a link-beside-the-database branch for engines that refuse the
+    descriptor, on the assumption that only macOS does. The build on the host refuses it
+    too, and `data/` is read-only for that unit, so the link failed on every iteration.
+    The copy goes where the role already writes its own state and nothing at all is
+    created beside the database.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+    from tests.runtime_readonly_sandbox import tree_state
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "notifications" / "svc"
+    before = tree_state(replica)
+
+    reader = _StableReadonlyDuckDB(database, control_root=control, atomically_published=True)
+    with reader as connection:
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        assert reader.opened_through == "copy"
+        assert Path(reader.generation_path).is_relative_to(control)
+        assert tree_state(replica) == before, "nothing may be created beside the database"
+
+    assert tree_state(replica) == before
+    assert not any(control.iterdir()), "the copy does not survive the read"
+
+
+def test_a_generation_over_the_copy_cap_is_read_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ~10 GB production replica: copying it is not a pinning mechanism, it is a stall.
+
+    `max_copy_bytes` is what says so. Above it the reader opens the database where it is,
+    pins nothing, and leans on the identity check `__exit__` already performs.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+    from tests.runtime_readonly_sandbox import tree_state
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "notifications" / "svc"
+    before = tree_state(replica)
+
+    reader = _StableReadonlyDuckDB(
+        database,
+        control_root=control,
+        max_copy_bytes=1,
+        atomically_published=True,
+    )
+    with reader as connection:
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        assert reader.opened_through == "in_place"
+        assert reader.generation_path == str(database)
+
+    assert tree_state(replica) == before
+    assert not control.exists() or not any(control.iterdir())
+
+
+def test_an_in_place_read_reports_a_generation_that_moved_under_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pinning is not no check: a replaced generation is named, not quietly served."""
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    replacement = replica / "next.duckdb"
+    _signal_projection_database(database)
+    _signal_projection_database(replacement)
+
+    reader = _StableReadonlyDuckDB(database, control_root=None)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="rotated"), reader as connection:
+        assert reader.opened_through == "in_place"
+        assert connection.execute("SELECT count(*) FROM screen_result").fetchone()[0] >= 1
+        os.replace(replacement, database)
+
+
+def test_nothing_is_ever_linked_beside_the_database_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch #255 is about is gone, not merely unused: `os.link` is never called."""
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+
+    def refuse_link(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the reader must never hard-link a generation")
+
+    monkeypatch.setattr(os, "link", refuse_link)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+
+    for control in (tmp_path / "control", None):
+        with _StableReadonlyDuckDB(
+            database,
+            control_root=control,
+            atomically_published=control is not None,
+        ) as connection:
+            assert connection.execute("SELECT 1").fetchone() == (1,)
+
+
+# ---------------------------------------------------------------------------------------
+# Review MF-3 / SF-1: a write lock is a write lock, and a copy must never serve stale rows
+# ---------------------------------------------------------------------------------------
+
+
+def _write_locked_child(database: Path, ready: Path) -> subprocess.Popen[str]:
+    """Another process holding DuckDB's write lock on `database`, with a row uncommitted.
+
+    This is `rquant-monitor` from 09:25 (#250), which is what the notifier actually meets
+    on the host: `page_projection_database_path` is the production **main** database
+    (`runtime_production_profile.py:1521`), not a replica.
+    """
+
+    import sys
+
+    program = f"""
+import duckdb, pathlib, time
+connection = duckdb.connect({str(database)!r})
+connection.execute("CREATE TABLE IF NOT EXISTS probe (a INTEGER)")
+connection.execute("INSERT INTO probe VALUES (1)")
+connection.execute("CHECKPOINT")
+connection.execute("INSERT INTO probe VALUES (2)")
+pathlib.Path({str(ready)!r}).write_text("held")
+time.sleep(60)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(200):
+        if ready.exists():
+            return child
+        time.sleep(0.05)
+    child.kill()
+    child.communicate()
+    raise AssertionError("the write-lock holder never started")
+
+
+def test_a_write_locked_database_is_reported_as_a_lock_not_as_a_refused_path(
+    tmp_path: Path,
+) -> None:
+    """Review MF-3: #255's message named the wrong cause because two failures were one.
+
+    v0.33.5 reached the fallback through a bare `except Exception`, so "another process
+    holds the write lock" and "this engine does not understand this path" produced the
+    same sentence -- and the window read that sentence as the engine's fault. With the
+    pinned duckdb 1.5.2 the descriptor path is accepted on Linux, so on the host the
+    likelier cause is the lock `rquant-monitor` holds from 09:25 (#250).
+
+    The classifier is fed a real exception from the real engine (the message wording is
+    the whole point), and the reader as a whole is asserted to refuse a write-locked
+    database however it gets there -- which branch raises is a platform fact.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "rquant.duckdb"
+    ready = tmp_path / "held"
+    child = _write_locked_child(database, ready)
+    try:
+        with pytest.raises(Exception) as engine:  # noqa: PT011 - duckdb's own type
+            duckdb.connect(str(database), read_only=True)
+        with pytest.raises(PageProjectionSourceIntegrityError, match="write lock"):
+            _StableReadonlyDuckDB._refuse_if_write_locked(
+                engine.value,
+                opened_path="/proc/self/fd/6",
+            )
+
+        reader = _StableReadonlyDuckDB(
+            database,
+            control_root=tmp_path / "control",
+            atomically_published=True,
+        )
+        with pytest.raises(PageProjectionSourceIntegrityError), reader:
+            pass  # pragma: no cover - the open is what raises
+    finally:
+        child.kill()
+        child.communicate()
+
+    #: and an error that is *not* a lock still falls through to the next opener
+    _StableReadonlyDuckDB._refuse_if_write_locked(
+        RuntimeError("no such file or directory"),
+        opened_path="/dev/fd/6",
+    )
+
+
+def test_a_live_writer_never_gets_a_byte_copy_served_as_a_pinned_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-1: the branch that replaced the hard link must fail closed where it did.
+
+    A hard link shares the inode, so it shared the lock and refused. A byte copy of the
+    main file does not: it opens cleanly and returns the **last checkpoint** -- older rows,
+    with nothing to say they are old. Here the engine is forced to refuse the descriptor
+    path, which is exactly the situation that used to reach the copy.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "rquant.duckdb"
+    ready = tmp_path / "held"
+    child = _write_locked_child(database, ready)
+    try:
+        _engine_that_refuses_descriptors(monkeypatch)
+        reader = _StableReadonlyDuckDB(
+            database,
+            control_root=tmp_path / "control",
+            atomically_published=True,
+        )
+        with pytest.raises(PageProjectionSourceIntegrityError) as raised, reader:
+            pass  # pragma: no cover - the open is what raises
+    finally:
+        child.kill()
+        child.communicate()
+
+    #: either half of the guard is a refusal; what must never happen is a connection
+    assert reader.connection is None
+    assert "write-ahead log" in str(raised.value) or "write lock" in str(raised.value)
+
+
+def test_the_copy_branch_is_off_unless_the_owner_publishes_by_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-1: copying is only safe for an artifact nobody writes in place."""
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "control"
+
+    with _StableReadonlyDuckDB(database, control_root=control) as connection:
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+    #: not stated, not copied
+    assert not control.exists() or not any(control.iterdir())
+
+    reader = _StableReadonlyDuckDB(database, control_root=control, atomically_published=True)
+    with reader:
+        assert reader.opened_through == "copy"
+
+
+def test_a_source_touched_during_the_copy_is_refused_rather_than_served(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-1: an in-place write that leaves the size alone still has to be caught."""
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "control"
+    reader = _StableReadonlyDuckDB(database, control_root=control, atomically_published=True)
+
+    real_copy = _StableReadonlyDuckDB._copy_descriptor
+
+    def copy_then_touch(self: object, destination: Path, *, size: int) -> None:
+        real_copy(self, destination, size=size)
+        #: the same bytes, the same length, a different moment
+        payload = database.read_bytes()
+        database.write_bytes(payload)
+
+    monkeypatch.setattr(_StableReadonlyDuckDB, "_copy_descriptor", copy_then_touch)
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="changed while"), reader:
+        pass  # pragma: no cover - the open is what raises
+    assert not any(control.iterdir())
+
+
+def test_a_source_whose_only_changed_stamp_is_ctime_is_still_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-7: the previous case moved mtime too, so it could not see `st_ctime_ns` work.
+
+    A writer that rewrites a page in place leaves the size and the inode alone, and mtime
+    can be put back -- deliberately by a tool that preserves timestamps, or accidentally
+    by a filesystem whose mtime granularity is coarser than the write. `st_ctime_ns` is
+    the stamp no unprivileged caller can restore, and it is the reason it is in
+    `_copy_identity` at all. Here everything else is held identical and only ctime moves.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    _engine_that_refuses_descriptors(monkeypatch)
+    replica = tmp_path / "data"
+    replica.mkdir()
+    database = replica / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    control = tmp_path / "control"
+    before = database.lstat()
+    reader = _StableReadonlyDuckDB(database, control_root=control, atomically_published=True)
+
+    real_copy = _StableReadonlyDuckDB._copy_descriptor
+
+    def copy_then_move_only_ctime(self: object, destination: Path, *, size: int) -> None:
+        real_copy(self, destination, size=size)
+        #: the same bytes into the same inode, then mtime handed back -- so `st_dev`,
+        #: `st_ino`, `st_size` and `st_mtime_ns` are all exactly what they were
+        database.write_bytes(database.read_bytes())
+        os.utime(database, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    monkeypatch.setattr(_StableReadonlyDuckDB, "_copy_descriptor", copy_then_move_only_ctime)
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="changed while"), reader:
+        pass  # pragma: no cover - the open is what raises
+
+    after = database.lstat()
+    #: the premise of the case: only `st_ctime_ns` moved
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert after.st_ctime_ns != before.st_ctime_ns
+    assert not any(control.iterdir())
+
