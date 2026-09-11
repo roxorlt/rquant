@@ -1410,9 +1410,14 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       mode（0600）与 `.wal` sidecar 两道门，门后紧接着是**整库字节拷贝**，而画像写死
       `snapshot_max_bytes = 8 GiB`、`snapshot_copy_timeout_seconds = 45`。
       **装机前先量一次**：`stat -c %s /home/lighthouse/rquant/data/rquant_ro.duckdb`，
-      **不小于 8 GiB 这个 role 就会继续红**，只是错误换成
-      `reference source database exceeds maximum byte budget`。详见下面「窗口里要预期到的」
-      与 #256（拷贝方式的重做归包 Q）。
+      **量出来不小于 8589934592（8 GiB）这个 role 就会继续红**。
+      门后那段拷贝有三条现成的失败路径，操作员看到的原话各不相同：体量超过 8 GiB 上限是
+      `reference source database exceeds maximum byte budget`；45 秒内拷不完是
+      `reference source snapshot copy deadline expired`；拷贝期间
+      `/home/lighthouse/rquant/data` 的指纹变了（副本同步或 15 分钟备份写了东西）是
+      `reference source database directory changed while snapshotting`。
+      **下一个窗口这个 role 预期仍然是红的**：包 O 与包 P 各自独立把生产副本记成约 10 GB，
+      大于 8 GiB 上限，所以它会以第一条继续红——那是 #256、归包 Q，不是 #250 没修好。
 
     **窗口里要预期到的两件事**：健康载荷的 `status` 仍然是 DEGRADED（`superseded:` 和 `missing:`
     一样会进 `reason`，只要有 reason 就是 DEGRADED）——改进的是「载荷发得出来、serving 不再被一个
