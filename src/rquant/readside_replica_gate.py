@@ -301,20 +301,15 @@ class ReplicaReadGate(Generic[T]):
                 return None
             return max(0, after_bytes - before_bytes)
 
-        #: The open is recorded **before** the loader runs, not after it returns (review
-        #: SF-7). A loader that raises part-way -- the auction-gap publisher's degraded
-        #: branch is reached exactly that way, when the replica is replaced under the read
-        #: -- did open the database and did read bytes, and an iteration summary saying
-        #: `(False, 0)` there would understate the very cost this package exists to count.
-        self._last = ReplicaRead(
-            value=None,  # type: ignore[arg-type]
-            opened=True,
-            generation=current,
-            read_bytes=None,
-        )
         try:
             value = loader()
         except BaseException:
+            #: A loader that raises part-way still opened the database and still read
+            #: bytes (review SF-7). The auction-gap publisher's degraded branch is reached
+            #: exactly that way -- the replica is replaced under the read and the loader's
+            #: own identity check refuses -- and an iteration summary saying `(False, 0)`
+            #: there would understate the very cost this package exists to count. What is
+            #: *not* kept is the answer: `forget()` below, so the next iteration reads.
             self._last = ReplicaRead(
                 value=None,  # type: ignore[arg-type]
                 opened=True,
