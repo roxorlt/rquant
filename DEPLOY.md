@@ -20,6 +20,40 @@
 判据是这四个 role 的心跳在整段窗口里 `replica_opened=false`；出现 `true` 只有两种解释：
 role 进程在这段时间里重启过（看 `started_at`），或者有人手工跑了 `sync-readonly-replica.sh`。
 
+### v0.33.8 合装预期（O + P + Q 三包一起上线，本段取代前面三条各自写的窗口预期）
+
+包 O（#254 #253 #252 #255，本文件 2026-09-09 那一条）、包 P（#250，写在本文件「路线 A 前置」
+一节的第 35 条里）与本包（#256）**在生产上一条都没有单独装过**——路线 A 的基础设施
+2026-09-07 装过（v0.32.2，权威链 sequence 3），生产代码仍停在 v0.28.3 没有切换，
+所以 v0.33.8 是把这三包一次装上去。那三条记录里凡是「装上之后仍然红、要等下一个 issue」的话，
+**对 v0.33.8 都不成立**，以本段为准。
+
+- **`reference-slow.source.v1` 不会再报 `reference source database exceeds maximum byte budget`**：
+  #250 把它的 `database_path` 指到只读副本，本包又把「整库拷进 `PrivateTmp` 再查拷贝」从
+  必经之路降成兜底（Linux 上先用已校验的描述符开库，一个字节都不拷）。
+  **但这不等于承诺它变绿**：它还要过 Tushare 配额、签名凭据、09:25 捕获截止这三关，
+  任何一关不过仍然 DEGRADED，只是 `last_error` 会是那三类之一，不再是字节预算。
+- **`market-minute.source.v1` / `watchlist-quote.source.v1` 那两行作废**：2026-09-09 那条记录
+  写「装上之后盘中仍然每轮红、要等 #250」，理由是 `candidate.auction_gap.v1` 的发布窗口
+  09:26–09:30 整段落在 `rquant-monitor` 的写锁里。#250 已经把它的 `daily_database_path`
+  改到副本，不再撞写锁，所以这条链盘前应当能起来；真起没起，看 09:26–09:30 那一轮
+  `candidate.auction_gap.v1` 有没有发布成功。
+- **`notifier.admin.shadow.v1` 那一行同样作废**：它读的也是副本了，不会再出现
+  「换成 DuckDB 写锁 IOException」那个预期。
+- **25 个 role 的心跳都会多两个键**：`replica_opened` 与 `replica_read_bytes`。
+  不读副本的 21 个 role 两个值都是 `null`，四个读侧 role 才写真值——回滚要挪的是全部 25 个，
+  理由与命令见下一段。
+- **本窗口的验收判据只有一条**：17:00–17:15 之间四个读侧 role 的 `replica_opened` 全部 `false`
+  （副本同步 15:55 → 17:30、备份 15:45 → 17:30，这一段里副本不换代、备份不在跑）。
+  另外顺手记下 **17:30 那一轮 notifier 的 `replica_read_bytes`**，它是 10 GB 副本上一次
+  `minute_coverage` 全表聚合的真值。
+- **已知限制，不是待装项**：`rquant-live-runtime.slice` 上的 `IOWeight=` **在这台主机上不生效**。
+  `/dev/vda` 的调度器是 `mq-deadline`，既没有 `bfq` 也没有配好的 `iocost`
+  （协调者 2026-09-09 23:3x 在云端实测），cgroup v2 的 `io.weight` 没有控制器去执行它。
+  所以 #243 那一包写进 unit 的 `IOWeight` 数值、以及包 Q 报告 §8.2 建议的 `IOWeight=10`，
+  在这台主机上都只是文件里的字——**不要据此以为 I/O 已经被限住**。真要限，走报告 §8.3 的
+  `io.max` 硬上限，而它的取值要先拿上面那个 `replica_read_bytes` 算出来，不能凭直觉取。
+
 **⚠️ 回滚（D-2 那一类，必读）**：本包给心跳**文件模型**加了 `replica_opened` 与
 `replica_read_bytes` 两个字段。`RuntimeServiceHeartbeat` 是 `extra="forbid"` 的，
 `read_heartbeat` 解析失败直接抛 `ValueError: runtime heartbeat is invalid: <service_id>`，
@@ -64,6 +98,10 @@ sudo find "${ROOT}/control" -mindepth 3 -maxdepth 4 -path '*/heartbeats/*.json' 
 ## 2026-09-09 · 待安装 · 第七窗口四缺口（#254 #253 #252 #255）— **装上之后现场仍会红，这是预期**
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**⚠️ 下面这张表的前两行在 v0.33.8 里已经作废**：它写的是「只装本包」的预期，而 #250 与 #256
+现在与本包同一代上线，那两个 source role 与 notifier 不再等 #250。以本文件最上面那一条的
+「v0.33.8 合装预期」为准。
 
 **装上之后当场会看到什么**（不写这一条，窗口当天会被误判成装机失败）：
 
