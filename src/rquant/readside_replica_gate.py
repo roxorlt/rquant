@@ -135,7 +135,13 @@ class ReplicaGeneration:
 
 @dataclass(frozen=True, slots=True)
 class ReplicaRead(Generic[T]):
-    """One iteration's answer, and what it cost."""
+    """One iteration's answer, and what it cost.
+
+    `value` is `None` on the one kind of read that has no answer: the loader raised. That
+    object never leaves `read()` -- the exception does -- but it is what `last_read` and
+    `iteration_summary()` report, because a read that failed part-way still opened the
+    database and still cost what it cost (review SF-7).
+    """
 
     value: T
     #: whether this iteration opened the database, or reused what the last open returned
@@ -240,7 +246,8 @@ class ReplicaReadGate(Generic[T]):
         `(False, 0)` when this iteration never asked -- it opened nothing and read nothing,
         which is a fact rather than an absence. `(False, 0)` again when it asked and
         recognised the generation. `(True, bytes)` when it opened the database, with
-        `bytes` `None` on a platform that will not say (see `_process_read_bytes`).
+        `bytes` `None` on a platform that will not say (see `_process_read_bytes`) --
+        **including when the loader then raised**, because that read still happened.
         """
 
         read = self._last
@@ -287,13 +294,36 @@ class ReplicaReadGate(Generic[T]):
             return read
 
         before_bytes = _process_read_bytes()
-        value = loader()
-        after_bytes = _process_read_bytes()
-        read_bytes = (
-            None
-            if before_bytes is None or after_bytes is None
-            else max(0, after_bytes - before_bytes)
+
+        def measured() -> int | None:
+            after_bytes = _process_read_bytes()
+            if before_bytes is None or after_bytes is None:
+                return None
+            return max(0, after_bytes - before_bytes)
+
+        #: The open is recorded **before** the loader runs, not after it returns (review
+        #: SF-7). A loader that raises part-way -- the auction-gap publisher's degraded
+        #: branch is reached exactly that way, when the replica is replaced under the read
+        #: -- did open the database and did read bytes, and an iteration summary saying
+        #: `(False, 0)` there would understate the very cost this package exists to count.
+        self._last = ReplicaRead(
+            value=None,  # type: ignore[arg-type]
+            opened=True,
+            generation=current,
+            read_bytes=None,
         )
+        try:
+            value = loader()
+        except BaseException:
+            self._last = ReplicaRead(
+                value=None,  # type: ignore[arg-type]
+                opened=True,
+                generation=current,
+                read_bytes=measured(),
+            )
+            self.forget()
+            raise
+        read_bytes = measured()
         after = self._observer(self.path)
         #: cache only what a whole read saw one generation of. A generation that moved
         #: while the loader ran is not refused here -- every one of these loaders has its

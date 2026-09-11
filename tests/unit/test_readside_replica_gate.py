@@ -173,6 +173,57 @@ def test_a_generation_that_moved_under_the_read_is_not_remembered_under_the_old_
     assert loader.calls == 2
 
 
+def test_a_read_that_raised_part_way_still_counts_as_an_open(tmp_path: Path) -> None:
+    """Review SF-7: a loader that fails did open the database, and it did read bytes.
+
+    This is the auction-gap publisher's degraded branch: the replica is replaced under the
+    read, the loader's own identity check refuses, and the iteration reports
+    `auction_gap_input_unavailable`. Saying `(False, 0)` there would understate the cost
+    this package exists to count -- and would hide exactly the iteration an operator wants
+    to see, the one that paid for a read and got nothing.
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    gate: ReplicaReadGate[object] = ReplicaReadGate(replica)
+
+    def failing_loader() -> object:
+        replica.read_bytes()
+        raise RuntimeError("daily snapshot changed while reading")
+
+    gate.begin_iteration()
+    with pytest.raises(RuntimeError, match="changed while reading"):
+        gate.read(failing_loader)
+
+    opened, read_bytes = gate.iteration_summary()
+    assert opened is True
+    assert read_bytes is None or read_bytes >= len(b"generation-one")
+    assert gate.last_read is not None and gate.last_read.value is None
+
+
+def test_a_read_that_raised_is_not_remembered_for_the_next_iteration(
+    tmp_path: Path,
+) -> None:
+    """Reporting the open is not the same as trusting what it returned."""
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    gate: ReplicaReadGate[object] = ReplicaReadGate(replica)
+    loader = _Loader()
+    attempts = {"count": 0}
+
+    def sometimes_failing() -> object:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("torn")
+        return loader()
+
+    with pytest.raises(RuntimeError, match="torn"):
+        gate.read(sometimes_failing)
+    recovered = gate.read(sometimes_failing)
+
+    assert recovered.opened is True
+    assert loader.calls == 1
+
+
 def test_a_replica_that_is_not_there_is_never_remembered(tmp_path: Path) -> None:
     gate: ReplicaReadGate[object] = ReplicaReadGate(tmp_path / "absent.duckdb")
     loader = _Loader()
