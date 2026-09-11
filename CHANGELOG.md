@@ -197,14 +197,20 @@
   `None`——0 是一个断言，不是「没有」。
 
   ③ **notifier 的 `minute_coverage` 由两条全表聚合合成一条**（复审 SF-1）：
-  `GROUP BY GROUPING SETS ((COALESCE(source,'unknown')), ())` 一次 `SEQ_SCAN` 同时算出
-  分组与总计，发布出去的行、值与顺序逐字节相同（空表那一格也一样：`()` 分组集会给一行
-  `COUNT(*)=0`，与改前同一个 `>0` 判据把它丢掉）。这是这一包之后剩下的最大一笔读取直接减半，
-  `PAGE_PROJECTION_CONTRACTS` 一字未改。
+  `GROUP BY GROUPING SETS ((COALESCE(source,'unknown')), ())` 一次扫描同时算出分组与总计，
+  发布出去的行、值与顺序逐字节相同（空表那一格也一样：`()` 分组集会给一行 `COUNT(*)=0`，
+  与改前同一个 `>0` 判据把它丢掉），`PAGE_PROJECTION_CONTRACTS` 一字未改。
+  **收益要照实说**：计划里两个 `SEQ_SCAN` 变成一个，但在本包的度量副本上**读取字节没有变化**
+  （43,790,567 → 43,790,567，A/B 见报告 §2.3.1）——两条聚合跑在同一个连接上，
+  第二条要的块 DuckDB 的 buffer pool 已经持有，从来就没有第二次去问文件系统。
+  10 GB 副本上它省不省，要等主机上 17:30 那一轮心跳里的 `replica_read_bytes` 才知道。
 
-  ⚠️ **回滚要先挪心跳文件**：心跳文件模型是 `extra="forbid"`，旧二进制读不了带这两个新字段的
-  心跳，回滚到 v0.33.7 或更早之前必须先停这四个 role、把它们的心跳挪走，命令见 `DEPLOY.md`
-  最上面那一条。已发布投影没变，serving 一侧不需要任何回滚动作。
+  ⚠️ **回滚要先挪心跳文件，而且是全部 25 个 role 的**：心跳用
+  `model_dump(mode="json")` 整个序列化、没有 `exclude_none`，所以**每个** role 的心跳里都有
+  `"replica_opened":null,"replica_read_bytes":null`，而文件模型是 `extra="forbid"`，
+  旧二进制一个都读不了。回滚到 v0.33.7 或更早之前必须先停 role、把
+  `$ROOT/control/*/*/heartbeats/*.json` 整批挪走，命令见 `DEPLOY.md` 最上面那一条。
+  已发布投影没变，serving 一侧不需要任何回滚动作。
 
   ⚠️ **`deploy/systemd/` 一个字没改**：gate 记在内存里，四个 role 谁都不需要新的可写路径。
   这一包给出的 `IOWeight` / `io.max` 建议值见 `pkgQ-report.md`，装机由 owner 单独授权。

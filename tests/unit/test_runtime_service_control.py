@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -742,6 +743,34 @@ def test_a_failed_iteration_does_not_keep_the_previous_read_s_numbers(
 
     assert failed.replica_opened is None
     assert failed.replica_read_bytes is None
+
+
+def test_a_role_with_no_replica_still_writes_both_keys_as_null(tmp_path: Path) -> None:
+    """Review MF-3: this is why the rollback moves **every** role's heartbeat, not four.
+
+    Heartbeats are serialized with a plain `model_dump(mode="json")` -- no `exclude_none`
+    -- so the two fields appear in the file for all 25 roles, as `null` for the 21 that
+    never touch the replica. The file model is `extra="forbid"` and `read_heartbeat`
+    raises rather than degrades, so a binary from before this package refuses every one of
+    those files, not just the four read-side ones. `DEPLOY.md`'s D-2 step moves them all.
+    """
+
+    control = RuntimeServiceControl(
+        tmp_path, spec=_spec("market-minute.source.v1"), clock=lambda: NOW
+    )
+    control.start()
+    try:
+        control.record_success(RuntimeStepResult(processed_count=1))
+    finally:
+        control.stop(reason="test complete")
+
+    written = next((tmp_path / "heartbeats").glob("*.json"))
+    payload = json.loads(written.read_text(encoding="utf-8"))
+
+    assert "replica_opened" in payload
+    assert "replica_read_bytes" in payload
+    assert payload["replica_opened"] is None
+    assert payload["replica_read_bytes"] is None
 
 
 def test_a_negative_read_is_refused() -> None:

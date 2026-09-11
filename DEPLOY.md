@@ -24,32 +24,36 @@ role 进程在这段时间里重启过（看 `started_at`），或者有人手�
 `replica_read_bytes` 两个字段。`RuntimeServiceHeartbeat` 是 `extra="forbid"` 的，
 `read_heartbeat` 解析失败直接抛 `ValueError: runtime heartbeat is invalid: <service_id>`，
 所以**新二进制读旧心跳没问题，旧二进制读新心跳会拒**——与 #231/#232、#216 完全同一类。
-**回滚到 v0.33.7 或更早之前，先停 unit、再把这四个 role 的心跳文件挪走**：
+
+**要挪的是全部 25 个 role 的心跳，不是读副本的那四个。** 心跳是
+`heartbeat.model_dump(mode="json")` 整个序列化的，**没有 `exclude_none`**
+（`runtime_service_control.py`），所以**每一个 role 的心跳文件里都会出现**
+`"replica_opened":null,"replica_read_bytes":null`——不读副本的那 21 个也一样，只是值是
+`null`。旧二进制的 `extra="forbid"` 对 `null` 同样拒。**漏挪任何一个 role 的心跳，
+那个 role 就起不来。**（用例
+`test_a_role_with_no_replica_still_writes_both_keys_as_null` 把这条钉死。）
+
+**回滚到 v0.33.7 或更早之前，先停所有 runtime role、再整批挪心跳**，与 #231/#232 那一条同形：
 
 ```bash
-# ① 先停这四个 role（模板 unit 没有 enable，stop 即回到未运行）
-sudo systemctl stop 'rquant-runtime-notifier@*.service' \
-     'rquant-runtime-reference-slow-source@*.service' \
-     'rquant-runtime-auction-universe@*.service' \
-     'rquant-runtime-candidate@*.service'
+# ① 停所有 runtime role（模板 unit 没有 enable，stop 即回到未运行）
+sudo systemctl stop 'rquant-runtime-*.service' 'rquant-page-control.service' \
+     'rquant-artifact-retention.service'
 
-# ② 把这四个 role 的心跳挪走（instance 目录名是 svc-<service_id 的 sha256>）
+# ② 整批挪走心跳——**所有 role**，不是四个
 ROOT=/home/lighthouse/rquant/data/runtime
 STAMP=$(date +%Y%m%d-%H%M%S)
 sudo install -d -m 0700 "/home/lighthouse/rquant-heartbeats-aside-${STAMP}"
-for sid in notifier.admin.shadow.v1 reference-slow.source.v1 \
-           auction-universe.publisher.v1 candidate.auction_gap.v1; do
-  inst="svc-$(printf %s "$sid" | sha256sum | cut -d' ' -f1)"
-  sudo find "${ROOT}/control" -mindepth 2 -maxdepth 4 -path "*/${inst}/heartbeats/*.json" \
-       -exec mv -t "/home/lighthouse/rquant-heartbeats-aside-${STAMP}/" {} +
-done
+sudo find "${ROOT}/control" -mindepth 3 -maxdepth 4 -path '*/heartbeats/*.json' \
+     -exec mv -t "/home/lighthouse/rquant-heartbeats-aside-${STAMP}/" {} +
 
 # ③ 再按 scripts/deploy-production.sh --target <上一个 tag> 常规回滚
 ```
 
-**挪走的文件留档不要删**。稳妥起见也可以直接沿用 #231/#232 那一条的做法，把
-`$ROOT/control/*/*/heartbeats/*.json` 整批挪走——多挪几个 role 的心跳没有副作用，
-下一次 `start()` 会重新写；漏挪这四个里的任何一个，旧二进制起不来。
+**挪走的文件留档不要删**，下一次 `start()` 会重新写。四个读侧 role
+（`notifier.admin.shadow.v1`、`reference-slow.source.v1`、`auction-universe.publisher.v1`、
+`candidate.auction_gap.v1`）当然也在这一批里——它们只是唯一会写**非 `null`** 值的四个，
+不是唯一需要挪的四个。
 
 **已发布投影没有变化**：`RuntimeServiceHeartbeatProjection` 一字未改，
 `runtime.serving.runtime-health` 仍是 v0.33.1 的九个字段（#237），所以
