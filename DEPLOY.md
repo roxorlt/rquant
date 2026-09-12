@@ -29,6 +29,14 @@
 不是残留——它自己会在通知状态下一次修订时改写。
 **顺手记一条数**：失败轮（如果还有）的 `replica_opened` 应当是 `true` 而不是 `null`。
 
+**协调者裁定（裁决 27）**：复审提出的「携带下来的指针不在本代 commit 下重新发布一次」这个
+判断，协调者予以维持——重新发布会推进 publication id 与 generation_id，等于把一次发版记成
+一次数据事件，而带审计的接管只有显式配置的 `serving_previous_producer_commit` 这一条路
+（它会记 `record_serving_authority_handoff` 并推进 sequence），这条显式覆盖保持不变；另外
+三个读侧 role（`reference-slow.source.v1`、`auction-universe.publisher.v1`、
+`candidate.auction_gap.v1`）失败轮的 `replica_opened` / `replica_read_bytes` 仍然是 `null`，
+那是另开 issue 跟进的事，不属于本包。
+
 **回滚**：与 v0.33.8 同一条路径，心跳字段没有新增，所以**不需要额外挪心跳**——
 回滚到 v0.33.7 或更早仍然适用 2026-09-10 那一条写的整批挪心跳步骤。
 
