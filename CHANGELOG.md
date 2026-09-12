@@ -151,6 +151,37 @@
 
 ### Fixed
 
+- **另外三个读侧 role 的失败轮也如实报告它对只读副本做了什么（#261）**：
+  #260 只把这条规则接到了 notifier 身上，`reference-slow.source.v1`、
+  `candidate.auction_gap.v1`、`auction-universe.publisher.v1` 的失败轮心跳里
+  `replica_opened` / `replica_read_bytes` 仍然是 `null`。三个 role 都是先读副本再做别的事——
+  参考数据捕获在第一次调用数据源之前就读完了副本，竞价全集在写权威之前先扫 `daily_bar`，
+  竞价缺口发布在 09:26–09:30 窗口里读——所以失败的那一轮往往正是**已经付过开库代价**的那一轮，
+  运维在交易日看到一条降级心跳却分辨不出这一轮有没有读那个约 10 GB 的副本。
+  现在三个 role 的 step 各自把自己 gate 的 `iteration_summary` 挂到 step 上（与 #260 给 notifier
+  的接法逐字一致），主循环在失败路径上取它：**没问过 gate 报 `(False, 0)`，开过库报
+  `(True, 字节)`**，loader 读到一半抛出的仍然算一次 open；没有副本可读的 role
+  （两个文档驱动的候选策略）两个字段仍然是 `null`，不是伪造的零。**没有新增任何心跳字段。**
+
+- **配额账本每次操作用完就关连接，不再等垃圾回收（#245）**：
+  `SourceQuotaStore._connect()` 返回的是 `sqlite3.Connection`，而调用点一律写成
+  `with self._connect() as connection:`——那个上下文管理器只提交或回滚，**不关闭**。
+  在 `reference-slow.source.v1` 这种整天常驻的 role 里，句柄就按操作次数一路堆着，
+  直到垃圾回收器收走它；回收那一刻触发的 checkpoint 会删掉
+  `live/reference-slow/quota.sqlite3` 的 `-wal` / `-shm` 边车文件，时刻不属于任何一次操作——
+  包 L 的沙箱 e2e 最初就把这一下误读成 `reference_slow_publisher` 的一次越权写。
+  25 个调用点（账本里 15 个、直接伸手进来的权威里 10 个）改走新的 `_transaction()` 上下文
+  管理器：提交/回滚语义原样保留，`finally` 里关闭。`_connect()` 保留为底层打开函数。
+
+- **`signal_family_recompute_expectations.py --write` 一条命令跑完三件事（#244）**：
+  它先写 R07 policy，再调 `scripts/full_suite_shards.py generate --expected-skips`，
+  而 `generate` 这个子命令根本不接受这个参数，argparse 直接退出——清单没重生成，
+  `tests/unit/test_assert_full_suite_shards.py` 里冻结的 `cases` 字面量也没回填，
+  工作树被改了一半。skip 数从来就不该由调用方传：`write_manifest_bundle` 自己从清单目录里的
+  approved skip map 推导它、并把那份 map 的摘要记在旁边，传进去的数字只可能与之打架。
+  这个参数从 generate 调用与本脚本自己的解析器里一并删除，`--write` 现在一次跑完
+  policy、清单、字面量三件事。
+
 - **`notifier.admin.shadow.v1` 换代之后不再拒收自己上一代写的 serving 指针（#260）**：
   第八个路线 A 窗口（09-12 09:19，v0.33.8，权威链 sequence 6）把第七代 bundle
   （`9eece6ad…`，producer_commit `1025b12`）装到第六代（`1aebc325…`，`3cdfa22`）之上以后，
@@ -170,6 +201,11 @@
   两头自证），就接受并携带，**其余一律按原样拒绝、措辞一字未改**。与 serving 不同的是
   notifier 有权改写这个指针，它会在自己下一次发布时改写——通知状态一有新修订就发生。
   这一轮继承了哪一代的指针，会像 serving 那样写进心跳的 `generation_events`。
+  **与显式接管的优先级（包 R 复审 SF-1）**：显式配置的 `serving_previous_producer_commit`
+  优先于这条 lineage——它是运维点名「从这一代接管」的指令，会记一条
+  `record_serving_authority_handoff` 审计行、推进 sequence 并用本代 commit 重发指针；
+  lineage 只是接受并携带，什么也不记。所以配了这个 commit 时主读者**不再拿到** lineage 判定，
+  走的就是接管那条路。生产画像里从来没有配过它，所以生产行为不变。
 
 - **失败的那一轮也如实报告它对只读副本做了什么（#260 附带）**：
   `record_failure` 原先无条件写 `replica_opened=null`，理由是「抛异常的一轮没读完」。
