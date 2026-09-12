@@ -151,6 +151,36 @@
 
 ### Fixed
 
+- **`notifier.admin.shadow.v1` 换代之后不再拒收自己上一代写的 serving 指针（#260）**：
+  第八个路线 A 窗口（09-12 09:19，v0.33.8，权威链 sequence 6）把第七代 bundle
+  （`9eece6ad…`，producer_commit `1025b12`）装到第六代（`1aebc325…`，`3cdfa22`）之上以后，
+  notifier 每 2 秒 DEGRADED 一次，报
+  `ServingSourceAuthorityIntegrityError: current pointer producer_commit does not match expected commit`。
+  signals 这份 serving 权威归 notifier 自己所有，它既发布也读取；而**发布新一代 bundle
+  并不会重写 `current.json`**，所以换代之后盘上那个指针仍然带着上一代的 producer_commit，
+  新一代的读者拿自己的 commit 去比，比不上就拒。失败是静默的（降级、留在主循环里、
+  没有 `OnFailure`、零推送），而且在 serving 发布出第七代指针之前 notifier 一张页面投影也不产出——
+  交易日 09:30 之后能自愈，跨周末则整段红。
+
+  这和 #253 是同一个形状的第二个读者。包 O（PR #257）已经把
+  `runtime_generation_lineage.producer_commit_lineage` 这个共用判定给了 `serving.publisher.v1`
+  ——它读的就是同一个文件。这一包不新造第二套判定，而是把同一个判定接到 notifier 的读者上：
+  指针的 producer_commit 只要能在本 runtime root 的代际树里追溯到一代**我们自己装过的**
+  （目录名 = 自身 basis 的 `canonical_sha256`，basis 记着这一服务 manifest 的 sha256，
+  两头自证），就接受并携带，**其余一律按原样拒绝、措辞一字未改**。与 serving 不同的是
+  notifier 有权改写这个指针，它会在自己下一次发布时改写——通知状态一有新修订就发生。
+  这一轮继承了哪一代的指针，会像 serving 那样写进心跳的 `generation_events`。
+
+- **失败的那一轮也如实报告它对只读副本做了什么（#260 附带）**：
+  `record_failure` 原先无条件写 `replica_opened=null`，理由是「抛异常的一轮没读完」。
+  对 notifier 不成立：它的**每一条返回路径都先发布页面投影、再碰 serving 权威**，所以
+  #260 里失败的每一轮**都已经打开并读过那个约 10 GB 的副本**，心跳却说「说不上来」。
+  现在主循环在失败路径上从 step 身上取这一轮的 gate 摘要（与 `generation_events` 同一种取法）
+  交给 `record_failure`，包 Q 的 MF-1 规则因此也覆盖到失败轮：**没问过 gate 报 `(False, 0)`，
+  开过库报 `(True, 字节)`**，loader 读到一半抛出的仍然算一次 open（包 Q SF-7）。
+  不读副本的 role、以及探针自身抛异常的情况，两个字段仍然是 `null`——代价是诊断，
+  不能顶替正在被记录的那个失败。**没有新增任何心跳字段**，两个键都是 #256 已经加过的。
+
 - **读侧 role 不再每一轮读 10 GB 副本，`reference-slow.source.v1` 不再整库拷贝（#256）**：
   09-08 与 09-09 两次 17:00 日线在 `daily_state` 阶段卡住（主线程 D 状态、DuckDB 线程等磁盘），
   停掉 runtime unit 后一分钟内就跑完；09-09 主机还有 9 GB 空闲内存，**约束是页缓存与磁盘带宽，

@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-09-12 · 待安装 · notifier 接受自己上一代的 serving 指针（#260）
+
+**状态**：**尚未安装**，而且**装机时机由协调者决定**——**不早于 2026-09-14（周一）跨交易日
+观察结束**。本条是安装前必读，不是部署记录。
+
+**要修的现象**：第八个窗口（09-12 09:19，v0.33.8，权威链 sequence 6，第六代 `1aebc325…`
+→ 第七代 `9eece6ad…`）之后 `notifier.admin.shadow.v1` 每 2 秒 DEGRADED，报
+`ServingSourceAuthorityIntegrityError: current pointer producer_commit does not match expected commit`。
+静默、零推送，serving 发布出第七代指针之前它一张页面投影也不产出。
+
+**这一包做了什么**：notifier 读 signals 那份 serving `current` 指针时，改用包 O 给
+`serving.publisher.v1` 的同一个 `producer_commit_lineage` 判定——指针的 producer_commit
+能在本 runtime root 的代际树里追溯到我们自己装过的一代就接受并携带，其余仍然拒绝、措辞不变。
+另外失败的那一轮也会把这一轮的副本代价写进心跳（`replica_opened` / `replica_read_bytes`
+是 #256 已有的两个键，**没有新增字段**）。`deploy/`、unit 文件、发布原语一个字未改。
+
+**装上之后该看到什么**：notifier 的 `last_error` 里不再出现
+`current pointer producer_commit does not match expected commit`；这一轮继承了哪一代的指针
+写在心跳的 `generation_events` 里，形如
+`serving source authority signals: current pointer of generation <64 位> carried across`；
+盘上的 `current.json` 在 notifier 下一次真正发布之前**仍然带着上一代的 commit**，这是预期，
+不是残留——它自己会在通知状态下一次修订时改写。
+**顺手记一条数**：失败轮（如果还有）的 `replica_opened` 应当是 `true` 而不是 `null`。
+
+**回滚**：与 v0.33.8 同一条路径，心跳字段没有新增，所以**不需要额外挪心跳**——
+回滚到 v0.33.7 或更早仍然适用 2026-09-10 那一条写的整批挪心跳步骤。
+
+---
+
 ## 2026-09-10 · 待安装 · 读侧 role 的 I/O 代价（#256）— **回滚前必须先挪心跳文件**
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。
