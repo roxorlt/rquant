@@ -278,6 +278,16 @@ class NotifierSettings(RuntimeContractModel):
         max_length=16_384,
     )
     page_projection_canvas_previous_public_key_pems: Mapping[str, str] = Field(default_factory=dict)
+    #: An operator naming the exact generation whose signals pointer this one takes over.
+    #: It **wins over the lineage** #260 gave this role: a configured takeover is an
+    #: instruction to take the pointer and record having done so -- it writes a
+    #: `record_serving_authority_handoff` row, advances the sequence and republishes the
+    #: pointer under this commit -- while the lineage silently accepts a carried pointer
+    #: and leaves it as it is. Letting the lineage answer first would swallow the
+    #: instruction along with its audit row (package R review SF-1), so when this is set
+    #: the primary reader is not given the lineage predicate at all and the takeover
+    #: branch is the one that runs. Unset -- which is every production profile -- the
+    #: lineage is what answers.
     serving_previous_producer_commit: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{40}$",
@@ -922,14 +932,21 @@ def notifier_builder(
             # generation installed under this runtime root is still refused, unchanged.
             # Unlike serving, this role may rewrite the pointer -- and does, on its own next
             # publish, as soon as its notification state revises.
+            # An explicitly configured takeover outranks the lineage: it is an operator
+            # naming one generation to take over from, and it is the only path that writes
+            # the handoff row. See `serving_previous_producer_commit` for the whole rule.
             authority_reader = ServingSourceAuthorityReader(
                 root=settings.serving_authority_root,
                 expected_producer_commit=manifest.producer_commit,
                 expected_dataset_id=_SIGNALS_DATASET_ID,
                 expected_payload_kind="signal_delivery",
-                previous_generation_of_producer_commit=producer_commit_lineage(
-                    runtime_root,
-                    service_id=manifest.service_id,
+                previous_generation_of_producer_commit=(
+                    None
+                    if settings.serving_previous_producer_commit is not None
+                    else producer_commit_lineage(
+                        runtime_root,
+                        service_id=manifest.service_id,
+                    )
                 ),
             )
             build_events = tuple(
