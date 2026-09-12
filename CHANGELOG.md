@@ -151,6 +151,40 @@
 
 ### Fixed
 
+- **`signal_router` 不再把「策略干净停机留下的 runner 库」判成损坏（#263）**：
+  第九个路线 A 窗口（09-12，v0.33.9，权威链 sequence 7）里三条策略 18:22–18:23 被干净停机
+  （runbook R-29 的阻塞式 `systemctl stop`），router 18:33 起来，18:43:38 退 1，报
+
+      sqlite3.OperationalError: unable to open database file
+      ValueError: runner source schema is unavailable
+
+  `OnFailure=rquant-alert@%n.service` 因此**发出一条真实推送**（2/3 通道），`Restart=` 在
+  18:43:52 把它拉回来（`NRestarts=1`），而两条策略的首轮直到 18:44:35 / 18:44:44 才轮换重建
+  runner——也就是说，router 只要再等一轮就好了。
+
+  成因是 SQLite 的写法而不是数据坏了：`runner.sqlite3` 是 WAL 库，干净关闭会做 checkpoint 并
+  删掉 `-wal`/`-shm`；而**只读打开一个 WAL 库需要创建 `-shm`（wal-index）**，
+  `deploy/systemd/rquant-runtime-signal-router@.service` 把 `live/strategies` 挂成只读，
+  这一步做不了。SQLite 对此报 `unable to open database file`——真故障报的也是这一句，
+  接口上分不出来。第八个窗口没撞上，只是因为第六代 runner 是被 SIGKILL 掉的，sidecar 还在。
+
+  「所有者没在跑」这件事，在这个平面上一直是**等待**而不是拒绝：runner 文件不存在是等待
+  （#232），runner 还带着我们自己上一代的身份是等待（#248），策略看一个停机的 paper broker
+  台账是等待（#252，包 O）。这一包把 #252 那个判定从 `strategy_paper_lifecycle.py` 抽到
+  `runtime_peer_artifacts` 的 `is_dormant_wal_database` / `dormant_wal_peer_wait`，
+  **两个读者用同一条规则**（不造第二套，否则日后放宽了一侧，另一侧的用例发现不了）。
+  router 现在对这个形状抛 `PeerArtifactUnavailableError`，心跳的 `waiting_for` 指向那份
+  runner、状态 DEGRADED、不退避，下一轮重试。
+
+  **放宽的只有这一个形状**：库头必须真是 SQLite 的、必须真写着 WAL、两个 sidecar 必须真的都
+  不在、目录必须真的是本进程写不了的，异常也必须真是 `OperationalError`。库头坏了、截断了、
+  是回滚日志、sidecar 还在、目录本进程写得了、库头读不出来，以及带着 sidecar 但 schema 不对的
+  runner，**全部照旧失败关闭，措辞一字未改**（仍是 `runner source schema is unavailable`）。
+  判定**不看错误消息**：同一个状态在 macOS 上报的是 `attempt to write a readonly database`，
+  在主机上报的是 `unable to open database file`。
+
+  `deploy/`、unit 文件、发布原语、已发布字段一个字未改。装机前的缓解写在 DEPLOY.md（runbook R-31）。
+
 - **`notifier.admin.shadow.v1` 换代之后不再拒收自己上一代写的 serving 指针（#260）**：
   第八个路线 A 窗口（09-12 09:19，v0.33.8，权威链 sequence 6）把第七代 bundle
   （`9eece6ad…`，producer_commit `1025b12`）装到第六代（`1aebc325…`，`3cdfa22`）之上以后，

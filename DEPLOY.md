@@ -5,6 +5,55 @@
 
 ---
 
+## 2026-09-12 · 待安装 · signal_router 等一条干净停机的策略，而不是退 1（#263）
+
+**状态**：**尚未安装**。随 **v0.33.10**（与包 S 同批）在协调者定的窗口装机。本条是安装前必读，
+不是部署记录。
+
+**要修的现象**：第九个窗口（09-12，v0.33.9 = `7947eae`，权威链 sequence 7，主机 82.156.0.68）里
+三条策略 18:22–18:23 按 R-29 干净停机，`rquant-runtime-signal-router@svc-c2d756ee…` 18:33 起来，
+**18:43:38 退 1**：
+
+```
+sqlite3.OperationalError: unable to open database file
+ValueError: runner source schema is unavailable
+```
+
+`OnFailure` 因此**发出一条真实推送**（18:43:45，2/3 通道），`Restart=` 18:43:52 拉回来
+（`NRestarts=1`），此后一直正常。两条策略的首轮 18:44:35 / 18:44:44 才轮换重建 runner——
+router 只要再等一轮就好。
+
+**成因**：`runner.sqlite3` 是 WAL 库，SQLite 干净关闭会 checkpoint 并删掉 `-wal`/`-shm`；
+**只读打开一个 WAL 库需要创建 `-shm`**，而 router 的 unit 把 `live/strategies` 挂成只读，
+这一步做不了。第八个窗口没撞上，只因为第六代 runner 是 09-09 被 SIGKILL 的，sidecar 还留着。
+
+**这一包做了什么**：这个形状改判为**等待 peer**（`PeerArtifactUnavailableError`），
+心跳 `waiting_for` 指向那份 runner、状态 DEGRADED、不退避、下一轮重试，**不再退出、不再推送**。
+判定与包 O 给 #252（策略看停机的 paper broker 台账）的是**同一个**，已抽到
+`runtime_peer_artifacts.is_dormant_wal_database` / `dormant_wal_peer_wait`，两个读者共用。
+带着 sidecar 但不合法的 runner（schema 错、库头坏、截断）**照旧失败关闭，措辞一字未改**。
+`deploy/`、unit 文件、发布原语、心跳字段一个字未改。
+
+**装机前的缓解（runbook R-31）**：滚动重启时，**先起 router、再停策略**；如果已经把策略停了，
+就等三条策略的 `runner.sqlite3-shm` 都出现（各自首轮跑完）之后再起 router：
+
+```bash
+ls -l /home/lighthouse/rquant/data/runtime/live/strategies/*/runner.sqlite3-shm
+```
+
+三条都在才起 `rquant-runtime-signal-router@*`。**不要指望 SIGKILL 留下的 sidecar**——
+那是第八个窗口侥幸没红的原因，不是一条可依赖的性质。
+
+**装上之后该看到什么**：同样的顺序（策略先停、router 后起）下，router **进主循环不再退出**，
+心跳 `status=degraded`、`waiting_for` 是那份 runner 的绝对路径、`last_error` 里带
+`-wal/-shm`；策略首轮跑完 sidecar 回来之后，下一轮 `waiting_for` 变 `null`、`last_error` 变
+`null`、`total_successes` 开始涨。**判据是这段时间 `OnFailure` 零推送。**
+
+**回滚**：与 v0.33.9 同一条路径，**没有新增心跳字段**，所以不需要额外挪心跳；回滚到 v0.33.7
+或更早仍然适用 2026-09-10 那一条写的整批挪心跳步骤。
+
+---
+
 ## 2026-09-12 · 待安装 · notifier 接受自己上一代的 serving 指针（#260）
 
 **状态**：**尚未安装**，而且**装机时机由协调者决定**——**不早于 2026-09-14（周一）跨交易日
