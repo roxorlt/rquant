@@ -254,6 +254,9 @@ class RoleRun:
         self.last_error: str | None = None
         #: the peer artifact this role's last iteration was waiting on, if it was (#232)
         self.waiting_for: str | None = None
+        #: what this role's last iteration did with the read-only replica (#256, #260)
+        self.replica_opened: bool | None = None
+        self.replica_read_bytes: int | None = None
         self.refusal: BaseException | None = None
         self.traceback: str | None = None
         #: writes the host would refuse because they are outside the runtime root
@@ -367,6 +370,8 @@ def run_role(
             run.status = heartbeat.status.value
             run.last_error = heartbeat.last_error
             run.waiting_for = heartbeat.waiting_for
+            run.replica_opened = heartbeat.replica_opened
+            run.replica_read_bytes = heartbeat.replica_read_bytes
     return run
 
 

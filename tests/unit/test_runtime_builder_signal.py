@@ -1251,6 +1251,297 @@ def test_notifier_rejects_authority_takeover_from_unlisted_commit(tmp_path: Path
         next_step()
 
 
+# ---------------------------------------------------------------------------------------
+# #260: the signals pointer this role's own previous generation left on disk
+# ---------------------------------------------------------------------------------------
+
+
+#: the service id `_bundle_inputs` installs a notifier under, so the generation tree the
+#: installer writes carries a manifest keyed by exactly this name
+INSTALLED_NOTIFIER_SERVICE = "notifier-admin"
+SECOND_COMMIT = "b" * 40
+
+
+@pytest.fixture
+def sealed_bundle_installs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The installer's credential sealing, stubbed the way its own module stubs it.
+
+    Requested rather than imported: `isolated_root_credential_sealer` is autouse in its
+    home module and importing it would make it autouse for this whole file.
+    """
+
+    from tests.unit.test_runtime_deployment_bundle import (
+        _CredentialRecoveryStub,
+        _CredentialTransactionStub,
+    )
+
+    monkeypatch.setattr(
+        "rquant.runtime_deployment_bundle._recover_runtime_credentials",
+        lambda **_kwargs: _CredentialRecoveryStub(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "rquant.runtime_deployment_bundle._seal_runtime_credentials",
+        lambda credentials: _CredentialTransactionStub(dict(credentials)),
+    )
+
+
+@pytest.fixture
+def two_notifier_generations(tmp_path: Path, sealed_bundle_installs: None) -> Path:
+    """A runtime root the installer really wrote twice, `a…` then `b…`.
+
+    The lineage reads the generation tree, not a fixture: each directory is named by
+    `canonical_sha256` of its own basis and the basis records the sha256 of the manifest it
+    installed for this service, so what these tests exercise is the same evidence the host
+    has after a release.
+    """
+
+    from tests.unit.test_runtime_deployment_bundle import (
+        _bundle_inputs,
+        install_runtime_deployment_bundle,
+    )
+
+    root = tmp_path / "runtime"
+    for commit in (COMMIT, SECOND_COMMIT):
+        manifests, capabilities = _bundle_inputs(root)
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=commit,
+            manifests=tuple(
+                manifest.model_copy(update={"producer_commit": commit})
+                for manifest in manifests
+            ),
+            capability_env=capabilities,
+        )
+    return root
+
+
+def _installed_notifier_manifest(tmp_path: Path, **overrides: object) -> RuntimeServiceManifest:
+    """This generation's notifier manifest, under the service id the bundle installed."""
+
+    return _notifier_manifest(tmp_path, **overrides).model_copy(
+        update={
+            "service_id": INSTALLED_NOTIFIER_SERVICE,
+            "producer_commit": SECOND_COMMIT,
+        }
+    )
+
+
+def _publish_previous_generation_pointer(authority_root: Path) -> str:
+    """`current.json` as the previous generation's notifier left it -- written by that role.
+
+    Running the builder under the older commit is what makes this the real thing rather
+    than a hand-rolled pointer: the bytes on disk are the bytes the role publishes.
+    """
+
+    previous_step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _installed_notifier_manifest(
+            authority_root.parent,
+            serving_authority_root=str(authority_root),
+        ).model_copy(update={"producer_commit": COMMIT})
+    )
+    previous_step()
+    return (authority_root / "current.json").read_text(encoding="utf-8")
+
+
+def test_notifier_carries_the_signals_pointer_its_previous_generation_published(
+    tmp_path: Path,
+    two_notifier_generations: Path,
+) -> None:
+    """#260: the eighth window's failure, in the world that produces it.
+
+    The signals authority belongs to this role, and a release does not republish it: after
+    the handover `current.json` still carries the previous generation's commit, and
+    comparing it against this one took `notifier.admin.shadow.v1` DEGRADED every two
+    seconds. `serving.publisher.v1` reads the very same file and was given this predicate
+    in #253; the notifier now asks the same question of the same generation tree.
+    """
+
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    pointer = _publish_previous_generation_pointer(authority_root)
+    assert COMMIT in pointer
+
+    manifest = _installed_notifier_manifest(
+        tmp_path,
+        serving_authority_root=str(authority_root),
+    )
+    blind = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW + timedelta(seconds=1),
+    )(manifest)
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="producer_commit"):
+        blind()
+
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW + timedelta(seconds=1),
+        runtime_root=two_notifier_generations,
+    )(manifest)
+    result = step()
+
+    assert len(result.source_generations["signals_serving_authority"]) == 64
+    assert result.degraded_reasons == ()
+
+
+def test_notifier_still_refuses_a_signals_pointer_from_no_generation_of_ours(
+    tmp_path: Path,
+    two_notifier_generations: Path,
+) -> None:
+    """The other half: only our own past is carried, and the refusal is word for word."""
+
+    from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
+    from rquant.runtime_serving_snapshot import SignalDeliveryPayload, SourceReadResult
+    from rquant.serving_contracts import FreshnessStatus
+
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    values: dict[str, object] = {
+        "dataset_id": SIGNALS_DATASET_ID,
+        "sequence": 1,
+        "event_time": NOW,
+        "published_at": NOW,
+        "status": FreshnessStatus.FRESH,
+        "reason": None,
+        "payload": SignalDeliveryPayload(),
+    }
+    from rquant.runtime_contracts import canonical_sha256
+
+    values["generation_id"] = canonical_sha256(values)
+    ServingSourceAuthorityPublisher(
+        root=authority_root,
+        producer_commit="e" * 40,
+        dataset_id=SIGNALS_DATASET_ID,
+        payload_kind="signal_delivery",
+        clock=lambda: NOW,
+    ).publish(SourceReadResult.model_validate(values))
+
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW + timedelta(seconds=1),
+        runtime_root=two_notifier_generations,
+    )(
+        _installed_notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+        )
+    )
+
+    with pytest.raises(
+        ServingSourceAuthorityIntegrityError,
+        match="current pointer producer_commit does not match expected commit",
+    ):
+        step()
+
+
+def test_a_runtime_root_that_cannot_say_leaves_the_notifier_exactly_as_strict(
+    tmp_path: Path,
+) -> None:
+    """Route B publishes no legacy bundle at all, and a bare build has no root either."""
+
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    _publish_previous_generation_pointer(authority_root)
+
+    for runtime_root in (None, tmp_path / "not-a-runtime-root"):
+        step = notifier_builder(
+            provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+            clock=lambda: NOW + timedelta(seconds=1),
+            runtime_root=runtime_root,
+        )(
+            _installed_notifier_manifest(
+                tmp_path,
+                serving_authority_root=str(authority_root),
+            )
+        )
+        with pytest.raises(ServingSourceAuthorityIntegrityError, match="producer_commit"):
+            step()
+
+
+def test_the_notifier_run_says_which_generations_pointer_it_inherited(
+    tmp_path: Path,
+    two_notifier_generations: Path,
+) -> None:
+    """The handover is stamped on the run rather than left invisible, as serving stamps it."""
+
+    from rquant.runtime_generation_lineage import load_runtime_generation_tree
+
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    manifest = _installed_notifier_manifest(
+        tmp_path,
+        serving_authority_root=str(authority_root),
+    )
+
+    def build() -> object:
+        return notifier_builder(
+            provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+            clock=lambda: NOW + timedelta(seconds=1),
+            runtime_root=two_notifier_generations,
+        )(manifest)
+
+    #: nothing published yet, so there is nothing to have inherited
+    assert getattr(build(), "generation_events", ()) == ()
+
+    _publish_previous_generation_pointer(authority_root)
+    lineage = load_runtime_generation_tree(two_notifier_generations).lineage(
+        INSTALLED_NOTIFIER_SERVICE
+    )
+    events = getattr(build(), "generation_events", ())
+
+    assert len(events) == 1
+    assert lineage.previous[0].generation_id in events[0]
+    assert SIGNALS_DATASET_ID in events[0]
+
+
+def test_a_failing_notifier_iteration_still_says_what_it_did_with_the_replica(
+    tmp_path: Path,
+) -> None:
+    """#260's side observation: the failing round had opened the replica and said `null`.
+
+    The page projection is published before the serving authority on every return path, so
+    an iteration that fails at the authority has already opened the database. The step
+    hands the loop its gate's own summary, which is how the MF-1 rule reaches a failed
+    round, and a notifier with no projection still hands it nothing.
+    """
+
+    _seed_outbox(tmp_path)
+    replica = _page_projection_replica(tmp_path, synced_at=NOW - timedelta(minutes=1))
+    authority_root = (tmp_path / "serving-signals").resolve()
+    reading_manifest = _installed_notifier_manifest(
+        tmp_path,
+        serving_authority_root=str(authority_root),
+        page_projection_database_path=str(replica),
+    )
+    #: no runtime root is given below, so this pointer is refused -- which is the failing
+    #: iteration this test needs, and the one the window actually saw
+    _publish_previous_generation_pointer(authority_root)
+
+    bare = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW + timedelta(seconds=1),
+    )(_installed_notifier_manifest(tmp_path, serving_authority_root=str(authority_root)))
+    assert getattr(bare, "replica_iteration_summary", None) is None
+
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW + timedelta(seconds=1),
+    )(reading_manifest)
+    summary = getattr(step, "replica_iteration_summary", None)
+    assert callable(summary)
+    assert summary() == (False, 0)
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="producer_commit"):
+        step()
+
+    opened, read_bytes = summary()
+    assert opened is True
+    assert read_bytes is None or read_bytes >= 0
+
+
 def test_notifier_paused_publishes_current_state_without_advancing_cursor(
     tmp_path: Path,
 ) -> None:

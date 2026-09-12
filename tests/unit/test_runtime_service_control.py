@@ -745,6 +745,108 @@ def test_a_failed_iteration_does_not_keep_the_previous_read_s_numbers(
     assert failed.replica_read_bytes is None
 
 
+def test_a_failed_iteration_reports_what_it_did_with_the_replica_before_it_raised(
+    tmp_path: Path,
+) -> None:
+    """#260: the iteration that fails is not the iteration that read nothing.
+
+    The notifier publishes its page projection before it touches the serving authority, so
+    on every one of the eighth window's failing iterations the replica had been opened and
+    read -- and the heartbeat said `null`, which is "cannot say" and was wrong. The role
+    that can say hands the loop its gate's own summary, and the same MF-1 rule applies to a
+    failed round as to a successful one.
+    """
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        opened = control.record_failure(
+            RuntimeError("current pointer producer_commit does not match expected commit"),
+            replica_cost=(True, 43_790_567),
+        )
+        never_asked = control.record_failure(
+            RuntimeError("stopped before the read"),
+            replica_cost=(False, 0),
+        )
+    finally:
+        control.stop(reason="test complete")
+
+    assert (opened.replica_opened, opened.replica_read_bytes) == (True, 43_790_567)
+    assert (never_asked.replica_opened, never_asked.replica_read_bytes) == (False, 0)
+    assert opened.last_error is not None
+    assert "producer_commit" in opened.last_error
+
+
+def test_the_loop_takes_the_failed_iteration_s_replica_cost_off_the_step(
+    tmp_path: Path,
+) -> None:
+    """The wiring, through the loop, the way `generation_events` is taken off the step."""
+
+    reported: list[str] = []
+
+    def step() -> RuntimeStepResult:
+        reported.append("iteration")
+        raise RuntimeError("the serving authority refused")
+
+    step.replica_iteration_summary = lambda: (True, 2048)  # type: ignore[attr-defined]
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    final = run_service_loop(
+        control,
+        step=step,
+        stop_event=Event(),
+        interval_seconds=0,
+        max_iterations=1,
+    )
+
+    assert reported == ["iteration"]
+    assert final.total_failures == 1
+    assert (final.replica_opened, final.replica_read_bytes) == (True, 2048)
+
+
+def test_a_step_that_cannot_say_still_reports_neither_on_failure(tmp_path: Path) -> None:
+    """Twenty-one roles read no replica, and a probe that raises is not an answer either.
+
+    Both halves are the same rule: the heartbeat's cost is a diagnostic and the failure is
+    the news, so anything short of a real summary leaves the two fields `null` rather than
+    inventing a zero or replacing the error being recorded.
+    """
+
+    def silent() -> RuntimeStepResult:
+        raise RuntimeError("this role reads no replica")
+
+    def broken() -> RuntimeStepResult:
+        raise RuntimeError("this role reads a replica and failed")
+
+    def malformed() -> RuntimeStepResult:
+        raise RuntimeError("this role reads a replica and failed differently")
+
+    broken.replica_iteration_summary = _raising_summary  # type: ignore[attr-defined]
+    #: not a pair -- the probe runs inside the loop's own except handler, so a summary
+    #: this shape must read as "cannot say" rather than take the loop down with it
+    malformed.replica_iteration_summary = lambda: "opened"  # type: ignore[attr-defined]
+
+    for step in (silent, broken, malformed):
+        control = RuntimeServiceControl(tmp_path / step.__name__, spec=_spec(), clock=lambda: NOW)
+        final = run_service_loop(
+            control,
+            step=step,
+            stop_event=Event(),
+            interval_seconds=0,
+            max_iterations=1,
+        )
+        assert final.total_failures == 1, step.__name__
+        assert final.replica_opened is None, step.__name__
+        assert final.replica_read_bytes is None, step.__name__
+        #: the failure itself is recorded unchanged, which is the half that matters
+        assert final.last_error is not None
+        assert "this role reads" in final.last_error, step.__name__
+
+
+def _raising_summary() -> tuple[bool, int | None]:
+    raise OSError("the gate itself is unusable")
+
+
 def test_a_role_with_no_replica_still_writes_both_keys_as_null(tmp_path: Path) -> None:
     """Review MF-3: this is why the rollback moves **every** role's heartbeat, not four.
 

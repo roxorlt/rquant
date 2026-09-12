@@ -1325,6 +1325,7 @@ def build_builtin_registry(
             provider_loader=provider_loader,
             capability_environment=capabilities,
             clock=resolved_clock,
+            runtime_root=runtime_root,
         )(manifest)
 
     registry.register(RuntimeServiceKind.NOTIFIER, build_notifier)

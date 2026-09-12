@@ -669,9 +669,11 @@ class RuntimeServiceControl:
         duration_seconds: float | None = None,
         backoff_seconds: float | None = None,
         failure_kind: str | None = None,
+        replica_cost: tuple[bool, int | None] | None = None,
     ) -> RuntimeServiceHeartbeat:
         current = self._require_active()
         now = normalize_aware_utc(self._clock())
+        opened, read_bytes = (None, None) if replica_cost is None else replica_cost
         return self._publish(
             self._validated_update(
                 current,
@@ -683,10 +685,12 @@ class RuntimeServiceControl:
                 last_error=_error_text(error),
                 failure_backoff_seconds=backoff_seconds,
                 failure_kind=failure_kind,
-                #: an iteration that raised did not finish a read, so it has no cost to
-                #: report; the previous iteration's numbers would read as this one's
-                replica_opened=None,
-                replica_read_bytes=None,
+                #: What this iteration did with the replica before it raised, when the role
+                #: can say (#260). Without it the heartbeat reported nothing for exactly the
+                #: iterations that failed, and the previous iteration's numbers would have
+                #: read as this one's -- so a role that cannot say still reports neither.
+                replica_opened=opened,
+                replica_read_bytes=read_bytes,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
@@ -876,6 +880,29 @@ def _wait_for_stop(
             return False
 
 
+def _iteration_replica_cost(step: object) -> tuple[bool, int | None] | None:
+    """`(opened, read_bytes)` for the iteration that just raised, or `None` (#260).
+
+    A role that reads the read-only replica hangs its gate's `iteration_summary` on its own
+    step, the way `generation_events` is hung there; a role that reads no replica has no
+    attribute and reports neither rather than a fabricated zero. Reading it must never be
+    able to replace the failure being recorded, so anything this probe raises is discarded
+    and read as "cannot say": the heartbeat's cost is a diagnostic, the error is the news.
+    """
+
+    summary = getattr(step, "replica_iteration_summary", None)
+    if not callable(summary):
+        return None
+    try:
+        reported = summary()
+        if reported is None:
+            return None
+        opened, read_bytes = reported
+        return bool(opened), None if read_bytes is None else int(read_bytes)
+    except Exception:  # noqa: BLE001 - a diagnostic may not displace the real failure
+        return None
+
+
 def run_service_loop(
     control: RuntimeServiceControl,
     *,
@@ -921,6 +948,7 @@ def run_service_loop(
                     duration_seconds=monotonic_clock() - started,
                     backoff_seconds=backoff,
                     failure_kind=kind,
+                    replica_cost=_iteration_replica_cost(step),
                 )
                 if backoff is not None:
                     delay = backoff
