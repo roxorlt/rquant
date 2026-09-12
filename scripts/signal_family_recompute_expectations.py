@@ -386,7 +386,7 @@ def _backfill_shard_baseline(full_suite: dict[str, Any], *, write: bool) -> bool
     return True
 
 
-def recompute_shard_manifest(*, write: bool, expected_skips: int) -> Outcome:
+def recompute_shard_manifest(*, write: bool) -> Outcome:
     index_path = MANIFEST_DIRECTORY / "index.json"
     before = json.loads(index_path.read_bytes())["full_suite"]
     if not write:
@@ -400,15 +400,13 @@ def recompute_shard_manifest(*, write: bool, expected_skips: int) -> Outcome:
             ),
         )
     shards = _load_script("full_suite_shards")
-    code = shards.main(
-        [
-            "generate",
-            "--manifest-dir",
-            str(MANIFEST_DIRECTORY),
-            "--expected-skips",
-            str(expected_skips),
-        ]
-    )
+    #: `generate` takes the manifest directory and nothing else about the suite. The skip
+    #: count is not the caller's to assert: `write_manifest_bundle` derives it from the
+    #: approved skip map that lives in the manifest directory, and records that map's digest
+    #: beside it, so a number passed in here could only ever disagree. Passing one anyway is
+    #: what made `--write` write the R07 policy and then exit on argparse, before the
+    #: manifest and before the frozen `cases` literal -- a half-applied backfill (#244).
+    code = shards.main(["generate", "--manifest-dir", str(MANIFEST_DIRECTORY)])
     if code != 0:
         raise SystemExit(f"full_suite_shards generate exited {code}")
     after = json.loads(index_path.read_bytes())["full_suite"]
@@ -436,7 +434,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="leave the full-suite shard manifest alone (it needs a full collect)",
     )
-    parser.add_argument("--expected-skips", type=int, default=48)
     arguments = parser.parse_args(argv)
 
     outcomes = [
@@ -445,12 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         recompute_policy(write=arguments.write),
     ]
     if not arguments.skip_manifest:
-        outcomes.append(
-            recompute_shard_manifest(
-                write=arguments.write,
-                expected_skips=arguments.expected_skips,
-            )
-        )
+        outcomes.append(recompute_shard_manifest(write=arguments.write))
     for outcome in outcomes:
         marker = "CHANGED" if outcome.changed else "current"
         print(f"[{marker:>7}] {outcome.name}: {outcome.detail}")

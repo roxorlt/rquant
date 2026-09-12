@@ -599,6 +599,12 @@ def candidate_publisher_builder(
 
         if rebind is not None:
             step.generation_events = (rebind.event,)
+        if replica_gate is not None:
+            #: The loop asks for this on its failure path, so a round that raised inside
+            #: 09:26-09:30 reports the replica it had already opened instead of `null`
+            #: (#261). A document-driven publisher has no gate and keeps reporting neither,
+            #: which is the same distinction `_replica_cost()` makes on the success path.
+            step.replica_iteration_summary = replica_gate.iteration_summary
 
         return step
 

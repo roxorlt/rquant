@@ -1387,6 +1387,108 @@ def test_notifier_carries_the_signals_pointer_its_previous_generation_published(
     assert result.degraded_reasons == ()
 
 
+def test_an_explicitly_named_previous_commit_outranks_the_lineage(
+    tmp_path: Path,
+    two_notifier_generations: Path,
+) -> None:
+    """Package R review SF-1: the two paths overlap, and the configured one wins.
+
+    Both answer the same question -- "is the pointer on disk our own previous
+    generation's?" -- but they answer it differently: the lineage accepts the pointer and
+    leaves it alone, while `serving_previous_producer_commit` is an operator instructing
+    a takeover, which writes a `record_serving_authority_handoff` row, advances the
+    sequence and republishes the pointer under this commit. Letting the lineage answer
+    first made the configured takeover silently not happen, audit row included, for
+    exactly the generation an operator would configure it for.
+    """
+
+    state = _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    assert COMMIT in _publish_previous_generation_pointer(authority_root)
+
+    step = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: NOW + timedelta(seconds=1),
+        runtime_root=two_notifier_generations,
+    )(
+        _installed_notifier_manifest(
+            tmp_path,
+            paused=True,
+            serving_authority_root=str(authority_root),
+            serving_previous_producer_commit=COMMIT,
+        )
+    )
+
+    result = step()
+
+    pointer = (authority_root / "current.json").read_text(encoding="utf-8")
+    handoffs = state.serving_authority_handoffs()
+    assert len(handoffs) == 1
+    assert handoffs[0].previous_producer_commit == COMMIT
+    assert handoffs[0].next_producer_commit == SECOND_COMMIT
+    #: the takeover republished under this commit, which is what the lineage path does
+    #: not do -- it carries the previous generation's pointer unchanged
+    assert SECOND_COMMIT in pointer
+    assert COMMIT not in pointer
+    assert result.source_generations["signals_serving_authority"]
+    #: and nothing was reported as carried across, because nothing was
+    assert getattr(step, "generation_events", ()) == ()
+
+
+def test_a_named_commit_that_is_not_the_pointer_refuses_even_on_our_own_lineage(
+    tmp_path: Path,
+    two_notifier_generations: Path,
+) -> None:
+    """Package S review SF-C: the priority's other face, and it is a new refusal.
+
+    The pointer on disk was written by a generation this runtime root installed, so the
+    lineage would carry it and the round would be healthy. Naming a *different* commit
+    takes the lineage away from the primary reader and there is nothing left to fall back
+    on, so the round fails closed instead. That is the intended reading of the rule --
+    an operator naming X while the pointer says Y is exactly where accepting Y on
+    ancestry would swallow the instruction a second time -- but it is a failure mode this
+    configuration did not have before, and it is pinned here rather than left to be
+    rediscovered on a trading day.
+    """
+
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    assert COMMIT in _publish_previous_generation_pointer(authority_root)
+
+    manifest = _installed_notifier_manifest(
+        tmp_path,
+        paused=True,
+        serving_authority_root=str(authority_root),
+    )
+    #: the same world, same pointer, same runtime root: only the named commit differs
+    carried = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: NOW + timedelta(seconds=1),
+        runtime_root=two_notifier_generations,
+    )(manifest)
+    assert carried().source_generations["signals_serving_authority"]
+
+    named = manifest.model_copy(
+        update={
+            "settings": {
+                **manifest.settings,
+                "serving_previous_producer_commit": "e" * 40,
+            }
+        }
+    )
+    step = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: NOW + timedelta(seconds=1),
+        runtime_root=two_notifier_generations,
+    )(named)
+
+    with pytest.raises(
+        ServingSourceAuthorityIntegrityError,
+        match="current pointer producer_commit does not match expected commit",
+    ):
+        step()
+
+
 def test_notifier_still_refuses_a_signals_pointer_from_no_generation_of_ours(
     tmp_path: Path,
     two_notifier_generations: Path,

@@ -847,6 +847,37 @@ def _raising_summary() -> tuple[bool, int | None]:
     raise OSError("the gate itself is unusable")
 
 
+def test_a_summary_that_answers_none_is_read_as_cannot_say(tmp_path: Path) -> None:
+    """Package R review SF-2: the one branch of `_iteration_replica_cost` nothing covered.
+
+    `ReplicaReadGate.iteration_summary()` always returns a pair, so no role reaches this
+    branch today -- which is exactly why it needs a case. It is the contract offered to
+    the next role that hangs a summary on its step, and an uncovered defensive branch is
+    where the next fabricated zero comes from. A probe that answers `None` has said it
+    cannot say, and both fields stay `null` rather than claiming the round read nothing.
+    """
+
+    def unanswered() -> RuntimeStepResult:
+        raise RuntimeError("this role reads a replica and its gate cannot say yet")
+
+    unanswered.replica_iteration_summary = lambda: None  # type: ignore[attr-defined]
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    final = run_service_loop(
+        control,
+        step=unanswered,
+        stop_event=Event(),
+        interval_seconds=0,
+        max_iterations=1,
+    )
+
+    assert final.total_failures == 1
+    assert final.replica_opened is None
+    assert final.replica_read_bytes is None
+    assert final.last_error is not None
+    assert "cannot say yet" in final.last_error
+
+
 def test_a_role_with_no_replica_still_writes_both_keys_as_null(tmp_path: Path) -> None:
     """Review MF-3: this is why the rollback moves **every** role's heartbeat, not four.
 

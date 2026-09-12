@@ -54,6 +54,28 @@ ls -l /home/lighthouse/rquant/data/runtime/live/strategies/*/runner.sqlite3-shm
 
 ---
 
+## 2026-09-12 · 待安装 · 周末并行小修（#261、#244、#245 + 包 R 复审 SF-1/SF-2）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+**装机口径（协调者 2026-09-12 定）**：本包与包 T 在**第十个窗口**一起装，装的是**一个 tag
+`v0.33.11`**——本包合入后打 `v0.33.10`，包 T 合入后打 `v0.33.11`，装机 target 取后者，
+上一条 v0.33.9（包 R）也在这一批里一起上线；**时机由协调者决定，不早于 2026-09-14（周一）
+跨交易日观察结束**。装上之后 `reference-slow.source.v1`、
+`candidate.auction_gap.v1`、`auction-universe.publisher.v1` 失败轮的 `replica_opened`
+应当从 `null` 变成 `true` 或 `false`（这三条正是上一条 09-12 记录里说「另开 issue 跟进」的那三个
+role，issue 就是 #261）；`deploy/`、unit 文件、发布原语、心跳字段一个字未改，回滚路径与
+v0.33.9 完全相同，**不需要额外挪心跳**。
+
+**一条只影响手工接管的收窄（包 R 复审 SF-1 + 包 S 复审 SF-C）**：notifier 的
+`serving_previous_producer_commit` 这个**手工接管**设置从此优先于 #260 的血缘判定，
+而且**配了它就没有血缘可退**——点名的 commit 与盘上 `current.json` 不一致时，本轮按
+`ServingSourceAuthorityIntegrityError` 失败降级，哪怕盘上那个指针是本机装过的某一代。
+**生产画像里从来没有配过这个字段**（`runtime_production_profile.py` 的 notifier 设置块里没有它），
+所以装机后的现场行为与 v0.33.9 完全一致；这条只是写给将来要手工接管的人看的：
+配它就配成盘上真实的那个 commit，接管完成后取消配置。
+
+---
+
 ## 2026-09-12 · 待安装 · notifier 接受自己上一代的 serving 指针（#260）
 
 **状态**：**尚未安装**，而且**装机时机由协调者决定**——**不早于 2026-09-14（周一）跨交易日

@@ -459,6 +459,14 @@ def reference_slow_source_builder(
                 update={"replica_opened": opened, "replica_read_bytes": read_bytes}
             )
 
+        #: An iteration that raises returns through none of the lines above, so the
+        #: heartbeat said `replica_opened=null` for exactly the rounds that failed -- and a
+        #: capture that failed after opening the replica is the expensive kind. The loop
+        #: reads this on its failure path, so the MF-1 rule reaches a failed round the same
+        #: way #260 gave it to the notifier: never asked is `(False, 0)`, opened is
+        #: `(True, bytes)`, and a loader that raised part-way still counts as opened (#261).
+        step.replica_iteration_summary = replica_gate.iteration_summary
+
         return step
 
     return build
@@ -660,6 +668,11 @@ def auction_universe_publisher_builder(
                 },
                 **_replica_cost(),
             )
+
+        #: A failed publication never reaches `_replica_cost()`, and the scan of the
+        #: replica's `daily_bar` it may already have paid for is the number an operator
+        #: reading a degraded heartbeat needs. Same wiring as the notifier's (#261, #260).
+        step.replica_iteration_summary = replica_gate.iteration_summary
 
         return step
 
