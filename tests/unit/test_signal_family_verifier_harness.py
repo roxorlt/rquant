@@ -1455,6 +1455,67 @@ class TestRecomputeExpectations:
         spec.loader.exec_module(module)
         return module
 
+    def test_the_manifest_step_hands_the_generator_an_argv_it_accepts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#244: `--write` wrote the R07 policy and then exited on argparse.
+
+        `full_suite_shards.py generate` takes a manifest directory and a profile; it
+        derives the skip count from the approved skip map itself. Handing it
+        `--expected-skips` made it exit 2 before the manifest was regenerated and before
+        the frozen `cases` literal was backfilled, so `--write` left the tree
+        half-applied -- policy moved, manifest and literal not -- and the recipe in #244
+        was three manual steps.
+
+        The real generator's parser and the real manifest writer run here, over a
+        temporary manifest directory; only the full collect is stubbed. An argument
+        `generate` does not take turns this red again, as does a manifest step that stops
+        backfilling the literal.
+        """
+
+        module = self._module()
+        shards = module._load_script("full_suite_shards")
+        manifest_directory = tmp_path / "full-suite-v1"
+        manifest_directory.mkdir()
+        (manifest_directory / "approved-skips.json").write_bytes(
+            json.dumps(
+                {"platforms": {"darwin": {}, "linux": {}}, "schema_version": 1},
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        (manifest_directory / "index.json").write_bytes(
+            json.dumps({"full_suite": {"cases": 0, "skips": 0}}).encode("utf-8")
+        )
+        contract = tmp_path / "test_assert_full_suite_shards.py"
+        contract.write_text(
+            'assert full_suite["cases"] == 0\nassert full_suite["skips"] == 0\n',
+            encoding="utf-8",
+        )
+        collected = (
+            "tests/unit/test_full_suite_shards.py::test_one",
+            "tests/unit/test_signal_family_verifier_harness.py::test_two",
+        )
+        monkeypatch.setattr(shards, "collect_nodeids", lambda *_: collected)
+        monkeypatch.setattr(module, "MANIFEST_DIRECTORY", manifest_directory)
+        monkeypatch.setattr(module, "SHARD_CONTRACT_TEST", contract)
+        monkeypatch.setattr(module, "_load_script", lambda name: shards)
+
+        outcome = module.recompute_shard_manifest(write=True)
+
+        index = json.loads((manifest_directory / "index.json").read_bytes())
+        assert outcome.changed is True
+        assert index["full_suite"]["cases"] == len(collected)
+        assert index["full_suite"]["skips"] == 0
+        assert f'assert full_suite["cases"] == {len(collected)}' in contract.read_text(
+            encoding="utf-8"
+        )
+
     def test_the_policy_recomputation_is_idempotent(self) -> None:
         module = self._module()
 

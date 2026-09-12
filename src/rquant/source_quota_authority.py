@@ -1217,7 +1217,7 @@ class SourceQuotaParentAuthority:
 
     def get_parent(self, parent_id: str) -> SourceQuotaParentSnapshot | None:
         identifier = _require_nonempty(parent_id, label="parent_id")
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             connection.execute("BEGIN")
             try:
                 if self._parent_row(connection, identifier) is None:
@@ -1396,7 +1396,7 @@ class SourceQuotaParentAuthority:
 
         if self._root is not None:
             self._synchronize_external_root()
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             connection.execute("BEGIN")
             try:
                 self._full_audit(connection, repair=False)
@@ -1622,7 +1622,7 @@ class SourceQuotaParentAuthority:
 
     def get_call(self, call_id: str) -> SourceQuotaCallAllocation | None:
         identifier = _require_nonempty(call_id, label="call_id")
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             if self._call_row(connection, identifier) is None:
                 return None
             return self._snapshot_call(connection, identifier)
@@ -1783,7 +1783,7 @@ class SourceQuotaParentAuthority:
             )
             """,
         )
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 3:
@@ -2093,7 +2093,7 @@ class SourceQuotaParentAuthority:
         root = self._root
         if root is None:
             return
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             local = self._external_checkpoint(connection)
             state = self._external_state_row(connection)
         if state is None:
@@ -2125,7 +2125,7 @@ class SourceQuotaParentAuthority:
                 previous_checkpoint_hash=EXTERNAL_MONOTONIC_ROOT_ZERO_HASH,
                 checkpoint=local,
             )
-            with self._store._connect() as connection:
+            with self._store._transaction() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     if self._external_state_row(connection) is not None:
@@ -2157,7 +2157,7 @@ class SourceQuotaParentAuthority:
             if state["pending_request_json"] is not None:
                 self._complete_external_pending()
 
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             local = self._external_checkpoint(connection)
             state = self._external_state_row(connection)
             if state is None:
@@ -2196,7 +2196,7 @@ class SourceQuotaParentAuthority:
         root = self._root
         if root is None:
             return
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             state = self._external_state_row(connection)
             if state is None:
                 raise SourceQuotaAuthorityIntegrityError("source quota external binding is missing")
@@ -2238,7 +2238,7 @@ class SourceQuotaParentAuthority:
                 "source quota external root acknowledged a divergent checkpoint"
             )
         receipt_json = canonical_model_json_bytes(receipt).decode("utf-8")
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 current = self._external_state_row(connection)
@@ -2352,7 +2352,7 @@ class SourceQuotaParentAuthority:
         if self._root is not None:
             self._synchronize_external_root()
         committed_result: SourceQuotaAuthorityResult | None = None
-        with self._store._connect() as connection:
+        with self._store._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 payload_parent_id = payload.get("parent_id")

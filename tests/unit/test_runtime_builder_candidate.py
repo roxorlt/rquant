@@ -391,6 +391,76 @@ def test_a_torn_read_in_the_auction_window_is_reported_as_the_open_it_was(
     assert degraded.replica_opened is True
 
 
+def test_a_failing_auction_iteration_still_says_what_it_did_with_the_replica(
+    tmp_path: Path,
+) -> None:
+    """#261: the round that raised reported `null`, and it had opened the replica.
+
+    `AuctionGapCandidateInputError` is the one failure this step turns into a degraded
+    return; everything else -- a snapshot the publisher refuses, a spool that will not
+    open -- leaves the step as an exception, and those rounds had already read the
+    replica. The step hands the loop its gate's own summary so they say so.
+    """
+
+    replica = tmp_path / "operational-ro.duckdb"
+    replica.write_bytes(b"a replica generation")
+    replica.chmod(0o644)
+    root = tmp_path / "live" / "auction-gap"
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(replica),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(root),
+        },
+    )
+
+    rounds = {"n": 0}
+
+    def failing_loader(*, read_gate: ReplicaReadGate[object], **_: object) -> object:
+        rounds["n"] += 1
+        if rounds["n"] == 1:
+            read_gate.read(lambda: replica.read_bytes(), key=("auction-gap",))
+            raise RuntimeError("auction spool is unreadable")
+        raise RuntimeError("auction spool is missing")
+
+    step = candidate_publisher_builder(
+        auction_input_loader=failing_loader,
+        clock=lambda: datetime(2026, 7, 31, 1, 26, 30, tzinfo=UTC),
+    )(manifest)
+
+    summary = getattr(step, "replica_iteration_summary", None)
+    assert callable(summary)
+    assert summary() == (False, 0)
+
+    with pytest.raises(RuntimeError, match="auction spool is unreadable"):
+        step()
+
+    opened, read_bytes = summary()
+    assert opened is True
+    assert read_bytes is None or read_bytes >= 0
+
+    #: the round after it fails before it reaches the replica at all, and must say so
+    #: rather than repeat the numbers of the round that did read it
+    with pytest.raises(RuntimeError, match="auction spool is missing"):
+        step()
+
+    assert summary() == (False, 0)
+
+
 def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path) -> None:
     """The other two strategies read a sealed document, so they report nothing, not zero."""
 
@@ -419,6 +489,9 @@ def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path)
 
     assert result.replica_opened is None
     assert result.replica_read_bytes is None
+    #: and a failed round of theirs reports neither too, because the loop finds nothing to
+    #: ask -- the same rule the success path applies, on the path that raised (#261)
+    assert getattr(step, "replica_iteration_summary", None) is None
 
 
 def test_auction_candidate_publisher_builds_live_input_during_auction_window(
