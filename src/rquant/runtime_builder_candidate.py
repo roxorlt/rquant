@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Literal, Protocol, TypeAlias
+from typing import Annotated, Any, Literal, Protocol, TypeAlias
 from zoneinfo import ZoneInfo
 
 from pydantic import (
@@ -27,6 +27,7 @@ from rquant.auction_gap_candidate_input import (
 )
 from rquant.live_contracts import BatchQualityStatus
 from rquant.live_spool import LiveBatchSpool
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_data_registry import ReadonlyReferenceRegistry
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_generation_lineage import candidate_authority_lineage
@@ -188,6 +189,7 @@ class AuctionCandidateInputLoader(Protocol):
         trade_date: date,
         observed_at: datetime,
         producer_commit: str,
+        read_gate: ReplicaReadGate[Any] | None = None,
     ) -> CandidatePublishBatch: ...
 
 
@@ -431,6 +433,7 @@ def load_live_auction_candidate_input(
     trade_date: date,
     observed_at: datetime,
     producer_commit: str,
+    read_gate: ReplicaReadGate[Any] | None = None,
 ) -> CandidatePublishBatch:
     calendar = load_market_calendar_authority(
         calendar_path,
@@ -446,6 +449,7 @@ def load_live_auction_candidate_input(
         trade_date=trade_date,
         observed_at=observed_at,
         producer_commit=producer_commit,
+        read_gate=read_gate,
     )
 
 
@@ -500,13 +504,38 @@ def candidate_publisher_builder(
                 static_feature_schema=settings.static_feature_schema,
             )
 
+        #: this publisher's memory of the replica generation it already read (#256).
+        #: Only `auction_live` reads a replica at all; the two document-driven strategies
+        #: have no `daily_database_path`, so they report nothing rather than a zero.
+        replica_gate: ReplicaReadGate[Any] | None = (
+            None
+            if settings.daily_database_path is None
+            else ReplicaReadGate(settings.daily_database_path)
+        )
+
+        def _replica_cost() -> dict[str, object]:
+            """What **this** iteration did with the replica, for the heartbeat (#256).
+
+            Empty for a publisher that has no replica to read. For the auction-gap
+            publisher it is always present: outside 09:26-09:30, and on the degraded
+            iterations where the auction spool has no batch yet, this reports "opened
+            nothing, read nothing" rather than the last real read's numbers (review MF-1).
+            """
+
+            if replica_gate is None:
+                return {}
+            opened, read_bytes = replica_gate.iteration_summary()
+            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
+
         def step() -> RuntimeStepResult:
+            if replica_gate is not None:
+                replica_gate.begin_iteration()
             if settings.input_mode == "auction_live":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
                 local_time = local.timetz().replace(tzinfo=None)
                 if not _AUCTION_INPUT_START <= local_time <= _AUCTION_INPUT_END:
-                    return RuntimeStepResult()
+                    return RuntimeStepResult(**_replica_cost())
                 if (
                     settings.auction_spool_root is None
                     or settings.daily_database_path is None
@@ -527,9 +556,13 @@ def candidate_publisher_builder(
                         trade_date=local.date(),
                         observed_at=observed_at,
                         producer_commit=manifest.producer_commit,
+                        read_gate=replica_gate,
                     )
                 except AuctionGapCandidateInputError:
-                    return RuntimeStepResult(degraded_reasons=("auction_gap_input_unavailable",))
+                    return RuntimeStepResult(
+                        degraded_reasons=("auction_gap_input_unavailable",),
+                        **_replica_cost(),
+                    )
             else:
                 if settings.candidate_input_path is None:
                     raise RuntimeError("validated candidate_input_path disappeared")
@@ -561,6 +594,7 @@ def candidate_publisher_builder(
                     "candidate_input": summary.authority_snapshot_id,
                     "strategy_candidate": summary.snapshot_content_sha256,
                 },
+                **_replica_cost(),
             )
 
         if rebind is not None:

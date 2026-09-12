@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from rquant.auction_match_gateway import AuctionMatchGateway
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool, LiveSpoolIntegrityError
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_data_registry import (
     ReadonlyReferenceRegistry,
     ReferenceDataIntegrityError,
@@ -134,12 +135,39 @@ def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
+_DailyVolumeRead = tuple[tuple[tuple[str, date, float], ...], datetime]
+
+
 def _daily_volume_rows(
     path: Path,
     *,
     ts_codes: tuple[str, ...],
     trade_dates: tuple[date, ...],
-) -> tuple[tuple[tuple[str, date, float], ...], datetime]:
+    read_gate: ReplicaReadGate[_DailyVolumeRead] | None = None,
+) -> _DailyVolumeRead:
+    """The five prior sessions' volumes, read only when the replica changed (#256).
+
+    This publisher runs every five seconds through its 09:26-09:30 window, and each read
+    was a query over the replica's whole `daily_bar` -- about 48 of them per session
+    against a 10 GB file. The gate belongs to the caller because it has to outlive one
+    iteration; the answer it remembers is keyed by the codes and dates asked for, so a
+    different question always reopens. Without a gate the read happens as it always did.
+    """
+
+    if read_gate is None:
+        return _query_daily_volume_rows(path, ts_codes=ts_codes, trade_dates=trade_dates)
+    return read_gate.read(
+        lambda: _query_daily_volume_rows(path, ts_codes=ts_codes, trade_dates=trade_dates),
+        key=("auction-gap-daily-volume", ts_codes, trade_dates),
+    ).value
+
+
+def _query_daily_volume_rows(
+    path: Path,
+    *,
+    ts_codes: tuple[str, ...],
+    trade_dates: tuple[date, ...],
+) -> _DailyVolumeRead:
     before, normalized = _private_snapshot_identity(path)
     import duckdb
 
@@ -237,6 +265,7 @@ def assemble_auction_gap_candidate_batch(
     trade_date: date,
     observed_at: datetime,
     producer_commit: str,
+    read_gate: ReplicaReadGate[_DailyVolumeRead] | None = None,
 ) -> AuctionGapCandidateBatch:
     """Assemble a live candidate batch without using evidence after ``observed_at``."""
 
@@ -282,6 +311,7 @@ def assemble_auction_gap_candidate_batch(
         daily_database_path,
         ts_codes=ts_codes,
         trade_dates=prior_dates,
+        read_gate=read_gate,
     )
     if daily_available_at > observed:
         raise AuctionGapCandidateInputError("daily snapshot is future evidence")

@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -33,6 +33,7 @@ from rquant.live_spool import (
 )
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
 from rquant.market_minute_source_service import capture_market_minute_step
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
     RuntimeCandidateUniverseConfig,
@@ -193,6 +194,7 @@ def _capture_reference_with_quota(
     producer_commit: str,
     retry_ordinal: int = 0,
     transport_observer: QuotaBoundTransportObserver | None = None,
+    read_gate: ReplicaReadGate[Any] | None = None,
 ) -> ReferenceSlowSourceSnapshot | ReferenceSlowQuotaCapture:
     from rquant.reference_slow_source import capture_reference_slow_source_snapshot
 
@@ -233,6 +235,7 @@ def _capture_reference_with_quota(
                 completion_clock=completion_clock,
                 producer_commit=producer_commit,
                 limits=settings.limits.model_dump(mode="python"),
+                read_gate=read_gate,
             )
             receipts = transport_observer.current_receipts()
         return ReferenceSlowQuotaCapture(
@@ -285,6 +288,7 @@ def _capture_reference_with_quota(
             completion_clock=completion_clock,
             producer_commit=producer_commit,
             limits=settings.limits.model_dump(mode="python"),
+            read_gate=read_gate,
         )
     except Exception:
         quota_store.commit_attempt(
@@ -373,8 +377,16 @@ def reference_slow_source_builder(
                 source_verifier=source_verifier,
             )
         )
+        #: one `lstat` per ask instead of a whole read of the replica, and one read for
+        #: the target session plus five revision look-backs rather than six (#256)
+        replica_gate: ReplicaReadGate[Any] = ReplicaReadGate(settings.database_path)
 
         def step() -> RuntimeStepResult:
+            #: this iteration's own scope, so an iteration that never reaches the capture
+            #: -- outside 09:20-09:25, or after today's batch is already sealed -- reports
+            #: "opened nothing, read nothing" instead of the last capture's numbers (#256
+            #: review MF-1). Four such early returns live in `capture_reference_slow_batch`.
+            replica_gate.begin_iteration()
             observed_at = clock()
             decision = decide_market_session(calendar, observed_at)
 
@@ -390,6 +402,7 @@ def reference_slow_source_builder(
                     producer_commit=manifest.producer_commit,
                     retry_ordinal=settings.retry_ordinal,
                     transport_observer=transport_observer,
+                    read_gate=replica_gate,
                 )
                 return (
                     captured.snapshot
@@ -409,6 +422,7 @@ def reference_slow_source_builder(
                     producer_commit=manifest.producer_commit,
                     retry_ordinal=settings.retry_ordinal + 1,
                     transport_observer=transport_observer,
+                    read_gate=replica_gate,
                 )
                 return (
                     captured.snapshot
@@ -440,7 +454,10 @@ def reference_slow_source_builder(
                         max_batches=settings.retention_page_size,
                         retired_at=clock(),
                     )
-            return result
+            opened, read_bytes = replica_gate.iteration_summary()
+            return result.model_copy(
+                update={"replica_opened": opened, "replica_read_bytes": read_bytes}
+            )
 
         return step
 
@@ -579,8 +596,19 @@ def auction_universe_publisher_builder(
         )
         if calendar.content_sha256 != settings.calendar_content_sha256:
             raise ValueError("auction universe calendar content identity mismatch")
+        #: one `lstat` per iteration instead of a scan of the replica's `daily_bar` (#256)
+        replica_gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(settings.database_path)
+
+        def _replica_cost() -> dict[str, object]:
+            opened, read_bytes = replica_gate.iteration_summary()
+            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
 
         def step() -> RuntimeStepResult:
+            #: 09:15-15:10 is this publisher's protection window and it returns below
+            #: without asking the gate; so does an iteration that finds today's universe
+            #: already published. Both report "opened nothing" rather than the last
+            #: publication's numbers (#256 review MF-1, SF-5).
+            replica_gate.begin_iteration()
             observed_at = clock()
             calendar_evidence = {"market_calendar": calendar.content_sha256}
             try:
@@ -590,7 +618,10 @@ def auction_universe_publisher_builder(
             except AuctionUniverseSourceError as exc:
                 if "protection window" not in str(exc):
                     raise
-                return RuntimeStepResult(source_generations=calendar_evidence)
+                return RuntimeStepResult(
+                    source_generations=calendar_evidence,
+                    **_replica_cost(),
+                )
 
             current_path = settings.authority_root / "current.json"
             try:
@@ -608,7 +639,8 @@ def auction_universe_publisher_builder(
                         **calendar_evidence,
                         "daily_bar": current.source_snapshot_id,
                         "auction_universe": current.content_sha256,
-                    }
+                    },
+                    **_replica_cost(),
                 )
 
             receipt = publish_auction_universe_from_daily_snapshot(
@@ -617,6 +649,7 @@ def auction_universe_publisher_builder(
                 calendar=calendar,
                 observed_at=observed_at,
                 producer_commit=manifest.producer_commit,
+                read_gate=replica_gate,
             )
             return RuntimeStepResult(
                 processed_count=receipt.code_count if receipt.published else 0,
@@ -625,6 +658,7 @@ def auction_universe_publisher_builder(
                     "daily_bar": receipt.source_snapshot_id,
                     "auction_universe": receipt.content_sha256,
                 },
+                **_replica_cost(),
             )
 
         return step

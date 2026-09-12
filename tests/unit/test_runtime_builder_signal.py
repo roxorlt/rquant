@@ -38,6 +38,7 @@ from rquant.runtime_serving_authority import (
 )
 from rquant.runtime_serving_snapshot import SIGNALS_DATASET_ID
 from rquant.runtime_shadow_validation import ShadowStrategyBinding
+from rquant.serving_page_projection_source import DuckDBSignalPageProjectionSource
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.signal_route_spool import SignalRouteSpool, publish_signal_bus_prefix
@@ -1055,6 +1056,111 @@ def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
     assert projections["screen_bounds"].rows[0]["preset_name"] == "n-shape-pool1"
     assert projections["minute_coverage"].rows[0]["source"] == "all"
     assert projections["surge_runtime_config"].rows[0]["boards_json"] == '["main","gem"]'
+
+
+def _page_projection_replica(tmp_path: Path, *, synced_at: datetime) -> Path:
+    """The five-minute replica the notifier's page projection reads, with a sane mtime."""
+
+    replica = (tmp_path / "rquant_ro.duckdb").resolve()
+    connection = duckdb.connect(str(replica))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE screen_result (
+                trade_date DATE, preset_name VARCHAR, ts_code VARCHAR, name VARCHAR,
+                close DOUBLE, pct_chg DOUBLE, extra JSON, created_at TIMESTAMP
+            );
+            INSERT INTO screen_result VALUES
+              ('2026-07-31', 'n-shape-pool1', '600000.SH', 'PF', 10.6, 6, '{}',
+               '2026-07-31 10:05:00');
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR, trade_time TIMESTAMP, freq VARCHAR, open DOUBLE,
+                high DOUBLE, low DOUBLE, close DOUBLE, vol DOUBLE, amount DOUBLE,
+                source VARCHAR, created_at TIMESTAMP
+            );
+            INSERT INTO minute_bar VALUES
+              ('600000.SH', '2026-07-31 09:30:00', '1min', 10, 10, 10, 10,
+               100, 1000, 'tushare', '2026-07-31 09:31:00');
+            """
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    stamp = synced_at.timestamp()
+    os.utime(replica, (stamp, stamp))
+    return replica
+
+
+def test_notifier_reports_what_each_iteration_did_with_the_replica(
+    tmp_path: Path,
+) -> None:
+    """#256: the first iteration opens the replica, the second recognises the generation."""
+
+    _seed_outbox(tmp_path)
+    replica = _page_projection_replica(tmp_path, synced_at=NOW - timedelta(minutes=1))
+    authority_root = (tmp_path / "serving-signals").resolve()
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+            page_projection_database_path=str(replica),
+        )
+    )
+
+    first = step()
+    second = step()
+
+    assert first.replica_opened is True
+    assert (second.replica_opened, second.replica_read_bytes) == (False, 0)
+
+
+def test_the_notifier_begins_each_iteration_s_replica_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MF-5: a wiring assertion, and the docstring says why it has to be one.
+
+    Every return path of this step publishes the page projection -- both branches guard on
+    the serving authority, and `NotifierSettings` refuses a projection database without a
+    serving authority root -- so this role asks the gate on *every* iteration, and removing
+    `begin_replica_iteration()` cannot currently be observed through the result. That makes
+    the call defensive rather than load-bearing, which is exactly why it needs a guard of
+    its own: the day someone adds an early return above the publish, the summary would
+    silently start reporting the previous iteration's read, and MF-1 would be back for this
+    role only.
+    """
+
+    _seed_outbox(tmp_path)
+    replica = _page_projection_replica(tmp_path, synced_at=NOW - timedelta(minutes=1))
+    authority_root = (tmp_path / "serving-signals").resolve()
+    begun: list[int] = []
+    original = DuckDBSignalPageProjectionSource.begin_replica_iteration
+
+    def counted(self: DuckDBSignalPageProjectionSource) -> None:
+        begun.append(1)
+        original(self)
+
+    monkeypatch.setattr(
+        DuckDBSignalPageProjectionSource, "begin_replica_iteration", counted
+    )
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+            page_projection_database_path=str(replica),
+        )
+    )
+
+    step()
+    step()
+
+    assert len(begun) == 2
 
 
 def test_notifier_takes_over_signals_authority_from_exact_previous_commit(

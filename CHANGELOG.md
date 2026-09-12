@@ -151,6 +151,70 @@
 
 ### Fixed
 
+- **读侧 role 不再每一轮读 10 GB 副本，`reference-slow.source.v1` 不再整库拷贝（#256）**：
+  09-08 与 09-09 两次 17:00 日线在 `daily_state` 阶段卡住（主线程 D 状态、DuckDB 线程等磁盘），
+  停掉 runtime unit 后一分钟内就跑完；09-09 主机还有 9 GB 空闲内存，**约束是页缓存与磁盘带宽，
+  不是内存**。四个 role 每一轮都读 `data/rquant_ro.duckdb`（约 10 GB）：notifier 每 2 秒把
+  `minute_bar` 整表聚合一遍（`COUNT(*)`、两个 `COUNT(DISTINCT)`、`MIN`/`MAX`），auction-gap
+  发布器 09:26–09:30 每 5 秒查一次 `daily_bar`，auction-universe 发布器每 30 秒查一次，
+  reference-slow source 在 09:20–09:25 的捕获窗口里每 30 秒问一次。加上每 15 分钟的备份
+  cp+gzip 与每 5 分钟的副本 cp，16 GB 主机的页缓存装不下两个 10 GB 库，日线自己的扫描就落盘。
+
+  两件事，都不改任何一条 SQL 的语义：
+
+  ① **`reference-slow.source.v1` 不再把整个数据库拷进 `PrivateTmp` 再查拷贝**。这条路
+  在 #250 之前从没被走到过（0600 那一关先返回了），#250 之后它必然失败：生产副本约 10 GB，
+  `snapshot_max_bytes` 是 8 GiB，每一轮 DEGRADED 报 `exceeds maximum byte budget`
+  （包 P 复核 MF-2）。现在按 `serving_page_projection_source._StableReadonlyDuckDB` 定下的顺序
+  开库：**先用已校验的描述符**（`/proc/self/fd/<n>`，pinned 的 duckdb 1.5.2 在 Linux 上接受，
+  一个字节都不拷）；引擎不认这条路径时**才**退到 `PrivateTmp` 里的私有拷贝（macOS 是这一支）；
+  这一代大于拷贝预算或磁盘没余量时，**就地读**。三条 limit 对拷贝那一支仍然有效，
+  但大于 `snapshot_max_bytes` 的一代从此是**被读**而不是被拒。校验一条没少，顺序也没变：
+  mode、属主、链接数、打开竞态、读前读后的 WAL sidecar、读后描述符与文件名的身份、
+  数据库所在目录的指纹；只有两处变化——消息里的 "snapshotting" 变成 "reading"，
+  身份比对挪到链接数检查之前，好让被替换的一代按「被替换」报出来而不是按「链接数不对」。
+
+  ② **四个读侧 role 每轮先 `stat` 副本，认得出这一代就整轮不开库**
+  （`rquant/readside_replica_gate.py`）。副本是被 `sync-readonly-replica.sh` **整体替换**的
+  （写 `.tmp.$$` → 校验 → `mv`），从不原地改写，所以
+  `(st_dev, st_ino, st_size, st_mtime_ns)` 相同就是内容相同。每个 role 的缓存键是它问的问题
+  （universe 的参考交易日、auction-gap 的代码与五个前序交易日、reference-slow 的两个日期），
+  问题变了必然重开——reference-slow 的六个回补日期就是六个键，gate 一个也合并不掉，
+  它在那里省下的是**同一个键的失败重试不再重读**（捕获窗口里约八轮问同一个键）。
+  notifier 的问题自己会走（每 2 秒一个新的 `now`），所以多一条精确规则：只有当上一次的
+  时间切点**不早于这一代自己的 mtime**、且不晚于这一次的切点时才复用——文件里每一行都写在
+  文件被写之前，所以更晚的切点只会纳入同一批行；这正是 `auction_gap_candidate_input`
+  早就在用的读法（它把副本的 `st_mtime_ns` 当作里面全部证据的 `available_at`）。
+  **本地日历这一层由调用者的缓存键管**：gate 只比时刻，notifier 把本地日期放进 key，
+  因为副本 17:30 同步之后到次日 09:00 不换代，一代要跨本地午夜，而它的谓词是
+  `trade_date <= ?`。**不在副本里、会自己变的东西照旧每轮读**：canvas 目录、
+  PageControl 审计、`surge_live` 的 JSONL。
+
+  心跳（**文件模型**，`RuntimeServiceHeartbeatProjection` 一字未动，serving 发布的仍是
+  v0.33.1 那一套字段，#237）多两个字段：`replica_opened` 说这一轮有没有开库，
+  `replica_read_bytes` 说 loader 期间这个进程从文件系统读了多少字节
+  （Linux 取 `/proc/self/io` 的 `rchar`，别的平台如实留空）。不读副本的 21 个 role 两个字段都是
+  `None`——0 是一个断言，不是「没有」。
+
+  ③ **notifier 的 `minute_coverage` 由两条全表聚合合成一条**（复审 SF-1）：
+  `GROUP BY GROUPING SETS ((COALESCE(source,'unknown')), ())` 一次扫描同时算出分组与总计，
+  发布出去的行、值与顺序逐字节相同（空表那一格也一样：`()` 分组集会给一行 `COUNT(*)=0`，
+  与改前同一个 `>0` 判据把它丢掉），`PAGE_PROJECTION_CONTRACTS` 一字未改。
+  **收益要照实说**：计划里两个 `SEQ_SCAN` 变成一个，但在本包的度量副本上**读取字节没有变化**
+  （43,790,567 → 43,790,567，A/B 见报告 §2.3.1）——两条聚合跑在同一个连接上，
+  第二条要的块 DuckDB 的 buffer pool 已经持有，从来就没有第二次去问文件系统。
+  10 GB 副本上它省不省，要等主机上 17:30 那一轮心跳里的 `replica_read_bytes` 才知道。
+
+  ⚠️ **回滚要先挪心跳文件，而且是全部 25 个 role 的**：心跳用
+  `model_dump(mode="json")` 整个序列化、没有 `exclude_none`，所以**每个** role 的心跳里都有
+  `"replica_opened":null,"replica_read_bytes":null`，而文件模型是 `extra="forbid"`，
+  旧二进制一个都读不了。回滚到 v0.33.7 或更早之前必须先停 role、把
+  `$ROOT/control/*/*/heartbeats/*.json` 整批挪走，命令见 `DEPLOY.md` 最上面那一条。
+  已发布投影没变，serving 一侧不需要任何回滚动作。
+
+  ⚠️ **`deploy/systemd/` 一个字没改**：gate 记在内存里，四个 role 谁都不需要新的可写路径。
+  这一包给出的 `IOWeight` / `io.max` 建议值见 `pkgQ-report.md`，装机由 owner 单独授权。
+
 - **三个读侧 role 从生产主库改读五分钟只读副本（#250）**：`rquant-monitor` 盘中 09:25–15:00
   一直持有 `data/rquant.duckdb` 的写锁，DuckDB 在写锁期间**拒绝任何新连接，`read_only=True` 也一样**
   （CLAUDE.md 强制条款）。包 N 把竞价 universe 改到了副本（#249），剩下三处仍指着主库：

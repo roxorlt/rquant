@@ -2337,3 +2337,417 @@ def test_a_source_whose_only_changed_stamp_is_ctime_is_still_refused(
     assert after.st_ctime_ns != before.st_ctime_ns
     assert not any(control.iterdir())
 
+
+
+def _count_database_opens(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times the page projection actually opened the replica (#256)."""
+
+    import rquant.serving_page_projection_source as module
+
+    opens = [0]
+    original = module._StableReadonlyDuckDB.__enter__
+
+    def counted(self: object) -> object:
+        opens[0] += 1
+        return original(self)
+
+    monkeypatch.setattr(module._StableReadonlyDuckDB, "__enter__", counted)
+    return opens
+
+
+def _synced_replica(path: Path, *, synced_at: datetime) -> None:
+    """The replica as the five-minute timer leaves it: written before anyone reads it."""
+
+    _signal_projection_database(path)
+    stamp = synced_at.timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+def test_an_unchanged_replica_is_not_opened_again_by_the_page_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#256: the notifier's interval is two seconds and the replica changes every five minutes.
+
+    Every iteration used to scan all of `minute_bar` in a 10 GB file. Three iterations
+    over one generation now open it once, and the answer is the same one.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    snapshots = [source(NOW + timedelta(seconds=2 * index)) for index in range(3)]
+
+    assert opens[0] == 1
+    assert source.last_replica_read is not None
+    assert source.last_replica_read.opened is False
+    assert {snapshot.content_sha256 for snapshot in snapshots} == {snapshots[0].content_sha256}
+
+
+def test_the_page_projection_opens_exactly_once_more_after_the_replica_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `mv` over the name is what `sync-readonly-replica.sh` does every five minutes."""
+
+    database = tmp_path / "rquant_ro.duckdb"
+    replacement = tmp_path / "rquant_ro.duckdb.tmp.1"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=6))
+    _synced_replica(replacement, synced_at=NOW - timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    source(NOW)
+    source(NOW + timedelta(seconds=2))
+    os.replace(replacement, database)
+    after = [source(NOW + timedelta(seconds=4 + 2 * index)) for index in range(3)]
+
+    assert opens[0] == 2
+    assert len(after) == 3
+    assert source.last_replica_read is not None
+    assert source.last_replica_read.opened is False
+
+
+def test_an_answer_taken_before_the_generation_was_written_is_never_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse rule is "at or after the file's own mtime", and it is load-bearing.
+
+    A replica written after this iteration started may hold rows this iteration's cutoff
+    excluded; the next one must ask again rather than be served the narrower answer.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW + timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    source(NOW)
+    source(NOW + timedelta(seconds=2))
+
+    assert opens[0] == 2
+
+
+def test_what_is_not_in_the_replica_is_still_read_every_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What is cached is the replica's part, not the projection.
+
+    `surge_live`, the canvas catalog and the PageControl audit are files that change on
+    their own; freezing them with the database would delay them by up to a replica period.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=1))
+    live_root = tmp_path / "surge_live"
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database, surge_live_root=live_root)
+
+    before = source(NOW)
+    live_root.mkdir()
+    alerts = live_root / "pulse_alerts-2026-08-03.jsonl"
+    alerts.write_text(
+        json.dumps(
+            {
+                "t": "10:15",
+                "kind": "broken_surge",
+                "kind_label": "炸板潮",
+                "before": 2.0,
+                "after": 6.0,
+                "window_minutes": 10,
+                "message": "炸板异动",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(alerts, (stamp, stamp))
+    after = source(NOW + timedelta(seconds=2))
+
+    assert opens[0] == 1
+    assert "pulse_alert" not in {item.table_name for item in before.projections}
+    assert "pulse_alert" in {item.table_name for item in after.projections}
+
+
+def test_one_generation_spanning_local_midnight_is_read_again_on_the_new_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review SF-3: the calendar granularity this projection publishes is the *local* date.
+
+    `rquant-replica-sync.timer`'s last run of the day is 17:30 and the next is 09:00, so
+    one generation of the replica spans local midnight -- 15.5 hours during which the file
+    does not change and every `trade_date <= ?` predicate below does. Reuse across that
+    boundary would serve `trade_date <= yesterday` after midnight, and the UTC date does
+    not move there (23:59 and 00:01 Asia/Shanghai are 15:59 and 16:01 the same UTC day),
+    so only the local date in the gate's key can refuse it.
+    """
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=datetime(2026, 8, 3, 9, 30, tzinfo=UTC))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+    before_midnight = datetime(2026, 8, 3, 15, 59, tzinfo=UTC)
+    after_midnight = datetime(2026, 8, 3, 16, 1, tzinfo=UTC)
+
+    assert before_midnight.date() == after_midnight.date()
+    source(before_midnight)
+    source(before_midnight + timedelta(seconds=2))
+    source(after_midnight)
+
+    assert opens[0] == 2
+
+
+def test_the_projection_reports_this_iteration_and_not_the_last_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MF-1: `begin_replica_iteration()` scopes the report without dropping the cache."""
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _synced_replica(database, synced_at=NOW - timedelta(minutes=1))
+    opens = _count_database_opens(monkeypatch)
+    source = DuckDBSignalPageProjectionSource(database)
+
+    assert source.replica_iteration_summary() == (False, 0)
+
+    source.begin_replica_iteration()
+    source(NOW)
+    opened = source.replica_iteration_summary()
+
+    source.begin_replica_iteration()
+    source(NOW + timedelta(seconds=2))
+    reused = source.replica_iteration_summary()
+
+    source.begin_replica_iteration()
+    silent = source.replica_iteration_summary()
+
+    assert opened[0] is True
+    assert reused == (False, 0)
+    assert silent == (False, 0)
+    assert opens[0] == 1
+
+
+_LEGACY_MINUTE_GROUPED = """
+    SELECT COALESCE(source, 'unknown'), COUNT(*), COUNT(DISTINCT ts_code),
+           COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
+    FROM minute_bar
+    WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
+    GROUP BY COALESCE(source, 'unknown')
+    ORDER BY COALESCE(source, 'unknown')
+    LIMIT ?
+"""
+
+_LEGACY_MINUTE_TOTAL = """
+    SELECT COUNT(*), COUNT(DISTINCT ts_code),
+           COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
+    FROM minute_bar
+    WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
+"""
+
+
+def _legacy_minute_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    cutoff: datetime,
+) -> tuple[MinuteCoverageProjectionRow, ...]:
+    """The two-query shape this projection had before review SF-1, verbatim.
+
+    Kept in the test rather than in the source so the equivalence is checked against what
+    was actually replaced, not against a paraphrase of it.
+    """
+
+    from rquant.serving_page_projection_source import (
+        _MAX_MINUTE_SOURCES,
+        _database_timestamp,
+    )
+
+    rows = connection.execute(
+        _LEGACY_MINUTE_GROUPED, (cutoff, cutoff, _MAX_MINUTE_SOURCES + 1)
+    ).fetchall()
+    if len(rows) > _MAX_MINUTE_SOURCES:
+        raise PageProjectionSourceIntegrityError(
+            "minute sources exceed the bounded projection limit"
+        )
+    total = connection.execute(_LEGACY_MINUTE_TOTAL, (cutoff, cutoff)).fetchone()
+    values: list[MinuteCoverageProjectionRow] = []
+    if total is not None and int(total[0]) > 0:
+        values.append(
+            MinuteCoverageProjectionRow(
+                is_total=True,
+                source="all",
+                rows_count=int(total[0]),
+                codes_count=int(total[1]),
+                trade_dates=int(total[2]),
+                min_time=_database_timestamp(total[3]),
+                max_time=_database_timestamp(total[4]),
+            )
+        )
+    values.extend(
+        MinuteCoverageProjectionRow(
+            is_total=False,
+            source=str(source),
+            rows_count=int(count),
+            codes_count=int(codes),
+            trade_dates=int(trade_dates),
+            min_time=_database_timestamp(minimum),
+            max_time=_database_timestamp(maximum),
+        )
+        for source, count, codes, trade_dates, minimum, maximum in rows
+    )
+    return tuple(values)
+
+
+def _minute_only_database(path: Path, rows: list[tuple[object, ...]]) -> None:
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR NOT NULL,
+                trade_time TIMESTAMP NOT NULL,
+                freq VARCHAR NOT NULL,
+                source VARCHAR,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        if rows:
+            connection.executemany("INSERT INTO minute_bar VALUES (?, ?, ?, ?, ?)", rows)
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("label", "rows"),
+    (
+        ("empty table", []),
+        (
+            "several sources, a NULL source, and rows the predicates exclude",
+            [
+                ("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00"),
+                ("600000.SH", "2026-07-31 09:31:00", "1min", "tushare", "2026-07-31 09:32:00"),
+                ("000001.SZ", "2026-08-01 09:30:00", "1min", "ashare", "2026-08-01 09:31:00"),
+                ("000002.SZ", "2026-08-02 09:30:00", "1min", None, "2026-08-02 09:31:00"),
+                #: excluded by `freq`
+                ("000003.SZ", "2026-08-02 09:30:00", "5min", "tushare", "2026-08-02 09:31:00"),
+                #: excluded by `trade_time <= cutoff`
+                ("000004.SZ", "2026-09-01 09:30:00", "1min", "tushare", "2026-08-02 09:31:00"),
+                #: excluded by `created_at <= cutoff`
+                ("000005.SZ", "2026-08-02 09:30:00", "1min", "tushare", "2026-09-01 09:31:00"),
+            ],
+        ),
+        (
+            "one source only",
+            [
+                ("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00"),
+            ],
+        ),
+        (
+            "every row has a NULL source",
+            [
+                ("600000.SH", "2026-07-31 09:30:00", "1min", None, "2026-07-31 09:31:00"),
+                ("000001.SZ", "2026-08-01 09:30:00", "1min", None, "2026-08-01 09:31:00"),
+            ],
+        ),
+    ),
+)
+def test_one_grouping_sets_pass_answers_exactly_what_two_aggregates_answered(
+    tmp_path: Path,
+    label: str,
+    rows: list[tuple[object, ...]],
+) -> None:
+    """Review SF-1: the merge is a read-cost change, not a projection change.
+
+    The published rows -- values, `is_total`, and the order the total and the sources come
+    in -- must be identical to the two-query shape on every one of these fixtures,
+    including the empty table where the `()` grouping set does produce a row that the
+    old code could not have produced.
+    """
+
+    database = tmp_path / f"{label.replace(' ', '-').replace(',', '')}.duckdb"
+    _minute_only_database(database, rows)
+    cutoff = datetime(2026, 8, 3, 8, 0)
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        merged = DuckDBSignalPageProjectionSource._minute_coverage(connection, cutoff=cutoff)
+        legacy = _legacy_minute_coverage(connection, cutoff=cutoff)
+    finally:
+        connection.close()
+
+    assert merged == legacy
+    assert [row.model_dump(mode="json") for row in merged] == [
+        row.model_dump(mode="json") for row in legacy
+    ]
+
+
+def test_the_merged_minute_coverage_reads_the_table_once(tmp_path: Path) -> None:
+    """The point of the merge: one `SEQ_SCAN` where there used to be two."""
+
+    database = tmp_path / "scan-count.duckdb"
+    _minute_only_database(
+        database,
+        [("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00")],
+    )
+    cutoff = "2026-08-03 08:00:00"
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        merged_plan = "\n".join(
+            str(row[1])
+            for row in connection.execute(
+                f"""
+                EXPLAIN
+                SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
+                       COALESCE(source, 'unknown') AS source_label,
+                       COUNT(*), COUNT(DISTINCT ts_code),
+                       COUNT(DISTINCT CAST(trade_time AS DATE)),
+                       MIN(trade_time), MAX(trade_time)
+                FROM minute_bar
+                WHERE freq = '1min' AND trade_time <= '{cutoff}' AND created_at <= '{cutoff}'
+                GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
+                ORDER BY is_total, source_label
+                """  # noqa: S608 - a literal timestamp in a test's own EXPLAIN
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+    assert merged_plan.count("SEQ_SCAN") == 1
+
+
+def test_the_source_budget_still_refuses_more_sources_than_it_publishes(
+    tmp_path: Path,
+) -> None:
+    """The total now shares the result set, so the limit had to move; the refusal did not."""
+
+    from rquant.serving_page_projection_source import _MAX_MINUTE_SOURCES
+
+    database = tmp_path / "too-many-sources.duckdb"
+    _minute_only_database(
+        database,
+        [
+            (
+                f"{600000 + index:06d}.SH",
+                "2026-07-31 09:30:00",
+                "1min",
+                f"source-{index:03d}",
+                "2026-07-31 09:31:00",
+            )
+            for index in range(_MAX_MINUTE_SOURCES + 1)
+        ],
+    )
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        with pytest.raises(PageProjectionSourceIntegrityError, match="minute sources exceed"):
+            DuckDBSignalPageProjectionSource._minute_coverage(
+                connection, cutoff=datetime(2026, 8, 3, 8, 0)
+            )
+    finally:
+        connection.close()

@@ -8,7 +8,9 @@ import pytest
 from pydantic import ValidationError
 
 from rquant import runtime_builder_candidate as candidate_module
+from rquant.auction_gap_candidate_input import AuctionGapCandidateInputError
 from rquant.live_contracts import BatchQualityStatus
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_builder_candidate import (
     CandidatePublisherRuntimeSettings,
     candidate_publisher_builder,
@@ -231,6 +233,194 @@ def test_candidate_publisher_binds_static_strategy_semantics(tmp_path: Path) -> 
     assert snapshot.authority_binding.candidate_schema_fingerprint == candidate_schema_fingerprint
 
 
+def test_an_auction_iteration_outside_its_window_says_it_read_nothing(
+    tmp_path: Path,
+) -> None:
+    """Review MF-1: this publisher acts for four minutes and idles for the rest of the day.
+
+    At its five-second interval that is about a thousand idle iterations, and each one
+    must report "opened nothing, read nothing" rather than the window's last real read.
+    """
+
+    root = tmp_path / "live" / "auction-gap"
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(tmp_path / "operational-ro.duckdb"),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(root),
+        },
+    )
+    #: 18:30 Asia/Shanghai, far outside 09:26-09:30
+    step = candidate_publisher_builder(
+        auction_input_loader=lambda **_: _batch("auction_gap"),
+        clock=lambda: datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
+    )(manifest)
+
+    result = step()
+
+    assert result.processed_count == 0
+    assert result.replica_opened is False
+    assert result.replica_read_bytes == 0
+
+
+def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
+    tmp_path: Path,
+) -> None:
+    """Review MF-5: the guard for `begin_iteration()` has to drive the **builder**.
+
+    `test_an_auction_iteration_outside_its_window_says_it_read_nothing` never reads
+    anything at all, so it passes with or without the call. This one reads for real in the
+    09:26-09:30 window and then idles outside it: without `begin_iteration()` the idle
+    iteration reports the window's read, which is the whole of MF-1 on this role.
+
+    The loader is a stub that uses the gate it is handed, because what is under test is
+    the builder's wiring -- begin the iteration, hand the gate down, summarise it -- and
+    not what the real assembler does with the gate (that is covered in
+    `test_auction_gap_candidate_input.py`).
+    """
+
+    replica = tmp_path / "operational-ro.duckdb"
+    replica.write_bytes(b"a replica generation")
+    replica.chmod(0o644)
+    root = tmp_path / "live" / "auction-gap"
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(replica),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(root),
+        },
+    )
+
+    def reading_loader(*, read_gate: ReplicaReadGate[object], **_: object) -> object:
+        read_gate.read(lambda: replica.read_bytes(), key=("auction-gap",))
+        return _batch("auction_gap")
+
+    #: 09:26:30 then 09:40 Asia/Shanghai: inside the window, then outside it
+    inside = datetime(2026, 7, 31, 1, 26, 30, tzinfo=UTC)
+    clock = {"now": inside}
+    step = candidate_publisher_builder(
+        auction_input_loader=reading_loader,
+        clock=lambda: clock["now"],
+    )(manifest)
+
+    published = step()
+    clock["now"] = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
+    idled = step()
+
+    assert published.replica_opened is True
+    assert idled.processed_count == 0
+    assert idled.replica_opened is False
+    assert idled.replica_read_bytes == 0
+
+
+def test_a_torn_read_in_the_auction_window_is_reported_as_the_open_it_was(
+    tmp_path: Path,
+) -> None:
+    """Review SF-7, through the builder: the degraded branch did open the database."""
+
+    replica = tmp_path / "operational-ro.duckdb"
+    replica.write_bytes(b"a replica generation")
+    replica.chmod(0o644)
+    root = tmp_path / "live" / "auction-gap"
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(replica),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(root),
+        },
+    )
+
+    def torn_loader(*, read_gate: ReplicaReadGate[object], **_: object) -> object:
+        def read_and_refuse() -> object:
+            replica.read_bytes()
+            raise AuctionGapCandidateInputError("daily snapshot changed while reading")
+
+        read_gate.read(read_and_refuse, key=("auction-gap",))
+        raise AssertionError("unreachable")
+
+    step = candidate_publisher_builder(
+        auction_input_loader=torn_loader,
+        clock=lambda: datetime(2026, 7, 31, 1, 26, 30, tzinfo=UTC),
+    )(manifest)
+
+    degraded = step()
+
+    assert degraded.degraded_reasons == ("auction_gap_input_unavailable",)
+    assert degraded.replica_opened is True
+
+
+def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path) -> None:
+    """The other two strategies read a sealed document, so they report nothing, not zero."""
+
+    root = tmp_path / "live" / "n-shape"
+    path = tmp_path / "n-shape.json"
+    path.write_bytes(serialize_candidate_input(_batch("n_shape")))
+    path.chmod(0o600)
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.n_shape.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "n_shape",
+            "strategy_version": 1,
+            **_exact_strategy_settings("n_shape"),
+            "candidate_input_path": str(path),
+            "snapshot_root": str(root),
+        },
+    )
+    step = candidate_publisher_builder(clock=lambda: CAPTURED_AT)(manifest)
+
+    result = step()
+
+    assert result.replica_opened is None
+    assert result.replica_read_bytes is None
+
+
 def test_auction_candidate_publisher_builds_live_input_during_auction_window(
     tmp_path: Path,
 ) -> None:
@@ -270,6 +460,11 @@ def test_auction_candidate_publisher_builds_live_input_during_auction_window(
     )(manifest)()
 
     assert len(calls) == 1
+    #: the publisher hands the loader its own memory of the replica generation (#256):
+    #: one object for the life of the run, pointed at the database this manifest names
+    read_gate = calls[0].pop("read_gate")
+    assert isinstance(read_gate, ReplicaReadGate)
+    assert read_gate.path == tmp_path / "operational-ro.duckdb"
     assert calls[0] == {
         "auction_spool_root": tmp_path / "auction-spool",
         "daily_database_path": tmp_path / "operational-ro.duckdb",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from rquant.auction_universe_source import (
     AuctionUniverseSourceError,
     publish_auction_universe_from_daily_snapshot,
 )
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_market_session import MarketCalendarAuthority
 
 COMMIT = "a" * 40
@@ -138,3 +140,80 @@ def test_source_rejects_unsafe_or_mutated_readonly_snapshot(tmp_path: Path) -> N
             observed_at=datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
             producer_commit=COMMIT,
         )
+
+
+def _count_connects(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times the source actually opened the replica (#256)."""
+
+    import duckdb
+
+    opens = [0]
+    original = duckdb.connect
+
+    def counted(*args: object, **kwargs: object) -> object:
+        opens[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", counted)
+    return opens
+
+
+def test_an_unchanged_replica_is_read_once_and_then_only_stat_ed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#256: this publisher runs every thirty seconds against a 10 GB file."""
+
+    database = _database((tmp_path / "operational-ro.duckdb").resolve())
+    root = (tmp_path / "authority").resolve()
+    observed_at = datetime(2026, 7, 31, 10, 30, tzinfo=UTC)
+    gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(database)
+    opens = _count_connects(monkeypatch)
+
+    receipts = [
+        publish_auction_universe_from_daily_snapshot(
+            database_path=database,
+            authority_root=root,
+            calendar=_calendar(),
+            observed_at=observed_at,
+            producer_commit=COMMIT,
+            read_gate=gate,
+        )
+        for _ in range(3)
+    ]
+
+    assert opens[0] == 1
+    assert {receipt.source_snapshot_id for receipt in receipts} == {
+        receipts[0].source_snapshot_id
+    }
+    assert gate.last_read is not None and gate.last_read.opened is False
+
+
+def test_a_replaced_replica_is_read_once_more(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _database((tmp_path / "operational-ro.duckdb").resolve())
+    replacement = _database((tmp_path / "operational-ro.duckdb.tmp.1").resolve())
+    root = (tmp_path / "authority").resolve()
+    observed_at = datetime(2026, 7, 31, 10, 30, tzinfo=UTC)
+    gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(database)
+    opens = _count_connects(monkeypatch)
+
+    def publish() -> object:
+        return publish_auction_universe_from_daily_snapshot(
+            database_path=database,
+            authority_root=root,
+            calendar=_calendar(),
+            observed_at=observed_at,
+            producer_commit=COMMIT,
+            read_gate=gate,
+        )
+
+    publish()
+    publish()
+    os.replace(replacement, database)
+    publish()
+    publish()
+
+    assert opens[0] == 2

@@ -14,6 +14,7 @@ from rquant.auction_gap_candidate_input import (
 )
 from rquant.auction_match_gateway import AuctionMatchGateway, AuctionMatchGatewayConfig
 from rquant.live_spool import LiveBatchSpool
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_data_registry import (
     ReadonlyReferenceRegistry,
     ReferenceDataset,
@@ -228,3 +229,91 @@ def test_repeated_assembly_keeps_evidence_capture_identity_stable(tmp_path: Path
     )
 
     assert repeated == first
+
+
+def _count_connects(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times the assembler actually opened the replica (#256)."""
+
+    import duckdb
+
+    opens = [0]
+    original = duckdb.connect
+
+    def counted(*args: object, **kwargs: object) -> object:
+        opens[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", counted)
+    return opens
+
+
+def test_an_unchanged_replica_is_read_once_across_the_auction_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#256: this publisher runs every five seconds through 09:26-09:30.
+
+    Each pass used to query the replica's whole `daily_bar`. Over one generation of a
+    file replaced every five minutes, the window's passes now open it once, and the
+    batch they assemble is the same one.
+    """
+
+    database = _daily_snapshot(tmp_path / "operational-ro.duckdb")
+    calendar = _calendar()
+    spool = _auction_spool(tmp_path)
+    registry = _reference_registry(tmp_path)
+    gate: ReplicaReadGate[object] = ReplicaReadGate(database)
+    opens = _count_connects(monkeypatch)
+
+    batches = [
+        assemble_auction_gap_candidate_batch(
+            auction_spool=spool,
+            daily_database_path=database,
+            reference_registry=registry,
+            calendar=calendar,
+            trade_date=TRADE_DATE,
+            observed_at=OBSERVED_AT,
+            producer_commit=COMMIT,
+            read_gate=gate,
+        )
+        for _ in range(3)
+    ]
+
+    assert opens[0] == 1
+    assert {batch.facts[0].source_snapshot_id for batch in batches} == {
+        batches[0].facts[0].source_snapshot_id
+    }
+    assert gate.last_read is not None and gate.last_read.opened is False
+
+
+def test_a_replaced_replica_is_read_again_by_the_next_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _daily_snapshot(tmp_path / "operational-ro.duckdb")
+    replacement = _daily_snapshot(tmp_path / "operational-ro.duckdb.tmp.1")
+    calendar = _calendar()
+    spool = _auction_spool(tmp_path)
+    registry = _reference_registry(tmp_path)
+    gate: ReplicaReadGate[object] = ReplicaReadGate(database)
+    opens = _count_connects(monkeypatch)
+
+    def assemble() -> object:
+        return assemble_auction_gap_candidate_batch(
+            auction_spool=spool,
+            daily_database_path=database,
+            reference_registry=registry,
+            calendar=calendar,
+            trade_date=TRADE_DATE,
+            observed_at=OBSERVED_AT,
+            producer_commit=COMMIT,
+            read_gate=gate,
+        )
+
+    assemble()
+    assemble()
+    os.replace(replacement, database)
+    assemble()
+    assemble()
+
+    assert opens[0] == 2

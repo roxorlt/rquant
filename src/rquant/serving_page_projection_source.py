@@ -51,6 +51,7 @@ from rquant.page_control import (
     PageControlStatus,
     read_canvas_current_head,
 )
+from rquant.readside_replica_gate import ReplicaRead, ReplicaReadGate
 from rquant.research_gate import (
     ResearchGateFailure,
     ResearchGateRequest,
@@ -922,6 +923,18 @@ class _ReadonlyPageControlAuditReader:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _DatabaseProjection:
+    """Everything one page projection takes out of the replica, in one open (#256)."""
+
+    screen_bounds: tuple[ScreenBoundsProjectionRow, ...]
+    minute_coverage: tuple[MinuteCoverageProjectionRow, ...]
+    latest_trade_date: date | None
+    canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
+    canvas_hits: tuple[CanvasHitProjectionRow, ...]
+    available_at: datetime
+
+
 class DuckDBSignalPageProjectionSource:
     """Build bounded point-in-time page projections from an atomic read replica."""
 
@@ -974,6 +987,26 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError(
                 "configured canvas catalog requires receipt root and keyring authority"
             )
+        #: this reader's memory of which replica generation it has already read (#256)
+        self._replica_gate: ReplicaReadGate[_DatabaseProjection] = ReplicaReadGate(
+            self.database_path
+        )
+
+    @property
+    def last_replica_read(self) -> ReplicaRead[_DatabaseProjection] | None:
+        """What the most recent projection did with the replica, for the heartbeat."""
+
+        return self._replica_gate.last_read
+
+    def begin_replica_iteration(self) -> None:
+        """Start a new loop iteration's accounting (review MF-1)."""
+
+        self._replica_gate.begin_iteration()
+
+    def replica_iteration_summary(self) -> tuple[bool, int | None]:
+        """`(opened, read_bytes)` for this iteration, for the heartbeat."""
+
+        return self._replica_gate.iteration_summary()
 
     def __call__(self, observed_at: datetime, /) -> SignalPageProjectionSnapshot:
         if self.page_control_outbox is None:
@@ -984,6 +1017,71 @@ class DuckDBSignalPageProjectionSource:
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         cutoff = _local_naive(observed)
+        #: One `lstat`, and the database is opened only if this generation of the replica
+        #: has not already been read (#256). This role's interval is two seconds and the
+        #: replica is replaced every five minutes, so before this it scanned all of
+        #: `minute_bar` in a 10 GB file about a hundred and fifty times per generation.
+        #:
+        #: `key` carries `cutoff.date()`, which is the **local** date (`_local_naive` is
+        #: this module's own Asia/Shanghai conversion), because that is the granularity
+        #: every predicate below is written against; the gate itself compares instants and
+        #: knows nothing about a local zone (review SF-3). This matters in production
+        #: rather than in theory: `rquant-replica-sync.timer`'s last run of the day is
+        #: 17:30 and the next is 09:00, so one generation spans local midnight, and
+        #: without the date in the key a projection taken at 23:59 would still be served
+        #: at 00:01 with `trade_date <= yesterday`.
+        #:
+        #: `cutoff=observed` carries the instant, so an answer is reused only when it was
+        #: taken at or after the generation's own mtime -- every row in the file was
+        #: written before the file was, so a later cutoff admits exactly the same rows.
+        read = self._replica_gate.read(
+            lambda: self._read_database_projection(cutoff),
+            key=("signal-page-projection", cutoff.date()),
+            cutoff=observed,
+        )
+        database = read.value
+        screen_bounds = database.screen_bounds
+        minute_coverage = database.minute_coverage
+        latest_date = database.latest_trade_date
+        diagnostics = database.canvas_diagnostics
+        hits = database.canvas_hits
+        available = database.available_at
+        canvas_definitions = self._canvas_definitions(observed=observed)
+        pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
+            self.surge_live_root,
+            observed=observed,
+        )
+        if canvas_definitions:
+            available = max(
+                available,
+                max(item.updated_at for item in canvas_definitions),
+            )
+        return SignalPageProjectionSnapshot.create(
+            available_at=available,
+            screen_bounds=screen_bounds,
+            minute_coverage=minute_coverage,
+            canvas_diagnostics=diagnostics,
+            canvas_latest_trade_date=(
+                None
+                if latest_date is None
+                else CanvasLatestTradeDateProjectionRow(trade_date=latest_date)
+            ),
+            canvas_hits=hits,
+            canvas_definitions=canvas_definitions,
+            pulse_history=pulse_history,
+            pulse_alerts=pulse_alerts,
+            surge_runtime_config=runtime_config,
+        )
+
+    def _read_database_projection(self, cutoff: datetime) -> _DatabaseProjection:
+        """Everything this projection takes out of the replica, in one open.
+
+        Split out of `_build_snapshot` so the gate above has something to remember. What
+        stays outside it is what does not live in the replica and changes on its own: the
+        canvas catalog, the PageControl audit, and the `surge_live` JSONL -- caching those
+        with the database would delay a canvas by up to a replica period.
+        """
+
         with _StableReadonlyDuckDB(
             self.database_path,
             control_root=self.control_root,
@@ -1099,32 +1197,13 @@ class DuckDBSignalPageProjectionSource:
             ).fetchone()
         if available_row is None or available_row[0] is None:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
-        available = _database_timestamp(available_row[0])
-        canvas_definitions = self._canvas_definitions(observed=observed)
-        pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
-            self.surge_live_root,
-            observed=observed,
-        )
-        if canvas_definitions:
-            available = max(
-                available,
-                max(item.updated_at for item in canvas_definitions),
-            )
-        return SignalPageProjectionSnapshot.create(
-            available_at=available,
+        return _DatabaseProjection(
             screen_bounds=screen_bounds,
             minute_coverage=minute_coverage,
+            latest_trade_date=latest_date,
             canvas_diagnostics=diagnostics,
-            canvas_latest_trade_date=(
-                None
-                if latest_date is None
-                else CanvasLatestTradeDateProjectionRow(trade_date=latest_date)
-            ),
             canvas_hits=hits,
-            canvas_definitions=canvas_definitions,
-            pulse_history=pulse_history,
-            pulse_alerts=pulse_alerts,
-            surge_runtime_config=runtime_config,
+            available_at=_database_timestamp(available_row[0]),
         )
 
     def _canvas_definitions(
@@ -1532,42 +1611,58 @@ class DuckDBSignalPageProjectionSource:
         *,
         cutoff: datetime,
     ) -> tuple[MinuteCoverageProjectionRow, ...]:
+        """Per-source and total 1-minute coverage, in **one** pass over `minute_bar` (#256).
+
+        This projection was, and after this package still is, the whole of what the
+        notifier reads from the replica -- 44,052,711 of 44,052,711 bytes on the package Q
+        measurement replica. It used to run *two* independent aggregates over the same
+        table, one grouped by source and one ungrouped, so every generation was scanned
+        twice. `GROUPING SETS ((COALESCE(source,'unknown')), ())` computes both from one
+        `SEQ_SCAN`, and `COUNT(DISTINCT ...)` is evaluated per grouping set, so the numbers
+        are the same numbers (review SF-1).
+
+        **Nothing about the published projection changes**: same rows, same values, same
+        order (the total first, then the sources ascending), and an empty table still
+        yields no rows at all -- the `()` grouping set does produce one row there, with
+        `COUNT(*) = 0`, and the same `> 0` guard as before drops it.
+
+        The row limit keeps its meaning too. `_MAX_MINUTE_SOURCES + 2` is fetched because
+        the total shares the result set; ordering by the grouping flag first puts the
+        source rows ahead of it, so more sources than the budget still overflows the count
+        and still refuses.
+        """
+
         rows = connection.execute(
             """
-            SELECT COALESCE(source, 'unknown'), COUNT(*), COUNT(DISTINCT ts_code),
+            SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
+                   COALESCE(source, 'unknown') AS source_label,
+                   COUNT(*), COUNT(DISTINCT ts_code),
                    COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
             FROM minute_bar
             WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
-            GROUP BY COALESCE(source, 'unknown')
-            ORDER BY COALESCE(source, 'unknown')
+            GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
+            ORDER BY is_total, source_label
             LIMIT ?
             """,
-            (cutoff, cutoff, _MAX_MINUTE_SOURCES + 1),
+            (cutoff, cutoff, _MAX_MINUTE_SOURCES + 2),
         ).fetchall()
-        if len(rows) > _MAX_MINUTE_SOURCES:
+        grouped = [row for row in rows if not int(row[0])]
+        if len(grouped) > _MAX_MINUTE_SOURCES:
             raise PageProjectionSourceIntegrityError(
                 "minute sources exceed the bounded projection limit"
             )
-        total = connection.execute(
-            """
-            SELECT COUNT(*), COUNT(DISTINCT ts_code),
-                   COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
-            FROM minute_bar
-            WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
-            """,
-            (cutoff, cutoff),
-        ).fetchone()
+        total = next((row for row in rows if int(row[0])), None)
         values: list[MinuteCoverageProjectionRow] = []
-        if total is not None and int(total[0]) > 0:
+        if total is not None and int(total[2]) > 0:
             values.append(
                 MinuteCoverageProjectionRow(
                     is_total=True,
                     source="all",
-                    rows_count=int(total[0]),
-                    codes_count=int(total[1]),
-                    trade_dates=int(total[2]),
-                    min_time=_database_timestamp(total[3]),
-                    max_time=_database_timestamp(total[4]),
+                    rows_count=int(total[2]),
+                    codes_count=int(total[3]),
+                    trade_dates=int(total[4]),
+                    min_time=_database_timestamp(total[5]),
+                    max_time=_database_timestamp(total[6]),
                 )
             )
         values.extend(
@@ -1580,7 +1675,7 @@ class DuckDBSignalPageProjectionSource:
                 min_time=_database_timestamp(minimum),
                 max_time=_database_timestamp(maximum),
             )
-            for source, count, codes, trade_dates, minimum, maximum in rows
+            for _flag, source, count, codes, trade_dates, minimum, maximum in grouped
         )
         return tuple(values)
 

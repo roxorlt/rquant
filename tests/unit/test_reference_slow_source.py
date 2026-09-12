@@ -4,6 +4,7 @@ import base64
 import inspect
 import os
 import subprocess
+import tempfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,9 @@ import duckdb
 import pandas as pd
 import pytest
 
+import rquant.readside_replica_gate as readside_replica_gate
 import rquant.reference_slow_source as reference_slow_source_module
+from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_slow_source import (
     ReferenceAdjustmentSourceFact,
     ReferenceDailySourceFact,
@@ -184,91 +187,286 @@ def _source_limits(**overrides: object):
     return reference_slow_source_module.ReferenceSlowSourceLimits(**values)
 
 
-def test_verified_snapshot_enforces_size_and_free_space_headroom(
+def _engine_accepts_the_descriptor_path(tmp_path: Path) -> bool:
+    """Whether this platform's duckdb opens `/proc/self/fd/<n>` -- Linux yes, macOS no."""
+
+    probe_directory = tmp_path / "probe"
+    probe_directory.mkdir(exist_ok=True)
+    descriptor = os.open(_database(probe_directory), os.O_RDONLY)
+    try:
+        reopen = readside_replica_gate.descriptor_reopen_path(descriptor)
+        if reopen is None:
+            return False
+        try:
+            duckdb.connect(reopen, read_only=True).close()
+        except Exception:  # noqa: BLE001 - the answer is exactly "it refused"
+            return False
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def test_the_read_takes_the_pinned_descriptor_where_the_engine_accepts_it(
+    tmp_path: Path,
+) -> None:
+    """#256: on the production host nothing is copied, and the copy is only the fallback.
+
+    Both outcomes are asserted rather than one of them skipped: the engine either accepts
+    the descriptor path -- Linux, the runtime host -- and the read pins the inode and
+    copies nothing, or it refuses it and the read falls back to the private copy this
+    function still keeps for small databases.
+    """
+
+    database = _database(tmp_path)
+    pinned = _engine_accepts_the_descriptor_path(tmp_path)
+
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as opened:
+        assert opened.opened_through == ("descriptor" if pinned else "copy")
+        if pinned:
+            assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
+        assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+
+
+def test_with_the_descriptor_refused_the_budget_decides_copy_or_in_place(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The fallback branch, forced, on every platform.
+
+    On Linux the engine accepts the descriptor path and the copy is never reached, so
+    the branch that decides between a private copy and an in-place read would otherwise
+    only ever be exercised on macOS. What must hold there is that a generation over
+    `snapshot_max_bytes` is **read** rather than refused -- that refusal is what left
+    `reference-slow.source.v1` DEGRADED on every iteration against a 10 GB replica.
+    """
+
+    database = _database(tmp_path)
+    size = database.stat().st_size
+    monkeypatch.setattr(reference_slow_source_module, "descriptor_reopen_path", lambda _fd: None)
+
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(snapshot_max_bytes=size * 4),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as copied:
+        assert copied.opened_through == "copy"
+
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(snapshot_max_bytes=size - 1),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as read_in_place:
+        assert read_in_place.opened_through == "in_place"
+        assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
+        assert (
+            read_in_place.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+        )
+
+
+def test_a_generation_over_the_copy_budget_is_read_in_place_and_copied_nowhere(
+    tmp_path: Path,
+) -> None:
+    """The production replica is about 10 GB against an 8 GiB budget (package P MF-2).
+
+    Before this package that combination was `exceeds maximum byte budget` on every
+    iteration. Now the budget only decides whether a copy is worth taking, and a
+    generation over it is read where it lies -- with no copy in the temporary directory
+    while the read is in flight.
+    """
+
     database = _database(tmp_path)
     size = database.stat().st_size
 
-    with (
-        pytest.raises(ReferenceSlowSourceError, match="maximum byte budget"),
-        reference_slow_source_module._verified_database_snapshot(
-            database,
-            limits=_source_limits(snapshot_max_bytes=size - 1),
-            monotonic_deadline=10.0,
-            monotonic_clock=lambda: 0.0,
-        ),
-    ):
-        pass
-
-    monkeypatch.setattr(
-        reference_slow_source_module.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=size * 2, used=size, free=size),
-    )
-    with (
-        pytest.raises(ReferenceSlowSourceError, match="free-space headroom"),
-        reference_slow_source_module._verified_database_snapshot(
-            database,
-            limits=_source_limits(snapshot_min_free_bytes=1),
-            monotonic_deadline=10.0,
-            monotonic_clock=lambda: 0.0,
-        ),
-    ):
-        pass
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(snapshot_max_bytes=size - 1),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as opened:
+        assert opened.opened_through in {"descriptor", "in_place"}
+        assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
+        assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
 
 
-def test_verified_snapshot_enforces_monotonic_copy_deadline(
-    tmp_path: Path,
-) -> None:
-    database = _database(tmp_path)
-    ticks = iter((0.0, 0.5, 1.01))
-
-    with (
-        pytest.raises(ReferenceSlowSourceError, match="copy deadline"),
-        reference_slow_source_module._verified_database_snapshot(
-            database,
-            limits=_source_limits(),
-            monotonic_deadline=1.0,
-            monotonic_clock=lambda: next(ticks),
-        ),
-    ):
-        pass
-
-
-def test_verified_snapshot_rejects_transient_wal_during_copy(
+def test_a_database_over_the_old_copy_budget_is_read_instead_of_refused(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The production replica is about 10 GB and the copy budget was 8 GiB (#256, package P MF-2).
+
+    Both gates the copy needed are gone, and neither can refuse the read any more: a
+    database larger than `snapshot_max_bytes`, on a filesystem with no free space at all.
+    """
+
+    database = _database(tmp_path)
+    size = database.stat().st_size
+    monkeypatch.setattr(
+        reference_slow_source_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=size, used=size, free=0),
+    )
+
+    rows = reference_slow_source_module._load_prior_daily(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        limits=_source_limits(snapshot_max_bytes=size - 1, snapshot_min_free_bytes=size * 4),
+    )
+
+    assert rows == (("300001.SZ", 20.0, 1.0), ("600000.SH", 10.0, 1.0))
+
+
+def test_verified_read_enforces_the_monotonic_deadline_before_it_opens(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+
+    with (
+        pytest.raises(ReferenceSlowSourceError, match="read deadline"),
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=1.0,
+            monotonic_clock=lambda: 1.01,
+        ),
+    ):
+        pass
+
+
+def _read_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the by-name branches (private copy, then in place) on any platform."""
+
+    monkeypatch.setattr(reference_slow_source_module, "descriptor_reopen_path", lambda _fd: None)
+
+
+def _read_through_a_descriptor(monkeypatch: pytest.MonkeyPatch, database: Path) -> None:
+    """Force the pinned-descriptor branch on any platform.
+
+    The name handed back is the database's own, because macOS's duckdb refuses
+    `/dev/fd/<n>`; what is being exercised is the branch, not the kernel's descriptor
+    directory, and the branch is what ruling 26 keys the directory fingerprint off.
+    """
+
+    monkeypatch.setattr(
+        reference_slow_source_module,
+        "descriptor_reopen_path",
+        lambda _fd: str(database),
+    )
+
+
+def test_a_wal_appearing_and_going_during_a_by_name_read_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read that reaches the database by name is guarded by the directory fingerprint.
+
+    The sidecar checks before and after cannot see a WAL that came and went in between;
+    the directory's own `mtime`/`ctime` can, and on the copy and in-place branches it
+    still does.
+    """
+
     database = _database(tmp_path)
     wal_path = Path(f"{database}.wal")
-    original_read = reference_slow_source_module.os.read
-    injected = False
-
-    def read_with_transient_wal(descriptor: int, size: int) -> bytes:
-        nonlocal injected
-        chunk = original_read(descriptor, size)
-        if chunk and not injected:
-            injected = True
-            wal_path.write_bytes(b"transient")
-            wal_path.unlink()
-        return chunk
-
-    monkeypatch.setattr(reference_slow_source_module.os, "read", read_with_transient_wal)
+    _read_by_name(monkeypatch)
 
     with (
         pytest.raises(ReferenceSlowSourceError, match="WAL|directory changed"),
-        reference_slow_source_module._verified_database_snapshot(
+        reference_slow_source_module._verified_database_read(
             database,
             limits=_source_limits(),
             monotonic_deadline=100.0,
             monotonic_clock=lambda: 1.0,
         ),
     ):
-        pass
+        wal_path.write_bytes(b"transient")
+        wal_path.unlink()
 
-    assert injected is True
+
+def test_a_sibling_file_in_the_data_directory_fails_a_by_name_read_and_not_a_pinned_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling 26: the directory fingerprint guards the reads that go through the name.
+
+    `scripts/sync-readonly-replica.sh` mutates the data directory four times per run
+    (create `.tmp.$$`, `mv`, `rm -f *.wal`, `mv` the sidecar) and its timer fires at 09:20
+    and 09:25 -- both ends of this source's capture window. A read that holds the pinned
+    inode cannot be misled by that, so it is no longer refused for it; a read that goes
+    through the name still is.
+    """
+
+    database = _database(tmp_path)
+    sibling = database.parent / f"{database.name}.tmp.1"
+
+    def read_while_the_sync_works() -> None:
+        with reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ) as opened:
+            assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+            sibling.write_bytes(b"replica sync staging")
+            sibling.unlink()
+
+    _read_through_a_descriptor(monkeypatch, database)
+    read_while_the_sync_works()
+
+    _read_by_name(monkeypatch)
+    with pytest.raises(ReferenceSlowSourceError, match="directory changed while reading"):
+        read_while_the_sync_works()
+
+
+def test_the_pinned_read_still_refuses_a_generation_that_moved_under_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling 26 drops one guard, not the guarantee: the file's own identity still stands."""
+
+    database = _database(tmp_path)
+    replacement_directory = tmp_path / "next"
+    replacement_directory.mkdir()
+    replacement = _database(replacement_directory)
+    _read_through_a_descriptor(monkeypatch, database)
+
+    with (
+        pytest.raises(ReferenceSlowSourceError, match="changed while reading"),
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ),
+    ):
+        os.replace(replacement, database)
+
+
+def test_verified_read_rejects_a_database_replaced_under_the_read(
+    tmp_path: Path,
+) -> None:
+    """A `rename()` over the name mid-read is what the replica sync does every five minutes."""
+
+    database = _database(tmp_path)
+    replacement_dir = tmp_path / "next"
+    replacement_dir.mkdir()
+    replacement = _database(replacement_dir)
+
+    with (
+        pytest.raises(ReferenceSlowSourceError, match="changed while reading"),
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ),
+    ):
+        os.replace(replacement, database)
 
 
 def test_prior_daily_query_streams_and_fails_closed_at_row_limit(tmp_path: Path) -> None:
@@ -285,7 +483,7 @@ def test_prior_daily_query_streams_and_fails_closed_at_row_limit(tmp_path: Path)
 
 
 def test_nl_universe_capture_has_no_prevalidation_limit() -> None:
-    source = inspect.getsource(reference_slow_source_module._load_database_reference_evidence)
+    source = inspect.getsource(reference_slow_source_module._query_database_reference_evidence)
 
     nl_query = source[source.index('"nl_screen_universe"') :]
     assert "LIMIT 8000" not in nl_query
@@ -897,6 +1095,62 @@ def test_runtime_reference_source_and_publisher_are_independent_and_idempotent(
     assert (tmp_path / "quota" / "reference.sqlite3").is_file()
 
 
+def test_each_iteration_reports_what_it_did_with_the_replica_not_what_the_last_one_did(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review MF-1: this source captures for five minutes a day and idles for the rest.
+
+    `capture_reference_slow_batch` has four paths that return before the loader is reached
+    (not an open session, outside 09:20-09:25, today's batch already recorded and it is not
+    yet 09:24, every look-back date already swept). Before this fix those iterations
+    reported the last real capture's numbers, so from 09:25 the heartbeat read
+    `replica_opened=true` all day -- the exact signal §9.2 tells the operator to
+    investigate.
+    """
+
+    adapter = _Adapter()
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    observed_at = datetime(2026, 7, 31, 1, 20, tzinfo=UTC)
+    monkeypatch.setattr(
+        "rquant.reference_slow_runtime._utc_now",
+        lambda: observed_at.replace(minute=24, second=40),
+    )
+    step = reference_slow_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: observed_at,
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    captured = step()
+    idled = step()
+
+    assert captured.processed_count == 1
+    assert captured.replica_opened is True
+    #: the second iteration takes the "already recorded" early return and never asks
+    assert idled.processed_count == 0
+    assert idled.replica_opened is False
+    assert idled.replica_read_bytes == 0
+
+
+def test_an_iteration_outside_the_capture_window_reports_no_read(tmp_path: Path) -> None:
+    """The other 23 hours 55 minutes of the day, at this role's 30-second interval."""
+
+    adapter = _Adapter()
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    step = reference_slow_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: datetime(2026, 7, 31, 1, 26, tzinfo=UTC),
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    result = step()
+
+    assert result.replica_opened is False
+    assert result.replica_read_bytes == 0
+    assert adapter.calls == []
+
+
 def test_runtime_reference_source_is_quiet_after_decision_cutoff(tmp_path: Path) -> None:
     adapter = _Adapter()
     source_manifest, _publisher_manifest = _runtime_manifests(tmp_path)
@@ -963,3 +1217,89 @@ def test_builtin_registry_registers_reference_source_and_publisher(
         "adj_factor",
         "suspend_d",
     ]
+
+
+def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times this source actually opened the replica (#256).
+
+    Counted at the verified read rather than at `duckdb.connect`, because one read is
+    two connects on a platform whose engine refuses the descriptor path.
+    """
+
+    reads = [0]
+    original = reference_slow_source_module._verified_database_read
+
+    def counted(*args: object, **kwargs: object) -> object:
+        reads[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reference_slow_source_module, "_verified_database_read", counted)
+    return reads
+
+
+def test_one_replica_generation_is_read_once_however_many_sessions_are_asked_for(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#256: one iteration asks up to six times -- the target session and five look-backs.
+
+    Each ask used to be a whole-database copy. Now the same question against the same
+    generation is answered once, and a different session still opens the database.
+    """
+
+    database = _database(tmp_path)
+    gate: ReplicaReadGate[object] = ReplicaReadGate(database)
+    reads = _count_reads(monkeypatch)
+
+    first = reference_slow_source_module._load_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        limits=_source_limits(),
+        read_gate=gate,
+    )
+    again = reference_slow_source_module._load_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        limits=_source_limits(),
+        read_gate=gate,
+    )
+    other_session = reference_slow_source_module._load_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        projection_as_of_date=TARGET_DATE,
+        limits=_source_limits(),
+        read_gate=gate,
+    )
+
+    assert reads[0] == 2
+    assert first == again
+    assert other_session[0] == first[0]
+    assert gate.last_read is not None and gate.last_read.opened is True
+
+
+def test_a_replaced_replica_is_read_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _database(tmp_path)
+    replacement_directory = tmp_path / "next"
+    replacement_directory.mkdir()
+    replacement = _database(replacement_directory)
+    gate: ReplicaReadGate[object] = ReplicaReadGate(database)
+    reads = _count_reads(monkeypatch)
+
+    def load() -> object:
+        return reference_slow_source_module._load_database_reference_evidence(
+            database,
+            prior_trade_date=PRIOR_DATE,
+            limits=_source_limits(),
+            read_gate=gate,
+        )
+
+    load()
+    load()
+    os.replace(replacement, database)
+    load()
+    load()
+
+    assert reads[0] == 2

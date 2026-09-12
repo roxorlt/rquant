@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -683,6 +684,98 @@ def test_the_backoff_is_a_file_field_and_reaches_no_published_payload() -> None:
     assert "failure_kind" in RuntimeServiceHeartbeat.model_fields
     assert "failure_backoff_seconds" not in RuntimeServiceHeartbeatProjection.model_fields
     assert "failure_kind" not in RuntimeServiceHeartbeatProjection.model_fields
+
+
+def test_the_replica_cost_is_a_file_field_and_reaches_no_published_payload() -> None:
+    """#237's line again, for the two fields #256 adds."""
+
+    assert "replica_opened" in RuntimeServiceHeartbeat.model_fields
+    assert "replica_read_bytes" in RuntimeServiceHeartbeat.model_fields
+    assert "replica_opened" not in RuntimeServiceHeartbeatProjection.model_fields
+    assert "replica_read_bytes" not in RuntimeServiceHeartbeatProjection.model_fields
+
+
+def test_a_successful_iteration_carries_what_it_did_with_the_replica(tmp_path: Path) -> None:
+    """An iteration that opened the database, then one that recognised the generation."""
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        opened = control.record_success(
+            RuntimeStepResult(replica_opened=True, replica_read_bytes=4096)
+        )
+        reused = control.record_success(
+            RuntimeStepResult(replica_opened=False, replica_read_bytes=0)
+        )
+    finally:
+        control.stop(reason="test complete")
+
+    assert (opened.replica_opened, opened.replica_read_bytes) == (True, 4096)
+    assert (reused.replica_opened, reused.replica_read_bytes) == (False, 0)
+
+
+def test_a_role_that_reads_no_replica_reports_nothing_rather_than_zero(
+    tmp_path: Path,
+) -> None:
+    """Twenty-one of the twenty-five roles never open it; "0 bytes" would be a claim."""
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        heartbeat = control.record_success(RuntimeStepResult())
+    finally:
+        control.stop(reason="test complete")
+
+    assert heartbeat.replica_opened is None
+    assert heartbeat.replica_read_bytes is None
+
+
+def test_a_failed_iteration_does_not_keep_the_previous_read_s_numbers(
+    tmp_path: Path,
+) -> None:
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    try:
+        control.record_success(RuntimeStepResult(replica_opened=True, replica_read_bytes=4096))
+        failed = control.record_failure(RuntimeError("the replica moved under the read"))
+    finally:
+        control.stop(reason="test complete")
+
+    assert failed.replica_opened is None
+    assert failed.replica_read_bytes is None
+
+
+def test_a_role_with_no_replica_still_writes_both_keys_as_null(tmp_path: Path) -> None:
+    """Review MF-3: this is why the rollback moves **every** role's heartbeat, not four.
+
+    Heartbeats are serialized with a plain `model_dump(mode="json")` -- no `exclude_none`
+    -- so the two fields appear in the file for all 25 roles, as `null` for the 21 that
+    never touch the replica. The file model is `extra="forbid"` and `read_heartbeat`
+    raises rather than degrades, so a binary from before this package refuses every one of
+    those files, not just the four read-side ones. `DEPLOY.md`'s D-2 step moves them all.
+    """
+
+    control = RuntimeServiceControl(
+        tmp_path, spec=_spec("market-minute.source.v1"), clock=lambda: NOW
+    )
+    control.start()
+    try:
+        control.record_success(RuntimeStepResult(processed_count=1))
+    finally:
+        control.stop(reason="test complete")
+
+    written = next((tmp_path / "heartbeats").glob("*.json"))
+    payload = json.loads(written.read_text(encoding="utf-8"))
+
+    assert "replica_opened" in payload
+    assert "replica_read_bytes" in payload
+    assert payload["replica_opened"] is None
+    assert payload["replica_read_bytes"] is None
+
+
+def test_a_negative_read_is_refused() -> None:
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        RuntimeStepResult(replica_opened=True, replica_read_bytes=-1)
 
 
 def test_a_long_wait_is_cut_short_by_a_stop_within_one_poll_slice() -> None:

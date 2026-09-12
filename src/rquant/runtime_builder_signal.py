@@ -985,7 +985,23 @@ def notifier_builder(
         else:
             resolved_provider_loader = provider_loader
 
+        def _replica_cost() -> dict[str, object]:
+            """What **this** iteration did with the read-only replica (#256, review MF-1).
+
+            Empty for a notifier with no page projection configured, so a role that has no
+            replica to read reports `None` rather than a fabricated zero. Where there is
+            one, the answer always describes this iteration: `begin_iteration()` below
+            clears the previous one's report without clearing its cache.
+            """
+
+            if page_projection_producer is None:
+                return {}
+            opened, read_bytes = page_projection_producer.source.replica_iteration_summary()
+            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
+
         def step() -> RuntimeStepResult:
+            if page_projection_producer is not None:
+                page_projection_producer.source.begin_replica_iteration()
             descriptor = source.source_descriptor()
             cursor = store.replication_cursor()
             if settings.paused:
@@ -1018,6 +1034,7 @@ def notifier_builder(
                     ),
                     source_generations=source_generations,
                     degraded_reasons=tuple(degraded),
+                    **_replica_cost(),
                 )
 
             observed_at = clock()
@@ -1102,6 +1119,7 @@ def notifier_builder(
                 ),
                 source_generations=source_generations,
                 degraded_reasons=tuple(degraded),
+                **_replica_cost(),
             )
 
         return step
