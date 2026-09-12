@@ -19,6 +19,17 @@ stays one. `DeferredPeerArtifact` is exactly that distinction:
   it raises `PeerArtifactUnavailableError`, which `run_service_loop` records as
   `last_error` on the heartbeat and then keeps the service alive for the next iteration.
 
+A third state means the same thing and does not look like it: an artifact that is on
+disk, is a WAL SQLite database, and has no `-wal`/`-shm` beside it, in a directory this
+role cannot write. A read-only open of a WAL database has to *create* the `-shm`
+wal-index, so SQLite answers `unable to open database file` -- the same words a real
+fault gets. Only the owner's own open keeps those sidecars there, so that shape is
+"the owner is not running" as surely as an absent file is. `is_dormant_wal_database`
+is that judgement and `dormant_wal_peer_wait` is the wait it earns; both readers of a
+peer's SQLite database on this plane use them, so there is one rule and not two:
+`strategy_live` -> `broker.sqlite3` (#252) and `signal_router` -> `runner.sqlite3`
+(#263).
+
 Nothing here loosens a check: the callables handed to `open_artifact` are the same
 constructors, with the same validation, that the builders used to call eagerly.
 """
@@ -31,6 +42,9 @@ from pathlib import Path
 from typing import Generic, TypeVar
 
 ArtifactT = TypeVar("ArtifactT")
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_SQLITE_HEADER_BYTES = 20
 
 
 class PeerArtifactUnavailableError(ValueError):
@@ -132,7 +146,70 @@ class DeferredPeerArtifact(Generic[ArtifactT]):
         return opened
 
 
+def is_dormant_wal_database(path: Path) -> bool:
+    """Exactly the shape a cleanly stopped owner leaves behind, and nothing wider.
+
+    Four things must all hold, and each one is checked against the filesystem rather than
+    against the error text: the header must really be SQLite's, it must really say WAL,
+    both sidecars must really be absent, and the directory must really be one this
+    process cannot write. A truncated or corrupt header, a rollback-journal database, a
+    database whose owner is running (its sidecars are there), one in a directory this
+    role *can* write, and a header this process cannot read all answer `False`, so the
+    caller refuses exactly as it did before.
+    """
+
+    candidate = Path(path)
+    try:
+        with open(candidate, "rb") as handle:
+            header = handle.read(_SQLITE_HEADER_BYTES)
+    except OSError:
+        return False
+    if len(header) < _SQLITE_HEADER_BYTES or not header.startswith(_SQLITE_MAGIC):
+        return False
+    #: bytes 18 and 19 are the write and read file format versions; 2 is WAL
+    if header[18] != 2 or header[19] != 2:
+        return False
+    parent = candidate.parent
+    for sidecar in (f"{candidate.name}-wal", f"{candidate.name}-shm"):
+        try:
+            (parent / sidecar).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        return False
+    return not os.access(parent, os.W_OK)
+
+
+def dormant_wal_peer_wait(
+    *,
+    reader: str,
+    artifact: str,
+    path: Path,
+    owner: str,
+) -> PeerArtifactUnavailableError | None:
+    """The wait a cleanly stopped `owner` earns, or `None` when the shape is not that.
+
+    Returned rather than raised so the caller keeps its own refusal -- its own exception
+    type and its own wording -- for every shape this does not recognise.
+    """
+
+    if not is_dormant_wal_database(path):
+        return None
+    return PeerArtifactUnavailableError(
+        reader=reader,
+        artifact=artifact,
+        path=Path(path),
+        reason=(
+            "it is a WAL database with no -wal/-shm sidecars in a directory this role "
+            f"cannot write, which is what a stopped {owner} leaves"
+        ),
+    )
+
+
 __all__ = [
     "DeferredPeerArtifact",
     "PeerArtifactUnavailableError",
+    "dormant_wal_peer_wait",
+    "is_dormant_wal_database",
 ]

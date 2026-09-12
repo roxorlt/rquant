@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Protocol, Self
+from typing import Annotated, NoReturn, Protocol, Self
 from urllib.parse import quote
 
 from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
@@ -24,7 +24,10 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
-from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+from rquant.runtime_peer_artifacts import (
+    PeerArtifactUnavailableError,
+    dormant_wal_peer_wait,
+)
 from rquant.runtime_shadow_validation import ShadowSourceCompletionReceipt
 from rquant.signal_bus import (
     RouteDecisionKind,
@@ -502,6 +505,48 @@ class ReadonlyStrategyRunnerSignalSource:
             raise ValueError("runner source must be a regular file")
         return candidate
 
+    def _refuse_or_wait(self, error: sqlite3.Error, message: str) -> NoReturn:
+        """A strategy that is not running is a peer to wait for; anything else refuses.
+
+        `runner.sqlite3` is a WAL database, and
+        `deploy/systemd/rquant-runtime-signal-router@.service` grants this role
+        `live/strategies` read-only. While a strategy runs, its own connection keeps
+        `-wal` and `-shm` beside the database and this read-only open succeeds; a clean
+        stop checkpoints and removes both, and a read-only open of a WAL database then
+        has to *create* `-shm`, which this role cannot do. SQLite reports that as
+        `unable to open database file`, which is also what a real fault gets, so the
+        shape on disk is the only thing that can tell the two apart.
+
+        Calling it a fault is what the ninth window cost: the three strategies were
+        stopped cleanly at 18:22, the router started at 18:33, and at 18:43:38 it turned
+        that open into `runner source schema is unavailable`, exited 1 and fired one real
+        `OnFailure` push -- while two of the strategies recreated their runners only at
+        18:44:3x (#263). An absent `runner.sqlite3` has been a wait since #232 and a
+        runner still carrying our own previous generation's identity since #248; this is
+        the third way the same sentence is true, and it is decided by the same judgement
+        the strategy applies to a stopped paper broker's ledger (#252).
+
+        Nothing else moves. `message` is the refusal the caller already raised, word for
+        word, and a runner that is present *with* its sidecars and malformed -- a wrong
+        schema, a corrupt header, a truncated file -- still gets it. So does any error
+        that is not `OperationalError`, and any of the shapes
+        `is_dormant_wal_database` refuses to recognise.
+        """
+
+        pending = (
+            dormant_wal_peer_wait(
+                reader="signal_router",
+                artifact="runner source",
+                path=self.path,
+                owner="strategy",
+            )
+            if isinstance(error, sqlite3.OperationalError)
+            else None
+        )
+        if pending is not None:
+            raise pending from error
+        raise ValueError(message) from error
+
     def _connect(self) -> sqlite3.Connection:
         observed = self.path.stat(follow_symlinks=False)
         if (observed.st_dev, observed.st_ino) != self._file_identity:
@@ -515,7 +560,7 @@ class ReadonlyStrategyRunnerSignalSource:
                 isolation_level=None,
             )
         except sqlite3.Error as exc:
-            raise ValueError("runner source is unavailable in read-only mode") from exc
+            self._refuse_or_wait(exc, "runner source is unavailable in read-only mode")
         try:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
@@ -544,7 +589,7 @@ class ReadonlyStrategyRunnerSignalSource:
                     """
                 ).fetchone()
         except sqlite3.Error as exc:
-            raise ValueError("runner source schema is unavailable") from exc
+            self._refuse_or_wait(exc, "runner source schema is unavailable")
         if metadata is None or source is None:
             raise ValueError("runner source identity is unavailable")
         spec_fingerprint = str(metadata["strategy_spec_fingerprint"])
@@ -585,7 +630,7 @@ class ReadonlyStrategyRunnerSignalSource:
                     """
                 ).fetchone()
         except sqlite3.Error as exc:
-            raise ValueError("runner strategy identity is unavailable") from exc
+            self._refuse_or_wait(exc, "runner strategy identity is unavailable")
         if row is None:
             raise ValueError("runner strategy identity is unavailable")
         raw = bytes(row["payload_bytes"])
@@ -623,7 +668,7 @@ class ReadonlyStrategyRunnerSignalSource:
                     budget=self._read_budget,
                 )
         except sqlite3.Error as exc:
-            raise ValueError("runner signals are unavailable") from exc
+            self._refuse_or_wait(exc, "runner signals are unavailable")
         return RunnerSignalBatch(
             snapshot=SourceSnapshot(
                 descriptor=RouteSourceDescriptor(
@@ -656,7 +701,7 @@ class ReadonlyStrategyRunnerSignalSource:
                     identity=identity,
                 )
         except sqlite3.Error as exc:
-            raise ValueError("runner completion receipt is unavailable") from exc
+            self._refuse_or_wait(exc, "runner completion receipt is unavailable")
 
     def read_completed_batch(
         self,
@@ -690,7 +735,7 @@ class ReadonlyStrategyRunnerSignalSource:
                     budget=self._read_budget,
                 )
         except sqlite3.Error as exc:
-            raise ValueError("completed runner signals are unavailable") from exc
+            self._refuse_or_wait(exc, "completed runner signals are unavailable")
         return _completed_runner_batch(
             source_id=self.source_id,
             identity=identity,
