@@ -183,6 +183,14 @@
   判定**不看错误消息**：同一个状态在 macOS 上报的是 `attempt to write a readonly database`，
   在主机上报的是 `unable to open database file`。
 
+  **一句 operator 看得见的措辞跟着变了（包 T 复审 SF-2）**：判定抽成共用之后，#252 那条等待理由里
+  的「WAL ledger」改成了「WAL database」——策略读一个停机的 paper broker 台账时，心跳
+  `last_error` 从
+  `it is a WAL ledger with no -wal/-shm sidecars in a directory this role cannot write, which is what a stopped paper broker leaves`
+  变成同一句话的 `WAL database` 版本。`-wal/-shm` 与 `which is what a stopped paper broker leaves`
+  两截**一字未改**，全仓库也没有任何断言或文档钉着原来那个词；但 #252 已经装到主机上，
+  所以这一处照本项目「措辞是契约」的惯例记在这里，免得运维按旧词去 grep 心跳。
+
   `deploy/`、unit 文件、发布原语、已发布字段一个字未改。装机前的缓解写在 DEPLOY.md（runbook R-31）。
 
 - **另外三个读侧 role 的失败轮也如实报告它对只读副本做了什么（#261）**：
