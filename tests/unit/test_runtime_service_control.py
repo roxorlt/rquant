@@ -764,8 +764,10 @@ def test_a_failed_iteration_reports_what_it_did_with_the_replica_before_it_raise
             RuntimeError("current pointer producer_commit does not match expected commit"),
             replica_cost=(True, 43_790_567),
         )
-        never_asked = control.record_failure(RuntimeError("stopped before the read"),
-                                             replica_cost=(False, 0))
+        never_asked = control.record_failure(
+            RuntimeError("stopped before the read"),
+            replica_cost=(False, 0),
+        )
     finally:
         control.stop(reason="test complete")
 
@@ -817,7 +819,7 @@ def test_a_step_that_cannot_say_still_reports_neither_on_failure(tmp_path: Path)
         raise RuntimeError("this role reads a replica and failed")
 
     def malformed() -> RuntimeStepResult:
-        raise RuntimeError("this role reads a replica and failed")
+        raise RuntimeError("this role reads a replica and failed differently")
 
     broken.replica_iteration_summary = _raising_summary  # type: ignore[attr-defined]
     #: not a pair -- the probe runs inside the loop's own except handler, so a summary
