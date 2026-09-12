@@ -895,12 +895,12 @@ def _iteration_replica_cost(step: object) -> tuple[bool, int | None] | None:
         return None
     try:
         reported = summary()
+        if reported is None:
+            return None
+        opened, read_bytes = reported
+        return bool(opened), None if read_bytes is None else int(read_bytes)
     except Exception:  # noqa: BLE001 - a diagnostic may not displace the real failure
         return None
-    if reported is None:
-        return None
-    opened, read_bytes = reported
-    return bool(opened), None if read_bytes is None else int(read_bytes)
 
 
 def run_service_loop(

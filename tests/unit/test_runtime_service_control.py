@@ -816,9 +816,15 @@ def test_a_step_that_cannot_say_still_reports_neither_on_failure(tmp_path: Path)
     def broken() -> RuntimeStepResult:
         raise RuntimeError("this role reads a replica and failed")
 
-    broken.replica_iteration_summary = _raising_summary  # type: ignore[attr-defined]
+    def malformed() -> RuntimeStepResult:
+        raise RuntimeError("this role reads a replica and failed")
 
-    for step in (silent, broken):
+    broken.replica_iteration_summary = _raising_summary  # type: ignore[attr-defined]
+    #: not a pair -- the probe runs inside the loop's own except handler, so a summary
+    #: this shape must read as "cannot say" rather than take the loop down with it
+    malformed.replica_iteration_summary = lambda: "opened"  # type: ignore[attr-defined]
+
+    for step in (silent, broken, malformed):
         control = RuntimeServiceControl(tmp_path / step.__name__, spec=_spec(), clock=lambda: NOW)
         final = run_service_loop(
             control,
