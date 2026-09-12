@@ -25,6 +25,7 @@ from rquant.runtime_generation_lineage import (
     RuntimeGenerationLineageError,
     load_runtime_generation_tree,
     previous_strategy_spec_generations,
+    producer_commit_lineage,
     strategy_runner_identity_lineage_for_instance,
 )
 from rquant.runtime_peer_artifacts import DeferredPeerArtifact
@@ -885,6 +886,7 @@ def notifier_builder(
     provider_loader: ProviderLoader | None = None,
     capability_environment: Mapping[str, str] | None = None,
     clock: Callable[[], datetime],
+    runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         _require_manifest(manifest, kind=RuntimeServiceKind.NOTIFIER)
@@ -895,10 +897,12 @@ def notifier_builder(
         authority_reader: ServingSourceAuthorityReader | None = None
         previous_authority_reader: ServingSourceAuthorityReader | None = None
         page_projection_producer: SignalPageProjectionProducer | None = None
+        build_events: tuple[str, ...] = ()
         if settings.serving_authority_root is not None:
             from rquant.runtime_serving_authority import (
                 ServingSourceAuthorityPublisher,
                 ServingSourceAuthorityReader,
+                serving_source_pointer_handover,
             )
 
             authority_publisher = ServingSourceAuthorityPublisher(
@@ -908,11 +912,30 @@ def notifier_builder(
                 payload_kind="signal_delivery",
                 clock=clock,
             )
+            # This role both owns and reads `serving-authority/current.json`, and a release
+            # does not republish it: the pointer on disk after a handover still carries the
+            # commit of our own previous generation, and comparing it against this one took
+            # `notifier.admin.shadow.v1` DEGRADED every two seconds of the eighth window
+            # (#260). `serving.publisher.v1` reads the very same file and was given this
+            # predicate for the same reason in #253, so the judgement is shared rather than
+            # duplicated: a commit `producer_commit_lineage` cannot trace back to a
+            # generation installed under this runtime root is still refused, unchanged.
+            # Unlike serving, this role may rewrite the pointer -- and does, on its own next
+            # publish, as soon as its notification state revises.
             authority_reader = ServingSourceAuthorityReader(
                 root=settings.serving_authority_root,
                 expected_producer_commit=manifest.producer_commit,
                 expected_dataset_id=_SIGNALS_DATASET_ID,
                 expected_payload_kind="signal_delivery",
+                previous_generation_of_producer_commit=producer_commit_lineage(
+                    runtime_root,
+                    service_id=manifest.service_id,
+                ),
+            )
+            build_events = tuple(
+                event
+                for event in (serving_source_pointer_handover(authority_reader),)
+                if event is not None
             )
             if settings.serving_previous_producer_commit is not None:
                 if settings.serving_previous_producer_commit == manifest.producer_commit:
@@ -1120,6 +1143,20 @@ def notifier_builder(
                 source_generations=source_generations,
                 degraded_reasons=tuple(degraded),
                 **_replica_cost(),
+            )
+
+        if build_events:
+            step.generation_events = build_events
+        if page_projection_producer is not None:
+            #: An iteration that raises never reaches `_replica_cost()`, so the heartbeat
+            #: said `replica_opened=null` for exactly the iterations #260 made fail -- and
+            #: those had opened the replica, because the page projection is published
+            #: before the serving authority on every return path. `run_service_loop` reads
+            #: this on the failure path so the same MF-1 rule reaches a failed round:
+            #: never asked the gate is `(False, 0)`, opened it is `(True, bytes)`, and a
+            #: loader that raised part-way still counts as opened (package Q SF-7).
+            step.replica_iteration_summary = (
+                page_projection_producer.source.replica_iteration_summary
             )
 
         return step
