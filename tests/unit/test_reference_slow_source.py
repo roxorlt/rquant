@@ -1133,6 +1133,47 @@ def test_each_iteration_reports_what_it_did_with_the_replica_not_what_the_last_o
     assert idled.replica_read_bytes == 0
 
 
+def test_a_failing_capture_still_says_what_it_did_with_the_replica(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#261: the round that raised reported `null`, and it had already read the replica.
+
+    The replica is read before the first adapter call, so a capture that fails at the
+    source -- the transport error this role fails on for real -- has already paid for the
+    open. The step hands the loop its gate's own summary, and `run_service_loop` reports
+    it on the failure path, so a degraded heartbeat tells the operator whether that round
+    read the replica instead of leaving them to guess.
+    """
+
+    class _FailingAdapter(_Adapter):
+        def stock_st_raw(self, trade_date: date):  # type: ignore[no-untyped-def]
+            raise RuntimeError("reference transport refused")
+
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    observed_at = datetime(2026, 7, 31, 1, 20, tzinfo=UTC)
+    monkeypatch.setattr(
+        "rquant.reference_slow_runtime._utc_now",
+        lambda: observed_at.replace(minute=24, second=40),
+    )
+    step = reference_slow_source_builder(
+        adapter_factory=_FailingAdapter,
+        clock=lambda: observed_at,
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    summary = getattr(step, "replica_iteration_summary", None)
+    assert callable(summary)
+    assert summary() == (False, 0)
+
+    with pytest.raises(RuntimeError, match="reference transport refused"):
+        step()
+
+    opened, read_bytes = summary()
+    assert opened is True
+    assert read_bytes is None or read_bytes >= 0
+
+
 def test_an_iteration_outside_the_capture_window_reports_no_read(tmp_path: Path) -> None:
     """The other 23 hours 55 minutes of the day, at this role's 30-second interval."""
 

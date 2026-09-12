@@ -5,8 +5,10 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from rquant.auction_universe_authority import load_auction_universe_authority
+from rquant.auction_universe_source import AuctionUniverseSourceError
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.runtime_service_builtin import auction_universe_publisher_builder
 from rquant.runtime_service_control import RuntimeServicePlane
@@ -146,6 +148,39 @@ def test_an_iteration_inside_the_protection_window_reports_no_read(tmp_path: Pat
 
     assert result.replica_opened is False
     assert result.replica_read_bytes == 0
+
+
+def test_a_failing_publication_still_says_what_it_did_with_the_replica(
+    tmp_path: Path,
+) -> None:
+    """#261: the round that raised reported `null`, and it had opened the replica.
+
+    The scan of `daily_bar` happens before the authority is written, so a publication that
+    fails has already paid for the open -- and the gate counts a loader that raised
+    part-way as an open (package Q SF-7). The step hands the loop its gate's own summary
+    so the failure path reports the same numbers the success path does.
+    """
+
+    manifest = _manifest(tmp_path)
+    replica = Path(manifest.settings["database_path"])
+    replica.unlink()
+    with duckdb.connect(str(replica)) as connection:
+        connection.execute("CREATE TABLE other(ts_code VARCHAR NOT NULL);")
+    replica.chmod(0o600)
+    step = auction_universe_publisher_builder(
+        clock=lambda: datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
+    )(manifest)
+
+    summary = getattr(step, "replica_iteration_summary", None)
+    assert callable(summary)
+    assert summary() == (False, 0)
+
+    with pytest.raises(AuctionUniverseSourceError, match="daily snapshot query failed"):
+        step()
+
+    opened, read_bytes = summary()
+    assert opened is True
+    assert read_bytes is None or read_bytes >= 0
 
 
 def test_runtime_publisher_rejects_wrong_kind_or_plane(tmp_path: Path) -> None:
