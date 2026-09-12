@@ -145,7 +145,12 @@ def test_the_carried_iteration_reports_what_it_did_with_the_replica(
     cold_chain: RouteAWorld,  # noqa: F811
     credentials_root: dict[str, Path],  # noqa: F811
 ) -> None:
-    """The heartbeat of the iteration that now gets through: `(True, bytes)`, not `null`."""
+    """The heartbeat of the iteration that now gets through: `(True, bytes)`, not `null`.
+
+    The refusal has to be absent as well as the numbers present: with the gate summary in
+    place a *failed* iteration also reports `(True, bytes)`, so "opened the replica" alone
+    would be true of the broken window too and would prove nothing about the pointer.
+    """
 
     notifier_projection_replica(cold_chain)
     write_first_generation_signals_pointer(cold_chain)
@@ -153,6 +158,7 @@ def test_the_carried_iteration_reports_what_it_did_with_the_replica(
     run = run_notifier(cold_chain, credentials_root)
 
     assert run.entered, run
+    assert REFUSAL not in (run.last_error or ""), run
     assert run.replica_opened is True, run
     assert run.replica_read_bytes is None or run.replica_read_bytes >= 0, run
 
