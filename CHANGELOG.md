@@ -206,6 +206,11 @@
   `record_serving_authority_handoff` 审计行、推进 sequence 并用本代 commit 重发指针；
   lineage 只是接受并携带，什么也不记。所以配了这个 commit 时主读者**不再拿到** lineage 判定，
   走的就是接管那条路。生产画像里从来没有配过它，所以生产行为不变。
+  **优先级的另一面（包 S 复审 SF-C）**：配了它就等于收窄了接受范围——主读者手里没有 lineage 可退，
+  所以**点名的 commit 与盘上指针不一致时，本轮按 `ServingSourceAuthorityIntegrityError` 失败降级**，
+  哪怕盘上那个指针正是本 runtime root 装过的某一代、lineage 本来会把它携带下来。这是有意为之：
+  运维点名 X 而盘上是 Y，再按血缘悄悄收下 Y 就是第二次吞掉指令，大声降级才看得见。
+  **用法**：只把它配成盘上真实的那个 commit，接管发生之后就取消配置。
 
 - **失败的那一轮也如实报告它对只读副本做了什么（#260 附带）**：
   `record_failure` 原先无条件写 `replica_opened=null`，理由是「抛异常的一轮没读完」。

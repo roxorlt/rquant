@@ -14,6 +14,14 @@
 role，issue 就是 #261）；`deploy/`、unit 文件、发布原语、心跳字段一个字未改，回滚路径与
 v0.33.9 完全相同，**不需要额外挪心跳**。
 
+**一条只影响手工接管的收窄（包 R 复审 SF-1 + 包 S 复审 SF-C）**：notifier 的
+`serving_previous_producer_commit` 这个**手工接管**设置从此优先于 #260 的血缘判定，
+而且**配了它就没有血缘可退**——点名的 commit 与盘上 `current.json` 不一致时，本轮按
+`ServingSourceAuthorityIntegrityError` 失败降级，哪怕盘上那个指针是本机装过的某一代。
+**生产画像里从来没有配过这个字段**（`runtime_production_profile.py` 的 notifier 设置块里没有它），
+所以装机后的现场行为与 v0.33.9 完全一致；这条只是写给将来要手工接管的人看的：
+配它就配成盘上真实的那个 commit，接管完成后取消配置。
+
 ---
 
 ## 2026-09-12 · 待安装 · notifier 接受自己上一代的 serving 指针（#260）

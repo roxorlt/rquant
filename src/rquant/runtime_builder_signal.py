@@ -288,6 +288,16 @@ class NotifierSettings(RuntimeContractModel):
     #: the primary reader is not given the lineage predicate at all and the takeover
     #: branch is the one that runs. Unset -- which is every production profile -- the
     #: lineage is what answers.
+    #:
+    #: **The other face of that: setting this narrows what is accepted.** Because the
+    #: primary reader loses the lineage entirely, a commit named here that is *not* the
+    #: one on disk fails the round closed with `ServingSourceAuthorityIntegrityError`,
+    #: even where the pointer on disk is a generation this runtime root installed and the
+    #: lineage would have carried it (package S review SF-C). That is deliberate: an
+    #: operator naming X while the pointer says Y is the case where quietly accepting Y on
+    #: ancestry would swallow the instruction a second time, and a role that degrades
+    #: loudly is the one an operator can see. Set this only to the commit actually on
+    #: disk, and unset it once the takeover has happened.
     serving_previous_producer_commit: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{40}$",
@@ -934,7 +944,10 @@ def notifier_builder(
             # publish, as soon as its notification state revises.
             # An explicitly configured takeover outranks the lineage: it is an operator
             # naming one generation to take over from, and it is the only path that writes
-            # the handoff row. See `serving_previous_producer_commit` for the whole rule.
+            # the handoff row. It also narrows this reader: with the commit set there is no
+            # lineage left to fall back on, so a pointer that is not the named commit is
+            # refused even when this runtime root installed the generation that wrote it
+            # (review SF-C). See `serving_previous_producer_commit` for the whole rule.
             authority_reader = ServingSourceAuthorityReader(
                 root=settings.serving_authority_root,
                 expected_producer_commit=manifest.producer_commit,
