@@ -152,7 +152,7 @@ class SourceQuotaStore:
         """One operation's connection: committed or rolled back, and then closed (#245).
 
         `sqlite3.Connection` is a transaction context manager, not a closing one, so every
-        call site that wrote `with self._transaction() as connection:` left the connection open
+        call site that wrote `with self._connect() as connection:` left the connection open
         until the collector reached it. In a role that runs all day that is an unbounded
         handle count, and the checkpoint the collector then triggers deletes the `-wal` and
         `-shm` sidecars at an arbitrary moment -- which the package L sandbox e2e first read

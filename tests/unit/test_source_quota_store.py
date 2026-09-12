@@ -103,6 +103,77 @@ def test_the_ledger_closes_every_connection_it_opens(tmp_path: Path) -> None:
     assert still_open == []
 
 
+def test_the_ledger_closes_the_connection_of_an_operation_that_raises(tmp_path: Path) -> None:
+    """#245, review SF-A: raising is a designed exit here, not an exceptional one.
+
+    A window runs out of units and `acquire` raises `SourceQuotaExhaustedError`; a window
+    contract is restated and `declare_window` raises `SourceQuotaConflictError`. A resident
+    role sitting near its ceiling takes the first of those every day, so the `finally` in
+    `_transaction()` guards exactly the round #245 most needs guarded -- and the success
+    path alone cannot tell a `finally` from a trailing `close()`.
+
+    Two things are asserted about the round that raised: the connection it opened is
+    closed, and the `-wal`/`-shm` sidecars are gone with it. The second is the issue's own
+    symptom: their lifetime has to belong to the operation, not to the collector.
+    """
+
+    path = tmp_path / "quota.sqlite3"
+    store = SourceQuotaStore(path)
+    store.declare_window(
+        source="tushare.rt_min",
+        window_id="20260731T0930",
+        starts_at=START,
+        resets_at=END,
+        total_units=1,
+    )
+    store.acquire(
+        source="tushare.rt_min",
+        owner="market-minute:poll-1",
+        units=1,
+        now=START,
+        expires_at=START + timedelta(seconds=10),
+    )
+
+    opened: list[sqlite3.Connection] = []
+    unwrapped = store._connect
+
+    def tracking() -> sqlite3.Connection:
+        connection = unwrapped()
+        opened.append(connection)
+        return connection
+
+    store._connect = tracking  # type: ignore[method-assign]
+    gc.disable()
+    try:
+        with pytest.raises(SourceQuotaExhaustedError, match="remaining=0"):
+            store.acquire(
+                source="tushare.rt_min",
+                owner="market-minute:poll-2",
+                units=1,
+                now=START + timedelta(seconds=1),
+                expires_at=START + timedelta(seconds=10),
+            )
+        with pytest.raises(SourceQuotaConflictError):
+            store.declare_window(
+                source="tushare.rt_min",
+                window_id="20260731T0930",
+                starts_at=START,
+                resets_at=END + timedelta(minutes=1),
+                total_units=1,
+            )
+    finally:
+        gc.enable()
+
+    assert len(opened) == 2
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+    assert not path.with_name(f"{path.name}-wal").exists()
+    assert not path.with_name(f"{path.name}-shm").exists()
+    #: and both rounds rolled back: the window is untouched and the ledger still reads
+    assert store.remaining("tushare.rt_min", now=START) == 0
+
+
 def test_acquire_is_idempotent_and_survives_reopen(tmp_path: Path) -> None:
     path = tmp_path / "quota.sqlite3"
     store = _store(path)
