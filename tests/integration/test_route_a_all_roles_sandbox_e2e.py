@@ -592,7 +592,11 @@ KNOWN_OUT_OF_SANDBOX: dict[str, str] = {}
 #:   and checkpointed it inside this role's measurement window, which deletes the sidecars.
 #:   `reference_slow_publisher` has no quota path in its manifest at all and never touches
 #:   that directory; on the host it has published several generations without a write grant
-#:   there. Under systemd each role is its own process, so neither can happen.
+#:   there. Under systemd each role is its own process, so neither can happen. #245 closed
+#:   the quota-ledger half of this: `SourceQuotaStore` now closes each operation's
+#:   connection, so the reference-slow sidecars go when the operation does rather than
+#:   whenever the collector runs. The containment below is unchanged -- the paper broker
+#:   still holds its connection, and the entry is allowed, not required.
 #:
 #: All three stay as tripwires -- a *new* role appearing here is a regression worth
 #: reading -- but the assertion is a containment, because whether a peer's sidecars are

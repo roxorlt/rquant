@@ -147,9 +147,29 @@ class SourceQuotaStore:
             raise
         return connection
 
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """One operation's connection: committed or rolled back, and then closed (#245).
+
+        `sqlite3.Connection` is a transaction context manager, not a closing one, so every
+        call site that wrote `with self._transaction() as connection:` left the connection open
+        until the collector reached it. In a role that runs all day that is an unbounded
+        handle count, and the checkpoint the collector then triggers deletes the `-wal` and
+        `-shm` sidecars at an arbitrary moment -- which the package L sandbox e2e first read
+        as a write by a different role. Closing here is what makes the sidecars' lifetime a
+        property of the operation instead of of the collector.
+        """
+
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
         try:
-            with self._migration_lock(), self._connect() as connection:
+            with self._migration_lock(), self._transaction() as connection:
                 connection.execute("BEGIN EXCLUSIVE")
                 try:
                     self._initialize_exclusive(connection)
@@ -364,7 +384,7 @@ class SourceQuotaStore:
         if total_units < 1:
             raise ValueError("total_units must be positive")
         payload = (source, window_id, _iso(starts), _iso(resets), total_units)
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 existing = connection.execute(
@@ -452,7 +472,7 @@ class SourceQuotaStore:
 
     def remaining(self, source: str, *, now: datetime) -> int:
         observed = normalize_aware_utc(now)
-        with self._connect() as connection:
+        with self._transaction() as connection:
             window = self._active_window(connection, source, observed)
             return self._remaining_in_window(connection, window, observed)
 
@@ -473,7 +493,7 @@ class SourceQuotaStore:
             raise ValueError("source and owner must be nonempty")
         if units < 1:
             raise ValueError("units must be positive")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 window = self._active_window(connection, source, observed)
@@ -551,14 +571,14 @@ class SourceQuotaStore:
         identifier = attempt_id.strip()
         if not identifier:
             raise ValueError("attempt_id must be nonempty")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM quota_attempt WHERE attempt_id = ?", (identifier,)
             ).fetchone()
             return None if row is None else self._attempt_from_row(row)
 
     def list_attempts(self, *, source: str | None = None) -> tuple[SourceQuotaAttempt, ...]:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             if source is None:
                 rows = connection.execute(
                     "SELECT * FROM quota_attempt ORDER BY prepared_at, attempt_id"
@@ -599,7 +619,7 @@ class SourceQuotaStore:
             normalized_api,
             call_ordinal,
         )
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 attempt = connection.execute(
@@ -651,7 +671,7 @@ class SourceQuotaStore:
         request_id = logical_request_id.strip()
         if not normalized_source or not request_id:
             raise ValueError("source and logical_request_id must be nonempty")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             rows = connection.execute(
                 """
                 SELECT attempt.*
@@ -715,7 +735,7 @@ class SourceQuotaStore:
             normalized_api,
             call_ordinal,
         )
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 observed = normalize_aware_utc(clock())
@@ -941,7 +961,7 @@ class SourceQuotaStore:
             raise ValueError("source, owner, and attempt_id must be nonempty")
         if units < 1:
             raise ValueError("units must be positive")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 existing_attempt = connection.execute(
@@ -1038,7 +1058,7 @@ class SourceQuotaStore:
         monotonic_ns = self._monotonic_ns()
         if monotonic_ns < 0:
             raise ValueError("monotonic_ns must be nonnegative")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
@@ -1084,7 +1104,7 @@ class SourceQuotaStore:
         monotonic_ns = self._monotonic_ns()
         if monotonic_ns < 0:
             raise ValueError("monotonic_ns must be nonnegative")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
@@ -1184,7 +1204,7 @@ class SourceQuotaStore:
         if current_monotonic_ns < 0:
             raise ValueError("monotonic_ns must be nonnegative")
         minimum_age_ns = int(min_age.total_seconds() * 1_000_000_000)
-        with self._connect() as connection:
+        with self._transaction() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM quota_attempt
@@ -1228,7 +1248,7 @@ class SourceQuotaStore:
         if units < 1:
             raise ValueError("units must be positive")
         observed = normalize_aware_utc(now)
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
@@ -1277,7 +1297,7 @@ class SourceQuotaStore:
 
     def release(self, lease_id: str, *, now: datetime) -> SourceQuotaLease:
         observed = normalize_aware_utc(now)
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(

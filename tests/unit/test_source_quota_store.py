@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -41,6 +42,65 @@ def _store(path: Path) -> SourceQuotaStore:
         total_units=500,
     )
     return store
+
+
+def test_the_ledger_closes_every_connection_it_opens(tmp_path: Path) -> None:
+    """#245: the connections a long-running role opens must not wait for the collector.
+
+    `sqlite3.Connection` is a transaction context manager, not a closing one, so
+    `with self._connect() as connection:` committed and left the handle open. In
+    `reference-slow.source.v1` that is one leaked handle per operation for a whole
+    trading day, and the checkpoint the collector eventually triggers deletes the
+    `-wal`/`-shm` sidecars of `live/reference-slow/quota.sqlite3` at a moment that
+    belongs to nothing -- which the package L sandbox e2e first attributed to a write
+    by `reference_slow_publisher`.
+
+    The collector is disabled for the loop, so nothing but an explicit `close()` can
+    make these handles unusable, and every one of them is asked directly.
+    """
+
+    path = tmp_path / "quota.sqlite3"
+    opened: list[sqlite3.Connection] = []
+    store = SourceQuotaStore(path)
+    unwrapped = store._connect
+
+    def tracking() -> sqlite3.Connection:
+        connection = unwrapped()
+        opened.append(connection)
+        return connection
+
+    store._connect = tracking  # type: ignore[method-assign]
+    gc.disable()
+    try:
+        for index in range(20):
+            window = START + timedelta(minutes=index)
+            store.declare_window(
+                source="tushare.rt_min",
+                window_id=f"w{index:04d}",
+                starts_at=window,
+                resets_at=window + timedelta(minutes=1),
+                total_units=5,
+            )
+            store.acquire(
+                source="tushare.rt_min",
+                owner=f"market-minute:poll-{index}",
+                units=1,
+                now=window,
+                expires_at=window + timedelta(seconds=10),
+            )
+            store.remaining("tushare.rt_min", now=window)
+    finally:
+        gc.enable()
+
+    assert len(opened) >= 20
+    still_open = []
+    for connection in opened:
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            continue
+        still_open.append(connection)
+    assert still_open == []
 
 
 def test_acquire_is_idempotent_and_survives_reopen(tmp_path: Path) -> None:
