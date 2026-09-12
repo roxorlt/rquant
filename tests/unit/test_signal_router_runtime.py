@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,10 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxStatus
+from rquant.runtime_peer_artifacts import (
+    DeferredPeerArtifact,
+    PeerArtifactUnavailableError,
+)
 from rquant.runtime_shadow_validation import (
     ShadowSourceCompletionReceipt,
     shadow_session_boundaries,
@@ -1333,3 +1338,272 @@ def test_restoring_the_bus_database_restores_cursor_receipts_and_outbox_together
     assert summary.last_sequence == 2
     assert len(restored_bus.route_receipts("n-shape-v1")) == 2
     assert len(restored_bus.outbox_records()) == 2
+
+
+# ---------------------------------------------------------------------------------------
+# #263: a strategy that stopped cleanly leaves a WAL runner with no sidecars
+# ---------------------------------------------------------------------------------------
+
+
+def _stopped_strategy_runner(tmp_path: Path) -> Path:
+    """A real runner database, cleanly closed, in the directory layout the router reads.
+
+    `deploy/systemd/rquant-runtime-signal-router@.service` mounts `live/strategies`
+    read-only, and a clean `systemctl stop` of `strategy_live` checkpoints
+    `runner.sqlite3` and removes `runner.sqlite3-wal` and `-shm`. The caller chmods the
+    directory: the file itself stays writable here so each shape can be prepared first.
+    """
+
+    directory = tmp_path / "live" / "strategies" / "svc-1"
+    directory.mkdir(parents=True)
+    path = directory / "runner.sqlite3"
+    _write_runner_source(path, signal=_signal("a"))
+    gc.collect()
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+    gc.collect()
+    assert not path.with_name(f"{path.name}-wal").exists()
+    assert not path.with_name(f"{path.name}-shm").exists()
+    return path
+
+
+def _open_runner_source(path: Path) -> ReadonlyStrategyRunnerSignalSource:
+    return ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+
+
+def test_a_cleanly_stopped_strategy_runner_is_a_peer_to_wait_for(tmp_path: Path) -> None:
+    """#263: one real `OnFailure` push came out of calling this state a schema fault.
+
+    Ninth Route A window, 2026-09-12: the three strategies were stopped cleanly at 18:22,
+    the router started at 18:33, and at 18:43:38 it opened a sidecar-less WAL runner
+    through its read-only mount, turned `sqlite3.OperationalError` into `runner source
+    schema is unavailable`, exited 1 and fired the alert relay. Two of the strategies
+    recreated their runners at 18:44:3x, one iteration later. The runner is not damaged:
+    its owner is not running, which is what an absent one has meant since #232.
+    """
+
+    path = _stopped_strategy_runner(tmp_path)
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(PeerArtifactUnavailableError) as raised:
+            _open_runner_source(path)
+    finally:
+        path.parent.chmod(0o700)
+
+    assert raised.value.path == path
+    assert raised.value.reader == "signal_router"
+    assert raised.value.artifact == "runner source"
+    assert "wal" in str(raised.value).lower()
+
+
+def test_the_same_runner_opens_normally_once_its_directory_is_writable(
+    tmp_path: Path,
+) -> None:
+    """The wait is about the sandbox, not about the file: nothing else changed."""
+
+    path = _stopped_strategy_runner(tmp_path)
+    assert _open_runner_source(path).path == path
+
+
+def test_the_strategy_reopening_its_runner_ends_the_wait(tmp_path: Path) -> None:
+    """`-shm` back beside the database is the strategy running again, and it routes."""
+
+    path = _stopped_strategy_runner(tmp_path)
+    owner = sqlite3.connect(path)
+    try:
+        #: the strategy's own connection, which is what keeps the wal-index on disk
+        owner.execute("SELECT COUNT(*) FROM runner_signal").fetchone()
+        assert path.with_name(f"{path.name}-shm").exists()
+        path.parent.chmod(0o500)
+        try:
+            source = _open_runner_source(path)
+            batch = source.read_batch(after_sequence=0, limit=10)
+        finally:
+            path.parent.chmod(0o700)
+    finally:
+        owner.close()
+    assert batch.snapshot.descriptor.high_watermark == 1
+    assert len(batch.records) == 1
+
+
+def test_the_stopped_runner_is_deferred_by_name_the_way_every_other_peer_is(
+    tmp_path: Path,
+) -> None:
+    """What the builder does with it: `probe()` keeps it, `get()` names it (#232)."""
+
+    path = _stopped_strategy_runner(tmp_path)
+    deferred: DeferredPeerArtifact[ReadonlyStrategyRunnerSignalSource] = DeferredPeerArtifact(
+        reader="signal_router",
+        artifact="runner source",
+        path=path,
+        open_artifact=lambda: _open_runner_source(path),
+    )
+    path.parent.chmod(0o500)
+    try:
+        assert deferred.probe() is None
+        with pytest.raises(PeerArtifactUnavailableError) as raised:
+            deferred.get()
+    finally:
+        path.parent.chmod(0o700)
+    #: the heartbeat's `waiting_for` is `str(error.path)` (`runtime_service_control`)
+    assert raised.value.path == path
+
+
+def test_a_strategy_that_stops_after_the_router_opened_its_runner_is_also_waited_for(
+    tmp_path: Path,
+) -> None:
+    """The same state one iteration later: the source is already open when it appears.
+
+    `DeferredPeerArtifact` opens each runner once and keeps it, so a strategy stopped
+    while the router is up is not met at construction but inside `read_batch`. Left as a
+    refusal that is the same exit and the same push, one window later.
+    """
+
+    path = _stopped_strategy_runner(tmp_path)
+    source = _open_runner_source(path)
+    assert source.read_batch(after_sequence=0, limit=10).records
+    gc.collect()
+    #: the reader's own read-only open created the wal-index; the strategy's clean stop
+    #: is what removes it, and here nothing else holds the database
+    for sidecar in (f"{path.name}-wal", f"{path.name}-shm"):
+        path.with_name(sidecar).unlink(missing_ok=True)
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(PeerArtifactUnavailableError) as raised:
+            source.read_batch(after_sequence=0, limit=10)
+    finally:
+        path.parent.chmod(0o700)
+    assert raised.value.path == path
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        "stopped_strategy",
+        "not_sqlite",
+        "rollback_journal",
+        "sidecars_present",
+        "writable_directory",
+        "unreadable_header",
+    ),
+)
+def test_only_the_stopped_strategy_shape_is_ever_treated_as_a_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """The classifier's contract with the failure it classifies held constant.
+
+    The host's own sentence -- `unable to open database file` -- is injected verbatim and
+    only the shape on disk varies, because the same state answers `attempt to write a
+    readonly database` on macOS and nothing may depend on which. Everything except the
+    exact stopped-strategy shape still refuses, with the wording it refused with before.
+    """
+
+    path = _stopped_strategy_runner(tmp_path)
+    if shape == "not_sqlite":
+        payload = bytearray(path.read_bytes())
+        payload[:16] = b"NotSQLite fmt 3\x00"
+        path.write_bytes(bytes(payload))
+    elif shape == "rollback_journal":
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("PRAGMA journal_mode = DELETE")
+        finally:
+            connection.close()
+        gc.collect()
+    elif shape == "sidecars_present":
+        path.with_name(f"{path.name}-shm").write_bytes(b"")
+    elif shape == "unreadable_header":
+        path.chmod(0o000)
+
+    def refuse_to_open(_self: object) -> None:
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(ReadonlyStrategyRunnerSignalSource, "_connect", refuse_to_open)
+    if shape != "writable_directory":
+        path.parent.chmod(0o500)
+    try:
+        with pytest.raises(ValueError) as raised:
+            _open_runner_source(path)
+    finally:
+        path.parent.chmod(0o700)
+        if shape == "unreadable_header":
+            path.chmod(0o600)
+
+    waited = isinstance(raised.value, PeerArtifactUnavailableError)
+    assert waited is (shape == "stopped_strategy"), (shape, raised.value)
+    if not waited:
+        #: ruling 29.2: the refusal keeps the words the host's journal carried
+        assert str(raised.value) == "runner source schema is unavailable"
+
+
+def test_a_sqlite_error_that_is_not_operational_is_never_a_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt page reaches the reader as `DatabaseError`, and that is a fault."""
+
+    path = _stopped_strategy_runner(tmp_path)
+
+    def refuse_to_open(_self: object) -> None:
+        raise sqlite3.DatabaseError("file is not a database")
+
+    monkeypatch.setattr(ReadonlyStrategyRunnerSignalSource, "_connect", refuse_to_open)
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(ValueError) as raised:
+            _open_runner_source(path)
+    finally:
+        path.parent.chmod(0o700)
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+    assert str(raised.value) == "runner source schema is unavailable"
+
+
+def test_a_malformed_runner_with_its_sidecars_still_fails_closed(tmp_path: Path) -> None:
+    """Ruling 29.2, against the real filesystem: present, openable, and wrong.
+
+    A runner whose identity table the strategy never created is reachable -- the open
+    succeeds because its sidecars are there -- so the audit runs and refuses, in a
+    directory the router cannot write. What must never happen is the reverse: a schema
+    the audit rejects being reported as a peer to wait for.
+    """
+
+    directory = tmp_path / "live" / "strategies" / "svc-2"
+    directory.mkdir(parents=True)
+    path = directory / "runner.sqlite3"
+    owner = sqlite3.connect(path)
+    try:
+        owner.execute("PRAGMA journal_mode = WAL")
+        owner.execute(
+            """
+            CREATE TABLE runner_metadata (
+                singleton INTEGER PRIMARY KEY,
+                strategy_spec_fingerprint TEXT NOT NULL,
+                strategy_spec_json TEXT NOT NULL,
+                evaluator_contract_fingerprint TEXT NOT NULL
+            )
+            """
+        )
+        owner.execute("INSERT INTO runner_metadata VALUES (1, ?, '{}', ?)", (SPEC, "2" * 64))
+        owner.commit()
+        #: the strategy is running, so its own connection keeps `-wal`/`-shm` on disk
+        assert path.with_name(f"{path.name}-shm").exists()
+        directory.chmod(0o500)
+        try:
+            with pytest.raises(ValueError) as raised:
+                _open_runner_source(path)
+        finally:
+            directory.chmod(0o700)
+    finally:
+        owner.close()
+    assert not isinstance(raised.value, PeerArtifactUnavailableError)
+    assert str(raised.value) == "runner source schema is unavailable"

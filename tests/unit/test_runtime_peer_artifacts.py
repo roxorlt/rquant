@@ -7,6 +7,8 @@ ten times over one night for artifacts that were merely absent (#231, #232, #220
 
 from __future__ import annotations
 
+import gc
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,8 @@ import pytest
 from rquant.runtime_peer_artifacts import (
     DeferredPeerArtifact,
     PeerArtifactUnavailableError,
+    dormant_wal_peer_wait,
+    is_dormant_wal_database,
 )
 
 
@@ -174,3 +178,155 @@ def test_a_path_that_cannot_be_stat_ed_is_present_not_missing(
         artifact.probe()
     with pytest.raises(ValueError, match="unusable"):
         artifact.get()
+
+
+# ---------------------------------------------------------------------------------------
+# #252 / #263: a WAL database whose owner is not running, in a directory we cannot write
+# ---------------------------------------------------------------------------------------
+
+
+def _dormant_wal_database(tmp_path: Path) -> Path:
+    """A real WAL database, cleanly closed, in a directory this process cannot write.
+
+    That is what a cleanly stopped `paper_broker` leaves in `live/paper-brokers/<svc>/`
+    for `strategy_live` (#252) and what a cleanly stopped `strategy_live` leaves in
+    `live/strategies/<svc>/` for `signal_router` (#263): SQLite checkpoints and removes
+    `-wal` and `-shm` when the last connection closes, and both readers mount the
+    directory read-only. The caller chmods the directory, so the file is left writable
+    here and every shape below can be written before the wait is judged.
+    """
+
+    directory = tmp_path / "live" / "svc"
+    directory.mkdir(parents=True)
+    path = directory / "owner.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("CREATE TABLE owned (a INTEGER)")
+        connection.commit()
+    finally:
+        connection.close()
+    gc.collect()
+    assert not path.with_name(f"{path.name}-wal").exists()
+    assert not path.with_name(f"{path.name}-shm").exists()
+    return path
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        "stopped_owner",
+        "absent",
+        "not_sqlite",
+        "truncated_header",
+        "rollback_journal",
+        "wal_sidecar_present",
+        "shm_sidecar_present",
+        "writable_directory",
+        "unreadable_header",
+    ),
+)
+def test_only_the_stopped_owner_shape_is_a_dormant_wal_database(
+    tmp_path: Path,
+    shape: str,
+) -> None:
+    """The whole contract of the judgement both readers share, shape by shape.
+
+    `unable to open database file` is what SQLite says for a stopped owner *and* for
+    several things that are genuinely wrong, and the API gives no way to tell them apart
+    -- on macOS the same state answers `attempt to write a readonly database` instead, so
+    the message cannot be part of the rule at all. The shape on disk is, and only the
+    exact stopped-owner shape may ever become a wait: everything else must keep failing
+    closed in the reader that asked.
+    """
+
+    path = _dormant_wal_database(tmp_path)
+    if shape == "absent":
+        path.unlink()
+    elif shape == "not_sqlite":
+        payload = bytearray(path.read_bytes())
+        payload[:16] = b"NotSQLite fmt 3\x00"
+        path.write_bytes(bytes(payload))
+    elif shape == "truncated_header":
+        path.write_bytes(path.read_bytes()[:8])
+    elif shape == "rollback_journal":
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("PRAGMA journal_mode = DELETE")
+        finally:
+            connection.close()
+        gc.collect()
+    elif shape == "wal_sidecar_present":
+        path.with_name(f"{path.name}-wal").write_bytes(b"")
+    elif shape == "shm_sidecar_present":
+        path.with_name(f"{path.name}-shm").write_bytes(b"")
+    elif shape == "unreadable_header":
+        path.chmod(0o000)
+
+    if shape != "writable_directory":
+        path.parent.chmod(0o500)
+    try:
+        assert is_dormant_wal_database(path) is (shape == "stopped_owner"), shape
+    finally:
+        path.parent.chmod(0o700)
+        if shape == "unreadable_header":
+            path.chmod(0o600)
+
+
+def test_the_wait_a_stopped_owner_earns_names_the_reader_the_artifact_and_the_path(
+    tmp_path: Path,
+) -> None:
+    """`waiting_for` in the heartbeat is `str(error.path)` (`runtime_service_control`)."""
+
+    path = _dormant_wal_database(tmp_path)
+    path.parent.chmod(0o500)
+    try:
+        pending = dormant_wal_peer_wait(
+            reader="signal_router",
+            artifact="runner source",
+            path=path,
+            owner="strategy",
+        )
+    finally:
+        path.parent.chmod(0o700)
+
+    assert isinstance(pending, PeerArtifactUnavailableError)
+    assert pending.path == path
+    assert pending.reader == "signal_router"
+    assert pending.artifact == "runner source"
+    assert "wal" in str(pending).lower()
+    assert "stopped strategy" in str(pending)
+
+
+def test_a_shape_that_is_not_a_stopped_owner_earns_no_wait_at_all(tmp_path: Path) -> None:
+    """`None` rather than an exception, so the caller keeps its own refusal and wording."""
+
+    path = _dormant_wal_database(tmp_path)
+    assert (
+        dormant_wal_peer_wait(
+            reader="signal_router",
+            artifact="runner source",
+            path=path,
+            owner="strategy",
+        )
+        is None
+    )
+
+
+def test_both_readers_of_a_peers_sqlite_database_bind_the_same_judgement() -> None:
+    """One rule, not two that can drift: #252's reader and #263's reader call this one.
+
+    The strategy met this state on `broker.sqlite3` in the seventh window and the router
+    met it on `runner.sqlite3` in the ninth. A second copy of the judgement is how one of
+    them would later be widened -- to swallow any `OperationalError`, say -- without the
+    other's tests noticing.
+    """
+
+    import rquant.signal_router_runtime as router
+    import rquant.strategy_paper_lifecycle as lifecycle
+
+    for module in (router, lifecycle):
+        assert module.dormant_wal_peer_wait is dormant_wal_peer_wait
+        source = Path(module.__file__).read_text()
+        #: no module may carry its own header magic: that is what a copy looks like
+        assert "SQLite format 3" not in source, module.__name__

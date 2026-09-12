@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import stat
 from collections.abc import Mapping
@@ -30,7 +29,7 @@ from rquant.paper_contracts import (
 )
 from rquant.research_run_spec import ExecutionCostSpec
 from rquant.runtime_contracts import normalize_aware_utc
-from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
+from rquant.runtime_peer_artifacts import dormant_wal_peer_wait
 from rquant.signal_contracts import (
     CurrentSignalEnvelope,
     SignalAction,
@@ -40,8 +39,6 @@ from rquant.signal_contracts import (
 )
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_SQLITE_MAGIC = b"SQLite format 3\x00"
-_SQLITE_HEADER_BYTES = 20
 _REQUIRED_TABLES = frozenset(
     {
         "broker_account",
@@ -281,43 +278,21 @@ class PaperBrokerLifecycleReader:
         one this process cannot write. A truncated or corrupt header, a missing table, a
         ledger at the wrong schema version, or a failure in a directory this role *can*
         write all still raise `PaperLifecycleIntegrityError`.
+
+        The judgement itself lives in `runtime_peer_artifacts` because `signal_router`
+        met the same state on `runner.sqlite3` in the ninth window and has to answer it
+        the same way (#263): one rule, used by both readers, not two that can drift.
         """
 
-        if self._dormant_wal_ledger():
-            raise PeerArtifactUnavailableError(
-                reader="strategy_live",
-                artifact="paper broker ledger",
-                path=self.path,
-                reason=(
-                    "it is a WAL ledger with no -wal/-shm sidecars in a directory this "
-                    "role cannot write, which is what a stopped paper broker leaves"
-                ),
-            ) from error
+        pending = dormant_wal_peer_wait(
+            reader="strategy_live",
+            artifact="paper broker ledger",
+            path=self.path,
+            owner="paper broker",
+        )
+        if pending is not None:
+            raise pending from error
         raise PaperLifecycleIntegrityError("paper broker database cannot be opened") from error
-
-    def _dormant_wal_ledger(self) -> bool:
-        """Exactly the shape a cleanly stopped broker leaves, and nothing wider."""
-
-        try:
-            with open(self.path, "rb") as handle:
-                header = handle.read(_SQLITE_HEADER_BYTES)
-        except OSError:
-            return False
-        if len(header) < _SQLITE_HEADER_BYTES or not header.startswith(_SQLITE_MAGIC):
-            return False
-        #: bytes 18 and 19 are the write and read file format versions; 2 is WAL
-        if header[18] != 2 or header[19] != 2:
-            return False
-        parent = self.path.parent
-        for sidecar in (f"{self.path.name}-wal", f"{self.path.name}-shm"):
-            try:
-                (parent / sidecar).lstat()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return False
-            return False
-        return not os.access(parent, os.W_OK)
 
     def _connect(self) -> sqlite3.Connection:
         uri = f"file:{quote(str(self.path), safe='/')}?mode=ro"

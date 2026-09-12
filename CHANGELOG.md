@@ -151,6 +151,48 @@
 
 ### Fixed
 
+- **`signal_router` 不再把「策略干净停机留下的 runner 库」判成损坏（#263）**：
+  第九个路线 A 窗口（09-12，v0.33.9，权威链 sequence 7）里三条策略 18:22–18:23 被干净停机
+  （runbook R-29 的阻塞式 `systemctl stop`），router 18:33 起来，18:43:38 退 1，报
+
+      sqlite3.OperationalError: unable to open database file
+      ValueError: runner source schema is unavailable
+
+  `OnFailure=rquant-alert@%n.service` 因此**发出一条真实推送**（2/3 通道），`Restart=` 在
+  18:43:52 把它拉回来（`NRestarts=1`），而两条策略的首轮直到 18:44:35 / 18:44:44 才轮换重建
+  runner——也就是说，router 只要再等一轮就好了。
+
+  成因是 SQLite 的写法而不是数据坏了：`runner.sqlite3` 是 WAL 库，干净关闭会做 checkpoint 并
+  删掉 `-wal`/`-shm`；而**只读打开一个 WAL 库需要创建 `-shm`（wal-index）**，
+  `deploy/systemd/rquant-runtime-signal-router@.service` 把 `live/strategies` 挂成只读，
+  这一步做不了。SQLite 对此报 `unable to open database file`——真故障报的也是这一句，
+  接口上分不出来。第八个窗口没撞上，只是因为第六代 runner 是被 SIGKILL 掉的，sidecar 还在。
+
+  「所有者没在跑」这件事，在这个平面上一直是**等待**而不是拒绝：runner 文件不存在是等待
+  （#232），runner 还带着我们自己上一代的身份是等待（#248），策略看一个停机的 paper broker
+  台账是等待（#252，包 O）。这一包把 #252 那个判定从 `strategy_paper_lifecycle.py` 抽到
+  `runtime_peer_artifacts` 的 `is_dormant_wal_database` / `dormant_wal_peer_wait`，
+  **两个读者用同一条规则**（不造第二套，否则日后放宽了一侧，另一侧的用例发现不了）。
+  router 现在对这个形状抛 `PeerArtifactUnavailableError`，心跳的 `waiting_for` 指向那份
+  runner、状态 DEGRADED、不退避，下一轮重试。
+
+  **放宽的只有这一个形状**：库头必须真是 SQLite 的、必须真写着 WAL、两个 sidecar 必须真的都
+  不在、目录必须真的是本进程写不了的，异常也必须真是 `OperationalError`。库头坏了、截断了、
+  是回滚日志、sidecar 还在、目录本进程写得了、库头读不出来，以及带着 sidecar 但 schema 不对的
+  runner，**全部照旧失败关闭，措辞一字未改**（仍是 `runner source schema is unavailable`）。
+  判定**不看错误消息**：同一个状态在 macOS 上报的是 `attempt to write a readonly database`，
+  在主机上报的是 `unable to open database file`。
+
+  **一句 operator 看得见的措辞跟着变了（包 T 复审 SF-2）**：判定抽成共用之后，#252 那条等待理由里
+  的「WAL ledger」改成了「WAL database」——策略读一个停机的 paper broker 台账时，心跳
+  `last_error` 从
+  `it is a WAL ledger with no -wal/-shm sidecars in a directory this role cannot write, which is what a stopped paper broker leaves`
+  变成同一句话的 `WAL database` 版本。`-wal/-shm` 与 `which is what a stopped paper broker leaves`
+  两截**一字未改**，全仓库也没有任何断言或文档钉着原来那个词；但 #252 已经装到主机上，
+  所以这一处照本项目「措辞是契约」的惯例记在这里，免得运维按旧词去 grep 心跳。
+
+  `deploy/`、unit 文件、发布原语、已发布字段一个字未改。装机前的缓解写在 DEPLOY.md（runbook R-31）。
+
 - **另外三个读侧 role 的失败轮也如实报告它对只读副本做了什么（#261）**：
   #260 只把这条规则接到了 notifier 身上，`reference-slow.source.v1`、
   `candidate.auction_gap.v1`、`auction-universe.publisher.v1` 的失败轮心跳里
