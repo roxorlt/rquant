@@ -3016,3 +3016,78 @@ def test_the_reader_only_drops_the_predicate_once_the_generation_is_sealed(
     with reader:
         assert reader.generation_modified_at == written_at
     assert reader.generation_modified_at is None, "and nothing is open any more"
+
+
+def _projection_database_with_a_row_only_created_at_excludes(path: Path) -> None:
+    """The signal projection fixture plus one row that *only* `created_at <= ?` keeps out.
+
+    Its `trade_time` is inside the cutoff, so `trade_time <= ?` admits it and `freq` admits
+    it; the single thing standing between it and the published total is the predicate
+    SF-7's optimisation removes. That makes it the only shape that can tell "the reader
+    checked whether this generation was sealed" from "the reader assumed it was".
+    """
+
+    _signal_projection_database(path)
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            INSERT INTO minute_bar VALUES
+              ('000002.SZ', '2026-08-01 09:30:00', '1min', 11, 11, 11, 11,
+               1000, 11000, 'tushare', '2026-09-01 09:31:00')
+            """
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+
+
+def test_a_generation_stamped_after_the_cutoff_keeps_the_created_at_predicate(
+    tmp_path: Path,
+) -> None:
+    """Review SF-7: the optimisation is conditional, and the condition is load-bearing.
+
+    A replica whose mtime is *later* than the observation cannot have the property the drop
+    rests on -- "every row here was written before the file was" says nothing useful when
+    the file claims to have been written after the question was asked. The reader must
+    notice and run the query it always ran, or a row no point-in-time answer may include
+    walks into the published total.
+    """
+
+    database = tmp_path / "stamped-ahead.duckdb"
+    _projection_database_with_a_row_only_created_at_excludes(database)
+    ahead = (NOW + timedelta(hours=1)).timestamp()
+    os.utime(database, (ahead, ahead))
+
+    snapshot = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    coverage = {item.table_name: item for item in snapshot.projections}["minute_coverage"]
+    total = next(row for row in coverage.rows if row["source"] == "all")
+    assert total["rows_count"] == 1, "the row written after the cutoff must stay out"
+
+
+def test_a_sealed_generation_publishes_the_same_totals_as_an_unsealed_one(
+    tmp_path: Path,
+) -> None:
+    """And the other side of the condition: dropping the predicate changes no answer.
+
+    Same database, same cutoff, mtime moved from after the observation to before it -- the
+    only difference is which query the reader chooses, and the published rows are identical.
+    """
+
+    database = tmp_path / "sealed-or-not.duckdb"
+    _signal_projection_database(database)
+    ahead = (NOW + timedelta(hours=1)).timestamp()
+    os.utime(database, (ahead, ahead))
+    unsealed = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    behind = (NOW - timedelta(hours=1)).timestamp()
+    os.utime(database, (behind, behind))
+    sealed = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    def coverage(snapshot: object) -> tuple[dict[str, object], ...]:
+        table = {item.table_name: item for item in snapshot.projections}["minute_coverage"]
+        return tuple(dict(row) for row in table.rows)
+
+    assert coverage(sealed) == coverage(unsealed)
+    assert coverage(sealed), "the fixture must publish something for this to mean anything"
