@@ -173,17 +173,24 @@
   （只是文件字段，冻结的 serving 投影一个字段都没动）。
 
 - **停机不再等一次 DuckDB 读跑完（#268）**：
-  同一天 09:33 协调者逐个停掉九个最重的 unit，其中七个正在读副本。Python 的信号处理函数只在
-  主线程的字节码之间跑，而一个卡在 `DuckDBPyConnection.execute()` 里的 role 在查询返回之前
-  一条字节码都不执行——所以 `stop_event.set()` 不是晚了，是**根本没跑**。七个 role 各自超过
+  同一天 09:33 协调者逐个停掉九个最重的 unit，其中七个正在读副本。七个 role 各自超过
   `TimeoutStopSec=60`、被 `SIGKILL`、记成 `Result=timeout`、触发 `OnFailure`，
   一次运维自己发起的 `systemctl stop` 变成了告警。
 
-  `StopSignalWatcher` 用 `signal.set_wakeup_fd`：CPython 的 C 层处理函数在收到信号的那个线程里
-  **立刻**把信号号写进管道，watcher 用自己的线程读它，再对每个正在读的连接调 DuckDB 的
-  `interrupt()`。在钉住的 duckdb 1.5.2 上实测：信号之后 **0.4 秒**查询抛
-  `InterruptException`。空闲时调 `interrupt()` 在这个引擎上是空操作（同样实测），所以停机之后
-  才开始的读**直接拒绝**而不是放它跑完。被中断的那一轮在 gate 里算「没读完」，不留半个答案。
+  **成因不是「信号没送到」**：`run_service_loop` 只在**两轮之间**看 `stop_event`，
+  而没有任何地方叫引擎放弃，所以一个在十分钟扫描第 1 秒到达的停机信号仍然要花掉十分钟。
+  信号处理函数跑没跑，是引擎的性质而不是 CPython 的性质，实测（信号在查询开始后 0.4 秒发出，
+  各三遍）：**duckdb 1.5.2 在 1.81–1.89 秒的查询里第 0.40–0.41 秒就跑了处理函数；
+  CPython 的 `sqlite3` 在 20.48–20.67 秒的语句里要到第 20.48–20.67 秒才跑**——也就是
+  语句结束、已经没有什么可中断的时候。
+
+  所以现在有**两条**路去调 `interrupt()`，各自补对方补不了的一半：entrypoint 的信号处理
+  函数里加一行（DuckDB 那半靠它），以及 `StopSignalWatcher`——它用
+  `signal.set_wakeup_fd`，CPython 的 C 层处理函数在收到信号的那个线程里**立刻**把信号号
+  写进管道，watcher 用自己的线程读它（SQLite 那半只能靠它，同时也是 DuckDB 那半的兜底）。
+  实测：信号之后 **0.4 秒**查询抛 `InterruptException`。
+  空闲时调 `interrupt()` 在这个引擎上是空操作（同样实测），所以停机之后才开始的读**直接拒绝**
+  而不是放它跑完。被中断的那一轮在 gate 里算「没读完」，不留半个答案。
   四个把 `duckdb.Error` 翻译成自己整性错误的读路径都改成先放行中断
   （`InterruptException` 正是 `duckdb.Error`），`run_service_loop` 把它读成「这个循环结束了」
   而不是「这一轮失败了」——退出码 0、心跳 `stopped`、失败计数不动。
