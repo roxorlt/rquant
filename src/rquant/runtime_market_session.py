@@ -25,7 +25,11 @@ CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-_SHANGHAI = ZoneInfo("Asia/Shanghai")
+#: The market clock every session decision is taken in. Exported because the read-side
+#: gate's no-read window has to be the *same* clock as `may_fetch_market_minute`, not a
+#: second copy of the string that can drift from it (#268).
+MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_SHANGHAI = MARKET_TIMEZONE
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _READ_CHUNK_BYTES = 1024 * 1024

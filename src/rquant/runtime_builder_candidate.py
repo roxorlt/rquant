@@ -27,7 +27,7 @@ from rquant.auction_gap_candidate_input import (
 )
 from rquant.live_contracts import BatchQualityStatus
 from rquant.live_spool import LiveBatchSpool
-from rquant.readside_replica_gate import ReplicaReadGate
+from rquant.readside_replica_gate import AUCTION_GAP_CANDIDATE_PROFILE, ReplicaReadGate
 from rquant.reference_data_registry import ReadonlyReferenceRegistry
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_generation_lineage import candidate_authority_lineage
@@ -510,7 +510,14 @@ def candidate_publisher_builder(
         replica_gate: ReplicaReadGate[Any] | None = (
             None
             if settings.daily_database_path is None
-            else ReplicaReadGate(settings.daily_database_path)
+            #: at most one open per five-minute generation inside its 09:26-09:30 window
+            #: (#268); the window is shorter than a generation, so in a healthy session
+            #: this changes nothing and in a retrying one it changes everything
+            else ReplicaReadGate(
+                settings.daily_database_path,
+                profile=AUCTION_GAP_CANDIDATE_PROFILE,
+                clock=clock,
+            )
         )
 
         def _replica_cost() -> dict[str, object]:
@@ -525,7 +532,11 @@ def candidate_publisher_builder(
             if replica_gate is None:
                 return {}
             opened, read_bytes = replica_gate.iteration_summary()
-            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
+            return {
+                "replica_opened": opened,
+                "replica_read_bytes": read_bytes,
+                "replica_skipped_by_floor": replica_gate.iteration_skipped_by_floor(),
+            }
 
         def step() -> RuntimeStepResult:
             if replica_gate is not None:
@@ -605,6 +616,7 @@ def candidate_publisher_builder(
             #: (#261). A document-driven publisher has no gate and keeps reporting neither,
             #: which is the same distinction `_replica_cost()` makes on the success path.
             step.replica_iteration_summary = replica_gate.iteration_summary
+            step.replica_iteration_skipped_by_floor = replica_gate.iteration_skipped_by_floor
 
         return step
 

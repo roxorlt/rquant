@@ -26,9 +26,11 @@ import os
 import stat
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
+
+from rquant.runtime_market_session import MARKET_TIMEZONE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import duckdb
@@ -42,6 +44,129 @@ DESCRIPTOR_DIRECTORIES = ("/proc/self/fd", "/dev/fd")
 #: What DuckDB says when another process holds the write lock, lowercased. Two markers,
 #: because the wording differs across builds and only the first half is stable.
 WRITE_LOCK_MARKERS = ("could not set lock", "conflicting lock")
+
+#: The twenty minutes around the open in which a role that already has an answer must not
+#: go and get a newer one. On 2026-09-14 the 09:25 replica `cp` of ten gigabytes, the
+#: production monitor's own startup scan of the main database, the 09:30 backup `cp`+`gzip`
+#: of ten more and four read-side roles opening the new generation landed inside the same
+#: minute; load went 14 -> 21, several processes sat in D state, and **the production
+#: monitor produced no poll for ten minutes after the open** (#268). Nothing these roles
+#: publish is worth that, because nothing they publish changes in those twenty minutes in
+#: a way a twenty-minute-old generation misreports.
+DEFAULT_NO_READ_WINDOW = (time(9, 20), time(9, 40))
+
+
+@dataclass(frozen=True, slots=True)
+class ReplicaReadProfile:
+    """How often this role may open a *new* generation, and when it may not at all.
+
+    Package Q stopped these roles re-reading a generation they had already read. What it
+    could not stop is the generation changing: `rquant-replica-sync.timer` replaces the
+    replica every five minutes on a trading day, so "read only when it changed" is "read
+    every five minutes" -- and for the notifier one of those reads is a multi-gigabyte
+    aggregate over `minute_bar` (#268).
+
+    `min_reread_interval` is the floor between two *opens*. A generation that arrives
+    inside it is seen, and deliberately not read: the role keeps the answer it has and
+    says so in its heartbeat, as `replica_skipped_by_floor`.
+
+    `no_read_window` is a pair of **market-local** times, half-open, that suspends new
+    generation reads outright. `None` means the role has a window of its own that already
+    confines it -- which is the case for three of the four readers, and why this is not
+    simply on everywhere:
+
+    * `reference-slow.source.v1` captures inside 09:20-09:25, and
+    * `candidate.auction_gap.v1` assembles inside 09:26-09:30,
+
+    both of which lie *inside* 09:20-09:40. A blanket window would not slow those two
+    down; it would stop them working. `auction-universe.publisher.v1` refuses to publish
+    anywhere in 09:15-15:10 on its own account, so the window would never bind on it
+    either. The notifier is the one role that reads all day, every two seconds, and whose
+    read is the expensive one -- so the notifier is the role that carries the window.
+
+    The floor never blocks a role that has **no** answer yet. A cold start inside the
+    window must read, or the role has nothing to publish at all and goes DEGRADED for
+    twenty minutes; suppressing a *re-*read is the point, not suppressing the role.
+    """
+
+    #: the shortest gap between two opens of this replica. Zero leaves the gate exactly as
+    #: package Q left it: every new generation is read.
+    min_reread_interval: timedelta = timedelta(0)
+    #: market-local `[start, end)` in which a role that has an answer keeps it
+    no_read_window: tuple[time, time] | None = None
+
+    def __post_init__(self) -> None:
+        if self.min_reread_interval < timedelta(0):
+            raise ValueError("minimum re-read interval cannot be negative")
+        window = self.no_read_window
+        if window is not None:
+            start, end = window
+            if not isinstance(start, time) or not isinstance(end, time):
+                raise TypeError("a no-read window is a pair of times")
+            if start.tzinfo is not None or end.tzinfo is not None:
+                raise ValueError("a no-read window is stated in market-local time")
+            if start >= end:
+                raise ValueError("a no-read window must start before it ends")
+
+    def suspends_reads_at(self, observed_at: datetime) -> bool:
+        """Whether `observed_at` falls inside this profile's no-read window.
+
+        The market clock is `runtime_market_session.MARKET_TIMEZONE`, the same one
+        `may_fetch_market_minute` is decided in, imported rather than restated.
+
+        The calendar's *open dates* are deliberately not consulted. A window that also
+        asked "is today a trading day" would need the signed calendar authority inside the
+        gate, and the notifier -- the only role carrying a window -- is configured with no
+        calendar path at all. The cost of being wrong on a Sunday is that a page projection
+        is up to twenty minutes older than it could be between 09:20 and 09:40 on a day
+        when nothing is trading, which is nothing; the cost of being wrong on a Monday is
+        #268.
+        """
+
+        window = self.no_read_window
+        if window is None:
+            return False
+        start, end = window
+        local = observed_at.astimezone(MARKET_TIMEZONE).timetz().replace(tzinfo=None)
+        return start <= local < end
+
+
+#: What a gate built without a profile gets: every new generation is read, which is
+#: exactly where package Q left these roles. The four production roles are given their own
+#: by their builder.
+UNLIMITED_READ_PROFILE = ReplicaReadProfile()
+
+#: `notifier.admin.shadow.v1`. A two-second loop whose generation read is the whole of
+#: what it takes from the replica -- 44,052,711 of 44,052,711 bytes on package Q's
+#: measurement replica, all of it the `minute_bar` aggregate. Fifteen minutes is the floor
+#: #268 asks for, and it is the role that carries the open window.
+NOTIFIER_PAGE_PROJECTION_PROFILE = ReplicaReadProfile(
+    min_reread_interval=timedelta(minutes=15),
+    no_read_window=DEFAULT_NO_READ_WINDOW,
+)
+
+#: `reference-slow.source.v1`, floored at its own 09:20-09:25 capture window. Its loop runs
+#: every thirty seconds, so a *retrying* capture -- a quota refusal, a credential -- asks
+#: about ten times per window, and before package Q every one of those re-read the replica.
+#: The gate stopped the repeats of one generation; this stops the repeats across the
+#: generation the 09:25 replica sync drops in the middle of the window.
+REFERENCE_SLOW_SOURCE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=5))
+
+#: `candidate.auction_gap.v1`, floored at its own 09:26-09:30 assembly window. What it
+#: reads is prior sessions' `daily_bar` volumes, which do not change while the session
+#: opens, so a generation arriving inside the window carries the same answer at the cost of
+#: another scan. One read per session is the whole of what this role needs.
+AUCTION_GAP_CANDIDATE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=4))
+
+#: `auction-universe.publisher.v1`. It has no narrow window -- it refuses 09:15-15:10 and
+#: works either side -- so its floor is one replica generation. It publishes once per
+#: session and then recognises its own `current.json` without asking the gate; the floor
+#: bounds the loop before that, which package Q measured at about ten reads per generation.
+AUCTION_UNIVERSE_PUBLISHER_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=5))
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def descriptor_reopen_path(descriptor: int) -> str | None:
@@ -150,6 +275,10 @@ class ReplicaRead(Generic[T]):
     #: bytes this process read from the filesystem while the loader ran, where the
     #: platform will say (Linux `/proc/self/io`); None where it will not
     read_bytes: int | None = None
+    #: whether this iteration saw a *newer* generation and kept the previous answer
+    #: because this role's profile would not let it open one yet (#268). Never true
+    #: together with `opened`: the floor is a decision not to open.
+    skipped_by_floor: bool = False
 
 
 def _process_read_bytes() -> int | None:
@@ -214,15 +343,25 @@ class ReplicaReadGate(Generic[T]):
         path: Path,
         *,
         observer: Callable[[Path], ReplicaGeneration | None] = ReplicaGeneration.observe,
+        profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.path = Path(os.path.abspath(path))
         self._observer = observer
+        #: how often this role may open a new generation, and when it may not (#268).
+        #: The default profile is inert, so a gate built without one behaves exactly as
+        #: package Q left it; the four production roles are given theirs by their builder,
+        #: which is where a role's identity lives.
+        self.profile = profile
+        self._clock = clock
         self._generation: ReplicaGeneration | None = None
         self._key: Hashable = None
         self._cutoff: datetime | None = None
         self._value: T | None = None
         self._cached = False
         self._last: ReplicaRead[T] | None = None
+        #: when this gate last actually opened the database, for the floor
+        self._opened_at: datetime | None = None
 
     @property
     def last_read(self) -> ReplicaRead[T] | None:
@@ -239,6 +378,19 @@ class ReplicaReadGate(Generic[T]):
         """
 
         self._last = None
+
+    def iteration_skipped_by_floor(self) -> bool:
+        """Whether this iteration kept an older answer because of the profile (#268).
+
+        False for an iteration that never asked and for one that read: those are `False, 0`
+        and `True, bytes` in `iteration_summary()` respectively, and neither is a skip. It
+        is a separate accessor rather than a third member of that tuple because
+        `iteration_summary()` is what four builders and `run_service_loop`'s failure path
+        already unpack, and widening it would say nothing they do not each have to ask for.
+        """
+
+        read = self._last
+        return read is not None and read.skipped_by_floor
 
     def iteration_summary(self) -> tuple[bool, int | None]:
         """`(opened, read_bytes)` for this iteration, for the heartbeat.
@@ -275,6 +427,43 @@ class ReplicaReadGate(Generic[T]):
             return False
         return self._cutoff >= current.modified_at and cutoff >= self._cutoff
 
+    def _reusable_across_generations(self, key: Hashable, cutoff: datetime | None) -> bool:
+        """Whether the cached answer may stand in for a generation it was not taken from.
+
+        The same question -- `key` is what makes a question a different one, and a
+        different question always opens. What is dropped compared with `_reusable` is the
+        one clause that binds the answer to *this* generation, `self._cutoff >=
+        current.modified_at`: keeping an answer taken before the file was written is
+        exactly what the floor is for. `cutoff >= self._cutoff` stays, because a reader
+        whose question moves forward in time may not be handed an answer from later than
+        it is asking about.
+        """
+
+        if not self._cached or self._key != key:
+            return False
+        if cutoff is None:
+            return self._cutoff is None
+        if self._cutoff is None:
+            return False
+        return cutoff >= self._cutoff
+
+    def _floor_blocks(self, observed_at: datetime) -> bool:
+        """Whether this role's profile refuses to open a new generation right now.
+
+        A clock that moved backwards -- NTP on a host that has just come up -- does not
+        block: an answer must never be held because the floor's arithmetic went negative.
+        """
+
+        if self.profile.suspends_reads_at(observed_at):
+            return True
+        interval = self.profile.min_reread_interval
+        if interval <= timedelta(0) or self._opened_at is None:
+            return False
+        elapsed = observed_at - self._opened_at
+        if elapsed < timedelta(0):
+            return False
+        return elapsed < interval
+
     def read(
         self,
         loader: Callable[[], T],
@@ -293,6 +482,25 @@ class ReplicaReadGate(Generic[T]):
             self._last = read
             return read
 
+        #: The generation this role has is not the generation on disk, so the answer is
+        #: out of date -- and on a trading day that is true every five minutes, all day,
+        #: because the replica is *replaced* on a timer rather than because anything this
+        #: role reads has changed (#268). The floor is where that is decided: inside it,
+        #: the previous answer stands and the heartbeat says it was kept. A role with no
+        #: answer at all is never held here -- `_reusable_across_generations` is False
+        #: when nothing is cached -- so a cold start still reads.
+        now = self._clock()
+        if self._floor_blocks(now) and self._reusable_across_generations(key, cutoff):
+            read = ReplicaRead(
+                value=self._value,  # type: ignore[arg-type]
+                opened=False,
+                generation=current,
+                read_bytes=0,
+                skipped_by_floor=True,
+            )
+            self._last = read
+            return read
+
         before_bytes = _process_read_bytes()
 
         def measured() -> int | None:
@@ -301,6 +509,7 @@ class ReplicaReadGate(Generic[T]):
                 return None
             return max(0, after_bytes - before_bytes)
 
+        self._opened_at = now
         try:
             value = loader()
         except BaseException:

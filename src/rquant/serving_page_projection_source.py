@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
@@ -51,7 +51,12 @@ from rquant.page_control import (
     PageControlStatus,
     read_canvas_current_head,
 )
-from rquant.readside_replica_gate import ReplicaRead, ReplicaReadGate
+from rquant.readside_replica_gate import (
+    UNLIMITED_READ_PROFILE,
+    ReplicaRead,
+    ReplicaReadGate,
+    ReplicaReadProfile,
+)
 from rquant.research_gate import (
     ResearchGateFailure,
     ResearchGateRequest,
@@ -962,6 +967,8 @@ class DuckDBSignalPageProjectionSource:
         surge_live_root: Path | None = None,
         control_root: Path | None = None,
         atomically_published: bool = False,
+        read_profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory, the only place it may write. Used solely as
@@ -1000,9 +1007,17 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError(
                 "configured canvas catalog requires receipt root and keyring authority"
             )
-        #: this reader's memory of which replica generation it has already read (#256)
+        #: this reader's memory of which replica generation it has already read (#256),
+        #: and of how often its role is allowed to open a newer one (#268). The default
+        #: profile is inert: a caller that has not said which role this is -- a test, a
+        #: CLI -- keeps package Q's behaviour, and `runtime_builder_signal` is where the
+        #: notifier's fifteen minutes and its 09:20-09:40 window are attached.
+        gate_arguments: dict[str, object] = {"profile": read_profile}
+        if clock is not None:
+            gate_arguments["clock"] = clock
         self._replica_gate: ReplicaReadGate[_DatabaseProjection] = ReplicaReadGate(
-            self.database_path
+            self.database_path,
+            **gate_arguments,  # type: ignore[arg-type]
         )
 
     @property
@@ -1020,6 +1035,11 @@ class DuckDBSignalPageProjectionSource:
         """`(opened, read_bytes)` for this iteration, for the heartbeat."""
 
         return self._replica_gate.iteration_summary()
+
+    def replica_iteration_skipped_by_floor(self) -> bool:
+        """Whether this iteration kept an older generation on purpose (#268)."""
+
+        return self._replica_gate.iteration_skipped_by_floor()
 
     def __call__(self, observed_at: datetime, /) -> SignalPageProjectionSnapshot:
         if self.page_control_outbox is None:
