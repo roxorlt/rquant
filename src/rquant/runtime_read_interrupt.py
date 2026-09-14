@@ -2,36 +2,48 @@
 
 On 2026-09-14, the first trading day with all twenty runtime units resident, the
 coordinator stopped the nine heaviest roles at 09:33. Seven of them were inside a read of
-the ten-gigabyte read-only replica, and a process in an uninterruptible read does not run
-a Python signal handler: `TimeoutStopSec=60` expired, systemd sent `SIGKILL`, the unit was
-reported `Result=timeout`, and `OnFailure` turned an operator's own `systemctl stop` into
-an alert. Lengthening the unit's timeout would hide the symptom and is the owner's
-decision anyway; this module removes the cause, which is that nothing told the engine to
-give up.
+the ten-gigabyte read-only replica. `TimeoutStopSec=60` expired, systemd sent `SIGKILL`,
+the unit was reported `Result=timeout`, and `OnFailure` turned an operator's own
+`systemctl stop` into an alert.
 
-**Why a thread and a pipe rather than a signal handler.** CPython runs a Python-level
-signal handler in the *main* thread, between bytecodes. A role blocked in
-`DuckDBPyConnection.execute()` is inside C with the GIL released and executes no bytecode
-at all until the query returns, so `stop_event.set()` written as a handler is not late --
-it has not run. What *does* run immediately, in whichever thread the kernel picks, is
-CPython's own C handler, and `signal.set_wakeup_fd` makes that handler write one byte,
-the signal number, to a pipe. `StopSignalWatcher` reads that byte on a thread of its own,
-so `interrupt()` reaches the engine while the main thread is still inside the query.
+**What was actually wrong.** Not that the signal was lost: `run_service_loop` looks at
+`stop_event` *between* iterations, and nothing anywhere told the engine to give up, so a
+stop that arrived one second into a ten-minute scan still cost ten minutes. The fix is
+`interrupt()`. Lengthening the unit's timeout would hide the symptom and is the owner's
+decision anyway.
+
+**Who calls it, and why there are two of them.** A Python-level signal handler runs in the
+main thread between bytecodes, so whether it runs during a read is a fact about the
+engine, not about CPython. Measured here, on the pinned duckdb 1.5.2 and this CPython's
+`sqlite3`, three runs each, signal sent 0.4 s into the query:
+
+| engine | query | Python handler ran at |
+|---|---|---|
+| duckdb 1.5.2 | 1.81-1.89 s | **0.40-0.41 s** -- during the query |
+| sqlite3 | 20.48-20.67 s | **20.48-20.67 s** -- only when the statement ended |
+
+So for DuckDB the handler is enough to *call* `interrupt()`, and the entrypoint's handler
+does. For SQLite it is not: the statement holds the GIL-released C call to the end and the
+handler does not run until there is nothing left to interrupt. `StopSignalWatcher` is what
+covers that half. It takes `signal.set_wakeup_fd`, whose byte CPython's own C handler
+writes immediately from whichever thread the kernel delivered the signal to, and reads it
+on a thread of its own -- so the interrupt reaches either engine while the main thread is
+still inside the query, and it keeps working if a future DuckDB build stops yielding to
+pending signal handlers the way this one does.
+
 DuckDB then raises `duckdb.InterruptException` out of `execute()` within about a second
-(measured: 0.508 s on the pinned 1.5.2), the role unwinds through its normal error paths,
-and `run_service_loop` recognises the abandoned read as the stop it is.
+(measured: 0.4 s from the signal), SQLite raises `OperationalError: interrupted`, the role
+unwinds through its normal error paths, and `run_service_loop` recognises the abandoned
+read as the stop it is.
 
 **An interrupted read is not a shorter read.** `ReplicaReadGate.read()` already treats a
 loader that raised as "opened the database, kept nothing" and forgets its cache, so an
 interrupted round leaves no half answer behind; the next generation is read whole.
 
-Two facts about `interrupt()` that shape the design, both measured on duckdb 1.5.2:
-
-* it aborts the query running on that connection *now*, and the connection stays usable;
-* issued while the connection is idle it is a **no-op** -- it does not arm the next query.
-
-The second is why `register()` refuses outright once a stop has been requested: a read
-that has not started yet cannot be interrupted into stopping, so it must not start.
+One more measured fact about `interrupt()` on duckdb 1.5.2: issued while the connection is
+idle it is a **no-op** -- it does not arm the next query. That is why `register()` refuses
+outright once a stop has been requested: a read that has not started yet cannot be
+interrupted into stopping, so it must not start.
 """
 
 from __future__ import annotations
@@ -247,12 +259,16 @@ def reset_read_interrupts() -> None:
 class StopSignalWatcher:
     """Hear SIGTERM on a thread of this process's own, not in the main thread's eval loop.
 
-    `signal.set_wakeup_fd` is the only thing CPython offers that acts while the main
-    thread is inside a C call: the C handler writes the signal number to the pipe from
-    whichever thread the kernel delivered the signal to, immediately. This watcher reads
-    that byte and does two things -- abandons the open reads, and calls `on_stop`, which is
-    what sets the loop's `stop_event`, because the Python-level handler that normally sets
-    it will not run until the read it is waiting on returns.
+    `signal.set_wakeup_fd` is the only thing CPython offers that acts while the main thread
+    is inside a C call: the C handler writes the signal number to the pipe from whichever
+    thread the kernel delivered the signal to, immediately. This watcher reads that byte
+    and does two things -- abandons the open reads, and calls `on_stop`, which is what sets
+    the loop's `stop_event`.
+
+    **Which reads need it** is measured in this module's own docstring: DuckDB yields to
+    pending Python handlers while a query runs and SQLite does not, so a long SQLite
+    statement is abandoned by this thread or by nothing. For DuckDB it is the second route
+    and the one that keeps working if a future build stops yielding.
 
     **It refuses to install over somebody else's wakeup fd.** `asyncio` uses the same slot
     on the main thread; taking it would break that loop's signal handling, and forwarding

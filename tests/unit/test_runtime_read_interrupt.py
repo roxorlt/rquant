@@ -201,17 +201,19 @@ def test_a_cycle_in_the_cause_chain_terminates() -> None:
 
 
 def test_a_signal_arriving_during_a_query_abandons_it_within_the_budget() -> None:
-    """The claim ruling 30 makes, measured end to end.
+    """The claim ruling 30 makes, with the watcher as the only thing that can deliver it.
 
-    A Python-level handler runs in the main thread between bytecodes; this test is in the
-    main thread and inside `execute()`, so the handler *cannot* run until the query
-    returns. Only the watcher's thread can act, and if it does not, the query runs for
-    hours and this test times out rather than passing quietly.
+    The handler installed here sets the stop event and **does not** ask for the interrupt,
+    which is what isolates the watcher: DuckDB does run pending Python handlers while a
+    query is in flight (measured: 0.40 s into a 1.85 s query), so a handler that asked
+    would hide whether the watcher works at all. Here nothing but the watcher's thread can
+    reach the engine, and if it does not, the query runs for hours and this test times out
+    rather than passing quietly.
     """
 
     stopped = threading.Event()
     previous = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGTERM, lambda *_: (stopped.set(), request_read_interrupt()))
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     connection = duckdb.connect(":memory:")
     raised: list[BaseException] = []
     try:
@@ -237,6 +239,48 @@ def test_a_signal_arriving_during_a_query_abandons_it_within_the_budget() -> Non
     assert is_read_interrupt(raised[0])
     assert elapsed < _BUDGET_SECONDS, f"the read was abandoned after {elapsed:.2f}s"
     assert stopped.is_set(), "the watcher must also set the loop's stop event"
+
+
+def test_only_the_watcher_can_abandon_a_long_sqlite_statement(tmp_path: Path) -> None:
+    """The half of #268 a signal handler cannot do anything about, whatever it is written to do.
+
+    Measured on this CPython: a Python-level handler runs 0.40 s into a 1.85 s DuckDB query
+    and only at the *end* of a 20.5 s SQLite statement -- `sqlite3` releases the GIL for
+    the whole statement and never yields to pending handlers. So here the handler asks for
+    the interrupt and it makes no difference; the statement is abandoned by the watcher's
+    thread or by nothing. This is why the watcher exists rather than just the handler.
+    """
+
+    connection = sqlite3.connect(tmp_path / "slow.sqlite3")
+    connection.execute("CREATE TABLE t(a INTEGER)")
+    connection.executemany("INSERT INTO t VALUES (?)", [(index,) for index in range(1_000)])
+    handler_ran = threading.Event()
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda *_: (handler_ran.set(), request_read_interrupt()))
+    raised: list[BaseException] = []
+    try:
+        with StopSignalWatcher() as watcher:
+            assert watcher.active
+            threading.Thread(
+                target=lambda: (time.sleep(0.3), os.kill(os.getpid(), signal.SIGTERM)),
+                daemon=True,
+            ).start()
+            started = time.monotonic()
+            try:
+                with interruptible_read(connection):
+                    connection.execute(
+                        "SELECT count(*) FROM t AS a, t AS b, t AS c WHERE a.a + b.a + c.a > 0"
+                    ).fetchall()
+            except BaseException as error:  # noqa: BLE001 - the exception is the assertion
+                raised.append(error)
+            elapsed = time.monotonic() - started
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        connection.close()
+
+    assert raised, "the statement ran to completion, so nothing reached the engine"
+    assert is_read_interrupt(raised[0])
+    assert elapsed < _BUDGET_SECONDS, f"the statement was abandoned after {elapsed:.2f}s"
 
 
 def test_the_watcher_restores_the_wakeup_fd_it_borrowed() -> None:

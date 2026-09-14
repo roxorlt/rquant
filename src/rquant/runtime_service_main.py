@@ -763,8 +763,11 @@ def run(args: argparse.Namespace) -> int:
 
     def request_stop(_signum: int, _frame: FrameType | None) -> None:
         stop_event.set()
-        #: the backstop for a process where the watcher below could not take the wakeup
-        #: fd. When it could, this handler has already been overtaken by it (#268).
+        #: Setting the event alone was the whole of this handler until #268, and it is why
+        #: a stop that arrived one second into a ten-minute read still cost ten minutes:
+        #: the loop looks at the event *between* iterations. DuckDB runs this handler
+        #: during a query (measured), so for the replica readers this line is what
+        #: abandons the read; the watcher below covers SQLite, where it does not.
         request_read_interrupt()
 
     previous_handlers = {
@@ -773,12 +776,13 @@ def run(args: argparse.Namespace) -> int:
     try:
         for signum in previous_handlers:
             signal.signal(signum, request_stop)
-        #: A handler set above runs in the main thread between bytecodes, and a role inside
-        #: `DuckDBPyConnection.execute()` runs no bytecode until the query returns -- which
-        #: on 09-14 was longer than `TimeoutStopSec` for seven roles at once, so systemd
-        #: killed them and `OnFailure` turned an operator's own stop into a push (#268).
-        #: The watcher hears the same signal on a thread of its own and tells the engine to
-        #: give up, so the stop takes about a second instead of the read.
+        #: A handler set above runs in the main thread between bytecodes, so whether it
+        #: runs during a read is a fact about the engine: DuckDB yields to it, SQLite does
+        #: not until the statement ends (both measured, see `runtime_read_interrupt`). The
+        #: watcher hears the same signal on a thread of its own, so the interrupt reaches
+        #: either engine while the query is still running and the stop takes about a
+        #: second instead of the read -- which on 09-14 was longer than `TimeoutStopSec`
+        #: for seven roles at once (#268).
         with (
             StopSignalWatcher(
                 signums=tuple(previous_handlers),
