@@ -47,13 +47,6 @@ class _Refusing(_Recording):
         raise RuntimeError("this connection is closed")
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry() -> None:
-    reset_read_interrupts()
-    yield
-    reset_read_interrupts()
-
-
 # ---------------------------------------------------------------------------------------
 # the registry
 # ---------------------------------------------------------------------------------------
@@ -320,3 +313,79 @@ def test_a_signal_the_watcher_does_not_watch_is_left_alone() -> None:
 
 def test_the_stop_reason_is_a_sentence_an_operator_can_read() -> None:
     assert READ_INTERRUPT_STOP_REASON == "stop requested during a database read"
+
+
+def test_a_watcher_over_a_signal_with_no_python_handler_says_it_is_not_armed() -> None:
+    """Review SF-2: `set_wakeup_fd` only writes for signals CPython actually handles.
+
+    A SIGTERM left at `SIG_DFL` is delivered in C and kills the process; the wakeup pipe
+    never sees it. A watcher that reported itself active there would be a silent lie, and
+    the entrypoint's own "could not install" warning would not fire either.
+    """
+
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        with StopSignalWatcher(signums=(signal.SIGTERM,)) as watcher:
+            assert not watcher.active
+            assert watcher.unarmed_signums == (signal.SIGTERM,)
+        #: and it took nothing it has to give back
+        assert signal.set_wakeup_fd(-1) == -1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_a_watcher_names_the_unarmed_signal_while_still_covering_the_armed_one() -> None:
+    """One handler missing is a partial watcher, not a dead one -- and it says which."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        #: SIGINT always has CPython's own `default_int_handler`, so it is armed
+        with StopSignalWatcher(signums=(signal.SIGINT, signal.SIGTERM)) as watcher:
+            assert watcher.active
+            assert watcher.unarmed_signums == (signal.SIGTERM,)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_an_ignored_signal_counts_as_unarmed() -> None:
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        with StopSignalWatcher(signums=(signal.SIGTERM,)) as watcher:
+            assert not watcher.active
+            assert watcher.unarmed_signums == (signal.SIGTERM,)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_the_stop_event_is_set_before_the_interrupt_is_requested() -> None:
+    """Review SF-4: `run_service_loop` only reads an abandoned read as a stop when the
+    event is already set, so the watcher must not interrupt first.
+
+    The order is observable rather than argued: the connection records whether the event
+    was set at the moment `interrupt()` reached it.
+    """
+
+    registry = ReadInterruptRegistry()
+    stopped = threading.Event()
+
+    class _WatchingOrder:
+        def __init__(self) -> None:
+            self.event_was_set: bool | None = None
+
+        def interrupt(self) -> None:
+            self.event_was_set = stopped.is_set()
+
+    connection = _WatchingOrder()
+    watcher = StopSignalWatcher(
+        signums=(signal.SIGTERM,),
+        registry=registry,
+        on_stop=stopped.set,
+    )
+    token = registry.register(connection)
+    assert watcher._handle(bytes([signal.SIGTERM])) is True
+    registry.release(token)
+
+    assert connection.event_was_set is True, "the interrupt overtook the stop event"

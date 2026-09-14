@@ -496,7 +496,18 @@ class ReplicaReadGate(Generic[T]):
         #: answer at all is never held here -- `_reusable_across_generations` is False
         #: when nothing is cached -- so a cold start still reads.
         now = normalize_aware_utc(self._clock())
-        if self._floor_blocks(now) and self._reusable_across_generations(key, cutoff):
+        #: `current is None` is not "a newer generation this role may skip", it is *no
+        #: readable file at that name* -- deleted, replaced by a symlink, replaced by a
+        #: directory. Holding the previous answer there would publish a stale page for a
+        #: quarter of an hour and report it as `replica_skipped_by_floor=true`, which
+        #: DEPLOY.md tells the owner to read as the fix working (review SF-1). A vanished
+        #: replica must surface as the failure package Q designed: the loader is called,
+        #: it says the replica is gone, and the heartbeat says the round failed.
+        if (
+            current is not None
+            and self._floor_blocks(now)
+            and self._reusable_across_generations(key, cutoff)
+        ):
             read = ReplicaRead(
                 value=self._value,  # type: ignore[arg-type]
                 opened=False,

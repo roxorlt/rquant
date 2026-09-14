@@ -795,6 +795,15 @@ def run(args: argparse.Namespace) -> int:
                     "runtime service could not install the read-interrupt watcher; "
                     "a stop during a database read waits for the read (#268)"
                 )
+            elif read_interrupts.unarmed_signums:
+                #: a watched signal with no Python handler never reaches the wakeup pipe,
+                #: so the watcher cannot act on it (review SF-2). Both are installed above,
+                #: so this is a guard against a future caller, not a live condition.
+                logger.warning(
+                    "runtime service read-interrupt watcher is not armed for signals "
+                    f"{sorted(read_interrupts.unarmed_signums)}; a stop on one of those "
+                    "during a database read waits for the read (#268)"
+                )
             registry_kwargs: dict[str, object] = {
                 "runtime_capabilities": runtime_capabilities,
                 # The generation tree under this root is what tells a role's own

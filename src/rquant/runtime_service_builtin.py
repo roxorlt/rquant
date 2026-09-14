@@ -465,8 +465,17 @@ def reference_slow_source_builder(
                         retired_at=clock(),
                     )
             opened, read_bytes = replica_gate.iteration_summary()
+            #: All three fields, the way the other three read-side builders report them
+            #: (review MF-1). Without the third, an iteration this role's floor held back
+            #: is `(False, 0, null)` -- indistinguishable from "never asked the gate" and
+            #: from "recognised the generation it already had", which is the one thing the
+            #: field exists to tell apart.
             return result.model_copy(
-                update={"replica_opened": opened, "replica_read_bytes": read_bytes}
+                update={
+                    "replica_opened": opened,
+                    "replica_read_bytes": read_bytes,
+                    "replica_skipped_by_floor": replica_gate.iteration_skipped_by_floor(),
+                }
             )
 
         #: An iteration that raises returns through none of the lines above, so the

@@ -370,6 +370,23 @@ class _StableReadonlyDuckDB:
             raise
         return self.connection
 
+    @property
+    def generation_modified_at(self) -> datetime | None:
+        """When the inode this reader has open was last written, or None before it opens.
+
+        Taken from the *descriptor*, not the name, so it answers for the generation being
+        read however the name moves under it. Every row inside a replica generation was
+        written before the file itself was, so a point-in-time cutoff at or after this is a
+        cutoff every row already satisfies -- which is what lets `_minute_coverage` drop a
+        predicate rather than evaluate it (review SF-7).
+        """
+
+        if self._descriptor < 0:
+            return None
+        return datetime.fromtimestamp(
+            os.fstat(self._descriptor).st_mtime_ns / 1_000_000_000, tz=UTC
+        )
+
     def _connect_generation(self, descriptor_path: str | None) -> duckdb.DuckDBPyConnection:
         """Open the exact generation this descriptor holds, writing nothing if possible.
 
@@ -1068,7 +1085,7 @@ class DuckDBSignalPageProjectionSource:
         #: taken at or after the generation's own mtime -- every row in the file was
         #: written before the file was, so a later cutoff admits exactly the same rows.
         read = self._replica_gate.read(
-            lambda: self._read_database_projection(cutoff),
+            lambda: self._read_database_projection(cutoff, observed=observed),
             key=("signal-page-projection", cutoff.date()),
             cutoff=observed,
         )
@@ -1106,7 +1123,12 @@ class DuckDBSignalPageProjectionSource:
             surge_runtime_config=runtime_config,
         )
 
-    def _read_database_projection(self, cutoff: datetime) -> _DatabaseProjection:
+    def _read_database_projection(
+        self,
+        cutoff: datetime,
+        *,
+        observed: datetime | None = None,
+    ) -> _DatabaseProjection:
         """Everything this projection takes out of the replica, in one open.
 
         Split out of `_build_snapshot` so the gate above has something to remember. What
@@ -1115,11 +1137,23 @@ class DuckDBSignalPageProjectionSource:
         with the database would delay a canvas by up to a replica period.
         """
 
-        with _StableReadonlyDuckDB(
+        stable = _StableReadonlyDuckDB(
             self.database_path,
             control_root=self.control_root,
             atomically_published=self.atomically_published,
-        ) as connection:
+        )
+        with stable as connection:
+            #: Whether every row in this generation was already written when the cutoff was
+            #: taken. The replica is *replaced* whole, never written in place, so a cutoff
+            #: at or after the file's own mtime is one that `created_at <= cutoff` cannot
+            #: exclude a single row by -- and a predicate that cannot exclude anything is a
+            #: column DuckDB does not have to read (review SF-7). False when the reader
+            #: cannot say, or when the file carries a stamp from the future, in which case
+            #: the predicate is evaluated exactly as before.
+            written_at = stable.generation_modified_at
+            sealed_before_cutoff = (
+                observed is not None and written_at is not None and observed >= written_at
+            )
             self._require_tables(connection)
             screen_rows = connection.execute(
                 """
@@ -1145,7 +1179,11 @@ class DuckDBSignalPageProjectionSource:
                 )
                 for preset, minimum, maximum, count in screen_rows
             )
-            minute_coverage = self._minute_coverage(connection, cutoff=cutoff)
+            minute_coverage = self._minute_coverage(
+                connection,
+                cutoff=cutoff,
+                generation_sealed_before_cutoff=sealed_before_cutoff,
+            )
             latest_row = connection.execute(
                 """
                 SELECT MAX(trade_date)
@@ -1643,6 +1681,7 @@ class DuckDBSignalPageProjectionSource:
         connection: duckdb.DuckDBPyConnection,
         *,
         cutoff: datetime,
+        generation_sealed_before_cutoff: bool = False,
     ) -> tuple[MinuteCoverageProjectionRow, ...]:
         """Per-source and total 1-minute coverage, in **one** pass over `minute_bar` (#256).
 
@@ -1663,22 +1702,56 @@ class DuckDBSignalPageProjectionSource:
         the total shares the result set; ordering by the grouping flag first puts the
         source rows ahead of it, so more sources than the budget still overflows the count
         and still refuses.
+
+        **`generation_sealed_before_cutoff` drops the `created_at` predicate, and nothing
+        else** (review SF-7). A replica generation is *replaced* whole and never written in
+        place, so every row inside it was written before the file was: a cutoff at or after
+        the file's own mtime is one that `created_at <= cutoff` cannot exclude a single row
+        by. The predicate is then not a cheaper filter, it is a column -- `created_at` is
+        one of five this scan reads, and dropping the clause takes it out of the plan
+        entirely. The published values are identical, which is the whole point and is
+        asserted directly rather than argued: the two forms are compared row by row on
+        several fixtures, and the scanned column list is read out of `EXPLAIN ANALYZE`.
+
+        The caller passes False whenever it cannot establish that -- no descriptor, or a
+        replica stamped in the future -- and then this runs exactly the query it ran
+        before. Ruling 30 item 3 asked for a *trade-date* narrowing, which is not available
+        (it changes three published fields, `test_the_minute_coverage_projection_cannot_be
+        _narrowed_to_the_current_trade_date`); this is the half of it that is.
         """
 
-        rows = connection.execute(
-            """
-            SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
-                   COALESCE(source, 'unknown') AS source_label,
-                   COUNT(*), COUNT(DISTINCT ts_code),
-                   COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time), MAX(trade_time)
-            FROM minute_bar
-            WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
-            GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
-            ORDER BY is_total, source_label
-            LIMIT ?
-            """,
-            (cutoff, cutoff, _MAX_MINUTE_SOURCES + 2),
-        ).fetchall()
+        if generation_sealed_before_cutoff:
+            rows = connection.execute(
+                """
+                SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
+                       COALESCE(source, 'unknown') AS source_label,
+                       COUNT(*), COUNT(DISTINCT ts_code),
+                       COUNT(DISTINCT CAST(trade_time AS DATE)),
+                       MIN(trade_time), MAX(trade_time)
+                FROM minute_bar
+                WHERE freq = '1min' AND trade_time <= ?
+                GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
+                ORDER BY is_total, source_label
+                LIMIT ?
+                """,
+                (cutoff, _MAX_MINUTE_SOURCES + 2),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
+                       COALESCE(source, 'unknown') AS source_label,
+                       COUNT(*), COUNT(DISTINCT ts_code),
+                       COUNT(DISTINCT CAST(trade_time AS DATE)),
+                       MIN(trade_time), MAX(trade_time)
+                FROM minute_bar
+                WHERE freq = '1min' AND trade_time <= ? AND created_at <= ?
+                GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
+                ORDER BY is_total, source_label
+                LIMIT ?
+                """,
+                (cutoff, cutoff, _MAX_MINUTE_SOURCES + 2),
+            ).fetchall()
         grouped = [row for row in rows if not int(row[0])]
         if len(grouped) > _MAX_MINUTE_SOURCES:
             raise PageProjectionSourceIntegrityError(

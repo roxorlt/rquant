@@ -31,10 +31,13 @@ on a thread of its own -- so the interrupt reaches either engine while the main 
 still inside the query, and it keeps working if a future DuckDB build stops yielding to
 pending signal handlers the way this one does.
 
-DuckDB then raises `duckdb.InterruptException` out of `execute()` within about a second
-(measured: 0.4 s from the signal), SQLite raises `OperationalError: interrupted`, the role
-unwinds through its normal error paths, and `run_service_loop` recognises the abandoned
-read as the stop it is.
+DuckDB then raises `duckdb.InterruptException` out of `execute()` and SQLite raises
+`OperationalError: interrupted`, the role unwinds through its normal error paths, and
+`run_service_loop` recognises the abandoned read as the stop it is. **How long that takes,
+measured from the signal**, signal sent one second into a query that would not finish,
+three runs each: DuckDB 0.004 / 0.000 / 0.000 s, SQLite 0.000 / 0.001 / 0.000 s. (An
+earlier version of this docstring said "0.4 s from the signal". That was the delay from
+*query start* in a probe whose signal was sent at 0.4 s -- review SF-3.)
 
 **An interrupted read is not a shorter read.** `ReplicaReadGate.read()` already treats a
 loader that raised as "opened the database, kept nothing" and forgets its cache, so an
@@ -274,6 +277,16 @@ class StopSignalWatcher:
     on the main thread; taking it would break that loop's signal handling, and forwarding
     bytes on to it correctly is more fragility than this is worth. `active` says which
     happened, so a caller can report the degradation rather than assume the mechanism.
+
+    **Precondition: the caller installs a Python handler for each watched signal first.**
+    CPython only routes a signal through its own C handler -- the one that writes the
+    wakeup byte -- for signals that have a Python-level handler installed. A SIGTERM left
+    at `SIG_DFL` never reaches this pipe at all; it kills the process, and a watcher that
+    reported itself active would be a silent lie (the review's first probe died exactly
+    that way, exit 143). `__enter__` therefore checks each watched signal and records the
+    ones that are not armed in `unarmed_signums`; `active` is True only when at least one
+    of them is, so a caller can warn with the list rather than assume the mechanism.
+    `runtime_service_main` installs both handlers before it enters this.
     """
 
     def __init__(
@@ -289,6 +302,9 @@ class StopSignalWatcher:
         self.registry = READ_INTERRUPTS if registry is None else registry
         self._on_stop = on_stop
         self.active = False
+        #: watched signals with no Python handler installed when this watcher started, so
+        #: no wakeup byte will ever be written for them (review SF-2)
+        self.unarmed_signums: tuple[int, ...] = ()
         #: signal numbers this watcher actually saw, in arrival order, for the tests
         self.observed: list[int] = []
         self._read_fd = -1
@@ -297,7 +313,30 @@ class StopSignalWatcher:
         self._thread: threading.Thread | None = None
         self._finished = threading.Event()
 
+    @staticmethod
+    def _is_armed(signum: int) -> bool:
+        """Whether CPython will route this signal through the handler that writes the pipe.
+
+        `SIG_DFL` and `SIG_IGN` are handled in C without ever entering CPython's own
+        handler, so no wakeup byte is written for them. Anything else -- including
+        `default_int_handler`, which CPython installs for SIGINT on its own -- is a Python
+        handler and does write one.
+        """
+
+        try:
+            current = signal.getsignal(signum)
+        except (ValueError, OSError):  # pragma: no cover - not a signal this platform has
+            return False
+        return current not in (signal.SIG_DFL, signal.SIG_IGN, None)
+
     def __enter__(self) -> StopSignalWatcher:
+        self.unarmed_signums = tuple(
+            signum for signum in self.signums if not self._is_armed(signum)
+        )
+        if len(self.unarmed_signums) == len(self.signums):
+            #: no watched signal reaches CPython's C handler, so the pipe would never be
+            #: written and `active` would be a lie (review SF-2)
+            return self
         read_fd, write_fd = os.pipe()
         os.set_blocking(read_fd, False)
         os.set_blocking(write_fd, False)
@@ -372,9 +411,14 @@ class StopSignalWatcher:
         if not watched:
             return False
         self.observed.extend(watched)
-        self.registry.request()
+        #: `on_stop` first, then the interrupt: `run_service_loop` only reads an abandoned
+        #: read as a stop when `stop_event` is already set, and the other order leaves a
+        #: window -- however small -- in which the exception reaches the loop before the
+        #: event does and the stop is recorded as an iteration failure (review SF-4). The
+        #: entrypoint's own handler is already in this order.
         if self._on_stop is not None:
             self._on_stop()
+        self.registry.request()
         return True
 
 

@@ -763,3 +763,65 @@ def test_the_window_is_read_in_the_market_clock_not_the_hosts() -> None:
     assert profile.suspends_reads_at(inside.astimezone(UTC))
     #: 09:30 UTC is 17:30 in the market clock, which is nowhere near the window
     assert not profile.suspends_reads_at(datetime(2026, 9, 14, 9, 30, tzinfo=UTC))
+
+
+def test_a_vanished_replica_is_a_failure_and_never_a_floor_skip(tmp_path: Path) -> None:
+    """Review SF-1: `current is None` is not "a newer generation this role may skip".
+
+    `ReplicaGeneration.observe` answers `None` for a name with no regular file behind it --
+    deleted, turned into a symlink, turned into a directory. Before this guard the floor
+    branch fired there too, so a role with a cached answer would serve it for the whole
+    interval and report `replica_skipped_by_floor=true` -- which DEPLOY.md tells the owner
+    to read as the fix working. A replica that is gone has to surface as the failure
+    package Q designed: the loader is called, it says so, and the round fails.
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    calls = {"count": 0}
+
+    def loader() -> object:
+        calls["count"] += 1
+        if not replica.exists():
+            raise RuntimeError("the replica is gone")
+        return "answer"
+
+    gate.read(loader)
+    replica.unlink()
+    clock.advance(timedelta(seconds=2))
+
+    with pytest.raises(RuntimeError, match="the replica is gone"):
+        gate.read(loader)
+
+    assert calls["count"] == 2, "the loader must be asked, not answered from the cache"
+    assert gate.last_read is not None
+    assert gate.last_read.skipped_by_floor is False
+    assert gate.iteration_skipped_by_floor() is False
+
+
+def test_a_replica_replaced_by_a_directory_is_refused_the_same_way(tmp_path: Path) -> None:
+    """The other shape `observe()` answers `None` for, so the guard is not about `unlink`."""
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.read(loader)
+    replica.unlink()
+    replica.mkdir()
+    clock.advance(timedelta(seconds=2))
+    gate.read(loader)
+
+    assert loader.calls == 2
+    assert gate.last_read is not None
+    assert gate.last_read.skipped_by_floor is False
