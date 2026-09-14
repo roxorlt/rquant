@@ -24,12 +24,30 @@
   `notifier.admin.shadow.v1` 上应当**经常是 `true`**——副本每五分钟换一代，而 notifier 的
   最短重读间隔是 15 分钟，所以三代里有两代会被压住，这是预期而不是故障。
   `replica_opened=true` 在 notifier 上一小时最多四次。
+  **另外三个 role 上这个字段基本恒为 `false`**：它们本来就只在自己那几分钟的窗口里读，
+  包 Q 的「变了才读」已经把它们压到每代一次，间隔在生产节拍上近似空操作。
+  **判断「限频起作用了」只看 notifier 的 `replica_opened` 频次**，不要指望另外三个。
 - 09:20–09:40 这二十分钟内 notifier 不开库，`replica_skipped_by_floor=true`。
   `reference-slow.source.v1`（09:20–09:25 采集）与 `candidate.auction_gap.v1`
   （09:26–09:30 装配）**照常读**，它们没有禁读时段，只有等于自己窗口长度的间隔。
 - 手工 `systemctl stop` 一个读侧 role：应当**几秒内**停干净，`systemctl show -p Result`
-  是 `success` 不是 `timeout`，心跳 `status=stopped`、`stop_reason` 是
-  `stop requested during a database read`，不再有 `OnFailure` 推送。
+  是 `success` 不是 `timeout`，心跳 `status=stopped`，不再有 `OnFailure` 推送。
+  **`stop_reason` 大概率是 `loop completed`，这不是没修好。** 装上第 2 条之后 notifier
+  十五分钟才开一次库，手工停的时候它绝大多数轮根本不在读；只有正好停在读里那一次，
+  `stop_reason` 才会是 `stop requested during a database read`。
+  换句话说，第 2 条把第 1 条的可观察特征变稀了——**验收看的是「几秒内停干净、
+  `Result=success`、没有推送」**，中断本身的证据在 e2e 里
+  （`test_a_role_interrupted_mid_read_exits_in_time_with_code_zero`：信号到进程返回 < 5 秒、
+  退出码 0、心跳 `stopped`），不要指望在生产上手工复现。
+
+**一个需要 owner 明确点头的取舍：开盘期间页面会更旧。** notifier 09:19:59 读一次之后，
+15 分钟的间隔在 09:34:59 到期，但禁读时段要到 09:40:00 才放开，所以那一代答案最长撑
+**20 分 1 秒**；加上它读的那一代副本本身最多已经旧 5 分钟，
+**开盘期间 `minute_coverage.max_time` 最坏落后约 25 分钟**。
+若再采纳下面「盘中副本同步 5 → 15 min」那一条，最坏值变成**约 35 分钟**。
+这一段正是用户最可能去看页面的时候。**这不是缺陷，是本包换来「monitor 能轮询」的代价**，
+请 owner 明确接受或另提要求。（已核：不破坏已发布投影的校验，旧答案不算「晚于
+`available_at` 的证据」。）
 
 **装机后的首个交易日按这一条走**：**只在 09:00 前起 unit，然后全天观察，中途不停不起**。
 本窗口验收判据在原有几条之外**加一条**：
@@ -46,7 +64,7 @@
 |---|---|---|---|
 | 盘中副本同步频率 | 5 min | **15 min** | 每次替换都是 10 GB 的 `cp`，而读侧现在最快也只有 15 min 重读一次，5 min 的代已经没人消费 |
 | 备份时段 | 每 15 min，含 09:30 | **避开 09:20–09:40** | 09:30 那一次是 `cp` + `gzip` 10 GB，正好落在开盘 |
-| `TimeoutStopSec` | 60 s | **≥ 300 s** | 代码侧已经让读可中断，这一条是兜底：中断链路万一不可用时，停机仍不该变成 `Result=timeout` 与推送 |
+| `TimeoutStopSec` | 60 s | **≥ 300 s** | **#268 点名七个 role，本包只接上四个**（notifier、reference-slow.source、candidate.auction_gap、auction-universe.publisher）。另外三个卡在 spool / 文件 I/O 上（`cp`、`os.read`、fsync），`interrupt()` 够不着，它们的停机仍然只能靠这一条兜底 |
 | vda 调度器 | `mq-deadline` | **`bfq`** | `rquant-live-runtime.slice` 上的 `IOWeight=` 在 `mq-deadline` 下不生效（2026-09-08 已记为已知限制） |
 
 ---

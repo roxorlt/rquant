@@ -201,8 +201,11 @@ def test_the_floor_is_the_roles_own_window_and_the_notifier_carries_the_open_win
 
     The no-read window is the notifier's alone, and that is a decision rather than an
     oversight: `reference-slow.source.v1` captures inside 09:20-09:25 and
-    `candidate.auction_gap.v1` assembles inside 09:26-09:30, both *inside* 09:20-09:40. A
-    blanket window would not slow those two down, it would stop them working.
+    `candidate.auction_gap.v1` assembles inside 09:26-09:30, both *inside* 09:20-09:40.
+    A window there would **freeze** their first answer until 09:40 rather than stop them
+    (review SF-6 measured that: their behaviour tests stay green with one added), and it
+    would save nothing, because package Q's gate already holds each of them to one read per
+    generation and their windows are shorter than a generation.
     """
 
     from datetime import UTC, datetime

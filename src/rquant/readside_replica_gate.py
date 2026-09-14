@@ -79,11 +79,19 @@ class ReplicaReadProfile:
     * `reference-slow.source.v1` captures inside 09:20-09:25, and
     * `candidate.auction_gap.v1` assembles inside 09:26-09:30,
 
-    both of which lie *inside* 09:20-09:40. A blanket window would not slow those two
-    down; it would stop them working. `auction-universe.publisher.v1` refuses to publish
-    anywhere in 09:15-15:10 on its own account, so the window would never bind on it
-    either. The notifier is the one role that reads all day, every two seconds, and whose
-    read is the expensive one -- so the notifier is the role that carries the window.
+    both of which lie *inside* 09:20-09:40. **What a blanket window would do to those two
+    is freeze, not stop** (review SF-6, which measured it: adding the window to
+    reference-slow leaves all of its behaviour tests green). A role with no answer is never
+    held -- the floor only stands in for an answer that exists -- and a different `key`
+    always opens, so their first read of the window still happens and their look-back dates
+    still read. What changes is that whatever generation the first read landed on would
+    then be the one they used until 09:40, for no saving at all: package Q's gate already
+    holds them to one read per generation, and their windows are shorter than a generation.
+    A window there would be cost without benefit rather than a malfunction, which is reason
+    enough not to add one. `auction-universe.publisher.v1` refuses to publish anywhere in
+    09:15-15:10 on its own account, so the window would never bind on it either. The
+    notifier is the one role that reads all day, every two seconds, and whose read is the
+    expensive one -- so the notifier is the role that carries the window.
 
     The floor never blocks a role that has **no** answer yet. A cold start inside the
     window must read, or the role has nothing to publish at all and goes DEGRADED for
