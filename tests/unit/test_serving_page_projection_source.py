@@ -3018,6 +3018,55 @@ def test_the_reader_only_drops_the_predicate_once_the_generation_is_sealed(
     assert reader.generation_modified_at is None, "and nothing is open any more"
 
 
+def test_the_seal_decision_reads_the_open_descriptor_and_not_the_name(
+    tmp_path: Path,
+) -> None:
+    """Review RM-SF7c: `fstat` on the descriptor, and swapping it for the name goes red.
+
+    "Taken from the descriptor, not the name" is the property the docstring of
+    `generation_modified_at` states, and it is the whole reason the answer is safe to act
+    on: the mtime that decides whether the `created_at` predicate can be dropped must
+    describe the inode whose rows are about to be read, not whatever is answering to that
+    path by the time the question is asked. The two only differ while the name is moving,
+    so this case moves it -- a successor generation stamped a month later lands on the name
+    mid-read. `os.lstat(self.path)` would report the successor's mtime and the reader would
+    seal a generation it never read; `os.fstat(self._descriptor)` reports the one it holds.
+
+    The rotation itself is already refused on the way out, which is why the block sits
+    inside `pytest.raises`: this case pins *which mtime was read*, not that rotation is
+    tolerated. Nothing is asserted inside the block either -- `__exit__` raises on its way
+    out and would replace an `AssertionError` raised in there with its own exception, so
+    the readings are collected inside and judged after the reader has closed.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "rotated-under-the-reader.duckdb"
+    _minute_only_database(database, _SEALED_ROWS)
+    opened_at = datetime(2026, 8, 3, 1, 0, tzinfo=UTC)
+    os.utime(database, (opened_at.timestamp(), opened_at.timestamp()))
+
+    successor = tmp_path / "successor.duckdb"
+    _minute_only_database(successor, _SEALED_ROWS)
+    replaced_at = datetime(2026, 9, 1, 1, 0, tzinfo=UTC)
+    os.utime(successor, (replaced_at.timestamp(), replaced_at.timestamp()))
+
+    reader = _StableReadonlyDuckDB(database)
+    readings: list[datetime | None] = []
+    by_name: list[float] = []
+    with pytest.raises(PageProjectionSourceIntegrityError), reader:
+        readings.append(reader.generation_modified_at)
+        os.replace(successor, database)
+        by_name.append(os.lstat(database).st_mtime)
+        readings.append(reader.generation_modified_at)
+
+    assert by_name == [replaced_at.timestamp()], "the name answers for the successor"
+    assert readings == [opened_at, opened_at], (
+        "the reader must answer for the inode it holds open, before and after the name "
+        "moved -- an mtime taken from the name would read the successor's here"
+    )
+
+
 def _projection_database_with_a_row_only_created_at_excludes(path: Path) -> None:
     """The signal projection fixture plus one row that *only* `created_at <= ?` keeps out.
 

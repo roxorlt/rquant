@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import duckdb
@@ -45,6 +47,29 @@ class _Refusing(_Recording):
     def interrupt(self) -> None:
         super().interrupt()
         raise RuntimeError("this connection is closed")
+
+
+@contextlib.contextmanager
+def _sigint_armed() -> Iterator[None]:
+    """Install a Python handler for SIGINT for the duration, then put back what was there.
+
+    Whether SIGINT arrives armed is a property of the *launching* process and nothing to do
+    with the code under test (review SF-9). A foreground shell hands it down as `SIG_DFL`
+    and CPython then installs `default_int_handler`; `nohup` and background jobs hand it
+    down as `SIG_IGN` and CPython installs nothing at all, so a watcher over the default
+    `(SIGINT, SIGTERM)` reports itself unarmed and every `watcher.active` assertion below
+    fails -- deterministically, in the environment rather than in the mechanism. Any case
+    that needs an armed signal arms it here instead of inheriting one.
+    """
+
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        #: `getsignal` answers None for a handler installed from C, which `signal` refuses
+        #: to take back; `SIG_DFL` is the only honest thing to restore in that case
+        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
 
 
 # ---------------------------------------------------------------------------------------
@@ -277,7 +302,9 @@ def test_only_the_watcher_can_abandon_a_long_sqlite_statement(tmp_path: Path) ->
 
 
 def test_the_watcher_restores_the_wakeup_fd_it_borrowed() -> None:
-    with StopSignalWatcher() as watcher:
+    #: the watcher only takes the slot when at least one watched signal is armed, so this
+    #: case arms one itself rather than depending on how this process was launched (SF-9)
+    with _sigint_armed(), StopSignalWatcher() as watcher:
         assert watcher.active
     #: -1 is "nobody is using it", which is where it must be left
     assert signal.set_wakeup_fd(-1) == -1
@@ -341,8 +368,13 @@ def test_a_watcher_names_the_unarmed_signal_while_still_covering_the_armed_one()
     previous = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     try:
-        #: SIGINT always has CPython's own `default_int_handler`, so it is armed
-        with StopSignalWatcher(signums=(signal.SIGINT, signal.SIGTERM)) as watcher:
+        #: SIGINT is armed because this case arms it. CPython installs
+        #: `default_int_handler` for SIGINT only when it inherits `SIG_DFL`, so under
+        #: `nohup` -- which hands SIGINT down as `SIG_IGN` -- an inherited one would not be
+        #: armed at all and this case would fail for a reason outside the mechanism (SF-9).
+        with _sigint_armed(), StopSignalWatcher(
+            signums=(signal.SIGINT, signal.SIGTERM)
+        ) as watcher:
             assert watcher.active
             assert watcher.unarmed_signums == (signal.SIGTERM,)
     finally:
