@@ -23,6 +23,7 @@ from rquant.reference_data_registry import (
 )
 from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_read_interrupt import interruptible_read, is_read_interrupt
 from rquant.strategy_candidate_producers import (
     AuctionMatchFact,
     PriorDailyVolumeFact,
@@ -176,17 +177,23 @@ def _query_daily_volume_rows(
         connection = duckdb.connect(str(normalized), read_only=True)
         placeholders_codes = ",".join("?" for _ in ts_codes)
         placeholders_dates = ",".join("?" for _ in trade_dates)
-        rows = connection.execute(
-            f"""
-            SELECT ts_code, trade_date, vol
-            FROM daily_bar
-            WHERE ts_code IN ({placeholders_codes})
-              AND trade_date IN ({placeholders_dates})
-            ORDER BY ts_code, trade_date
-            """,  # noqa: S608 - placeholders bind every selected value
-            [*ts_codes, *trade_dates],
-        ).fetchall()
+        #: abandonable on a stop (#268), and the interrupt is re-raised as itself:
+        #: `InterruptException` is a `duckdb.Error`, so the clause below would otherwise
+        #: report an operator's `systemctl stop` as a snapshot query failure.
+        with interruptible_read(connection):
+            rows = connection.execute(
+                f"""
+                SELECT ts_code, trade_date, vol
+                FROM daily_bar
+                WHERE ts_code IN ({placeholders_codes})
+                  AND trade_date IN ({placeholders_dates})
+                ORDER BY ts_code, trade_date
+                """,  # noqa: S608 - placeholders bind every selected value
+                [*ts_codes, *trade_dates],
+            ).fetchall()
     except duckdb.Error as exc:
+        if is_read_interrupt(exc):
+            raise
         raise AuctionGapCandidateInputError("daily snapshot query failed") from exc
     finally:
         if connection is not None:

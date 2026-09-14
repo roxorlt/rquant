@@ -64,6 +64,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_read_interrupt import READ_INTERRUPTS, interruptible_read
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
 
@@ -325,6 +326,8 @@ class _StableReadonlyDuckDB:
         #: rather than discovered at run time.
         self.opened_through: str | None = None
         self.connection: duckdb.DuckDBPyConnection | None = None
+        #: this read's entry in the process-wide interrupt registry, -1 while none (#268)
+        self._interrupt_token = -1
 
     def __enter__(self) -> duckdb.DuckDBPyConnection:
         before = os.lstat(self.path)
@@ -348,6 +351,10 @@ class _StableReadonlyDuckDB:
                 )
             descriptor_path = _descriptor_path(self._descriptor)
             self.connection = self._connect_generation(descriptor_path)
+            #: for as long as this reader is open, a stop abandons the query in flight
+            #: rather than waiting a multi-gigabyte scan out (#268). Released in
+            #: `_release()`, which every exit path runs.
+            self._interrupt_token = READ_INTERRUPTS.register(self.connection)
             after_open = os.fstat(self._descriptor)
             if _file_identity(after_open) != _file_identity(before):
                 raise PageProjectionSourceIntegrityError(
@@ -525,6 +532,9 @@ class _StableReadonlyDuckDB:
         return self._generation_path
 
     def _release(self) -> None:
+        if self._interrupt_token >= 0:
+            READ_INTERRUPTS.release(self._interrupt_token)
+            self._interrupt_token = -1
         if self.connection is not None:
             self.connection.close()
             self.connection = None
@@ -634,10 +644,13 @@ class _ReadonlyPageControlAuditReader:
 
     @contextmanager
     def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        #: sqlite has its own `interrupt()` and the same reason to use it (#268): this
+        #: audit is read inside the notifier's iteration, on the same stop path.
         if self._snapshot_connection is not None:
-            yield self._snapshot_connection
+            with interruptible_read(self._snapshot_connection):
+                yield self._snapshot_connection
             return
-        with self._connect() as connection:
+        with self._connect() as connection, interruptible_read(connection):
             yield connection
 
     @contextmanager

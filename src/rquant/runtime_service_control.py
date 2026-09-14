@@ -25,6 +25,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_read_interrupt import READ_INTERRUPT_STOP_REASON, is_read_interrupt
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -934,6 +935,15 @@ def run_service_loop(
             try:
                 result = step()
             except Exception as error:
+                if stop_event.is_set() and is_read_interrupt(error):
+                    #: The stop reached this role inside a database read and the read gave
+                    #: up on being told to (#268). That is this loop finishing, not an
+                    #: iteration failing: recording a failure here would leave the last
+                    #: heartbeat before `stopped` reporting a fault an operator caused, and
+                    #: on 09-14 the same event was a `Result=timeout` and an OnFailure push.
+                    #: The gate has already forgotten the half-read generation, so the next
+                    #: run reads it whole.
+                    return control.stop(reason=READ_INTERRUPT_STOP_REASON)
                 kind = failure_kind_of(error)
                 repeated_count = repeated_count + 1 if kind == repeated_kind else 1
                 repeated_kind = kind
@@ -995,6 +1005,7 @@ def inspect_runtime_health(
 
 __all__ = [
     "MAX_FAILURE_BACKOFF_SECONDS",
+    "READ_INTERRUPT_STOP_REASON",
     "RuntimeServiceAlreadyRunningError",
     "RuntimeServiceControl",
     "RuntimeServiceHealth",
