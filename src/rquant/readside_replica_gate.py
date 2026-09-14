@@ -30,6 +30,7 @@ from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
 
+from rquant.runtime_contracts import normalize_aware_utc
 from rquant.runtime_market_session import MARKET_TIMEZONE
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -450,6 +451,11 @@ class ReplicaReadGate(Generic[T]):
     def _floor_blocks(self, observed_at: datetime) -> bool:
         """Whether this role's profile refuses to open a new generation right now.
 
+        `observed_at` has already been through `normalize_aware_utc`, so the window's
+        `astimezone` is answering in the market clock rather than in whatever the host
+        thinks local time is -- the production host runs on CST and the difference would
+        not show there, which is exactly how it would get out.
+
         A clock that moved backwards -- NTP on a host that has just come up -- does not
         block: an answer must never be held because the floor's arithmetic went negative.
         """
@@ -489,7 +495,7 @@ class ReplicaReadGate(Generic[T]):
         #: the previous answer stands and the heartbeat says it was kept. A role with no
         #: answer at all is never held here -- `_reusable_across_generations` is False
         #: when nothing is cached -- so a cold start still reads.
-        now = self._clock()
+        now = normalize_aware_utc(self._clock())
         if self._floor_blocks(now) and self._reusable_across_generations(key, cutoff):
             read = ReplicaRead(
                 value=self._value,  # type: ignore[arg-type]

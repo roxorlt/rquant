@@ -510,9 +510,10 @@ def candidate_publisher_builder(
         replica_gate: ReplicaReadGate[Any] | None = (
             None
             if settings.daily_database_path is None
-            #: at most one open per five-minute generation inside its 09:26-09:30 window
-            #: (#268); the window is shorter than a generation, so in a healthy session
-            #: this changes nothing and in a retrying one it changes everything
+            #: at most one open per 09:26-09:30 assembly window (#268). What it reads is
+            #: prior sessions' `daily_bar` volumes, which do not change while the session
+            #: opens, so a generation arriving mid-window carries the same answer at the
+            #: cost of another whole scan
             else ReplicaReadGate(
                 settings.daily_database_path,
                 profile=AUCTION_GAP_CANDIDATE_PROFILE,
