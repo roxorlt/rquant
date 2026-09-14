@@ -151,6 +151,46 @@
 
 ### Fixed
 
+- **开盘那二十分钟：读侧 role 不再每五分钟换代重读，停机也不再等读完（#268）**：
+  09-14（周一）是二十个 runtime unit 全部常驻后的第一个交易日。09:25 副本同步拷贝 10 GB、
+  `rquant-monitor` 同时启动并扫主库、四个读侧 role 打开新一代副本（其中 notifier 那一次是
+  `minute_bar` 的整表聚合，数 GB）、09:30 备份再拷贝并压缩 10 GB——全部撞在同一分钟里。
+  load 从 14 涨到 21，多个进程进 D 状态，**生产 monitor 在开盘后十分钟一次轮询都没做**，
+  `rquant-monitor-watchdog` 超时 6 次（前两个没有 unit 的交易日是 0 次）。争的是云盘的
+  IOPS 与延迟，不是带宽（`vmstat` 的 bi/bo 只有 27/53 MB/s）。
+
+  根因是包 Q 的「变了才读」在交易日等于「每五分钟读一次」：
+  `rquant-replica-sync.timer` 每五分钟**整文件替换**一次副本，所以「代变了」这个条件一天要
+  成立上百次。**`ReplicaReadProfile` 给每个 role 加了两样东西**——两次打开之间的最短间隔，
+  以及一段按盘中时钟算的禁读时段（用的就是 `may_fetch_market_minute` 那个
+  `Asia/Shanghai` 时钟，从 `runtime_market_session` 导入而不是另抄一份）。
+  notifier 是四个里唯一全天每两秒跑、且那一次读是数 GB 的，所以它拿 15 分钟的间隔
+  **和** 09:20–09:40 的禁读时段；另外三个各有自己的窗口（reference-slow 的采集窗口
+  09:20–09:25、auction-gap 的装配窗口 09:26–09:30，都**落在** 09:20–09:40 里面），
+  对它们加禁读时段不是放慢而是停掉，所以它们只拿等于自己窗口长度的间隔。
+  **没有答案的 role 永远不受间隔约束**：冷启动必须读，压住的是「重读」不是这个 role 本身。
+  被压住的那一代不是悄悄忽略，心跳文件模型新增 `replica_skipped_by_floor`
+  （只是文件字段，冻结的 serving 投影一个字段都没动）。
+
+- **停机不再等一次 DuckDB 读跑完（#268）**：
+  同一天 09:33 协调者逐个停掉九个最重的 unit，其中七个正在读副本。Python 的信号处理函数只在
+  主线程的字节码之间跑，而一个卡在 `DuckDBPyConnection.execute()` 里的 role 在查询返回之前
+  一条字节码都不执行——所以 `stop_event.set()` 不是晚了，是**根本没跑**。七个 role 各自超过
+  `TimeoutStopSec=60`、被 `SIGKILL`、记成 `Result=timeout`、触发 `OnFailure`，
+  一次运维自己发起的 `systemctl stop` 变成了告警。
+
+  `StopSignalWatcher` 用 `signal.set_wakeup_fd`：CPython 的 C 层处理函数在收到信号的那个线程里
+  **立刻**把信号号写进管道，watcher 用自己的线程读它，再对每个正在读的连接调 DuckDB 的
+  `interrupt()`。在钉住的 duckdb 1.5.2 上实测：信号之后 **0.4 秒**查询抛
+  `InterruptException`。空闲时调 `interrupt()` 在这个引擎上是空操作（同样实测），所以停机之后
+  才开始的读**直接拒绝**而不是放它跑完。被中断的那一轮在 gate 里算「没读完」，不留半个答案。
+  四个把 `duckdb.Error` 翻译成自己整性错误的读路径都改成先放行中断
+  （`InterruptException` 正是 `duckdb.Error`），`run_service_loop` 把它读成「这个循环结束了」
+  而不是「这一轮失败了」——退出码 0、心跳 `stopped`、失败计数不动。
+
+  **本包不改 `deploy/`**。`TimeoutStopSec`、副本同步频率、备份时段、云盘调度器都是 owner 的
+  决策，建议写在包 U 报告的「给 owner 的建议」一节。
+
 - **`signal_router` 不再把「策略干净停机留下的 runner 库」判成损坏（#263）**：
   第九个路线 A 窗口（09-12，v0.33.9，权威链 sequence 7）里三条策略 18:22–18:23 被干净停机
   （runbook R-29 的阻塞式 `systemctl stop`），router 18:33 起来，18:43:38 退 1，报

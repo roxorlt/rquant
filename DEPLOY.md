@@ -5,6 +5,52 @@
 
 ---
 
+## 2026-09-14 · 待安装 · 开盘那二十分钟的 I/O 干扰与停机推送（#268）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+**装机口径**：本包在**第十个窗口**与前面几条一起装，装的是**一个 tag `v0.33.12`**——
+`v0.33.11` 是前面那一批合完之后的号，本包合入后打 `v0.33.12`，部署器 target 取后者。
+**时机由协调者决定。**
+
+**要修的现象**：09-14（周一）是二十个 unit 全部常驻后的第一个交易日。09:25 副本同步拷贝
+10 GB、`rquant-monitor` 同时启动扫主库、四个读侧 role 打开新一代副本、09:30 备份再拷贝并
+压缩 10 GB 撞在一起；load 14 → 21，**生产 monitor 在开盘后十分钟没有任何轮询**，
+`rquant-monitor-watchdog` 超时 6 次。09:33 停九个 unit 时，七个正在读 DuckDB 的 role
+全部超过 `TimeoutStopSec=60` 被 `SIGKILL`，`OnFailure` 发出一条推送到 owner。
+
+**装上之后当场应该看到什么**：
+
+- 四个读侧 role 的心跳里出现新字段 `replica_skipped_by_floor`。盘中它在
+  `notifier.admin.shadow.v1` 上应当**经常是 `true`**——副本每五分钟换一代，而 notifier 的
+  最短重读间隔是 15 分钟，所以三代里有两代会被压住，这是预期而不是故障。
+  `replica_opened=true` 在 notifier 上一小时最多四次。
+- 09:20–09:40 这二十分钟内 notifier 不开库，`replica_skipped_by_floor=true`。
+  `reference-slow.source.v1`（09:20–09:25 采集）与 `candidate.auction_gap.v1`
+  （09:26–09:30 装配）**照常读**，它们没有禁读时段，只有等于自己窗口长度的间隔。
+- 手工 `systemctl stop` 一个读侧 role：应当**几秒内**停干净，`systemctl show -p Result`
+  是 `success` 不是 `timeout`，心跳 `status=stopped`、`stop_reason` 是
+  `stop requested during a database read`，不再有 `OnFailure` 推送。
+
+**装机后的首个交易日按这一条走**：**只在 09:00 前起 unit，然后全天观察，中途不停不起**。
+本窗口验收判据在原有几条之外**加一条**：
+
+> **09:25–09:40 生产 monitor 轮询无中断，`rquant-monitor-watchdog` 0 次超时。**
+
+**回滚**：与 `v0.33.11` 同一条路径。**本包新增一个心跳文件字段
+`replica_skipped_by_floor`**，所以回滚到 `v0.33.11` 或更早时，按 2026-09-10 那一条写的整批
+挪心跳步骤先把心跳挪开——旧代码的心跳模型不认识这个字段。
+
+**本包不改 `deploy/`。** 下面四条是 owner 的决策，本包一个字都没有动，装机与否互不影响：
+
+| 建议 | 现值 | 建议值 | 为什么 |
+|---|---|---|---|
+| 盘中副本同步频率 | 5 min | **15 min** | 每次替换都是 10 GB 的 `cp`，而读侧现在最快也只有 15 min 重读一次，5 min 的代已经没人消费 |
+| 备份时段 | 每 15 min，含 09:30 | **避开 09:20–09:40** | 09:30 那一次是 `cp` + `gzip` 10 GB，正好落在开盘 |
+| `TimeoutStopSec` | 60 s | **≥ 300 s** | 代码侧已经让读可中断，这一条是兜底：中断链路万一不可用时，停机仍不该变成 `Result=timeout` 与推送 |
+| vda 调度器 | `mq-deadline` | **`bfq`** | `rquant-live-runtime.slice` 上的 `IOWeight=` 在 `mq-deadline` 下不生效（2026-09-08 已记为已知限制） |
+
+---
+
 ## 2026-09-12 · 待安装 · signal_router 等一条干净停机的策略，而不是退 1（#263）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。
