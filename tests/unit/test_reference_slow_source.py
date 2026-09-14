@@ -1344,3 +1344,70 @@ def test_a_replaced_replica_is_read_again(
     load()
 
     assert reads[0] == 2
+
+
+def test_the_verified_read_is_abandonable_for_exactly_as_long_as_it_is_open(
+    tmp_path: Path,
+) -> None:
+    """#268: seven roles were inside this read when the coordinator stopped them.
+
+    Every one outlived `TimeoutStopSec=60`, was killed, and was reported as a unit
+    failure that fired `OnFailure`. The connection is in the process interrupt registry
+    for the life of the read and out of it afterwards, so a stop reaches the query in
+    flight and never an unrelated one.
+    """
+
+    from rquant.runtime_read_interrupt import READ_INTERRUPTS
+
+    database = _database(tmp_path)
+    before = READ_INTERRUPTS.open_reads
+    with reference_slow_source_module._verified_database_read(
+        database,
+        limits=_source_limits(),
+        monotonic_deadline=100.0,
+        monotonic_clock=lambda: 1.0,
+    ) as opened:
+        assert READ_INTERRUPTS.open_reads == before + 1
+        assert opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
+    assert READ_INTERRUPTS.open_reads == before
+
+
+def test_a_stop_during_the_evidence_query_is_not_reported_as_a_query_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`InterruptException` is a `duckdb.Error`, and this module converts those (#268)."""
+
+    from rquant.runtime_read_interrupt import is_read_interrupt
+
+    database = _database(tmp_path)
+    original = duckdb.connect
+
+    class _Interrupting:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def interrupt(self) -> None:
+            self._inner.interrupt()  # type: ignore[attr-defined]
+
+        def execute(self, *_args: object, **_kwargs: object) -> object:
+            raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+
+        def close(self) -> None:
+            self._inner.close()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(duckdb, "connect", lambda *a, **k: _Interrupting(original(*a, **k)))
+
+    with (
+        pytest.raises(duckdb.InterruptException) as raised,
+        reference_slow_source_module._verified_database_read(
+            database,
+            limits=_source_limits(),
+            monotonic_deadline=100.0,
+            monotonic_clock=lambda: 1.0,
+        ) as opened,
+    ):
+        opened.connection.execute("SELECT count(*) FROM daily_bar").fetchone()
+
+    assert is_read_interrupt(raised.value)
+    assert not isinstance(raised.value, ReferenceSlowSourceError)

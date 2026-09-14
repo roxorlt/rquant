@@ -6,11 +6,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 
+import duckdb
 import pytest
 
 from rquant.runtime_peer_artifacts import PeerArtifactUnavailableError
 from rquant.runtime_service_control import (
     MAX_FAILURE_BACKOFF_SECONDS,
+    READ_INTERRUPT_STOP_REASON,
     RuntimeServiceAlreadyRunningError,
     RuntimeServiceControl,
     RuntimeServiceHealth,
@@ -1095,3 +1097,152 @@ def test_a_stop_during_the_loop_s_own_wait_never_needs_to_be_killed(
     assert final.stop_reason == "loop completed"
     assert attempts == 1, attempts
     assert elapsed < 3.0, elapsed
+
+
+# ---------------------------------------------------------------------------------------
+# #268: a stop that arrives during a read, and the floor the heartbeat reports
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_replica_floor_is_a_file_field_and_reaches_no_published_payload() -> None:
+    """#237's line again, for the field #268 adds."""
+
+    assert "replica_skipped_by_floor" in RuntimeServiceHeartbeat.model_fields
+    assert "replica_skipped_by_floor" not in RuntimeServiceHeartbeatProjection.model_fields
+
+
+def test_a_successful_iteration_says_it_kept_an_older_generation_on_purpose(
+    tmp_path: Path,
+) -> None:
+    """"Did not open the database" and "was not allowed to" are different facts (#268)."""
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    recognised = control.record_success(
+        RuntimeStepResult(replica_opened=False, replica_read_bytes=0),
+    )
+    assert recognised.replica_skipped_by_floor is None
+
+    held = control.record_success(
+        RuntimeStepResult(
+            replica_opened=False,
+            replica_read_bytes=0,
+            replica_skipped_by_floor=True,
+        ),
+    )
+    assert held.replica_opened is False
+    assert held.replica_skipped_by_floor is True
+    control.stop(reason="done")
+
+
+def test_the_loop_takes_the_failed_iterations_floor_off_the_step(tmp_path: Path) -> None:
+    """Same wiring as the replica cost, and the same "cannot say" rules."""
+
+    def held() -> RuntimeStepResult:
+        raise RuntimeError("the serving authority refused")
+
+    held.replica_iteration_summary = lambda: (False, 0)  # type: ignore[attr-defined]
+    held.replica_iteration_skipped_by_floor = lambda: True  # type: ignore[attr-defined]
+
+    def silent() -> RuntimeStepResult:
+        raise RuntimeError("this role reads no replica")
+
+    def broken() -> RuntimeStepResult:
+        raise RuntimeError("this role reads a replica and its probe is unusable")
+
+    broken.replica_iteration_skipped_by_floor = _raising_floor  # type: ignore[attr-defined]
+
+    control = RuntimeServiceControl(tmp_path / "held", spec=_spec(), clock=lambda: NOW)
+    final = run_service_loop(
+        control, step=held, stop_event=Event(), interval_seconds=0, max_iterations=1
+    )
+    assert final.replica_skipped_by_floor is True
+
+    for step in (silent, broken):
+        control = RuntimeServiceControl(tmp_path / step.__name__, spec=_spec(), clock=lambda: NOW)
+        final = run_service_loop(
+            control, step=step, stop_event=Event(), interval_seconds=0, max_iterations=1
+        )
+        assert final.total_failures == 1, step.__name__
+        assert final.replica_skipped_by_floor is None, step.__name__
+
+
+def _raising_floor() -> bool:
+    raise OSError("the gate itself is unusable")
+
+
+def test_a_read_abandoned_by_a_requested_stop_is_this_loop_finishing(tmp_path: Path) -> None:
+    """The 09-14 stop path, as the loop sees it (#268).
+
+    Seven roles were inside an uninterruptible DuckDB read when the coordinator stopped
+    them; every one outlived `TimeoutStopSec`, was killed, and was reported as a unit
+    failure. With the read abandonable, the exception that comes out of it is not a fault
+    -- recording one would leave the last heartbeat before `stopped` blaming the operator
+    for the stop they asked for, and would raise this role's failure counters for it.
+    """
+
+    stop_event = Event()
+
+    def interrupted() -> RuntimeStepResult:
+        stop_event.set()
+        raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    final = run_service_loop(
+        control,
+        step=interrupted,
+        stop_event=stop_event,
+        interval_seconds=0,
+    )
+
+    assert final.status is RuntimeServiceStatus.STOPPED
+    assert final.stop_reason == READ_INTERRUPT_STOP_REASON
+    assert final.total_failures == 0
+    assert final.last_error is None
+
+
+def test_an_interrupt_nobody_asked_for_is_still_a_failure(tmp_path: Path) -> None:
+    """The stop event is half the judgement, and it is the half that makes it a stop.
+
+    An `InterruptException` with no stop requested is a real fault -- something else took
+    the query away -- and must be recorded as one, or a role interrupted by anything but
+    an operator would exit silently with a clean heartbeat.
+    """
+
+    def interrupted() -> RuntimeStepResult:
+        raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    final = run_service_loop(
+        control,
+        step=interrupted,
+        stop_event=Event(),
+        interval_seconds=0,
+        max_iterations=1,
+    )
+
+    assert final.total_failures == 1
+    assert final.last_error is not None
+    assert "Interrupted" in final.last_error
+
+
+def test_an_ordinary_failure_during_a_stop_is_still_recorded(tmp_path: Path) -> None:
+    """A role failing for its own reasons while being stopped has still failed."""
+
+    stop_event = Event()
+
+    def failing() -> RuntimeStepResult:
+        stop_event.set()
+        raise RuntimeError("the serving authority refused")
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    final = run_service_loop(
+        control,
+        step=failing,
+        stop_event=stop_event,
+        interval_seconds=0,
+    )
+
+    assert final.status is RuntimeServiceStatus.STOPPED
+    assert final.stop_reason == "loop completed"
+    assert final.total_failures == 1

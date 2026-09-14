@@ -2751,3 +2751,84 @@ def test_the_source_budget_still_refuses_more_sources_than_it_publishes(
             )
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------------------------------
+# #268
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_minute_coverage_projection_cannot_be_narrowed_to_the_current_trade_date(
+    tmp_path: Path,
+) -> None:
+    """Ruling 30's third item, answered in the negative and pinned so it stays answered.
+
+    #268 asks for the notifier's generation read to be shrunk by reading only the current
+    trade date's range. On the package Q measurement replica that predicate is worth a
+    lot -- 43,790,572 `rchar` bytes down to 8,138,988, measured on Linux with duckdb
+    1.5.2 -- and it is not available, because `minute_coverage` publishes an **all-time**
+    summary: how many 1-minute rows this database holds, over how many codes, over how
+    many sessions, earliest and latest. A lower bound on `trade_time` changes every one of
+    those numbers, and the published projection is frozen (#237).
+
+    So the notifier's generation read is not made smaller; it is made *rarer*, by the
+    fifteen-minute floor and the 09:20-09:40 window in
+    `NOTIFIER_PAGE_PROJECTION_PROFILE`. This case exists so that the next reader who has
+    the same good idea finds the measurement rather than repeating it: narrowing it is a
+    change to what the page says, not a change to what the read costs.
+    """
+
+    database = tmp_path / "two-sessions.duckdb"
+    _minute_only_database(
+        database,
+        [
+            ("600000.SH", "2026-07-30 09:30:00", "1min", "tushare", "2026-07-30 09:31:00"),
+            ("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00"),
+        ],
+    )
+    cutoff = datetime(2026, 8, 3, 8, 0)
+    today_start = datetime(2026, 7, 31, 0, 0)
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        published = DuckDBSignalPageProjectionSource._minute_coverage(connection, cutoff=cutoff)
+        narrowed = connection.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time)
+            FROM minute_bar
+            WHERE freq = '1min' AND trade_time >= ? AND trade_time <= ? AND created_at <= ?
+            """,
+            (today_start, cutoff, cutoff),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    total = next(row for row in published if row.is_total)
+    assert (total.rows_count, total.trade_dates) == (2, 2)
+    #: published in UTC; 09:30 in the market clock the database stores is 01:30 UTC
+    assert total.min_time == datetime(2026, 7, 30, 1, 30, tzinfo=UTC)
+    #: the same query with the proposed lower bound answers something else entirely
+    assert narrowed == (1, 1, datetime(2026, 7, 31, 9, 30))
+
+
+def test_the_projection_read_is_abandonable_while_it_is_open(tmp_path: Path) -> None:
+    """#268: the connection is in the process registry for exactly the life of the read.
+
+    This is the read that took ten minutes on 09-14 and the one `TimeoutStopSec=60` could
+    not outlast. Registration is what lets a stop reach it; the pairing is what keeps a
+    finished read from being interrupted later, which would abort an unrelated query.
+    """
+
+    from rquant.runtime_read_interrupt import READ_INTERRUPTS
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "abandonable.duckdb"
+    _minute_only_database(
+        database,
+        [("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00")],
+    )
+
+    before = READ_INTERRUPTS.open_reads
+    with _StableReadonlyDuckDB(database) as connection:
+        assert READ_INTERRUPTS.open_reads == before + 1
+        connection.execute("SELECT count(*) FROM minute_bar").fetchall()
+    assert READ_INTERRUPTS.open_reads == before
