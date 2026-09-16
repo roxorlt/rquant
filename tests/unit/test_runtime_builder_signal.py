@@ -2313,3 +2313,55 @@ def test_a_source_that_grows_while_being_routed_still_reports_the_move(
     assert SignalBusStore(
         tmp_path / "signal-bus.sqlite3"
     ).route_cursor("n-shape-v1").observed_high_watermark == 3
+
+
+def test_a_second_source_that_grows_alone_still_reports_the_move(tmp_path: Path) -> None:
+    """The production shape: three sources, and the one that moves is not the first.
+
+    `signal-router.all-strategies.v1` is configured with one source per live strategy, so
+    three in production (`runtime_production_profile.py`, `for strategy in
+    config.strategies`). Every other builder case here configures one source, which means an
+    aggregation bug that only ever looks at the first source would pass all of them --
+    and `watermark_advanced` is the field DEPLOY.md tells an operator to read.
+    """
+
+    sources = {
+        f"n-shape-{index}": _GrowingSource(source_id=f"n-shape-{index}") for index in range(3)
+    }
+    for index, source in enumerate(sources.values()):
+        # Distinct payloads: a signal identity belongs to exactly one source, and the
+        # seed is one hex character repeated into the parameter fingerprint.
+        source.records.append(RunnerSignalRecord(sequence=1, signal=_signal("abc"[index])))
+    clock = NOW
+    step = signal_router_builder(
+        source_loader=lambda source_id: sources[source_id],
+        target_resolver=_route_target,
+        clock=lambda: clock,
+    )(
+        _router_manifest(
+            tmp_path,
+            source_id=None,
+            sources=[{"source_id": source_id} for source_id in sorted(sources)],
+            batch_limit=10,
+        )
+    )
+
+    first = step()
+    clock = NOW + timedelta(seconds=2)
+    idle = step()
+    # Only the *third* source grows.
+    sources["n-shape-2"].records.append(RunnerSignalRecord(sequence=2, signal=_signal("d")))
+    clock = NOW + timedelta(seconds=4)
+    grown = step()
+    clock = NOW + timedelta(seconds=6)
+    settled = step()
+
+    assert first.watermark_advanced is True
+    assert idle.watermark_advanced is False
+    assert grown.watermark_advanced is True
+    assert settled.watermark_advanced is False
+
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    assert bus.route_cursor("n-shape-0").observed_high_watermark == 1
+    assert bus.route_cursor("n-shape-1").observed_high_watermark == 1
+    assert bus.route_cursor("n-shape-2").observed_high_watermark == 2

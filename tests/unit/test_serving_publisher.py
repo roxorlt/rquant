@@ -729,3 +729,44 @@ def test_a_current_pointer_whose_generation_is_gone_is_published_over(tmp_path: 
     assert healed.written is True
     assert (tmp_path / "serving" / "generations" / healed.manifest.generation_id).is_dir()
     assert publisher.current_pointer().generation_id == healed.manifest.generation_id
+
+
+def test_a_moved_schema_version_still_builds_its_own_generation(tmp_path: Path) -> None:
+    """A schema rollout can move this without moving the producer commit.
+
+    `schema_version` comes from the service manifest's settings, not from the code, so a
+    live schema rollout plan can advance it while the producer commit and all six source
+    generations stay exactly where they are. That is the one moment when this comparison
+    is the only thing left that would rebuild, and the physical tables it names are a
+    different artifact from the ones already published.
+    """
+
+    root = tmp_path / "serving"
+    first = _publish_generation(_publisher(root))
+    rolled = ServingPublisher(
+        root,
+        producer_commit=_COMMIT,
+        schema_version=2,
+        table_specs={"signals": ServingTableSpec(sort_keys=("trade_date", "ts_code"))},
+    )
+    publication = rolled.publish_generation(
+        {"signals": _signals()},
+        watermarks=(_watermark(generation_id="source-1", built_at=_BUILT_AT),),
+        source_generations={"signals": "source-1"},
+        built_at=_BUILT_AT + timedelta(seconds=30),
+    )
+
+    assert publication.written is True
+    assert publication.manifest.schema_version == 2
+    assert publication.manifest.generation_id != first.manifest.generation_id
+    assert len(tuple((root / "generations").iterdir())) == 2
+    # And the next iteration under the new schema version is quiet again.
+    assert (
+        rolled.publish_generation(
+            {"signals": _signals()},
+            watermarks=(_watermark(generation_id="source-1", built_at=_BUILT_AT),),
+            source_generations={"signals": "source-1"},
+            built_at=_BUILT_AT + timedelta(seconds=60),
+        ).written
+        is False
+    )
