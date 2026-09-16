@@ -675,13 +675,17 @@ class ArtifactGcHealthAuthorityAdapter:
             processed_count=processed_count + terminal_releases,
             backlog_count=health.backlog_count,
             source_generations={
-                "artifact_gc_health": canonical_sha256(health),
-                "terminal_release_outbox": canonical_sha256(
-                    {
-                        "published": terminal_releases,
-                        "observed_at": health.observed_at,
-                    }
+                # Content only. Both of these used to carry `observed_at` -- the first
+                # because it hashed the whole snapshot, which is stamped with the loop's
+                # clock, and the second because it put the clock in by hand. That is the
+                # #271 shape in a seventh place: the generation changed every three
+                # hundred seconds over an artifact tree nobody had touched, and once
+                # `runtime-health.all.v1` reads a peer's `source_generations` that is a
+                # health generation and a `serving.duckdb` rebuild behind each one.
+                "artifact_gc_health": canonical_sha256(
+                    health.model_dump(mode="python", exclude={"observed_at"})
                 ),
+                "terminal_release_outbox": canonical_sha256({"published": terminal_releases}),
             },
             degraded_reasons=tuple(reasons),
         )

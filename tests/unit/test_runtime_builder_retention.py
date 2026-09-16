@@ -1028,3 +1028,56 @@ def test_gc_health_adapter_projects_standard_runtime_health_state() -> None:
         "artifact_gc_health",
         "terminal_release_outbox",
     }
+
+
+def test_gc_health_generations_name_the_tree_and_not_the_clock() -> None:
+    """#271's seventh site: `artifact-retention.primary.v1` hashed its own clock.
+
+    Both of this role's generation ids used to move on every five-minute iteration over an
+    artifact tree nobody had touched -- one because it hashed the whole health snapshot,
+    which is stamped `observed_at` by the loop, and one because it put `observed_at` in by
+    hand. `runtime-health.all.v1` reads its peers' heartbeats, so a generation that churns
+    here is a health generation and a `serving.duckdb` rebuild behind it, which is exactly
+    what this package is removing.
+    """
+
+    def health_at(observed_at: datetime, *, backlog: int = 3) -> ArtifactGcHealthSummary:
+        return ArtifactGcHealthSummary(
+            observed_at=observed_at,
+            status="healthy",
+            backlog_count=backlog,
+            operation_reconciliation_pending_count=0,
+            quarantine_orphan_count=0,
+            retry_count=0,
+            dead_letter_count=0,
+            lease_fence=7,
+            lease_active=False,
+        )
+
+    adapter = ArtifactGcHealthAuthorityAdapter()
+    first = adapter.project(health_at(NOW), processed_count=0, terminal_releases=0)
+    later = adapter.project(
+        health_at(NOW + timedelta(hours=3)),
+        processed_count=0,
+        terminal_releases=0,
+    )
+    moved = adapter.project(
+        health_at(NOW + timedelta(hours=3), backlog=9),
+        processed_count=0,
+        terminal_releases=0,
+    )
+    released = adapter.project(
+        health_at(NOW + timedelta(hours=3)),
+        processed_count=0,
+        terminal_releases=2,
+    )
+
+    # Three hours later over the same tree: the same two generations.
+    assert dict(later.source_generations) == dict(first.source_generations)
+    # A backlog that actually moved, and an outbox that actually released: new ones.
+    assert moved.source_generations["artifact_gc_health"] != (
+        first.source_generations["artifact_gc_health"]
+    )
+    assert released.source_generations["terminal_release_outbox"] != (
+        first.source_generations["terminal_release_outbox"]
+    )
