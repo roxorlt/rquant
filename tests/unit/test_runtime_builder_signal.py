@@ -2111,3 +2111,205 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
     assert violations == [], violations
     assert tree_state(control) == before
     assert result.degraded_reasons == ()
+
+
+# ---------------------------------------------------------------------------------------
+# #271: what the router's heartbeat says about the watermark row it holds
+# ---------------------------------------------------------------------------------------
+
+
+class _GrowingSource:
+    """`_Source`, except the caller can add records to it between iterations."""
+
+    def __init__(self, source_id: str = "n-shape-v1") -> None:
+        self.source_id = source_id
+        self.records: list[RunnerSignalRecord] = []
+
+    def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+        return RunnerSignalBatch(
+            snapshot=SourceSnapshot(
+                descriptor=RouteSourceDescriptor(
+                    source_id=self.source_id,
+                    generation_id=hashlib.sha256(self.source_id.encode()).hexdigest(),
+                    strategy_spec_fingerprint=SPEC,
+                    first_sequence=1,
+                    high_watermark=len(self.records),
+                )
+            ),
+            after_sequence=after_sequence,
+            limit=limit,
+            records=tuple(
+                record for record in self.records if record.sequence > after_sequence
+            )[:limit],
+        )
+
+
+def test_the_router_says_whether_this_iteration_moved_a_watermark(tmp_path: Path) -> None:
+    """`False` on an idle iteration, `True` on the one where a source actually grew.
+
+    This is the evidence the fsync gate needs: before #271 the router rewrote
+    `signal_route_source` for every source on every two-second iteration, because the row
+    carried `updated_at` from the loop's own clock, so "did this iteration write" was
+    always yes and the heartbeat could not tell an idle router from a busy one.
+    """
+
+    source = _GrowingSource()
+    source.records.append(RunnerSignalRecord(sequence=1, signal=_signal("2")))
+    clock = NOW
+    step = signal_router_builder(
+        source_loader=lambda _source_id: source,
+        target_resolver=_route_target,
+        clock=lambda: clock,
+    )(_router_manifest(tmp_path, batch_limit=10))
+
+    first = step()
+    idle = []
+    for index in range(3):
+        clock = NOW + timedelta(seconds=2 * (index + 1))
+        idle.append(step())
+    source.records.append(RunnerSignalRecord(sequence=2, signal=_signal("3")))
+    clock = NOW + timedelta(seconds=8)
+    grown = step()
+    clock = NOW + timedelta(seconds=10)
+    settled = step()
+
+    assert first.watermark_advanced is True
+    assert [result.watermark_advanced for result in idle] == [False, False, False]
+    assert [result.processed_count for result in idle] == [0, 0, 0]
+    assert grown.watermark_advanced is True
+    assert grown.processed_count == 1
+    assert settled.watermark_advanced is False
+    # The row the gate protects is still correct after all of it.
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    assert bus.route_cursor("n-shape-v1").observed_high_watermark == 2
+
+
+def test_a_paused_router_still_reports_its_idle_watermark(tmp_path: Path) -> None:
+    """A paused router binds its sources before it checks the pause, so it answers too."""
+
+    source = _GrowingSource()
+    source.records.append(RunnerSignalRecord(sequence=1, signal=_signal("4")))
+    clock = NOW
+    step = signal_router_builder(
+        source_loader=lambda _source_id: source,
+        target_resolver=_route_target,
+        clock=lambda: clock,
+    )(_router_manifest(tmp_path, paused=True))
+
+    first = step()
+    clock = NOW + timedelta(seconds=2)
+    idle = step()
+
+    assert first.degraded_reasons == ("signal_router:paused",)
+    assert first.watermark_advanced is True
+    assert idle.degraded_reasons == ("signal_router:paused",)
+    assert idle.watermark_advanced is False
+
+
+def test_a_router_returning_early_on_spool_catchup_moved_no_watermark(tmp_path: Path) -> None:
+    """The one return above every bind, so nothing was even looked at, let alone written."""
+
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    backlog = _Source(
+        (
+            RunnerSignalRecord(sequence=1, signal=_signal("5")),
+            RunnerSignalRecord(sequence=2, signal=_signal("6")),
+        )
+    )
+    route_runner_signals(
+        source_id="n-shape-v1",
+        source=backlog,
+        bus=bus,
+        cursors=SignalRouteCursorStore(
+            tmp_path / "route-cursor.sqlite3",
+            routing_policy_fingerprint=POLICY,
+        ),
+        routed_at=NOW,
+        target_resolver=_route_target,
+        limit=10,
+    )
+    step = signal_router_builder(
+        source_loader=lambda _source_id: backlog,
+        target_resolver=_route_target,
+        clock=lambda: NOW,
+    )(_router_manifest(tmp_path, batch_limit=1))
+
+    result = step()
+
+    assert result.degraded_reasons == ("signal_router:spool_catchup",)
+    assert result.watermark_advanced is False
+
+
+class _RacingSource:
+    """A runner that appends one signal between the router's inspect read and its route read.
+
+    The step binds each source from a descriptor read with `limit=0`, and
+    `route_runner_signals` then reads the same source again and binds its own frozen
+    descriptor. A strategy that writes in between moves the watermark inside that second
+    bind rather than the first, which is the one path where the iteration wrote but the
+    step's own bind did not.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[RunnerSignalRecord] = []
+        self.append_before_next_route = False
+
+    def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+        if limit > 0 and self.append_before_next_route:
+            self.append_before_next_route = False
+            self.records.append(
+                RunnerSignalRecord(
+                    sequence=len(self.records) + 1,
+                    signal=_signal(chr(ord("a") + len(self.records))),
+                )
+            )
+        return RunnerSignalBatch(
+            snapshot=SourceSnapshot(
+                descriptor=RouteSourceDescriptor(
+                    source_id="n-shape-v1",
+                    generation_id=GENERATION,
+                    strategy_spec_fingerprint=SPEC,
+                    first_sequence=1,
+                    high_watermark=len(self.records),
+                )
+            ),
+            after_sequence=after_sequence,
+            limit=limit,
+            records=tuple(
+                record for record in self.records if record.sequence > after_sequence
+            )[:limit],
+        )
+
+
+def test_a_source_that_grows_while_being_routed_still_reports_the_move(
+    tmp_path: Path,
+) -> None:
+    """The step's own bind wrote nothing this iteration, and the iteration still wrote."""
+
+    source = _RacingSource()
+    source.records.extend(
+        (
+            RunnerSignalRecord(sequence=1, signal=_signal("2")),
+            RunnerSignalRecord(sequence=2, signal=_signal("3")),
+        )
+    )
+    clock = NOW
+    step = signal_router_builder(
+        source_loader=lambda _source_id: source,
+        target_resolver=_route_target,
+        clock=lambda: clock,
+    )(_router_manifest(tmp_path, batch_limit=1))
+
+    first = step()
+    # The next iteration's inspect read sees the watermark the ledger already holds, so
+    # the step's bind writes nothing — and then the source grows under the route read.
+    source.append_before_next_route = True
+    clock = NOW + timedelta(seconds=2)
+    raced = step()
+
+    assert first.watermark_advanced is True
+    assert raced.watermark_advanced is True
+    assert raced.processed_count == 1
+    assert SignalBusStore(
+        tmp_path / "signal-bus.sqlite3"
+    ).route_cursor("n-shape-v1").observed_high_watermark == 3

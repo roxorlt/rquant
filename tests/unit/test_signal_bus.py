@@ -14,10 +14,13 @@ from rquant.delivery_contracts import (
     RouterDisposition,
 )
 from rquant.signal_bus import (
+    RouteSourceDescriptor,
     SignalBusLeaseError,
     SignalBusSourceSequenceError,
     SignalBusStore,
     SignalBusWatermarkError,
+    SignalRouteConflictError,
+    SignalRouteSequenceError,
     recover_signal_bus_high_watermark,
 )
 from rquant.signal_contracts import SignalAction, SignalEnvelope
@@ -1061,3 +1064,193 @@ def test_recovery_still_refuses_an_empty_acknowledgement_when_the_row_is_missing
         recover_signal_bus_high_watermark(path, acknowledgement="  ", now=NOW)
 
     assert _watermark_row(path) is None
+
+
+# ---------------------------------------------------------------------------------------
+# #271: what one idle `bind_route_source` costs the host
+# ---------------------------------------------------------------------------------------
+
+#: Two seconds, the production interval of `signal-router.all-strategies.v1`, which binds
+#: three sources on every one of them.
+ROUTER_INTERVAL = timedelta(seconds=2)
+IDLE_ITERATIONS = 60
+ROUTING_POLICY = "9" * 64
+
+
+class CommitWatcher:
+    """One read-only connection, held open, that sees every commit anybody else makes.
+
+    `PRAGMA data_version` is SQLite's own answer to "has another connection committed
+    since I last looked", and it is only comparable **within one connection** — so the
+    connection is held open across the loop rather than reopened per sample. The other
+    portable candidates are unsound here: `total_changes` counts what one connection did
+    and these stores open their own per call; the `-wal` file is created and truncated by
+    opening a write connection whether or not it commits; and the main file's size and
+    mtime move when a checkpoint gets around to running, which depends on whether a reader
+    happens to be open.
+
+    Holding this reader open has a second use: it keeps the WAL from being checkpointed,
+    so `-wal` bytes are exactly the bytes commits appended during the window, and zero of
+    them is a second, independent way of saying nothing was committed.
+    """
+
+    def __init__(self, database: Path, *, tables: tuple[str, ...]) -> None:
+        self.database = database
+        self.tables = tables
+        self.connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def stamp(self) -> tuple[object, ...]:
+        data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+        rows = tuple(
+            tuple(tuple(row) for row in self.connection.execute(f"SELECT * FROM {table}"))
+            for table in self.tables
+        )
+        wal = self.database.with_name(self.database.name + "-wal")
+        wal_bytes = wal.stat().st_size if wal.exists() else 0
+        return (data_version, wal_bytes, rows)
+
+
+def _route_descriptor(high_watermark: int) -> RouteSourceDescriptor:
+    return RouteSourceDescriptor(
+        source_id="n-shape-v1",
+        generation_id="1" * 64,
+        strategy_spec_fingerprint="2" * 64,
+        first_sequence=1,
+        high_watermark=high_watermark,
+    )
+
+
+def test_binding_an_unchanged_route_source_commits_nothing_at_all(tmp_path: Path) -> None:
+    """Sixty idle binds, zero commits, and the row byte-identical afterwards.
+
+    The UPDATE this replaces set two columns: the watermark, which had not moved, and
+    `updated_at`, which was the router's own loop clock — so it rewrote the row on every
+    iteration whatever the source was doing. `bind_route_source` is on a two-second loop
+    over three production sources, and the ledger is `journal_mode=WAL` with
+    `synchronous=FULL`, so that was three fsyncs every two seconds all day (#271).
+    """
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    first = store.bind_route_source_observed(
+        _route_descriptor(4),
+        routing_policy_fingerprint=ROUTING_POLICY,
+        observed_at=NOW,
+    )
+
+    assert first.watermark_advanced is True
+    assert first.cursor.observed_high_watermark == 4
+
+    watcher = CommitWatcher(path, tables=("signal_route_source", "signal_route_source_rotation"))
+    try:
+        before = watcher.stamp()
+        idle = [
+            store.bind_route_source_observed(
+                _route_descriptor(4),
+                routing_policy_fingerprint=ROUTING_POLICY,
+                # A fresh clock on every iteration: the whole point is that the row no
+                # longer carries it.
+                observed_at=NOW + ROUTER_INTERVAL * (index + 1),
+            )
+            for index in range(IDLE_ITERATIONS)
+        ]
+        after = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert after == before, "an idle route source bind committed to the ledger"
+    assert [binding.watermark_advanced for binding in idle] == [False] * IDLE_ITERATIONS
+    assert [binding.cursor.observed_high_watermark for binding in idle] == [4] * IDLE_ITERATIONS
+    # `updated_at` now means "when the watermark last advanced", and the first bind is
+    # when that was.
+    assert idle[-1].cursor.updated_at == NOW
+
+
+def test_a_route_source_that_grows_writes_exactly_once(tmp_path: Path) -> None:
+    """One commit for the one iteration that had something to record, none on either side."""
+
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.bind_route_source_observed(
+        _route_descriptor(4),
+        routing_policy_fingerprint=ROUTING_POLICY,
+        observed_at=NOW,
+    )
+
+    watcher = CommitWatcher(path, tables=("signal_route_source",))
+    try:
+        before = watcher.stamp()
+        store.bind_route_source_observed(
+            _route_descriptor(4),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW + ROUTER_INTERVAL,
+        )
+        quiet = watcher.stamp()
+        grown = store.bind_route_source_observed(
+            _route_descriptor(5),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW + ROUTER_INTERVAL * 2,
+        )
+        wrote = watcher.stamp()
+        store.bind_route_source_observed(
+            _route_descriptor(5),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW + ROUTER_INTERVAL * 3,
+        )
+        settled = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert quiet == before
+    assert wrote != quiet
+    assert settled == wrote
+    assert grown.watermark_advanced is True
+    assert grown.cursor.observed_high_watermark == 5
+    assert grown.cursor.updated_at == NOW + ROUTER_INTERVAL * 2
+
+
+def test_the_gate_leaves_every_bind_check_running_on_an_unchanged_source(
+    tmp_path: Path,
+) -> None:
+    """Skipping the write does not skip a single validation the bind used to make.
+
+    Each of these is refused on a source whose watermark is exactly the stored one — the
+    case that now writes nothing — so the checks demonstrably still run after the row is
+    already at that value.
+    """
+
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    store.bind_route_source_observed(
+        _route_descriptor(4),
+        routing_policy_fingerprint=ROUTING_POLICY,
+        observed_at=NOW,
+    )
+
+    with pytest.raises(SignalRouteSequenceError, match="regressed"):
+        store.bind_route_source(
+            _route_descriptor(3),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW + ROUTER_INTERVAL,
+        )
+    with pytest.raises(SignalRouteConflictError, match="routing policy changed"):
+        store.bind_route_source(
+            _route_descriptor(4),
+            routing_policy_fingerprint="8" * 64,
+            observed_at=NOW + ROUTER_INTERVAL,
+        )
+    with pytest.raises(SignalRouteConflictError, match="strategy spec changed"):
+        store.bind_route_source(
+            _route_descriptor(4).model_copy(update={"strategy_spec_fingerprint": "3" * 64}),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW + ROUTER_INTERVAL,
+        )
+    with pytest.raises(SignalRouteConflictError, match="first sequence changed"):
+        store.bind_route_source(
+            _route_descriptor(4).model_copy(update={"first_sequence": 2}),
+            routing_policy_fingerprint=ROUTING_POLICY,
+            observed_at=NOW + ROUTER_INTERVAL,
+        )
+    assert store.route_cursor("n-shape-v1").observed_high_watermark == 4
