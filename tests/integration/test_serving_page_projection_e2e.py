@@ -1504,11 +1504,23 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
         if stage == "after_pointer_switch":
             raise RuntimeError("injected pointer failure")
 
+    # A third source generation, because #271 moved the rebuild gate in front of the
+    # build: republishing the generation that is already current is now a read, and this
+    # case is about what happens when the pointer switch itself fails.
+    moved_generation = "d" * 64
+    moved_watermarks = tuple(
+        watermark.model_copy(update={"generation_id": moved_generation})
+        if watermark.dataset_id == "reference_slow"
+        else watermark
+        for watermark in second.watermarks
+    )
+    moved_sources = {**second.source_generations, "reference_slow": moved_generation}
+
     with pytest.raises(RuntimeError, match="pointer failure"):
         publisher.publish(
             tables,
-            watermarks=second.watermarks,
-            source_generations=second.source_generations,
+            watermarks=moved_watermarks,
+            source_generations=moved_sources,
             built_at=clock[0] + timedelta(seconds=1),
             failure_hook=fail_after_switch,
         )
