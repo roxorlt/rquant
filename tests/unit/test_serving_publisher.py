@@ -581,3 +581,95 @@ def test_publish_generation_budgets_fail_before_pointer_switch(tmp_path: Path) -
             source_generation="source-3",
         )
     assert publisher.current_manifest() == first
+
+
+def _publish_generation(
+    publisher: ServingPublisher,
+    *,
+    frame: pd.DataFrame | None = None,
+    built_at: datetime = _BUILT_AT,
+    source_generation: str = "source-1",
+):
+    # The watermark belongs to the *source's* published generation, so it does not move
+    # with this role's loop clock -- only `built_at` does.
+    return publisher.publish_generation(
+        {"signals": _signals() if frame is None else frame},
+        watermarks=(_watermark(generation_id=source_generation, built_at=_BUILT_AT),),
+        source_generations={"signals": source_generation},
+        built_at=built_at,
+    )
+
+
+def test_sixty_iterations_over_unchanged_sources_build_one_generation(tmp_path: Path) -> None:
+    """#271: the thirty-second rebuild that ran all day behind two clock-stamped inputs.
+
+    A generation's identity includes `content_sha256` and `built_at`, so the only place
+    this can be decided is before the build: by the time there is a manifest to compare,
+    the DuckDB file has been written, verified, hashed and fsynced. Production sampled
+    this role rebuilding `serving.duckdb` every thirty seconds with nothing trading.
+    """
+
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    assert first.written is True
+    generations = tmp_path / "serving" / "generations"
+    settled = {path.name for path in generations.iterdir()}
+    pointer_bytes = (tmp_path / "serving" / "current.json").read_bytes()
+
+    written = []
+    for iteration in range(1, 61):
+        built_at = _BUILT_AT + timedelta(seconds=30 * iteration)
+        publication = _publish_generation(publisher, built_at=built_at)
+        assert publication.manifest == first.manifest
+        written.append(publication.written)
+
+    assert written == [False] * 60
+    assert {path.name for path in generations.iterdir()} == settled
+    assert (tmp_path / "serving" / "current.json").read_bytes() == pointer_bytes
+
+
+def test_one_upstream_generation_change_builds_exactly_one_generation(tmp_path: Path) -> None:
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    moved = _publish_generation(
+        publisher,
+        frame=_signals(price_delta=1.0),
+        built_at=_BUILT_AT + timedelta(seconds=30),
+        source_generation="source-2",
+    )
+
+    assert moved.written is True
+    assert moved.manifest.generation_id != first.manifest.generation_id
+    assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
+
+    written = [
+        _publish_generation(
+            publisher,
+            frame=_signals(price_delta=1.0),
+            built_at=_BUILT_AT + timedelta(seconds=30 * iteration),
+            source_generation="source-2",
+        ).written
+        for iteration in range(2, 8)
+    ]
+    assert written == [False] * 6
+    assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
+
+
+def test_a_moved_producer_commit_still_builds_its_own_generation(tmp_path: Path) -> None:
+    """A release is a different artifact whatever the six sources say."""
+
+    root = tmp_path / "serving"
+    _publish_generation(_publisher(root))
+    released = ServingPublisher(
+        root,
+        producer_commit="b" * 40,
+        table_specs={"signals": ServingTableSpec(sort_keys=("trade_date", "ts_code"))},
+    )
+    publication = released.publish_generation(
+        {"signals": _signals()},
+        watermarks=(_watermark(generation_id="source-1", built_at=_BUILT_AT),),
+        source_generations={"signals": "source-1"},
+        built_at=_BUILT_AT + timedelta(seconds=30),
+    )
+    assert publication.written is True
+    assert len(tuple((root / "generations").iterdir())) == 2

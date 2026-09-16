@@ -282,7 +282,7 @@ def test_builder_does_not_acknowledge_when_serving_publish_fails(
         lambda **_kwargs: calls.append("resolved") or (),
     )
     monkeypatch.setattr(
-        "rquant.runtime_builder_serving.ServingPublisher.publish",
+        "rquant.runtime_builder_serving.ServingPublisher.publish_generation",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("publish failed")),
     )
     step = serving_publisher_builder(
@@ -310,7 +310,11 @@ def test_repeated_identical_snapshot_is_idempotent_without_extra_generation(
     second = step()
     second_paths = tuple((tmp_path / "serving" / "generations").iterdir())
 
-    assert second == first
+    # Same six source generations, so the second iteration selects the generation that
+    # is already current and never opens a DuckDB file to build another (#271).
+    assert first.generation_published is True
+    assert second.generation_published is False
+    assert second == first.model_copy(update={"generation_published": False})
     assert second.processed_count == 1
     assert len(first_paths) == 1
     assert second_paths == first_paths

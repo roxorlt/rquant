@@ -295,12 +295,13 @@ def serving_publisher_builder(
                 raise ValueError("serving snapshot contains future evidence at runtime clock")
 
             tables = build_serving_read_models(snapshot.read_model)
-            generation = publisher.publish(
+            publication = publisher.publish_generation(
                 tables,
                 watermarks=snapshot.watermarks,
                 source_generations=snapshot.source_generations,
                 built_at=snapshot.read_model.observed_at,
             )
+            generation = publication.manifest
             for acknowledger in current_runtime_schema_consumer_acknowledgers(
                 service_id=manifest.service_id,
                 producer_commit=manifest.producer_commit,
@@ -327,6 +328,7 @@ def serving_publisher_builder(
                     "serving_generation": generation.generation_id,
                 },
                 degraded_reasons=_degraded_reasons(snapshot.watermarks),
+                generation_published=publication.written,
             )
 
         if build_events:
