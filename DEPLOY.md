@@ -57,9 +57,20 @@
      `live_backlog_age_seconds`。**判断某个 role 是不是还活着，看 `stale` 这一位**，
      它仍然会在 `stale_after` 之内翻转，翻转那一轮就发一代新的。
 
-  **积压、进出序号、`processed_count`、上游 generation 都照常刷新**——它们是内容，
-  一个 role 的积压从 0 涨到 3000 会发一代（用例
-  `test_a_backlog_that_grows_publishes_exactly_one_generation`）。
+  3. **同伴的游标与它在读哪一代**（`input_sequence`、`output_sequence`、
+     `source_generations`）。这三个是**同伴自己的事**，不进 health 的身份——
+     `runtime-health.all.v1` 盯着二十四个 loop，而其中至少两个在空闲时也会动它们
+     （retention 本包之前把自己的时钟算进了 generation；catalog 每步都推进扫描游标），
+     把它们算进来等于让 health 每天多发约 288 代、每代后面一次 `serving.duckdb` 重建。
+     要看某个 role 的游标或它在读哪一代，看那个 role 自己的心跳文件。
+
+  **积压与 `processed_count` 照常刷新**——它们是内容，一个 role 的积压从 0 涨到 3000
+  会发一代（用例 `test_a_backlog_that_grows_publishes_exactly_one_generation`）。
+
+- **验收方法（就按这一条数）**：收盘后对
+  `/home/lighthouse/rquant/data/runtime/control/authority-runtime-health/generations/`
+  数一次文件个数，**十分钟后再数一次，应当完全一样**；`serving/generations/` 同理。
+  装之前那十分钟会多出 60 个与 20 个。
 
 **回滚：本条可以只挪心跳，不需要清任何库。**
 
