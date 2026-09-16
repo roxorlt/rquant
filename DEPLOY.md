@@ -52,17 +52,28 @@
 
 1. 与 `v0.33.12` 同一条路径；**本包新增一个心跳文件字段 `projection_published`**，
    所以回滚到 `v0.33.12` 或更早时，先按 2026-09-10 那一条写的整批挪心跳步骤把心跳挪开。
-2. **另外必须清掉本包写下的页投影权威行。** 本包写的行，`generation_id` 是按「只对内容求
-   哈希」算的；`v0.33.12` 及更早的代码读到这样一行会重算旧规则的哈希、对不上、
-   在 `serving_snapshot` 里抛 `ValueError`，而那是 notifier 每一轮都要走的路径——
+2. **另外必须清掉本包写下的页投影权威行。** 本包写的行带 `content_id`，`generation_id`
+   按「`content_id` + 两个时刻」算；`v0.33.12` 及更早的代码读到这样一行会重算旧规则的哈希、
+   对不上、在 `serving_snapshot` 里抛 `ValueError`，而那是 notifier 每一轮都要走的路径——
    结果是回滚之后 notifier 每两秒失败一次。本包读旧行是兼容的，**旧代码读新行不是**。
+   （本包给这张表加的 `content_id` 列本身不妨碍旧代码——SQLite 多一列不影响
+   `SELECT payload_json`；出问题的是行里的 `payload_json`。）
    具体做法：停 `rquant-runtime-notifier@svc-*`，把
    `/home/lighthouse/rquant/data/runtime/live/notifications/svc-*/notification_state.sqlite3`
-   整个挪开（与心跳一起挪，不要只删表——该表上有禁止 DELETE 的触发器），再起旧版本。
-   挪走之后 notifier 从空状态重建：投影下一轮就重新发布，外发队列里未送达的条目会丢，
-   **所以回滚窗口选在收盘后、队列为空的时候**。
+   整个挪开，再起旧版本。三处细节，少一处就不对：
+   - **不要只删那张表**——表上有禁止 DELETE 的触发器，删不动。
+   - **`-wal` 和 `-shm` 两个边车要跟主文件一起挪走**。只挪主文件的话新库照样能开
+     （SQLite 会把对不上的 WAL 当无效重置），但挪走的那份 `.bak` 就缺了最后没 checkpoint
+     的那一段，以后想从它里面捞外发队列会捞不全。
+   - 挪走之后 notifier 从空状态重建，**这有两个方向的后果**：外发队列里未送达的条目会丢；
+     而复制游标也一并归零，所以 **spool 里留存的那整段前缀会被重新复制、重新入队、
+     重新推送**（本项目刚在 `06c4eb0` 处理过推送风暴，这一条是同一类）。
+     **所以回滚窗口选在收盘后、队列为空的时候，并且先确认 notifier 处于 `paused: true`
+     （今天的生产 manifest 就是）或者确认 spool 留存前缀重新投递是可以接受的。**
 
 **本包不改 `deploy/`，不改 systemd unit，不动发布原语。**
+状态库会多一个可空列 `content_id`（开库时自动 `ALTER TABLE` 补上，只改 schema、
+不重写任何行、不触发不可变触发器），不需要人工迁移。
 
 ---
 
