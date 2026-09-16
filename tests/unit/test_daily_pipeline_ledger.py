@@ -1018,3 +1018,202 @@ def test_finalize_rejects_swapped_terminal_receipt_pointer(tmp_path: Path) -> No
 
     with pytest.raises(DailyPipelineLedgerError, match="terminal receipt binding"):
         ledger.finalize_success(lease, prepared, now=NOW + timedelta(seconds=2))
+
+
+def test_run_for_spec_is_the_read_only_twin_of_create_run(tmp_path: Path) -> None:
+    """Same record, same conflict, without spending a fencing token to find out."""
+
+    ledger = _ledger(tmp_path)
+    spec = _spec()
+
+    assert ledger.run_for_spec(spec) is None
+
+    lease = _lease(ledger)
+    created = ledger.create_run(lease, spec, now=NOW)
+    token_after_create = _writer_row(ledger)["fencing_token"]
+
+    assert ledger.run_for_spec(spec) == created
+    assert ledger.create_run(lease, spec, now=NOW) == created
+    assert _writer_row(ledger)["fencing_token"] == token_after_create
+
+    conflicting = _spec(run_id=str(created.run_id), code_commit="c" * 40)
+    assert conflicting.run_id == created.run_id
+    with pytest.raises(DailyPipelineLedgerError, match="immutable input identity"):
+        ledger.run_for_spec(conflicting)
+    with pytest.raises(DailyPipelineLedgerError, match="immutable input identity"):
+        ledger.create_run(lease, conflicting, now=NOW)
+
+
+def test_run_for_spec_rejects_a_foreign_storage_profile(tmp_path: Path) -> None:
+    """The read-only twin keeps ``create_run``'s profile guard, not just its lookup."""
+
+    ledger = _ledger(tmp_path)
+    with pytest.raises(DailyPipelineLedgerError, match="storage profile"):
+        ledger.run_for_spec(_spec(profile_hash="f" * 64))
+
+
+def test_recovery_probe_agrees_with_recover_at_every_stage_of_a_run(tmp_path: Path) -> None:
+    """Walk one run through its states and check the probe against what recover did."""
+
+    ledger = _ledger(tmp_path)
+    lease = _lease(ledger)
+    run = ledger.create_run(lease, _spec(), now=NOW)
+
+    # Nothing claimed yet: a page of pending stages with no deadline is a no-op sweep.
+    probe = ledger.recovery_probe(now=NOW, run_id=run.run_id)
+    assert probe.would_write is False
+    assert probe.next_cursor == ledger.recover(lease, now=NOW, run_id=run.run_id).next_cursor
+
+    capture = ledger.claim_next(lease, now=NOW)
+    assert capture is not None
+    # Claimed but with no prepared receipt: recovery deliberately leaves it alone.
+    assert ledger.recovery_probe(now=NOW, run_id=run.run_id).would_write is False
+
+    prepared = ledger.prepare_success(
+        lease,
+        capture,
+        StageResult(content_hash="e" * 64, evidence_hash="f" * 64),
+        now=NOW,
+    )
+    assert ledger.recovery_probe(now=NOW, run_id=run.run_id).would_write is True
+
+    summary = ledger.recover(lease, now=NOW, run_id=run.run_id)
+    assert summary.finalized_receipt_ids == (prepared.receipt_id,)
+    assert ledger.recovery_probe(now=NOW, run_id=run.run_id).would_write is False
+
+
+def test_recovery_probe_sees_an_expired_deadline(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    lease = _lease(ledger)
+    run = ledger.create_run(
+        lease,
+        _spec(deadline_at=NOW + timedelta(seconds=30)),
+        now=NOW,
+    )
+
+    assert ledger.recovery_probe(now=NOW, run_id=run.run_id).would_write is False
+    assert ledger.recovery_probe(now=NOW + timedelta(seconds=30), run_id=run.run_id).would_write
+
+    ledger.recover(lease, now=NOW + timedelta(seconds=30), run_id=run.run_id)
+    assert ledger.run(run.run_id).state is DailyRunState.FAILED
+    # A failed run leaves the page empty, so the sweep has nothing left to find.
+    assert ledger.recovery_probe(now=NOW + timedelta(seconds=60)).would_write is False
+
+
+def test_has_claimable_stage_work_agrees_with_claim_next_for_run(tmp_path: Path) -> None:
+    """Every claim the ledger would make has a ``True`` here, and no other."""
+
+    ledger = _ledger(tmp_path)
+    lease = _lease(ledger)
+    run = ledger.create_run(lease, _spec(), now=NOW)
+
+    assert ledger.has_claimable_stage_work(now=NOW, run_id=run.run_id) is True
+    capture = ledger.claim_next_for_run(lease, run.run_id, now=NOW)
+    assert capture is not None
+
+    # A running stage is adoptable, which rewrites its claim row.
+    assert ledger.has_claimable_stage_work(now=NOW, run_id=run.run_id) is True
+
+    ledger.succeed(
+        lease,
+        capture,
+        StageResult(content_hash="e" * 64, evidence_hash="f" * 64),
+        now=NOW + timedelta(seconds=1),
+    )
+    assert ledger.has_claimable_stage_work(now=NOW + timedelta(seconds=1), run_id=run.run_id)
+
+    publish = ledger.claim_next_for_run(lease, run.run_id, now=NOW + timedelta(seconds=1))
+    assert publish is not None
+    ledger.succeed(
+        lease,
+        publish,
+        StageResult(content_hash="1" * 64, evidence_hash="2" * 64),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert ledger.run(run.run_id).state is DailyRunState.SUCCEEDED
+    assert ledger.has_claimable_stage_work(now=NOW + timedelta(seconds=2), run_id=run.run_id) is (
+        False
+    )
+    assert ledger.claim_next_for_run(lease, run.run_id, now=NOW + timedelta(seconds=2)) is None
+
+
+def test_has_claimable_stage_work_skips_a_stage_whose_dependency_is_unfinished(
+    tmp_path: Path,
+) -> None:
+    """``publish`` waits on ``capture``, and a waiting stage is not work to claim."""
+
+    ledger = _ledger(tmp_path)
+    lease = _lease(ledger)
+    run = ledger.create_run(lease, _spec(), now=NOW)
+    capture = ledger.claim_next_for_run(lease, run.run_id, now=NOW)
+    assert capture is not None
+    ledger.fail(
+        lease,
+        capture,
+        StageFailure(error_code="transient", message="retry me"),
+        retryable=True,
+        now=NOW,
+    )
+
+    # ``capture`` is waiting out its backoff and ``publish`` is waiting on ``capture``,
+    # so the whole run is pending and none of it is claimable yet.
+    assert ledger.stage(run.run_id, "capture").state is DailyStageState.RETRY_WAIT
+    assert ledger.has_claimable_stage_work(now=NOW, run_id=run.run_id) is False
+    assert ledger.claim_next_for_run(lease, run.run_id, now=NOW) is None
+    assert ledger.has_claimable_stage_work(now=NOW + timedelta(minutes=1), run_id=run.run_id)
+    assert ledger.claim_next_for_run(lease, run.run_id, now=NOW + timedelta(minutes=1)) is not None
+
+
+def test_has_recoverable_effect_attempts_tracks_the_prepared_effect(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    lease = _lease(ledger)
+    run = ledger.create_run(lease, _spec(), now=NOW)
+
+    assert ledger.has_recoverable_effect_attempts(run_id=run.run_id) is False
+
+    capture = ledger.claim_next_for_run(lease, run.run_id, now=NOW)
+    assert capture is not None
+    assert ledger.has_recoverable_effect_attempts(run_id=run.run_id) is False
+
+    ledger.prepare_effect(lease, capture, _effect_intent(run, capture), now=NOW)
+
+    assert ledger.has_recoverable_effect_attempts(run_id=run.run_id) is True
+    assert ledger.has_recoverable_effect_attempts() is True
+    assert ledger.has_recoverable_effect_attempts(run_id="daily-nonexistent") is False
+    assert tuple(
+        attempt.stage_id
+        for attempt in ledger.active_effect_attempts(lease, now=NOW, run_id=run.run_id)
+    ) == ("capture",)
+
+
+def _effect_intent(run, attempt):
+    from rquant.daily_pipeline_ledger import DailyStageEffectIntent
+
+    return DailyStageEffectIntent(
+        mode=run.spec.mode,
+        idempotency_key=canonical_sha256(
+            {
+                "contract": "daily-stage-idempotency-key/v3",
+                "mode": run.spec.mode,
+                "run_id": run.run_id,
+                "stage_id": attempt.stage_id,
+                "input_identity": run.input_identity,
+                "command_manifest_hash": run.spec.command_manifest_hash,
+            }
+        ),
+        command_manifest_hash=run.spec.command_manifest_hash,
+        adapter_identity="ledger-probe-test/v1",
+        receipt_locator="/tmp/daily-probe-receipt.json",
+    )
+
+
+def _writer_row(ledger: DailyPipelineLedger) -> sqlite3.Row:
+    connection = sqlite3.connect(f"file:{ledger.path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        return connection.execute(
+            "SELECT * FROM daily_pipeline_writer WHERE singleton = 1"
+        ).fetchone()
+    finally:
+        connection.close()

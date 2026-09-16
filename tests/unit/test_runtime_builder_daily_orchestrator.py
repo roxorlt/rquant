@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -997,3 +998,138 @@ def test_daily_production_signer_client_has_no_sudo_key_argv_or_endpoint_choice(
         "timeout_seconds",
         "max_attempts",
     }
+
+
+class _CommitWatcher:
+    """One read-only connection, held open, that sees every commit anybody else makes.
+
+    ``PRAGMA data_version`` is SQLite's own answer to "has another connection committed
+    since I last looked", and it is only comparable **within one connection** -- so the
+    connection is held open across the loop rather than reopened per sample.  The other
+    portable candidates are unsound here: ``total_changes`` counts what one connection
+    did and the ledger opens its own per call, and the ``-wal`` file is created and
+    truncated by opening a write connection whether or not that connection commits.
+
+    Holding the reader open also keeps the WAL from being checkpointed, so the ``-wal``
+    byte count is exactly what commits appended during the window -- a second,
+    independent way of saying nothing was committed.
+    """
+
+    def __init__(self, database: Path) -> None:
+        self.database = database
+        self.connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        self.connection.row_factory = sqlite3.Row
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def stamp(self) -> tuple[object, ...]:
+        data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+        writer = self.connection.execute(
+            "SELECT * FROM daily_pipeline_writer WHERE singleton = 1"
+        ).fetchone()
+        counts = tuple(
+            int(self.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            for table in (
+                "daily_pipeline_run",
+                "daily_pipeline_stage",
+                "daily_pipeline_stage_receipt",
+                "daily_pipeline_effect_intent",
+            )
+        )
+        wal = self.database.with_name(self.database.name + "-wal")
+        wal_bytes = wal.stat().st_size if wal.exists() else 0
+        return (data_version, wal_bytes, counts, tuple(writer) if writer is not None else None)
+
+
+def test_idle_daily_orchestrator_iterations_take_no_writer_lease(tmp_path: Path) -> None:
+    """Sixty idle minutes after the day's run succeeded commit nothing at all.
+
+    The role rebuilt the same spec every sixty seconds and called ``create_run``,
+    ``recover`` and ``advance`` on it.  Each of the three unconditionally took the
+    writer lease, and every acquisition is ``BEGIN IMMEDIATE ... UPDATE
+    daily_pipeline_writer ... COMMIT`` on a WAL, ``synchronous=FULL`` database -- three
+    real fsyncs a minute, all day, on a run with nothing left to advance (#271).
+    """
+
+    runtime_root = (tmp_path / "runtime").resolve()
+    _publish_daily_close_source(runtime_root)
+    receipt_authority = create_daily_ed25519_test_authority(tmp_path / "daily-receipt")
+    profile, manifest = _daily_profile(runtime_root, receipt_authority=receipt_authority)
+    assert profile.profile_id is not None
+    _write_profile(profile, runtime_root)
+
+    from rquant.runtime_builder_daily_orchestrator import daily_pipeline_orchestrator_builder
+
+    observed = datetime(2026, 8, 3, 10, tzinfo=UTC)
+    clock = observed
+    step = daily_pipeline_orchestrator_builder(clock=lambda: clock)(manifest)
+
+    first = step()
+    assert first.writer_lease_acquired is True
+
+    storage_profile = DailyPipelineStorageProfile.create(
+        root=runtime_root / "research" / "daily-pipeline",
+        mode=DailyPipelineMode.SHADOW,
+        profile_hash=profile.profile_id,
+    )
+    watcher = _CommitWatcher(storage_profile.state_path)
+    try:
+        before = watcher.stamp()
+        idle = []
+        for index in range(60):
+            clock = observed + timedelta(seconds=60 * (index + 1))
+            idle.append(step())
+        after = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert after == before, "an idle daily orchestrator committed to its ledger"
+    assert [result.writer_lease_acquired for result in idle] == [False] * 60
+    assert {result.source_generations["daily_pipeline_completion_receipt"] for result in idle} == {
+        first.source_generations["daily_pipeline_completion_receipt"]
+    }
+    assert len(tuple(storage_profile.report_root.glob("*.json"))) == 1
+
+
+def test_a_daily_iteration_with_a_stage_left_still_takes_the_lease(tmp_path: Path) -> None:
+    """The saving is only in the idle case: real work still fences itself as before."""
+
+    runtime_root = (tmp_path / "runtime").resolve()
+    _publish_daily_close_source(runtime_root)
+    receipt_authority = create_daily_ed25519_test_authority(tmp_path / "daily-receipt")
+    profile, manifest = _daily_profile(runtime_root, receipt_authority=receipt_authority)
+    assert profile.profile_id is not None
+    _write_profile(profile, runtime_root)
+
+    from rquant.daily_pipeline_orchestrator import DEFAULT_DAILY_CLOSE_PIPELINE
+    from rquant.runtime_builder_daily_orchestrator import daily_pipeline_orchestrator_builder
+
+    observed = datetime(2026, 8, 3, 10, tzinfo=UTC)
+    clock = observed
+    step = daily_pipeline_orchestrator_builder(clock=lambda: clock)(manifest)
+
+    storage_profile = DailyPipelineStorageProfile.create(
+        root=runtime_root / "research" / "daily-pipeline",
+        mode=DailyPipelineMode.SHADOW,
+        profile_hash=profile.profile_id,
+    )
+
+    first = step()
+
+    connection = sqlite3.connect(f"file:{storage_profile.state_path}?mode=ro", uri=True)
+    try:
+        token = int(
+            connection.execute(
+                "SELECT fencing_token FROM daily_pipeline_writer WHERE singleton = 1"
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+
+    # One acquisition for the run insert, then one for each stage the DAG advanced --
+    # the loop calls ``advance`` once more than there are stages, and that last call now
+    # finds nothing claimable and stops before the lease.
+    assert first.writer_lease_acquired is True
+    assert first.processed_count == len(DEFAULT_DAILY_CLOSE_PIPELINE.stage_ids)
+    assert token == 1 + len(DEFAULT_DAILY_CLOSE_PIPELINE.stage_ids)
