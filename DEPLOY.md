@@ -39,12 +39,27 @@
   各 role 上哪几个字段是 `null` 是正常的：一个 role 只报它自己会做的那一类写。
 - 盘中 `watchlist-quote.source.v1` 在熔断/退避/节拍未到的那些轮 `batch_published=false`，
   spool 的 `sequence` 不再每五秒加一。
-- **`serving.duckdb` 的内容会更旧，这是取舍。** 六个上游权威都没换代的时候 serving 不再重建，
-  所以 `dashboard_summary` 里的 `monitor_last_at` / `daily_last_at` 这类「上次心跳时刻」
-  在系统真的空闲时会停住，直到某个 role 的状态（status / 陈旧 / 降级原因 / 最后一次错误）
-  真的变了才刷新。**判断某个 role 是不是还活着，从今天起看它自己的心跳文件，不要看页面上的
-  那两个时刻。** 页面上真正的死活信号是 `stale`，那一位仍然会在 `stale_after` 之内翻转，
-  并且翻转那一轮就会发一代新的。
+- **交易时段 serving 照常重建，省下来的是收盘之后。** `runtime-health.all.v1` 的身份里留着
+  每个 role 的游标、`processed_count`、`backlog_count` 和 `source_generations`——盘中这些
+  一直在动，所以 health 照常发代、serving 照常大约每三十秒重建一次。**这是对的**：那时候
+  内容真的在变。本包省下的是**没有数据在流动的那些小时**，也就是 17:00 那一段。
+
+- **页面上恰好有两类东西不再逐轮刷新，其余照旧。** 只有这两类：
+
+  1. **「同一件事又发生了多少次」**——`consecutive_failures`、`total_failures`、
+     `total_successes` 三个计数器。一个 role **开始**失败照样立刻发一代（`status` 翻成
+     DEGRADED，`last_error` 与 `degraded_reasons` 都在身份里），但它**第十一次以同样的方式
+     失败**不再发。想看「连续失败了多少次」，看那个 role 自己的心跳文件。
+     这一条是故意的：不然一个每两秒失败一次的 role 会让 serving 每三十秒重建一次，
+     持续整个故障期间——2026-09-09 那天正是两个 role 在这么干，而主机当时 load 已经 11-12。
+  2. **纯观测量**——心跳时刻（`heartbeat_at` / `last_success_at`，也就是页面上的
+     `monitor_last_at` / `daily_last_at`）、三个时延字段、积压**年龄**
+     `live_backlog_age_seconds`。**判断某个 role 是不是还活着，看 `stale` 这一位**，
+     它仍然会在 `stale_after` 之内翻转，翻转那一轮就发一代新的。
+
+  **积压、进出序号、`processed_count`、上游 generation 都照常刷新**——它们是内容，
+  一个 role 的积压从 0 涨到 3000 会发一代（用例
+  `test_a_backlog_that_grows_publishes_exactly_one_generation`）。
 
 **回滚：本条可以只挪心跳，不需要清任何库。**
 
