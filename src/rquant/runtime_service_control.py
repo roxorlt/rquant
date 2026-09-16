@@ -97,6 +97,7 @@ class RuntimeStepResult(RuntimeContractModel):
     batch_published: bool | None = None
     #: Whether this iteration actually took the daily writer lease, which is one fencing
     #: token per acquisition. `None` for every role but the daily orchestrator (#271).
+    writer_lease_acquired: bool | None = None
 
     @field_validator("source_generations")
     @classmethod
