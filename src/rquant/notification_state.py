@@ -610,31 +610,64 @@ class NotificationStateStore(SignalBusStore):
                     """
                 )
 
-    #: The row `serving_snapshot` would serve, by the same order it uses (#271, review
-    #: SF-1). The gate compares against *this* row and no other: "some row already holds
-    #: this content" is not the question, because a content that reverts byte for byte to
-    #: an earlier form has such a row and is still not what is being served.
+    #: The row `serving_snapshot` would serve **to this caller's clock** (#271, reviews
+    #: SF-1 and DF-3). Same order *and* the same point-in-time filter as
+    #: `serving_snapshot`: without the filter this asked "newest overall", so one row
+    #: stamped ahead of the clock -- a clock that went backwards is the only way to get
+    #: one -- would have made the gate skip a publication the reader could not yet see,
+    #: which is SF-1's shape again by another route. Monotonic clocks make that
+    #: unreachable and the filter is two index-free comparisons on one row, so it is
+    #: stated rather than assumed.
+    #:
+    #: `payload_json` is deliberately **not** selected (review DF-1). The table has no
+    #: index on `available_at`, so this is a scan plus a temporary B-tree for the sort,
+    #: and dragging a 20 KB payload per row through that sorter cost 29 ms at 5k rows and
+    #: 400-650 ms at 80k -- about 25x what the same query costs without it. The legacy
+    #: branch below fetches the payload by primary key, for the one row that needs it.
     _LATEST_PROJECTION_AUTHORITY_SQL = """
-        SELECT generation_id, content_id, payload_json
+        SELECT generation_id, content_id
         FROM notification_projection_authority
+        WHERE available_at <= ? AND observed_at <= ?
         ORDER BY available_at DESC, observed_at DESC, generation_id DESC
         LIMIT 1
     """
 
-    @staticmethod
-    def _published_content_id(row: sqlite3.Row) -> str:
-        """The content identity of the row `serving_snapshot` is currently serving.
+    #: One row by primary key, for a latest row written before v0.33.13.
+    _PROJECTION_AUTHORITY_PAYLOAD_SQL = """
+        SELECT payload_json FROM notification_projection_authority WHERE generation_id = ?
+    """
 
-        Rows written before v0.33.13 have no `content_id` column value, so theirs is
-        derived from the payload once -- after the next publication the latest row carries
-        its own and this branch is not taken again.
+    @classmethod
+    def _latest_published_content(
+        cls,
+        connection: sqlite3.Connection,
+        observed_text: str,
+    ) -> tuple[str, str] | None:
+        """`(generation_id, content_id)` of what is being served at `observed_text`.
+
+        Rows written before v0.33.13 have no `content_id`, so theirs is derived from the
+        payload -- one primary-key read, and only while such a row is still the latest.
+        After the next publication the latest row carries its own and this never runs.
         """
 
-        stored = row["content_id"]
-        if stored is not None:
-            return str(stored)
-        legacy = NotificationProjectionAuthoritySnapshot.model_validate_json(row["payload_json"])
-        return canonical_sha256(legacy.content_identity())
+        row = connection.execute(
+            cls._LATEST_PROJECTION_AUTHORITY_SQL,
+            (observed_text, observed_text),
+        ).fetchone()
+        if row is None:
+            return None
+        generation_id = str(row["generation_id"])
+        content_id = row["content_id"]
+        if content_id is not None:
+            return generation_id, str(content_id)
+        payload = connection.execute(
+            cls._PROJECTION_AUTHORITY_PAYLOAD_SQL,
+            (generation_id,),
+        ).fetchone()
+        legacy = NotificationProjectionAuthoritySnapshot.model_validate_json(
+            payload["payload_json"]
+        )
+        return generation_id, canonical_sha256(legacy.content_identity())
 
     def publish_projection_authority(
         self,
@@ -650,23 +683,25 @@ class NotificationStateStore(SignalBusStore):
         fsync (#271). The read below runs on the read-only connection precisely so that
         the common case does not take the database's write lock.
 
-        The comparison is against the **latest** row rather than against any row carrying
-        this content, so a projection that reverts to an earlier form is published again
-        as a new row instead of silently leaving the intermediate generation in front of
-        it (review SF-1). `generation_id` is per publication for the same reason: it is
-        the row key, and two publications of one content have to be two rows.
+        The comparison is against the **latest visible** row rather than against any row
+        carrying this content, so a projection that reverts to an earlier form is
+        published again as a new row instead of silently leaving the intermediate
+        generation in front of it (review SF-1). `generation_id` is per publication for
+        the same reason: it is the row key, and two publications of one content have to be
+        two rows.
         """
 
         validated = NotificationProjectionAuthoritySnapshot.model_validate(snapshot)
-        latest = self._latest_projection_authority()
-        if latest is not None and self._published_content_id(latest) == validated.content_id:
-            return NotificationProjectionPublication(
-                generation_id=str(latest["generation_id"]),
-                written=False,
-            )
-        payload_json = validated.model_dump_json()
         observed_text = validated.observed_at.isoformat(timespec="microseconds")
         available_text = validated.available_at.isoformat(timespec="microseconds")
+        connection = self._connect_readonly()
+        try:
+            latest = self._latest_published_content(connection, observed_text)
+        finally:
+            connection.close()
+        if latest is not None and latest[1] == validated.content_id:
+            return NotificationProjectionPublication(generation_id=latest[0], written=False)
+        payload_json = validated.model_dump_json()
         receipts_json = json.dumps(
             dict(validated.source_receipts),
             ensure_ascii=True,
@@ -675,12 +710,9 @@ class NotificationStateStore(SignalBusStore):
         )
         with self._write_transaction() as connection:
             # Another writer may have published between the read above and this lock.
-            latest = connection.execute(self._LATEST_PROJECTION_AUTHORITY_SQL).fetchone()
-            if latest is not None and self._published_content_id(latest) == validated.content_id:
-                return NotificationProjectionPublication(
-                    generation_id=str(latest["generation_id"]),
-                    written=False,
-                )
+            latest = self._latest_published_content(connection, observed_text)
+            if latest is not None and latest[1] == validated.content_id:
+                return NotificationProjectionPublication(generation_id=latest[0], written=False)
             try:
                 connection.execute(
                     """
@@ -699,10 +731,10 @@ class NotificationStateStore(SignalBusStore):
                     ),
                 )
             except sqlite3.IntegrityError as error:
-                #: One generation id is one content at one instant, and the table is
-                #: append-only, so this is a second publication of a snapshot that was
-                #: already written and is no longer the latest -- a caller replaying an
-                #: old snapshot, never the notifier's loop.
+                #: This snapshot was published before and something else has been
+                #: published since, so it is no longer what the latest row holds -- a
+                #: caller replaying an old snapshot object, never the notifier's loop,
+                #: which builds a new one from the clock on every iteration (review DF-2).
                 raise NotificationReplicationError(
                     "notification projection generation was already published"
                 ) from error
@@ -710,13 +742,6 @@ class NotificationStateStore(SignalBusStore):
             generation_id=validated.generation_id,
             written=True,
         )
-
-    def _latest_projection_authority(self) -> sqlite3.Row | None:
-        connection = self._connect_readonly()
-        try:
-            return connection.execute(self._LATEST_PROJECTION_AUTHORITY_SQL).fetchone()
-        finally:
-            connection.close()
 
     def replication_cursor(self) -> NotificationReplicationCursor:
         connection = self._connect_readonly()

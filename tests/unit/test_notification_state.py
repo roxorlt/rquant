@@ -694,13 +694,140 @@ def test_a_projection_that_reverts_to_an_earlier_form_is_published_again(
     ).written
 
 
+def test_the_gate_never_drags_the_payload_through_its_sort(tmp_path: Path) -> None:
+    """Review DF-1: the gate's query runs every two seconds against a growing table.
+
+    There is no index on `available_at`, so this is a scan plus a temporary B-tree for the
+    sort. Selecting `payload_json` puts a 20 KB blob per row through that sorter: 29 ms at
+    5k rows and 400-650 ms at 80k, about twenty-five times what the same query costs
+    without it. The legacy branch fetches the payload by primary key instead, for the one
+    row that needs it.
+    """
+
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    store.publish_projection_authority(
+        NotificationProjectionAuthoritySnapshot.create(
+            observed_at=NOW,
+            available_at=NOW,
+            source_receipts={"market-minute": "1" * 64},
+            projections=_page_projections(),
+        )
+    )
+    connection = sqlite3.connect(
+        f"file:{tmp_path / 'notification-state.sqlite3'}?mode=ro",
+        uri=True,
+    )
+    try:
+        cursor = connection.execute(
+            NotificationStateStore._LATEST_PROJECTION_AUTHORITY_SQL,
+            (
+                NOW.isoformat(timespec="microseconds"),
+                NOW.isoformat(timespec="microseconds"),
+            ),
+        )
+        columns = tuple(description[0] for description in cursor.description)
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN " + NotificationStateStore._LATEST_PROJECTION_AUTHORITY_SQL,
+            (
+                NOW.isoformat(timespec="microseconds"),
+                NOW.isoformat(timespec="microseconds"),
+            ),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert columns == ("generation_id", "content_id")
+    assert "payload_json" not in NotificationStateStore._LATEST_PROJECTION_AUTHORITY_SQL
+    # The sort is what makes the projected columns matter; if this ever stops being a
+    # temp-B-tree sort the column list is free again and this test can go.
+    assert any("TEMP B-TREE" in str(step[3]).upper() for step in plan), plan
+    # The payload is reachable by primary key, which is how the legacy branch reads it.
+    assert "WHERE generation_id = ?" in NotificationStateStore._PROJECTION_AUTHORITY_PAYLOAD_SQL
+
+
+def test_a_row_stamped_ahead_of_the_clock_cannot_make_the_gate_skip(tmp_path: Path) -> None:
+    """Review DF-3: the gate and the reader must answer at the same instant.
+
+    `serving_snapshot` takes the latest row `available_at <= now AND observed_at <= now`.
+    Without that filter the gate took the latest row *overall*, so a row stamped ahead of
+    the clock -- which takes a clock that went backwards to produce -- would have made the
+    gate skip a publication the reader could not see, and the reader would have gone on
+    serving the older content. SF-1's shape by another route.
+    """
+
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+
+    def content(receipt: str, at: datetime) -> NotificationProjectionAuthoritySnapshot:
+        return NotificationProjectionAuthoritySnapshot.create(
+            observed_at=at,
+            available_at=at,
+            source_receipts={"market-minute": receipt * 64},
+            projections=_page_projections(),
+        )
+
+    store.publish_projection_authority(content("1", NOW))
+    ahead = content("2", NOW + timedelta(days=1))
+    store.publish_projection_authority(ahead)
+
+    now = NOW + timedelta(minutes=1)
+    published = store.publish_projection_authority(content("2", now))
+    served = store.serving_snapshot(observed_at=now, history_limit=10)
+
+    # The reader could not see the row a day ahead, so the gate must not have used it.
+    assert published.written
+    assert served.projection_generation_id == published.generation_id
+    assert served.projection_source_receipts == {"market-minute": "2" * 64}
+    assert served.projection_generation_id != ahead.generation_id
+
+
+def test_replaying_a_snapshot_that_is_no_longer_the_latest_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Review DF-2: the `IntegrityError` branch is reachable, so it is tested.
+
+    Two contents published at the same instant are two rows the order separates only by
+    `generation_id`; re-publishing the one that lost that tie is a snapshot whose content
+    is not what the latest row holds and whose row is already there. The notifier's loop
+    cannot do this -- it builds a new snapshot from the clock every iteration -- but a
+    caller replaying a stored snapshot object can.
+    """
+
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    candidates = sorted(
+        (
+            NotificationProjectionAuthoritySnapshot.create(
+                observed_at=NOW,
+                available_at=NOW,
+                source_receipts={"market-minute": receipt * 64},
+                projections=_page_projections(),
+            )
+            for receipt in ("1", "2")
+        ),
+        key=lambda item: item.generation_id,
+    )
+    loses_the_tie, wins_the_tie = candidates
+
+    assert store.publish_projection_authority(loses_the_tie).written
+    assert store.publish_projection_authority(wins_the_tie).written
+
+    with pytest.raises(NotificationReplicationError, match="already published"):
+        store.publish_projection_authority(loses_the_tie)
+
+    # The refusal rolled back cleanly and the store still works.
+    assert not store.publish_projection_authority(wins_the_tie).written
+
+
 def test_a_projection_authority_written_before_the_content_gate_is_still_read(
     tmp_path: Path,
 ) -> None:
     """Production's state database is older than this change and outlives a deployment.
 
-    Rows written before v0.33.13 hash `observed_at` into `generation_id`. They are read
-    here exactly as they were written; nothing recomputes or rewrites them.
+    Rows written before v0.33.13 hash `observed_at` into `generation_id` and have no
+    `content_id` at all. They are read here exactly as they were written; nothing
+    recomputes or rewrites them. And while such a row is still the latest, the gate has to
+    derive its content id from the payload -- a primary-key read of the one row that needs
+    it (review DF-1) -- or the first iteration after an install would publish a row for
+    content that is already there.
     """
 
     store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
@@ -720,8 +847,29 @@ def test_a_projection_authority_written_before_the_content_gate_is_still_read(
     assert store.publish_projection_authority(legacy).written
 
     snapshot = store.serving_snapshot(observed_at=NOW, history_limit=10)
+    # The same content again, in the new form: the legacy row's content id is derived and
+    # matches, so nothing is written.
+    unchanged = store.publish_projection_authority(
+        NotificationProjectionAuthoritySnapshot.create(
+            observed_at=NOW + timedelta(minutes=1),
+            available_at=NOW + timedelta(minutes=1),
+            source_receipts={"market-minute": "1" * 64},
+            projections=_page_projections(),
+        )
+    )
+    changed = store.publish_projection_authority(
+        NotificationProjectionAuthoritySnapshot.create(
+            observed_at=NOW + timedelta(minutes=2),
+            available_at=NOW + timedelta(minutes=2),
+            source_receipts={"market-minute": "2" * 64},
+            projections=_page_projections(),
+        )
+    )
 
     assert snapshot.projection_generation_id == legacy.generation_id
+    assert not unchanged.written
+    assert unchanged.generation_id == legacy.generation_id
+    assert changed.written
 
 
 def test_a_projection_generation_that_matches_neither_identity_is_refused() -> None:

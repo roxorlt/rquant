@@ -53,11 +53,15 @@
 1. 与 `v0.33.12` 同一条路径；**本包新增一个心跳文件字段 `projection_published`**，
    所以回滚到 `v0.33.12` 或更早时，先按 2026-09-10 那一条写的整批挪心跳步骤把心跳挪开。
 2. **另外必须清掉本包写下的页投影权威行。** 本包写的行带 `content_id`，`generation_id`
-   按「`content_id` + 两个时刻」算；`v0.33.12` 及更早的代码读到这样一行会重算旧规则的哈希、
-   对不上、在 `serving_snapshot` 里抛 `ValueError`，而那是 notifier 每一轮都要走的路径——
-   结果是回滚之后 notifier 每两秒失败一次。本包读旧行是兼容的，**旧代码读新行不是**。
-   （本包给这张表加的 `content_id` 列本身不妨碍旧代码——SQLite 多一列不影响
-   `SELECT payload_json`；出问题的是行里的 `payload_json`。）
+   按「`content_id` + 两个时刻」算；`v0.33.12` 及更早的代码读到这样一行，**在 pydantic 解析
+   payload 的那一步就被挡下**——旧模型没有 `content_id` 这个字段，报
+   `ValidationError: content_id — Extra inputs are not permitted`，**根本走不到重算哈希那一步**。
+   `ValidationError` 是 `ValueError` 的子类，抛出的位置还是 `serving_snapshot`，
+   而那是 notifier 每一轮都要走的路径——结果是回滚之后 notifier 每两秒失败一次。
+   本包读旧行是兼容的，**旧代码读新行不是**。
+   （本包给这张表加的 `content_id` **列**本身不妨碍旧代码——SQLite 多一列不影响
+   `SELECT payload_json`，实测旧代码能打开、能 `serving_snapshot`；出问题的是行里的
+   `payload_json` 多了一个字段。）
    具体做法：停 `rquant-runtime-notifier@svc-*`，把
    `/home/lighthouse/rquant/data/runtime/live/notifications/svc-*/notification_state.sqlite3`
    整个挪开，再起旧版本。三处细节，少一处就不对：
