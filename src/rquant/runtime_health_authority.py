@@ -607,24 +607,43 @@ _HEALTH_PAYLOAD_OBSERVATION_FIELDS = (
     "live_backlog_age_seconds",
     "live_p95_latency_seconds",
 )
-#: `source_generations` is excluded for a second reason on top of being an echo of
-#: datasets serving reads from their own authorities: `lab-jobs.serving.v1` is one of the
-#: sources this role watches, so a health generation that moved because a watched role's
-#: `source_generations` moved would be a loop with no idle state in it.
+#: The test for this list is one question, asked of each field: **does it move on an
+#: iteration that changed nothing?** A field that does is a measurement of the moment the
+#: reader looked, and hashing it into the generation id is what made this role publish
+#: 8640 generations a day. A field that does not is evidence, and it stays -- even though
+#: it moves often on a busy host, because moving when work happens is the whole point.
+#:
+#: So `input_sequence`, `output_sequence`, `processed_count`, `backlog_count` and
+#: `source_generations` are **in** the identity: an idle role reports the same cursor, a
+#: `processed_count` of zero, a `backlog_count` of zero and the same upstream generations
+#: every iteration, and every one of them is a column of serving's `runtime_services`
+#: table that an operator reads. A backlog climbing 0 -> 3000 is exactly the kind of
+#: change this dataset exists to show.
+#:
+#: Two kinds of field are out, and they are the only two moments at which this role now
+#: declines to publish something a reader might have wanted:
+#:
+#: 1. **How many times the same thing happened again.** `consecutive_failures`,
+#:    `total_failures` and `total_successes` are tallies, not states. The *transition*
+#:    into failure still publishes -- `status` flips to DEGRADED, and `last_error` and
+#:    `degraded_reasons` are in the identity -- but the eleventh identical failure is the
+#:    same state as the tenth. Keeping them would mean that a role failing every two
+#:    seconds republishes health every ten and rebuilds `serving.duckdb` every thirty, for
+#:    as long as the incident lasts; 2026-09-09 was two roles doing exactly that on a host
+#:    already at load 11-12, which is the storm this package exists to stop.
+#: 2. **Pure measurement of the instant.** `heartbeat_at` and `last_success_at` are the
+#:    clock; the three duration fields are the loop's own latency. `total_successes`
+#:    belongs here too -- it increments on every successful iteration, idle ones included,
+#:    so it can never be in the identity of a gate that is meant to be quiet when idle.
 _HEARTBEAT_OBSERVATION_FIELDS = (
     "heartbeat_at",
     "last_success_at",
-    "input_sequence",
-    "output_sequence",
-    "processed_count",
-    "backlog_count",
     "consecutive_failures",
     "total_failures",
     "total_successes",
     "last_step_duration_seconds",
     "p95_step_duration_seconds",
     "recent_step_durations_seconds",
-    "source_generations",
 )
 _DASHBOARD_ROW_OBSERVATION_FIELDS = ("monitor_last_at", "daily_last_at")
 
@@ -634,9 +653,11 @@ def runtime_health_state_identity(result: SourceReadResult) -> str:
 
     What survives is the service set and, per service, its plane, whether the heartbeat
     could be read at all, the status, the staleness verdict, the run and spec identity it
-    is running under, its degraded reasons and its last error -- everything a reader of
-    this dataset acts on. What is dropped is the answer to "when did you look", which is
-    not evidence about the host.
+    is running under, its degraded reasons, its last error, its cursor and counts of the
+    work this iteration did, and the upstream generations it is on -- everything a reader
+    of this dataset acts on. What is dropped is the answer to "when did you look" and
+    "how many times did that happen again", neither of which is a new state; the note on
+    `_HEARTBEAT_OBSERVATION_FIELDS` above works through it field by field.
 
     Staleness is the reason this cannot simply be "drop the publisher's own clock": a
     service that stops heartbeating is detected by comparing a real `now` against a

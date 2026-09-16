@@ -306,7 +306,15 @@ def test_runtime_health_publisher_uses_existing_serving_authority(tmp_path: Path
 
 
 def _heartbeat_iteration(root: Path, service_id: str, at: datetime) -> None:
-    """One more ordinary iteration of a live role: same state, later clock and counters."""
+    """One more *idle* iteration of a live role, written the way the loop writes it.
+
+    Exactly three things move when a resident role succeeds at doing nothing:
+    `heartbeat_at`, `last_success_at` and the lifetime `total_successes` tally. The
+    cursor does not move, `processed_count` is the count for *this* iteration and so
+    stays zero, the backlog stays zero, and the upstream generations are the ones it was
+    already on -- which is why all four are in the identity and none of them makes this
+    role publish while the host is quiet.
+    """
 
     spec = _spec(service_id)
     path = RuntimeServiceControl._path_for(root, spec)
@@ -317,11 +325,27 @@ def _heartbeat_iteration(root: Path, service_id: str, at: datetime) -> None:
             update={
                 "heartbeat_at": at,
                 "last_success_at": at,
-                "processed_count": heartbeat.processed_count + 1,
                 "total_successes": heartbeat.total_successes + 1,
-                "input_sequence": heartbeat.input_sequence + 1,
-                "output_sequence": heartbeat.output_sequence + 1,
-                "source_generations": {"upstream": "b" * 64},
+            }
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+
+def _heartbeat_backlog(root: Path, service_id: str, at: datetime, backlog: int) -> None:
+    """An iteration that found work waiting: an idle tick plus a backlog."""
+
+    spec = _spec(service_id)
+    path = RuntimeServiceControl._path_for(root, spec)
+    heartbeat = RuntimeServiceControl.read_heartbeat(root, spec)
+    assert heartbeat is not None
+    path.write_text(
+        heartbeat.model_copy(
+            update={
+                "heartbeat_at": at,
+                "last_success_at": at,
+                "total_successes": heartbeat.total_successes + 1,
+                "backlog_count": backlog,
             }
         ).model_dump_json(),
         encoding="utf-8",
@@ -499,3 +523,85 @@ def test_the_health_state_identity_drops_only_the_instant_it_looked(tmp_path: Pa
     assert health_module.runtime_health_state_identity(stale) != (
         health_module.runtime_health_state_identity(first)
     )
+
+
+def test_a_backlog_that_grows_publishes_exactly_one_generation(tmp_path: Path) -> None:
+    """A backlog is content, and the page has to be able to show it moving.
+
+    The first cut of this gate dropped `backlog_count` along with the clocks, and a role
+    whose backlog climbed from nothing to three thousand published no generation at all --
+    on a trading day as much as a quiet one, because the rest of the identity (status,
+    `stale`, the run identity, the degraded reasons) does not move while a role is
+    healthily falling behind. The counts of work are back in the identity, and this is
+    what says so.
+    """
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    _running(feature_root, "feature")
+    authority_root = tmp_path / "authority"
+    clock = [NOW]
+    publisher = _health_publisher(
+        authority_root=authority_root,
+        sources=(_source(feature_root, "feature"),),
+        clock=clock,
+    )
+    assert publisher.publish(NOW).written is True
+
+    written = []
+    for iteration in range(1, 9):
+        moment = NOW + timedelta(seconds=10 * iteration)
+        clock[0] = moment
+        heartbeat_at = moment - timedelta(seconds=1)
+        if iteration < 3:
+            _heartbeat_iteration(feature_root, "feature", heartbeat_at)
+        else:
+            # The backlog appears on the third iteration and then stays where it is.
+            _heartbeat_backlog(feature_root, "feature", heartbeat_at, 3_000)
+        written.append(publisher.publish(moment).written)
+
+    assert written == [False, False, True, False, False, False, False, False]
+
+
+def test_the_health_state_identity_keeps_the_work_a_role_did(tmp_path: Path) -> None:
+    """Field by field, on the function: what counts as evidence and what does not."""
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    _running(feature_root, "feature")
+    spec = _spec("feature")
+    path = RuntimeServiceControl._path_for(feature_root, spec)
+    reader = RuntimeHealthSourceReader(
+        sources=(_source(feature_root, "feature"),),
+        serving_service_id="serving",
+    )
+    # Five seconds after the fixture wrote its heartbeat: old enough that the clocks have
+    # room to move without landing in the future, young enough that `stale_after` (ten
+    # seconds) is nowhere near.
+    at = NOW + timedelta(seconds=5)
+    baseline = health_module.runtime_health_state_identity(reader(at))
+
+    def identity_after(**updates: object) -> str:
+        heartbeat = RuntimeServiceControl.read_heartbeat(feature_root, spec)
+        assert heartbeat is not None
+        original = path.read_text(encoding="utf-8")
+        path.write_text(heartbeat.model_copy(update=updates).model_dump_json(), encoding="utf-8")
+        try:
+            identity = health_module.runtime_health_state_identity(reader(at))
+        finally:
+            path.write_text(original, encoding="utf-8")
+        return identity
+
+    # Evidence: the work this role did, and what it is working from.
+    assert identity_after(backlog_count=3_000) != baseline
+    assert identity_after(processed_count=7) != baseline
+    assert identity_after(input_sequence=99) != baseline
+    assert identity_after(output_sequence=99) != baseline
+    assert identity_after(source_generations={"upstream": "b" * 64}) != baseline
+
+    # Observation: when the reader looked, and how many times the same thing happened
+    # again. The two clocks move together because a heartbeat whose last success is later
+    # than the heartbeat itself is not a document this role will read at all.
+    ticked = at - timedelta(seconds=2)
+    assert identity_after(heartbeat_at=ticked, last_success_at=ticked) == baseline
+    assert identity_after(total_successes=1_000) == baseline
+    assert identity_after(total_failures=1_000) == baseline
+    assert identity_after(consecutive_failures=1_000) == baseline

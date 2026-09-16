@@ -190,12 +190,15 @@ def _proc_io() -> dict[str, int] | None:
 
 
 def _tick_peer_heartbeats(runtime_root: Path, *, at: datetime, skip: Path | None) -> None:
-    """Move every other role's heartbeat on, the way a live peer would.
+    """Move every other role's heartbeat on, the way an *idle* live peer would.
 
-    Only the fields an ordinary successful iteration moves: the clock, the success clock
-    and the counters. The duration window is left alone because the heartbeat model checks
-    `last_step_duration_seconds` and the p95 against it, and a peer that is idle is not
-    changing its step latency anyway.
+    Exactly three fields move when a resident role succeeds at doing nothing: the two
+    clocks and the lifetime `total_successes` tally. Everything else a heartbeat carries
+    is either the state it is in or the work it did, and an idle iteration does no work --
+    `processed_count` is this iteration's count and stays zero, the cursor does not move,
+    the backlog stays where it was. Writing it any other way would be simulating a busy
+    host and calling it idle. The duration window is left alone as well, because the
+    heartbeat model checks `last_step_duration_seconds` and the p95 against it.
     """
 
     stamp = (at - timedelta(seconds=1)).isoformat()
@@ -208,8 +211,7 @@ def _tick_peer_heartbeats(runtime_root: Path, *, at: datetime, skip: Path | None
         document["heartbeat_at"] = stamp
         if document.get("last_success_at") is not None:
             document["last_success_at"] = stamp
-        for name in ("processed_count", "total_successes"):
-            document[name] = int(document.get(name, 0)) + 1
+        document["total_successes"] = int(document.get("total_successes", 0)) + 1
         path.write_text(
             json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
             encoding="utf-8",
