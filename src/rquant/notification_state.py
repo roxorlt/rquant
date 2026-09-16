@@ -147,6 +147,34 @@ class NotificationRecipientMigrationSummary(RuntimeContractModel):
     audit_ids: tuple[str, ...]
 
 
+#: What a projection authority's `generation_id` is **not** computed over (#271).
+#:
+#: `notification_projection_authority` is a content-addressed, INSERT-only table: the
+#: `WHERE generation_id = ?` lookup in `publish_projection_authority` is what makes
+#: publishing the same content twice a no-op. Until v0.33.13 the id was hashed over
+#: every field including `observed_at`, which is the notifier's own clock and therefore
+#: different on each of its iterations -- so the lookup never matched, and
+#: `notifier.admin.shadow.v1` inserted a new row, committed it and fsynced it every two
+#: seconds all day whether or not one byte of the projection had changed. Keeping
+#: `observed_at` out of the hash makes the id name the content, so an idle notifier
+#: finds its own previous row and writes nothing.
+#:
+#: `observed_at` stays a field and a column, and says what it always said: when this
+#: content was first observed. The table forbids UPDATE, so it is written exactly once
+#: per distinct content and never touched again.
+_AUTHORITY_IDENTITY_EXCLUDED = frozenset({"generation_id", "observed_at"})
+
+#: The same rule one level down. A source receipt's `published_at` is the iteration clock
+#: as well, and its `receipt_id` is carried into the authority's `source_receipts` -- so
+#: leaving it in the hash would have made the authority's content differ every iteration
+#: no matter what the authority itself excluded. Everything else on the receipt
+#: (`dataset_id`, the source's own `generation_id`, `sequence`, `event_time`, `status`,
+#: `projections`) is derived from the content it receipts for. These receipts are built
+#: and consumed inside one publish and are never persisted on their own, so unlike the
+#: authority above this rule has no older form to read.
+_SOURCE_RECEIPT_IDENTITY_EXCLUDED = frozenset({"receipt_id", "published_at"})
+
+
 class NotificationProjectionSourceReceipt(RuntimeContractModel):
     """Canonical receipt for one already-verified PIT projection authority."""
 
@@ -178,7 +206,9 @@ class NotificationProjectionSourceReceipt(RuntimeContractModel):
             raise ValueError("notification projection source event time exceeds publication")
         if any(projection.available_at > self.published_at for projection in self.projections):
             raise ValueError("notification projection source contains future evidence")
-        expected = canonical_sha256(self.model_dump(mode="python", exclude={"receipt_id"}))
+        expected = canonical_sha256(
+            self.model_dump(mode="python", exclude=_SOURCE_RECEIPT_IDENTITY_EXCLUDED)
+        )
         if self.receipt_id != expected:
             raise ValueError("notification projection source receipt does not match content")
         return self
@@ -203,7 +233,12 @@ class NotificationProjectionSourceReceipt(RuntimeContractModel):
             "status": FreshnessStatus.FRESH,
             "projections": tuple(sorted(projections, key=lambda item: item.table_name)),
         }
-        return cls(**values, receipt_id=canonical_sha256(values))
+        identity = {
+            name: value
+            for name, value in values.items()
+            if name not in _SOURCE_RECEIPT_IDENTITY_EXCLUDED
+        }
+        return cls(**values, receipt_id=canonical_sha256(identity))
 
 
 class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
@@ -257,9 +292,14 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
             raise ValueError("notification projection availability exceeds observation time")
         if any(projection.available_at > self.available_at for projection in self.projections):
             raise ValueError("notification projection contains future source evidence")
-        expected = canonical_sha256(self.model_dump(mode="python", exclude={"generation_id"}))
-        if self.generation_id != expected:
-            raise ValueError("notification projection generation does not match content")
+        content = self.model_dump(mode="python", exclude=_AUTHORITY_IDENTITY_EXCLUDED)
+        if self.generation_id != canonical_sha256(content):
+            #: Rows written before v0.33.13 hashed `observed_at` in, so their id is the
+            #: legacy form and nothing recomputes it. They are read here and never
+            #: written: `create()` only ever produces the content form above.
+            legacy = self.model_dump(mode="python", exclude={"generation_id"})
+            if self.generation_id != canonical_sha256(legacy):
+                raise ValueError("notification projection generation does not match content")
         return self
 
     @classmethod
@@ -278,7 +318,12 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
             "source_receipts": dict(source_receipts),
             "projections": tuple(sorted(projections, key=lambda item: item.table_name)),
         }
-        return cls(**values, generation_id=canonical_sha256(values))
+        identity = {
+            name: value
+            for name, value in values.items()
+            if name not in _AUTHORITY_IDENTITY_EXCLUDED
+        }
+        return cls(**values, generation_id=canonical_sha256(identity))
 
     @classmethod
     def create_from_sources(
@@ -309,6 +354,21 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
             source_receipts={source.dataset_id: source.receipt_id for source in validated},
             projections=projections,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationProjectionPublication:
+    """What one `publish_projection_authority` call did.
+
+    `written` is the answer to "did this iteration actually put a row in the database",
+    which is what the notifier's heartbeat reports as `projection_published` and what the
+    #271 e2e asserts against `sqlite3.Connection.total_changes`. It is not derivable from
+    `generation_id`: the same id comes back whether the row was inserted now or an hour
+    ago.
+    """
+
+    generation_id: str
+    written: bool
 
 
 @dataclass(frozen=True)
@@ -504,11 +564,50 @@ class NotificationStateStore(SignalBusStore):
                     """
                 )
 
+    @staticmethod
+    def _require_same_projection_content(
+        stored_payload: str,
+        validated: NotificationProjectionAuthoritySnapshot,
+    ) -> None:
+        """Refuse a second content under one generation id, ignoring `observed_at`.
+
+        The stored row carries the `observed_at` of the iteration that first saw this
+        content and the caller carries this iteration's, so the models are compared
+        without it (#271). Everything the id is computed over is compared, which is
+        everything else.
+        """
+
+        stored = NotificationProjectionAuthoritySnapshot.model_validate_json(stored_payload)
+        if stored.model_dump(mode="python", exclude={"observed_at"}) != validated.model_dump(
+            mode="python", exclude={"observed_at"}
+        ):
+            raise NotificationReplicationError(
+                "notification projection generation conflicts with immutable content"
+            )
+
     def publish_projection_authority(
         self,
         snapshot: NotificationProjectionAuthoritySnapshot,
-    ) -> str:
+    ) -> NotificationProjectionPublication:
+        """Publish this projection content, or recognise that it is already published.
+
+        `written` is False for a call that found its own content already there. That is
+        the ordinary case for `notifier.admin.shadow.v1`, whose loop runs every two
+        seconds against a replica that is replaced every five minutes: the content it
+        publishes is the same content for hundreds of iterations at a time, and this
+        method now touches nothing at all for those -- no write transaction, no commit,
+        no fsync (#271). The read below runs on the read-only connection precisely so
+        that the common case does not take the database's write lock.
+        """
+
         validated = NotificationProjectionAuthoritySnapshot.model_validate(snapshot)
+        published = self._published_projection_payload(validated.generation_id)
+        if published is not None:
+            self._require_same_projection_content(published, validated)
+            return NotificationProjectionPublication(
+                generation_id=validated.generation_id,
+                written=False,
+            )
         payload_json = validated.model_dump_json()
         observed_text = validated.observed_at.isoformat(timespec="microseconds")
         available_text = validated.available_at.isoformat(timespec="microseconds")
@@ -525,16 +624,12 @@ class NotificationStateStore(SignalBusStore):
                 (validated.generation_id,),
             ).fetchone()
             if existing is not None:
-                if (
-                    NotificationProjectionAuthoritySnapshot.model_validate_json(
-                        existing["payload_json"]
-                    )
-                    != validated
-                ):
-                    raise NotificationReplicationError(
-                        "notification projection generation conflicts with immutable content"
-                    )
-                return validated.generation_id
+                # Another writer got there between the read above and this lock.
+                self._require_same_projection_content(existing["payload_json"], validated)
+                return NotificationProjectionPublication(
+                    generation_id=validated.generation_id,
+                    written=False,
+                )
             connection.execute(
                 """
                 INSERT INTO notification_projection_authority(
@@ -550,7 +645,22 @@ class NotificationStateStore(SignalBusStore):
                     payload_json,
                 ),
             )
-        return validated.generation_id
+        return NotificationProjectionPublication(
+            generation_id=validated.generation_id,
+            written=True,
+        )
+
+    def _published_projection_payload(self, generation_id: str) -> str | None:
+        connection = self._connect_readonly()
+        try:
+            row = connection.execute(
+                "SELECT payload_json FROM notification_projection_authority "
+                "WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else str(row["payload_json"])
 
     def replication_cursor(self) -> NotificationReplicationCursor:
         connection = self._connect_readonly()

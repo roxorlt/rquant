@@ -14,6 +14,7 @@ from rquant.notification_state import (
     NotificationReplicationError,
     NotificationStateStore,
 )
+from rquant.runtime_contracts import canonical_sha256
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.signal_bus import SignalBusRoutedRecord, SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
@@ -358,10 +359,152 @@ def test_notification_projection_authority_is_pit_bound_and_persisted_atomically
     repeated = store.publish_projection_authority(authority)
     snapshot = store.serving_snapshot(observed_at=NOW, history_limit=10)
 
-    assert first == repeated == authority.generation_id
+    assert first.generation_id == repeated.generation_id == authority.generation_id
+    assert first.written
+    assert not repeated.written
     assert snapshot.payload.projections == authority.projections
     assert snapshot.projection_generation_id == authority.generation_id
     assert snapshot.projection_source_receipts == authority.source_receipts
+
+
+def test_the_projection_generation_names_the_content_and_not_the_iteration_clock() -> None:
+    """#271: two iterations that see the same projection publish the same generation.
+
+    `notifier.admin.shadow.v1` calls this every two seconds with a fresh `observed_at`
+    and a replica that is replaced every five minutes, so if the clock reached the id
+    the same content would be a new generation hundreds of times over.
+    """
+
+    first = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=NOW,
+        available_at=NOW,
+        source_receipts={"market-minute": "1" * 64},
+        projections=_page_projections(),
+    )
+    later = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=NOW + timedelta(hours=3),
+        available_at=NOW,
+        source_receipts={"market-minute": "1" * 64},
+        projections=_page_projections(),
+    )
+    changed = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=NOW,
+        available_at=NOW,
+        source_receipts={"market-minute": "2" * 64},
+        projections=_page_projections(),
+    )
+
+    assert first.generation_id == later.generation_id
+    assert first.observed_at != later.observed_at
+    assert changed.generation_id != first.generation_id
+
+
+def test_the_source_receipt_identity_drops_the_publication_clock() -> None:
+    """The receipt id is carried into the authority, so it has to be content too."""
+
+    def receipt(published_at: datetime) -> NotificationProjectionSourceReceipt:
+        return NotificationProjectionSourceReceipt.create(
+            dataset_id="signal-page-projections",
+            generation_id="3" * 64,
+            sequence=9,
+            event_time=NOW - timedelta(seconds=2),
+            published_at=published_at,
+            projections=_page_projections(NOW - timedelta(seconds=2)),
+        )
+
+    assert receipt(NOW).receipt_id == receipt(NOW + timedelta(hours=3)).receipt_id
+
+
+def test_republishing_one_projection_content_writes_the_database_once(
+    tmp_path: Path,
+) -> None:
+    """Sixty idle iterations, one row, one write -- the whole of #271 in one assertion."""
+
+    database = tmp_path / "notification-state.sqlite3"
+    store = NotificationStateStore(database)
+
+    written = []
+    idle_generation = ""
+    for index in range(60):
+        authority = NotificationProjectionAuthoritySnapshot.create(
+            observed_at=NOW + timedelta(seconds=2 * index),
+            available_at=NOW,
+            source_receipts={"market-minute": "1" * 64},
+            projections=_page_projections(),
+        )
+        idle_generation = authority.generation_id
+        written.append(store.publish_projection_authority(authority).written)
+
+    revised_at = NOW + timedelta(minutes=5)
+    revised = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=revised_at,
+        available_at=revised_at,
+        source_receipts={"market-minute": "2" * 64},
+        projections=_page_projections(revised_at),
+    )
+    revised_publication = store.publish_projection_authority(revised)
+
+    connection = sqlite3.connect(database)
+    try:
+        rows = connection.execute(
+            "SELECT generation_id, observed_at FROM notification_projection_authority "
+            "ORDER BY observed_at"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert written == [True] + [False] * 59
+    assert revised_publication.written
+    assert [row[0] for row in rows] == [idle_generation, revised.generation_id]
+    # The row keeps the `observed_at` of the iteration that first saw this content, and
+    # the fifty-nine that saw it again left it alone.
+    assert rows[0][1].startswith("2026-07-31T02:30:00")
+
+
+def test_a_projection_authority_written_before_the_content_gate_is_still_read(
+    tmp_path: Path,
+) -> None:
+    """Production's state database is older than this change and outlives a deployment.
+
+    Rows written before v0.33.13 hash `observed_at` into `generation_id`. They are read
+    here exactly as they were written; nothing recomputes or rewrites them.
+    """
+
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    content = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=NOW,
+        available_at=NOW,
+        source_receipts={"market-minute": "1" * 64},
+        projections=_page_projections(),
+    )
+    payload = content.model_dump(mode="python", exclude={"generation_id"})
+    legacy = NotificationProjectionAuthoritySnapshot.model_validate(
+        {**payload, "generation_id": canonical_sha256(payload)}
+    )
+
+    assert legacy.generation_id != content.generation_id
+    assert store.publish_projection_authority(legacy).written
+
+    snapshot = store.serving_snapshot(observed_at=NOW, history_limit=10)
+
+    assert snapshot.projection_generation_id == legacy.generation_id
+
+
+def test_a_projection_generation_that_matches_neither_identity_is_refused() -> None:
+    content = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=NOW,
+        available_at=NOW,
+        source_receipts={"market-minute": "1" * 64},
+        projections=_page_projections(),
+    )
+
+    with pytest.raises(ValueError, match="does not match content"):
+        NotificationProjectionAuthoritySnapshot.model_validate(
+            {
+                **content.model_dump(mode="python", exclude={"generation_id"}),
+                "generation_id": "f" * 64,
+            }
+        )
 
 
 def test_notification_projection_authority_is_assembled_from_verified_pit_receipts() -> None:
