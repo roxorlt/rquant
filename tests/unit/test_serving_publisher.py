@@ -673,3 +673,31 @@ def test_a_moved_producer_commit_still_builds_its_own_generation(tmp_path: Path)
     )
     assert publication.written is True
     assert len(tuple((root / "generations").iterdir())) == 2
+
+
+def test_a_watermark_that_moves_under_one_generation_still_builds(tmp_path: Path) -> None:
+    """Why the gate compares the watermarks and not only the source generation ids.
+
+    A generation id names its sources, so in production equal source generations mean
+    equal watermarks -- the watermark is read out of the source's own published document.
+    The comparison is here for the case where that stops being true: freshness is what a
+    consumer of `serving.duckdb` reads off these rows, and a degraded source that kept its
+    generation id must not be served as fresh.
+    """
+
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    degraded = publisher.publish_generation(
+        {"signals": _signals()},
+        watermarks=(
+            _watermark(generation_id="source-1", built_at=_BUILT_AT).model_copy(
+                update={"status": FreshnessStatus.DEGRADED, "reason": "source is behind"}
+            ),
+        ),
+        source_generations={"signals": "source-1"},
+        built_at=_BUILT_AT + timedelta(seconds=30),
+    )
+
+    assert degraded.written is True
+    assert degraded.manifest.generation_id != first.manifest.generation_id
+    assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
