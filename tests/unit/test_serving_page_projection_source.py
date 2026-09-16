@@ -2751,3 +2751,392 @@ def test_the_source_budget_still_refuses_more_sources_than_it_publishes(
             )
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------------------------------
+# #268
+# ---------------------------------------------------------------------------------------
+
+
+def test_the_minute_coverage_projection_cannot_be_narrowed_to_the_current_trade_date(
+    tmp_path: Path,
+) -> None:
+    """Ruling 30's third item, answered in the negative and pinned so it stays answered.
+
+    #268 asks for the notifier's generation read to be shrunk by reading only the current
+    trade date's range. On the package Q measurement replica that predicate is worth a
+    lot -- 43,790,572 `rchar` bytes down to 8,138,988, measured on Linux with duckdb
+    1.5.2 -- and it is not available, because `minute_coverage` publishes an **all-time**
+    summary: how many 1-minute rows this database holds, over how many codes, over how
+    many sessions, earliest and latest. A lower bound on `trade_time` changes every one of
+    those numbers, and the published projection is frozen (#237).
+
+    So the notifier's generation read is not made smaller; it is made *rarer*, by the
+    fifteen-minute floor and the 09:20-09:40 window in
+    `NOTIFIER_PAGE_PROJECTION_PROFILE`. This case exists so that the next reader who has
+    the same good idea finds the measurement rather than repeating it: narrowing it is a
+    change to what the page says, not a change to what the read costs.
+    """
+
+    database = tmp_path / "two-sessions.duckdb"
+    _minute_only_database(
+        database,
+        [
+            ("600000.SH", "2026-07-30 09:30:00", "1min", "tushare", "2026-07-30 09:31:00"),
+            ("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00"),
+        ],
+    )
+    cutoff = datetime(2026, 8, 3, 8, 0)
+    today_start = datetime(2026, 7, 31, 0, 0)
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        published = DuckDBSignalPageProjectionSource._minute_coverage(connection, cutoff=cutoff)
+        narrowed = connection.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT CAST(trade_time AS DATE)), MIN(trade_time)
+            FROM minute_bar
+            WHERE freq = '1min' AND trade_time >= ? AND trade_time <= ? AND created_at <= ?
+            """,
+            (today_start, cutoff, cutoff),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    total = next(row for row in published if row.is_total)
+    assert (total.rows_count, total.trade_dates) == (2, 2)
+    #: published in UTC; 09:30 in the market clock the database stores is 01:30 UTC
+    assert total.min_time == datetime(2026, 7, 30, 1, 30, tzinfo=UTC)
+    #: the same query with the proposed lower bound answers something else entirely
+    assert narrowed == (1, 1, datetime(2026, 7, 31, 9, 30))
+
+
+def test_the_projection_read_is_abandonable_while_it_is_open(tmp_path: Path) -> None:
+    """#268: the connection is in the process registry for exactly the life of the read.
+
+    This is the read that took ten minutes on 09-14 and the one `TimeoutStopSec=60` could
+    not outlast. Registration is what lets a stop reach it; the pairing is what keeps a
+    finished read from being interrupted later, which would abort an unrelated query.
+    """
+
+    from rquant.runtime_read_interrupt import READ_INTERRUPTS
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "abandonable.duckdb"
+    _minute_only_database(
+        database,
+        [("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00")],
+    )
+
+    before = READ_INTERRUPTS.open_reads
+    with _StableReadonlyDuckDB(database) as connection:
+        assert READ_INTERRUPTS.open_reads == before + 1
+        connection.execute("SELECT count(*) FROM minute_bar").fetchall()
+    assert READ_INTERRUPTS.open_reads == before
+
+
+# ---------------------------------------------------------------------------------------
+# #268 review SF-7: the half of ruling 30 item 3 that *is* available
+# ---------------------------------------------------------------------------------------
+
+#: rows whose `created_at` is at or before the generation's own mtime, which is every row a
+#: real replica generation can hold: the file is a copy of a database those rows were
+#: already in, so they were written before it was.
+_SEALED_ROWS = [
+    ("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00"),
+    ("600000.SH", "2026-07-31 09:31:00", "1min", "tushare", "2026-07-31 09:32:00"),
+    ("000001.SZ", "2026-08-01 09:30:00", "1min", "ashare", "2026-08-01 09:31:00"),
+    ("000002.SZ", "2026-08-02 09:30:00", "1min", None, "2026-08-02 09:31:00"),
+    #: still excluded by `freq`
+    ("000003.SZ", "2026-08-02 09:30:00", "5min", "tushare", "2026-08-02 09:31:00"),
+    #: still excluded by `trade_time <= cutoff`
+    ("000004.SZ", "2026-09-01 09:30:00", "1min", "tushare", "2026-08-02 09:31:00"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rows"),
+    (
+        ("empty table", []),
+        ("several sources, a NULL source, and rows the other predicates exclude", _SEALED_ROWS),
+        (
+            "one source only",
+            [("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00")],
+        ),
+    ),
+)
+def test_dropping_the_created_at_predicate_publishes_the_same_rows(
+    tmp_path: Path,
+    label: str,
+    rows: list[tuple[object, ...]],
+) -> None:
+    """Review SF-7: identical published values, asserted rather than argued.
+
+    A replica generation is replaced whole and never written in place, so every row in it
+    was written before the file was. Once the cutoff is at or after the file's own mtime,
+    `created_at <= cutoff` cannot exclude a single row -- and a predicate that excludes
+    nothing is a whole column the scan does not have to read.
+    """
+
+    database = tmp_path / f"{label.replace(' ', '-').replace(',', '')}.duckdb"
+    _minute_only_database(database, rows)
+    cutoff = datetime(2026, 8, 3, 8, 0)
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        with_predicate = DuckDBSignalPageProjectionSource._minute_coverage(
+            connection, cutoff=cutoff
+        )
+        without_predicate = DuckDBSignalPageProjectionSource._minute_coverage(
+            connection, cutoff=cutoff, generation_sealed_before_cutoff=True
+        )
+    finally:
+        connection.close()
+
+    assert with_predicate == without_predicate
+    assert [row.model_dump(mode="json") for row in with_predicate] == [
+        row.model_dump(mode="json") for row in without_predicate
+    ]
+
+
+def test_dropping_the_predicate_still_reads_the_table_exactly_once(tmp_path: Path) -> None:
+    """The drop must not cost a second pass, which is what package Q bought.
+
+    **What this case does not claim**: that the plan shows the saving. It does not. On the
+    package Q measurement replica both forms report the same `Projections`
+    (`trade_time`, `source`, `ts_code`) and the same `Filters` (`freq='1min'`) -- DuckDB
+    folds a constant-true comparison out of the printed plan -- and yet the wide form reads
+    **44,052,715** bytes where the narrow form reads **27,275,499** (`/proc/self/io` rchar,
+    three runs each, identical every time; report SF-7). The plan is the wrong instrument
+    for this saving and saying so here is cheaper than someone re-deriving it. What the
+    plan does answer is the question this case asks: one pass, not two.
+    """
+
+    database = tmp_path / "scanned-columns.duckdb"
+    _minute_only_database(database, _SEALED_ROWS)
+    cutoff = "2026-08-03 08:00:00"
+    connection = duckdb.connect(str(database), read_only=True)
+
+    def scans(where: str) -> list[dict[str, object]]:
+        plan = json.loads(
+            connection.execute(
+                f"""
+                EXPLAIN (FORMAT JSON)
+                SELECT GROUPING(COALESCE(source, 'unknown')) AS is_total,
+                       COALESCE(source, 'unknown') AS source_label,
+                       COUNT(*), COUNT(DISTINCT ts_code),
+                       COUNT(DISTINCT CAST(trade_time AS DATE)),
+                       MIN(trade_time), MAX(trade_time)
+                FROM minute_bar
+                WHERE {where}
+                GROUP BY GROUPING SETS ((COALESCE(source, 'unknown')), ())
+                ORDER BY is_total, source_label
+                """  # noqa: S608 - a literal timestamp in a test's own EXPLAIN
+            ).fetchall()[0][1]
+        )
+        found: list[dict[str, object]] = []
+
+        def walk(node: object) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+            if node.get("name") in {"SEQ_SCAN", "TABLE_SCAN"}:
+                found.append(dict(node.get("extra_info") or {}))
+            walk(node.get("children") or [])
+
+        walk(plan)
+        return found
+
+    try:
+        wide = scans(f"freq = '1min' AND trade_time <= '{cutoff}' AND created_at <= '{cutoff}'")
+        narrow = scans(f"freq = '1min' AND trade_time <= '{cutoff}'")
+    finally:
+        connection.close()
+
+    assert len(wide) == 1
+    assert len(narrow) == 1
+    #: and the narrow form still asks for every column the answer needs
+    projected = narrow[0].get("Projections")
+    assert isinstance(projected, list)
+    assert {"trade_time", "source", "ts_code"} <= set(projected)
+
+
+def test_a_row_written_after_its_own_generation_keeps_the_predicate(tmp_path: Path) -> None:
+    """The precondition is what makes the drop sound, so the unsound case is kept honest.
+
+    A row whose `created_at` is later than the cutoff *is* excluded by the predicate, and
+    dropping it would publish that row. A real replica generation cannot hold one -- the
+    file is a copy taken after those rows existed -- which is exactly why the caller only
+    passes the flag when it has established `cutoff >= this generation's mtime`. This case
+    exists so that the two forms are never assumed equal unconditionally.
+    """
+
+    database = tmp_path / "future-created-at.duckdb"
+    _minute_only_database(
+        database,
+        [
+            ("600000.SH", "2026-07-31 09:30:00", "1min", "tushare", "2026-07-31 09:31:00"),
+            #: written after the cutoff; only `created_at <= ?` keeps it out
+            ("000005.SZ", "2026-08-02 09:30:00", "1min", "tushare", "2026-09-01 09:31:00"),
+        ],
+    )
+    cutoff = datetime(2026, 8, 3, 8, 0)
+    connection = duckdb.connect(str(database), read_only=True)
+    try:
+        kept = DuckDBSignalPageProjectionSource._minute_coverage(connection, cutoff=cutoff)
+        dropped = DuckDBSignalPageProjectionSource._minute_coverage(
+            connection, cutoff=cutoff, generation_sealed_before_cutoff=True
+        )
+    finally:
+        connection.close()
+
+    assert next(row for row in kept if row.is_total).rows_count == 1
+    assert next(row for row in dropped if row.is_total).rows_count == 2
+
+
+def test_the_reader_only_drops_the_predicate_once_the_generation_is_sealed(
+    tmp_path: Path,
+) -> None:
+    """Who decides: the reader, from the mtime of the inode it actually has open.
+
+    `generation_modified_at` comes from `fstat` on the descriptor rather than from the
+    name, so it answers for the generation being read however the name moves under it.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "sealed.duckdb"
+    _minute_only_database(database, _SEALED_ROWS)
+    written_at = datetime(2026, 8, 3, 1, 0, tzinfo=UTC)
+    os.utime(database, (written_at.timestamp(), written_at.timestamp()))
+
+    reader = _StableReadonlyDuckDB(database)
+    assert reader.generation_modified_at is None, "nothing is open yet"
+    with reader:
+        assert reader.generation_modified_at == written_at
+    assert reader.generation_modified_at is None, "and nothing is open any more"
+
+
+def test_the_seal_decision_reads_the_open_descriptor_and_not_the_name(
+    tmp_path: Path,
+) -> None:
+    """Review RM-SF7c: `fstat` on the descriptor, and swapping it for the name goes red.
+
+    "Taken from the descriptor, not the name" is the property the docstring of
+    `generation_modified_at` states, and it is the whole reason the answer is safe to act
+    on: the mtime that decides whether the `created_at` predicate can be dropped must
+    describe the inode whose rows are about to be read, not whatever is answering to that
+    path by the time the question is asked. The two only differ while the name is moving,
+    so this case moves it -- a successor generation stamped a month later lands on the name
+    mid-read. `os.lstat(self.path)` would report the successor's mtime and the reader would
+    seal a generation it never read; `os.fstat(self._descriptor)` reports the one it holds.
+
+    The rotation itself is already refused on the way out, which is why the block sits
+    inside `pytest.raises`: this case pins *which mtime was read*, not that rotation is
+    tolerated. Nothing is asserted inside the block either -- `__exit__` raises on its way
+    out and would replace an `AssertionError` raised in there with its own exception, so
+    the readings are collected inside and judged after the reader has closed.
+    """
+
+    from rquant.serving_page_projection_source import _StableReadonlyDuckDB
+
+    database = tmp_path / "rotated-under-the-reader.duckdb"
+    _minute_only_database(database, _SEALED_ROWS)
+    opened_at = datetime(2026, 8, 3, 1, 0, tzinfo=UTC)
+    os.utime(database, (opened_at.timestamp(), opened_at.timestamp()))
+
+    successor = tmp_path / "successor.duckdb"
+    _minute_only_database(successor, _SEALED_ROWS)
+    replaced_at = datetime(2026, 9, 1, 1, 0, tzinfo=UTC)
+    os.utime(successor, (replaced_at.timestamp(), replaced_at.timestamp()))
+
+    reader = _StableReadonlyDuckDB(database)
+    readings: list[datetime | None] = []
+    by_name: list[float] = []
+    with pytest.raises(PageProjectionSourceIntegrityError), reader:
+        readings.append(reader.generation_modified_at)
+        os.replace(successor, database)
+        by_name.append(os.lstat(database).st_mtime)
+        readings.append(reader.generation_modified_at)
+
+    assert by_name == [replaced_at.timestamp()], "the name answers for the successor"
+    assert readings == [opened_at, opened_at], (
+        "the reader must answer for the inode it holds open, before and after the name "
+        "moved -- an mtime taken from the name would read the successor's here"
+    )
+
+
+def _projection_database_with_a_row_only_created_at_excludes(path: Path) -> None:
+    """The signal projection fixture plus one row that *only* `created_at <= ?` keeps out.
+
+    Its `trade_time` is inside the cutoff, so `trade_time <= ?` admits it and `freq` admits
+    it; the single thing standing between it and the published total is the predicate
+    SF-7's optimisation removes. That makes it the only shape that can tell "the reader
+    checked whether this generation was sealed" from "the reader assumed it was".
+    """
+
+    _signal_projection_database(path)
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            INSERT INTO minute_bar VALUES
+              ('000002.SZ', '2026-08-01 09:30:00', '1min', 11, 11, 11, 11,
+               1000, 11000, 'tushare', '2026-09-01 09:31:00')
+            """
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+
+
+def test_a_generation_stamped_after_the_cutoff_keeps_the_created_at_predicate(
+    tmp_path: Path,
+) -> None:
+    """Review SF-7: the optimisation is conditional, and the condition is load-bearing.
+
+    A replica whose mtime is *later* than the observation cannot have the property the drop
+    rests on -- "every row here was written before the file was" says nothing useful when
+    the file claims to have been written after the question was asked. The reader must
+    notice and run the query it always ran, or a row no point-in-time answer may include
+    walks into the published total.
+    """
+
+    database = tmp_path / "stamped-ahead.duckdb"
+    _projection_database_with_a_row_only_created_at_excludes(database)
+    ahead = (NOW + timedelta(hours=1)).timestamp()
+    os.utime(database, (ahead, ahead))
+
+    snapshot = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    coverage = {item.table_name: item for item in snapshot.projections}["minute_coverage"]
+    total = next(row for row in coverage.rows if row["source"] == "all")
+    assert total["rows_count"] == 1, "the row written after the cutoff must stay out"
+
+
+def test_a_sealed_generation_publishes_the_same_totals_as_an_unsealed_one(
+    tmp_path: Path,
+) -> None:
+    """And the other side of the condition: dropping the predicate changes no answer.
+
+    Same database, same cutoff, mtime moved from after the observation to before it -- the
+    only difference is which query the reader chooses, and the published rows are identical.
+    """
+
+    database = tmp_path / "sealed-or-not.duckdb"
+    _signal_projection_database(database)
+    ahead = (NOW + timedelta(hours=1)).timestamp()
+    os.utime(database, (ahead, ahead))
+    unsealed = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    behind = (NOW - timedelta(hours=1)).timestamp()
+    os.utime(database, (behind, behind))
+    sealed = DuckDBSignalPageProjectionSource(database)(NOW)
+
+    def coverage(snapshot: object) -> tuple[dict[str, object], ...]:
+        table = {item.table_name: item for item in snapshot.projections}["minute_coverage"]
+        return tuple(dict(row) for row in table.rows)
+
+    assert coverage(sealed) == coverage(unsealed)
+    assert coverage(sealed), "the fixture must publish something for this to mean anything"

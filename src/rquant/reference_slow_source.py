@@ -33,6 +33,7 @@ from rquant.reference_slow_publisher import (
 )
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256, normalize_aware_utc
 from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_read_interrupt import interruptible_read, is_read_interrupt
 from rquant.security_status import normalize_name
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionPayload
 from rquant.strict_json import canonical_json_bytes
@@ -462,8 +463,14 @@ def _verified_database_read(
             try:
                 connection = duckdb.connect(str(target), read_only=True)
             except duckdb.Error as exc:
+                if is_read_interrupt(exc):
+                    raise
                 raise ReferenceSlowSourceError("reference source database query failed") from exc
-        yield _OpenedDatabase(connection=connection, opened_through=opened_through)
+        #: for as long as the caller reads through it, a stop abandons the query instead
+        #: of waiting the read out (#268). 09-14: seven roles sat in exactly this read past
+        #: `TimeoutStopSec` and were killed, each one an `OnFailure` push.
+        with interruptible_read(connection):
+            yield _OpenedDatabase(connection=connection, opened_through=opened_through)
         if monotonic_clock() > monotonic_deadline:
             raise ReferenceSlowSourceError("reference source read deadline expired")
 
@@ -1017,6 +1024,10 @@ def _query_database_reference_evidence(
                     source_table="daily_state",
                 )
         except duckdb.Error as exc:
+            #: an operator's stop is not a query failure (#268); `InterruptException` is a
+            #: `duckdb.Error`, so it has to be let through as itself here.
+            if is_read_interrupt(exc):
+                raise
             raise ReferenceSlowSourceError("reference source database query failed") from exc
 
     result = tuple(normalized)

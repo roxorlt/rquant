@@ -25,6 +25,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_read_interrupt import READ_INTERRUPT_STOP_REASON, is_read_interrupt
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -79,6 +80,9 @@ class RuntimeStepResult(RuntimeContractModel):
     #: for a role that does not read it at all, which is 21 of the 25 (#256).
     replica_opened: bool | None = None
     replica_read_bytes: int | None = Field(default=None, ge=0)
+    #: Whether this iteration saw a newer generation and kept the previous answer because
+    #: this role's read profile would not let it open one yet (#268).
+    replica_skipped_by_floor: bool | None = None
 
     @field_validator("source_generations")
     @classmethod
@@ -168,6 +172,16 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: Both are *file* fields, for the reason `generation_events` gives above.
     replica_opened: bool | None = None
     replica_read_bytes: int | None = Field(default=None, ge=0)
+    #: Whether this iteration saw a newer replica generation and deliberately kept the
+    #: answer it already had, because this role's read profile would not let it open one
+    #: yet. The replica is *replaced* every five minutes on a trading day, so package Q's
+    #: "read only when the generation changed" became "read every five minutes" -- and on
+    #: 2026-09-14 four such reads, the replica `cp`, the monitor's startup scan and the
+    #: 09:30 backup landed together and the production monitor did not poll for ten
+    #: minutes after the open (#268). `None` for the 21 roles that read no replica, and
+    #: for an iteration that never asked. A *file* field, for the reason
+    #: `generation_events` gives above.
+    replica_skipped_by_floor: bool | None = None
 
     @field_validator("failure_kind")
     @classmethod
@@ -658,6 +672,7 @@ class RuntimeServiceControl:
                 failure_kind=None,
                 replica_opened=result.replica_opened,
                 replica_read_bytes=result.replica_read_bytes,
+                replica_skipped_by_floor=result.replica_skipped_by_floor,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -670,6 +685,7 @@ class RuntimeServiceControl:
         backoff_seconds: float | None = None,
         failure_kind: str | None = None,
         replica_cost: tuple[bool, int | None] | None = None,
+        replica_skipped_by_floor: bool | None = None,
     ) -> RuntimeServiceHeartbeat:
         current = self._require_active()
         now = normalize_aware_utc(self._clock())
@@ -691,6 +707,7 @@ class RuntimeServiceControl:
                 #: read as this one's -- so a role that cannot say still reports neither.
                 replica_opened=opened,
                 replica_read_bytes=read_bytes,
+                replica_skipped_by_floor=replica_skipped_by_floor,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
@@ -903,6 +920,24 @@ def _iteration_replica_cost(step: object) -> tuple[bool, int | None] | None:
         return None
 
 
+def _iteration_replica_floor(step: object) -> bool | None:
+    """Whether the iteration that just raised kept an older generation on purpose (#268).
+
+    The same shape as `_iteration_replica_cost` and for the same reasons: a role that has
+    no gate has no attribute and reports nothing rather than a fabricated `False`, and
+    anything this probe raises is discarded, because a diagnostic may not displace the
+    failure being recorded.
+    """
+
+    skipped = getattr(step, "replica_iteration_skipped_by_floor", None)
+    if not callable(skipped):
+        return None
+    try:
+        return bool(skipped())
+    except Exception:  # noqa: BLE001 - a diagnostic may not displace the real failure
+        return None
+
+
 def run_service_loop(
     control: RuntimeServiceControl,
     *,
@@ -934,6 +969,15 @@ def run_service_loop(
             try:
                 result = step()
             except Exception as error:
+                if stop_event.is_set() and is_read_interrupt(error):
+                    #: The stop reached this role inside a database read and the read gave
+                    #: up on being told to (#268). That is this loop finishing, not an
+                    #: iteration failing: recording a failure here would leave the last
+                    #: heartbeat before `stopped` reporting a fault an operator caused, and
+                    #: on 09-14 the same event was a `Result=timeout` and an OnFailure push.
+                    #: The gate has already forgotten the half-read generation, so the next
+                    #: run reads it whole.
+                    return control.stop(reason=READ_INTERRUPT_STOP_REASON)
                 kind = failure_kind_of(error)
                 repeated_count = repeated_count + 1 if kind == repeated_kind else 1
                 repeated_kind = kind
@@ -949,6 +993,7 @@ def run_service_loop(
                     backoff_seconds=backoff,
                     failure_kind=kind,
                     replica_cost=_iteration_replica_cost(step),
+                    replica_skipped_by_floor=_iteration_replica_floor(step),
                 )
                 if backoff is not None:
                     delay = backoff
@@ -995,6 +1040,7 @@ def inspect_runtime_health(
 
 __all__ = [
     "MAX_FAILURE_BACKOFF_SECONDS",
+    "READ_INTERRUPT_STOP_REASON",
     "RuntimeServiceAlreadyRunningError",
     "RuntimeServiceControl",
     "RuntimeServiceHealth",

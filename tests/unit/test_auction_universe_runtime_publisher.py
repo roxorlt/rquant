@@ -202,3 +202,31 @@ def test_runtime_publisher_rejects_wrong_kind_or_plane(tmp_path: Path) -> None:
         assert "live plane" in str(exc)
     else:
         raise AssertionError("wrong service plane was accepted")
+
+
+def test_every_return_path_says_whether_the_floor_held_a_generation_back(
+    tmp_path: Path,
+) -> None:
+    """#268 review RM6: nothing pinned this role's third replica field, so it could vanish.
+
+    `replica_skipped_by_floor` is what separates "this iteration did not open the database
+    because it recognised the generation it already had" from "it did not open the database
+    because its profile would not let it yet". A role that reports only the first two
+    fields reports those two cases identically, which is the whole reason the third exists.
+    """
+
+    observed_at = datetime(2026, 7, 31, 10, 30, tzinfo=UTC)
+    manifest = _manifest(tmp_path)
+    step = auction_universe_publisher_builder(clock=lambda: observed_at)(manifest)
+
+    published = step()
+    already_published = step()
+
+    assert published.replica_skipped_by_floor is False
+    assert already_published.replica_skipped_by_floor is False
+
+    #: an iteration that never asked the gate is not a skip either
+    protected = auction_universe_publisher_builder(
+        clock=lambda: datetime(2026, 7, 31, 2, 0, tzinfo=UTC),
+    )(manifest)()
+    assert protected.replica_skipped_by_floor is False

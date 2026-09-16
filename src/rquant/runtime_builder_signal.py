@@ -980,6 +980,7 @@ def notifier_builder(
                 )
             if settings.page_projection_database_path is not None:
                 from rquant.canvas_publication_receipt import Ed25519CanvasPublicationKeyring
+                from rquant.readside_replica_gate import NOTIFIER_PAGE_PROJECTION_PROFILE
                 from rquant.serving_page_projection_source import (
                     DuckDBSignalPageProjectionSource,
                     SignalPageProjectionProducer,
@@ -1003,6 +1004,15 @@ def notifier_builder(
                 page_projection_producer = SignalPageProjectionProducer(
                     source=DuckDBSignalPageProjectionSource(
                         settings.page_projection_database_path,
+                        #: #268: this is the role whose generation read is the multi-
+                        #: gigabyte `minute_bar` aggregate, and the only one of the four
+                        #: that reads all day rather than inside a window of its own. It
+                        #: re-opens the replica at most every fifteen minutes, and never
+                        #: between 09:20 and 09:40, where on 2026-09-14 it was one of the
+                        #: readers that kept the production monitor off the disk for ten
+                        #: minutes after the open.
+                        read_profile=NOTIFIER_PAGE_PROJECTION_PROFILE,
+                        clock=clock,
                         surge_live_root=settings.page_projection_surge_live_root,
                         canvas_catalog_root=settings.page_projection_canvas_catalog_root,
                         canvas_receipt_root=settings.page_projection_canvas_receipt_root,
@@ -1050,7 +1060,13 @@ def notifier_builder(
             if page_projection_producer is None:
                 return {}
             opened, read_bytes = page_projection_producer.source.replica_iteration_summary()
-            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
+            return {
+                "replica_opened": opened,
+                "replica_read_bytes": read_bytes,
+                "replica_skipped_by_floor": (
+                    page_projection_producer.source.replica_iteration_skipped_by_floor()
+                ),
+            }
 
         def step() -> RuntimeStepResult:
             if page_projection_producer is not None:
@@ -1187,6 +1203,9 @@ def notifier_builder(
             #: loader that raised part-way still counts as opened (package Q SF-7).
             step.replica_iteration_summary = (
                 page_projection_producer.source.replica_iteration_summary
+            )
+            step.replica_iteration_skipped_by_floor = (
+                page_projection_producer.source.replica_iteration_skipped_by_floor
             )
 
         return step

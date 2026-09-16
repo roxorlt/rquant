@@ -5,6 +5,77 @@
 
 ---
 
+## 2026-09-14 · 待安装 · 开盘那二十分钟的 I/O 干扰与停机推送（#268）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+**装机口径（集成时定，2026-09-14）**：本包与包 R、包 S、包 T 在**第十个窗口**里
+**一批装一个 tag `v0.33.12`**——包 R 是 v0.33.9、包 S 是 v0.33.10、包 T 是 v0.33.11
+（三条都已合入 main、都还没装机），本包合入后打 **`v0.33.12`**，**部署器 target 取
+`v0.33.12` 这一个**，前三个 tag 不单独部署。**时机由协调者决定。**
+
+**要修的现象**：09-14（周一）是二十个 unit 全部常驻后的第一个交易日。09:25 副本同步拷贝
+10 GB、`rquant-monitor` 同时启动扫主库、四个读侧 role 打开新一代副本、09:30 备份再拷贝并
+压缩 10 GB 撞在一起；load 14 → 21，**生产 monitor 在开盘后十分钟没有任何轮询**，
+`rquant-monitor-watchdog` 超时 6 次。09:33 停九个 unit 时，七个正在读 DuckDB 的 role
+全部超过 `TimeoutStopSec=60` 被 `SIGKILL`，`OnFailure` 发出一条推送到 owner。
+
+**装上之后当场应该看到什么**：
+
+- 四个读侧 role 的心跳里出现新字段 `replica_skipped_by_floor`。盘中它在
+  `notifier.admin.shadow.v1` 上应当**经常是 `true`**——副本每五分钟换一代，而 notifier 的
+  最短重读间隔是 15 分钟，所以三代里有两代会被压住，这是预期而不是故障。
+  `replica_opened=true` 在 notifier 上一小时最多四次。
+  **另外三个 role 上这个字段基本恒为 `false`**：它们本来就只在自己那几分钟的窗口里读，
+  包 Q 的「变了才读」已经把它们压到每代一次，间隔在生产节拍上近似空操作。
+  **判断「限频起作用了」只看 notifier 的 `replica_opened` 频次**，不要指望另外三个。
+- 09:20–09:40 这二十分钟内 notifier 不开库，`replica_skipped_by_floor=true`。
+  `reference-slow.source.v1`（09:20–09:25 采集）与 `candidate.auction_gap.v1`
+  （09:26–09:30 装配）**照常读**，它们没有禁读时段，只有等于自己窗口长度的间隔。
+- 手工 `systemctl stop` 一个读侧 role：应当**几秒内**停干净，`systemctl show -p Result`
+  是 `success` 不是 `timeout`，心跳 `status=stopped`，不再有 `OnFailure` 推送。
+  **`stop_reason` 大概率是 `loop completed`，这不是没修好。** 装上第 2 条之后 notifier
+  十五分钟才开一次库，手工停的时候它绝大多数轮根本不在读；只有正好停在读里那一次，
+  `stop_reason` 才会是 `stop requested during a database read`。
+  换句话说，第 2 条把第 1 条的可观察特征变稀了——**验收看的是「几秒内停干净、
+  `Result=success`、没有推送」**，中断本身的证据在 e2e 里
+  （`test_a_role_interrupted_mid_read_exits_in_time_with_code_zero`：信号到进程返回 < 5 秒、
+  退出码 0、心跳 `stopped`），不要指望在生产上手工复现。
+
+**一个需要 owner 明确点头的取舍：开盘期间页面会更旧。** notifier 09:19:59 读一次之后，
+15 分钟的间隔在 09:34:59 到期，但禁读时段要到 09:40:00 才放开，所以那一代答案最长撑
+**20 分 1 秒**；加上它读的那一代副本本身最多已经旧 5 分钟，
+**开盘期间 `minute_coverage.max_time` 最坏落后约 25 分钟**。
+若再采纳下面「盘中副本同步 5 → 15 min」那一条，最坏值变成**约 35 分钟**。
+这一段正是用户最可能去看页面的时候。**这不是缺陷，是本包换来「monitor 能轮询」的代价**，
+请 owner 明确接受或另提要求。（已核：不破坏已发布投影的校验，旧答案不算「晚于
+`available_at` 的证据」。）
+
+**装机后的首个交易日按这一条走**：**装完之后的第一个交易日，只在 09:00 前把 unit 起起来，
+然后全天观察，中途不停不起**（09:00 是为了让四个读侧 role 在 09:20 禁读时段开始之前
+就已经各读到一代，避免把「冷启动必须读」和「被间隔压住」混在一起看）。
+本窗口验收判据在原有几条之外**加两条**：
+
+> 1. **09:25–09:40 生产 monitor 轮询无中断，`rquant-monitor-watchdog` 0 次超时。**
+> 2. **09:20–09:40 之间，`notifier.admin.shadow.v1` 的心跳上看得到
+>    `replica_skipped_by_floor=true`。** 看不到就是禁读时段没有生效（或者 notifier 那一轮
+>    根本没跑到判定），要当成本包没装上来查，不要当成「这段时间恰好没有新代」——
+>    副本同步每五分钟换一代，这二十分钟里必定有代可跳。
+
+**回滚**：与 `v0.33.11` 同一条路径。**本包新增一个心跳文件字段
+`replica_skipped_by_floor`**，所以回滚到 `v0.33.11` 或更早时，按 2026-09-10 那一条写的整批
+挪心跳步骤先把心跳挪开——旧代码的心跳模型不认识这个字段。
+
+**本包不改 `deploy/`。** 下面四条是 owner 的决策，本包一个字都没有动，装机与否互不影响：
+
+| 建议 | 现值 | 建议值 | 为什么 |
+|---|---|---|---|
+| 盘中副本同步频率 | 5 min | **15 min** | 每次替换都是 10 GB 的 `cp`，而读侧现在最快也只有 15 min 重读一次，5 min 的代已经没人消费 |
+| 备份时段 | 每 15 min，含 09:30 | **避开 09:20–09:40** | 09:30 那一次是 `cp` + `gzip` 10 GB，正好落在开盘 |
+| `TimeoutStopSec` | 60 s | **≥ 300 s** | **#268 点名七个 role，本包只接上四个**（notifier、reference-slow.source、candidate.auction_gap、auction-universe.publisher）。另外三个卡在 spool / 文件 I/O 上（`cp`、`os.read`、fsync），`interrupt()` 够不着，它们的停机仍然只能靠这一条兜底 |
+| vda 调度器 | `mq-deadline` | **`bfq`** | `rquant-live-runtime.slice` 上的 `IOWeight=` 在 `mq-deadline` 下不生效（2026-09-08 已记为已知限制） |
+
+---
+
 ## 2026-09-12 · 待安装 · signal_router 等一条干净停机的策略，而不是退 1（#263）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。

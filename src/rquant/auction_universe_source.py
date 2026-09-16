@@ -18,6 +18,7 @@ from rquant.auction_universe_publisher import (
 from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_read_interrupt import interruptible_read, is_read_interrupt
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _TS_CODE_PATTERN = re.compile(r"^[0-9]{6}\.(?:BJ|SH|SZ)$")
@@ -143,16 +144,23 @@ def _query_codes(database_path: Path, *, reference_trade_date: date) -> tuple[st
     connection = None
     try:
         connection = duckdb.connect(str(database_path), read_only=True)
-        rows = connection.execute(
-            """
-            SELECT DISTINCT ts_code
-            FROM daily_bar
-            WHERE trade_date = ?
-            ORDER BY ts_code
-            """,
-            [reference_trade_date],
-        ).fetchall()
+        #: a stop that arrives mid-scan abandons the query rather than waiting it out
+        #: (#268). The interrupt is re-raised as itself: `InterruptException` is a
+        #: `duckdb.Error`, and the clause below would otherwise report an operator's
+        #: `systemctl stop` as a snapshot integrity failure.
+        with interruptible_read(connection):
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ts_code
+                FROM daily_bar
+                WHERE trade_date = ?
+                ORDER BY ts_code
+                """,
+                [reference_trade_date],
+            ).fetchall()
     except duckdb.Error as exc:
+        if is_read_interrupt(exc):
+            raise
         raise AuctionUniverseSourceError("daily snapshot query failed") from exc
     finally:
         if connection is not None:

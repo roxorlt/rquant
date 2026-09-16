@@ -191,17 +191,29 @@ def test_the_auction_gap_publisher_reads_the_replica_once_over_four_iterations(
     assert heartbeat.degraded_reasons == ()
     #: the last iteration recognised the generation and did not open the database
     assert heartbeat.replica_opened is False
+    #: and it recognised it, rather than being held off a newer one (#268)
+    assert heartbeat.replica_skipped_by_floor is False
 
 
-def test_an_atomic_replacement_costs_exactly_one_more_read(
+def test_an_atomic_replacement_inside_the_floor_costs_no_further_read(
     session_world: ReplicaWorld,
     locked_main_database: Any,
     counted_replica_reads: dict[str, int],
 ) -> None:
     """`sync-readonly-replica.sh` `mv`s a new file over the name every five minutes.
 
-    One read for the generation the run started on, one for the generation that replaced
-    it, and nothing for the three iterations that followed either of them.
+    **This assertion is the one #268 changed, and it changed on purpose.** Package Q
+    established that a replacement costs exactly one more read, which is right when the
+    question is "does this role notice a new generation" and wrong when the replacement
+    happens every five minutes all day: on 2026-09-14 those reads, the replica `cp`, the
+    production monitor's own startup scan and the 09:30 backup landed together and the
+    monitor produced no poll for ten minutes after the open.
+
+    `candidate.auction_gap.v1` reads prior sessions' `daily_bar` volumes, which do not
+    change while today's session opens, so the generation that arrives mid-window carries
+    the same answer at the cost of another whole scan. Its profile floors it at its own
+    09:26-09:30 assembly window: one read per session, and the heartbeat says the newer
+    generation was seen and deliberately not read.
     """
 
     replica = session_world.inputs.readonly_replica_database_path
@@ -230,11 +242,13 @@ def test_an_atomic_replacement_costs_exactly_one_more_read(
     )
 
     assert code == 0
-    assert counted_replica_reads["auction_gap"] == 2
+    assert counted_replica_reads["auction_gap"] == 1
     assert heartbeat is not None
     assert heartbeat.total_successes == 6
     assert heartbeat.degraded_reasons == ()
     assert heartbeat.replica_opened is False
+    #: not "there was nothing new": there was, and the floor is what kept the old answer
+    assert heartbeat.replica_skipped_by_floor is True
 
 
 def test_the_heartbeat_says_what_the_last_iteration_did_with_the_replica(

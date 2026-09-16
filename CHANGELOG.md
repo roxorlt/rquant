@@ -151,6 +151,80 @@
 
 ### Fixed
 
+- **开盘那二十分钟：读侧 role 不再每五分钟换代重读，停机也不再等读完（#268）**：
+  09-14（周一）是二十个 runtime unit 全部常驻后的第一个交易日。09:25 副本同步拷贝 10 GB、
+  `rquant-monitor` 同时启动并扫主库、四个读侧 role 打开新一代副本（其中 notifier 那一次是
+  `minute_bar` 的整表聚合，数 GB）、09:30 备份再拷贝并压缩 10 GB——全部撞在同一分钟里。
+  load 从 14 涨到 21，多个进程进 D 状态，**生产 monitor 在开盘后十分钟一次轮询都没做**，
+  `rquant-monitor-watchdog` 超时 6 次（前两个没有 unit 的交易日是 0 次）。争的是云盘的
+  IOPS 与延迟，不是带宽（`vmstat` 的 bi/bo 只有 27/53 MB/s）。
+
+  根因是包 Q 的「变了才读」在交易日等于「每五分钟读一次」：
+  `rquant-replica-sync.timer` 每五分钟**整文件替换**一次副本，所以「代变了」这个条件一天要
+  成立上百次。**`ReplicaReadProfile` 给每个 role 加了两样东西**——两次打开之间的最短间隔，
+  以及一段按盘中时钟算的禁读时段（用的就是 `may_fetch_market_minute` 那个
+  `Asia/Shanghai` 时钟，从 `runtime_market_session` 导入而不是另抄一份）。
+  notifier 是四个里唯一全天每两秒跑、且那一次读是数 GB 的，所以它拿 15 分钟的间隔
+  **和** 09:20–09:40 的禁读时段；另外三个各有自己的窗口（reference-slow 的采集窗口
+  09:20–09:25、auction-gap 的装配窗口 09:26–09:30，都**落在** 09:20–09:40 里面），
+  对它们加禁读时段的后果是**把窗口里第一次读到的那一代冻到 09:40**，而且一次也省不下来
+  （包 Q 的「变了才读」已经把它们压到每代一次，而它们的窗口比一代还短），
+  所以它们只拿等于自己窗口长度的间隔、不加禁读时段。
+  **没有答案的 role 永远不受间隔约束**：冷启动必须读，压住的是「重读」不是这个 role 本身。
+  被压住的那一代不是悄悄忽略，心跳文件模型新增 `replica_skipped_by_floor`
+  （只是文件字段，冻结的 serving 投影一个字段都没动）。
+
+- **停机不再等一次 DuckDB 读跑完（#268）**：
+  同一天 09:33 协调者逐个停掉九个最重的 unit，其中七个正在读副本。七个 role 各自超过
+  `TimeoutStopSec=60`、被 `SIGKILL`、记成 `Result=timeout`、触发 `OnFailure`，
+  一次运维自己发起的 `systemctl stop` 变成了告警。
+
+  **成因不是「信号没送到」**：`run_service_loop` 只在**两轮之间**看 `stop_event`，
+  而没有任何地方叫引擎放弃，所以一个在十分钟扫描第 1 秒到达的停机信号仍然要花掉十分钟。
+  信号处理函数跑没跑，是引擎的性质而不是 CPython 的性质，实测（信号在查询开始后 0.4 秒发出，
+  各三遍）：**duckdb 1.5.2 在 1.81–1.89 秒的查询里第 0.40–0.41 秒就跑了处理函数；
+  CPython 的 `sqlite3` 在 20.48–20.67 秒的语句里要到第 20.48–20.67 秒才跑**——也就是
+  语句结束、已经没有什么可中断的时候。
+
+  所以现在有**两条**路去调 `interrupt()`，各自补对方补不了的一半：entrypoint 的信号处理
+  函数里加一行（DuckDB 那半靠它），以及 `StopSignalWatcher`——它用
+  `signal.set_wakeup_fd`，CPython 的 C 层处理函数在收到信号的那个线程里**立刻**把信号号
+  写进管道，watcher 用自己的线程读它（SQLite 那半只能靠它，同时也是 DuckDB 那半的兜底）。
+  实测：信号之后 **0.4 秒**查询抛 `InterruptException`。
+  空闲时调 `interrupt()` 在这个引擎上是空操作（同样实测），所以停机之后才开始的读**直接拒绝**
+  而不是放它跑完。被中断的那一轮在 gate 里算「没读完」，不留半个答案。
+  四个把 `duckdb.Error` 翻译成自己整性错误的读路径都改成先放行中断
+  （`InterruptException` 正是 `duckdb.Error`），`run_service_loop` 把它读成「这个循环结束了」
+  而不是「这一轮失败了」——退出码 0、心跳 `stopped`、失败计数不动。
+
+  **口径要说清楚**：#268 点名的是**七个**停不下来的 role，本包接上的是其中**四个**
+  （notifier、reference-slow.source、candidate.auction_gap、auction-universe.publisher）——
+  就是打开 DuckDB/SQLite 做查询的那四个。另外三个卡住的是 spool / 文件 I/O
+  （`cp`、`os.read`、fsync），`interrupt()` 本来就够不着，它们的停机仍然只能靠
+  `TimeoutStopSec` 兜底。
+
+  **本包不改 `deploy/`**。`TimeoutStopSec`、副本同步频率、备份时段、云盘调度器都是 owner 的
+  决策，建议写在包 U 报告的「给 owner 的建议」一节。
+
+- **notifier 的 `minute_coverage` 每代少读 38%（#268 复审 SF-7）**：
+  这条扫描过去带着 `created_at <= ?` 谓词。而副本是**整文件替换**的、从不原地写，
+  所以文件里每一行的 `created_at` 都早于文件自己的 `mtime`——只要 cutoff 不早于这一代的
+  `mtime`，这个谓词一行也排除不掉。`_StableReadonlyDuckDB` 现在报出**它真正打开的那个
+  inode** 的 `mtime`（`fstat` 描述符，不是看名字），读侧据此决定发哪一条 SQL；
+  条件不成立时（拿不到描述符、副本被打上未来时间戳）跑的还是原来那条。
+  在包 Q 那份 217,067,520 字节的合成副本上实测（Linux、duckdb 1.5.2、各三轮，轮轮相同）：
+  **44,052,715 → 27,275,499 字节**，发布出来的行逐字节相同。
+  **给后面看的人留一句**：执行计划**看不出**这个差别——两种写法打印出来的
+  `Projections` 与 `Filters` 完全一样（DuckDB 把恒真比较从打印的计划里折掉了），
+  是字节数量出来的。
+  **38% 是这份合成副本上的数，不是一个可以外推的常数**：省下来的是引擎为求值这个谓词而
+  读 `created_at` 那一列的字节，所以当 row group 的 min/max（zone map）已经能在**计划期**
+  证明它恒真时，引擎本来就不读这一列，去掉谓词省下来的是**零**——复审在一份
+  `created_at` 只有 40 个取值、cutoff 写成字面量的副本上实测就是 0.0%。
+  发出去的这一版把 cutoff 作为**绑定参数**传（zone map 在计划期证不了），而生产上
+  `minute_bar.created_at` 是逐行的插入时间戳，所以是会省的那一侧；具体省多少随数据而变。
+  裁决 30 第 3 条要的那个「按当日日期收窄」仍然做不到（会改三个已发布字段）。
+
 - **`signal_router` 不再把「策略干净停机留下的 runner 库」判成损坏（#263）**：
   第九个路线 A 窗口（09-12，v0.33.9，权威链 sequence 7）里三条策略 18:22–18:23 被干净停机
   （runbook R-29 的阻塞式 `systemctl stop`），router 18:33 起来，18:43:38 退 1，报

@@ -1743,6 +1743,13 @@ def test_production_source_builder_retires_only_committed_consumer_history(
     assert first_result.processed_count == 0
     assert not cursor_root.exists()
     assert not producer.reference_archive_paths(0)[0].exists()
+    #: #268 review MF-1: this role's success path reports all three replica fields, the
+    #: way the other three read-side builders do. Before the review it copied only two, so
+    #: an iteration its five-minute floor held back was `(False, 0, null)` -- the same
+    #: heartbeat as "never asked the gate", which is the one case the third field exists to
+    #: tell apart. `False` here rather than `None` is what says the field is wired at all;
+    #: the `True` case is pinned on the gate itself, which is where the decision is taken.
+    assert first_result.replica_skipped_by_floor is False
 
     publisher = LiveBatchSpool(spool_root, cursor_root=cursor_root)
     publisher.commit_cursor(
@@ -1760,6 +1767,7 @@ def test_production_source_builder_retires_only_committed_consumer_history(
     result = source_step()
 
     assert result.processed_count == 0
+    assert result.replica_skipped_by_floor is False
     assert all(path.exists() for path in producer.reference_archive_paths(2))
     assert producer._manifest_path(LiveChannel.REFERENCE_SLOW, 3).exists()
     assert producer.current(LiveChannel.REFERENCE_SLOW) is not None

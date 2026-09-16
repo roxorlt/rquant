@@ -33,7 +33,11 @@ from rquant.live_spool import (
 )
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
 from rquant.market_minute_source_service import capture_market_minute_step
-from rquant.readside_replica_gate import ReplicaReadGate
+from rquant.readside_replica_gate import (
+    AUCTION_UNIVERSE_PUBLISHER_PROFILE,
+    REFERENCE_SLOW_SOURCE_PROFILE,
+    ReplicaReadGate,
+)
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
     RuntimeCandidateUniverseConfig,
@@ -378,8 +382,14 @@ def reference_slow_source_builder(
             )
         )
         #: one `lstat` per ask instead of a whole read of the replica, and one read for
-        #: the target session plus five revision look-backs rather than six (#256)
-        replica_gate: ReplicaReadGate[Any] = ReplicaReadGate(settings.database_path)
+        #: the target session plus five revision look-backs rather than six (#256); the
+        #: profile is what keeps a *retrying* capture from re-reading a fresh generation
+        #: every thirty seconds through the open (#268)
+        replica_gate: ReplicaReadGate[Any] = ReplicaReadGate(
+            settings.database_path,
+            profile=REFERENCE_SLOW_SOURCE_PROFILE,
+            clock=clock,
+        )
 
         def step() -> RuntimeStepResult:
             #: this iteration's own scope, so an iteration that never reaches the capture
@@ -455,8 +465,17 @@ def reference_slow_source_builder(
                         retired_at=clock(),
                     )
             opened, read_bytes = replica_gate.iteration_summary()
+            #: All three fields, the way the other three read-side builders report them
+            #: (review MF-1). Without the third, an iteration this role's floor held back
+            #: is `(False, 0, null)` -- indistinguishable from "never asked the gate" and
+            #: from "recognised the generation it already had", which is the one thing the
+            #: field exists to tell apart.
             return result.model_copy(
-                update={"replica_opened": opened, "replica_read_bytes": read_bytes}
+                update={
+                    "replica_opened": opened,
+                    "replica_read_bytes": read_bytes,
+                    "replica_skipped_by_floor": replica_gate.iteration_skipped_by_floor(),
+                }
             )
 
         #: An iteration that raises returns through none of the lines above, so the
@@ -466,6 +485,7 @@ def reference_slow_source_builder(
         #: way #260 gave it to the notifier: never asked is `(False, 0)`, opened is
         #: `(True, bytes)`, and a loader that raised part-way still counts as opened (#261).
         step.replica_iteration_summary = replica_gate.iteration_summary
+        step.replica_iteration_skipped_by_floor = replica_gate.iteration_skipped_by_floor
 
         return step
 
@@ -604,12 +624,22 @@ def auction_universe_publisher_builder(
         )
         if calendar.content_sha256 != settings.calendar_content_sha256:
             raise ValueError("auction universe calendar content identity mismatch")
-        #: one `lstat` per iteration instead of a scan of the replica's `daily_bar` (#256)
-        replica_gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(settings.database_path)
+        #: one `lstat` per iteration instead of a scan of the replica's `daily_bar` (#256),
+        #: and at most one open per five-minute generation while today's universe is not
+        #: published yet (#268)
+        replica_gate: ReplicaReadGate[tuple[str, ...]] = ReplicaReadGate(
+            settings.database_path,
+            profile=AUCTION_UNIVERSE_PUBLISHER_PROFILE,
+            clock=clock,
+        )
 
         def _replica_cost() -> dict[str, object]:
             opened, read_bytes = replica_gate.iteration_summary()
-            return {"replica_opened": opened, "replica_read_bytes": read_bytes}
+            return {
+                "replica_opened": opened,
+                "replica_read_bytes": read_bytes,
+                "replica_skipped_by_floor": replica_gate.iteration_skipped_by_floor(),
+            }
 
         def step() -> RuntimeStepResult:
             #: 09:15-15:10 is this publisher's protection window and it returns below
@@ -673,6 +703,7 @@ def auction_universe_publisher_builder(
         #: replica's `daily_bar` it may already have paid for is the number an operator
         #: reading a degraded heartbeat needs. Same wiring as the notifier's (#261, #260).
         step.replica_iteration_summary = replica_gate.iteration_summary
+        step.replica_iteration_skipped_by_floor = replica_gate.iteration_skipped_by_floor
 
         return step
 

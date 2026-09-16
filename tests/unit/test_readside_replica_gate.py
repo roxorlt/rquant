@@ -11,15 +11,19 @@ generation.
 from __future__ import annotations
 
 import os
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
 from rquant.readside_replica_gate import (
+    DEFAULT_NO_READ_WINDOW,
+    NOTIFIER_PAGE_PROJECTION_PROFILE,
+    UNLIMITED_READ_PROFILE,
     ReplicaGeneration,
     ReplicaReadGate,
+    ReplicaReadProfile,
     connect_pinned_readonly,
     descriptor_reopen_path,
     is_write_lock_error,
@@ -487,3 +491,337 @@ def test_the_descriptor_directories_are_the_two_this_platform_family_publishes(
     from rquant.readside_replica_gate import DESCRIPTOR_DIRECTORIES
 
     assert directory in DESCRIPTOR_DIRECTORIES
+
+
+# ---------------------------------------------------------------------------------------
+# #268: how often a role may open a *new* generation
+# ---------------------------------------------------------------------------------------
+
+
+class _Clock:
+    """A clock the test moves, so the floor is asserted rather than waited out."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
+
+
+def test_three_consecutive_replacements_inside_the_floor_cost_one_read(tmp_path: Path) -> None:
+    """The shape of a trading day: a new generation every five minutes, all day.
+
+    Package Q's gate opens the database once per generation, which on a trading day is
+    once every five minutes per role -- and on 2026-09-14 four of those, the replica `cp`,
+    the production monitor's startup scan and the 09:30 backup landed together and the
+    monitor did not poll for ten minutes after the open (#268).
+
+    Three replacements inside one floor cost one read. On the production cadence that is
+    the notifier's fifteen-minute floor skipping two generations out of every three; the
+    third, which falls on the floor's own edge, is the read that starts the next one
+    (`test_a_generation_arriving_after_the_floor_is_read`).
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    first = gate.read(loader)
+    reads = []
+    for generation in range(3):
+        clock.advance(timedelta(minutes=4))
+        _replace(
+            replica,
+            payload=f"generation-{generation + 2}".encode(),
+            synced_at=SYNCED_AT + timedelta(minutes=4 * (generation + 1)),
+        )
+        reads.append(gate.read(loader))
+
+    assert loader.calls == 1
+    assert first.opened is True
+    assert first.skipped_by_floor is False
+    assert [read.opened for read in reads] == [False, False, False]
+    assert [read.skipped_by_floor for read in reads] == [True, True, True]
+    #: the answer that stands is the one the first read took
+    assert [read.value for read in reads] == ["rows"] * 3
+
+
+def test_a_generation_arriving_after_the_floor_is_read(tmp_path: Path) -> None:
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.read(loader)
+    clock.advance(timedelta(minutes=16))
+    _replace(replica, payload=b"generation-two", synced_at=SYNCED_AT + timedelta(minutes=15))
+    second = gate.read(loader)
+
+    assert loader.calls == 2
+    assert second.opened is True
+    assert second.skipped_by_floor is False
+
+
+def test_a_role_with_no_answer_yet_is_never_held_by_the_floor(tmp_path: Path) -> None:
+    """Suppressing a re-read is the point; suppressing the role is not.
+
+    A cold start inside the no-read window has nothing to publish at all, and holding it
+    would invent a second, longer outage on top of the one this is about.
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    #: 01:30 UTC is 09:30 in the market clock, the middle of the window
+    clock = _Clock(datetime(2026, 9, 14, 1, 30, tzinfo=UTC))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=NOTIFIER_PAGE_PROJECTION_PROFILE,
+        clock=clock,
+    )
+    loader = _Loader()
+
+    first = gate.read(loader)
+
+    assert loader.calls == 1
+    assert first.opened is True
+    assert first.skipped_by_floor is False
+
+
+def test_the_no_read_window_holds_a_newer_generation_and_lets_go_at_its_end(
+    tmp_path: Path,
+) -> None:
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(datetime(2026, 9, 14, 1, 10, tzinfo=UTC))  # 09:10 market time
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(no_read_window=DEFAULT_NO_READ_WINDOW),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.read(loader)
+    clock.now = datetime(2026, 9, 14, 1, 25, tzinfo=UTC)  # 09:25, inside
+    _replace(replica, payload=b"generation-two", synced_at=SYNCED_AT + timedelta(minutes=5))
+    inside = gate.read(loader)
+    clock.now = datetime(2026, 9, 14, 1, 40, tzinfo=UTC)  # 09:40, the far edge
+    after = gate.read(loader)
+
+    assert inside.opened is False
+    assert inside.skipped_by_floor is True
+    assert after.opened is True
+    assert after.skipped_by_floor is False
+    assert loader.calls == 2
+
+
+def test_a_different_question_is_never_answered_from_the_floor(tmp_path: Path) -> None:
+    """`key` is what makes a question a different one, and a different one always opens."""
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(hours=1)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.read(loader, key=("session", date(2026, 9, 14)))
+    clock.advance(timedelta(minutes=1))
+    _replace(replica, payload=b"generation-two", synced_at=SYNCED_AT + timedelta(minutes=5))
+    other = gate.read(loader, key=("session", date(2026, 9, 15)))
+
+    assert loader.calls == 2
+    assert other.opened is True
+    assert other.skipped_by_floor is False
+
+
+def test_a_clock_that_went_backwards_does_not_hold_an_answer_for_ever(tmp_path: Path) -> None:
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(hours=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.read(loader)
+    #: NTP stepping a host that has just come up
+    clock.now = SYNCED_AT
+    _replace(replica, payload=b"generation-two", synced_at=SYNCED_AT + timedelta(minutes=5))
+    second = gate.read(loader)
+
+    assert loader.calls == 2
+    assert second.opened is True
+
+
+def test_a_failed_read_inside_the_floor_is_retried_rather_than_held(tmp_path: Path) -> None:
+    """A loader that raised leaves no answer, so there is nothing for the floor to keep."""
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(hours=1)),
+        clock=clock,
+    )
+    calls = {"count": 0}
+
+    def failing() -> object:
+        calls["count"] += 1
+        raise RuntimeError("the loader could not finish")
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            gate.read(failing)
+        clock.advance(timedelta(seconds=2))
+
+    assert calls["count"] == 3
+
+
+def test_the_iteration_report_separates_a_skip_from_a_recognised_generation(
+    tmp_path: Path,
+) -> None:
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(hours=1)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.begin_iteration()
+    assert gate.iteration_summary() == (False, 0)
+    assert gate.iteration_skipped_by_floor() is False
+
+    gate.begin_iteration()
+    gate.read(loader)
+    assert gate.iteration_summary()[0] is True
+    assert gate.iteration_skipped_by_floor() is False
+
+    gate.begin_iteration()
+    gate.read(loader)
+    assert gate.iteration_summary() == (False, 0)
+    assert gate.iteration_skipped_by_floor() is False, "same generation is not a skip"
+
+    _replace(replica, payload=b"generation-two", synced_at=SYNCED_AT + timedelta(minutes=5))
+    gate.begin_iteration()
+    gate.read(loader)
+    assert gate.iteration_summary() == (False, 0)
+    assert gate.iteration_skipped_by_floor() is True
+
+
+def test_a_gate_built_without_a_profile_is_where_package_q_left_it(tmp_path: Path) -> None:
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    gate: ReplicaReadGate[object] = ReplicaReadGate(replica)
+    loader = _Loader()
+
+    gate.read(loader)
+    _replace(replica, payload=b"generation-two", synced_at=SYNCED_AT + timedelta(minutes=5))
+    second = gate.read(loader)
+
+    assert gate.profile is UNLIMITED_READ_PROFILE
+    assert loader.calls == 2
+    assert second.opened is True
+    assert second.skipped_by_floor is False
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"min_reread_interval": timedelta(seconds=-1)},
+        {"no_read_window": (time(9, 40), time(9, 20))},
+        {"no_read_window": (time(9, 20), time(9, 20))},
+        {"no_read_window": (time(9, 20, tzinfo=UTC), time(9, 40))},
+    ],
+)
+def test_an_unusable_profile_is_refused_where_it_is_written(arguments: dict) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        ReplicaReadProfile(**arguments)
+
+
+def test_the_window_is_read_in_the_market_clock_not_the_hosts() -> None:
+    """The same clock `may_fetch_market_minute` is decided in, imported rather than copied."""
+
+    from rquant.runtime_market_session import MARKET_TIMEZONE
+
+    profile = ReplicaReadProfile(no_read_window=DEFAULT_NO_READ_WINDOW)
+    inside = datetime(2026, 9, 14, 9, 30, tzinfo=MARKET_TIMEZONE)
+    assert profile.suspends_reads_at(inside)
+    assert profile.suspends_reads_at(inside.astimezone(UTC))
+    #: 09:30 UTC is 17:30 in the market clock, which is nowhere near the window
+    assert not profile.suspends_reads_at(datetime(2026, 9, 14, 9, 30, tzinfo=UTC))
+
+
+def test_a_vanished_replica_is_a_failure_and_never_a_floor_skip(tmp_path: Path) -> None:
+    """Review SF-1: `current is None` is not "a newer generation this role may skip".
+
+    `ReplicaGeneration.observe` answers `None` for a name with no regular file behind it --
+    deleted, turned into a symlink, turned into a directory. Before this guard the floor
+    branch fired there too, so a role with a cached answer would serve it for the whole
+    interval and report `replica_skipped_by_floor=true` -- which DEPLOY.md tells the owner
+    to read as the fix working. A replica that is gone has to surface as the failure
+    package Q designed: the loader is called, it says so, and the round fails.
+    """
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    calls = {"count": 0}
+
+    def loader() -> object:
+        calls["count"] += 1
+        if not replica.exists():
+            raise RuntimeError("the replica is gone")
+        return "answer"
+
+    gate.read(loader)
+    replica.unlink()
+    clock.advance(timedelta(seconds=2))
+
+    with pytest.raises(RuntimeError, match="the replica is gone"):
+        gate.read(loader)
+
+    assert calls["count"] == 2, "the loader must be asked, not answered from the cache"
+    assert gate.last_read is not None
+    assert gate.last_read.skipped_by_floor is False
+    assert gate.iteration_skipped_by_floor() is False
+
+
+def test_a_replica_replaced_by_a_directory_is_refused_the_same_way(tmp_path: Path) -> None:
+    """The other shape `observe()` answers `None` for, so the guard is not about `unlink`."""
+
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    clock = _Clock(SYNCED_AT + timedelta(minutes=1))
+    gate: ReplicaReadGate[object] = ReplicaReadGate(
+        replica,
+        profile=ReplicaReadProfile(min_reread_interval=timedelta(minutes=15)),
+        clock=clock,
+    )
+    loader = _Loader()
+
+    gate.read(loader)
+    replica.unlink()
+    replica.mkdir()
+    clock.advance(timedelta(seconds=2))
+    gate.read(loader)
+
+    assert loader.calls == 2
+    assert gate.last_read is not None
+    assert gate.last_read.skipped_by_floor is False

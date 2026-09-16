@@ -29,6 +29,7 @@ from rquant.runtime_legacy_generation_binding import (
     LegacyGenerationBindingError,
     parse_legacy_generation_binding,
 )
+from rquant.runtime_read_interrupt import StopSignalWatcher, request_read_interrupt
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceKind,
     RuntimeServiceManifest,
@@ -762,6 +763,12 @@ def run(args: argparse.Namespace) -> int:
 
     def request_stop(_signum: int, _frame: FrameType | None) -> None:
         stop_event.set()
+        #: Setting the event alone was the whole of this handler until #268, and it is why
+        #: a stop that arrived one second into a ten-minute read still cost ten minutes:
+        #: the loop looks at the event *between* iterations. DuckDB runs this handler
+        #: during a query (measured), so for the replica readers this line is what
+        #: abandons the read; the watcher below covers SQLite, where it does not.
+        request_read_interrupt()
 
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
@@ -769,7 +776,34 @@ def run(args: argparse.Namespace) -> int:
     try:
         for signum in previous_handlers:
             signal.signal(signum, request_stop)
-        with runtime_schema_dual_write_context(schema_bindings):
+        #: A handler set above runs in the main thread between bytecodes, so whether it
+        #: runs during a read is a fact about the engine: DuckDB yields to it, SQLite does
+        #: not until the statement ends (both measured, see `runtime_read_interrupt`). The
+        #: watcher hears the same signal on a thread of its own, so the interrupt reaches
+        #: either engine while the query is still running and the stop takes about a
+        #: second instead of the read -- which on 09-14 was longer than `TimeoutStopSec`
+        #: for seven roles at once (#268).
+        with (
+            StopSignalWatcher(
+                signums=tuple(previous_handlers),
+                on_stop=stop_event.set,
+            ) as read_interrupts,
+            runtime_schema_dual_write_context(schema_bindings),
+        ):
+            if not read_interrupts.active:
+                logger.warning(
+                    "runtime service could not install the read-interrupt watcher; "
+                    "a stop during a database read waits for the read (#268)"
+                )
+            elif read_interrupts.unarmed_signums:
+                #: a watched signal with no Python handler never reaches the wakeup pipe,
+                #: so the watcher cannot act on it (review SF-2). Both are installed above,
+                #: so this is a guard against a future caller, not a live condition.
+                logger.warning(
+                    "runtime service read-interrupt watcher is not armed for signals "
+                    f"{sorted(read_interrupts.unarmed_signums)}; a stop on one of those "
+                    "during a database read waits for the read (#268)"
+                )
             registry_kwargs: dict[str, object] = {
                 "runtime_capabilities": runtime_capabilities,
                 # The generation tree under this root is what tells a role's own

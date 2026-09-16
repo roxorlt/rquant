@@ -14,6 +14,12 @@ from rquant.auction_universe_source import (
 )
 from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_read_interrupt import (
+    ReadInterruptedError,
+    is_read_interrupt,
+    request_read_interrupt,
+    reset_read_interrupts,
+)
 
 COMMIT = "a" * 40
 
@@ -217,3 +223,70 @@ def test_a_replaced_replica_is_read_once_more(
     publish()
 
     assert opens[0] == 2
+
+
+def test_a_stop_during_the_scan_is_reported_as_a_stop_not_a_snapshot_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#268: `InterruptException` is a `duckdb.Error`, and this path converts those.
+
+    Without the re-raise, an operator's own `systemctl stop` came back through the loop as
+    `daily snapshot query failed` -- a fault the role would have recorded, backed off on,
+    and left in its last heartbeat before `stopped`.
+    """
+
+    import duckdb
+
+    database = _database((tmp_path / "operational-ro.duckdb").resolve())
+    root = (tmp_path / "authority").resolve()
+    original = duckdb.connect
+
+    class _Interrupting:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def interrupt(self) -> None:
+            self._inner.interrupt()  # type: ignore[attr-defined]
+
+        def execute(self, *_args: object, **_kwargs: object) -> object:
+            raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+
+        def close(self) -> None:
+            self._inner.close()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(duckdb, "connect", lambda *a, **k: _Interrupting(original(*a, **k)))
+
+    with pytest.raises(duckdb.InterruptException) as raised:
+        publish_auction_universe_from_daily_snapshot(
+            database_path=database,
+            authority_root=root,
+            calendar=_calendar(),
+            observed_at=datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
+            producer_commit=COMMIT,
+        )
+
+    assert is_read_interrupt(raised.value)
+    assert not isinstance(raised.value, AuctionUniverseSourceError)
+
+
+def test_a_read_may_not_begin_once_this_process_has_been_asked_to_stop(
+    tmp_path: Path,
+) -> None:
+    """An idle `interrupt()` does not arm the next query, so the read must not start."""
+
+    database = _database((tmp_path / "operational-ro.duckdb").resolve())
+    root = (tmp_path / "authority").resolve()
+    reset_read_interrupts()
+    request_read_interrupt()
+    try:
+        with pytest.raises(ReadInterruptedError):
+            publish_auction_universe_from_daily_snapshot(
+                database_path=database,
+                authority_root=root,
+                calendar=_calendar(),
+                observed_at=datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
+                producer_commit=COMMIT,
+            )
+    finally:
+        reset_read_interrupts()

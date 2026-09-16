@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 
 
@@ -45,3 +47,24 @@ def _the_suite_is_not_a_runtime_unit(monkeypatch):
         "_SYSTEMD_CGROUP_PATH",
         Path("/nonexistent/rquant-suite-is-not-a-unit/cgroup"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_read_interrupts() -> Iterator[None]:
+    """Leave no process-wide stop latch behind for the next case (#268, review SF-8).
+
+    `runtime_read_interrupt.READ_INTERRUPTS` is one object per process, and `request()`
+    *latches*: once it has been called, every later `register()` refuses with
+    `ReadInterruptedError`. That is right in production -- the process is stopping -- and
+    poison in a test worker, where one case that asks for a stop and does not clean up
+    would make every subsequent read-side case in the same worker fail with an error that
+    names none of them. Two cases in this suite set the latch deliberately, and the
+    end-to-end one sends a real SIGTERM to the pytest process; this fixture is what keeps
+    either of them from reaching the next case.
+    """
+
+    from rquant.runtime_read_interrupt import reset_read_interrupts
+
+    reset_read_interrupts()
+    yield
+    reset_read_interrupts()
