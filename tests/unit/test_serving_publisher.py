@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -701,3 +702,30 @@ def test_a_watermark_that_moves_under_one_generation_still_builds(tmp_path: Path
     assert degraded.written is True
     assert degraded.manifest.generation_id != first.manifest.generation_id
     assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
+
+
+def test_a_current_pointer_whose_generation_is_gone_is_published_over(tmp_path: Path) -> None:
+    """The rebuild gate must not turn a healable state into a permanent failure.
+
+    Before #271 the publisher only read the current manifest when its generation id
+    matched the candidate's -- which could not happen, because `built_at` made every
+    candidate id new. So a `current.json` left pointing at a generation somebody removed
+    was healed on the next publish. The gate reads that manifest on every call now, so it
+    has to fall through on exactly the failures that used to be invisible.
+    """
+
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    # A published generation is 0500/0400 on purpose, so removing it is what an operator
+    # or a retention sweep would have to do.
+    gone = tmp_path / "serving" / "generations" / first.manifest.generation_id
+    gone.chmod(0o700)
+    for child in gone.iterdir():
+        child.chmod(0o600)
+    shutil.rmtree(gone)
+
+    healed = _publish_generation(publisher, built_at=_BUILT_AT + timedelta(seconds=30))
+
+    assert healed.written is True
+    assert (tmp_path / "serving" / "generations" / healed.manifest.generation_id).is_dir()
+    assert publisher.current_pointer().generation_id == healed.manifest.generation_id

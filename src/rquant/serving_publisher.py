@@ -574,7 +574,14 @@ class ServingPublisher:
         pointer = self._current_pointer_if_present()
         if pointer is None:
             return None
-        manifest = self._read_manifest_for_pointer(pointer)
+        try:
+            manifest = self._read_manifest_for_pointer(pointer)
+        except ServingIntegrityError:
+            # A `current.json` whose generation is gone or does not verify used to be
+            # healed by publishing over it, because the old check only read that manifest
+            # when the two generation ids matched -- and they could not, since `built_at`
+            # made every candidate id new. Falling through keeps exactly that.
+            return None
         if manifest.schema_version != self.schema_version:
             return None
         if manifest.producer_commit != self.producer_commit:
@@ -585,8 +592,11 @@ class ServingPublisher:
         offered = {watermark.dataset_id: watermark for watermark in watermarks}
         if selected != offered:
             return None
-        self._verify_generation_database(manifest)
-        self._ensure_receipt(pointer, previous_pointer=None)
+        try:
+            self._verify_generation_database(manifest)
+            self._ensure_receipt(pointer, previous_pointer=None)
+        except ServingIntegrityError:
+            return None
         return manifest
 
     def _current_pointer_if_present(self) -> ServingCurrentPointer | None:
