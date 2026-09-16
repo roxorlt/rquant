@@ -151,6 +151,60 @@
 
 ### Fixed
 
+- **其余六个 role 的「每轮无条件写」：内容没变就不写、不提交、不 fsync（#271，本包）**：
+  包 V 把 notifier 那两处从时钟上摘下来之后，全 role fsync 盘点里还剩六处，形状全都一样
+  ——被比较的那个东西里混进了本轮的时钟，所以「同一份内容发第二次是空操作」这道门结构上
+  永远合不上。六处逐条：
+
+  1. **`runtime-health.all.v1`（10 s）**把自己的 `observed_at` 写进 `sequence`、
+     `event_time`、`published_at`、每个 service 的 `observed_at` 和 dashboard 投影，
+     再把这一整份算成 `generation_id`——**一天 8640 代**。读仍然用真时钟（陈旧判定就是拿
+     `now` 去比，role 死了必须发现得了），变的是发布前先问一句「这次读到的东西跟已经发布的
+     那一代有没有不同」：`runtime_health_state_identity` 留下 service 集合，以及每个
+     service 的 plane、status、`stale`、run 与 spec 身份、降级原因、最后一次错误；
+     丢掉的是发布者的四个时钟、每份心跳的时钟/计数器/时延窗口、两个 live SLO 观测量、
+     逐源收据（每条都把整份心跳文档连同观测时刻算进哈希），以及 `source_generations`
+     ——后者是 serving 自己会直接去各权威读的东西的回声，而 `lab-jobs.serving.v1` 正是本
+     role 监视的对象之一，留着它就是一个没有空闲态的循环。
+  2. **`lab-jobs.serving.v1`（30 s）**同一个错，外加第四条路径：每个 job 的 ETA 是「按被
+     问到的那一刻」陈述的，所以 `as_of` 与整个 `finish_at` 窗口每三十秒滑一次，哪怕这个 job
+     一周没人动过。`lab_jobs_state_identity` 只丢这六个值，job 摘要里的 `progress` 和
+     `version` 都留着——真的在跑的 job 照样重发，并且带一份新的 ETA。
+  3. **`serving.publisher.v1`（30 s）**因此每三十秒重建一份完整的 `serving.duckdb`
+     ——建库、校验、求哈希、fsync 目录、切 `current.json`。它自己的去重判断写得是对的，
+     但跑在建库**之后**，而且结构上永远合不上：一代的身份里含 `content_sha256`（还没写出来
+     的那个文件的哈希）与 `built_at`（被问到的那一刻）。门因此挪到建库之前：
+     `current.json` 选中的那一代若正是由这一组 `source_generations`、这一组水位、
+     这个 schema 版本和这个 producer commit 建出来的，它就是答案，什么都不建。
+  4. **`signal-router.all-strategies.v1`（2 s）**每轮每源重写一次 `signal_route_source`
+     ——生产三个源，两秒三次，开盘与否都写；**`paper-broker.shadow-main.v1`（2 s）**每轮重写
+     一次 `paper_consumer_source`。两处都没有跟库里的值比过，因为语句里另一列是
+     `updated_at`，而那是本轮的时钟。两个库都是 WAL 加 `synchronous=FULL`，每一次都是真的
+     fsync；router 那次还在它自己的 `paused` 判断**之前**，所以暂停也照写。现在水位没动就
+     不写，`updated_at` 因此表示「水位上一次前进的时刻」——已核：模块外唯一的消费者是
+     `signal_router_runtime` 的排空证据，它把这一列当**上界**用（`updated_at > observed`
+     才拒），值更旧只会更容易通过；而真正路由时的那次提交仍然无条件盖章。
+  5. **`watchlist-quote.source.v1`（5 s）**算了 `content_sha256` 却从不跟任何东西比，
+     盘中每五秒发一个 spool 批、约 2880 次/天。熔断打开、退避中、节拍未到、配额耗尽、超时、
+     provider 报错这六条**根本没调 provider** 的路径也落到同一句发布上，而且它们带的是空
+     frame、事件窗口就是本轮时钟，所以按窗口找上一版永远找不中——门必须跟**最新一批**比，
+     不是跟本窗口那一条比。
+  6. **daily orchestrator（60 s）**在 run 早已成功的那一天里，仍然每分钟取三次写者租约
+     （`create_run`、`recover`、立刻返回 `None` 的那次 `advance`），每次都是一个
+     `fencing_token + 1` 的 UPDATE。fencing token 是租约计数器，不能由内容决定，复用未过期的
+     租约又会让两个持有者拿到同一个有效 token——所以改法是**不写的那一轮根本不取租约**：
+     ledger 上新增四个只读探针，逐分支对应各自的写入孪生体，租约只在探针之后取。
+
+  心跳文件模型新增四个字段说明本轮到底写没写：`generation_published`、
+  `watermark_advanced`、`batch_published`、`writer_lease_acquired`（发布投影
+  `RuntimeServiceHeartbeatProjection` 一个字段没动，快照闸不动）。
+  验收在 `tests/integration/test_route_a_idle_writers_e2e.py`：同一个真装两代 bundle 的世界，
+  每个能起来的 role 先跑三轮进入稳态、再跑六十轮，时钟按 role 自己的 manifest 间隔前进、
+  每个边界上把同伴的心跳按活着的样子改写一遍，然后逐轮比对 runtime root 下的持久状态。
+  **修前**：`runtime-health.all.v1` 六十轮写六十代（6 次/分，每次一份 generation 文档、
+  一份 publication 文档、一次 `current.json` 原子替换），`signal-router.all-strategies.v1`
+  六十轮全写（30 次/分，每次三条提交）。**修后两者都是 0。**
+
 - **开盘那二十分钟：读侧 role 不再每五分钟换代重读，停机也不再等读完（#268）**：
   09-14（周一）是二十个 runtime unit 全部常驻后的第一个交易日。09:25 副本同步拷贝 10 GB、
   `rquant-monitor` 同时启动并扫主库、四个读侧 role 打开新一代副本（其中 notifier 那一次是
