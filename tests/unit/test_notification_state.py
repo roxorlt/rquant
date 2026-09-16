@@ -534,6 +534,49 @@ def test_republishing_one_projection_content_writes_the_database_once(
     assert rows[0][1].startswith("2026-07-31T02:30:00")
 
 
+def test_an_already_published_projection_never_asks_for_the_write_lock(
+    tmp_path: Path,
+) -> None:
+    """The gate runs on the read-only connection, which is the point of it being there.
+
+    `notifier.admin.shadow.v1` shares this database with nothing, but it does share the
+    host with the 17:00 daily and the backups, and a `BEGIN IMMEDIATE` every two seconds
+    for a transaction that will find its own row and return is work for no answer. With
+    the lock held by somebody else, a republish of published content still succeeds and a
+    new content still has to wait for it -- which is how this test tells the two apart.
+    """
+
+    database = tmp_path / "notification-state.sqlite3"
+    store = NotificationStateStore(database, busy_timeout_ms=50)
+    authority = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=NOW,
+        available_at=NOW,
+        source_receipts={"market-minute": "1" * 64},
+        projections=_page_projections(),
+    )
+    store.publish_projection_authority(authority)
+    revised_at = NOW + timedelta(minutes=5)
+    revised = NotificationProjectionAuthoritySnapshot.create(
+        observed_at=revised_at,
+        available_at=revised_at,
+        source_receipts={"market-minute": "2" * 64},
+        projections=_page_projections(revised_at),
+    )
+
+    holder = sqlite3.connect(database, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        repeated = store.publish_projection_authority(authority)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.publish_projection_authority(revised)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert repeated.generation_id == authority.generation_id
+    assert not repeated.written
+
+
 def test_a_projection_authority_written_before_the_content_gate_is_still_read(
     tmp_path: Path,
 ) -> None:
