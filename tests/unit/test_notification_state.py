@@ -170,6 +170,75 @@ def test_notification_state_replicates_routed_prefix_into_owned_outbox(
     )
 
 
+def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
+    tmp_path: Path,
+) -> None:
+    """#271: the second unconditional write in the notifier's two-second loop.
+
+    The cursor row was rewritten on every `replicate` call because `updated_at` carried
+    the iteration clock, so an idle notifier dirtied a page, committed it and fsynced it
+    every two seconds with nothing to replicate. `updated_at` now says when the cursor
+    last advanced.
+    """
+
+    database = tmp_path / "notification-state.sqlite3"
+    source = _published_source(tmp_path)
+    store = NotificationStateStore(database)
+    descriptor = source.source_descriptor()
+    records = source.routed_after_global_sequence(
+        after_sequence=0,
+        through_sequence=descriptor.high_watermark,
+        limit=10,
+    )
+
+    store.replicate(descriptor, records, observed_at=NOW)
+    advanced = store.replication_cursor()
+    before = _database_stamp(database)
+    for index in range(1, 61):
+        store.replicate(descriptor, (), observed_at=NOW + timedelta(seconds=2 * index))
+    after = _database_stamp(database)
+    idle = store.replication_cursor()
+
+    assert after == before
+    assert idle == advanced
+    assert idle.updated_at == advanced.updated_at
+
+
+def _database_stamp(database: Path) -> tuple[object, ...]:
+    """Everything that moves when this database is committed to, and nothing that does not.
+
+    The `-wal` size and mtime say whether anything was committed at all --
+    `sqlite3.Connection.total_changes` counts what *one* connection did and the store
+    opens its own per call, so the file is asked instead -- and the row counts say what
+    was written. Both, because a commit that writes and then undoes a value still moves
+    the WAL, and a row replaced in place still changes no count.
+    """
+
+    wal = database.with_name(database.name + "-wal")
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        counts = tuple(
+            connection.execute(f"SELECT count(*), max(rowid) FROM {table}").fetchone()
+            for table in (
+                "notification_replication_source",
+                "signal_envelope",
+                "delivery_outbox",
+                "notification_projection_authority",
+            )
+        )
+        cursor_row = connection.execute(
+            "SELECT * FROM notification_replication_source WHERE singleton = 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    try:
+        observed = wal.stat()
+        wal_stamp: tuple[int, int] = (observed.st_size, observed.st_mtime_ns)
+    except FileNotFoundError:
+        wal_stamp = (0, 0)
+    return (wal_stamp, counts, tuple(cursor_row) if cursor_row is not None else None)
+
+
 def test_notification_state_rolls_back_signal_outbox_and_cursor_together(
     tmp_path: Path,
 ) -> None:

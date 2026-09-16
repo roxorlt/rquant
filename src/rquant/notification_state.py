@@ -693,12 +693,14 @@ class NotificationStateStore(SignalBusStore):
             row = connection.execute(
                 "SELECT * FROM notification_replication_source WHERE singleton = 1"
             ).fetchone()
+            stored_cursor: NotificationReplicationCursor | None = None
             if row is None:
                 started_after = source.first_global_sequence - 1
                 observed_high = started_after
                 last_signal_id = None
             else:
                 cursor = self._cursor_from_row(row)
+                stored_cursor = cursor
                 if cursor.source_id != self.replication_source_id:
                     raise NotificationReplicationError("notification source identity changed")
                 if cursor.source_generation_id != source.generation_id:
@@ -766,30 +768,44 @@ class NotificationStateStore(SignalBusStore):
                 raise NotificationReplicationError(
                     "notification cursor exceeds source high watermark"
                 )
-            timestamp = observed.isoformat(timespec="microseconds")
-            connection.execute(
-                """
-                INSERT INTO notification_replication_source(
-                    singleton, source_id, source_generation_id,
-                    first_global_sequence, observed_high_watermark,
-                    last_global_sequence, last_signal_id, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET
-                    observed_high_watermark = excluded.observed_high_watermark,
-                    last_global_sequence = excluded.last_global_sequence,
-                    last_signal_id = excluded.last_signal_id,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    self.replication_source_id,
-                    source.generation_id,
-                    source.first_global_sequence,
-                    max(observed_high, source.high_watermark),
-                    ended_at,
-                    last_signal_id,
-                    timestamp,
-                ),
-            )
+            high_watermark = max(observed_high, source.high_watermark)
+            #: The cursor is written only when it has somewhere to move (#271). The three
+            #: columns above are the cursor; `updated_at` was the fourth, and it is the
+            #: iteration clock, so writing the row unconditionally dirtied a page,
+            #: committed it and -- `journal_mode=WAL` with `synchronous=FULL` -- fsynced
+            #: it on every one of `notifier.admin.shadow.v1`'s two-second iterations,
+            #: whether or not a single signal had arrived. `updated_at` now says when this
+            #: cursor last advanced, which is the question anybody reading it was asking.
+            if (
+                stored_cursor is None
+                or stored_cursor.observed_high_watermark != high_watermark
+                or stored_cursor.last_global_sequence != ended_at
+                or stored_cursor.last_signal_id != last_signal_id
+            ):
+                timestamp = observed.isoformat(timespec="microseconds")
+                connection.execute(
+                    """
+                    INSERT INTO notification_replication_source(
+                        singleton, source_id, source_generation_id,
+                        first_global_sequence, observed_high_watermark,
+                        last_global_sequence, last_signal_id, updated_at
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        observed_high_watermark = excluded.observed_high_watermark,
+                        last_global_sequence = excluded.last_global_sequence,
+                        last_signal_id = excluded.last_signal_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self.replication_source_id,
+                        source.generation_id,
+                        source.first_global_sequence,
+                        high_watermark,
+                        ended_at,
+                        last_signal_id,
+                        timestamp,
+                    ),
+                )
             self._before_commit(connection)
 
         return NotificationReplicationSummary(
