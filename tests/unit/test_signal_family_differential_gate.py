@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #262's to PR #265's. It is the merge base of the
+    # main; this one moves it from PR #265's to PR #266's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "e398715e50c71ea6528c78d4cd0749e831322467"
-    assert BASELINE_TREE_SHA == "fca7f58414146885b4faccd4b2f10f73804fbf51"
+    assert BASELINE_COMMIT_SHA == "4e7685019f65e84af308bb1205eaabb3f15a7e29"
+    assert BASELINE_TREE_SHA == "ae19f793a5d0241841771f7380fef0825585cf8d"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``e398715`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``4e76850`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1508,17 +1508,19 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # the refreeze to 059d62b left it out because the read-side I/O cost topic touched no
     # workflow either, the refreeze to 1025b12 left it out because the notifier pointer
     # lineage topic touched no workflow either, the refreeze to 7947eae left it out because
-    # the weekend small-fix topic touched no workflow either, and this refreeze to e398715
-    # leaves it out on the same reading: the router runner peer-wait topic adds no module
-    # under src/rquant/ and changes four, adds one integration file and touches four unit
-    # files, changes nothing under scripts/, marks nothing ``linux_exact``, adds no job, and
+    # the weekend small-fix topic touched no workflow either, the refreeze to e398715 left
+    # it out because the router runner peer-wait topic touched no workflow either, and this
+    # refreeze to 4e76850 leaves it out on the same reading: the open-time I/O interference
+    # topic adds one module under src/rquant/ (runtime_read_interrupt.py) and changes
+    # eleven, adds two test files and touches ten existing ones including tests/conftest.py,
+    # changes nothing under scripts/, marks nothing ``linux_exact``, adds no job, and
     # does not touch .github/workflows/ci.yml. It does regenerate the shard manifest, which
     # is a test artifact and not that workflow - and it leaves the frozen source-broker
     # boundary alone, because it touches none of the nine modules that manifest collects;
     # the matrix in the workflow is unchanged at five shards, so the one thing that has ever
     # made this path true has not happened.
-    # That is ten refreezes in a row without a flip. A named path would have flipped truth
-    # value nine times in twenty-two refreezes: naming one
+    # That is eleven refreezes in a row without a flip. A named path would have flipped truth
+    # value nine times in twenty-three refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted
