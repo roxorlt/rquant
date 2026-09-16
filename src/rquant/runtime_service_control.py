@@ -83,6 +83,18 @@ class RuntimeStepResult(RuntimeContractModel):
     #: Whether this iteration saw a newer generation and kept the previous answer because
     #: this role's read profile would not let it open one yet (#268).
     replica_skipped_by_floor: bool | None = None
+    #: Whether this iteration actually published a new serving generation. `None` for the
+    #: roles that publish none (#271).
+    generation_published: bool | None = None
+    #: Whether this iteration actually moved a source watermark forward. `None` for the
+    #: roles that hold no watermark (#271).
+    watermark_advanced: bool | None = None
+    #: Whether this iteration actually published a spool batch. `None` for the roles that
+    #: publish none (#271).
+    batch_published: bool | None = None
+    #: Whether this iteration actually took the daily writer lease, which is one fencing
+    #: token per acquisition. `None` for every role but the daily orchestrator (#271).
+    writer_lease_acquired: bool | None = None
 
     @field_validator("source_generations")
     @classmethod
@@ -182,6 +194,24 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: for an iteration that never asked. A *file* field, for the reason
     #: `generation_events` gives above.
     replica_skipped_by_floor: bool | None = None
+    #: Whether this iteration published a new serving generation, moved a watermark,
+    #: published a spool batch, or took the daily writer lease. Until v0.33.14 four roles
+    #: answered "every iteration" to one of these whatever they were given to do, because
+    #: the thing being compared carried the loop's own clock: `runtime-health.all.v1` and
+    #: `lab-jobs.serving.v1` hashed the observation instant into their generation id, so
+    #: `serving.publisher.v1` rebuilt a whole `serving.duckdb` every thirty seconds;
+    #: `signal-router.all-strategies.v1` and `paper-broker.shadow-main.v1` rewrote a
+    #: watermark row whose `updated_at` was that clock; `watchlist-quote.source.v1`
+    #: published a spool batch with no content gate at all; and the daily orchestrator
+    #: bumped a fencing token three times a minute with no run to advance (#271). `False`
+    #: is now the ordinary answer and a `True` is a real change, which is what makes these
+    #: worth fields rather than log lines. `None` for the roles that do none of it, and
+    #: for an iteration that failed before it could say. All four are *file* fields, for
+    #: the reason `generation_events` gives above.
+    generation_published: bool | None = None
+    watermark_advanced: bool | None = None
+    batch_published: bool | None = None
+    writer_lease_acquired: bool | None = None
 
     @field_validator("failure_kind")
     @classmethod
@@ -673,6 +703,10 @@ class RuntimeServiceControl:
                 replica_opened=result.replica_opened,
                 replica_read_bytes=result.replica_read_bytes,
                 replica_skipped_by_floor=result.replica_skipped_by_floor,
+                generation_published=result.generation_published,
+                watermark_advanced=result.watermark_advanced,
+                batch_published=result.batch_published,
+                writer_lease_acquired=result.writer_lease_acquired,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -708,6 +742,13 @@ class RuntimeServiceControl:
                 replica_opened=opened,
                 replica_read_bytes=read_bytes,
                 replica_skipped_by_floor=replica_skipped_by_floor,
+                #: An iteration that raised cannot say what it wrote, and the previous
+                #: iteration's answer is not this one's -- the same rule the replica
+                #: fields above follow (#260).
+                generation_published=None,
+                watermark_advanced=None,
+                batch_published=None,
+                writer_lease_acquired=None,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
