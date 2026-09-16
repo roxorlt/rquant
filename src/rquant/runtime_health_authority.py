@@ -21,7 +21,7 @@ from rquant.runtime_service_control import (
     project_heartbeat,
 )
 from rquant.runtime_serving_authority import (
-    ServingSourceAuthorityPointer,
+    ServingSourceAuthorityPublication,
     ServingSourceAuthorityPublisher,
 )
 from rquant.runtime_serving_snapshot import (
@@ -588,6 +588,125 @@ class RuntimeHealthSourceReader:
         return SourceReadResult.model_validate(values)
 
 
+#: What a runtime-health read says about *when* it looked, rather than about what it
+#: found. Every one of these moves on every iteration on a perfectly healthy host: the
+#: reader stamps its own clock into four places, and the twenty heartbeats it reads carry
+#: a clock, a duration window and five counters that advance whether or not anything
+#: happened. Hashing them into the generation id made `runtime-health.all.v1` publish a
+#: new generation every ten seconds forever, which is what kept `serving.publisher.v1`
+#: rebuilding a whole `serving.duckdb` every thirty (#271).
+_HEALTH_OBSERVATION_FIELDS = ("sequence", "event_time", "published_at", "generation_id")
+_HEALTH_PAYLOAD_OBSERVATION_FIELDS = (
+    "dashboard_summary_observed_at",
+    "dashboard_summary_generation_id",
+    #: A per-source receipt hashes the whole heartbeat document plus `observed_at`.
+    "dashboard_summary_source_receipts",
+    #: Both are measurements of the moment, not of the host: the backlog age is
+    #: `observed_at - last_success_at` and the latency is the rolling p95 of the last few
+    #: iterations. `live_healthy`, which is derived from status and staleness, stays.
+    "live_backlog_age_seconds",
+    "live_p95_latency_seconds",
+)
+#: The test for this list is one question, asked of each field: **does it move on an
+#: iteration that changed nothing?** A field that does is a measurement of the moment the
+#: reader looked, and hashing it into the generation id is what made this role publish
+#: 8640 generations a day. A field that does not is evidence, and it stays -- even though
+#: it moves often on a busy host, because moving when work happens is the whole point.
+#:
+#: So `backlog_count` and `processed_count` are **in** the identity: an idle role reports
+#: zero for both, and a backlog climbing 0 -> 3000 is exactly the kind of change this
+#: dataset exists to show. Both are columns of serving's `runtime_services` table.
+#:
+#: Three kinds of field are out:
+#:
+#: 1. **Another role's cursor, and what it is reading.** `input_sequence`,
+#:    `output_sequence` and `source_generations` describe a *peer's* progress, and this
+#:    role watches twenty-four of them -- so putting them in the identity makes health's
+#:    quiet depend on twenty-four other loops being quiet in a way none of them promises.
+#:    Two of them are not: `artifact-retention.primary.v1` hashes its own clock into its
+#:    `source_generations` every iteration, and `artifact-catalog.primary.v1` advances its
+#:    scan cursor on every step even over an unchanged tree. Coupling to them costs ~288
+#:    health generations a day and a `serving.duckdb` rebuild behind each one -- the very
+#:    defect this package exists to remove, re-imported through the back door. A peer's
+#:    cursor is the peer's business; health publishes when a peer's *status*, error,
+#:    backlog or processed count moves.
+#: 2. **How many times the same thing happened again.** `consecutive_failures`,
+#:    `total_failures` and `total_successes` are tallies, not states. The *transition*
+#:    into failure still publishes -- `status` flips to DEGRADED, and `last_error` and
+#:    `degraded_reasons` are in the identity -- but the eleventh identical failure is the
+#:    same state as the tenth. Keeping them would mean that a role failing every two
+#:    seconds republishes health every ten and rebuilds `serving.duckdb` every thirty, for
+#:    as long as the incident lasts; 2026-09-09 was two roles doing exactly that on a host
+#:    already at load 11-12, which is the storm this package exists to stop.
+#: 3. **Pure measurement of the instant.** `heartbeat_at` and `last_success_at` are the
+#:    clock; the three duration fields are the loop's own latency. `total_successes`
+#:    belongs here too -- it increments on every successful iteration, idle ones included,
+#:    so it can never be in the identity of a gate that is meant to be quiet when idle.
+_HEARTBEAT_OBSERVATION_FIELDS = (
+    "heartbeat_at",
+    "last_success_at",
+    "input_sequence",
+    "output_sequence",
+    "source_generations",
+    "consecutive_failures",
+    "total_failures",
+    "total_successes",
+    "last_step_duration_seconds",
+    "p95_step_duration_seconds",
+    "recent_step_durations_seconds",
+)
+_DASHBOARD_ROW_OBSERVATION_FIELDS = ("monitor_last_at", "daily_last_at")
+
+
+def runtime_health_state_identity(result: SourceReadResult) -> str:
+    """Name what a runtime-health read *found*, with the instant it looked taken out.
+
+    What survives is the service set and, per service, its plane, whether the heartbeat
+    could be read at all, the status, the staleness verdict, the run and spec identity it
+    is running under, its degraded reasons, its last error, and how much work it did and
+    has waiting -- everything a reader of this dataset acts on. What is dropped is the
+    answer to "when did you look", "how many times did that happen again", and "where has
+    some other role got to"; the note on `_HEARTBEAT_OBSERVATION_FIELDS` above works
+    through it field by field.
+
+    Staleness is the reason this cannot simply be "drop the publisher's own clock": a
+    service that stops heartbeating is detected by comparing a real `now` against a
+    heartbeat that stopped moving, so the read has to keep using a real clock -- and the
+    verdict it produces, `stale`, is in the identity, so a death still publishes exactly
+    one generation.
+
+    Never persisted: it is computed on both sides of one comparison by this same
+    function, so its shape is free to change and a rollback reads every generation this
+    code published.
+    """
+
+    state = result.model_dump(mode="json")
+    for name in _HEALTH_OBSERVATION_FIELDS:
+        state.pop(name, None)
+    payload = state.get("payload")
+    if isinstance(payload, dict):
+        for name in _HEALTH_PAYLOAD_OBSERVATION_FIELDS:
+            payload.pop(name, None)
+        for service in payload.get("runtime_services") or ():
+            if not isinstance(service, dict):
+                continue
+            service.pop("observed_at", None)
+            heartbeat = service.get("heartbeat")
+            if isinstance(heartbeat, dict):
+                for name in _HEARTBEAT_OBSERVATION_FIELDS:
+                    heartbeat.pop(name, None)
+        for projection in payload.get("projections") or ():
+            if not isinstance(projection, dict):
+                continue
+            projection.pop("available_at", None)
+            for row in projection.get("rows") or ():
+                if not isinstance(row, dict):
+                    continue
+                for name in _DASHBOARD_ROW_OBSERVATION_FIELDS:
+                    row.pop(name, None)
+    return canonical_sha256({"contract": "runtime-health-state/v1", "state": state})
+
+
 class RuntimeHealthAuthorityPublisher:
     """Publish one verified runtime-health read through the generic source authority."""
 
@@ -608,8 +727,11 @@ class RuntimeHealthAuthorityPublisher:
         self.reader = reader
         self.publisher = publisher
 
-    def publish(self, observed_at: datetime) -> ServingSourceAuthorityPointer:
-        return self.publisher.publish(self.reader(observed_at))
+    def publish(self, observed_at: datetime) -> ServingSourceAuthorityPublication:
+        return self.publisher.publish_if_changed(
+            self.reader(observed_at),
+            unchanged_identity=runtime_health_state_identity,
+        )
 
 
 __all__ = [
@@ -617,4 +739,5 @@ __all__ = [
     "RuntimeHealthAuthorityPublisher",
     "RuntimeHealthControlSource",
     "RuntimeHealthSourceReader",
+    "runtime_health_state_identity",
 ]

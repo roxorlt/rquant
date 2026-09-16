@@ -1163,6 +1163,56 @@ def test_whether_the_projection_was_written_is_a_file_field_too(tmp_path: Path) 
     control.stop(reason="done")
 
 
+def test_whether_this_iteration_wrote_anything_is_four_file_fields(tmp_path: Path) -> None:
+    """#237's line once more, for the four fields #271 adds, and what they carry.
+
+    `False` is the ordinary answer for all four. A `True` is a real change: a new serving
+    generation, a watermark that moved, a spool batch with new content, a fencing token
+    taken because there was a run to advance. Before #271 four roles answered `True` on
+    every iteration whatever they were handed, because the thing each compared carried
+    the loop's own clock rather than the content.
+    """
+
+    written = (
+        "generation_published",
+        "watermark_advanced",
+        "batch_published",
+        "writer_lease_acquired",
+    )
+    for name in written:
+        assert name in RuntimeServiceHeartbeat.model_fields
+        assert name not in RuntimeServiceHeartbeatProjection.model_fields
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    silent = control.record_success(RuntimeStepResult())
+    idle = control.record_success(
+        RuntimeStepResult(
+            generation_published=False,
+            watermark_advanced=False,
+            batch_published=False,
+            writer_lease_acquired=False,
+        )
+    )
+    wrote = control.record_success(
+        RuntimeStepResult(
+            generation_published=True,
+            watermark_advanced=True,
+            batch_published=True,
+            writer_lease_acquired=True,
+        )
+    )
+    failed = control.record_failure(RuntimeError("the serving authority refused"))
+
+    for name in written:
+        assert getattr(silent, name) is None
+        assert getattr(idle, name) is False
+        assert getattr(wrote, name) is True
+        # An iteration that raised cannot say, and the previous one's answer is not its own.
+        assert getattr(failed, name) is None
+    control.stop(reason="done")
+
+
 def test_the_loop_takes_the_failed_iterations_floor_off_the_step(tmp_path: Path) -> None:
     """Same wiring as the replica cost, and the same "cannot say" rules."""
 

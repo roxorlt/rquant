@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import itertools
 import json
 import multiprocessing
 import os
@@ -67,6 +69,22 @@ def _record_spawn_loader_start() -> pd.DataFrame:
             }
         ]
     )
+
+
+def _advancing_clock(
+    start: datetime,
+    step: timedelta = timedelta(seconds=1),
+) -> Callable[[], datetime]:
+    ticks = itertools.count()
+    return lambda: start + step * next(ticks)
+
+
+def _spool_snapshot(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def _gateway(
@@ -1176,3 +1194,188 @@ def test_capture_lock_serializes_multiple_gateway_processes(tmp_path: Path) -> N
     assert len(calls) == 1
     spool = LiveBatchSpool(tmp_path / "spool")
     assert len(spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1)) == 1
+
+
+def test_sixty_idle_circuit_open_iterations_publish_one_batch(tmp_path: Path) -> None:
+    calls = 0
+
+    def failing_provider(_codes: tuple[str, ...], *, timeout_seconds: float) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        raise TimeoutError(f"timed out after {timeout_seconds}")
+
+    gateway = _gateway(
+        tmp_path,
+        failing_provider,
+        clock=_advancing_clock(NOW + timedelta(minutes=10)),
+        failure_threshold=1,
+        circuit_cooldown_seconds=900,
+    )
+    root = gateway.spool.root
+
+    gateway.capture_once(
+        codes=("600000.SH",),
+        scheduled_at=NOW,
+        universe_as_of=NOW,
+        trade_date=NOW.date(),
+    )
+
+    captures = []
+    snapshots = []
+    watermarks = []
+    for offset in range(1, 61):
+        captures.append(
+            gateway.capture_once(
+                codes=("600000.SH",),
+                scheduled_at=NOW + timedelta(seconds=offset),
+                universe_as_of=NOW,
+                trade_date=NOW.date(),
+            )
+        )
+        snapshots.append(_spool_snapshot(root))
+        watermarks.append(
+            gateway.spool.source_descriptor(LiveChannel.WATCHLIST_QUOTE).model_dump(mode="json")
+        )
+
+    assert calls == 1
+    assert [capture.published for capture in captures] == [True] + [False] * 59
+    assert {capture.pointer.sequence for capture in captures} == {1}
+    records = gateway.spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1)
+    assert [record.envelope.degraded_reasons for record in records] == [
+        ("provider_timeout",),
+        ("circuit_open",),
+    ]
+    assert snapshots == [snapshots[0]] * 60
+    assert watermarks == [watermarks[0]] * 60
+
+
+def test_returning_quotes_publish_exactly_one_new_batch_after_idle_iterations(
+    tmp_path: Path,
+) -> None:
+    prices = iter((10.1, 11.3))
+    calls = 0
+
+    def provider(_codes: tuple[str, ...], *, timeout_seconds: float) -> pd.DataFrame:
+        nonlocal calls
+        del timeout_seconds
+        calls += 1
+        frame = _quotes()
+        frame["price"] = next(prices)
+        return frame
+
+    gateway = _gateway(
+        tmp_path,
+        provider,
+        clock=_advancing_clock(NOW + timedelta(minutes=10)),
+        minimum_cadence_seconds=5,
+    )
+
+    captures = [
+        gateway.capture_once(
+            codes=("600000.SH",),
+            scheduled_at=NOW + timedelta(seconds=offset),
+            universe_as_of=NOW,
+            trade_date=NOW.date(),
+        )
+        for offset in range(5)
+    ]
+
+    assert calls == 2
+    assert [capture.published for capture in captures] == [True, True, False, False, True]
+    records = gateway.spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1)
+    assert [record.envelope.row_count for record in records] == [1, 0, 1]
+    assert records[0].envelope.content_sha256 != records[2].envelope.content_sha256
+    assert records[2].envelope.revises_batch_id == records[0].envelope.batch_id
+    assert records[2].envelope.revision == 2
+
+
+def test_degraded_reasons_change_alone_publishes_exactly_one_new_batch(tmp_path: Path) -> None:
+    def failing_provider(_codes: tuple[str, ...], *, timeout_seconds: float) -> pd.DataFrame:
+        raise TimeoutError(f"timed out after {timeout_seconds}")
+
+    gateway = _gateway(
+        tmp_path,
+        failing_provider,
+        clock=_advancing_clock(NOW + timedelta(minutes=10)),
+        failure_threshold=1,
+        circuit_cooldown_seconds=900,
+    )
+
+    captures = [
+        gateway.capture_once(
+            codes=("600000.SH",),
+            scheduled_at=NOW + timedelta(seconds=offset),
+            universe_as_of=NOW,
+            trade_date=NOW.date(),
+        )
+        for offset in range(4)
+    ]
+
+    assert [capture.published for capture in captures] == [True, True, False, False]
+    records = gateway.spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1)
+    assert len(records) == 2
+    assert records[0].envelope.content_sha256 == records[1].envelope.content_sha256
+    assert {record.envelope.quality_status for record in records} == {BatchQualityStatus.STALE}
+    assert [record.envelope.degraded_reasons for record in records] == [
+        ("provider_timeout",),
+        ("circuit_open",),
+    ]
+
+
+def test_quality_status_change_alone_publishes_exactly_one_new_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_provider(_codes: tuple[str, ...], *, timeout_seconds: float) -> pd.DataFrame:
+        raise TimeoutError(f"timed out after {timeout_seconds}")
+
+    gateway = _gateway(
+        tmp_path,
+        failing_provider,
+        clock=_advancing_clock(NOW + timedelta(minutes=10)),
+        failure_threshold=1,
+        circuit_cooldown_seconds=900,
+    )
+    qualities = iter(
+        (
+            BatchQualityStatus.STALE,
+            BatchQualityStatus.STALE,
+            BatchQualityStatus.DEGRADED,
+            BatchQualityStatus.DEGRADED,
+        )
+    )
+
+    def only_quality_moves(
+        _self: WatchlistQuoteGateway,
+        *,
+        quality: BatchQualityStatus,
+        reasons: tuple[str, ...],
+        event_end: datetime,
+    ) -> tuple[BatchQualityStatus, tuple[str, ...]]:
+        del quality, reasons, event_end
+        return next(qualities), ("circuit_open",)
+
+    monkeypatch.setattr(WatchlistQuoteGateway, "_classify_lateness", only_quality_moves)
+
+    captures = [
+        gateway.capture_once(
+            codes=("600000.SH",),
+            scheduled_at=NOW + timedelta(seconds=offset),
+            universe_as_of=NOW,
+            trade_date=NOW.date(),
+        )
+        for offset in range(4)
+    ]
+
+    assert [capture.published for capture in captures] == [True, False, True, False]
+    records = gateway.spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1)
+    assert len(records) == 2
+    assert records[0].envelope.content_sha256 == records[1].envelope.content_sha256
+    assert [record.envelope.degraded_reasons for record in records] == [
+        ("circuit_open",),
+        ("circuit_open",),
+    ]
+    assert [record.envelope.quality_status for record in records] == [
+        BatchQualityStatus.STALE,
+        BatchQualityStatus.DEGRADED,
+    ]

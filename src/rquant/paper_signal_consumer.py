@@ -110,6 +110,17 @@ class PaperSignalConsumerSummary(RuntimeContractModel):
     delegated_count: int = Field(ge=0)
     replayed_count: int = Field(ge=0)
     has_deferred_signals: bool
+    #: Whether this pass actually moved `paper_consumer_source.observed_high_watermark`.
+    #: `False` is the ordinary answer: the source stands still for most of the day and the
+    #: consumer looks at it every two seconds (#271).
+    watermark_advanced: bool
+
+
+class PaperSourceObservation(RuntimeContractModel):
+    """What one `observe_source` call did, beside handing back the cursor (#271)."""
+
+    cursor: PaperSignalConsumerCursor
+    watermark_advanced: bool
 
 
 class _BindResult(RuntimeContractModel):
@@ -263,8 +274,9 @@ class PaperSignalConsumerStateStore:
         descriptor: SignalBusSourceDescriptor,
         *,
         observed_at: datetime,
-    ) -> PaperSignalConsumerCursor:
+    ) -> PaperSourceObservation:
         observed = normalize_aware_utc(observed_at)
+        watermark_advanced = True
         with self._write_transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM paper_consumer_source WHERE singleton = 1"
@@ -298,15 +310,29 @@ class PaperSignalConsumerStateStore:
                     raise PaperSignalConsumerSourceError(
                         "signal source high watermark precedes the consumer cursor"
                     )
-                connection.execute(
-                    """
-                    UPDATE paper_consumer_source
-                    SET observed_high_watermark = ?, updated_at = ?
-                    WHERE singleton = 1
-                    """,
-                    (descriptor.high_watermark, observed.isoformat()),
+                # Both verifications above still run on every pass. Only the write is
+                # gated: this UPDATE sets the watermark and `updated_at`, and
+                # `updated_at` is the consumer's own loop clock -- so an unchanged
+                # watermark rewrote the row anyway, once every two seconds on a
+                # `journal_mode=WAL`, `synchronous=FULL` database, which is a real fsync
+                # each time (#271). The rollback check above leaves only `>=`, so `!=`
+                # here is `>`: the source grew.
+                watermark_advanced = descriptor.high_watermark != int(
+                    row["observed_high_watermark"]
                 )
-        return self.cursor()
+                if watermark_advanced:
+                    connection.execute(
+                        """
+                        UPDATE paper_consumer_source
+                        SET observed_high_watermark = ?, updated_at = ?
+                        WHERE singleton = 1
+                        """,
+                        (descriptor.high_watermark, observed.isoformat()),
+                    )
+        return PaperSourceObservation(
+            cursor=self.cursor(),
+            watermark_advanced=watermark_advanced,
+        )
 
     @staticmethod
     def _verify_source_row(
@@ -570,7 +596,8 @@ def consume_signal_bus_to_paper(
             signal,
             operation="consume_signal_bus_to_paper",
         )
-    starting_cursor = state.observe_source(descriptor, observed_at=observed)
+    observation = state.observe_source(descriptor, observed_at=observed)
+    starting_cursor = observation.cursor
 
     delegated_count = 0
     replayed_count = 0
@@ -606,4 +633,5 @@ def consume_signal_bus_to_paper(
         delegated_count=delegated_count,
         replayed_count=replayed_count,
         has_deferred_signals=(ending_cursor.last_global_sequence < descriptor.high_watermark),
+        watermark_advanced=observation.watermark_advanced,
     )

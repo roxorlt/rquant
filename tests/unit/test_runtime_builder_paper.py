@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -476,3 +477,149 @@ def test_paper_role_settings_reject_cross_role_storage_and_cost_fields(
             quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
             trade_date_resolver=lambda _now: NOW.date(),
         )(broker)
+
+
+# ---------------------------------------------------------------------------------------
+# #271: what the paper roles' heartbeat says about the watermark row they hold
+# ---------------------------------------------------------------------------------------
+
+
+def _second_signal() -> SignalEnvelope:
+    """A second, distinct envelope — the signal id is derived, so `model_copy` cannot make one."""
+
+    return SignalEnvelope(
+        schema_version=1,
+        strategy_id="n-shape",
+        strategy_version="1",
+        parameter_fingerprint="f" * 64,
+        dataset_snapshot_id="c" * 64,
+        feature_snapshot_id="d" * 64,
+        event_time=NOW - timedelta(seconds=5),
+        available_at=NOW,
+        candidate_id="600001.SH",
+        action=SignalAction.B_INTENT,
+        reason_codes=("paper-runtime",),
+        evidence={},
+        expires_at=NOW + timedelta(minutes=5),
+        producer_commit="e" * 40,
+    )
+
+
+def _quote_resolver(at: datetime) -> Callable[[SignalEnvelope, datetime], PaperQuoteSnapshot]:
+    def resolve(_signal: SignalEnvelope, _now: datetime) -> PaperQuoteSnapshot:
+        return PaperQuoteSnapshot(
+            ts_code="600000.SH",
+            event_time=at,
+            available_at=at,
+            context=BrokerExecutionContext(
+                executable_price=Decimal("10.00"),
+                instrument_context=paper_instrument_context(),
+                acquisition_available_date=date(2026, 8, 3),
+            ),
+            producer_commit=COMMIT,
+        )
+
+    return resolve
+
+
+def test_the_paper_consumer_says_whether_this_iteration_moved_a_watermark(
+    tmp_path: Path,
+) -> None:
+    """`False` on an idle iteration, `True` on the one where the bus actually grew."""
+
+    bus = SignalBusStore(tmp_path / "bus.sqlite3")
+    bus.ingest(_signal(), received_at=NOW)
+    clock = NOW
+    step = paper_consumer_builder(clock=lambda: clock)(
+        _manifest(tmp_path, RuntimeServiceKind.PAPER_CONSUMER)
+    )
+
+    first = step()
+    idle = []
+    for index in range(3):
+        clock = NOW + timedelta(seconds=2 * (index + 1))
+        idle.append(step())
+    bus.ingest(_second_signal(), received_at=NOW + timedelta(seconds=8))
+    clock = NOW + timedelta(seconds=8)
+    grown = step()
+
+    assert first.watermark_advanced is True
+    assert [result.watermark_advanced for result in idle] == [False, False, False]
+    assert [result.processed_count for result in idle] == [0, 0, 0]
+    assert grown.watermark_advanced is True
+    assert grown.processed_count == 1
+
+
+def test_a_paused_paper_consumer_moved_no_watermark(tmp_path: Path) -> None:
+    """A paused consumer never observes the source, so there is nothing to have moved."""
+
+    bus = SignalBusStore(tmp_path / "bus.sqlite3")
+    bus.ingest(_signal(), received_at=NOW)
+    manifest = _manifest(tmp_path, RuntimeServiceKind.PAPER_CONSUMER)
+    manifest = manifest.model_copy(
+        update={
+            "settings": {
+                **manifest.model_dump(mode="json")["settings"],
+                "paused": True,
+            }
+        }
+    )
+
+    result = paper_consumer_builder(clock=lambda: NOW)(manifest)()
+
+    assert result.degraded_reasons == ("paper_consumer:paused",)
+    assert result.watermark_advanced is False
+
+
+def test_the_paper_broker_says_whether_this_iteration_moved_a_watermark(
+    tmp_path: Path,
+) -> None:
+    """The production role: `paper-broker.shadow-main.v1`, on its two-second loop.
+
+    Before #271 its `observe_source` rewrote `paper_consumer_source` on every iteration,
+    because the row's `updated_at` was the loop's own clock — one fsync every two seconds
+    on a `journal_mode=WAL`, `synchronous=FULL` database, whatever the spool was doing.
+    """
+
+    _publish_signal(tmp_path)
+    execution_time = NOW + timedelta(minutes=1)
+    clock = execution_time
+    step = paper_broker_builder(
+        clock=lambda: clock,
+        quote_resolver=_quote_resolver(execution_time),
+        trade_date_resolver=lambda _now: date(2026, 7, 31),
+    )(_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER))
+
+    first = step()
+    idle = []
+    for index in range(3):
+        clock = execution_time + timedelta(seconds=2 * (index + 1))
+        idle.append(step())
+
+    assert first.watermark_advanced is True
+    assert first.processed_count == 1
+    assert [result.watermark_advanced for result in idle] == [False, False, False]
+    assert [result.processed_count for result in idle] == [0, 0, 0]
+
+
+def test_a_paused_paper_broker_moved_no_watermark(tmp_path: Path) -> None:
+    """A paused broker never observes the spool source either."""
+
+    _publish_signal(tmp_path)
+    manifest = _manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER)
+    manifest = RuntimeServiceManifest(
+        **{
+            **manifest.model_dump(mode="json"),
+            "settings": {**_broker_settings(tmp_path), "paused": True},
+        }
+    )
+    step = paper_broker_builder(
+        clock=lambda: NOW,
+        quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
+        trade_date_resolver=lambda _now: date(2026, 7, 31),
+    )(manifest)
+
+    result = step()
+
+    assert result.degraded_reasons == ("paper_broker:paused",)
+    assert result.watermark_advanced is False

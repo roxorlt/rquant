@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import subprocess
 import sys
@@ -118,6 +119,32 @@ class _UniverseAdapter:
                 for code in codes
             ]
         )
+
+
+def _advancing_clock(
+    start: datetime,
+    step: timedelta = timedelta(seconds=1),
+) -> Callable[[], datetime]:
+    ticks = itertools.count()
+    return lambda: start + step * next(ticks)
+
+
+def _watchlist_manifest(tmp_path: Path, **settings: object) -> RuntimeServiceManifest:
+    return RuntimeServiceManifest(
+        service_id="watchlist-quote.source.v1",
+        service_kind=RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=30,
+        producer_commit=COMMIT,
+        settings={
+            "spool_root": str(tmp_path / "watchlist-quote"),
+            "quota_path": str(tmp_path / "watchlist-quote" / "quota.sqlite3"),
+            "quota_units_per_window": 120,
+            "producer_version": "watchlist-quote-source-v1",
+            **settings,
+        },
+    )
 
 
 def _manifest(tmp_path: Path) -> RuntimeServiceManifest:
@@ -1269,3 +1296,96 @@ def test_default_adapter_factory_does_not_fall_back_to_global_backup_setting(
 def test_default_adapter_factory_requires_source_capability() -> None:
     with pytest.raises(RuntimeError, match="TUSHARE_TOKEN_MAIN"):
         builtin_module._default_adapter_factory({})
+
+
+def test_watchlist_quote_step_reports_batch_published_only_when_a_batch_is_written(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    clock = _advancing_clock(NOW)
+
+    def provider(
+        codes: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        on_started: Callable[[datetime], None],
+    ) -> pd.DataFrame:
+        del timeout_seconds
+        calls.append(codes)
+        on_started(clock())
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": code,
+                    "price": 10.1,
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.9,
+                    "volume": 1_000.0,
+                    "amount": 10_100.0,
+                }
+                for code in codes
+            ]
+        )
+
+    step = watchlist_quote_source_builder(
+        provider_factory=lambda: provider,
+        universe_loader=lambda: ["600000.SH"],
+        clock=clock,
+    )(_watchlist_manifest(tmp_path, minimum_cadence_seconds=60))
+
+    results = [step() for _ in range(4)]
+
+    assert calls == [("600000.SH",)]
+    assert [result.batch_published for result in results] == [True, True, False, False]
+    assert [result.processed_count for result in results] == [1, 1, 0, 0]
+    assert [result.output_sequence for result in results] == [0, 1, 1, 1]
+    spool = LiveBatchSpool(tmp_path / "watchlist-quote")
+    records = spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1)
+    assert [record.envelope.degraded_reasons for record in records] == [(), ("cadence_active",)]
+
+
+def test_watchlist_quote_step_outside_the_session_reports_no_batch_published(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def provider(
+        codes: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        on_started: Callable[[datetime], None],
+    ) -> pd.DataFrame:
+        del timeout_seconds, on_started
+        calls.append(codes)
+        raise AssertionError("provider must not run outside the session")
+
+    calendar_path, calendar = _write_calendar(tmp_path / "calendar.json")
+    authority = _publish_candidate_authority(
+        tmp_path / "n-candidates",
+        strategy_id="n_shape",
+        strategy_version="1",
+        codes=("600000.SH",),
+    )
+    manifest = _watchlist_manifest(
+        tmp_path,
+        calendar_path=str(calendar_path),
+        calendar_expected_commit=COMMIT,
+        calendar_content_sha256=calendar.content_sha256,
+        candidate_authorities=[authority.model_dump(mode="json")],
+    )
+    lunch_break = datetime(2026, 7, 31, 4, 0, tzinfo=UTC)
+    step = watchlist_quote_source_builder(
+        provider_factory=lambda: provider,
+        universe_loader=None,
+        clock=lambda: lunch_break,
+    )(manifest)
+
+    result = step()
+
+    assert calls == []
+    assert result.batch_published is False
+    assert result.processed_count == 0
+    assert set(result.source_generations) == {"market_calendar"}
+    spool_root = tmp_path / "watchlist-quote"
+    assert not (spool_root / "watchlist_quote").exists()

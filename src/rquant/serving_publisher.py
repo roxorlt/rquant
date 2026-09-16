@@ -147,6 +147,17 @@ class _ServingRecoveryRecord(RuntimeContractModel):
     recovered_at: datetime
 
 
+class ServingPublication(RuntimeContractModel):
+    """The generation now selected, and whether this call had to build it.
+
+    `written` cannot be read off the manifest: the same `generation_id` may be the one
+    this call just published or the one it found already selected (#271).
+    """
+
+    manifest: ServingGenerationManifest
+    written: bool
+
+
 class ServingPublisher:
     """Publish isolated DuckDB generations and atomically select the current one."""
 
@@ -207,6 +218,25 @@ class ServingPublisher:
     ) -> ServingGenerationManifest:
         """Build and verify an immutable generation before switching ``current.json``."""
 
+        return self.publish_generation(
+            tables,
+            watermarks=watermarks,
+            source_generations=source_generations,
+            built_at=built_at,
+            failure_hook=failure_hook,
+        ).manifest
+
+    def publish_generation(
+        self,
+        tables: Mapping[str, pd.DataFrame],
+        *,
+        watermarks: Sequence[ServingDatasetWatermark],
+        source_generations: Mapping[str, str],
+        built_at: datetime,
+        failure_hook: FailureHook | None = None,
+    ) -> ServingPublication:
+        """Same publication, and whether it had to build a generation to do it."""
+
         with self._publish_lock():
             self._recover_incomplete_publication()
             return self._publish_locked(
@@ -225,10 +255,16 @@ class ServingPublisher:
         source_generations: Mapping[str, str],
         built_at: datetime,
         failure_hook: FailureHook | None,
-    ) -> ServingGenerationManifest:
+    ) -> ServingPublication:
 
         if set(tables) != set(self.table_specs):
             raise ValueError("tables must exactly match table_specs")
+        restated = self._generation_already_current(
+            watermarks=watermarks,
+            source_generations=source_generations,
+        )
+        if restated is not None:
+            return ServingPublication(manifest=restated, written=False)
         normalized_tables = {
             table_name: self._normalize_table(
                 table_name,
@@ -291,7 +327,7 @@ class ServingPublisher:
                 current_manifest = self._read_manifest_for_pointer(existing_pointer)
                 self._verify_generation_database(current_manifest)
                 self._ensure_receipt(existing_pointer, previous_pointer=None)
-                return current_manifest
+                return ServingPublication(manifest=current_manifest, written=False)
 
             pointer = ServingCurrentPointer(
                 generation_id=manifest.generation_id,
@@ -320,7 +356,7 @@ class ServingPublisher:
                 else:
                     self._clear_intent()
                 raise
-            return manifest
+            return ServingPublication(manifest=manifest, written=True)
         finally:
             if not finalized and candidate.exists():
                 shutil.rmtree(candidate)
@@ -511,6 +547,57 @@ class ServingPublisher:
         if not database_path.exists():
             raise ServingIntegrityError("current database is missing")
         return database_path
+
+    def _generation_already_current(
+        self,
+        *,
+        watermarks: Sequence[ServingDatasetWatermark],
+        source_generations: Mapping[str, str],
+    ) -> ServingGenerationManifest | None:
+        """The selected generation, when it was built from exactly these sources.
+
+        The gate has to be here, before the build, because the identity of a generation
+        includes `content_sha256` and `built_at` -- the hash of a DuckDB file this call
+        has not written yet, and the instant it was asked. Downstream of the build there
+        is nothing left to gate: every thirty seconds `serving.publisher.v1` wrote a whole
+        new `serving.duckdb`, fsynced its directory, and switched `current.json` to it,
+        because two of its six inputs (runtime health and lab jobs) changed their
+        generation id on every iteration and the read model carries the observation
+        instant besides (#271).
+
+        A generation id names its sources, so equal `source_generations` means equal
+        source content; the watermarks are compared as well because they are what a
+        consumer reads freshness from, and a schema version or producer commit that moved
+        means the next generation is a different artifact whatever the sources say.
+        """
+
+        pointer = self._current_pointer_if_present()
+        if pointer is None:
+            return None
+        try:
+            manifest = self._read_manifest_for_pointer(pointer)
+        except ServingIntegrityError:
+            # A `current.json` whose generation is gone or does not verify used to be
+            # healed by publishing over it, because the old check only read that manifest
+            # when the two generation ids matched -- and they could not, since `built_at`
+            # made every candidate id new. Falling through keeps exactly that.
+            return None
+        if manifest.schema_version != self.schema_version:
+            return None
+        if manifest.producer_commit != self.producer_commit:
+            return None
+        if dict(manifest.source_generations) != dict(source_generations):
+            return None
+        selected = {watermark.dataset_id: watermark for watermark in manifest.watermarks}
+        offered = {watermark.dataset_id: watermark for watermark in watermarks}
+        if selected != offered:
+            return None
+        try:
+            self._verify_generation_database(manifest)
+            self._ensure_receipt(pointer, previous_pointer=None)
+        except ServingIntegrityError:
+            return None
+        return manifest
 
     def _current_pointer_if_present(self) -> ServingCurrentPointer | None:
         if not self.current_path.exists():

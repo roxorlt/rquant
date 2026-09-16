@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -581,3 +582,191 @@ def test_publish_generation_budgets_fail_before_pointer_switch(tmp_path: Path) -
             source_generation="source-3",
         )
     assert publisher.current_manifest() == first
+
+
+def _publish_generation(
+    publisher: ServingPublisher,
+    *,
+    frame: pd.DataFrame | None = None,
+    built_at: datetime = _BUILT_AT,
+    source_generation: str = "source-1",
+):
+    # The watermark belongs to the *source's* published generation, so it does not move
+    # with this role's loop clock -- only `built_at` does.
+    return publisher.publish_generation(
+        {"signals": _signals() if frame is None else frame},
+        watermarks=(_watermark(generation_id=source_generation, built_at=_BUILT_AT),),
+        source_generations={"signals": source_generation},
+        built_at=built_at,
+    )
+
+
+def test_sixty_iterations_over_unchanged_sources_build_one_generation(tmp_path: Path) -> None:
+    """#271: the thirty-second rebuild that ran all day behind two clock-stamped inputs.
+
+    A generation's identity includes `content_sha256` and `built_at`, so the only place
+    this can be decided is before the build: by the time there is a manifest to compare,
+    the DuckDB file has been written, verified, hashed and fsynced. Production sampled
+    this role rebuilding `serving.duckdb` every thirty seconds with nothing trading.
+    """
+
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    assert first.written is True
+    generations = tmp_path / "serving" / "generations"
+    settled = {path.name for path in generations.iterdir()}
+    pointer_bytes = (tmp_path / "serving" / "current.json").read_bytes()
+
+    written = []
+    for iteration in range(1, 61):
+        built_at = _BUILT_AT + timedelta(seconds=30 * iteration)
+        publication = _publish_generation(publisher, built_at=built_at)
+        assert publication.manifest == first.manifest
+        written.append(publication.written)
+
+    assert written == [False] * 60
+    assert {path.name for path in generations.iterdir()} == settled
+    assert (tmp_path / "serving" / "current.json").read_bytes() == pointer_bytes
+
+
+def test_one_upstream_generation_change_builds_exactly_one_generation(tmp_path: Path) -> None:
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    moved = _publish_generation(
+        publisher,
+        frame=_signals(price_delta=1.0),
+        built_at=_BUILT_AT + timedelta(seconds=30),
+        source_generation="source-2",
+    )
+
+    assert moved.written is True
+    assert moved.manifest.generation_id != first.manifest.generation_id
+    assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
+
+    written = [
+        _publish_generation(
+            publisher,
+            frame=_signals(price_delta=1.0),
+            built_at=_BUILT_AT + timedelta(seconds=30 * iteration),
+            source_generation="source-2",
+        ).written
+        for iteration in range(2, 8)
+    ]
+    assert written == [False] * 6
+    assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
+
+
+def test_a_moved_producer_commit_still_builds_its_own_generation(tmp_path: Path) -> None:
+    """A release is a different artifact whatever the six sources say."""
+
+    root = tmp_path / "serving"
+    _publish_generation(_publisher(root))
+    released = ServingPublisher(
+        root,
+        producer_commit="b" * 40,
+        table_specs={"signals": ServingTableSpec(sort_keys=("trade_date", "ts_code"))},
+    )
+    publication = released.publish_generation(
+        {"signals": _signals()},
+        watermarks=(_watermark(generation_id="source-1", built_at=_BUILT_AT),),
+        source_generations={"signals": "source-1"},
+        built_at=_BUILT_AT + timedelta(seconds=30),
+    )
+    assert publication.written is True
+    assert len(tuple((root / "generations").iterdir())) == 2
+
+
+def test_a_watermark_that_moves_under_one_generation_still_builds(tmp_path: Path) -> None:
+    """Why the gate compares the watermarks and not only the source generation ids.
+
+    A generation id names its sources, so in production equal source generations mean
+    equal watermarks -- the watermark is read out of the source's own published document.
+    The comparison is here for the case where that stops being true: freshness is what a
+    consumer of `serving.duckdb` reads off these rows, and a degraded source that kept its
+    generation id must not be served as fresh.
+    """
+
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    degraded = publisher.publish_generation(
+        {"signals": _signals()},
+        watermarks=(
+            _watermark(generation_id="source-1", built_at=_BUILT_AT).model_copy(
+                update={"status": FreshnessStatus.DEGRADED, "reason": "source is behind"}
+            ),
+        ),
+        source_generations={"signals": "source-1"},
+        built_at=_BUILT_AT + timedelta(seconds=30),
+    )
+
+    assert degraded.written is True
+    assert degraded.manifest.generation_id != first.manifest.generation_id
+    assert len(tuple((tmp_path / "serving" / "generations").iterdir())) == 2
+
+
+def test_a_current_pointer_whose_generation_is_gone_is_published_over(tmp_path: Path) -> None:
+    """The rebuild gate must not turn a healable state into a permanent failure.
+
+    Before #271 the publisher only read the current manifest when its generation id
+    matched the candidate's -- which could not happen, because `built_at` made every
+    candidate id new. So a `current.json` left pointing at a generation somebody removed
+    was healed on the next publish. The gate reads that manifest on every call now, so it
+    has to fall through on exactly the failures that used to be invisible.
+    """
+
+    publisher = _publisher(tmp_path / "serving")
+    first = _publish_generation(publisher)
+    # A published generation is 0500/0400 on purpose, so removing it is what an operator
+    # or a retention sweep would have to do.
+    gone = tmp_path / "serving" / "generations" / first.manifest.generation_id
+    gone.chmod(0o700)
+    for child in gone.iterdir():
+        child.chmod(0o600)
+    shutil.rmtree(gone)
+
+    healed = _publish_generation(publisher, built_at=_BUILT_AT + timedelta(seconds=30))
+
+    assert healed.written is True
+    assert (tmp_path / "serving" / "generations" / healed.manifest.generation_id).is_dir()
+    assert publisher.current_pointer().generation_id == healed.manifest.generation_id
+
+
+def test_a_moved_schema_version_still_builds_its_own_generation(tmp_path: Path) -> None:
+    """A schema rollout can move this without moving the producer commit.
+
+    `schema_version` comes from the service manifest's settings, not from the code, so a
+    live schema rollout plan can advance it while the producer commit and all six source
+    generations stay exactly where they are. That is the one moment when this comparison
+    is the only thing left that would rebuild, and the physical tables it names are a
+    different artifact from the ones already published.
+    """
+
+    root = tmp_path / "serving"
+    first = _publish_generation(_publisher(root))
+    rolled = ServingPublisher(
+        root,
+        producer_commit=_COMMIT,
+        schema_version=2,
+        table_specs={"signals": ServingTableSpec(sort_keys=("trade_date", "ts_code"))},
+    )
+    publication = rolled.publish_generation(
+        {"signals": _signals()},
+        watermarks=(_watermark(generation_id="source-1", built_at=_BUILT_AT),),
+        source_generations={"signals": "source-1"},
+        built_at=_BUILT_AT + timedelta(seconds=30),
+    )
+
+    assert publication.written is True
+    assert publication.manifest.schema_version == 2
+    assert publication.manifest.generation_id != first.manifest.generation_id
+    assert len(tuple((root / "generations").iterdir())) == 2
+    # And the next iteration under the new schema version is quiet again.
+    assert (
+        rolled.publish_generation(
+            {"signals": _signals()},
+            watermarks=(_watermark(generation_id="source-1", built_at=_BUILT_AT),),
+            source_generations={"signals": "source-1"},
+            built_at=_BUILT_AT + timedelta(seconds=60),
+        ).written
+        is False
+    )

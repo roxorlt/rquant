@@ -735,6 +735,8 @@ def signal_router_builder(
                         "signal_route_spool": before_publish.source_generation_id,
                     },
                     degraded_reasons=("signal_router:spool_catchup",),
+                    # This return is above every bind, so no watermark was even looked at.
+                    watermark_advanced=False,
                 )
             sources: dict[str, RunnerSignalSource] = {}
             descriptors: dict[str, RouteSourceDescriptor] = {}
@@ -746,6 +748,9 @@ def signal_router_builder(
                 "signal_route_spool": before_publish.source_generation_id,
             }
             observed_at = clock()
+            #: True as soon as one source's `observed_high_watermark` actually moves this
+            #: iteration; `False` on every idle one, which is most of them (#271).
+            watermark_advanced = False
             for index, source_settings in enumerate(settings.source_settings):
                 source_id = source_settings.source_id
                 source = resolved_source_loader(source_id)
@@ -755,11 +760,12 @@ def signal_router_builder(
                     source=source,
                     after_sequence=current.last_sequence,
                 )
-                bus.bind_route_source(
+                binding = bus.bind_route_source_observed(
                     descriptor,
                     routing_policy_fingerprint=settings.routing_policy_fingerprint,
                     observed_at=observed_at,
                 )
+                watermark_advanced = watermark_advanced or binding.watermark_advanced
                 sources[source_id] = source
                 descriptors[source_id] = descriptor
                 cursor_sequences[source_id] = current.last_sequence
@@ -775,6 +781,9 @@ def signal_router_builder(
                     backlog_count=max(0, input_sequence - output_sequence),
                     source_generations=generations,
                     degraded_reasons=("signal_router:paused",),
+                    # The binds above already ran -- a paused router still observes its
+                    # sources -- so this carries what they did.
+                    watermark_advanced=watermark_advanced,
                 )
 
             remaining = settings.batch_limit
@@ -810,6 +819,11 @@ def signal_router_builder(
                         limit=1,
                     )
                     processed = summary.last_sequence - summary.started_after_sequence
+                    # `route_runner_signals` binds the source again from its own frozen
+                    # descriptor, so a source that grew between the bind above and this
+                    # read moves the watermark row in there instead of here.
+                    if summary.source_high_watermark > previous_high_watermark:
+                        watermark_advanced = True
                     input_sequence += summary.source_high_watermark - previous_high_watermark
                     descriptors[source_id] = descriptors[source_id].model_copy(
                         update={"high_watermark": summary.source_high_watermark}
@@ -844,6 +858,7 @@ def signal_router_builder(
                     if published.published_high_watermark < published.source_high_watermark
                     else ()
                 ),
+                watermark_advanced=watermark_advanced,
             )
 
         return step

@@ -205,6 +205,8 @@ def paper_consumer_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBu
                     backlog_count=(descriptor.high_watermark - cursor.last_global_sequence),
                     source_generations={"signal_bus": descriptor.generation_id},
                     degraded_reasons=("paper_consumer:paused",),
+                    # A paused consumer never observes the source, so nothing moved.
+                    watermark_advanced=False,
                 )
             summary = consume_signal_bus_to_paper(
                 bus,
@@ -222,6 +224,7 @@ def paper_consumer_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBu
                     summary.source_high_watermark - summary.ended_at_sequence,
                 ),
                 source_generations={"signal_bus": summary.source_generation_id},
+                watermark_advanced=summary.watermark_advanced,
             )
 
         return step
@@ -387,6 +390,8 @@ def paper_broker_builder(
                         ),
                     },
                     degraded_reasons=("paper_broker:paused",),
+                    # A paused broker never observes the spool source, so nothing moved.
+                    watermark_advanced=False,
                 )
             consumed = consume_signal_bus_to_paper(
                 source,
@@ -423,6 +428,7 @@ def paper_broker_builder(
                     ),
                 },
                 degraded_reasons=("paper_execution_failed",) if failures else (),
+                watermark_advanced=consumed.watermark_advanced,
             )
 
         return step

@@ -231,6 +231,20 @@ class SignalRouteCursor(RuntimeContractModel):
     updated_at: AwareUtcDatetime | None = None
 
 
+class RouteSourceBinding(RuntimeContractModel):
+    """What one `bind_route_source` call did, beside handing back the cursor.
+
+    `watermark_advanced` is `True` only when the call actually moved
+    `signal_route_source.observed_high_watermark` -- a first bind, a generation rotation,
+    or a source that grew since the previous iteration. A router with nothing to do binds
+    the same watermark it bound two seconds ago and writes nothing, so `False` is the
+    ordinary answer outside a session (#271).
+    """
+
+    cursor: SignalRouteCursor
+    watermark_advanced: bool
+
+
 class SignalRouteReceipt(RuntimeContractModel):
     source_id: str = Field(min_length=1)
     source_sequence: int = Field(ge=1)
@@ -1284,14 +1298,35 @@ class SignalBusStore:
         routing_policy_fingerprint: str,
         observed_at: datetime,
     ) -> SignalRouteCursor:
+        return self.bind_route_source_observed(
+            descriptor,
+            routing_policy_fingerprint=routing_policy_fingerprint,
+            observed_at=observed_at,
+        ).cursor
+
+    def bind_route_source_observed(
+        self,
+        descriptor: RouteSourceDescriptor,
+        *,
+        routing_policy_fingerprint: str,
+        observed_at: datetime,
+    ) -> RouteSourceBinding:
+        """`bind_route_source`, and whether this bind moved the watermark at all (#271)."""
+
         request = _RouteSourceBindingRequest(
             descriptor=descriptor,
             routing_policy_fingerprint=routing_policy_fingerprint,
             observed_at=observed_at,
         )
         with self._write_transaction() as connection:
-            row = self._bind_route_source_in_transaction(connection, request)
-            return self._route_cursor_from_row(row)
+            row, watermark_advanced = self._bind_route_source_in_transaction(
+                connection,
+                request,
+            )
+            return RouteSourceBinding(
+                cursor=self._route_cursor_from_row(row),
+                watermark_advanced=watermark_advanced,
+            )
 
     def _rotate_previous_generation_source(
         self,
@@ -1508,7 +1543,7 @@ class SignalBusStore:
         self,
         connection: sqlite3.Connection,
         request: _RouteSourceBindingRequest,
-    ) -> sqlite3.Row:
+    ) -> tuple[sqlite3.Row, bool]:
         descriptor = request.descriptor
         row = connection.execute(
             "SELECT * FROM signal_route_source WHERE source_id = ?",
@@ -1537,6 +1572,7 @@ class SignalBusStore:
                     now_text,
                 ),
             )
+            watermark_advanced = True
         else:
             immutable_fields = (
                 ("generation_id", descriptor.generation_id, "generation"),
@@ -1558,7 +1594,7 @@ class SignalBusStore:
                 row=row,
             )
             if rotated is not None:
-                return rotated
+                return rotated, True
             for column, expected, label in immutable_fields:
                 if row[column] != expected:
                     raise SignalRouteConflictError(
@@ -1575,20 +1611,30 @@ class SignalBusStore:
                 raise SignalRouteSequenceError(
                     "source high watermark is behind the committed cursor"
                 )
-            connection.execute(
-                """
-                UPDATE signal_route_source
-                SET observed_high_watermark = ?, updated_at = ?
-                WHERE source_id = ?
-                """,
-                (descriptor.high_watermark, now_text, descriptor.source_id),
-            )
+            # Every validation above still runs on every bind. Only the write is gated:
+            # the two columns this UPDATE sets are the watermark and `updated_at`, and
+            # `updated_at` carries the router's own loop clock -- so an unchanged
+            # watermark used to rewrite the row anyway, once per source per iteration.
+            # On a `journal_mode=WAL`, `synchronous=FULL` database that is a real fsync,
+            # and `signal-router.all-strategies.v1` binds three sources on a two-second
+            # loop whether or not the market is open (#271). The regression checks above
+            # leave only `>=` here, so `!=` is `>`: the watermark grew.
+            watermark_advanced = descriptor.high_watermark != observed_high
+            if watermark_advanced:
+                connection.execute(
+                    """
+                    UPDATE signal_route_source
+                    SET observed_high_watermark = ?, updated_at = ?
+                    WHERE source_id = ?
+                    """,
+                    (descriptor.high_watermark, now_text, descriptor.source_id),
+                )
         bound = connection.execute(
             "SELECT * FROM signal_route_source WHERE source_id = ?",
             (descriptor.source_id,),
         ).fetchone()
         assert bound is not None
-        return bound
+        return bound, watermark_advanced
 
     def route_cursor(self, source_id: str) -> SignalRouteCursor:
         normalized = source_id.strip()
@@ -1676,7 +1722,7 @@ class SignalBusStore:
             raise ValueError("signal_id must be materialized before routing")
 
         with self._write_transaction() as connection:
-            source_row = self._bind_route_source_in_transaction(
+            source_row, _watermark_advanced = self._bind_route_source_in_transaction(
                 connection,
                 _RouteSourceBindingRequest(
                     descriptor=request.descriptor,

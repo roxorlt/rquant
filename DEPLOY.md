@@ -5,15 +5,106 @@
 
 ---
 
+## 2026-09-16 · 待安装 · 其余六个 role 的每轮无条件写（#271 第二部分）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+**装机口径（集成时定，2026-09-17）**：本包在**包 V（`v0.33.13`）之后**集成，合入后打
+**`v0.33.14`**，在**第十一个窗口**装机，时间取 **2026-09-17（周四）15:15 收盘之后**。
+**部署器 target 就是 `v0.33.14` 这一个**——它是那一刻仓库里最高的 tag，而且**六个包的内容
+都在里面**：`v0.33.9`（包 R）、`v0.33.10`（包 S）、`v0.33.11`（包 T）、`v0.33.12`（包 U）、
+`v0.33.13`（包 V）至今都还没装机，**一律不单独部署**，它们的内容由这一个 tag 一次带上去。
+每一条的现象、验收判据和回滚步骤见本文件下面各自那一条，全部照样有效。
+**装机记录里还要带上包 V 那条要求的两个数**：当天 `notification_state.sqlite3` 的行数与
+文件大小（见下一条 DF-1）。
+
+**要修的现象**（09-16 只读代码确认并在 e2e 里实测，base `00d74c63` = v0.33.12）：
+
+1. `runtime-health.all.v1` 每十秒发一代权威，**一天 8640 代**，每代一份 generation 文档、
+   一份 publication 文档、一次 `current.json` 原子替换。原因是它把自己的 `observed_at`
+   算进了 `generation_id`。
+2. `lab-jobs.serving.v1` 每三十秒同样发一代，原因相同，外加每个 job 的 ETA 是按被问到的
+   那一刻陈述的。
+3. 因此 `serving.publisher.v1` **每三十秒重建一份完整的 `serving.duckdb`**——它自己的去重
+   判断是对的，但输入里那两个 id 每轮都变，而且判断跑在建库之后。这是全系统最贵的一处。
+4. `signal-router.all-strategies.v1` 每两秒重写三行水位，`paper-broker.shadow-main.v1`
+   每两秒重写一行，两个库都是 WAL 加 `synchronous=FULL`。
+5. `watchlist-quote.source.v1` 盘中每五秒发一个 spool 批，没有内容门。
+6. daily orchestrator 每分钟取三次写者租约，也就是三次 `fencing_token + 1` 的提交。
+
+**装上之后当场应该看到什么**：
+
+- **收盘后（比如 16:00–16:50）对
+  `/home/lighthouse/rquant/data/runtime/control/authority-runtime-health/generations/`
+  数一次文件个数，十分钟后再数一次，应当完全不变。** 装之前这十分钟会多出 60 个。
+  同样地，`/home/lighthouse/rquant/data/runtime/serving/generations/` 在收盘后不再增长
+  ——装之前每三十秒多一个目录，每个里面一份完整的 `serving.duckdb`。
+- 二十个 role 的心跳文件里出现四个新字段：`generation_published`、`watermark_advanced`、
+  `batch_published`、`writer_lease_acquired`。收盘后它们应当**绝大多数轮是 `false`**，
+  只有真的发生变化的那一轮是 `true`；**恒为 `true` 就是本包没装上**，要当故障查。
+  各 role 上哪几个字段是 `null` 是正常的：一个 role 只报它自己会做的那一类写。
+- 盘中 `watchlist-quote.source.v1` 在熔断/退避/节拍未到的那些轮 `batch_published=false`，
+  spool 的 `sequence` 不再每五秒加一。
+- **交易时段 serving 照常重建，省下来的是收盘之后。** `runtime-health.all.v1` 的身份里留着
+  每个 role 的游标、`processed_count`、`backlog_count` 和 `source_generations`——盘中这些
+  一直在动，所以 health 照常发代、serving 照常大约每三十秒重建一次。**这是对的**：那时候
+  内容真的在变。本包省下的是**没有数据在流动的那些小时**，也就是 17:00 那一段。
+
+- **页面上恰好有两类东西不再逐轮刷新，其余照旧。** 只有这两类：
+
+  1. **「同一件事又发生了多少次」**——`consecutive_failures`、`total_failures`、
+     `total_successes` 三个计数器。一个 role **开始**失败照样立刻发一代（`status` 翻成
+     DEGRADED，`last_error` 与 `degraded_reasons` 都在身份里），但它**第十一次以同样的方式
+     失败**不再发。想看「连续失败了多少次」，看那个 role 自己的心跳文件。
+     这一条是故意的：不然一个每两秒失败一次的 role 会让 serving 每三十秒重建一次，
+     持续整个故障期间——2026-09-09 那天正是两个 role 在这么干，而主机当时 load 已经 11-12。
+  2. **纯观测量**——心跳时刻（`heartbeat_at` / `last_success_at`，也就是页面上的
+     `monitor_last_at` / `daily_last_at`）、三个时延字段、积压**年龄**
+     `live_backlog_age_seconds`。**判断某个 role 是不是还活着，看 `stale` 这一位**，
+     它仍然会在 `stale_after` 之内翻转，翻转那一轮就发一代新的。
+
+  3. **同伴的游标与它在读哪一代**（`input_sequence`、`output_sequence`、
+     `source_generations`）。这三个是**同伴自己的事**，不进 health 的身份——
+     `runtime-health.all.v1` 盯着二十四个 loop，而其中至少两个在空闲时也会动它们
+     （retention 本包之前把自己的时钟算进了 generation；catalog 每步都推进扫描游标），
+     把它们算进来等于让 health 每天多发约 288 代、每代后面一次 `serving.duckdb` 重建。
+     要看某个 role 的游标或它在读哪一代，看那个 role 自己的心跳文件。
+
+  **积压与 `processed_count` 照常刷新**——它们是内容，一个 role 的积压从 0 涨到 3000
+  会发一代（用例 `test_a_backlog_that_grows_publishes_exactly_one_generation`）。
+
+- **验收方法（就按这一条数）**：收盘后对
+  `/home/lighthouse/rquant/data/runtime/control/authority-runtime-health/generations/`
+  数一次文件个数，**十分钟后再数一次，应当完全一样**；`serving/generations/` 同理。
+  装之前那十分钟会多出 60 个与 20 个。
+
+**回滚：本条可以只挪心跳，不需要清任何库。**
+
+1. 与 `v0.33.13` 同一条路径。**本包新增四个心跳文件字段**（`generation_published`、
+   `watermark_advanced`、`batch_published`、`writer_lease_acquired`），所以回滚到
+   `v0.33.13` 或更早时，先按 2026-09-10 那一条写的整批挪心跳步骤把心跳挪开。
+2. **本包不存在「旧代码读不懂新数据」的问题**，这一点与包 V 不同，值得说清楚：
+   - 两个新的身份函数（`runtime_health_state_identity`、`lab_jobs_state_identity`）
+     **从不落盘**。比较的两侧都由同一份代码现算，所以它们的形状随便改，旧代码读本包发布的
+     任何一代都按原来的规则读，`generation_id` 仍然是对整份内容求的哈希。
+   - serving 的一代、spool 的一批、两张水位表、fencing token 的格式**一个字节都没动**。
+   - 唯一的方向性差别是**数量**：回滚之后这六个 role 会重新开始每轮写。
+   - 所以回滚不需要挪 `authority-runtime-health/`、`serving/`、`signal-bus.sqlite3`、
+     `consumer.sqlite3`、`lab_jobs.sqlite3` 里的任何东西。
+
+**本包不改 `deploy/`，不改 systemd unit，不动发布原语，不动任何已发布的模型字段**
+（`RuntimeServiceHeartbeatProjection`、`PAGE_PROJECTION_CONTRACTS`、serving 的冻结投影
+都一个字段没动，快照闸 4 条全绿）。
+
+---
+
 ## 2026-09-16 · 待安装 · 空闲 notifier 的每轮 fsync 与 17:00 附近的换代读（#271）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。
-**装机口径（集成时定，2026-09-17）**：本包合入后打 **`v0.33.13`**，但**第十一个窗口装的是
-那一刻仓库里最高的那个 tag，不是 `v0.33.13`**。包 W（#271 的另一半，常驻 role 的同类空写）
-紧跟着本包合入并打 **`v0.33.14`**，所以**只要 W 也进来了，第十一个窗口的部署器 target
-就是 `v0.33.14` 这一个**；只有 W 没能赶上，才退回装 `v0.33.13`。`v0.33.13` 与更早那几个
-tag（`v0.33.9`–`v0.33.12`，包 R/S/T/U，至今都还没装机）**一律不单独部署**，它们的内容
-由这一个 tag 一次带上去。
+**装机口径（集成时定，2026-09-17；包 W 合入后落定）**：本包合入后打的是 **`v0.33.13`**，
+但**第十一个窗口装的不是它**——包 W（#271 的另一半，常驻 role 的同类空写）已经紧跟着合入并打
+**`v0.33.14`**，所以**第十一个窗口的部署器 target 就是 `v0.33.14` 这一个**（见本文件最上面
+那一条）。`v0.33.13` 与更早那几个 tag（`v0.33.9`–`v0.33.12`，包 R/S/T/U，至今都还没装机）
+**一律不单独部署**，它们的内容由这一个 tag 一次带上去。
 **时间取 2026-09-17（周四）15:15 收盘之后**，也就是当天 16:28 的 17:00 观察**之前**——
 这样当天 17:00 那一轮观察直接就是对本包的检验。
 

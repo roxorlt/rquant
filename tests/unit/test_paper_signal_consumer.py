@@ -18,8 +18,9 @@ from rquant.paper_signal_worker import (
     PaperSignalQueueStatus,
     PaperSignalQueueStore,
 )
-from rquant.signal_bus import SignalBusStore
+from rquant.signal_bus import SignalBusSourceDescriptor, SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from tests.unit.test_signal_bus import CommitWatcher
 
 NOW = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 
@@ -299,3 +300,159 @@ def test_concurrent_consumers_share_one_ordered_cursor(tmp_path: Path) -> None:
     assert all(
         _queue(queue_path).record(_signal(seed).signal_id) is not None for seed in ("a", "e", "f")
     )
+
+
+# ---------------------------------------------------------------------------------------
+# #271: what one idle `observe_source` costs the host
+# ---------------------------------------------------------------------------------------
+
+#: Two seconds, the production interval of `paper-broker.shadow-main.v1`.
+BROKER_INTERVAL = timedelta(seconds=2)
+IDLE_ITERATIONS = 60
+
+
+def _source_descriptor(high_watermark: int) -> SignalBusSourceDescriptor:
+    return SignalBusSourceDescriptor(
+        generation_id="a" * 64,
+        first_global_sequence=1,
+        high_watermark=high_watermark,
+    )
+
+
+def test_observing_an_unchanged_signal_source_commits_nothing_at_all(tmp_path: Path) -> None:
+    """Sixty idle observations, zero commits, and the row byte-identical afterwards.
+
+    The UPDATE this replaces set the watermark, which had not moved, and `updated_at`,
+    which was the broker's own loop clock — so it rewrote the row on every iteration of a
+    two-second loop, on a `journal_mode=WAL`, `synchronous=FULL` database, all day (#271).
+    """
+
+    path = tmp_path / "consumer.sqlite3"
+    state = PaperSignalConsumerStateStore(path)
+    first = state.observe_source(_source_descriptor(3), observed_at=NOW)
+
+    assert first.watermark_advanced is True
+    assert first.cursor.observed_high_watermark == 3
+
+    watcher = CommitWatcher(path, tables=("paper_consumer_source", "paper_consumer_receipt"))
+    try:
+        before = watcher.stamp()
+        idle = [
+            state.observe_source(
+                _source_descriptor(3),
+                # A fresh clock on every iteration: the whole point is that the row no
+                # longer carries it.
+                observed_at=NOW + BROKER_INTERVAL * (index + 1),
+            )
+            for index in range(IDLE_ITERATIONS)
+        ]
+        after = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert after == before, "an idle source observation committed to the consumer state"
+    assert [item.watermark_advanced for item in idle] == [False] * IDLE_ITERATIONS
+    assert [item.cursor.observed_high_watermark for item in idle] == [3] * IDLE_ITERATIONS
+    # `updated_at` now means "when the watermark last advanced", and the first observation
+    # is when that was.
+    assert idle[-1].cursor.updated_at == NOW
+
+
+def test_a_signal_source_that_grows_writes_exactly_once(tmp_path: Path) -> None:
+    """One commit for the one observation that had something to record, none on either side."""
+
+    path = tmp_path / "consumer.sqlite3"
+    state = PaperSignalConsumerStateStore(path)
+    state.observe_source(_source_descriptor(3), observed_at=NOW)
+
+    watcher = CommitWatcher(path, tables=("paper_consumer_source",))
+    try:
+        before = watcher.stamp()
+        state.observe_source(_source_descriptor(3), observed_at=NOW + BROKER_INTERVAL)
+        quiet = watcher.stamp()
+        grown = state.observe_source(_source_descriptor(4), observed_at=NOW + BROKER_INTERVAL * 2)
+        wrote = watcher.stamp()
+        state.observe_source(_source_descriptor(4), observed_at=NOW + BROKER_INTERVAL * 3)
+        settled = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert quiet == before
+    assert wrote != quiet
+    assert settled == wrote
+    assert grown.watermark_advanced is True
+    assert grown.cursor.observed_high_watermark == 4
+    assert grown.cursor.updated_at == NOW + BROKER_INTERVAL * 2
+
+
+def test_the_gate_leaves_every_observation_check_running_on_an_unchanged_source(
+    tmp_path: Path,
+) -> None:
+    """Skipping the write does not skip a single verification the observation used to make.
+
+    Each of these is refused against a row whose watermark is exactly the stored one — the
+    case that now writes nothing — so the checks demonstrably still run.
+    """
+
+    state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+    state.observe_source(_source_descriptor(3), observed_at=NOW)
+
+    with pytest.raises(PaperSignalConsumerSourceError, match="rolled back"):
+        state.observe_source(_source_descriptor(2), observed_at=NOW + BROKER_INTERVAL)
+    with pytest.raises(PaperSignalConsumerSourceError, match="generation changed"):
+        state.observe_source(
+            _source_descriptor(3).model_copy(update={"generation_id": "b" * 64}),
+            observed_at=NOW + BROKER_INTERVAL,
+        )
+    with pytest.raises(PaperSignalConsumerSourceError, match="source id changed"):
+        state.observe_source(
+            _source_descriptor(3).model_copy(update={"source_id": "other-bus/v1"}),
+            observed_at=NOW + BROKER_INTERVAL,
+        )
+    assert state.cursor().observed_high_watermark == 3
+
+
+def test_a_drained_consumer_pass_commits_nothing_and_says_so(tmp_path: Path) -> None:
+    """The same property through `consume_signal_bus_to_paper`, which is what the role runs."""
+
+    bus = _bus(tmp_path / "bus.sqlite3")
+    queue = _queue(tmp_path / "queue.sqlite3")
+    path = tmp_path / "consumer.sqlite3"
+    state = PaperSignalConsumerStateStore(path)
+    bus.ingest(_signal("a"), received_at=NOW)
+
+    drained = consume_signal_bus_to_paper(bus, queue, state, observed_at=NOW, limit=10)
+    assert drained.watermark_advanced is True
+
+    watcher = CommitWatcher(path, tables=("paper_consumer_source", "paper_consumer_receipt"))
+    try:
+        before = watcher.stamp()
+        idle = [
+            consume_signal_bus_to_paper(
+                bus,
+                queue,
+                state,
+                observed_at=NOW + BROKER_INTERVAL * (index + 1),
+                limit=10,
+            )
+            for index in range(IDLE_ITERATIONS)
+        ]
+        after = watcher.stamp()
+        bus.ingest(_signal("e"), received_at=NOW + BROKER_INTERVAL * 61)
+        grown = consume_signal_bus_to_paper(
+            bus,
+            queue,
+            state,
+            observed_at=NOW + BROKER_INTERVAL * 61,
+            limit=10,
+        )
+        wrote = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert after == before, "an idle paper consumer pass committed to its state database"
+    assert [item.watermark_advanced for item in idle] == [False] * IDLE_ITERATIONS
+    assert [item.delegated_count for item in idle] == [0] * IDLE_ITERATIONS
+    assert grown.watermark_advanced is True
+    assert grown.delegated_count == 1
+    assert wrote != after

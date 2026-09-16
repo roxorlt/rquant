@@ -1143,6 +1143,10 @@ def watchlist_quote_source_builder(
                                 **dict(last_result.source_generations),
                                 **evidence,
                             },
+                            #: An iteration that never asked the gateway for a batch
+                            #: published none; the previous iteration's answer is not
+                            #: this one's (#271).
+                            "batch_published": False,
                         }
                     )
                 candidate_result = candidate_loader.load(

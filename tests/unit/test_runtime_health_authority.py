@@ -289,7 +289,7 @@ def test_runtime_health_publisher_uses_existing_serving_authority(tmp_path: Path
         clock=lambda: NOW,
     )
 
-    pointer = RuntimeHealthAuthorityPublisher(
+    publication = RuntimeHealthAuthorityPublisher(
         reader=source_reader,
         publisher=generic_publisher,
     ).publish(NOW)
@@ -300,5 +300,316 @@ def test_runtime_health_publisher_uses_existing_serving_authority(tmp_path: Path
         expected_payload_kind="runtime_health",
     )(NOW)
 
-    assert pointer.generation_id == loaded.generation_id
+    assert publication.written is True
+    assert publication.pointer.generation_id == loaded.generation_id
     assert loaded == source_reader(NOW)
+
+
+def _heartbeat_iteration(root: Path, service_id: str, at: datetime) -> None:
+    """One more *idle* iteration of a live role, written the way the loop writes it.
+
+    Exactly three things move when a resident role succeeds at doing nothing:
+    `heartbeat_at`, `last_success_at` and the lifetime `total_successes` tally. The
+    cursor does not move, `processed_count` is the count for *this* iteration and so
+    stays zero, the backlog stays zero, and the upstream generations are the ones it was
+    already on -- which is why all four are in the identity and none of them makes this
+    role publish while the host is quiet.
+    """
+
+    spec = _spec(service_id)
+    path = RuntimeServiceControl._path_for(root, spec)
+    heartbeat = RuntimeServiceControl.read_heartbeat(root, spec)
+    assert heartbeat is not None
+    path.write_text(
+        heartbeat.model_copy(
+            update={
+                "heartbeat_at": at,
+                "last_success_at": at,
+                "total_successes": heartbeat.total_successes + 1,
+            }
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+
+def _heartbeat_backlog(root: Path, service_id: str, at: datetime, backlog: int) -> None:
+    """An iteration that found work waiting: an idle tick plus a backlog."""
+
+    spec = _spec(service_id)
+    path = RuntimeServiceControl._path_for(root, spec)
+    heartbeat = RuntimeServiceControl.read_heartbeat(root, spec)
+    assert heartbeat is not None
+    path.write_text(
+        heartbeat.model_copy(
+            update={
+                "heartbeat_at": at,
+                "last_success_at": at,
+                "total_successes": heartbeat.total_successes + 1,
+                "backlog_count": backlog,
+            }
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+
+def _health_publisher(
+    *,
+    authority_root: Path,
+    sources: tuple[RuntimeHealthControlSource, ...],
+    clock: list[datetime],
+) -> RuntimeHealthAuthorityPublisher:
+    return RuntimeHealthAuthorityPublisher(
+        reader=RuntimeHealthSourceReader(sources=sources, serving_service_id="serving"),
+        publisher=ServingSourceAuthorityPublisher(
+            root=authority_root,
+            producer_commit=COMMIT,
+            dataset_id=RUNTIME_HEALTH_DATASET_ID,
+            payload_kind="runtime_health",
+            clock=lambda: clock[0],
+        ),
+    )
+
+
+def _generation_files(authority_root: Path) -> set[str]:
+    generations = authority_root / "generations"
+    return {path.name for path in generations.iterdir()} if generations.exists() else set()
+
+
+def test_a_healthy_host_publishes_one_runtime_health_generation_and_not_sixty(
+    tmp_path: Path,
+) -> None:
+    """Sixty ten-second iterations over two live roles, one generation.
+
+    Every one of those iterations sees genuinely different bytes: two heartbeats whose
+    clock, counters and duration window moved, and a reader that stamps its own
+    `observed_at` into four more places. None of it is evidence about the host, and
+    before #271 all of it went into the generation id -- so this role published 8640
+    generations a day and `serving.publisher.v1` rebuilt `serving.duckdb` behind every
+    third one.
+    """
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    router_root = tmp_path / "control" / "signal-routers" / "router"
+    _running(feature_root, "feature")
+    _running(router_root, "router")
+    authority_root = tmp_path / "authority"
+    clock = [NOW]
+    publisher = _health_publisher(
+        authority_root=authority_root,
+        sources=(_source(feature_root, "feature"), _source(router_root, "router")),
+        clock=clock,
+    )
+
+    first = publisher.publish(NOW)
+    assert first.written is True
+    settled = _generation_files(authority_root)
+
+    written = []
+    for iteration in range(1, 61):
+        moment = NOW + timedelta(seconds=10 * iteration)
+        clock[0] = moment
+        _heartbeat_iteration(feature_root, "feature", moment - timedelta(seconds=1))
+        _heartbeat_iteration(router_root, "router", moment - timedelta(seconds=2))
+        written.append(publisher.publish(moment).written)
+
+    assert written == [False] * 60
+    assert _generation_files(authority_root) == settled
+    assert (
+        ServingSourceAuthorityReader(
+            root=authority_root,
+            expected_producer_commit=COMMIT,
+            expected_dataset_id=RUNTIME_HEALTH_DATASET_ID,
+            expected_payload_kind="runtime_health",
+        )(NOW + timedelta(seconds=600)).generation_id
+        == first.pointer.generation_id
+    )
+
+
+def test_a_role_that_stops_heartbeating_publishes_exactly_one_generation(
+    tmp_path: Path,
+) -> None:
+    """The one thing this dataset is for still costs exactly one write."""
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    router_root = tmp_path / "control" / "signal-routers" / "router"
+    _running(feature_root, "feature")
+    _running(router_root, "router")
+    authority_root = tmp_path / "authority"
+    clock = [NOW]
+    publisher = _health_publisher(
+        authority_root=authority_root,
+        sources=(_source(feature_root, "feature"), _source(router_root, "router")),
+        clock=clock,
+    )
+    assert publisher.publish(NOW).written is True
+
+    # The router keeps going; the feature role's heartbeat stops moving.
+    written = []
+    for iteration in range(1, 7):
+        moment = NOW + timedelta(seconds=10 * iteration)
+        clock[0] = moment
+        _heartbeat_iteration(router_root, "router", moment - timedelta(seconds=2))
+        written.append(publisher.publish(moment).written)
+
+    # `stale_after` is ten seconds, so the verdict flips on the first iteration strictly
+    # past it and never moves again -- one generation for the death, not one per
+    # iteration for the rest of the day.
+    assert written.count(True) == 1
+    flipped = written.index(True)
+    assert written == [False] * flipped + [True] + [False] * (5 - flipped)
+
+
+def test_a_degraded_reason_publishes_once_and_a_repeat_of_it_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A loop stuck on one failure is the case that produced the 2026-09-09 load."""
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    _running(feature_root, "feature")
+    authority_root = tmp_path / "authority"
+    clock = [NOW]
+    publisher = _health_publisher(
+        authority_root=authority_root,
+        sources=(_source(feature_root, "feature"),),
+        clock=clock,
+    )
+    assert publisher.publish(NOW).written is True
+
+    spec = _spec("feature")
+    path = RuntimeServiceControl._path_for(feature_root, spec)
+    written = []
+    for iteration in range(1, 7):
+        moment = NOW + timedelta(seconds=10 * iteration)
+        clock[0] = moment
+        heartbeat = RuntimeServiceControl.read_heartbeat(feature_root, spec)
+        assert heartbeat is not None
+        path.write_text(
+            heartbeat.model_copy(
+                update={
+                    "heartbeat_at": moment - timedelta(seconds=1),
+                    "status": RuntimeServiceStatus.DEGRADED,
+                    "last_error": "the candidate store moved while it was read",
+                    "consecutive_failures": heartbeat.consecutive_failures + 1,
+                    "total_failures": heartbeat.total_failures + 1,
+                }
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        written.append(publisher.publish(moment).written)
+
+    assert written == [True] + [False] * 5
+
+
+def test_the_health_state_identity_drops_only_the_instant_it_looked(tmp_path: Path) -> None:
+    """Directly, on the function, so the property is not only an emergent one."""
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    _running(feature_root, "feature")
+    reader = RuntimeHealthSourceReader(
+        sources=(_source(feature_root, "feature"),),
+        serving_service_id="serving",
+    )
+    first = reader(NOW)
+    _heartbeat_iteration(feature_root, "feature", NOW + timedelta(seconds=5))
+    later = reader(NOW + timedelta(seconds=6))
+
+    assert later.generation_id != first.generation_id
+    assert health_module.runtime_health_state_identity(later) == (
+        health_module.runtime_health_state_identity(first)
+    )
+
+    # A verdict that moves is evidence, and it moves the identity.
+    stale = reader(NOW + timedelta(seconds=120))
+    assert health_module.runtime_health_state_identity(stale) != (
+        health_module.runtime_health_state_identity(first)
+    )
+
+
+def test_a_backlog_that_grows_publishes_exactly_one_generation(tmp_path: Path) -> None:
+    """A backlog is content, and the page has to be able to show it moving.
+
+    The first cut of this gate dropped `backlog_count` along with the clocks, and a role
+    whose backlog climbed from nothing to three thousand published no generation at all --
+    on a trading day as much as a quiet one, because the rest of the identity (status,
+    `stale`, the run identity, the degraded reasons) does not move while a role is
+    healthily falling behind. The counts of work are back in the identity, and this is
+    what says so.
+    """
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    _running(feature_root, "feature")
+    authority_root = tmp_path / "authority"
+    clock = [NOW]
+    publisher = _health_publisher(
+        authority_root=authority_root,
+        sources=(_source(feature_root, "feature"),),
+        clock=clock,
+    )
+    assert publisher.publish(NOW).written is True
+
+    written = []
+    for iteration in range(1, 9):
+        moment = NOW + timedelta(seconds=10 * iteration)
+        clock[0] = moment
+        heartbeat_at = moment - timedelta(seconds=1)
+        if iteration < 3:
+            _heartbeat_iteration(feature_root, "feature", heartbeat_at)
+        else:
+            # The backlog appears on the third iteration and then stays where it is.
+            _heartbeat_backlog(feature_root, "feature", heartbeat_at, 3_000)
+        written.append(publisher.publish(moment).written)
+
+    assert written == [False, False, True, False, False, False, False, False]
+
+
+def test_the_health_state_identity_keeps_the_work_a_role_did(tmp_path: Path) -> None:
+    """Field by field, on the function: what counts as evidence and what does not."""
+
+    feature_root = tmp_path / "control" / "features" / "feature"
+    _running(feature_root, "feature")
+    spec = _spec("feature")
+    path = RuntimeServiceControl._path_for(feature_root, spec)
+    reader = RuntimeHealthSourceReader(
+        sources=(_source(feature_root, "feature"),),
+        serving_service_id="serving",
+    )
+    # Five seconds after the fixture wrote its heartbeat: old enough that the clocks have
+    # room to move without landing in the future, young enough that `stale_after` (ten
+    # seconds) is nowhere near.
+    at = NOW + timedelta(seconds=5)
+    baseline = health_module.runtime_health_state_identity(reader(at))
+
+    def identity_after(**updates: object) -> str:
+        heartbeat = RuntimeServiceControl.read_heartbeat(feature_root, spec)
+        assert heartbeat is not None
+        original = path.read_text(encoding="utf-8")
+        path.write_text(heartbeat.model_copy(update=updates).model_dump_json(), encoding="utf-8")
+        try:
+            identity = health_module.runtime_health_state_identity(reader(at))
+        finally:
+            path.write_text(original, encoding="utf-8")
+        return identity
+
+    # Evidence: how much work this role did, and how much it has waiting.
+    assert identity_after(backlog_count=3_000) != baseline
+    assert identity_after(processed_count=7) != baseline
+
+    # Not evidence: a *peer's* cursor and what it is reading. This role watches
+    # twenty-four loops, and at least two of them move their cursor or their
+    # `source_generations` on an iteration that observed nothing --
+    # `artifact-retention.primary.v1` hashed its own clock in there, and
+    # `artifact-catalog.primary.v1` advances its scan cursor over an unchanged tree. In
+    # the identity they would drag health, and `serving.duckdb` behind it, back to
+    # publishing all day.
+    assert identity_after(input_sequence=99) == baseline
+    assert identity_after(output_sequence=99) == baseline
+    assert identity_after(source_generations={"upstream": "b" * 64}) == baseline
+
+    # Observation: when the reader looked, and how many times the same thing happened
+    # again. The two clocks move together because a heartbeat whose last success is later
+    # than the heartbeat itself is not a document this role will read at all.
+    ticked = at - timedelta(seconds=2)
+    assert identity_after(heartbeat_at=ticked, last_success_at=ticked) == baseline
+    assert identity_after(total_successes=1_000) == baseline
+    assert identity_after(total_failures=1_000) == baseline
+    assert identity_after(consecutive_failures=1_000) == baseline

@@ -282,7 +282,7 @@ def test_builder_does_not_acknowledge_when_serving_publish_fails(
         lambda **_kwargs: calls.append("resolved") or (),
     )
     monkeypatch.setattr(
-        "rquant.runtime_builder_serving.ServingPublisher.publish",
+        "rquant.runtime_builder_serving.ServingPublisher.publish_generation",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("publish failed")),
     )
     step = serving_publisher_builder(
@@ -310,7 +310,11 @@ def test_repeated_identical_snapshot_is_idempotent_without_extra_generation(
     second = step()
     second_paths = tuple((tmp_path / "serving" / "generations").iterdir())
 
-    assert second == first
+    # Same six source generations, so the second iteration selects the generation that
+    # is already current and never opens a DuckDB file to build another (#271).
+    assert first.generation_published is True
+    assert second.generation_published is False
+    assert second == first.model_copy(update={"generation_published": False})
     assert second.processed_count == 1
     assert len(first_paths) == 1
     assert second_paths == first_paths
@@ -459,3 +463,42 @@ def test_injected_loader_cannot_mix_with_owner_authorities(tmp_path: Path) -> No
             snapshot_loader=lambda _as_of: _snapshot(),
             clock=lambda: NOW,
         )(_manifest(tmp_path, settings=settings))
+
+
+def test_sixty_idle_steps_of_the_built_role_leave_one_generation(tmp_path: Path) -> None:
+    """#271, through the role's own step: the clock moves, the six sources do not.
+
+    This is what production looks like once runtime health and lab jobs stop restating
+    themselves: the assembler still stamps `observed_at = as_of` into the read model, and
+    the step still hands it to the publisher as `built_at`. Without a gate in front of the
+    build, that alone was a whole new `serving.duckdb` generation every thirty seconds --
+    built, verified, hashed, fsynced, and selected.
+    """
+
+    base = _snapshot()
+    clock = [NOW]
+
+    def loader(as_of: datetime) -> ServingRuntimeSnapshot:
+        return base.model_copy(
+            update={"read_model": ServingReadModelInput(observed_at=as_of)}
+        )
+
+    step = serving_publisher_builder(snapshot_loader=loader, clock=lambda: clock[0])(
+        _manifest(tmp_path)
+    )
+    generations = tmp_path / "serving" / "generations"
+    current = tmp_path / "serving" / "current.json"
+
+    first = step()
+    assert first.generation_published is True
+    settled = {path.name for path in generations.iterdir()}
+    pointer_bytes = current.read_bytes()
+
+    published = []
+    for iteration in range(1, 61):
+        clock[0] = NOW + timedelta(seconds=30 * iteration)
+        published.append(step().generation_published)
+
+    assert published == [False] * 60
+    assert {path.name for path in generations.iterdir()} == settled
+    assert current.read_bytes() == pointer_bytes

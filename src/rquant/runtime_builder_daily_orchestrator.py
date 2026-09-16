@@ -2646,6 +2646,10 @@ def daily_pipeline_orchestrator_builder(
                     "daily_pipeline_command_manifest": command_manifest_hash,
                     "daily_pipeline_completion_receipt": run_completion_receipt.receipt_id,
                 },
+                #: One orchestrator is built per iteration, so this is whether this
+                #: iteration took the daily writer lease at all -- False on the idle
+                #: iterations that make up nearly the whole day (#271).
+                writer_lease_acquired=orchestrator.writer_acquisitions > 0,
             )
 
         return step

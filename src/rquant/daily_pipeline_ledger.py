@@ -605,6 +605,19 @@ class DailyRecoverySummary(RuntimeContractModel):
     next_cursor: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DailyRecoveryProbe:
+    """What :meth:`DailyPipelineLedger.recover` would do, answered without writing.
+
+    ``would_write`` is true when the sweep would change at least one durable row.
+    ``next_cursor`` is the cursor the sweep would have returned, so a caller that
+    skips the sweep can still hand back the summary the sweep would have produced.
+    """
+
+    would_write: bool
+    next_cursor: str | None
+
+
 class DailyLedgerStageFence:
     """Public, transaction-held view of one claimed daily stage."""
 
@@ -1503,6 +1516,35 @@ class DailyPipelineLedger:
                 created_at=observed,
             )
 
+    def run_for_spec(self, spec: DailyRunSpec) -> DailyRunRecord | None:
+        """Return the run this spec would create, if the ledger already holds it.
+
+        Read-only twin of :meth:`create_run`'s idempotent branch, down to the same
+        storage-profile rejection and the same conflict error for a run id whose
+        immutable input identity differs.  A caller that gets a record back has been
+        told the run exists without taking the writer lease for it, which is what the
+        daily role's every-minute ``create_run`` needed: a fencing token is a lease
+        counter, and burning one to be told "already there" is one fsync for nothing.
+        ``None`` means the run genuinely has to be inserted, which does need the lease.
+        """
+        verified = DailyRunSpec.model_validate(spec)
+        if (
+            verified.mode is not self.storage_profile.mode
+            or verified.profile_hash != self.storage_profile.profile_hash
+        ):
+            raise DailyPipelineLedgerError("daily run does not match the ledger storage profile")
+        spec_hash = canonical_sha256(verified)
+        with self._snapshot() as connection:
+            self._validate_schema(connection)
+            existing = connection.execute(
+                "SELECT * FROM daily_pipeline_run WHERE run_id = ?", (verified.run_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+            if existing["spec_hash"] != spec_hash:
+                raise DailyPipelineLedgerError("daily run conflicts with immutable input identity")
+            return self._run_from_row(existing)
+
     def claim_next(
         self,
         lease: DailyWriterLease,
@@ -1525,6 +1567,62 @@ class DailyPipelineLedger:
         accidentally leasing work that belongs to an older run.
         """
         return self._claim_next(lease, now=now, run_id=run_id)
+
+    def has_claimable_stage_work(self, *, now: datetime, run_id: str) -> bool:
+        """Would adopting or claiming a stage of this run change a durable row?
+
+        Read-only twin of :meth:`active_running_attempts` followed by
+        :meth:`claim_next_for_run`, which is the pair an orchestrator uses to pick the
+        stage it will run.  Adoption always rewrites the claim row of the stage it
+        adopts, and every candidate ``_claim_next`` does not skip is either claimed or
+        marked failed -- so "a candidate exists" and "this call would write" are the
+        same question.  The one candidate that writes nothing is a stage whose
+        dependencies have not all succeeded, which ``_claim_next`` passes over.
+
+        Keep this in step with :meth:`_claim_next`: every branch there that writes has
+        a branch here that returns ``True``.
+        """
+        observed = normalize_aware_utc(now)
+        with self._snapshot() as connection:
+            self._validate_schema(connection)
+            adoptable = connection.execute(
+                """
+                SELECT 1
+                FROM daily_pipeline_stage AS stage
+                JOIN daily_pipeline_run AS run ON run.run_id = stage.run_id
+                WHERE stage.state = ? AND run.state = ? AND stage.run_id = ?
+                LIMIT 1
+                """,
+                (DailyStageState.RUNNING.value, DailyRunState.RUNNING.value, run_id),
+            ).fetchone()
+            if adoptable is not None:
+                return True
+            for row in connection.execute(
+                """
+                SELECT stage.*, run.spec_json
+                FROM daily_pipeline_stage AS stage
+                JOIN daily_pipeline_run AS run ON run.run_id = stage.run_id
+                WHERE stage.state IN (?, ?)
+                  AND run.state = ?
+                  AND (stage.next_attempt_at IS NULL OR stage.next_attempt_at <= ?)
+                  AND stage.run_id = ?
+                ORDER BY run.created_at, stage.sequence
+                """,
+                (
+                    DailyStageState.PENDING.value,
+                    DailyStageState.RETRY_WAIT.value,
+                    DailyRunState.RUNNING.value,
+                    _dump_datetime(observed),
+                    run_id,
+                ),
+            ):
+                deadline = self._effective_deadline(row, row["spec_json"])
+                if deadline is not None and observed >= deadline:
+                    return True
+                if not self._dependencies_succeeded(connection, row["run_id"], row["stage_id"]):
+                    continue
+                return True
+            return False
 
     def _claim_next(
         self,
@@ -1780,6 +1878,35 @@ class DailyPipelineLedger:
                 )
                 for row in rows
             )
+
+    def has_recoverable_effect_attempts(self, *, run_id: str | None = None) -> bool:
+        """Is there any external effect a replacement writer would adopt and reconcile?
+
+        Read-only twin of :meth:`active_effect_attempts` being non-empty.  That method
+        needs a lease only to validate one, not because it writes; this answers the same
+        question for a caller deciding whether the lease is worth taking at all.  No
+        ``now`` argument, because the query itself has never used one.
+        """
+        with self._snapshot() as connection:
+            self._validate_schema(connection)
+            predicate = "" if run_id is None else " AND stage.run_id = ?"
+            row = connection.execute(
+                f"""
+                SELECT 1
+                FROM daily_pipeline_stage AS stage
+                JOIN daily_pipeline_effect_intent AS effect
+                  ON effect.run_id = stage.run_id AND effect.stage_id = stage.stage_id
+                JOIN daily_pipeline_run AS run ON run.run_id = stage.run_id
+                WHERE stage.state = ? AND run.state = ?{predicate}
+                LIMIT 1
+                """,
+                (
+                    DailyStageState.RUNNING.value,
+                    DailyRunState.RUNNING.value,
+                    *((run_id,) if run_id is not None else ()),
+                ),
+            ).fetchone()
+            return row is not None
 
     def active_running_attempts(
         self,
@@ -2295,6 +2422,77 @@ class DailyPipelineLedger:
             failed_stage_ids=tuple(failed),
             next_cursor=next_cursor,
         )
+
+    def recovery_probe(
+        self,
+        *,
+        now: datetime,
+        limit: int = _DEFAULT_RECOVERY_LIMIT,
+        cursor: str | None = None,
+        run_id: str | None = None,
+    ) -> DailyRecoveryProbe:
+        """Read-only twin of :meth:`recover`: would it write, and with what cursor.
+
+        The sweep below is the same page of the same query ``recover`` walks, and each
+        ``would_write`` branch mirrors one branch there that calls ``_mark_failed`` or
+        ``_mark_succeeded``.  A sweep over a page with nothing to sweep -- which is the
+        ordinary case, because a day whose run has finished leaves no ``RUNNING`` run
+        for the page to return at all -- must not cost the caller a writer lease, and a
+        lease is a fencing token plus a ``synchronous=FULL`` fsync every time.
+
+        ``next_cursor`` is returned even when nothing would be written, so the caller
+        can hand back the summary ``recover`` would have produced rather than a
+        differently-paged one.
+
+        Keep this in step with :meth:`recover`: a mutating branch added there needs a
+        ``True`` here, or the daily role will quietly stop recovering.
+        """
+        observed = normalize_aware_utc(now)
+        bounded_limit = self._validate_recovery_limit(limit)
+        cursor_key = _decode_cursor(cursor)
+        with self._snapshot() as connection:
+            self._validate_schema(connection)
+            rows, next_cursor = self._active_stage_page(
+                connection,
+                states=(
+                    DailyStageState.PENDING.value,
+                    DailyStageState.RETRY_WAIT.value,
+                    DailyStageState.RUNNING.value,
+                    DailyStageState.SUCCEEDED.value,
+                ),
+                cursor=cursor_key,
+                limit=bounded_limit,
+                run_id=run_id,
+            )
+            for row in rows:
+                state = DailyStageState(row["state"])
+                deadline = self._effective_deadline(row, row["spec_json"])
+                if (
+                    state
+                    in {
+                        DailyStageState.PENDING,
+                        DailyStageState.RETRY_WAIT,
+                        DailyStageState.RUNNING,
+                    }
+                    and deadline is not None
+                    and observed >= deadline
+                ):
+                    return DailyRecoveryProbe(would_write=True, next_cursor=next_cursor)
+                if state is DailyStageState.SUCCEEDED:
+                    if self._terminal_receipt_for_stage(connection, row) is None:
+                        return DailyRecoveryProbe(would_write=True, next_cursor=next_cursor)
+                    continue
+                if state is not DailyStageState.RUNNING:
+                    continue
+                prepared = self._receipt_for_attempt(
+                    connection,
+                    row["run_id"],
+                    row["stage_id"],
+                    int(row["attempts"]),
+                )
+                if prepared is not None:
+                    return DailyRecoveryProbe(would_write=True, next_cursor=next_cursor)
+            return DailyRecoveryProbe(would_write=False, next_cursor=next_cursor)
 
     def stage(self, run_id: str, stage_id: str) -> DailyStageRecord:
         with self._snapshot() as connection:

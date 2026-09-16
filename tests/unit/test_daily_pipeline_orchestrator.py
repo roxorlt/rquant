@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -841,3 +842,224 @@ def test_create_run_rejects_source_identity_that_is_not_current(tmp_path: Path) 
             profile_hash="d" * 64,
             now=NOW,
         )
+
+
+class _WriterWatcher:
+    """A held-open read-only connection that sees every commit the ledger makes.
+
+    ``PRAGMA data_version`` is SQLite's own "has another connection committed since I
+    last looked", and it only compares within one connection, so this one stays open
+    across the loop.  ``total_changes`` would not do: it counts what a single connection
+    did, and the ledger opens a fresh one per call.  Nor would the ``-wal`` file's
+    existence: opening a write connection creates and truncates it whether or not that
+    connection commits.  Holding the reader open also stops checkpointing, so the
+    ``-wal`` byte count is exactly what commits appended.
+    """
+
+    def __init__(self, database: Path) -> None:
+        self.database = database
+        self.connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        self.connection.row_factory = sqlite3.Row
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def writer_row(self) -> tuple[object, ...] | None:
+        row = self.connection.execute(
+            "SELECT * FROM daily_pipeline_writer WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else tuple(row)
+
+    def stamp(self) -> tuple[object, ...]:
+        data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+        wal = self.database.with_name(self.database.name + "-wal")
+        return (data_version, wal.stat().st_size if wal.exists() else 0, self.writer_row())
+
+
+def _idle_iteration(orchestrator, observed: datetime):
+    """The daily role's whole minute: create the day's run, recover it, advance it."""
+
+    run = orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id=SHA,
+        source_content_hash="c" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        now=observed,
+    )
+    orchestrator.recover(run_id=run.run_id, now=observed)
+    while orchestrator.advance(run.run_id, now=observed) is not None:
+        pass
+    return run
+
+
+def test_sixty_idle_iterations_take_no_lease_and_commit_nothing(tmp_path: Path) -> None:
+    """A day whose run already succeeded must cost the ledger nothing per minute.
+
+    ``create_run``, ``recover`` and ``advance`` each took the writer lease before they
+    looked at whether they had anything to do, and every acquisition is one fencing
+    token written through ``BEGIN IMMEDIATE ... COMMIT`` on a WAL, ``synchronous=FULL``
+    database -- three real fsyncs a minute for a run with nothing left in it (#271).
+    """
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _idle_iteration(orchestrator, NOW)
+    assert orchestrator.status(run.run_id).state is DailyRunState.SUCCEEDED
+
+    watcher = _WriterWatcher(orchestrator.ledger.path)
+    try:
+        before = watcher.stamp()
+        acquisitions = []
+        for index in range(60):
+            observed = NOW + timedelta(seconds=60 * (index + 1))
+            # A fresh orchestrator per iteration, the way the runtime role builds one.
+            idle = _orchestrator(tmp_path, adapters)
+            assert _idle_iteration(idle, observed).run_id == run.run_id
+            acquisitions.append(idle.writer_acquisitions)
+        after = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert acquisitions == [0] * 60
+    assert after == before, "an idle daily orchestrator committed to its ledger"
+    assert calls == list(_definition().stage_ids)
+
+
+def test_one_acquisition_per_real_write_and_none_for_the_last_empty_advance(
+    tmp_path: Path,
+) -> None:
+    """Work still takes the lease, and the token still counts acquisitions one by one."""
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+
+    run = orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id=SHA,
+        source_content_hash="c" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        now=NOW,
+    )
+    assert orchestrator.writer_acquisitions == 1
+
+    tokens = []
+    for index, _stage_id in enumerate(_definition().stage_ids):
+        outcome = orchestrator.advance(run.run_id, now=NOW + timedelta(seconds=index))
+        assert outcome is not None
+        tokens.append(orchestrator.writer_acquisitions)
+    assert tokens == [2, 3, 4, 5, 6, 7]
+
+    assert orchestrator.advance(run.run_id, now=NOW + timedelta(seconds=10)) is None
+    assert orchestrator.writer_acquisitions == 7
+
+    watcher = _WriterWatcher(orchestrator.ledger.path)
+    try:
+        assert watcher.writer_row()[2] == 7
+    finally:
+        watcher.close()
+
+
+def test_a_second_acquisition_still_fences_the_older_lease(tmp_path: Path) -> None:
+    """Lazy acquisition must not hand two live holders a lease that both still work."""
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+    ledger = orchestrator.ledger
+
+    older = ledger.acquire_writer(owner="daily-shadow", now=NOW, lease_for=timedelta(minutes=15))
+    newer = ledger.acquire_writer(owner="daily-shadow", now=NOW, lease_for=timedelta(minutes=15))
+
+    assert newer.fencing_token == older.fencing_token + 1
+    with pytest.raises(LeaseLost):
+        ledger.claim_next_for_run(older, run.run_id, now=NOW)
+    assert ledger.claim_next_for_run(newer, run.run_id, now=NOW) is not None
+
+
+def test_recovery_with_a_prepared_receipt_still_takes_the_lease(tmp_path: Path) -> None:
+    """The probe must not suppress a sweep that has a durable receipt to finalize."""
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+    ledger = orchestrator.ledger
+    lease = ledger.acquire_writer(owner="daily-shadow", now=NOW, lease_for=timedelta(seconds=1))
+    attempt = ledger.claim_next(lease, now=NOW)
+    assert attempt is not None
+    prepared = ledger.prepare_success(
+        lease,
+        attempt,
+        StageResult(content_hash="e" * 64, evidence_hash="f" * 64),
+        now=NOW,
+    )
+
+    resumed = _orchestrator(tmp_path, adapters)
+    assert resumed.ledger.recovery_probe(now=NOW + timedelta(seconds=2)).would_write is True
+    recovery = resumed.recover(run_id=run.run_id, now=NOW + timedelta(seconds=2))
+
+    assert recovery.finalized_receipt_ids == (prepared.receipt_id,)
+    assert resumed.writer_acquisitions == 1
+    assert resumed.ledger.stage(run.run_id, "raw_capture").state is DailyStageState.SUCCEEDED
+
+
+def test_recovery_with_an_expired_deadline_still_takes_the_lease(tmp_path: Path) -> None:
+    """A stage past its deadline is recoverable work, and the probe must say so."""
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id=SHA,
+        source_content_hash="c" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        deadline_at=NOW + timedelta(seconds=5),
+        now=NOW,
+    )
+
+    early = _orchestrator(tmp_path, adapters)
+    assert early.ledger.recovery_probe(now=NOW).would_write is False
+    assert early.recover(run_id=run.run_id, now=NOW).failed_stage_ids == ()
+    assert early.writer_acquisitions == 0
+
+    late = _orchestrator(tmp_path, adapters)
+    assert late.ledger.recovery_probe(now=NOW + timedelta(seconds=6)).would_write is True
+    recovery = late.recover(run_id=run.run_id, now=NOW + timedelta(seconds=6))
+
+    assert recovery.failed_stage_ids
+    assert late.writer_acquisitions == 1
+    assert late.status(run.run_id).state is DailyRunState.FAILED
+
+
+def test_an_empty_recovery_returns_the_same_summary_the_sweep_would_have(
+    tmp_path: Path,
+) -> None:
+    """The no-lease summary must be the swept one, cursor included, not an empty stub."""
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+    ledger = orchestrator.ledger
+
+    lazy = orchestrator.recover(run_id=run.run_id, now=NOW)
+    assert orchestrator.writer_acquisitions == 1  # only the create_run above
+
+    lease = ledger.acquire_writer(owner="daily-shadow", now=NOW, lease_for=timedelta(minutes=15))
+    swept = ledger.recover(lease, now=NOW, run_id=run.run_id)
+
+    assert lazy == swept
+    assert lazy.next_cursor == swept.next_cursor

@@ -129,7 +129,10 @@ def test_empty_database_publishes_fresh_idempotent_authority_without_writing_sql
         expected_payload_kind="lab_jobs",
     )(PUBLISHED_AT)
 
-    assert repeated == first
+    assert first.written is True
+    # Same content, so the second call selects the same generation and writes nothing.
+    assert repeated.written is False
+    assert repeated.pointer == first.pointer
     assert loaded.dataset_id == LAB_JOBS_DATASET_ID
     assert loaded.status is FreshnessStatus.FRESH
     assert loaded.reason is None
@@ -301,3 +304,114 @@ def test_reader_rejects_job_limits_outside_authoritative_reader_bound(
             reader=LabJobReader(store.path),
             max_jobs=max_jobs,
         )
+
+
+def _add_job(store: LabJobStore, lease: object, index: int) -> None:
+    result = store.apply_command(
+        _submit(job_id=UUID(int=index + 1), spec=_spec()),
+        lease=lease,
+        now=NOW + timedelta(seconds=index),
+    )
+    assert result.status == "applied"
+
+
+def _generation_files(authority_root: Path) -> set[str]:
+    generations = authority_root / "generations"
+    return {path.name for path in generations.iterdir()} if generations.exists() else set()
+
+
+def test_sixty_idle_iterations_over_the_same_jobs_publish_one_generation(
+    tmp_path: Path,
+) -> None:
+    """#271: the thirty-second loop that rebuilt `serving.duckdb` behind it all day.
+
+    Every field this read used to hash a clock into moves on its own: `sequence`,
+    `event_time` and `published_at` are the observation instant, and each job's ETA is
+    restated as of it, so `as_of` and the whole `finish_at` window slide every thirty
+    seconds over jobs nobody has touched since last week.
+    """
+
+    store = _store(tmp_path)
+    _seed_jobs(store, 3)
+    published_at = [PUBLISHED_AT]
+    authority = LabJobsServingAuthorityPublisher(
+        reader=LabJobsServingSourceReader(reader=LabJobReader(store.path), max_jobs=10),
+        publisher=ServingSourceAuthorityPublisher(
+            root=tmp_path / "authority",
+            producer_commit=COMMIT,
+            dataset_id=LAB_JOBS_DATASET_ID,
+            payload_kind="lab_jobs",
+            clock=lambda: published_at[0],
+        ),
+    )
+
+    first = authority.publish(OBSERVED_AT)
+    assert first.written is True
+    settled = _generation_files(tmp_path / "authority")
+
+    written = []
+    for iteration in range(1, 61):
+        observed = OBSERVED_AT + timedelta(seconds=30 * iteration)
+        published_at[0] = observed + timedelta(seconds=5)
+        result = authority.reader(observed)
+        # The read really is different bytes every time -- that is the whole defect.
+        assert result.generation_id != first.pointer.generation_id
+        written.append(authority.publish(observed).written)
+
+    assert written == [False] * 60
+    assert _generation_files(tmp_path / "authority") == settled
+
+
+def test_a_job_that_moves_publishes_exactly_one_more_generation(tmp_path: Path) -> None:
+    """The ETA is only allowed to go stale while the jobs behind it are standing still."""
+
+    store = _store(tmp_path)
+    lease = _lease(store)
+    _add_job(store, lease, 0)
+    published_at = [PUBLISHED_AT]
+    authority = LabJobsServingAuthorityPublisher(
+        reader=LabJobsServingSourceReader(reader=LabJobReader(store.path), max_jobs=10),
+        publisher=ServingSourceAuthorityPublisher(
+            root=tmp_path / "authority",
+            producer_commit=COMMIT,
+            dataset_id=LAB_JOBS_DATASET_ID,
+            payload_kind="lab_jobs",
+            clock=lambda: published_at[0],
+        ),
+    )
+    assert authority.publish(OBSERVED_AT).written is True
+
+    moved = OBSERVED_AT + timedelta(seconds=30)
+    published_at[0] = moved + timedelta(seconds=5)
+    _add_job(store, lease, 1)
+    assert authority.publish(moved).written is True
+
+    written = []
+    for iteration in range(2, 8):
+        observed = OBSERVED_AT + timedelta(seconds=30 * iteration)
+        published_at[0] = observed + timedelta(seconds=5)
+        written.append(authority.publish(observed).written)
+    assert written == [False] * 6
+
+
+def test_the_lab_jobs_state_identity_drops_only_the_instant_it_was_asked(
+    tmp_path: Path,
+) -> None:
+    """Directly on the function, so the property is not only an emergent one."""
+
+    from rquant.lab_jobs_serving_authority import lab_jobs_state_identity
+
+    store = _store(tmp_path)
+    lease = _lease(store)
+    _add_job(store, lease, 0)
+    _add_job(store, lease, 1)
+    reader = LabJobsServingSourceReader(reader=LabJobReader(store.path), max_jobs=10)
+    first = reader(OBSERVED_AT)
+    later = reader(OBSERVED_AT + timedelta(hours=3))
+
+    assert later.generation_id != first.generation_id
+    assert lab_jobs_state_identity(later) == lab_jobs_state_identity(first)
+
+    _add_job(store, lease, 2)
+    changed = reader(OBSERVED_AT + timedelta(hours=3))
+    assert lab_jobs_state_identity(changed) != lab_jobs_state_identity(first)

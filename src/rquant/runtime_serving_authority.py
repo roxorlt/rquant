@@ -103,6 +103,19 @@ class ServingSourceAuthorityPointer(_StrictAuthorityModel):
         return self
 
 
+class ServingSourceAuthorityPublication(_StrictAuthorityModel):
+    """What one publish attempt selected, and whether it had to write anything.
+
+    `written` cannot be read off the pointer: the same `generation_id` may be the one
+    this call just published or the one an hour-old call left behind. A role that is only
+    asked to re-state what it already said needs to be able to say so -- which is the
+    whole point of the content gate below (#271).
+    """
+
+    pointer: ServingSourceAuthorityPointer
+    written: bool
+
+
 class ServingSourceAuthorityPublisher:
     """Single-owner atomic publisher for current plus retained generations."""
 
@@ -127,6 +140,40 @@ class ServingSourceAuthorityPublisher:
         self.max_bytes = _require_max_bytes(max_bytes)
 
     def publish(self, result: SourceReadResult) -> ServingSourceAuthorityPointer:
+        return self._publish(result, unchanged_identity=None).pointer
+
+    def publish_if_changed(
+        self,
+        result: SourceReadResult,
+        *,
+        unchanged_identity: Callable[[SourceReadResult], str],
+    ) -> ServingSourceAuthorityPublication:
+        """Publish only when `unchanged_identity` separates this read from the current one.
+
+        A dataset whose reader cannot avoid carrying the observation instant in its
+        payload -- runtime health measures staleness against a real clock, a lab job's ETA
+        is stated as of the moment it was asked -- would otherwise produce a new
+        `generation_id` on every iteration and the idempotent path below could never
+        match. The callback names the part of a read that is *evidence* rather than
+        observation; two reads that agree on it are the same answer, and the generation
+        already published stays selected, unwritten and unfsynced (#271).
+
+        The published document is never rewritten in place, so the timestamps in the
+        selected generation are the ones from the iteration that first observed this
+        state, not the latest one -- the same trade package V made for the notifier's
+        projection authority.
+        """
+
+        if not callable(unchanged_identity):
+            raise TypeError("unchanged_identity must be callable")
+        return self._publish(result, unchanged_identity=unchanged_identity)
+
+    def _publish(
+        self,
+        result: SourceReadResult,
+        *,
+        unchanged_identity: Callable[[SourceReadResult], str] | None,
+    ) -> ServingSourceAuthorityPublication:
         if not isinstance(result, SourceReadResult):
             raise TypeError("result must be SourceReadResult")
         result = SourceReadResult.model_validate(result)
@@ -178,27 +225,38 @@ class ServingSourceAuthorityPublisher:
             )
             if current is not None:
                 current_pointer, current_document, current_pointer_bytes = current
-                if current_pointer.generation_id == result.generation_id:
-                    if current_document == document:
-                        if current_pointer_bytes != _canonical_json(current_pointer):
-                            raise ServingSourceAuthorityIntegrityError(
-                                "idempotent current pointer bytes conflict"
-                            )
-                        _archive_publication(
-                            publications_fd,
-                            pointer=current_pointer,
-                            payload=current_pointer_bytes,
-                            max_bytes=self.max_bytes,
+                same_generation = current_pointer.generation_id == result.generation_id
+                # Byte-for-byte the same read, or -- when the caller supplied one -- the
+                # same answer under an identity that drops the observation instant.
+                restates_current = same_generation and current_document == document
+                if not restates_current and unchanged_identity is not None:
+                    restates_current = unchanged_identity(current_document.result) == (
+                        unchanged_identity(result)
+                    )
+                if restates_current:
+                    if current_pointer_bytes != _canonical_json(current_pointer):
+                        raise ServingSourceAuthorityIntegrityError(
+                            "idempotent current pointer bytes conflict"
                         )
-                        _verify_existing_current_pointer(
-                            chain,
-                            root_fd=root_fd,
-                            generations_entry=generations_entry,
-                            publications_entry=publications_entry,
-                            expected_payload=current_pointer_bytes,
-                            max_bytes=self.max_bytes,
-                        )
-                        return current_pointer
+                    _archive_publication(
+                        publications_fd,
+                        pointer=current_pointer,
+                        payload=current_pointer_bytes,
+                        max_bytes=self.max_bytes,
+                    )
+                    _verify_existing_current_pointer(
+                        chain,
+                        root_fd=root_fd,
+                        generations_entry=generations_entry,
+                        publications_entry=publications_entry,
+                        expected_payload=current_pointer_bytes,
+                        max_bytes=self.max_bytes,
+                    )
+                    return ServingSourceAuthorityPublication(
+                        pointer=current_pointer,
+                        written=False,
+                    )
+                if same_generation:
                     if current_document.result != result:
                         raise ServingSourceAuthorityIntegrityError(
                             "idempotent authority publication conflicts with current content"
@@ -270,7 +328,7 @@ class ServingSourceAuthorityPublisher:
                 publications_entry=publications_entry,
                 max_bytes=self.max_bytes,
             )
-            return pointer
+            return ServingSourceAuthorityPublication(pointer=pointer, written=True)
         finally:
             if lock_fd >= 0:
                 with suppress(OSError):
@@ -1619,6 +1677,7 @@ __all__ = [
     "ServingSourceAuthorityDocument",
     "ServingSourceAuthorityIntegrityError",
     "ServingSourceAuthorityPointer",
+    "ServingSourceAuthorityPublication",
     "ServingSourceAuthorityPublisher",
     "ServingSourceAuthorityReader",
     "ServingSourceAuthorityUnavailableError",

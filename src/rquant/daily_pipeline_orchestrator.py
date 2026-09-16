@@ -410,6 +410,7 @@ class DailyPipelineOrchestrator:
         self._monotonic_clock = monotonic_clock
         self._lease_for = lease_for
         self._execution_mode = execution_mode
+        self._writer_acquisitions = 0
         supplied = {adapter.stage_id: adapter for adapter in adapters}
         if set(supplied) != set(self._definition.stage_ids):
             raise ValueError("daily orchestrator adapters must exactly match the pipeline stages")
@@ -422,6 +423,16 @@ class DailyPipelineOrchestrator:
     @property
     def adapters(self) -> Mapping[str, DailyStageAdapter]:
         return self._adapters
+
+    @property
+    def writer_acquisitions(self) -> int:
+        """How many writer leases this orchestrator instance has taken.
+
+        Each acquisition is one fencing token and one fsync.  The daily role builds one
+        orchestrator per iteration, so a zero here is that iteration saying it found
+        nothing to write and took no lease at all (#271).
+        """
+        return self._writer_acquisitions
 
     def create_run(
         self,
@@ -457,6 +468,13 @@ class DailyPipelineOrchestrator:
             created_at=observed,
         )
         self._assert_source_identity(provisional)
+        # The ledger already holding this exact run is the ordinary case: the role
+        # rebuilds the same spec every minute all day.  Returning it read-only is the
+        # same record ``ledger.create_run`` would have returned from its idempotent
+        # branch, minus the fencing token that branch charged for it (#271).
+        existing = self.ledger.run_for_spec(spec)
+        if existing is not None:
+            return existing
         lease = self._acquire(observed)
         return self.ledger.create_run(lease, spec, now=observed)
 
@@ -467,6 +485,8 @@ class DailyPipelineOrchestrator:
         now: datetime | None = None,
     ) -> DailyStageAdvanceOutcome | None:
         observed = self._now(now)
+        if not self._advance_would_write(run_id, observed):
+            return None
         lease = self._acquire(observed)
         self.ledger.recover(lease, now=observed)
         run = self.ledger.run(run_id)
@@ -622,6 +642,19 @@ class DailyPipelineOrchestrator:
         now: datetime | None = None,
     ) -> DailyRecoverySummary:
         observed = self._now(now)
+        # Recovery is a sweep, and most days there is nothing in the ledger to sweep.
+        # Probe first: the summary below is byte-for-byte the one an empty sweep would
+        # have returned, cursor included, and it costs no fencing token (#271).
+        probe = self.ledger.recovery_probe(now=observed, run_id=run_id)
+        if not probe.would_write and not self.ledger.has_recoverable_effect_attempts(
+            run_id=run_id
+        ):
+            return DailyRecoverySummary(
+                finalized_receipt_ids=(),
+                retried_stage_ids=(),
+                failed_stage_ids=(),
+                next_cursor=probe.next_cursor,
+            )
         lease = self._acquire(observed)
         baseline = self.ledger.recover(lease, now=observed, run_id=run_id)
         finalized = list(baseline.finalized_receipt_ids)
@@ -697,11 +730,37 @@ class DailyPipelineOrchestrator:
         )
 
     def _acquire(self, observed: datetime) -> DailyWriterLease:
-        return self.ledger.acquire_writer(
+        lease = self.ledger.acquire_writer(
             owner=self._service_owner,
             now=observed,
             lease_for=self._lease_for,
         )
+        self._writer_acquisitions += 1
+        return lease
+
+    def _advance_would_write(self, run_id: str, observed: datetime) -> bool:
+        """Can :meth:`advance` still change a durable row before it returns ``None``?
+
+        ``advance`` writes in exactly three places: the ledger-wide recovery sweep it
+        opens with, the adopt-or-claim that picks its stage, and the stage execution
+        that a claim leads to -- and the third cannot happen without the second.  When
+        neither of the first two would touch a row, the whole call is a read, and
+        taking the writer lease for it burns a fencing token and an fsync for a run
+        that has nothing left to do (#271).
+
+        The source-identity assertion stays on every path that returns, so a run whose
+        source was revised under it still raises here rather than being reported idle.
+        """
+        if self.ledger.recovery_probe(now=observed).would_write:
+            return True
+        run = self.ledger.run(run_id)
+        if run.state is not DailyRunState.RUNNING:
+            self._assert_source_identity(run)
+            return False
+        if self.ledger.has_claimable_stage_work(now=observed, run_id=run_id):
+            return True
+        self._assert_source_identity(run)
+        return False
 
     def _dependency_receipts(
         self,

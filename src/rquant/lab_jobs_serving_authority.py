@@ -43,7 +43,7 @@ from rquant.lab_worker import LabShardResultManifest
 from rquant.research_run_spec import ResearchExperimentIdentity, StrategyExecutionIdentity
 from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.runtime_serving_authority import (
-    ServingSourceAuthorityPointer,
+    ServingSourceAuthorityPublication,
     ServingSourceAuthorityPublisher,
 )
 from rquant.runtime_serving_snapshot import (
@@ -909,6 +909,41 @@ class LabJobsServingSourceReader:
             raise LabJobsServingAuthorityIntegrityError("lab job ETA contains future evidence")
 
 
+#: What a Lab Jobs read says about *when* it was asked rather than about the jobs. The
+#: top four are the reader's own clock; the two ETA fields are the estimate restated
+#: against it -- `as_of` is the question's timestamp and `finish_at` is `as_of` plus the
+#: remaining duration, so both slide every thirty seconds while a job sits there. The rest
+#: of the estimate (`status`, `estimator`, the shard counts, `remaining_duration`) is
+#: computed from telemetry and stays in the identity, and so does every job summary --
+#: which carries `progress` and `version`, so a job that is actually moving republishes
+#: and gets a fresh ETA with it (#271).
+_LAB_JOBS_OBSERVATION_FIELDS = ("sequence", "event_time", "published_at", "generation_id")
+_LAB_JOBS_ETA_OBSERVATION_FIELDS = ("as_of", "finish_at")
+
+
+def lab_jobs_state_identity(result: SourceReadResult) -> str:
+    """Name what a Lab Jobs read *found*, with the instant it was asked taken out.
+
+    Never persisted: it is computed on both sides of one comparison by this same
+    function, so its shape is free to change and a rollback reads every generation this
+    code published.
+    """
+
+    state = result.model_dump(mode="json")
+    for name in _LAB_JOBS_OBSERVATION_FIELDS:
+        state.pop(name, None)
+    payload = state.get("payload")
+    if isinstance(payload, dict):
+        for record in payload.get("lab_jobs") or ():
+            if not isinstance(record, dict):
+                continue
+            eta = record.get("eta")
+            if isinstance(eta, dict):
+                for name in _LAB_JOBS_ETA_OBSERVATION_FIELDS:
+                    eta.pop(name, None)
+    return canonical_sha256({"contract": "lab-jobs-state/v1", "state": state})
+
+
 class LabJobsServingAuthorityPublisher:
     """Publish one verified Lab Jobs projection through its owner authority."""
 
@@ -929,8 +964,11 @@ class LabJobsServingAuthorityPublisher:
         self.reader = reader
         self.publisher = publisher
 
-    def publish(self, observed_at: datetime) -> ServingSourceAuthorityPointer:
-        return self.publisher.publish(self.reader(observed_at))
+    def publish(self, observed_at: datetime) -> ServingSourceAuthorityPublication:
+        return self.publisher.publish_if_changed(
+            self.reader(observed_at),
+            unchanged_identity=lab_jobs_state_identity,
+        )
 
 
 def _sequence_for(observed_at: datetime) -> int:
@@ -948,4 +986,5 @@ __all__ = [
     "LabJobsServingSourceReader",
     "LabTerminalAuthorityIntegrityError",
     "TrustedLabStrategyProjectionReader",
+    "lab_jobs_state_identity",
 ]
