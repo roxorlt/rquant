@@ -695,12 +695,21 @@ class TestRootImportClosure:
     #: contract module at import time. Those constants now live in the leaf module
     #: `rquant.signal_family_constants`, which imports nothing from `rquant`, so the
     #: contract module leaves the root's closure and the leaf module takes its place.
+    #: Amended again for #268: `rquant.runtime_service_control` -- already in this closure
+    #: -- now reads `READ_INTERRUPT_STOP_REASON` and `is_read_interrupt` from
+    #: `rquant.runtime_read_interrupt`, so that module enters with it. It is admitted on
+    #: the same terms as `signal_family_constants`: it imports nothing from `rquant` (only
+    #: errno, os, select, signal, threading, and typing helpers), and at import time it
+    #: builds one `RLock`, one empty dict and three constants -- no file descriptor, no
+    #: signal handler, no thread. Nothing here reaches a database driver, a builder, or any
+    #: surface module, which is what FORBIDDEN_MODULES below actually guards.
     ALLOWED_MODULES = (
         "rquant",
         "rquant.authority_path_security",
         "rquant.privilege_launcher",
         "rquant.runtime_authority",
         "rquant.runtime_contracts",
+        "rquant.runtime_read_interrupt",
         "rquant.runtime_service_control",
         "rquant.runtime_service_entrypoint",
         "rquant.signal_family_constants",
