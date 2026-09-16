@@ -21,7 +21,7 @@ from rquant.runtime_service_control import (
     project_heartbeat,
 )
 from rquant.runtime_serving_authority import (
-    ServingSourceAuthorityPointer,
+    ServingSourceAuthorityPublication,
     ServingSourceAuthorityPublisher,
 )
 from rquant.runtime_serving_snapshot import (
@@ -588,6 +588,94 @@ class RuntimeHealthSourceReader:
         return SourceReadResult.model_validate(values)
 
 
+#: What a runtime-health read says about *when* it looked, rather than about what it
+#: found. Every one of these moves on every iteration on a perfectly healthy host: the
+#: reader stamps its own clock into four places, and the twenty heartbeats it reads carry
+#: a clock, a duration window and five counters that advance whether or not anything
+#: happened. Hashing them into the generation id made `runtime-health.all.v1` publish a
+#: new generation every ten seconds forever, which is what kept `serving.publisher.v1`
+#: rebuilding a whole `serving.duckdb` every thirty (#271).
+_HEALTH_OBSERVATION_FIELDS = ("sequence", "event_time", "published_at", "generation_id")
+_HEALTH_PAYLOAD_OBSERVATION_FIELDS = (
+    "dashboard_summary_observed_at",
+    "dashboard_summary_generation_id",
+    #: A per-source receipt hashes the whole heartbeat document plus `observed_at`.
+    "dashboard_summary_source_receipts",
+    #: Both are measurements of the moment, not of the host: the backlog age is
+    #: `observed_at - last_success_at` and the latency is the rolling p95 of the last few
+    #: iterations. `live_healthy`, which is derived from status and staleness, stays.
+    "live_backlog_age_seconds",
+    "live_p95_latency_seconds",
+)
+#: `source_generations` is excluded for a second reason on top of being an echo of
+#: datasets serving reads from their own authorities: `lab-jobs.serving.v1` is one of the
+#: sources this role watches, so a health generation that moved because a watched role's
+#: `source_generations` moved would be a loop with no idle state in it.
+_HEARTBEAT_OBSERVATION_FIELDS = (
+    "heartbeat_at",
+    "last_success_at",
+    "input_sequence",
+    "output_sequence",
+    "processed_count",
+    "backlog_count",
+    "consecutive_failures",
+    "total_failures",
+    "total_successes",
+    "last_step_duration_seconds",
+    "p95_step_duration_seconds",
+    "recent_step_durations_seconds",
+    "source_generations",
+)
+_DASHBOARD_ROW_OBSERVATION_FIELDS = ("monitor_last_at", "daily_last_at")
+
+
+def runtime_health_state_identity(result: SourceReadResult) -> str:
+    """Name what a runtime-health read *found*, with the instant it looked taken out.
+
+    What survives is the service set and, per service, its plane, whether the heartbeat
+    could be read at all, the status, the staleness verdict, the run and spec identity it
+    is running under, its degraded reasons and its last error -- everything a reader of
+    this dataset acts on. What is dropped is the answer to "when did you look", which is
+    not evidence about the host.
+
+    Staleness is the reason this cannot simply be "drop the publisher's own clock": a
+    service that stops heartbeating is detected by comparing a real `now` against a
+    heartbeat that stopped moving, so the read has to keep using a real clock -- and the
+    verdict it produces, `stale`, is in the identity, so a death still publishes exactly
+    one generation.
+
+    Never persisted: it is computed on both sides of one comparison by this same
+    function, so its shape is free to change and a rollback reads every generation this
+    code published.
+    """
+
+    state = result.model_dump(mode="json")
+    for name in _HEALTH_OBSERVATION_FIELDS:
+        state.pop(name, None)
+    payload = state.get("payload")
+    if isinstance(payload, dict):
+        for name in _HEALTH_PAYLOAD_OBSERVATION_FIELDS:
+            payload.pop(name, None)
+        for service in payload.get("runtime_services") or ():
+            if not isinstance(service, dict):
+                continue
+            service.pop("observed_at", None)
+            heartbeat = service.get("heartbeat")
+            if isinstance(heartbeat, dict):
+                for name in _HEARTBEAT_OBSERVATION_FIELDS:
+                    heartbeat.pop(name, None)
+        for projection in payload.get("projections") or ():
+            if not isinstance(projection, dict):
+                continue
+            projection.pop("available_at", None)
+            for row in projection.get("rows") or ():
+                if not isinstance(row, dict):
+                    continue
+                for name in _DASHBOARD_ROW_OBSERVATION_FIELDS:
+                    row.pop(name, None)
+    return canonical_sha256({"contract": "runtime-health-state/v1", "state": state})
+
+
 class RuntimeHealthAuthorityPublisher:
     """Publish one verified runtime-health read through the generic source authority."""
 
@@ -608,8 +696,11 @@ class RuntimeHealthAuthorityPublisher:
         self.reader = reader
         self.publisher = publisher
 
-    def publish(self, observed_at: datetime) -> ServingSourceAuthorityPointer:
-        return self.publisher.publish(self.reader(observed_at))
+    def publish(self, observed_at: datetime) -> ServingSourceAuthorityPublication:
+        return self.publisher.publish_if_changed(
+            self.reader(observed_at),
+            unchanged_identity=runtime_health_state_identity,
+        )
 
 
 __all__ = [
@@ -617,4 +708,5 @@ __all__ = [
     "RuntimeHealthAuthorityPublisher",
     "RuntimeHealthControlSource",
     "RuntimeHealthSourceReader",
+    "runtime_health_state_identity",
 ]

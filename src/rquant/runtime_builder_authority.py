@@ -232,7 +232,10 @@ def runtime_health_publisher_builder(
             raise ValueError("runtime health publisher must run on the serving plane")
         settings = RuntimeHealthPublisherSettings.model_validate(dict(manifest.settings))
         from rquant.runtime_generation_lineage import previous_spec_identities
-        from rquant.runtime_health_authority import RuntimeHealthSourceReader
+        from rquant.runtime_health_authority import (
+            RuntimeHealthSourceReader,
+            runtime_health_state_identity,
+        )
         from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
         from rquant.runtime_serving_snapshot import RUNTIME_HEALTH_DATASET_ID
 
@@ -259,12 +262,21 @@ def runtime_health_publisher_builder(
 
         def step() -> RuntimeStepResult:
             source = reader(clock())
-            pointer = publisher.publish(source)
+            # The read still uses a real clock -- staleness is measured against one -- but
+            # the generation is only republished when the state it found differs from the
+            # one already selected (#271).
+            publication = publisher.publish_if_changed(
+                source,
+                unchanged_identity=runtime_health_state_identity,
+            )
             return RuntimeStepResult(
                 input_sequence=source.sequence,
                 output_sequence=source.sequence,
                 processed_count=len(settings.sources),
-                source_generations={RUNTIME_HEALTH_DATASET_ID: pointer.generation_id},
+                source_generations={
+                    RUNTIME_HEALTH_DATASET_ID: publication.pointer.generation_id
+                },
+                generation_published=publication.written,
             )
 
         return step
