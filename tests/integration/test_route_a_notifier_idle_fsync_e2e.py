@@ -39,24 +39,35 @@ INTERVAL = timedelta(seconds=2)
 IDLE_ITERATIONS = 60
 
 
-def _state_stamp(database: Path) -> tuple[object, ...]:
-    """Everything that moves when this database is committed to.
+class _CommitWatcher:
+    """One read-only connection, held open, that sees every commit anybody else makes.
 
-    The **main file's** size and mtime are the commit evidence. The store opens and
-    closes a connection per call, so every commit is checkpointed into this file before
-    the call returns, and a file whose mtime has not moved is a database nothing was
-    committed to. The `-wal` is deliberately not looked at: opening a write connection
-    creates and truncates it whether or not that connection goes on to commit, so its
-    mtime moves on an iteration that wrote nothing at all. `total_changes` is no use
-    either -- it counts what *one* connection did -- and `/proc/self/io` `syscw` is
-    Linux-only, so this runs on both lanes. The row counts and the cursor row come with
-    it because a row rewritten in place moves no count, and the point is to catch both.
+    `PRAGMA data_version` is SQLite's own answer to "has another connection committed
+    since I last looked", and it is only comparable **within one connection** -- so the
+    connection is held open across the loop rather than reopened per sample. The other
+    portable candidates were tried and are unsound here: `total_changes` counts what one
+    connection did and the store opens its own per call; the `-wal` file is created and
+    truncated by opening a write connection whether or not it commits; and the main
+    file's size and mtime move when a checkpoint gets around to running, which depends on
+    whether a reader happens to be open and differed between 3.11 and 3.12 on the same
+    code. `/proc/self/io` `syscw` would do it on Linux only.
+
+    Holding this reader open has a second use: it keeps the WAL from being checkpointed,
+    so `-wal` bytes are exactly the bytes commits appended during the window, and zero of
+    them is a second, independent way of saying nothing was committed.
     """
 
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    try:
+    def __init__(self, database: Path) -> None:
+        self.database = database
+        self.connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def stamp(self) -> tuple[object, ...]:
+        data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
         counts = tuple(
-            int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            int(self.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
             for table in (
                 "notification_projection_authority",
                 "notification_replication_source",
@@ -65,17 +76,12 @@ def _state_stamp(database: Path) -> tuple[object, ...]:
                 "delivery_attempt",
             )
         )
-        cursor_row = connection.execute(
+        cursor_row = self.connection.execute(
             "SELECT * FROM notification_replication_source WHERE singleton = 1"
         ).fetchone()
-    finally:
-        connection.close()
-    observed = database.stat()
-    return (
-        (observed.st_size, observed.st_mtime_ns),
-        counts,
-        tuple(cursor_row) if cursor_row else None,
-    )
+        wal = self.database.with_name(self.database.name + "-wal")
+        wal_bytes = wal.stat().st_size if wal.exists() else 0
+        return (data_version, wal_bytes, counts, tuple(cursor_row) if cursor_row else None)
 
 
 def _projection_generations(database: Path) -> tuple[str, ...]:
@@ -118,12 +124,16 @@ def test_an_idle_notifier_commits_nothing_and_one_change_commits_once(
     settle = [step(), step()]
     assert [result.projection_published for result in settle] == [True, False]
 
-    before = _state_stamp(state)
-    idle = []
-    for index in range(IDLE_ITERATIONS):
-        clock = NOW + INTERVAL * (index + 1)
-        idle.append(step())
-    after = _state_stamp(state)
+    watcher = _CommitWatcher(state)
+    try:
+        before = watcher.stamp()
+        idle = []
+        for index in range(IDLE_ITERATIONS):
+            clock = NOW + INTERVAL * (index + 1)
+            idle.append(step())
+        after = watcher.stamp()
+    finally:
+        watcher.close()
 
     assert after == before, "an idle notifier committed to its state database"
     assert [result.projection_published for result in idle] == [False] * IDLE_ITERATIONS
@@ -158,3 +168,50 @@ def test_an_idle_notifier_commits_nothing_and_one_change_commits_once(
     assert again.projection_published is False
     assert len(generations) == 2
     assert generations[0] != generations[1]
+
+
+def test_the_paused_notifier_production_actually_runs_commits_nothing_either(
+    tmp_path: Path,
+) -> None:
+    """The production manifest sets `paused: true`, and that branch publishes too.
+
+    `runtime_production_profile` gives `notifier.admin.shadow.v1` `"paused": True`, so the
+    branch the host has been running every two seconds since the roles went resident is
+    the paused one -- which skips the replication and the delivery batch and still calls
+    `page_projection_producer.publish()` unconditionally. Sixty of those must commit
+    nothing either, or the fix does not reach the thing that was measured.
+    """
+
+    _seed_outbox(tmp_path)
+    replica = _page_projection_replica(tmp_path, synced_at=NOW - timedelta(minutes=1))
+    state = tmp_path / "notification-state.sqlite3"
+    clock = NOW
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: clock,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            paused=True,
+            serving_authority_root=str((tmp_path / "serving-signals").resolve()),
+            page_projection_database_path=str(replica),
+        )
+    )
+
+    first = step()
+    watcher = _CommitWatcher(state)
+    try:
+        before = watcher.stamp()
+        idle = []
+        for index in range(IDLE_ITERATIONS):
+            clock = NOW + INTERVAL * (index + 1)
+            idle.append(step())
+        after = watcher.stamp()
+    finally:
+        watcher.close()
+
+    assert first.projection_published is True
+    assert "notifier:paused" in first.degraded_reasons
+    assert after == before, "a paused idle notifier committed to its state database"
+    assert [result.projection_published for result in idle] == [False] * IDLE_ITERATIONS
+    assert len(_projection_generations(state)) == 1

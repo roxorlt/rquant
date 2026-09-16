@@ -193,10 +193,14 @@ def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
 
     store.replicate(descriptor, records, observed_at=NOW)
     advanced = store.replication_cursor()
-    before = _database_stamp(database)
-    for index in range(1, 61):
-        store.replicate(descriptor, (), observed_at=NOW + timedelta(seconds=2 * index))
-    after = _database_stamp(database)
+    watcher = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        before = _committed_stamp(watcher)
+        for index in range(1, 61):
+            store.replicate(descriptor, (), observed_at=NOW + timedelta(seconds=2 * index))
+        after = _committed_stamp(watcher)
+    finally:
+        watcher.close()
     idle = store.replication_cursor()
 
     assert after == before
@@ -204,38 +208,36 @@ def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
     assert idle.updated_at == advanced.updated_at
 
 
-def _database_stamp(database: Path) -> tuple[object, ...]:
-    """Everything that moves when this database is committed to, and nothing that does not.
+def _committed_stamp(watcher: sqlite3.Connection) -> tuple[object, ...]:
+    """What this one held-open connection can see of anybody else's commits.
 
-    The main file's size and mtime say whether anything was committed at all: the store
-    opens and closes a connection per call, so a commit is checkpointed into this file
-    before the call returns. `sqlite3.Connection.total_changes` counts what *one*
-    connection did, and the `-wal` is created and truncated by opening a write connection
-    whether or not it commits, so neither of those answers the question. The row counts
-    and the cursor row come with it, because a row replaced in place changes no count.
+    `PRAGMA data_version` is SQLite's own "has another connection committed since I last
+    looked", and it is comparable only within one connection -- hence a connection held
+    open across the loop rather than reopened per sample. The alternatives do not answer
+    the question: `total_changes` counts what one connection *did* and the store opens its
+    own per call; the main file's mtime moves when a checkpoint gets around to running,
+    which depends on whether a reader is open; and the `-wal` is created and truncated by
+    opening a write connection whether or not it commits. The row counts and the cursor
+    row come with it, because a row replaced in place changes no count.
     """
 
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    try:
-        counts = tuple(
-            connection.execute(f"SELECT count(*), max(rowid) FROM {table}").fetchone()
+    return (
+        watcher.execute("PRAGMA data_version").fetchone()[0],
+        tuple(
+            watcher.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             for table in (
                 "notification_replication_source",
                 "signal_envelope",
                 "delivery_outbox",
                 "notification_projection_authority",
             )
-        )
-        cursor_row = connection.execute(
-            "SELECT * FROM notification_replication_source WHERE singleton = 1"
-        ).fetchone()
-    finally:
-        connection.close()
-    observed = database.stat()
-    return (
-        (observed.st_size, observed.st_mtime_ns),
-        counts,
-        tuple(cursor_row) if cursor_row is not None else None,
+        ),
+        tuple(
+            watcher.execute(
+                "SELECT * FROM notification_replication_source WHERE singleton = 1"
+            ).fetchone()
+            or ()
+        ),
     )
 
 
