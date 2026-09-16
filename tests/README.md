@@ -31,8 +31,8 @@ uv run pytest --cov=rquant --cov-report=term-missing
 ## Full Suite CI 分片
 
 默认非网络、非 `linux_exact` 全集由
-`tests/manifests/full-suite-v1/index.json` 固定为 **14547 cases / 55 skips**，并以
-`51e4e43f0722607924d4044217f680d4949291d14faf72435dc6e0738df4515c` 绑定完整 nodeid
+`tests/manifests/full-suite-v1/index.json` 固定为 **14565 cases / 55 skips**，并以
+`f45a778fb2e52d7d11d6882da1e919938c7ba127c178351386c4c64323c4b592` 绑定完整 nodeid
 集合。五个 JSONL shard 必须并集精确等于该集合、彼此不重叠；不要手改 nodeid 或 digest。
 分片数是 `scripts/full_suite_shards.py` 里的 `SHARD_COUNT`：改这个常量再重生成清单，
 CI 矩阵 `shard: [0, 1, 2, 3, 4]` 要同步。

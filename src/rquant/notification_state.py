@@ -147,6 +147,41 @@ class NotificationRecipientMigrationSummary(RuntimeContractModel):
     audit_ids: tuple[str, ...]
 
 
+#: A projection authority carries **two** identities (#271), and the split is the whole
+#: of the fix.
+#:
+#: `content_id` names what is published: the projections, their source receipts, and the
+#: schema version. Nothing that moves on its own is in it, so an iteration that finds the
+#: same projection computes the same `content_id` as the last one -- which is what lets
+#: `publish_projection_authority` recognise its own last publication and write nothing.
+#: Until v0.33.13 there was no such field: the id was hashed over every field of the
+#: snapshot, `observed_at` (the notifier's own clock) and `available_at` (the receipts'
+#: `published_at`, which the producer stamps from the same clock) included. So the same
+#: projection was a new generation on every one of `notifier.admin.shadow.v1`'s two-second
+#: iterations, the dedup lookup never matched, and the role inserted a row, committed it
+#: and -- WAL with `synchronous = FULL` -- fsynced it all day whatever the replica held.
+#:
+#: `generation_id` names **this publication** of that content: the content id plus the two
+#: instants. It stays per-publication on purpose, because the table is keyed by it and
+#: `serving_snapshot` orders by `available_at DESC, observed_at DESC` -- so publishing a
+#: content is always a new row, later than every row before it, and "the latest row" is
+#: "the most recently published content". That is what the first cut of this fix got
+#: wrong: with the id hashed over content alone, a projection that reverted byte for byte
+#: to an earlier form matched that earlier *row*, wrote nothing, and left the intermediate
+#: generation being served for as long as the revert lasted (review SF-1).
+_AUTHORITY_CONTENT_IDENTITY = ("schema_version", "source_receipts", "projections")
+
+#: The same rule one level down. A source receipt's `published_at` is the iteration clock
+#: as well, and its `receipt_id` is carried into the authority's `source_receipts` -- so
+#: leaving it in the hash would have made the authority's content differ every iteration
+#: no matter what the authority itself excluded. Everything else on the receipt
+#: (`dataset_id`, the source's own `generation_id`, `sequence`, `event_time`, `status`,
+#: `projections`) is derived from the content it receipts for. These receipts are built
+#: and consumed inside one publish and are never persisted on their own, so unlike the
+#: authority above this rule has no older form to read.
+_SOURCE_RECEIPT_IDENTITY_EXCLUDED = frozenset({"receipt_id", "published_at"})
+
+
 class NotificationProjectionSourceReceipt(RuntimeContractModel):
     """Canonical receipt for one already-verified PIT projection authority."""
 
@@ -178,7 +213,9 @@ class NotificationProjectionSourceReceipt(RuntimeContractModel):
             raise ValueError("notification projection source event time exceeds publication")
         if any(projection.available_at > self.published_at for projection in self.projections):
             raise ValueError("notification projection source contains future evidence")
-        expected = canonical_sha256(self.model_dump(mode="python", exclude={"receipt_id"}))
+        expected = canonical_sha256(
+            self.model_dump(mode="python", exclude=_SOURCE_RECEIPT_IDENTITY_EXCLUDED)
+        )
         if self.receipt_id != expected:
             raise ValueError("notification projection source receipt does not match content")
         return self
@@ -203,7 +240,12 @@ class NotificationProjectionSourceReceipt(RuntimeContractModel):
             "status": FreshnessStatus.FRESH,
             "projections": tuple(sorted(projections, key=lambda item: item.table_name)),
         }
-        return cls(**values, receipt_id=canonical_sha256(values))
+        identity = {
+            name: value
+            for name, value in values.items()
+            if name not in _SOURCE_RECEIPT_IDENTITY_EXCLUDED
+        }
+        return cls(**values, receipt_id=canonical_sha256(identity))
 
 
 class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
@@ -214,6 +256,10 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
     available_at: AwareUtcDatetime
     source_receipts: Mapping[str, str] = Field(min_length=1)
     projections: tuple[ServingProjectionPayload, ...]
+    #: What is published, without either clock. `None` only on a row written before
+    #: v0.33.13, whose `generation_id` is the older whole-snapshot hash; those are read
+    #: and never produced.
+    content_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("source_receipts", mode="after")
@@ -257,10 +303,31 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
             raise ValueError("notification projection availability exceeds observation time")
         if any(projection.available_at > self.available_at for projection in self.projections):
             raise ValueError("notification projection contains future source evidence")
-        expected = canonical_sha256(self.model_dump(mode="python", exclude={"generation_id"}))
-        if self.generation_id != expected:
+        if self.content_id is None:
+            #: A row written before v0.33.13: one hash over the whole snapshot, both
+            #: clocks included. Read as it was written; `create()` never produces this.
+            legacy = self.model_dump(mode="python", exclude={"generation_id", "content_id"})
+            if self.generation_id != canonical_sha256(legacy):
+                raise ValueError("notification projection generation does not match content")
+            return self
+        if self.content_id != canonical_sha256(self.content_identity()):
+            raise ValueError("notification projection content does not match its identity")
+        if self.generation_id != canonical_sha256(self._publication_identity()):
             raise ValueError("notification projection generation does not match content")
         return self
+
+    def content_identity(self) -> dict[str, object]:
+        """What `content_id` is the hash of: this publication minus both of its clocks."""
+
+        values = self.model_dump(mode="python")
+        return {name: values[name] for name in _AUTHORITY_CONTENT_IDENTITY}
+
+    def _publication_identity(self) -> dict[str, object]:
+        return {
+            "content_id": self.content_id,
+            "observed_at": self.observed_at,
+            "available_at": self.available_at,
+        }
 
     @classmethod
     def create(
@@ -278,7 +345,15 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
             "source_receipts": dict(source_receipts),
             "projections": tuple(sorted(projections, key=lambda item: item.table_name)),
         }
-        return cls(**values, generation_id=canonical_sha256(values))
+        content_id = canonical_sha256({name: values[name] for name in _AUTHORITY_CONTENT_IDENTITY})
+        generation_id = canonical_sha256(
+            {
+                "content_id": content_id,
+                "observed_at": values["observed_at"],
+                "available_at": values["available_at"],
+            }
+        )
+        return cls(**values, content_id=content_id, generation_id=generation_id)
 
     @classmethod
     def create_from_sources(
@@ -309,6 +384,21 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
             source_receipts={source.dataset_id: source.receipt_id for source in validated},
             projections=projections,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationProjectionPublication:
+    """What one `publish_projection_authority` call did.
+
+    `written` is the answer to "did this iteration actually put a row in the database",
+    which is what the notifier's heartbeat reports as `projection_published` and what the
+    #271 e2e asserts against `sqlite3.Connection.total_changes`. It is not derivable from
+    `generation_id`: the same id comes back whether the row was inserted now or an hour
+    ago.
+    """
+
+    generation_id: str
+    written: bool
 
 
 @dataclass(frozen=True)
@@ -434,10 +524,26 @@ class NotificationStateStore(SignalBusStore):
                     observed_at TEXT NOT NULL,
                     available_at TEXT NOT NULL,
                     source_receipts_json TEXT NOT NULL,
-                    payload_json TEXT NOT NULL
+                    payload_json TEXT NOT NULL,
+                    content_id TEXT
                 );
                 """
             )
+            #: A database created before v0.33.13 has the table without `content_id`
+            #: (#271). `ADD COLUMN` is a schema-only change -- it rewrites no row and fires
+            #: none of the immutability triggers below -- and the column is nullable, so
+            #: every row already there keeps saying "written under the older rule", which
+            #: is exactly what `validate_snapshot` reads it as.
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(notification_projection_authority)"
+                ).fetchall()
+            }
+            if "content_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE notification_projection_authority ADD COLUMN content_id TEXT"
+                )
             for table in (
                 "signal_envelope",
                 "notification_source_route_receipt",
@@ -504,14 +610,98 @@ class NotificationStateStore(SignalBusStore):
                     """
                 )
 
+    #: The row `serving_snapshot` would serve **to this caller's clock** (#271, reviews
+    #: SF-1 and DF-3). Same order *and* the same point-in-time filter as
+    #: `serving_snapshot`: without the filter this asked "newest overall", so one row
+    #: stamped ahead of the clock -- a clock that went backwards is the only way to get
+    #: one -- would have made the gate skip a publication the reader could not yet see,
+    #: which is SF-1's shape again by another route. Monotonic clocks make that
+    #: unreachable and the filter is two index-free comparisons on one row, so it is
+    #: stated rather than assumed.
+    #:
+    #: `payload_json` is deliberately **not** selected (review DF-1). The table has no
+    #: index on `available_at`, so this is a scan plus a temporary B-tree for the sort,
+    #: and dragging a 20 KB payload per row through that sorter cost 29 ms at 5k rows and
+    #: 400-650 ms at 80k -- about 25x what the same query costs without it. The legacy
+    #: branch below fetches the payload by primary key, for the one row that needs it.
+    _LATEST_PROJECTION_AUTHORITY_SQL = """
+        SELECT generation_id, content_id
+        FROM notification_projection_authority
+        WHERE available_at <= ? AND observed_at <= ?
+        ORDER BY available_at DESC, observed_at DESC, generation_id DESC
+        LIMIT 1
+    """
+
+    #: One row by primary key, for a latest row written before v0.33.13.
+    _PROJECTION_AUTHORITY_PAYLOAD_SQL = """
+        SELECT payload_json FROM notification_projection_authority WHERE generation_id = ?
+    """
+
+    @classmethod
+    def _latest_published_content(
+        cls,
+        connection: sqlite3.Connection,
+        observed_text: str,
+    ) -> tuple[str, str] | None:
+        """`(generation_id, content_id)` of what is being served at `observed_text`.
+
+        Rows written before v0.33.13 have no `content_id`, so theirs is derived from the
+        payload -- one primary-key read, and only while such a row is still the latest.
+        After the next publication the latest row carries its own and this never runs.
+        """
+
+        row = connection.execute(
+            cls._LATEST_PROJECTION_AUTHORITY_SQL,
+            (observed_text, observed_text),
+        ).fetchone()
+        if row is None:
+            return None
+        generation_id = str(row["generation_id"])
+        content_id = row["content_id"]
+        if content_id is not None:
+            return generation_id, str(content_id)
+        payload = connection.execute(
+            cls._PROJECTION_AUTHORITY_PAYLOAD_SQL,
+            (generation_id,),
+        ).fetchone()
+        legacy = NotificationProjectionAuthoritySnapshot.model_validate_json(
+            payload["payload_json"]
+        )
+        return generation_id, canonical_sha256(legacy.content_identity())
+
     def publish_projection_authority(
         self,
         snapshot: NotificationProjectionAuthoritySnapshot,
-    ) -> str:
+    ) -> NotificationProjectionPublication:
+        """Publish this projection content, or recognise that it is already the latest.
+
+        `written` is False for a call whose content is what the most recent publication
+        already holds. That is the ordinary case for `notifier.admin.shadow.v1`, whose
+        loop runs every two seconds against a replica that is replaced every five minutes:
+        the content is the same content for hundreds of iterations at a time, and this
+        method touches nothing at all for those -- no write transaction, no commit, no
+        fsync (#271). The read below runs on the read-only connection precisely so that
+        the common case does not take the database's write lock.
+
+        The comparison is against the **latest visible** row rather than against any row
+        carrying this content, so a projection that reverts to an earlier form is
+        published again as a new row instead of silently leaving the intermediate
+        generation in front of it (review SF-1). `generation_id` is per publication for
+        the same reason: it is the row key, and two publications of one content have to be
+        two rows.
+        """
+
         validated = NotificationProjectionAuthoritySnapshot.model_validate(snapshot)
-        payload_json = validated.model_dump_json()
         observed_text = validated.observed_at.isoformat(timespec="microseconds")
         available_text = validated.available_at.isoformat(timespec="microseconds")
+        connection = self._connect_readonly()
+        try:
+            latest = self._latest_published_content(connection, observed_text)
+        finally:
+            connection.close()
+        if latest is not None and latest[1] == validated.content_id:
+            return NotificationProjectionPublication(generation_id=latest[0], written=False)
+        payload_json = validated.model_dump_json()
         receipts_json = json.dumps(
             dict(validated.source_receipts),
             ensure_ascii=True,
@@ -519,38 +709,39 @@ class NotificationStateStore(SignalBusStore):
             sort_keys=True,
         )
         with self._write_transaction() as connection:
-            existing = connection.execute(
-                "SELECT payload_json FROM notification_projection_authority "
-                "WHERE generation_id = ?",
-                (validated.generation_id,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    NotificationProjectionAuthoritySnapshot.model_validate_json(
-                        existing["payload_json"]
-                    )
-                    != validated
-                ):
-                    raise NotificationReplicationError(
-                        "notification projection generation conflicts with immutable content"
-                    )
-                return validated.generation_id
-            connection.execute(
-                """
-                INSERT INTO notification_projection_authority(
-                    generation_id, observed_at, available_at,
-                    source_receipts_json, payload_json
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    validated.generation_id,
-                    observed_text,
-                    available_text,
-                    receipts_json,
-                    payload_json,
-                ),
-            )
-        return validated.generation_id
+            # Another writer may have published between the read above and this lock.
+            latest = self._latest_published_content(connection, observed_text)
+            if latest is not None and latest[1] == validated.content_id:
+                return NotificationProjectionPublication(generation_id=latest[0], written=False)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO notification_projection_authority(
+                        generation_id, content_id, observed_at, available_at,
+                        source_receipts_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        validated.generation_id,
+                        validated.content_id,
+                        observed_text,
+                        available_text,
+                        receipts_json,
+                        payload_json,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                #: This snapshot was published before and something else has been
+                #: published since, so it is no longer what the latest row holds -- a
+                #: caller replaying an old snapshot object, never the notifier's loop,
+                #: which builds a new one from the clock on every iteration (review DF-2).
+                raise NotificationReplicationError(
+                    "notification projection generation was already published"
+                ) from error
+        return NotificationProjectionPublication(
+            generation_id=validated.generation_id,
+            written=True,
+        )
 
     def replication_cursor(self) -> NotificationReplicationCursor:
         connection = self._connect_readonly()
@@ -583,12 +774,14 @@ class NotificationStateStore(SignalBusStore):
             row = connection.execute(
                 "SELECT * FROM notification_replication_source WHERE singleton = 1"
             ).fetchone()
+            stored_cursor: NotificationReplicationCursor | None = None
             if row is None:
                 started_after = source.first_global_sequence - 1
                 observed_high = started_after
                 last_signal_id = None
             else:
                 cursor = self._cursor_from_row(row)
+                stored_cursor = cursor
                 if cursor.source_id != self.replication_source_id:
                     raise NotificationReplicationError("notification source identity changed")
                 if cursor.source_generation_id != source.generation_id:
@@ -656,30 +849,44 @@ class NotificationStateStore(SignalBusStore):
                 raise NotificationReplicationError(
                     "notification cursor exceeds source high watermark"
                 )
-            timestamp = observed.isoformat(timespec="microseconds")
-            connection.execute(
-                """
-                INSERT INTO notification_replication_source(
-                    singleton, source_id, source_generation_id,
-                    first_global_sequence, observed_high_watermark,
-                    last_global_sequence, last_signal_id, updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET
-                    observed_high_watermark = excluded.observed_high_watermark,
-                    last_global_sequence = excluded.last_global_sequence,
-                    last_signal_id = excluded.last_signal_id,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    self.replication_source_id,
-                    source.generation_id,
-                    source.first_global_sequence,
-                    max(observed_high, source.high_watermark),
-                    ended_at,
-                    last_signal_id,
-                    timestamp,
-                ),
-            )
+            high_watermark = max(observed_high, source.high_watermark)
+            #: The cursor is written only when it has somewhere to move (#271). The three
+            #: columns above are the cursor; `updated_at` was the fourth, and it is the
+            #: iteration clock, so writing the row unconditionally dirtied a page,
+            #: committed it and -- `journal_mode=WAL` with `synchronous=FULL` -- fsynced
+            #: it on every one of `notifier.admin.shadow.v1`'s two-second iterations,
+            #: whether or not a single signal had arrived. `updated_at` now says when this
+            #: cursor last advanced, which is the question anybody reading it was asking.
+            if (
+                stored_cursor is None
+                or stored_cursor.observed_high_watermark != high_watermark
+                or stored_cursor.last_global_sequence != ended_at
+                or stored_cursor.last_signal_id != last_signal_id
+            ):
+                timestamp = observed.isoformat(timespec="microseconds")
+                connection.execute(
+                    """
+                    INSERT INTO notification_replication_source(
+                        singleton, source_id, source_generation_id,
+                        first_global_sequence, observed_high_watermark,
+                        last_global_sequence, last_signal_id, updated_at
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET
+                        observed_high_watermark = excluded.observed_high_watermark,
+                        last_global_sequence = excluded.last_global_sequence,
+                        last_signal_id = excluded.last_signal_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self.replication_source_id,
+                        source.generation_id,
+                        source.first_global_sequence,
+                        high_watermark,
+                        ended_at,
+                        last_signal_id,
+                        timestamp,
+                    ),
+                )
             self._before_commit(connection)
 
         return NotificationReplicationSummary(

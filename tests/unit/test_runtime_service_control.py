@@ -1135,6 +1135,34 @@ def test_a_successful_iteration_says_it_kept_an_older_generation_on_purpose(
     control.stop(reason="done")
 
 
+def test_whether_the_projection_was_written_is_a_file_field_too(tmp_path: Path) -> None:
+    """#237's line once more, for the field #271 adds, and what it carries.
+
+    `False` is the ordinary answer for `notifier.admin.shadow.v1`: its page projection
+    is a function of a replica that is replaced every five minutes, read by a loop that
+    runs every two seconds. A run of `True` is a real change in the projection -- and
+    before #271 it was `True` on every iteration, because the row's id was hashed over
+    the notifier's own clock.
+    """
+
+    assert "projection_published" in RuntimeServiceHeartbeat.model_fields
+    assert "projection_published" not in RuntimeServiceHeartbeatProjection.model_fields
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    silent = control.record_success(RuntimeStepResult())
+    idle = control.record_success(RuntimeStepResult(projection_published=False))
+    wrote = control.record_success(RuntimeStepResult(projection_published=True))
+    failed = control.record_failure(RuntimeError("the projection source refused"))
+
+    assert silent.projection_published is None
+    assert idle.projection_published is False
+    assert wrote.projection_published is True
+    # An iteration that raised cannot say, and the previous one's answer is not its own.
+    assert failed.projection_published is None
+    control.stop(reason="done")
+
+
 def test_whether_this_iteration_wrote_anything_is_four_file_fields(tmp_path: Path) -> None:
     """#237's line once more, for the four fields #271 adds, and what they carry.
 

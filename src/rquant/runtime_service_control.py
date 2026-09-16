@@ -83,6 +83,9 @@ class RuntimeStepResult(RuntimeContractModel):
     #: Whether this iteration saw a newer generation and kept the previous answer because
     #: this role's read profile would not let it open one yet (#268).
     replica_skipped_by_floor: bool | None = None
+    #: Whether this iteration actually wrote the page projection authority it publishes.
+    #: `None` for the roles that publish none, which is every role but the notifier (#271).
+    projection_published: bool | None = None
     #: Whether this iteration actually published a new serving generation. `None` for the
     #: roles that publish none (#271).
     generation_published: bool | None = None
@@ -94,7 +97,6 @@ class RuntimeStepResult(RuntimeContractModel):
     batch_published: bool | None = None
     #: Whether this iteration actually took the daily writer lease, which is one fencing
     #: token per acquisition. `None` for every role but the daily orchestrator (#271).
-    writer_lease_acquired: bool | None = None
 
     @field_validator("source_generations")
     @classmethod
@@ -194,6 +196,17 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: for an iteration that never asked. A *file* field, for the reason
     #: `generation_events` gives above.
     replica_skipped_by_floor: bool | None = None
+    #: Whether this iteration wrote a row into `notification_projection_authority`, which
+    #: is the one write in the notifier's loop that carries an fsync of its own. Until
+    #: v0.33.13 the answer was "every iteration": the row's id was hashed over the
+    #: notifier's own clock, so the same content never matched itself and
+    #: `notifier.admin.shadow.v1` committed and fsynced every two seconds all day
+    #: whatever the replica held (#271). `False` is now the ordinary answer and a run of
+    #: `True` is a real change in the projection -- which is what makes this worth a
+    #: field rather than a log line. `None` for the 24 roles that publish no page
+    #: projection, and for an iteration that failed before it could say. Also a *file*
+    #: field, for the reason `generation_events` gives above.
+    projection_published: bool | None = None
     #: Whether this iteration published a new serving generation, moved a watermark,
     #: published a spool batch, or took the daily writer lease. Until v0.33.14 four roles
     #: answered "every iteration" to one of these whatever they were given to do, because
@@ -703,6 +716,7 @@ class RuntimeServiceControl:
                 replica_opened=result.replica_opened,
                 replica_read_bytes=result.replica_read_bytes,
                 replica_skipped_by_floor=result.replica_skipped_by_floor,
+                projection_published=result.projection_published,
                 generation_published=result.generation_published,
                 watermark_advanced=result.watermark_advanced,
                 batch_published=result.batch_published,
@@ -745,6 +759,7 @@ class RuntimeServiceControl:
                 #: An iteration that raised cannot say what it wrote, and the previous
                 #: iteration's answer is not this one's -- the same rule the replica
                 #: fields above follow (#260).
+                projection_published=None,
                 generation_published=None,
                 watermark_advanced=None,
                 batch_published=None,

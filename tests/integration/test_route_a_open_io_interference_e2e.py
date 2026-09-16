@@ -216,7 +216,7 @@ def test_the_floor_is_the_roles_own_window_and_the_notifier_carries_the_open_win
     )
 
     assert NOTIFIER_PAGE_PROJECTION_PROFILE.min_reread_interval == timedelta(minutes=15)
-    assert NOTIFIER_PAGE_PROJECTION_PROFILE.no_read_window == DEFAULT_NO_READ_WINDOW
+    assert DEFAULT_NO_READ_WINDOW in NOTIFIER_PAGE_PROJECTION_PROFILE.no_read_windows
     #: 01:30 UTC is 09:30 in the market clock `may_fetch_market_minute` is decided in
     assert NOTIFIER_PAGE_PROJECTION_PROFILE.suspends_reads_at(
         datetime(2026, 9, 14, 1, 30, tzinfo=UTC)
@@ -231,7 +231,7 @@ def test_the_floor_is_the_roles_own_window_and_the_notifier_carries_the_open_win
         AUCTION_UNIVERSE_PUBLISHER_PROFILE,
     )
     for profile in windowed:
-        assert profile.no_read_window is None
+        assert profile.no_read_windows == ()
         assert profile.min_reread_interval > timedelta(0)
     assert AUCTION_GAP_CANDIDATE_PROFILE.min_reread_interval == timedelta(minutes=4)
 
