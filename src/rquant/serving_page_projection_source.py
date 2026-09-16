@@ -42,6 +42,7 @@ from rquant.canvas_publication_receipt import (
 )
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
+    NotificationProjectionPublication,
     NotificationProjectionSourceReceipt,
     NotificationStateStore,
 )
@@ -1938,7 +1939,15 @@ class SignalPageProjectionProducer:
             raise ValueError("signal companion projections are incomplete")
         self.companion_projections = companion_projections
 
-    def publish(self, observed_at: datetime) -> NotificationProjectionAuthoritySnapshot:
+    def publish(self, observed_at: datetime) -> NotificationProjectionPublication:
+        """Publish this iteration's page projection, and say whether it wrote anything.
+
+        The snapshot it assembles is a function of the replica generation, the canvas
+        catalog and the `surge_live` files -- none of which move on this role's two-second
+        interval -- so the ordinary answer is the content that is already published, and
+        `written` is False (#271).
+        """
+
         observed = normalize_aware_utc(observed_at)
         snapshot = self.source(observed)
         page_source = NotificationProjectionSourceReceipt.create(
@@ -1983,8 +1992,7 @@ class SignalPageProjectionProducer:
             observed_at=observed,
             sources=(page_source, companion_source),
         )
-        self.store.publish_projection_authority(authority)
-        return authority
+        return self.store.publish_projection_authority(authority)
 
 
 class ScreenBoundsProjectionRow(RuntimeContractModel):

@@ -83,6 +83,9 @@ class RuntimeStepResult(RuntimeContractModel):
     #: Whether this iteration saw a newer generation and kept the previous answer because
     #: this role's read profile would not let it open one yet (#268).
     replica_skipped_by_floor: bool | None = None
+    #: Whether this iteration actually wrote the page projection authority it publishes.
+    #: `None` for the roles that publish none, which is every role but the notifier (#271).
+    projection_published: bool | None = None
 
     @field_validator("source_generations")
     @classmethod
@@ -182,6 +185,17 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: for an iteration that never asked. A *file* field, for the reason
     #: `generation_events` gives above.
     replica_skipped_by_floor: bool | None = None
+    #: Whether this iteration wrote a row into `notification_projection_authority`, which
+    #: is the one write in the notifier's loop that carries an fsync of its own. Until
+    #: v0.33.13 the answer was "every iteration": the row's id was hashed over the
+    #: notifier's own clock, so the same content never matched itself and
+    #: `notifier.admin.shadow.v1` committed and fsynced every two seconds all day
+    #: whatever the replica held (#271). `False` is now the ordinary answer and a run of
+    #: `True` is a real change in the projection -- which is what makes this worth a
+    #: field rather than a log line. `None` for the 24 roles that publish no page
+    #: projection, and for an iteration that failed before it could say. Also a *file*
+    #: field, for the reason `generation_events` gives above.
+    projection_published: bool | None = None
 
     @field_validator("failure_kind")
     @classmethod
@@ -673,6 +687,7 @@ class RuntimeServiceControl:
                 replica_opened=result.replica_opened,
                 replica_read_bytes=result.replica_read_bytes,
                 replica_skipped_by_floor=result.replica_skipped_by_floor,
+                projection_published=result.projection_published,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -708,6 +723,10 @@ class RuntimeServiceControl:
                 replica_opened=opened,
                 replica_read_bytes=read_bytes,
                 replica_skipped_by_floor=replica_skipped_by_floor,
+                #: An iteration that raised cannot say what it published, and the previous
+                #: iteration's answer is not this one's -- the same rule the replica
+                #: fields above follow (#260).
+                projection_published=None,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
