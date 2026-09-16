@@ -613,17 +613,24 @@ _HEALTH_PAYLOAD_OBSERVATION_FIELDS = (
 #: 8640 generations a day. A field that does not is evidence, and it stays -- even though
 #: it moves often on a busy host, because moving when work happens is the whole point.
 #:
-#: So `input_sequence`, `output_sequence`, `processed_count`, `backlog_count` and
-#: `source_generations` are **in** the identity: an idle role reports the same cursor, a
-#: `processed_count` of zero, a `backlog_count` of zero and the same upstream generations
-#: every iteration, and every one of them is a column of serving's `runtime_services`
-#: table that an operator reads. A backlog climbing 0 -> 3000 is exactly the kind of
-#: change this dataset exists to show.
+#: So `backlog_count` and `processed_count` are **in** the identity: an idle role reports
+#: zero for both, and a backlog climbing 0 -> 3000 is exactly the kind of change this
+#: dataset exists to show. Both are columns of serving's `runtime_services` table.
 #:
-#: Two kinds of field are out, and they are the only two moments at which this role now
-#: declines to publish something a reader might have wanted:
+#: Three kinds of field are out:
 #:
-#: 1. **How many times the same thing happened again.** `consecutive_failures`,
+#: 1. **Another role's cursor, and what it is reading.** `input_sequence`,
+#:    `output_sequence` and `source_generations` describe a *peer's* progress, and this
+#:    role watches twenty-four of them -- so putting them in the identity makes health's
+#:    quiet depend on twenty-four other loops being quiet in a way none of them promises.
+#:    Two of them are not: `artifact-retention.primary.v1` hashes its own clock into its
+#:    `source_generations` every iteration, and `artifact-catalog.primary.v1` advances its
+#:    scan cursor on every step even over an unchanged tree. Coupling to them costs ~288
+#:    health generations a day and a `serving.duckdb` rebuild behind each one -- the very
+#:    defect this package exists to remove, re-imported through the back door. A peer's
+#:    cursor is the peer's business; health publishes when a peer's *status*, error,
+#:    backlog or processed count moves.
+#: 2. **How many times the same thing happened again.** `consecutive_failures`,
 #:    `total_failures` and `total_successes` are tallies, not states. The *transition*
 #:    into failure still publishes -- `status` flips to DEGRADED, and `last_error` and
 #:    `degraded_reasons` are in the identity -- but the eleventh identical failure is the
@@ -631,13 +638,16 @@ _HEALTH_PAYLOAD_OBSERVATION_FIELDS = (
 #:    seconds republishes health every ten and rebuilds `serving.duckdb` every thirty, for
 #:    as long as the incident lasts; 2026-09-09 was two roles doing exactly that on a host
 #:    already at load 11-12, which is the storm this package exists to stop.
-#: 2. **Pure measurement of the instant.** `heartbeat_at` and `last_success_at` are the
+#: 3. **Pure measurement of the instant.** `heartbeat_at` and `last_success_at` are the
 #:    clock; the three duration fields are the loop's own latency. `total_successes`
 #:    belongs here too -- it increments on every successful iteration, idle ones included,
 #:    so it can never be in the identity of a gate that is meant to be quiet when idle.
 _HEARTBEAT_OBSERVATION_FIELDS = (
     "heartbeat_at",
     "last_success_at",
+    "input_sequence",
+    "output_sequence",
+    "source_generations",
     "consecutive_failures",
     "total_failures",
     "total_successes",
@@ -653,11 +663,11 @@ def runtime_health_state_identity(result: SourceReadResult) -> str:
 
     What survives is the service set and, per service, its plane, whether the heartbeat
     could be read at all, the status, the staleness verdict, the run and spec identity it
-    is running under, its degraded reasons, its last error, its cursor and counts of the
-    work this iteration did, and the upstream generations it is on -- everything a reader
-    of this dataset acts on. What is dropped is the answer to "when did you look" and
-    "how many times did that happen again", neither of which is a new state; the note on
-    `_HEARTBEAT_OBSERVATION_FIELDS` above works through it field by field.
+    is running under, its degraded reasons, its last error, and how much work it did and
+    has waiting -- everything a reader of this dataset acts on. What is dropped is the
+    answer to "when did you look", "how many times did that happen again", and "where has
+    some other role got to"; the note on `_HEARTBEAT_OBSERVATION_FIELDS` above works
+    through it field by field.
 
     Staleness is the reason this cannot simply be "drop the publisher's own clock": a
     service that stops heartbeating is detected by comparing a real `now` against a

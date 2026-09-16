@@ -590,12 +590,20 @@ def test_the_health_state_identity_keeps_the_work_a_role_did(tmp_path: Path) -> 
             path.write_text(original, encoding="utf-8")
         return identity
 
-    # Evidence: the work this role did, and what it is working from.
+    # Evidence: how much work this role did, and how much it has waiting.
     assert identity_after(backlog_count=3_000) != baseline
     assert identity_after(processed_count=7) != baseline
-    assert identity_after(input_sequence=99) != baseline
-    assert identity_after(output_sequence=99) != baseline
-    assert identity_after(source_generations={"upstream": "b" * 64}) != baseline
+
+    # Not evidence: a *peer's* cursor and what it is reading. This role watches
+    # twenty-four loops, and at least two of them move their cursor or their
+    # `source_generations` on an iteration that observed nothing --
+    # `artifact-retention.primary.v1` hashed its own clock in there, and
+    # `artifact-catalog.primary.v1` advances its scan cursor over an unchanged tree. In
+    # the identity they would drag health, and `serving.duckdb` behind it, back to
+    # publishing all day.
+    assert identity_after(input_sequence=99) == baseline
+    assert identity_after(output_sequence=99) == baseline
+    assert identity_after(source_generations={"upstream": "b" * 64}) == baseline
 
     # Observation: when the reader looked, and how many times the same thing happened
     # again. The two clocks move together because a heartbeat whose last success is later
