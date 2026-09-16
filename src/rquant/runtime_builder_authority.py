@@ -297,7 +297,10 @@ def lab_jobs_publisher_builder(
         if manifest.plane is not RuntimeServicePlane.RESEARCH:
             raise ValueError("lab jobs publisher must run on the research plane")
         settings = LabJobsPublisherSettings.model_validate(dict(manifest.settings))
-        from rquant.lab_jobs_serving_authority import LabJobsServingSourceReader
+        from rquant.lab_jobs_serving_authority import (
+            LabJobsServingSourceReader,
+            lab_jobs_state_identity,
+        )
         from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
 
         publisher = ServingSourceAuthorityPublisher(
@@ -337,12 +340,19 @@ def lab_jobs_publisher_builder(
 
             def step() -> RuntimeStepResult:
                 source = reader(clock())
-                pointer = publisher.publish(source)
+                # The ETA is stated as of the moment it was asked, so the read cannot
+                # avoid carrying a clock; the generation is republished only when the
+                # jobs themselves moved (#271).
+                publication = publisher.publish_if_changed(
+                    source,
+                    unchanged_identity=lab_jobs_state_identity,
+                )
                 return RuntimeStepResult(
                     input_sequence=source.sequence,
                     output_sequence=source.sequence,
                     processed_count=len(source.payload.lab_jobs),
-                    source_generations={"lab_jobs": pointer.generation_id},
+                    source_generations={"lab_jobs": publication.pointer.generation_id},
+                    generation_published=publication.written,
                 )
         except BaseException:
             lifecycle.close()
