@@ -225,10 +225,19 @@ def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
     the iteration clock, so an idle notifier dirtied a page, committed it and fsynced it
     every two seconds with nothing to replicate. `updated_at` now says when the cursor
     last advanced.
+
+    **Three signals, not one** (review SF-3): with one, the cursor's start and end are
+    both 1, so a gate comparing `first_global_sequence` instead of `last_global_sequence`
+    reads as "unchanged" here and writes nothing -- the mutation that broke the fix would
+    have stayed green. With three they are 1 and 3, and that gate writes on every one of
+    the idle rounds below.
     """
 
     database = tmp_path / "notification-state.sqlite3"
-    source = _published_source(tmp_path)
+    source = _published_source(
+        tmp_path,
+        signals=tuple(_signal("0123456789abcdef"[index]) for index in range(1, 4)),
+    )
     store = NotificationStateStore(database)
     descriptor = source.source_descriptor()
     records = source.routed_after_global_sequence(
@@ -249,6 +258,8 @@ def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
         watcher.close()
     idle = store.replication_cursor()
 
+    assert advanced.first_global_sequence == 1
+    assert advanced.last_global_sequence == 3
     assert after == before
     assert idle == advanced
     assert idle.updated_at == advanced.updated_at
