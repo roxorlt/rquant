@@ -39,6 +39,7 @@ whose size and mtime move. On Linux `/proc/self/io` is read as well and reported
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import traceback
@@ -247,6 +248,13 @@ class _IdleIterations(Event):
 
     def wait(self, timeout: float | None = None) -> bool:  # noqa: ARG002 - not a sleep
         self.iterations += 1
+        # A SQLite connection an earlier role in this same process left open checkpoints
+        # its write-ahead log into the main database when the interpreter finally collects
+        # it -- which modifies a file nobody wrote to, at whatever moment the collector
+        # happens to run. The all-roles sandbox file records the same artifact. Collecting
+        # here puts it before the sample instead of between two of them. Under systemd
+        # each role is its own process and none of this exists.
+        gc.collect()
         self.samples.append(_durable_state(self.runtime_root))
         self.io.append(_proc_io())
         self.clock[0] = self.clock[0] + self.interval
