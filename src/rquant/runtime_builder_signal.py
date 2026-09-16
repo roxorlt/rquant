@@ -1069,6 +1069,10 @@ def notifier_builder(
             }
 
         def step() -> RuntimeStepResult:
+            #: Whether this iteration put a row in `notification_projection_authority`.
+            #: `None` until a publish happens at all, so a notifier configured without a
+            #: page projection reports nothing rather than a fabricated False (#271).
+            projection_published: bool | None = None
             if page_projection_producer is not None:
                 page_projection_producer.source.begin_replica_iteration()
             descriptor = source.source_descriptor()
@@ -1081,7 +1085,9 @@ def notifier_builder(
                 if authority_publisher is not None and authority_reader is not None:
                     authority_observed_at = clock()
                     if page_projection_producer is not None:
-                        page_projection_producer.publish(authority_observed_at)
+                        projection_published = page_projection_producer.publish(
+                            authority_observed_at
+                        ).written
                     generation_id, omitted = _publish_signal_authority(
                         store=store,
                         publisher=authority_publisher,
@@ -1103,6 +1109,7 @@ def notifier_builder(
                     ),
                     source_generations=source_generations,
                     degraded_reasons=tuple(degraded),
+                    projection_published=projection_published,
                     **_replica_cost(),
                 )
 
@@ -1165,7 +1172,9 @@ def notifier_builder(
             if authority_publisher is not None and authority_reader is not None:
                 authority_observed_at = clock()
                 if page_projection_producer is not None:
-                    page_projection_producer.publish(authority_observed_at)
+                    projection_published = page_projection_producer.publish(
+                        authority_observed_at
+                    ).written
                 generation_id, omitted = _publish_signal_authority(
                     store=store,
                     publisher=authority_publisher,
@@ -1188,6 +1197,7 @@ def notifier_builder(
                 ),
                 source_generations=source_generations,
                 degraded_reasons=tuple(degraded),
+                projection_published=projection_published,
                 **_replica_cost(),
             )
 
