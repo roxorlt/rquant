@@ -18,6 +18,7 @@ import duckdb
 import pytest
 
 from rquant.readside_replica_gate import (
+    DAILY_CLOSE_NO_READ_WINDOW,
     DEFAULT_NO_READ_WINDOW,
     NOTIFIER_PAGE_PROJECTION_PROFILE,
     UNLIMITED_READ_PROFILE,
@@ -605,7 +606,7 @@ def test_the_no_read_window_holds_a_newer_generation_and_lets_go_at_its_end(
     clock = _Clock(datetime(2026, 9, 14, 1, 10, tzinfo=UTC))  # 09:10 market time
     gate: ReplicaReadGate[object] = ReplicaReadGate(
         replica,
-        profile=ReplicaReadProfile(no_read_window=DEFAULT_NO_READ_WINDOW),
+        profile=ReplicaReadProfile(no_read_windows=(DEFAULT_NO_READ_WINDOW,)),
         clock=clock,
     )
     loader = _Loader()
@@ -742,9 +743,11 @@ def test_a_gate_built_without_a_profile_is_where_package_q_left_it(tmp_path: Pat
     "arguments",
     [
         {"min_reread_interval": timedelta(seconds=-1)},
-        {"no_read_window": (time(9, 40), time(9, 20))},
-        {"no_read_window": (time(9, 20), time(9, 20))},
-        {"no_read_window": (time(9, 20, tzinfo=UTC), time(9, 40))},
+        {"no_read_windows": ((time(9, 40), time(9, 20)),)},
+        {"no_read_windows": ((time(9, 20), time(9, 20)),)},
+        {"no_read_windows": ((time(9, 20, tzinfo=UTC), time(9, 40)),)},
+        {"no_read_windows": ((time(9, 20), time(9, 40)), (time(9, 30), time(9, 50)))},
+        {"no_read_windows": ((time(16, 55), time(17, 40)), (time(9, 20), time(9, 40)))},
     ],
 )
 def test_an_unusable_profile_is_refused_where_it_is_written(arguments: dict) -> None:
@@ -757,12 +760,44 @@ def test_the_window_is_read_in_the_market_clock_not_the_hosts() -> None:
 
     from rquant.runtime_market_session import MARKET_TIMEZONE
 
-    profile = ReplicaReadProfile(no_read_window=DEFAULT_NO_READ_WINDOW)
+    profile = ReplicaReadProfile(no_read_windows=(DEFAULT_NO_READ_WINDOW,))
     inside = datetime(2026, 9, 14, 9, 30, tzinfo=MARKET_TIMEZONE)
     assert profile.suspends_reads_at(inside)
     assert profile.suspends_reads_at(inside.astimezone(UTC))
-    #: 09:30 UTC is 17:30 in the market clock, which is nowhere near the window
+    #: 09:30 UTC is 17:30 in the market clock, which is nowhere near this window -- and
+    #: is inside the other one, which this profile does not carry.
     assert not profile.suspends_reads_at(datetime(2026, 9, 14, 9, 30, tzinfo=UTC))
+
+
+def test_the_notifier_also_stops_reading_while_the_daily_pipeline_starts() -> None:
+    """#271: a 692 MB generation reread must not land on the 17:00 daily's page cache.
+
+    The daily reads the *main* database, not this replica, but out of a page cache the
+    two share: on 2026-09-08 and 2026-09-09 it stalled in `daily_state` while these roles
+    ran and finished within a minute of their being stopped. The notifier's floor is
+    fifteen minutes, so without this window one of its rereads lands inside the daily's
+    opening minutes about one day in four.
+    """
+
+    from rquant.runtime_market_session import MARKET_TIMEZONE
+
+    profile = NOTIFIER_PAGE_PROJECTION_PROFILE
+
+    def market(hour: int, minute: int) -> datetime:
+        return datetime(2026, 9, 17, hour, minute, tzinfo=MARKET_TIMEZONE)
+
+    assert profile.no_read_windows == (DEFAULT_NO_READ_WINDOW, DAILY_CLOSE_NO_READ_WINDOW)
+    assert not profile.suspends_reads_at(market(16, 54))
+    assert profile.suspends_reads_at(market(16, 55))
+    assert profile.suspends_reads_at(market(17, 0))
+    assert profile.suspends_reads_at(market(17, 39))
+    #: half-open at the far edge, just after the 17:30 replica sync: the first read after
+    #: the window is of the generation the day ends on
+    assert not profile.suspends_reads_at(market(17, 40))
+    #: and the same instant in UTC, because the window is market-local
+    assert profile.suspends_reads_at(market(17, 0).astimezone(UTC))
+    #: the session itself is untouched: the notifier still rereads every fifteen minutes
+    assert not profile.suspends_reads_at(market(13, 30))
 
 
 def test_a_vanished_replica_is_a_failure_and_never_a_floor_skip(tmp_path: Path) -> None:

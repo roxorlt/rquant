@@ -56,6 +56,18 @@ WRITE_LOCK_MARKERS = ("could not set lock", "conflicting lock")
 #: a way a twenty-minute-old generation misreports.
 DEFAULT_NO_READ_WINDOW = (time(9, 20), time(9, 40))
 
+#: The other time of day the host cannot afford a ten-gigabyte scan. The 17:00 production
+#: daily pipeline reads the *main* database from a page cache the replica readers share,
+#: and on 2026-09-08 and 2026-09-09 it stalled in `daily_state` while the runtime roles
+#: ran and finished within a minute of their being stopped. The notifier's floor is
+#: fifteen minutes, so without a window one of its 692 MB generation rereads lands inside
+#: the daily's first minutes about one day in four -- on a cache the daily has just been
+#: given and this read would take back. It opens at 16:55 because the last replica sync
+#: of the day is 17:30, so a generation dropped at 16:55, 17:00, ... would otherwise be
+#: read at exactly the wrong moment, and closes at 17:40 just after that last sync: the
+#: first read after the window is of the generation the day ends on.
+DAILY_CLOSE_NO_READ_WINDOW = (time(16, 55), time(17, 40))
+
 
 @dataclass(frozen=True, slots=True)
 class ReplicaReadProfile:
@@ -71,10 +83,10 @@ class ReplicaReadProfile:
     inside it is seen, and deliberately not read: the role keeps the answer it has and
     says so in its heartbeat, as `replica_skipped_by_floor`.
 
-    `no_read_window` is a pair of **market-local** times, half-open, that suspends new
-    generation reads outright. `None` means the role has a window of its own that already
-    confines it -- which is the case for three of the four readers, and why this is not
-    simply on everywhere:
+    `no_read_windows` are pairs of **market-local** times, half-open and disjoint, that
+    suspend new generation reads outright. Empty means the role has a window of its own
+    that already confines it -- which is the case for three of the four readers, and why
+    this is not simply on everywhere:
 
     * `reference-slow.source.v1` captures inside 09:20-09:25, and
     * `candidate.auction_gap.v1` assembles inside 09:26-09:30,
@@ -91,7 +103,9 @@ class ReplicaReadProfile:
     enough not to add one. `auction-universe.publisher.v1` refuses to publish anywhere in
     09:15-15:10 on its own account, so the window would never bind on it either. The
     notifier is the one role that reads all day, every two seconds, and whose read is the
-    expensive one -- so the notifier is the role that carries the window.
+    expensive one -- so the notifier is the role that carries the windows, and it carries
+    both of them: the open (`DEFAULT_NO_READ_WINDOW`) and the 17:00 daily
+    (`DAILY_CLOSE_NO_READ_WINDOW`).
 
     The floor never blocks a role that has **no** answer yet. A cold start inside the
     window must read, or the role has nothing to publish at all and goes DEGRADED for
@@ -101,14 +115,14 @@ class ReplicaReadProfile:
     #: the shortest gap between two opens of this replica. Zero leaves the gate exactly as
     #: package Q left it: every new generation is read.
     min_reread_interval: timedelta = timedelta(0)
-    #: market-local `[start, end)` in which a role that has an answer keeps it
-    no_read_window: tuple[time, time] | None = None
+    #: market-local `[start, end)` spans in which a role that has an answer keeps it
+    no_read_windows: tuple[tuple[time, time], ...] = ()
 
     def __post_init__(self) -> None:
         if self.min_reread_interval < timedelta(0):
             raise ValueError("minimum re-read interval cannot be negative")
-        window = self.no_read_window
-        if window is not None:
+        previous_end: time | None = None
+        for window in self.no_read_windows:
             start, end = window
             if not isinstance(start, time) or not isinstance(end, time):
                 raise TypeError("a no-read window is a pair of times")
@@ -116,9 +130,15 @@ class ReplicaReadProfile:
                 raise ValueError("a no-read window is stated in market-local time")
             if start >= end:
                 raise ValueError("a no-read window must start before it ends")
+            #: Ordered and disjoint, so that reading the tuple is reading the day. Two
+            #: windows that overlapped would still answer the same question, and would
+            #: still be two ways of saying one thing.
+            if previous_end is not None and start < previous_end:
+                raise ValueError("no-read windows must be disjoint and in order")
+            previous_end = end
 
     def suspends_reads_at(self, observed_at: datetime) -> bool:
-        """Whether `observed_at` falls inside this profile's no-read window.
+        """Whether `observed_at` falls inside one of this profile's no-read windows.
 
         The market clock is `runtime_market_session.MARKET_TIMEZONE`, the same one
         `may_fetch_market_minute` is decided in, imported rather than restated.
@@ -132,12 +152,10 @@ class ReplicaReadProfile:
         #268.
         """
 
-        window = self.no_read_window
-        if window is None:
+        if not self.no_read_windows:
             return False
-        start, end = window
         local = observed_at.astimezone(MARKET_TIMEZONE).timetz().replace(tzinfo=None)
-        return start <= local < end
+        return any(start <= local < end for start, end in self.no_read_windows)
 
 
 #: What a gate built without a profile gets: every new generation is read, which is
@@ -147,11 +165,12 @@ UNLIMITED_READ_PROFILE = ReplicaReadProfile()
 
 #: `notifier.admin.shadow.v1`. A two-second loop whose generation read is the whole of
 #: what it takes from the replica -- 44,052,711 of 44,052,711 bytes on package Q's
-#: measurement replica, all of it the `minute_bar` aggregate. Fifteen minutes is the floor
-#: #268 asks for, and it is the role that carries the open window.
+#: measurement replica, all of it the `minute_bar` aggregate, and 692 MB of it on
+#: production's. Fifteen minutes is the floor #268 asks for, and it is the role that
+#: carries both windows: the open (#268) and the 17:00 daily (#271).
 NOTIFIER_PAGE_PROJECTION_PROFILE = ReplicaReadProfile(
     min_reread_interval=timedelta(minutes=15),
-    no_read_window=DEFAULT_NO_READ_WINDOW,
+    no_read_windows=(DEFAULT_NO_READ_WINDOW, DAILY_CLOSE_NO_READ_WINDOW),
 )
 
 #: `reference-slow.source.v1`, floored at its own 09:20-09:25 capture window. Its loop runs
