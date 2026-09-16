@@ -170,6 +170,52 @@ def test_notification_state_replicates_routed_prefix_into_owned_outbox(
     )
 
 
+def test_a_second_batch_moves_the_cursor_and_the_column_the_gate_compares_is_the_end(
+    tmp_path: Path,
+) -> None:
+    """Review SF-2/SF-3: the gate has a "write it" half, and it compares the right column.
+
+    Every fixture in this file replicated a single signal, which made
+    `first_global_sequence == last_global_sequence == 1` -- so a gate that compared the
+    *start* of the source instead of the end, and a gate cut down to "write once and
+    never again", both stayed green. Four signals in two batches separate all three.
+    """
+
+    source = _published_source(
+        tmp_path,
+        signals=tuple(_signal("0123456789abcdef"[index]) for index in range(1, 5)),
+    )
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    descriptor = source.source_descriptor()
+    first_batch = source.routed_after_global_sequence(
+        after_sequence=0,
+        through_sequence=2,
+        limit=10,
+    )
+    second_batch = source.routed_after_global_sequence(
+        after_sequence=2,
+        through_sequence=descriptor.high_watermark,
+        limit=10,
+    )
+
+    store.replicate(descriptor, first_batch, observed_at=NOW)
+    after_first = store.replication_cursor()
+    store.replicate(
+        descriptor,
+        second_batch,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    after_second = store.replication_cursor()
+
+    assert descriptor.high_watermark == 4
+    # The start never moves, so a gate comparing it would never see the second batch.
+    assert after_first.first_global_sequence == after_second.first_global_sequence == 1
+    assert after_first.last_global_sequence == 2
+    assert after_second.last_global_sequence == 4
+    assert after_second.last_signal_id != after_first.last_signal_id
+    assert after_second.updated_at == NOW + timedelta(seconds=2)
+
+
 def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
     tmp_path: Path,
 ) -> None:
@@ -438,12 +484,14 @@ def test_notification_projection_authority_is_pit_bound_and_persisted_atomically
     assert snapshot.projection_source_receipts == authority.source_receipts
 
 
-def test_the_projection_generation_names_the_content_and_not_the_iteration_clock() -> None:
-    """#271: two iterations that see the same projection publish the same generation.
+def test_the_projection_content_id_names_the_content_and_not_the_iteration_clock() -> None:
+    """#271: two iterations that see the same projection compute the same `content_id`.
 
     `notifier.admin.shadow.v1` calls this every two seconds with a fresh `observed_at`
-    and a replica that is replaced every five minutes, so if the clock reached the id
-    the same content would be a new generation hundreds of times over.
+    and a replica that is replaced every five minutes, so if a clock reached the identity
+    the gate compares, the same content would be a new publication hundreds of times over.
+    `generation_id` is the other half of the split and is per publication on purpose: it
+    is the row key, and two publications of one content have to be two rows (review SF-1).
     """
 
     first = NotificationProjectionAuthoritySnapshot.create(
@@ -468,9 +516,11 @@ def test_the_projection_generation_names_the_content_and_not_the_iteration_clock
         projections=_page_projections(),
     )
 
-    assert first.generation_id == later.generation_id
+    assert first.content_id == later.content_id
     assert first.observed_at != later.observed_at
     assert first.available_at != later.available_at
+    assert first.generation_id != later.generation_id
+    assert changed.content_id != first.content_id
     assert changed.generation_id != first.generation_id
 
 
@@ -499,16 +549,20 @@ def test_republishing_one_projection_content_writes_the_database_once(
     store = NotificationStateStore(database)
 
     written = []
+    served = set()
     idle_generation = ""
     for index in range(60):
         authority = NotificationProjectionAuthoritySnapshot.create(
             observed_at=NOW + timedelta(seconds=2 * index),
-            available_at=NOW,
+            available_at=NOW + timedelta(seconds=2 * index),
             source_receipts={"market-minute": "1" * 64},
             projections=_page_projections(),
         )
-        idle_generation = authority.generation_id
-        written.append(store.publish_projection_authority(authority).written)
+        publication = store.publish_projection_authority(authority)
+        if not index:
+            idle_generation = authority.generation_id
+        written.append(publication.written)
+        served.add(publication.generation_id)
 
     revised_at = NOW + timedelta(minutes=5)
     revised = NotificationProjectionAuthoritySnapshot.create(
@@ -530,6 +584,9 @@ def test_republishing_one_projection_content_writes_the_database_once(
 
     assert written == [True] + [False] * 59
     assert revised_publication.written
+    # Every one of the fifty-nine iterations that wrote nothing was told which generation
+    # is being served -- the one row that is there, not the one it just computed.
+    assert served == {idle_generation}
     assert [row[0] for row in rows] == [idle_generation, revised.generation_id]
     # The row keeps the `observed_at` of the iteration that first saw this content, and
     # the fifty-nine that saw it again left it alone.
@@ -579,6 +636,53 @@ def test_an_already_published_projection_never_asks_for_the_write_lock(
     assert not repeated.written
 
 
+def test_a_projection_that_reverts_to_an_earlier_form_is_published_again(
+    tmp_path: Path,
+) -> None:
+    """Review SF-1: "already published once" is not "is what is being served".
+
+    Publish content A, then B, then A again. The first cut of this fix keyed the table by
+    the content alone, so the third publication found A's own earlier row, wrote nothing,
+    and `serving_snapshot` -- which orders by `available_at DESC, observed_at DESC` --
+    went on serving **B**, silently, for as long as the revert lasted. The gate now
+    compares against the latest row, so the revert is a third row and the answer is A.
+    """
+
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+
+    def content(receipt: str, at: datetime) -> NotificationProjectionAuthoritySnapshot:
+        return NotificationProjectionAuthoritySnapshot.create(
+            observed_at=at,
+            available_at=at,
+            source_receipts={"market-minute": receipt * 64},
+            projections=_page_projections(),
+        )
+
+    first = content("1", NOW)
+    other = content("2", NOW + timedelta(minutes=1))
+    reverted = content("1", NOW + timedelta(minutes=2))
+
+    published = [
+        store.publish_projection_authority(first),
+        store.publish_projection_authority(other),
+        store.publish_projection_authority(reverted),
+    ]
+    served = store.serving_snapshot(
+        observed_at=NOW + timedelta(minutes=2),
+        history_limit=10,
+    )
+
+    assert first.content_id == reverted.content_id
+    assert first.generation_id != reverted.generation_id
+    assert [item.written for item in published] == [True, True, True]
+    assert served.projection_generation_id == reverted.generation_id
+    assert served.projection_source_receipts == {"market-minute": "1" * 64}
+    # And the revert, once published, is idle again.
+    assert not store.publish_projection_authority(
+        content("1", NOW + timedelta(minutes=3))
+    ).written
+
+
 def test_a_projection_authority_written_before_the_content_gate_is_still_read(
     tmp_path: Path,
 ) -> None:
@@ -595,11 +699,12 @@ def test_a_projection_authority_written_before_the_content_gate_is_still_read(
         source_receipts={"market-minute": "1" * 64},
         projections=_page_projections(),
     )
-    payload = content.model_dump(mode="python", exclude={"generation_id"})
+    payload = content.model_dump(mode="python", exclude={"generation_id", "content_id"})
     legacy = NotificationProjectionAuthoritySnapshot.model_validate(
         {**payload, "generation_id": canonical_sha256(payload)}
     )
 
+    assert legacy.content_id is None
     assert legacy.generation_id != content.generation_id
     assert store.publish_projection_authority(legacy).written
 
@@ -622,6 +727,10 @@ def test_a_projection_generation_that_matches_neither_identity_is_refused() -> N
                 **content.model_dump(mode="python", exclude={"generation_id"}),
                 "generation_id": "f" * 64,
             }
+        )
+    with pytest.raises(ValueError, match="content does not match its identity"):
+        NotificationProjectionAuthoritySnapshot.model_validate(
+            {**content.model_dump(mode="python"), "content_id": "e" * 64}
         )
 
 
