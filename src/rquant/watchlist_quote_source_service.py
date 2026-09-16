@@ -43,6 +43,7 @@ def capture_watchlist_quote_step(
             LiveChannel.WATCHLIST_QUOTE.value: capture.pointer.source_generation_id,
         },
         degraded_reasons=reasons,
+        batch_published=capture.published,
     )
 
 

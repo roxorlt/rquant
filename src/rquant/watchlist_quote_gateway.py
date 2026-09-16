@@ -422,43 +422,60 @@ class WatchlistQuoteGateway:
         )
         payload = encode_watchlist_quote_payload(frame)
         content_sha256 = hashlib.sha256(payload).hexdigest()
-        latest_by_window, latest = self._revision_index()
+        latest_by_window, latest_record = self._revision_index()
+        latest = None if latest_record is None else latest_record.envelope
         event_window = (event_start, event_end)
         previous = latest_by_window.get(event_window)
-        sequence = 0 if latest is None else latest.sequence + 1
-        revision = 1 if previous is None else previous.revision + 1
-        envelope = BatchEnvelope(
-            schema_version=self.config.schema_version,
-            channel=LiveChannel.WATCHLIST_QUOTE,
-            dataset_id=self.config.dataset_id,
-            source=self.config.source,
-            source_request_id=request_id,
-            batch_id=canonical_sha256(
-                {
-                    "channel": LiveChannel.WATCHLIST_QUOTE,
-                    "sequence": sequence,
-                    "revision": revision,
-                    "event_time_start": event_start,
-                    "event_time_end": event_end,
-                    "content_sha256": content_sha256,
-                }
-            ),
-            sequence=sequence,
-            revision=revision,
-            revises_batch_id=None if previous is None else previous.batch_id,
-            event_time_start=event_start,
-            event_time_end=event_end,
-            source_time=source_time,
-            received_at=response_received_at,
-            available_at=max(response_received_at, event_end),
-            row_count=len(frame),
-            content_sha256=content_sha256,
-            quality_status=quality,
-            degraded_reasons=reasons,
-            producer_version=self.config.producer_version,
-            producer_commit=self.config.producer_commit,
-        )
-        pointer = self.spool.publish(envelope, payload)
+        pointer: CurrentPointer | BatchPointer
+        if (
+            latest_record is not None
+            and latest is not None
+            and latest.content_sha256 == content_sha256
+            and latest.quality_status is quality
+            and latest.degraded_reasons == reasons
+        ):
+            # An idle iteration (circuit_open / backoff_active / cadence_active /
+            # quota_exhausted / provider failure) carries an empty frame whose event window
+            # is this iteration's own clock, so the per-window entry never matches and the
+            # gate has to compare against the latest published batch instead.
+            pointer = self._pointer_for(latest_record)
+            published = False
+        else:
+            sequence = 0 if latest is None else latest.sequence + 1
+            revision = 1 if previous is None else previous.revision + 1
+            envelope = BatchEnvelope(
+                schema_version=self.config.schema_version,
+                channel=LiveChannel.WATCHLIST_QUOTE,
+                dataset_id=self.config.dataset_id,
+                source=self.config.source,
+                source_request_id=request_id,
+                batch_id=canonical_sha256(
+                    {
+                        "channel": LiveChannel.WATCHLIST_QUOTE,
+                        "sequence": sequence,
+                        "revision": revision,
+                        "event_time_start": event_start,
+                        "event_time_end": event_end,
+                        "content_sha256": content_sha256,
+                    }
+                ),
+                sequence=sequence,
+                revision=revision,
+                revises_batch_id=None if previous is None else previous.batch_id,
+                event_time_start=event_start,
+                event_time_end=event_end,
+                source_time=source_time,
+                received_at=response_received_at,
+                available_at=max(response_received_at, event_end),
+                row_count=len(frame),
+                content_sha256=content_sha256,
+                quality_status=quality,
+                degraded_reasons=reasons,
+                producer_version=self.config.producer_version,
+                producer_commit=self.config.producer_commit,
+            )
+            pointer = self.spool.publish(envelope, payload)
+            published = True
         if dispatch_admitted and raw is not None and not provider_failure:
             self._write_state(
                 _GatewayState(
@@ -466,7 +483,7 @@ class WatchlistQuoteGateway:
                     last_dispatch_at=state.last_dispatch_at,
                 )
             )
-        return WatchlistQuoteCapture(pointer=pointer, published=True)
+        return WatchlistQuoteCapture(pointer=pointer, published=published)
 
     def _consume_quota_before_dispatch(
         self,
@@ -639,9 +656,9 @@ class WatchlistQuoteGateway:
 
     def _revision_index(
         self,
-    ) -> tuple[dict[tuple[datetime, datetime], BatchEnvelope], BatchEnvelope | None]:
+    ) -> tuple[dict[tuple[datetime, datetime], BatchEnvelope], LiveBatchRecord | None]:
         index: dict[tuple[datetime, datetime], BatchEnvelope] = {}
-        latest: BatchEnvelope | None = None
+        latest: LiveBatchRecord | None = None
         for record in self.spool.list_after(LiveChannel.WATCHLIST_QUOTE, sequence=-1):
             envelope = record.envelope
             key = (envelope.event_time_start, envelope.event_time_end)
@@ -651,7 +668,7 @@ class WatchlistQuoteGateway:
             if envelope.revises_batch_id != (None if previous is None else previous.batch_id):
                 raise WatchlistQuoteStateError("watchlist quote revision parent is not contiguous")
             index[key] = envelope
-            latest = envelope
+            latest = record
         return index, latest
 
     def _find_request(self, request_id: str) -> LiveBatchRecord | None:
