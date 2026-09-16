@@ -207,14 +207,14 @@ def test_an_idle_replication_leaves_the_cursor_row_exactly_as_it_was(
 def _database_stamp(database: Path) -> tuple[object, ...]:
     """Everything that moves when this database is committed to, and nothing that does not.
 
-    The `-wal` size and mtime say whether anything was committed at all --
-    `sqlite3.Connection.total_changes` counts what *one* connection did and the store
-    opens its own per call, so the file is asked instead -- and the row counts say what
-    was written. Both, because a commit that writes and then undoes a value still moves
-    the WAL, and a row replaced in place still changes no count.
+    The main file's size and mtime say whether anything was committed at all: the store
+    opens and closes a connection per call, so a commit is checkpointed into this file
+    before the call returns. `sqlite3.Connection.total_changes` counts what *one*
+    connection did, and the `-wal` is created and truncated by opening a write connection
+    whether or not it commits, so neither of those answers the question. The row counts
+    and the cursor row come with it, because a row replaced in place changes no count.
     """
 
-    wal = database.with_name(database.name + "-wal")
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     try:
         counts = tuple(
@@ -231,12 +231,12 @@ def _database_stamp(database: Path) -> tuple[object, ...]:
         ).fetchone()
     finally:
         connection.close()
-    try:
-        observed = wal.stat()
-        wal_stamp: tuple[int, int] = (observed.st_size, observed.st_mtime_ns)
-    except FileNotFoundError:
-        wal_stamp = (0, 0)
-    return (wal_stamp, counts, tuple(cursor_row) if cursor_row is not None else None)
+    observed = database.stat()
+    return (
+        (observed.st_size, observed.st_mtime_ns),
+        counts,
+        tuple(cursor_row) if cursor_row is not None else None,
+    )
 
 
 def test_notification_state_rolls_back_signal_outbox_and_cursor_together(
@@ -451,8 +451,11 @@ def test_the_projection_generation_names_the_content_and_not_the_iteration_clock
         projections=_page_projections(),
     )
     later = NotificationProjectionAuthoritySnapshot.create(
+        #: both clocks move, because both are stamped from the iteration:
+        #: `create_from_sources` takes `available_at` from the receipts' `published_at`,
+        #: which the producer stamps with the same `observed_at` it is called with
         observed_at=NOW + timedelta(hours=3),
-        available_at=NOW,
+        available_at=NOW + timedelta(hours=1),
         source_receipts={"market-minute": "1" * 64},
         projections=_page_projections(),
     )
@@ -465,6 +468,7 @@ def test_the_projection_generation_names_the_content_and_not_the_iteration_clock
 
     assert first.generation_id == later.generation_id
     assert first.observed_at != later.observed_at
+    assert first.available_at != later.available_at
     assert changed.generation_id != first.generation_id
 
 

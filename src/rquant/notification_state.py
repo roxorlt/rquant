@@ -159,10 +159,18 @@ class NotificationRecipientMigrationSummary(RuntimeContractModel):
 #: `observed_at` out of the hash makes the id name the content, so an idle notifier
 #: finds its own previous row and writes nothing.
 #:
-#: `observed_at` stays a field and a column, and says what it always said: when this
-#: content was first observed. The table forbids UPDATE, so it is written exactly once
-#: per distinct content and never touched again.
-_AUTHORITY_IDENTITY_EXCLUDED = frozenset({"generation_id", "observed_at"})
+#: `available_at` is out for the same reason and is less obvious about it:
+#: `create_from_sources` sets it to the latest `published_at` of the receipts it was given,
+#: and the producer stamps those with the same iteration clock -- so it too was a new value
+#: on every iteration, and excluding `observed_at` alone left the id moving. It keeps the
+#: meaning it has always had, the instant from which this publication is answerable, and
+#: the row that carries it is now the *first* publication of this content rather than the
+#: most recent: `serving_snapshot` orders by it, and a later content still has a later
+#: first publication, so the ordering is the one it always was.
+#:
+#: `observed_at` and `available_at` stay fields and columns. The table forbids UPDATE, so
+#: they are written exactly once per distinct content and never touched again.
+_AUTHORITY_IDENTITY_EXCLUDED = frozenset({"generation_id", "observed_at", "available_at"})
 
 #: The same rule one level down. A source receipt's `published_at` is the iteration clock
 #: as well, and its `receipt_id` is carried into the authority's `source_receipts` -- so
@@ -569,17 +577,18 @@ class NotificationStateStore(SignalBusStore):
         stored_payload: str,
         validated: NotificationProjectionAuthoritySnapshot,
     ) -> None:
-        """Refuse a second content under one generation id, ignoring `observed_at`.
+        """Refuse a second content under one generation id, ignoring the two clocks.
 
-        The stored row carries the `observed_at` of the iteration that first saw this
-        content and the caller carries this iteration's, so the models are compared
-        without it (#271). Everything the id is computed over is compared, which is
-        everything else.
+        The stored row carries the `observed_at` and `available_at` of the iteration that
+        first saw this content and the caller carries this iteration's, so the models are
+        compared without them (#271). Everything the id is computed over is compared,
+        which is everything else.
         """
 
+        ignored = _AUTHORITY_IDENTITY_EXCLUDED - {"generation_id"}
         stored = NotificationProjectionAuthoritySnapshot.model_validate_json(stored_payload)
-        if stored.model_dump(mode="python", exclude={"observed_at"}) != validated.model_dump(
-            mode="python", exclude={"observed_at"}
+        if stored.model_dump(mode="python", exclude=ignored) != validated.model_dump(
+            mode="python", exclude=ignored
         ):
             raise NotificationReplicationError(
                 "notification projection generation conflicts with immutable content"
