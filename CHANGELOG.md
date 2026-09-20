@@ -86,6 +86,8 @@
 
 ### Changed
 
+- **deploy(systemd): raise slice MemoryHigh ceilings (rquant 6144M→11264M, live 3840M→7680M, live-runtime 1536M→4096M, serving 512M→1536M) so the production monitor/daily and the dashboard no longer share memory.high reclaim pressure with the Route A roles (fixes the 09-14 open-time stall and the 09-16 17:00 daily stall root cause: cgroup memory.high throttling, not I/O)** (#268, #271)
+
 - **主机资源包络：备份降频 + 放宽超时，运行时工作面加 CPU 限额（#243，owner 2026-09-08 授权裁决 21「选 1+2」）**：
   生产机 82.156.0.68 是 2 vCPU / 7.7 GB / swap 1 GB 常满。10 GB DuckDB 的一次快照
   （`cp` + `gzip` 到 3.66 GB）实测 8m16s–8m50s，而 timer 是盘中每 5 分钟一次——一轮没跑完

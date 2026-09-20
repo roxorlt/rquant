@@ -542,16 +542,28 @@ Streamlit 只创建 job spec 和读取状态。浏览器卡死、刷新、切 ta
 | `rquant-research.slice` | ingest、repair、backfill、replay、optimizer | 最低 |
 | `rquant-maintenance.slice` | backup、replica-sync | 最低，按并发峰值求和 |
 
-当前最低准入基线是实测 2 CPU / 7.51 GiB 可见内存的 8 GiB 标称主机。生产证据为 monitor
-current 2415 MiB、peak 2814 MiB，backup peak 1303 MiB。父级与 live 的
-`MemoryLow=3072M` 使祖先保护可兑现；父级/live/serving 只设
-`MemoryHigh=6144M/3840M/512M`，maintenance 在证据完成前不设 `MemoryHigh` 或 hard cap，只保留
+当前最低准入基线是实测 2 CPU / 7.51 GiB 可见内存的 8 GiB 标称主机（`WORKLOAD_MEMORY_BUDGET_MIB`
+里的最小可用底线，独立于生产实际物理内存）。生产证据为 monitor current 2415 MiB、peak 2814
+MiB，backup peak 1303 MiB。父级与 live 的 `MemoryLow=3072M` 使祖先保护可兑现；父级/live/serving
+原设 `MemoryHigh=6144M/3840M/512M`，maintenance 在证据完成前不设 `MemoryHigh` 或 hard cap，只保留
 低 CPU/IO 权重。research 独立保持
 `MemoryMax=768M` 与精确 `CPUQuota=100%`，在 2 CPU 主机上最多占用一个核。
 
-正常 research 运行态的静态上界为 live 3840 + serving 512 + research 768 + OS/其他
-`system.slice` 1280 = 6400 MiB。maintenance 没有可信 aggregate 峰值，不能再宣称其运行态总量
-低于 7680 MiB；backup 与 replica 可并发，文件缓存也不能用 512 MiB service cap 强杀。二者与
+Amended 2026-09-20 per owner decision (#268 / #271)。生产宿主机实际 15.7 GiB 内存，Route A
+运行时上线后 live 面常驻 monitor（实测 MemoryPeak 2095 MiB）与子 slice
+`rquant-live-runtime.slice`（18 个常驻 role，anon 2323 MiB + page cache，合计约 3756 MiB）叠加已
+超出 3840M，serving 面（dashboard 实测常驻约 700 MiB）也从 09-08 起持续压在 512M 回收线之上——
+这是 09-14 开盘 monitor 卡死、09-16 17:00 daily 跑 19 分钟的根因（memory.high 节流，不是
+I/O）。四个 slice 的 `MemoryHigh` 改为 `rquant.slice` 11264M、`rquant-live.slice` 7680M、
+`rquant-live-runtime.slice` 4096M（独立预算，不再从父面切份额）、`rquant-serving.slice`
+1536M；`rquant-research.slice` 保持 512M 不变，maintenance 仍不设上限。子 slice 的 `MemoryHigh`
+不得超过父 slice——这正是旧配置曾出现的反转 bug（role 面被临时调到 4096M 时父 slice
+`rquant-live.slice` 仍是 3840M）。
+
+正常 research 运行态的历史静态上界（8 GiB 标称主机基线，未随 09-20 变更调整）为 live 3840 +
+serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB。maintenance 没有可信
+aggregate 峰值，不能再宣称其运行态总量低于 7680 MiB；backup 与 replica 可并发，文件缓存也不能
+用 512 MiB service cap 强杀。二者与
 research 通过固定 root-owned flock wrapper 做全生命周期跨 plane 排他：maintenance pending
 阻止新 research，可抢占已运行 research，并有有界等待；同 plane 仍允许并发，timer calendar 不变。
 wrapper 路径不可由 `.env` 覆盖，安装时配套发布 root-owned SHA-256；registry 使用
