@@ -42,18 +42,18 @@ systemd 的 dash 命名按短横线逐段派生层级，所以前四个解析为
 | maintenance | backup、replica-sync | `rquant-maintenance.slice`，并发预算求和；不修改各自 timer 或假定互斥 |
 | root authority exception | daily-receipt-signer | `system.slice`，保持 root-only socket signing 边界并设独立进程上限 |
 
-最低基线改为实测 2 CPU / 7.51 GiB 可见内存（8 GiB 标称主机）。已知生产高水位为
-monitor current 2415 MiB、monitor peak 2814 MiB、backup peak 1303 MiB。证据不足以安全设置
-live、serving、maintenance 或父级硬上限，因此父级/live/serving 只使用权重、`MemoryLow` 和
-`MemoryHigh`，maintenance 暂时只使用低 CPU/IO 权重；仅 research 保留严格
+最低基线改为实测 2 CPU / 7.51 GiB 可见内存（8 GiB 标称主机，`WORKLOAD_MEMORY_BUDGET_MIB` 里
+独立于真实生产宿主机内存的最小可用底线，见下文「静态上界」）。已知生产高水位为
+monitor current 2415 MiB、monitor peak 2814 MiB、backup peak 1303 MiB。父级/live/serving 使用
+权重、`MemoryLow` 和 `MemoryHigh`，maintenance 暂时只使用低 CPU/IO 权重；仅 research 保留严格
 `MemoryMax=768M`：
 
 | 边界 | CPU / IO | MemoryLow | MemoryHigh | MemoryMax |
 |---|---:|---:|---:|---:|
-| `rquant.slice` | 100 / 100 | 3072 MiB | 6144 MiB | 不设 |
-| live | 1000 / 1000，**不设 `CPUQuota`** | 3072 MiB | 3840 MiB | 不设 |
-| live-runtime（live 的子 slice） | 100 / 100，`CPUQuota=60%` | 0 | 1536 MiB | 不设 |
-| serving | 500 / 500，`CPUQuota=30%` | 0 | 512 MiB | 不设 |
+| `rquant.slice` | 100 / 100 | 3072 MiB | 11264 MiB | 不设 |
+| live | 1000 / 1000，**不设 `CPUQuota`** | 3072 MiB | 7680 MiB | 不设 |
+| live-runtime（live 的子 slice） | 100 / 100，`CPUQuota=60%` | 0 | 4096 MiB | 不设 |
+| serving | 500 / 500，`CPUQuota=30%` | 0 | 1536 MiB | 不设 |
 | research | 100 / 100，`CPUQuota=100%` | 0 | 512 MiB | 768 MiB |
 | maintenance | 300 / 50，不设 `CPUQuota` | 0 | **待校准，不设** | 不设 |
 
@@ -74,16 +74,26 @@ research 仍是精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane
 重叠。maintenance 在 `rquant.slice` 内部的权重从 50 提到 300（备份跑时 research 必然不在跑，
 真实分母是 1800，份额 3.2% → 16.7%），仍低于 live/serving。
 
-内存一列里 **live / 父级的 `MemoryHigh` 没有改**：live 面里的 `rquant-monitor.service` 实测
-cgroup peak 2814 MiB，`MemoryLow` 又是 3072 MiB，任何低于 3838 MiB 的 live `MemoryHigh` 都会
-先掐监控自己（`verify_workload_memory_admission` 里「live 至少高出 monitor peak 1024 MiB」
-那条 fail-closed 断言）。新增的 `live-runtime` `MemoryHigh=1536M` 是**从 live 的 3840M 里
-切给 role 的**，不是额外增加：19 个 role 实测合计 2800 MiB，与 monitor peak 相加是 5614 MiB、
-早已超顶，加了子 slice 的上限之后回收先打在 role 身上而不是 monitor 身上。
+**2026-09-20 owner 裁决（#268、#271）改了 live / 父级 / live-runtime / serving 四个
+`MemoryHigh`**：Route A 上线后 live 面常驻 monitor（实测 MemoryPeak 2095 MiB）与子 slice
+`rquant-live-runtime.slice`（18 个常驻 role，anon 2323 MiB + page cache，合计约 3756 MiB）叠加
+早已超出旧的 3840M，serving 面（dashboard 实测常驻约 700 MiB）也从 09-08 起持续压在旧 512M
+回收线之上（PSI ~95%）——这是 09-14 开盘 monitor 卡死、09-16 17:00 daily 跑 19 分钟的根因
+（memory.high 节流，不是 I/O）。**`live-runtime` 不再是「从 live 里切一份」，而是独立
+4096 MiB 预算**；父面 live 同步提到 7680 MiB，让这 4096 MiB 完整落在父预算之内——子 slice 的
+`MemoryHigh` 永远不能超过父 slice，这正是旧配置出现过的反转 bug（role 面被临时用
+`systemctl set-property` 调到 4096M 时父 slice 仍是 3840M）。serving 同理提到 1536 MiB
+（dashboard ~700M + runtime-health/serving role ~300M + 余量）。
+`verify_workload_memory_admission` 里「live 至少高出 monitor peak 1024 MiB」那条 fail-closed
+断言用的是独立的、**未随本次调整**的 `WORKLOAD_MEMORY_BUDGET_MIB` 底线模型（仍是
+live=3840、monitor peak=2814，判断逻辑不变），不代表这四个 slice 文件今天的真实上限。
 
 `MemoryHigh` 不是 reservation，不能用它证明 backup/replica 并发安全。正常 research 运行态的
-静态上界为 live 3840 + serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB，
-低于 7680 MiB。maintenance 没有足够证据形成静态内存上界，因此不能写出“总量不超”的绿色
+历史静态上界（`WORKLOAD_MEMORY_BUDGET_MIB` 里未随 09-20 变更调整的 8 GiB 标称主机底线）为
+live 3840 + serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB，低于该模型的
+usable_host 7680 MiB；这与当前 live/serving 真实的 `MemoryHigh`（分别是 7680 / 1536 MiB）是
+两回事，前者是代码里未变的最小底线，后者是这份 README 表格与 slice 文件的当前值。
+maintenance 没有足够证据形成静态内存上界，因此不能写出“总量不超”的绿色
 结论。backup 与 replica 允许同类并发，证据必须同时记录独立峰值和 maintenance aggregate
 峰值，不能假装互斥，也不对文件缓存设置 512 MiB hard cap。
 
@@ -194,8 +204,8 @@ cat "/sys/fs/cgroup${runtime_cgroup}/memory.events"      # role 的 high 计数�
 cat "/sys/fs/cgroup${research_cgroup}/memory.events"
 ```
 
-**`rquant-live-runtime.slice` 那一份不能省**（#243）：role 搬进子 slice 之后，它们撞
-`MemoryHigh=1536M` 产生的 `high` 计数**不会**出现在 `rquant-live.slice` 那一层。
+**`rquant-live-runtime.slice` 那一份不能省**（#243、2026-09-20 #268/#271）：role 搬进子 slice
+之后，它们撞 `MemoryHigh=4096M` 产生的 `high` 计数**不会**出现在 `rquant-live.slice` 那一层。
 `MemoryHigh` 是节流不是硬顶——不 OOM-kill，只是把分配拖慢并强制回收，而这台机 swap 已满、
 role 又几乎全是匿名页，所以满编 soak 的表现是**role 变慢/卡住而不是响亮地失败**。
 `high` 计数持续增长就是唯一的可见信号。
