@@ -5,6 +5,30 @@
 
 ---
 
+## 2026-09-20 · 待安装 · live/serving slice MemoryHigh 提额（#268、#271）
+
+**状态**：**尚未安装**。四个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-20 经 owner
+授权，用 `systemctl set-property` 在生产主机临时生效（`rquant.slice` 6144M→11264M、
+`rquant-live.slice` 3840M→7680M、`rquant-live-runtime.slice` 1536M→4096M、
+`rquant-serving.slice` 512M→1536M），持久化落在 `/etc/systemd/system.control/` 下的 drop-in；
+本条只是把同样的值写回 checked-in 的 slice 文件，还没有装到服务器上。
+
+**装机前必须先清掉 drop-in**，否则文件改了不生效（drop-in 优先级更高）：
+
+```bash
+ls /etc/systemd/system.control/rquant*.slice.d/
+sudo systemctl revert rquant.slice rquant-live.slice rquant-live-runtime.slice rquant-serving.slice
+sudo systemctl daemon-reload
+```
+
+装完之后 `systemctl cat <slice>` 应只看到 checked-in 文件里的这一份 `MemoryHigh`，
+`/etc/systemd/system.control/` 下不应再留 rquant 相关目录。
+
+**回滚**：与其他只改 `deploy/systemd/` 的记录一样，`scripts/deploy-production.sh
+--target <上一个 tag>` 即可；四个数值没有数据副作用，回滚不需要额外挪状态。
+
+---
+
 ## 2026-09-16 · 待安装 · 其余六个 role 的每轮无条件写（#271 第二部分）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。

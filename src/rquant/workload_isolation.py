@@ -61,7 +61,10 @@ PARENT_SLICE_LIMITS: Mapping[str, str] = {
     "CPUWeight": "100",
     "IOWeight": "100",
     "MemoryLow": "3072M",
-    "MemoryHigh": "6144M",
+    # 2026-09-20 owner decision (#268 / #271): 6144M -> 11264M so live(7680M) +
+    # serving(1536M) + research(512M, unchanged) fit inside it with headroom for
+    # maintenance, and the host still keeps >= 4.4GB for the OS/non-rQuant services.
+    "MemoryHigh": "11264M",
     "TasksMax": "1024",
 }
 WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
@@ -69,7 +72,13 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
         "CPUWeight": "1000",
         "IOWeight": "1000",
         "MemoryLow": "3072M",
-        "MemoryHigh": "3840M",
+        # 2026-09-20 owner decision (#268 / #271): 3840M -> 7680M. The child
+        # rquant-live-runtime.slice now gets its own 4096M budget instead of
+        # carving one out of this plane's total, and monitor's MemoryPeak alone
+        # is ~2100M, so 3840M could no longer hold runtime + monitor + daily/kpl
+        # without throttling under memory.high (root cause of the 09-14 open-time
+        # monitor stall and the 09-16 17:00 daily stall).
+        "MemoryHigh": "7680M",
         "TasksMax": "512",
     },
     # The runtime role plane. It is a child of rquant-live.slice so the eleven resident
@@ -79,14 +88,24 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
         "CPUWeight": "100",
         "CPUQuota": "60%",
         "IOWeight": "100",
-        "MemoryHigh": "1536M",
+        # 2026-09-20 owner decision (#268 / #271): 1536M -> 4096M, now an
+        # independent budget (not a share carved out of the parent's 3840M)
+        # sized for the 18 resident roles actually running (anon 2323M + page
+        # cache, ~3756M measured). A child slice's MemoryHigh must never exceed
+        # its parent's; the parent rquant-live.slice was raised to 7680M in the
+        # same change so this 4096M fits inside it.
+        "MemoryHigh": "4096M",
         "TasksMax": "256",
     },
     "rquant-serving.slice": {
         "CPUWeight": "500",
         "CPUQuota": "30%",
         "IOWeight": "500",
-        "MemoryHigh": "512M",
+        # 2026-09-20 owner decision (#268 / #271): 512M -> 1536M. Dashboard alone
+        # resides at ~700M and this slice has been continuously over its high
+        # watermark since 09-08 (PSI ~95%); 1536M covers dashboard + the
+        # runtime-health/serving roles (~300M) with headroom.
+        "MemoryHigh": "1536M",
         "TasksMax": "256",
     },
     "rquant-research.slice": {

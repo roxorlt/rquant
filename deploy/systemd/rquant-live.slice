@@ -13,7 +13,16 @@ CPUWeight=1000
 IOAccounting=true
 IOWeight=1000
 MemoryAccounting=true
+# 2026-09-20 owner 裁决（#268 / #271）：3840M 装不下这个面——monitor 实测
+# MemoryPeak 2095 MiB，子 slice rquant-live-runtime.slice 独立预算 4096M（18 个
+# 常驻 role anon 2323 MiB + page cache 合计约 3756 MiB），再加 daily / kpl-snapshot
+# 等批处理任务的余量，早就超出 3840M；子 slice 的 MemoryHigh 不能超过父 slice，
+# 生产曾临时把 role 面调到 4096M 但父面仍是 3840M，这个反转是 09-14 开盘 monitor
+# 卡死、09-16 17:00 daily 跑 19 分钟的根因（memory.high 回收节流，不是 I/O）。
+# 改成 7680M = role 面 4096M（独立预算，不再是从这里切的份额）+ monitor ~2100M +
+# daily/kpl/alert 余量，monitor / daily 与 20 个 role 从此各花各的预算，不共享
+# 回收压力。
 MemoryLow=3072M
-MemoryHigh=3840M
+MemoryHigh=7680M
 TasksAccounting=true
 TasksMax=512

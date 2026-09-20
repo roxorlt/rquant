@@ -7,7 +7,12 @@ CPUWeight=100
 IOAccounting=true
 IOWeight=100
 MemoryAccounting=true
+# 2026-09-20 owner 裁决（#268 / #271）：宿主机物理内存 15.7GB，MemoryHigh 是回收
+# 节流阈值，不是预留量。子面提额后：live(7680M) + serving(1536M) +
+# research(512M，未变) = 9728M ≤ 11264M，maintenance 不设上限（有限时长的批处理，
+# 见 rquant-maintenance.slice）。顶层从 6144M 提到 11264M，给 OS 和非 rQuant 服务
+# 留 ≥ 4.4GB。
 MemoryLow=3072M
-MemoryHigh=6144M
+MemoryHigh=11264M
 TasksAccounting=true
 TasksMax=1024

@@ -14,12 +14,17 @@ CPUQuota=60%
 IOAccounting=true
 IOWeight=100
 MemoryAccounting=true
-# 从 live 的 3840M 里切给 role 的份额，不是额外增加：monitor 实测 cgroup peak 2814 MiB，
-# 19 个 role 实测合计 2800 MiB（≈147 MiB/个），两者相加 5614 MiB 早已超出 live 的 3840M，
-# 也就是说今天回收压力会落到 monitor 头上。1536M 覆盖当前 8 个基线 role 的估算用量
-# （2800 − 11×147 ≈ 1183 MiB）并留约 30% 余量，同时把 20 role 状态（≈2950 MiB）压到一半，
-# 回收先打在 role 上。更严的取法是 1024M（3840 − 2814 = 1026，live 永不超顶），
-# 但那会让今天就在跑的基线 role 长期处于回收态，且本机 swap 已满，故未采用（见包 M 报告）。
-MemoryHigh=1536M
+# 2026-09-20 owner 裁决（#268 / #271）：旧配置是「从 live 的 3840M 里切一份给
+# role 面」，1536M 只覆盖当时 8 个基线 role；生产实际跑到 18 个常驻 role，anon
+# 2323 MiB + page cache 合计约 3756 MiB，加上 monitor 实测 MemoryPeak 2095 MiB，
+# 早已超出 live 3840M 的总预算，回收压力全打在 monitor 头上（09-14 开盘 monitor
+# 卡死、09-16 17:00 daily 跑了 19 分钟，根因是 memory.high 节流，不是 I/O）。
+# 生产曾用 systemctl set-property 把这个子 slice 临时调到 4096M，但父 slice
+# rquant-live.slice 当时仍是 3840M——子 slice 预算（4096M）超过父 slice 上限
+# （3840M）本身就是配置反转，这正是这次要修的 bug：子 slice 的 MemoryHigh 永远
+# 不能超过父 slice。这次把 role 面改为独立 4096M 预算，父面 rquant-live.slice
+# 同步提到 7680M，4096M 完整落在父预算之内，role 面不再和 monitor / daily 抢
+# 回收压力（详见 rquant-live.slice 的评论）。
+MemoryHigh=4096M
 TasksAccounting=true
 TasksMax=256
