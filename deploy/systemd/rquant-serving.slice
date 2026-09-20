@@ -10,6 +10,10 @@ CPUQuota=30%
 IOAccounting=true
 IOWeight=500
 MemoryAccounting=true
-MemoryHigh=512M
+# 2026-09-20 owner 裁决（#268 / #271）：512M 从 09-08 起就持续压在回收线之上
+# （memory.events high 累计 22.5M 次，PSI 常态约 95%）。dashboard 实测常驻
+# ~700 MiB，一家就超了 512M，再加 runtime-health / serving role 合计约 300 MiB，
+# 改成 1536M = dashboard ~700M + health/serving role ~300M + 余量。
+MemoryHigh=1536M
 TasksAccounting=true
 TasksMax=256
