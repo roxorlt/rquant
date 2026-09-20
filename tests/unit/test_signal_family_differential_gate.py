@@ -692,8 +692,8 @@ def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
     # main; this one moves it from PR #265's to PR #266's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "79bccd8594af6cc777212202b63f1a460d110280"
-    assert BASELINE_TREE_SHA == "a75474793c4045cffbf0475a708d8bee1fd6c4d1"
+    assert BASELINE_COMMIT_SHA == "722971ab30b95d533ffe3a7f624ea4a2911cfc05"
+    assert BASELINE_TREE_SHA == "ab49e3cde2af262391f5c49ed3b63612c075dfe6"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``79bccd8`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``722971a`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1512,17 +1512,18 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # it out because the router runner peer-wait topic touched no workflow either, the
     # refreeze to 4e76850 left it out because the open-time I/O interference topic touched no
     # workflow either, the refreeze to 00d74c6 left it out because the notifier idle-fsync
-    # topic touched no workflow either, and this refreeze to 79bccd8 leaves it out on that
-    # same reading at the widest face yet: the resident-role idle-writes topic adds no module
-    # under src/rquant/ at all and changes nineteen, adds one test file and touches
-    # twenty-five existing ones, changes nothing under scripts/, marks nothing
-    # ``linux_exact``, adds no job, and does not touch .github/workflows/ci.yml. It does
-    # regenerate the shard manifest, which is a test artifact and not that workflow - and it
-    # leaves the frozen source-broker boundary alone, because it touches none of the nine
-    # modules that manifest collects; the matrix in the workflow is unchanged at five shards,
-    # so the one thing that has ever made this path true has not happened.
-    # That is thirteen refreezes in a row without a flip. A named path would have flipped
-    # truth value nine times in twenty-five refreezes: naming one
+    # topic touched no workflow either, the refreeze to 79bccd8 left it out because the
+    # resident-role idle-writes topic touched no workflow either, and this refreeze to
+    # 722971a leaves it out on that same reading once more: the Route A slice MemoryHigh
+    # topic adds no module under src/rquant/ at all and changes two, adds no test file and
+    # touches one existing one, changes nothing under scripts/, marks nothing
+    # ``linux_exact``, adds no job, and does not touch .github/workflows/ci.yml. It does not
+    # regenerate the shard manifest either, because no test count changed - and it leaves the
+    # frozen source-broker boundary alone, because it touches none of the nine modules that
+    # manifest collects; the matrix in the workflow is unchanged at five shards, so the one
+    # thing that has ever made this path true has not happened.
+    # That is fourteen refreezes in a row without a flip. A named path would have flipped
+    # truth value nine times in twenty-six refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted
