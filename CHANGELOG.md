@@ -25,10 +25,15 @@
     三档，三个世界只差输入文档里的一个值：`paused` 断言 outbox 零行、`shadow` 断言 outbox 与
     attempt 有行、能说话的 provider 一条都没收到、当代 `signals` 里**按 `event_time` 过滤出
     本场次**的信号非空，`live` 断言记录器收到了投递。
-  - **切换与回滚见 `DEPLOY.md` 2026-09-21 那条**：shadow → live 安全（游标一直在前进），
-    paused → live 不安全（会一次推出整条积压 spool，#86 那一类风暴）；新画像带的
-    `suppress_delivery` / `notifier_delivery_mode` 两个键会被 v0.33.15 的
-    `extra="forbid"` 模型拒收，**回滚必须先用回滚目标那一版代码重新生成画像**。
+  - shadow 下凭据、收件人解析、别名迁移、preflight 全是真的，**唯一看不见的是线那一头的回答**：
+    影子档永远不会产生 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`，
+    所以切 live 的第一轮仍可能是投递失败第一次出现的时刻。
+  - **切换与回滚见 `DEPLOY.md` 2026-09-21 那条**：shadow → live 不会有告警风暴（游标一直在
+    前进），但档位要重启 notifier 才生效，而发布器在工作日 09:15–15:10 拒绝任何需要重启的发布，
+    所以只能开盘前或收盘后切；paused → live 不安全（会一次推出整条积压 spool，#86 那一类风暴）。
+    新画像带的 `suppress_delivery` / `notifier_delivery_mode` 两个键会被 v0.33.16 及更早版本的
+    `extra="forbid"` 模型拒收，**回滚必须先把 `notifier_delivery_mode` 从输入文档里删掉**；
+    自动回滚不重新生成画像，会留下「新画像 + 旧代码」，notifier 起不来，收尾步骤写在 DEPLOY 里。
 
 - **25 个 role 各自在自己 unit 的沙箱里起一次的 e2e（`tests/integration/test_route_a_all_roles_sandbox_e2e.py`）**：
   Route A 的裸跑排查（runbook R-20）用 `runtime-exec.pyz` 起 role，**完全没有沙箱**，所以

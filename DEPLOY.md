@@ -23,62 +23,155 @@
 
 看到这两个就是没发出去；两个都没有、`degraded_reasons` 干净，才是真的在发。
 
-### 怎么生成一份指定档位的画像
+### 影子档看不见什么（切 live 之前必须知道）
+
+影子档下**凭据、收件人解析、别名迁移、preflight 全是真的**：凭据配错、收件人不在
+capability 里、凭据仓库读不到，这几类失败在 shadow 下与 live 逐字相同（对照实测过）。
+
+**唯一看不见的是线那一头的回答。** `SuppressedNotificationProvider.deliver()` 不会抛，
+所以影子档**永远不会**产生 `notifier:confirmed_failures:*` 或 `notifier:unknown_outcomes:*`——
+「对端拒收」「网络超时」这两类在影子档下构造不出来。也就是说：
+
+> 影子档跑得再干净，切 live 的第一轮仍然可能是投递失败第一次出现的时刻。
+
+切 live 之后的第一轮心跳要专门看这两个字符串。
+
+### 档位写在哪儿
+
+发布器不吃命令行档位参数。它读的是 `RQUANT_RUNTIME_PRODUCTION_INPUTS` 指的那份输入文档
+（生产机上是 `/home/lighthouse/rquant/data/runtime-production-inputs.json`），用
+`rquant runtime-production-profile --inputs <该文档>` 重新生成画像并安装
+（`src/rquant/ops/production_deploy.py:576-700`）。所以**改档位 = 改那份输入文档里的
+`notifier_delivery_mode`，然后发一次版**。
+
+两种改法，二选一：
 
 ```bash
-# 默认就是 shadow，写出来是为了让部署记录上留下它选了什么
+ROOT=/home/lighthouse/rquant
+INPUTS="${ROOT}/data/runtime-production-inputs.json"
+
+# 改法 A：只改一个键（推荐，其余字段一个字不动）
+python - "$INPUTS" <<'EOF'
+import json, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["notifier_delivery_mode"] = "live"      # paused / shadow / live
+path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+EOF
+
+# 改法 B：整份重新生成（四十来个参数都要给全，只在本来就要重生成时用）
 python scripts/build_runtime_production_inputs.py \
-    --notifier-delivery-mode shadow \
-    ...（其余参数照旧）
+    --notifier-delivery-mode live \
+    --checkout "${ROOT}" \
+    --calendar-database ... --output-root ... --inputs-output "$INPUTS" \
+    ...（其余参数照 docs/production-release.md 那一份）
 ```
+
+改完 `git diff` / `jq .notifier_delivery_mode "$INPUTS"` 确认只动了这一个键。
 
 ### 切正式（shadow → live）
 
-**安全**，可以在盘中切。影子档一直在消耗 outbox、复制游标一直在前进，所以第一轮 live
-只会看到「从现在起」的新信号：
+**「安全」指的是不会有告警风暴，不是指随时可以切。** 影子档一直在消耗 outbox、复制游标一直在
+前进，所以第一轮 live 只会看到「从现在起」的新信号，没有积压可推——这一点已实测。
 
-1. 用 `--notifier-delivery-mode live` 重新生成画像 → 装新一代 → `rquant-notifier` 重启；
-2. 第一轮心跳里 `notifier:shadow_transport` 应当消失，`delivery_attempt` 里新出现的回执
-   不再以 `shadow:` 开头；
-3. 手机上应当只收到切换之后产生的信号。
+**但时间窗不由你选**：档位只有在 `rquant-notifier` 重启之后才生效，而发布器对任何需要重启服务的
+发布，在**工作日 09:15–15:10 直接拒绝**（`src/rquant/ops/production_deploy.py:507-511`
+`is_protected_market_window`，`:1631-1636` 抛 `ProtectedWindowError`），**不存在 force/emergency
+绕过**。所以：
+
+> **开盘前或收盘后切**。盘中想切也切不了，发布器会拒。
+
+步骤：
+
+```bash
+ROOT=/home/lighthouse/rquant
+cd "${ROOT}"
+export RQUANT_RUNTIME_PRODUCTION_INPUTS="${ROOT}/data/runtime-production-inputs.json"
+export RQUANT_RUNTIME_PROFILE_OUTPUT_DIR="${ROOT}/data/runtime-profiles"
+export RQUANT_RUNTIME_ROOT="${ROOT}/data/runtime"
+
+# ① 把输入文档里的 notifier_delivery_mode 改成 live（见上一节）
+# ② 发一次版（target 就是当前在跑的那个 tag，代码没变，变的是画像）
+bash scripts/deploy-production.sh --target <当前 tag>
+```
+
+验收：
+
+1. 第一轮心跳里 `notifier:shadow_transport` 消失；
+2. 新写入的 `delivery_attempt.provider_receipt` 不再以 `shadow:` 开头；
+3. **专门看 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`**（见上一节）；
+4. 手机上只应收到切换之后产生的信号。
 
 ### paused → live（**不要这么切**）
 
-**不安全**。急停档下复制游标从来没有前进过，第一轮 live 会从
-`cursor.last_global_sequence` 开始把攒下的整条 spool 一次认领出来，按
-`batch_limit=128` / `interval_seconds=2` 一轮轮推——这正是 #86 修过的那一类告警风暴，
-唯一的闸是信号自己的 `expires_at`。必须走下面两条之一：
+急停档下复制游标从来没前进过，第一轮 live 会从 `cursor.last_global_sequence` 开始把攒下的
+整条 spool 一次认领，按 `batch_limit=128` / `interval_seconds=2` 一轮轮推——就是 #86
+修过的那一类告警风暴，唯一的闸是信号自己的 `expires_at`。两条合法路径：
 
-- **先切 shadow**，让它把积压消耗完（心跳的 `backlog_count` 回到 0），再切 live；
-- 或者**开盘前**切，并且人工确认 spool 里没有还没过期的积压。
+- **先切 shadow**，等心跳的 `backlog_count` 回到 0，再切 live；
+- 或者**开盘前**切，并人工确认 spool 里没有未过期的积压。
 
-### 回滚（**必须连画像一起回**）
+### 回滚（**必须连画像一起回**，且自动回滚不会帮你做）
 
 新画像的 notifier manifest 多了一个 `suppress_delivery` 键，输入文档多了一个
 `notifier_delivery_mode` 键。两个模型都是 `RuntimeContractModel`（`extra="forbid"`），
-所以 **v0.33.15 的代码读不了新画像**，实测：
+所以 **v0.33.16 及更早的代码读不了新画像**，实测：
 
 ```
-NotifierSettings（v0.33.15）  ← {"suppress_delivery": True, ...}
+NotifierSettings（v0.33.16）  ← {"suppress_delivery": True, ...}
   ValidationError: suppress_delivery / extra_forbidden / Extra inputs are not permitted
-ProductionRuntimeProfileInputs（v0.33.15） ← {"notifier_delivery_mode": "shadow", ...}
+ProductionRuntimeProfileInputs（v0.33.16） ← {"notifier_delivery_mode": "shadow", ...}
   ValidationError: notifier_delivery_mode / extra_forbidden / Extra inputs are not permitted
 ```
+
+（`main` 现在的 tag 是 **v0.33.16**（`16b76a5b`），它里面 `suppress_delivery` 出现 0 次、
+`"paused": True` 仍硬编码在 `runtime_production_profile.py:1722`；本包发出来是 **v0.33.17**
+的内容。v0.33.15 同样读不了，结论对这两个 tag 都成立。）
 
 影响范围是**一个 role**：`RuntimeServiceManifest.settings` 的类型是
 `Mapping[str, JsonValue]`，装机与权威链校验都不看键名，所以整代画像仍然装得上、其余
 role 照跑；炸的是 `rquant-notifier` 起不来（builder 在
 `runtime_builder_signal.py:965` 校验 `NotifierSettings`）。
 
-所以回滚顺序是：
+**情况一：主动回滚（正向发到旧 tag）。** 发布器会用旧代码重新生成画像，而旧代码读到输入文档里的
+`notifier_delivery_mode` 会被拒，所以**先把这个键从输入文档里删掉**：
 
 ```bash
-# ① 先用回滚目标那一版代码重新生成画像（输入文档里不能带 notifier_delivery_mode）
-# ② 装这一代画像
-# ③ 再 bash scripts/deploy-production.sh --target <上一个 tag>
+# ① 从输入文档里删掉 notifier_delivery_mode
+python - "$RQUANT_RUNTIME_PRODUCTION_INPUTS" <<'EOF'
+import json, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc.pop("notifier_delivery_mode", None)
+path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+EOF
+
+# ② 再回代码（发布器会用旧代码重新生成并安装画像）
+bash scripts/deploy-production.sh --target <上一个 tag>
 ```
 
-反过来（先回代码再回画像）会让 notifier 在中间那段时间起不来。
+顺序反了，中间那段时间 notifier 起不来。
+
+**情况二：一次失败发布触发了自动回滚。** `_deploy_runtime_profile` 在
+`action == "rollback"` 时**直接 return，根本不重新生成画像**
+（`src/rquant/ops/production_deploy.py:568-575`）。所以自动回滚之后主机上是
+**「新一代画像 + 旧代码」**，其余 role 正常、只有 `rquant-notifier` 起不来。人工收尾：
+
+```bash
+# ① 确认现象：notifier 反复启动失败，日志里是 suppress_delivery / extra_forbidden
+systemctl status 'rquant-runtime-notifier@*'
+journalctl -u 'rquant-runtime-notifier@*' -n 50 --no-pager | grep -i extra_forbidden
+
+# ② 按「情况一 ①」把 notifier_delivery_mode 从输入文档里删掉
+# ③ 用回滚后那一版代码重新生成并安装画像（target = 自动回滚落到的那个 tag）
+bash scripts/deploy-production.sh --target <自动回滚落到的 tag>
+
+# ④ 确认 notifier 起来了
+systemctl status 'rquant-runtime-notifier@*'
+```
+
+第 ③ 步同样受 09:15–15:10 保护窗限制。若在盘中发生，notifier 会一直起不来到收盘——
+这正是**不要在临近开盘时发版**的理由。
 
 ---
 
