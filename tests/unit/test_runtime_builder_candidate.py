@@ -22,6 +22,7 @@ from rquant.runtime_builder_candidate import (
 )
 from rquant.runtime_market_session import (
     MarketCalendarAuthority,
+    MarketSessionCalendarError,
     auction_windows_are_consistent,
 )
 from rquant.runtime_service_builtin import (
@@ -1640,8 +1641,13 @@ def test_a_date_outside_calendar_coverage_is_a_visible_degradation(tmp_path: Pat
     assert result.degraded_reasons == (f"calendar_uncovered:{SESSION_UNCOVERED_DATE.isoformat()}",)
 
 
-def test_a_calendar_generated_after_the_clock_is_also_refused(tmp_path: Path) -> None:
-    """`decide_market_session` 的第二条护栏（防时钟回拨 / 权威错代）跟着一起拿回来了。"""
+def test_a_calendar_generated_after_the_clock_fails_hard(tmp_path: Path) -> None:
+    """时钟回拨 / 权威错代是**硬失败**，不是降级（复核裁定 A / B）。
+
+    `decide_market_session` 的两种拒绝原来共用一个 `calendar_uncovered:` 标签，操作员看到
+    它会去查日历覆盖期，查完发现覆盖期没问题。现在拆成两条，而且「这台机器现在说的话不
+    可信」这一条在**两个 role 里都抛**——auction-match 本来就抛，这里跟上。
+    """
 
     calls: list[dict[str, object]] = []
     step = candidate_publisher_builder(
@@ -1650,10 +1656,10 @@ def test_a_calendar_generated_after_the_clock_is_also_refused(tmp_path: Path) ->
         clock=lambda: _at(8, 45, day=SESSION_OPEN_DATES[0]) - timedelta(days=2),
     )(_session_manifest(tmp_path))
 
-    result = step()
+    with pytest.raises(MarketSessionCalendarError, match="calendar_clock_regressed:"):
+        step()
 
     assert calls == []
-    assert result.degraded_reasons and result.degraded_reasons[0].startswith("calendar_uncovered:")
 
 
 def test_the_next_session_gets_its_own_document(tmp_path: Path) -> None:

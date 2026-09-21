@@ -20,7 +20,11 @@ from rquant.auction_universe_authority import AuctionUniverseAuthority
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.runtime_contracts import canonical_sha256
-from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_market_session import (
+    MarketCalendarAuthority,
+    MarketSessionCalendarError,
+    calendar_refusal_reason,
+)
 from rquant.runtime_service_builtin import (
     AUCTION_MATCH_DEFAULT_CAPTURE_END,
     AUCTION_MATCH_DEFAULT_CAPTURE_START,
@@ -235,6 +239,12 @@ def test_the_window_comes_from_settings_and_defaults_when_absent(tmp_path: Path)
     [
         ({"capture_start": "09:45:00", "capture_end": "09:31:00"}, "precede"),
         ({"capture_start": "09:20:00"}, "09:26"),
+        #: 显式间隔与窗宽对不上（复核 CF-2）。默认窗 09:31-09:45、三次尝试：
+        #: 600 s ⇒ 第三次到期 09:51，在窗外；
+        #: 420 s ⇒ 第三次到期正好 09:45:00，也就是 MF-1 那个相位缺陷的旧写法，
+        #: 边界是左闭右开，所以同样被拒。
+        ({"retry_interval_seconds": 600}, "fall inside"),
+        ({"retry_interval_seconds": 420}, "fall inside"),
     ],
 )
 def test_an_impossible_window_is_refused(
@@ -246,6 +256,23 @@ def test_an_impossible_window_is_refused(
         AuctionMatchSourceSettings.model_validate(
             dict(_manifest(tmp_path, **overrides).settings)
         )
+
+
+@pytest.mark.parametrize("interval_seconds", [419, 280, 1])
+def test_an_interval_whose_attempts_all_fit_is_accepted(
+    tmp_path: Path,
+    interval_seconds: int,
+) -> None:
+    """校验的是「落在 `[start, end)` 内」，不是「什么都拒」（复核 CF-2 的另一侧）。
+
+    419 s 是刚好放得下的那一个：第三次到期 09:44:58，离右界还有两秒。
+    """
+
+    settings = AuctionMatchSourceSettings.model_validate(
+        dict(_manifest(tmp_path, retry_interval_seconds=interval_seconds).settings)
+    )
+
+    assert settings.capture_retry_interval_seconds == interval_seconds
 
 
 def test_the_three_attempts_are_spread_across_the_window(tmp_path: Path) -> None:
@@ -573,6 +600,66 @@ def test_a_window_that_passes_without_any_attempt_is_capture_missed(tmp_path: Pa
 
     assert adapter.calls == []
     assert "capture_missed" in result.degraded_reasons
+
+
+def test_a_date_outside_calendar_coverage_is_a_soft_degradation(tmp_path: Path) -> None:
+    """冻结日历过期时软降级，两个 role 一致（复核裁定 A / B）。
+
+    改动前 `decide_market_session` 直接抛，auction-match 于是在覆盖期外每轮 `record_failure`；
+    而 session 发布者对同一件事是软降级。同一个条件在两个 role 里一软一硬，现在统一成软。
+    """
+
+    adapter = _Adapter()
+    #: 日历覆盖到 2026-08-03 为止，把钟拨到之后一周
+    step = auction_match_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: at(9, 31, day=date(2026, 8, 10)),
+    )(_manifest(tmp_path))
+
+    result = step()
+
+    assert adapter.calls == []
+    assert result.degraded_reasons == ("calendar_uncovered:2026-08-10",)
+
+
+def test_a_calendar_generated_after_the_clock_fails_hard(tmp_path: Path) -> None:
+    """时钟回拨 / 权威错代是硬失败：抛出去，`record_failure` 记 `last_error`。
+
+    日历的 `generated_at` 是 2026-07-30 08:00 UTC；把钟拨到它之前，`decide_market_session`
+    两条判据都不满足（那天也在覆盖期之前），按裁定 B 取更根本的那一条——时钟不对。
+    """
+
+    adapter = _Adapter()
+    step = auction_match_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: at(9, 31, day=date(2026, 7, 29)),
+    )(_manifest(tmp_path))
+
+    with pytest.raises(MarketSessionCalendarError, match="calendar_clock_regressed:"):
+        step()
+
+    assert adapter.calls == []
+
+
+def test_the_two_calendar_refusals_are_told_apart_by_the_shared_helper() -> None:
+    """标签与软硬由一个共用函数决定，两个 role 用的是同一份（复核裁定 A）。"""
+
+    calendar = MarketCalendarAuthority.create(
+        schema_version=1,
+        exchange="SSE",
+        producer_commit=COMMIT,
+        coverage_start=TRADE_DATE,
+        coverage_end=NEXT_TRADE_DATE,
+        open_dates=(TRADE_DATE, NEXT_TRADE_DATE),
+        generated_at=datetime(2026, 7, 30, 8, 0, tzinfo=UTC),
+    )
+    error = MarketSessionCalendarError("whatever decide_market_session said")
+
+    uncovered = calendar_refusal_reason(calendar, at(9, 31, day=date(2026, 8, 10)), error)
+    regressed = calendar_refusal_reason(calendar, at(9, 31, day=date(2026, 7, 29)), error)
+
+    assert uncovered == ("calendar_uncovered:2026-08-10", False)
+    assert regressed == ("calendar_clock_regressed:2026-07-30T08:00:00+00:00", True)
 
 
 def test_an_idle_day_reports_nothing_at_all(tmp_path: Path) -> None:

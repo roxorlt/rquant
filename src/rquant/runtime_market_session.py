@@ -301,6 +301,44 @@ def decide_market_session(
     )
 
 
+def calendar_refusal_reason(
+    calendar: MarketCalendarAuthority,
+    observed_at: datetime,
+    error: MarketSessionCalendarError,
+) -> tuple[str, bool]:
+    """把 `decide_market_session` 的两种拒绝分开，并说明各自是软是硬（复核裁定 A / B）。
+
+    `MarketSessionCalendarError` 盖着两件完全不同的事：
+
+    1. **日期超出日历覆盖期**（`runtime_market_session.py:286-289`）——冻结的日历过期了。
+       这是「该刷日历了」，是**软降级**：报 `calendar_uncovered:<date>`，role 继续活着。
+    2. **日历权威的生成时刻晚于观测时刻**（`:290-291`）——要么时钟被回拨，要么装了错代的
+       权威。这不是「数据没到」，是**这台机器现在说的话不可信**，所以**硬失败**：
+       原样抛出去，`record_failure` 把它记进 `last_error`，两个 role 一致。
+
+    两者同时成立时按第 2 种处理：时钟不对是更根本的那一个，先修它。
+    返回 `(理由标签, 是否硬失败)`。
+    """
+
+    if calendar.generated_at > normalize_aware_utc(observed_at):
+        return (f"calendar_clock_regressed:{calendar.generated_at.isoformat()}", True)
+    local_date = normalize_aware_utc(observed_at).astimezone(MARKET_TIMEZONE).date()
+    return (f"calendar_uncovered:{local_date.isoformat()}", False)
+
+
+def raise_or_label_calendar_refusal(
+    calendar: MarketCalendarAuthority,
+    observed_at: datetime,
+    error: MarketSessionCalendarError,
+) -> str:
+    """硬的那一种当场抛，软的那一种把标签交回去让调用者降级。"""
+
+    label, hard = calendar_refusal_reason(calendar, observed_at, error)
+    if hard:
+        raise MarketSessionCalendarError(f"{label}: {error}") from error
+    return label
+
+
 # ---------------------------------------------------------------------------------------
 # 本地挂钟窗口的算术（#277 复核 MF-1 / 代码质量 1）
 #
@@ -373,9 +411,11 @@ __all__ = [
     "MarketSessionDecision",
     "MarketSessionPhase",
     "auction_windows_are_consistent",
+    "calendar_refusal_reason",
     "decide_market_session",
     "load_market_calendar_authority",
     "local_window_contains",
+    "raise_or_label_calendar_refusal",
     "seconds_of_day",
     "spread_interval_seconds",
     "window_schedule_fits",

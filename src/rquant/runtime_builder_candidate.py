@@ -41,6 +41,7 @@ from rquant.runtime_market_session import (
     decide_market_session,
     load_market_calendar_authority,
     local_window_contains,
+    raise_or_label_calendar_refusal,
 )
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -672,12 +673,21 @@ def candidate_publisher_builder(
                 #: 走 `decide_market_session` 而不是自己判「今天在不在 open_dates 里」
                 #: （复核 SF-1）。自己判会把「这本日历根本覆盖不到今天」和「今天不开市」
                 #: 当成同一件事，于是日历过期之后发布者天天空转、心跳干干净净——正是 #277
-                #: 那种「什么都没发生而看不出来」的形状，只是换了个地方。顺带也拿回了
-                #: 「日历权威的生成时刻晚于 observed_at」那条防时钟回拨的护栏。
+                #: 那种「什么都没发生而看不出来」的形状，只是换了个地方。
+                #: 两种拒绝的软硬分工与 auction-match 逐字相同（复核裁定 A / B）：覆盖期外
+                #: 软降级 `calendar_uncovered:<date>`，时钟回拨**硬失败**（抛，记 last_error）。
                 try:
                     decision = decide_market_session(session_calendar, observed_at)
-                except MarketSessionCalendarError:
-                    return idle_result((f"calendar_uncovered:{local.date().isoformat()}",))
+                except MarketSessionCalendarError as error:
+                    return idle_result(
+                        (
+                            raise_or_label_calendar_refusal(
+                                session_calendar,
+                                observed_at,
+                                error,
+                            ),
+                        )
+                    )
                 trade_date = decision.local_trade_date
                 if (
                     not decision.is_open_date

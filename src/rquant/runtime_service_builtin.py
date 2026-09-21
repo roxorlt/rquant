@@ -46,8 +46,10 @@ from rquant.runtime_candidate_universe import (
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.runtime_market_session import (
     MarketCalendarAuthority,
+    MarketSessionCalendarError,
     decide_market_session,
     load_market_calendar_authority,
+    raise_or_label_calendar_refusal,
     seconds_of_day,
     spread_interval_seconds,
     window_schedule_fits,
@@ -826,8 +828,37 @@ def auction_match_source_builder(
             nonlocal attempt_trade_date, attempts, completed, last_result
             nonlocal capture_failed, capture_missed
             observed_at = clock()
-            decision = decide_market_session(calendar, observed_at)
             evidence = {"market_calendar": calendar.content_sha256}
+
+            def idle_result(extra: tuple[str, ...] = ()) -> RuntimeStepResult:
+                reasons = tuple(last_result.degraded_reasons)
+                for reason in (
+                    *extra,
+                    *(("capture_failed",) if capture_failed else ()),
+                    *(("capture_missed",) if capture_missed else ()),
+                ):
+                    if reason not in reasons:
+                        reasons = (*reasons, reason)
+                return RuntimeStepResult(
+                    **{
+                        **last_result.model_dump(mode="python"),
+                        "processed_count": 0,
+                        "source_generations": {
+                            **dict(last_result.source_generations),
+                            **evidence,
+                        },
+                        "degraded_reasons": reasons,
+                    }
+                )
+
+            #: 日历拒绝回答时的软硬分工与 session 发布者逐字相同（复核裁定 A / B）：
+            #: 覆盖期外是软降级，时钟回拨是硬失败。
+            try:
+                decision = decide_market_session(calendar, observed_at)
+            except MarketSessionCalendarError as error:
+                return idle_result(
+                    (raise_or_label_calendar_refusal(calendar, observed_at, error),)
+                )
             if attempt_trade_date != decision.local_trade_date:
                 attempt_trade_date = decision.local_trade_date
                 attempts = 0
@@ -849,26 +880,6 @@ def auction_match_source_builder(
                     capture_failed = True
                 elif window_passed:
                     capture_missed = True
-
-            def idle_result() -> RuntimeStepResult:
-                reasons = tuple(last_result.degraded_reasons)
-                for reason, raised in (
-                    ("capture_failed", capture_failed),
-                    ("capture_missed", capture_missed),
-                ):
-                    if raised and reason not in reasons:
-                        reasons = (*reasons, reason)
-                return RuntimeStepResult(
-                    **{
-                        **last_result.model_dump(mode="python"),
-                        "processed_count": 0,
-                        "source_generations": {
-                            **dict(last_result.source_generations),
-                            **evidence,
-                        },
-                        "degraded_reasons": reasons,
-                    }
-                )
 
             if (
                 not decision.is_open_date
