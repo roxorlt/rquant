@@ -5,6 +5,49 @@
 
 ---
 
+## 2026-09-21 · 待安装 · 研究面两源缺席不再让 serving 整轮拒（#283）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**现象**：serving 的六个源权威里，`lab_jobs` 与 `promotions` 属于研究面，而研究面四个角色
+在主机上被 workload arbiter 的高水位证据门挡着（#217），**一代权威都没发过**。
+`ServingSnapshotAssembler` 此前六个源一律 fail-closed，所以这两个根目录里没有 `current.json`
+这一件事，就让 `serving.publisher.v1` **每一轮都整轮拒，`serving/generations/` 一代都不会有**
+——哪怕信号链当天每一跳都正常。
+
+**改法**：assembler 的 `fail_closed: bool` 换成 `optional_datasets: frozenset[str]`，
+默认 `{"lab_jobs", "promotions"}`；只有集合里的 dataset 走降级（空载荷 + `unavailable` 水位），
+**其余四个照旧整轮拒**。这个区分是必需的：③b 判据从空的 `signals` 表读出
+「今天没有信号走完这条链」，只有在 `signals` 读不到时仍然整轮拒的前提下，这句话才和
+「notifier 坏了」分得开。
+`reference_slow_authority` **永远不可选**（它的载荷没有合法空值），画像里写它会被拒，
+运行期读它失败也仍然抛。
+
+同时，unavailable 的那一代**不再含时钟**：generation id 只由 dataset 与拒绝理由派生，
+水位的 `event_time` / `published_at` 取 epoch。否则 `_generation_already_current`（#271）
+每轮都会看到不同的输入，serving 会在研究面缺席期间**每三十秒重建一次 `serving.duckdb`**。
+
+**装上之后当场应该看到什么**（③b 验收清单第 5.5 行按此改写）：
+
+| 看什么 | 判据 |
+|---|---|
+| `$ROOT/serving/generations/` | 当天有新增的一代，`$ROOT/serving/current.json` 指向它。**研究面两源没有 `current.json` 不再是阻塞原因** |
+| serving 心跳的 `degraded_reasons` | 含 `serving:lab_jobs:unavailable:…` 与 `serving:promotions:unavailable:…` 两条。根目录存在但没有 `current.json` 时理由是 `ServingSourceAuthorityUnavailableError: current pointer is unavailable`（主机是这一种，目录由 runbook C-1 预建）；根目录整个不存在时是 `… current authority is unavailable` |
+| serving 心跳的 `last_error` | 仍然是 `null`，`consecutive_failures` 为 0。缺席是 **degraded**，不是 failed |
+| 其余四源 | 任缺一个（`signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`），serving 照旧整轮拒、一代都不出，心跳 `last_error` 写 `<dataset> reader failed: …` |
+| 收盘后静置 | 研究面持续缺席期间 `serving/generations/` 目录不再增长，`current.json` 不再被改写 |
+
+**回滚口径（必读）**：本包给 serving 的 manifest 加了一个 `optional_source_datasets` 键。
+`RuntimeContractModel` 是 `extra="forbid"`，所以
+
+- **旧 manifest + 新代码** → 可以，字段有默认值，行为与写了默认值一样；
+- **新 manifest + 旧代码** → **不行**，serving 会在 build 期被 `extra_forbidden` 拒掉。
+
+因此回滚代码时**必须把 runtime generation 一起回滚**（照第 16 条把 `data/runtime/current`
+退回上一代，或用上一个 tag 重新 stage + publish），不能只换代码留着本代的 profile。
+
+---
+
 ## 2026-09-20 · 待安装 · live/serving slice MemoryHigh 提额（#268、#271）
 
 **状态**：**尚未安装**。四个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-20 经 owner

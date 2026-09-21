@@ -153,6 +153,31 @@
 
 ### Fixed
 
+- **研究面两源缺席时 serving 降级而不是整轮拒（#283）**：
+  serving 的六个源权威里 `lab_jobs` 与 `promotions` 属于研究面，而研究面四个角色在主机上被
+  高水位证据门挡着（#217），**一代权威都没发过**。`ServingSnapshotAssembler` 此前六个源一律
+  fail-closed，所以这两个目录里没有 `current.json` 这一件事，就让 `serving.publisher.v1`
+  每一轮整轮拒——**信号链当天每一跳都正常，`serving/generations/` 仍然一代都没有**，
+  ③b 判据因此根本读不出来。
+  `fail_closed: bool` 换成 `optional_datasets: frozenset[str]`，默认
+  `{"lab_jobs", "promotions"}`：只有集合里的 dataset 走 `UNAVAILABLE` 降级（空载荷 +
+  `unavailable` 水位 + 心跳上一条 `serving:<dataset>:unavailable:<理由>`），
+  `signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`
+  **照旧整轮拒**。这个白名单不能换成一个全局开关：③b 从空的 `signals` 表读出
+  「今天没有信号走完这条链」，只有在 `signals` 读不到时仍然整轮拒的前提下，这句话才和
+  「notifier 坏了」分得开。`reference_slow_authority` 永远不可选——它的载荷每个字段都必填
+  （参考代 id、revision、价格与复权口径），降级只能意味着把一个编造的口径发给下游消费者；
+  画像里写它会在构造时被拒，运行期读它失败也仍然抛。
+  同一改动里，unavailable 的那一代**不再含时钟**：generation id 只由 dataset 与拒绝理由
+  派生，水位的 `event_time` / `published_at` 取 epoch。原来含 `as_of`，
+  而 `_generation_already_current`（#271）是按源代次与水位逐一比相等的，
+  所以研究面持续缺席期间 serving 会每三十秒重建一次 `serving.duckdb`；
+  单测里三十分钟的迭代之后 serving 目录逐字节不变。
+  画像把 `optional_source_datasets` 显式写进 serving manifest。**回滚要带上 runtime
+  generation**：`RuntimeContractModel` 是 `extra="forbid"`，旧 manifest 配新代码可以
+  （字段有默认值），新 manifest 配旧代码会在 build 期被拒。
+
+
 - **其余六个 role 的「每轮无条件写」：内容没变就不写、不提交、不 fsync（#271，本包）**：
   包 V 把 notifier 那两处从时钟上摘下来之后，全 role fsync 盘点里还剩六处，形状全都一样
   ——被比较的那个东西里混进了本轮的时钟，所以「同一份内容发第二次是空操作」这道门结构上
