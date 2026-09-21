@@ -480,6 +480,38 @@ def test_serving_publishes_while_the_research_authorities_have_never_published(
     )
 
 
+def test_the_manifest_decides_which_sources_are_optional_not_the_default(
+    tmp_path: Path,
+) -> None:
+    """A profile that shortens the list back to `[]` really tightens the rule.
+
+    The builder's default and what `runtime_production_profile` writes into the manifest
+    are the same two datasets today, so every other case here cannot tell the two paths
+    apart: wiring `:313` back to the constant leaves all of them green. That matters
+    because writing the list into the manifest is the whole reason the profile spells it
+    out -- the day the research plane publishes, shortening it to `[]` is meant to be a
+    profile change with its own fingerprint, and it has to actually bite.
+
+    So this one asks for the opposite of the default on a world where `lab_jobs` never
+    published: with `optional_source_datasets: []` the round is refused, exactly as it
+    was before #283.
+    """
+
+    settings, _roots = _authority_settings(
+        tmp_path,
+        unpublished=frozenset({LAB_JOBS_DATASET_ID}),
+    )
+    settings["optional_source_datasets"] = []
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
+        _manifest(tmp_path, settings=settings)
+    )
+
+    with pytest.raises(RuntimeError, match="lab_jobs reader failed"):
+        step()
+
+    assert not (tmp_path / "serving" / "current.json").exists()
+
+
 @pytest.mark.parametrize(
     "dataset_id",
     [SIGNALS_DATASET_ID, RUNTIME_HEALTH_DATASET_ID, REFERENCE_SLOW_AUTHORITY_DATASET_ID],
