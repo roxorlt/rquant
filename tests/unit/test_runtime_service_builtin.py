@@ -897,7 +897,8 @@ def test_builtin_registry_passes_injected_candidate_loader_to_default_builder(
 
 
 def test_builtin_registry_passes_clock_and_live_auction_loader(tmp_path: Path) -> None:
-    observed_at = datetime(2026, 7, 31, 1, 27, tzinfo=UTC)
+    #: 09:32 Asia/Shanghai：#277 把装配窗从 09:26-09:30 移到了 09:31-09:50
+    observed_at = datetime(2026, 7, 31, 1, 32, tzinfo=UTC)
     calls: list[dict[str, object]] = []
     batch = AuctionGapCandidateBatch(
         authority=PublishedCandidateInputAuthority(
