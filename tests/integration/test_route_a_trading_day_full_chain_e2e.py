@@ -1351,6 +1351,64 @@ def drive_the_chain(
     return runs
 
 
+def bus_envelopes_for(route: RouteAWorld, strategy_id: str) -> int:
+    """Envelopes on the signal bus that came from one strategy."""
+
+    path = setting_of(route, "signal-router.all-strategies.v1", "signal_bus_path")
+    if not path.is_file():
+        return 0
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(signal_envelope)")
+        }
+        column = next(
+            name for name in ("signal_json", "payload_json", "envelope_json") if name in columns
+        )
+        return int(
+            connection.execute(
+                f"SELECT count(*) FROM signal_envelope WHERE {column} LIKE ?",
+                (f'%"strategy_id":"{strategy_id}"%',),
+            ).fetchone()[0]
+        )
+
+
+def tamper_one_byte_of_a_runner_signal(route: RouteAWorld, service_id: str) -> None:
+    """Flip one byte of one stored signal payload in a strategy's runner database.
+
+    A single byte inside the JSON payload, not a structural edit: the row still parses and
+    still has every field, so what refuses it downstream can only be the integrity check
+    rather than a shape check that would have refused a malformed row anyway.
+    """
+
+    path = setting_of(route, service_id, "runner_state_path")
+    with closing(sqlite3.connect(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(runner_signal)")
+        }
+        column = next(
+            name for name in ("signal_json", "payload_json", "envelope_json") if name in columns
+        )
+        #: `sequence` is `INTEGER PRIMARY KEY`, so it *is* the rowid and the result
+        #: column carries that name rather than "rowid"
+        row = connection.execute(
+            f"SELECT sequence, {column} AS payload FROM runner_signal "
+            "ORDER BY sequence LIMIT 1"
+        ).fetchone()
+        assert row is not None, "there is no runner signal to tamper with"
+        payload = str(row["payload"])
+        #: the last digit of the first price-like number, so the document stays valid JSON
+        index = payload.index('"latest_close":') + len('"latest_close":')
+        flipped = payload[:index] + ("8" if payload[index] != "8" else "7") + payload[index + 1 :]
+        assert flipped != payload
+        connection.execute(
+            f"UPDATE runner_signal SET {column} = ? WHERE sequence = ?",
+            (flipped, row["sequence"]),
+        )
+        connection.commit()
+
+
 def serving_signal_rows(route: RouteAWorld) -> int:
     """Rows in the `signals` table of the generation `current.json` points at."""
 
@@ -1511,3 +1569,141 @@ def test_the_shipped_profile_stops_the_signal_at_the_paper_broker(
     assert len(serving_generations(route)) == 1
     assert serving_current(route) is not None
     assert serving_signal_rows(route) == 0
+
+
+# ---------------------------------------------------------------------------------------
+# The negative half
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_candidate_document_dated_anything_but_today_is_refused_by_the_loader(
+    trading_day_chain: RouteAWorld,
+) -> None:
+    """Criterion (3a)'s guard, from the strategy's side of it.
+
+    `run_strategy_live_batch` derives `required_trade_date` from the feature envelope's
+    own event time, so the date a candidate document has to carry is not a parameter the
+    role can drift on: it is the session the features came from.
+    `RuntimeCandidateUniverseLoader._validate_snapshot` compares it twice, once for the
+    snapshot and once for every row, and refuses either way.
+
+    The document here is yesterday's -- a publisher that did not run this morning, which
+    is exactly the 2026-09-21 shape package Y was about -- and the strategy refuses rather
+    than trading on it.
+    """
+
+    publish_minute_batch(trading_day_chain)
+    publish_candidates(
+        trading_day_chain,
+        trade_date=OPEN_DATES[-2],
+        captured_at=CANDIDATES_CAPTURED_AT - timedelta(days=1),
+    )
+    feature = instance_of(trading_day_chain, FEATURE_ROLE)[0]
+    run_at(trading_day_chain, FEATURE_ROLE, instance=feature, now=HOP_CLOCKS[FEATURE_ROLE])
+
+    instance = _instance_name(N_SHAPE_SERVICE_ID)
+    run = run_at(
+        trading_day_chain,
+        STRATEGY_ROLE,
+        instance=instance,
+        now=HOP_CLOCKS[STRATEGY_ROLE],
+    )
+
+    #: fail-closed and visible: the role stays up, the iteration does not, and the
+    #: heartbeat says which check refused
+    assert run.entered, run
+    assert run.violations == [], run.violations
+    assert "trade date does not match required trade date" in (run.last_error or ""), (
+        run.last_error
+    )
+    assert runner_signal_count(trading_day_chain, N_SHAPE_SERVICE_ID) == 0
+
+
+def test_a_signal_receipt_with_one_byte_changed_is_refused_by_the_router(
+    trading_day_chain: RouteAWorld,
+) -> None:
+    """The router's integrity check, against a runner store altered by a single byte.
+
+    The strategy signs what it emits and the router verifies it before routing, so a
+    runner database edited underneath the pair is the tamper this checks. One byte of one
+    signal's stored payload is flipped -- the row is still well-formed SQL and still
+    parses -- and the router refuses to route it rather than degrading past it.
+    """
+
+    publish_minute_batch(trading_day_chain)
+    publish_candidates(trading_day_chain)
+    feature = instance_of(trading_day_chain, FEATURE_ROLE)[0]
+    run_at(trading_day_chain, FEATURE_ROLE, instance=feature, now=HOP_CLOCKS[FEATURE_ROLE])
+    #: all three, because the router refuses to start on a missing runner source and
+    #: would otherwise stop on `auction_gap`'s absence rather than on the tamper (#232)
+    for strategy in instance_of(trading_day_chain, STRATEGY_ROLE):
+        run_at(
+            trading_day_chain,
+            STRATEGY_ROLE,
+            instance=strategy,
+            now=HOP_CLOCKS[STRATEGY_ROLE],
+        )
+    assert runner_signal_count(trading_day_chain, N_SHAPE_SERVICE_ID) >= 1
+
+    tamper_one_byte_of_a_runner_signal(trading_day_chain, N_SHAPE_SERVICE_ID)
+
+    router = instance_of(trading_day_chain, ROUTER_ROLE)[0]
+    run = run_at(trading_day_chain, ROUTER_ROLE, instance=router, now=HOP_CLOCKS[ROUTER_ROLE])
+
+    assert run.entered, run
+    assert run.violations == [], run.violations
+    assert run.last_error is not None, "the router routed a tampered signal"
+    #: The refusal is an integrity refusal, not a shape or a timing one: `signal_id` is a
+    #: digest of the payload, so a payload that no longer hashes to the id it is stored
+    #: under cannot be parsed back into the signal it claims to be. This is the fail-closed
+    #: rule the package Y review states -- a tamper must still raise, and only report-shape
+    #: or timing conditions may degrade -- so the message is asserted verbatim rather than
+    #: matched loosely, and a future change that turns this into a degradation fails here.
+    assert "runner signal payload is invalid" in run.last_error, run.last_error
+    #: and the tampered source put nothing on the bus. The router works per source, so
+    #: `auction_gap`'s own (untampered) watch signal is routed in the same iteration --
+    #: refusing one source's ledger is not a reason to drop another's -- and what must be
+    #: absent is every envelope from the strategy whose store was edited.
+    assert bus_envelopes_for(trading_day_chain, "n_shape") == 0
+    assert bus_envelopes_for(trading_day_chain, "auction_gap") >= 1
+
+
+def test_serving_does_not_cut_a_second_generation_for_content_that_has_not_moved(
+    active_notifier_chain: RouteAWorld,
+    credentials_root_active: dict[str, Path],
+    delivery_recorder: _RecordingProvider,
+) -> None:
+    """Package W's criterion, on a chain that really produced something to publish.
+
+    `_generation_already_current` is the gate #271 added: every thirty seconds the
+    publisher was writing a whole new `serving.duckdb`, fsyncing it and moving
+    `current.json`, because two of its six sources changed their generation id on every
+    iteration and the read model carries the observation instant besides. The gate has to
+    sit before the build, since a generation's identity includes the hash of a file that
+    has not been written yet.
+
+    So the second pass here runs over sources that have not moved, and the assertion is
+    that the directory is byte-for-byte what it was.
+    """
+
+    route = active_notifier_chain
+    publish_minute_batch(route)
+    publish_candidates(route)
+    drive_the_chain(route, credentials_root_active, hops=[])
+
+    first = serving_generations(route)
+    assert len(first) == 1, first
+    pointer_before = serving_current(route)
+    from tests.runtime_readonly_sandbox import tree_state
+
+    serving_root = setting_of(route, "serving.publisher.v1", "serving_root")
+    before = tree_state(serving_root)
+
+    serving = instance_of(route, SERVING_ROLE)[0]
+    run = run_at(route, SERVING_ROLE, instance=serving, now=SERVING_NOW + timedelta(seconds=31))
+
+    assert run.entered, run
+    assert run.last_error is None, run.last_error
+    assert serving_generations(route) == first, "serving cut a second generation"
+    assert serving_current(route) == pointer_before
+    assert tree_state(serving_root) == before, "serving rewrote its own directory"
