@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Annotated, Literal, Protocol
 
@@ -20,6 +21,7 @@ from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
+    DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ServingReferenceSlowEvidence,
     ServingRuntimeSnapshot,
 )
@@ -49,6 +51,23 @@ PROMOTIONS_DATASET_ID = "promotions"
 REFERENCE_SLOW_AUTHORITY_DATASET_ID = "reference_slow_authority"
 REFERENCE_SLOW_DATASET_ID = "reference_slow"
 REFERENCE_SLOW_CONTRACT_DATASET_ID = "reference_slow_contract"
+
+SOURCE_DATASET_IDS: frozenset[str] = frozenset(
+    {
+        SIGNALS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        RUNTIME_HEALTH_DATASET_ID,
+        LAB_JOBS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+        REFERENCE_SLOW_AUTHORITY_DATASET_ID,
+    }
+)
+
+#: What an unavailable source stamps on its watermark instead of the clock. It is before
+#: any evidence this system can hold, which is the truthful reading of "there is nothing
+#: here", and it is constant, which is what keeps the generation identity still while a
+#: source stays away.
+UNAVAILABLE_EVIDENCE_INSTANT = datetime(1970, 1, 1, tzinfo=UTC)
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
@@ -324,7 +343,7 @@ class ServingSnapshotAssembler:
         lab_jobs_reader: LabJobsReader,
         promotions_reader: PromotionsReader,
         reference_slow_reader: ReferenceSlowReader,
-        fail_closed: bool = True,
+        optional_datasets: frozenset[str] = DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ) -> None:
         readers = (
             signal_reader,
@@ -336,15 +355,28 @@ class ServingSnapshotAssembler:
         )
         if any(not callable(reader) for reader in readers):
             raise TypeError("all serving source readers must be callable")
-        if type(fail_closed) is not bool:
-            raise TypeError("fail_closed must be bool")
+        if not isinstance(optional_datasets, frozenset):
+            raise TypeError("optional_datasets must be a frozenset")
+        unknown = sorted(optional_datasets.difference(SOURCE_DATASET_IDS))
+        if unknown:
+            raise ValueError(
+                f"optional_datasets names datasets this assembler never reads: {unknown}"
+            )
+        if REFERENCE_SLOW_AUTHORITY_DATASET_ID in optional_datasets:
+            # The serving row's price and adjustment basis is quoted from this payload, and
+            # `ReferenceSlowPayload` is the one source payload without a legal empty value
+            # (`:217-219`): every field it carries is required, so "degraded" could only
+            # mean an invented reference generation id in the evidence a consumer prices
+            # against. It is refused here as well as at the read, so a profile that asks
+            # for it is rejected at build rather than silently ignored.
+            raise ValueError("reference_slow_authority can never be an optional serving source")
         self.signal_reader = signal_reader
         self.paper_accounts_reader = paper_accounts_reader
         self.runtime_health_reader = runtime_health_reader
         self.lab_jobs_reader = lab_jobs_reader
         self.promotions_reader = promotions_reader
         self.reference_slow_reader = reference_slow_reader
-        self.fail_closed = fail_closed
+        self.optional_datasets = optional_datasets
 
     def assemble(self, as_of: AwareUtcDatetime) -> ServingRuntimeSnapshot:
         observed_at = normalize_aware_utc(as_of)
@@ -510,24 +542,34 @@ class ServingSnapshotAssembler:
         try:
             result = reader(as_of)
         except Exception as error:
-            if self.fail_closed:
+            if dataset_id not in self.optional_datasets:
                 raise RuntimeError(f"{dataset_id} reader failed: {_error_text(error)}") from error
             if payload_type is ReferenceSlowPayload:
                 raise RuntimeError(f"{dataset_id} reader failed: {_error_text(error)}") from error
             reason = _error_text(error)
             return SourceReadResult(
                 dataset_id=dataset_id,
+                #: Named by the refusal and nothing else. `as_of` used to be part of this
+                #: identity, which gave an absent source a new generation id on every
+                #: thirty-second iteration; `_generation_already_current` compares source
+                #: generations and watermarks for equality (#271), so serving would have
+                #: rebuilt and re-pointed `serving.duckdb` every iteration for as long as
+                #: the source stayed away. A source that is not there has no evidence and
+                #: therefore no instant of its own: the identity a missing source
+                #: contributes is a function of which source it is and why it refused.
                 generation_id=canonical_sha256(
                     {
                         "contract": "serving-source-unavailable/v1",
                         "dataset_id": dataset_id,
-                        "as_of": as_of,
                         "reason": reason,
                     }
                 ),
                 sequence=0,
-                event_time=as_of,
-                published_at=as_of,
+                #: the same reason, for the watermark's own two instants: they are compared
+                #: by the same gate, and the epoch says "no evidence at all" without
+                #: claiming the read observed anything at this clock
+                event_time=UNAVAILABLE_EVIDENCE_INSTANT,
+                published_at=UNAVAILABLE_EVIDENCE_INSTANT,
                 status=FreshnessStatus.UNAVAILABLE,
                 reason=reason,
                 payload=payload_type(),
@@ -538,11 +580,14 @@ class ServingSnapshotAssembler:
 
 
 __all__ = [
+    "DEFAULT_OPTIONAL_SOURCE_DATASETS",
     "LAB_JOBS_DATASET_ID",
     "PAPER_ACCOUNTS_DATASET_ID",
     "PROMOTIONS_DATASET_ID",
     "RUNTIME_HEALTH_DATASET_ID",
     "SIGNALS_DATASET_ID",
+    "SOURCE_DATASET_IDS",
+    "UNAVAILABLE_EVIDENCE_INSTANT",
     "LabJobsPayload",
     "PaperAccountsPayload",
     "PromotionsPayload",
