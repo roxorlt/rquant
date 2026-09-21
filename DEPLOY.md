@@ -69,19 +69,28 @@ python scripts/build_runtime_production_inputs.py \
 
 改完 `git diff` / `jq .notifier_delivery_mode "$INPUTS"` 确认只动了这一个键。
 
+> ⚠️ **但光改这份文档，现在的发布器发不出去（#284）。**
+> `deploy-production.sh` 只认 target tag：当 target 解析出来的 SHA 与已部署的 SHA 相同时，
+> `deploy()` 在 `src/rquant/ops/production_deploy.py:1580-1607` 提前 return `already_current`，
+> 那条路上**只跑一次 `rquant preflight`**——不重新生成画像、不装新一代、不 rollout、不重启。
+> 输入文档改没改，它根本不看（变更清单来自 `git diff --name-only <旧 SHA>..<新 SHA>`，
+> `:1616-1623`）。所以改完文档再跑一次同一个 tag，命令会成功返回，主机却什么都没变。
+>
+> 下面「切正式」的第 ② 步与「回滚情况二」的第 ③ 步**都卡在这一点上，#284 修好之前不要照着敲**。
+
+
 ### 切正式（shadow → live）
 
 **「安全」指的是不会有告警风暴，不是指随时可以切。** 影子档一直在消耗 outbox、复制游标一直在
 前进，所以第一轮 live 只会看到「从现在起」的新信号，没有积压可推——这一点已实测。
 
-**但时间窗不由你选**：档位只有在 `rquant-notifier` 重启之后才生效，而发布器对任何需要重启服务的
-发布，在**工作日 09:15–15:10 直接拒绝**（`src/rquant/ops/production_deploy.py:507-511`
-`is_protected_market_window`，`:1631-1636` 抛 `ProtectedWindowError`），**不存在 force/emergency
-绕过**。所以：
+**时间规矩：开盘前或收盘后切。** 理由是档位这种 role settings **只有在 unit 重启之后才生效**，
+而盘中重启 `rquant-notifier` 会在告警链路上开一个口子。（发布器对**代码发布**有一条
+09:15–15:10 的保护窗，`production_deploy.py:507-511` / `:1631-1636`；但它是按
+`git diff` 出来的变更清单判的，**只改输入文档时那张清单是空的，保护窗根本不会触发**——
+所以这条时间规矩现在靠人守，不靠工具拦。）
 
-> **开盘前或收盘后切**。盘中想切也切不了，发布器会拒。
-
-步骤：
+**当前状态：② 卡住（#284）。** 步骤先写在这里，等 #284 修好再执行：
 
 ```bash
 ROOT=/home/lighthouse/rquant
@@ -90,16 +99,25 @@ export RQUANT_RUNTIME_PRODUCTION_INPUTS="${ROOT}/data/runtime-production-inputs.
 export RQUANT_RUNTIME_PROFILE_OUTPUT_DIR="${ROOT}/data/runtime-profiles"
 export RQUANT_RUNTIME_ROOT="${ROOT}/data/runtime"
 
-# ① 把输入文档里的 notifier_delivery_mode 改成 live（见上一节）
-# ② 发一次版（target 就是当前在跑的那个 tag，代码没变，变的是画像）
-bash scripts/deploy-production.sh --target <当前 tag>
+# ① 把输入文档里的 notifier_delivery_mode 改成 live（见上一节）—— 这一步现在就能做
+# ② 【#284 修好前不可用】发一次版让新画像装上去并重启 notifier
+#    bash scripts/deploy-production.sh --target <当前 tag>
+#    ← target 与已部署 SHA 相同 ⇒ already_current ⇒ 只跑 preflight，什么都不会变
 ```
 
-验收：
+在 #284 修好之前，② 有三条替代路，都需要 owner 单独授权（#284 正文里列的就是这三条）：
+
+1. 让这次档位切换跟着一个**新 tag**走（哪怕是一个空提交），发布器就会正常重新生成并安装画像；
+2. 按发布器内部步骤**人工执行**（`rquant runtime-production-profile` →
+   `runtime-deployment-profile-apply` → `runtime-deployment-rollout` → 重启 notifier）——
+   绕开审计路径，必须逐次授权；
+3. 等 #284 把「输入文档变了」变成发布器认得的一种变更（推荐，单独开包做）。
+
+验收（不管走哪条路，切完都要看）：
 
 1. 第一轮心跳里 `notifier:shadow_transport` 消失；
 2. 新写入的 `delivery_attempt.provider_receipt` 不再以 `shadow:` 开头；
-3. **专门看 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`**（见上一节）；
+3. **专门看 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`**（见前面那一节）；
 4. 手机上只应收到切换之后产生的信号。
 
 ### paused → live（**不要这么切**）
@@ -111,7 +129,7 @@ bash scripts/deploy-production.sh --target <当前 tag>
 - **先切 shadow**，等心跳的 `backlog_count` 回到 0，再切 live；
 - 或者**开盘前**切，并人工确认 spool 里没有未过期的积压。
 
-### 回滚（**必须连画像一起回**，且自动回滚不会帮你做）
+### 回滚（**主动回滚必须连画像一起回**；自动回滚一般会回画像，但有例外）
 
 新画像的 notifier manifest 多了一个 `suppress_delivery` 键，输入文档多了一个
 `notifier_delivery_mode` 键。两个模型都是 `RuntimeContractModel`（`extra="forbid"`），
@@ -152,10 +170,19 @@ bash scripts/deploy-production.sh --target <上一个 tag>
 
 顺序反了，中间那段时间 notifier 起不来。
 
-**情况二：一次失败发布触发了自动回滚。** `_deploy_runtime_profile` 在
-`action == "rollback"` 时**直接 return，根本不重新生成画像**
-（`src/rquant/ops/production_deploy.py:568-575`）。所以自动回滚之后主机上是
-**「新一代画像 + 旧代码」**，其余 role 正常、只有 `rquant-notifier` 起不来。人工收尾：
+**情况二：一次失败发布触发了自动回滚。** 正常路径下**画像会跟着代码一起回**：
+`profile_applied` 为真时 `_rollback_runtime_profile`（`production_deploy.py:732-771`）会被调用
+（`:1414`、`:1725`），跑 `rquant runtime-deployment-rollback` 把那一代滚回去；
+`_deploy_runtime_profile` 在 `action == "rollback"` 时直接 return（`:568-575`）指的是
+「回滚不重新生成画像」，不是「回滚不回画像」。
+
+**但「新一代画像 + 旧代码」这个组合仍然可能出现**，已知的一条具体路径是加锁恢复：
+`:1408-1420` 只有在 `current_sha == intent.target_sha` 时才回滚画像，所以如果上一次崩溃
+已经把 checkout 退回 `previous_sha`（或有人手工 reset 过），恢复流程会**跳过画像回滚**，
+却仍然走 `_rollback_unmanaged` 的 `git reset --hard <previous_sha>`（`:1333`）。
+结果就是画像是新的、代码是旧的，其余 role 正常、只有 `rquant-notifier` 起不来。
+
+下面四步是幂等的，**先确认现象再动手**：
 
 ```bash
 # ① 确认现象：notifier 反复启动失败，日志里是 suppress_delivery / extra_forbidden
@@ -163,15 +190,18 @@ systemctl status 'rquant-runtime-notifier@*'
 journalctl -u 'rquant-runtime-notifier@*' -n 50 --no-pager | grep -i extra_forbidden
 
 # ② 按「情况一 ①」把 notifier_delivery_mode 从输入文档里删掉
-# ③ 用回滚后那一版代码重新生成并安装画像（target = 自动回滚落到的那个 tag）
-bash scripts/deploy-production.sh --target <自动回滚落到的 tag>
+
+# ③ 【#284 修好前不可用】用回滚后那一版代码重新生成并安装画像
+#    bash scripts/deploy-production.sh --target <自动回滚落到的 tag>
+#    ← 自动回滚已经把 checkout reset 到这个 SHA，所以 target 与已部署 SHA 相同
+#      ⇒ already_current ⇒ 只跑 preflight，画像不会被重新生成
+#    替代路同「切正式」那三条，需 owner 单独授权
 
 # ④ 确认 notifier 起来了
 systemctl status 'rquant-runtime-notifier@*'
 ```
 
-第 ③ 步同样受 09:15–15:10 保护窗限制。若在盘中发生，notifier 会一直起不来到收盘——
-这正是**不要在临近开盘时发版**的理由。
+在 ③ 可用之前，盘中撞上这个状态的话 notifier 会一直起不来——**这正是不要在临近开盘时发版的理由**。
 
 ---
 

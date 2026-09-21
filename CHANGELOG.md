@@ -29,11 +29,14 @@
     影子档永远不会产生 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`，
     所以切 live 的第一轮仍可能是投递失败第一次出现的时刻。
   - **切换与回滚见 `DEPLOY.md` 2026-09-21 那条**：shadow → live 不会有告警风暴（游标一直在
-    前进），但档位要重启 notifier 才生效，而发布器在工作日 09:15–15:10 拒绝任何需要重启的发布，
-    所以只能开盘前或收盘后切；paused → live 不安全（会一次推出整条积压 spool，#86 那一类风暴）。
-    新画像带的 `suppress_delivery` / `notifier_delivery_mode` 两个键会被 v0.33.16 及更早版本的
-    `extra="forbid"` 模型拒收，**回滚必须先把 `notifier_delivery_mode` 从输入文档里删掉**；
-    自动回滚不重新生成画像，会留下「新画像 + 旧代码」，notifier 起不来，收尾步骤写在 DEPLOY 里。
+    前进），但档位要重启 notifier 才生效，所以只能开盘前或收盘后切；paused → live 不安全
+    （会一次推出整条积压 spool，#86 那一类风暴）。新画像带的 `suppress_delivery` /
+    `notifier_delivery_mode` 两个键会被 v0.33.16 及更早版本的 `extra="forbid"` 模型拒收，
+    **回滚必须先把 `notifier_delivery_mode` 从输入文档里删掉**。
+  - ⚠️ **切换本身现在发不出去（#284）**：`deploy-production.sh` 只认 target tag，target 与已部署
+    SHA 相同时 `deploy()` 提前 return `already_current`（只跑一次 `preflight`），改过的输入文档
+    根本不会被读。DEPLOY 里那两处 `--target` 已标注「#284 修好前不可用」，并列了三条需 owner
+    单独授权的替代路。
 
 - **25 个 role 各自在自己 unit 的沙箱里起一次的 e2e（`tests/integration/test_route_a_all_roles_sandbox_e2e.py`）**：
   Route A 的裸跑排查（runbook R-20）用 `runtime-exec.pyz` 起 role，**完全没有沙箱**，所以
