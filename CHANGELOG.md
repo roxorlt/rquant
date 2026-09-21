@@ -224,9 +224,12 @@
   `captured_at` = 生成时刻，`basis_trade_date` = 只读副本里能读到的最新那一场日线结果的日期
   （09:15 之前必然是上一场，这是这两个策略本来的口径，不是降级）。当天发过就整轮不写
   （包 V/W 的纪律）。一个 10:00 才被拉起来的发布者仍会补发今天这一份。
-  「今天开不开市」走 `decide_market_session` 而不是自己判 `open_dates`：日历覆盖不到当天时
-  带一条 `calendar_uncovered:<date>` 的降级理由，而不是安静空转（独立复核 SF-1）——顺带也
-  拿回了「日历权威生成时刻晚于 observed_at」那条防时钟回拨的护栏。
+  「今天开不开市」走 `decide_market_session` 而不是自己判 `open_dates`（独立复核 SF-1）。
+  `decide_market_session` 的两种拒绝**拆成两条理由、两个 role 一致**（复核裁定 A / B）：
+  日历覆盖不到当天是 `calendar_uncovered:<date>`，**软降级**（auction-match 原来对这一条
+  直接抛，现在也降级）；日历生成时刻晚于观测时刻是 `calendar_clock_regressed:<generated_at>`，
+  **硬失败**（session 发布者原来接住降级，现在也抛）——前者是「该刷日历了」，后者是
+  「这台机器现在说的话不可信」，不该共用一个标签、也不该一软一硬。
   `--generated-at` 留空时改取墙钟，不再取 `trade_calendar.updated_at`；确定性由显式传
   `--generated-at` 提供。`sealed_document` 模式保留给回放与测试，**loader 的
   `trade_date == 当日` 校验一个字没放宽**。

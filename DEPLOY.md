@@ -76,6 +76,9 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   `sequence` 每个交易日至少 +1（不再恒为 0）。盘中同一天之内不再有第二次写（例外见下）。
   日历覆盖不到当天时这两个 role 的心跳会带 `calendar_uncovered:<date>`——生产日历的覆盖
   下限是 2027-12-31，正常不会看到，看到了就说明该刷日历了。
+  另有一条 **`calendar_clock_regressed:<generated_at>`**：日历权威的生成时刻晚于观测时刻，
+  也就是时钟被回拨或装了错代的权威。这一条是**硬失败**（unit 的 `last_error` 里看，
+  不在 `degraded_reasons` 里），`auction-match` 与两个候选发布者行为一致。
 - **采集窗第一次尝试**（临时默认 09:31）：`live/auction-match/batches/auction_match/` 下出现
   批次。当天数据还没出时是 DEGRADED + `empty_source_result`，出了之后是 PUBLISHED。
 - **窗结束之后**：`rquant-runtime-auction-match@…` 的心跳 `degraded_reasons` 里会带
@@ -104,7 +107,7 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   `processed_count >= 1`，随后 `watchlist-quote` / `market-minute` 的
   `degraded_reasons` 为空、`source_generations` 里有 `candidate_universe`。
 
-**已知的、不是缺陷的三件事**：
+**已知的、不是缺陷的四件事**：
 
 1. **09:30 到装配窗起点之间两个源会降级**。`market-minute` / `watchlist-quote` 从 09:30 起
    就去读候选全集，而当日的 auction_gap 快照最早在装配窗起点之后才装得出来。这一段是
@@ -112,12 +115,16 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
    非零退出，所以 `OnFailure=rquant-alert@%n.service` 不触发、`Restart=on-failure` 不重启。
    **这一段的长度 = 装配窗起点 − 09:30**，现在是 1 分钟；探测如果把窗定到 09:36，它就变成
    6 分钟。上线标准里若写了「盘中零降级」，措辞要按探测值重裁。
-2. **窗内重启会报销当天的采集**（既有机制，本包把暴露面从 7 秒放大到整个窗）。配额台账按
+2. **竞价全集读不出来时，窗内每一轮都会记一次失败**。`consecutive_failures` 可能飙到几百
+   （2 秒轮询 × 14 分钟 ≈ 420 次），这是「全集没发布之前每轮都再试、不烧采集次数」换来的，
+   仓库里没有任何逻辑对 `consecutive_failures` 设阈值，**不要误判成崩溃循环**。
+   真正要看的是 `last_error` 说的是不是「竞价全集读不出来」。
+3. **窗内重启会报销当天的采集**（既有机制，本包把暴露面从 7 秒放大到整个窗）。配额台账按
    `retry_ordinal` 去重，而序号来自进程内计数；role 在窗内崩溃重启之后序号从 0 重来，撞上
    台账里同一条 attempt 被拒，那几轮全落成 `source_error:SourceQuotaConflictError` 的 STALE
    批次。已经发过 PUBLISHED 批次的那一天不受影响。真正的修法（序号落盘）与「两面旗子是
    进程内记忆」是同一件事，留作后续 issue。
-3. **15:10 之后重启发布者会发第二代当日候选文档**。日线管道把当天结果写进副本之后，
+4. **15:10 之后重启发布者会发第二代当日候选文档**。日线管道把当天结果写进副本之后，
    `basis_trade_date` 会从「上一场」翻成「当天」，文档语义因此不同，于是发新一代。盘中重启
    不会（`basis` 不变 ⇒ 语义相同 ⇒ 不写）。所以上面「同一天之内不再有第二次写」这句
    **限盘中**。
