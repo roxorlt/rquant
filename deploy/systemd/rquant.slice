@@ -12,7 +12,10 @@ MemoryAccounting=true
 # research(512M，未变) = 9728M ≤ 11264M，maintenance 不设上限（有限时长的批处理，
 # 见 rquant-maintenance.slice）。顶层从 6144M 提到 11264M，给 OS 和非 rQuant 服务
 # 留 ≥ 4.4GB。
+# 2026-09-21 owner 裁决（#268 / #271）后续验收：15 分钟备份期间父面峰值 10763 MiB
+# 顶着 11264M 上限（含维护页缓存），随 live 面同步提到 12288M，仍给 OS/非 rQuant
+# 服务留 ≥ 3.4GB。
 MemoryLow=3072M
-MemoryHigh=11264M
+MemoryHigh=12288M
 TasksAccounting=true
 TasksMax=1024

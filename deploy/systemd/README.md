@@ -50,8 +50,8 @@ monitor current 2415 MiB、monitor peak 2814 MiB、backup peak 1303 MiB。父级
 
 | 边界 | CPU / IO | MemoryLow | MemoryHigh | MemoryMax |
 |---|---:|---:|---:|---:|
-| `rquant.slice` | 100 / 100 | 3072 MiB | 11264 MiB | 不设 |
-| live | 1000 / 1000，**不设 `CPUQuota`** | 3072 MiB | 7680 MiB | 不设 |
+| `rquant.slice` | 100 / 100 | 3072 MiB | 12288 MiB | 不设 |
+| live | 1000 / 1000，**不设 `CPUQuota`** | 3072 MiB | 9216 MiB | 不设 |
 | live-runtime（live 的子 slice） | 100 / 100，`CPUQuota=60%` | 0 | 4096 MiB | 不设 |
 | serving | 500 / 500，`CPUQuota=30%` | 0 | 1536 MiB | 不设 |
 | research | 100 / 100，`CPUQuota=100%` | 0 | 512 MiB | 768 MiB |
@@ -88,10 +88,18 @@ research 仍是精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane
 断言用的是独立的、**未随本次调整**的 `WORKLOAD_MEMORY_BUDGET_MIB` 底线模型（仍是
 live=3840、monitor peak=2814，判断逻辑不变），不代表这四个 slice 文件今天的真实上限。
 
+**2026-09-21 owner 裁决（#268、#271）后续验收：又改了 `rquant.slice` 与
+`rquant-live.slice` 两个 `MemoryHigh`**：验收当天 17:00 daily 期间 live 面峰值达到
+7,634 MiB，顶着刚改完的 7,680 MiB 上限（runtime 3,401 MiB + daily ≈ 4.2 GiB）；15 分钟一次
+的备份期间父面峰值达到 10,763 MiB，顶着 11,264 MiB 上限（含维护页缓存）。`MemoryHigh` 是
+节流阈值不是预留量，两个上限都提高：live 7680 MiB → 9216 MiB、父级 11264 MiB → 12288 MiB，
+`live-runtime`（4096 MiB）与 serving（1536 MiB）不变。宿主机 15.7 GiB，非 rQuant 服务约
+1.2 GiB，12288 MiB 之外仍给 OS/非 rQuant 服务留 ≥ 3.4 GiB。
+
 `MemoryHigh` 不是 reservation，不能用它证明 backup/replica 并发安全。正常 research 运行态的
-历史静态上界（`WORKLOAD_MEMORY_BUDGET_MIB` 里未随 09-20 变更调整的 8 GiB 标称主机底线）为
-live 3840 + serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB，低于该模型的
-usable_host 7680 MiB；这与当前 live/serving 真实的 `MemoryHigh`（分别是 7680 / 1536 MiB）是
+历史静态上界（`WORKLOAD_MEMORY_BUDGET_MIB` 里未随 09-20/09-21 变更调整的 8 GiB 标称主机底线）
+为 live 3840 + serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB，低于该模型的
+usable_host 7680 MiB；这与当前 live/serving 真实的 `MemoryHigh`（分别是 9216 / 1536 MiB）是
 两回事，前者是代码里未变的最小底线，后者是这份 README 表格与 slice 文件的当前值。
 maintenance 没有足够证据形成静态内存上界，因此不能写出“总量不超”的绿色
 结论。backup 与 replica 允许同类并发，证据必须同时记录独立峰值和 maintenance aggregate

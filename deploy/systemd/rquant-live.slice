@@ -22,7 +22,10 @@ MemoryAccounting=true
 # 改成 7680M = role 面 4096M（独立预算，不再是从这里切的份额）+ monitor ~2100M +
 # daily/kpl/alert 余量，monitor / daily 与 20 个 role 从此各花各的预算，不共享
 # 回收压力。
+# 2026-09-21 owner 裁决（#268 / #271）后续验收：17:00 daily 期间面峰值 7634 MiB
+# 顶着 7680M 上限（runtime 3401 MiB + daily ≈4.2GB），提到 9216M，role 面
+# rquant-live-runtime.slice（4096M）预算不变。
 MemoryLow=3072M
-MemoryHigh=7680M
+MemoryHigh=9216M
 TasksAccounting=true
 TasksMax=512

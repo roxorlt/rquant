@@ -64,7 +64,11 @@ PARENT_SLICE_LIMITS: Mapping[str, str] = {
     # 2026-09-20 owner decision (#268 / #271): 6144M -> 11264M so live(7680M) +
     # serving(1536M) + research(512M, unchanged) fit inside it with headroom for
     # maintenance, and the host still keeps >= 4.4GB for the OS/non-rQuant services.
-    "MemoryHigh": "11264M",
+    # 2026-09-21 owner decision (#268 / #271) follow-up: the acceptance-day parent
+    # peak hit 10,763 MiB against the 11264M ceiling during the 15-minute backups
+    # (maintenance page cache counted), so this was raised again to 12288M,
+    # keeping >= 3.4GB for the OS/non-rQuant services.
+    "MemoryHigh": "12288M",
     "TasksMax": "1024",
 }
 WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
@@ -78,7 +82,11 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
         # is ~2100M, so 3840M could no longer hold runtime + monitor + daily/kpl
         # without throttling under memory.high (root cause of the 09-14 open-time
         # monitor stall and the 09-16 17:00 daily stall).
-        "MemoryHigh": "7680M",
+        # 2026-09-21 owner decision (#268 / #271) follow-up: the acceptance-day
+        # peak hit 7,634 MiB against the 7680M ceiling during the 17:00 daily
+        # (runtime 3,401 MiB + daily ~4.2GB), so this was raised again to
+        # 9216M; rquant-live-runtime.slice keeps its own 4096M budget.
+        "MemoryHigh": "9216M",
         "TasksMax": "512",
     },
     # The runtime role plane. It is a child of rquant-live.slice so the eleven resident
