@@ -1550,10 +1550,6 @@ def build_production_runtime_profile(
         )
     )
 
-    sealed_candidate_inputs = {
-        "n_shape": config.n_shape_candidate_input_path,
-        "growth_board_surge": config.growth_board_candidate_input_path,
-    }
     for strategy in config.strategies:
         settings: dict[str, object] = {
             "strategy_id": strategy.strategy_id,
@@ -1588,9 +1584,22 @@ def build_production_runtime_profile(
                 calendar_content_sha256=config.market_calendar_content_sha256,
             )
         else:
+            #: #278：这两个策略的候选文档不再是装机时封死的那一份。它带着
+            #: `trade_date 2026-07-14`（装机脚本把 `trade_calendar.updated_at` 当成生成
+            #: 时刻），而 watchlist-quote / market-minute 用「当日」去读，且三个候选权威
+            #: 都是 required——任何一个真实交易日这两份都对不上。改为每个交易日 08:45 起
+            #: 按同一条构造重建一次，`trade_date` = 当日，`captured_at` = 生成时刻，
+            #: `basis_trade_date` = 副本里能读到的最新那一场日线结果（通常是上一场）。
+            #: 封存文档仍然生成，只用于回放与测试。
             settings.update(
-                input_mode="sealed_document",
-                candidate_input_path=str(sealed_candidate_inputs[strategy.strategy_id]),
+                input_mode="session_document",
+                #: 副本，永远不是主库——这个发布者跑在 08:45 之后，与
+                #: `rquant-monitor` 09:25 起的写锁只差四十分钟，而重启之后它还要能在
+                #: 盘中补发今天的文档（#250 的同一条理由）。
+                daily_database_path=str(config.readonly_replica_database_path),
+                calendar_path=str(calendar),
+                calendar_expected_commit=config.market_calendar_producer_commit,
+                calendar_content_sha256=config.market_calendar_content_sha256,
             )
         manifests.append(
             _manifest(

@@ -112,6 +112,12 @@ class PublishedCandidateInputAuthority(RuntimeContractModel):
     quality_status: BatchQualityStatus
     authority_snapshot_id: Sha256
     producer_commit: CommitSha
+    #: 这批候选是**按哪一天的日线结果**算出来的（#278）。`trade_date` 永远是本场交易日，
+    #: 而 09:15 之前能读到的最新日线结果通常是上一场的——两者不是同一天，文档得把这件事
+    #: 说出来，不能让读的人以为候选是用今天的数据算的。`None` = 与 `trade_date` 同一天
+    #: 或不适用，`serialize_candidate_input` 在这种情况下**不写这个键**，所以旧版本的
+    #: 读者（extra="forbid"）仍然认得这份文档。
+    basis_trade_date: date | None = None
 
     @field_validator("quality_status", mode="before")
     @classmethod
@@ -124,6 +130,8 @@ class PublishedCandidateInputAuthority(RuntimeContractModel):
     def validate_capture_session(self) -> PublishedCandidateInputAuthority:
         if self.captured_at.astimezone(_SHANGHAI).date() != self.trade_date:
             raise ValueError("captured_at must fall on trade_date in Asia/Shanghai")
+        if self.basis_trade_date is not None and self.basis_trade_date > self.trade_date:
+            raise ValueError("basis_trade_date cannot follow trade_date")
         return self
 
 

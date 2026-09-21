@@ -3,7 +3,7 @@
 The premise is CLAUDE.md's single-writer rule and what package O's review found behind it.
 `rquant-monitor` holds the write lock on `data/rquant.duckdb` from 09:25 to 15:00, and
 DuckDB refuses *every* new connection to a locked file, `read_only=True` included. The
-`auction_gap` candidate publisher may publish only inside 09:26-09:30 Asia/Shanghai
+`auction_gap` candidate publisher may publish only inside its assembly window
 (`runtime_builder_candidate.py`), which is entirely inside that window, and its manifest
 named the main database — so it never published, `market-minute.source.v1` and
 `watchlist-quote.source.v1` failed every iteration on `required authority has no
@@ -17,8 +17,8 @@ DuckDB connection holding the main database in write mode for the whole test**, 
 what `rquant-monitor` is. Any role that reaches for the main file fails here for exactly
 the reason it failed on the host.
 
-The order is the chain's own: the publisher at 09:26:30, inside its window, then the two
-sources at 09:31, in the morning phase, reading what it published.
+The order is the chain's own: the publisher at 09:32, inside the window #277 moved it to,
+then the two sources at 09:35, in the morning phase, reading what it published.
 """
 
 from __future__ import annotations
@@ -77,15 +77,16 @@ OPEN_DATES = (
 TRADE_DATE = OPEN_DATES[-1]
 PRIOR_DATES = OPEN_DATES[1:-1]
 
-#: 09:26:30 Asia/Shanghai: inside the publisher's 09:26-09:30 window, a minute and a half
+#: 09:32 Asia/Shanghai: inside the publisher's assembly window, which #277 moved to
+#: 09:31-09:50 because Tushare's `stk_auction` has no rows for the session at 09:26 (the
+#: 2026-09-21 measurement: empty at 09:26:01/04/08, 6,073 rows by 15:10). Seven minutes
 #: after `rquant-monitor` took the main database's write lock, and just after the
-#: auction-match source captured the batch this publisher consumes (the gateway refuses
-#: auction data received before 09:26, so 09:26 is the earliest either of them can act).
-PUBLISH_AT = datetime.combine(TRADE_DATE, time(9, 26, 30), tzinfo=_SHANGHAI).astimezone(UTC)
-#: 09:31, the morning phase — when the two sources actually load a candidate universe
-#: (before 09:30 the session is `pre_open` and `may_fetch_market_minute` is false, so the
-#: minute source returns without touching the universe at all).
-CONSUME_AT = datetime.combine(TRADE_DATE, time(9, 31), tzinfo=_SHANGHAI).astimezone(UTC)
+#: auction-match source captured the batch this publisher consumes.
+PUBLISH_AT = datetime.combine(TRADE_DATE, time(9, 32), tzinfo=_SHANGHAI).astimezone(UTC)
+#: 09:35, the morning phase and after the publisher: the two sources load a candidate
+#: universe only from 09:30 (`may_fetch_market_minute`), and a snapshot captured at 09:32
+#: is not visible to a reader whose `as_of` is earlier than it.
+CONSUME_AT = datetime.combine(TRADE_DATE, time(9, 35), tzinfo=_SHANGHAI).astimezone(UTC)
 #: When the second install stamps its schema rollout window. A producer records its
 #: dual-write with the *service's* clock, and `SchemaRolloutStore` refuses a record outside
 #: `[started_at, deadline]`, so a world whose roles run at a market clock has to open that
@@ -94,8 +95,9 @@ SCHEMA_ROLLOUT_STARTED_AT = PUBLISH_AT - timedelta(minutes=1)
 #: When the replica-sync timer last replaced the replica: inside the five-minute bound and
 #: before the publisher looks at it, because the publisher refuses future evidence.
 REPLICA_SYNCED_AT = datetime.combine(TRADE_DATE, time(9, 23), tzinfo=_SHANGHAI).astimezone(UTC)
+#: the earliest instant the moved capture window can produce a batch (#277)
 AUCTION_AVAILABLE_AT = datetime.combine(
-    TRADE_DATE, time(9, 26, 5), tzinfo=_SHANGHAI
+    TRADE_DATE, time(9, 31, 5), tzinfo=_SHANGHAI
 ).astimezone(UTC)
 REFERENCE_PUBLISHED_AT = datetime.combine(
     TRADE_DATE, time(9, 20), tzinfo=_SHANGHAI
@@ -228,13 +230,14 @@ def _publish_reference_generation(path: Path) -> None:
 
 
 def _seal_candidate_documents(inputs: Any, *, producer_commit: str) -> None:
-    """The two sealed candidate documents the other two strategies publish from.
+    """The two sealed candidate documents, which since #278 production no longer reads.
 
     `market-minute.source.v1` and `watchlist-quote.source.v1` bind all three strategies as
     *required* candidate authorities, so the session cannot be reached with only the
-    auction-gap snapshot. The bytes come from the production generator's own
-    `build_sealed_candidate_payload`, sealed for this session so the consumers accept them
-    (their `trade_date` has to be the session's), and captured before the publisher runs.
+    auction-gap snapshot -- but the two document-driven publishers now rebuild their
+    document every session (`session_document`), so what makes those two authorities
+    present here is running the publishers, not these files. They are still written
+    because the inputs document names them and the loader checks that they are there.
     """
 
     import sys
@@ -437,7 +440,7 @@ def test_the_auction_gap_publisher_publishes_inside_its_window(
     session_world: ReplicaWorld,
     locked_main_database: Any,
 ) -> None:
-    """09:26, one minute after the monitor took the lock: it reads the replica and publishes."""
+    """09:32, inside the moved window: it reads the replica and publishes."""
 
     instance = _instance_name(AUCTION_GAP_SERVICE_ID)
     code, heartbeat = session_world.run(CANDIDATE_ROLE, instance=instance, now=PUBLISH_AT)
@@ -512,7 +515,12 @@ class _QuoteProvider:
 
 
 def _publish_every_candidate_authority(session_world: ReplicaWorld) -> None:
-    """The three candidate publishers, at 09:26:30, in the order the profile lists them."""
+    """The three candidate publishers, at 09:32, in the order the profile lists them.
+
+    Since #278 the two document-driven ones are `session_document`: they rebuild today's
+    document from the replica rather than republishing the sealed one, and their start
+    time (08:45) has passed by 09:32, so one pass each is still the whole setup.
+    """
 
     for manifest in session_world.profile.manifests:
         if manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER:
