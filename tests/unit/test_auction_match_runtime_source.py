@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -675,3 +677,62 @@ def test_an_idle_day_reports_nothing_at_all(tmp_path: Path) -> None:
 
     assert result.degraded_reasons == ()
     assert result.processed_count == 0
+
+
+def test_the_deploy_acceptance_query_runs_against_a_real_quota_store(tmp_path: Path) -> None:
+    """复核 CF-1：DEPLOY 验收清单里的那条 sqlite 命令必须真的跑得起来。
+
+    上一版写的是 `created_at`，而 `quota_attempt` **没有这一列**
+    （`src/rquant/source_quota_store.py:253-269`：attempt_id / source / owner / lease_id /
+    units / prepared_at / dispatched_at / outcome / committed_at / …），操作员照抄会当场
+    `no such column: created_at`。而 SF-3 的整个硬化思路就是「心跳不是唯一判据，落盘的
+    批次与 `quota_attempt` 行数才是重启也不丢的证据」——被告知去信任的那条命令报错，
+    这条思路就断了。
+
+    这条用例**把 SQL 从 `DEPLOY.md` 里抓出来**，对着一个真的 `SourceQuotaStore` 执行，
+    所以文档与表结构不会再各说各的：谁动了表结构而没动文档，这里当场红。
+    """
+
+    deploy = (Path(__file__).resolve().parents[2] / "DEPLOY.md").read_text(encoding="utf-8")
+    statements = re.findall(r"SELECT [^\"]*FROM quota_attempt[^\"]*", deploy)
+    assert statements, "DEPLOY.md 里找不到那条 quota_attempt 查询"
+
+    store = SourceQuotaStore(tmp_path / "quota.sqlite3")
+    #: 真的开一次库并落一条尝试，这样查的是真表而不是空文件
+    attempt, created = store.begin_transport_dispatch(
+        source="tushare.stk_auction",
+        owner="auction-match:deploy-acceptance",
+        attempt_id="d" * 64,
+        logical_request_id="d" * 64,
+        api_name="stk_auction",
+        call_ordinal=1,
+        units=1,
+        total_units=500,
+        window_kind="minute",
+        clock=lambda: CAPTURE_AT,
+    )
+    assert created is True
+    store.commit_attempt(
+        attempt.attempt_id,
+        outcome=SourceQuotaAttemptOutcome.SUCCESS,
+        now=CAPTURE_AT,
+    )
+
+    connection = sqlite3.connect(tmp_path / "quota.sqlite3")
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(quota_attempt)").fetchall()
+        }
+        assert "created_at" not in columns
+        assert {"prepared_at", "dispatched_at", "outcome"} <= columns
+        for statement in statements:
+            #: 跑得起来，且当天那一行真的被 `prepared_at` 的过滤选中
+            dated = re.sub(
+                r"\d{4}-\d{2}-\d{2}",
+                CAPTURE_AT.astimezone(UTC).date().isoformat(),
+                statement,
+            )
+            rows = connection.execute(dated).fetchall()
+            assert len(rows) == 1, (statement, rows)
+    finally:
+        connection.close()

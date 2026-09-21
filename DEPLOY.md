@@ -88,10 +88,15 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   ```bash
   # ① 当天有没有批次（DEGRADED / STALE / PUBLISHED 都算「试过」）
   ls -l /home/lighthouse/rquant/data/runtime/live/auction-match/batches/auction_match/ | tail
-  # ② 当天窗口里实际发出过几次请求
+  # ② 当天窗口里实际发出过几次请求（把 2026-09-22 换成当天）
   sqlite3 /home/lighthouse/rquant/data/runtime/live/auction-match/quota.sqlite3 \
-    "SELECT attempt_id, outcome, created_at FROM quota_attempt ORDER BY created_at DESC LIMIT 10;"
+    "SELECT attempt_id, outcome, prepared_at, dispatched_at FROM quota_attempt WHERE prepared_at LIKE '2026-09-22%' ORDER BY prepared_at DESC LIMIT 10;"
   ```
+
+  **列名是 `prepared_at`，不是 `created_at`**（`quota_attempt` 没有 `created_at` 这一列，
+  照抄会报 `no such column`）。这条命令的 SQL 由
+  `tests/unit/test_auction_match_runtime_source.py::test_the_deploy_acceptance_query_runs_against_a_real_quota_store`
+  **从本文件里抓出来、对着一个真的 `SourceQuotaStore` 跑一遍**，所以它与表结构不会再各说各的。
 
   `quota_attempt` 里当天窗口的行数就是真实发出的请求数；它应当等于 `max_attempts`（3），
   少于 3 说明窗口里有轮次没跑到。
