@@ -560,7 +560,13 @@ I/O）。四个 slice 的 `MemoryHigh` 改为 `rquant.slice` 11264M、`rquant-li
 不得超过父 slice——这正是旧配置曾出现的反转 bug（role 面被临时调到 4096M 时父 slice
 `rquant-live.slice` 仍是 3840M）。
 
-正常 research 运行态的历史静态上界（8 GiB 标称主机基线，未随 09-20 变更调整）为 live 3840 +
+Amended 2026-09-21 per owner decision (#268 / #271) 的后续验收：验收当天 17:00 daily 期间
+live 面峰值 7,634 MiB 顶着刚改完的 7680M 上限（runtime 3,401 MiB + daily ≈ 4.2 GiB），15 分钟
+一次的备份期间父面峰值 10,763 MiB 顶着 11264M 上限（含维护页缓存）。两个 `MemoryHigh` 再次
+提高：`rquant.slice` 11264M → 12288M、`rquant-live.slice` 7680M → 9216M，
+`rquant-live-runtime.slice`（4096M）与 `rquant-serving.slice`（1536M）不变。
+
+正常 research 运行态的历史静态上界（8 GiB 标称主机基线，未随 09-20/09-21 变更调整）为 live 3840 +
 serving 512 + research 768 + OS/其他 `system.slice` 1280 = 6400 MiB。maintenance 没有可信
 aggregate 峰值，不能再宣称其运行态总量低于 7680 MiB；backup 与 replica 可并发，文件缓存也不能
 用 512 MiB service cap 强杀。二者与
