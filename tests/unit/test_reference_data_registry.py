@@ -1325,3 +1325,114 @@ def test_a_held_registry_names_the_holders_instead_of_saying_database_is_locked(
     assert str(registry.path) in message
     assert "exclusive access" in message
     assert "lsof" in message
+
+
+# ---------------------------------------------------------------------------------------
+# #280: a reader under a read-only mount
+# ---------------------------------------------------------------------------------------
+
+
+def test_a_reader_takes_the_publication_lock_without_asking_for_write_access(
+    tmp_path: Path,
+) -> None:
+    """#280, at the layer that can be checked in a second rather than in four minutes.
+
+    On the host the reader of this registry is `paper_constraint_publisher`, whose unit
+    mounts `authorities/reference-slow` read-only. Every read path takes
+    `publication_commit_lock(exclusive=False)`, and that used to open the lock file
+    `O_RDWR | O_CREAT` -- a write into a directory the role does not own, which is `EROFS`
+    there.
+
+    `chmod 0500` on the directory does **not** reproduce it: directory write permission
+    governs creating and deleting names, not opening an existing file for writing, so
+    `O_RDWR | O_CREAT` on a lock file that already exists succeeds under 0500. What the
+    host actually applies is a read-only *mount*, which refuses the open by its flags
+    whatever the file's own mode is. `readonly_runtime` is that rule -- its `_WRITE_FLAGS`
+    includes `O_RDWR`, so an open with write intent is refused even when it would not have
+    written a byte -- which is why the simulation is the faithful one here.
+
+    Reverting the fix turns this case red in about a second; before it existed, the only
+    thing that caught the regression was a four-minute Route A end-to-end.
+    """
+
+    from tests.runtime_readonly_sandbox import readonly_runtime
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    published = registry.publish(published_at=BASE + timedelta(hours=2))
+    lock_path = registry.path.with_name(f".{registry.path.name}.publication.lock")
+    assert lock_path.is_file(), "the publisher leaves the lock file behind"
+
+    readonly = ReadonlyReferenceRegistry(registry.path)
+    #: nothing under `tmp_path` is writable, which is the grant `paper_constraint_publisher`
+    #: has over this directory: none
+    with readonly_runtime(tmp_path, writable=()) as violations:
+        observed = readonly.as_of(
+            dataset_id=ReferenceDataset.ST_STATUS,
+            key="600000.SH",
+            event_time=BASE + timedelta(days=1),
+            decision_time=BASE + timedelta(hours=3),
+            generation_id=published.generation_id,
+        )
+
+    assert observed.record.payload == {"is_st": False}
+    assert violations == [], violations
+
+
+def test_a_writer_still_creates_the_publication_lock_it_owns(tmp_path: Path) -> None:
+    """The other half: an exclusive lock is the publisher's, and it may still create.
+
+    Without this, "the reader no longer creates the lock" could be satisfied by never
+    creating it at all, and no publisher would be able to start on a fresh directory.
+    """
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert not any(fresh.iterdir())
+
+    registry = _registry(fresh)
+
+    lock_path = registry.path.with_name(f".{registry.path.name}.publication.lock")
+    assert lock_path.is_file(), "a writer on an empty directory created no lock"
+    assert lock_path.stat().st_mode & 0o777 == 0o600
+
+    #: and it is still a working publisher over it
+    registry.append(_record())
+    assert registry.publish(published_at=BASE + timedelta(hours=2)).generation_id
+
+
+def test_a_reader_with_no_publication_lock_fails_closed_by_name(tmp_path: Path) -> None:
+    """The window a restore opens, refused with a sentence instead of an errno.
+
+    The recovery artifact restores `reference.sqlite3` and not the dot-file beside it, so
+    between a restore and that day's first `reference_slow_publisher` run the database is
+    present and the lock is not. The reader cannot create it under its own mount, and the
+    bare `[Errno 30] Read-only file system: .../.reference.sqlite3.publication.lock` it
+    used to raise is character-for-character the symptom of #280 itself -- an operator
+    reading it would conclude the fix had not been deployed.
+    """
+
+    from tests.runtime_readonly_sandbox import readonly_runtime
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    published = registry.publish(published_at=BASE + timedelta(hours=2))
+    lock_path = registry.path.with_name(f".{registry.path.name}.publication.lock")
+    lock_path.unlink()
+
+    readonly = ReadonlyReferenceRegistry(registry.path)
+    with (
+        readonly_runtime(tmp_path, writable=()),
+        pytest.raises(ReferenceDataUnavailableError) as refusal,
+    ):
+        readonly.as_of(
+            dataset_id=ReferenceDataset.ST_STATUS,
+            key="600000.SH",
+            event_time=BASE + timedelta(days=1),
+            decision_time=BASE + timedelta(hours=3),
+            generation_id=published.generation_id,
+        )
+
+    message = str(refusal.value)
+    assert str(lock_path) in message, message
+    assert "reference_slow_publisher" in message, message

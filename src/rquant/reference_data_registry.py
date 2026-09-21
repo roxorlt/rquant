@@ -787,8 +787,18 @@ class ReferenceRegistry:
         `flock` places a shared lock on a read-only descriptor perfectly well, so a reader
         can serialize against the publisher's commit without asking for write access. When
         the lock file is not there at all, the old open is kept: a reader in a directory it
-        *does* own still creates it, and one in a directory it does not still fails, which
-        is the fail-closed answer for "this registry has no publisher yet".
+        *does* own still creates it, and one in a directory it does not still fails.
+
+        That last case is reachable rather than theoretical, and it is fail-closed by
+        *name* rather than by `EROFS`. The recovery artifact restores
+        `runtime/authorities/reference-slow/reference.sqlite3` and **not** the dot-file
+        beside it (`scripts/build_runtime_production_inputs.py`), so the first reader after
+        a restore -- before that day's `reference_slow_publisher` has run -- finds the
+        database present and the lock absent. Raising bare `[Errno 30] Read-only file
+        system: .../.reference.sqlite3.publication.lock` there is exactly the symptom this
+        fix removes, and an operator reading it would conclude the fix had not been
+        deployed. `ReferenceDataUnavailableError` separates "this registry has no publisher
+        yet" from "the reader is still asking for write access".
         """
 
         if not exclusive:
@@ -799,11 +809,21 @@ class ReferenceRegistry:
                 )
             except FileNotFoundError:
                 pass
-        return os.open(
-            self._publication_lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
+        try:
+            return os.open(
+                self._publication_lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except OSError as exc:
+            if exclusive:
+                raise
+            raise ReferenceDataUnavailableError(
+                "reference registry has no publication lock and this reader cannot create "
+                f"one: {self._publication_lock_path}. Its publisher "
+                "(reference_slow_publisher) owns that directory and has not run since the "
+                "registry was put there."
+            ) from exc
 
     @contextmanager
     def publication_commit_lock(self, *, exclusive: bool = True) -> Iterator[None]:
