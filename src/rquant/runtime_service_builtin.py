@@ -570,6 +570,16 @@ def reference_slow_publisher_builder(
     return build
 
 
+#: 采集窗的**临时**默认值（#277）。2026-09-21 实测：主 token 的 `stk_auction(20260921)`
+#: 在 09:26:01/04/08 三次都返回空，15:10 已有 6,073 行——09:26 不是接口坏了，是当天的数据
+#: 还没就绪。首次可用时刻由 09-22 早上的主机探测给出，拿到之后把这两个常量（或 manifest
+#: 里 `auction-match.source.v1` 的同名设置）改成「探测值 + 余量」再装机，顺序见 DEPLOY.md。
+AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 31)
+AUCTION_MATCH_DEFAULT_CAPTURE_END = time(9, 45)
+#: 网关自己拒绝 09:26 之前收到的竞价数据，所以采集窗的起点不能早于它
+AUCTION_MATCH_EARLIEST_CAPTURE_START = time(9, 26)
+
+
 class AuctionMatchSourceSettings(RuntimeContractModel):
     spool_root: Path
     quota_path: Path
@@ -584,6 +594,13 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
     calendar_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     universe_path: Path
     max_attempts: StrictInt = Field(default=3, gt=0, le=10)
+    #: 本地时间（Asia/Shanghai）。改动前是写死的 09:26-09:30 加三次立刻重试，三次全落在
+    #: 七秒之内，等于只在 09:26:0x 问了一次（#277 的现场）。
+    capture_start: time = AUCTION_MATCH_DEFAULT_CAPTURE_START
+    capture_end: time = AUCTION_MATCH_DEFAULT_CAPTURE_END
+    #: 两次尝试之间的最小间隔。留空时由窗宽与尝试次数推出来，把 `max_attempts` 次尝试**摊在
+    #: 整个窗里**（首尾各一次），这样「数据比预计晚到」不会因为三次重试挤在开头而错过。
+    retry_interval_seconds: StrictInt | None = Field(default=None, gt=0, le=3600)
 
     @field_validator("spool_root", "quota_path", "calendar_path", "universe_path")
     @classmethod
@@ -591,6 +608,35 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
         if not value.is_absolute():
             raise ValueError("runtime data paths must be absolute")
         return value
+
+    @model_validator(mode="after")
+    def validate_capture_window(self) -> AuctionMatchSourceSettings:
+        if self.capture_start >= self.capture_end:
+            raise ValueError("auction capture_start must precede capture_end")
+        if self.capture_start < AUCTION_MATCH_EARLIEST_CAPTURE_START:
+            raise ValueError("auction capture_start cannot precede 09:26")
+        if self.capture_start.microsecond or self.capture_end.microsecond:
+            raise ValueError("auction capture window must be whole seconds")
+        if self.capture_start.tzinfo is not None or self.capture_end.tzinfo is not None:
+            raise ValueError("auction capture window is local Asia/Shanghai wall time")
+        return self
+
+    @property
+    def capture_retry_interval_seconds(self) -> int:
+        """`max_attempts` 次尝试摊在窗里的间隔，显式配置优先。
+
+        窗宽 14 分钟、三次尝试时是 420 秒：09:31、09:38、09:45。一次尝试的情况下间隔没有
+        意义，取整个窗宽，判据于是退化成「窗内只问一次」。
+        """
+
+        if self.retry_interval_seconds is not None:
+            return int(self.retry_interval_seconds)
+        span = _seconds_of_day(self.capture_end) - _seconds_of_day(self.capture_start)
+        return max(span // max(self.max_attempts - 1, 1), 1)
+
+
+def _seconds_of_day(value: time) -> int:
+    return value.hour * 3600 + value.minute * 60 + value.second
 
 
 class AuctionUniversePublisherSettings(RuntimeContractModel):
@@ -747,9 +793,16 @@ def auction_match_source_builder(
         attempt_trade_date: date | None = None
         attempts = 0
         completed = False
+        #: 「今天的采集彻底没成」这件事，一直挂到交易日切换为止（#277 第三个缺陷）。
+        #: 改动前早退分支返回的是那份**从未被写过**的初始结果，`record_success` 把它变成
+        #: 一条干净心跳，09:26 的三次真失败在几秒内就被洗掉，心跳上看不出今天出过事。
+        capture_failed = False
+        retry_interval = settings.capture_retry_interval_seconds
+        window_start_seconds = _seconds_of_day(settings.capture_start)
+        window_end_seconds = _seconds_of_day(settings.capture_end)
 
         def step() -> RuntimeStepResult:
-            nonlocal attempt_trade_date, attempts, completed, last_result
+            nonlocal attempt_trade_date, attempts, completed, last_result, capture_failed
             observed_at = clock()
             decision = decide_market_session(calendar, observed_at)
             evidence = {"market_calendar": calendar.content_sha256}
@@ -757,15 +810,22 @@ def auction_match_source_builder(
                 attempt_trade_date = decision.local_trade_date
                 attempts = 0
                 completed = False
+                capture_failed = False
                 last_result = RuntimeStepResult(source_generations=evidence)
             local_time = decision.observed_at.astimezone(_SHANGHAI).timetz().replace(tzinfo=None)
-            if (
-                not decision.is_open_date
-                or local_time < time(9, 26)
-                or local_time > time(9, 30)
-                or completed
-                or attempts >= settings.max_attempts
+            now_seconds = _seconds_of_day(local_time)
+            exhausted = attempts >= settings.max_attempts
+            #: 尝试摊在窗里：第 k 次（0 起）不早于 capture_start + k * interval
+            due = now_seconds >= window_start_seconds + attempts * retry_interval
+            if (decision.is_open_date and not completed) and (
+                exhausted or (now_seconds > window_end_seconds and attempts > 0)
             ):
+                capture_failed = True
+
+            def idle_result() -> RuntimeStepResult:
+                reasons = tuple(last_result.degraded_reasons)
+                if capture_failed and "capture_failed" not in reasons:
+                    reasons = (*reasons, "capture_failed")
                 return RuntimeStepResult(
                     **{
                         **last_result.model_dump(mode="python"),
@@ -774,16 +834,30 @@ def auction_match_source_builder(
                             **dict(last_result.source_generations),
                             **evidence,
                         },
+                        "degraded_reasons": reasons,
                     }
                 )
+
+            if (
+                not decision.is_open_date
+                or now_seconds < window_start_seconds
+                or now_seconds > window_end_seconds
+                or completed
+                or exhausted
+                or not due
+            ):
+                return idle_result()
+            retry_ordinal = attempts  # Retry ordinals are zero-based: 0, 1, ... max_attempts - 1.
+            #: 计数在读权威之前。竞价全集没发布出来时 `load_auction_universe_authority` 会抛,
+            #: 那一轮同样是「今天试过而没成」；记在尝试之后的话，这一类失败永远耗不尽次数，
+            #: 也就永远不会留下 `capture_failed`，又回到被洗干净的心跳。
+            attempts += 1
             universe = load_auction_universe_authority(
                 settings.universe_path,
                 expected_commit=manifest.producer_commit,
                 required_trade_date=decision.local_trade_date,
                 as_of=observed_at,
             )
-            retry_ordinal = attempts  # Retry ordinals are zero-based: 0, 1, ... max_attempts - 1.
-            attempts += 1
             capture = gateway.capture_once(
                 trade_date=decision.local_trade_date,
                 received_at=observed_at,
