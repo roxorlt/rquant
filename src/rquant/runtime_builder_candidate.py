@@ -602,7 +602,7 @@ def candidate_publisher_builder(
         replica_gate: ReplicaReadGate[Any] | None = (
             None
             if settings.daily_database_path is None
-            #: at most one open per 09:26-09:30 assembly window (#268). What it reads is
+            #: at most one open per assembly window (#268). What it reads is
             #: prior sessions' `daily_bar` volumes, which do not change while the session
             #: opens, so a generation arriving mid-window carries the same answer at the
             #: cost of another whole scan
@@ -619,12 +619,18 @@ def candidate_publisher_builder(
         #: 今天这一场的文档已经发过了吗。发过就整轮不写——内容里带着生成时刻，没有这个记号
         #: 就会变成「每五秒发一代新快照」，正是包 W 拆掉的那种每轮无条件写。
         published_trade_date: date | None = None
+        #: 这个进程已经发到第几代。**空闲那一轮必须把它照抄出去**：
+        #: `RuntimeServiceControl.record_success` 拒绝回退的输出序号
+        #: （`ValueError: output sequence cannot regress`），而发完一代之后窗外的每一轮
+        #: 原来都返回 -1。auction_gap 从来没真的发出过东西（#254/#277），所以这条路径
+        #: 一次都没被走到过；竞价链一旦真的开始产出，它会在每一轮上抛。
+        last_output_sequence = -1
 
         def _replica_cost() -> dict[str, object]:
             """What **this** iteration did with the replica, for the heartbeat (#256).
 
             Empty for a publisher that has no replica to read. For the auction-gap
-            publisher it is always present: outside 09:26-09:30, and on the degraded
+            publisher it is always present: outside its assembly window, and on the degraded
             iterations where the auction spool has no batch yet, this reports "opened
             nothing, read nothing" rather than the last real read's numbers (review MF-1).
             """
@@ -639,7 +645,19 @@ def candidate_publisher_builder(
             }
 
         def step() -> RuntimeStepResult:
-            nonlocal published_trade_date
+            nonlocal published_trade_date, last_output_sequence
+
+            def idle_result(
+                degraded_reasons: tuple[str, ...] = (),
+            ) -> RuntimeStepResult:
+                """这一轮什么都没发：报本进程已经发到的那一代，不是 -1。"""
+
+                return RuntimeStepResult(
+                    output_sequence=last_output_sequence,
+                    degraded_reasons=degraded_reasons,
+                    **_replica_cost(),
+                )
+
             if replica_gate is not None:
                 replica_gate.begin_iteration()
             if settings.input_mode == "session_document":
@@ -652,7 +670,7 @@ def candidate_publisher_builder(
                     or local.timetz().replace(tzinfo=None) < settings.session_document_start
                     or published_trade_date == trade_date
                 ):
-                    return RuntimeStepResult(**_replica_cost())
+                    return idle_result()
                 if settings.daily_database_path is None:
                     raise RuntimeError("validated session replica path disappeared")
                 try:
@@ -666,16 +684,13 @@ def candidate_publisher_builder(
                         read_gate=replica_gate,
                     )
                 except SessionCandidateInputError:
-                    return RuntimeStepResult(
-                        degraded_reasons=("session_candidate_input_unavailable",),
-                        **_replica_cost(),
-                    )
+                    return idle_result(("session_candidate_input_unavailable",))
             elif settings.input_mode == "auction_live":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
                 local_time = local.timetz().replace(tzinfo=None)
                 if not settings.auction_input_start <= local_time <= settings.auction_input_end:
-                    return RuntimeStepResult(**_replica_cost())
+                    return idle_result()
                 if (
                     settings.auction_spool_root is None
                     or settings.daily_database_path is None
@@ -699,10 +714,7 @@ def candidate_publisher_builder(
                         read_gate=replica_gate,
                     )
                 except AuctionGapCandidateInputError:
-                    return RuntimeStepResult(
-                        degraded_reasons=("auction_gap_input_unavailable",),
-                        **_replica_cost(),
-                    )
+                    return idle_result(("auction_gap_input_unavailable",))
             else:
                 if settings.candidate_input_path is None:
                     raise RuntimeError("validated candidate_input_path disappeared")
@@ -728,6 +740,7 @@ def candidate_publisher_builder(
                 static_feature_schema=settings.static_feature_schema,
                 previous_generation_of_binding=previous_generation_of_binding,
             )
+            last_output_sequence = max(last_output_sequence, summary.snapshot_sequence)
             return RuntimeStepResult(
                 output_sequence=summary.snapshot_sequence,
                 processed_count=summary.candidate_count,

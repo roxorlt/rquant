@@ -189,6 +189,16 @@
   而当日的 auction_gap 快照最早 09:31 之后才装得出来，中间这一段两个源仍会降级——这是
   「当天数据 09:26 还没出」这件事本身的后果，不是新引入的缺陷。
 
+- **候选发布者发完一代之后，窗外的每一轮都会让心跳抛「输出序号回退」（#277 连带，本包）**：
+  `RuntimeServiceControl.record_success` 拒绝回退的 `output_sequence`
+  （`ValueError: output sequence cannot regress`），而 `candidate_publisher_builder` 的两条
+  空闲路径——窗外那一轮、以及读不到证据的降级那一轮——返回的都是默认的 `-1`。
+  `candidate.auction_gap.v1` 从来没真的发出过东西（#254、#277），所以这条路径一次都没被走到
+  过；本包让竞价链真的开始产出之后，它会在**发完第一代之后的每一轮**上抛，一天上千次。
+  现在空闲那一轮照抄本进程已经发到的那一代（`session_document` 与 `auction_live` 两支都改），
+  `processed_count` 仍是 0。新增用例
+  `test_an_idle_round_after_a_publish_does_not_regress_the_output_sequence` 两支都打。
+
 - **n_shape / growth_board_surge 的候选文档停在 2026-07-14，盘中 loader 每场都拒（#278，本包）**：
   `scripts/build_runtime_production_inputs.py` 把 `trade_calendar` 表里最新的 `updated_at`
   （生产副本上是 2026-07-14 18:13）当成生成时刻，据此封出 `trade_date 2026-07-14` 的文档，

@@ -1323,6 +1323,7 @@ SESSION_OPEN_DATES = (date(2026, 8, 10), date(2026, 8, 11), SESSION_TRADE_DATE)
 
 
 def _session_calendar_path(tmp_path: Path) -> tuple[Path, MarketCalendarAuthority]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     calendar = MarketCalendarAuthority.create(
         schema_version=1,
         exchange="SSE",
@@ -1426,7 +1427,9 @@ def test_the_session_publisher_rebuilds_todays_document_once(tmp_path: Path) -> 
     assert first.processed_count == 0  # 空事实列表：候选数为零，但快照发出去了
     assert first.output_sequence == 0
     assert first.degraded_reasons == ()
-    assert second.output_sequence == -1, "第二轮什么都没写"
+    #: 第二轮什么都没写，但**输出序号照抄**——心跳不接受回退的序号
+    assert second.output_sequence == first.output_sequence
+    assert second.processed_count == 0
     assert second.degraded_reasons == ()
 
     snapshot = StrategyCandidateSnapshotSpool(tmp_path / "live" / "n_shape").read_strategy_as_of(
@@ -1438,6 +1441,49 @@ def test_the_session_publisher_rebuilds_todays_document_once(tmp_path: Path) -> 
     assert snapshot is not None
     assert snapshot.trade_date == SESSION_TRADE_DATE
     assert snapshot.captured_at == _at(8, 45)
+
+
+def test_an_idle_round_after_a_publish_does_not_regress_the_output_sequence(
+    tmp_path: Path,
+) -> None:
+    """`RuntimeServiceControl.record_success` 拒绝回退的输出序号。
+
+    发完一代之后窗外的每一轮原来都返回 -1，于是心跳一侧会抛
+    `ValueError: output sequence cannot regress`——两种 live 模式都有这条路径。
+    auction_gap 从来没真的发出过东西（#254 / #277），所以它一次都没被走到过；
+    竞价链一旦真的开始产出，它会在每一轮上抛。
+    """
+
+    calls: list[dict[str, object]] = []
+    clock = {"now": _at(8, 45)}
+    session = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: clock["now"],
+    )(_session_manifest(tmp_path / "session"))
+
+    published = session()
+    clock["now"] = _at(9, 10)
+    idled = session()
+    clock["now"] = _at(8, 30, day=SESSION_OPEN_DATES[-2])
+    closed = session()
+
+    assert published.output_sequence == 0
+    assert idled.output_sequence == 0
+    assert closed.output_sequence == 0
+
+    #: auction_live 那一支同样
+    gap_clock = {"now": datetime(2026, 7, 31, 1, 32, tzinfo=UTC)}
+    gap = candidate_publisher_builder(
+        auction_input_loader=lambda **_: _batch("auction_gap"),
+        clock=lambda: gap_clock["now"],
+    )(_auction_manifest(tmp_path / "gap"))
+
+    gap_published = gap()
+    gap_clock["now"] = datetime(2026, 7, 31, 1, 55, tzinfo=UTC)
+    gap_idled = gap()
+
+    assert gap_published.output_sequence == 0
+    assert gap_idled.output_sequence == 0
 
 
 def test_the_session_publisher_waits_for_its_start_time(tmp_path: Path) -> None:
