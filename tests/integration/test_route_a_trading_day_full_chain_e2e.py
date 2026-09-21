@@ -1467,7 +1467,7 @@ def serving_signal_rows(route: RouteAWorld, *, session: date | None = TRADE_DATE
             #: instant is a binder error. Zero rows in total is zero rows in any session.
             #:
             #: **This guard is load-bearing, not an optimisation.** Delete it and
-            #: `test_the_shipped_profile_stops_the_signal_at_the_paper_broker` fails with
+            #: `test_the_paused_notifier_stops_the_signal_at_the_paper_broker` fails with
             #: `Binder Error: Cannot compare values of type INTEGER and type TIMESTAMP
             #: WITH TIME ZONE`, because a paused notifier is exactly the case that leaves
             #: this table empty. The operator command in the package report spells the
@@ -1485,29 +1485,6 @@ def serving_signal_rows(route: RouteAWorld, *, session: date | None = TRADE_DATE
             connection.execute(
                 "SELECT count(*) FROM signals "
                 f"WHERE event_time >= TIMESTAMPTZ '{opened_at.isoformat()}'"
-            ).fetchone()[0]
-        )
-
-
-def serving_signal_rows_from_this_session(route: RouteAWorld) -> int:
-    """The same table, counting only signals whose `event_time` is in today's session.
-
-    `count(*) > 0` is not the same claim. The notifier publishes its `signals` authority
-    from a rolling history of `serving_history_limit` (1000 in production), so the moment
-    a shadow notifier starts replicating, the generation carries whatever backlog its
-    store holds -- and a non-empty `signals` table would then be true on a day nothing
-    traded (package Z review, risk (d); MF-3). The session's own opening instant is the
-    line: a row at or after 09:15 on the trading day is evidence from this session.
-    """
-
-    from rquant.serving_publisher import ServingReader
-
-    root = setting_of(route, "serving.publisher.v1", "serving_root")
-    with ServingReader(root).open_current_readonly() as connection:
-        return int(
-            connection.execute(
-                "SELECT count(*) FROM signals WHERE event_time >= ?",
-                [_at(9, 15)],
             ).fetchone()[0]
         )
 
@@ -1616,9 +1593,6 @@ def test_one_signal_travels_the_whole_chain_to_a_same_day_serving_generation(
     assert serving_signal_rows(route, session=TRADE_DATE) >= 1, (
         "serving published a generation that carries no signal for this session"
     )
-    assert serving_signal_rows_from_this_session(route) >= 1, (
-        "the generation's signals are all from before this session"
-    )
 
 
 def test_the_shadow_mode_notifier_writes_every_row_and_sends_nothing(
@@ -1686,7 +1660,7 @@ def test_the_shadow_mode_notifier_writes_every_row_and_sends_nothing(
     #: and serving published this session's signal
     assert len(serving_generations(route)) == 1
     assert serving_current(route) is not None
-    assert serving_signal_rows_from_this_session(route) >= 1, (
+    assert serving_signal_rows(route, session=TRADE_DATE) >= 1, (
         "the shadow notifier published a generation with no signal from this session"
     )
 
