@@ -33,7 +33,9 @@
 |---|---|
 | `$ROOT/serving/generations/` | 当天有新增的一代，`$ROOT/serving/current.json` 指向它。**研究面两源没有 `current.json` 不再是阻塞原因** |
 | serving 心跳的 `degraded_reasons` | 含 `serving:lab_jobs:unavailable:…` 与 `serving:promotions:unavailable:…` 两条。根目录存在但没有 `current.json` 时理由是 `ServingSourceAuthorityUnavailableError: current pointer is unavailable`（主机是这一种，目录由 runbook C-1 预建）；根目录整个不存在时是 `… current authority is unavailable` |
+| serving 心跳的 `degraded_reasons`（续） | **只看这两条前缀就够，同时还有别的降级理由属正常**——这个世界本来就会有 `serving:paper_accounts:degraded:…`，以及 runtime health 投影里那串 `missing:strategy.*`。判据是「这两条前缀在不在」，不是「一共几条」（e2e 的断言也是按前缀过滤的，`…full_chain_e2e.py:1690-1693`） |
 | serving 心跳的 `last_error` | 仍然是 `null`，`consecutive_failures` 为 0。缺席是 **degraded**，不是 failed |
+| **serving-only 页的横幅** | **研究面缺席期间每一帧都会是 `DEGRADED`，这是预期，不是故障**。`manifest_freshness`（`dashboard/serving_only_page_data.py:160-177`）只要水位里有一个 `UNAVAILABLE` 就返回 `DEGRADED`，而 `required_projections` 为空时六个水位全算（`:249-252`）。**行照常渲染**，只是横幅变色；只有 `UNAVAILABLE` 才会拦渲染（`:299-312`）。比改之前严格更好：以前是一代都没有、页面什么都看不到 |
 | 其余四源 | 任缺一个（`signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`），serving 照旧整轮拒、一代都不出，心跳 `last_error` 写 `<dataset> reader failed: …` |
 | 收盘后静置 | 研究面持续缺席期间 `serving/generations/` 目录不再增长，`current.json` 不再被改写 |
 
@@ -43,8 +45,18 @@
 - **旧 manifest + 新代码** → 可以，字段有默认值，行为与写了默认值一样；
 - **新 manifest + 旧代码** → **不行**，serving 会在 build 期被 `extra_forbidden` 拒掉。
 
-因此回滚代码时**必须把 runtime generation 一起回滚**（照第 16 条把 `data/runtime/current`
-退回上一代，或用上一个 tag 重新 stage + publish），不能只换代码留着本代的 profile。
+因此回滚代码时**必须把 runtime generation 一起处理**，三选一（**不能只换代码、留着本代的 profile**）：
+
+1. **（最小）用上一个 tag 重新 stage + publish**——那一代的画像由那一刻的代码生成，不带这个键；
+2. **把 `data/runtime/current` 指回上一代**；
+3. **删掉 `data/runtime/current`，整体回落路线 B**——见本文件
+   「路线 A 前置（生产 inputs 与真实画像，本轮 PR 引入，开工前逐条确认）」清单（`:1256` 起）
+   的第 16 条（`:1350`）。注意那一条讲的是**删掉**指针、让角色回到降级分支，它那句
+   「不需要再换 generation」针对的是**那个动作本身**（路线 A 整个不生效，这份 manifest
+   根本不会被读），**不是**说换代码可以留着本代 profile。
+
+**条目号在本文件里不唯一**（另有一处「16.」在「v0.30.0 Release A 上线前置条件」清单的
+`:2329`，讲的是别的事），所以上面按「章节 + 行号」引，不要只按号找。
 
 ---
 
