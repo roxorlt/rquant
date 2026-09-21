@@ -787,8 +787,18 @@ class ReferenceRegistry:
         `flock` places a shared lock on a read-only descriptor perfectly well, so a reader
         can serialize against the publisher's commit without asking for write access. When
         the lock file is not there at all, the old open is kept: a reader in a directory it
-        *does* own still creates it, and one in a directory it does not still fails, which
-        is the fail-closed answer for "this registry has no publisher yet".
+        *does* own still creates it, and one in a directory it does not still fails.
+
+        That last case is reachable rather than theoretical, and it is fail-closed by
+        *name* rather than by `EROFS`. The recovery artifact restores
+        `runtime/authorities/reference-slow/reference.sqlite3` and **not** the dot-file
+        beside it (`scripts/build_runtime_production_inputs.py`), so the first reader after
+        a restore -- before that day's `reference_slow_publisher` has run -- finds the
+        database present and the lock absent. Raising bare `[Errno 30] Read-only file
+        system: .../.reference.sqlite3.publication.lock` there is exactly the symptom this
+        fix removes, and an operator reading it would conclude the fix had not been
+        deployed. `ReferenceDataUnavailableError` separates "this registry has no publisher
+        yet" from "the reader is still asking for write access".
         """
 
         if not exclusive:
@@ -799,11 +809,31 @@ class ReferenceRegistry:
                 )
             except FileNotFoundError:
                 pass
-        return os.open(
-            self._publication_lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
+        try:
+            return os.open(
+                self._publication_lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except OSError as exc:
+            if exclusive:
+                raise
+            #: Only "the publisher has not run" is renamed. Reaching here at all means the
+            #: `O_RDONLY | O_NOFOLLOW` open above raised `FileNotFoundError` and something
+            #: then appeared at that path between the two opens: with `O_NOFOLLOW` a
+            #: symlink is `ELOOP`, and a parent segment that is no longer a directory is
+            #: `ENOTDIR`. Those are integrity conditions -- the shape package Y's review
+            #: requires to keep raising -- and calling a symlink swapped in underneath us
+            #: "this registry has no publication lock" would hide exactly what the
+            #: `O_NOFOLLOW` is there to catch. They are re-raised as themselves.
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise
+            raise ReferenceDataUnavailableError(
+                "reference registry has no publication lock and this reader cannot create "
+                f"one: {self._publication_lock_path}. Its publisher "
+                "(reference_slow_publisher) owns that directory and has not run since the "
+                "registry was put there."
+            ) from exc
 
     @contextmanager
     def publication_commit_lock(self, *, exclusive: bool = True) -> Iterator[None]:

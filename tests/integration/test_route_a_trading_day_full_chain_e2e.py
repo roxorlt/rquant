@@ -140,8 +140,8 @@ CANDIDATES_CAPTURED_AT = _at(8, 47, 11)
 #: The second install's schema rollout window. A producer records its dual-write with
 #: the *service's* clock and `SchemaRolloutStore` refuses a record outside
 #: `[started_at, deadline]`, so the window is opened at the market clock and early
-#: enough that the whole chain -- 09:46:03 to 09:49:53 -- runs inside the profile's
-#: 600-second stage timeout.
+#: enough that the whole chain -- `HOP_CLOCKS`, 09:47:17 to 09:48:53 -- runs inside the
+#: profile's 600-second stage timeout.
 SCHEMA_ROLLOUT_STARTED_AT = _at(9, 44, 11)
 #: when the replica-sync timer last replaced the read-only replica the notifier reads
 REPLICA_SYNCED_AT = _at(9, 22, 47)
@@ -676,7 +676,6 @@ def build_trading_day_chain(
         _freeze_before_the_session(target)
 
     route = RouteAWorld(world, inputs.runtime_root)
-    route.inputs = inputs  # type: ignore[attr-defined]
     route.profile = profile
     route.receipt = receipt
     route.sealed_credentials = sealed
@@ -1439,14 +1438,55 @@ def tamper_one_byte_of_a_runner_signal(route: RouteAWorld, service_id: str) -> N
         connection.commit()
 
 
-def serving_signal_rows(route: RouteAWorld) -> int:
-    """Rows in the `signals` table of the generation `current.json` points at."""
+def serving_signal_rows(route: RouteAWorld, *, session: date | None = TRADE_DATE) -> int:
+    """Rows in the `signals` table of the generation `current.json` points at.
+
+    **Scoped to one session by default, and that is the point.** The notifier publishes
+    the newest `serving_history_limit` route receipts (default 1000,
+    `runtime_builder_signal.NotifierSettings.serving_history_limit`) selected by
+    `ORDER BY signal.global_sequence DESC LIMIT ?` with no date predicate at all
+    (`notification_state.py`). So `signals` is a rolling history, not a same-day table:
+    once one signal has ever been published, an unfiltered `count(*)` is greater than zero
+    every day afterwards, including a day on which nothing traded.
+
+    Criterion (3b) is a claim about *today*, so the count it is read from has to be
+    filtered by `event_time`, which is one of the table's own columns
+    (`serving_read_models.build_serving_read_models`). `session=None` gives the unfiltered
+    count, which is only useful for saying how much history a generation carries.
+    """
 
     from rquant.serving_publisher import ServingReader
 
     root = setting_of(route, "serving.publisher.v1", "serving_root")
     with ServingReader(root).open_current_readonly() as connection:
-        return int(connection.execute("SELECT count(*) FROM signals").fetchone()[0])
+        total = int(connection.execute("SELECT count(*) FROM signals").fetchone()[0])
+        if session is None or total == 0:
+            #: An empty generation cannot be filtered by time: the table is built from an
+            #: empty frame, so DuckDB has no rows to infer from and types `event_time`
+            #: `INTEGER` rather than `TIMESTAMP WITH TIME ZONE`, and comparing it with an
+            #: instant is a binder error. Zero rows in total is zero rows in any session.
+            #:
+            #: **This guard is load-bearing, not an optimisation.** Delete it and
+            #: `test_the_shipped_profile_stops_the_signal_at_the_paper_broker` fails with
+            #: `Binder Error: Cannot compare values of type INTEGER and type TIMESTAMP
+            #: WITH TIME ZONE`, because a paused notifier is exactly the case that leaves
+            #: this table empty. The operator command in the package report spells the
+            #: same rule `TRY_CAST(event_time AS TIMESTAMPTZ)` for the same reason.
+            return total
+        #: the session opens at 09:15 local, before the auction, so the bound catches
+        #: everything the day produced and nothing the day before did
+        opened_at = datetime.combine(
+            session, clock_time(9, 15), tzinfo=_SHANGHAI
+        ).astimezone(UTC)
+        #: an explicit TIMESTAMPTZ literal rather than a bound parameter: the reader's
+        #: connection binds a Python datetime as an integer and DuckDB then refuses to
+        #: compare it with the column's own type
+        return int(
+            connection.execute(
+                "SELECT count(*) FROM signals "
+                f"WHERE event_time >= TIMESTAMPTZ '{opened_at.isoformat()}'"
+            ).fetchone()[0]
+        )
 
 
 def serving_signal_rows_from_this_session(route: RouteAWorld) -> int:
@@ -1571,8 +1611,10 @@ def test_one_signal_travels_the_whole_chain_to_a_same_day_serving_generation(
     assert pointer is not None
     assert pointer["generation_id"] == generations[0].name
     assert (generations[0] / "serving.duckdb").is_file()
-    assert serving_signal_rows(route) >= 1, (
-        "serving published a generation that carries no signal"
+    #: the criterion, session-scoped: a rolling-history table answers "has one ever been
+    #: published", and (3b) asks "did one travel today"
+    assert serving_signal_rows(route, session=TRADE_DATE) >= 1, (
+        "serving published a generation that carries no signal for this session"
     )
     assert serving_signal_rows_from_this_session(route) >= 1, (
         "the generation's signals are all from before this session"
@@ -1699,7 +1741,9 @@ def test_the_paused_notifier_stops_the_signal_at_the_paper_broker(
     #: serving published, and what it published has no signal in it
     assert len(serving_generations(route)) == 1
     assert serving_current(route) is not None
-    assert serving_signal_rows(route) == 0
+    assert serving_signal_rows(route, session=TRADE_DATE) == 0
+    #: and it is not that the history was trimmed -- there is nothing in it at all
+    assert serving_signal_rows(route, session=None) == 0
 
 
 # ---------------------------------------------------------------------------------------
