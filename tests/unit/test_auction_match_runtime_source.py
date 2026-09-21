@@ -222,8 +222,9 @@ def test_the_window_comes_from_settings_and_defaults_when_absent(tmp_path: Path)
 
     assert absent.capture_start == AUCTION_MATCH_DEFAULT_CAPTURE_START
     assert absent.capture_end == AUCTION_MATCH_DEFAULT_CAPTURE_END
-    #: 14 分钟摊给三次尝试：09:31、09:38、09:45
-    assert absent.capture_retry_interval_seconds == 420
+    #: 14 分钟摊给三次尝试，除的是 3 不是 2：09:31:00 / 09:35:40 / 09:40:20，
+    #: 最后一次到期之后离窗口右界还有整整 280 秒
+    assert absent.capture_retry_interval_seconds == 280
     assert explicit.capture_start == time(9, 33)
     assert explicit.capture_end == time(9, 41)
     assert explicit.capture_retry_interval_seconds == 120
@@ -248,10 +249,11 @@ def test_an_impossible_window_is_refused(
 
 
 def test_the_three_attempts_are_spread_across_the_window(tmp_path: Path) -> None:
-    """三次重试不再挤在七秒里：09:31 一次，09:33 不问，09:38 第二次，09:45 第三次。
+    """三次重试不再挤在七秒里：09:31:00 / 09:35:40 / 09:40:20。
 
     #277 的现场就是三次全落在 09:26:01-09:26:08——等于只在同一秒问了一次，
-    数据晚到一分钟就永远看不到。
+    数据晚到一分钟就永远看不到。间隔是 `窗宽 // max_attempts`，所以第三次到期之后离
+    窗口右界 09:45 还留着 280 秒（复核 MF-1）。
     """
 
     adapter = _Adapter([RuntimeError("down"), RuntimeError("down"), RuntimeError("down")])
@@ -266,16 +268,16 @@ def test_the_three_attempts_are_spread_across_the_window(tmp_path: Path) -> None
     clock.now = at(9, 33)
     step()
     assert len(adapter.calls) == 1, "窗内但还没到下一次的时刻，不该再问"
-    clock.now = at(9, 38)
+    clock.now = at(9, 35, 40)
     step()
     assert len(adapter.calls) == 2
-    clock.now = at(9, 44, 59)
+    clock.now = at(9, 40, 19)
     step()
     assert len(adapter.calls) == 2
-    clock.now = at(9, 45)
+    clock.now = at(9, 40, 20)
     step()
     assert len(adapter.calls) == 3
-    clock.now = at(9, 45)
+    clock.now = at(9, 44)
     step()
     assert len(adapter.calls) == 3, "次数用尽后不再问"
 
@@ -305,6 +307,41 @@ def test_the_three_attempts_are_spread_across_the_window(tmp_path: Path) -> None
     }
     assert {attempt.attempt_id for attempt in attempts} == expected_attempt_ids
     assert {attempt.outcome for attempt in attempts} == {SourceQuotaAttemptOutcome.FAILURE}
+
+
+def test_every_polling_phase_gets_the_full_attempt_budget(tmp_path: Path) -> None:
+    """复核 MF-1 的正面：**任何轮询相位**都拿得到 `max_attempts` 次尝试。
+
+    改动前间隔按 `max_attempts - 1` 推，第三次的到期时刻正好等于 `capture_end`，而窗口闸门是
+    「过了右界就整轮空转」，于是第三次只在右界那一整秒内可达。复核者在 HEAD 上实测：
+
+        2s tick, calls by start-phase second: {0: 3, 1: 2, 2: 3, 3: 2, 4: 3, 5: 2}
+        5s tick, calls by start-phase second: {0: 3, 1: 2, 2: 2, 3: 2, 4: 2}
+
+    配置写着 3 次、实际常常只发 2 次，而被吃掉的恰恰是最晚那一次——正是为「数据晚到」准备的
+    那一次。这条用例用真的构建器、真的配额台账，从几个不同相位按固定步长 tick 过整个窗，
+    断言每个相位都恰好发出 `max_attempts` 次请求。
+    """
+
+    counts: dict[tuple[int, int], int] = {}
+    for tick_seconds in (2, 5):
+        for phase in range(tick_seconds):
+            adapter = _Adapter([_empty_frame() for _ in range(6)])
+            clock = _Clock(at(9, 30, phase))
+            step = auction_match_source_builder(
+                adapter_factory=lambda adapter=adapter: adapter,
+                clock=clock,
+            )(_manifest(tmp_path / f"tick{tick_seconds}-phase{phase}"))
+            moment = at(9, 30, phase)
+            deadline = at(9, 46)
+            while moment <= deadline:
+                clock.now = moment
+                step()
+                moment += timedelta(seconds=tick_seconds)
+            counts[(tick_seconds, phase)] = len(adapter.calls)
+
+    assert set(counts.values()) == {3}, counts
+
 
 
 def test_nothing_is_fetched_before_the_window_or_on_a_closed_date(tmp_path: Path) -> None:
@@ -494,8 +531,12 @@ def test_a_published_batch_never_leaves_capture_failed_behind(tmp_path: Path) ->
         assert "capture_failed" not in step().degraded_reasons
 
 
-def test_a_missing_universe_authority_still_consumes_an_attempt(tmp_path: Path) -> None:
-    """竞价全集没发出来时那一轮也算「试过」，否则次数永远用不完，失败也就永远留不下。"""
+def test_a_missing_universe_authority_never_consumes_an_attempt(tmp_path: Path) -> None:
+    """竞价全集读不出来时**每一轮都再试**，不烧尝试次数（复核 SF-2）。
+
+    改动前计数放在读权威之前，于是「全集晚发了十分钟」会直接报销掉当天仅有的三次预算。
+    「今天一次都没发出去」这件事由 `capture_missed` 留痕（复核 SF-3），不必靠烧掉次数来换。
+    """
 
     adapter = _Adapter()
     clock = _Clock(at(9, 31))
@@ -504,7 +545,8 @@ def test_a_missing_universe_authority_still_consumes_an_attempt(tmp_path: Path) 
         clock=clock,
     )(_manifest(tmp_path, universe=False))
 
-    for moment in (at(9, 31), at(9, 38), at(9, 45)):
+    #: 窗内每一轮都抛，抛多少轮都不消耗次数
+    for moment in (at(9, 31), at(9, 32), at(9, 33), at(9, 40), at(9, 44)):
         clock.now = moment
         with pytest.raises(Exception):  # noqa: B017 - 具体类型由权威加载器决定
             step()
@@ -513,7 +555,24 @@ def test_a_missing_universe_authority_still_consumes_an_attempt(tmp_path: Path) 
     result = step()
 
     assert adapter.calls == []
-    assert "capture_failed" in result.degraded_reasons
+    #: 一次请求都没发出去，所以是「没采成」不是「试过都没成」
+    assert "capture_missed" in result.degraded_reasons
+    assert "capture_failed" not in result.degraded_reasons
+
+
+def test_a_window_that_passes_without_any_attempt_is_capture_missed(tmp_path: Path) -> None:
+    """role 整个窗口都没起来（宕机 / 部署 / watchdog），心跳也必须说得出来（复核 SF-3）。"""
+
+    adapter = _Adapter()
+    step = auction_match_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: at(10, 0),
+    )(_manifest(tmp_path))
+
+    result = step()
+
+    assert adapter.calls == []
+    assert "capture_missed" in result.degraded_reasons
 
 
 def test_an_idle_day_reports_nothing_at_all(tmp_path: Path) -> None:
