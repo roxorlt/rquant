@@ -13,6 +13,7 @@ from rquant.runtime_service_control import (
     RuntimeServiceStatus,
 )
 from rquant.runtime_serving_snapshot import (
+    DEFAULT_OPTIONAL_SOURCE_DATASETS,
     LAB_JOBS_DATASET_ID,
     PAPER_ACCOUNTS_DATASET_ID,
     PROMOTIONS_DATASET_ID,
@@ -21,6 +22,7 @@ from rquant.runtime_serving_snapshot import (
     REFERENCE_SLOW_DATASET_ID,
     RUNTIME_HEALTH_DATASET_ID,
     SIGNALS_DATASET_ID,
+    UNAVAILABLE_EVIDENCE_INSTANT,
     LabJobsPayload,
     PaperAccountsPayload,
     PromotionsPayload,
@@ -108,7 +110,7 @@ def _assembler(
     signal_result: SourceReadResult | None = None,
     paper_result: SourceReadResult | None = None,
     runtime_result: SourceReadResult | None = None,
-    fail_closed: bool = True,
+    optional_datasets: frozenset[str] = DEFAULT_OPTIONAL_SOURCE_DATASETS,
 ) -> ServingSnapshotAssembler:
     return ServingSnapshotAssembler(
         signal_reader=lambda _as_of: (
@@ -156,7 +158,7 @@ def _assembler(
             ),
             generation_character="7",
         ),
-        fail_closed=fail_closed,
+        optional_datasets=optional_datasets,
     )
 
 
@@ -323,27 +325,147 @@ def test_page_projection_is_bound_to_the_verified_owner_generation() -> None:
     assert projection.owner_generation_id == "7" * 64
 
 
-def test_reader_failure_is_fail_closed_or_explicitly_unavailable() -> None:
-    def failed_reader(_as_of: datetime) -> SourceReadResult:
-        raise OSError("runtime heartbeat unavailable")
+def _failing_reader(message: str):
+    def reader(_as_of: datetime) -> SourceReadResult:
+        raise OSError(message)
 
-    closed = _assembler()
-    object.__setattr__(closed, "runtime_health_reader", failed_reader)
-    with pytest.raises(RuntimeError, match="runtime_health reader failed"):
-        closed.assemble(NOW)
+    return reader
 
-    open_assembler = _assembler(fail_closed=False)
-    object.__setattr__(open_assembler, "runtime_health_reader", failed_reader)
-    snapshot = open_assembler.assemble(NOW)
-    watermark = next(
-        item for item in snapshot.watermarks if item.dataset_id == RUNTIME_HEALTH_DATASET_ID
-    )
+
+@pytest.mark.parametrize(
+    ("dataset_id", "attribute"),
+    [
+        (SIGNALS_DATASET_ID, "signal_reader"),
+        (PAPER_ACCOUNTS_DATASET_ID, "paper_accounts_reader"),
+        (RUNTIME_HEALTH_DATASET_ID, "runtime_health_reader"),
+    ],
+)
+def test_a_source_outside_the_optional_set_still_refuses_the_whole_round(
+    dataset_id: str,
+    attribute: str,
+) -> None:
+    """The half of #283 that must not move.
+
+    Criterion (3b) reads "no signal travelled today" off an empty `signals` table, and
+    that reading is worth something only while a `signals` reader that cannot be read
+    refuses the round instead of publishing the same empty table. The same holds for the
+    paper accounts and the runtime health a heartbeat is judged by.
+    """
+
+    assembler = _assembler()
+    object.__setattr__(assembler, attribute, _failing_reader("owner store unavailable"))
+
+    with pytest.raises(RuntimeError, match=f"{dataset_id} reader failed"):
+        assembler.assemble(NOW)
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "attribute"),
+    [
+        (LAB_JOBS_DATASET_ID, "lab_jobs_reader"),
+        (PROMOTIONS_DATASET_ID, "promotions_reader"),
+    ],
+)
+def test_an_absent_research_source_degrades_to_an_empty_payload(
+    dataset_id: str,
+    attribute: str,
+) -> None:
+    """#283: the research plane has published nothing, and serving still cuts a generation."""
+
+    assembler = _assembler()
+    object.__setattr__(assembler, attribute, _failing_reader("research authority is unavailable"))
+
+    snapshot = assembler.assemble(NOW)
+    watermark = next(item for item in snapshot.watermarks if item.dataset_id == dataset_id)
 
     assert watermark.status is FreshnessStatus.UNAVAILABLE
-    assert watermark.reason == "OSError: runtime heartbeat unavailable"
-    assert watermark.event_time == NOW
-    assert watermark.published_at == NOW
-    assert snapshot.read_model.runtime_services == ()
+    assert watermark.reason == "OSError: research authority is unavailable"
+    assert snapshot.source_generations[dataset_id] == watermark.generation_id
+    assert snapshot.read_model.lab_jobs == ()
+    assert snapshot.read_model.promotions == ()
+    #: the four that did answer are untouched, so the generation still carries them
+    assert snapshot.read_model.observed_at == NOW
+
+
+def test_an_absent_source_puts_no_clock_in_the_generation_it_contributes() -> None:
+    """The half of #283 that keeps #271 alive.
+
+    `_generation_already_current` compares source generations and watermarks for
+    equality, so an identity carrying `as_of` would have handed the publisher a different
+    source every thirty seconds and made it rebuild `serving.duckdb` for as long as the
+    research plane stayed away. An absent source has no evidence and therefore no instant
+    of its own; what it contributes is a function of which source it is and why it
+    refused.
+    """
+
+    assembler = _assembler()
+    object.__setattr__(
+        assembler,
+        "lab_jobs_reader",
+        _failing_reader("research authority is unavailable"),
+    )
+
+    first = assembler.assemble(NOW)
+    later = assembler.assemble(NOW + timedelta(seconds=30))
+
+    def watermark_of(snapshot, dataset_id: str):
+        return next(item for item in snapshot.watermarks if item.dataset_id == dataset_id)
+
+    absent_first = watermark_of(first, LAB_JOBS_DATASET_ID)
+    absent_later = watermark_of(later, LAB_JOBS_DATASET_ID)
+
+    assert absent_first == absent_later, "an absent source moved between two iterations"
+    assert absent_first.event_time == UNAVAILABLE_EVIDENCE_INSTANT
+    assert absent_first.published_at == UNAVAILABLE_EVIDENCE_INSTANT
+    assert first.source_generations[LAB_JOBS_DATASET_ID] == (
+        later.source_generations[LAB_JOBS_DATASET_ID]
+    )
+
+    #: and it is still an identity, not a constant: a different refusal is a different
+    #: source, which is what makes the publisher rebuild when the reason really changes
+    other = _assembler()
+    object.__setattr__(other, "lab_jobs_reader", _failing_reader("authority is corrupt"))
+    assert other.assemble(NOW).source_generations[LAB_JOBS_DATASET_ID] != (
+        first.source_generations[LAB_JOBS_DATASET_ID]
+    )
+
+
+def test_reference_slow_can_never_be_made_optional() -> None:
+    """`ReferenceSlowPayload` is the one payload with no legal empty value.
+
+    Every field it carries is required -- the reference generation id, the revision, the
+    price and adjustment basis a consumer prices against -- so "degraded" could only mean
+    an invented basis in the evidence the serving row quotes. Refused where a profile
+    asks for it, and refused again at the read, so removing either guard is visible.
+    """
+
+    with pytest.raises(ValueError, match="reference_slow_authority can never be"):
+        _assembler(
+            optional_datasets=DEFAULT_OPTIONAL_SOURCE_DATASETS
+            | {REFERENCE_SLOW_AUTHORITY_DATASET_ID}
+        )
+
+    smuggled = _assembler()
+    object.__setattr__(
+        smuggled,
+        "optional_datasets",
+        DEFAULT_OPTIONAL_SOURCE_DATASETS | {REFERENCE_SLOW_AUTHORITY_DATASET_ID},
+    )
+    object.__setattr__(
+        smuggled,
+        "reference_slow_reader",
+        _failing_reader("reference authority is unavailable"),
+    )
+    with pytest.raises(RuntimeError, match="reference_slow_authority reader failed"):
+        smuggled.assemble(NOW)
+
+
+def test_optional_datasets_must_name_sources_this_assembler_reads() -> None:
+    with pytest.raises(TypeError, match="optional_datasets must be a frozenset"):
+        _assembler(optional_datasets={"lab_jobs"})  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="never reads"):
+        _assembler(optional_datasets=frozenset({"lab_jobs", "reference_slow"}))
 
 
 def test_nonfresh_source_requires_reason_and_is_preserved() -> None:

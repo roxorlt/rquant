@@ -7,7 +7,9 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.runtime_builder_serving import (
+    DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ServingReferenceSlowEvidence,
+    ServingRuntimeSettings,
     ServingRuntimeSnapshot,
     serving_publisher_builder,
 )
@@ -168,7 +170,17 @@ def _authority_result(
     return SourceReadResult.model_validate(values)
 
 
-def _authority_settings(tmp_path: Path) -> tuple[dict[str, object], dict[str, Path]]:
+def _authority_settings(
+    tmp_path: Path,
+    *,
+    unpublished: frozenset[str] = frozenset(),
+) -> tuple[dict[str, object], dict[str, Path]]:
+    """The six owner authorities, minus any the caller says never published.
+
+    An authority root that was never written is exactly what the host shows for the two
+    research datasets: the settings still name it, and the read is what finds nothing.
+    """
+
     payloads = {
         SIGNALS_DATASET_ID: SignalDeliveryPayload(),
         PAPER_ACCOUNTS_DATASET_ID: PaperAccountsPayload(),
@@ -182,6 +194,8 @@ def _authority_settings(tmp_path: Path) -> tuple[dict[str, object], dict[str, Pa
     roots = {dataset_id: tmp_path / "authorities" / dataset_id for dataset_id in payloads}
     (tmp_path / "authorities").mkdir(parents=True)
     for dataset_id, payload in payloads.items():
+        if dataset_id in unpublished:
+            continue
         ServingSourceAuthorityPublisher(
             root=roots[dataset_id],
             producer_commit=COMMIT,
@@ -391,6 +405,136 @@ def test_default_builder_reads_five_dynamic_owner_authorities(tmp_path: Path) ->
     assert second.source_generations[SIGNALS_DATASET_ID] == updated.generation_id
     assert second.input_sequence == 2
     assert second.output_sequence == 2
+
+
+def test_the_research_sources_are_optional_by_default_and_reference_slow_never_is() -> None:
+    """What a manifest written before #283 gets, and what no manifest may ask for."""
+
+    inherited = ServingRuntimeSettings(serving_root=Path("/srv/serving"), schema_version=3)
+    assert inherited.optional_source_datasets == tuple(sorted(DEFAULT_OPTIONAL_SOURCE_DATASETS))
+
+    with pytest.raises(ValidationError, match="reference_slow_authority can never be"):
+        ServingRuntimeSettings(
+            serving_root=Path("/srv/serving"),
+            schema_version=3,
+            optional_source_datasets=(LAB_JOBS_DATASET_ID, REFERENCE_SLOW_AUTHORITY_DATASET_ID),
+        )
+
+    with pytest.raises(ValidationError, match="not owner datasets"):
+        ServingRuntimeSettings(
+            serving_root=Path("/srv/serving"),
+            schema_version=3,
+            optional_source_datasets=(REFERENCE_SLOW_DATASET_ID,),
+        )
+
+    with pytest.raises(ValidationError, match="duplicate"):
+        ServingRuntimeSettings(
+            serving_root=Path("/srv/serving"),
+            schema_version=3,
+            optional_source_datasets=(LAB_JOBS_DATASET_ID, LAB_JOBS_DATASET_ID),
+        )
+
+    #: a profile may still tighten the rule back to nothing, which is what the day the
+    #: research plane publishes looks like
+    tightened = ServingRuntimeSettings(
+        serving_root=Path("/srv/serving"),
+        schema_version=3,
+        optional_source_datasets=(),
+    )
+    assert tightened.optional_source_datasets == ()
+
+
+def test_serving_publishes_while_the_research_authorities_have_never_published(
+    tmp_path: Path,
+) -> None:
+    """#283 through the real builder: four sources answer, two were never written.
+
+    This is the host as it stands -- `research/serving-authorities/lab-jobs` and
+    `.../promotions` hold no generation at all -- and before this the six fail-closed
+    reads meant serving cut nothing, so criterion (3b) could not be read on a day the
+    signal chain worked.
+    """
+
+    absent = frozenset({LAB_JOBS_DATASET_ID, PROMOTIONS_DATASET_ID})
+    settings, roots = _authority_settings(tmp_path, unpublished=absent)
+    assert not roots[LAB_JOBS_DATASET_ID].exists()
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
+        _manifest(tmp_path, settings=settings)
+    )
+
+    result = step()
+
+    assert result.generation_published is True
+    assert (tmp_path / "serving" / "current.json").is_file()
+    assert sorted(result.degraded_reasons) == [
+        "serving:lab_jobs:unavailable:ServingSourceAuthorityUnavailableError: "
+        "current authority is unavailable",
+        "serving:promotions:unavailable:ServingSourceAuthorityUnavailableError: "
+        "current authority is unavailable",
+    ]
+    #: and the four that did answer are still bound to their own evidence -- only the
+    #: two named above were degraded
+    assert result.source_generations[REFERENCE_SLOW_DATASET_ID] == REFERENCE_GENERATION
+    assert result.source_generations[LAB_JOBS_DATASET_ID] != (
+        result.source_generations[PROMOTIONS_DATASET_ID]
+    )
+
+
+@pytest.mark.parametrize(
+    "dataset_id",
+    [SIGNALS_DATASET_ID, RUNTIME_HEALTH_DATASET_ID, REFERENCE_SLOW_AUTHORITY_DATASET_ID],
+)
+def test_a_source_outside_the_optional_set_stops_the_whole_round(
+    tmp_path: Path,
+    dataset_id: str,
+) -> None:
+    """The negative half of #283, at the builder: only the two research sources degrade."""
+
+    settings, _roots = _authority_settings(tmp_path, unpublished=frozenset({dataset_id}))
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
+        _manifest(tmp_path, settings=settings)
+    )
+
+    with pytest.raises(RuntimeError, match=f"{dataset_id} reader failed"):
+        step()
+
+    assert not (tmp_path / "serving" / "current.json").exists()
+
+
+def test_sixty_idle_steps_with_the_research_plane_absent_leave_one_generation(
+    tmp_path: Path,
+) -> None:
+    """The #283 degrade must not undo #271.
+
+    An unavailable source used to stamp `as_of` into its generation id and its watermark,
+    so a source that stayed away handed the publisher a different input on every
+    iteration -- `_generation_already_current` compares both for equality -- and serving
+    would have rebuilt, hashed, fsynced and re-pointed `serving.duckdb` every thirty
+    seconds for as long as the research plane did not run. The evidence is the directory
+    itself: thirty minutes of iterations, byte for byte unchanged.
+    """
+
+    from tests.runtime_readonly_sandbox import tree_state
+
+    absent = frozenset({LAB_JOBS_DATASET_ID, PROMOTIONS_DATASET_ID})
+    settings, _roots = _authority_settings(tmp_path, unpublished=absent)
+    clock = [NOW]
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: clock[0])(
+        _manifest(tmp_path, settings=settings)
+    )
+    serving_root = tmp_path / "serving"
+
+    first = step()
+    assert first.generation_published is True
+    settled = tree_state(serving_root)
+
+    published = []
+    for iteration in range(1, 61):
+        clock[0] = NOW + timedelta(seconds=30 * iteration)
+        published.append(step().generation_published)
+
+    assert published == [False] * 60
+    assert tree_state(serving_root) == settled, "serving rewrote itself while a source was absent"
 
 
 def test_reference_revision_publishes_new_generation_and_keeps_old_readable(
