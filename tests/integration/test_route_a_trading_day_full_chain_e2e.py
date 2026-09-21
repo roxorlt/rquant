@@ -1513,6 +1513,13 @@ def serving_signal_rows(route: RouteAWorld, *, session: date | None = TRADE_DATE
             #: empty frame, so DuckDB has no rows to infer from and types `event_time`
             #: `INTEGER` rather than `TIMESTAMP WITH TIME ZONE`, and comparing it with an
             #: instant is a binder error. Zero rows in total is zero rows in any session.
+            #:
+            #: **This guard is load-bearing, not an optimisation.** Delete it and
+            #: `test_the_shipped_profile_stops_the_signal_at_the_paper_broker` fails with
+            #: `Binder Error: Cannot compare values of type INTEGER and type TIMESTAMP
+            #: WITH TIME ZONE`, because a paused notifier is exactly the case that leaves
+            #: this table empty. The operator command in the package report spells the
+            #: same rule `TRY_CAST(event_time AS TIMESTAMPTZ)` for the same reason.
             return total
         #: the session opens at 09:15 local, before the auction, so the bound catches
         #: everything the day produced and nothing the day before did

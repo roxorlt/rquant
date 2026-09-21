@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -1436,3 +1437,60 @@ def test_a_reader_with_no_publication_lock_fails_closed_by_name(tmp_path: Path) 
     message = str(refusal.value)
     assert str(lock_path) in message, message
     assert "reference_slow_publisher" in message, message
+
+
+@pytest.mark.parametrize("swapped_in", [errno.ELOOP, errno.ENOTDIR])
+def test_a_lock_swapped_in_between_the_two_opens_is_raised_as_itself(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swapped_in: int,
+) -> None:
+    """A reader must not rename an integrity refusal into "the publisher has not run".
+
+    The reader opens the lock `O_RDONLY | O_NOFOLLOW` and falls through to the create path
+    only on `FileNotFoundError`. So reaching the second open means the lock was absent a
+    moment ago and something is there now. With `O_NOFOLLOW` a symlink comes back `ELOOP`,
+    and a parent segment that stopped being a directory comes back `ENOTDIR`. Renaming
+    either into `ReferenceDataUnavailableError` would hide the one thing `O_NOFOLLOW`
+    exists to catch -- the fail-closed rule package Y's review settled: tampering keeps
+    raising, only shape and timing may be renamed.
+
+    This is a genuine race between two syscalls, so it is arranged at `os.open` rather
+    than on disk: planting a symlink beforehand is seen by the *first* open and never
+    reaches the branch under test. Only opens of the lock file are intercepted; every
+    other open in the read path, the database included, is the real one.
+    """
+
+    registry = _registry(tmp_path)
+    registry.append(_record())
+    published = registry.publish(published_at=BASE + timedelta(hours=2))
+    lock_path = registry.path.with_name(f".{registry.path.name}.publication.lock")
+    lock_path.unlink()
+
+    real_open = os.open
+    attempts: list[int] = []
+
+    def open_with_a_swap(path, flags, mode=0o777, **kwargs):  # type: ignore[no-untyped-def]
+        if Path(path) != lock_path:
+            return real_open(path, flags, mode, **kwargs)
+        attempts.append(flags)
+        if len(attempts) == 1:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        raise OSError(swapped_in, os.strerror(swapped_in), str(path))
+
+    monkeypatch.setattr(registry_module.os, "open", open_with_a_swap)
+
+    readonly = ReadonlyReferenceRegistry(registry.path)
+    with pytest.raises(OSError) as refusal:
+        readonly.as_of(
+            dataset_id=ReferenceDataset.ST_STATUS,
+            key="600000.SH",
+            event_time=BASE + timedelta(days=1),
+            decision_time=BASE + timedelta(hours=3),
+            generation_id=published.generation_id,
+        )
+
+    #: both opens were tried, and the second one is the one that decided the outcome
+    assert len(attempts) == 2, attempts
+    assert not isinstance(refusal.value, ReferenceDataUnavailableError), refusal.value
+    assert refusal.value.errno == swapped_in, refusal.value

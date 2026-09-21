@@ -818,6 +818,16 @@ class ReferenceRegistry:
         except OSError as exc:
             if exclusive:
                 raise
+            #: Only "the publisher has not run" is renamed. Reaching here at all means the
+            #: `O_RDONLY | O_NOFOLLOW` open above raised `FileNotFoundError` and something
+            #: then appeared at that path between the two opens: with `O_NOFOLLOW` a
+            #: symlink is `ELOOP`, and a parent segment that is no longer a directory is
+            #: `ENOTDIR`. Those are integrity conditions -- the shape package Y's review
+            #: requires to keep raising -- and calling a symlink swapped in underneath us
+            #: "this registry has no publication lock" would hide exactly what the
+            #: `O_NOFOLLOW` is there to catch. They are re-raised as themselves.
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise
             raise ReferenceDataUnavailableError(
                 "reference registry has no publication lock and this reader cannot create "
                 f"one: {self._publication_lock_path}. Its publisher "
