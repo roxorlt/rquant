@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-09-21 · 待安装 · rquant/live slice MemoryHigh 二次提额（#268、#271）
+
+**状态**：**尚未安装**。两个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-21 20:17 经
+owner 授权，用 `systemctl set-property` 在生产主机临时生效（`rquant.slice` 11264M→12288M、
+`rquant-live.slice` 7680M→9216M），持久化落在 `/etc/systemd/system.control/` 下的 drop-in；
+本条只是把同样的值写回 checked-in 的 slice 文件，还没有装到服务器上。`rquant-live-runtime.slice`
+（4096M）与 `rquant-serving.slice`（1536M）本次不变。
+
+背景：2026-09-21 验收日 live 面峰值 7,634 MiB 顶着刚改完的 7,680 MiB 上限（17:00 daily 期间
+runtime 3,401 MiB + daily ≈ 4.2 GiB），父面峰值 10,763 MiB 顶着 11,264 MiB 上限（15 分钟一次的
+备份期间，含维护页缓存）；`memory.high` 是节流阈值不是预留量，宿主机 15.7 GiB、非 rQuant 服务
+约 1.2 GiB，12,288 MiB 之外仍留 ≥ 3.4 GB。
+
+**装机前必须先清掉 drop-in**，否则文件改了不生效（drop-in 优先级更高）：
+
+```bash
+ls /etc/systemd/system.control/rquant*.slice.d/
+sudo systemctl revert rquant.slice rquant-live.slice
+sudo systemctl daemon-reload
+```
+
+装完之后 `systemctl cat <slice>` 应只看到 checked-in 文件里的这一份 `MemoryHigh`，
+`/etc/systemd/system.control/` 下不应再留 rquant 相关目录。
+
+**回滚**：与其他只改 `deploy/systemd/` 的记录一样，`scripts/deploy-production.sh
+--target <上一个 tag>` 即可；两个数值没有数据副作用，回滚不需要额外挪状态。
+
+---
+
 ## 2026-09-20 · 待安装 · live/serving slice MemoryHigh 提额（#268、#271）
 
 **状态**：**尚未安装**。四个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-20 经 owner
