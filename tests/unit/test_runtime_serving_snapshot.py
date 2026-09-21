@@ -22,6 +22,7 @@ from rquant.runtime_serving_snapshot import (
     REFERENCE_SLOW_DATASET_ID,
     RUNTIME_HEALTH_DATASET_ID,
     SIGNALS_DATASET_ID,
+    SOURCE_DATASET_IDS,
     UNAVAILABLE_EVIDENCE_INSTANT,
     LabJobsPayload,
     PaperAccountsPayload,
@@ -417,17 +418,15 @@ def test_an_absent_source_puts_no_clock_in_the_generation_it_contributes() -> No
     assert absent_first == absent_later, "an absent source moved between two iterations"
     assert absent_first.event_time == UNAVAILABLE_EVIDENCE_INSTANT
     assert absent_first.published_at == UNAVAILABLE_EVIDENCE_INSTANT
-    assert first.source_generations[LAB_JOBS_DATASET_ID] == (
-        later.source_generations[LAB_JOBS_DATASET_ID]
-    )
+    absent_generation = first.source_generations[LAB_JOBS_DATASET_ID]
+    assert absent_generation == later.source_generations[LAB_JOBS_DATASET_ID]
 
     #: and it is still an identity, not a constant: a different refusal is a different
     #: source, which is what makes the publisher rebuild when the reason really changes
     other = _assembler()
     object.__setattr__(other, "lab_jobs_reader", _failing_reader("authority is corrupt"))
-    assert other.assemble(NOW).source_generations[LAB_JOBS_DATASET_ID] != (
-        first.source_generations[LAB_JOBS_DATASET_ID]
-    )
+    other_generation = other.assemble(NOW).source_generations[LAB_JOBS_DATASET_ID]
+    assert other_generation != absent_generation
 
 
 def test_reference_slow_can_never_be_made_optional() -> None:
@@ -458,6 +457,28 @@ def test_reference_slow_can_never_be_made_optional() -> None:
     )
     with pytest.raises(RuntimeError, match="reference_slow_authority reader failed"):
         smuggled.assemble(NOW)
+
+
+def test_the_six_owner_datasets_are_named_in_one_place() -> None:
+    """The guards read one list; the module's own constants must agree with it.
+
+    `SOURCE_DATASET_IDS` is `runtime_builder_serving`'s payload-kind mapping, so the
+    assembler's construction check and the settings validator cannot drift apart. What
+    that does not cover is the six id *strings* this module also spells out, so they are
+    compared here. The third place a dataset id is written -- a profile's
+    `source_authorities` -- carries a root per entry and cannot be derived; it is checked
+    against the same mapping by `ServingRuntimeSettings.validate_source_authorities`.
+    """
+
+    assert {
+        SIGNALS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        RUNTIME_HEALTH_DATASET_ID,
+        LAB_JOBS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+        REFERENCE_SLOW_AUTHORITY_DATASET_ID,
+    } == SOURCE_DATASET_IDS
+    assert DEFAULT_OPTIONAL_SOURCE_DATASETS < SOURCE_DATASET_IDS
 
 
 def test_optional_datasets_must_name_sources_this_assembler_reads() -> None:

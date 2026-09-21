@@ -147,6 +147,15 @@ _SOURCE_PAYLOAD_KINDS = {
     _REFERENCE_SLOW_AUTHORITY_DATASET_ID: "reference_slow",
 }
 
+#: The one list of owner datasets serving reads. Both guards that have to name the six
+#: derive from here -- `ServingRuntimeSettings.validate_optional_source_datasets` above,
+#: and `ServingSnapshotAssembler`'s construction check, which imports this name. A
+#: profile's `source_authorities` cannot be derived (each entry carries its own root),
+#: but it is checked against the same mapping by `validate_source_authorities`, so a
+#: seventh source added in one place and missed in another is refused rather than
+#: silently leaving the two guards out of step.
+SERVING_SOURCE_DATASET_IDS: frozenset[str] = frozenset(_SOURCE_PAYLOAD_KINDS)
+
 
 class ServingReferenceSlowEvidence(RuntimeContractModel):
     reference_generation_id: GenerationId

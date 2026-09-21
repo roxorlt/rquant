@@ -475,9 +475,8 @@ def test_serving_publishes_while_the_research_authorities_have_never_published(
     #: and the four that did answer are still bound to their own evidence -- only the
     #: two named above were degraded
     assert result.source_generations[REFERENCE_SLOW_DATASET_ID] == REFERENCE_GENERATION
-    assert result.source_generations[LAB_JOBS_DATASET_ID] != (
-        result.source_generations[PROMOTIONS_DATASET_ID]
-    )
+    absent = result.source_generations
+    assert absent[LAB_JOBS_DATASET_ID] != absent[PROMOTIONS_DATASET_ID]
 
 
 def test_the_manifest_decides_which_sources_are_optional_not_the_default(

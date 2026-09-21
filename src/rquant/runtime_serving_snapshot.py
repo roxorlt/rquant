@@ -22,6 +22,7 @@ from rquant.experiment_registry import PromotionDecision
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
+    SERVING_SOURCE_DATASET_IDS,
     ServingReferenceSlowEvidence,
     ServingRuntimeSnapshot,
 )
@@ -52,16 +53,9 @@ REFERENCE_SLOW_AUTHORITY_DATASET_ID = "reference_slow_authority"
 REFERENCE_SLOW_DATASET_ID = "reference_slow"
 REFERENCE_SLOW_CONTRACT_DATASET_ID = "reference_slow_contract"
 
-SOURCE_DATASET_IDS: frozenset[str] = frozenset(
-    {
-        SIGNALS_DATASET_ID,
-        PAPER_ACCOUNTS_DATASET_ID,
-        RUNTIME_HEALTH_DATASET_ID,
-        LAB_JOBS_DATASET_ID,
-        PROMOTIONS_DATASET_ID,
-        REFERENCE_SLOW_AUTHORITY_DATASET_ID,
-    }
-)
+#: Not a second copy of the six: the owner datasets are named once, by
+#: `runtime_builder_serving._SOURCE_PAYLOAD_KINDS`, and both guards read that one list.
+SOURCE_DATASET_IDS: frozenset[str] = SERVING_SOURCE_DATASET_IDS
 
 #: What an unavailable source stamps on its watermark instead of the clock. It is before
 #: any evidence this system can hold, which is the truthful reading of "there is nothing
