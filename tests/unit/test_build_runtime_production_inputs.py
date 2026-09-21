@@ -84,6 +84,10 @@ def _argv(tmp_path: Path, **overrides: str) -> list[str]:
         "--checkout": str(generator._REPOSITORY_ROOT),
         "--producer-commit": COMMIT,
         "--calendar-database": str(tmp_path / "calendar.duckdb"),
+        #: #278：默认值已经改成墙钟，确定性现在由显式传这一项提供。生产复核者重跑装机文档
+        #: 时传的也是这一项（原来的默认值是 `trade_calendar.updated_at`，而生产那张表最后
+        #: 一次刷新停在 2026-07-14，封存候选文档因此永远是那一天的）。
+        "--generated-at": CALENDAR_UPDATED_AT.isoformat(),
         "--output-root": str(data_root / "runtime-inputs"),
         "--inputs-output": str(data_root / "runtime-production-inputs.json"),
         "--runtime-root": str(data_root / "runtime"),
@@ -160,6 +164,33 @@ def test_rerunning_the_generator_reproduces_every_byte(tmp_path: Path) -> None:
     second["inputs"] = (tmp_path / "data" / "runtime-production-inputs.json").read_bytes()
 
     assert first == second
+
+
+def test_without_an_explicit_instant_the_generator_takes_the_wall_clock(tmp_path: Path) -> None:
+    """#278：默认值不再是 `trade_calendar.updated_at`。
+
+    生产副本上那张表最后一次刷新是 2026-07-14 18:13，于是每一次装机生成的日历都自称生成于
+    七月，封存候选文档也停在 2026-07-14——而盘中 loader 要的是当日。
+    """
+
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+    argv = [item for item in _argv(tmp_path) if item != "--generated-at"]
+    argv = [item for item in argv if item != CALENDAR_UPDATED_AT.isoformat()]
+    before = datetime.now(UTC)
+
+    assert generator.main(argv) == 0
+
+    inputs = load_production_runtime_profile_inputs(
+        tmp_path / "data" / "runtime-production-inputs.json",
+        expected_commit=COMMIT,
+    )
+    calendar = load_market_calendar_authority(
+        inputs.market_calendar_authority_path,
+        expected_commit=COMMIT,
+    )
+
+    assert calendar.generated_at != CALENDAR_UPDATED_AT
+    assert before <= calendar.generated_at <= datetime.now(UTC)
 
 
 def test_every_generated_document_carries_the_mode_its_loader_demands(generated: Path) -> None:
