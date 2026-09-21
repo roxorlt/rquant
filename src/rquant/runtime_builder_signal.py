@@ -394,10 +394,17 @@ def _active_outbox_count(store: SignalBusStore) -> int:
     return sum(record.status in _ACTIVE_OUTBOX_STATUSES for record in store.outbox_records())
 
 
-def _shadow_transport(
+def _shadow_providers(
     providers: Mapping[DeliveryChannel, NotificationProvider],
 ) -> Mapping[DeliveryChannel, NotificationProvider]:
-    """Every channel's provider replaced by the shadow transport, the registry kept.
+    """Every channel's provider replaced by the suppressing one, the registry kept.
+
+    It is the **provider** that is swapped, not the transport under it. Replacing the
+    transport would mean handing one to `build_environment_notification_provider_loader`,
+    and a loader given an external transport skips `_require_https_endpoint`
+    (`runtime_notification_providers.py`), so the endpoint check the production loader
+    performs would stop happening in shadow -- less faithful, not more. The heartbeat
+    reason keeps the name `notifier:shadow_transport`, which is what an operator reads.
 
     #281, risk (g): what the loader built stays built. The credential is read, the
     recipient ids are resolved, the alias migration contract and the preflight verdict are
@@ -1180,7 +1187,7 @@ def notifier_builder(
             )
             loaded_providers = resolved_provider_loader()
             if settings.suppress_delivery:
-                loaded_providers = _shadow_transport(loaded_providers)
+                loaded_providers = _shadow_providers(loaded_providers)
             recipient_migration = None
             inferred_channels: tuple[DeliveryChannel, ...] = ()
             from rquant.runtime_notification_providers import (
