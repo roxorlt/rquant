@@ -176,18 +176,30 @@
      批次、`degraded_reasons` 带 `validation_failed:<原话>`，与 `source_error:` 那一支同形。
      校验本身一条没放宽——`normalize_frame` 照旧逐条拒绝。
   4. **采集窗写死在 09:26-09:30、三次重试挤在七秒里、早退分支用那份从未被写过的初始结果把
-     心跳洗干净**。现在窗由 `capture_start` / `capture_end` 配置（**临时默认 09:31-09:45**，
-     首次可用时刻由主机探测给出后再改，顺序见 DEPLOY.md），`max_attempts` 次尝试按
-     `retry_interval_seconds`（留空则由窗宽推出，三次就是 09:31 / 09:38 / 09:45）摊在整个窗里；
-     当天尝试耗尽、或窗过去而试过仍无批次时，心跳一直带 `degraded_reasons=("capture_failed", …)`
-     直到交易日切换。尝试计数前移到读竞价全集之前，否则「全集没发布」那一类失败永远耗不尽次数。
-     **边界如实记下**：这面旗子活在进程内存里，role 重启之后心跳不再复述当天的失败（落盘的
-     DEGRADED 批次与 `quota.sqlite3` 的尝试记录仍在）。
+     心跳洗干净**。现在窗由 `AUCTION_MATCH_DEFAULT_CAPTURE_START` / `..._END` 两个常量给出
+     （**临时默认 09:31-09:45**，首次可用时刻由主机探测给出后再改——**定窗只有改代码常量
+     这一条路**，顺序与时间预算见 DEPLOY.md），`max_attempts` 次尝试按 `窗宽 // max_attempts`
+     摊在整个窗里（默认 280 秒 ⇒ 09:31:00 / 09:35:40 / 09:40:20）。
+     **除的是 `max_attempts` 不是 `max_attempts - 1`**：后者会让最后一次的到期时刻正好等于
+     窗口右界，而闸门是「过了右界就整轮空转」，于是 2 秒轮询下有一半的相位永远拿不到第三次
+     尝试——被吃掉的恰恰是为「数据晚到」准备的那一次（独立复核 MF-1 实测）。设置模型另加一条
+     校验：所有尝试必须落在 `[capture_start, capture_end)` 内，显式给的 `retry_interval_seconds`
+     与窗宽对不上会被当场拒绝。
+     当天尝试耗尽、或窗过去而试过仍无批次时，心跳一直带 `capture_failed` 直到交易日切换；
+     **窗过去而一次请求都没发出去**（role 没起来、部署、watchdog 重启，或竞价全集一直读不
+     出来）则带 `capture_missed`——两种情况分开，因为心跳必须回答得了「今天到底采没采」。
+     竞价全集读不出来时**不消耗尝试次数**，窗内每一轮都再试，直到它可读为止。
+     **边界如实记下**：这两面旗子活在进程内存里，role 重启之后心跳不再复述当天的失败；
+     落盘的 DEGRADED 批次与 `quota.sqlite3` 的尝试记录才是重启也不丢的证据，DEPLOY 的验收
+     清单以它们为准。
 
-  `candidate.auction_gap` 的装配窗随之从 09:26-09:30 移到 **09:31-09:50**，两端同样可从
-  manifest 配置。代价如实记下：`market-minute` / `watchlist-quote` 从 09:30 起就去读候选全集，
-  而当日的 auction_gap 快照最早 09:31 之后才装得出来，中间这一段两个源仍会降级——这是
-  「当天数据 09:26 还没出」这件事本身的后果，不是新引入的缺陷。
+  `candidate.auction_gap` 的装配窗随之从 09:26-09:30 移到 **09:31-09:50**，同样是代码常量。
+  两对窗口的一致性由 `auction_windows_are_consistent` 在**生产画像生成时**当场校验，
+  探测定窗时四个常量必须一起改，只改一边会让 `rquant runtime-production-profile` 直接失败。
+  代价如实记下：`market-minute` / `watchlist-quote` 从 09:30 起就去读候选全集，而当日的
+  auction_gap 快照最早在装配窗起点之后才装得出来，中间这一段两个源仍会降级（DEGRADED 不是
+  failed，不触发 `OnFailure`）——这是「当天数据 09:26 还没出」这件事本身的后果，不是新引入的
+  缺陷；**这一段的长度 = 装配窗起点 − 09:30，会随探测值线性变长**。
 
 - **候选发布者发完一代之后，窗外的每一轮都会让心跳抛「输出序号回退」（#277 连带，本包）**：
   `RuntimeServiceControl.record_success` 拒绝回退的 `output_sequence`
@@ -212,6 +224,9 @@
   `captured_at` = 生成时刻，`basis_trade_date` = 只读副本里能读到的最新那一场日线结果的日期
   （09:15 之前必然是上一场，这是这两个策略本来的口径，不是降级）。当天发过就整轮不写
   （包 V/W 的纪律）。一个 10:00 才被拉起来的发布者仍会补发今天这一份。
+  「今天开不开市」走 `decide_market_session` 而不是自己判 `open_dates`：日历覆盖不到当天时
+  带一条 `calendar_uncovered:<date>` 的降级理由，而不是安静空转（独立复核 SF-1）——顺带也
+  拿回了「日历权威生成时刻晚于 observed_at」那条防时钟回拨的护栏。
   `--generated-at` 留空时改取墙钟，不再取 `trade_calendar.updated_at`；确定性由显式传
   `--generated-at` 提供。`sealed_document` 模式保留给回放与测试，**loader 的
   `trade_date == 当日` 校验一个字没放宽**。
