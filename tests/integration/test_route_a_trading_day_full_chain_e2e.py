@@ -387,8 +387,18 @@ OFF_CHAIN_SERVING_AUTHORITIES: tuple[tuple[str, str], ...] = (
 )
 
 
-def publish_off_chain_serving_authorities(route: RouteAWorld) -> None:
-    """One published generation per off-chain serving source, through its own publisher."""
+def publish_off_chain_serving_authorities(
+    route: RouteAWorld,
+    *,
+    unpublished: frozenset[str] = frozenset(),
+) -> None:
+    """One published generation per off-chain serving source, through its own publisher.
+
+    `unpublished` leaves an authority root untouched, which is what the host actually
+    shows for the two research datasets: `research/serving-authorities/lab-jobs` and
+    `.../promotions` have never held a generation, because neither research role has run
+    (#283).
+    """
 
     from rquant.runtime_contracts import canonical_sha256
     from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
@@ -419,6 +429,8 @@ def publish_off_chain_serving_authorities(route: RouteAWorld) -> None:
         for entry in manifest.settings["source_authorities"]
     }
     for dataset_id, payload_kind in OFF_CHAIN_SERVING_AUTHORITIES:
+        if dataset_id in unpublished:
+            continue
         values: dict[str, Any] = {
             "dataset_id": dataset_id,
             "sequence": 1,
@@ -626,6 +638,8 @@ def build_trading_day_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     minute_history_parquet: bytes,
+    *,
+    unpublished_authorities: frozenset[str] = frozenset(),
 ) -> RouteAWorld:
     """Two acknowledged generations on an open day, with all four inputs real.
 
@@ -727,7 +741,7 @@ def build_trading_day_chain(
     publish_reference_generation(
         setting_of(route, CONSTRAINT_SERVICE_ID, "reference_registry_path")
     )
-    publish_off_chain_serving_authorities(route)
+    publish_off_chain_serving_authorities(route, unpublished=unpublished_authorities)
     return route
 
 
@@ -758,6 +772,47 @@ def active_notifier_chain(
 
     unpause_the_notifier(monkeypatch)
     return build_trading_day_chain(tmp_path, monkeypatch, minute_history_parquet)
+
+
+RESEARCH_PLANE_DATASETS = frozenset({"lab_jobs", "promotions"})
+
+
+@pytest.fixture
+def research_plane_absent_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minute_history_parquet: bytes,
+    delivery_recorder: _RecordingProvider,
+) -> RouteAWorld:
+    """The chain that delivers, with the research plane exactly as the host has it.
+
+    Neither `lab_jobs` nor `promotions` has ever published an authority generation there,
+    and until #283 that alone stopped serving from cutting any generation at all.
+    """
+
+    unpause_the_notifier(monkeypatch)
+    return build_trading_day_chain(
+        tmp_path,
+        monkeypatch,
+        minute_history_parquet,
+        unpublished_authorities=RESEARCH_PLANE_DATASETS,
+    )
+
+
+@pytest.fixture
+def reference_authority_absent_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minute_history_parquet: bytes,
+) -> RouteAWorld:
+    """The same world with the reference plane's serving authority missing instead."""
+
+    return build_trading_day_chain(
+        tmp_path,
+        monkeypatch,
+        minute_history_parquet,
+        unpublished_authorities=frozenset({"reference_slow_authority"}),
+    )
 
 
 def manifest_of(route: RouteAWorld, service_id: str) -> Any:
@@ -817,6 +872,29 @@ def credentials_root_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, Path]:
     return deliver_credentials(active_notifier_chain, tmp_path / "credentials", monkeypatch)
+
+
+#: One credential root per world, and never two worlds in one test: each `*_chain`
+#: fixture builds its own bundle under the same `tmp_path`, so pairing a test with the
+#: credentials of a different world builds the world twice and the second `mkdir` fails.
+@pytest.fixture
+def credentials_root_research_absent(
+    research_plane_absent_chain: RouteAWorld,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
+    return deliver_credentials(research_plane_absent_chain, tmp_path / "credentials", monkeypatch)
+
+
+@pytest.fixture
+def credentials_root_reference_absent(
+    reference_authority_absent_chain: RouteAWorld,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
+    return deliver_credentials(
+        reference_authority_absent_chain, tmp_path / "credentials", monkeypatch
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -1554,6 +1632,131 @@ def test_one_signal_travels_the_whole_chain_to_a_same_day_serving_generation(
     assert serving_signal_rows(route, session=TRADE_DATE) >= 1, (
         "serving published a generation that carries no signal for this session"
     )
+
+
+#: What an authority root that exists but holds no generation answers. The research
+#: roots are pre-created on the host (runbook C-1), so this is the refusal serving
+#: actually sees there -- "current authority is unavailable" is the other one, for a root
+#: that was never created at all.
+UNAVAILABLE_AUTHORITY_REASON = (
+    "ServingSourceAuthorityUnavailableError: current pointer is unavailable"
+)
+
+
+def test_the_chain_reaches_serving_with_the_research_plane_never_published(
+    research_plane_absent_chain: RouteAWorld,
+    credentials_root_research_absent: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Criterion (3b) on the host as it really is, research plane and all (#283).
+
+    Two of serving's six source authorities belong to roles that have never run here:
+    `research/serving-authorities/lab-jobs` and `.../promotions` hold no generation, and
+    while all six reads were fail-closed that absence cost the whole round -- not one
+    generation was cut, on a day every hop of the signal chain worked.
+
+    What is asserted is that the two halves hold at once: serving publishes the same-day
+    generation and the signal is in it, **and** the heartbeat says out loud which two
+    sources it did not have. An operator reading 5.5 of the acceptance list sees the
+    difference between "the research plane has not started" and "the signal chain is
+    broken" without opening anything else.
+    """
+
+    route = research_plane_absent_chain
+    assert publish_minute_batch(route).published is True
+    publish_candidates(route)
+
+    hops: list[Hop] = []
+    drive_the_chain(route, credentials_root_research_absent, hops=hops)
+    _print_hops(capsys, hops)
+    _assert_every_role_stayed_inside_its_unit(hops)
+
+    serving = next(hop.run for hop in hops if hop.label == "serving")
+
+    #: serving published, and the signal that travelled today is in what it published
+    assert len(serving_generations(route)) == 1, serving_generations(route)
+    assert serving_current(route) is not None
+    assert serving_signal_rows(route, session=TRADE_DATE) >= 1, (
+        "serving cut a generation that carries no signal for this session"
+    )
+
+    #: and the absence is on the heartbeat, named source by source. The list is filtered
+    #: rather than compared whole: this world degrades serving on other counts too (the
+    #: runtime health projection names the roles that have no heartbeat yet), and what
+    #: (3b) is read from is which *sources* were missing.
+    reasons = tuple(serving.heartbeat.degraded_reasons)
+    assert sorted(
+        reason
+        for reason in reasons
+        if reason.startswith(("serving:lab_jobs:", "serving:promotions:"))
+    ) == [
+        f"serving:lab_jobs:unavailable:{UNAVAILABLE_AUTHORITY_REASON}",
+        f"serving:promotions:unavailable:{UNAVAILABLE_AUTHORITY_REASON}",
+    ], reasons
+    #: and no source outside the research plane was degraded into silence
+    assert [reason for reason in reasons if reason.startswith("serving:signals:")] == [], reasons
+    #: degraded, which is a role that ran, and not failed. `run.status` is what the
+    #: instance ended on (`stopped`, since the harness runs one pass and stops it), so
+    #: the distinction is read from the heartbeat the pass wrote.
+    assert serving.heartbeat.last_error is None, serving.heartbeat.last_error
+    assert serving.heartbeat.consecutive_failures == 0
+    assert serving.heartbeat.total_successes >= 1
+    assert serving.heartbeat.last_success_at is not None
+
+
+def test_serving_still_refuses_the_round_without_the_reference_authority(
+    reference_authority_absent_chain: RouteAWorld,
+    credentials_root_reference_absent: dict[str, Path],
+) -> None:
+    """The first negative of #283: `reference_slow` is not one of the optional two.
+
+    Its payload is the only source payload with no legal empty value -- the reference
+    generation id, the revision, and the price and adjustment basis a serving row is
+    quoted on are all required -- so degrading it could only mean publishing an invented
+    basis. The round stops instead, and nothing is selected.
+    """
+
+    route = reference_authority_absent_chain
+    publish_minute_batch(route)
+    publish_candidates(route)
+
+    hops: list[Hop] = []
+    drive_the_chain(route, credentials_root_reference_absent, hops=hops)
+    serving = next(hop.run for hop in hops if hop.label == "serving")
+
+    assert serving.last_error is not None
+    assert "reference_slow_authority reader failed" in serving.last_error, serving.last_error
+    assert serving_generations(route) == (), serving_generations(route)
+    assert serving_current(route) is None
+
+
+def test_serving_still_refuses_the_round_without_the_signals_authority(
+    trading_day_chain: RouteAWorld,
+    credentials_root: dict[str, Path],
+) -> None:
+    """The second negative, and the one criterion (3b) depends on.
+
+    The notifier owns the `signals` authority, so the chain is driven without it and the
+    authority is never written. If `signals` degraded the way the research sources do,
+    serving would publish a generation with an empty `signals` table -- byte for byte the
+    same thing it publishes on a day that really produced no signal -- and (3b) would
+    stop being able to tell "nothing traded today" from "the notifier is broken".
+    """
+
+    route = trading_day_chain
+    publish_minute_batch(route)
+    publish_candidates(route)
+
+    without_the_notifier = tuple(entry for entry in CHAIN_ORDER if entry[0] != "notifier")
+    assert len(without_the_notifier) == len(CHAIN_ORDER) - 1
+    hops: list[Hop] = []
+    drive_the_chain(route, credentials_root, hops=hops, roles=without_the_notifier)
+    serving = next(hop.run for hop in hops if hop.label == "serving")
+
+    assert serving.last_error is not None
+    assert "signals reader failed" in serving.last_error, serving.last_error
+    assert serving_generations(route) == (), serving_generations(route)
+    assert serving_current(route) is None
 
 
 def test_the_shipped_profile_stops_the_signal_at_the_paper_broker(
