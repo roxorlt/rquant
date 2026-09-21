@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -20,10 +20,14 @@ from rquant.runtime_builder_candidate import (
     load_candidate_input,
     serialize_candidate_input,
 )
-from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_market_session import (
+    MarketCalendarAuthority,
+    auction_windows_are_consistent,
+)
 from rquant.runtime_service_builtin import (
     AUCTION_MATCH_DEFAULT_CAPTURE_END,
     AUCTION_MATCH_DEFAULT_CAPTURE_START,
+    AuctionMatchSourceSettings,
 )
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
@@ -583,6 +587,84 @@ def test_the_assembly_window_can_be_moved_from_the_manifest(tmp_path: Path) -> N
     step()
 
     assert calls == []
+
+
+def _auction_match_settings(tmp_path: Path, **overrides: object) -> dict[str, object]:
+    """`auction-match.source.v1` 的 manifest settings，与它自己的画像同形。
+
+    这里只需要窗口那几项能被模型校验，所以路径给的是本用例的临时目录。
+    """
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    settings: dict[str, object] = {
+        "spool_root": str(tmp_path / "auction-match"),
+        "quota_path": str(tmp_path / "auction-match" / "quota.sqlite3"),
+        "quota_units_per_window": 500,
+        "producer_version": "auction-match-source-v1",
+        "calendar_path": str(tmp_path / "calendar.json"),
+        "calendar_expected_commit": COMMIT,
+        "calendar_content_sha256": "c" * 64,
+        "universe_path": str(tmp_path / "universe.json"),
+        "max_attempts": 3,
+    }
+    settings.update(overrides)
+    return settings
+
+
+@pytest.mark.parametrize(
+    ("capture", "assembly", "consistent"),
+    [
+        #: 默认的四个常量
+        ((time(9, 31), time(9, 45)), (time(9, 31), time(9, 50)), True),
+        #: 探测把窗整体后移，两边一起改
+        ((time(9, 36), time(9, 50)), (time(9, 36), time(9, 55)), True),
+        #: 只改了采集窗，忘了装配窗——竞价链会安静地什么都不产出
+        ((time(9, 36), time(9, 50)), (time(9, 31), time(9, 50)), False),
+        #: 只改了装配窗
+        ((time(9, 31), time(9, 45)), (time(9, 36), time(9, 55)), False),
+        #: 装配窗没有留出采集之后的余量
+        ((time(9, 31), time(9, 45)), (time(9, 31), time(9, 45)), False),
+    ],
+)
+def test_the_two_window_settings_stay_bound_to_each_other(
+    tmp_path: Path,
+    capture: tuple[time, time],
+    assembly: tuple[time, time],
+    consistent: bool,
+) -> None:
+    """复核代码质量 2：两对窗口只有默认常量被绑住，manifest 设置没有。
+
+    这条用例把**设置对象里的值**（不是常量）喂给同一个判据函数，所以「操作员只改了一边」
+    这件事在两个层面上都有人看着：生产画像生成时当场拒绝（常量那一层），以及这里
+    （任何一对窗口设置那一层）。
+    """
+
+    capture_settings = AuctionMatchSourceSettings.model_validate(
+        _auction_match_settings(
+            tmp_path / "match",
+            capture_start=capture[0].isoformat(),
+            capture_end=capture[1].isoformat(),
+        )
+    )
+    assembly_settings = CandidatePublisherRuntimeSettings.model_validate(
+        dict(
+            _auction_manifest(
+                tmp_path / "gap",
+                auction_input_start=assembly[0].isoformat(),
+                auction_input_end=assembly[1].isoformat(),
+            ).settings
+        )
+    )
+
+    assert (
+        auction_windows_are_consistent(
+            capture_start=capture_settings.capture_start,
+            capture_end=capture_settings.capture_end,
+            input_start=assembly_settings.auction_input_start,
+            input_end=assembly_settings.auction_input_end,
+        )
+        is consistent
+    )
 
 
 def test_an_impossible_assembly_window_is_refused(tmp_path: Path) -> None:
@@ -1320,6 +1402,13 @@ def test_a_root_that_is_not_private_is_still_refused_at_build(tmp_path: Path) ->
 
 SESSION_TRADE_DATE = date(2026, 8, 12)
 SESSION_OPEN_DATES = (date(2026, 8, 10), date(2026, 8, 11), SESSION_TRADE_DATE)
+#: 覆盖期比开盘日宽，这样才分得清「今天不开市」与「这本日历覆盖不到今天」（复核 SF-1）
+SESSION_COVERAGE_START = date(2026, 8, 10)
+SESSION_COVERAGE_END = date(2026, 8, 16)
+#: 覆盖期内的周六：不开市，但日历回答得了
+SESSION_CLOSED_DATE = date(2026, 8, 15)
+#: 覆盖期之外：日历回答不了
+SESSION_UNCOVERED_DATE = date(2026, 8, 20)
 
 
 def _session_calendar_path(tmp_path: Path) -> tuple[Path, MarketCalendarAuthority]:
@@ -1328,8 +1417,8 @@ def _session_calendar_path(tmp_path: Path) -> tuple[Path, MarketCalendarAuthorit
         schema_version=1,
         exchange="SSE",
         producer_commit=COMMIT,
-        coverage_start=SESSION_OPEN_DATES[0],
-        coverage_end=SESSION_OPEN_DATES[-1],
+        coverage_start=SESSION_COVERAGE_START,
+        coverage_end=SESSION_COVERAGE_END,
         open_dates=SESSION_OPEN_DATES,
         generated_at=datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
     )
@@ -1516,10 +1605,12 @@ def test_a_publisher_restarted_after_the_open_still_publishes_today(tmp_path: Pa
 
 
 def test_a_closed_date_publishes_nothing_and_is_not_a_degradation(tmp_path: Path) -> None:
+    """日历回答得了、答案是「今天不开市」——这不是降级，是正常的周末。"""
+
     calls: list[dict[str, object]] = []
     step = candidate_publisher_builder(
         session_input_loader=_session_loader(calls),
-        clock=lambda: _at(8, 45, day=date(2026, 8, 15)),
+        clock=lambda: _at(8, 45, day=SESSION_CLOSED_DATE),
     )(_session_manifest(tmp_path))
 
     result = step()
@@ -1527,6 +1618,42 @@ def test_a_closed_date_publishes_nothing_and_is_not_a_degradation(tmp_path: Path
     assert calls == []
     assert result.degraded_reasons == ()
     assert result.replica_opened is False
+
+
+def test_a_date_outside_calendar_coverage_is_a_visible_degradation(tmp_path: Path) -> None:
+    """复核 SF-1：日历覆盖不到今天时不许安静空转。
+
+    改动前这个分支自己判 `trade_date not in open_dates`，于是「日历过期了」与「今天不开市」
+    走同一条静默的路，心跳干干净净——正是 #277 那种看不出来的形状。现在走
+    `decide_market_session`，它对覆盖期外是抛，构建器把它翻成一条点名的降级理由。
+    """
+
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: _at(8, 45, day=SESSION_UNCOVERED_DATE),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert calls == []
+    assert result.degraded_reasons == (f"calendar_uncovered:{SESSION_UNCOVERED_DATE.isoformat()}",)
+
+
+def test_a_calendar_generated_after_the_clock_is_also_refused(tmp_path: Path) -> None:
+    """`decide_market_session` 的第二条护栏（防时钟回拨 / 权威错代）跟着一起拿回来了。"""
+
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        #: 日历的 generated_at 是 2026-08-09 08:00 UTC，把钟拨到它之前
+        clock=lambda: _at(8, 45, day=SESSION_OPEN_DATES[0]) - timedelta(days=2),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert calls == []
+    assert result.degraded_reasons and result.degraded_reasons[0].startswith("calendar_uncovered:")
 
 
 def test_the_next_session_gets_its_own_document(tmp_path: Path) -> None:
