@@ -173,9 +173,15 @@
   而 `_generation_already_current`（#271）是按源代次与水位逐一比相等的，
   所以研究面持续缺席期间 serving 会每三十秒重建一次 `serving.duckdb`；
   单测里三十分钟的迭代之后 serving 目录逐字节不变。
-  画像把 `optional_source_datasets` 显式写进 serving manifest。**回滚要带上 runtime
-  generation**：`RuntimeContractModel` 是 `extra="forbid"`，旧 manifest 配新代码可以
-  （字段有默认值），新 manifest 配旧代码会在 build 期被拒。
+  画像把 `optional_source_datasets` 显式写进 serving manifest，运行期读的是 manifest 那一份
+  ——研究面真正启用那天把列表收回 `[]`，才是一次有指纹的画像变更而不是改一个代码默认值；
+  这一条由 `test_the_manifest_decides_which_sources_are_optional_not_the_default` 钉住。
+  「六个源」的列表也只留一份（`SERVING_SOURCE_DATASET_IDS`，由 `_SOURCE_PAYLOAD_KINDS` 派生），
+  assembler 构造期与 settings 两道闸从此读同一份，不会因为加源时改一份漏一份而悄悄不同步。
+  **回滚要带上 runtime generation**：`RuntimeContractModel` 是 `extra="forbid"`，
+  旧 manifest 配新代码可以（字段有默认值），新 manifest 配旧代码会在 build 期被拒；
+  三个可选动作（重新 stage 上一个 tag / 把 `current` 指回上一代 / 删掉 `current` 回落路线 B）
+  见 `DEPLOY.md` 这一条。
 
 
 - **其余六个 role 的「每轮无条件写」：内容没变就不写、不提交、不 fsync（#271，本包）**：
