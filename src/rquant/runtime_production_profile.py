@@ -51,7 +51,10 @@ from rquant.runtime_market_calendar_generation import (
     install_market_calendar_generation,
     market_calendar_generation_path,
 )
-from rquant.runtime_market_session import load_market_calendar_authority
+from rquant.runtime_market_session import (
+    auction_windows_are_consistent,
+    load_market_calendar_authority,
+)
 from rquant.runtime_schema_registry import build_runtime_schema_contract_bundle
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
@@ -1549,6 +1552,29 @@ def build_production_runtime_profile(
             },
         )
     )
+
+    #: 采集窗与装配窗是四个代码常量，探测定窗时要一起改（唯一的定窗路径，见 DEPLOY.md）。
+    #: 只改了一边的话竞价链会安安静静地什么都不产出——这里把「只改了一边」变成画像生成时
+    #: 的一次当场拒绝，而画像生成正是操作员改完常量之后必经的那一步（复核代码质量 2）。
+    from rquant.runtime_builder_candidate import (
+        AUCTION_GAP_DEFAULT_INPUT_END,
+        AUCTION_GAP_DEFAULT_INPUT_START,
+    )
+    from rquant.runtime_service_builtin import (
+        AUCTION_MATCH_DEFAULT_CAPTURE_END,
+        AUCTION_MATCH_DEFAULT_CAPTURE_START,
+    )
+
+    if not auction_windows_are_consistent(
+        capture_start=AUCTION_MATCH_DEFAULT_CAPTURE_START,
+        capture_end=AUCTION_MATCH_DEFAULT_CAPTURE_END,
+        input_start=AUCTION_GAP_DEFAULT_INPUT_START,
+        input_end=AUCTION_GAP_DEFAULT_INPUT_END,
+    ):
+        raise ValueError(
+            "the auction capture window and the auction_gap assembly window disagree: "
+            "both pairs of constants have to move together"
+        )
 
     for strategy in config.strategies:
         settings: dict[str, object] = {

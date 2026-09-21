@@ -37,7 +37,10 @@ from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_generation_lineage import candidate_authority_lineage
 from rquant.runtime_market_session import (
     MarketCalendarAuthority,
+    MarketSessionCalendarError,
+    decide_market_session,
     load_market_calendar_authority,
+    local_window_contains,
 )
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -663,10 +666,20 @@ def candidate_publisher_builder(
             if settings.input_mode == "session_document":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
-                trade_date = local.date()
+                if session_calendar is None:
+                    raise RuntimeError("validated session calendar disappeared")
+                #: 走 `decide_market_session` 而不是自己判「今天在不在 open_dates 里」
+                #: （复核 SF-1）。自己判会把「这本日历根本覆盖不到今天」和「今天不开市」
+                #: 当成同一件事，于是日历过期之后发布者天天空转、心跳干干净净——正是 #277
+                #: 那种「什么都没发生而看不出来」的形状，只是换了个地方。顺带也拿回了
+                #: 「日历权威的生成时刻晚于 observed_at」那条防时钟回拨的护栏。
+                try:
+                    decision = decide_market_session(session_calendar, observed_at)
+                except MarketSessionCalendarError:
+                    return idle_result((f"calendar_uncovered:{local.date().isoformat()}",))
+                trade_date = decision.local_trade_date
                 if (
-                    session_calendar is None
-                    or trade_date not in session_calendar.open_dates
+                    not decision.is_open_date
                     or local.timetz().replace(tzinfo=None) < settings.session_document_start
                     or published_trade_date == trade_date
                 ):
@@ -689,7 +702,12 @@ def candidate_publisher_builder(
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
                 local_time = local.timetz().replace(tzinfo=None)
-                if not settings.auction_input_start <= local_time <= settings.auction_input_end:
+                #: 与 auction-match 的采集窗共用同一份整秒算术（复核代码质量 1）
+                if not local_window_contains(
+                    local_time,
+                    start=settings.auction_input_start,
+                    end=settings.auction_input_end,
+                ):
                     return idle_result()
                 if (
                     settings.auction_spool_root is None
