@@ -53,7 +53,8 @@ import os
 import sqlite3
 import time
 from contextlib import closing
-from datetime import UTC, date, datetime, time as clock_time, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as clock_time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -62,7 +63,6 @@ import pandas as pd
 import pytest
 
 import tests.integration.test_route_a_all_roles_sandbox_e2e as harness
-from rquant.live_contracts import LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
 from rquant.runtime_capabilities import RUNTIME_CAPABILITY_CREDENTIAL_NAME
