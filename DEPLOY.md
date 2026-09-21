@@ -5,6 +5,82 @@
 
 ---
 
+## 2026-09-21 · 待安装 · 盘中竞价链真正产出（#277、#278）—— **顺序：探测 → 定窗 → 装机**
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。只改 `src/` 与 `scripts/`，
+`deploy/` 一个字没动。
+
+### 0. 装之前必须先做的一件事：探测首次可用时刻（**不能跳过**）
+
+2026-09-21 实测：生产主 token 的 `stk_auction(20260921)` 在 **09:26:01 / 09:26:04 / 09:26:08
+三次都返回空**，同一个 token 在 **15:10 已经有 6,073 行**（列含 `pre_close`、`float_share`）。
+所以当天的数据在 09:26 还没就绪，**首次可用的确切时刻仓库里没人知道**。代码里的采集窗默认值
+是**临时的** `09:31:00–09:45:00`（`AUCTION_MATCH_DEFAULT_CAPTURE_START` /
+`AUCTION_MATCH_DEFAULT_CAPTURE_END`，`src/rquant/runtime_service_builtin.py`），装机前必须用
+主机上那一轮探测（`/tmp/stk-auction-probe.log`，cron 09:27 读）给出的真值替换：
+
+- **起点 = 探测到的首次可用时刻 + 60 s 余量**；
+- **终点 = 起点 + 14 分钟**（保持三次尝试 7 分钟一次的节奏），或按探测到的抖动放宽；
+- 同时把 `candidate.auction_gap` 的装配窗跟着移：起点与采集窗起点相同，终点在采集窗终点
+  之后至少 5 分钟（`AUCTION_GAP_DEFAULT_INPUT_START` / `AUCTION_GAP_DEFAULT_INPUT_END`，
+  `src/rquant/runtime_builder_candidate.py`）。
+
+**两个改法，任选其一**：
+
+1. **改默认常量**（四个 `time(...)`），重新走 PR → tag → 部署器。适合探测值稳定之后一次定死。
+2. **改 manifest 设置，不动代码**：在 `auction-match.source.v1` 的 settings 里加
+   `capture_start` / `capture_end` / `max_attempts` / `retry_interval_seconds`，在
+   `candidate.auction_gap.v1` 的 settings 里加 `auction_input_start` / `auction_input_end`
+   （都是 `"HH:MM:SS"` 本地挂钟串），随下一次 inputs / manifest 重生成带上去。
+   **冻结的 manifest 里没有这些键时默认值顶上**，所以不重生成也能装，只是用的是临时窗。
+
+`capture_start` 早于 **09:26** 会被设置模型当场拒绝（网关本身就拒绝 09:26 之前收到的竞价数据）。
+
+### 1. 这一版修了什么
+
+见 CHANGELOG `[Unreleased] / Fixed` 的 #277、#278 两条。一句话：竞价链原来**一个批次都发不
+出来且心跳干净**（适配器不要 `pre_close`、空表被当成缺八列、校验异常穿过 `capture_once`、
+早退分支用初始结果洗心跳），n_shape / growth_board 的候选文档停在 `trade_date 2026-07-14`。
+
+### 2. 装上之后当场应该看到什么
+
+- **08:45 之后**：`data/runtime/live/candidates/<n_shape 实例>/current.json` 与
+  `<growth_board 实例>/current.json` 的 `trade_date` 是**当日**、`captured_at` 是当天早上，
+  `sequence` 每个交易日 +1（不再恒为 0）。同一天之内不再有第二次写。
+- **采集窗第一次尝试**（临时默认 09:31）：`live/auction-match/batches/auction_match/` 下出现
+  批次。当天数据还没出时是 DEGRADED + `empty_source_result`，出了之后是 PUBLISHED。
+- **窗结束之后**：若当天一次都没成，`rquant-runtime-auction-match@…` 的心跳
+  `degraded_reasons` 里带 **`capture_failed`**，一直带到次日——这正是 09-21 那天缺的东西。
+- **装配窗内**（临时默认 09:31–09:50）：`candidate.auction_gap.v1` 的
+  `processed_count >= 1`，随后 `watchlist-quote` / `market-minute` 的
+  `degraded_reasons` 为空、`source_generations` 里有 `candidate_universe`。
+
+**已知的、不是缺陷的一段**：两个源从 09:30 起就去读候选全集，而当日的 auction_gap 快照最早
+09:31 之后才装得出来，中间这一分多钟两个源仍会 DEGRADED（不是 failed，不触发 `OnFailure`）。
+这是「当天竞价数据 09:26 还没出」本身的后果。
+
+### 3. 回滚
+
+`bash scripts/deploy-production.sh --target <上一个 tag>`。
+
+**候选文档格式是否向后兼容 v0.33.15 的读者？——是，有条件地是**：
+
+- `PublishedCandidateInputAuthority` 新增可选字段 `basis_trade_date`，而
+  `serialize_candidate_input` 在它为空时**不写这个键**，所以
+  `n-shape-candidates.json` / `growth-board-surge-candidates.json` 这两份**封存文档的字节与
+  v0.33.15 逐字相同**（`tests/unit/test_session_candidate_input.py` 钉住了 id 与线上形状）。
+  回滚之后旧代码照样读得懂它们。
+- **带 `basis_trade_date` 的文档只存在于内存**：`session_document` 模式装配出来的批次不落盘成
+  文档，只发布成候选快照，而快照的格式一点没变（schema v3，字段集相同）。所以回滚之后旧代码
+  读本包发布过的快照也没有问题。
+- **需要手工处理的只有一件事**：回滚到 v0.33.15 之后，两个 document-driven 发布者会回到
+  `sealed_document` 模式，重新去读那两份封存文档——它们的 `trade_date` 仍是装机那天的日期，
+  于是 #278 的现象原样回来（`watchlist-quote` / `market-minute` 整天 DEGRADED）。
+  **回滚等于回到已知缺陷，不是回到安全态**；若必须回滚，先确认当天不需要盘中链产出。
+- 已经落在 `live/candidates/*/` 下的快照不需要挪动，也不需要删除。
+
+---
+
 ## 2026-09-20 · 待安装 · live/serving slice MemoryHigh 提额（#268、#271）
 
 **状态**：**尚未安装**。四个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-20 经 owner
