@@ -91,17 +91,20 @@ REPLICA_SYNCED_AT = at(8, 40)
 SESSION_DOCUMENT_AT = at(8, 45)
 #: 竞价全集：09:15 的保护窗之前
 UNIVERSE_AT = at(9, 0)
-#: 采集窗的第一、二、三次尝试（09:31-09:45，三次摊开 = 420 秒一次）
-CAPTURE_FIRST = at(9, 31)
-CAPTURE_SECOND = at(9, 38)
-CAPTURE_THIRD = at(9, 45)
+#: 采集窗的第一、二、三次尝试。间隔 = 窗宽 // max_attempts = 840 // 3 = 280 秒，
+#: 到期时刻是 09:31:00 / 09:35:40 / 09:40:20；这里**故意取到期之后的偏相位时刻**
+#: （+37 / +29 秒），不再踩在到期秒或窗口右界上——复核 MF-1 指出的相位缺陷正是被
+#: 「所有时刻都恰好踩在边界上」的测试放过去的。
+CAPTURE_FIRST = at(9, 31, 37)
+CAPTURE_SECOND = at(9, 36, 29)
+CAPTURE_THIRD = at(9, 41, 7)
 #: 窗过去之后的任意一轮，以及当天更晚的时刻
 AFTER_WINDOW = at(9, 46)
 AFTER_CLOSE = at(15, 30)
 #: 下一个交易日的盘前：交易日切换之后旗子应当落下
 NEXT_SESSION = at(8, 30, day=OPEN_DATES[-1] + timedelta(days=1))
-#: 装配窗（09:31-09:50）里的一轮，排在第一次成功采集之后
-ASSEMBLE_AT = at(9, 32)
+#: 装配窗（09:31-09:50）里的一轮，排在第一次成功采集（09:31:37）之后
+ASSEMBLE_AT = at(9, 32, 11)
 #: 两个源真正去读候选全集的时刻：早盘阶段，且晚于上面那一次装配
 CONSUME_AT = at(9, 35)
 #: 第二次安装打开 schema rollout 窗口的时刻。窗宽是生产画像的
@@ -442,7 +445,7 @@ def test_an_empty_source_then_a_real_one_leaves_a_degraded_batch_then_a_publishe
     publish_auction_universe(auction_world)
     adapter = _AuctionAdapter([empty_auction_frame(), auction_frame()])
 
-    #: 同一个进程的两轮：09:31 与 09:38，正是三次尝试摊在窗里的头两次
+    #: 同一个进程的两轮，是三次尝试摊在窗里的头两次（取的是到期之后的偏相位时刻）
     second = run_auction_match(
         auction_world,
         adapter,
@@ -518,6 +521,28 @@ def test_an_exhausted_day_keeps_capture_failed_in_the_heartbeat_until_the_next_d
     assert adapter.calls == [TRADE_DATE, TRADE_DATE, TRADE_DATE]
     #: 收盘之后那一轮的心跳仍然说得出「今天没采到」
     assert "capture_failed" in heartbeat.degraded_reasons
+
+
+def test_a_window_the_role_slept_through_is_capture_missed(
+    auction_world: ReplicaWorld,
+) -> None:
+    """复核 SF-3：role 整个窗口都没起来时，心跳也必须说得出来。
+
+    宕机、部署、watchdog 重启都会造成这个形状。改动前 `capture_failed` 要求
+    `attempts > 0`，于是「今天一次都没试过」反而留下一条干干净净的心跳——正是 #277
+    最初的症状。现在这一种有它自己的理由 `capture_missed`。
+    """
+
+    publish_auction_universe(auction_world)
+    adapter = _AuctionAdapter([])
+
+    heartbeat = run_auction_match(auction_world, adapter, now=AFTER_WINDOW)
+
+    assert adapter.calls == []
+    assert "capture_missed" in heartbeat.degraded_reasons
+    assert "capture_failed" not in heartbeat.degraded_reasons
+    #: 落盘的那一半同样是空的，两个证据一致（`list_after` 返回的是 tuple）
+    assert not auction_records(auction_world)
 
 
 def test_the_failure_flag_is_a_per_process_memory_that_a_restart_loses(
