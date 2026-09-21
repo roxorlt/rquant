@@ -5,6 +5,83 @@
 
 ---
 
+## 2026-09-21 · 待安装 · notifier 影子档（#281）——写库、出信号、不发一个字节
+
+**状态**：**尚未安装**，`deploy/` 一个字没动。notifier 的档位从代码里的硬编码
+`"paused": True` 改成画像输入 `notifier_delivery_mode`，三档：
+
+| 档位 | manifest 里的两个布尔 | 行为 |
+|---|---|---|
+| `paused` | `paused=True`、`suppress_delivery=False` | 急停：不复制、不认领、不投递；仍发布一份空的 `signals` 权威 |
+| `shadow`（**默认**） | `paused=False`、`suppress_delivery=True` | live 分支原样跑：复制路由回执、按 live 节奏消耗 outbox、写 attempt 行、发布非空 `signals` 权威；**不向 PushDeer / PushPlus 发一个字节** |
+| `live` | 两个都 `False` | 同上，并且真发 |
+
+影子档的两个标记（值班的人只认这两个）：
+
+- 心跳 `degraded_reasons` 里有 `notifier:shadow_transport`；
+- `delivery_attempt.provider_receipt` 以 `shadow:` 开头。
+
+看到这两个就是没发出去；两个都没有、`degraded_reasons` 干净，才是真的在发。
+
+### 怎么生成一份指定档位的画像
+
+```bash
+# 默认就是 shadow，写出来是为了让部署记录上留下它选了什么
+python scripts/build_runtime_production_inputs.py \
+    --notifier-delivery-mode shadow \
+    ...（其余参数照旧）
+```
+
+### 切正式（shadow → live）
+
+**安全**，可以在盘中切。影子档一直在消耗 outbox、复制游标一直在前进，所以第一轮 live
+只会看到「从现在起」的新信号：
+
+1. 用 `--notifier-delivery-mode live` 重新生成画像 → 装新一代 → `rquant-notifier` 重启；
+2. 第一轮心跳里 `notifier:shadow_transport` 应当消失，`delivery_attempt` 里新出现的回执
+   不再以 `shadow:` 开头；
+3. 手机上应当只收到切换之后产生的信号。
+
+### paused → live（**不要这么切**）
+
+**不安全**。急停档下复制游标从来没有前进过，第一轮 live 会从
+`cursor.last_global_sequence` 开始把攒下的整条 spool 一次认领出来，按
+`batch_limit=128` / `interval_seconds=2` 一轮轮推——这正是 #86 修过的那一类告警风暴，
+唯一的闸是信号自己的 `expires_at`。必须走下面两条之一：
+
+- **先切 shadow**，让它把积压消耗完（心跳的 `backlog_count` 回到 0），再切 live；
+- 或者**开盘前**切，并且人工确认 spool 里没有还没过期的积压。
+
+### 回滚（**必须连画像一起回**）
+
+新画像的 notifier manifest 多了一个 `suppress_delivery` 键，输入文档多了一个
+`notifier_delivery_mode` 键。两个模型都是 `RuntimeContractModel`（`extra="forbid"`），
+所以 **v0.33.15 的代码读不了新画像**，实测：
+
+```
+NotifierSettings（v0.33.15）  ← {"suppress_delivery": True, ...}
+  ValidationError: suppress_delivery / extra_forbidden / Extra inputs are not permitted
+ProductionRuntimeProfileInputs（v0.33.15） ← {"notifier_delivery_mode": "shadow", ...}
+  ValidationError: notifier_delivery_mode / extra_forbidden / Extra inputs are not permitted
+```
+
+影响范围是**一个 role**：`RuntimeServiceManifest.settings` 的类型是
+`Mapping[str, JsonValue]`，装机与权威链校验都不看键名，所以整代画像仍然装得上、其余
+role 照跑；炸的是 `rquant-notifier` 起不来（builder 在
+`runtime_builder_signal.py:965` 校验 `NotifierSettings`）。
+
+所以回滚顺序是：
+
+```bash
+# ① 先用回滚目标那一版代码重新生成画像（输入文档里不能带 notifier_delivery_mode）
+# ② 装这一代画像
+# ③ 再 bash scripts/deploy-production.sh --target <上一个 tag>
+```
+
+反过来（先回代码再回画像）会让 notifier 在中间那段时间起不来。
+
+---
+
 ## 2026-09-20 · 待安装 · live/serving slice MemoryHigh 提额（#268、#271）
 
 **状态**：**尚未安装**。四个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-20 经 owner

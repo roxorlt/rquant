@@ -173,11 +173,12 @@ def test_an_idle_notifier_commits_nothing_and_one_change_commits_once(
 def test_the_paused_notifier_production_actually_runs_commits_nothing_either(
     tmp_path: Path,
 ) -> None:
-    """The production manifest sets `paused: true`, and that branch publishes too.
+    """The emergency-stop branch publishes too, so it must be idle-free as well.
 
-    `runtime_production_profile` gives `notifier.admin.shadow.v1` `"paused": True`, so the
-    branch the host has been running every two seconds since the roles went resident is
-    the paused one -- which skips the replication and the delivery batch and still calls
+    `notifier.admin.shadow.v1` ran `paused: true` on the host from the day the roles went
+    resident until #281 made the mode a profile input (`notifier_delivery_mode`, default
+    `shadow`), and `paused` is still the emergency stop an operator selects. That branch
+    skips the replication and the delivery batch and still calls
     `page_projection_producer.publish()` unconditionally. Sixty of those must commit
     nothing either, or the fix does not reach the thing that was measured.
     """

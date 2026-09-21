@@ -6,6 +6,30 @@
 
 ### Added
 
+- **notifier 影子档：写库、出 `signals` 权威、不发一个字节（#281）**：`notifier.admin.shadow.v1`
+  的 `"paused": True` 原来硬编码在 `runtime_production_profile.py` 里，要让一条信号走到
+  serving 的 `signals` 数据集只能改代码重新发版。现在它是画像输入
+  `ProductionRuntimeProfileInputs.notifier_delivery_mode`（`paused` / `shadow` / `live`，
+  **默认 `shadow`**），生成器新增 `--notifier-delivery-mode`，`deploy/` 一个字没改——档位随
+  manifest 走，不需要动 unit。
+  - `shadow` 走的是**原样不动的 live 分支**：复制路由回执进通知状态库、跑收件人 preflight
+    与冻结的别名迁移、按 live 节奏（`batch_limit=128` / 2 秒）认领 outbox、写 attempt 行、
+    用 live 分支同一句 `_publish_signal_authority(...)` 发布**非空**的 `signals` 权威；唯一的
+    差别是 channel 的 provider 被换成 `SuppressedNotificationProvider`，它不开 socket，回执是
+    确定的 `shadow:<outbox_id>`（重试写同一条回执，一次投递重试不会读成两次投递）。
+  - 两个标记让影子 notifier 不会被当成干净的 live：心跳 `degraded_reasons` 里的
+    `notifier:shadow_transport`，以及 `delivery_attempt.provider_receipt` 的 `shadow:` 前缀。
+  - `paused` 语义不变，仍是急停档；`PUSHDEER_KEYS` / `PUSHPLUS_TOKENS` 三档都照常下发，
+    所以从 shadow 切 live 改变的只有「字节去哪儿」。
+  - 开盘日全链 e2e（`tests/integration/test_route_a_trading_day_full_chain_e2e.py`）从两档扩成
+    三档，三个世界只差输入文档里的一个值：`paused` 断言 outbox 零行、`shadow` 断言 outbox 与
+    attempt 有行、能说话的 provider 一条都没收到、当代 `signals` 里**按 `event_time` 过滤出
+    本场次**的信号非空，`live` 断言记录器收到了投递。
+  - **切换与回滚见 `DEPLOY.md` 2026-09-21 那条**：shadow → live 安全（游标一直在前进），
+    paused → live 不安全（会一次推出整条积压 spool，#86 那一类风暴）；新画像带的
+    `suppress_delivery` / `notifier_delivery_mode` 两个键会被 v0.33.15 的
+    `extra="forbid"` 模型拒收，**回滚必须先用回滚目标那一版代码重新生成画像**。
+
 - **25 个 role 各自在自己 unit 的沙箱里起一次的 e2e（`tests/integration/test_route_a_all_roles_sandbox_e2e.py`）**：
   Route A 的裸跑排查（runbook R-20）用 `runtime-exec.pyz` 起 role，**完全没有沙箱**，所以
   「这个 role 往哪儿写」这一整类缺陷它一条也看不见——#242 与 #241 都是这一类。包 J 的 e2e 把
