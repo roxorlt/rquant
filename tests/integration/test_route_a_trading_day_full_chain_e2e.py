@@ -79,7 +79,6 @@ from tests.integration.test_route_a_all_roles_sandbox_e2e import (
 )
 from tests.integration.test_route_a_legacy_binding_e2e import RouteAWorld, _production_bundle
 from tests.integration.test_route_a_live_chain_idle_e2e import PREVIOUS_COMMIT, _instance_name
-from tests.integration.test_route_a_readside_replica_e2e import _write_replica
 from tests.integration.test_route_a_strategy_chain_e2e import _routing_policy_payload
 from tests.shadow_ed25519_support import create_shadow_ed25519_test_authority
 from tests.support.systemd_credential_delivery import deliver
@@ -105,6 +104,12 @@ TRADE_DATE = OPEN_DATES[-1]
 #: the two sessions the historical minute parquet is exported from: both open, both before
 #: the session that trades, so nothing in the sealed history is same-day evidence
 HISTORY_DATES = (OPEN_DATES[-3], OPEN_DATES[-2])
+#: The paper broker's PIT calendar has to run past the session, because settling a buy
+#: needs the *next* open day: `runtime_paper_quote` refuses with "frozen calendar has no
+#: next SSE open day after <date>" when the session it is trading is the calendar's last
+#: entry. The market calendar the bundle installs stays at `OPEN_DATES`; only the PIT
+#: document the broker hashes carries the two sessions after it.
+PIT_DATES = (*OPEN_DATES, date(2026, 8, 12), date(2026, 8, 13))
 
 #: Three codes, one per exchange prefix the cost engine's selectors cover, so the paper
 #: broker's instrument context resolves and the minute history is not a single series.
@@ -121,28 +126,31 @@ def _at(hour: int, minute: int, second: int = 0, *, day: date = TRADE_DATE) -> d
     ).astimezone(UTC)
 
 
-#: 09:47:23 Shanghai -- inside the continuous session, after the 09:31-09:45 auction
+#: 09:47:37 Shanghai -- inside the continuous session, after the 09:31-09:45 auction
 #: assembly window, and deliberately off-phase. Package Y's review found a defect that
 #: every test had walked past because every instant in it sat exactly on a boundary, so
 #: no instant in this file is a round minute of anything the code compares against.
-SESSION_NOW = _at(9, 47, 23)
+SESSION_NOW = _at(9, 47, 37)
 #: when the minute batch the feature role consumes was received: one minute back, so the
 #: bar is complete and inside the paper broker's `quote_max_age_seconds` of 90
-MINUTE_RECEIVED_AT = _at(9, 46, 41)
+MINUTE_RECEIVED_AT = _at(9, 47, 11)
 #: when the candidate snapshots were captured: before the open, as a publisher that ran in
 #: its 08:45 window would have left them
 CANDIDATES_CAPTURED_AT = _at(8, 47, 11)
-#: the second install's schema rollout window, opened at the market clock because a
-#: producer records its dual-write with the service's own clock (#227)
-SCHEMA_ROLLOUT_STARTED_AT = _at(9, 30, 17)
+#: The second install's schema rollout window. A producer records its dual-write with
+#: the *service's* clock and `SchemaRolloutStore` refuses a record outside
+#: `[started_at, deadline]`, so the window is opened at the market clock and early
+#: enough that the whole chain -- 09:46:03 to 09:49:53 -- runs inside the profile's
+#: 600-second stage timeout.
+SCHEMA_ROLLOUT_STARTED_AT = _at(9, 44, 11)
 #: when the replica-sync timer last replaced the read-only replica the notifier reads
 REPLICA_SYNCED_AT = _at(9, 22, 47)
 #: The instants the later hops run at. The paper broker's `execution_lag_seconds` is 60,
 #: so a signal routed at `SESSION_NOW` is not executable until a minute later.
-ROUTER_NOW = _at(9, 47, 41)
-BROKER_NOW = _at(9, 49, 7)
-NOTIFIER_NOW = _at(9, 49, 29)
-SERVING_NOW = _at(9, 49, 53)
+ROUTER_NOW = _at(9, 48, 3)
+BROKER_NOW = _at(9, 48, 19)
+NOTIFIER_NOW = _at(9, 48, 37)
+SERVING_NOW = _at(9, 48, 53)
 
 FEATURE_ROLE = "feature_live"
 STRATEGY_ROLE = "strategy_live"
@@ -158,6 +166,7 @@ REFERENCE_PUBLISHER_ROLE = "reference_slow_publisher"
 
 N_SHAPE_SERVICE_ID = "strategy.n_shape.v1"
 N_SHAPE_CANDIDATE_SERVICE_ID = "candidate.n_shape.v1"
+CONSTRAINT_SERVICE_ID = "paper-constraint.market.v1"
 
 
 # ---------------------------------------------------------------------------------------
@@ -298,12 +307,205 @@ def test_the_sealed_history_is_a_real_export_of_three_codes_over_two_sessions(
 # ---------------------------------------------------------------------------------------
 
 
+#: when a host that ran the two pre-open reference roles would have published: before the
+#: session, because `paper_constraint_publisher` refuses evidence from its own future
+REFERENCE_PUBLISHED_AT = _at(9, 4, 13)
+
+
+def publish_reference_generation(path: Path) -> None:
+    """One published reference generation covering every code the minute batch carries.
+
+    `paper_constraint_publisher` resolves four datasets per code and refuses a code it has
+    no evidence for, so the generation has to span the whole batch rather than one symbol.
+    Written through `ReferenceRegistry` itself, which is what `reference_slow_publisher`
+    calls, so what lands is what that role would have left at 09:0x.
+    """
+
+    from rquant.reference_data_registry import (
+        ReferenceDataset,
+        ReferenceRecord,
+        ReferenceRegistry,
+    )
+
+    registry = ReferenceRegistry(path)
+    effective_from = _at(0, 0)
+    for code in CODES:
+        for dataset, payload in (
+            (ReferenceDataset.ST_STATUS, {"is_st": False}),
+            (ReferenceDataset.SUSPENSION_STATUS, {"is_suspended": False}),
+            (
+                ReferenceDataset.LISTING_STATUS,
+                {
+                    "status": "listed",
+                    #: `_required_a_share_instrument_context` builds the broker's
+                    #: instrument context out of these four and refuses anything that is
+                    #: not a CN A-share equity, which is also what the cost engine's
+                    #: selectors key on
+                    "market": "CN",
+                    "exchange": "SSE" if code.endswith(".SH") else "SZSE",
+                    "instrument_class": "EQUITY",
+                    "security_class": "A_SHARE",
+                },
+            ),
+            (
+                ReferenceDataset.PRICE_LIMIT_REGIME,
+                {
+                    "limit_eligible": True,
+                    "limit_percent": 0.1,
+                    #: the same limit the `n_shape` candidate document states, so the
+                    #: evaluator's `below_limit` and the broker's own limit agree
+                    "limit_up_price": 12.1,
+                    "limit_down_price": 9.9,
+                },
+            ),
+        ):
+            registry.append(
+                ReferenceRecord(
+                    dataset_id=dataset,
+                    key=code,
+                    effective_from=effective_from,
+                    revision=1,
+                    source="test.reference",
+                    first_available_at=REFERENCE_PUBLISHED_AT,
+                    payload=payload,
+                )
+            )
+    registry.publish(published_at=REFERENCE_PUBLISHED_AT)
+
+
+#: The serving publisher reads six source authorities and fails closed if any one of them
+#: is unreadable. Two are hops of this chain and are produced by the real roles here --
+#: `signals` by the notifier, `paper_accounts` by the paper broker -- and `runtime_health`
+#: is published by `runtime_health_publisher`, which is in the chain for that reason. The
+#: remaining three belong to the research and reference planes: their owners are pre-open
+#: or research-plane roles that are not on the signal path at all, so their artifact is
+#: written by the same publisher those roles use and the session starts with it in place.
+OFF_CHAIN_SERVING_AUTHORITIES: tuple[tuple[str, str], ...] = (
+    ("lab_jobs", "lab_jobs"),
+    ("promotions", "promotions"),
+    ("reference_slow_authority", "reference_slow"),
+)
+
+
+def publish_off_chain_serving_authorities(route: RouteAWorld) -> None:
+    """One published generation per off-chain serving source, through its own publisher."""
+
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
+    from rquant.runtime_serving_snapshot import (
+        LabJobsPayload,
+        PromotionsPayload,
+        ReferenceSlowPayload,
+        SourceReadResult,
+    )
+    from rquant.serving_contracts import FreshnessStatus
+
+    payloads: dict[str, Any] = {
+        "lab_jobs": LabJobsPayload(),
+        "promotions": PromotionsPayload(),
+        #: the reference plane's own evidence: which published generation the serving
+        #: row was built from, and on what price and adjustment basis
+        "reference_slow": ReferenceSlowPayload(
+            reference_generation_id="b" * 64,
+            revision=1,
+            price_basis="raw_session",
+            adjustment_basis="tushare_adj_factor",
+            available_at=REFERENCE_PUBLISHED_AT,
+        ),
+    }
+    manifest = manifest_of(route, "serving.publisher.v1")
+    roots = {
+        str(dict(entry)["dataset_id"]): Path(str(dict(entry)["root"]))
+        for entry in manifest.settings["source_authorities"]
+    }
+    for dataset_id, payload_kind in OFF_CHAIN_SERVING_AUTHORITIES:
+        values: dict[str, Any] = {
+            "dataset_id": dataset_id,
+            "sequence": 1,
+            "event_time": REFERENCE_PUBLISHED_AT,
+            "published_at": REFERENCE_PUBLISHED_AT,
+            "status": FreshnessStatus.FRESH,
+            "reason": None,
+            "payload": payloads[payload_kind],
+        }
+        values["generation_id"] = canonical_sha256(values)
+        ServingSourceAuthorityPublisher(
+            root=roots[dataset_id],
+            producer_commit=route.world.commit,
+            dataset_id=dataset_id,
+            payload_kind=payload_kind,
+            clock=lambda: REFERENCE_PUBLISHED_AT,
+        ).publish(SourceReadResult.model_validate(values))
+
+
+def write_projection_replica(path: Path) -> None:
+    """The read-only replica the notifier's page projection opens, with the tables it needs.
+
+    `scripts/sync-readonly-replica.sh` leaves a WAL-free 0644 copy of the main database,
+    which is why the readers' mode rule allows 0644 (#249). `DuckDBSignalPageProjectionSource`
+    refuses a projection database without both `screen_result` and `minute_bar`, so a
+    replica carrying only `daily_bar` -- which is all the read-side file's world needs --
+    takes this role DEGRADED on every iteration. The mtime is the instant the timer last
+    replaced it, before anything in this file reads it, because every reader on this path
+    refuses evidence from its own future.
+    """
+
+    import duckdb
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE daily_bar(ts_code VARCHAR, trade_date DATE, vol DOUBLE);
+            CREATE TABLE screen_result (
+                trade_date DATE, preset_name VARCHAR, ts_code VARCHAR, name VARCHAR,
+                close DOUBLE, pct_chg DOUBLE, extra JSON, created_at TIMESTAMP
+            );
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR, trade_time TIMESTAMP, freq VARCHAR, open DOUBLE,
+                high DOUBLE, low DOUBLE, close DOUBLE, vol DOUBLE, amount DOUBLE,
+                source VARCHAR, created_at TIMESTAMP
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO daily_bar VALUES (?, ?, ?)",
+            [(SIGNAL_CODE, day, 1_000.0) for day in OPEN_DATES[:-1]],
+        )
+        connection.execute(
+            "INSERT INTO screen_result VALUES (?, 'n-shape-pool1', ?, '浦发银行', 10.6, 6, "
+            "'{}', ?)",
+            [
+                OPEN_DATES[-2],
+                SIGNAL_CODE,
+                datetime.combine(OPEN_DATES[-2], clock_time(15, 5)),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO minute_bar SELECT ?, TIMESTAMP '"
+            + f"{OPEN_DATES[-2].isoformat()} 09:30:00"
+            + "' + range * INTERVAL 1 MINUTE, '1min', 10, 10.6, 10, 10.6, 100, 1000, "
+            "'tushare', ? FROM range(240)",
+            [SIGNAL_CODE, datetime.combine(OPEN_DATES[-2], clock_time(15, 5))],
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    assert not Path(f"{path}.wal").exists()
+    path.chmod(0o644)
+    stamp = REPLICA_SYNCED_AT.timestamp()
+    os.utime(path, (stamp, stamp))
+
+
 def _pit_trade_calendar_payload() -> bytes:
     from build_runtime_production_inputs import build_pit_trade_calendar_payload
 
     generated_at = datetime.combine(OPEN_DATES[0], clock_time(0, 0), tzinfo=UTC)
     return build_pit_trade_calendar_payload(
-        tuple((day, True, generated_at) for day in OPEN_DATES)
+        tuple((day, True, generated_at) for day in PIT_DATES)
     )
 
 
@@ -321,8 +523,106 @@ def _freeze_before_the_session(path: Path) -> None:
     os.utime(path, (stamp, stamp))
 
 
-@pytest.fixture
-def trading_day_chain(
+class _RecordingProvider:
+    """A notification provider that confirms delivery instead of reaching the network.
+
+    The notifier's default provider loader builds a real PushDeer/PushPlus client out of
+    the capability credential the bundle sealed, and a real client posts to
+    `api2.pushdeer.com`. Left alone it does exactly that: the first run of this file took
+    the notifier hop from 0.87s to 2.58s and recorded `notifier:unknown_outcomes:2`,
+    because nothing answered -- which is the notifier behaving correctly and the test
+    behaving badly. No case in this repository is allowed to touch the network outside
+    `-m network`, and an outcome that depends on an endpoint answering is not evidence.
+
+    Only the transport is replaced. The claim, the lease, the attempt row and the receipt
+    are all the real `run_notification_batch`.
+    """
+
+    def __init__(self) -> None:
+        self.deliveries: list[Any] = []
+
+    def deliver(self, delivery: Any) -> str:
+        self.deliveries.append(delivery)
+        return f"test:{len(self.deliveries)}"
+
+
+def confirm_deliveries_without_the_network(monkeypatch: pytest.MonkeyPatch) -> _RecordingProvider:
+    """Swap every channel's provider for a recording one, keeping the registry real."""
+
+    import rquant.runtime_notification_providers as providers_module
+
+    recorder = _RecordingProvider()
+    real_loader = providers_module.build_environment_notification_provider_loader
+
+    def loader_with_a_recording_transport(**kwargs: Any) -> Any:
+        real = real_loader(**kwargs)
+
+        def load() -> Any:
+            registry = real()
+            return providers_module.RecipientScopedProviderRegistry(
+                providers={channel: recorder for channel in registry},
+                recipient_ids={
+                    channel: registry.recipient_ids.get(channel, ()) for channel in registry
+                },
+                inferred_channels=registry.recipient_preflight.inferred_channels,
+            )
+
+        return load
+
+    monkeypatch.setattr(
+        providers_module,
+        "build_environment_notification_provider_loader",
+        loader_with_a_recording_transport,
+    )
+    return recorder
+
+
+def unpause_the_notifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build the same profile with `notifier.admin.shadow.v1` active instead of paused.
+
+    `build_production_runtime_profile` hard-codes `"paused": True` for the notifier
+    (`runtime_production_profile.py`, the `notifier` manifest). That is a deliberate
+    shadow-rollout stance -- the service is named `.shadow.` -- and its consequence is
+    measured by this file rather than assumed: a paused notifier never calls
+    `store.replicate`, so it never writes an outbox row, and the `signals` serving
+    authority it publishes from its own store stays empty for ever. Serving reads that
+    authority for its `signals` dataset, so on the host as shipped a signal reaches the
+    paper broker and stops there.
+
+    Flipping one setting and letting the profile rebuild itself -- the model recomputes
+    `profile_id` from its own content when it is None -- gives a second, fully consistent
+    world in which the last two hops can be measured. Nothing else differs, so a
+    difference between the two fixtures is a difference this one flag makes.
+    """
+
+    import rquant.runtime_production_profile as production_profile
+
+    real_build = production_profile.build_production_runtime_profile
+
+    def build_with_an_active_notifier(inputs: Any) -> Any:
+        profile = real_build(inputs)
+        manifests = []
+        for manifest in profile.manifests:
+            if manifest.service_kind.value == "notifier":
+                settings = dict(manifest.settings)
+                assert settings["paused"] is True, settings["paused"]
+                settings["paused"] = False
+                manifest = manifest.model_copy(update={"settings": settings})
+            manifests.append(manifest)
+        rebuilt = dict(profile.model_dump(mode="python"))
+        rebuilt["manifests"] = manifests
+        #: None makes the model recompute the id over the content it now has
+        rebuilt["profile_id"] = None
+        return type(profile).model_validate(rebuilt)
+
+    monkeypatch.setattr(
+        production_profile,
+        "build_production_runtime_profile",
+        build_with_an_active_notifier,
+    )
+
+
+def build_trading_day_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     minute_history_parquet: bytes,
@@ -422,13 +722,43 @@ def trading_day_chain(
     acknowledge_runtime_schema_rollout_preparation(
         route.runtime_root, now=SCHEMA_ROLLOUT_STARTED_AT + timedelta(seconds=37)
     )
-    #: the read-only replica the notifier's page projection opens (#250/#268)
-    _write_replica(
-        Path(inputs.readonly_replica_database_path),
-        trade_dates=OPEN_DATES[:-1],
-        synced_at=REPLICA_SYNCED_AT,
+    #: the read-only replica the notifier's page projection opens (#250/#268), and the
+    #: reference generation `paper_constraint_publisher` resolves every quote against
+    write_projection_replica(Path(inputs.readonly_replica_database_path))
+    publish_reference_generation(
+        setting_of(route, CONSTRAINT_SERVICE_ID, "reference_registry_path")
     )
+    publish_off_chain_serving_authorities(route)
     return route
+
+
+@pytest.fixture
+def trading_day_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minute_history_parquet: bytes,
+) -> RouteAWorld:
+    """The world exactly as the production profile builds it, notifier paused and all."""
+
+    return build_trading_day_chain(tmp_path, monkeypatch, minute_history_parquet)
+
+
+@pytest.fixture
+def delivery_recorder(monkeypatch: pytest.MonkeyPatch) -> _RecordingProvider:
+    return confirm_deliveries_without_the_network(monkeypatch)
+
+
+@pytest.fixture
+def active_notifier_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minute_history_parquet: bytes,
+    delivery_recorder: _RecordingProvider,
+) -> RouteAWorld:
+    """The same world with the one flag flipped, so the last two hops can be measured."""
+
+    unpause_the_notifier(monkeypatch)
+    return build_trading_day_chain(tmp_path, monkeypatch, minute_history_parquet)
 
 
 def manifest_of(route: RouteAWorld, service_id: str) -> Any:
@@ -439,18 +769,21 @@ def setting_of(route: RouteAWorld, service_id: str, field: str) -> Path:
     return Path(str(manifest_of(route, service_id).settings[field]))
 
 
-@pytest.fixture
-def credentials_root(
-    trading_day_chain: RouteAWorld,
-    tmp_path: Path,
+def deliver_credentials(
+    route: RouteAWorld,
+    root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, Path]:
-    """One `/run/credentials/<unit>` per credstore role, laid out as systemd lays it out."""
+    """One `/run/credentials/<unit>` per credstore role, laid out as systemd lays it out.
+
+    Root-owned 0440 `capabilities.json` admitted to the service user through an ACL, inside
+    a root-owned 0550 directory on systemd's own mount -- `systemd_credential_delivery`
+    moves the three facts a non-root test cannot produce and nothing else (packages E/I).
+    """
 
     directories: dict[str, Path] = {}
-    root = tmp_path / "credentials"
     for role in sorted(CREDSTORE_ROLES):
-        for instance in instance_of(trading_day_chain, role):
+        for instance in instance_of(route, role):
             unit = ROLE_UNITS[role]
             name = (
                 f"{unit[: -len('@.service')]}@{instance}.service"
@@ -461,12 +794,30 @@ def credentials_root(
                 monkeypatch,
                 root=root,
                 unit=name,
-                payload=trading_day_chain.sealed_credentials[instance],
+                payload=route.sealed_credentials[instance],
                 mode=0o440,
             )
             assert delivery.path.name == RUNTIME_CAPABILITY_CREDENTIAL_NAME
             directories[instance] = delivery.directory
     return directories
+
+
+@pytest.fixture
+def credentials_root(
+    trading_day_chain: RouteAWorld,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
+    return deliver_credentials(trading_day_chain, tmp_path / "credentials", monkeypatch)
+
+
+@pytest.fixture
+def credentials_root_active(
+    active_notifier_chain: RouteAWorld,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
+    return deliver_credentials(active_notifier_chain, tmp_path / "credentials", monkeypatch)
 
 
 # ---------------------------------------------------------------------------------------
@@ -513,20 +864,29 @@ def run_at(
     finally:
         harness.FROZEN_NOW = previous
     elapsed = time.perf_counter() - started
+    run.heartbeat = heartbeat_of(route, role, instance)
     if hops is not None:
         hops.append(Hop(label or role, run, elapsed))
     return run
 
 
 def heartbeat_of(route: RouteAWorld, role: str, instance: str) -> Any:
+    """This instance's heartbeat, from the control root the wrapper's own argv names.
+
+    `RoleRun` carries four of the heartbeat's fields and not `output_sequence`, which is
+    the one that says a role *moved* rather than merely ran, so the file is re-read here.
+    """
+
     from rquant.runtime_service_control import RuntimeServiceControl
 
+    resolved = harness.launch(route, role, instance, None)
+    argv = harness.relocated(route, list(resolved["module_argv"]))
+    control_root = Path(argv[argv.index("--control-root") + 1])
     manifest = next(
         item
         for item in route.profile.manifests
         if _instance_name(item.service_id) == instance
     )
-    control_root = route.runtime_root / "control" / "services"
     return RuntimeServiceControl.read_heartbeat(control_root, manifest.service_spec)
 
 
@@ -561,7 +921,7 @@ def publish_minute_batch(
             #: a rising session: the first bars set the low and the vwap, the last one is
             #: the breakout the evaluator reads as `latest_close`
             for step, price in enumerate((close - 0.06, close - 0.03, close)):
-                stamp = datetime.combine(TRADE_DATE, clock_time(9, 44)) + timedelta(
+                stamp = datetime.combine(TRADE_DATE, clock_time(9, 45)) + timedelta(
                     minutes=step
                 )
                 volume = 5_000.0 + 100.0 * step
@@ -658,19 +1018,37 @@ def _candidate_rows(
     #: `n_shape`'s thresholds, against a minute batch whose last close for `SIGNAL_CODE`
     #: is 11.0 and whose session low is 10.92 (see `publish_minute_batch`).
     values: dict[str, Any] = {
-        "candidate_price_basis": StrategyCandidatePriceBasis.QFQ_PIT.value,
+        #: `_raw_session_basis` requires exactly this string. It is not the record's
+        #: `price_basis` (`raw` / `qfq_pit`, which is how the *reference* prices were
+        #: adjusted) but a statement about the three prices beside it: they have been
+        #: rebased onto the current session's raw quotes, so comparing them against an
+        #: unadjusted intraday close is sound.
+        "candidate_price_basis": "raw_session",
         "t_close_session_raw": 10.5,
         "t_high_session_raw": 10.8,
         "limit_up_price_session_raw": 12.1,
         "limit_pct": 10.0,
-        #: `growth_board_surge` and `auction_gap` carry their own names; anything their
-        #: schema declares and this map does not is filled with a neutral number below.
-        "candidate_score": 0.91,
     }
-    static = {
-        name: values.get(name, 1.0 if spec.get("dtype") == "number" else "raw_session_only")
-        for name, spec in schema.items()
+    #: `growth_board_surge` and `auction_gap` declare their own static features, and their
+    #: signals are not what this file is about. Anything their schema names and the map
+    #: above does not is filled with a neutral value **of the dtype the schema declares**:
+    #: `publish_strategy_records` type-checks every static feature against it, so a filler
+    #: that guessed `float` for `ma_alignment` (declared `bool`) is refused by the writer.
+    neutral: dict[str, Any] = {
+        "number": 1.0,
+        "integer": 1,
+        "string": "raw_session_only",
+        "bool": True,
+        "null": None,
     }
+    static: dict[str, Any] = {}
+    for name, spec in schema.items():
+        if name in values:
+            static[name] = values[name]
+            continue
+        dtype = str(dict(spec).get("dtype"))
+        assert dtype in neutral, f"no neutral value for {name!r} of dtype {dtype!r}"
+        static[name] = neutral[dtype]
     decision_at = captured_at - timedelta(minutes=17)
     return (
         StrategyCandidateRecord(
@@ -726,23 +1104,71 @@ def runner_signal_count(route: RouteAWorld, service_id: str) -> int:
         return int(connection.execute("SELECT count(*) FROM runner_signal").fetchone()[0])
 
 
-def signal_bus_counts(route: RouteAWorld) -> dict[str, int]:
-    path = setting_of(route, "signal-router.all-strategies.v1", "signal_bus_path")
+def _row_counts(path: Path, tables: tuple[str, ...]) -> dict[str, int]:
+    """Row counts for `tables`, reading the store the way a bystander reads it.
+
+    Read-only URI mode rather than a plain `connect`, because a plain connect on a WAL
+    database creates the `-shm` wal-index beside it, which is the write into a producer's
+    directory the all-roles file records as `KNOWN_C_LEVEL_WRITES`. A reader in a test
+    should not add another one.
+    """
+
     if not path.is_file():
-        return {}
+        return dict.fromkeys(tables, 0)
     counts: dict[str, int] = {}
     with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
-        for table in ("signals", "route_receipt", "outbox", "delivery_attempt"):
-            row = connection.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
-                (table,),
-            ).fetchone()
+        present = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        for table in tables:
             counts[table] = (
                 int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-                if row[0]
+                if table in present
                 else 0
             )
     return counts
+
+
+def signal_bus_counts(route: RouteAWorld) -> dict[str, int]:
+    """What the router left on the bus: envelopes, route receipts, and the outbox rows."""
+
+    return _row_counts(
+        setting_of(route, "signal-router.all-strategies.v1", "signal_bus_path"),
+        ("signal_envelope", "signal_route_receipt", "delivery_outbox", "delivery_attempt"),
+    )
+
+
+def paper_fill_count(route: RouteAWorld) -> int:
+    """Fills in the paper broker's own ledger -- the hop that books a routed signal."""
+
+    return _row_counts(
+        setting_of(route, "paper-broker.shadow-main.v1", "broker_path"),
+        ("paper_fill",),
+    )["paper_fill"]
+
+
+def notification_counts(route: RouteAWorld) -> dict[str, int]:
+    """The notifier's own durable outbox, replicated from the route spool.
+
+    `NotificationStateStore` extends `SignalBusStore`, so the notifier's store carries its
+    own `delivery_outbox` / `delivery_attempt` beside the replication tables. These are
+    the rows criterion (3b) means by "the notifier produced a notification": they are in
+    the notifier's database, not the router's.
+    """
+
+    return _row_counts(
+        setting_of(route, "notifier.admin.shadow.v1", "notification_state_path"),
+        (
+            "notification_replication_source",
+            "notification_source_route_receipt",
+            "signal_envelope",
+            "delivery_outbox",
+            "delivery_attempt",
+        ),
+    )
 
 
 def serving_generations(route: RouteAWorld) -> tuple[Path, ...]:
@@ -832,3 +1258,256 @@ def test_the_feature_role_turns_a_minute_batch_into_a_feature_batch(
     assert run.violations == [], run.violations
     assert run.exit_code == 0
     assert feature_batches(trading_day_chain) >= 0, "the feature role published nothing"
+
+
+def test_the_n_shape_strategy_emits_a_signal_from_a_real_feature_batch(
+    trading_day_chain: RouteAWorld,
+) -> None:
+    """The second hop: a candidate universe plus a feature batch becomes a signal.
+
+    `n_shape` is the simplest of the three evaluators -- carry, breakout, vwap, below the
+    limit -- and every one of those four reads comes from somewhere real here: the three
+    session values out of the feature batch the previous hop produced, and the rebased
+    reference close, reference high and limit-up price out of the candidate document.
+    """
+
+    publish_minute_batch(trading_day_chain)
+    publish_candidates(trading_day_chain)
+    feature = instance_of(trading_day_chain, FEATURE_ROLE)[0]
+    run_at(trading_day_chain, FEATURE_ROLE, instance=feature, now=SESSION_NOW)
+
+    instance = _instance_name(N_SHAPE_SERVICE_ID)
+    assert runner_signal_count(trading_day_chain, N_SHAPE_SERVICE_ID) == 0
+    run = run_at(trading_day_chain, STRATEGY_ROLE, instance=instance, now=SESSION_NOW)
+
+    assert run.refusal is None, run.traceback
+    assert run.entered, run
+    assert run.violations == [], run.violations
+    assert run.last_error is None, run.last_error
+    assert runner_signal_count(trading_day_chain, N_SHAPE_SERVICE_ID) >= 1, (
+        "the strategy consumed the feature batch and emitted nothing"
+    )
+
+
+#: The chain, in the runbook's C-3 order, with the producers each hop needs in front of
+#: it. `paper_constraint_publisher` is what puts a current pointer under
+#: `authorities/paper-execution`, which package J recorded as the one thing an otherwise
+#: healthy paper broker waits on, and `runtime_health_publisher` owns one of the six
+#: source authorities serving reads.
+#:
+#: `reference_slow_source` and `reference_slow_publisher` are deliberately **not** here.
+#: They are pre-open roles -- the publisher refuses outright after 09:25 -- and their
+#: product, one published reference generation, is an *input* to this chain rather than a
+#: hop of it, so it is written by the same writer they use and the session starts with it
+#: already on disk, exactly as a host that ran them at 09:0x would have.
+CHAIN_ORDER: tuple[tuple[str, str], ...] = (
+    ("runtime_health_publisher", "health"),
+    ("paper_constraint_publisher", "constraint"),
+    ("feature_live", "feature"),
+    ("strategy_live", "strategy"),
+    ("signal_router", "router"),
+    ("paper_broker", "broker"),
+    ("notifier", "notifier"),
+    ("serving_publisher", "serving"),
+)
+
+#: when each role in `CHAIN_ORDER` runs. The chain's own timing is under test, so these
+#: are not one instant: the paper broker's `execution_lag_seconds` is 60, so a signal
+#: routed at `SESSION_NOW` is not executable until the minute after.
+HOP_CLOCKS: dict[str, datetime] = {
+    "runtime_health_publisher": _at(9, 47, 17),
+    "paper_constraint_publisher": _at(9, 47, 29),
+    "feature_live": SESSION_NOW,
+    "strategy_live": _at(9, 47, 51),
+    "signal_router": ROUTER_NOW,
+    "paper_broker": BROKER_NOW,
+    "notifier": NOTIFIER_NOW,
+    "serving_publisher": SERVING_NOW,
+}
+
+
+def drive_the_chain(
+    route: RouteAWorld,
+    credentials: dict[str, Path],
+    *,
+    hops: list[Hop],
+    roles: tuple[tuple[str, str], ...] = CHAIN_ORDER,
+) -> dict[str, list[Any]]:
+    """Every role in `CHAIN_ORDER`, each at its own instant, inside its own unit."""
+
+    runs: dict[str, list[Any]] = {}
+    for role, label in roles:
+        for instance in instance_of(route, role):
+            run = run_at(
+                route,
+                role,
+                instance=instance,
+                now=HOP_CLOCKS[role],
+                credentials=credentials.get(instance),
+                label=label,
+                hops=hops,
+            )
+            runs.setdefault(role, []).append(run)
+    return runs
+
+
+def serving_signal_rows(route: RouteAWorld) -> int:
+    """Rows in the `signals` table of the generation `current.json` points at."""
+
+    from rquant.serving_publisher import ServingReader
+
+    root = setting_of(route, "serving.publisher.v1", "serving_root")
+    with ServingReader(root).open_current_readonly() as connection:
+        return int(connection.execute("SELECT count(*) FROM signals").fetchone()[0])
+
+
+def _print_hops(capsys: pytest.CaptureFixture[str], hops: list[Hop]) -> None:
+    with capsys.disabled():
+        print("\n  hop timings (wall clock, one pass each)")
+        for hop in hops:
+            print(
+                f"    {hop.label:<12} {hop.seconds:6.2f}s  status={hop.run.status}"
+                f" seq={getattr(hop.run.heartbeat, 'output_sequence', None)}"
+                f" error={hop.run.last_error}"
+            )
+
+
+def _assert_every_role_stayed_inside_its_unit(hops: list[Hop]) -> None:
+    outside = {
+        hop.label: [violation.path for violation in hop.run.violations]
+        for hop in hops
+        if hop.run.violations
+    }
+    assert outside == {}, outside
+    refused = {hop.label: hop.run.traceback for hop in hops if hop.run.refusal is not None}
+    assert refused == {}, refused
+    stalled = [hop.label for hop in hops if not hop.run.entered]
+    assert stalled == [], stalled
+    failed = {hop.label: hop.run.last_error for hop in hops if hop.run.last_error}
+    assert failed == {}, failed
+
+
+def test_one_signal_travels_the_whole_chain_to_a_same_day_serving_generation(
+    active_notifier_chain: RouteAWorld,
+    credentials_root_active: dict[str, Path],
+    delivery_recorder: _RecordingProvider,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Criterion (3b), end to end, with every hop's artifact asserted on disk.
+
+    The two producers in front of the chain put a minute batch and today's candidate
+    documents where their owners would have put them; from there every hop is the real
+    role, built by the real builder out of the real manifest, inside the sandbox its own
+    unit describes. Every assertion below is about what that role left behind.
+
+    The notifier is active here rather than paused, which is the one setting this world
+    changes and the reason it is a separate fixture; the case after this one measures what
+    the shipped profile does instead.
+    """
+
+    route = active_notifier_chain
+    capture = publish_minute_batch(route)
+    assert capture.published is True
+    publish_candidates(route)
+
+    before = feature_batches(route)
+    assert before == -1, "the feature spool already had a batch before the chain ran"
+
+    hops: list[Hop] = []
+    drive_the_chain(route, credentials_root_active, hops=hops)
+    _print_hops(capsys, hops)
+    _assert_every_role_stayed_inside_its_unit(hops)
+
+    by_label = {hop.label: hop.run for hop in hops}
+
+    # -- hop 1: a minute batch became a feature batch -----------------------------------
+    assert feature_batches(route) >= 0, "the feature role published nothing"
+    assert by_label["feature"].heartbeat.output_sequence == feature_batches(route)
+
+    # -- hop 2: a feature batch and today's candidate became a signal -------------------
+    assert runner_signal_count(route, N_SHAPE_SERVICE_ID) >= 1, (
+        "the strategy consumed the feature batch and emitted nothing"
+    )
+
+    # -- hop 3: the router put it on the bus and in the route spool ---------------------
+    counts = signal_bus_counts(route)
+    assert counts["signal_envelope"] >= 1, counts
+    assert counts["signal_route_receipt"] >= 1, counts
+    assert counts["delivery_outbox"] >= 1, counts
+    spool_root = setting_of(route, "signal-router.all-strategies.v1", "signal_spool_root")
+    assert (spool_root / "source.json").is_file()
+    assert by_label["router"].heartbeat.output_sequence >= 1
+
+    # -- hop 4: the paper broker booked it ----------------------------------------------
+    assert paper_fill_count(route) >= 1, "the paper broker booked nothing"
+
+    # -- hop 5: the notifier replicated it and delivered it -----------------------------
+    notifications = notification_counts(route)
+    assert notifications["delivery_outbox"] >= 1, notifications
+    assert notifications["delivery_attempt"] >= 1, notifications
+    assert notifications["notification_source_route_receipt"] >= 1, notifications
+    assert delivery_recorder.deliveries, "no delivery reached a provider"
+    assert by_label["notifier"].heartbeat.degraded_reasons == (), (
+        by_label["notifier"].heartbeat.degraded_reasons
+    )
+
+    # -- hop 6: serving published a same-day generation carrying the signal -------------
+    generations = serving_generations(route)
+    assert len(generations) == 1, generations
+    pointer = serving_current(route)
+    assert pointer is not None
+    assert pointer["generation_id"] == generations[0].name
+    assert (generations[0] / "serving.duckdb").is_file()
+    assert serving_signal_rows(route) >= 1, (
+        "serving published a generation that carries no signal"
+    )
+
+
+def test_the_shipped_profile_stops_the_signal_at_the_paper_broker(
+    trading_day_chain: RouteAWorld,
+    credentials_root: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same chain on the profile as shipped, where `notifier` is `paused: True`.
+
+    This is not a smaller version of the case above: it is the production answer. The
+    first four hops are identical -- the signal is emitted, routed, and booked -- and then
+    the notifier, being paused, replicates nothing, writes no outbox row, and publishes a
+    `signals` serving authority built from its own empty store. Serving still cuts a
+    generation, because five of its six sources moved, and that generation carries **no
+    signal**.
+
+    So "a generation appears under `serving/generations/`" is true on the host as shipped
+    and "one signal travels the chain to serving" is not, and the difference is one
+    hard-coded flag. Asserted rather than described, so that the day the flag changes,
+    this case fails and says so.
+    """
+
+    route = trading_day_chain
+    publish_minute_batch(route)
+    publish_candidates(route)
+
+    hops: list[Hop] = []
+    drive_the_chain(route, credentials_root, hops=hops)
+    _print_hops(capsys, hops)
+    _assert_every_role_stayed_inside_its_unit(hops)
+
+    #: the first four hops are the same
+    assert runner_signal_count(route, N_SHAPE_SERVICE_ID) >= 1
+    assert signal_bus_counts(route)["signal_envelope"] >= 1
+    assert paper_fill_count(route) >= 1
+
+    #: and the notifier, paused, produced nothing at all
+    notifications = notification_counts(route)
+    assert notifications["delivery_outbox"] == 0, notifications
+    assert notifications["delivery_attempt"] == 0, notifications
+    assert notifications["notification_source_route_receipt"] == 0, notifications
+    notifier = next(hop.run for hop in hops if hop.label == "notifier")
+    assert "notifier:paused" in (notifier.heartbeat.degraded_reasons or ()), (
+        notifier.heartbeat.degraded_reasons
+    )
+
+    #: serving published, and what it published has no signal in it
+    assert len(serving_generations(route)) == 1
+    assert serving_current(route) is not None
+    assert serving_signal_rows(route) == 0
