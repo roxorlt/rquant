@@ -115,7 +115,8 @@ class CandidatePublisherRuntimeSettings(RuntimeContractModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
-    #: 本地时间（Asia/Shanghai）的装配窗，只对 `auction_live` 有意义
+    #: 本地时间（Asia/Shanghai）的装配窗，只对 `auction_live` 有意义。**生产画像不写这两个键**，
+    #: 走的是下面两个常量；它们留在设置上只为回放与测试。定窗要改常量，见 DEPLOY.md。
     auction_input_start: time = AUCTION_GAP_DEFAULT_INPUT_START
     auction_input_end: time = AUCTION_GAP_DEFAULT_INPUT_END
     #: `session_document` 每个交易日**最早**从这个本地时刻起重建一次当日文档。没有终点：
