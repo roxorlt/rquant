@@ -575,13 +575,17 @@ def reference_slow_publisher_builder(
     return build
 
 
-#: 采集窗的**临时**默认值（#277）。2026-09-21 实测：主 token 的 `stk_auction(20260921)`
-#: 在 09:26:01/04/08 三次都返回空，15:10 已有 6,073 行——09:26 不是接口坏了，是当天的数据
-#: 还没就绪。首次可用时刻由主机探测给出，拿到之后**改这两个常量**（连同
-#: `runtime_builder_candidate` 那两个装配窗常量一起）再走 PR → CI → tag → 部署器，顺序与
-#: 时间预算见 DEPLOY.md。仓库里没有「改 manifest 设置就能定窗」这条路。
-AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 31)
-AUCTION_MATCH_DEFAULT_CAPTURE_END = time(9, 45)
+#: 采集窗的默认值（#277）。2026-09-22 生产探测：主 token 的 `stk_auction(20260922)` 在
+#: 09:26:02 / 09:26:04 / 09:26:08 三次都返回空，到 09:51:11 已经有 6,075 行。所以首次可用的
+#: 那一刻落在 **09:26:08 与 09:51:11 之间**，确切时刻仓库里还不知道（更细的探测 09-23 再跑
+#: 一轮）。协调者的裁定是不去猜那一刻，而是**用更多次尝试把整个区间盖住**：窗取
+#: 09:35:00–10:05:00，尝试次数取 6，间隔由 `窗宽 // max_attempts` 推成 300 秒，六次到期时刻
+#: 是 09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，全部落在窗内。09-23 拿到精确时刻之后再
+#: 把窗收紧——路径仍然只有「改这四个常量」（连同 `runtime_builder_candidate` 那两个装配窗
+#: 常量）再走 PR → CI → tag → 部署器这一条，顺序与时间预算见 DEPLOY.md。仓库里没有
+#: 「改 manifest 设置就能定窗」这条路。
+AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 35)
+AUCTION_MATCH_DEFAULT_CAPTURE_END = time(10, 5)
 #: 网关自己拒绝 09:26 之前收到的竞价数据，所以采集窗的起点不能早于它
 AUCTION_MATCH_EARLIEST_CAPTURE_START = time(9, 26)
 
@@ -599,7 +603,9 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
     calendar_expected_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     calendar_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     universe_path: Path
-    max_attempts: StrictInt = Field(default=3, gt=0, le=10)
+    #: 09-22 的探测只圈出了一个区间（09:26:08 空、09:51:11 非空），所以次数从 3 提到 **6**：
+    #: 六次 300 秒一次地摊过 09:35-10:05，不押注区间里的哪一刻（#277）。
+    max_attempts: StrictInt = Field(default=6, gt=0, le=10)
     #: 本地时间（Asia/Shanghai）。改动前是写死的 09:26-09:30 加三次立刻重试，三次全落在
     #: 七秒之内，等于只在 09:26:0x 问了一次（#277 的现场）。
     capture_start: time = AUCTION_MATCH_DEFAULT_CAPTURE_START
@@ -625,9 +631,9 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
             raise ValueError("auction capture window must be whole seconds")
         if self.capture_start.tzinfo is not None or self.capture_end.tzinfo is not None:
             raise ValueError("auction capture window is local Asia/Shanghai wall time")
-        #: 复核 MF-1 的另一半：显式给的间隔与窗宽对不上时原来照收不误。14 分钟的窗配
-        #: `retry_interval_seconds=600` + `max_attempts=3`，第三次的到期时刻是 09:51，
-        #: 永远不会发生——而探测定窗之后操作员正是要动这几个值的。
+        #: 复核 MF-1 的另一半：显式给的间隔与窗宽对不上时原来照收不误。30 分钟的窗配
+        #: `retry_interval_seconds=600` + `max_attempts=6`，第六次的到期时刻是 10:25，
+        #: 永远不会发生——而探测收窗之后操作员正是要动这几个值的。
         if not window_schedule_fits(
             start=self.capture_start,
             end=self.capture_end,
@@ -643,9 +649,10 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
     def capture_retry_interval_seconds(self) -> int:
         """`max_attempts` 次尝试摊在窗里的间隔，显式配置优先。
 
-        窗宽 14 分钟、三次尝试时是 **280** 秒：09:31:00 / 09:35:40 / 09:40:20，最后一次到期
-        之后离窗口右界还有整整 280 秒。按 `max_attempts - 1` 摊开的写法（420 秒 ⇒ 最后一次
-        正好到期在 09:45:00）在 2 秒轮询下有一半的相位永远拿不到第三次尝试——复核 MF-1。
+        窗宽 30 分钟、六次尝试时是 **300** 秒：09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，
+        最后一次到期之后离窗口右界还有整整 300 秒。按 `max_attempts - 1` 摊开的写法
+        （360 秒 ⇒ 最后一次正好到期在 10:05:00）在 2 秒轮询下有一半的相位永远拿不到最后那次
+        尝试——复核 MF-1。
         """
 
         if self.retry_interval_seconds is not None:

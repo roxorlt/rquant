@@ -10,42 +10,54 @@
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。只改 `src/` 与 `scripts/`，
 `deploy/` 一个字没动。
 
-### 0. 装之前必须先做的一件事：探测首次可用时刻（**不能跳过**）
+### 0. 探测 → 定窗：09-22 的探测只圈出一个区间，窗按「盖住整个区间」定（**已做完，写在代码里**）
 
 2026-09-21 实测：生产主 token 的 `stk_auction(20260921)` 在 **09:26:01 / 09:26:04 / 09:26:08
 三次都返回空**，同一个 token 在 **15:10 已经有 6,073 行**（列含 `pre_close`、`float_share`）。
-所以当天的数据在 09:26 还没就绪，**首次可用的确切时刻仓库里没人知道**。代码里的采集窗默认值
-是**临时的** `09:31:00–09:45:00`（`AUCTION_MATCH_DEFAULT_CAPTURE_START` /
-`AUCTION_MATCH_DEFAULT_CAPTURE_END`，`src/rquant/runtime_service_builtin.py`），装机前必须用
-主机上那一轮探测（`/tmp/stk-auction-probe.log`，cron 09:27 读）给出的真值替换：
+2026-09-22 又用同一个主 token 只读探测一轮，结果是一个**区间**而不是一个时刻：
 
-- **起点 = 探测到的首次可用时刻 + 60 s 余量**；
-- **终点 = 起点 + 14 分钟**，或按探测到的抖动放宽。三次尝试的间隔由 `窗宽 // max_attempts`
-  推出来（14 分钟 ⇒ 280 秒 ⇒ 起点 / +4:40 / +9:20），最后一次到期后离窗口右界还留着整整一个
-  间隔；
-- 同时把 `candidate.auction_gap` 的装配窗跟着移：起点**与采集窗起点逐字相同**，终点在采集窗
-  终点之后至少 5 分钟。
+| 时刻 | `stk_auction(20260922)` |
+|---|---|
+| 09:26:02 / 09:26:04 / 09:26:08 | **空**（0 行） |
+| 09:51:11 | **非空**，6,075 行 |
 
-**定窗只有一条路：改四个代码常量。** 仓库里没有「改 manifest 设置就能定窗」这条路——
+所以首次可用的那一刻落在 **09:26:08 与 09:51:11 之间**，确切时刻这一轮没卡出来
+（`/tmp/stk-auction-probe.log`，cron 09:27 读；**09-23 有一轮更细的探测**再去卡）。
+
+**协调者的裁定：不猜那一刻，用更多次尝试把整个区间盖住。** 本条对应的 PR 已经把四个常量
+（外加尝试次数）改成下面这一组，不再是「临时默认」：
+
+| 项 | 值 | 文件 |
+|---|---|---|
+| `AUCTION_MATCH_DEFAULT_CAPTURE_START` | `09:35:00` | `src/rquant/runtime_service_builtin.py` |
+| `AUCTION_MATCH_DEFAULT_CAPTURE_END` | `10:05:00` | 同上 |
+| `AuctionMatchSourceSettings.max_attempts` 默认值 | `6` | 同上 |
+| 画像里 `auction-match.source.v1` 的 `max_attempts` | `6` | `src/rquant/runtime_production_profile.py` |
+| `AUCTION_GAP_DEFAULT_INPUT_START` | `09:35:00` | `src/rquant/runtime_builder_candidate.py` |
+| `AUCTION_GAP_DEFAULT_INPUT_END` | `10:10:00` | 同上 |
+
+间隔由 `窗宽 // max_attempts` 推出来：`1800 // 6 = 300` 秒，六次到期时刻是
+**09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00**，全部落在 `[09:35, 10:05)` 里，最后一次
+到期之后离窗口右界还留着整整一个间隔。
+
+**精确 T 待 09-23 探测后收紧**：拿到首次可用的确切时刻之后，窗可以收回「T + 60 s 起点、
+宽 14 分钟、三次尝试」那种形状（间隔 280 秒），装配窗跟着收。收紧走的还是下面这条路，
+时间预算一样。
+
+**定窗只有一条路：改上面这几个代码常量。** 仓库里没有「改 manifest 设置就能定窗」这条路——
 manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_production_profile.py`），
 `ProductionRuntimeProfileInputs` 没有任何 settings 透传字段，手改盘上的
 `production-runtime-profile.json` 也会被下一次部署重新生成的那一份覆盖掉。
 （这几项在设置模型上仍然是可选字段，只为回放与测试保留；生产画像不写它们。）
 
-要改的四个常量：
-
-| 常量 | 文件 |
-|---|---|
-| `AUCTION_MATCH_DEFAULT_CAPTURE_START` / `..._END` | `src/rquant/runtime_service_builtin.py` |
-| `AUCTION_GAP_DEFAULT_INPUT_START` / `..._END` | `src/rquant/runtime_builder_candidate.py` |
-
-**四个必须一起改**：两对窗口的一致性（装配窗与采集窗同时开始、在它之后关闭）由
+**四个窗口常量必须一起改**：两对窗口的一致性（装配窗与采集窗同时开始、在它之后关闭）由
 `auction_windows_are_consistent` 在**生产画像生成时**当场校验，只改一边会让
 `rquant runtime-production-profile` 直接失败——这是有意的，因为只改一边的后果是竞价链
 安安静静地什么都不产出。
 
 `capture_start` 早于 **09:26** 会被设置模型当场拒绝（网关本身就拒绝 09:26 之前收到的竞价
-数据）；`max_attempts` 次尝试有任何一次落不进 `[capture_start, capture_end)` 也会被拒。
+数据）；`max_attempts` 次尝试有任何一次落不进 `[capture_start, capture_end)` 也会被拒
+（所以改次数和改窗宽是同一件事的两面，得一起算）。
 
 ### 0.1 时间预算：探测当天装不了机
 
@@ -53,15 +65,16 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
 
 | 步骤 | 何时 | 说明 |
 |---|---|---|
-| ① 探测 | 交易日 D 的 09:2x–09:4x | 主机 cron 读 `/tmp/stk-auction-probe.log`，拿到首次可用时刻 |
-| ② 改四个常量 + 开 PR | D 当天 | 同时改 CHANGELOG 里记下探测值 |
+| ① 探测 | 交易日 D 的 09:2x–09:5x | 主机 cron 读 `/tmp/stk-auction-probe.log`；09-22 这一轮只圈出区间，09-23 再卡精确时刻 |
+| ② 改常量 + 开 PR | D 当天 | 同时在 CHANGELOG 与本条里记下探测值 |
 | ③ CI 绿（3.11 / 3.12） | D 当天 | |
 | ④ squash merge + 打 tag | D 当天 | |
 | ⑤ 部署 | **D 收盘之后**（或 D+1 收盘后） | `bash scripts/deploy-production.sh --target <tag>`；部署器在工作日 09:15–15:10 会自动延期 |
 | ⑥ 验收 | **D+1（或 D+2）开盘** | 按下面第 2 节逐条看 |
 
-也就是说：**探测日 D 只能拿到数，真正生效最早是 D+1 的开盘**。中间这一两个交易日跑的仍是
-临时窗 09:31–09:45，竞价链可能照旧采不到——这是已知的、可接受的过渡，不是回归。
+也就是说：**探测日 D 只能拿到数，真正生效最早是 D+1 的开盘**。装机之前生产跑的仍是写死的
+老窗 09:26–09:30 加七秒内三次重试，竞价链照旧采不到——这是已知的、可接受的过渡，不是回归。
+09-23 那一轮探测若把窗收紧，走的是同一张表，再来一遍。
 
 ### 1. 这一版修了什么
 
@@ -79,8 +92,10 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   另有一条 **`calendar_clock_regressed:<generated_at>`**：日历权威的生成时刻晚于观测时刻，
   也就是时钟被回拨或装了错代的权威。这一条是**硬失败**（unit 的 `last_error` 里看，
   不在 `degraded_reasons` 里），`auction-match` 与两个候选发布者行为一致。
-- **采集窗第一次尝试**（临时默认 09:31）：`live/auction-match/batches/auction_match/` 下出现
-  批次。当天数据还没出时是 DEGRADED + `empty_source_result`，出了之后是 PUBLISHED。
+- **采集窗第一次尝试**（09:35，其后每 300 秒一次，共六次到 10:00）：
+  `live/auction-match/batches/auction_match/` 下出现批次。当天数据还没出时是
+  DEGRADED + `empty_source_result`，出了之后是 PUBLISHED。09-22 的区间（09:26:08 空、
+  09:51:11 非空）意味着**前几次很可能仍是空批次，后几次才出数**，这是窗按区间定的用意。
 - **窗结束之后**：`rquant-runtime-auction-match@…` 的心跳 `degraded_reasons` 里会带
   **`capture_failed`**（试过但都没成）或 **`capture_missed`**（一次请求都没发出去——role 没
   起来、部署、watchdog 重启，或者竞价全集一直读不出来），一直带到次日。这正是 09-21 那天
@@ -101,9 +116,10 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   `tests/unit/test_auction_match_runtime_source.py::test_the_deploy_acceptance_query_runs_against_a_real_quota_store`
   **从本文件里抓出来、对着一个真的 `SourceQuotaStore` 跑一遍**，所以它与表结构不会再各说各的。
 
-  `quota_attempt` 里当天窗口的行数就是真实发出的请求数；它应当等于 `max_attempts`（3），
-  少于 3 说明窗口里有轮次没跑到。
-- **装配窗内**（临时默认 09:31–09:50）：`candidate.auction_gap.v1` 的
+  `quota_attempt` 里当天窗口的行数就是真实发出的请求数；采集一直没成时它应当等于
+  `max_attempts`（**6**），少于 6 说明窗口里有轮次没跑到；某一次成了之后就不再发请求，
+  行数少于 6 是对的。
+- **装配窗内**（09:35–10:10）：`candidate.auction_gap.v1` 的
   `processed_count >= 1`，随后 `watchlist-quote` / `market-minute` 的
   `degraded_reasons` 为空、`source_generations` 里有 `candidate_universe`。
 
@@ -113,10 +129,11 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
    就去读候选全集，而当日的 auction_gap 快照最早在装配窗起点之后才装得出来。这一段是
    **DEGRADED 不是 failed**：`run_service_loop` 记 `record_failure` 之后继续循环，进程从不以
    非零退出，所以 `OnFailure=rquant-alert@%n.service` 不触发、`Restart=on-failure` 不重启。
-   **这一段的长度 = 装配窗起点 − 09:30**，现在是 1 分钟；探测如果把窗定到 09:36，它就变成
-   6 分钟。上线标准里若写了「盘中零降级」，措辞要按探测值重裁。
-2. **竞价全集读不出来时，窗内每一轮都会记一次失败**。`consecutive_failures` 可能飙到几百
-   （2 秒轮询 × 14 分钟 ≈ 420 次），这是「全集没发布之前每轮都再试、不烧采集次数」换来的，
+   **这一段的长度 = 装配窗起点 − 09:30**，按现在的 09:35 是 **5 分钟**；而当天数据真正出来
+   得更晚时（09-22 的区间说它可能晚到 09:51），这一段会一直延到第一次采到数为止。
+   上线标准里若写了「盘中零降级」，措辞要按这个区间重裁。
+2. **竞价全集读不出来时，窗内每一轮都会记一次失败**。`consecutive_failures` 可能飙到上千
+   （2 秒轮询 × 30 分钟 ≈ 900 次），这是「全集没发布之前每轮都再试、不烧采集次数」换来的，
    仓库里没有任何逻辑对 `consecutive_failures` 设阈值，**不要误判成崩溃循环**。
    真正要看的是 `last_error` 说的是不是「竞价全集读不出来」。
 3. **窗内重启会报销当天的采集**（既有机制，本包把暴露面从 7 秒放大到整个窗）。配额台账按

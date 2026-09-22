@@ -91,28 +91,41 @@ REPLICA_SYNCED_AT = at(8, 40)
 SESSION_DOCUMENT_AT = at(8, 45)
 #: 竞价全集：09:15 的保护窗之前
 UNIVERSE_AT = at(9, 0)
-#: 采集窗的第一、二、三次尝试。间隔 = 窗宽 // max_attempts = 840 // 3 = 280 秒，
-#: 到期时刻是 09:31:00 / 09:35:40 / 09:40:20；这里**故意取到期之后的偏相位时刻**
-#: （+37 / +29 秒），不再踩在到期秒或窗口右界上——复核 MF-1 指出的相位缺陷正是被
-#: 「所有时刻都恰好踩在边界上」的测试放过去的。
-CAPTURE_FIRST = at(9, 31, 37)
-CAPTURE_SECOND = at(9, 36, 29)
-CAPTURE_THIRD = at(9, 41, 7)
+#: 采集窗 09:35-10:05 的六次尝试。间隔 = 窗宽 // max_attempts = 1800 // 6 = 300 秒，
+#: 到期时刻是 09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00；这里**故意取到期之后的偏相位
+#: 时刻**（+1:37 / +1:29 / +1:07 …），不再踩在到期秒或窗口右界上——复核 MF-1 指出的相位
+#: 缺陷正是被「所有时刻都恰好踩在边界上」的测试放过去的。窗与次数由 09-22 的探测区间定
+#: （09:26:08 空、09:51:11 非空，精确时刻 09-23 再探）。
+CAPTURE_FIRST = at(9, 36, 37)
+CAPTURE_SECOND = at(9, 41, 29)
+CAPTURE_THIRD = at(9, 46, 7)
+CAPTURE_FOURTH = at(9, 51, 43)
+CAPTURE_FIFTH = at(9, 56, 19)
+CAPTURE_SIXTH = at(10, 1, 53)
+#: 采集窗里的六轮，一个进程按顺序跑完就是「今天的次数用尽了」
+CAPTURE_MOMENTS = (
+    CAPTURE_FIRST,
+    CAPTURE_SECOND,
+    CAPTURE_THIRD,
+    CAPTURE_FOURTH,
+    CAPTURE_FIFTH,
+    CAPTURE_SIXTH,
+)
 #: 窗过去之后的任意一轮，以及当天更晚的时刻
-AFTER_WINDOW = at(9, 46)
+AFTER_WINDOW = at(10, 6)
 AFTER_CLOSE = at(15, 30)
 #: 下一个交易日的盘前：交易日切换之后旗子应当落下
 NEXT_SESSION = at(8, 30, day=OPEN_DATES[-1] + timedelta(days=1))
-#: 装配窗（09:31-09:50）里的一轮，排在第一次成功采集（09:31:37）之后
-ASSEMBLE_AT = at(9, 32, 11)
+#: 装配窗（09:35-10:10）里的一轮，排在第一次成功采集（09:36:37）之后
+ASSEMBLE_AT = at(9, 37, 11)
 #: 两个源真正去读候选全集的时刻：早盘阶段，且晚于上面那一次装配
-CONSUME_AT = at(9, 35)
+CONSUME_AT = at(9, 40)
 #: 第二次安装打开 schema rollout 窗口的时刻。窗宽是生产画像的
 #: `schema_rollout_stage_timeout_seconds` = 600 s，而**记一条 dual-write 的是两个消费者**
 #: （`market-minute` / `watchlist-quote`，`runtime.strategy_candidate.snapshot` 这条
 #: channel 的消费方），它们跑在 `CONSUME_AT`。所以窗开在 `CONSUME_AT` 前五分钟：
 #: 早于窗的那些轮次（08:45 的候选文档、09:00 的竞价全集）不记 dual-write，不受影响。
-SCHEMA_ROLLOUT_STARTED_AT = at(9, 30)
+SCHEMA_ROLLOUT_STARTED_AT = at(9, 35)
 
 
 # ---------------------------------------------------------------------------------------
@@ -445,7 +458,7 @@ def test_an_empty_source_then_a_real_one_leaves_a_degraded_batch_then_a_publishe
     publish_auction_universe(auction_world)
     adapter = _AuctionAdapter([empty_auction_frame(), auction_frame()])
 
-    #: 同一个进程的两轮，是三次尝试摊在窗里的头两次（取的是到期之后的偏相位时刻）
+    #: 同一个进程的两轮，是六次尝试摊在窗里的头两次（取的是到期之后的偏相位时刻）
     second = run_auction_match(
         auction_world,
         adapter,
@@ -507,18 +520,16 @@ def test_an_exhausted_day_keeps_capture_failed_in_the_heartbeat_until_the_next_d
     """#277 第三个缺陷：早退分支不许再把今天的失败洗成一条干净心跳。"""
 
     publish_auction_universe(auction_world)
-    adapter = _AuctionAdapter(
-        [empty_auction_frame(), empty_auction_frame(), empty_auction_frame()]
-    )
+    adapter = _AuctionAdapter([empty_auction_frame() for _ in CAPTURE_MOMENTS])
 
     heartbeat = run_auction_match(
         auction_world,
         adapter,
-        moments=[CAPTURE_FIRST, CAPTURE_SECOND, CAPTURE_THIRD, AFTER_WINDOW, AFTER_CLOSE],
+        moments=[*CAPTURE_MOMENTS, AFTER_WINDOW, AFTER_CLOSE],
     )
 
-    #: 三次尝试用完之后不再发请求
-    assert adapter.calls == [TRADE_DATE, TRADE_DATE, TRADE_DATE]
+    #: 六次尝试用完之后不再发请求
+    assert adapter.calls == [TRADE_DATE] * len(CAPTURE_MOMENTS)
     #: 收盘之后那一轮的心跳仍然说得出「今天没采到」
     assert "capture_failed" in heartbeat.degraded_reasons
 
@@ -557,13 +568,11 @@ def test_the_failure_flag_is_a_per_process_memory_that_a_restart_loses(
     """
 
     publish_auction_universe(auction_world)
-    adapter = _AuctionAdapter(
-        [empty_auction_frame(), empty_auction_frame(), empty_auction_frame()]
-    )
+    adapter = _AuctionAdapter([empty_auction_frame() for _ in CAPTURE_MOMENTS])
     exhausted = run_auction_match(
         auction_world,
         adapter,
-        moments=[CAPTURE_FIRST, CAPTURE_SECOND, CAPTURE_THIRD, AFTER_WINDOW],
+        moments=[*CAPTURE_MOMENTS, AFTER_WINDOW],
     )
     assert "capture_failed" in exhausted.degraded_reasons
 
@@ -780,7 +789,7 @@ def test_the_world_is_two_generations_over_a_session_the_calendar_opens(
     assert auction_world.receipt.previous_generation_hash is not None
     assert TRADE_DATE in OPEN_DATES
     assert auction_world.inputs.readonly_replica_database_path.is_file()
-    #: 冻结的 manifest 里没有采集窗那几项，走的是代码里的临时默认 09:31-09:45
+    #: 冻结的 manifest 里没有采集窗那几项，走的是代码里的默认 09:35-10:05
     settings = auction_world.manifest(AUCTION_MATCH_SERVICE_ID).settings
     assert "capture_start" not in settings
     assert "capture_end" not in settings

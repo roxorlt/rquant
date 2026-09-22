@@ -1269,7 +1269,10 @@ def build_production_runtime_profile(
                 "calendar_expected_commit": config.market_calendar_producer_commit,
                 "calendar_content_sha256": config.market_calendar_content_sha256,
                 "universe_path": str(root / "authorities" / "auction-universe" / "current.json"),
-                "max_attempts": 3,
+                #: 六次，与 `AuctionMatchSourceSettings.max_attempts` 的默认值一致：09-22 的
+                #: 探测只圈出了 09:26:08（空）到 09:51:11（非空）这个区间，所以用次数盖住
+                #: 整个 09:35-10:05 的窗，间隔推出来是 300 秒（#277）。
+                "max_attempts": 6,
             },
         ),
     ]

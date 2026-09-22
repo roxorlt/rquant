@@ -283,7 +283,7 @@ def test_an_auction_iteration_outside_its_window_says_it_read_nothing(
             "snapshot_root": str(root),
         },
     )
-    #: 18:30 Asia/Shanghai, far outside 09:31-09:50
+    #: 18:30 Asia/Shanghai, far outside 09:35-10:10
     step = candidate_publisher_builder(
         auction_input_loader=lambda **_: _batch("auction_gap"),
         clock=lambda: datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
@@ -303,7 +303,7 @@ def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
 
     `test_an_auction_iteration_outside_its_window_says_it_read_nothing` never reads
     anything at all, so it passes with or without the call. This one reads for real in the
-    09:31-09:50 window and then idles outside it: without `begin_iteration()` the idle
+    09:35-10:10 window and then idles outside it: without `begin_iteration()` the idle
     iteration reports the window's read, which is the whole of MF-1 on this role.
 
     The loader is a stub that uses the gate it is handed, because what is under test is
@@ -342,8 +342,8 @@ def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
         read_gate.read(lambda: replica.read_bytes(), key=("auction-gap",))
         return _batch("auction_gap")
 
-    #: 09:32 then 09:55 Asia/Shanghai: inside the window, then outside it
-    inside = datetime(2026, 7, 31, 1, 32, tzinfo=UTC)
+    #: 09:40 then 10:15 Asia/Shanghai: inside the window, then outside it
+    inside = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
     clock = {"now": inside}
     step = candidate_publisher_builder(
         auction_input_loader=reading_loader,
@@ -351,7 +351,7 @@ def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
     )(manifest)
 
     published = step()
-    clock["now"] = datetime(2026, 7, 31, 1, 55, tzinfo=UTC)
+    clock["now"] = datetime(2026, 7, 31, 2, 15, tzinfo=UTC)
     idled = step()
 
     assert published.replica_opened is True
@@ -401,7 +401,7 @@ def test_a_torn_read_in_the_auction_window_is_reported_as_the_open_it_was(
 
     step = candidate_publisher_builder(
         auction_input_loader=torn_loader,
-        clock=lambda: datetime(2026, 7, 31, 1, 32, tzinfo=UTC),
+        clock=lambda: datetime(2026, 7, 31, 1, 40, tzinfo=UTC),
     )(manifest)
 
     degraded = step()
@@ -458,7 +458,7 @@ def test_a_failing_auction_iteration_still_says_what_it_did_with_the_replica(
 
     step = candidate_publisher_builder(
         auction_input_loader=failing_loader,
-        clock=lambda: datetime(2026, 7, 31, 1, 32, tzinfo=UTC),
+        clock=lambda: datetime(2026, 7, 31, 1, 40, tzinfo=UTC),
     )(manifest)
 
     summary = getattr(step, "replica_iteration_summary", None)
@@ -514,7 +514,7 @@ def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path)
 
 
 def test_the_auction_assembly_window_follows_the_capture_window(tmp_path: Path) -> None:
-    """#277：采集窗后移到 09:31-09:45，装配窗必须跟着走，否则窗里永远没有料。
+    """#277：采集窗后移到 09:35-10:05，装配窗必须跟着走，否则窗里永远没有料。
 
     默认起点与 `AUCTION_MATCH_DEFAULT_CAPTURE_START` 逐字相同，终点在
     `AUCTION_MATCH_DEFAULT_CAPTURE_END` 之后——最后一次采集成功之后还装得出来。
@@ -553,13 +553,13 @@ def _auction_manifest(tmp_path: Path, **overrides: object) -> RuntimeServiceMani
 @pytest.mark.parametrize(
     ("hour", "minute", "expected"),
     [
-        (1, 30, 0),
-        (1, 31, 1),
-        (1, 50, 1),
-        (1, 51, 0),
+        (1, 34, 0),
+        (1, 35, 1),
+        (2, 10, 1),
+        (2, 11, 0),
     ],
 )
-def test_the_default_assembly_window_is_nine_thirty_one_to_nine_fifty(
+def test_the_default_assembly_window_is_nine_thirty_five_to_ten_ten(
     tmp_path: Path,
     hour: int,
     minute: int,
@@ -577,7 +577,7 @@ def test_the_default_assembly_window_is_nine_thirty_one_to_nine_fifty(
 
 
 def test_the_assembly_window_can_be_moved_from_the_manifest(tmp_path: Path) -> None:
-    """探测定下采集窗之后，这两项跟着改，不用改代码。"""
+    """设置里给了装配窗就按给的走（回放与测试用；生产画像不写这两项，定窗只能改常量）。"""
 
     calls: list[object] = []
     step = candidate_publisher_builder(
@@ -606,7 +606,7 @@ def _auction_match_settings(tmp_path: Path, **overrides: object) -> dict[str, ob
         "calendar_expected_commit": COMMIT,
         "calendar_content_sha256": "c" * 64,
         "universe_path": str(tmp_path / "universe.json"),
-        "max_attempts": 3,
+        "max_attempts": 6,
     }
     settings.update(overrides)
     return settings
@@ -616,7 +616,7 @@ def _auction_match_settings(tmp_path: Path, **overrides: object) -> dict[str, ob
     ("capture", "assembly", "consistent"),
     [
         #: 默认的四个常量
-        ((time(9, 31), time(9, 45)), (time(9, 31), time(9, 50)), True),
+        ((time(9, 35), time(10, 5)), (time(9, 35), time(10, 10)), True),
         #: 探测把窗整体后移，两边一起改
         ((time(9, 36), time(9, 50)), (time(9, 36), time(9, 55)), True),
         #: 只改了采集窗，忘了装配窗——竞价链会安静地什么都不产出
@@ -712,7 +712,7 @@ def test_auction_candidate_publisher_builds_live_input_during_auction_window(
             "snapshot_root": str(root),
         },
     )
-    observed_at = datetime(2026, 7, 31, 1, 32, tzinfo=UTC)
+    observed_at = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
 
     result = candidate_publisher_builder(
         auction_input_loader=auction_loader,
@@ -1562,14 +1562,14 @@ def test_an_idle_round_after_a_publish_does_not_regress_the_output_sequence(
     assert closed.output_sequence == 0
 
     #: auction_live 那一支同样
-    gap_clock = {"now": datetime(2026, 7, 31, 1, 32, tzinfo=UTC)}
+    gap_clock = {"now": datetime(2026, 7, 31, 1, 40, tzinfo=UTC)}
     gap = candidate_publisher_builder(
         auction_input_loader=lambda **_: _batch("auction_gap"),
         clock=lambda: gap_clock["now"],
     )(_auction_manifest(tmp_path / "gap"))
 
     gap_published = gap()
-    gap_clock["now"] = datetime(2026, 7, 31, 1, 55, tzinfo=UTC)
+    gap_clock["now"] = datetime(2026, 7, 31, 2, 15, tzinfo=UTC)
     gap_idled = gap()
 
     assert gap_published.output_sequence == 0
