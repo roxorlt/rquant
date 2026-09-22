@@ -49,6 +49,16 @@ _REFERENCE_SLOW_AUTHORITY_DATASET_ID = "reference_slow_authority"
 _REFERENCE_SLOW_DATASET_ID = "reference_slow"
 _REFERENCE_SLOW_CONTRACT_DATASET_ID = "reference_slow_contract"
 
+#: The two sources serving degrades on instead of refusing the whole round (#283). Both
+#: belong to the research plane, which has never published a generation on the host, and
+#: neither is evidence any serving consumer prices or alerts against: an empty
+#: `LabJobsPayload` / `PromotionsPayload` is a legal value of its own contract. The other
+#: four stay fail-closed, and `signals` above all: criterion (3b) reads "no signal today"
+#: off an empty `signals` table, and that reading is only worth anything while a broken
+#: `signals` reader still refuses the round instead of publishing the same empty table.
+#: It lives here rather than in `runtime_serving_snapshot`, which imports this module.
+DEFAULT_OPTIONAL_SOURCE_DATASETS: frozenset[str] = frozenset({"lab_jobs", "promotions"})
+
 
 def current_runtime_schema_consumer_acknowledgers(
     *,
@@ -69,6 +79,15 @@ class ServingRuntimeSettings(RuntimeContractModel):
     serving_root: Path
     schema_version: StrictInt = Field(ge=1)
     source_authorities: tuple[ServingSourceAuthoritySettings, ...] = ()
+    #: A manifest written before #283 does not carry this key, and the default is what
+    #: this release decided, so such a manifest gets the same behaviour without being
+    #: rewritten. The reverse does not hold: `RuntimeContractModel` forbids extra keys, so
+    #: a runtime generation staged by this code and left published while the code rolls
+    #: back to one that has no such field is refused at build. Roll the runtime generation
+    #: back together with the code.
+    optional_source_datasets: tuple[StrictStr, ...] = tuple(
+        sorted(DEFAULT_OPTIONAL_SOURCE_DATASETS)
+    )
 
     @field_validator("serving_root")
     @classmethod
@@ -76,6 +95,18 @@ class ServingRuntimeSettings(RuntimeContractModel):
         if not value.is_absolute():
             raise ValueError("serving runtime root must be absolute")
         return value
+
+    @field_validator("optional_source_datasets")
+    @classmethod
+    def validate_optional_source_datasets(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("optional serving source datasets contain a duplicate")
+        unknown = sorted(set(value).difference(_SOURCE_PAYLOAD_KINDS))
+        if unknown:
+            raise ValueError(f"optional serving source datasets are not owner datasets: {unknown}")
+        if _REFERENCE_SLOW_AUTHORITY_DATASET_ID in value:
+            raise ValueError("reference_slow_authority can never be an optional serving source")
+        return tuple(sorted(value))
 
     @model_validator(mode="after")
     def validate_source_authorities(self) -> ServingRuntimeSettings:
@@ -115,6 +146,15 @@ _SOURCE_PAYLOAD_KINDS = {
     "promotions": "promotions",
     _REFERENCE_SLOW_AUTHORITY_DATASET_ID: "reference_slow",
 }
+
+#: The one list of owner datasets serving reads. Both guards that have to name the six
+#: derive from here -- `ServingRuntimeSettings.validate_optional_source_datasets` above,
+#: and `ServingSnapshotAssembler`'s construction check, which imports this name. A
+#: profile's `source_authorities` cannot be derived (each entry carries its own root),
+#: but it is checked against the same mapping by `validate_source_authorities`, so a
+#: seventh source added in one place and missed in another is refused rather than
+#: silently leaving the two guards out of step.
+SERVING_SOURCE_DATASET_IDS: frozenset[str] = frozenset(_SOURCE_PAYLOAD_KINDS)
 
 
 class ServingReferenceSlowEvidence(RuntimeContractModel):
@@ -275,6 +315,11 @@ def serving_publisher_builder(
                 lab_jobs_reader=readers["lab_jobs"],
                 promotions_reader=readers["promotions"],
                 reference_slow_reader=readers[_REFERENCE_SLOW_AUTHORITY_DATASET_ID],
+                #: #283: the research plane has never published a generation on the host,
+                #: and a fail-closed read of it stopped serving from cutting any
+                #: generation at all. These two degrade to an empty payload and an
+                #: `unavailable` watermark; the other four still refuse the round.
+                optional_datasets=frozenset(settings.optional_source_datasets),
             )
             resolved_snapshot_loader = assembler.assemble
             build_events = handover_events
