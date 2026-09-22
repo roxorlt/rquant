@@ -303,7 +303,16 @@ class NotifierSettings(RuntimeContractModel):
         pattern=r"^[0-9a-f]{40}$",
     )
     serving_history_limit: StrictInt = Field(default=1_000, ge=1, le=10_000)
+    #: The emergency stop. A paused notifier replicates nothing, claims nothing and
+    #: delivers nothing; it still publishes the `signals` serving authority, built from
+    #: whatever its store already holds.
     paused: StrictBool = False
+    #: #281, shadow mode: the live branch, with the transport replaced. Everything a live
+    #: notifier does happens -- replication, the recipient preflight and alias migration,
+    #: the leased batch, the attempt rows, the serving authority -- and no byte reaches
+    #: PushDeer or PushPlus. This is not a second kind of pause: `paused` stops the work,
+    #: `suppress_delivery` only stops the send.
+    suppress_delivery: StrictBool = False
 
     @field_validator(
         "signal_spool_root",
@@ -383,6 +392,41 @@ def _require_manifest(
 
 def _active_outbox_count(store: SignalBusStore) -> int:
     return sum(record.status in _ACTIVE_OUTBOX_STATUSES for record in store.outbox_records())
+
+
+def _shadow_providers(
+    providers: Mapping[DeliveryChannel, NotificationProvider],
+) -> Mapping[DeliveryChannel, NotificationProvider]:
+    """Every channel's provider replaced by the suppressing one, the registry kept.
+
+    It is the **provider** that is swapped, not the transport under it. Replacing the
+    transport would mean handing one to `build_environment_notification_provider_loader`,
+    and a loader given an external transport skips `_require_https_endpoint`
+    (`runtime_notification_providers.py`), so the endpoint check the production loader
+    performs would stop happening in shadow -- less faithful, not more. The heartbeat
+    reason keeps the name `notifier:shadow_transport`, which is what an operator reads.
+
+    #281, risk (g): what the loader built stays built. The credential is read, the
+    recipient ids are resolved, the alias migration contract and the preflight verdict are
+    the real ones -- a `RecipientScopedProviderRegistry` in, a `RecipientScopedProviderRegistry`
+    out, carrying the same `recipient_ids`, aliases and inferred channels -- so switching a
+    notifier from shadow to live changes where the bytes go and nothing else.
+    """
+
+    from rquant.runtime_notification_providers import (
+        RecipientScopedProviderRegistry,
+        SuppressedNotificationProvider,
+    )
+
+    suppressed = SuppressedNotificationProvider()
+    if not isinstance(providers, RecipientScopedProviderRegistry):
+        return {channel: suppressed for channel in providers}
+    return RecipientScopedProviderRegistry(
+        providers={channel: suppressed for channel in providers},
+        recipient_ids=dict(providers.recipient_ids),
+        aliases=providers.recipient_preflight.aliases,
+        inferred_channels=providers.recipient_preflight.inferred_channels,
+    )
 
 
 def _validated_providers(
@@ -1142,6 +1186,8 @@ def notifier_builder(
                 observed_at=observed_at,
             )
             loaded_providers = resolved_provider_loader()
+            if settings.suppress_delivery:
+                loaded_providers = _shadow_providers(loaded_providers)
             recipient_migration = None
             inferred_channels: tuple[DeliveryChannel, ...] = ()
             from rquant.runtime_notification_providers import (
@@ -1166,6 +1212,9 @@ def notifier_builder(
                 clock=clock,
             )
             degraded: list[str] = []
+            if settings.suppress_delivery:
+                #: the heartbeat of a shadow notifier never reads as a clean live one
+                degraded.append("notifier:shadow_transport")
             if summary.failed_count:
                 degraded.append(f"notifier:confirmed_failures:{summary.failed_count}")
             if summary.unknown_count:

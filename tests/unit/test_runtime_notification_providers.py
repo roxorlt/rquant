@@ -21,6 +21,7 @@ from rquant.runtime_notification_providers import (
     ExistingClientNotificationTransport,
     NotificationTransportResult,
     RecipientNotificationCapabilities,
+    SuppressedNotificationProvider,
     build_environment_notification_provider_loader,
     build_notification_provider_loader,
     format_signal_notification,
@@ -447,3 +448,27 @@ def test_wrong_channel_is_rejected_before_transport() -> None:
     with pytest.raises(ConfirmedDeliveryFailureError, match="channel mismatch"):
         provider.deliver(_delivery(channel=DeliveryChannel.PUSHPLUS))
     assert transport.calls == []
+
+
+def test_the_shadow_transport_opens_no_socket_and_receipts_deterministically() -> None:
+    """#281 risk (b): a retried lease must not read as a second delivery.
+
+    `run_notification_batch` writes whatever the provider returns into the attempt log, so
+    a generated id here would make one delivery attempted twice look like two deliveries
+    made -- and the count of deliveries is exactly what an operator reads to decide
+    whether a shadow notifier is behaving. The receipt is the outbox id, which is stable
+    across attempts and different between two deliveries.
+
+    There is no transport to record against: this provider is given none and asks for
+    none, which is the whole point of it.
+    """
+
+    provider = SuppressedNotificationProvider()
+    delivery = _delivery()
+    other = _delivery(recipient_id="admin.mac")
+
+    assert provider.deliver(delivery) == f"shadow:{delivery.record.outbox_id}"
+    assert provider.deliver(delivery) == provider.deliver(delivery)
+    assert SuppressedNotificationProvider().deliver(delivery) == provider.deliver(delivery)
+    assert provider.deliver(other) != provider.deliver(delivery)
+    assert provider.deliver(delivery).startswith("shadow:")

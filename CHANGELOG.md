@@ -6,6 +6,43 @@
 
 ### Added
 
+- **notifier 影子档：写库、出 `signals` 权威、不发一个字节（#281）**：`notifier.admin.shadow.v1`
+  的 `"paused": True` 原来硬编码在 `runtime_production_profile.py` 里，要让一条信号走到
+  serving 的 `signals` 数据集只能改代码重新发版。现在它是画像输入
+  `ProductionRuntimeProfileInputs.notifier_delivery_mode`（`paused` / `shadow` / `live`，
+  **默认 `shadow`**），生成器新增 `--notifier-delivery-mode`，`deploy/` 一个字没改——档位随
+  manifest 走，不需要动 unit。
+  - `shadow` 走的是**原样不动的 live 分支**：复制路由回执进通知状态库、跑收件人 preflight
+    与冻结的别名迁移、按 live 节奏（`batch_limit=128` / 2 秒）认领 outbox、写 attempt 行、
+    用 live 分支同一句 `_publish_signal_authority(...)` 发布**非空**的 `signals` 权威；唯一的
+    差别是 channel 的 provider 被换成 `SuppressedNotificationProvider`，它不开 socket，回执是
+    确定的 `shadow:<outbox_id>`（重试写同一条回执，一次投递重试不会读成两次投递）。
+  - 两个标记让影子 notifier 不会被当成干净的 live：心跳 `degraded_reasons` 里的
+    `notifier:shadow_transport`，以及 `delivery_attempt.provider_receipt` 的 `shadow:` 前缀。
+  - `paused` 语义不变，仍是急停档；`PUSHDEER_KEYS` / `PUSHPLUS_TOKENS` 三档都照常下发，
+    所以从 shadow 切 live 改变的只有「字节去哪儿」。
+  - 开盘日全链 e2e（`tests/integration/test_route_a_trading_day_full_chain_e2e.py`）从两档扩成
+    三档，三个世界只差输入文档里的一个值：`paused` 断言 outbox 零行、`shadow` 断言 outbox 与
+    attempt 有行、能说话的 provider 一条都没收到、当代 `signals` 里**按 `event_time` 过滤出
+    本场次**的信号非空，`live` 断言记录器收到了投递。
+  - shadow 下凭据、收件人解析、别名迁移、preflight 全是真的，**唯一看不见的是线那一头的回答**：
+    影子档永远不会产生 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`，
+    所以切 live 的第一轮仍可能是投递失败第一次出现的时刻。
+  - **切换与回滚见 `DEPLOY.md` 2026-09-21 那条**：shadow → live 不会有告警风暴（游标一直在
+    前进），但档位要重启 notifier 才生效，所以只能开盘前或收盘后切；paused → live 不安全
+    （会一次推出整条积压 spool，#86 那一类风暴）。新画像带的 `suppress_delivery` /
+    `notifier_delivery_mode` 两个键会被 v0.33.16 及更早版本的 `extra="forbid"` 模型拒收，
+    **回滚必须先把 `notifier_delivery_mode` 从输入文档里删掉**。
+  - **路线 B 的复述跟着走**：`runtime_authority_stage.bootstrap_settings` 是画像表达式的复述
+    （路线 B 调不了 `build_production_runtime_profile`），它的 notifier 现在同样是
+    `paused: False` + `suppress_delivery: True`。**两行缺一不可**——`suppress_delivery` 的
+    字段默认值是 `False`，只翻 `paused` 会让路线 B 的 notifier 真的往 PushDeer / PushPlus 发。
+    这条由 BLK3 的逐字段对照用例钉住（`test_runtime_authority_publish.py`）。
+  - ⚠️ **切换本身现在发不出去（#284）**：`deploy-production.sh` 只认 target tag，target 与已部署
+    SHA 相同时 `deploy()` 提前 return `already_current`（只跑一次 `preflight`），改过的输入文档
+    根本不会被读。DEPLOY 里那两处 `--target` 已标注「#284 修好前不可用」，并列了三条需 owner
+    单独授权的替代路。
+
 - **25 个 role 各自在自己 unit 的沙箱里起一次的 e2e（`tests/integration/test_route_a_all_roles_sandbox_e2e.py`）**：
   Route A 的裸跑排查（runbook R-20）用 `runtime-exec.pyz` 起 role，**完全没有沙箱**，所以
   「这个 role 往哪儿写」这一整类缺陷它一条也看不见——#242 与 #241 都是这一类。包 J 的 e2e 把
@@ -154,6 +191,52 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **`paper_constraint_publisher` 盘中读不了参考注册表（#280）**：读者打开参考注册表时要拿
+  `.reference.sqlite3.publication.lock` 这个锁文件，而它是用写模式打开的；盘中参考目录被挂成
+  只读，于是每一轮都撞 `EROFS`。结果是 `authorities/paper-execution/` 下**永远不会有 current
+  指针**，`paper_broker` 永远在等——也就是**给信号记账的那一跳根本不会发生**，一条信号因此走
+  不到 serving。读者现在以只读方式取这把锁，拿不到时抛的是具名拒绝（`reference registry has
+  no publication lock ...`），而不是一个裸 `OSError`；锁在读者手里被换成符号链接或目录时
+  （`ELOOP` / `ENOTDIR`）原样再抛，不会被说成「没有 publication lock」。
+  - 一并补上整条开盘日全链的验收测试（`tests/integration/test_route_a_trading_day_full_chain_e2e.py`）：
+    一条 `n_shape` 的信号从关注股行情出发，经特征、策略、路由、记账、通知六跳走进当日的
+    `serving/generations/`，每一跳的产物都落盘并被断言，四样外部输入全是真的。
+  - **③b 的判据口径同时改了**：`signals` 是滚动历史表不是当日表，`count(*) > 0` 一旦成立就
+    天天成立。判据改成按当日 `event_time` 过滤（见 `DEPLOY.md` 「路线 A 前置」第 37 条），
+    测试里对应 `serving_signal_rows(route, session=TRADE_DATE)`。
+
+- **研究面两源缺席时 serving 降级而不是整轮拒（#283）**：
+  serving 的六个源权威里 `lab_jobs` 与 `promotions` 属于研究面，而研究面四个角色在主机上被
+  高水位证据门挡着（#217），**一代权威都没发过**。`ServingSnapshotAssembler` 此前六个源一律
+  fail-closed，所以这两个目录里没有 `current.json` 这一件事，就让 `serving.publisher.v1`
+  每一轮整轮拒——**信号链当天每一跳都正常，`serving/generations/` 仍然一代都没有**，
+  ③b 判据因此根本读不出来。
+  `fail_closed: bool` 换成 `optional_datasets: frozenset[str]`，默认
+  `{"lab_jobs", "promotions"}`：只有集合里的 dataset 走 `UNAVAILABLE` 降级（空载荷 +
+  `unavailable` 水位 + 心跳上一条 `serving:<dataset>:unavailable:<理由>`），
+  `signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`
+  **照旧整轮拒**。这个白名单不能换成一个全局开关：③b 从空的 `signals` 表读出
+  「今天没有信号走完这条链」，只有在 `signals` 读不到时仍然整轮拒的前提下，这句话才和
+  「notifier 坏了」分得开。`reference_slow_authority` 永远不可选——它的载荷每个字段都必填
+  （参考代 id、revision、价格与复权口径），降级只能意味着把一个编造的口径发给下游消费者；
+  画像里写它会在构造时被拒，运行期读它失败也仍然抛。
+  同一改动里，unavailable 的那一代**不再含时钟**：generation id 只由 dataset 与拒绝理由
+  派生，水位的 `event_time` / `published_at` 取 epoch。原来含 `as_of`，
+  而 `_generation_already_current`（#271）是按源代次与水位逐一比相等的，
+  所以研究面持续缺席期间 serving 会每三十秒重建一次 `serving.duckdb`；
+  单测里三十分钟的迭代之后 serving 目录逐字节不变。
+  画像把 `optional_source_datasets` 显式写进 serving manifest，运行期读的是 manifest 那一份
+  ——研究面真正启用那天把列表收回 `[]`，才是一次有指纹的画像变更而不是改一个代码默认值；
+  这一条由 `test_the_manifest_decides_which_sources_are_optional_not_the_default` 钉住。
+  「六个源」的列表也只留一份（`SERVING_SOURCE_DATASET_IDS`，由 `_SOURCE_PAYLOAD_KINDS` 派生），
+  assembler 构造期与 settings 两道闸从此读同一份，不会因为加源时改一份漏一份而悄悄不同步。
+  **回滚要带上 runtime generation**：`RuntimeContractModel` 是 `extra="forbid"`，
+  旧 manifest 配新代码可以（字段有默认值），新 manifest 配旧代码会在 build 期被拒；
+  三个可选动作（重新 stage 上一个 tag / 把 `current` 指回上一代 / 删掉 `current` 回落路线 B）
+  见 `DEPLOY.md` 这一条。
+  路线 B 的 `bootstrap_settings` 也显式写上同一对可选源，理由与画像那处相同：
+  哪些源可降级由 manifest 决定，不由字段默认值决定。
 
 - **盘中竞价链一个批次也发不出来：适配器缺列、空表被当成缺列、失败被早退分支洗掉（#277，本包）**：
   2026-09-21 验收日，`auction-match.source.v1` 在 09:26:01 / 09:26:04 / 09:26:08 三次请求

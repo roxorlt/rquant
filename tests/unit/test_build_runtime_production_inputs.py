@@ -28,6 +28,7 @@ from rquant.runtime_production_profile import (
     load_production_runtime_profile_inputs,
 )
 from rquant.runtime_routing_policy import load_frozen_routing_policy
+from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 COMMIT = "a" * 40
@@ -143,6 +144,66 @@ def test_the_document_builds_one_profile_whose_id_is_stable(generated: Path) -> 
     assert first.profile_id is not None
     assert first.profile_id == second.profile_id
     assert len(first.manifests) == 26
+
+
+def _notifier_settings_of(generated: Path) -> dict[str, object]:
+    inputs = load_production_runtime_profile_inputs(
+        generated / "runtime-production-inputs.json",
+        expected_commit=COMMIT,
+        expected_runtime_mode="local-test",
+    )
+    notifier = next(
+        manifest
+        for manifest in build_production_runtime_profile(inputs).manifests
+        if manifest.service_kind is RuntimeServiceKind.NOTIFIER
+    )
+    return {
+        "mode": inputs.notifier_delivery_mode,
+        "paused": notifier.settings["paused"],
+        "suppress_delivery": notifier.settings["suppress_delivery"],
+    }
+
+
+def test_a_run_that_says_nothing_about_delivery_writes_a_shadow_document(
+    generated: Path,
+) -> None:
+    """#281 risk (a), at the layer that decides what the host's document says.
+
+    `ProductionRuntimeProfileInputs.notifier_delivery_mode` defaults to `shadow` and
+    `test_runtime_production_profile` pins that -- but this generator always passes
+    `arguments.notifier_delivery_mode` explicitly, so the model's default is never reached
+    on the path that writes the document the production host installs. Its argparse
+    default is therefore a second, independent default, and flipping it to `live` left
+    every case in this file green while the generated document said `live` (package AA
+    review, MF-1). This is the case that fails instead.
+
+    The `generated` fixture is a run with no delivery flag at all, which is what an
+    operator following `docs/production-release.md` performs.
+    """
+
+    assert _notifier_settings_of(generated) == {
+        "mode": "shadow",
+        "paused": False,
+        "suppress_delivery": True,
+    }
+
+
+def test_the_delivery_mode_flag_is_what_carries_a_sending_notifier(tmp_path: Path) -> None:
+    """And the flag reaches the document, so `--notifier-delivery-mode live` is the switch.
+
+    Without this, the case above could be satisfied by a generator that ignores the flag
+    entirely and hard-codes `shadow` -- which would be the #281 defect again, one value
+    further along.
+    """
+
+    _write_calendar_database(tmp_path / "calendar.duckdb")
+
+    assert generator.main(_argv(tmp_path, **{"--notifier-delivery-mode": "live"})) == 0
+    assert _notifier_settings_of(tmp_path / "data") == {
+        "mode": "live",
+        "paused": False,
+        "suppress_delivery": False,
+    }
 
 
 def test_rerunning_the_generator_reproduces_every_byte(tmp_path: Path) -> None:

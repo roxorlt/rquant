@@ -2069,6 +2069,88 @@ def test_production_profile_binds_complete_page_control_canvas_authority(
     )
 
 
+def test_the_notifier_delivery_mode_is_an_input_and_defaults_to_shadow(
+    tmp_path: Path,
+) -> None:
+    """#281: the three modes, and which one an inputs document that says nothing means.
+
+    `"paused": True` used to be written into the notifier manifest as a literal, so the
+    only way a signal could reach the `signals` serving dataset was a code change and a
+    redeploy. The mode is an input now, and the two booleans the manifest carries are a
+    pure function of it:
+
+    * `paused` -- the emergency stop, unchanged: no replication, no claim, no delivery;
+    * `shadow` -- the default: the live branch with the transport suppressed;
+    * `live` -- the live branch, sending.
+
+    The default matters as much as the mapping. An input that defaulted to `live` would
+    make the next redeploy of any host start pushing to PushDeer without anyone deciding
+    to (package Z review, risk (a)).
+    """
+
+    base = _inputs(tmp_path)
+
+    assert base.notifier_delivery_mode == "shadow"
+
+    def notifier_settings(mode: str) -> NotifierSettings:
+        profile = build_production_runtime_profile(
+            base.model_copy(update={"notifier_delivery_mode": mode})
+        )
+        manifest = next(
+            item
+            for item in profile.manifests
+            if item.service_kind is RuntimeServiceKind.NOTIFIER
+        )
+        return NotifierSettings.model_validate(dict(manifest.settings))
+
+    default = NotifierSettings.model_validate(
+        dict(
+            next(
+                item
+                for item in build_production_runtime_profile(base).manifests
+                if item.service_kind is RuntimeServiceKind.NOTIFIER
+            ).settings
+        )
+    )
+
+    assert (default.paused, default.suppress_delivery) == (False, True)
+    assert [
+        (notifier_settings(mode).paused, notifier_settings(mode).suppress_delivery)
+        for mode in ("paused", "shadow", "live")
+    ] == [(True, False), (False, True), (False, False)]
+
+    with pytest.raises(ValidationError):
+        build_production_runtime_profile(
+            base.model_copy(update={"notifier_delivery_mode": "quiet"})
+        )
+
+
+def test_a_shadow_notifier_still_gets_its_real_push_credentials(tmp_path: Path) -> None:
+    """#281 risk (g): switching shadow to live must change only where the bytes go.
+
+    The notifier keeps `PUSHDEER_KEYS` and `PUSHPLUS_TOKENS` in every mode, so the real
+    provider loader runs in shadow too: the credential is read, the recipient ids are
+    resolved from it and the frozen alias migration is applied against the real device
+    list. Withholding the secret in shadow would make the switch to live the first time
+    any of that happens, which is the opposite of a rehearsal.
+    """
+
+    base = _inputs(tmp_path)
+    for mode in ("paused", "shadow", "live"):
+        profile = build_production_runtime_profile(
+            base.model_copy(update={"notifier_delivery_mode": mode})
+        )
+        notifier = next(
+            item
+            for item in profile.manifests
+            if item.service_kind is RuntimeServiceKind.NOTIFIER
+        )
+        assert profile.capability_environment[notifier.service_id] == (
+            "PUSHDEER_KEYS",
+            "PUSHPLUS_TOKENS",
+        ), mode
+
+
 def test_profile_preview_rejects_caller_runtime_root_mismatch(tmp_path: Path) -> None:
     inputs = _inputs(tmp_path)
     profile = build_production_runtime_profile(inputs)

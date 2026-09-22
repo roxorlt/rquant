@@ -16,6 +16,7 @@ from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxSta
 from rquant.notification_state import NotificationReplicationError, NotificationStateStore
 from rquant.notification_worker import NotificationDelivery
 from rquant.runtime_builder_signal import (
+    NotifierSettings,
     build_shadow_runner_sources,
     notifier_builder,
     signal_router_builder,
@@ -944,6 +945,112 @@ def test_notifier_pause_or_provider_loader_failure_never_claims_outbox(
     record = state.outbox_records()[0]
     assert record.status is OutboxStatus.PENDING
     assert record.attempt_count == 0
+
+
+def test_a_notifier_settings_document_without_the_new_key_is_a_sending_notifier(
+    tmp_path: Path,
+) -> None:
+    """#281: the field's default is what an existing manifest means.
+
+    `suppress_delivery` is new, so every manifest written before it -- including the one
+    installed on the production host -- carries no such key. The default has to be the
+    behaviour those manifests already had, which is to send; a default of `True` would
+    silently turn every deployed notifier into a shadow one. The *profile input* defaults
+    the other way, and that is the layer where the choice belongs.
+    """
+
+    settings = NotifierSettings.model_validate(dict(_notifier_manifest(tmp_path).settings))
+
+    assert settings.suppress_delivery is False
+    assert settings.paused is False
+
+
+def test_a_shadow_notifier_runs_the_whole_batch_and_sends_nothing(
+    tmp_path: Path,
+) -> None:
+    """#281: the live branch with the transport replaced, and only the transport.
+
+    The loader here is the real environment loader over a recording transport, so
+    everything between the manifest and the socket is the production path: the credential
+    is read, two device recipients are resolved out of `PUSHDEER_KEYS`, the frozen alias
+    migration rewrites the legacy `admin` outbox row into those two, the batch claims both
+    under a lease and writes both attempt rows. The only difference from
+    `test_notifier_migrates_legacy_admin_outbox_to_frozen_device_recipients_once`, which
+    is this same world sending, is that the transport is never called.
+    """
+
+    state = _seed_outbox(tmp_path)
+    transport = _RecordingTransport()
+    provider_loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "iphone-key,mac-key",
+            "PUSHDEER_RECIPIENT_IDS": "admin.iphone,admin.mac",
+        },
+        transport=transport,
+    )
+    step = notifier_builder(
+        provider_loader=provider_loader,
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path, suppress_delivery=True))
+
+    result = step()
+    records = state.outbox_records()
+    attempts = state.attempts()
+    migrations = state.recipient_migration_audits()
+
+    #: not one byte left the host
+    assert transport.calls == []
+    #: and everything else happened
+    assert result.processed_count == 2
+    assert result.output_sequence == 1
+    assert result.backlog_count == 0
+    assert "notifier:shadow_transport" in result.degraded_reasons
+    assert all(record.status is OutboxStatus.SUCCEEDED for record in records)
+    assert tuple(record.target.recipient_id for record in records) == (
+        "admin.iphone",
+        "admin.mac",
+    )
+    assert len(migrations) == 1 and migrations[0].outcome == "migrated"
+    assert len(attempts) == 2
+    assert {attempt.provider_receipt for attempt in attempts} == {
+        f"shadow:{record.outbox_id}" for record in records
+    }
+
+
+def test_a_shadow_notifier_keeps_advancing_its_cursor_so_live_is_a_safe_switch(
+    tmp_path: Path,
+) -> None:
+    """#281 risk (c): shadow consumes the spool, so switching to live starts from now.
+
+    A paused notifier never advances the replication cursor, so its first live iteration
+    starts at whatever the cursor said when it was paused and claims everything since --
+    the #86 alert-storm shape. A shadow notifier has already consumed all of it, so the
+    second signal is the only thing its first live iteration has to deliver.
+    """
+
+    state = _seed_outbox(tmp_path, signal_count=2)
+    shadow = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path, suppress_delivery=True))
+
+    shadow_result = shadow()
+
+    assert shadow_result.processed_count == 2
+    assert shadow_result.backlog_count == 0
+    assert all(record.status is OutboxStatus.SUCCEEDED for record in state.outbox_records())
+
+    provider = _Provider()
+    live = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: provider},
+        clock=lambda: NOW + timedelta(seconds=2),
+    )(_notifier_manifest(tmp_path))
+
+    live_result = live()
+
+    assert live_result.processed_count == 0
+    assert provider.deliveries == []
+    assert live_result.degraded_reasons == ()
 
 
 def test_notifier_publishes_owned_signal_delivery_authority_after_writeback(

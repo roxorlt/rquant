@@ -5,6 +5,262 @@
 
 ---
 
+## 2026-09-21 · 待安装 · 研究面两源缺席不再让 serving 整轮拒（#283）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**现象**：serving 的六个源权威里，`lab_jobs` 与 `promotions` 属于研究面，而研究面四个角色
+在主机上被 workload arbiter 的高水位证据门挡着（#217），**一代权威都没发过**。
+`ServingSnapshotAssembler` 此前六个源一律 fail-closed，所以这两个根目录里没有 `current.json`
+这一件事，就让 `serving.publisher.v1` **每一轮都整轮拒，`serving/generations/` 一代都不会有**
+——哪怕信号链当天每一跳都正常。
+
+**改法**：assembler 的 `fail_closed: bool` 换成 `optional_datasets: frozenset[str]`，
+默认 `{"lab_jobs", "promotions"}`；只有集合里的 dataset 走降级（空载荷 + `unavailable` 水位），
+**其余四个照旧整轮拒**。这个区分是必需的：③b 判据从空的 `signals` 表读出
+「今天没有信号走完这条链」，只有在 `signals` 读不到时仍然整轮拒的前提下，这句话才和
+「notifier 坏了」分得开。
+`reference_slow_authority` **永远不可选**（它的载荷没有合法空值），画像里写它会被拒，
+运行期读它失败也仍然抛。
+
+同时，unavailable 的那一代**不再含时钟**：generation id 只由 dataset 与拒绝理由派生，
+水位的 `event_time` / `published_at` 取 epoch。否则 `_generation_already_current`（#271）
+每轮都会看到不同的输入，serving 会在研究面缺席期间**每三十秒重建一次 `serving.duckdb`**。
+
+**装上之后当场应该看到什么**（③b 验收清单第 5.5 行按此改写）：
+
+| 看什么 | 判据 |
+|---|---|
+| `$ROOT/serving/generations/` | 当天有新增的一代，`$ROOT/serving/current.json` 指向它。**研究面两源没有 `current.json` 不再是阻塞原因** |
+| serving 心跳的 `degraded_reasons` | 含 `serving:lab_jobs:unavailable:…` 与 `serving:promotions:unavailable:…` 两条。根目录存在但没有 `current.json` 时理由是 `ServingSourceAuthorityUnavailableError: current pointer is unavailable`（主机是这一种，目录由 runbook C-1 预建）；根目录整个不存在时是 `… current authority is unavailable` |
+| serving 心跳的 `degraded_reasons`（续） | **只看这两条前缀就够，同时还有别的降级理由属正常**——这个世界本来就会有 `serving:paper_accounts:degraded:…`，以及 runtime health 投影里那串 `missing:strategy.*`。判据是「这两条前缀在不在」，不是「一共几条」（e2e 的断言也是按前缀过滤的，`…full_chain_e2e.py:1690-1693`） |
+| serving 心跳的 `last_error` | 仍然是 `null`，`consecutive_failures` 为 0。缺席是 **degraded**，不是 failed |
+| **serving-only 页的横幅** | **研究面缺席期间每一帧都会是 `DEGRADED`，这是预期，不是故障**。`manifest_freshness`（`dashboard/serving_only_page_data.py:160-177`）只要水位里有一个 `UNAVAILABLE` 就返回 `DEGRADED`，而 `required_projections` 为空时六个水位全算（`:249-252`）。**行照常渲染**，只是横幅变色；只有 `UNAVAILABLE` 才会拦渲染（`:299-312`）。比改之前严格更好：以前是一代都没有、页面什么都看不到 |
+| 其余四源 | 任缺一个（`signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`），serving 照旧整轮拒、一代都不出，心跳 `last_error` 写 `<dataset> reader failed: …` |
+| 收盘后静置 | 研究面持续缺席期间 `serving/generations/` 目录不再增长，`current.json` 不再被改写 |
+
+**回滚口径（必读）**：本包给 serving 的 manifest 加了一个 `optional_source_datasets` 键。
+`RuntimeContractModel` 是 `extra="forbid"`，所以
+
+- **旧 manifest + 新代码** → 可以，字段有默认值，行为与写了默认值一样；
+- **新 manifest + 旧代码** → **不行**，serving 会在 build 期被 `extra_forbidden` 拒掉。
+
+因此回滚代码时**必须把 runtime generation 一起处理**，三选一（**不能只换代码、留着本代的 profile**）：
+
+1. **（最小）用上一个 tag 重新 stage + publish**——那一代的画像由那一刻的代码生成，不带这个键；
+2. **把 `data/runtime/current` 指回上一代**；
+3. **删掉 `data/runtime/current`，整体回落路线 B**——见本文件
+   「路线 A 前置（生产 inputs 与真实画像，本轮 PR 引入，开工前逐条确认）」清单（`:1268` 起）
+   的第 16 条「回滚含义」（`:1362`）。注意那一条讲的是**删掉**指针、让角色回到降级分支，它那句
+   「不需要再换 generation」针对的是**那个动作本身**（路线 A 整个不生效，这份 manifest
+   根本不会被读），**不是**说换代码可以留着本代 profile。
+
+**条目号在本文件里不唯一**（另有一处「16.」在「v0.30.0 Release A 上线前置条件」清单的
+`:2341`，讲的是 Phase C，不是回滚），所以上面按「章节标题 + 条目标题 + 行号」三样一起引；
+本文件还在增长，行号会漂，**以章节与条目标题为准**。
+
+---
+
+## 2026-09-21 · 待安装 · notifier 影子档（#281）——写库、出信号、不发一个字节
+
+**状态**：**尚未安装**，`deploy/` 一个字没动。notifier 的档位从代码里的硬编码
+`"paused": True` 改成画像输入 `notifier_delivery_mode`，三档：
+
+| 档位 | manifest 里的两个布尔 | 行为 |
+|---|---|---|
+| `paused` | `paused=True`、`suppress_delivery=False` | 急停：不复制、不认领、不投递；仍发布一份空的 `signals` 权威 |
+| `shadow`（**默认**） | `paused=False`、`suppress_delivery=True` | live 分支原样跑：复制路由回执、按 live 节奏消耗 outbox、写 attempt 行、发布非空 `signals` 权威；**不向 PushDeer / PushPlus 发一个字节** |
+| `live` | 两个都 `False` | 同上，并且真发 |
+
+影子档的两个标记（值班的人只认这两个）：
+
+- 心跳 `degraded_reasons` 里有 `notifier:shadow_transport`；
+- `delivery_attempt.provider_receipt` 以 `shadow:` 开头。
+
+看到这两个就是没发出去；两个都没有、`degraded_reasons` 干净，才是真的在发。
+
+### 影子档看不见什么（切 live 之前必须知道）
+
+影子档下**凭据、收件人解析、别名迁移、preflight 全是真的**：凭据配错、收件人不在
+capability 里、凭据仓库读不到，这几类失败在 shadow 下与 live 逐字相同（对照实测过）。
+
+**唯一看不见的是线那一头的回答。** `SuppressedNotificationProvider.deliver()` 不会抛，
+所以影子档**永远不会**产生 `notifier:confirmed_failures:*` 或 `notifier:unknown_outcomes:*`——
+「对端拒收」「网络超时」这两类在影子档下构造不出来。也就是说：
+
+> 影子档跑得再干净，切 live 的第一轮仍然可能是投递失败第一次出现的时刻。
+
+切 live 之后的第一轮心跳要专门看这两个字符串。
+
+### 档位写在哪儿
+
+发布器不吃命令行档位参数。它读的是 `RQUANT_RUNTIME_PRODUCTION_INPUTS` 指的那份输入文档
+（生产机上是 `/home/lighthouse/rquant/data/runtime-production-inputs.json`），用
+`rquant runtime-production-profile --inputs <该文档>` 重新生成画像并安装
+（`src/rquant/ops/production_deploy.py:576-700`）。所以**改档位 = 改那份输入文档里的
+`notifier_delivery_mode`，然后发一次版**。
+
+两种改法，二选一：
+
+```bash
+ROOT=/home/lighthouse/rquant
+INPUTS="${ROOT}/data/runtime-production-inputs.json"
+
+# 改法 A：只改一个键（推荐，其余字段一个字不动）
+python - "$INPUTS" <<'EOF'
+import json, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["notifier_delivery_mode"] = "live"      # paused / shadow / live
+path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+EOF
+
+# 改法 B：整份重新生成（四十来个参数都要给全，只在本来就要重生成时用）
+python scripts/build_runtime_production_inputs.py \
+    --notifier-delivery-mode live \
+    --checkout "${ROOT}" \
+    --calendar-database ... --output-root ... --inputs-output "$INPUTS" \
+    ...（其余参数照 docs/production-release.md 那一份）
+```
+
+改完 `git diff` / `jq .notifier_delivery_mode "$INPUTS"` 确认只动了这一个键。
+
+> ⚠️ **但光改这份文档，现在的发布器发不出去（#284）。**
+> `deploy-production.sh` 只认 target tag：当 target 解析出来的 SHA 与已部署的 SHA 相同时，
+> `deploy()` 在 `src/rquant/ops/production_deploy.py:1580-1607` 提前 return `already_current`，
+> 那条路上**只跑一次 `rquant preflight`**——不重新生成画像、不装新一代、不 rollout、不重启。
+> 输入文档改没改，它根本不看（变更清单来自 `git diff --name-only <旧 SHA>..<新 SHA>`，
+> `:1616-1623`）。所以改完文档再跑一次同一个 tag，命令会成功返回，主机却什么都没变。
+>
+> 下面「切正式」的第 ② 步与「回滚情况二」的第 ③ 步**都卡在这一点上，#284 修好之前不要照着敲**。
+
+
+### 切正式（shadow → live）
+
+**「安全」指的是不会有告警风暴，不是指随时可以切。** 影子档一直在消耗 outbox、复制游标一直在
+前进，所以第一轮 live 只会看到「从现在起」的新信号，没有积压可推——这一点已实测。
+
+**时间规矩：开盘前或收盘后切。** 理由是档位这种 role settings **只有在 unit 重启之后才生效**，
+而盘中重启 `rquant-notifier` 会在告警链路上开一个口子。（发布器对**代码发布**有一条
+09:15–15:10 的保护窗，`production_deploy.py:507-511` / `:1631-1636`；但它是按
+`git diff` 出来的变更清单判的，**只改输入文档时那张清单是空的，保护窗根本不会触发**——
+所以这条时间规矩现在靠人守，不靠工具拦。）
+
+**当前状态：② 卡住（#284）。** 步骤先写在这里，等 #284 修好再执行：
+
+```bash
+ROOT=/home/lighthouse/rquant
+cd "${ROOT}"
+export RQUANT_RUNTIME_PRODUCTION_INPUTS="${ROOT}/data/runtime-production-inputs.json"
+export RQUANT_RUNTIME_PROFILE_OUTPUT_DIR="${ROOT}/data/runtime-profiles"
+export RQUANT_RUNTIME_ROOT="${ROOT}/data/runtime"
+
+# ① 把输入文档里的 notifier_delivery_mode 改成 live（见上一节）—— 这一步现在就能做
+# ② 【#284 修好前不可用】发一次版让新画像装上去并重启 notifier
+#    bash scripts/deploy-production.sh --target <当前 tag>
+#    ← target 与已部署 SHA 相同 ⇒ already_current ⇒ 只跑 preflight，什么都不会变
+```
+
+在 #284 修好之前，② 有三条替代路，都需要 owner 单独授权（#284 正文里列的就是这三条）：
+
+1. 让这次档位切换跟着一个**新 tag**走（哪怕是一个空提交），发布器就会正常重新生成并安装画像；
+2. 按发布器内部步骤**人工执行**（`rquant runtime-production-profile` →
+   `runtime-deployment-profile-apply` → `runtime-deployment-rollout` → 重启 notifier）——
+   绕开审计路径，必须逐次授权；
+3. 等 #284 把「输入文档变了」变成发布器认得的一种变更（推荐，单独开包做）。
+
+验收（不管走哪条路，切完都要看）：
+
+1. 第一轮心跳里 `notifier:shadow_transport` 消失；
+2. 新写入的 `delivery_attempt.provider_receipt` 不再以 `shadow:` 开头；
+3. **专门看 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`**（见前面那一节）；
+4. 手机上只应收到切换之后产生的信号。
+
+### paused → live（**不要这么切**）
+
+急停档下复制游标从来没前进过，第一轮 live 会从 `cursor.last_global_sequence` 开始把攒下的
+整条 spool 一次认领，按 `batch_limit=128` / `interval_seconds=2` 一轮轮推——就是 #86
+修过的那一类告警风暴，唯一的闸是信号自己的 `expires_at`。两条合法路径：
+
+- **先切 shadow**，等心跳的 `backlog_count` 回到 0，再切 live；
+- 或者**开盘前**切，并人工确认 spool 里没有未过期的积压。
+
+### 回滚（**主动回滚必须连画像一起回**；自动回滚一般会回画像，但有例外）
+
+新画像的 notifier manifest 多了一个 `suppress_delivery` 键，输入文档多了一个
+`notifier_delivery_mode` 键。两个模型都是 `RuntimeContractModel`（`extra="forbid"`），
+所以 **v0.33.16 及更早的代码读不了新画像**，实测：
+
+```
+NotifierSettings（v0.33.16）  ← {"suppress_delivery": True, ...}
+  ValidationError: suppress_delivery / extra_forbidden / Extra inputs are not permitted
+ProductionRuntimeProfileInputs（v0.33.16） ← {"notifier_delivery_mode": "shadow", ...}
+  ValidationError: notifier_delivery_mode / extra_forbidden / Extra inputs are not permitted
+```
+
+（`main` 现在的 tag 是 **v0.33.16**（`16b76a5b`），它里面 `suppress_delivery` 出现 0 次、
+`"paused": True` 仍硬编码在 `runtime_production_profile.py:1722`；本包发出来是 **v0.33.17**
+的内容。v0.33.15 同样读不了，结论对这两个 tag 都成立。）
+
+影响范围是**一个 role**：`RuntimeServiceManifest.settings` 的类型是
+`Mapping[str, JsonValue]`，装机与权威链校验都不看键名，所以整代画像仍然装得上、其余
+role 照跑；炸的是 `rquant-notifier` 起不来（builder 在
+`runtime_builder_signal.py:965` 校验 `NotifierSettings`）。
+
+**情况一：主动回滚（正向发到旧 tag）。** 发布器会用旧代码重新生成画像，而旧代码读到输入文档里的
+`notifier_delivery_mode` 会被拒，所以**先把这个键从输入文档里删掉**：
+
+```bash
+# ① 从输入文档里删掉 notifier_delivery_mode
+python - "$RQUANT_RUNTIME_PRODUCTION_INPUTS" <<'EOF'
+import json, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc.pop("notifier_delivery_mode", None)
+path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+EOF
+
+# ② 再回代码（发布器会用旧代码重新生成并安装画像）
+bash scripts/deploy-production.sh --target <上一个 tag>
+```
+
+顺序反了，中间那段时间 notifier 起不来。
+
+**情况二：一次失败发布触发了自动回滚。** 正常路径下**画像会跟着代码一起回**：
+`profile_applied` 为真时 `_rollback_runtime_profile`（`production_deploy.py:732-771`）会被调用
+（`:1414`、`:1725`），跑 `rquant runtime-deployment-rollback` 把那一代滚回去；
+`_deploy_runtime_profile` 在 `action == "rollback"` 时直接 return（`:568-575`）指的是
+「回滚不重新生成画像」，不是「回滚不回画像」。
+
+**但「新一代画像 + 旧代码」这个组合仍然可能出现**，已知的一条具体路径是加锁恢复：
+`:1408-1420` 只有在 `current_sha == intent.target_sha` 时才回滚画像，所以如果上一次崩溃
+已经把 checkout 退回 `previous_sha`（或有人手工 reset 过），恢复流程会**跳过画像回滚**，
+却仍然走 `_rollback_unmanaged` 的 `git reset --hard <previous_sha>`（`:1333`）。
+结果就是画像是新的、代码是旧的，其余 role 正常、只有 `rquant-notifier` 起不来。
+
+下面四步是幂等的，**先确认现象再动手**：
+
+```bash
+# ① 确认现象：notifier 反复启动失败，日志里是 suppress_delivery / extra_forbidden
+systemctl status 'rquant-runtime-notifier@*'
+journalctl -u 'rquant-runtime-notifier@*' -n 50 --no-pager | grep -i extra_forbidden
+
+# ② 按「情况一 ①」把 notifier_delivery_mode 从输入文档里删掉
+
+# ③ 【#284 修好前不可用】用回滚后那一版代码重新生成并安装画像
+#    bash scripts/deploy-production.sh --target <自动回滚落到的 tag>
+#    ← 自动回滚已经把 checkout reset 到这个 SHA，所以 target 与已部署 SHA 相同
+#      ⇒ already_current ⇒ 只跑 preflight，画像不会被重新生成
+#    替代路同「切正式」那三条，需 owner 单独授权
+
+# ④ 确认 notifier 起来了
+systemctl status 'rquant-runtime-notifier@*'
+```
+
+在 ③ 可用之前，盘中撞上这个状态的话 notifier 会一直起不来——**这正是不要在临近开盘时发版的理由**。
+
+---
+
 ## 2026-09-21 · 待安装 · 盘中竞价链真正产出（#277、#278）—— **顺序：探测 → 定窗 → 装机**
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。只改 `src/` 与 `scripts/`，
@@ -1420,7 +1676,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 #227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）；第 32 条来自 #230，
 也就是 #215 的第三处断点（凭证的投递形状）；第 33 条来自 #237，也就是「v0.33.2 装不上第三代」
 这件事本身；第 34 条来自 #242 与 #241 的修复包（沙箱路径缺陷），它是那两个修复在主机上的操作面。
-下面三十四条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+第 37 条是 ③b（一条信号当天走到 serving）的验收清单，随 #280 / #281 / #283 三包一起立。
+下面三十七条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -2107,6 +2364,89 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     role 实例保持停止）。09:25 起 `rquant-monitor` 持生产主库写锁到收盘；17:00 起 `rquant-daily`
     的 `daily_state` 阶段要扫主库，而 role 每轮读 10 GB 只读副本会把 page cache 挤掉，这个阶段从
     1.5 分钟涨到 9–60 分钟（2026-09-08 与 09-09 各观察到一次）。装机与验收放在这两个窗口之外做。
+
+37. **③b 的验收清单（开盘后在主机上逐跳对照，#280 / #281 / #283 一起装之后才成立）**
+
+    运行根 `/home/lighthouse/rquant/data/runtime`（下文 `$ROOT`）。按 C-3 顺序起完之后，
+    **盘中**（09:30 之后，建议 09:45–10:00）逐跳看。三个缺陷装在一起才读得出非零结果：
+    #280 让执行约束指针出得来、#281 让 notifier 真写行、#283 让 serving 在研究面缺席时
+    仍然出代。
+
+    **心跳在哪儿**：不在 `$ROOT/control/services/`——`services` 这个桶不存在。真实布局是
+    **`$ROOT/control/<桶>/<实例>/heartbeats/<identity>.json`**，`<桶>` 由
+    `runtime_production_profile._control_bucket()` 给出，`<实例>` 是 `svc-<sha256(service_id)>`，
+    `<identity>` 是 `canonical_sha256({"service_id": ...})`。每个 role 只有一份心跳文件，
+    所以最省事的看法是：
+
+    ```bash
+    ROOT=/home/lighthouse/rquant/data/runtime
+    cat $ROOT/control/features/*/heartbeats/*.json | python3 -m json.tool
+    ```
+
+    | 跳 | 桶 | 实例目录 |
+    |---|---|---|
+    | `runtime-health.all.v1` | `runtime-health-publishers` | `svc-2a07f3cafccf6e13c0b3850b9b41d9612a7314e736cc67a623a24f488e64ccb3` |
+    | `paper-constraint.market.v1` | `paper-constraints` | `svc-dc7b9b33169226b8e1930b1b82a717bdc14a1366f361b16a90244b134b1b35d0` |
+    | `feature.intraday-pit.v1` | `features` | `svc-39a4247f2171f4f01ce0e0c3588543efe2a95ccc41345059c839635435c1c028` |
+    | `strategy.n_shape.v1` | `strategies` | `svc-c8486717d6ddce5bd0371d2809eb823eb595e6f0dd4a562ad01c9ec4411d066b` |
+    | `strategy.auction_gap.v1` | `strategies` | `svc-332642f2ddd4a6a7f35eafbf64e71de289ff0b1719d6dcb85f3965b97f859bc9` |
+    | `strategy.growth_board_surge.v1` | `strategies` | `svc-46dfa614db6b61b21bdff66c94c1a194589694d8f741ebbd49e44465e3db43f2` |
+    | `signal-router.all-strategies.v1` | `signal-routers` | `svc-c2d756ee80d19a659f05142d30e32dd2a6a01d65488c0424173e2f172b916178` |
+    | `paper-broker.shadow-main.v1` | `paper-brokers` | `svc-8198269a766fc0da7ee26e4a0a0ea8b306da29aa52ea5fee16d4c948cb373803` |
+    | `notifier.admin.shadow.v1` | `notifiers` | `svc-f2518f7a4231460f183242dfbaaf34b78603c9f9212c8c76046ab2ef06fd11cc` |
+    | `serving.publisher.v1` | `serving-publishers` | `svc-63af0b41929c26a8fbf2953e8aa3981cf9867f2ea6dc1c5d8820683112206f88` |
+
+    三个候选发布者的桶是 `candidates`，实例分别是 `svc-b06a23f4…`（n_shape）、
+    `svc-13d5551c…`（auction_gap）、`svc-f64122fe…`（growth_board）。
+
+    | # | 跳 | 该看到什么 | 看不到说明什么 |
+    |---|---|---|---|
+    | 0 | 参考代 | `$ROOT/authorities/reference-slow/reference.sqlite3` 有已发布代；旁边有 `.reference.sqlite3.publication.lock` | 盘前两个 reference role 没跑成。**若刚做过恢复**：恢复工件只还原数据库、不还原那个点文件，此时约束发布者报具名错误 `reference registry has no publication lock…`，等发布者跑一次就好 |
+    | 0 | 执行约束 | `$ROOT/authorities/paper-execution/current.json` 存在且 mtime 是**当天盘中** | #280 没装上：看 `control/paper-constraints/*/heartbeats/*.json`，`last_error` 里若有 `.reference.sqlite3.publication.lock` 与 `Read-only file system` 就是它 |
+    | 1 | 特征 | `$ROOT/live/features/batches/` 当天有新批次；心跳 `output_sequence` 随分钟递增 | 上游 `market_minute_source` 没发批次，或历史 parquet 的 sha256 对不上（启动直接拒） |
+    | 2 | 候选 | `$ROOT/live/candidates/<候选实例>/` 当天有快照 | ③a 的问题：当日候选没产出 |
+    | 2 | 策略 | `$ROOT/live/strategies/<strategy 实例>/runner.sqlite3` 的 `runner_signal` 当天有行 | 候选全集为空，或候选文档日期不是当日（心跳里是 `snapshot trade date does not match required trade date`）。竞价全集权威在 `$ROOT/authorities/auction-universe/current.json` |
+    | 3 | 路由 | `$ROOT/live/signal-bus/signal_bus.sqlite3` 的 `signal_envelope` / `signal_route_receipt` 当天有行；`$ROOT/live/signal-bus/spool/source.json` 存在 | router 在等某个 `runner.sqlite3`，心跳的 `waiting_for` 会点名是哪一个 |
+    | 4 | 记账 | `$ROOT/live/paper-brokers/<broker 实例>/broker.sqlite3` 的 `paper_fill` 当天有行 | 多半是第 0 行的执行约束指针没出来；也可能行情过期（`quote_max_age_seconds=90`）或 PIT 日历没有次一交易日 |
+    | 5 | 通知 | `$ROOT/live/notifications/<notifier 实例>/notification_state.sqlite3` 的 `delivery_outbox` / `delivery_attempt` **当天有行**，`delivery_attempt.provider_receipt` 全部以 `shadow:` 开头，心跳 `degraded_reasons` 里有 `notifier:shadow_transport` | 出厂档位是 `shadow`（#281）。心跳里若是 `notifier:paused` 就是输入文档里被改成 `paused` 了；若两个标记都没有，那是真的在往 PushDeer / PushPlus 发字节 |
+    | **5.5** | **serving 的六个源权威** | 四个必需源（`signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`）的 `current.json` 都在；**研究面两源（`lab_jobs` / `promotions`）没有 `current.json` 不再是阻塞原因**（#283），serving 心跳里会有 `serving:lab_jobs:unavailable:…` 与 `serving:promotions:unavailable:…` 两条 | 四个必需源任缺一个，serving 照旧整轮拒、一代都不出，心跳 `last_error` 写 `<dataset> reader failed: …` |
+    | 6 | 发布 | `$ROOT/serving/generations/<id>/serving.duckdb` 当天新增，`$ROOT/serving/current.json` 指向它 | 先回到 5.5 行——原因十有八九在那里，不在信号链上 |
+    | 6' | **信号真的到了** | 见下面那条命令，结果 **> 0** | 回到第 5 行：notifier 档位不是 shadow/live，信号就到不了 `signals` |
+
+    **serving-only 页在研究面缺席期间每一帧都会是 `DEGRADED`，这是预期不是故障**：
+    `manifest_freshness` 只要水位里有一个 `UNAVAILABLE` 就返回 `DEGRADED`，**行照常渲染**，
+    只是横幅变色（只有 `UNAVAILABLE` 才会拦渲染）。比改之前严格更好：以前是一代都没有、
+    页面什么都看不到。
+
+    **③b 的唯一判据**：`signals` 是滚动历史表，不是当日表——notifier 发的权威带的是最近
+    `serving_history_limit`（默认 1000）条，选取语句没有任何日期条件，所以
+    `count(*) > 0` 一旦成立就天天成立。判据必须按当日 `event_time` 过滤：
+
+    ```bash
+    ROOT=/home/lighthouse/rquant/data/runtime
+    GEN=$(python3 -c "import json;print(json.load(open('$ROOT/serving/current.json'))['generation_id'])")
+    duckdb -readonly "$ROOT/serving/generations/$GEN/serving.duckdb" \
+      "SELECT count(*) FROM signals
+       WHERE TRY_CAST(event_time AS TIMESTAMPTZ) >= TIMESTAMPTZ '2026-09-23 09:15:00+08';"
+    ```
+
+    09:15 是开盘前、竞价之前的下界：当天产出的全进，前一天的全不进。日期换成验收当天。
+
+    > **`TRY_CAST` 不能去掉。** 这一代的表是用 pandas frame 建的，**空表没有行可供推断**，
+    > DuckDB 会把 `event_time` 推成 `INTEGER` 而不是 `TIMESTAMP WITH TIME ZONE`，裸比较当场抛
+    > `Binder Error: Cannot compare values of type INTEGER and type TIMESTAMP WITH TIME ZONE`。
+    > 而空 generation 正是 notifier 被改回 `paused` 时会看到的样子——最需要这条命令的那天
+    > 恰恰是它会报错的那天。实测：空表裸比较 BinderException / `TRY_CAST` 版 0；当日一行
+    > 两者都是 1；前一日一行两者都是 0。
+    >
+    > 更稳的做法是把这一代的 `max(global_sequence)` 与前一代比，看它是否真的前进了。
+
+    **装机时重出 inputs 文档要显式写档位**：第十二个窗口（本 PR 的 tag）重跑
+    `scripts/build_runtime_production_inputs.py` 时**加上 `--notifier-delivery-mode shadow`**。
+    不加也是 shadow（生成器与画像模型的默认都是它，两处都有测试钉住），显式写出来是为了让
+    装机记录里能看见这一轮选的是哪一档；`--generated-at` 不传，取墙钟。
+    **切 live 不在本窗口做**——见本文件最上面 2026-09-21 那条 notifier 影子档记录，
+    切换这一步本身卡在 #284。
 
 ### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合，以及包 N 追出全部范围的 #250 与它交回给 #235 的那处告警回退，再加上第七窗口 17:00 两次卡住 `rquant-daily` 之后立的 #256；末列写「已修」的条目已修，其余不修）
 

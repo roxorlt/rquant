@@ -387,6 +387,31 @@ class RecipientScopedNotificationProvider(NotificationProvider):
         return f"{self._channel.value}:{receipt}"
 
 
+class SuppressedNotificationProvider(NotificationProvider):
+    """The shadow transport: the batch runs in full and no byte leaves the host.
+
+    #281. A notifier in `shadow` mode takes the live branch of `step()` -- it replicates
+    the route receipts into its own state database, claims the outbox under a lease,
+    writes the attempt row and publishes the `signals` serving authority -- and only the
+    thing at the end of the wire is this. Nothing here opens a socket, reads a credential
+    or formats a message.
+
+    The receipt is `shadow:<outbox_id>` rather than anything generated, because
+    `run_notification_batch` writes what a provider returns into the attempt log and a
+    retried lease has to produce the same receipt as the first attempt. A uuid here would
+    make one delivery reattempted look like two deliveries made (package Z review, risk
+    (b)).
+
+    A receipt beginning `shadow:` is one of the two marks of a shadow notifier; the other
+    is `notifier:shadow_transport` on its heartbeat.
+    """
+
+    __slots__ = ()
+
+    def deliver(self, delivery: NotificationDelivery) -> str:
+        return f"shadow:{delivery.record.outbox_id}"
+
+
 CapabilityInput = RecipientNotificationCapabilities | Mapping[DeliveryChannel, Mapping[str, str]]
 CapabilityLoader = Callable[[], CapabilityInput]
 
@@ -542,6 +567,7 @@ __all__ = [
     "RecipientNotificationCapabilities",
     "RecipientScopedProviderRegistry",
     "RecipientScopedNotificationProvider",
+    "SuppressedNotificationProvider",
     "build_environment_notification_provider_loader",
     "build_notification_provider_loader",
     "format_signal_notification",
