@@ -27,10 +27,14 @@ carrying a write bit (`_read_frozen_policy`, "routing policy file must be read-o
 is written 0444. Everything else is rejected unless it is private to its owner.
 
 Determinism is a contract, not a nicety: the operator reruns this to prove the document on
-the host matches the document that was reviewed. Nothing here reads the wall clock. The
-calendar's `generated_at` defaults to the newest `updated_at` of the SSE rows the query
-returned, and the sealed candidate documents take their trade date from the calendar. Pass
-`--generated-at` to pin it explicitly.
+the host matches the document that was reviewed -- and since #278 that rerun has to pass
+`--generated-at`, because the default is now the wall clock. It used to be the newest
+`updated_at` of the SSE rows, which on the production replica is 2026-07-14 18:13: every
+install therefore produced a calendar that claimed to have been generated in July and
+sealed candidate documents dated 2026-07-14, which the intraday loader refuses on every
+real session. The sealed candidate documents still take their trade date from
+`--generated-at`; production does not publish from them any more (see
+`session_candidate_input`), and they are kept for replay and for tests.
 
 The calendar has to reach `--calendar-coverage-floor` (coordinator ruling 8, 2027-12-31) or
 the run refuses. Lowering that value is the supported way to install against a table that
@@ -88,7 +92,6 @@ if str(_REPOSITORY_ROOT / "src") not in sys.path:  # pragma: no cover - import b
 
 from pydantic import ValidationError  # noqa: E402
 
-from rquant.live_contracts import BatchQualityStatus  # noqa: E402
 from rquant.runtime_builder_candidate import serialize_candidate_input  # noqa: E402
 from rquant.runtime_builder_retention import (  # noqa: E402
     DescriptorSchemaBinding,
@@ -108,12 +111,9 @@ from rquant.runtime_production_profile import (  # noqa: E402
 )
 from rquant.runtime_recovery_artifacts import RealRecoveryArtifactKind  # noqa: E402
 from rquant.runtime_routing_policy import RoutingPolicyDocument  # noqa: E402
-from rquant.strategy_candidate_producers import (  # noqa: E402
-    PublishedCandidateInputAuthority,
-)
-from rquant.strategy_candidate_publish_service import (  # noqa: E402
-    GrowthBoardCandidateBatch,
-    NShapeCandidateBatch,
+from rquant.session_candidate_input import (  # noqa: E402
+    SEALED_CANDIDATE_CONTRACT,
+    candidate_input_batch,
 )
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads  # noqa: E402
 
@@ -486,27 +486,26 @@ def build_sealed_candidate_payload(
     `serialize_candidate_input` is the loader's own inverse, so the bytes are canonical typed
     JSON by construction rather than by imitation. `authority_snapshot_id` addresses the
     (empty) fact list, so re-sealing the same emptiness yields the same id.
+
+    Since #278 this is **the same construction the per-session publisher uses**
+    (`rquant.session_candidate_input.candidate_input_batch`), with the sealed contract
+    string and no `basis_trade_date`; the bytes are unchanged from v0.33.15. Production
+    no longer publishes from these documents -- `candidate.n_shape.v1` and
+    `candidate.growth_board_surge.v1` rebuild theirs every session -- so they are kept
+    for replay and for tests.
     """
 
-    authority = PublishedCandidateInputAuthority(
-        trade_date=trade_date,
-        captured_at=captured_at,
-        quality_status=BatchQualityStatus.PUBLISHED,
-        authority_snapshot_id=canonical_sha256(
-            {
-                "contract": "route-a/sealed-candidate-input/v1",
-                "strategy_id": strategy_id,
-                "trade_date": trade_date,
-                "facts": [],
-            }
-        ),
-        producer_commit=producer_commit,
+    if strategy_id not in {"n_shape", "growth_board_surge"}:
+        raise GeneratorError(f"no sealed candidate document is defined for {strategy_id}")
+    return serialize_candidate_input(
+        candidate_input_batch(
+            strategy_id=strategy_id,
+            producer_commit=producer_commit,
+            trade_date=trade_date,
+            captured_at=captured_at,
+            contract=SEALED_CANDIDATE_CONTRACT,
+        )
     )
-    if strategy_id == "n_shape":
-        return serialize_candidate_input(NShapeCandidateBatch(authority=authority, facts=()))
-    if strategy_id == "growth_board_surge":
-        return serialize_candidate_input(GrowthBoardCandidateBatch(authority=authority, facts=()))
-    raise GeneratorError(f"no sealed candidate document is defined for {strategy_id}")
 
 
 def sealed_candidate_trade_date(
@@ -1049,7 +1048,11 @@ def _run(arguments: argparse.Namespace) -> int:
 
     rows = read_sse_calendar(calendar_database)
     if arguments.generated_at is None:
-        generated_at = max(row[2] for row in rows)
+        #: 墙钟，不是 `trade_calendar.updated_at`（#278）。那张表在生产副本上最后一次刷新是
+        #: 2026-07-14 18:13，于是每一次装机生成的日历都自称生成于七月，封存候选文档也跟着
+        #: 停在 2026-07-14——而盘中 loader 要的是**当日**。确定性由 `--generated-at` 提供：
+        #: 复核者用同一个值重跑就得到同一份文档。
+        generated_at = datetime.now(UTC)
     else:
         generated_at = datetime.fromisoformat(arguments.generated_at)
         if generated_at.tzinfo is None:

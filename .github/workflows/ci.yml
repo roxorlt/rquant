@@ -88,7 +88,18 @@ jobs:
     # raised limit is headroom for the next growth step, not the fix itself. A hang
     # is still caught early by pytest's faulthandler_timeout (600s), so a generous
     # job limit only buys the slowest shard room to finish.
-    timeout-minutes: 100
+    #
+    # The same shape came back on PR #285, one lane over. The opening-auction chain
+    # package put its e2e worlds - two installed generations and a published
+    # authority chain per test - into shard 1, and the 3.12 lane of that shard was
+    # cancelled at the 100-minute limit twice with nothing failed: 06:16:37Z ->
+    # 07:56:55Z (100m18s) in run 35694108896 and 04:22:39Z -> 06:03:09Z (100m30s) in
+    # run 35686530696. The 3.11 lane of the same shard finished both times, at 93m
+    # and 68m, which is the measured gap between the two interpreter lanes and the
+    # measured spread between two runs of the same shard. 120 minutes is headroom
+    # over the slower lane's cancelled runs; rebalancing shard 1 by duration, or
+    # giving the suite a sixth shard, is tracked separately and is the real fix.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

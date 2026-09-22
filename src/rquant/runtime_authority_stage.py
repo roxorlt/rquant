@@ -611,6 +611,7 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
         PRODUCTION_SHADOW_SIGNER_COMMAND,
     )
     from rquant.runtime_production_profile import _control_bucket
+    from rquant.runtime_service_builtin import AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS
     from rquant.runtime_service_entrypoint import RuntimeServiceKind
 
     root = production_runtime_root()
@@ -731,7 +732,9 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
             "quota_cost_per_request": 1,
             "producer_version": "auction-match-source-v1",
             "universe_path": str(auction_universe_root / "current.json"),
-            "max_attempts": 3,
+            #: 与画像同源的那一个常量（#277）。这里原来是字面量 `3`，而画像那边改成 6 之后
+            #: 第一次安装装出来的次数就和画像说的不是一个数了——BLK3 的逐字段比对当场红。
+            "max_attempts": AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS,
         },
         "market-minute.source.v1": {
             "spool_root": str(minute_root),

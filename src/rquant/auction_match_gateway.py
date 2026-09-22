@@ -162,17 +162,20 @@ class AuctionMatchGateway:
     ) -> pd.DataFrame:
         if not isinstance(raw, pd.DataFrame):
             raise AuctionMatchValidationError("source result must be a DataFrame")
-        missing = sorted(set(AUCTION_MATCH_COLUMNS) - set(raw.columns))
-        if missing:
-            raise AuctionMatchValidationError(f"missing columns: {missing}")
         expected = AuctionMatchGateway._normalize_universe(
             expected_codes,
             label="expected_codes",
             allow_empty=False,
         )
-        frame = raw.loc[:, AUCTION_MATCH_COLUMNS].copy()
-        if frame.empty:
+        #: 空在列之前。一张零行的表没有任何内容可校验，而「今天还没出数」正是 09:2x 的
+        #: 常态；列检查排在前面时，一张无列空表会被报成「缺八个字段」，于是「返回空」变成
+        #: 一个抛出的校验异常，空批次与回执一份都写不出来（#277 第一个缺陷）。
+        if raw.empty:
             return AuctionMatchGateway._empty_frame()
+        missing = sorted(set(AUCTION_MATCH_COLUMNS) - set(raw.columns))
+        if missing:
+            raise AuctionMatchValidationError(f"missing columns: {missing}")
+        frame = raw.loc[:, AUCTION_MATCH_COLUMNS].copy()
 
         if any(
             AuctionMatchGateway._contains_bool(frame[column])
@@ -489,6 +492,7 @@ class AuctionMatchGateway:
         quality = BatchQualityStatus.PUBLISHED
         degraded_reasons: list[str] = []
         source_failed = False
+        validation_failed = False
         raw_empty = False
         latest = self._latest_envelope()
         try:
@@ -505,16 +509,25 @@ class AuctionMatchGateway:
             degraded_reasons.append(f"source_error:{type(exc).__name__}")
         else:
             raw_empty = isinstance(raw, pd.DataFrame) and raw.empty
-            frame = self.normalize_frame(
-                raw,
-                trade_date=trade_date,
-                expected_codes=expected,
-            )
+            #: 与上面 `source_error:` 那一支同形（#277 第一个缺陷的第二半）：这一句原来在
+            #: `try` 之外，上游给了一份读不懂的报文时异常直接穿出去，既不发批次也不留回执，
+            #: 心跳随后被早退分支洗成正常。源头给错了东西是一条**可见的降级**，不是一次崩溃。
+            try:
+                frame = self.normalize_frame(
+                    raw,
+                    trade_date=trade_date,
+                    expected_codes=expected,
+                )
+            except AuctionMatchValidationError as exc:
+                validation_failed = True
+                frame = self._empty_frame()
+                quality = BatchQualityStatus.DEGRADED
+                degraded_reasons.append(f"validation_failed:{exc}")
 
         observed = tuple(frame["ts_code"].astype(str))
         missing_required = tuple(sorted(set(required) - set(observed)))
         coverage_ratio = len(observed) / len(expected)
-        if not source_failed:
+        if not source_failed and not validation_failed:
             if frame.empty:
                 degraded_reasons.append(
                     "empty_source_result" if raw_empty else "expected_universe_no_match"

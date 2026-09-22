@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import multiprocessing as mp
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -549,21 +550,91 @@ def test_capture_lock_revalidates_path_after_waiting_for_flock(
         (pd.DataFrame([_row("600000.SH", turnover_rate=-0.1)]), "nonnegative"),
     ],
 )
-def test_structural_errors_fail_closed_without_publication(
+def test_structural_errors_publish_an_empty_degraded_batch_that_names_them(
     tmp_path: Path,
     raw: pd.DataFrame,
     message: str,
 ) -> None:
+    """读不懂的报文是一条可见的降级，不是一次抛出（#277）。
+
+    改动前这一句在 `try` 之外：上游给了一份读不懂的东西，异常穿过 `capture_once`，既不发
+    批次也不留回执，而构建器的早退分支随后把心跳洗成正常——2026-09-21 现场的形状。现在
+    发一个 **零行** 的 DEGRADED 批次，`degraded_reasons` 里带 `validation_failed:` 加原话，
+    所以「今天的报文不合法」这件事在心跳上看得见。一行不合法的数据都没有进 payload，
+    这才是 fail closed 的本意；`normalize_frame` 自己照旧抛，见下一条用例。
+    """
+
     gateway = _gateway(tmp_path, lambda _: raw)
 
+    capture = gateway.capture_once(
+        trade_date=TRADE_DATE,
+        received_at=RECEIVED,
+        expected_codes=("600000.SH",),
+    )
+
+    assert capture.published is True
+    assert capture.observed_count == 0
+    assert capture.pointer.quality_status is BatchQualityStatus.DEGRADED
+    envelope = _records(gateway)[0].envelope
+    assert envelope.row_count == 0
+    assert len(envelope.degraded_reasons) == 1
+    reason = envelope.degraded_reasons[0]
+    assert reason.startswith("validation_failed:")
+    assert re.search(message, reason), reason
+    #: 空结果那一条降级不该同时挂上来：这次不是「返回空」，是「返回了读不懂的东西」
+    assert "empty_source_result" not in envelope.degraded_reasons
+    assert gateway.decode_payload(gateway.spool.read_payload(_records(gateway)[0])).empty
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (pd.DataFrame([{"ts_code": "600000.SH"}]), "missing columns"),
+        (pd.DataFrame([_row("600000.SH", trade_date=date(2026, 7, 30))]), "trade_date"),
+        (pd.DataFrame([_row("BAD")]), "ts_code"),
+        (pd.DataFrame([_row("600000.SH"), _row("600000.SH")]), "duplicate"),
+        (pd.DataFrame([_row("600000.SH", price=True)]), "bool"),
+        (pd.DataFrame([_row("600000.SH", amount=np.inf)]), "finite"),
+        (pd.DataFrame([_row("600000.SH", vol=-1)]), "nonnegative"),
+        (pd.DataFrame([_row("600000.SH", price=0)]), "positive"),
+    ],
+)
+def test_normalize_frame_itself_still_refuses_every_structural_error(
+    raw: pd.DataFrame,
+    message: str,
+) -> None:
+    """降级的是 `_capture_locked` 那一层，校验本身一条都没有放宽。"""
+
     with pytest.raises(AuctionMatchValidationError, match=message):
-        gateway.capture_once(
+        AuctionMatchGateway.normalize_frame(
+            raw,
             trade_date=TRADE_DATE,
-            received_at=RECEIVED,
             expected_codes=("600000.SH",),
         )
 
-    assert gateway.spool.current(LiveChannel.AUCTION_MATCH) is None
+
+def test_a_column_less_empty_frame_is_empty_rather_than_missing_columns() -> None:
+    """09:26 那三次「返回空」的形状：零行、零列，是空，不是缺八个字段。"""
+
+    normalized = AuctionMatchGateway.normalize_frame(
+        pd.DataFrame(),
+        trade_date=TRADE_DATE,
+        expected_codes=("600000.SH",),
+    )
+
+    assert normalized.empty
+    assert tuple(normalized.columns) == AUCTION_MATCH_COLUMNS
+
+
+def test_an_empty_frame_still_refuses_an_invalid_expected_universe() -> None:
+    """空表走的是捷径，但 `expected_codes` 的校验排在捷径之前，没有被跳过。"""
+
+    with pytest.raises(AuctionMatchValidationError, match="expected_codes"):
+        AuctionMatchGateway.normalize_frame(
+            pd.DataFrame(),
+            trade_date=TRADE_DATE,
+            expected_codes=(),
+        )
 
 
 def test_optional_metrics_allow_nan_and_round_trip(tmp_path: Path) -> None:
@@ -606,6 +677,9 @@ def test_low_coverage_and_missing_required_are_degraded(tmp_path: Path) -> None:
     ("raw", "reason"),
     [
         (pd.DataFrame(columns=AUCTION_MATCH_COLUMNS), "empty_source_result"),
+        #: 09:26 现场那一张：零行**零列**。改动前它走的是「缺八个字段」那条抛出的路，
+        #: 一个批次都留不下来（#277）
+        (pd.DataFrame(), "empty_source_result"),
         (_frame("300001.SZ"), "expected_universe_no_match"),
     ],
 )

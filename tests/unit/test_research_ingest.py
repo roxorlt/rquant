@@ -171,6 +171,7 @@ class _Adapter:
                     "price": price,
                     "vol": 1000.0,
                     "amount": 10_000.0,
+                    "pre_close": price - 0.1,
                     "turnover_rate": 0.1,
                     "volume_ratio": 1.5,
                     "source": "tushare",

@@ -8,7 +8,7 @@ import os
 import stat
 import subprocess
 from collections import Counter
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 
 import pandas as pd
@@ -2910,3 +2910,46 @@ def test_a_raw_unhydrated_linux_payload_is_still_refused(
 
     with pytest.raises(ValidationError, match="must be hydrated"):
         build_production_runtime_profile(payload)  # type: ignore[arg-type]
+
+
+def test_the_generator_refuses_a_capture_window_the_assembly_window_did_not_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """复核 CF-3：四个窗口常量只改了一边，画像生成必须当场失败。
+
+    探测定窗是唯一会动到这四个常量的场合，而只改一边的后果是竞价链安安静静地什么都不
+    产出——`candidate.auction_gap` 的装配窗与 `auction-match` 的采集窗错开之后，装配窗里
+    永远没有料。这道闸门就守在操作员改完常量之后必经的那一步上。
+
+    生成器是**函数内 import** 这两个常量的，所以 monkeypatch 模块属性一定生效。
+    """
+
+    import rquant.runtime_service_builtin as builtin_module
+
+    inputs = _inputs(tmp_path)
+    assert build_production_runtime_profile(inputs) is not None
+
+    #: 只把采集窗整体后移，装配窗不动
+    monkeypatch.setattr(builtin_module, "AUCTION_MATCH_DEFAULT_CAPTURE_START", time(9, 36))
+    monkeypatch.setattr(builtin_module, "AUCTION_MATCH_DEFAULT_CAPTURE_END", time(9, 50))
+
+    with pytest.raises(ValueError, match="disagree"):
+        build_production_runtime_profile(inputs)
+
+
+def test_the_generator_accepts_four_constants_that_moved_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """闸门守的是「对不上」，不是「不许改」——四个一起改照样生成得出来。"""
+
+    import rquant.runtime_builder_candidate as candidate_module
+    import rquant.runtime_service_builtin as builtin_module
+
+    monkeypatch.setattr(builtin_module, "AUCTION_MATCH_DEFAULT_CAPTURE_START", time(9, 36))
+    monkeypatch.setattr(builtin_module, "AUCTION_MATCH_DEFAULT_CAPTURE_END", time(9, 50))
+    monkeypatch.setattr(candidate_module, "AUCTION_GAP_DEFAULT_INPUT_START", time(9, 36))
+    monkeypatch.setattr(candidate_module, "AUCTION_GAP_DEFAULT_INPUT_END", time(9, 55))
+
+    assert build_production_runtime_profile(_inputs(tmp_path)) is not None

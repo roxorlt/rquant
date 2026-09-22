@@ -186,6 +186,13 @@ REFERENCE_SLOW_SOURCE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta
 #: another scan. One read per session is the whole of what this role needs.
 AUCTION_GAP_CANDIDATE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=4))
 
+#: `candidate.n_shape.v1` / `candidate.growth_board_surge.v1` since #278. What they ask the
+#: replica is one `max(trade_date)` over `daily_bar`, once per session -- the publisher
+#: remembers the session it published and stops asking -- so the floor only bounds the
+#: iterations before the first answer of the day, and there is no no-read window: a role
+#: restarted at 10:00 must still be able to publish today's document.
+SESSION_CANDIDATE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=5))
+
 #: `auction-universe.publisher.v1`. It has no narrow window -- it refuses 09:15-15:10 and
 #: works either side -- so its floor is one replica generation. It publishes once per
 #: session and then recognises its own `current.json` without asking the gate; the floor

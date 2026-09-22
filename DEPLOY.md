@@ -261,6 +261,174 @@ systemctl status 'rquant-runtime-notifier@*'
 
 ---
 
+## 2026-09-21 · 待安装 · 盘中竞价链真正产出（#277、#278）—— **顺序：探测 → 定窗 → 装机**
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。只改 `src/` 与 `scripts/`，
+`deploy/` 一个字没动。
+
+### 0. 探测 → 定窗：09-22 的探测只圈出一个区间，窗按「盖住整个区间」定（**已做完，写在代码里**）
+
+2026-09-21 实测：生产主 token 的 `stk_auction(20260921)` 在 **09:26:01 / 09:26:04 / 09:26:08
+三次都返回空**，同一个 token 在 **15:10 已经有 6,073 行**（列含 `pre_close`、`float_share`）。
+2026-09-22 又用同一个主 token 只读探测一轮，结果是一个**区间**而不是一个时刻：
+
+| 时刻 | `stk_auction(20260922)` |
+|---|---|
+| 09:26:02 / 09:26:04 / 09:26:08 | **空**（0 行） |
+| 09:51:11 | **非空**，6,075 行 |
+
+所以首次可用的那一刻落在 **09:26:08 与 09:51:11 之间**，确切时刻这一轮没卡出来
+（`/tmp/stk-auction-probe.log`，cron 09:27 读；**09-23 有一轮更细的探测**再去卡）。
+
+**协调者的裁定：不猜那一刻，用更多次尝试把整个区间盖住。** 本条对应的 PR 已经把四个常量
+（外加尝试次数）改成下面这一组，不再是「临时默认」：
+
+| 项 | 值 | 文件 |
+|---|---|---|
+| `AUCTION_MATCH_DEFAULT_CAPTURE_START` | `09:35:00` | `src/rquant/runtime_service_builtin.py` |
+| `AUCTION_MATCH_DEFAULT_CAPTURE_END` | `10:05:00` | 同上 |
+| `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS` | `6` | 同上 |
+| `AUCTION_GAP_DEFAULT_INPUT_START` | `09:35:00` | `src/rquant/runtime_builder_candidate.py` |
+| `AUCTION_GAP_DEFAULT_INPUT_END` | `10:10:00` | 同上 |
+
+尝试次数只有 `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS` 这一处：设置模型的默认值、生产画像写进
+manifest 的那一项、route B 第一次安装时的自举派生
+（`runtime_authority_stage.bootstrap_settings`）**三处都读它**。原来画像与自举各写一个字面量
+`3`，只改一边会让第一次安装装出来的次数与画像说的不是一个数，
+`test_blk3_derived_settings_agree_with_the_production_profile_field_by_field` 逐字段比对时当场红。
+
+间隔由 `窗宽 // max_attempts` 推出来：`1800 // 6 = 300` 秒，六次到期时刻是
+**09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00**，全部落在 `[09:35, 10:05)` 里，最后一次
+到期之后离窗口右界还留着整整一个间隔。
+
+**精确 T 待 09-23 探测后收紧**：拿到首次可用的确切时刻之后，窗可以收回「T + 60 s 起点、
+宽 14 分钟、三次尝试」那种形状（间隔 280 秒），装配窗跟着收。收紧走的还是下面这条路，
+时间预算一样。
+
+**定窗只有一条路：改上面这几个代码常量。** 仓库里没有「改 manifest 设置就能定窗」这条路——
+manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_production_profile.py`），
+`ProductionRuntimeProfileInputs` 没有任何 settings 透传字段，手改盘上的
+`production-runtime-profile.json` 也会被下一次部署重新生成的那一份覆盖掉。
+（这几项在设置模型上仍然是可选字段，只为回放与测试保留；生产画像不写它们。）
+
+**四个窗口常量必须一起改**：两对窗口的一致性（装配窗与采集窗同时开始、在它之后关闭）由
+`auction_windows_are_consistent` 在**生产画像生成时**当场校验，只改一边会让
+`rquant runtime-production-profile` 直接失败——这是有意的，因为只改一边的后果是竞价链
+安安静静地什么都不产出。
+
+`capture_start` 早于 **09:26** 会被设置模型当场拒绝（网关本身就拒绝 09:26 之前收到的竞价
+数据）；`max_attempts` 次尝试有任何一次落不进 `[capture_start, capture_end)` 也会被拒
+（所以改次数和改窗宽是同一件事的两面，得一起算）。
+
+### 0.1 时间预算：探测当天装不了机
+
+只有改代码这一条路，所以顺序与耗时是固定的，**不要指望探测当天早上就把窗定下来并装上**：
+
+| 步骤 | 何时 | 说明 |
+|---|---|---|
+| ① 探测 | 交易日 D 的 09:2x–09:5x | 主机 cron 读 `/tmp/stk-auction-probe.log`；09-22 这一轮只圈出区间，09-23 再卡精确时刻 |
+| ② 改常量 + 开 PR | D 当天 | 同时在 CHANGELOG 与本条里记下探测值 |
+| ③ CI 绿（3.11 / 3.12） | D 当天 | |
+| ④ squash merge + 打 tag | D 当天 | |
+| ⑤ 部署 | **D 收盘之后**（或 D+1 收盘后） | `bash scripts/deploy-production.sh --target <tag>`；部署器在工作日 09:15–15:10 会自动延期 |
+| ⑥ 验收 | **D+1（或 D+2）开盘** | 按下面第 2 节逐条看 |
+
+也就是说：**探测日 D 只能拿到数，真正生效最早是 D+1 的开盘**。装机之前生产跑的仍是写死的
+老窗 09:26–09:30 加七秒内三次重试，竞价链照旧采不到——这是已知的、可接受的过渡，不是回归。
+09-23 那一轮探测若把窗收紧，走的是同一张表，再来一遍。
+
+### 1. 这一版修了什么
+
+见 CHANGELOG `[Unreleased] / Fixed` 的 #277、#278 两条。一句话：竞价链原来**一个批次都发不
+出来且心跳干净**（适配器不要 `pre_close`、空表被当成缺八列、校验异常穿过 `capture_once`、
+早退分支用初始结果洗心跳），n_shape / growth_board 的候选文档停在 `trade_date 2026-07-14`。
+
+### 2. 装上之后当场应该看到什么
+
+- **08:45 之后**：`data/runtime/live/candidates/<n_shape 实例>/current.json` 与
+  `<growth_board 实例>/current.json` 的 `trade_date` 是**当日**、`captured_at` 是当天早上，
+  `sequence` 每个交易日至少 +1（不再恒为 0）。盘中同一天之内不再有第二次写（例外见下）。
+  日历覆盖不到当天时这两个 role 的心跳会带 `calendar_uncovered:<date>`——生产日历的覆盖
+  下限是 2027-12-31，正常不会看到，看到了就说明该刷日历了。
+  另有一条 **`calendar_clock_regressed:<generated_at>`**：日历权威的生成时刻晚于观测时刻，
+  也就是时钟被回拨或装了错代的权威。这一条是**硬失败**（unit 的 `last_error` 里看，
+  不在 `degraded_reasons` 里），`auction-match` 与两个候选发布者行为一致。
+- **采集窗第一次尝试**（09:35，其后每 300 秒一次，共六次到 10:00）：
+  `live/auction-match/batches/auction_match/` 下出现批次。当天数据还没出时是
+  DEGRADED + `empty_source_result`，出了之后是 PUBLISHED。09-22 的区间（09:26:08 空、
+  09:51:11 非空）意味着**前几次很可能仍是空批次，后几次才出数**，这是窗按区间定的用意。
+- **窗结束之后**：`rquant-runtime-auction-match@…` 的心跳 `degraded_reasons` 里会带
+  **`capture_failed`**（试过但都没成）或 **`capture_missed`**（一次请求都没发出去——role 没
+  起来、部署、watchdog 重启，或者竞价全集一直读不出来），一直带到次日。这正是 09-21 那天
+  缺的东西。
+  **但心跳不是唯一判据**，因为这两面旗子是**进程内记忆**，role 一重启就丢。落盘的两样才是
+  重启也不丢的证据，验收时两样都要看：
+
+  ```bash
+  # ① 当天有没有批次（DEGRADED / STALE / PUBLISHED 都算「试过」）
+  ls -l /home/lighthouse/rquant/data/runtime/live/auction-match/batches/auction_match/ | tail
+  # ② 当天窗口里实际发出过几次请求（把 2026-09-22 换成当天）
+  sqlite3 /home/lighthouse/rquant/data/runtime/live/auction-match/quota.sqlite3 \
+    "SELECT attempt_id, outcome, prepared_at, dispatched_at FROM quota_attempt WHERE prepared_at LIKE '2026-09-22%' ORDER BY prepared_at DESC LIMIT 10;"
+  ```
+
+  **列名是 `prepared_at`，不是 `created_at`**（`quota_attempt` 没有 `created_at` 这一列，
+  照抄会报 `no such column`）。这条命令的 SQL 由
+  `tests/unit/test_auction_match_runtime_source.py::test_the_deploy_acceptance_query_runs_against_a_real_quota_store`
+  **从本文件里抓出来、对着一个真的 `SourceQuotaStore` 跑一遍**，所以它与表结构不会再各说各的。
+
+  `quota_attempt` 里当天窗口的行数就是真实发出的请求数；采集一直没成时它应当等于
+  `max_attempts`（**6**），少于 6 说明窗口里有轮次没跑到；某一次成了之后就不再发请求，
+  行数少于 6 是对的。
+- **装配窗内**（09:35–10:10）：`candidate.auction_gap.v1` 的
+  `processed_count >= 1`，随后 `watchlist-quote` / `market-minute` 的
+  `degraded_reasons` 为空、`source_generations` 里有 `candidate_universe`。
+
+**已知的、不是缺陷的四件事**：
+
+1. **09:30 到装配窗起点之间两个源会降级**。`market-minute` / `watchlist-quote` 从 09:30 起
+   就去读候选全集，而当日的 auction_gap 快照最早在装配窗起点之后才装得出来。这一段是
+   **DEGRADED 不是 failed**：`run_service_loop` 记 `record_failure` 之后继续循环，进程从不以
+   非零退出，所以 `OnFailure=rquant-alert@%n.service` 不触发、`Restart=on-failure` 不重启。
+   **这一段的长度 = 装配窗起点 − 09:30**，按现在的 09:35 是 **5 分钟**；而当天数据真正出来
+   得更晚时（09-22 的区间说它可能晚到 09:51），这一段会一直延到第一次采到数为止。
+   上线标准里若写了「盘中零降级」，措辞要按这个区间重裁。
+2. **竞价全集读不出来时，窗内每一轮都会记一次失败**。`consecutive_failures` 可能飙到上千
+   （2 秒轮询 × 30 分钟 ≈ 900 次），这是「全集没发布之前每轮都再试、不烧采集次数」换来的，
+   仓库里没有任何逻辑对 `consecutive_failures` 设阈值，**不要误判成崩溃循环**。
+   真正要看的是 `last_error` 说的是不是「竞价全集读不出来」。
+3. **窗内重启会报销当天的采集**（既有机制，本包把暴露面从 7 秒放大到整个窗）。配额台账按
+   `retry_ordinal` 去重，而序号来自进程内计数；role 在窗内崩溃重启之后序号从 0 重来，撞上
+   台账里同一条 attempt 被拒，那几轮全落成 `source_error:SourceQuotaConflictError` 的 STALE
+   批次。已经发过 PUBLISHED 批次的那一天不受影响。真正的修法（序号落盘）与「两面旗子是
+   进程内记忆」是同一件事，留作后续 issue。
+4. **15:10 之后重启发布者会发第二代当日候选文档**。日线管道把当天结果写进副本之后，
+   `basis_trade_date` 会从「上一场」翻成「当天」，文档语义因此不同，于是发新一代。盘中重启
+   不会（`basis` 不变 ⇒ 语义相同 ⇒ 不写）。所以上面「同一天之内不再有第二次写」这句
+   **限盘中**。
+
+### 3. 回滚
+
+`bash scripts/deploy-production.sh --target <上一个 tag>`。
+
+**候选文档格式是否向后兼容 v0.33.15 的读者？——是，有条件地是**：
+
+- `PublishedCandidateInputAuthority` 新增可选字段 `basis_trade_date`，而
+  `serialize_candidate_input` 在它为空时**不写这个键**，所以
+  `n-shape-candidates.json` / `growth-board-surge-candidates.json` 这两份**封存文档的字节与
+  v0.33.15 逐字相同**（`tests/unit/test_session_candidate_input.py` 钉住了 id 与线上形状）。
+  回滚之后旧代码照样读得懂它们。
+- **带 `basis_trade_date` 的文档只存在于内存**：`session_document` 模式装配出来的批次不落盘成
+  文档，只发布成候选快照，而快照的格式一点没变（schema v3，字段集相同）。所以回滚之后旧代码
+  读本包发布过的快照也没有问题。
+- **需要手工处理的只有一件事**：回滚到 v0.33.15 之后，两个 document-driven 发布者会回到
+  `sealed_document` 模式，重新去读那两份封存文档——它们的 `trade_date` 仍是装机那天的日期，
+  于是 #278 的现象原样回来（`watchlist-quote` / `market-minute` 整天 DEGRADED）。
+  **回滚等于回到已知缺陷，不是回到安全态**；若必须回滚，先确认当天不需要盘中链产出。
+- 已经落在 `live/candidates/*/` 下的快照不需要挪动，也不需要删除。
+
+---
+
 ## 2026-09-21 · 待安装 · rquant/live slice MemoryHigh 二次提额（#268、#271）
 
 **状态**：**尚未安装**。两个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-21 20:17 经
@@ -1513,8 +1681,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
-   续期的做法是：扩 `trade_calendar` 表 → 重跑生成器 → 重跑命令链 ①②③④。这是**换一代
-   generation，不换 `profile_id`**。
+   续期的做法是：扩 `trade_calendar` 表 → 重跑生成器（**带 `--generated-at`**，见第 34 条：
+   自 #278 起默认值是墙钟）→ 重跑命令链 ①②③④。这是**换一代 generation，不换 `profile_id`**。
 
    **首次装机显式传 `--calendar-coverage-floor 2026-12-31`**（#211）：生产库的 `trade_calendar`
    目前只到 `2026-12-31`，补 2027 年的日历要往生产库写数据，属于需要 owner 单独授权的高风险
@@ -2108,6 +2276,10 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       `--readonly-replica-database-path /home/lighthouse/rquant/data/rquant_ro.duckdb`
       （这是默认值，显式写进部署命令便于事后核对）。`readonly_replica_database_path` 是**必填**输入，
       用旧 inputs 会在 `ProductionRuntimeProfileInputs` 校验期直接被拒。
+      **自 #278 起还要带 `--generated-at`**：这一项留空时取的是墙钟（以前取
+      `trade_calendar.updated_at`，而那张表最后一次刷新停在 2026-07-14，于是每次装机生成的
+      日历都自称生成于七月）。不传就没有「复核者重跑得到同一份文档」这条确定性，例如
+      `--generated-at 2026-09-22T08:00:00+00:00`，并把这个值记在本条下面。
     - 用新 inputs 重新生成 profile 再装 bundle。`auction-universe.publisher.v1` 的 manifest
       `database_path` 从 `rquant.duckdb` 改成 `rquant_ro.duckdb`，**`profile_id` 会变**、bundle
       generation 跟着变，权威链按第 13–17 条的既有约定走。

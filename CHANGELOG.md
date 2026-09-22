@@ -238,6 +238,95 @@
   路线 B 的 `bootstrap_settings` 也显式写上同一对可选源，理由与画像那处相同：
   哪些源可降级由 manifest 决定，不由字段默认值决定。
 
+- **盘中竞价链一个批次也发不出来：适配器缺列、空表被当成缺列、失败被早退分支洗掉（#277，本包）**：
+  2026-09-21 验收日，`auction-match.source.v1` 在 09:26:01 / 09:26:04 / 09:26:08 三次请求
+  `stk_auction`，三次都「返回空」，随后**零批次、零报错**——09:50 的心跳仍是
+  `running / last_error None / processed_count 0 / output_sequence -1`；下游
+  `candidate.auction_gap.v1` 整天装不出东西，`watchlist-quote` 与 `market-minute` 整天报
+  `auction_gap@1: required authority has no not_visible snapshot`。协调者当天 15:10 用同一个
+  生产主 token 只读探测：`stk_auction(20260921)` 已经有 6,073 行，列里就有 `pre_close`；
+  备用 token 的回答是「抱歉，您没有接口(stk_auction)访问权限」。所以 09:26 不是接口坏了，
+  是**当天数据那时还没就绪**，而四件事叠在一起让这件事既没被重试到，也没在心跳上留下痕迹：
+
+  1. **适配器从来没向接口要过 `pre_close`**，而网关的 `AUCTION_MATCH_COLUMNS` 把它列为必需
+     数值列——就算 09:26 真有数，非空结果也会被判「缺 `pre_close`」。现在 `fields` 与必需列
+     都从 `STK_AUCTION_COLUMNS` 来，列集与列序和 `AUCTION_MATCH_COLUMNS` 逐字相同，由
+     `tests/unit/test_tushare_stk_auction.py` 钉住（适配器不 import 网关，两边一致没有编译期
+     保证，只有这一条用例）。
+  2. **空结果返回的是一张无列的 `pd.DataFrame()`**，而 `normalize_frame` 先查列再看行，于是
+     「返回空」被报成「缺八个字段」并抛出。两层都修：适配器的空结果带齐八列，网关的空判定
+     排到列检查之前（`expected_codes` 的校验仍在捷径之前，没被跳过）。
+  3. **那句 `normalize_frame` 在 `_capture_locked` 的 `try` 之外**，异常直接穿过
+     `capture_once`，空批次与回执一份都写不出来。现在它进降级路径，发一个**零行**的 DEGRADED
+     批次、`degraded_reasons` 带 `validation_failed:<原话>`，与 `source_error:` 那一支同形。
+     校验本身一条没放宽——`normalize_frame` 照旧逐条拒绝。
+  4. **采集窗写死在 09:26-09:30、三次重试挤在七秒里、早退分支用那份从未被写过的初始结果把
+     心跳洗干净**。现在窗由 `AUCTION_MATCH_DEFAULT_CAPTURE_START` / `..._END` 两个常量给出
+     （**09:35:00–10:05:00**），尝试次数取 **6**（`AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS` 一处
+     定义，设置模型默认值、生产画像与 route B 的自举派生都读它，不再各写一份字面量），
+     按 `窗宽 // max_attempts` 摊在整个窗里
+     （300 秒 ⇒ 09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00）。
+     窗与次数来自 **2026-09-22 的生产探测**：同一个主 token 的 `stk_auction(20260922)` 在
+     09:26:02 / 09:26:04 / 09:26:08 三次返回空，到 09:51:11 已有 6,075 行——探测只圈出了
+     **09:26:08 到 09:51:11 这个区间**，首次可用的确切时刻还不知道（09-23 再探一轮更细的）。
+     协调者据此裁定不猜那一刻，而是**用更多次尝试把整个区间盖住**；拿到精确时刻之后再把窗
+     收紧，**定窗只有改代码常量这一条路**，顺序与时间预算见 DEPLOY.md。
+     **除的是 `max_attempts` 不是 `max_attempts - 1`**：后者会让最后一次的到期时刻正好等于
+     窗口右界，而闸门是「过了右界就整轮空转」，于是 2 秒轮询下有一半的相位永远拿不到最后
+     那次尝试——被吃掉的恰恰是为「数据晚到」准备的那一次（独立复核 MF-1 实测）。设置模型另加一条
+     校验：所有尝试必须落在 `[capture_start, capture_end)` 内，显式给的 `retry_interval_seconds`
+     与窗宽对不上会被当场拒绝。
+     当天尝试耗尽、或窗过去而试过仍无批次时，心跳一直带 `capture_failed` 直到交易日切换；
+     **窗过去而一次请求都没发出去**（role 没起来、部署、watchdog 重启，或竞价全集一直读不
+     出来）则带 `capture_missed`——两种情况分开，因为心跳必须回答得了「今天到底采没采」。
+     竞价全集读不出来时**不消耗尝试次数**，窗内每一轮都再试，直到它可读为止。
+     **边界如实记下**：这两面旗子活在进程内存里，role 重启之后心跳不再复述当天的失败；
+     落盘的 DEGRADED 批次与 `quota.sqlite3` 的尝试记录才是重启也不丢的证据，DEPLOY 的验收
+     清单以它们为准。
+
+  `candidate.auction_gap` 的装配窗随之从 09:26-09:30 移到 **09:35-10:10**，同样是代码常量。
+  两对窗口的一致性由 `auction_windows_are_consistent` 在**生产画像生成时**当场校验，
+  探测定窗时四个常量必须一起改，只改一边会让 `rquant runtime-production-profile` 直接失败。
+  代价如实记下：`market-minute` / `watchlist-quote` 从 09:30 起就去读候选全集，而当日的
+  auction_gap 快照最早在装配窗起点之后才装得出来，中间这一段两个源仍会降级（DEGRADED 不是
+  failed，不触发 `OnFailure`）——这是「当天数据 09:26 还没出」这件事本身的后果，不是新引入的
+  缺陷；**这一段的长度 = 装配窗起点 − 09:30，按 09:35 的起点是 5 分钟**，当天数据真正出得
+  更晚时（09-22 的区间说它可能晚到 09:51）会一直延到第一次采到数为止。
+
+- **候选发布者发完一代之后，窗外的每一轮都会让心跳抛「输出序号回退」（#277 连带，本包）**：
+  `RuntimeServiceControl.record_success` 拒绝回退的 `output_sequence`
+  （`ValueError: output sequence cannot regress`），而 `candidate_publisher_builder` 的两条
+  空闲路径——窗外那一轮、以及读不到证据的降级那一轮——返回的都是默认的 `-1`。
+  `candidate.auction_gap.v1` 从来没真的发出过东西（#254、#277），所以这条路径一次都没被走到
+  过；本包让竞价链真的开始产出之后，它会在**发完第一代之后的每一轮**上抛，一天上千次。
+  现在空闲那一轮照抄本进程已经发到的那一代（`session_document` 与 `auction_live` 两支都改），
+  `processed_count` 仍是 0。新增用例
+  `test_an_idle_round_after_a_publish_does_not_regress_the_output_sequence` 两支都打。
+
+- **n_shape / growth_board_surge 的候选文档停在 2026-07-14，盘中 loader 每场都拒（#278，本包）**：
+  `scripts/build_runtime_production_inputs.py` 把 `trade_calendar` 表里最新的 `updated_at`
+  （生产副本上是 2026-07-14 18:13）当成生成时刻，据此封出 `trade_date 2026-07-14` 的文档，
+  两个发布者每轮把同一份重发一遍；而 `watchlist-quote` / `market-minute` 用
+  `required_trade_date = 当日` 去读，三个候选权威又都是 `required: True`。只是因为 auction_gap
+  排在前面先失败（#277），这一条才一直没浮上来。
+  现在这两个发布者改用新的 **`session_document`** 模式：每个交易日 **08:45 起**（#278 要求的
+  「09:15 之前」留了半小时余量，且落在 `auction-universe.publisher.v1` 的 09:15-15:10 保护窗
+  之前）按**同一条构造**重建一次当日文档——装机脚本与发布者现在共用
+  `rquant.session_candidate_input.candidate_input_batch`——`trade_date` = 当日，
+  `captured_at` = 生成时刻，`basis_trade_date` = 只读副本里能读到的最新那一场日线结果的日期
+  （09:15 之前必然是上一场，这是这两个策略本来的口径，不是降级）。当天发过就整轮不写
+  （包 V/W 的纪律）。一个 10:00 才被拉起来的发布者仍会补发今天这一份。
+  「今天开不开市」走 `decide_market_session` 而不是自己判 `open_dates`（独立复核 SF-1）。
+  `decide_market_session` 的两种拒绝**拆成两条理由、两个 role 一致**（复核裁定 A / B）：
+  日历覆盖不到当天是 `calendar_uncovered:<date>`，**软降级**（auction-match 原来对这一条
+  直接抛，现在也降级）；日历生成时刻晚于观测时刻是 `calendar_clock_regressed:<generated_at>`，
+  **硬失败**（session 发布者原来接住降级，现在也抛）——前者是「该刷日历了」，后者是
+  「这台机器现在说的话不可信」，不该共用一个标签、也不该一软一硬。
+  `--generated-at` 留空时改取墙钟，不再取 `trade_calendar.updated_at`；确定性由显式传
+  `--generated-at` 提供。`sealed_document` 模式保留给回放与测试，**loader 的
+  `trade_date == 当日` 校验一个字没放宽**。
+  **事实列表仍然是空的**：装机脚本封的就是空列表，本包只把日期搬对，「候选事实从哪条查询来」
+  是另一件事。
 
 - **其余六个 role 的「每轮无条件写」：内容没变就不写、不提交、不 fsync（#271，本包）**：
   包 V 把 notifier 那两处从时钟上摘下来之后，全 role fsync 盘点里还剩六处，形状全都一样

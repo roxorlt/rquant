@@ -299,3 +299,124 @@ def decide_market_session(
         is_open_date=is_open,
         may_fetch_market_minute=may_fetch,
     )
+
+
+def calendar_refusal_reason(
+    calendar: MarketCalendarAuthority,
+    observed_at: datetime,
+    error: MarketSessionCalendarError,
+) -> tuple[str, bool]:
+    """把 `decide_market_session` 的两种拒绝分开，并说明各自是软是硬（复核裁定 A / B）。
+
+    `MarketSessionCalendarError` 盖着两件完全不同的事：
+
+    1. **日期超出日历覆盖期**（`runtime_market_session.py:286-289`）——冻结的日历过期了。
+       这是「该刷日历了」，是**软降级**：报 `calendar_uncovered:<date>`，role 继续活着。
+    2. **日历权威的生成时刻晚于观测时刻**（`:290-291`）——要么时钟被回拨，要么装了错代的
+       权威。这不是「数据没到」，是**这台机器现在说的话不可信**，所以**硬失败**：
+       原样抛出去，`record_failure` 把它记进 `last_error`，两个 role 一致。
+
+    两者同时成立时按第 2 种处理：时钟不对是更根本的那一个，先修它。
+    返回 `(理由标签, 是否硬失败)`。
+    """
+
+    if calendar.generated_at > normalize_aware_utc(observed_at):
+        return (f"calendar_clock_regressed:{calendar.generated_at.isoformat()}", True)
+    local_date = normalize_aware_utc(observed_at).astimezone(MARKET_TIMEZONE).date()
+    return (f"calendar_uncovered:{local_date.isoformat()}", False)
+
+
+def raise_or_label_calendar_refusal(
+    calendar: MarketCalendarAuthority,
+    observed_at: datetime,
+    error: MarketSessionCalendarError,
+) -> str:
+    """硬的那一种当场抛，软的那一种把标签交回去让调用者降级。"""
+
+    label, hard = calendar_refusal_reason(calendar, observed_at, error)
+    if hard:
+        raise MarketSessionCalendarError(f"{label}: {error}") from error
+    return label
+
+
+# ---------------------------------------------------------------------------------------
+# 本地挂钟窗口的算术（#277 复核 MF-1 / 代码质量 1）
+#
+# auction-match 的采集窗与 candidate.auction_gap 的装配窗是同一个概念的两个实例，改动前
+# 两边各写一套：一边把 `time` 换成整秒去比，一边直接比 `time` 对象。同一个概念两种表达，
+# 改窗的时候很容易只改一边。下面这几个函数是两边共用的那一份。
+# ---------------------------------------------------------------------------------------
+
+
+def seconds_of_day(value: time) -> int:
+    """本地挂钟时刻的「当日第几秒」。窗口比较一律走整秒，微秒在设置层就被拒了。"""
+
+    return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def local_window_contains(value: time, *, start: time, end: time) -> bool:
+    """`value` 是否落在闭区间 `[start, end]` 里（本地挂钟，整秒）。"""
+
+    observed = seconds_of_day(value)
+    return seconds_of_day(start) <= observed <= seconds_of_day(end)
+
+
+def spread_interval_seconds(*, start: time, end: time, attempts: int) -> int:
+    """把 `attempts` 次尝试摊在 `[start, end)` 里的间隔。
+
+    **除的是 `attempts` 不是 `attempts - 1`**，这是复核 MF-1 指出的相位缺陷的修法：
+    按 `attempts - 1` 摊开时最后一次的到期时刻**正好等于** `end`，而窗口闸门是「过了 `end`
+    就整轮空转」，于是最后一次只在 `end` 那一整秒内可达——2 秒轮询下有一半的相位永远拿不到
+    第三次尝试，配置写着 3 次、实际只发 2 次，被吃掉的恰恰是为「数据晚到」准备的那一次。
+    除以 `attempts` 之后，最后一次到期后离窗口右界还留着整整一个间隔。
+    """
+
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    span = seconds_of_day(end) - seconds_of_day(start)
+    return max(span // attempts, 1)
+
+
+def window_schedule_fits(*, start: time, end: time, attempts: int, interval_seconds: int) -> bool:
+    """`attempts` 次尝试（第 k 次在 `start + k*interval`）是否全部落在 `[start, end)` 里。"""
+
+    if attempts < 1 or interval_seconds < 1:
+        return False
+    last = seconds_of_day(start) + (attempts - 1) * interval_seconds
+    return last < seconds_of_day(end)
+
+
+def auction_windows_are_consistent(
+    *,
+    capture_start: time,
+    capture_end: time,
+    input_start: time,
+    input_end: time,
+) -> bool:
+    """采集窗与装配窗是否还对得上。
+
+    装配窗必须与采集窗同时开始（批次最早在采集窗起点之后才可能出现），并且在采集窗结束之后
+    才关闭（最后一次成功采集仍要留出装配的余量）。探测定窗时四个常量要一起改，只改一边会让
+    竞价链安安静静地什么都不产出——生产画像在生成两份 manifest 时调这个函数，把「只改了一边」
+    变成一次当场的拒绝。
+    """
+
+    return capture_start == input_start and seconds_of_day(input_end) > seconds_of_day(capture_end)
+
+
+__all__ = [
+    "MARKET_TIMEZONE",
+    "MarketCalendarAuthority",
+    "MarketSessionCalendarError",
+    "MarketSessionDecision",
+    "MarketSessionPhase",
+    "auction_windows_are_consistent",
+    "calendar_refusal_reason",
+    "decide_market_session",
+    "load_market_calendar_authority",
+    "local_window_contains",
+    "raise_or_label_calendar_refusal",
+    "seconds_of_day",
+    "spread_interval_seconds",
+    "window_schedule_fits",
+]
