@@ -1508,7 +1508,8 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
 #227 的第二包（安装器代做的 PREPARE 承认与十六个 unit 的 rollout 写权限）；第 32 条来自 #230，
 也就是 #215 的第三处断点（凭证的投递形状）；第 33 条来自 #237，也就是「v0.33.2 装不上第三代」
 这件事本身；第 34 条来自 #242 与 #241 的修复包（沙箱路径缺陷），它是那两个修复在主机上的操作面。
-下面三十四条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
+第 37 条是 ③b（一条信号当天走到 serving）的验收清单，随 #280 / #281 / #283 三包一起立。
+下面三十七条是照着脚本敲命令时会踩到的东西，**不是部署记录**。
 
 1. **市场日历的到期日与续期步骤**：生成器的 `--calendar-coverage-floor` 默认 `2027-12-31`，日历表
    覆盖不到这个下限就报错退出。跑完把实际的 `coverage_end` 与 `open_dates` 条数**记在本条下面**。
@@ -2191,6 +2192,89 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     role 实例保持停止）。09:25 起 `rquant-monitor` 持生产主库写锁到收盘；17:00 起 `rquant-daily`
     的 `daily_state` 阶段要扫主库，而 role 每轮读 10 GB 只读副本会把 page cache 挤掉，这个阶段从
     1.5 分钟涨到 9–60 分钟（2026-09-08 与 09-09 各观察到一次）。装机与验收放在这两个窗口之外做。
+
+37. **③b 的验收清单（开盘后在主机上逐跳对照，#280 / #281 / #283 一起装之后才成立）**
+
+    运行根 `/home/lighthouse/rquant/data/runtime`（下文 `$ROOT`）。按 C-3 顺序起完之后，
+    **盘中**（09:30 之后，建议 09:45–10:00）逐跳看。三个缺陷装在一起才读得出非零结果：
+    #280 让执行约束指针出得来、#281 让 notifier 真写行、#283 让 serving 在研究面缺席时
+    仍然出代。
+
+    **心跳在哪儿**：不在 `$ROOT/control/services/`——`services` 这个桶不存在。真实布局是
+    **`$ROOT/control/<桶>/<实例>/heartbeats/<identity>.json`**，`<桶>` 由
+    `runtime_production_profile._control_bucket()` 给出，`<实例>` 是 `svc-<sha256(service_id)>`，
+    `<identity>` 是 `canonical_sha256({"service_id": ...})`。每个 role 只有一份心跳文件，
+    所以最省事的看法是：
+
+    ```bash
+    ROOT=/home/lighthouse/rquant/data/runtime
+    cat $ROOT/control/features/*/heartbeats/*.json | python3 -m json.tool
+    ```
+
+    | 跳 | 桶 | 实例目录 |
+    |---|---|---|
+    | `runtime-health.all.v1` | `runtime-health-publishers` | `svc-2a07f3cafccf6e13c0b3850b9b41d9612a7314e736cc67a623a24f488e64ccb3` |
+    | `paper-constraint.market.v1` | `paper-constraints` | `svc-dc7b9b33169226b8e1930b1b82a717bdc14a1366f361b16a90244b134b1b35d0` |
+    | `feature.intraday-pit.v1` | `features` | `svc-39a4247f2171f4f01ce0e0c3588543efe2a95ccc41345059c839635435c1c028` |
+    | `strategy.n_shape.v1` | `strategies` | `svc-c8486717d6ddce5bd0371d2809eb823eb595e6f0dd4a562ad01c9ec4411d066b` |
+    | `strategy.auction_gap.v1` | `strategies` | `svc-332642f2ddd4a6a7f35eafbf64e71de289ff0b1719d6dcb85f3965b97f859bc9` |
+    | `strategy.growth_board_surge.v1` | `strategies` | `svc-46dfa614db6b61b21bdff66c94c1a194589694d8f741ebbd49e44465e3db43f2` |
+    | `signal-router.all-strategies.v1` | `signal-routers` | `svc-c2d756ee80d19a659f05142d30e32dd2a6a01d65488c0424173e2f172b916178` |
+    | `paper-broker.shadow-main.v1` | `paper-brokers` | `svc-8198269a766fc0da7ee26e4a0a0ea8b306da29aa52ea5fee16d4c948cb373803` |
+    | `notifier.admin.shadow.v1` | `notifiers` | `svc-f2518f7a4231460f183242dfbaaf34b78603c9f9212c8c76046ab2ef06fd11cc` |
+    | `serving.publisher.v1` | `serving-publishers` | `svc-63af0b41929c26a8fbf2953e8aa3981cf9867f2ea6dc1c5d8820683112206f88` |
+
+    三个候选发布者的桶是 `candidates`，实例分别是 `svc-b06a23f4…`（n_shape）、
+    `svc-13d5551c…`（auction_gap）、`svc-f64122fe…`（growth_board）。
+
+    | # | 跳 | 该看到什么 | 看不到说明什么 |
+    |---|---|---|---|
+    | 0 | 参考代 | `$ROOT/authorities/reference-slow/reference.sqlite3` 有已发布代；旁边有 `.reference.sqlite3.publication.lock` | 盘前两个 reference role 没跑成。**若刚做过恢复**：恢复工件只还原数据库、不还原那个点文件，此时约束发布者报具名错误 `reference registry has no publication lock…`，等发布者跑一次就好 |
+    | 0 | 执行约束 | `$ROOT/authorities/paper-execution/current.json` 存在且 mtime 是**当天盘中** | #280 没装上：看 `control/paper-constraints/*/heartbeats/*.json`，`last_error` 里若有 `.reference.sqlite3.publication.lock` 与 `Read-only file system` 就是它 |
+    | 1 | 特征 | `$ROOT/live/features/batches/` 当天有新批次；心跳 `output_sequence` 随分钟递增 | 上游 `market_minute_source` 没发批次，或历史 parquet 的 sha256 对不上（启动直接拒） |
+    | 2 | 候选 | `$ROOT/live/candidates/<候选实例>/` 当天有快照 | ③a 的问题：当日候选没产出 |
+    | 2 | 策略 | `$ROOT/live/strategies/<strategy 实例>/runner.sqlite3` 的 `runner_signal` 当天有行 | 候选全集为空，或候选文档日期不是当日（心跳里是 `snapshot trade date does not match required trade date`）。竞价全集权威在 `$ROOT/authorities/auction-universe/current.json` |
+    | 3 | 路由 | `$ROOT/live/signal-bus/signal_bus.sqlite3` 的 `signal_envelope` / `signal_route_receipt` 当天有行；`$ROOT/live/signal-bus/spool/source.json` 存在 | router 在等某个 `runner.sqlite3`，心跳的 `waiting_for` 会点名是哪一个 |
+    | 4 | 记账 | `$ROOT/live/paper-brokers/<broker 实例>/broker.sqlite3` 的 `paper_fill` 当天有行 | 多半是第 0 行的执行约束指针没出来；也可能行情过期（`quote_max_age_seconds=90`）或 PIT 日历没有次一交易日 |
+    | 5 | 通知 | `$ROOT/live/notifications/<notifier 实例>/notification_state.sqlite3` 的 `delivery_outbox` / `delivery_attempt` **当天有行**，`delivery_attempt.provider_receipt` 全部以 `shadow:` 开头，心跳 `degraded_reasons` 里有 `notifier:shadow_transport` | 出厂档位是 `shadow`（#281）。心跳里若是 `notifier:paused` 就是输入文档里被改成 `paused` 了；若两个标记都没有，那是真的在往 PushDeer / PushPlus 发字节 |
+    | **5.5** | **serving 的六个源权威** | 四个必需源（`signals` / `paper_accounts` / `runtime_health` / `reference_slow_authority`）的 `current.json` 都在；**研究面两源（`lab_jobs` / `promotions`）没有 `current.json` 不再是阻塞原因**（#283），serving 心跳里会有 `serving:lab_jobs:unavailable:…` 与 `serving:promotions:unavailable:…` 两条 | 四个必需源任缺一个，serving 照旧整轮拒、一代都不出，心跳 `last_error` 写 `<dataset> reader failed: …` |
+    | 6 | 发布 | `$ROOT/serving/generations/<id>/serving.duckdb` 当天新增，`$ROOT/serving/current.json` 指向它 | 先回到 5.5 行——原因十有八九在那里，不在信号链上 |
+    | 6' | **信号真的到了** | 见下面那条命令，结果 **> 0** | 回到第 5 行：notifier 档位不是 shadow/live，信号就到不了 `signals` |
+
+    **serving-only 页在研究面缺席期间每一帧都会是 `DEGRADED`，这是预期不是故障**：
+    `manifest_freshness` 只要水位里有一个 `UNAVAILABLE` 就返回 `DEGRADED`，**行照常渲染**，
+    只是横幅变色（只有 `UNAVAILABLE` 才会拦渲染）。比改之前严格更好：以前是一代都没有、
+    页面什么都看不到。
+
+    **③b 的唯一判据**：`signals` 是滚动历史表，不是当日表——notifier 发的权威带的是最近
+    `serving_history_limit`（默认 1000）条，选取语句没有任何日期条件，所以
+    `count(*) > 0` 一旦成立就天天成立。判据必须按当日 `event_time` 过滤：
+
+    ```bash
+    ROOT=/home/lighthouse/rquant/data/runtime
+    GEN=$(python3 -c "import json;print(json.load(open('$ROOT/serving/current.json'))['generation_id'])")
+    duckdb -readonly "$ROOT/serving/generations/$GEN/serving.duckdb" \
+      "SELECT count(*) FROM signals
+       WHERE TRY_CAST(event_time AS TIMESTAMPTZ) >= TIMESTAMPTZ '2026-09-23 09:15:00+08';"
+    ```
+
+    09:15 是开盘前、竞价之前的下界：当天产出的全进，前一天的全不进。日期换成验收当天。
+
+    > **`TRY_CAST` 不能去掉。** 这一代的表是用 pandas frame 建的，**空表没有行可供推断**，
+    > DuckDB 会把 `event_time` 推成 `INTEGER` 而不是 `TIMESTAMP WITH TIME ZONE`，裸比较当场抛
+    > `Binder Error: Cannot compare values of type INTEGER and type TIMESTAMP WITH TIME ZONE`。
+    > 而空 generation 正是 notifier 被改回 `paused` 时会看到的样子——最需要这条命令的那天
+    > 恰恰是它会报错的那天。实测：空表裸比较 BinderException / `TRY_CAST` 版 0；当日一行
+    > 两者都是 1；前一日一行两者都是 0。
+    >
+    > 更稳的做法是把这一代的 `max(global_sequence)` 与前一代比，看它是否真的前进了。
+
+    **装机时重出 inputs 文档要显式写档位**：第十二个窗口（本 PR 的 tag）重跑
+    `scripts/build_runtime_production_inputs.py` 时**加上 `--notifier-delivery-mode shadow`**。
+    不加也是 shadow（生成器与画像模型的默认都是它，两处都有测试钉住），显式写出来是为了让
+    装机记录里能看见这一轮选的是哪一档；`--generated-at` 不传，取墙钟。
+    **切 live 不在本窗口做**——见本文件最上面 2026-09-21 那条 notifier 影子档记录，
+    切换这一步本身卡在 #284。
 
 ### 已知限制（装机前已登记的 issue，外加 2026-09-05 首次装机当场发现的 #198、路线 A 首次安装当场发现的 #215–#218，修 #218 时查出来的 #220，以及修 #237 时分出来的 #238、#239，再加上包 L 量 `tree_state` 时查出来的 #245 与一条没有编号的 `signal_router` `-shm` 耦合，以及包 N 追出全部范围的 #250 与它交回给 #235 的那处告警回退，再加上第七窗口 17:00 两次卡住 `rquant-daily` 之后立的 #256；末列写「已修」的条目已修，其余不修）
 

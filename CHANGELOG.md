@@ -187,6 +187,20 @@
 
 ### Fixed
 
+- **`paper_constraint_publisher` 盘中读不了参考注册表（#280）**：读者打开参考注册表时要拿
+  `.reference.sqlite3.publication.lock` 这个锁文件，而它是用写模式打开的；盘中参考目录被挂成
+  只读，于是每一轮都撞 `EROFS`。结果是 `authorities/paper-execution/` 下**永远不会有 current
+  指针**，`paper_broker` 永远在等——也就是**给信号记账的那一跳根本不会发生**，一条信号因此走
+  不到 serving。读者现在以只读方式取这把锁，拿不到时抛的是具名拒绝（`reference registry has
+  no publication lock ...`），而不是一个裸 `OSError`；锁在读者手里被换成符号链接或目录时
+  （`ELOOP` / `ENOTDIR`）原样再抛，不会被说成「没有 publication lock」。
+  - 一并补上整条开盘日全链的验收测试（`tests/integration/test_route_a_trading_day_full_chain_e2e.py`）：
+    一条 `n_shape` 的信号从关注股行情出发，经特征、策略、路由、记账、通知六跳走进当日的
+    `serving/generations/`，每一跳的产物都落盘并被断言，四样外部输入全是真的。
+  - **③b 的判据口径同时改了**：`signals` 是滚动历史表不是当日表，`count(*) > 0` 一旦成立就
+    天天成立。判据改成按当日 `event_time` 过滤（见 `DEPLOY.md` 「路线 A 前置」第 37 条），
+    测试里对应 `serving_signal_rows(route, session=TRADE_DATE)`。
+
 - **研究面两源缺席时 serving 降级而不是整轮拒（#283）**：
   serving 的六个源权威里 `lab_jobs` 与 `promotions` 属于研究面，而研究面四个角色在主机上被
   高水位证据门挡着（#217），**一代权威都没发过**。`ServingSnapshotAssembler` 此前六个源一律
