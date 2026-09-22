@@ -1439,7 +1439,11 @@ def test_a_reader_with_no_publication_lock_fails_closed_by_name(tmp_path: Path) 
     assert "reference_slow_publisher" in message, message
 
 
-@pytest.mark.parametrize("swapped_in", [errno.ELOOP, errno.ENOTDIR])
+#: ids are spelled out because the nodeid must not depend on the platform: errno
+#: values are not portable (ELOOP is 62 on Darwin and 40 on Linux), and an id
+#: derived from the number makes the collected nodeid differ between the host that
+#: generates the shard manifest and the host that runs it.
+@pytest.mark.parametrize("swapped_in", [errno.ELOOP, errno.ENOTDIR], ids=["ELOOP", "ENOTDIR"])
 def test_a_lock_swapped_in_between_the_two_opens_is_raised_as_itself(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

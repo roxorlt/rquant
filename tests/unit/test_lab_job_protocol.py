@@ -205,7 +205,14 @@ def test_rename_noreplace_linux_without_renameat2_fails_closed(
     assert captured.value.errno == errno.ENOTSUP
 
 
-@pytest.mark.parametrize("error_number", [errno.EEXIST, errno.ENOENT, errno.EXDEV])
+#: ids are spelled out for the same reason as in test_reference_data_registry: a
+#: nodeid must never carry a numeric errno. These three happen to have the same
+#: value on Darwin and Linux today, which is exactly why the trap is easy to miss.
+@pytest.mark.parametrize(
+    "error_number",
+    [errno.EEXIST, errno.ENOENT, errno.EXDEV],
+    ids=["EEXIST", "ENOENT", "EXDEV"],
+)
 def test_rename_noreplace_preserves_non_eintr_errors(
     monkeypatch: pytest.MonkeyPatch,
     error_number: int,
