@@ -116,9 +116,12 @@ DEGRADED_IN_THIS_WORLD: dict[str, str] = {
     "notifier": "rquant_ro.duckdb",
     "promotions_publisher": "experiment registry does not exist",
     "lab_artifact_catalog": "artifact ancestor is missing",
-    #: two of the three candidate instances have no input; the third publishes
-    "candidate_publisher": "candidate input is unavailable or contains a symlink",
 }
+#: `candidate_publisher` 从这张表里去掉了（#278）。它原来每轮都抛
+#: `candidate input is unavailable or contains a symlink`——两个 document-driven 实例在这个
+#: 世界里没有封存文档可读。改成 `session_document` 之后，非交易日的那一轮**什么都不做**
+#: （连日历都在 build 时读过一次），于是它进了「每一轮都成功」的那一组，并且在这里被真正
+#: 测出空闲写次数：应当是 0。
 
 
 def _heartbeat_files(runtime_root: Path) -> tuple[Path, ...]:

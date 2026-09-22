@@ -141,7 +141,7 @@ def _run_iterations(
 def counted_replica_reads(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Where the auction-gap publisher actually opens the replica, counted.
 
-    Only this role: package P's world sits at 09:26:30, and `auction-universe.publisher.v1`
+    Only this role: package P's world sits at 09:37, and `auction-universe.publisher.v1`
     refuses to act at all between 09:15 and 15:10 (its protection window), so in this world
     it never reaches a read and counting it would assert nothing. That role's gate is
     covered in `tests/unit/test_auction_universe_source.py`, where three publishes over one
@@ -169,7 +169,7 @@ def test_the_auction_gap_publisher_reads_the_replica_once_over_four_iterations(
     locked_main_database: Any,
     counted_replica_reads: dict[str, int],
 ) -> None:
-    """Four passes of the 09:26-09:30 window over one generation, one read.
+    """Four passes of the assembly window over one generation, one read.
 
     At the manifest's five-second interval the window is about 48 passes; before this
     every one of them queried the replica's whole `daily_bar`.
@@ -212,7 +212,7 @@ def test_an_atomic_replacement_inside_the_floor_costs_no_further_read(
     `candidate.auction_gap.v1` reads prior sessions' `daily_bar` volumes, which do not
     change while today's session opens, so the generation that arrives mid-window carries
     the same answer at the cost of another whole scan. Its profile floors it at its own
-    09:26-09:30 assembly window: one read per session, and the heartbeat says the newer
+    assembly window: one read per session, and the heartbeat says the newer
     generation was seen and deliberately not read.
     """
 

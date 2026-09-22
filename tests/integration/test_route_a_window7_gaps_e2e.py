@@ -178,9 +178,10 @@ def test_the_host_s_own_shape_is_a_root_that_was_never_published_into(
 
     The lock is created before any generation is, by every path that writes one, so a root
     with no lock is a root **no publish has ever run against** -- it has no generations
-    either. That is the auction_gap root: its publisher's only window is 09:26-09:30
-    (`runtime_builder_candidate.py:70-71`) and that window lies entirely inside the write
-    lock `rquant-monitor` holds on the main database it reads, from 09:25 (#250).
+    either. That is the auction_gap root: its publisher has one window a day
+    (`runtime_builder_candidate.py:92-93`, 09:26-09:30 when this package ran, 09:35-10:10
+    since #277 moved it) and that window lies entirely inside the write lock
+    `rquant-monitor` holds on the main database it reads, from 09:25 (#250).
 
     So after this package the two source roles stop saying "damaged" and start saying
     "there is no snapshot" -- which is true, and still a failure every in-session

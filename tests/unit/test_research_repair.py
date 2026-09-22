@@ -73,6 +73,7 @@ def _auction_frame(
                 "price": 10.0 + index / 100,
                 "vol": 1_000.0 + index,
                 "amount": 10_000.0 + index,
+                "pre_close": 9.9 + index / 100,
                 "turnover_rate": 0.1,
                 "volume_ratio": 1.5,
                 "source": source,

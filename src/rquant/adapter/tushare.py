@@ -25,6 +25,41 @@ from rquant.trade_calendar import normalize_trade_calendar
 _PAGE_SLEEP = 0.35
 _T = TypeVar("_T")
 
+#: `stk_auction` 向 Tushare 要、并且向下游保证一定出现的列，顺序与列集都与
+#: `rquant.auction_match_gateway.AUCTION_MATCH_COLUMNS` 逐字相同。这里不 import 那个模块
+#: （适配器不该把 parquet/spool 那一串依赖拖进来），两边一致由
+#: `tests/unit/test_tushare_stk_auction.py` 钉住——#277 的第二个缺陷就是这两份列表各写各的，
+#: 网关要 `pre_close` 而适配器从来不取，于是非空结果也过不了校验。
+STK_AUCTION_COLUMNS: tuple[str, ...] = (
+    "ts_code",
+    "trade_date",
+    "price",
+    "vol",
+    "amount",
+    "pre_close",
+    "turnover_rate",
+    "volume_ratio",
+)
+
+
+def _empty_stk_auction_frame() -> pd.DataFrame:
+    """空结果的形状：零行，但八列俱全，再加上非空路径也会加的两列。"""
+
+    frame = pd.DataFrame(
+        {
+            "ts_code": pd.Series(dtype="object"),
+            "trade_date": pd.Series(dtype="object"),
+            **{
+                column: pd.Series(dtype="float64")
+                for column in STK_AUCTION_COLUMNS
+                if column not in {"ts_code", "trade_date"}
+            },
+        }
+    )
+    frame["auction_type"] = pd.Series(dtype="object")
+    frame["source"] = pd.Series(dtype="object")
+    return frame.loc[:, [*STK_AUCTION_COLUMNS, "auction_type", "source"]]
+
 
 def _settings() -> Any:
     """The process-wide settings, built on first use rather than at import (#215, #189).
@@ -619,10 +654,16 @@ class TushareAdapter:
         """拉取 A 股当日集合竞价成交情况。
 
         Tushare `stk_auction` 独立权限接口，历史从 2025-01-01 起提供。
-        不切备用 token：备用 token 未必开通同一付费权限，失败应直接暴露。
+        不切备用 token：备用 token 未必开通同一付费权限，失败应直接暴露
+        （2026-09-21 实测备用 token 的报文就是「抱歉，您没有接口(stk_auction)访问权限」，
+        悄悄降级会把它变成一条看不见的空结果）。
+
+        返回列恒为 `STK_AUCTION_COLUMNS` + `auction_type` + `source`：空结果也带齐列，
+        因为下游 `AuctionMatchGateway.normalize_frame` 先看列再看行，一张无列空表会被它
+        当成「缺八个字段」而抛，整条竞价链因此一个批次都发不出来（#277）。
         """
         trade_date_str = trade_date.strftime("%Y%m%d")
-        fields = "ts_code,trade_date,vol,price,amount,turnover_rate,volume_ratio"
+        fields = ",".join(STK_AUCTION_COLUMNS)
         logger.info(f"Tushare stk_auction 请求：date={trade_date_str}")
 
         try:
@@ -632,17 +673,9 @@ class TushareAdapter:
 
         if df is None or df.empty:
             logger.warning(f"Tushare stk_auction 返回空：date={trade_date_str}")
-            return pd.DataFrame()
+            return _empty_stk_auction_frame()
 
-        required = [
-            "ts_code",
-            "trade_date",
-            "vol",
-            "price",
-            "amount",
-            "turnover_rate",
-            "volume_ratio",
-        ]
+        required = list(STK_AUCTION_COLUMNS)
         missing = set(required) - set(df.columns)
         if missing:
             raise RuntimeError(f"Tushare stk_auction 返回缺字段：{sorted(missing)}")

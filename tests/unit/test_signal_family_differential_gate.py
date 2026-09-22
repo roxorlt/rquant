@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #265's to PR #266's. It is the merge base of the
+    # main; this one moves it from PR #274's to PR #282's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "af2ab339130deebdd87a0a823fcb67887d4f0c6f"
-    assert BASELINE_TREE_SHA == "ae45abb09ddbdb98f8e4cba83cf769e275c81a62"
+    assert BASELINE_COMMIT_SHA == "16b76a5bd07be036b0b184d552a4c83402d548e8"
+    assert BASELINE_TREE_SHA == "255699be4c3b4c40b232e8bf8d46008ea1d38ce9"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``af2ab33`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``16b76a5`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1514,18 +1514,21 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # workflow either, the refreeze to 00d74c6 left it out because the notifier idle-fsync
     # topic touched no workflow either, the refreeze to 79bccd8 left it out because the
     # resident-role idle-writes topic touched no workflow either, the refreeze to 722971a
-    # left it out because the Route A slice MemoryHigh topic touched no workflow either, and
-    # this refreeze to af2ab33 leaves it out on that same reading once more: the slice
-    # MemoryHigh follow-up topic adds no module under src/rquant/ at all and changes two
-    # (workload_isolation.py itself, and this gate's own baseline constants), adds no test
-    # file and touches one existing one, changes nothing under scripts/, marks nothing
-    # ``linux_exact``, adds no job, and does not touch .github/workflows/ci.yml. It does not
-    # regenerate the shard manifest either, because no test count changed - and it leaves the
-    # frozen source-broker boundary alone, because it touches none of the nine modules that
-    # manifest collects; the matrix in the workflow is unchanged at five shards, so the one
-    # thing that has ever made this path true has not happened.
-    # That is fifteen refreezes in a row without a flip. A named path would have flipped
-    # truth value nine times in twenty-seven refreezes: naming one
+    # left it out because the Route A slice MemoryHigh topic touched no workflow either, the
+    # refreeze to af2ab33 left it out because the slice MemoryHigh follow-up topic touched no
+    # workflow either, and this refreeze to 16b76a5 **puts it back**: the opening-auction
+    # chain topic adds one module under src/rquant/ (session_candidate_input.py) and changes
+    # ten, adds three test files and touches sixteen existing ones, changes one script
+    # (build_runtime_production_inputs.py), marks nothing ``linux_exact`` and adds no job -
+    # but it does touch .github/workflows/ci.yml, for a third reason neither of the two
+    # earlier ones predicts: its e2e worlds landed in shard 1 and the 3.12 lane of that shard
+    # was cancelled at the job's 100-minute limit twice with nothing failed, so the limit
+    # moved to 120. The matrix is still five shards and no job was added; what changed is a
+    # duration the suite grew into. It also regenerates the shard manifest, because the test
+    # count changed - and it still leaves the frozen source-broker boundary alone, because it
+    # touches none of the nine modules that manifest collects.
+    # That ends fifteen refreezes in a row without a flip. A named path would have flipped
+    # truth value ten times in twenty-eight refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted

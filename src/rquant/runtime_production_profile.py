@@ -51,7 +51,10 @@ from rquant.runtime_market_calendar_generation import (
     install_market_calendar_generation,
     market_calendar_generation_path,
 )
-from rquant.runtime_market_session import load_market_calendar_authority
+from rquant.runtime_market_session import (
+    auction_windows_are_consistent,
+    load_market_calendar_authority,
+)
 from rquant.runtime_schema_registry import build_runtime_schema_contract_bundle
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
@@ -826,6 +829,20 @@ def _strategy_service_id(strategy_id: str) -> str:
     return f"strategy.{strategy_id}.v1"
 
 
+def _auction_match_max_attempts() -> int:
+    """采集次数取 `runtime_service_builtin` 的常量，这个模块不再写第二份字面量（#277）。
+
+    `runtime_authority_stage.bootstrap_settings` 把这一项的表达式**重述**一遍（route B 的
+    自举派生），而 `test_blk3_derived_settings_agree_with_the_production_profile_field_by_field`
+    逐字段比对两者：两处各写一个 `3` 的时候，把画像那份改成 6 就当场红。函数内 import 与
+    四常量一致性闸取窗的方式相同，这个模块不在 import 期依赖 builtin。
+    """
+
+    from rquant.runtime_service_builtin import AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS
+
+    return int(AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS)
+
+
 def _candidate_root(root: Path, strategy_id: str) -> Path:
     return root / "live" / "candidates" / _instance_name(_candidate_service_id(strategy_id))
 
@@ -1266,7 +1283,8 @@ def build_production_runtime_profile(
                 "calendar_expected_commit": config.market_calendar_producer_commit,
                 "calendar_content_sha256": config.market_calendar_content_sha256,
                 "universe_path": str(root / "authorities" / "auction-universe" / "current.json"),
-                "max_attempts": 3,
+                #: 次数是常量不是字面量：route B 的自举派生也写这一项，两处必须同源（#277）
+                "max_attempts": _auction_match_max_attempts(),
             },
         ),
     ]
@@ -1550,10 +1568,29 @@ def build_production_runtime_profile(
         )
     )
 
-    sealed_candidate_inputs = {
-        "n_shape": config.n_shape_candidate_input_path,
-        "growth_board_surge": config.growth_board_candidate_input_path,
-    }
+    #: 采集窗与装配窗是四个代码常量，探测定窗时要一起改（唯一的定窗路径，见 DEPLOY.md）。
+    #: 只改了一边的话竞价链会安安静静地什么都不产出——这里把「只改了一边」变成画像生成时
+    #: 的一次当场拒绝，而画像生成正是操作员改完常量之后必经的那一步（复核代码质量 2）。
+    from rquant.runtime_builder_candidate import (
+        AUCTION_GAP_DEFAULT_INPUT_END,
+        AUCTION_GAP_DEFAULT_INPUT_START,
+    )
+    from rquant.runtime_service_builtin import (
+        AUCTION_MATCH_DEFAULT_CAPTURE_END,
+        AUCTION_MATCH_DEFAULT_CAPTURE_START,
+    )
+
+    if not auction_windows_are_consistent(
+        capture_start=AUCTION_MATCH_DEFAULT_CAPTURE_START,
+        capture_end=AUCTION_MATCH_DEFAULT_CAPTURE_END,
+        input_start=AUCTION_GAP_DEFAULT_INPUT_START,
+        input_end=AUCTION_GAP_DEFAULT_INPUT_END,
+    ):
+        raise ValueError(
+            "the auction capture window and the auction_gap assembly window disagree: "
+            "both pairs of constants have to move together"
+        )
+
     for strategy in config.strategies:
         settings: dict[str, object] = {
             "strategy_id": strategy.strategy_id,
@@ -1588,9 +1625,22 @@ def build_production_runtime_profile(
                 calendar_content_sha256=config.market_calendar_content_sha256,
             )
         else:
+            #: #278：这两个策略的候选文档不再是装机时封死的那一份。它带着
+            #: `trade_date 2026-07-14`（装机脚本把 `trade_calendar.updated_at` 当成生成
+            #: 时刻），而 watchlist-quote / market-minute 用「当日」去读，且三个候选权威
+            #: 都是 required——任何一个真实交易日这两份都对不上。改为每个交易日 08:45 起
+            #: 按同一条构造重建一次，`trade_date` = 当日，`captured_at` = 生成时刻，
+            #: `basis_trade_date` = 副本里能读到的最新那一场日线结果（通常是上一场）。
+            #: 封存文档仍然生成，只用于回放与测试。
             settings.update(
-                input_mode="sealed_document",
-                candidate_input_path=str(sealed_candidate_inputs[strategy.strategy_id]),
+                input_mode="session_document",
+                #: 副本，永远不是主库——这个发布者跑在 08:45 之后，与
+                #: `rquant-monitor` 09:25 起的写锁只差四十分钟，而重启之后它还要能在
+                #: 盘中补发今天的文档（#250 的同一条理由）。
+                daily_database_path=str(config.readonly_replica_database_path),
+                calendar_path=str(calendar),
+                calendar_expected_commit=config.market_calendar_producer_commit,
+                calendar_content_sha256=config.market_calendar_content_sha256,
             )
         manifests.append(
             _manifest(

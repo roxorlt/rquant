@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -12,13 +13,30 @@ from rquant.auction_gap_candidate_input import AuctionGapCandidateInputError
 from rquant.live_contracts import BatchQualityStatus
 from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.runtime_builder_candidate import (
+    AUCTION_GAP_DEFAULT_INPUT_END,
+    AUCTION_GAP_DEFAULT_INPUT_START,
     CandidatePublisherRuntimeSettings,
     candidate_publisher_builder,
     load_candidate_input,
     serialize_candidate_input,
 )
+from rquant.runtime_market_session import (
+    MarketCalendarAuthority,
+    MarketSessionCalendarError,
+    auction_windows_are_consistent,
+)
+from rquant.runtime_service_builtin import (
+    AUCTION_MATCH_DEFAULT_CAPTURE_END,
+    AUCTION_MATCH_DEFAULT_CAPTURE_START,
+    AuctionMatchSourceSettings,
+)
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
+from rquant.session_candidate_input import (
+    SESSION_CANDIDATE_CONTRACT,
+    SessionCandidateInputError,
+    candidate_input_batch,
+)
 from rquant.strategy_candidate_producers import (
     NShapePoolFact,
     PublishedCandidateInputAuthority,
@@ -38,6 +56,7 @@ REFERENCE_DATE = date(2026, 7, 30)
 CAPTURED_AT = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 AVAILABLE_AT = datetime(2026, 7, 31, 1, 26, tzinfo=UTC)
 COMMIT = "a" * 40
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 REGISTRY = BuiltinStrategyEvaluatorRegistry(producer_commit=COMMIT)
 
 
@@ -264,7 +283,7 @@ def test_an_auction_iteration_outside_its_window_says_it_read_nothing(
             "snapshot_root": str(root),
         },
     )
-    #: 18:30 Asia/Shanghai, far outside 09:26-09:30
+    #: 18:30 Asia/Shanghai, far outside 09:35-10:10
     step = candidate_publisher_builder(
         auction_input_loader=lambda **_: _batch("auction_gap"),
         clock=lambda: datetime(2026, 7, 31, 10, 30, tzinfo=UTC),
@@ -284,7 +303,7 @@ def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
 
     `test_an_auction_iteration_outside_its_window_says_it_read_nothing` never reads
     anything at all, so it passes with or without the call. This one reads for real in the
-    09:26-09:30 window and then idles outside it: without `begin_iteration()` the idle
+    09:35-10:10 window and then idles outside it: without `begin_iteration()` the idle
     iteration reports the window's read, which is the whole of MF-1 on this role.
 
     The loader is a stub that uses the gate it is handed, because what is under test is
@@ -323,8 +342,8 @@ def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
         read_gate.read(lambda: replica.read_bytes(), key=("auction-gap",))
         return _batch("auction_gap")
 
-    #: 09:26:30 then 09:40 Asia/Shanghai: inside the window, then outside it
-    inside = datetime(2026, 7, 31, 1, 26, 30, tzinfo=UTC)
+    #: 09:40 then 10:15 Asia/Shanghai: inside the window, then outside it
+    inside = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
     clock = {"now": inside}
     step = candidate_publisher_builder(
         auction_input_loader=reading_loader,
@@ -332,7 +351,7 @@ def test_the_publisher_does_not_carry_one_iteration_s_read_into_the_next(
     )(manifest)
 
     published = step()
-    clock["now"] = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
+    clock["now"] = datetime(2026, 7, 31, 2, 15, tzinfo=UTC)
     idled = step()
 
     assert published.replica_opened is True
@@ -382,7 +401,7 @@ def test_a_torn_read_in_the_auction_window_is_reported_as_the_open_it_was(
 
     step = candidate_publisher_builder(
         auction_input_loader=torn_loader,
-        clock=lambda: datetime(2026, 7, 31, 1, 26, 30, tzinfo=UTC),
+        clock=lambda: datetime(2026, 7, 31, 1, 40, tzinfo=UTC),
     )(manifest)
 
     degraded = step()
@@ -439,7 +458,7 @@ def test_a_failing_auction_iteration_still_says_what_it_did_with_the_replica(
 
     step = candidate_publisher_builder(
         auction_input_loader=failing_loader,
-        clock=lambda: datetime(2026, 7, 31, 1, 26, 30, tzinfo=UTC),
+        clock=lambda: datetime(2026, 7, 31, 1, 40, tzinfo=UTC),
     )(manifest)
 
     summary = getattr(step, "replica_iteration_summary", None)
@@ -494,6 +513,174 @@ def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path)
     assert getattr(step, "replica_iteration_summary", None) is None
 
 
+def test_the_auction_assembly_window_follows_the_capture_window(tmp_path: Path) -> None:
+    """#277：采集窗后移到 09:35-10:05，装配窗必须跟着走，否则窗里永远没有料。
+
+    默认起点与 `AUCTION_MATCH_DEFAULT_CAPTURE_START` 逐字相同，终点在
+    `AUCTION_MATCH_DEFAULT_CAPTURE_END` 之后——最后一次采集成功之后还装得出来。
+    """
+
+    assert AUCTION_GAP_DEFAULT_INPUT_START == AUCTION_MATCH_DEFAULT_CAPTURE_START
+    assert AUCTION_GAP_DEFAULT_INPUT_END > AUCTION_MATCH_DEFAULT_CAPTURE_END
+
+
+def _auction_manifest(tmp_path: Path, **overrides: object) -> RuntimeServiceManifest:
+    settings: dict[str, object] = {
+        "strategy_id": "auction_gap",
+        "strategy_version": 1,
+        **_exact_strategy_settings("auction_gap"),
+        "input_mode": "auction_live",
+        "auction_spool_root": str(tmp_path / "auction-spool"),
+        "daily_database_path": str(tmp_path / "operational-ro.duckdb"),
+        "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+        "calendar_path": str(tmp_path / "calendar.json"),
+        "calendar_expected_commit": COMMIT,
+        "calendar_content_sha256": "c" * 64,
+        "snapshot_root": str(tmp_path / "live" / "auction-gap"),
+    }
+    settings.update(overrides)
+    return RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings=settings,
+    )
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "expected"),
+    [
+        (1, 34, 0),
+        (1, 35, 1),
+        (2, 10, 1),
+        (2, 11, 0),
+    ],
+)
+def test_the_default_assembly_window_is_nine_thirty_five_to_ten_ten(
+    tmp_path: Path,
+    hour: int,
+    minute: int,
+    expected: int,
+) -> None:
+    calls: list[object] = []
+    step = candidate_publisher_builder(
+        auction_input_loader=lambda **kwargs: (calls.append(kwargs), _batch("auction_gap"))[1],
+        clock=lambda: datetime(2026, 7, 31, hour, minute, tzinfo=UTC),
+    )(_auction_manifest(tmp_path))
+
+    step()
+
+    assert len(calls) == expected
+
+
+def test_the_assembly_window_can_be_moved_from_the_manifest(tmp_path: Path) -> None:
+    """设置里给了装配窗就按给的走（回放与测试用；生产画像不写这两项，定窗只能改常量）。"""
+
+    calls: list[object] = []
+    step = candidate_publisher_builder(
+        auction_input_loader=lambda **kwargs: (calls.append(kwargs), _batch("auction_gap"))[1],
+        clock=lambda: datetime(2026, 7, 31, 1, 31, tzinfo=UTC),
+    )(_auction_manifest(tmp_path, auction_input_start="09:36:00", auction_input_end="09:55:00"))
+
+    step()
+
+    assert calls == []
+
+
+def _auction_match_settings(tmp_path: Path, **overrides: object) -> dict[str, object]:
+    """`auction-match.source.v1` 的 manifest settings，与它自己的画像同形。
+
+    这里只需要窗口那几项能被模型校验，所以路径给的是本用例的临时目录。
+    """
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    settings: dict[str, object] = {
+        "spool_root": str(tmp_path / "auction-match"),
+        "quota_path": str(tmp_path / "auction-match" / "quota.sqlite3"),
+        "quota_units_per_window": 500,
+        "producer_version": "auction-match-source-v1",
+        "calendar_path": str(tmp_path / "calendar.json"),
+        "calendar_expected_commit": COMMIT,
+        "calendar_content_sha256": "c" * 64,
+        "universe_path": str(tmp_path / "universe.json"),
+        "max_attempts": 6,
+    }
+    settings.update(overrides)
+    return settings
+
+
+@pytest.mark.parametrize(
+    ("capture", "assembly", "consistent"),
+    [
+        #: 默认的四个常量
+        ((time(9, 35), time(10, 5)), (time(9, 35), time(10, 10)), True),
+        #: 探测把窗整体后移，两边一起改
+        ((time(9, 36), time(9, 50)), (time(9, 36), time(9, 55)), True),
+        #: 只改了采集窗，忘了装配窗——竞价链会安静地什么都不产出
+        ((time(9, 36), time(9, 50)), (time(9, 31), time(9, 50)), False),
+        #: 只改了装配窗
+        ((time(9, 31), time(9, 45)), (time(9, 36), time(9, 55)), False),
+        #: 装配窗没有留出采集之后的余量
+        ((time(9, 31), time(9, 45)), (time(9, 31), time(9, 45)), False),
+    ],
+)
+def test_the_two_window_settings_stay_bound_to_each_other(
+    tmp_path: Path,
+    capture: tuple[time, time],
+    assembly: tuple[time, time],
+    consistent: bool,
+) -> None:
+    """复核代码质量 2：两对窗口只有默认常量被绑住，manifest 设置没有。
+
+    这条用例把**设置对象里的值**（不是常量）喂给同一个判据函数，所以「操作员只改了一边」
+    这件事在两个层面上都有人看着：生产画像生成时当场拒绝（常量那一层），以及这里
+    （任何一对窗口设置那一层）。
+    """
+
+    capture_settings = AuctionMatchSourceSettings.model_validate(
+        _auction_match_settings(
+            tmp_path / "match",
+            capture_start=capture[0].isoformat(),
+            capture_end=capture[1].isoformat(),
+        )
+    )
+    assembly_settings = CandidatePublisherRuntimeSettings.model_validate(
+        dict(
+            _auction_manifest(
+                tmp_path / "gap",
+                auction_input_start=assembly[0].isoformat(),
+                auction_input_end=assembly[1].isoformat(),
+            ).settings
+        )
+    )
+
+    assert (
+        auction_windows_are_consistent(
+            capture_start=capture_settings.capture_start,
+            capture_end=capture_settings.capture_end,
+            input_start=assembly_settings.auction_input_start,
+            input_end=assembly_settings.auction_input_end,
+        )
+        is consistent
+    )
+
+
+def test_an_impossible_assembly_window_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="auction_input_start"):
+        CandidatePublisherRuntimeSettings.model_validate(
+            dict(
+                _auction_manifest(
+                    tmp_path,
+                    auction_input_start="09:50:00",
+                    auction_input_end="09:31:00",
+                ).settings
+            )
+        )
+
+
 def test_auction_candidate_publisher_builds_live_input_during_auction_window(
     tmp_path: Path,
 ) -> None:
@@ -525,7 +712,7 @@ def test_auction_candidate_publisher_builds_live_input_during_auction_window(
             "snapshot_root": str(root),
         },
     )
-    observed_at = datetime(2026, 7, 31, 1, 27, tzinfo=UTC)
+    observed_at = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
 
     result = candidate_publisher_builder(
         auction_input_loader=auction_loader,
@@ -1208,3 +1395,340 @@ def test_a_root_that_is_not_private_is_still_refused_at_build(tmp_path: Path) ->
     with pytest.raises(Exception, match="directory"):
         candidate_publisher_builder()(_manifest(tmp_path, snapshot_root=root))
 
+
+
+# ---------------------------------------------------------------------------------------
+# #278：n_shape / growth_board_surge 的候选文档按交易日重建
+# ---------------------------------------------------------------------------------------
+
+SESSION_TRADE_DATE = date(2026, 8, 12)
+SESSION_OPEN_DATES = (date(2026, 8, 10), date(2026, 8, 11), SESSION_TRADE_DATE)
+#: 覆盖期比开盘日宽，这样才分得清「今天不开市」与「这本日历覆盖不到今天」（复核 SF-1）
+SESSION_COVERAGE_START = date(2026, 8, 10)
+SESSION_COVERAGE_END = date(2026, 8, 16)
+#: 覆盖期内的周六：不开市，但日历回答得了
+SESSION_CLOSED_DATE = date(2026, 8, 15)
+#: 覆盖期之外：日历回答不了
+SESSION_UNCOVERED_DATE = date(2026, 8, 20)
+
+
+def _session_calendar_path(tmp_path: Path) -> tuple[Path, MarketCalendarAuthority]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    calendar = MarketCalendarAuthority.create(
+        schema_version=1,
+        exchange="SSE",
+        producer_commit=COMMIT,
+        coverage_start=SESSION_COVERAGE_START,
+        coverage_end=SESSION_COVERAGE_END,
+        open_dates=SESSION_OPEN_DATES,
+        generated_at=datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+    )
+    path = tmp_path / "calendar.json"
+    path.write_text(
+        json.dumps(
+            calendar.model_dump(mode="json"),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    path.chmod(0o600)
+    return path, calendar
+
+
+def _session_manifest(
+    tmp_path: Path,
+    *,
+    strategy_id: str = "n_shape",
+    **overrides: object,
+) -> RuntimeServiceManifest:
+    calendar_path, calendar = _session_calendar_path(tmp_path)
+    settings: dict[str, object] = {
+        "strategy_id": strategy_id,
+        "strategy_version": 1,
+        **_exact_strategy_settings(strategy_id),
+        "input_mode": "session_document",
+        "daily_database_path": str(tmp_path / "rquant_ro.duckdb"),
+        "calendar_path": str(calendar_path),
+        "calendar_expected_commit": COMMIT,
+        "calendar_content_sha256": calendar.content_sha256,
+        "snapshot_root": str(tmp_path / "live" / strategy_id),
+    }
+    settings.update(overrides)
+    return RuntimeServiceManifest(
+        service_id=f"candidate.{strategy_id}.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=5,
+        stale_after_seconds=180,
+        producer_commit=COMMIT,
+        settings=settings,
+    )
+
+
+def _session_batch(strategy_id: str, *, trade_date: date, captured_at: datetime):
+    return candidate_input_batch(
+        strategy_id=strategy_id,
+        producer_commit=COMMIT,
+        trade_date=trade_date,
+        captured_at=captured_at,
+        basis_trade_date=SESSION_OPEN_DATES[-2],
+        contract=SESSION_CANDIDATE_CONTRACT,
+    )
+
+
+def _session_loader(calls: list[dict[str, object]]):
+    def loader(**kwargs: object):
+        calls.append(dict(kwargs))
+        return _session_batch(
+            str(kwargs["strategy_id"]),
+            trade_date=kwargs["trade_date"],  # type: ignore[arg-type]
+            captured_at=kwargs["observed_at"],  # type: ignore[arg-type]
+        )
+
+    return loader
+
+
+def _at(hour: int, minute: int, *, day: date = SESSION_TRADE_DATE) -> datetime:
+    return datetime.combine(day, time(hour, minute), tzinfo=SHANGHAI).astimezone(UTC)
+
+
+def test_the_session_publisher_rebuilds_todays_document_once(tmp_path: Path) -> None:
+    """#278 的正面：每个交易日一份当日文档，且一天只发一次。
+
+    一天只发一次是硬要求，不是优化：文档里带着生成时刻，每轮重建就是每五秒发一代新快照，
+    正是包 W 拆掉的那种「每轮无条件写」。
+    """
+
+    calls: list[dict[str, object]] = []
+    clock = {"now": _at(8, 45)}
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: clock["now"],
+    )(_session_manifest(tmp_path))
+
+    first = step()
+    clock["now"] = _at(9, 10)
+    second = step()
+
+    assert len(calls) == 1
+    assert calls[0]["trade_date"] == SESSION_TRADE_DATE
+    assert calls[0]["observed_at"] == _at(8, 45)
+    assert first.processed_count == 0  # 空事实列表：候选数为零，但快照发出去了
+    assert first.output_sequence == 0
+    assert first.degraded_reasons == ()
+    #: 第二轮什么都没写，但**输出序号照抄**——心跳不接受回退的序号
+    assert second.output_sequence == first.output_sequence
+    assert second.processed_count == 0
+    assert second.degraded_reasons == ()
+
+    snapshot = StrategyCandidateSnapshotSpool(tmp_path / "live" / "n_shape").read_strategy_as_of(
+        _at(9, 10),
+        strategy_id="n_shape",
+        strategy_version="1",
+        **_exact_strategy_settings("n_shape"),
+    )
+    assert snapshot is not None
+    assert snapshot.trade_date == SESSION_TRADE_DATE
+    assert snapshot.captured_at == _at(8, 45)
+
+
+def test_an_idle_round_after_a_publish_does_not_regress_the_output_sequence(
+    tmp_path: Path,
+) -> None:
+    """`RuntimeServiceControl.record_success` 拒绝回退的输出序号。
+
+    发完一代之后窗外的每一轮原来都返回 -1，于是心跳一侧会抛
+    `ValueError: output sequence cannot regress`——两种 live 模式都有这条路径。
+    auction_gap 从来没真的发出过东西（#254 / #277），所以它一次都没被走到过；
+    竞价链一旦真的开始产出，它会在每一轮上抛。
+    """
+
+    calls: list[dict[str, object]] = []
+    clock = {"now": _at(8, 45)}
+    session = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: clock["now"],
+    )(_session_manifest(tmp_path / "session"))
+
+    published = session()
+    clock["now"] = _at(9, 10)
+    idled = session()
+    clock["now"] = _at(8, 30, day=SESSION_OPEN_DATES[-2])
+    closed = session()
+
+    assert published.output_sequence == 0
+    assert idled.output_sequence == 0
+    assert closed.output_sequence == 0
+
+    #: auction_live 那一支同样
+    gap_clock = {"now": datetime(2026, 7, 31, 1, 40, tzinfo=UTC)}
+    gap = candidate_publisher_builder(
+        auction_input_loader=lambda **_: _batch("auction_gap"),
+        clock=lambda: gap_clock["now"],
+    )(_auction_manifest(tmp_path / "gap"))
+
+    gap_published = gap()
+    gap_clock["now"] = datetime(2026, 7, 31, 2, 15, tzinfo=UTC)
+    gap_idled = gap()
+
+    assert gap_published.output_sequence == 0
+    assert gap_idled.output_sequence == 0
+
+
+def test_the_session_publisher_waits_for_its_start_time(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: _at(8, 44),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert calls == []
+    assert result.degraded_reasons == ()
+    assert result.output_sequence == -1
+
+
+def test_a_publisher_restarted_after_the_open_still_publishes_today(tmp_path: Path) -> None:
+    """10:00 才被拉起来也要发今天这一份，否则两个下游源一整天读不到必需的权威。"""
+
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: _at(10, 0),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert len(calls) == 1
+    assert result.output_sequence == 0
+
+
+def test_a_closed_date_publishes_nothing_and_is_not_a_degradation(tmp_path: Path) -> None:
+    """日历回答得了、答案是「今天不开市」——这不是降级，是正常的周末。"""
+
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: _at(8, 45, day=SESSION_CLOSED_DATE),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert calls == []
+    assert result.degraded_reasons == ()
+    assert result.replica_opened is False
+
+
+def test_a_date_outside_calendar_coverage_is_a_visible_degradation(tmp_path: Path) -> None:
+    """复核 SF-1：日历覆盖不到今天时不许安静空转。
+
+    改动前这个分支自己判 `trade_date not in open_dates`，于是「日历过期了」与「今天不开市」
+    走同一条静默的路，心跳干干净净——正是 #277 那种看不出来的形状。现在走
+    `decide_market_session`，它对覆盖期外是抛，构建器把它翻成一条点名的降级理由。
+    """
+
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: _at(8, 45, day=SESSION_UNCOVERED_DATE),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert calls == []
+    assert result.degraded_reasons == (f"calendar_uncovered:{SESSION_UNCOVERED_DATE.isoformat()}",)
+
+
+def test_a_calendar_generated_after_the_clock_fails_hard(tmp_path: Path) -> None:
+    """时钟回拨 / 权威错代是**硬失败**，不是降级（复核裁定 A / B）。
+
+    `decide_market_session` 的两种拒绝原来共用一个 `calendar_uncovered:` 标签，操作员看到
+    它会去查日历覆盖期，查完发现覆盖期没问题。现在拆成两条，而且「这台机器现在说的话不
+    可信」这一条在**两个 role 里都抛**——auction-match 本来就抛，这里跟上。
+    """
+
+    calls: list[dict[str, object]] = []
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        #: 日历的 generated_at 是 2026-08-09 08:00 UTC，把钟拨到它之前
+        clock=lambda: _at(8, 45, day=SESSION_OPEN_DATES[0]) - timedelta(days=2),
+    )(_session_manifest(tmp_path))
+
+    with pytest.raises(MarketSessionCalendarError, match="calendar_clock_regressed:"):
+        step()
+
+    assert calls == []
+
+
+def test_the_next_session_gets_its_own_document(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+    clock = {"now": _at(8, 45, day=SESSION_OPEN_DATES[-2])}
+    step = candidate_publisher_builder(
+        session_input_loader=_session_loader(calls),
+        clock=lambda: clock["now"],
+    )(_session_manifest(tmp_path))
+
+    step()
+    clock["now"] = _at(8, 45)
+    step()
+
+    assert [call["trade_date"] for call in calls] == [SESSION_OPEN_DATES[-2], SESSION_TRADE_DATE]
+
+
+def test_a_replica_that_cannot_answer_is_a_named_degradation(tmp_path: Path) -> None:
+    def refusing(**_: object):
+        raise SessionCandidateInputError("the read-only replica has no daily result")
+
+    step = candidate_publisher_builder(
+        session_input_loader=refusing,
+        clock=lambda: _at(8, 45),
+    )(_session_manifest(tmp_path))
+
+    result = step()
+
+    assert result.degraded_reasons == ("session_candidate_input_unavailable",)
+    assert result.output_sequence == -1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"strategy_id": "auction_gap"}, "not valid for auction_gap"),
+        ({"candidate_input_path": "/tmp/x.json"}, "candidate_input_path is forbidden"),
+        ({"auction_spool_root": "/tmp/spool"}, "auction spool paths are forbidden"),
+        ({"daily_database_path": None}, "needs the replica and the calendar"),
+    ],
+)
+def test_the_session_mode_refuses_a_settings_shape_it_cannot_run(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    settings = dict(_session_manifest(tmp_path).settings)
+    for key, value in overrides.items():
+        if value is None:
+            settings.pop(key)
+        else:
+            settings[key] = value
+    if overrides.get("strategy_id") == "auction_gap":
+        settings.update(_exact_strategy_settings("auction_gap"))
+
+    with pytest.raises(ValidationError, match=message):
+        CandidatePublisherRuntimeSettings.model_validate(settings)
+
+
+def test_a_sealed_document_publisher_is_still_supported_for_replay(tmp_path: Path) -> None:
+    """封存模式没有被删掉，只是生产不再用它——回放与测试还要。"""
+
+    settings = CandidatePublisherRuntimeSettings.model_validate(
+        dict(
+            _manifest(
+                tmp_path,
+                strategy_id="n_shape",
+            ).settings
+        )
+    )
+
+    assert settings.input_mode == "sealed_document"

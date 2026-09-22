@@ -46,8 +46,13 @@ from rquant.runtime_candidate_universe import (
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.runtime_market_session import (
     MarketCalendarAuthority,
+    MarketSessionCalendarError,
     decide_market_session,
     load_market_calendar_authority,
+    raise_or_label_calendar_refusal,
+    seconds_of_day,
+    spread_interval_seconds,
+    window_schedule_fits,
 )
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -570,6 +575,28 @@ def reference_slow_publisher_builder(
     return build
 
 
+#: 采集窗的默认值（#277）。2026-09-22 生产探测：主 token 的 `stk_auction(20260922)` 在
+#: 09:26:02 / 09:26:04 / 09:26:08 三次都返回空，到 09:51:11 已经有 6,075 行。所以首次可用的
+#: 那一刻落在 **09:26:08 与 09:51:11 之间**，确切时刻仓库里还不知道（更细的探测 09-23 再跑
+#: 一轮）。协调者的裁定是不去猜那一刻，而是**用更多次尝试把整个区间盖住**：窗取
+#: 09:35:00–10:05:00，尝试次数取 6，间隔由 `窗宽 // max_attempts` 推成 300 秒，六次到期时刻
+#: 是 09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，全部落在窗内。09-23 拿到精确时刻之后再
+#: 把窗收紧——路径仍然只有「改这四个常量」（连同 `runtime_builder_candidate` 那两个装配窗
+#: 常量）再走 PR → CI → tag → 部署器这一条，顺序与时间预算见 DEPLOY.md。仓库里没有
+#: 「改 manifest 设置就能定窗」这条路。
+AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 35)
+AUCTION_MATCH_DEFAULT_CAPTURE_END = time(10, 5)
+#: 采集窗里发几次请求。09-22 的探测只圈出了一个区间（09:26:08 空、09:51:11 非空），所以
+#: 次数从 3 提到 **6**：六次 300 秒一次地摊过 09:35-10:05，不押注区间里的哪一刻（#277）。
+#: **两条装机路径都读这一个常量**：生产画像（`runtime_production_profile`）与 route B 的
+#: 自举派生（`runtime_authority_stage.bootstrap_settings`）原来各写一份字面量 `3`，只改画像
+#: 那一份会让 `test_blk3_derived_settings_agree_with_the_production_profile_field_by_field`
+#: 当场红——两处必须同源，否则第一次安装装出来的次数和画像说的不是一个数。
+AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS = 6
+#: 网关自己拒绝 09:26 之前收到的竞价数据，所以采集窗的起点不能早于它
+AUCTION_MATCH_EARLIEST_CAPTURE_START = time(9, 26)
+
+
 class AuctionMatchSourceSettings(RuntimeContractModel):
     spool_root: Path
     quota_path: Path
@@ -583,7 +610,15 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
     calendar_expected_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     calendar_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     universe_path: Path
-    max_attempts: StrictInt = Field(default=3, gt=0, le=10)
+    #: 默认次数与两条装机路径同源，见 `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS`（#277）
+    max_attempts: StrictInt = Field(default=AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS, gt=0, le=10)
+    #: 本地时间（Asia/Shanghai）。改动前是写死的 09:26-09:30 加三次立刻重试，三次全落在
+    #: 七秒之内，等于只在 09:26:0x 问了一次（#277 的现场）。
+    capture_start: time = AUCTION_MATCH_DEFAULT_CAPTURE_START
+    capture_end: time = AUCTION_MATCH_DEFAULT_CAPTURE_END
+    #: 两次尝试之间的最小间隔。留空时由窗宽与尝试次数推出来，把 `max_attempts` 次尝试**摊在
+    #: 整个窗里**（首尾各一次），这样「数据比预计晚到」不会因为三次重试挤在开头而错过。
+    retry_interval_seconds: StrictInt | None = Field(default=None, gt=0, le=3600)
 
     @field_validator("spool_root", "quota_path", "calendar_path", "universe_path")
     @classmethod
@@ -591,6 +626,48 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
         if not value.is_absolute():
             raise ValueError("runtime data paths must be absolute")
         return value
+
+    @model_validator(mode="after")
+    def validate_capture_window(self) -> AuctionMatchSourceSettings:
+        if self.capture_start >= self.capture_end:
+            raise ValueError("auction capture_start must precede capture_end")
+        if self.capture_start < AUCTION_MATCH_EARLIEST_CAPTURE_START:
+            raise ValueError("auction capture_start cannot precede 09:26")
+        if self.capture_start.microsecond or self.capture_end.microsecond:
+            raise ValueError("auction capture window must be whole seconds")
+        if self.capture_start.tzinfo is not None or self.capture_end.tzinfo is not None:
+            raise ValueError("auction capture window is local Asia/Shanghai wall time")
+        #: 复核 MF-1 的另一半：显式给的间隔与窗宽对不上时原来照收不误。30 分钟的窗配
+        #: `retry_interval_seconds=600` + `max_attempts=6`，第六次的到期时刻是 10:25，
+        #: 永远不会发生——而探测收窗之后操作员正是要动这几个值的。
+        if not window_schedule_fits(
+            start=self.capture_start,
+            end=self.capture_end,
+            attempts=self.max_attempts,
+            interval_seconds=self.capture_retry_interval_seconds,
+        ):
+            raise ValueError(
+                "every auction capture attempt must fall inside [capture_start, capture_end)"
+            )
+        return self
+
+    @property
+    def capture_retry_interval_seconds(self) -> int:
+        """`max_attempts` 次尝试摊在窗里的间隔，显式配置优先。
+
+        窗宽 30 分钟、六次尝试时是 **300** 秒：09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，
+        最后一次到期之后离窗口右界还有整整 300 秒。按 `max_attempts - 1` 摊开的写法
+        （360 秒 ⇒ 最后一次正好到期在 10:05:00）在 2 秒轮询下有一半的相位永远拿不到最后那次
+        尝试——复核 MF-1。
+        """
+
+        if self.retry_interval_seconds is not None:
+            return int(self.retry_interval_seconds)
+        return spread_interval_seconds(
+            start=self.capture_start,
+            end=self.capture_end,
+            attempts=self.max_attempts,
+        )
 
 
 class AuctionUniversePublisherSettings(RuntimeContractModel):
@@ -747,25 +824,34 @@ def auction_match_source_builder(
         attempt_trade_date: date | None = None
         attempts = 0
         completed = False
+        #: 「今天的采集彻底没成」这件事，一直挂到交易日切换为止（#277 第三个缺陷）。
+        #: 改动前早退分支返回的是那份**从未被写过**的初始结果，`record_success` 把它变成
+        #: 一条干净心跳，09:26 的三次真失败在几秒内就被洗掉，心跳上看不出今天出过事。
+        capture_failed = False
+        #: 窗口整个过去了而**一次请求都没发出来**（role 没起来、部署、watchdog 重启，或者
+        #: 竞价全集一直读不出来）。它与 `capture_failed` 是两件事，所以两条理由分开
+        #: （复核 SF-3）：心跳必须回答得了「今天到底采没采」，而不是只在「试过但都没成」
+        #: 那一种情况下才留痕。
+        capture_missed = False
+        retry_interval = settings.capture_retry_interval_seconds
+        window_start_seconds = seconds_of_day(settings.capture_start)
+        window_end_seconds = seconds_of_day(settings.capture_end)
 
         def step() -> RuntimeStepResult:
             nonlocal attempt_trade_date, attempts, completed, last_result
+            nonlocal capture_failed, capture_missed
             observed_at = clock()
-            decision = decide_market_session(calendar, observed_at)
             evidence = {"market_calendar": calendar.content_sha256}
-            if attempt_trade_date != decision.local_trade_date:
-                attempt_trade_date = decision.local_trade_date
-                attempts = 0
-                completed = False
-                last_result = RuntimeStepResult(source_generations=evidence)
-            local_time = decision.observed_at.astimezone(_SHANGHAI).timetz().replace(tzinfo=None)
-            if (
-                not decision.is_open_date
-                or local_time < time(9, 26)
-                or local_time > time(9, 30)
-                or completed
-                or attempts >= settings.max_attempts
-            ):
+
+            def idle_result(extra: tuple[str, ...] = ()) -> RuntimeStepResult:
+                reasons = tuple(last_result.degraded_reasons)
+                for reason in (
+                    *extra,
+                    *(("capture_failed",) if capture_failed else ()),
+                    *(("capture_missed",) if capture_missed else ()),
+                ):
+                    if reason not in reasons:
+                        reasons = (*reasons, reason)
                 return RuntimeStepResult(
                     **{
                         **last_result.model_dump(mode="python"),
@@ -774,8 +860,53 @@ def auction_match_source_builder(
                             **dict(last_result.source_generations),
                             **evidence,
                         },
+                        "degraded_reasons": reasons,
                     }
                 )
+
+            #: 日历拒绝回答时的软硬分工与 session 发布者逐字相同（复核裁定 A / B）：
+            #: 覆盖期外是软降级，时钟回拨是硬失败。
+            try:
+                decision = decide_market_session(calendar, observed_at)
+            except MarketSessionCalendarError as error:
+                return idle_result(
+                    (raise_or_label_calendar_refusal(calendar, observed_at, error),)
+                )
+            if attempt_trade_date != decision.local_trade_date:
+                attempt_trade_date = decision.local_trade_date
+                attempts = 0
+                completed = False
+                capture_failed = False
+                capture_missed = False
+                last_result = RuntimeStepResult(source_generations=evidence)
+            local_time = decision.observed_at.astimezone(_SHANGHAI).timetz().replace(tzinfo=None)
+            now_seconds = seconds_of_day(local_time)
+            exhausted = attempts >= settings.max_attempts
+            #: 尝试摊在窗里：第 k 次（0 起）不早于 capture_start + k * interval。
+            #: 间隔按 `窗宽 // max_attempts` 推，所以最后一次到期之后离窗口右界还有整整一个
+            #: 间隔——按 `max_attempts - 1` 推的写法会让它正好到期在右界上，于是只有恰好落在
+            #: 那一秒里的轮询才拿得到（复核 MF-1）。
+            due = now_seconds >= window_start_seconds + attempts * retry_interval
+            window_passed = now_seconds > window_end_seconds
+            if decision.is_open_date and not completed:
+                if exhausted or (window_passed and attempts > 0):
+                    capture_failed = True
+                elif window_passed:
+                    capture_missed = True
+
+            if (
+                not decision.is_open_date
+                or now_seconds < window_start_seconds
+                or window_passed
+                or completed
+                or exhausted
+                or not due
+            ):
+                return idle_result()
+            #: 竞价全集读不出来时这一句抛，`record_failure` 把它记进 `last_error`，而
+            #: **尝试次数不动**——窗内每一轮都会再试，直到全集可读为止（复核 SF-2）。
+            #: 把计数放在它前面会让「全集晚发了十分钟」直接报销掉当天仅有的三次预算；
+            #: 「一次都没发出去」这件事由 `capture_missed` 留痕，不必靠烧掉次数来换。
             universe = load_auction_universe_authority(
                 settings.universe_path,
                 expected_commit=manifest.producer_commit,

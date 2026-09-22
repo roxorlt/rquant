@@ -27,17 +27,32 @@ from rquant.auction_gap_candidate_input import (
 )
 from rquant.live_contracts import BatchQualityStatus
 from rquant.live_spool import LiveBatchSpool
-from rquant.readside_replica_gate import AUCTION_GAP_CANDIDATE_PROFILE, ReplicaReadGate
+from rquant.readside_replica_gate import (
+    AUCTION_GAP_CANDIDATE_PROFILE,
+    SESSION_CANDIDATE_PROFILE,
+    ReplicaReadGate,
+)
 from rquant.reference_data_registry import ReadonlyReferenceRegistry
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_generation_lineage import candidate_authority_lineage
-from rquant.runtime_market_session import load_market_calendar_authority
+from rquant.runtime_market_session import (
+    MarketCalendarAuthority,
+    MarketSessionCalendarError,
+    decide_market_session,
+    load_market_calendar_authority,
+    local_window_contains,
+    raise_or_label_calendar_refusal,
+)
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
     RuntimeServiceKind,
     RuntimeServiceManifest,
     RuntimeServiceStep,
+)
+from rquant.session_candidate_input import (
+    SessionCandidateInputError,
+    assemble_session_candidate_batch,
 )
 from rquant.strategy_candidate_publish_service import (
     AuctionGapCandidateBatch,
@@ -68,8 +83,17 @@ _MAX_CANDIDATE_INPUT_BYTES = 16 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_AUCTION_INPUT_START = time(9, 26)
-_AUCTION_INPUT_END = time(9, 30)
+#: 装配窗跟着 auction-match 的采集窗走（#277）。原来是 09:26-09:30，而采集窗现在是
+#: 09:35-10:05（09-22 探测圈出的可用区间：09:26:08 空、09:51:11 非空）——批次要到 09:35 之后
+#: 才可能出现，09:26-09:30 这段里永远没有料可装。
+#: 起点与 `AUCTION_MATCH_DEFAULT_CAPTURE_START` 对齐，终点是
+#: `AUCTION_MATCH_DEFAULT_CAPTURE_END` 之后五分钟：最后一次采集成功之后仍有一整个
+#: 五秒轮次的余量把它装出来。09-23 探测把采集窗收紧时，这两项跟着一起改。
+AUCTION_GAP_DEFAULT_INPUT_START = time(9, 35)
+AUCTION_GAP_DEFAULT_INPUT_END = time(10, 10)
+#: #278 要求「每个交易日 09:15 之前重建一次」。08:45 给了半小时余量，而且落在
+#: `auction-universe.publisher.v1` 的 09:15-15:10 保护窗之前，读副本不跟它撞。
+SESSION_DOCUMENT_DEFAULT_START = time(8, 45)
 
 
 class CandidatePublisherRuntimeSettings(RuntimeContractModel):
@@ -79,7 +103,7 @@ class CandidatePublisherRuntimeSettings(RuntimeContractModel):
     executable_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_schema_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic]
-    input_mode: Literal["sealed_document", "auction_live"] = "sealed_document"
+    input_mode: Literal["sealed_document", "auction_live", "session_document"] = "sealed_document"
     candidate_input_path: Path | None = None
     auction_spool_root: Path | None = None
     daily_database_path: Path | None = None
@@ -93,6 +117,14 @@ class CandidatePublisherRuntimeSettings(RuntimeContractModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    #: 本地时间（Asia/Shanghai）的装配窗，只对 `auction_live` 有意义。**生产画像不写这两个键**，
+    #: 走的是下面两个常量；它们留在设置上只为回放与测试。定窗要改常量，见 DEPLOY.md。
+    auction_input_start: time = AUCTION_GAP_DEFAULT_INPUT_START
+    auction_input_end: time = AUCTION_GAP_DEFAULT_INPUT_END
+    #: `session_document` 每个交易日**最早**从这个本地时刻起重建一次当日文档。没有终点：
+    #: 一个 10:00 才被拉起来的发布者仍然要能把今天的文档发出来，否则两个下游源一整天
+    #: 读不到必需的候选权威（#278）。
+    session_document_start: time = SESSION_DOCUMENT_DEFAULT_START
     snapshot_root: Path
 
     @field_validator("strategy_version", mode="before")
@@ -136,6 +168,14 @@ class CandidatePublisherRuntimeSettings(RuntimeContractModel):
         return value
 
     @model_validator(mode="after")
+    def validate_auction_input_window(self) -> CandidatePublisherRuntimeSettings:
+        if self.auction_input_start >= self.auction_input_end:
+            raise ValueError("auction_input_start must precede auction_input_end")
+        if self.auction_input_start.tzinfo is not None or self.auction_input_end.tzinfo is not None:
+            raise ValueError("the auction input window is local Asia/Shanghai wall time")
+        return self
+
+    @model_validator(mode="after")
     def validate_input_mode(self) -> CandidatePublisherRuntimeSettings:
         if self.candidate_schema_fingerprint != strategy_candidate_schema_fingerprint(
             strategy_id=self.strategy_id,
@@ -156,6 +196,24 @@ class CandidatePublisherRuntimeSettings(RuntimeContractModel):
                 raise ValueError("candidate_input_path is required for sealed_document")
             if any(path is not None for path in live_paths):
                 raise ValueError("auction live paths are forbidden for sealed_document")
+            return self
+        if self.input_mode == "session_document":
+            if self.strategy_id == "auction_gap":
+                raise ValueError("session_document input mode is not valid for auction_gap")
+            if self.candidate_input_path is not None:
+                raise ValueError("candidate_input_path is forbidden for session_document")
+            if self.auction_spool_root is not None or self.reference_registry_path is not None:
+                raise ValueError("auction spool paths are forbidden for session_document")
+            if any(
+                value is None
+                for value in (
+                    self.daily_database_path,
+                    self.calendar_path,
+                    self.calendar_expected_commit,
+                    self.calendar_content_sha256,
+                )
+            ):
+                raise ValueError("session_document needs the replica and the calendar")
             return self
         if self.strategy_id != "auction_gap":
             raise ValueError("auction_live input mode is only valid for auction_gap")
@@ -186,6 +244,20 @@ class AuctionCandidateInputLoader(Protocol):
         calendar_path: Path,
         calendar_expected_commit: str,
         calendar_content_sha256: str,
+        trade_date: date,
+        observed_at: datetime,
+        producer_commit: str,
+        read_gate: ReplicaReadGate[Any] | None = None,
+    ) -> CandidatePublishBatch: ...
+
+
+class SessionCandidateInputLoader(Protocol):
+    def __call__(
+        self,
+        *,
+        strategy_id: Any,
+        daily_database_path: Path,
+        calendar: MarketCalendarAuthority,
         trade_date: date,
         observed_at: datetime,
         producer_commit: str,
@@ -244,8 +316,19 @@ def _document_for_batch(batch: CandidatePublishBatch) -> CandidateInputDocument:
 
 
 def serialize_candidate_input(batch: CandidatePublishBatch) -> bytes:
+    """典范 JSON；没有 `basis_trade_date` 的文档与 v0.33.15 的字节逐字相同。
+
+    `RuntimeContractModel` 是 `extra="forbid"`，所以多写一个 `"basis_trade_date": null`
+    会让回滚之后的读者拒绝这份文档。这里在值为 `None` 时把键整个去掉：新代码照样读得懂
+    两种形状，旧代码读得懂它一直读的那一种（#278 的回滚面）。
+    """
+
     document = _document_for_batch(batch)
-    return canonical_json_bytes(document.model_dump(mode="json"))
+    payload = document.model_dump(mode="json")
+    authority = payload["batch"]["authority"]
+    if authority.get("basis_trade_date") is None:
+        authority.pop("basis_trade_date", None)
+    return canonical_json_bytes(payload)
 
 
 def _require_normalized_path(path: Path) -> Path:
@@ -461,11 +544,13 @@ def candidate_publisher_builder(
     *,
     candidate_input_loader: CandidateInputLoader | None = None,
     auction_input_loader: AuctionCandidateInputLoader | None = None,
+    session_input_loader: SessionCandidateInputLoader | None = None,
     clock: Callable[[], datetime] = _utc_now,
     runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     loader: CandidateInputLoader = candidate_input_loader or load_candidate_input
     live_auction_loader = auction_input_loader or load_live_auction_candidate_input
+    live_session_loader = session_input_loader or assemble_session_candidate_batch
 
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         if manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER:
@@ -473,6 +558,19 @@ def candidate_publisher_builder(
         if manifest.plane is not RuntimeServicePlane.LIVE:
             raise ValueError("candidate publisher must run on the live plane")
         settings = CandidatePublisherRuntimeSettings.model_validate(dict(manifest.settings))
+        #: `session_document` 每轮都要回答「今天开不开市」，而那是一份装机时就冻结的日历。
+        #: 在 build 里读一次并校验内容身份：非交易日的那一轮因此**什么都不做**，不会为了
+        #: 问日历去开副本，也不会因为「今天不是交易日」把自己标成降级（#278）。
+        session_calendar: MarketCalendarAuthority | None = None
+        if settings.input_mode == "session_document":
+            if settings.calendar_path is None or settings.calendar_expected_commit is None:
+                raise RuntimeError("validated session calendar settings disappeared")
+            session_calendar = load_market_calendar_authority(
+                settings.calendar_path,
+                expected_commit=settings.calendar_expected_commit,
+            )
+            if session_calendar.content_sha256 != settings.calendar_content_sha256:
+                raise ValueError("session candidate calendar content identity mismatch")
         # `authority.json` is create-only and pins two commit-derived fingerprints, so
         # every release leaves the publisher a binding it cannot match. This is what lets
         # the owner re-bind its own previous generation's root instead of going DEGRADED
@@ -510,22 +608,35 @@ def candidate_publisher_builder(
         replica_gate: ReplicaReadGate[Any] | None = (
             None
             if settings.daily_database_path is None
-            #: at most one open per 09:26-09:30 assembly window (#268). What it reads is
+            #: at most one open per assembly window (#268). What it reads is
             #: prior sessions' `daily_bar` volumes, which do not change while the session
             #: opens, so a generation arriving mid-window carries the same answer at the
             #: cost of another whole scan
             else ReplicaReadGate(
                 settings.daily_database_path,
-                profile=AUCTION_GAP_CANDIDATE_PROFILE,
+                profile=(
+                    SESSION_CANDIDATE_PROFILE
+                    if settings.input_mode == "session_document"
+                    else AUCTION_GAP_CANDIDATE_PROFILE
+                ),
                 clock=clock,
             )
         )
+        #: 今天这一场的文档已经发过了吗。发过就整轮不写——内容里带着生成时刻，没有这个记号
+        #: 就会变成「每五秒发一代新快照」，正是包 W 拆掉的那种每轮无条件写。
+        published_trade_date: date | None = None
+        #: 这个进程已经发到第几代。**空闲那一轮必须把它照抄出去**：
+        #: `RuntimeServiceControl.record_success` 拒绝回退的输出序号
+        #: （`ValueError: output sequence cannot regress`），而发完一代之后窗外的每一轮
+        #: 原来都返回 -1。auction_gap 从来没真的发出过东西（#254/#277），所以这条路径
+        #: 一次都没被走到过；竞价链一旦真的开始产出，它会在每一轮上抛。
+        last_output_sequence = -1
 
         def _replica_cost() -> dict[str, object]:
             """What **this** iteration did with the replica, for the heartbeat (#256).
 
             Empty for a publisher that has no replica to read. For the auction-gap
-            publisher it is always present: outside 09:26-09:30, and on the degraded
+            publisher it is always present: outside its assembly window, and on the degraded
             iterations where the auction spool has no batch yet, this reports "opened
             nothing, read nothing" rather than the last real read's numbers (review MF-1).
             """
@@ -540,14 +651,76 @@ def candidate_publisher_builder(
             }
 
         def step() -> RuntimeStepResult:
+            nonlocal published_trade_date, last_output_sequence
+
+            def idle_result(
+                degraded_reasons: tuple[str, ...] = (),
+            ) -> RuntimeStepResult:
+                """这一轮什么都没发：报本进程已经发到的那一代，不是 -1。"""
+
+                return RuntimeStepResult(
+                    output_sequence=last_output_sequence,
+                    degraded_reasons=degraded_reasons,
+                    **_replica_cost(),
+                )
+
             if replica_gate is not None:
                 replica_gate.begin_iteration()
-            if settings.input_mode == "auction_live":
+            if settings.input_mode == "session_document":
+                observed_at = normalize_aware_utc(clock())
+                local = observed_at.astimezone(_SHANGHAI)
+                if session_calendar is None:
+                    raise RuntimeError("validated session calendar disappeared")
+                #: 走 `decide_market_session` 而不是自己判「今天在不在 open_dates 里」
+                #: （复核 SF-1）。自己判会把「这本日历根本覆盖不到今天」和「今天不开市」
+                #: 当成同一件事，于是日历过期之后发布者天天空转、心跳干干净净——正是 #277
+                #: 那种「什么都没发生而看不出来」的形状，只是换了个地方。
+                #: 两种拒绝的软硬分工与 auction-match 逐字相同（复核裁定 A / B）：覆盖期外
+                #: 软降级 `calendar_uncovered:<date>`，时钟回拨**硬失败**（抛，记 last_error）。
+                try:
+                    decision = decide_market_session(session_calendar, observed_at)
+                except MarketSessionCalendarError as error:
+                    return idle_result(
+                        (
+                            raise_or_label_calendar_refusal(
+                                session_calendar,
+                                observed_at,
+                                error,
+                            ),
+                        )
+                    )
+                trade_date = decision.local_trade_date
+                if (
+                    not decision.is_open_date
+                    or local.timetz().replace(tzinfo=None) < settings.session_document_start
+                    or published_trade_date == trade_date
+                ):
+                    return idle_result()
+                if settings.daily_database_path is None:
+                    raise RuntimeError("validated session replica path disappeared")
+                try:
+                    loaded = live_session_loader(
+                        strategy_id=settings.strategy_id,
+                        daily_database_path=settings.daily_database_path,
+                        calendar=session_calendar,
+                        trade_date=trade_date,
+                        observed_at=observed_at,
+                        producer_commit=manifest.producer_commit,
+                        read_gate=replica_gate,
+                    )
+                except SessionCandidateInputError:
+                    return idle_result(("session_candidate_input_unavailable",))
+            elif settings.input_mode == "auction_live":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
                 local_time = local.timetz().replace(tzinfo=None)
-                if not _AUCTION_INPUT_START <= local_time <= _AUCTION_INPUT_END:
-                    return RuntimeStepResult(**_replica_cost())
+                #: 与 auction-match 的采集窗共用同一份整秒算术（复核代码质量 1）
+                if not local_window_contains(
+                    local_time,
+                    start=settings.auction_input_start,
+                    end=settings.auction_input_end,
+                ):
+                    return idle_result()
                 if (
                     settings.auction_spool_root is None
                     or settings.daily_database_path is None
@@ -571,10 +744,7 @@ def candidate_publisher_builder(
                         read_gate=replica_gate,
                     )
                 except AuctionGapCandidateInputError:
-                    return RuntimeStepResult(
-                        degraded_reasons=("auction_gap_input_unavailable",),
-                        **_replica_cost(),
-                    )
+                    return idle_result(("auction_gap_input_unavailable",))
             else:
                 if settings.candidate_input_path is None:
                     raise RuntimeError("validated candidate_input_path disappeared")
@@ -588,6 +758,8 @@ def candidate_publisher_builder(
                 strategy_id=settings.strategy_id,
                 expected_commit=manifest.producer_commit,
             )
+            if settings.input_mode == "session_document":
+                published_trade_date = batch.authority.trade_date
             summary = publish_candidate_batch(
                 snapshot_root=settings.snapshot_root,
                 expected_commit=manifest.producer_commit,
@@ -598,6 +770,7 @@ def candidate_publisher_builder(
                 static_feature_schema=settings.static_feature_schema,
                 previous_generation_of_binding=previous_generation_of_binding,
             )
+            last_output_sequence = max(last_output_sequence, summary.snapshot_sequence)
             return RuntimeStepResult(
                 output_sequence=summary.snapshot_sequence,
                 processed_count=summary.candidate_count,
@@ -625,11 +798,15 @@ def candidate_publisher_builder(
 
 
 __all__ = [
+    "AUCTION_GAP_DEFAULT_INPUT_END",
+    "AUCTION_GAP_DEFAULT_INPUT_START",
     "AuctionCandidateInputLoader",
     "CandidateInputLoader",
     "CandidateInputDocument",
     "CandidatePublisherRuntimeSettings",
     "CandidateStrategyId",
+    "SESSION_DOCUMENT_DEFAULT_START",
+    "SessionCandidateInputLoader",
     "candidate_publisher_builder",
     "load_candidate_input",
     "load_live_auction_candidate_input",
