@@ -772,6 +772,69 @@ class ReferenceRegistry:
                 "SQLite connected database identity is not the validated registry"
             )
 
+    def _open_publication_lock(self, *, exclusive: bool) -> int:
+        """The lock descriptor, opened the way the caller's role is allowed to open it.
+
+        A **shared** lock is a reader's lock, and on this deployment a reader of this
+        registry is a role whose unit mounts `authorities/reference-slow` read-only:
+        `paper_constraint_publisher` is the live one. Opening `O_RDWR | O_CREAT` there is
+        a write into a directory the role does not own, which is `EROFS` on the host --
+        the same shape as #242, whose WAL sidecar was the other write into this same
+        directory. It was invisible because the role returns early with "paper constraints
+        require a visible market-minute batch" whenever no minute batch is visible, and
+        every test in the repository ran it outside a session, where that is always true.
+
+        `flock` places a shared lock on a read-only descriptor perfectly well, so a reader
+        can serialize against the publisher's commit without asking for write access. When
+        the lock file is not there at all, the old open is kept: a reader in a directory it
+        *does* own still creates it, and one in a directory it does not still fails.
+
+        That last case is reachable rather than theoretical, and it is fail-closed by
+        *name* rather than by `EROFS`. The recovery artifact restores
+        `runtime/authorities/reference-slow/reference.sqlite3` and **not** the dot-file
+        beside it (`scripts/build_runtime_production_inputs.py`), so the first reader after
+        a restore -- before that day's `reference_slow_publisher` has run -- finds the
+        database present and the lock absent. Raising bare `[Errno 30] Read-only file
+        system: .../.reference.sqlite3.publication.lock` there is exactly the symptom this
+        fix removes, and an operator reading it would conclude the fix had not been
+        deployed. `ReferenceDataUnavailableError` separates "this registry has no publisher
+        yet" from "the reader is still asking for write access".
+        """
+
+        if not exclusive:
+            try:
+                return os.open(
+                    self._publication_lock_path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+            except FileNotFoundError:
+                pass
+        try:
+            return os.open(
+                self._publication_lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except OSError as exc:
+            if exclusive:
+                raise
+            #: Only "the publisher has not run" is renamed. Reaching here at all means the
+            #: `O_RDONLY | O_NOFOLLOW` open above raised `FileNotFoundError` and something
+            #: then appeared at that path between the two opens: with `O_NOFOLLOW` a
+            #: symlink is `ELOOP`, and a parent segment that is no longer a directory is
+            #: `ENOTDIR`. Those are integrity conditions -- the shape package Y's review
+            #: requires to keep raising -- and calling a symlink swapped in underneath us
+            #: "this registry has no publication lock" would hide exactly what the
+            #: `O_NOFOLLOW` is there to catch. They are re-raised as themselves.
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise
+            raise ReferenceDataUnavailableError(
+                "reference registry has no publication lock and this reader cannot create "
+                f"one: {self._publication_lock_path}. Its publisher "
+                "(reference_slow_publisher) owns that directory and has not run since the "
+                "registry was put there."
+            ) from exc
+
     @contextmanager
     def publication_commit_lock(self, *, exclusive: bool = True) -> Iterator[None]:
         """Serialize the registry/cursor commit protocol across readers and writers."""
@@ -801,11 +864,7 @@ class ReferenceRegistry:
                     held[lock_key] = (descriptor, held_exclusive, depth)
                 return
 
-            descriptor = os.open(
-                self._publication_lock_path,
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
+            descriptor = self._open_publication_lock(exclusive=exclusive)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
                 held[lock_key] = (descriptor, exclusive, 1)

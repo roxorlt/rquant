@@ -168,19 +168,29 @@ def _production_bundle(
     )
     inputs = _inputs(tmp_path)
     inputs.historical_minutes_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        columns=(
-            "ts_code",
-            "trade_time",
-            "available_at",
-            "open",
-            "high",
-            "low",
-            "close",
-            "vol",
-            "amount",
-        )
-    ).to_parquet(inputs.historical_minutes_snapshot_path, index=False)
+    #: The empty-schema placeholder is written only when the caller's `_inputs` did not
+    #: already put a snapshot there. Every world that never trades gets the placeholder
+    #: exactly as before -- `minute_snapshot` writes the same empty frame, so the bytes
+    #: and therefore the recorded id are unchanged -- while a world that *does* trade can
+    #: install a real historical parquet through `_inputs` and keep it. Overwriting
+    #: unconditionally is what made the real generator
+    #: (`scripts/export_intraday_snapshot.py`) unreachable from every Route A e2e: the id
+    #: recorded below is re-read off this file, so a real payload was silently replaced by
+    #: zero rows before the profile ever saw it.
+    if not inputs.historical_minutes_snapshot_path.exists():
+        pd.DataFrame(
+            columns=(
+                "ts_code",
+                "trade_time",
+                "available_at",
+                "open",
+                "high",
+                "low",
+                "close",
+                "vol",
+                "amount",
+            )
+        ).to_parquet(inputs.historical_minutes_snapshot_path, index=False)
     bindings = tuple(
         ProductionStrategyBinding.model_validate(binding.model_dump(mode="python"))
         for binding in plan_builtin_definitions(producer_commit=producer_commit).strategies
