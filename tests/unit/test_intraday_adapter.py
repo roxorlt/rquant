@@ -53,6 +53,8 @@ class _FakePro:
             "trade_date": trade_date,
             "fields": fields,
         })
+        #: `pre_close` 自 #277 起是必需列：网关拿它算竞价缺口，适配器也把它写进 `fields`，
+        #: 真接口本来就返回它。少了这一列适配器当场抛「返回缺字段」。
         return pd.DataFrame([
             {
                 "ts_code": "600000.SH",
@@ -60,6 +62,7 @@ class _FakePro:
                 "vol": 28355900.0,
                 "price": 9.81,
                 "amount": 278113479.0,
+                "pre_close": 9.75,
                 "turnover_rate": 0.1,
                 "volume_ratio": 3.2,
             },
@@ -69,6 +72,7 @@ class _FakePro:
                 "vol": 1200000.0,
                 "price": 11.23,
                 "amount": 13476000.0,
+                "pre_close": 11.10,
                 "turnover_rate": 0.03,
                 "volume_ratio": 1.1,
             },
@@ -399,7 +403,7 @@ def test_stk_auction_normalizes_tushare_rows(monkeypatch) -> None:
 
     assert fake.calls[-1] == {
         "trade_date": "20250218",
-        "fields": "ts_code,trade_date,vol,price,amount,turnover_rate,volume_ratio",
+        "fields": "ts_code,trade_date,price,vol,amount,pre_close,turnover_rate,volume_ratio",
     }
     assert df["ts_code"].tolist() == ["000001.SZ", "600000.SH"]
     assert df["trade_date"].tolist() == [
@@ -409,6 +413,8 @@ def test_stk_auction_normalizes_tushare_rows(monkeypatch) -> None:
     assert df["auction_type"].tolist() == ["open_realtime", "open_realtime"]
     assert df["source"].tolist() == ["tushare", "tushare"]
     assert df.iloc[0]["price"] == 11.23
+    #: 归一化之后 `pre_close` 还在，而且跟着行一起被排序（#277）
+    assert df["pre_close"].tolist() == [11.10, 9.75]
 
 
 def test_stk_auction_rejects_missing_required_columns(monkeypatch) -> None:
