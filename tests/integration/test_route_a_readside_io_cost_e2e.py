@@ -141,7 +141,7 @@ def _run_iterations(
 def counted_replica_reads(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Where the auction-gap publisher actually opens the replica, counted.
 
-    Only this role: package P's world sits at 09:32, and `auction-universe.publisher.v1`
+    Only this role: package P's world sits at 09:37, and `auction-universe.publisher.v1`
     refuses to act at all between 09:15 and 15:10 (its protection window), so in this world
     it never reaches a read and counting it would assert nothing. That role's gate is
     covered in `tests/unit/test_auction_universe_source.py`, where three publishes over one
