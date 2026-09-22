@@ -33,6 +33,11 @@
     （会一次推出整条积压 spool，#86 那一类风暴）。新画像带的 `suppress_delivery` /
     `notifier_delivery_mode` 两个键会被 v0.33.16 及更早版本的 `extra="forbid"` 模型拒收，
     **回滚必须先把 `notifier_delivery_mode` 从输入文档里删掉**。
+  - **路线 B 的复述跟着走**：`runtime_authority_stage.bootstrap_settings` 是画像表达式的复述
+    （路线 B 调不了 `build_production_runtime_profile`），它的 notifier 现在同样是
+    `paused: False` + `suppress_delivery: True`。**两行缺一不可**——`suppress_delivery` 的
+    字段默认值是 `False`，只翻 `paused` 会让路线 B 的 notifier 真的往 PushDeer / PushPlus 发。
+    这条由 BLK3 的逐字段对照用例钉住（`test_runtime_authority_publish.py`）。
   - ⚠️ **切换本身现在发不出去（#284）**：`deploy-production.sh` 只认 target tag，target 与已部署
     SHA 相同时 `deploy()` 提前 return `already_current`（只跑一次 `preflight`），改过的输入文档
     根本不会被读。DEPLOY 里那两处 `--target` 已标注「#284 修好前不可用」，并列了三条需 owner
@@ -230,6 +235,8 @@
   旧 manifest 配新代码可以（字段有默认值），新 manifest 配旧代码会在 build 期被拒；
   三个可选动作（重新 stage 上一个 tag / 把 `current` 指回上一代 / 删掉 `current` 回落路线 B）
   见 `DEPLOY.md` 这一条。
+  路线 B 的 `bootstrap_settings` 也显式写上同一对可选源，理由与画像那处相同：
+  哪些源可降级由 manifest 决定，不由字段默认值决定。
 
 
 - **其余六个 role 的「每轮无条件写」：内容没变就不写、不提交、不 fsync（#271，本包）**：
