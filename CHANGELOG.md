@@ -86,6 +86,8 @@
 
 ### Changed
 
+- deploy(systemd): raise rquant.slice 11264M→12288M and rquant-live.slice 7680M→9216M after the 2026-09-21 acceptance day peaks (live 7,634/7,680 MB during the daily, top 10,763/11,264 MB during backups)
+
 - **deploy(systemd): raise slice MemoryHigh ceilings (rquant 6144M→11264M, live 3840M→7680M, live-runtime 1536M→4096M, serving 512M→1536M) so the production monitor/daily and the dashboard no longer share memory.high reclaim pressure with the Route A roles (fixes the 09-14 open-time stall and the 09-16 17:00 daily stall root cause: cgroup memory.high throttling, not I/O)** (#268, #271)
 
 - **主机资源包络：备份降频 + 放宽超时，运行时工作面加 CPU 限额（#243，owner 2026-09-08 授权裁决 21「选 1+2」）**：
