@@ -586,6 +586,13 @@ def reference_slow_publisher_builder(
 #: 「改 manifest 设置就能定窗」这条路。
 AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 35)
 AUCTION_MATCH_DEFAULT_CAPTURE_END = time(10, 5)
+#: 采集窗里发几次请求。09-22 的探测只圈出了一个区间（09:26:08 空、09:51:11 非空），所以
+#: 次数从 3 提到 **6**：六次 300 秒一次地摊过 09:35-10:05，不押注区间里的哪一刻（#277）。
+#: **两条装机路径都读这一个常量**：生产画像（`runtime_production_profile`）与 route B 的
+#: 自举派生（`runtime_authority_stage.bootstrap_settings`）原来各写一份字面量 `3`，只改画像
+#: 那一份会让 `test_blk3_derived_settings_agree_with_the_production_profile_field_by_field`
+#: 当场红——两处必须同源，否则第一次安装装出来的次数和画像说的不是一个数。
+AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS = 6
 #: 网关自己拒绝 09:26 之前收到的竞价数据，所以采集窗的起点不能早于它
 AUCTION_MATCH_EARLIEST_CAPTURE_START = time(9, 26)
 
@@ -603,9 +610,8 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
     calendar_expected_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     calendar_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     universe_path: Path
-    #: 09-22 的探测只圈出了一个区间（09:26:08 空、09:51:11 非空），所以次数从 3 提到 **6**：
-    #: 六次 300 秒一次地摊过 09:35-10:05，不押注区间里的哪一刻（#277）。
-    max_attempts: StrictInt = Field(default=6, gt=0, le=10)
+    #: 默认次数与两条装机路径同源，见 `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS`（#277）
+    max_attempts: StrictInt = Field(default=AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS, gt=0, le=10)
     #: 本地时间（Asia/Shanghai）。改动前是写死的 09:26-09:30 加三次立刻重试，三次全落在
     #: 七秒之内，等于只在 09:26:0x 问了一次（#277 的现场）。
     capture_start: time = AUCTION_MATCH_DEFAULT_CAPTURE_START

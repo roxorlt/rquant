@@ -31,10 +31,15 @@
 |---|---|---|
 | `AUCTION_MATCH_DEFAULT_CAPTURE_START` | `09:35:00` | `src/rquant/runtime_service_builtin.py` |
 | `AUCTION_MATCH_DEFAULT_CAPTURE_END` | `10:05:00` | 同上 |
-| `AuctionMatchSourceSettings.max_attempts` 默认值 | `6` | 同上 |
-| 画像里 `auction-match.source.v1` 的 `max_attempts` | `6` | `src/rquant/runtime_production_profile.py` |
+| `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS` | `6` | 同上 |
 | `AUCTION_GAP_DEFAULT_INPUT_START` | `09:35:00` | `src/rquant/runtime_builder_candidate.py` |
 | `AUCTION_GAP_DEFAULT_INPUT_END` | `10:10:00` | 同上 |
+
+尝试次数只有 `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS` 这一处：设置模型的默认值、生产画像写进
+manifest 的那一项、route B 第一次安装时的自举派生
+（`runtime_authority_stage.bootstrap_settings`）**三处都读它**。原来画像与自举各写一个字面量
+`3`，只改一边会让第一次安装装出来的次数与画像说的不是一个数，
+`test_blk3_derived_settings_agree_with_the_production_profile_field_by_field` 逐字段比对时当场红。
 
 间隔由 `窗宽 // max_attempts` 推出来：`1800 // 6 = 300` 秒，六次到期时刻是
 **09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00**，全部落在 `[09:35, 10:05)` 里，最后一次

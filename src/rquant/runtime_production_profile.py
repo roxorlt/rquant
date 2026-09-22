@@ -829,6 +829,20 @@ def _strategy_service_id(strategy_id: str) -> str:
     return f"strategy.{strategy_id}.v1"
 
 
+def _auction_match_max_attempts() -> int:
+    """采集次数取 `runtime_service_builtin` 的常量，这个模块不再写第二份字面量（#277）。
+
+    `runtime_authority_stage.bootstrap_settings` 把这一项的表达式**重述**一遍（route B 的
+    自举派生），而 `test_blk3_derived_settings_agree_with_the_production_profile_field_by_field`
+    逐字段比对两者：两处各写一个 `3` 的时候，把画像那份改成 6 就当场红。函数内 import 与
+    四常量一致性闸取窗的方式相同，这个模块不在 import 期依赖 builtin。
+    """
+
+    from rquant.runtime_service_builtin import AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS
+
+    return int(AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS)
+
+
 def _candidate_root(root: Path, strategy_id: str) -> Path:
     return root / "live" / "candidates" / _instance_name(_candidate_service_id(strategy_id))
 
@@ -1269,10 +1283,8 @@ def build_production_runtime_profile(
                 "calendar_expected_commit": config.market_calendar_producer_commit,
                 "calendar_content_sha256": config.market_calendar_content_sha256,
                 "universe_path": str(root / "authorities" / "auction-universe" / "current.json"),
-                #: 六次，与 `AuctionMatchSourceSettings.max_attempts` 的默认值一致：09-22 的
-                #: 探测只圈出了 09:26:08（空）到 09:51:11（非空）这个区间，所以用次数盖住
-                #: 整个 09:35-10:05 的窗，间隔推出来是 300 秒（#277）。
-                "max_attempts": 6,
+                #: 次数是常量不是字面量：route B 的自举派生也写这一项，两处必须同源（#277）
+                "max_attempts": _auction_match_max_attempts(),
             },
         ),
     ]
