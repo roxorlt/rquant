@@ -864,7 +864,15 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
             "serving_authority_root": str(notifier_root / "serving-authority"),
             "page_projection_database_path": str(database),
             "page_projection_surge_live_root": str(database.parent / "surge_live"),
-            "paused": True,
+            #: the production profile's default delivery mode is `shadow` (#281), and this
+            #: derivation restates it rather than route B keeping its own answer: the
+            #: notifier does every bit of the live work -- replicate, lease, write the
+            #: attempt rows, publish a non-empty `signals` authority -- with the transport
+            #: suppressed. `paused` is the emergency stop and stays off; dropping
+            #: `suppress_delivery` here would leave route B sending for real, because the
+            #: field's own default is False.
+            "paused": False,
+            "suppress_delivery": True,
         },
         "paper-constraint.market.v1": {
             "minute_spool_root": str(minute_root),
@@ -953,6 +961,11 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
                     "root": str(reference_spool / "serving-authority"),
                 },
             ],
+            #: named here rather than left to the field's default, for the same reason the
+            #: production profile names it (#283): which sources may degrade is a manifest
+            #: decision. The two research-plane publishers have never cut a generation on
+            #: the host, and before this the whole round refused over their absence.
+            "optional_source_datasets": ["lab_jobs", "promotions"],
         },
     }
     for strategy in strategies:
