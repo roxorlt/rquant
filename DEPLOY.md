@@ -5,6 +5,206 @@
 
 ---
 
+## 2026-09-21 · 待安装 · notifier 影子档（#281）——写库、出信号、不发一个字节
+
+**状态**：**尚未安装**，`deploy/` 一个字没动。notifier 的档位从代码里的硬编码
+`"paused": True` 改成画像输入 `notifier_delivery_mode`，三档：
+
+| 档位 | manifest 里的两个布尔 | 行为 |
+|---|---|---|
+| `paused` | `paused=True`、`suppress_delivery=False` | 急停：不复制、不认领、不投递；仍发布一份空的 `signals` 权威 |
+| `shadow`（**默认**） | `paused=False`、`suppress_delivery=True` | live 分支原样跑：复制路由回执、按 live 节奏消耗 outbox、写 attempt 行、发布非空 `signals` 权威；**不向 PushDeer / PushPlus 发一个字节** |
+| `live` | 两个都 `False` | 同上，并且真发 |
+
+影子档的两个标记（值班的人只认这两个）：
+
+- 心跳 `degraded_reasons` 里有 `notifier:shadow_transport`；
+- `delivery_attempt.provider_receipt` 以 `shadow:` 开头。
+
+看到这两个就是没发出去；两个都没有、`degraded_reasons` 干净，才是真的在发。
+
+### 影子档看不见什么（切 live 之前必须知道）
+
+影子档下**凭据、收件人解析、别名迁移、preflight 全是真的**：凭据配错、收件人不在
+capability 里、凭据仓库读不到，这几类失败在 shadow 下与 live 逐字相同（对照实测过）。
+
+**唯一看不见的是线那一头的回答。** `SuppressedNotificationProvider.deliver()` 不会抛，
+所以影子档**永远不会**产生 `notifier:confirmed_failures:*` 或 `notifier:unknown_outcomes:*`——
+「对端拒收」「网络超时」这两类在影子档下构造不出来。也就是说：
+
+> 影子档跑得再干净，切 live 的第一轮仍然可能是投递失败第一次出现的时刻。
+
+切 live 之后的第一轮心跳要专门看这两个字符串。
+
+### 档位写在哪儿
+
+发布器不吃命令行档位参数。它读的是 `RQUANT_RUNTIME_PRODUCTION_INPUTS` 指的那份输入文档
+（生产机上是 `/home/lighthouse/rquant/data/runtime-production-inputs.json`），用
+`rquant runtime-production-profile --inputs <该文档>` 重新生成画像并安装
+（`src/rquant/ops/production_deploy.py:576-700`）。所以**改档位 = 改那份输入文档里的
+`notifier_delivery_mode`，然后发一次版**。
+
+两种改法，二选一：
+
+```bash
+ROOT=/home/lighthouse/rquant
+INPUTS="${ROOT}/data/runtime-production-inputs.json"
+
+# 改法 A：只改一个键（推荐，其余字段一个字不动）
+python - "$INPUTS" <<'EOF'
+import json, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["notifier_delivery_mode"] = "live"      # paused / shadow / live
+path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+EOF
+
+# 改法 B：整份重新生成（四十来个参数都要给全，只在本来就要重生成时用）
+python scripts/build_runtime_production_inputs.py \
+    --notifier-delivery-mode live \
+    --checkout "${ROOT}" \
+    --calendar-database ... --output-root ... --inputs-output "$INPUTS" \
+    ...（其余参数照 docs/production-release.md 那一份）
+```
+
+改完 `git diff` / `jq .notifier_delivery_mode "$INPUTS"` 确认只动了这一个键。
+
+> ⚠️ **但光改这份文档，现在的发布器发不出去（#284）。**
+> `deploy-production.sh` 只认 target tag：当 target 解析出来的 SHA 与已部署的 SHA 相同时，
+> `deploy()` 在 `src/rquant/ops/production_deploy.py:1580-1607` 提前 return `already_current`，
+> 那条路上**只跑一次 `rquant preflight`**——不重新生成画像、不装新一代、不 rollout、不重启。
+> 输入文档改没改，它根本不看（变更清单来自 `git diff --name-only <旧 SHA>..<新 SHA>`，
+> `:1616-1623`）。所以改完文档再跑一次同一个 tag，命令会成功返回，主机却什么都没变。
+>
+> 下面「切正式」的第 ② 步与「回滚情况二」的第 ③ 步**都卡在这一点上，#284 修好之前不要照着敲**。
+
+
+### 切正式（shadow → live）
+
+**「安全」指的是不会有告警风暴，不是指随时可以切。** 影子档一直在消耗 outbox、复制游标一直在
+前进，所以第一轮 live 只会看到「从现在起」的新信号，没有积压可推——这一点已实测。
+
+**时间规矩：开盘前或收盘后切。** 理由是档位这种 role settings **只有在 unit 重启之后才生效**，
+而盘中重启 `rquant-notifier` 会在告警链路上开一个口子。（发布器对**代码发布**有一条
+09:15–15:10 的保护窗，`production_deploy.py:507-511` / `:1631-1636`；但它是按
+`git diff` 出来的变更清单判的，**只改输入文档时那张清单是空的，保护窗根本不会触发**——
+所以这条时间规矩现在靠人守，不靠工具拦。）
+
+**当前状态：② 卡住（#284）。** 步骤先写在这里，等 #284 修好再执行：
+
+```bash
+ROOT=/home/lighthouse/rquant
+cd "${ROOT}"
+export RQUANT_RUNTIME_PRODUCTION_INPUTS="${ROOT}/data/runtime-production-inputs.json"
+export RQUANT_RUNTIME_PROFILE_OUTPUT_DIR="${ROOT}/data/runtime-profiles"
+export RQUANT_RUNTIME_ROOT="${ROOT}/data/runtime"
+
+# ① 把输入文档里的 notifier_delivery_mode 改成 live（见上一节）—— 这一步现在就能做
+# ② 【#284 修好前不可用】发一次版让新画像装上去并重启 notifier
+#    bash scripts/deploy-production.sh --target <当前 tag>
+#    ← target 与已部署 SHA 相同 ⇒ already_current ⇒ 只跑 preflight，什么都不会变
+```
+
+在 #284 修好之前，② 有三条替代路，都需要 owner 单独授权（#284 正文里列的就是这三条）：
+
+1. 让这次档位切换跟着一个**新 tag**走（哪怕是一个空提交），发布器就会正常重新生成并安装画像；
+2. 按发布器内部步骤**人工执行**（`rquant runtime-production-profile` →
+   `runtime-deployment-profile-apply` → `runtime-deployment-rollout` → 重启 notifier）——
+   绕开审计路径，必须逐次授权；
+3. 等 #284 把「输入文档变了」变成发布器认得的一种变更（推荐，单独开包做）。
+
+验收（不管走哪条路，切完都要看）：
+
+1. 第一轮心跳里 `notifier:shadow_transport` 消失；
+2. 新写入的 `delivery_attempt.provider_receipt` 不再以 `shadow:` 开头；
+3. **专门看 `notifier:confirmed_failures:*` / `notifier:unknown_outcomes:*`**（见前面那一节）；
+4. 手机上只应收到切换之后产生的信号。
+
+### paused → live（**不要这么切**）
+
+急停档下复制游标从来没前进过，第一轮 live 会从 `cursor.last_global_sequence` 开始把攒下的
+整条 spool 一次认领，按 `batch_limit=128` / `interval_seconds=2` 一轮轮推——就是 #86
+修过的那一类告警风暴，唯一的闸是信号自己的 `expires_at`。两条合法路径：
+
+- **先切 shadow**，等心跳的 `backlog_count` 回到 0，再切 live；
+- 或者**开盘前**切，并人工确认 spool 里没有未过期的积压。
+
+### 回滚（**主动回滚必须连画像一起回**；自动回滚一般会回画像，但有例外）
+
+新画像的 notifier manifest 多了一个 `suppress_delivery` 键，输入文档多了一个
+`notifier_delivery_mode` 键。两个模型都是 `RuntimeContractModel`（`extra="forbid"`），
+所以 **v0.33.16 及更早的代码读不了新画像**，实测：
+
+```
+NotifierSettings（v0.33.16）  ← {"suppress_delivery": True, ...}
+  ValidationError: suppress_delivery / extra_forbidden / Extra inputs are not permitted
+ProductionRuntimeProfileInputs（v0.33.16） ← {"notifier_delivery_mode": "shadow", ...}
+  ValidationError: notifier_delivery_mode / extra_forbidden / Extra inputs are not permitted
+```
+
+（`main` 现在的 tag 是 **v0.33.16**（`16b76a5b`），它里面 `suppress_delivery` 出现 0 次、
+`"paused": True` 仍硬编码在 `runtime_production_profile.py:1722`；本包发出来是 **v0.33.17**
+的内容。v0.33.15 同样读不了，结论对这两个 tag 都成立。）
+
+影响范围是**一个 role**：`RuntimeServiceManifest.settings` 的类型是
+`Mapping[str, JsonValue]`，装机与权威链校验都不看键名，所以整代画像仍然装得上、其余
+role 照跑；炸的是 `rquant-notifier` 起不来（builder 在
+`runtime_builder_signal.py:965` 校验 `NotifierSettings`）。
+
+**情况一：主动回滚（正向发到旧 tag）。** 发布器会用旧代码重新生成画像，而旧代码读到输入文档里的
+`notifier_delivery_mode` 会被拒，所以**先把这个键从输入文档里删掉**：
+
+```bash
+# ① 从输入文档里删掉 notifier_delivery_mode
+python - "$RQUANT_RUNTIME_PRODUCTION_INPUTS" <<'EOF'
+import json, sys, pathlib
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc.pop("notifier_delivery_mode", None)
+path.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+EOF
+
+# ② 再回代码（发布器会用旧代码重新生成并安装画像）
+bash scripts/deploy-production.sh --target <上一个 tag>
+```
+
+顺序反了，中间那段时间 notifier 起不来。
+
+**情况二：一次失败发布触发了自动回滚。** 正常路径下**画像会跟着代码一起回**：
+`profile_applied` 为真时 `_rollback_runtime_profile`（`production_deploy.py:732-771`）会被调用
+（`:1414`、`:1725`），跑 `rquant runtime-deployment-rollback` 把那一代滚回去；
+`_deploy_runtime_profile` 在 `action == "rollback"` 时直接 return（`:568-575`）指的是
+「回滚不重新生成画像」，不是「回滚不回画像」。
+
+**但「新一代画像 + 旧代码」这个组合仍然可能出现**，已知的一条具体路径是加锁恢复：
+`:1408-1420` 只有在 `current_sha == intent.target_sha` 时才回滚画像，所以如果上一次崩溃
+已经把 checkout 退回 `previous_sha`（或有人手工 reset 过），恢复流程会**跳过画像回滚**，
+却仍然走 `_rollback_unmanaged` 的 `git reset --hard <previous_sha>`（`:1333`）。
+结果就是画像是新的、代码是旧的，其余 role 正常、只有 `rquant-notifier` 起不来。
+
+下面四步是幂等的，**先确认现象再动手**：
+
+```bash
+# ① 确认现象：notifier 反复启动失败，日志里是 suppress_delivery / extra_forbidden
+systemctl status 'rquant-runtime-notifier@*'
+journalctl -u 'rquant-runtime-notifier@*' -n 50 --no-pager | grep -i extra_forbidden
+
+# ② 按「情况一 ①」把 notifier_delivery_mode 从输入文档里删掉
+
+# ③ 【#284 修好前不可用】用回滚后那一版代码重新生成并安装画像
+#    bash scripts/deploy-production.sh --target <自动回滚落到的 tag>
+#    ← 自动回滚已经把 checkout reset 到这个 SHA，所以 target 与已部署 SHA 相同
+#      ⇒ already_current ⇒ 只跑 preflight，画像不会被重新生成
+#    替代路同「切正式」那三条，需 owner 单独授权
+
+# ④ 确认 notifier 起来了
+systemctl status 'rquant-runtime-notifier@*'
+```
+
+在 ③ 可用之前，盘中撞上这个状态的话 notifier 会一直起不来——**这正是不要在临近开盘时发版的理由**。
+
+---
+
 ## 2026-09-21 · 待安装 · rquant/live slice MemoryHigh 二次提额（#268、#271）
 
 **状态**：**尚未安装**。两个 `deploy/systemd/*.slice` 的 `MemoryHigh` 已于 2026-09-21 20:17 经

@@ -806,6 +806,7 @@ def build_inputs_payload(
     shadow_completion_active_public_key_pem: str,
     shadow_report_active_key_id: str,
     shadow_report_active_public_key_pem: str,
+    notifier_delivery_mode: str,
 ) -> dict[str, Any]:
     """Validate the whole document as a model, then hand back its canonical dump.
 
@@ -858,6 +859,7 @@ def build_inputs_payload(
         shadow_completion_active_public_key_pem=shadow_completion_active_public_key_pem,
         shadow_report_active_key_id=shadow_report_active_key_id,
         shadow_report_active_public_key_pem=shadow_report_active_public_key_pem,
+        notifier_delivery_mode=notifier_delivery_mode,
     )
     payload = inputs.model_dump(mode="json")
     payload["runtime_mode"] = runtime_mode
@@ -970,6 +972,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shadow-report-keyring", default=None)
     parser.add_argument("--shadow-report-active-key-id", default=None)
     parser.add_argument("--shadow-report-active-public-key-pem", default=None)
+    parser.add_argument(
+        "--notifier-delivery-mode",
+        choices=("paused", "shadow", "live"),
+        default="shadow",
+        help=(
+            "what the notifier does with a routed signal (#281).\n"
+            "  paused -- the emergency stop: replicate nothing, deliver nothing\n"
+            "  shadow -- the default: run the whole notifier, send nothing\n"
+            "  live   -- the same, sending to PushDeer/PushPlus\n"
+            "Read the cutover rule in DEPLOY.md before going from paused straight\n"
+            "to live: the first live iteration claims the whole accumulated spool."
+        ),
+    )
     parser.add_argument("--shadow-completion-keyring", default=None)
     parser.add_argument("--shadow-completion-active-key-id", default=None)
     parser.add_argument("--shadow-completion-active-public-key-pem", default=None)
@@ -1204,6 +1219,7 @@ def _run(arguments: argparse.Namespace) -> int:
         shadow_completion_active_public_key_pem=completion_public_key,
         shadow_report_active_key_id=report_key_id,
         shadow_report_active_public_key_pem=report_public_key,
+        notifier_delivery_mode=arguments.notifier_delivery_mode,
     )
     document = canonical_json_bytes(payload)
     strict_canonical_json_loads(document)

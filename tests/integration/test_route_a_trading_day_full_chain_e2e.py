@@ -577,57 +577,20 @@ def confirm_deliveries_without_the_network(monkeypatch: pytest.MonkeyPatch) -> _
     return recorder
 
 
-def unpause_the_notifier(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Build the same profile with `notifier.admin.shadow.v1` active instead of paused.
-
-    `build_production_runtime_profile` hard-codes `"paused": True` for the notifier
-    (`runtime_production_profile.py`, the `notifier` manifest). That is a deliberate
-    shadow-rollout stance -- the service is named `.shadow.` -- and its consequence is
-    measured by this file rather than assumed: a paused notifier never calls
-    `store.replicate`, so it never writes an outbox row, and the `signals` serving
-    authority it publishes from its own store stays empty for ever. Serving reads that
-    authority for its `signals` dataset, so on the host as shipped a signal reaches the
-    paper broker and stops there.
-
-    Flipping one setting and letting the profile rebuild itself -- the model recomputes
-    `profile_id` from its own content when it is None -- gives a second, fully consistent
-    world in which the last two hops can be measured. Nothing else differs, so a
-    difference between the two fixtures is a difference this one flag makes.
-    """
-
-    import rquant.runtime_production_profile as production_profile
-
-    real_build = production_profile.build_production_runtime_profile
-
-    def build_with_an_active_notifier(inputs: Any) -> Any:
-        profile = real_build(inputs)
-        manifests = []
-        for manifest in profile.manifests:
-            if manifest.service_kind.value == "notifier":
-                settings = dict(manifest.settings)
-                assert settings["paused"] is True, settings["paused"]
-                settings["paused"] = False
-                manifest = manifest.model_copy(update={"settings": settings})
-            manifests.append(manifest)
-        rebuilt = dict(profile.model_dump(mode="python"))
-        rebuilt["manifests"] = manifests
-        #: None makes the model recompute the id over the content it now has
-        rebuilt["profile_id"] = None
-        return type(profile).model_validate(rebuilt)
-
-    monkeypatch.setattr(
-        production_profile,
-        "build_production_runtime_profile",
-        build_with_an_active_notifier,
-    )
-
-
 def build_trading_day_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     minute_history_parquet: bytes,
+    *,
+    notifier_delivery_mode: str = "shadow",
 ) -> RouteAWorld:
     """Two acknowledged generations on an open day, with all four inputs real.
+
+    `notifier_delivery_mode` is the #281 profile input, and it is set here rather than by
+    editing the built manifest: the three worlds below differ by one value in the inputs
+    document, and everything between that value and the notifier's behaviour -- the
+    generator, `build_production_runtime_profile`, the manifest, `NotifierSettings` -- is
+    the production path. The default is the profile's own default, `shadow`.
 
     Package J's `cold_chain` with three changes, each one forced by the premise:
 
@@ -660,6 +623,7 @@ def build_trading_day_chain(
             target.chmod(mode)
         return inputs.model_copy(
             update={
+                "notifier_delivery_mode": notifier_delivery_mode,
                 "shadow_completion_active_key_id": authority.keyring.active_key_id,
                 "shadow_completion_active_public_key_pem": public_key_pem,
                 "routing_policy_fingerprint": hashlib.sha256(policy_payload).hexdigest(),
@@ -737,14 +701,47 @@ def trading_day_chain(
     monkeypatch: pytest.MonkeyPatch,
     minute_history_parquet: bytes,
 ) -> RouteAWorld:
-    """The world exactly as the production profile builds it, notifier paused and all."""
+    """The world with the notifier on its emergency stop, `notifier_delivery_mode=paused`.
 
-    return build_trading_day_chain(tmp_path, monkeypatch, minute_history_parquet)
+    This was the shipped profile until #281 made the mode an input; it is now the mode an
+    operator selects to stop the notifier dead. The negative half of this file uses it
+    because a paused notifier is the cheapest of the three and none of those cases is
+    about the notifier.
+    """
+
+    return build_trading_day_chain(
+        tmp_path,
+        monkeypatch,
+        minute_history_parquet,
+        notifier_delivery_mode="paused",
+    )
 
 
 @pytest.fixture
 def delivery_recorder(monkeypatch: pytest.MonkeyPatch) -> _RecordingProvider:
     return confirm_deliveries_without_the_network(monkeypatch)
+
+
+@pytest.fixture
+def shadow_notifier_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minute_history_parquet: bytes,
+    delivery_recorder: _RecordingProvider,
+) -> RouteAWorld:
+    """The world as the production profile now builds it by default: shadow.
+
+    The recorder is installed here for the same reason it is installed for the live world
+    -- it is the provider that *can* speak. In this world it is then replaced by the
+    shadow transport inside the notifier, and the case asserts it was never called.
+    """
+
+    return build_trading_day_chain(
+        tmp_path,
+        monkeypatch,
+        minute_history_parquet,
+        notifier_delivery_mode="shadow",
+    )
 
 
 @pytest.fixture
@@ -754,10 +751,14 @@ def active_notifier_chain(
     minute_history_parquet: bytes,
     delivery_recorder: _RecordingProvider,
 ) -> RouteAWorld:
-    """The same world with the one flag flipped, so the last two hops can be measured."""
+    """The same world sending, so the last two hops can be measured with a delivery."""
 
-    unpause_the_notifier(monkeypatch)
-    return build_trading_day_chain(tmp_path, monkeypatch, minute_history_parquet)
+    return build_trading_day_chain(
+        tmp_path,
+        monkeypatch,
+        minute_history_parquet,
+        notifier_delivery_mode="live",
+    )
 
 
 def manifest_of(route: RouteAWorld, service_id: str) -> Any:
@@ -808,6 +809,15 @@ def credentials_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, Path]:
     return deliver_credentials(trading_day_chain, tmp_path / "credentials", monkeypatch)
+
+
+@pytest.fixture
+def credentials_root_shadow(
+    shadow_notifier_chain: RouteAWorld,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Path]:
+    return deliver_credentials(shadow_notifier_chain, tmp_path / "credentials", monkeypatch)
 
 
 @pytest.fixture
@@ -1170,6 +1180,26 @@ def notification_counts(route: RouteAWorld) -> dict[str, int]:
     )
 
 
+def notification_attempt_receipts(route: RouteAWorld) -> tuple[str, ...]:
+    """Every provider receipt the notifier's own attempt log holds.
+
+    `shadow:` in front of each of them is one of the two marks of a shadow notifier (the
+    other is `notifier:shadow_transport` on the heartbeat), and the mark is what tells a
+    later reader of this database that those deliveries never left the host.
+    """
+
+    path = setting_of(route, "notifier.admin.shadow.v1", "notification_state_path")
+    if not path.is_file():
+        return ()
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT provider_receipt FROM delivery_attempt WHERE provider_receipt IS NOT NULL"
+            )
+        )
+
+
 def serving_generations(route: RouteAWorld) -> tuple[Path, ...]:
     root = setting_of(route, "serving.publisher.v1", "serving_root") / "generations"
     if not root.is_dir():
@@ -1437,7 +1467,7 @@ def serving_signal_rows(route: RouteAWorld, *, session: date | None = TRADE_DATE
             #: instant is a binder error. Zero rows in total is zero rows in any session.
             #:
             #: **This guard is load-bearing, not an optimisation.** Delete it and
-            #: `test_the_shipped_profile_stops_the_signal_at_the_paper_broker` fails with
+            #: `test_the_paused_notifier_stops_the_signal_at_the_paper_broker` fails with
             #: `Binder Error: Cannot compare values of type INTEGER and type TIMESTAMP
             #: WITH TIME ZONE`, because a paused notifier is exactly the case that leaves
             #: this table empty. The operator command in the package report spells the
@@ -1498,9 +1528,11 @@ def test_one_signal_travels_the_whole_chain_to_a_same_day_serving_generation(
     role, built by the real builder out of the real manifest, inside the sandbox its own
     unit describes. Every assertion below is about what that role left behind.
 
-    The notifier is active here rather than paused, which is the one setting this world
-    changes and the reason it is a separate fixture; the case after this one measures what
-    the shipped profile does instead.
+    The notifier is `live` here, which is one value of one input (#281), and the two cases
+    after this one run the identical world on the other two: `shadow`, which is what the
+    profile now builds by default, and `paused`, the emergency stop. The three differ by
+    that value and nothing else, so a difference between them is a difference the mode
+    makes.
     """
 
     route = active_notifier_chain
@@ -1563,27 +1595,99 @@ def test_one_signal_travels_the_whole_chain_to_a_same_day_serving_generation(
     )
 
 
-def test_the_shipped_profile_stops_the_signal_at_the_paper_broker(
+def test_the_shadow_mode_notifier_writes_every_row_and_sends_nothing(
+    shadow_notifier_chain: RouteAWorld,
+    credentials_root_shadow: dict[str, Path],
+    delivery_recorder: _RecordingProvider,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#281 shadow: the same chain as the live case, with nothing on the wire.
+
+    This is the profile's default, so it is the answer to "what does the host do on
+    2026-09-23 if nobody changes anything". Every row the live case produces is produced
+    here -- the route receipts replicated into the notifier's own store, the outbox rows,
+    the leased attempts, a `signals` serving authority carrying this session's signal --
+    and the one thing that does not happen is the send.
+
+    The recorder is the provider that can speak, installed by the same fixture the live
+    case uses, and it is asserted empty: not "the transport was configured away" but "the
+    thing that would have talked was never called". The heartbeat says
+    `notifier:shadow_transport`, so no operator reading it can mistake this for a live
+    notifier that happened to have nothing to deliver.
+
+    The `signals` assertion is filtered by `event_time` rather than counted (MF-3): the
+    authority carries a rolling history, so a non-empty table alone would not say that
+    today's signal is in it.
+    """
+
+    route = shadow_notifier_chain
+    assert manifest_of(route, "notifier.admin.shadow.v1").settings["suppress_delivery"] is True
+    assert manifest_of(route, "notifier.admin.shadow.v1").settings["paused"] is False
+
+    publish_minute_batch(route)
+    publish_candidates(route)
+
+    hops: list[Hop] = []
+    drive_the_chain(route, credentials_root_shadow, hops=hops)
+    _print_hops(capsys, hops)
+    _assert_every_role_stayed_inside_its_unit(hops)
+
+    #: the first four hops are the live ones
+    assert runner_signal_count(route, N_SHAPE_SERVICE_ID) >= 1
+    assert signal_bus_counts(route)["signal_envelope"] >= 1
+    assert paper_fill_count(route) >= 1
+
+    #: the notifier did all of its work
+    notifications = notification_counts(route)
+    assert notifications["notification_source_route_receipt"] >= 1, notifications
+    assert notifications["delivery_outbox"] >= 1, notifications
+    assert notifications["delivery_attempt"] >= 1, notifications
+
+    #: and none of it reached a provider that could have spoken
+    assert delivery_recorder.deliveries == [], delivery_recorder.deliveries
+
+    notifier = next(hop.run for hop in hops if hop.label == "notifier")
+    assert "notifier:shadow_transport" in (notifier.heartbeat.degraded_reasons or ()), (
+        notifier.heartbeat.degraded_reasons
+    )
+    assert "notifier:paused" not in (notifier.heartbeat.degraded_reasons or ())
+
+    #: every receipt in the attempt log is a shadow receipt
+    receipts = notification_attempt_receipts(route)
+    assert receipts, "the notifier claimed nothing"
+    assert all(receipt.startswith("shadow:") for receipt in receipts), receipts
+
+    #: and serving published this session's signal
+    assert len(serving_generations(route)) == 1
+    assert serving_current(route) is not None
+    assert serving_signal_rows(route, session=TRADE_DATE) >= 1, (
+        "the shadow notifier published a generation with no signal from this session"
+    )
+
+
+def test_the_paused_notifier_stops_the_signal_at_the_paper_broker(
     trading_day_chain: RouteAWorld,
     credentials_root: dict[str, Path],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The same chain on the profile as shipped, where `notifier` is `paused: True`.
+    """`notifier_delivery_mode="paused"`: the emergency stop, measured.
 
-    This is not a smaller version of the case above: it is the production answer. The
-    first four hops are identical -- the signal is emitted, routed, and booked -- and then
-    the notifier, being paused, replicates nothing, writes no outbox row, and publishes a
-    `signals` serving authority built from its own empty store. Serving still cuts a
-    generation, because five of its six sources moved, and that generation carries **no
-    signal**.
+    This was the shipped behaviour until #281 made the mode an input, and it is what an
+    operator now selects deliberately. The first four hops are identical -- the signal is
+    emitted, routed, and booked -- and then the notifier, being paused, replicates
+    nothing, writes no outbox row, and publishes a `signals` serving authority built from
+    its own empty store. Serving still cuts a generation, because five of its six sources
+    moved, and that generation carries **no signal**.
 
-    So "a generation appears under `serving/generations/`" is true on the host as shipped
-    and "one signal travels the chain to serving" is not, and the difference is one
-    hard-coded flag. Asserted rather than described, so that the day the flag changes,
-    this case fails and says so.
+    So "a generation appears under `serving/generations/`" is true with the notifier
+    stopped and "one signal travels the chain to serving" is not. Asserted rather than
+    described, so the day the emergency stop stops stopping things, this case says so.
     """
 
     route = trading_day_chain
+    assert manifest_of(route, "notifier.admin.shadow.v1").settings["paused"] is True
+    assert manifest_of(route, "notifier.admin.shadow.v1").settings["suppress_delivery"] is False
+
     publish_minute_batch(route)
     publish_candidates(route)
 
@@ -1606,6 +1710,7 @@ def test_the_shipped_profile_stops_the_signal_at_the_paper_broker(
     assert "notifier:paused" in (notifier.heartbeat.degraded_reasons or ()), (
         notifier.heartbeat.degraded_reasons
     )
+    assert "notifier:shadow_transport" not in (notifier.heartbeat.degraded_reasons or ())
 
     #: serving published, and what it published has no signal in it
     assert len(serving_generations(route)) == 1

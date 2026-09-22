@@ -137,6 +137,21 @@ class ProductionRuntimeProfileInputs(RuntimeContractModel):
     artifact_retention_schema_authority_sha256: Sha256
     artifact_retention_recovery_target_manifest_id: Sha256
     artifact_retention_full_recovery_receipt_id: Sha256
+    #: #281. What the notifier does with a routed signal, and the only input that decides
+    #: whether a byte leaves the host for PushDeer or PushPlus.
+    #:
+    #: * `paused` -- the emergency stop. The role runs, replicates nothing, claims nothing
+    #:   and publishes a `signals` authority built from its own untouched store.
+    #: * `shadow` -- the default. The live branch with the transport suppressed: the route
+    #:   receipts are replicated, the outbox is consumed at the live cadence, the attempt
+    #:   rows are written with `shadow:` receipts, the `signals` authority is non-empty,
+    #:   and nothing is sent.
+    #: * `live` -- the same, sending.
+    #:
+    #: The default is `shadow` rather than `live` deliberately (package Z review, risk
+    #: (a)): a profile that defaults to sending would start sending on the next redeploy
+    #: of a host that never asked for it.
+    notifier_delivery_mode: Literal["paused", "shadow", "live"] = "shadow"
     schema_rollout_stage_timeout_seconds: PositiveSeconds = 600
     schema_consumer_ack_max_age_seconds: PositiveSeconds = 300
     schema_retire_observation_seconds: ObservationSeconds = 86_400
@@ -1719,7 +1734,8 @@ def build_production_runtime_profile(
                     )
                     else {}
                 ),
-                "paused": True,
+                "paused": config.notifier_delivery_mode == "paused",
+                "suppress_delivery": config.notifier_delivery_mode == "shadow",
             },
         )
     )
