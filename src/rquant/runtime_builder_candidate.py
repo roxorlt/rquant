@@ -83,14 +83,16 @@ _MAX_CANDIDATE_INPUT_BYTES = 16 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-#: 装配窗跟着 auction-match 的采集窗走（#277）。原来是 09:26-09:30，而采集窗现在是
-#: 09:35-10:05（09-22 探测圈出的可用区间：09:26:08 空、09:51:11 非空）——批次要到 09:35 之后
-#: 才可能出现，09:26-09:30 这段里永远没有料可装。
+#: 装配窗跟着 auction-match 的采集窗走（#277）。原来是 09:26-09:30，09-22 只圈出区间时是
+#: 09:35-10:10；09-23 的探测卡到首次可用时刻 T = 09:27:14（09:26:54 零行、09:27:14 六千余
+#: 行），采集窗因此收成 09:29-09:44，装配窗跟着收成 **09:29-09:49**。批次要到采集窗起点
+#: 之后才可能出现，起点之前这段里永远没有料可装。
 #: 起点与 `AUCTION_MATCH_DEFAULT_CAPTURE_START` 对齐，终点是
 #: `AUCTION_MATCH_DEFAULT_CAPTURE_END` 之后五分钟：最后一次采集成功之后仍有一整个
-#: 五秒轮次的余量把它装出来。09-23 探测把采集窗收紧时，这两项跟着一起改。
-AUCTION_GAP_DEFAULT_INPUT_START = time(9, 35)
-AUCTION_GAP_DEFAULT_INPUT_END = time(10, 10)
+#: 五秒轮次的余量把它装出来。再收窗时这两项跟着一起改，一致性由
+#: `auction_windows_are_consistent` 在生产画像生成时当场校验。
+AUCTION_GAP_DEFAULT_INPUT_START = time(9, 29)
+AUCTION_GAP_DEFAULT_INPUT_END = time(9, 49)
 #: #278 要求「每个交易日 09:15 之前重建一次」。08:45 给了半小时余量，而且落在
 #: `auction-universe.publisher.v1` 的 09:15-15:10 保护窗之前，读副本不跟它撞。
 SESSION_DOCUMENT_DEFAULT_START = time(8, 45)
