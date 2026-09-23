@@ -56,6 +56,7 @@ STOCK_BASIC_COLUMNS: tuple[str, ...] = (
     "list_status",
 )
 
+
 def _empty_stk_auction_frame() -> pd.DataFrame:
     """空结果的形状：零行，但八列俱全，再加上非空路径也会加的两列。"""
 
