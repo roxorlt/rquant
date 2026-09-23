@@ -502,6 +502,56 @@ def test_a_response_without_pre_close_is_a_visible_validation_failure(tmp_path: 
     assert records[0].envelope.row_count == 0
 
 
+def test_rows_without_an_auction_match_are_dropped_and_named_on_the_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """2026-09-23 现场：有几行没有竞价成交，整批就被拒了。
+
+    当天 09:35 的第一次尝试拿到了 6,077 行，其中 407 行 `price` 是 NaN（`vol` / `amount`
+    都是 0，即今天没有集合竞价成交）。网关当场把**整张表**判成
+    `validation_failed:required numeric values must be finite`，批次发成零行 DEGRADED，
+    `candidate.auction_gap` 于是整天看不到 PUBLISHED 批次。现在这些行被丢掉、其余照常发布，
+    丢了几行由心跳说出来。
+    """
+
+    raw = pd.concat(
+        [
+            _frame(),
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600289.SH",
+                        "trade_date": TRADE_DATE,
+                        "price": float("nan"),
+                        "vol": 0.0,
+                        "amount": 0.0,
+                        "pre_close": 4.42,
+                        "turnover_rate": 0.0,
+                        "volume_ratio": 0.0,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    adapter = _Adapter([raw])
+    step = auction_match_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: CAPTURE_AT,
+    )(_manifest(tmp_path))
+
+    result = step()
+
+    assert result.processed_count == 1
+    assert result.degraded_reasons == ("auction_match:rows_dropped_non_finite:1",)
+    records = _records(tmp_path)
+    assert len(records) == 1
+    assert records[0].envelope.quality_status is BatchQualityStatus.PUBLISHED
+    assert records[0].envelope.row_count == 2
+    #: PUBLISHED 的信封不许带降级理由，所以这条记录只在心跳上
+    assert records[0].envelope.degraded_reasons == ()
+
+
 # ---------------------------------------------------------------------------------------
 # 今天没采到，就一直说没采到
 # ---------------------------------------------------------------------------------------

@@ -542,7 +542,9 @@ def test_capture_lock_revalidates_path_after_waiting_for_flock(
         (pd.DataFrame([_row("BAD")]), "ts_code"),
         (pd.DataFrame([_row("600000.SH"), _row("600000.SH")]), "duplicate"),
         (pd.DataFrame([_row("600000.SH", price=True)]), "bool"),
-        (pd.DataFrame([_row("600000.SH", amount=np.inf)]), "finite"),
+        #: 必填列里的 ±inf / NaN 不在这张表里：那是**丢行**，见
+        #: `test_non_finite_required_rows_are_dropped_and_the_batch_still_publishes`。
+        #: 可选列里的 ±inf 仍然整批拒——可选列允许缺，不允许是个无穷大。
         (pd.DataFrame([_row("600000.SH", volume_ratio=np.inf)]), "finite"),
         (pd.DataFrame([_row("600000.SH", vol=-1)]), "nonnegative"),
         (pd.DataFrame([_row("600000.SH", price=0)]), "positive"),
@@ -594,7 +596,7 @@ def test_structural_errors_publish_an_empty_degraded_batch_that_names_them(
         (pd.DataFrame([_row("BAD")]), "ts_code"),
         (pd.DataFrame([_row("600000.SH"), _row("600000.SH")]), "duplicate"),
         (pd.DataFrame([_row("600000.SH", price=True)]), "bool"),
-        (pd.DataFrame([_row("600000.SH", amount=np.inf)]), "finite"),
+        (pd.DataFrame([_row("600000.SH", volume_ratio=np.inf)]), "finite"),
         (pd.DataFrame([_row("600000.SH", vol=-1)]), "nonnegative"),
         (pd.DataFrame([_row("600000.SH", price=0)]), "positive"),
     ],
@@ -651,6 +653,134 @@ def test_optional_metrics_allow_nan_and_round_trip(tmp_path: Path) -> None:
     restored = gateway.decode_payload(gateway.spool.read_payload(_records(gateway)[0]))
     assert pd.isna(restored.loc[0, "turnover_rate"])
     assert pd.isna(restored.loc[0, "volume_ratio"])
+
+
+def _no_match_row(ts_code: str) -> dict[str, object]:
+    """2026-09-23 生产现场里「今天没有集合竞价成交」的那种一行。
+
+    当天 `stk_auction(20260923)` 的 6,077 行里有 407 行长这样：`price` 是 NaN，同一行的
+    `vol` 与 `amount` 都是 0，`pre_close` 反而是有数的（例：`600289.SH price=NaN vol=0
+    amount=0 pre_close=4.42 turnover_rate=0.0 volume_ratio=0.0`）。整张表因此被判
+    `required numeric values must be finite`，批次发成零行 DEGRADED。
+    """
+
+    return _row(ts_code, price=np.nan, vol=0.0, amount=0.0, pre_close=4.42,
+                turnover_rate=0.0, volume_ratio=0.0)
+
+
+def test_non_finite_required_rows_are_dropped_and_the_batch_still_publishes(
+    tmp_path: Path,
+) -> None:
+    """必填数值不是有限数的那些行丢掉，剩下的照常发布（2026-09-23 现场）。
+
+    三行被丢：一行 `price` 是 NaN（当天真实形状），一行 `pre_close` 是 NaN，一行 `amount`
+    是 +inf。三行的代码都不在竞价全集里——停牌到今天的票昨天没有日线，而全集正是
+    「昨天有日线的代码」。于是覆盖率不受影响，批次是 PUBLISHED，下游
+    `candidate.auction_gap` 读得到它。
+    """
+
+    raw = pd.DataFrame(
+        [
+            _row("000001.SZ"),
+            _row("600000.SH"),
+            _no_match_row("600289.SH"),
+            _row("300001.SZ", pre_close=np.nan),
+            _row("002001.SZ", amount=np.inf),
+        ]
+    )
+    gateway = _gateway(tmp_path, lambda _: raw)
+
+    capture = gateway.capture_once(
+        trade_date=TRADE_DATE,
+        received_at=RECEIVED,
+        expected_codes=EXPECTED,
+    )
+
+    assert capture.rows_dropped_non_finite == 3
+    assert capture.observed_count == 2
+    assert capture.coverage_ratio == 1.0
+    assert capture.pointer.quality_status is BatchQualityStatus.PUBLISHED
+    envelope = _records(gateway)[0].envelope
+    assert envelope.row_count == 2
+    #: PUBLISHED 的信封不许带 degraded_reasons（`BatchEnvelope` 的不变量），所以丢行这件事
+    #: 记在采集结果上、由心跳那一层说出来，见 test_auction_match_runtime_source.py
+    assert envelope.degraded_reasons == ()
+    restored = gateway.decode_payload(gateway.spool.read_payload(_records(gateway)[0]))
+    assert tuple(restored["ts_code"].astype(str)) == EXPECTED
+
+
+def test_a_dropped_row_inside_the_universe_costs_coverage(tmp_path: Path) -> None:
+    """丢的那一行若在全集里，覆盖率照跌——覆盖率那条规则一个字都没有放宽。
+
+    生产上这正是要盯的数：全集是「昨天有日线的代码」，今天停牌的票仍在全集里。全集里被丢
+    掉的行数超过 `1 - min_coverage_ratio`（默认 0.95，即 5%）时，批次是 DEGRADED，
+    `candidate.auction_gap` 照旧读不到 PUBLISHED 批次。
+    """
+
+    raw = pd.DataFrame([_row("000001.SZ"), _no_match_row("600000.SH")])
+    gateway = _gateway(tmp_path, lambda _: raw)
+
+    capture = gateway.capture_once(
+        trade_date=TRADE_DATE,
+        received_at=RECEIVED,
+        expected_codes=EXPECTED,
+    )
+
+    assert capture.rows_dropped_non_finite == 1
+    assert capture.observed_count == 1
+    assert capture.coverage_ratio == 0.5
+    assert capture.pointer.quality_status is BatchQualityStatus.DEGRADED
+    assert _records(gateway)[0].envelope.degraded_reasons == ("coverage_below_minimum",)
+
+
+def test_a_frame_where_every_row_is_non_finite_is_degraded_not_an_exception(
+    tmp_path: Path,
+) -> None:
+    """全是 NaN 的一张表走覆盖率那条路降级，不抛异常、不静默。"""
+
+    raw = pd.DataFrame([_no_match_row(code) for code in EXPECTED])
+    gateway = _gateway(tmp_path, lambda _: raw)
+
+    capture = gateway.capture_once(
+        trade_date=TRADE_DATE,
+        received_at=RECEIVED,
+        expected_codes=EXPECTED,
+    )
+
+    assert capture.rows_dropped_non_finite == 2
+    assert capture.observed_count == 0
+    assert capture.pointer.quality_status is BatchQualityStatus.DEGRADED
+    reasons = _records(gateway)[0].envelope.degraded_reasons
+    assert "coverage_below_minimum" in reasons
+    assert not any(reason.startswith("validation_failed:") for reason in reasons)
+    assert _records(gateway)[0].envelope.row_count == 0
+
+
+def test_normalize_capture_counts_the_rows_it_dropped() -> None:
+    """规范化那一层自己就把「丢了几行」交出来，覆盖率之外不改任何判据。"""
+
+    raw = pd.DataFrame(
+        [
+            _row("600000.SH"),
+            _no_match_row("000001.SZ"),
+            _row("300001.SZ", vol=np.inf),
+        ]
+    )
+
+    normalized = AuctionMatchGateway.normalize_capture(
+        raw,
+        trade_date=TRADE_DATE,
+        expected_codes=("600000.SH", "000001.SZ", "300001.SZ"),
+    )
+
+    assert normalized.rows_dropped_non_finite == 2
+    assert tuple(normalized.frame["ts_code"].astype(str)) == ("600000.SH",)
+    #: 只要表的老写法照旧
+    assert AuctionMatchGateway.normalize_frame(
+        raw,
+        trade_date=TRADE_DATE,
+        expected_codes=("600000.SH", "000001.SZ", "300001.SZ"),
+    ).equals(normalized.frame)
 
 
 def test_low_coverage_and_missing_required_are_degraded(tmp_path: Path) -> None:

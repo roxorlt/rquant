@@ -155,6 +155,39 @@ def auction_frame(*, drop: str | None = None) -> pd.DataFrame:
     return frame
 
 
+def auction_frame_with_unmatched_rows() -> pd.DataFrame:
+    """2026-09-23 生产报文的形状：正常行里混着几行「今天没有集合竞价成交」。
+
+    当天 `stk_auction(20260923)` 的 6,077 行里有 407 行 `price` 是 NaN，同一行的 `vol` 与
+    `amount` 都是 0、`pre_close` 有数（例：`600289.SH pre_close=4.42`）。整张表因此被判
+    `validation_failed:required numeric values must be finite`，批次发成零行 DEGRADED，
+    `candidate.auction_gap` 一整天读不到 PUBLISHED 批次（③a 当天没过）。
+    这两行的代码都不在竞价全集里——全集是「昨天有日线的代码」。
+    """
+
+    return pd.concat(
+        [
+            auction_frame(),
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": ts_code,
+                        "trade_date": TRADE_DATE,
+                        "price": float("nan"),
+                        "vol": 0.0,
+                        "amount": 0.0,
+                        "pre_close": pre_close,
+                        "turnover_rate": 0.0,
+                        "volume_ratio": float("nan"),
+                    }
+                    for ts_code, pre_close in (("600289.SH", 4.42), ("000004.SZ", 12.8))
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+
+
 def empty_auction_frame() -> pd.DataFrame:
     """09:26 三次「返回空」时适配器现在交出的形状：零行，八列俱全。"""
 
@@ -647,6 +680,50 @@ def test_the_auction_gap_publisher_assembles_todays_candidates_in_the_moved_wind
     )
     assert snapshot is not None
     assert snapshot.trade_date == TRADE_DATE
+    assert [row.candidate_id for row in snapshot.rows] == [CODE]
+
+
+def test_rows_without_an_auction_match_do_not_cost_the_day_its_candidates(
+    auction_world: ReplicaWorld,
+) -> None:
+    """2026-09-23 的现场与它应有的结局：几行没有成交，当天的候选照样装得出来。
+
+    当天 09:35 的第一次尝试真的拿到了 6,077 行（包 Y 的 `pre_close` 修复是有效的），却
+    因为其中 407 行必填数值是 NaN 而被整批拒，`candidate.auction_gap` 于是报
+    `auction_gap_input_unavailable`，watchlist / market-minute 一整天降级。现在这些行被丢掉，
+    批次照常 PUBLISHED，丢了几行由心跳说出来，候选链往下走。
+    """
+
+    publish_auction_universe(auction_world)
+    adapter = _AuctionAdapter([auction_frame_with_unmatched_rows()])
+
+    capture_heartbeat = run_auction_match(auction_world, adapter, now=CAPTURE_FIRST)
+
+    assert capture_heartbeat.last_error is None
+    assert capture_heartbeat.degraded_reasons == ("auction_match:rows_dropped_non_finite:2",)
+    records = auction_records(auction_world)
+    assert len(records) == 1
+    assert records[0].envelope.quality_status is BatchQualityStatus.PUBLISHED
+    assert records[0].envelope.row_count == 1
+    assert records[0].envelope.degraded_reasons == ()
+
+    heartbeat = assemble_auction_gap(auction_world)
+
+    assert heartbeat.last_error is None
+    assert heartbeat.degraded_reasons == ()
+    assert heartbeat.processed_count == 1
+    snapshot_root = auction_world.setting(AUCTION_GAP_SERVICE_ID, "snapshot_root")
+    settings = auction_world.manifest(AUCTION_GAP_SERVICE_ID).settings
+    snapshot = StrategyCandidateSnapshotSpool(snapshot_root).read_strategy_as_of(
+        CONSUME_AT,
+        strategy_id="auction_gap",
+        strategy_version="1",
+        definition_fingerprint=str(settings["definition_fingerprint"]),
+        executable_fingerprint=str(settings["executable_fingerprint"]),
+        candidate_schema_fingerprint=str(settings["candidate_schema_fingerprint"]),
+        static_feature_schema=settings["static_feature_schema"],
+    )
+    assert snapshot is not None
     assert [row.candidate_id for row in snapshot.rows] == [CODE]
 
 
