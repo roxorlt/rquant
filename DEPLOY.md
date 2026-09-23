@@ -368,8 +368,10 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   PUBLISHED（#289）。
   **批次若是 DEGRADED + `coverage_below_minimum`**：丢掉的行里落在竞价全集
   （`authorities/auction-universe/current.json` 的 `codes`）里的超过了全集的 5%
-  （`min_coverage_ratio` 默认 0.95，生产画像不写它）。09-23 那 407 行若全部在全集里，覆盖率
-  约 93%，就是这个结局——**装机前用当天的报文与全集求一次交集**，把这个数量出来。
+  （`min_coverage_ratio` 默认 0.95，生产画像不写它）。这个交集在主机上已经用 09-23 的报文量过：
+  全集 5,554 个代码，丢行之后留下来且在全集里的是 5,464 个，覆盖率 **5,464 / 5,554 = 98.4%**，
+  高于 0.95。所以某一天真出现这一条，说明当天停牌或无成交的票比 09-23 多出一大截，先拿当天报文
+  与全集重求一次交集再下结论，不要直接去改门槛。
 - **窗结束之后**：`rquant-runtime-auction-match@…` 的心跳 `degraded_reasons` 里会带
   **`capture_failed`**（试过但都没成）或 **`capture_missed`**（一次请求都没发出去——role 没
   起来、部署、watchdog 重启，或者竞价全集一直读不出来），一直带到次日。这正是 09-21 那天

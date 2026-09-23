@@ -206,9 +206,12 @@
   - 丢了几行记在 `AuctionMatchCapture.rows_dropped_non_finite` 上，由 runtime step 写进心跳
     `auction_match:rows_dropped_non_finite:<n>`。**不写进批次信封**：`BatchEnvelope` 不允许
     PUBLISHED 批次带 `degraded_reasons`，写进去就等于把批次判成 DEGRADED。
-  - **已知风险**：覆盖率的分母是竞价全集（前一交易日有日线的代码）。当天被丢的 407 个代码里若有
-    超过全集 5% 的票在全集里（今天停牌、昨天还有日线），丢行之后覆盖率约 93%，低于 0.95，批次
-    仍是 `coverage_below_minimum` 的 DEGRADED。装机前要用线上全集把这个数量出来，见 DEPLOY.md。
+  - **覆盖率在主机上量过，门槛不用动**：覆盖率的分母是竞价全集（前一交易日有日线的代码）。被丢的
+    行若大量落在全集里，丢行之后覆盖率可能跌破 0.95、批次仍是 `coverage_below_minimum` 的
+    DEGRADED——这是包 AD 交付时留下的疑问。协调者随后在主机上用 09-23 的报文与当天的竞价全集
+    求了交集：全集 5,554 个代码，丢行之后留下来且在全集里的是 5,464 个，覆盖率
+    **5,464 / 5,554 = 98.4%**，高于 0.95，所以 09-23 这份报文在本修复下发成 PUBLISHED。
+    `min_coverage_ratio` 因此保持 0.95 不改。
 - **采集窗按实测的首次可用时刻收紧（#277 的收尾）**：09-23 探测卡到 `stk_auction(20260923)`
   在 09:26:54 返回 0 行、09:27:14 返回 6,077 行，即 **T = 09:27:14**。
   `AUCTION_MATCH_DEFAULT_CAPTURE_START/END` 09:35/10:05 → **09:29/09:44**，
