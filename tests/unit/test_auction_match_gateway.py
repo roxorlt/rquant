@@ -664,8 +664,15 @@ def _no_match_row(ts_code: str) -> dict[str, object]:
     `required numeric values must be finite`，批次发成零行 DEGRADED。
     """
 
-    return _row(ts_code, price=np.nan, vol=0.0, amount=0.0, pre_close=4.42,
-                turnover_rate=0.0, volume_ratio=0.0)
+    return _row(
+        ts_code,
+        price=np.nan,
+        vol=0.0,
+        amount=0.0,
+        pre_close=4.42,
+        turnover_rate=0.0,
+        volume_ratio=0.0,
+    )
 
 
 def test_non_finite_required_rows_are_dropped_and_the_batch_still_publishes(

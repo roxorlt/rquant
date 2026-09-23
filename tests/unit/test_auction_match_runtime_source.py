@@ -215,7 +215,7 @@ def test_the_window_starts_after_the_measured_first_availability() -> None:
     assert time(9, 29) == AUCTION_MATCH_DEFAULT_CAPTURE_START
     assert time(9, 44) == AUCTION_MATCH_DEFAULT_CAPTURE_END
     #: 起点仍然晚于网关自己的 09:26 下限，也晚于 09-23 实测的 T
-    assert AUCTION_MATCH_DEFAULT_CAPTURE_START > time(9, 27, 14)
+    assert time(9, 27, 14) < AUCTION_MATCH_DEFAULT_CAPTURE_START
 
 
 def test_the_window_comes_from_settings_and_defaults_when_absent(tmp_path: Path) -> None:
