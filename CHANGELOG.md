@@ -218,6 +218,11 @@
   - **真数据演练脚本**：`scripts/reference_slow_dry_run.py --database <只读副本> --trade-date <已开盘的交易日>`
     用真实 `TushareAdapter` 跑一遍 stock_st、stock_basic L/D/P、副本里的前一日全集、adj_factor、suspend_d、
     事实装配、批次载荷与 serving 载荷，在任何写入之前停下（不写 spool、配额账本、注册表、权威）。
+  - **主机演练结果（协调者 2026-09-23 晚，只读）**：本分支代码加主机生产 venv，
+    `--trade-date 2026-09-23` 跑到底，最后一行 `DRY RUN OK`：`stock_basic` L 5,568 / D 338
+    （另跳过 1 行 `T600018.SH`）/ P 0，`adj_factor` 5,568 行，批次信封
+    `quality_status=published row_count=5554`，serving 载荷 `status=fresh`。演练用的是早已开盘的
+    09-23，证明不了次日 09:20 那一刻当日 `adj_factor` 已经入库（见 DEPLOY 同名一条）。
 
 - **auction-match 不再因为几行没有竞价成交就整批拒（#289，#277 同一条采集链、#280 同一轮上线）**：
   2026-09-23 09:35:00 第一次尝试拿到了 `stk_auction(20260923)` 的全部 6,077 行（#277 的

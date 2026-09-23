@@ -5,6 +5,41 @@
 
 ---
 
+## 2026-09-23 · 待安装 · 参考慢源第一次能发布（#293）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+
+**现象**：`reference-slow.source.v1` 从 09-14 起每个交易日 09:20 都失败，一次都没发布过
+（`stock_basic source is missing columns: delist_date`），`authorities/reference-slow` 一代都没有。
+serving 的 `reference_slow_authority` 是硬源，所以 serving 每一轮都整轮拒，③b 过不了。
+修了什么见 CHANGELOG `[Unreleased] / Fixed` 的 #293 一条。本版不改 spool、注册表、权威的
+落盘格式。
+
+**装机前的主机演练（协调者 2026-09-23 晚，只读，已做完）**：本分支代码加主机生产 venv 跑
+`scripts/reference_slow_dry_run.py --database /home/lighthouse/rquant/data/rquant_ro.duckdb --trade-date 2026-09-23`，
+最后一行 `DRY RUN OK`：`stock_basic` L 5,568 / D 338（另跳过 1 行 `T600018.SH`）/ P 0；
+`adj_factor` 5,568 行；批次信封 `quality_status=published row_count=5554`；serving 载荷
+`status=fresh`。演练不写任何地方。
+
+**装上之后当场应该看到什么**（每个交易日 09:20–09:25 的采集窗）：
+
+- **09:20 第一轮**：`journalctl -u 'rquant-runtime-reference-slow-source@*'` 里依次是 `stock_st`、
+  三次 `stock_basic`（L / D / P）、`Tushare adj_factor(by_date) 返回 N 行`、`suspend_d`。D 名单那一次
+  之后有一条 WARNING `skipped 1 row(s) with a non-canonical ts_code: T600018.SH`，这是**预期的记录，
+  不是故障**，每天都会有。
+- **随后**：`data/runtime/live/reference-slow/batches/` 下出现当日批次（此前这个目录下只有
+  `quota.sqlite3`），`reference-slow.publisher.v1` 发出 `authorities/reference-slow` 的第一代，
+  serving 不再因为 `reference_slow_authority` 整轮拒。
+- **若 09:20 那一次失败**：心跳 `degraded_reasons` 里挂 `capture_failed:<第一次失败的异常类名>`，
+  一直挂到换交易日（进程内状态，role 重启即清）。**当天救不回来**（#295）：之后每一轮都撞
+  `SourceQuotaConflictError: reference source attempt already exists`，这是已知限制，不是新故障，
+  原因看 journal 里第一次失败的那一条。最该先看的是 `adj_factor(by_date)`：演练用的是数据早已
+  齐全的 09-23，证明不了 09:20 那一刻当日复权因子已经入库（Tushare 文档写的是盘前 9:15–9:20
+  入库）；它若为空，报错是 `adj_factor source is missing columns`。
+
+**回滚**：回到 v0.33.19 就回到「每天 09:20 失败、心跳 09:25 起又是干净的」的状态；没有需要
+一起回的落盘文件。
+
 ## 2026-09-21 · 待安装 · 研究面两源缺席不再让 serving 整轮拒（#283）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。
