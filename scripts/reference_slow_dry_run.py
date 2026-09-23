@@ -280,8 +280,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calendar-commit", default=None)
     arguments = parser.parse_args(argv)
 
-    from rquant.adapter.tushare import TushareAdapter
+    import rquant
+    from rquant.adapter.tushare import STOCK_BASIC_COLUMNS, TushareAdapter
 
+    #: which checkout is actually imported: a PYTHONPATH pointing at the fixed tree must win
+    #: over the deployed editable install, and this line is how to tell
+    print(f"[0] code  rquant={Path(rquant.__file__).resolve().parent}")
+    print(f"  stock_basic fields={','.join(STOCK_BASIC_COLUMNS)}")
     adapter = TushareAdapter()
     calendar = None
     if arguments.calendar is not None:
