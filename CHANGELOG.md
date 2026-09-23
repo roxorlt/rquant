@@ -192,6 +192,33 @@
 
 ### Fixed
 
+- **参考慢源从来没有发布过一次：`stock_basic` 没要 `delist_date`，退市名单里还有一行历史代码（#293，包 AE）**：
+  serving 的 `reference_slow_authority` 是硬源（永远不是可选源），而主机上
+  `authorities/reference-slow` 一代都没有，于是 serving 每一轮都拒，③b 过不了。
+  - **生产证据（协调者 2026-09-23 只读核查）**：健康权威 09:20:20 记下
+    `reference-slow.source.v1` 的 `ReferenceSlowSourceError: stock_basic source is missing columns: delist_date`，
+    09:20:51 重试撞 `SourceQuotaConflictError: reference source attempt already exists: success`，
+    09:25 起心跳又是干净的。journal 里是 `stock_st(20260923)` 204 行、`stock_basic(list_status=L)`
+    5,568 行，然后就没有了。`live/reference-slow/` 下只有 `quota.sqlite3`，09-14/18/21/22 也一样。
+  - **缺陷一**：`TushareAdapter.stock_basic` 的 `fields` 里没有 `delist_date`，Tushare 只回点名的列，
+    参考慢源却把它当必需列。现在显式要（`STOCK_BASIC_COLUMNS`，其余列一个不少）；空结果也保持列齐全
+    （#277 同一类：零行又没有列的表会被校验读成「缺列」）。
+  - **缺陷二**：主机上补上 `delist_date` 重放，L 5,568 条、P 0 行（有列）都过，D 339 行因恰好一行
+    `T600018.SH 上港集箱(退)`（2006-10-20 退市、`market` 为空）过不了 ts_code 正则而整批拒。
+    现在 **D / P 名单里**代码不规范的行**跳过并计数**——这种代码不可能在前一交易日的日线全集里，
+    后面「stock_basic does not cover prior daily universe」那道覆盖检查照旧守着；**L 名单仍然严格拒**，
+    缺 `delist_date` 列、D 行缺 `delist_date` 值也仍然整批拒。跳过几行写进 journald 的 WARNING
+    （`skipped <n> row(s) with a non-canonical ts_code: T600018.SH`），**不写进批次信封也不写进心跳**：
+    那一行每天都在，写进心跳就等于参考慢源每个交易日都显示 `degraded`（#290 记的是 auction-match 的同一个问题）。
+  - **失败被洗掉（#277 同一类）**：09:20 失败之后，窗口外的早退轮次返回干净结果，`record_success`
+    在 09:25 把心跳洗回 running。现在一个交易日里只要失败过、而且当天没有采到批次，之后每一轮心跳都挂
+    `capture_failed:<第一次失败的异常类名>`，直到交易日切换（进程内状态，重启即清）。
+  - **重试救不回来（#295，未修）**：尝试号由（source、交易日、常量 `retry_ordinal`）确定，第一次尝试的
+    Tushare 调用都成功、校验失败之后，同一天后面每一轮都撞 `attempt already exists: success`——一天只有一次机会。
+  - **真数据演练脚本**：`scripts/reference_slow_dry_run.py --database <只读副本> --trade-date <已开盘的交易日>`
+    用真实 `TushareAdapter` 跑一遍 stock_st、stock_basic L/D/P、副本里的前一日全集、adj_factor、suspend_d、
+    事实装配、批次载荷与 serving 载荷，在任何写入之前停下（不写 spool、配额账本、注册表、权威）。
+
 - **auction-match 不再因为几行没有竞价成交就整批拒（#289，#277 同一条采集链、#280 同一轮上线）**：
   2026-09-23 09:35:00 第一次尝试拿到了 `stk_auction(20260923)` 的全部 6,077 行（#277 的
   `pre_close` 修复是有效的），其中 **407 行 `price` 是 NaN**（同一行 `vol` 与 `amount` 都是 0，
