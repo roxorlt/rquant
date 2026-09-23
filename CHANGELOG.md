@@ -192,6 +192,30 @@
 
 ### Fixed
 
+- **auction-match 不再因为几行没有竞价成交就整批拒（#289，#277 同一条采集链、#280 同一轮上线）**：
+  2026-09-23 09:35:00 第一次尝试拿到了 `stk_auction(20260923)` 的全部 6,077 行（#277 的
+  `pre_close` 修复是有效的），其中 **407 行 `price` 是 NaN**（同一行 `vol` 与 `amount` 都是 0，
+  `pre_close` 有数，即「今天没有集合竞价成交」），网关因此把整张表判成
+  `validation_failed:required numeric values must be finite`，批次 `00000000000000000000.json`
+  发成 `row_count 0` 的 DEGRADED，`candidate.auction_gap` 一整天报
+  `auction_gap_input_unavailable`，watchlist-quote / market-minute 跟着降级，③a 当天没过。
+  - 必填数值列（`price` / `vol` / `amount` / `pre_close`）里是 NaN 或 ±inf 的行现在**丢掉并计数**，
+    其余行照常规范化；PUBLISHED 还是 DEGRADED 仍然只由覆盖率（`min_coverage_ratio`，默认 0.95）
+    与必需代码两条规则决定，两条都没有放宽。缺列、重复代码、bool、负数、非正价格、可选列里的
+    ±inf 仍然整批拒。可选列（`turnover_rate` / `volume_ratio`）的 NaN 原来就允许，照旧。
+  - 丢了几行记在 `AuctionMatchCapture.rows_dropped_non_finite` 上，由 runtime step 写进心跳
+    `auction_match:rows_dropped_non_finite:<n>`。**不写进批次信封**：`BatchEnvelope` 不允许
+    PUBLISHED 批次带 `degraded_reasons`，写进去就等于把批次判成 DEGRADED。
+  - **已知风险**：覆盖率的分母是竞价全集（前一交易日有日线的代码）。当天被丢的 407 个代码里若有
+    超过全集 5% 的票在全集里（今天停牌、昨天还有日线），丢行之后覆盖率约 93%，低于 0.95，批次
+    仍是 `coverage_below_minimum` 的 DEGRADED。装机前要用线上全集把这个数量出来，见 DEPLOY.md。
+- **采集窗按实测的首次可用时刻收紧（#277 的收尾）**：09-23 探测卡到 `stk_auction(20260923)`
+  在 09:26:54 返回 0 行、09:27:14 返回 6,077 行，即 **T = 09:27:14**。
+  `AUCTION_MATCH_DEFAULT_CAPTURE_START/END` 09:35/10:05 → **09:29/09:44**，
+  `AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS` 6 → **3**（间隔 `900 // 3 = 300` 秒，09:29 / 09:34 / 09:39），
+  `AUCTION_GAP_DEFAULT_INPUT_START/END` 09:35/10:10 → **09:29/09:49**。生产画像的 `max_attempts`、
+  route B 自举派生与四常量一致性闸都读这几个常量，没有第二份字面量。
+
 - **`paper_constraint_publisher` 盘中读不了参考注册表（#280）**：读者打开参考注册表时要拿
   `.reference.sqlite3.publication.lock` 这个锁文件，而它是用写模式打开的；盘中参考目录被挂成
   只读，于是每一轮都撞 `EROFS`。结果是 `authorities/paper-execution/` 下**永远不会有 current
