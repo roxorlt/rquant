@@ -42,6 +42,20 @@ STK_AUCTION_COLUMNS: tuple[str, ...] = (
 )
 
 
+#: `stock_basic` 向 Tushare 要的列。`delist_date` 是参考慢源的必需列（#293）：Tushare 只回
+#: `fields` 里点名的列，漏了它，参考慢源每天 09:20 都以「缺列」失败。
+STOCK_BASIC_COLUMNS: tuple[str, ...] = (
+    "ts_code",
+    "symbol",
+    "name",
+    "area",
+    "industry",
+    "list_date",
+    "delist_date",
+    "market",
+    "list_status",
+)
+
 def _empty_stk_auction_frame() -> pd.DataFrame:
     """空结果的形状：零行，但八列俱全，再加上非空路径也会加的两列。"""
 
@@ -836,9 +850,15 @@ class TushareAdapter:
         return df
 
     def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
-        """股票基础信息（代码 / 名称 / 行业 / 上市日期等）。
+        """股票基础信息（代码 / 名称 / 行业 / 上市日期 / 退市日期等）。
 
         list_status: L=上市, D=退市, P=暂停上市
+
+        `delist_date` 必须显式请求（#293）：Tushare 只返回 `fields` 里点名的列，
+        参考慢源（`reference_slow_source._security_source_facts`）把它当必需列，
+        v0.33.19 之前这里没点名，09-14 起每个交易日 09:20 都以
+        `stock_basic source is missing columns: delist_date` 失败、一次都没发布过。
+        空结果也保持列齐全（#277 同一类）：零行但没有列的表会被校验当成「缺列」整批拒。
         """
         logger.info(f"Tushare stock_basic 请求：list_status={list_status}")
         df = self._call_with_backoff(
@@ -846,11 +866,14 @@ class TushareAdapter:
             lambda: self._pro.stock_basic(
                 exchange="",
                 list_status=list_status,
-                fields=("ts_code,symbol,name,area,industry,list_date,market,list_status"),
+                fields=",".join(STOCK_BASIC_COLUMNS),
             ),
         )
-        if df is None:
-            return pd.DataFrame()
+        if df is None or df.empty:
+            logger.info(f"Tushare stock_basic 成功返回空：list_status={list_status}")
+            return pd.DataFrame(
+                {column: pd.Series(dtype="object") for column in STOCK_BASIC_COLUMNS}
+            )
         logger.info(f"Tushare stock_basic 返回 {len(df)} 行")
         return df
 
