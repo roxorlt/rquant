@@ -395,8 +395,17 @@ def reference_slow_source_builder(
             profile=REFERENCE_SLOW_SOURCE_PROFILE,
             clock=clock,
         )
+        #: 「今天的采集失败过、而且今天一次都没成」一直挂到交易日切换为止（#293，#277 的
+        #: 同一类）。改动前失败的那一轮把心跳写成 failed，09:25 窗口一过，早退分支返回的
+        #: 干净结果就把它洗成 running：09-14 起每天 09:20 都失败，09:25 起心跳又是干净的，
+        #: 看心跳看不出参考慢源从来没发布过。只记第一次失败的异常类名——之后几轮撞的是
+        #: `SourceQuotaConflictError`（同一天的请求号已经用过），它不是原因。
+        capture_failed_trade_date: date | None = None
+        capture_failed_reason: str | None = None
+        captured_trade_date: date | None = None
 
         def step() -> RuntimeStepResult:
+            nonlocal capture_failed_trade_date, capture_failed_reason, captured_trade_date
             #: this iteration's own scope, so an iteration that never reaches the capture
             #: -- outside 09:20-09:25, or after today's batch is already sealed -- reports
             #: "opened nothing, read nothing" instead of the last capture's numbers (#256
@@ -445,17 +454,30 @@ def reference_slow_source_builder(
                     else captured
                 )
 
-            result = capture_reference_slow_batch(
-                spool=spool,
-                calendar=calendar,
-                observed_at=decision.observed_at,
-                producer_commit=manifest.producer_commit,
-                producer_version=settings.producer_version,
-                snapshot_loader=load_snapshot,
-                revision_snapshot_loader=load_revision,
-                revision_lookback_sessions=settings.revision_lookback_sessions,
-                history_page_size=settings.history_page_size,
-                completion_clock=clock,
+            trade_date = decision.local_trade_date
+            try:
+                result = capture_reference_slow_batch(
+                    spool=spool,
+                    calendar=calendar,
+                    observed_at=decision.observed_at,
+                    producer_commit=manifest.producer_commit,
+                    producer_version=settings.producer_version,
+                    snapshot_loader=load_snapshot,
+                    revision_snapshot_loader=load_revision,
+                    revision_lookback_sessions=settings.revision_lookback_sessions,
+                    history_page_size=settings.history_page_size,
+                    completion_clock=clock,
+                )
+            except Exception as error:
+                if captured_trade_date != trade_date and capture_failed_trade_date != trade_date:
+                    capture_failed_trade_date = trade_date
+                    capture_failed_reason = type(error).__name__
+                raise
+            #: 只有窗口内、今天的批次已经在 spool 里的那几轮才带 `reference_slow` 这一代
+            if "reference_slow" in result.source_generations:
+                captured_trade_date = trade_date
+            capture_failed = (
+                capture_failed_trade_date == trade_date and captured_trade_date != trade_date
             )
             if cursor_reader is not None:
                 cursor = cursor_reader.load_cursor(
@@ -475,11 +497,17 @@ def reference_slow_source_builder(
             #: is `(False, 0, null)` -- indistinguishable from "never asked the gate" and
             #: from "recognised the generation it already had", which is the one thing the
             #: field exists to tell apart.
+            degraded_reasons = tuple(result.degraded_reasons)
+            if capture_failed:
+                reason = f"capture_failed:{capture_failed_reason}"
+                if reason not in degraded_reasons:
+                    degraded_reasons = (*degraded_reasons, reason)
             return result.model_copy(
                 update={
                     "replica_opened": opened,
                     "replica_read_bytes": read_bytes,
                     "replica_skipped_by_floor": replica_gate.iteration_skipped_by_floor(),
+                    "degraded_reasons": degraded_reasons,
                 }
             )
 
