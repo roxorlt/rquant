@@ -514,7 +514,8 @@ def test_a_document_driven_publisher_has_no_replica_to_report_on(tmp_path: Path)
 
 
 def test_the_auction_assembly_window_follows_the_capture_window(tmp_path: Path) -> None:
-    """#277：采集窗后移到 09:35-10:05，装配窗必须跟着走，否则窗里永远没有料。
+    """#277：采集窗按 09-23 实测的 T = 09:27:14 收成 09:29-09:44，装配窗必须跟着走，
+    否则窗里永远没有料。
 
     默认起点与 `AUCTION_MATCH_DEFAULT_CAPTURE_START` 逐字相同，终点在
     `AUCTION_MATCH_DEFAULT_CAPTURE_END` 之后——最后一次采集成功之后还装得出来。
@@ -553,13 +554,14 @@ def _auction_manifest(tmp_path: Path, **overrides: object) -> RuntimeServiceMani
 @pytest.mark.parametrize(
     ("hour", "minute", "expected"),
     [
-        (1, 34, 0),
-        (1, 35, 1),
-        (2, 10, 1),
-        (2, 11, 0),
+        #: UTC 01:29 = 本地 09:29，UTC 01:49 = 本地 09:49（右界含）
+        (1, 28, 0),
+        (1, 29, 1),
+        (1, 49, 1),
+        (1, 50, 0),
     ],
 )
-def test_the_default_assembly_window_is_nine_thirty_five_to_ten_ten(
+def test_the_default_assembly_window_is_nine_twenty_nine_to_nine_forty_nine(
     tmp_path: Path,
     hour: int,
     minute: int,
@@ -606,7 +608,7 @@ def _auction_match_settings(tmp_path: Path, **overrides: object) -> dict[str, ob
         "calendar_expected_commit": COMMIT,
         "calendar_content_sha256": "c" * 64,
         "universe_path": str(tmp_path / "universe.json"),
-        "max_attempts": 6,
+        "max_attempts": 3,
     }
     settings.update(overrides)
     return settings
@@ -615,8 +617,8 @@ def _auction_match_settings(tmp_path: Path, **overrides: object) -> dict[str, ob
 @pytest.mark.parametrize(
     ("capture", "assembly", "consistent"),
     [
-        #: 默认的四个常量
-        ((time(9, 35), time(10, 5)), (time(9, 35), time(10, 10)), True),
+        #: 默认的四个常量（09-23 实测 T = 09:27:14 之后）
+        ((time(9, 29), time(9, 44)), (time(9, 29), time(9, 49)), True),
         #: 探测把窗整体后移，两边一起改
         ((time(9, 36), time(9, 50)), (time(9, 36), time(9, 55)), True),
         #: 只改了采集窗，忘了装配窗——竞价链会安静地什么都不产出

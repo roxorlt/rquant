@@ -50,7 +50,7 @@ def at(hour: int, minute: int, second: int = 0, *, day: date = TRADE_DATE) -> da
 
 
 #: 新默认窗的起点，也是本文件里「正常的第一次尝试」
-CAPTURE_AT = at(9, 35)
+CAPTURE_AT = at(9, 29)
 
 
 class _Adapter:
@@ -176,8 +176,9 @@ def _manifest(
         "calendar_expected_commit": calendar.producer_commit,
         "calendar_content_sha256": calendar.content_sha256,
         "universe_path": str(universe_path),
-        #: 与生产画像同值：09-22 的探测只圈出了一个区间，所以用六次尝试盖住整个窗
-        "max_attempts": 6,
+        #: 与生产画像同值：09-23 的探测卡到首次可用时刻 T = 09:27:14，窗收成 09:29-09:44，
+        #: 三次尝试 300 秒一次
+        "max_attempts": 3,
     }
     settings.update(overrides)
     return RuntimeServiceManifest(
@@ -203,16 +204,18 @@ def _records(tmp_path: Path) -> list:
 # ---------------------------------------------------------------------------------------
 
 
-def test_the_window_covers_the_whole_availability_bracket() -> None:
+def test_the_window_starts_after_the_measured_first_availability() -> None:
     """09:26 是错的起点——当天数据那时还没出。
 
-    09-22 的探测只圈出了一个区间：`stk_auction(20260922)` 在 09:26:02/04/08 三次返回空、
-    09:51:11 已有 6,075 行。确切的首次可用时刻还不知道，所以窗按「盖住整个区间」来定，
-    09:35-10:05 配六次尝试；09-23 更细的探测拿到精确时刻之后再收紧。
+    09-23 的探测卡到了确切时刻：同一个生产主 token 问 `stk_auction(20260923)`，09:26:54
+    返回 0 行、09:27:14 返回 6,077 行，所以 **T = 09:27:14**。窗按 T 收紧成 09:29-09:44
+    （起点比 T 晚 106 秒，宽 15 分钟），三次尝试摊在里面。
     """
 
-    assert time(9, 35) == AUCTION_MATCH_DEFAULT_CAPTURE_START
-    assert time(10, 5) == AUCTION_MATCH_DEFAULT_CAPTURE_END
+    assert time(9, 29) == AUCTION_MATCH_DEFAULT_CAPTURE_START
+    assert time(9, 44) == AUCTION_MATCH_DEFAULT_CAPTURE_END
+    #: 起点仍然晚于网关自己的 09:26 下限，也晚于 09-23 实测的 T
+    assert time(9, 27, 14) < AUCTION_MATCH_DEFAULT_CAPTURE_START
 
 
 def test_the_window_comes_from_settings_and_defaults_when_absent(tmp_path: Path) -> None:
@@ -234,8 +237,8 @@ def test_the_window_comes_from_settings_and_defaults_when_absent(tmp_path: Path)
 
     assert absent.capture_start == AUCTION_MATCH_DEFAULT_CAPTURE_START
     assert absent.capture_end == AUCTION_MATCH_DEFAULT_CAPTURE_END
-    #: 30 分钟摊给六次尝试，除的是 6 不是 5：09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，
-    #: 最后一次到期之后离窗口右界还有整整 300 秒
+    #: 15 分钟摊给三次尝试，除的是 3 不是 2：09:29 / 09:34 / 09:39，
+    #: 最后一次到期之后离窗口右界 09:44 还有整整 300 秒
     assert absent.capture_retry_interval_seconds == 300
     assert explicit.capture_start == time(9, 36)
     assert explicit.capture_end == time(9, 56)
@@ -245,14 +248,14 @@ def test_the_window_comes_from_settings_and_defaults_when_absent(tmp_path: Path)
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"capture_start": "10:05:00", "capture_end": "09:35:00"}, "precede"),
+        ({"capture_start": "09:44:00", "capture_end": "09:29:00"}, "precede"),
         ({"capture_start": "09:20:00"}, "09:26"),
-        #: 显式间隔与窗宽对不上（复核 CF-2）。默认窗 09:35-10:05、六次尝试：
-        #: 600 s ⇒ 第六次到期 10:25，在窗外；
-        #: 360 s ⇒ 第六次到期正好 10:05:00，也就是 MF-1 那个相位缺陷的旧写法
+        #: 显式间隔与窗宽对不上（复核 CF-2）。默认窗 09:29-09:44、三次尝试：
+        #: 600 s ⇒ 第三次到期 09:49，在窗外；
+        #: 450 s ⇒ 第三次到期正好 09:44:00，也就是 MF-1 那个相位缺陷的旧写法
         #: （`窗宽 // (次数 - 1)`），边界是左闭右开，所以同样被拒。
         ({"retry_interval_seconds": 600}, "fall inside"),
-        ({"retry_interval_seconds": 360}, "fall inside"),
+        ({"retry_interval_seconds": 450}, "fall inside"),
     ],
 )
 def test_an_impossible_window_is_refused(
@@ -266,14 +269,14 @@ def test_an_impossible_window_is_refused(
         )
 
 
-@pytest.mark.parametrize("interval_seconds", [359, 300, 1])
+@pytest.mark.parametrize("interval_seconds", [449, 300, 1])
 def test_an_interval_whose_attempts_all_fit_is_accepted(
     tmp_path: Path,
     interval_seconds: int,
 ) -> None:
     """校验的是「落在 `[start, end)` 内」，不是「什么都拒」（复核 CF-2 的另一侧）。
 
-    359 s 是刚好放得下的那一个：第六次到期 10:04:55，离右界还有五秒。
+    449 s 是刚好放得下的那一个：第三次到期 09:43:58，离右界还有两秒。
     """
 
     settings = AuctionMatchSourceSettings.model_validate(
@@ -283,16 +286,16 @@ def test_an_interval_whose_attempts_all_fit_is_accepted(
     assert settings.capture_retry_interval_seconds == interval_seconds
 
 
-def test_the_six_attempts_are_spread_across_the_window(tmp_path: Path) -> None:
-    """六次重试不再挤在七秒里：09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00。
+def test_the_three_attempts_are_spread_across_the_window(tmp_path: Path) -> None:
+    """三次重试不再挤在七秒里：09:29 / 09:34 / 09:39。
 
     #277 的现场就是三次全落在 09:26:01-09:26:08——等于只在同一秒问了一次，
     数据晚到一分钟就永远看不到。间隔是 `窗宽 // max_attempts`，所以最后一次到期之后离
-    窗口右界 10:05 还留着 300 秒（复核 MF-1）。
+    窗口右界 09:44 还留着 300 秒（复核 MF-1）。
     """
 
-    adapter = _Adapter([RuntimeError("down") for _ in range(6)])
-    clock = _Clock(at(9, 35))
+    adapter = _Adapter([RuntimeError("down") for _ in range(3)])
+    clock = _Clock(at(9, 29))
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
         clock=clock,
@@ -300,25 +303,21 @@ def test_the_six_attempts_are_spread_across_the_window(tmp_path: Path) -> None:
 
     step()
     assert len(adapter.calls) == 1
-    clock.now = at(9, 37)
+    clock.now = at(9, 31)
     step()
     assert len(adapter.calls) == 1, "窗内但还没到下一次的时刻，不该再问"
-    clock.now = at(9, 40)
+    clock.now = at(9, 34)
     step()
     assert len(adapter.calls) == 2
-    clock.now = at(9, 44, 59)
+    clock.now = at(9, 38, 59)
     step()
     assert len(adapter.calls) == 2
-    clock.now = at(9, 45)
+    clock.now = at(9, 39)
     step()
     assert len(adapter.calls) == 3
-    for ordinal, moment in enumerate((at(9, 50), at(9, 55), at(10, 0)), start=4):
-        clock.now = moment
-        step()
-        assert len(adapter.calls) == ordinal
-    clock.now = at(10, 4)
+    clock.now = at(9, 43)
     step()
-    assert len(adapter.calls) == 6, "次数用尽后不再问"
+    assert len(adapter.calls) == 3, "次数用尽后不再问"
 
     attempts = SourceQuotaStore(tmp_path / "auction-match" / "quota.sqlite3").list_attempts(
         source="tushare.stk_auction"
@@ -342,7 +341,7 @@ def test_the_six_attempts_are_spread_across_the_window(tmp_path: Path) -> None:
                 "retry_ordinal": retry_ordinal,
             }
         )
-        for retry_ordinal in range(6)
+        for retry_ordinal in range(3)
     }
     assert {attempt.attempt_id for attempt in attempts} == expected_attempt_ids
     assert {attempt.outcome for attempt in attempts} == {SourceQuotaAttemptOutcome.FAILURE}
@@ -357,6 +356,9 @@ def test_every_polling_phase_gets_the_full_attempt_budget(tmp_path: Path) -> Non
         2s tick, calls by start-phase second: {0: 3, 1: 2, 2: 3, 3: 2, 4: 3, 5: 2}
         5s tick, calls by start-phase second: {0: 3, 1: 2, 2: 2, 3: 2, 4: 2}
 
+    （上面那两行是复核者在 09:35-10:05 那一版窗上实测的，窗收紧之后判据不变：任何相位
+    都恰好发出 `max_attempts` = 3 次。）
+
     配置写着 3 次、实际常常只发 2 次，而被吃掉的恰恰是最晚那一次——正是为「数据晚到」准备的
     那一次。这条用例用真的构建器、真的配额台账，从几个不同相位按固定步长 tick 过整个窗，
     断言每个相位都恰好发出 `max_attempts` 次请求。
@@ -366,20 +368,20 @@ def test_every_polling_phase_gets_the_full_attempt_budget(tmp_path: Path) -> Non
     for tick_seconds in (2, 5):
         for phase in range(tick_seconds):
             adapter = _Adapter([_empty_frame() for _ in range(8)])
-            clock = _Clock(at(9, 34, phase))
+            clock = _Clock(at(9, 28, phase))
             step = auction_match_source_builder(
                 adapter_factory=lambda adapter=adapter: adapter,
                 clock=clock,
             )(_manifest(tmp_path / f"tick{tick_seconds}-phase{phase}"))
-            moment = at(9, 34, phase)
-            deadline = at(10, 6)
+            moment = at(9, 28, phase)
+            deadline = at(9, 45)
             while moment <= deadline:
                 clock.now = moment
                 step()
                 moment += timedelta(seconds=tick_seconds)
             counts[(tick_seconds, phase)] = len(adapter.calls)
 
-    assert set(counts.values()) == {6}, counts
+    assert set(counts.values()) == {3}, counts
 
 
 
@@ -387,13 +389,13 @@ def test_nothing_is_fetched_before_the_window_or_on_a_closed_date(tmp_path: Path
     before = _Adapter()
     before_step = auction_match_source_builder(
         adapter_factory=lambda: before,
-        clock=lambda: at(9, 34, 59),
+        clock=lambda: at(9, 28, 59),
     )(_manifest(tmp_path / "before"))
 
     after = _Adapter()
     after_step = auction_match_source_builder(
         adapter_factory=lambda: after,
-        clock=lambda: at(10, 5, 1),
+        clock=lambda: at(9, 44, 1),
     )(_manifest(tmp_path / "after"))
 
     closed = _Adapter()
@@ -460,14 +462,14 @@ def test_an_empty_response_then_a_real_one_publishes_degraded_then_published(
     """09-21 的形状加上 09-22 希望看到的结局：先空后有，两个批次都留了下来。"""
 
     adapter = _Adapter([_empty_frame(), _frame()])
-    clock = _Clock(at(9, 35))
+    clock = _Clock(at(9, 29))
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
         clock=clock,
     )(_manifest(tmp_path))
 
     first = step()
-    clock.now = at(9, 42)
+    clock.now = at(9, 36)
     second = step()
 
     assert adapter.calls == [TRADE_DATE, TRADE_DATE]
@@ -502,6 +504,56 @@ def test_a_response_without_pre_close_is_a_visible_validation_failure(tmp_path: 
     assert records[0].envelope.row_count == 0
 
 
+def test_rows_without_an_auction_match_are_dropped_and_named_on_the_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """2026-09-23 现场：有几行没有竞价成交，整批就被拒了。
+
+    当天 09:35 的第一次尝试拿到了 6,077 行，其中 407 行 `price` 是 NaN（`vol` / `amount`
+    都是 0，即今天没有集合竞价成交）。网关当场把**整张表**判成
+    `validation_failed:required numeric values must be finite`，批次发成零行 DEGRADED，
+    `candidate.auction_gap` 于是整天看不到 PUBLISHED 批次。现在这些行被丢掉、其余照常发布，
+    丢了几行由心跳说出来。
+    """
+
+    raw = pd.concat(
+        [
+            _frame(),
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600289.SH",
+                        "trade_date": TRADE_DATE,
+                        "price": float("nan"),
+                        "vol": 0.0,
+                        "amount": 0.0,
+                        "pre_close": 4.42,
+                        "turnover_rate": 0.0,
+                        "volume_ratio": 0.0,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    adapter = _Adapter([raw])
+    step = auction_match_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: CAPTURE_AT,
+    )(_manifest(tmp_path))
+
+    result = step()
+
+    assert result.processed_count == 1
+    assert result.degraded_reasons == ("auction_match:rows_dropped_non_finite:1",)
+    records = _records(tmp_path)
+    assert len(records) == 1
+    assert records[0].envelope.quality_status is BatchQualityStatus.PUBLISHED
+    assert records[0].envelope.row_count == 2
+    #: PUBLISHED 的信封不许带降级理由，所以这条记录只在心跳上
+    assert records[0].envelope.degraded_reasons == ()
+
+
 # ---------------------------------------------------------------------------------------
 # 今天没采到，就一直说没采到
 # ---------------------------------------------------------------------------------------
@@ -512,18 +564,18 @@ def test_an_exhausted_day_keeps_capture_failed_until_the_trade_date_rolls_over(
 ) -> None:
     """#277 第三个缺陷的正面：次数用尽之后，心跳一整天都带着 `capture_failed`。"""
 
-    adapter = _Adapter([_empty_frame() for _ in range(6)])
-    clock = _Clock(at(9, 35))
+    adapter = _Adapter([_empty_frame() for _ in range(3)])
+    clock = _Clock(at(9, 29))
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
         clock=clock,
     )(_manifest(tmp_path))
 
-    for moment in (at(9, 35), at(9, 40), at(9, 45), at(9, 50), at(9, 55), at(10, 0)):
+    for moment in (at(9, 29), at(9, 34), at(9, 39)):
         clock.now = moment
         step()
 
-    for moment in (at(10, 6), at(11, 30), at(15, 30), at(22, 0)):
+    for moment in (at(9, 45), at(11, 30), at(15, 30), at(22, 0)):
         clock.now = moment
         result = step()
         assert "capture_failed" in result.degraded_reasons, moment
@@ -533,21 +585,21 @@ def test_an_exhausted_day_keeps_capture_failed_until_the_trade_date_rolls_over(
     clock.now = at(8, 0, day=NEXT_TRADE_DATE)
     rolled = step()
     assert "capture_failed" not in rolled.degraded_reasons
-    assert len(adapter.calls) == 6
+    assert len(adapter.calls) == 3
 
 
 def test_a_window_that_passes_with_attempts_made_is_also_capture_failed(tmp_path: Path) -> None:
     """次数没用尽但窗过去了，同样是「今天没采到」。"""
 
     adapter = _Adapter([_empty_frame()])
-    clock = _Clock(at(9, 35))
+    clock = _Clock(at(9, 29))
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
         clock=clock,
     )(_manifest(tmp_path))
 
     step()
-    clock.now = at(10, 6)
+    clock.now = at(9, 45)
     result = step()
 
     assert len(adapter.calls) == 1
@@ -558,14 +610,14 @@ def test_a_published_batch_never_leaves_capture_failed_behind(tmp_path: Path) ->
     """成了就是成了：发过一个 PUBLISHED 批次之后，一天都不会冒出 `capture_failed`。"""
 
     adapter = _Adapter([_frame()])
-    clock = _Clock(at(9, 35))
+    clock = _Clock(at(9, 29))
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
         clock=clock,
     )(_manifest(tmp_path))
 
     step()
-    for moment in (at(10, 5), at(10, 6), at(15, 0)):
+    for moment in (at(9, 44), at(9, 45), at(15, 0)):
         clock.now = moment
         assert "capture_failed" not in step().degraded_reasons
 
@@ -573,24 +625,24 @@ def test_a_published_batch_never_leaves_capture_failed_behind(tmp_path: Path) ->
 def test_a_missing_universe_authority_never_consumes_an_attempt(tmp_path: Path) -> None:
     """竞价全集读不出来时**每一轮都再试**，不烧尝试次数（复核 SF-2）。
 
-    改动前计数放在读权威之前，于是「全集晚发了十分钟」会直接报销掉当天仅有的六次预算。
+    改动前计数放在读权威之前，于是「全集晚发了十分钟」会直接报销掉当天仅有的三次预算。
     「今天一次都没发出去」这件事由 `capture_missed` 留痕（复核 SF-3），不必靠烧掉次数来换。
     """
 
     adapter = _Adapter()
-    clock = _Clock(at(9, 35))
+    clock = _Clock(at(9, 29))
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
         clock=clock,
     )(_manifest(tmp_path, universe=False))
 
     #: 窗内每一轮都抛，抛多少轮都不消耗次数
-    for moment in (at(9, 35), at(9, 36), at(9, 37), at(9, 50), at(10, 4)):
+    for moment in (at(9, 29), at(9, 30), at(9, 31), at(9, 40), at(9, 43)):
         clock.now = moment
         with pytest.raises(Exception):  # noqa: B017 - 具体类型由权威加载器决定
             step()
 
-    clock.now = at(10, 6)
+    clock.now = at(9, 45)
     result = step()
 
     assert adapter.calls == []
@@ -625,7 +677,7 @@ def test_a_date_outside_calendar_coverage_is_a_soft_degradation(tmp_path: Path) 
     #: 日历覆盖到 2026-08-03 为止，把钟拨到之后一周
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
-        clock=lambda: at(9, 35, day=date(2026, 8, 10)),
+        clock=lambda: at(9, 29, day=date(2026, 8, 10)),
     )(_manifest(tmp_path))
 
     result = step()
@@ -644,7 +696,7 @@ def test_a_calendar_generated_after_the_clock_fails_hard(tmp_path: Path) -> None
     adapter = _Adapter()
     step = auction_match_source_builder(
         adapter_factory=lambda: adapter,
-        clock=lambda: at(9, 35, day=date(2026, 7, 29)),
+        clock=lambda: at(9, 29, day=date(2026, 7, 29)),
     )(_manifest(tmp_path))
 
     with pytest.raises(MarketSessionCalendarError, match="calendar_clock_regressed:"):
@@ -667,8 +719,8 @@ def test_the_two_calendar_refusals_are_told_apart_by_the_shared_helper() -> None
     )
     error = MarketSessionCalendarError("whatever decide_market_session said")
 
-    uncovered = calendar_refusal_reason(calendar, at(9, 35, day=date(2026, 8, 10)), error)
-    regressed = calendar_refusal_reason(calendar, at(9, 35, day=date(2026, 7, 29)), error)
+    uncovered = calendar_refusal_reason(calendar, at(9, 29, day=date(2026, 8, 10)), error)
+    regressed = calendar_refusal_reason(calendar, at(9, 29, day=date(2026, 7, 29)), error)
 
     assert uncovered == ("calendar_uncovered:2026-08-10", False)
     assert regressed == ("calendar_clock_regressed:2026-07-30T08:00:00+00:00", True)
@@ -677,7 +729,7 @@ def test_the_two_calendar_refusals_are_told_apart_by_the_shared_helper() -> None
 def test_an_idle_day_reports_nothing_at_all(tmp_path: Path) -> None:
     """非交易日不该凭空长出降级理由。"""
 
-    clock = _Clock(at(9, 35) + timedelta(days=1))
+    clock = _Clock(at(9, 29) + timedelta(days=1))
     step = auction_match_source_builder(
         adapter_factory=_Adapter,
         clock=clock,

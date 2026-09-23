@@ -28,6 +28,15 @@ def capture_auction_match_step(
             f"auction_match:{envelope.quality_status.value}:{reason}"
             for reason in envelope.degraded_reasons
         )
+    #: 丢行这件事说在心跳上，不写进批次信封：`BatchEnvelope` 的不变量是「非降级状态禁止
+    #: 携带 degraded_reasons」，把这条记进信封就等于把批次判成 DEGRADED，而
+    #: `candidate.auction_gap` 只认 PUBLISHED——那正是 2026-09-23 要修的那件事本身。
+    #: 心跳是落盘的（`control/<桶>/<实例>/heartbeats/*.json`），所以这条记录不是只活在内存里。
+    if capture.rows_dropped_non_finite:
+        degraded_reasons = (
+            *degraded_reasons,
+            f"auction_match:rows_dropped_non_finite:{capture.rows_dropped_non_finite}",
+        )
     return RuntimeStepResult(
         output_sequence=capture.pointer.sequence,
         processed_count=int(capture.published),

@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #282's to PR #285's. It is the merge base of the
+    # main; this one moves it from PR #285's to PR #288's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "611d464dbe783941aac99183063234db86bc9d6e"
-    assert BASELINE_TREE_SHA == "413f48205713c07c1ee44957b24b648231b80380"
+    assert BASELINE_COMMIT_SHA == "911f24125e05bdaea652744ccac5edd43afb6d75"
+    assert BASELINE_TREE_SHA == "5da8052aa6dccf214c87231bd0c526daf648bb3f"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``611d464`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``911f241`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1527,7 +1527,7 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # duration the suite grew into. It also regenerates the shard manifest, because the test
     # count changed - and it still leaves the frozen source-broker boundary alone, because it
     # touches none of the nine modules that manifest collects.
-    # And this refreeze to 611d464 leaves it out again: the signal-chain / notifier-shadow /
+    # The refreeze to 611d464 left it out again: the signal-chain / notifier-shadow /
     # serving-degrade topic adds no module under src/rquant/ and changes seven, adds one test
     # file and touches nineteen existing ones, changes the same one script
     # (build_runtime_production_inputs.py, for the delivery-mode flag), marks nothing
@@ -1541,8 +1541,18 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # source_file_snapshots modules, runtime_builder_serving.py and runtime_builder_signal.py
     # - so those two snapshots and the two boundary probes that live in changed files move
     # with it, all statically re-derived rather than asserted here.
-    # That ends sixteen refreezes in a row without a flip. A named path would have flipped
-    # truth value ten times in twenty-eight refreezes: naming one
+    # And this refreeze to 911f241 leaves it out as well: the auction-match finite-row topic
+    # adds no module under src/rquant/ and changes five, adds no test file and touches six
+    # existing test modules, changes no script, marks nothing ``linux_exact``, adds no job and
+    # does not touch .github/workflows/ci.yml. It regenerates the shard manifest because the
+    # test count changed (14758 -> 14763); the matrix is unchanged at five shards. Of the nine
+    # source_file_snapshots modules it changes one, runtime_service_builtin.py (the capture
+    # window constants), so that snapshot and the one boundary probe living in it,
+    # probe-r07-b19, move with it - statically re-derived rather than asserted here.
+    # The line that stood here said the refreeze to 611d464 ended sixteen refreezes in a row
+    # without a flip; it was itself a flip, taking ci.yml back out after 16b76a5 had put it
+    # in. So this refreeze is the first without a flip since then, and a named path would
+    # have flipped truth value eleven times in thirty refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted

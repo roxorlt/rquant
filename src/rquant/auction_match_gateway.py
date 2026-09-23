@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time
 from io import BytesIO
-from typing import Annotated
+from typing import Annotated, NamedTuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -60,6 +60,18 @@ class AuctionMatchValidationError(ValueError):
     pass
 
 
+class NormalizedAuctionFrame(NamedTuple):
+    """规范化之后的一张表，外加「因为必填数值不是有限数而丢掉的行数」。
+
+    这个数不是批次质量的判据，它是**发生了什么**的记录：`_capture_locked` 把它挂到
+    `AuctionMatchCapture` 上，心跳那一层再把它说出来。质量仍然只由覆盖率与必需代码两条
+    规则决定（#280 家族的这一条：见 `normalize_frame`）。
+    """
+
+    frame: pd.DataFrame
+    rows_dropped_non_finite: int
+
+
 class AuctionMatchGatewayConfig(RuntimeContractModel):
     source: str = Field(default="tushare.stk_auction", min_length=1)
     dataset_id: str = Field(default="auction_match", min_length=1)
@@ -77,6 +89,12 @@ class AuctionMatchCapture(RuntimeContractModel):
     observed_count: int = Field(ge=0)
     coverage_ratio: float = Field(ge=0, le=1)
     missing_required_codes: tuple[str, ...] = ()
+    #: 这一次采集里因为必填数值不是有限数而丢掉的行数（见 `normalize_capture`）。
+    #: 覆盖率与它无关：`observed_count` 数的是留下来的行，丢掉的那些本来也进不了 payload。
+    #: 幂等复看那条路（`_completed_published_capture`）读的是已经落盘的批次，批次信封里
+    #: 没有这个数，所以那条路上它是 0——进程在窗内重启之后心跳上这条记录会消失，批次本身
+    #: 与下游不受影响。
+    rows_dropped_non_finite: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_counts(self) -> AuctionMatchCapture:
@@ -160,6 +178,21 @@ class AuctionMatchGateway:
         trade_date: date,
         expected_codes: Iterable[str],
     ) -> pd.DataFrame:
+        """`normalize_capture` 的表那一半，给只要表的调用方与既有用例。"""
+
+        return AuctionMatchGateway.normalize_capture(
+            raw,
+            trade_date=trade_date,
+            expected_codes=expected_codes,
+        ).frame
+
+    @staticmethod
+    def normalize_capture(
+        raw: pd.DataFrame,
+        *,
+        trade_date: date,
+        expected_codes: Iterable[str],
+    ) -> NormalizedAuctionFrame:
         if not isinstance(raw, pd.DataFrame):
             raise AuctionMatchValidationError("source result must be a DataFrame")
         expected = AuctionMatchGateway._normalize_universe(
@@ -171,7 +204,7 @@ class AuctionMatchGateway:
         #: 常态；列检查排在前面时，一张无列空表会被报成「缺八个字段」，于是「返回空」变成
         #: 一个抛出的校验异常，空批次与回执一份都写不出来（#277 第一个缺陷）。
         if raw.empty:
-            return AuctionMatchGateway._empty_frame()
+            return NormalizedAuctionFrame(AuctionMatchGateway._empty_frame(), 0)
         missing = sorted(set(AUCTION_MATCH_COLUMNS) - set(raw.columns))
         if missing:
             raise AuctionMatchValidationError(f"missing columns: {missing}")
@@ -206,9 +239,19 @@ class AuctionMatchGateway:
         except (TypeError, ValueError) as exc:
             raise AuctionMatchValidationError("invalid numeric value") from exc
 
+        #: 必填列里不是有限数的那些行**丢掉，不再整批拒**（2026-09-23 现场）。当天
+        #: `stk_auction(20260923)` 的 6,077 行里有 407 行 `price` 是 NaN（同一行的 `vol`
+        #: 与 `amount` 都是 0，即「今天没有集合竞价成交」的停牌股与无人报价的票），整张表
+        #: 因此被判 `validation_failed:required numeric values must be finite`，批次发成
+        #: 零行 DEGRADED，`candidate.auction_gap` 于是整天读不到 PUBLISHED 批次。
+        #: 一行读不出价就是这一行没有竞价，不是这份报文不可信——**丢行，留表**。
+        #: 结构性/被篡改的形状（缺列、重复代码、bool、负数、非正价格、可选列里的 ±inf）
+        #: 仍然照包 Y 留下的样子整批拒，一条都没有放宽。
         required = frame.loc[:, _REQUIRED_NUMERIC_COLUMNS].to_numpy(dtype="float64")
-        if not np.isfinite(required).all():
-            raise AuctionMatchValidationError("required numeric values must be finite")
+        finite_rows = np.isfinite(required).all(axis=1)
+        rows_dropped_non_finite = int((~finite_rows).sum())
+        if rows_dropped_non_finite:
+            frame = frame.loc[finite_rows].copy()
         if (frame[["price", "pre_close"]] <= 0).to_numpy().any():
             raise AuctionMatchValidationError("price and pre_close must be positive")
         if (frame[["vol", "amount"]] < 0).to_numpy().any():
@@ -223,7 +266,10 @@ class AuctionMatchGateway:
                 raise AuctionMatchValidationError("optional numeric values must be nonnegative")
 
         frame = frame.loc[frame["ts_code"].isin(expected), AUCTION_MATCH_COLUMNS]
-        return frame.sort_values("ts_code", kind="stable").reset_index(drop=True)
+        return NormalizedAuctionFrame(
+            frame.sort_values("ts_code", kind="stable").reset_index(drop=True),
+            rows_dropped_non_finite,
+        )
 
     @staticmethod
     def encode_payload(frame: pd.DataFrame) -> bytes:
@@ -491,6 +537,7 @@ class AuctionMatchGateway:
     ) -> AuctionMatchCapture:
         quality = BatchQualityStatus.PUBLISHED
         degraded_reasons: list[str] = []
+        rows_dropped_non_finite = 0
         source_failed = False
         validation_failed = False
         raw_empty = False
@@ -513,7 +560,7 @@ class AuctionMatchGateway:
             #: `try` 之外，上游给了一份读不懂的报文时异常直接穿出去，既不发批次也不留回执，
             #: 心跳随后被早退分支洗成正常。源头给错了东西是一条**可见的降级**，不是一次崩溃。
             try:
-                frame = self.normalize_frame(
+                frame, rows_dropped_non_finite = self.normalize_capture(
                     raw,
                     trade_date=trade_date,
                     expected_codes=expected,
@@ -581,6 +628,7 @@ class AuctionMatchGateway:
                 observed_count=len(observed),
                 coverage_ratio=coverage_ratio,
                 missing_required_codes=missing_required,
+                rows_dropped_non_finite=rows_dropped_non_finite,
             )
 
         sequence = 0 if latest is None else latest.sequence + 1
@@ -629,6 +677,7 @@ class AuctionMatchGateway:
             observed_count=len(observed),
             coverage_ratio=coverage_ratio,
             missing_required_codes=missing_required,
+            rows_dropped_non_finite=rows_dropped_non_finite,
         )
 
     def capture_once(

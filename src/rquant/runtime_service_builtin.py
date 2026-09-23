@@ -575,24 +575,27 @@ def reference_slow_publisher_builder(
     return build
 
 
-#: 采集窗的默认值（#277）。2026-09-22 生产探测：主 token 的 `stk_auction(20260922)` 在
-#: 09:26:02 / 09:26:04 / 09:26:08 三次都返回空，到 09:51:11 已经有 6,075 行。所以首次可用的
-#: 那一刻落在 **09:26:08 与 09:51:11 之间**，确切时刻仓库里还不知道（更细的探测 09-23 再跑
-#: 一轮）。协调者的裁定是不去猜那一刻，而是**用更多次尝试把整个区间盖住**：窗取
-#: 09:35:00–10:05:00，尝试次数取 6，间隔由 `窗宽 // max_attempts` 推成 300 秒，六次到期时刻
-#: 是 09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，全部落在窗内。09-23 拿到精确时刻之后再
-#: 把窗收紧——路径仍然只有「改这四个常量」（连同 `runtime_builder_candidate` 那两个装配窗
-#: 常量）再走 PR → CI → tag → 部署器这一条，顺序与时间预算见 DEPLOY.md。仓库里没有
-#: 「改 manifest 设置就能定窗」这条路。
-AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 35)
-AUCTION_MATCH_DEFAULT_CAPTURE_END = time(10, 5)
-#: 采集窗里发几次请求。09-22 的探测只圈出了一个区间（09:26:08 空、09:51:11 非空），所以
-#: 次数从 3 提到 **6**：六次 300 秒一次地摊过 09:35-10:05，不押注区间里的哪一刻（#277）。
+#: 采集窗的默认值（#277）。2026-09-23 的探测卡到了**确切时刻**：同一个生产主 token 问
+#: `stk_auction(20260923)`，09:26:54 返回 0 行、09:27:14 返回 6,077 行，所以当天首次可用的
+#: 那一刻 **T = 09:27:14**（前一天只圈出 09:26:08–09:51:11 这个区间，窗因此先取了宽的
+#: 09:35–10:05 配六次）。拿到 T 之后窗按「T 之后约一分半起步、盖住一刻钟」收紧：
+#: 09:29:00–09:44:00 配三次尝试，间隔由 `窗宽 // max_attempts` 推成 `900 // 3 = 300` 秒，
+#: 三次到期时刻是 **09:29 / 09:34 / 09:39**，全部落在窗内，最后一次到期之后离右界还留着
+#: 整整一个间隔。起点比 T 晚 106 秒，是给「某一天数据比 09-23 晚一点出来」留的余量；
+#: 15 分钟的窗则容得下比 T 晚十分钟的那一天。
+#: 定窗路径仍然只有「改这四个常量」（连同 `runtime_builder_candidate` 那两个装配窗常量）
+#: 再走 PR → CI → tag → 部署器这一条，顺序与时间预算见 DEPLOY.md。仓库里没有「改 manifest
+#: 设置就能定窗」这条路。
+AUCTION_MATCH_DEFAULT_CAPTURE_START = time(9, 29)
+AUCTION_MATCH_DEFAULT_CAPTURE_END = time(9, 44)
+#: 采集窗里发几次请求。09-22 只圈出区间时次数提到 6 去盖住整段；09-23 拿到 T = 09:27:14
+#: 之后窗收成 15 分钟，次数回到 **3**（300 秒一次：09:29 / 09:34 / 09:39）——窗窄了，同样的
+#: 间隔不需要六次才铺得满（#277）。
 #: **两条装机路径都读这一个常量**：生产画像（`runtime_production_profile`）与 route B 的
 #: 自举派生（`runtime_authority_stage.bootstrap_settings`）原来各写一份字面量 `3`，只改画像
 #: 那一份会让 `test_blk3_derived_settings_agree_with_the_production_profile_field_by_field`
 #: 当场红——两处必须同源，否则第一次安装装出来的次数和画像说的不是一个数。
-AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS = 6
+AUCTION_MATCH_DEFAULT_MAX_ATTEMPTS = 3
 #: 网关自己拒绝 09:26 之前收到的竞价数据，所以采集窗的起点不能早于它
 AUCTION_MATCH_EARLIEST_CAPTURE_START = time(9, 26)
 
@@ -637,8 +640,8 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
             raise ValueError("auction capture window must be whole seconds")
         if self.capture_start.tzinfo is not None or self.capture_end.tzinfo is not None:
             raise ValueError("auction capture window is local Asia/Shanghai wall time")
-        #: 复核 MF-1 的另一半：显式给的间隔与窗宽对不上时原来照收不误。30 分钟的窗配
-        #: `retry_interval_seconds=600` + `max_attempts=6`，第六次的到期时刻是 10:25，
+        #: 复核 MF-1 的另一半：显式给的间隔与窗宽对不上时原来照收不误。15 分钟的窗配
+        #: `retry_interval_seconds=600` + `max_attempts=3`，第三次的到期时刻是 09:49，
         #: 永远不会发生——而探测收窗之后操作员正是要动这几个值的。
         if not window_schedule_fits(
             start=self.capture_start,
@@ -655,10 +658,9 @@ class AuctionMatchSourceSettings(RuntimeContractModel):
     def capture_retry_interval_seconds(self) -> int:
         """`max_attempts` 次尝试摊在窗里的间隔，显式配置优先。
 
-        窗宽 30 分钟、六次尝试时是 **300** 秒：09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00，
-        最后一次到期之后离窗口右界还有整整 300 秒。按 `max_attempts - 1` 摊开的写法
-        （360 秒 ⇒ 最后一次正好到期在 10:05:00）在 2 秒轮询下有一半的相位永远拿不到最后那次
-        尝试——复核 MF-1。
+        窗宽 15 分钟、三次尝试时是 **300** 秒：09:29 / 09:34 / 09:39，最后一次到期之后离
+        窗口右界 09:44 还有整整 300 秒。按 `max_attempts - 1` 摊开的写法（450 秒 ⇒ 最后一次
+        正好到期在 09:44:00）在 2 秒轮询下有一半的相位永远拿不到最后那次尝试——复核 MF-1。
         """
 
         if self.retry_interval_seconds is not None:

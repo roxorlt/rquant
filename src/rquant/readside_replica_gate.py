@@ -89,9 +89,11 @@ class ReplicaReadProfile:
     this is not simply on everywhere:
 
     * `reference-slow.source.v1` captures inside 09:20-09:25, and
-    * `candidate.auction_gap.v1` assembles inside 09:26-09:30,
+    * `candidate.auction_gap.v1` assembled inside 09:26-09:30 when this was written (the
+      window is 09:29-09:49 since #277, so it now runs past 09:40; the argument below does
+      not change, because one read per session is still all that role needs),
 
-    both of which lie *inside* 09:20-09:40. **What a blanket window would do to those two
+    both of which lay *inside* 09:20-09:40. **What a blanket window would do to those two
     is freeze, not stop** (review SF-6, which measured it: adding the window to
     reference-slow leaves all of its behaviour tests green). A role with no answer is never
     held -- the floor only stands in for an answer that exists -- and a different `key`
@@ -180,10 +182,12 @@ NOTIFIER_PAGE_PROJECTION_PROFILE = ReplicaReadProfile(
 #: generation the 09:25 replica sync drops in the middle of the window.
 REFERENCE_SLOW_SOURCE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=5))
 
-#: `candidate.auction_gap.v1`, floored at its own 09:26-09:30 assembly window. What it
-#: reads is prior sessions' `daily_bar` volumes, which do not change while the session
-#: opens, so a generation arriving inside the window carries the same answer at the cost of
-#: another scan. One read per session is the whole of what this role needs.
+#: `candidate.auction_gap.v1`. The floor was sized for the old 09:26-09:30 assembly window;
+#: the window is now 09:29-09:49 (`AUCTION_GAP_DEFAULT_INPUT_START/END`, #277), so
+#: four minutes no longer spans it and a generation arriving later in the window can cost
+#: another read. That is re-read cost only, never a different answer: what the role reads
+#: is prior sessions' `daily_bar` volumes, which do not change while the session opens.
+#: One read per session is the whole of what this role needs.
 AUCTION_GAP_CANDIDATE_PROFILE = ReplicaReadProfile(min_reread_interval=timedelta(minutes=4))
 
 #: `candidate.n_shape.v1` / `candidate.growth_board_surge.v1` since #278. What they ask the

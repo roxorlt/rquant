@@ -91,33 +91,27 @@ REPLICA_SYNCED_AT = at(8, 40)
 SESSION_DOCUMENT_AT = at(8, 45)
 #: 竞价全集：09:15 的保护窗之前
 UNIVERSE_AT = at(9, 0)
-#: 采集窗 09:35-10:05 的六次尝试。间隔 = 窗宽 // max_attempts = 1800 // 6 = 300 秒，
-#: 到期时刻是 09:35 / 09:40 / 09:45 / 09:50 / 09:55 / 10:00；这里**故意取到期之后的偏相位
-#: 时刻**（+1:37 / +1:29 / +1:07 …），不再踩在到期秒或窗口右界上——复核 MF-1 指出的相位
-#: 缺陷正是被「所有时刻都恰好踩在边界上」的测试放过去的。窗与次数由 09-22 的探测区间定
-#: （09:26:08 空、09:51:11 非空，精确时刻 09-23 再探）。
-CAPTURE_FIRST = at(9, 36, 37)
-CAPTURE_SECOND = at(9, 41, 29)
-CAPTURE_THIRD = at(9, 46, 7)
-CAPTURE_FOURTH = at(9, 51, 43)
-CAPTURE_FIFTH = at(9, 56, 19)
-CAPTURE_SIXTH = at(10, 1, 53)
-#: 采集窗里的六轮，一个进程按顺序跑完就是「今天的次数用尽了」
+#: 采集窗 09:29-09:44 的三次尝试。间隔 = 窗宽 // max_attempts = 900 // 3 = 300 秒，
+#: 到期时刻是 09:29 / 09:34 / 09:39；这里**故意取到期之后的偏相位时刻**（+1:37 / +1:29 /
+#: +1:07），不再踩在到期秒或窗口右界上——复核 MF-1 指出的相位缺陷正是被「所有时刻都恰好
+#: 踩在边界上」的测试放过去的。窗由 09-23 探测到的首次可用时刻 T = 09:27:14 定
+#: （09:26:54 零行、09:27:14 六千余行）。
+CAPTURE_FIRST = at(9, 30, 37)
+CAPTURE_SECOND = at(9, 35, 29)
+CAPTURE_THIRD = at(9, 40, 7)
+#: 采集窗里的三轮，一个进程按顺序跑完就是「今天的次数用尽了」
 CAPTURE_MOMENTS = (
     CAPTURE_FIRST,
     CAPTURE_SECOND,
     CAPTURE_THIRD,
-    CAPTURE_FOURTH,
-    CAPTURE_FIFTH,
-    CAPTURE_SIXTH,
 )
 #: 窗过去之后的任意一轮，以及当天更晚的时刻
-AFTER_WINDOW = at(10, 6)
+AFTER_WINDOW = at(9, 45)
 AFTER_CLOSE = at(15, 30)
 #: 下一个交易日的盘前：交易日切换之后旗子应当落下
 NEXT_SESSION = at(8, 30, day=OPEN_DATES[-1] + timedelta(days=1))
-#: 装配窗（09:35-10:10）里的一轮，排在第一次成功采集（09:36:37）之后
-ASSEMBLE_AT = at(9, 37, 11)
+#: 装配窗（09:29-09:49）里的一轮，排在第一次成功采集（09:30:37）之后
+ASSEMBLE_AT = at(9, 31, 11)
 #: 两个源真正去读候选全集的时刻：早盘阶段，且晚于上面那一次装配
 CONSUME_AT = at(9, 40)
 #: 第二次安装打开 schema rollout 窗口的时刻。窗宽是生产画像的
@@ -153,6 +147,39 @@ def auction_frame(*, drop: str | None = None) -> pd.DataFrame:
     if drop is not None:
         frame = frame.drop(columns=[drop])
     return frame
+
+
+def auction_frame_with_unmatched_rows() -> pd.DataFrame:
+    """2026-09-23 生产报文的形状：正常行里混着几行「今天没有集合竞价成交」。
+
+    当天 `stk_auction(20260923)` 的 6,077 行里有 407 行 `price` 是 NaN，同一行的 `vol` 与
+    `amount` 都是 0、`pre_close` 有数（例：`600289.SH pre_close=4.42`）。整张表因此被判
+    `validation_failed:required numeric values must be finite`，批次发成零行 DEGRADED，
+    `candidate.auction_gap` 一整天读不到 PUBLISHED 批次（③a 当天没过）。
+    这两行的代码都不在竞价全集里——全集是「昨天有日线的代码」。
+    """
+
+    return pd.concat(
+        [
+            auction_frame(),
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": ts_code,
+                        "trade_date": TRADE_DATE,
+                        "price": float("nan"),
+                        "vol": 0.0,
+                        "amount": 0.0,
+                        "pre_close": pre_close,
+                        "turnover_rate": 0.0,
+                        "volume_ratio": float("nan"),
+                    }
+                    for ts_code, pre_close in (("600289.SH", 4.42), ("000004.SZ", 12.8))
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
 
 
 def empty_auction_frame() -> pd.DataFrame:
@@ -458,7 +485,7 @@ def test_an_empty_source_then_a_real_one_leaves_a_degraded_batch_then_a_publishe
     publish_auction_universe(auction_world)
     adapter = _AuctionAdapter([empty_auction_frame(), auction_frame()])
 
-    #: 同一个进程的两轮，是六次尝试摊在窗里的头两次（取的是到期之后的偏相位时刻）
+    #: 同一个进程的两轮，是三次尝试摊在窗里的头两次（取的是到期之后的偏相位时刻）
     second = run_auction_match(
         auction_world,
         adapter,
@@ -528,7 +555,7 @@ def test_an_exhausted_day_keeps_capture_failed_in_the_heartbeat_until_the_next_d
         moments=[*CAPTURE_MOMENTS, AFTER_WINDOW, AFTER_CLOSE],
     )
 
-    #: 六次尝试用完之后不再发请求
+    #: 三次尝试用完之后不再发请求
     assert adapter.calls == [TRADE_DATE] * len(CAPTURE_MOMENTS)
     #: 收盘之后那一轮的心跳仍然说得出「今天没采到」
     assert "capture_failed" in heartbeat.degraded_reasons
@@ -650,10 +677,58 @@ def test_the_auction_gap_publisher_assembles_todays_candidates_in_the_moved_wind
     assert [row.candidate_id for row in snapshot.rows] == [CODE]
 
 
+def test_rows_without_an_auction_match_do_not_cost_the_day_its_candidates(
+    auction_world: ReplicaWorld,
+) -> None:
+    """2026-09-23 的现场与它应有的结局：几行没有成交，当天的候选照样装得出来。
+
+    当天 09:35 的第一次尝试真的拿到了 6,077 行（包 Y 的 `pre_close` 修复是有效的），却
+    因为其中 407 行必填数值是 NaN 而被整批拒，`candidate.auction_gap` 于是报
+    `auction_gap_input_unavailable`，watchlist / market-minute 一整天降级。现在这些行被丢掉，
+    批次照常 PUBLISHED，丢了几行由心跳说出来，候选链往下走。
+    """
+
+    publish_auction_universe(auction_world)
+    adapter = _AuctionAdapter([auction_frame_with_unmatched_rows()])
+
+    capture_heartbeat = run_auction_match(auction_world, adapter, now=CAPTURE_FIRST)
+
+    assert capture_heartbeat.last_error is None
+    assert capture_heartbeat.degraded_reasons == ("auction_match:rows_dropped_non_finite:2",)
+    records = auction_records(auction_world)
+    assert len(records) == 1
+    assert records[0].envelope.quality_status is BatchQualityStatus.PUBLISHED
+    assert records[0].envelope.row_count == 1
+    assert records[0].envelope.degraded_reasons == ()
+
+    heartbeat = assemble_auction_gap(auction_world)
+
+    assert heartbeat.last_error is None
+    assert heartbeat.degraded_reasons == ()
+    assert heartbeat.processed_count == 1
+    snapshot_root = auction_world.setting(AUCTION_GAP_SERVICE_ID, "snapshot_root")
+    settings = auction_world.manifest(AUCTION_GAP_SERVICE_ID).settings
+    snapshot = StrategyCandidateSnapshotSpool(snapshot_root).read_strategy_as_of(
+        CONSUME_AT,
+        strategy_id="auction_gap",
+        strategy_version="1",
+        definition_fingerprint=str(settings["definition_fingerprint"]),
+        executable_fingerprint=str(settings["executable_fingerprint"]),
+        candidate_schema_fingerprint=str(settings["candidate_schema_fingerprint"]),
+        static_feature_schema=settings["static_feature_schema"],
+    )
+    assert snapshot is not None
+    assert [row.candidate_id for row in snapshot.rows] == [CODE]
+
+
 def test_the_old_window_would_have_had_nothing_to_assemble(
     auction_world: ReplicaWorld,
 ) -> None:
-    """反面：09:26-09:30 里没有任何可装的料，这正是窗必须跟着采集窗后移的理由。"""
+    """反面：装配窗起点之前没有任何可装的料，这正是窗必须跟着采集窗一起挪的理由。
+
+    09:28 落在老窗 09:26-09:30 里，却在新的装配窗 09:29-09:49 之外——采集窗最早 09:29
+    才发第一次请求，09:28 这一轮手上什么批次都没有。
+    """
 
     publish_auction_universe(auction_world)
 
@@ -789,10 +864,12 @@ def test_the_world_is_two_generations_over_a_session_the_calendar_opens(
     assert auction_world.receipt.previous_generation_hash is not None
     assert TRADE_DATE in OPEN_DATES
     assert auction_world.inputs.readonly_replica_database_path.is_file()
-    #: 冻结的 manifest 里没有采集窗那几项，走的是代码里的默认 09:35-10:05
+    #: 冻结的 manifest 里没有采集窗那几项，走的是代码里的默认 09:29-09:44；
+    #: 尝试次数是画像写进 manifest 的那一项，读的是同一个常量（3）
     settings = auction_world.manifest(AUCTION_MATCH_SERVICE_ID).settings
     assert "capture_start" not in settings
     assert "capture_end" not in settings
+    assert settings["max_attempts"] == 3
 
 
 def test_the_instance_names_are_the_ones_the_units_carry(
