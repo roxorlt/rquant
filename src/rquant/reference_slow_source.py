@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from loguru import logger
 from pydantic import Field, field_validator
 
 from rquant.readside_replica_gate import (
@@ -1103,13 +1104,31 @@ def _frame_rows(frame: pd.DataFrame, columns: tuple[str, ...]) -> Iterator[tuple
         yield tuple(row[index] for index in indexes)
 
 
+#: 退市 / 暂停上市名单里允许「跳过并计数」的那一类行：代码本身不是规范的 A 股代码。
+#: 2026-09-23 主机实测 D 名单 339 行里恰有一行 `T600018.SH 上港集箱(退)`（2006 年退市、
+#: `market` 为空），它让整张 D 名单、进而整批参考慢源被拒（#293）。这类历史代码不可能出现在
+#: 前一交易日的日线全集里（日线证据读取时就按同一个正则拒掉非规范代码），所以跳过它不会
+#: 让任何需要的代码失去状态事实；后面「stock_basic does not cover prior daily universe」
+#: 那道覆盖检查照旧守着。上市名单 L 仍然严格：L 里出现非规范代码说明数据源本身出了问题。
+_SKIPPABLE_INVALID_CODE_STATUSES = frozenset({"D", "P"})
+
+
+@dataclass(frozen=True, slots=True)
+class _SecuritySourceParse:
+    facts: tuple[ReferenceSecuritySourceFact, ...]
+    #: 因代码不规范而跳过的原始代码（去空白、转大写后），按出现顺序
+    skipped_invalid_codes: tuple[str, ...] = ()
+
+
 def _security_source_facts(
     frame: pd.DataFrame,
     *,
     list_status: str,
     st_codes: frozenset[str],
     limits: ReferenceSlowSourceLimits,
-) -> tuple[ReferenceSecuritySourceFact, ...]:
+) -> _SecuritySourceParse:
+    if list_status not in {"L", "D", "P"}:
+        raise ReferenceSlowSourceError("stock_basic contains an invalid list_status")
     required = _required_frame(
         frame,
         label="stock_basic",
@@ -1123,23 +1142,23 @@ def _security_source_facts(
         limits=limits,
     )
     rows: dict[str, ReferenceSecuritySourceFact] = {}
-    has_delist_date = "delist_date" in required.columns
-    columns = ("ts_code", "name", "list_date", "market") + (
-        ("delist_date",) if has_delist_date else ()
-    )
-    for row in _frame_rows(required, columns):
-        raw_code, raw_name, raw_list_date, raw_market, *optional_delist = row
+    skipped: list[str] = []
+    columns = ("ts_code", "name", "list_date", "market", "delist_date")
+    for raw_code, raw_name, raw_list_date, raw_market, raw_delist_date in _frame_rows(
+        required, columns
+    ):
         code = str(raw_code).strip().upper()
         if _TS_CODE_PATTERN.fullmatch(code) is None:
+            if list_status in _SKIPPABLE_INVALID_CODE_STATUSES:
+                skipped.append(code)
+                continue
             raise ReferenceSlowSourceError("stock_basic contains an invalid ts_code")
         if code in rows:
             raise ReferenceSlowSourceError("stock_basic contains duplicate status rows")
         name, name_is_st = normalize_name(raw_name)
         if name is None or name_is_st is None:
             raise ReferenceSlowSourceError(f"{code} stock_basic name is invalid")
-        if list_status not in {"L", "D", "P"}:
-            raise ReferenceSlowSourceError("stock_basic contains an invalid list_status")
-        raw_delist_date = optional_delist[0] if optional_delist else None
+        #: 列是必需的；值只对 D 必需——上市名单与暂停名单的 `delist_date` 本来就是空
         delist_date = (
             None
             if raw_delist_date is None
@@ -1158,7 +1177,28 @@ def _security_source_facts(
             source_list_status=list_status,
             market=str(raw_market).strip(),
         )
-    return tuple(rows[code] for code in sorted(rows))
+    return _SecuritySourceParse(
+        facts=tuple(rows[code] for code in sorted(rows)),
+        skipped_invalid_codes=tuple(skipped),
+    )
+
+
+def _report_skipped_security_rows(list_status: str, skipped: tuple[str, ...]) -> None:
+    """把跳过的行说在日志里：落进 journald，能查，且不把参考慢源判成降级（#293）。
+
+    不写进批次信封（`BatchEnvelope` 禁止 PUBLISHED 批次携带 `degraded_reasons`），也不写
+    进心跳的 `degraded_reasons`：D 名单里那一行 `T600018.SH` 每天都在，写进心跳就等于每个
+    交易日 09:20 起参考慢源都显示 `degraded`——#290 记的正是 auction-match 的同一个问题，
+    心跳上加一个不影响状态的信息字段是那张 issue 的事。
+    """
+
+    if not skipped:
+        return
+    logger.warning(
+        f"reference slow source stock_basic(list_status={list_status}) "
+        f"skipped {len(skipped)} row(s) with a non-canonical ts_code: "
+        f"{', '.join(skipped[:10])}{' ...' if len(skipped) > 10 else ''}"
+    )
 
 
 def _is_tradable_on(
@@ -1291,13 +1331,14 @@ def capture_reference_slow_source_snapshot(
     security_by_code: dict[str, ReferenceSecuritySourceFact] = {}
     for list_status in ("L", "D", "P"):
         frame = adapter.stock_basic(list_status=list_status)
-        facts = _security_source_facts(
+        parsed = _security_source_facts(
             frame,
             list_status=list_status,
             st_codes=observed_st_codes,
             limits=limits,
         )
-        for fact in facts:
+        _report_skipped_security_rows(list_status, parsed.skipped_invalid_codes)
+        for fact in parsed.facts:
             if fact.ts_code in security_by_code:
                 raise ReferenceSlowSourceError("stock_basic contains duplicate cross-status rows")
             security_by_code[fact.ts_code] = fact

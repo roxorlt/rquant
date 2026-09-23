@@ -1411,3 +1411,399 @@ def test_a_stop_during_the_evidence_query_is_not_reported_as_a_query_failure(
 
     assert is_read_interrupt(raised.value)
     assert not isinstance(raised.value, ReferenceSlowSourceError)
+
+
+# --- #293: stock_basic delist_date and the historical non-canonical delisted code -------------
+
+#: the one row the 2026-09-23 host simulation found in the D list (339 rows): delisted in
+#: 2006, `market` empty, and a code that is not `NNNNNN.SH|SZ|BJ`
+_HISTORICAL_DELISTED_ROW = {
+    "ts_code": "T600018.SH",
+    "symbol": "600018",
+    "name": "上港集箱(退)",
+    "area": "上海",
+    "industry": "港口",
+    "list_date": "20000719",
+    "delist_date": "20061020",
+    "market": float("nan"),
+    "list_status": "D",
+}
+
+_TUSHARE_STOCK_BASIC_ROWS: dict[str, list[dict[str, object]]] = {
+    "L": [
+        {
+            "ts_code": "300001.SZ",
+            "symbol": "300001",
+            "name": "成长样本",
+            "area": "深圳",
+            "industry": "软件服务",
+            "list_date": "20200102",
+            "delist_date": None,
+            "market": "创业板",
+            "list_status": "L",
+        },
+        {
+            "ts_code": "600000.SH",
+            "symbol": "600000",
+            "name": "普通样本",
+            "area": "上海",
+            "industry": "银行",
+            "list_date": "19991110",
+            "delist_date": None,
+            "market": "主板",
+            "list_status": "L",
+        },
+    ],
+    "D": [
+        _HISTORICAL_DELISTED_ROW,
+        {
+            "ts_code": "600001.SH",
+            "symbol": "600001",
+            "name": "退市样本",
+            "area": "上海",
+            "industry": "钢铁",
+            "list_date": "20000101",
+            "delist_date": "20200101",
+            "market": "主板",
+            "list_status": "D",
+        },
+    ],
+    "P": [],
+}
+
+
+def _field_honoring_stock_basic(
+    calls: list[dict[str, str]],
+    rows: dict[str, list[dict[str, object]]] = _TUSHARE_STOCK_BASIC_ROWS,
+):  # type: ignore[no-untyped-def]
+    """Tushare's behaviour that bit production: only the columns named in `fields` come back."""
+
+    def stock_basic(*, exchange: str, list_status: str, fields: str) -> pd.DataFrame:
+        calls.append({"exchange": exchange, "list_status": list_status, "fields": fields})
+        columns = fields.split(",")
+        return pd.DataFrame(
+            [{column: row.get(column) for column in columns} for row in rows[list_status]],
+            columns=columns,
+        )
+
+    return stock_basic
+
+
+def _tushare_adapter(pro: object):  # type: ignore[no-untyped-def]
+    from rquant.adapter.tushare import TushareAdapter
+
+    adapter = TushareAdapter.__new__(TushareAdapter)
+    adapter._pro = pro
+    adapter._primary_token = "primary"
+    adapter._backup_token = ""
+    adapter._using_backup = False
+    adapter._transport_observer = None
+    return adapter
+
+
+def _production_shaped_pro(calls: list[dict[str, str]]) -> SimpleNamespace:
+    def stock_st(*, trade_date: str, fields: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [{"ts_code": "600000.SH", "name": "普通样本", "trade_date": trade_date}],
+            columns=fields.split(","),
+        )
+
+    def suspend_d(*, trade_date: str, fields: str) -> pd.DataFrame:
+        return pd.DataFrame(columns=fields.split(","))
+
+    def adj_factor(*, trade_date: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {"ts_code": "300001.SZ", "trade_date": trade_date, "adj_factor": 2.0},
+                {"ts_code": "600000.SH", "trade_date": trade_date, "adj_factor": 1.0},
+            ]
+        )
+
+    return SimpleNamespace(
+        stock_basic=_field_honoring_stock_basic(calls),
+        stock_st=stock_st,
+        suspend_d=suspend_d,
+        adj_factor=adj_factor,
+    )
+
+
+@pytest.fixture
+def _warnings() -> list[str]:
+    from loguru import logger
+
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    yield messages
+    logger.remove(sink)
+
+
+def test_the_adapter_asks_tushare_for_delist_date_and_keeps_every_other_column() -> None:
+    calls: list[dict[str, str]] = []
+    adapter = _tushare_adapter(SimpleNamespace(stock_basic=_field_honoring_stock_basic(calls)))
+
+    frame = adapter.stock_basic(list_status="D")
+
+    assert calls[0]["list_status"] == "D"
+    assert calls[0]["fields"].split(",") == [
+        "ts_code",
+        "symbol",
+        "name",
+        "area",
+        "industry",
+        "list_date",
+        "delist_date",
+        "market",
+        "list_status",
+    ]
+    assert "delist_date" in frame.columns
+    assert frame.loc[frame["ts_code"] == "600001.SH", "delist_date"].item() == "20200101"
+
+
+@pytest.mark.parametrize(
+    "empty_response",
+    [None, pd.DataFrame()],
+    ids=["none", "column-less-empty-frame"],
+)
+def test_an_empty_stock_basic_response_keeps_the_requested_columns(
+    empty_response: pd.DataFrame | None,
+) -> None:
+    """The #277 shape: zero rows *and* no columns is read by the validator as 'missing columns'."""
+
+    adapter = _tushare_adapter(SimpleNamespace(stock_basic=lambda **_kwargs: empty_response))
+
+    frame = adapter.stock_basic(list_status="P")
+
+    assert frame.empty
+    assert {"ts_code", "name", "list_date", "delist_date", "market"} <= set(frame.columns)
+    parsed = reference_slow_source_module._security_source_facts(
+        frame,
+        list_status="P",
+        st_codes=frozenset(),
+        limits=_source_limits(),
+    )
+    assert parsed.facts == ()
+    assert parsed.skipped_invalid_codes == ()
+
+
+def _stock_basic_frame(status: str) -> pd.DataFrame:
+    return pd.DataFrame(_TUSHARE_STOCK_BASIC_ROWS[status])
+
+
+def test_a_historical_non_canonical_delisted_code_is_skipped_and_counted() -> None:
+    parsed = reference_slow_source_module._security_source_facts(
+        _stock_basic_frame("D"),
+        list_status="D",
+        st_codes=frozenset(),
+        limits=_source_limits(),
+    )
+
+    assert tuple(fact.ts_code for fact in parsed.facts) == ("600001.SH",)
+    assert parsed.facts[0].delist_date == date(2020, 1, 1)
+    assert parsed.facts[0].source_list_status == "D"
+    assert parsed.skipped_invalid_codes == ("T600018.SH",)
+
+
+def test_a_non_canonical_code_in_the_suspended_list_is_skipped_too() -> None:
+    frame = pd.DataFrame([{**_HISTORICAL_DELISTED_ROW, "delist_date": None, "list_status": "P"}])
+
+    parsed = reference_slow_source_module._security_source_facts(
+        frame,
+        list_status="P",
+        st_codes=frozenset(),
+        limits=_source_limits(),
+    )
+
+    assert parsed.facts == ()
+    assert parsed.skipped_invalid_codes == ("T600018.SH",)
+
+
+def test_a_non_canonical_code_in_the_listed_list_still_rejects_the_capture() -> None:
+    frame = pd.DataFrame(
+        [*_TUSHARE_STOCK_BASIC_ROWS["L"], {**_HISTORICAL_DELISTED_ROW, "list_status": "L"}]
+    )
+
+    with pytest.raises(ReferenceSlowSourceError, match="invalid ts_code"):
+        reference_slow_source_module._security_source_facts(
+            frame,
+            list_status="L",
+            st_codes=frozenset(),
+            limits=_source_limits(),
+        )
+
+
+@pytest.mark.parametrize("status", ["L", "D", "P"])
+def test_a_stock_basic_list_without_the_delist_date_column_is_still_rejected(
+    status: str,
+) -> None:
+    frame = pd.DataFrame(_TUSHARE_STOCK_BASIC_ROWS["L"]).drop(columns=["delist_date"])
+
+    with pytest.raises(ReferenceSlowSourceError, match="missing columns: delist_date"):
+        reference_slow_source_module._security_source_facts(
+            frame,
+            list_status=status,
+            st_codes=frozenset(),
+            limits=_source_limits(),
+        )
+
+
+def test_a_delisted_row_without_a_delist_date_value_is_still_rejected() -> None:
+    frame = pd.DataFrame([{**_TUSHARE_STOCK_BASIC_ROWS["D"][1], "delist_date": None}])
+
+    with pytest.raises(ReferenceSlowSourceError, match="lacks delist_date"):
+        reference_slow_source_module._security_source_facts(
+            frame,
+            list_status="D",
+            st_codes=frozenset(),
+            limits=_source_limits(),
+        )
+
+
+def test_the_capture_seals_a_snapshot_through_the_real_adapter_and_logs_the_skip(
+    tmp_path: Path,
+    _warnings: list[str],
+) -> None:
+    calls: list[dict[str, str]] = []
+
+    snapshot = capture_reference_slow_source_snapshot(
+        database_path=_database(tmp_path),
+        adapter=_tushare_adapter(_production_shaped_pro(calls)),
+        calendar=_calendar(),
+        target_trade_date=TARGET_DATE,
+        captured_at=OBSERVED_AT,
+        completion_clock=lambda: OBSERVED_AT,
+        producer_commit=COMMIT,
+    )
+
+    assert [call["list_status"] for call in calls] == ["L", "D", "P"]
+    assert tuple(fact.ts_code for fact in snapshot.security_facts) == (
+        "300001.SZ",
+        "600000.SH",
+    )
+    skip_lines = [line for line in _warnings if "non-canonical ts_code" in line]
+    assert len(skip_lines) == 1
+    assert "list_status=D" in skip_lines[0]
+    assert "skipped 1 row(s)" in skip_lines[0]
+    assert "T600018.SH" in skip_lines[0]
+
+
+def test_the_production_shaped_stock_basic_reaches_the_reference_slow_serving_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _warnings: list[str],
+) -> None:
+    """source.reference-slow -> publisher.reference-slow -> `reference_slow_authority`.
+
+    What serving's hard `reference_slow_authority` source reads is the serving authority the
+    publisher writes under the spool; on the host it had 0 generations, because the source
+    never sealed a batch (#293).
+    """
+
+    from rquant.live_contracts import LiveChannel
+    from rquant.live_spool import LiveBatchSpool
+    from rquant.reference_slow_publisher import ReferenceSlowSourceSnapshot
+    from rquant.runtime_serving_authority import ServingSourceAuthorityReader
+    from rquant.runtime_serving_snapshot import (
+        REFERENCE_SLOW_AUTHORITY_DATASET_ID,
+        ReferenceSlowPayload,
+    )
+    from rquant.strict_json import strict_model_validate_canonical_json
+
+    calls: list[dict[str, str]] = []
+    adapter = _tushare_adapter(_production_shaped_pro(calls))
+    source_manifest, publisher_manifest = _runtime_manifests(tmp_path)
+    observed_at = datetime(2026, 7, 31, 1, 20, tzinfo=UTC)
+    published_at = observed_at.replace(minute=24, second=40)
+    monkeypatch.setattr("rquant.reference_slow_runtime._utc_now", lambda: published_at)
+    source_step = reference_slow_source_builder(
+        adapter_factory=lambda: adapter,
+        clock=lambda: observed_at,
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+    publisher_step = reference_slow_publisher_builder(
+        clock=lambda: published_at,
+        runtime_capabilities=_runtime_capabilities(),
+    )(publisher_manifest)
+
+    captured = source_step()
+    published = publisher_step()
+
+    assert captured.processed_count == 1
+    assert captured.degraded_reasons == ()
+    assert published.processed_count == 1
+    assert [call["list_status"] for call in calls] == ["L", "D", "P"]
+    assert any("T600018.SH" in line for line in _warnings)
+
+    spool = LiveBatchSpool(tmp_path / "reference-slow-spool", read_only=True)
+    records = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1, limit=4)
+    assert len(records) == 1
+    sealed = strict_model_validate_canonical_json(
+        ReferenceSlowSourceSnapshot, spool.read_payload(records[0])
+    )
+    assert tuple(fact.ts_code for fact in sealed.security_facts) == ("300001.SZ", "600000.SH")
+
+    authority = ServingSourceAuthorityReader(
+        root=tmp_path / "reference-slow-spool" / "serving-authority",
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=REFERENCE_SLOW_AUTHORITY_DATASET_ID,
+        expected_payload_kind="reference_slow",
+    )(datetime(2026, 7, 31, 1, 25, tzinfo=UTC))
+    assert isinstance(authority.payload, ReferenceSlowPayload)
+    registry_generation = published.source_generations["reference_registry"]
+    assert authority.payload.reference_generation_id == registry_generation
+
+
+class _MissingDelistDateAdapter(_Adapter):
+    """What v0.33.19 handed the source every morning: `stock_basic` without `delist_date`."""
+
+    def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
+        return super().stock_basic(list_status).drop(columns=["delist_date"])
+
+
+def test_a_failed_capture_stays_on_the_heartbeat_until_the_trade_date_rolls_over(
+    tmp_path: Path,
+) -> None:
+    """#293 masking: 09:20 failed, and from 09:25 the heartbeat read clean again (#277 family)."""
+
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    now = [datetime(2026, 7, 31, 1, 20, 20, tzinfo=UTC)]
+    step = reference_slow_source_builder(
+        adapter_factory=_MissingDelistDateAdapter,
+        clock=lambda: now[0],
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    with pytest.raises(ReferenceSlowSourceError, match="missing columns: delist_date"):
+        step()
+    #: the retry in the window: the same logical request id was already used (#295)
+    now[0] = datetime(2026, 7, 31, 1, 20, 51, tzinfo=UTC)
+    with pytest.raises(Exception, match="reference source attempt already exists"):
+        step()
+
+    now[0] = datetime(2026, 7, 31, 1, 25, 30, tzinfo=UTC)
+    after_window = step()
+    now[0] = datetime(2026, 7, 31, 6, 0, tzinfo=UTC)
+    afternoon = step()
+    now[0] = datetime(2026, 8, 3, 1, 0, tzinfo=UTC)
+    next_session = step()
+
+    assert after_window.degraded_reasons == ("capture_failed:ReferenceSlowSourceError",)
+    assert afternoon.degraded_reasons == ("capture_failed:ReferenceSlowSourceError",)
+    assert next_session.degraded_reasons == ()
+
+
+def test_a_successful_capture_leaves_no_failure_reason_after_the_window(tmp_path: Path) -> None:
+    source_manifest, _publisher = _runtime_manifests(tmp_path)
+    now = [datetime(2026, 7, 31, 1, 20, 20, tzinfo=UTC)]
+    step = reference_slow_source_builder(
+        adapter_factory=_Adapter,
+        clock=lambda: now[0],
+        runtime_capabilities=_runtime_capabilities(),
+    )(source_manifest)
+
+    captured = step()
+    now[0] = datetime(2026, 7, 31, 1, 25, 30, tzinfo=UTC)
+    after_window = step()
+
+    assert captured.processed_count == 1
+    assert captured.degraded_reasons == ()
+    assert after_window.degraded_reasons == ()
