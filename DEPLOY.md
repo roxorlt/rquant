@@ -366,6 +366,14 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   n 是当天必填数值不是有限数、被丢掉的行数（09-23 的报文里是 407：`price` 为 NaN、`vol` 与
   `amount` 为 0 的「今天没有集合竞价成交」）。这一条是**预期的记录，不是故障**，批次仍是
   PUBLISHED（#289）。
+  **从这一版起，auction-match 的心跳状态每个交易日都是 `degraded`，一直到换交易日**：
+  这一条从 09:29 采到数那一刻起挂在心跳上；窗过后的空转轮次沿用上一次结果的
+  `degraded_reasons`（`runtime_service_builtin.py:848-849`），所以它一直留到交易日翻篇；而
+  `degraded_reasons` 非空时心跳状态就记成 `DEGRADED`（`runtime_service_control.py:696-700`）。
+  连带 `runtime-health` 的 `reason` 里会多一条 `degraded:<auction-match 实例>`。这两处都**只用于
+  展示**：部署器、watchdog、候选装配都不读它。**验收时不要把它当成故障**，auction-match 真正要看的
+  是批次是不是 PUBLISHED。把丢行数挪到心跳上一个只作记录的字段、让健康的采集不再显示为降级，
+  由后续 issue 跟踪。
   **批次若是 DEGRADED + `coverage_below_minimum`**：丢掉的行里落在竞价全集
   （`authorities/auction-universe/current.json` 的 `codes`）里的超过了全集的 5%
   （`min_coverage_ratio` 默认 0.95，生产画像不写它）。这个交集在主机上已经用 09-23 的报文量过：
@@ -399,7 +407,7 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
   `processed_count >= 1`，随后 `watchlist-quote` / `market-minute` 的
   `degraded_reasons` 为空、`source_generations` 里有 `candidate_universe`。
 
-**已知的、不是缺陷的四件事**：
+**已知的、不是缺陷的五件事**：
 
 1. **09:30 到装配窗起点之间两个源会降级**。`market-minute` / `watchlist-quote` 从 09:30 起
    就去读候选全集，而当日的 auction_gap 快照最早在装配窗起点之后才装得出来。这一段是
@@ -422,6 +430,11 @@ manifest 的 settings 是生成器写死的字面量（`src/rquant/runtime_produ
    `basis_trade_date` 会从「上一场」翻成「当天」，文档语义因此不同，于是发新一代。盘中重启
    不会（`basis` 不变 ⇒ 语义相同 ⇒ 不写）。所以上面「同一天之内不再有第二次写」这句
    **限盘中**。
+5. **auction-match 每个交易日从 09:29 到换交易日都显示 `degraded`**（#289）。原因是上面那条
+   `auction_match:rows_dropped_non_finite:<n>`：停牌或没有竞价成交的票天天有，这一条天天挂着，
+   `runtime-health` 跟着多一条 `degraded:<auction-match 实例>`。只用于展示，部署器、watchdog、
+   候选装配都不读它；判 auction-match 好坏看批次是不是 PUBLISHED。窗内重启之后这一条会消失
+   （幂等复看那条路读的是已落盘的批次，信封里没有这个数），批次与下游不受影响。
 
 ### 3. 回滚
 
