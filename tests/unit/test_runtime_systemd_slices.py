@@ -96,7 +96,15 @@ def test_plane_priority_descends_from_live_to_serving_to_background() -> None:
     # giving the resident services priority (#243 review M-1).
     live_runtime = _load_slice("live-runtime")["Slice"]
     assert "CPUQuota" not in live
-    assert _percent(live_runtime["CPUQuota"]) + _percent(serving["CPUQuota"]) <= 100
+    # 2026-09-24 owner decision ("cpu可以调到2个", issue #297): live-runtime's own
+    # CPUQuota rose from 60% to 200%, so the two constrained planes now sum to 230%.
+    # The "<= 100%" bound this replaced assumed a 2 vCPU host where live-runtime and
+    # serving had to fit in the one core not reserved for backup/system (#243 / owner
+    # ruling 21, 2026-09-08); neither rquant-live.slice nor rquant.slice carries a
+    # CPUQuota, so nothing here still enforces a combined ceiling on the two child
+    # slices, and this assertion is not re-deriving one -- it only pins today's values.
+    assert _percent(live_runtime["CPUQuota"]) == 200
+    assert _percent(serving["CPUQuota"]) == 30
     assert int(live_runtime["CPUWeight"]) < int(live["CPUWeight"])
     assert "CPUQuota" not in maintenance
     assert "MemoryLow" in live
