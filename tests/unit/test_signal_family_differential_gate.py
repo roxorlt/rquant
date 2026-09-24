@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #291's to PR #296's. It is the merge base of the
+    # main; this one moves it from PR #296's to PR #303's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "304f6ed164f327c656f07c39e45cb57e6f7dbe40"
-    assert BASELINE_TREE_SHA == "f81b39bf58d5753133210a1e73f01eb31b04bdc2"
+    assert BASELINE_COMMIT_SHA == "2ca5607aa77e0b9db74cd832d23133087cf2b52d"
+    assert BASELINE_TREE_SHA == "60bdfad9f96f386564126b7ff2d90b0fcd90b0cd"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``304f6ed`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``2ca5607`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1562,7 +1562,7 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # only runtime_service_builtin.py (the reference-slow capture-failure memory), so that
     # snapshot and probe-r07-b19 move with it - statically re-derived rather than asserted
     # here.
-    # And this refreeze to 304f6ed leaves it out again: the reference-slow publish-window topic,
+    # The refreeze to 304f6ed left it out again: the reference-slow publish-window topic,
     # shipped together with the bulk reference reads and the runtime slice CPUQuota raise, adds
     # no module under src/rquant/ and changes nine, adds three test files and touches eleven
     # existing test modules, adds one script (reference_slow_publish_rehearsal.py, a rehearsal
@@ -1572,9 +1572,22 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # the shard manifest because the test count changed (14781 -> 14836); the matrix is unchanged
     # at five shards. Of the nine source_file_snapshots modules it once more changes only
     # runtime_service_builtin.py (the idle-round heartbeat sequences), so that snapshot and
-    # probe-r07-b19 move with it - statically re-derived rather than asserted here. That is three
-    # refreezes in a row without a flip, and a named path would have flipped truth value eleven
-    # times in thirty-two refreezes: naming one
+    # probe-r07-b19 move with it - statically re-derived rather than asserted here.
+    # And this refreeze to 2ca5607 leaves it out once more: the Route A chain-blockers release
+    # (the day replay tool, hotfix AI and hotfix AJ, with the nginx /preview/ location) adds no
+    # module under src/rquant/ and changes fourteen, adds seven test files and one test helper
+    # module and touches twenty existing test modules, adds one script (route_a_day_replay.py, a
+    # sandboxed replay that is read-only against production, which the assertion below holds to
+    # architecture), changes deploy/nginx/rquant-backup.conf (architecture as well), marks
+    # nothing ``linux_exact``, adds no job and does not touch .github/workflows/ci.yml. It
+    # regenerates the shard manifest because the test count changed (14836 -> 14894); the matrix
+    # is unchanged at five shards. Of the nine source_file_snapshots modules it changes two,
+    # runtime_builder_shadow.py (the degraded detail) and runtime_builder_strategy.py (the
+    # skipped-candidates observation), so those two snapshots and the two roots that live in
+    # them move with it; no boundary probe lives in either file, and the one in
+    # strategy_runner.py (probe-r07-b01) sits above every change there - all statically
+    # re-derived rather than asserted here. That is four refreezes in a row without a flip, and a
+    # named path would have flipped truth value eleven times in thirty-three refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted
