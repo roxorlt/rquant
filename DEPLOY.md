@@ -36,10 +36,12 @@ cd "${WT}"
   --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
 ```
 
-  **只有报 `schema_changed: 0` 才往下走第 ④ 步**。预期 `plans: 208`、`schema_changed: 0`；`closed` 是「apply 时会关掉」
-  的份数（dry-run 不关任何一份），此时 `current` 还是 09-24 那代，所以 `closed_current_generation` 应为 16（那代自己的
-  16 份计划）——这只是预览，这一步不 apply。仍是 WAL 的库在这里报 `state_unreadable`（`acknowledge` 转换之前本来就读不了），
-  不算阻断；阻断条件只有 `schema_changed` 不为 0——那说明主机上有一份计划保护的是真实的 schema 变化，停下来找协调者。
+  **只有退出码 0 且报 `schema_changed: 0` 才往下走第 ④ 步；退 2（有计划报 `schema_changed`）就停下，不装**，找协调者。
+  这一步要紧：新代与当前代形状相同就不建计划、准入也不看旧代的计划，若当前代真有一份没走完的真变化计划，装上新代后
+  那次变化会在没有消费者回执的情况下生效（#308，细节见「热修 AJ」一条）。预期 `plans: 208`、`schema_changed: 0`；
+  `closed` 是「apply 时会关掉」的份数（dry-run 不关任何一份），此时 `current` 还是 09-24 那代，所以
+  `closed_current_generation` 应为 16（那代自己的 16 份计划）——这只是预览，这一步不 apply。仍是 WAL 的库在这里报
+  `state_unreadable`（`acknowledge` 转换之前本来就读不了），不算阻断。
 - **第 ④ 步 `runtime-deployment-profile --apply`**：新代装在 09-24 代之上，**一份 rollout 计划都不建**（热修 AJ：
   v0.33.21 与 v0.33.22 的 21 个 channel 形状和 serving 物理 schema 逐一相同）。回执里 `schema_rollout_plan_ids` 是 `[]`，
   `control/schema-rollouts` 仍是 208 个目录。
@@ -58,9 +60,9 @@ cd "${WT}"
   --runtime-root /home/lighthouse/rquant/data/runtime
 ```
 
-  dry-run 预期 `plans: 208`、`closed: 208`、`closed_current_generation: 0`、`schema_changed: 0`（仍是 WAL 的库报
+  dry-run 预期 `plans: 208`、`closed: 208`、`closed_current_generation: 0`、`schema_changed: 0`、退出码 0（仍是 WAL 的库报
   `state_unreadable`，先跑一次 `acknowledge` 转换再 dry-run）；apply 后每份 `phase_after: rollback`，`current` 不动；
-  再跑一次 `closed: 0`、全部 `terminal`。**只要出现 `schema_changed` 就停下**，那份计划保护的是真实的 schema 变化。
+  再跑一次 `closed: 0`、全部 `terminal`。**只要出现 `schema_changed`（退出码 2）就停下**，那份计划保护的是真实的 schema 变化。
 - **起 unit 之后**：心跳文件多出 `observations` 与 `degraded_detail` 两个键（每个 role 都写）；
   `candidate.auction_gap.v1` 的 `observations.auction_gap_prior5_incomplete_codes` 是当天被排除的代码数、状态仍是 running。
   其余「应该看到什么」见热修 AI 一条。
