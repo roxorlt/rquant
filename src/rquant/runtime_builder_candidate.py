@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Annotated, Any, Literal, Protocol, TypeAlias
 from zoneinfo import ZoneInfo
 
+from loguru import logger
 from pydantic import (
     Field,
     TypeAdapter,
@@ -22,8 +23,10 @@ from pydantic import (
 )
 
 from rquant.auction_gap_candidate_input import (
+    PRIOR_FIVE_INCOMPLETE_OBSERVATION,
+    AuctionGapCandidateAssembly,
     AuctionGapCandidateInputError,
-    assemble_auction_gap_candidate_batch,
+    assemble_auction_gap_candidate_input,
 )
 from rquant.live_contracts import BatchQualityStatus
 from rquant.live_spool import LiveBatchSpool
@@ -43,7 +46,11 @@ from rquant.runtime_market_session import (
     local_window_contains,
     raise_or_label_calendar_refusal,
 )
-from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
+from rquant.runtime_service_control import (
+    RuntimeServicePlane,
+    RuntimeStepResult,
+    degraded_cause,
+)
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
     RuntimeServiceKind,
@@ -250,7 +257,7 @@ class AuctionCandidateInputLoader(Protocol):
         observed_at: datetime,
         producer_commit: str,
         read_gate: ReplicaReadGate[Any] | None = None,
-    ) -> CandidatePublishBatch: ...
+    ) -> CandidatePublishBatch | AuctionGapCandidateAssembly: ...
 
 
 class SessionCandidateInputLoader(Protocol):
@@ -507,6 +514,39 @@ def load_candidate_input(
     )
 
 
+def load_live_auction_candidate_assembly(
+    *,
+    auction_spool_root: Path,
+    daily_database_path: Path,
+    reference_registry_path: Path,
+    calendar_path: Path,
+    calendar_expected_commit: str,
+    calendar_content_sha256: str,
+    trade_date: date,
+    observed_at: datetime,
+    producer_commit: str,
+    read_gate: ReplicaReadGate[Any] | None = None,
+) -> AuctionGapCandidateAssembly:
+    """One production round's batch, with the auction codes it had to leave out."""
+
+    calendar = load_market_calendar_authority(
+        calendar_path,
+        expected_commit=calendar_expected_commit,
+    )
+    if calendar.content_sha256 != calendar_content_sha256:
+        raise ValueError("auction candidate calendar content identity mismatch")
+    return assemble_auction_gap_candidate_input(
+        auction_spool=LiveBatchSpool(auction_spool_root),
+        daily_database_path=daily_database_path,
+        reference_registry=ReadonlyReferenceRegistry(reference_registry_path),
+        calendar=calendar,
+        trade_date=trade_date,
+        observed_at=observed_at,
+        producer_commit=producer_commit,
+        read_gate=read_gate,
+    )
+
+
 def load_live_auction_candidate_input(
     *,
     auction_spool_root: Path,
@@ -520,22 +560,18 @@ def load_live_auction_candidate_input(
     producer_commit: str,
     read_gate: ReplicaReadGate[Any] | None = None,
 ) -> CandidatePublishBatch:
-    calendar = load_market_calendar_authority(
-        calendar_path,
-        expected_commit=calendar_expected_commit,
-    )
-    if calendar.content_sha256 != calendar_content_sha256:
-        raise ValueError("auction candidate calendar content identity mismatch")
-    return assemble_auction_gap_candidate_batch(
-        auction_spool=LiveBatchSpool(auction_spool_root),
+    return load_live_auction_candidate_assembly(
+        auction_spool_root=auction_spool_root,
         daily_database_path=daily_database_path,
-        reference_registry=ReadonlyReferenceRegistry(reference_registry_path),
-        calendar=calendar,
+        reference_registry_path=reference_registry_path,
+        calendar_path=calendar_path,
+        calendar_expected_commit=calendar_expected_commit,
+        calendar_content_sha256=calendar_content_sha256,
         trade_date=trade_date,
         observed_at=observed_at,
         producer_commit=producer_commit,
         read_gate=read_gate,
-    )
+    ).batch
 
 
 def _utc_now() -> datetime:
@@ -551,7 +587,9 @@ def candidate_publisher_builder(
     runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     loader: CandidateInputLoader = candidate_input_loader or load_candidate_input
-    live_auction_loader = auction_input_loader or load_live_auction_candidate_input
+    live_auction_loader: AuctionCandidateInputLoader = (
+        auction_input_loader or load_live_auction_candidate_assembly
+    )
     live_session_loader = session_input_loader or assemble_session_candidate_batch
 
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
@@ -633,6 +671,9 @@ def candidate_publisher_builder(
         #: 原来都返回 -1。auction_gap 从来没真的发出过东西（#254/#277），所以这条路径
         #: 一次都没被走到过；竞价链一旦真的开始产出，它会在每一轮上抛。
         last_output_sequence = -1
+        #: 本进程最近一次发出的批次留下的计数（例如缺五日日线被排除的竞价代码数）。窗外与
+        #: 已发之后的空闲轮照抄它，否则 09:49 之后心跳上就再也看不到当天排除了几只。
+        last_observations: Mapping[str, int] = MappingProxyType({})
 
         def _replica_cost() -> dict[str, object]:
             """What **this** iteration did with the replica, for the heartbeat (#256).
@@ -653,16 +694,19 @@ def candidate_publisher_builder(
             }
 
         def step() -> RuntimeStepResult:
-            nonlocal published_trade_date, last_output_sequence
+            nonlocal published_trade_date, last_output_sequence, last_observations
 
             def idle_result(
                 degraded_reasons: tuple[str, ...] = (),
+                degraded_detail: str | None = None,
             ) -> RuntimeStepResult:
                 """这一轮什么都没发：报本进程已经发到的那一代，不是 -1。"""
 
                 return RuntimeStepResult(
                     output_sequence=last_output_sequence,
                     degraded_reasons=degraded_reasons,
+                    degraded_detail=degraded_detail,
+                    observations=last_observations,
                     **_replica_cost(),
                 )
 
@@ -710,8 +754,10 @@ def candidate_publisher_builder(
                         producer_commit=manifest.producer_commit,
                         read_gate=replica_gate,
                     )
-                except SessionCandidateInputError:
-                    return idle_result(("session_candidate_input_unavailable",))
+                except SessionCandidateInputError as error:
+                    return idle_result(
+                        *degraded_cause("session_candidate_input_unavailable", error)
+                    )
             elif settings.input_mode == "auction_live":
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
@@ -745,8 +791,22 @@ def candidate_publisher_builder(
                         producer_commit=manifest.producer_commit,
                         read_gate=replica_gate,
                     )
-                except AuctionGapCandidateInputError:
-                    return idle_result(("auction_gap_input_unavailable",))
+                except AuctionGapCandidateInputError as error:
+                    return idle_result(*degraded_cause("auction_gap_input_unavailable", error))
+                if isinstance(loaded, AuctionGapCandidateAssembly):
+                    incomplete = loaded.prior_five_incomplete_codes
+                    observations = {PRIOR_FIVE_INCOMPLETE_OBSERVATION: len(incomplete)}
+                    if incomplete and dict(last_observations) != observations:
+                        logger.warning(
+                            "auction_gap left out {count} of {total} auction codes without "
+                            "exactly one daily_bar row on each of the five prior sessions: "
+                            "{codes}",
+                            count=len(incomplete),
+                            total=loaded.auction_code_count,
+                            codes=", ".join(incomplete),
+                        )
+                    last_observations = MappingProxyType(observations)
+                    loaded = loaded.batch
             else:
                 if settings.candidate_input_path is None:
                     raise RuntimeError("validated candidate_input_path disappeared")
@@ -781,6 +841,7 @@ def candidate_publisher_builder(
                     "candidate_input": summary.authority_snapshot_id,
                     "strategy_candidate": summary.snapshot_content_sha256,
                 },
+                observations=last_observations,
                 **_replica_cost(),
             )
 
@@ -811,6 +872,7 @@ __all__ = [
     "SessionCandidateInputLoader",
     "candidate_publisher_builder",
     "load_candidate_input",
+    "load_live_auction_candidate_assembly",
     "load_live_auction_candidate_input",
     "serialize_candidate_input",
 ]

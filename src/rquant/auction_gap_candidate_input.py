@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import stat
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from numbers import Real
 from pathlib import Path
@@ -40,10 +41,39 @@ _REFERENCE_DATASETS = (
     ReferenceDataset.LISTING_STATUS,
     ReferenceDataset.PRICE_LIMIT_REGIME,
 )
+#: The largest share of the day's auction codes that may be left out for lacking exactly
+#: one `daily_bar` row on each of the five prior sessions before the snapshot itself is
+#: distrusted and the whole batch refused.
+#:
+#: The codes this is meant to let through are individual securities: a new listing has
+#: fewer than five sessions, and a suspension or resumption leaves a hole. On 2026-09-24
+#: that was 6 of 5,475 (0.11 %); a heavy IPO week and a few dozen suspensions stay under
+#: 1 %. What it must still refuse is a snapshot that is itself incomplete: a prior session
+#: the daily pipeline never loaded makes ~100 % of codes short, and one exchange's rows
+#: missing for a day makes ~30-45 % short. 5 % sits an order of magnitude above the first
+#: and well below the second, so neither case is ambiguous.
+PRIOR_FIVE_INCOMPLETE_MAX_FRACTION = 0.05
+#: `RuntimeStepResult.observations` key under which the publisher reports the count.
+PRIOR_FIVE_INCOMPLETE_OBSERVATION = "auction_gap_prior5_incomplete_codes"
 
 
 class AuctionGapCandidateInputError(RuntimeError):
     """Published evidence cannot form a trustworthy auction-gap input batch."""
+
+
+@dataclass(frozen=True)
+class AuctionGapCandidateAssembly:
+    """One assembled batch and what the assembly had to leave out to make it.
+
+    `prior_five_incomplete_codes` are auction codes without exactly one `daily_bar` row on
+    each of the five prior sessions. They are not in `batch.facts`: the auction-gap ratio
+    is defined over five sessions, so such a code cannot be a candidate today, and until
+    2026-09-24 one of them refused the other 5,469 (#1 of package AI).
+    """
+
+    batch: AuctionGapCandidateBatch
+    auction_code_count: int
+    prior_five_incomplete_codes: tuple[str, ...] = ()
 
 
 def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
@@ -221,14 +251,50 @@ def _query_daily_volume_rows(
         if not math.isfinite(volume) or volume < 0:
             raise AuctionGapCandidateInputError("daily volume must be finite and nonnegative")
         normalized_rows.append((str(code), row_date, volume))
-    expected = {(code, row_date) for code in ts_codes for row_date in trade_dates}
-    observed = [(code, row_date) for code, row_date, _ in normalized_rows]
-    if len(observed) != len(expected) or set(observed) != expected:
-        raise AuctionGapCandidateInputError(
-            "daily snapshot must contain exactly one row for every prior-five session"
-        )
+    requested_codes = set(ts_codes)
+    requested_dates = set(trade_dates)
+    if any(
+        code not in requested_codes or row_date not in requested_dates
+        for code, row_date, _ in normalized_rows
+    ):
+        raise AuctionGapCandidateInputError("daily snapshot returned rows it was not asked for")
     available_at = datetime.fromtimestamp(before.st_mtime_ns / 1_000_000_000, tz=UTC)
     return tuple(normalized_rows), available_at
+
+
+def _partition_prior_five(
+    rows: tuple[tuple[str, date, float], ...],
+    *,
+    ts_codes: tuple[str, ...],
+    trade_dates: tuple[date, ...],
+) -> tuple[tuple[tuple[str, date, float], ...], tuple[str, ...]]:
+    """Split the rows into codes with exactly one row per prior session, and the rest.
+
+    A code is complete when its rows are exactly one per date in `trade_dates`: a missing
+    session (new listing, suspension) and a duplicated one both leave it out. The whole
+    batch is refused only when the share left out says the snapshot, not the security, is
+    what is wrong (`PRIOR_FIVE_INCOMPLETE_MAX_FRACTION`).
+    """
+
+    by_code: dict[str, list[tuple[str, date, float]]] = {code: [] for code in ts_codes}
+    for row in rows:
+        by_code[row[0]].append(row)
+    expected_dates = tuple(sorted(trade_dates))
+    complete: list[tuple[str, date, float]] = []
+    incomplete: list[str] = []
+    for code in ts_codes:
+        code_rows = by_code[code]
+        if tuple(sorted(row_date for _code, row_date, _volume in code_rows)) == expected_dates:
+            complete.extend(code_rows)
+        else:
+            incomplete.append(code)
+    if len(incomplete) > PRIOR_FIVE_INCOMPLETE_MAX_FRACTION * len(ts_codes):
+        raise AuctionGapCandidateInputError(
+            "daily snapshot must contain exactly one row for every prior-five session: "
+            f"{len(incomplete)} of {len(ts_codes)} auction codes lack it, more than "
+            f"{PRIOR_FIVE_INCOMPLETE_MAX_FRACTION:.0%} (first: {', '.join(incomplete[:5])})"
+        )
+    return tuple(complete), tuple(incomplete)
 
 
 def _required_bool(lookup: ReferenceLookup, field: str) -> bool:
@@ -283,6 +349,31 @@ def assemble_auction_gap_candidate_batch(
 ) -> AuctionGapCandidateBatch:
     """Assemble a live candidate batch without using evidence after ``observed_at``."""
 
+    return assemble_auction_gap_candidate_input(
+        auction_spool=auction_spool,
+        daily_database_path=daily_database_path,
+        reference_registry=reference_registry,
+        calendar=calendar,
+        trade_date=trade_date,
+        observed_at=observed_at,
+        producer_commit=producer_commit,
+        read_gate=read_gate,
+    ).batch
+
+
+def assemble_auction_gap_candidate_input(
+    *,
+    auction_spool: LiveBatchSpool,
+    daily_database_path: Path,
+    reference_registry: ReadonlyReferenceRegistry,
+    calendar: MarketCalendarAuthority,
+    trade_date: date,
+    observed_at: datetime,
+    producer_commit: str,
+    read_gate: ReplicaReadGate[_DailyVolumeRead] | None = None,
+) -> AuctionGapCandidateAssembly:
+    """The batch, and the auction codes it left out for lacking five prior daily rows."""
+
     observed = normalize_aware_utc(observed_at)
     if calendar.generated_at > observed:
         raise AuctionGapCandidateInputError("calendar is future evidence")
@@ -321,7 +412,7 @@ def assemble_auction_gap_candidate_batch(
     if pointer.switched_at > observed or manifest.published_at > observed:
         raise AuctionGapCandidateInputError("reference generation is future evidence")
 
-    daily_rows, daily_available_at = _daily_volume_rows(
+    raw_daily_rows, daily_available_at = _daily_volume_rows(
         daily_database_path,
         ts_codes=ts_codes,
         trade_dates=prior_dates,
@@ -329,14 +420,23 @@ def assemble_auction_gap_candidate_batch(
     )
     if daily_available_at > observed:
         raise AuctionGapCandidateInputError("daily snapshot is future evidence")
-    daily_snapshot_id = canonical_sha256(
-        {
-            "contract": "auction-gap-daily-volume/v1",
-            "trade_date": trade_date,
-            "prior_dates": prior_dates,
-            "rows": daily_rows,
-        }
+    daily_rows, incomplete_codes = _partition_prior_five(
+        raw_daily_rows,
+        ts_codes=ts_codes,
+        trade_dates=prior_dates,
     )
+    daily_snapshot_identity: dict[str, object] = {
+        "contract": "auction-gap-daily-volume/v1",
+        "trade_date": trade_date,
+        "prior_dates": prior_dates,
+        "rows": daily_rows,
+    }
+    if incomplete_codes:
+        #: only when there are any, so a day without a short code keeps the identity
+        #: every earlier release computed for it
+        daily_snapshot_identity["prior5_incomplete_codes"] = incomplete_codes
+    daily_snapshot_id = canonical_sha256(daily_snapshot_identity)
+    excluded = frozenset(incomplete_codes)
     #: one pass over the rows, in their order: filtering all of them once per code was
     #: 5,475 x 27,375 tuple comparisons per round (#299)
     grouped_volumes: dict[str, list[tuple[str, date, float]]] = {code: [] for code in ts_codes}
@@ -352,6 +452,8 @@ def assemble_auction_gap_candidate_batch(
     #: as that row, with the same message.
     references: ReferenceAsOfSnapshot | None = None
     for row in frame.itertuples(index=False):
+        if row.ts_code in excluded:
+            continue
         event_time = envelope.event_time_end
         try:
             if references is None:
@@ -482,10 +584,18 @@ def assemble_auction_gap_candidate_batch(
         authority_snapshot_id=authority_snapshot_id,
         producer_commit=producer_commit,
     )
-    return AuctionGapCandidateBatch(authority=authority, facts=tuple(facts))
+    return AuctionGapCandidateAssembly(
+        batch=AuctionGapCandidateBatch(authority=authority, facts=tuple(facts)),
+        auction_code_count=len(ts_codes),
+        prior_five_incomplete_codes=incomplete_codes,
+    )
 
 
 __all__ = (
+    "PRIOR_FIVE_INCOMPLETE_MAX_FRACTION",
+    "PRIOR_FIVE_INCOMPLETE_OBSERVATION",
+    "AuctionGapCandidateAssembly",
     "AuctionGapCandidateInputError",
     "assemble_auction_gap_candidate_batch",
+    "assemble_auction_gap_candidate_input",
 )
