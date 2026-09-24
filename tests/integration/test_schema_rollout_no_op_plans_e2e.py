@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -616,3 +617,48 @@ def test_the_production_profile_s_sixteen_policies_stage_no_plan_for_a_commit_on
     assert candidate.schema_rollout_plan_ids == ()
     rollouts = root / "control" / "schema-rollouts"
     assert not rollouts.exists() or not any(rollouts.iterdir())
+
+
+def test_the_replay_summary_counts_plan_directories_not_channels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review item 6: two installs' plans on one channel are two plans in the replay summary."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "route_a_day_replay_under_test",
+        Path(__file__).resolve().parents[2] / "scripts" / "route_a_day_replay.py",
+    )
+    assert spec is not None and spec.loader is not None
+    replay = importlib.util.module_from_spec(spec)
+    #: its dataclasses resolve their module through `sys.modules`
+    monkeypatch.setitem(sys.modules, spec.name, replay)
+    spec.loader.exec_module(replay)
+
+    _disable_test_credential_sealer(monkeypatch)
+    root = tmp_path / "runtime"
+    _first_profile, first = _install(root, COMMITS[0], bootstrap=True)
+    thursday_profile, thursday = _install(root, COMMITS[1])
+    stage_pre_228_rollout_plans(
+        root,
+        profile=thursday_profile,
+        previous_generation_id=first.generation_hash,
+        target_generation_id=thursday.generation_hash,
+        started_at=STAGED_AT,
+    )
+    weekend_profile, weekend = _install(root, COMMITS[2])
+    stage_pre_228_rollout_plans(
+        root,
+        profile=weekend_profile,
+        previous_generation_id=thursday.generation_hash,
+        target_generation_id=weekend.generation_hash,
+        started_at=STAGED_AT + timedelta(days=2),
+    )
+
+    facts = replay._schema_rollout_facts(root, receipt=weekend)
+
+    assert facts["plans"] == 2
+    assert facts["receipt_plan_ids"] == 0
+    assert facts["phases_by_channel"] == {MARKET_MINUTE: ["prepare", "prepare"]}
