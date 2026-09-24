@@ -462,3 +462,68 @@ def test_six_short_codes_and_a_stale_candidate_still_reach_a_same_day_generation
     assert serving["signals_rows_today"] >= 1, serving
     assert summary["notifier_provider_deliveries"] == 0
     assert summary["verdict"]["crashed_roles"] == []
+
+
+def test_two_generations_reach_a_same_day_generation_with_signals_past_the_rollout_window(
+    tmp_path: Path,
+) -> None:
+    """Package AJ (#304, #228): the second generation of an install is not bound to any plan.
+
+    `--generations 2` installs the previous generation, then this one at 09:14 and runs the
+    installer's acknowledgement at 09:14:37 — ten minutes before the first market-minute
+    capture, so a plan's 600-second window has closed by then, which is how package AI
+    reproduced F5. Before this package that install staged sixteen plans (one per two-sided
+    channel, the release changing nothing but its commit), `market_minute_source` failed at
+    the first capture with `rollout deadline has expired` and then every iteration with
+    `immutable sequence already contains different content`, and `feature_live` every
+    iteration. Now the install stages none, and the day runs as the one-generation day does.
+    """
+
+    host = _host(
+        tmp_path,
+        codes=WIDE_CODES,
+        auction_price={code: 9.9 for code in WIDE_CODES[8:]},
+        prior_sessions=SHORT_CODES,
+        day_minutes={MINUTE_CODE: time(15, 0), STALE_CODE: time(9, 45)},
+    )
+    before = _tree(host["data"])
+
+    result = _run(
+        host,
+        tmp_path / "replay",
+        "--generations",
+        "2",
+        "--step-seconds",
+        "60",
+        "--until",
+        "10:30",
+    )
+
+    output = result.stdout + result.stderr
+    (sandbox,) = (tmp_path / "replay").iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert result.returncode == 0, output[-6000:]
+    assert _tree(host["data"]) == before
+    assert summary["stubs"]["listing_classification"] == "off"
+    assert len(summary["world"]["generations"]) == 2
+    assert summary["world"]["schema_rollout"] == {
+        "plans": 0,
+        "receipt_plan_ids": 0,
+        "phases": {},
+    }
+    roles = summary["roles"]
+    for label in ("market-minute.source.v1", "feature.intraday-pit.v1"):
+        assert not any(
+            marker in message
+            for message in roles[label]["errors"]
+            for marker in ("rollout deadline", "immutable sequence", "dual_write")
+        ), (label, roles[label]["errors"])
+    assert roles["market-minute.source.v1"]["total_failures"] == 0
+    assert roles["strategy.auction_gap.v1"]["total_failures"] == 0
+    chain = summary["chain"]
+    assert chain["signals_per_strategy"]["auction_gap"] >= 1
+    serving = chain["serving"]
+    assert serving["same_day"] is True, serving
+    assert serving["signals_rows_today"] >= 1, serving
+    assert summary["notifier_provider_deliveries"] == 0
+    assert summary["verdict"]["crashed_roles"] == []
