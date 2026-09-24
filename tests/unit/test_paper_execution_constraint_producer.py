@@ -464,3 +464,144 @@ def test_fails_closed_when_requested_code_has_no_visible_minute(tmp_path: Path) 
             spool=spool,
             published_at=_cn(9, 31, 30),
         ).produce(_request(generation_id=generation_id, observed_at=_cn(9, 31, 30)))
+
+
+# #299 -- one registry read per production request -------------------------------------
+
+
+class _SingleKeyReads:
+    """What the producer did before #299: every lookup its own `as_of` round trip."""
+
+    def __init__(self, registry: ReferenceRegistry, generation_id: str | None) -> None:
+        self._registry = registry
+        self._generation_id = generation_id
+
+    def as_of(self, **lookup: object) -> object:
+        return self._registry.as_of(**lookup, generation_id=self._generation_id)
+
+
+def _read_per_lookup(registry: ReferenceRegistry) -> None:
+    def single_key_snapshot(
+        *,
+        dataset_ids: object,
+        keys: object,
+        generation_id: str | None = None,
+    ) -> _SingleKeyReads:
+        return _SingleKeyReads(registry, generation_id)
+
+    registry.as_of_snapshot = single_key_snapshot  # type: ignore[method-assign]
+
+
+def _production_outcome(
+    root: Path,
+    *,
+    registry_path: Path,
+    spool: LiveBatchSpool,
+    generation_id: str,
+    observed_at: datetime,
+    per_lookup: bool,
+) -> tuple[str, object, object]:
+    root.mkdir(mode=0o700)
+    registry = ReferenceRegistry(registry_path)
+    if per_lookup:
+        _read_per_lookup(registry)
+    try:
+        publication = _producer(
+            root,
+            registry=registry,
+            spool=spool,
+            published_at=observed_at,
+        ).produce(_request(generation_id=generation_id, observed_at=observed_at))
+    except PaperExecutionConstraintEvidenceError as exc:
+        cause = exc.__cause__
+        return (
+            str(exc),
+            type(cause).__name__ if cause is not None else None,
+            str(cause) if cause is not None else None,
+        )
+    return ("batch", publication.batch, None)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        {},
+        {"is_st": True, "is_suspended": True},
+        {"include_listing": False},
+        {"price_payload": {"limit_up_price": 11.0}},
+        {
+            "listing_payload": {
+                "market": "CN",
+                "exchange": "SSE",
+                "instrument_class": "FUND",
+                "security_class": "ETF",
+                "status": "listed",
+            }
+        },
+        {"missing_st": True},
+    ],
+)
+def test_bulk_reference_reads_publish_what_single_lookups_published(
+    tmp_path: Path,
+    scenario: dict[str, object],
+) -> None:
+    options = dict(scenario)
+    if options.pop("missing_st", False):
+        registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+        _append_reference(
+            registry,
+            dataset=ReferenceDataset.SUSPENSION_STATUS,
+            payload={"is_suspended": False},
+        )
+        _append_reference(
+            registry,
+            dataset=ReferenceDataset.PRICE_LIMIT_REGIME,
+            payload={"limit_up_price": 11.0, "limit_down_price": 9.0},
+        )
+        generation_id = registry.publish(published_at=DEFAULT_REFERENCE_PUBLISHED_AT).generation_id
+    else:
+        registry, generation_id = _complete_reference_registry(tmp_path, **options)  # type: ignore[arg-type]
+    spool = _minute_spool(tmp_path, ((31, 10.0), (32, 11.0), (33, 10.5), (34, 9.0)))
+
+    outcomes = [
+        _production_outcome(
+            tmp_path / label,
+            registry_path=registry.path,
+            spool=spool,
+            generation_id=generation_id,
+            observed_at=_cn(9, 34, 30),
+            per_lookup=per_lookup,
+        )
+        for label, per_lookup in (("bulk", False), ("per-lookup", True))
+    ]
+
+    assert outcomes[0] == outcomes[1]
+    if not scenario:
+        assert outcomes[0][0] == "batch"
+        assert len(outcomes[0][1].records) == 4  # type: ignore[union-attr]
+    if scenario.get("missing_st"):
+        assert outcomes[0][0] == f"{CODE} required reference evidence is unavailable"
+    if scenario.get("include_listing") is False:
+        assert outcomes[0][0] == f"{CODE} listing classification is unavailable"
+
+
+def test_a_request_reads_the_reference_registry_once_however_many_minutes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The old path was one `generation()` plus 4 lookups x 4 minute batches = 17 reads."""
+
+    from tests.unit.test_reference_as_of_snapshot import count_registry_io
+
+    registry, generation_id = _complete_reference_registry(tmp_path)
+    spool = _minute_spool(tmp_path, ((31, 10.0), (32, 11.0), (33, 10.5), (34, 9.0)))
+    producer = _producer(tmp_path, registry=registry, spool=spool, published_at=_cn(9, 34, 30))
+    io = count_registry_io(monkeypatch, ReferenceRegistry)
+
+    publication = producer.produce(
+        _request(generation_id=generation_id, observed_at=_cn(9, 34, 30))
+    )
+
+    assert len(publication.batch.records) == 4
+    assert io.connections == 2
+    assert sum("business_key IN" in statement for statement in io.statements) == 4
