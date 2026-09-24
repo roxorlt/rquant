@@ -22,6 +22,7 @@ from rquant.runtime_market_session import MarketCalendarAuthority
 
 SHANGHAI = timezone(timedelta(hours=8))
 RECEIVED = datetime(2026, 7, 31, 1, 40, 2, tzinfo=UTC)
+DEGRADED_RECEIVED = datetime(2026, 7, 31, 1, 31, 5, tzinfo=UTC)
 GEOMETRY_FIELDS = {
     "latest_open",
     "latest_high",
@@ -159,8 +160,11 @@ def _publish_degraded_raw_batch(spool: LiveBatchSpool) -> None:
             event_time_start=event_start,
             event_time_end=event_end,
             source_time=event_end,
-            received_at=RECEIVED,
-            available_at=RECEIVED,
+            #: five seconds after its newest bar: a batch received at `RECEIVED` (09:40)
+            #: would be nine minutes late, and every field STALE rather than DEGRADED
+            #: (package AI marks late codes STALE)
+            received_at=DEGRADED_RECEIVED,
+            available_at=DEGRADED_RECEIVED,
             row_count=len(normalized),
             content_sha256=hashlib.sha256(payload).hexdigest(),
             quality_status=BatchQualityStatus.DEGRADED,

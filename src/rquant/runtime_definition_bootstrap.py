@@ -16,6 +16,7 @@ from rquant.definition_registry import (
     _strategy_executable_fingerprint,
 )
 from rquant.feature_contracts import FeatureContract, FeatureDefinition
+from rquant.intraday_feature_engine import MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -137,7 +138,8 @@ def _feature_contracts(
             source_datasets = ("market_minute",)
             lookback = 90
             pit_rule = "all source available_at values <= decision_time"
-            max_delay_seconds = 60
+            #: the bound the feature engine marks STALE at, from one constant
+            max_delay_seconds = MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
             missing_policy = "mark_unavailable"
             late_policy = "mark_stale"
         features.append(
