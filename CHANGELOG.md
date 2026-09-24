@@ -314,7 +314,7 @@
     实测提交秒数、`first_available_at` / `switched_at` / `published_at`、serving 权威，以及 auction_gap 输入在
     09:24:59（必须拒）与 09:29（必须接受）的参考检查；只写演练根，生产文件只读，演练根不许与运行根重叠。
     命令与预期见 DEPLOY 2026-09-24 那条。
-  - **另一个发现（本包未修，报给协调者）**：`auction_gap_candidate_input` 每一行做 4 次 `as_of`，每次都是一次新的
+  - **另一个发现（本包未修，报给协调者；同一版 v0.33.21 里 #299 那一条已修）**：`auction_gap_candidate_input` 每一行做 4 次 `as_of`，每次都是一次新的
     SQLite 连接加锁加祖先链递归查询，本机空闲时约 20 毫秒一次；5,556 行约 7.5 分钟，6,077 行约 8 分钟，主机上
     只会更慢，而装配窗是 09:29–09:49。参考代一直没有发布过，所以这条路径从来没真的跑满过。
   - **用例**：`tests/unit/test_reference_slow_publish_rehearsal_script.py`（3 个：演练在 09:25 可见地发布、只写

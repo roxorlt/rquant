@@ -5,15 +5,17 @@
 
 ---
 
-## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ `rquant-live-runtime.slice` CPUQuota 200%
+## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ 参考批量查表（#299）+ `rquant-live-runtime.slice` CPUQuota 200%
 
-**状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；两处改动各自的背景、预期与细节在紧接着的
-两条里（「rquant-live-runtime.slice CPUQuota 提额」与「参考慢源发布窗口只剩 09:25 一个期限」）。
+**状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；AF 与 slice 两处改动各自的背景、预期与细节在紧接着的
+两条里（「rquant-live-runtime.slice CPUQuota 提额」与「参考慢源发布窗口只剩 09:25 一个期限」）；热修 AG
+没有单独的装机条目（没有 schema、unit、manifest 字段或运行时配置变化），它的演练输出写在 AF 那条里。
 
-**这一版装的是两处改动**：
+**这一版装的是三处改动**：
 
 | 改动 | 落在哪 | 细节 |
 |---|---|---|
+| 热修 AG（#299）：auction_gap 候选输入一轮的参考查表（约 2.2 万次）与模拟盘约束一个请求的参考查表，改成一次读注册表（`ReferenceRegistry.as_of_snapshot`），答案与逐次 `as_of` 逐字相同；主机上整轮装配 13.99 秒（原来单键 74 毫秒一次、一轮约 27 分钟，比 09:29–09:49 的装配窗还长） | `src/rquant/reference_data_registry.py`、`auction_gap_candidate_input.py`、`paper_execution_constraint_producer.py` + 演练脚本第 5 步 | CHANGELOG `[Unreleased]/Fixed` 的 #299 一条；演练输出见下面 AF 那条 |
 | 热修 AF：参考慢源当天的记录、代、指针一律在 09:25 可见，唯一期限就是 09:25；源的保护时间 5 秒 → 30 秒；09:25 之后源不再崩（#298），auction-match / daily-close 零点换日与 market-minute STALE 之后的同类序号回退一起修；跳过 09-24 留下的过期批次；第二个交易日的 serving 权威不再被当成回滚 | `src/rquant/` 六个模块 + `scripts/reference_slow_publish_rehearsal.py` | 下面「参考慢源发布窗口只剩 09:25 一个期限」一条 |
 | `rquant-live-runtime.slice` 的 `CPUQuota` 60% → 200%（owner 2026-09-24 授权「cpu可以调到2个」；主机 10:42 已用 `set-property` 生效，本版把同样的值写回仓库） | `deploy/systemd/rquant-live-runtime.slice`，`src/rquant/workload_isolation.py` 里的镜像 | 下面「rquant-live-runtime.slice CPUQuota 提额」一条 |
 
@@ -30,8 +32,10 @@
 1. 代码切到 v0.33.21（按路线 A 窗口的做法）。
 2. 在主机上跑热修 AF 的两条演练（命令与逐行判据见下面 AF 那条）：第一条退出码 0、最后一行 `REHEARSAL OK`；
    第二条退出码 1、拒成 `reference slow publisher completed after 09:25` 并打印
-   `registry rolled back (no current generation): true`。演练只写 `/home/lighthouse/rquant/var/rehearsal/`，
-   不碰生产注册表与 spool。
+   `registry rolled back (no current generation): true`。第一条的输出里 `auction_gap reference checks` 的
+   `single_key_as_of.mismatches_with_bulk` 必须是 `[]`（热修 AG 的对照）。演练只写
+   `/home/lighthouse/rquant/var/rehearsal/`，不碰生产注册表与 spool；**不要在 09:15–09:30 之间加
+   `--production-registry-copy` 跑**。
 3. 装 slice 文件。主机当前生效值已经是 200%，这一步只是让 `/etc/systemd/system/` 里的文件与生效值一致、
    并去掉 10:42 留下的 drop-in；不停 role、不重启任何服务（10:42 的 `set-property` 也没有重启）。
 
@@ -68,6 +72,7 @@ cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.
 
 **回滚**（两处互相独立，可以只回其中一处）：
 
+- **代码（热修 AG）**：回到上一个版本就是回到逐次查询，没有落盘格式变化；但逐次查询在主机上一轮约 27 分钟，装配窗 09:29–09:49 跑不完，③a 过不了。AG 与 AF 同一个 tag，回代码就是两个一起回。
 - **代码（热修 AF）**：回到 v0.33.20 就回到 09-24 的行为（5 秒保护、09:26 崩一次推一条、被 09-24 那一批卡住）。
   新版本写出的注册表与 serving 权威 v0.33.20 读得懂（列与模型都没变），但 serving 权威改成按代的祖先序号编号：
   **回滚之后的第一个发布日**，旧版本主路径算出的编号更小，权威那一步会被拒成回滚，要等下一轮的恢复分支重建——
@@ -147,10 +152,27 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/lighthouse/rquant/src /home/lighthous
 09:20:58.52 + 30 秒），下一轮 `published`；`registry` 的 `first_available_at`、`pointer_switched_at`、
 `manifest_published_at` 都是 09:25:00（`2026-09-24T01:25:00Z`），`records_written` 约 33,336；
 `serving authority` 在 09:24:59.999999 不可见、09:25 可见；`auction_gap reference checks at 09:24:59` 是
-`refused: reference generation is future evidence`，09:29 那一次 `unavailable: {}`。它还会打印
-`ms_per_lookup` 和 `projected_seconds_for_all_codes`：这是 auction_gap 输入一轮花在参考查表上的时间
-（本机约 20 毫秒一次、全量约 7.5 分钟），**周一 ③a 之前值得看一眼**；加 `--full-auction-assembly` 会把整份
-输入真跑一遍并计时（与生产一轮一样长）。脚本以 lighthouse 读生产文件；若某个文件读不了，会以
+`refused: reference generation is future evidence`，09:29 那一次 `unavailable: {}`。
+
+同一版里的热修 AG（#299）把 auction_gap 输入的参考查表改成一次读注册表，演练的第 5 步跟着改了（下面这几项是
+AG 之后的输出；AF 原来写的 `ms_per_lookup` / `projected_seconds_for_all_codes` 两项现在只作为单键对照出现）：
+
+- `auction_gap reference checks` 默认对**全部**竞价代码走快照路径（`--auction-sample` 默认 0 = 全部）：`codes_checked`
+  是查了多少只、`lookups` 是 4 倍、`snapshot_read_seconds` 是读一次快照的秒数、`seconds` 是这一轮参考查表的总秒数。
+- 其中的 `single_key_as_of` 是对照：前 `--single-key-sample` 只（默认 50）再用旧的逐次 `as_of` 读一遍并计时
+  （`ms_per_lookup`、`projected_seconds_for_all_codes` 是旧读法全量的推算），**`mismatches_with_bulk` 必须是 `[]`**，
+  不是空就以 `bulk and single-key reference reads disagree` 拒、退出码 1。
+- 加 `--full-auction-assembly` 会真跑一整轮生产调用（`load_live_auction_candidate_input`：日历 + 打开注册表 + 装配）并计时：
+  `registry_open_seconds` 是打开注册表那一次完整性检查的秒数，`registry_connections` 是这一轮开的注册表连接数（#299 之前每行
+  竞价多 4 个），`seconds` 是整轮秒数。
+- 加 `--production-registry-copy` 会用 SQLite 备份接口从 `mode=ro` 连接把**生产**注册表复制到演练根，计时打开与全部代码的
+  一次快照，只报告、不影响退出码。**不要在 09:15–09:30 之间跑 `--production-registry-copy`**（那段时间发布者正在写这个注册表）。
+- 协调者 09-24 在主机上的实测：AF 那条（提交拖慢 10 秒）`REHEARSAL OK`，09:25 可见，截止照样拒；AG 那条 5,475 只代码、21,900 次
+  查询 4.1 秒，旧读法单键一次 74 毫秒，整轮生产 auction_gap 装配 13.99 秒。
+- 还没解决的一条（#302）：候选发布者每一轮都重新打开注册表，打开时的完整性检查解码注册表里曾有过的每一条记录，
+  每个交易日约多 3.3 万条，整轮每个交易日约多 6–7 秒；`registry_open_seconds` 就是看它的。
+
+脚本以 lighthouse 读生产文件；若某个文件读不了，会以
 `REHEARSAL REFUSED: PermissionError ...` 退出。演练根留在 `/home/lighthouse/rquant/var/rehearsal/<时刻>-<随机>/`，
 看完可以删掉。
 
