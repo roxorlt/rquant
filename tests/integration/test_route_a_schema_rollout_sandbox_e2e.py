@@ -18,7 +18,9 @@ else real:
 
 * two generations are really installed — `install_runtime_deployment_profile` twice over the
   real production profile, the second with no bootstrap reason, which is what makes its
-  receipt carry a `previous_generation_hash` and prepare the rollout plans;
+  receipt carry a `previous_generation_hash`; since #228 that install prepares no plan (no
+  channel's shape moved), so the plans the older installer prepared for exactly this pair
+  are put there by `stage_pre_228_rollout_plans`, the old installer's own loop;
 * `control/schema-rollouts` is then stripped of every write bit, directories included, which
   is what the unit sandbox does to it and what no other test does;
 * the authority chain is really staged and published over that runtime root, and the
@@ -43,6 +45,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -65,15 +68,16 @@ from tests.integration.test_route_a_legacy_binding_e2e import (
     _production_bundle,
     _StopAfterOneIteration,
 )
+from tests.schema_rollout_legacy_plans import stage_pre_228_rollout_plans
 from tests.unit.test_runtime_authority_publish import World
 
 pytestmark = pytest.mark.integration
 
-#: The generation the rollout moves away from. Any commit but the chain's own will do: a
-#: declaration fingerprint is `semantic_fingerprint + producer_commit`, so a different commit
-#: is exactly what makes every two-sided channel a changed channel and gives the second
-#: install something to prepare a rollout for. This is the host's situation too — window one
-#: installed `7d572c79…` at one commit and window two `bf2da6d8…` at another.
+#: The generation the rollout moves away from. Any commit but the chain's own will do. Before
+#: #228 was fixed a different commit was exactly what made every two-sided channel a changed
+#: channel and gave the second install something to prepare a rollout for — the host's
+#: situation, window one at `7d572c79…` and window two at `bf2da6d8…`. The installer no longer
+#: prepares those, so the fixture stages them the way it did (`stage_pre_228_rollout_plans`).
 PREVIOUS_COMMIT = "1e2d3c4b5a69788796a5b4c3d2e1f00918273645"
 
 #: Two of the eight units that flapped, and the two that need no write to be admitted.
@@ -123,13 +127,16 @@ class RolloutWorld(RouteAWorld):
     """A `RouteAWorld` whose runtime root holds two generations and a prepared rollout."""
 
     previous_receipt: Any = None
+    #: the plans the pre-#228 installer would have prepared for this pair of generations;
+    #: the installer itself prepares none now, because no channel's shape moved
+    legacy_plan_ids: tuple[str, ...] = ()
 
     @property
     def rollout_root(self) -> Path:
         return self.runtime_root / "control" / "schema-rollouts"
 
     def plan_ids(self) -> tuple[str, ...]:
-        return tuple(self.receipt.schema_rollout_plan_ids)
+        return self.legacy_plan_ids
 
     def state_path(self, plan_id: str) -> Path:
         return self.rollout_root / plan_id / "state.sqlite3"
@@ -196,6 +203,17 @@ def rollout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Rollout
     route.receipt = receipt
     route.previous_receipt = previous_receipt
     route.sealed_credentials = sealed
+    #: Since #228 the second install prepares nothing: the two generations differ only in
+    #: their commit. The host still carries the plans every earlier install left, and those
+    #: are what #227 was about, so they are put there the way the old installer did.
+    assert receipt.schema_rollout_plan_ids == ()
+    route.legacy_plan_ids = stage_pre_228_rollout_plans(
+        route.runtime_root,
+        profile=profile,
+        previous_generation_id=previous_receipt.generation_hash,
+        target_generation_id=receipt.generation_hash,
+        started_at=datetime.now(UTC),
+    )
     route.stage_and_publish()
 
     _seal(route.rollout_root)

@@ -59,10 +59,12 @@ from tests.unit.test_runtime_deployment_bundle import (
     isolated_root_credential_sealer,  # noqa: F401 - autouse fixture, imported to apply here
 )
 
-#: The commit the second generation is built at. A declaration fingerprint is
-#: `semantic_fingerprint + producer_commit`, so a different commit is what makes every
-#: two-sided channel a changed channel — the same reason the production host staged sixteen
-#: plans for a release that changed no schema at all (#228).
+#: The commit the second generation is built at. Until #228 was fixed a declaration's
+#: change fingerprint carried `producer_commit`, so a different commit made every two-sided
+#: channel a changed channel and the host staged sixteen plans for every release. The
+#: installer no longer does that, but the host still carries every one of those plans, and
+#: they are what this module's command walks — so the fixture prepares the same set
+#: directly, one plan per two-sided channel, instead of asking the installer for it.
 NEXT_COMMIT = "b" * 40
 
 #: The production profile's own window: `runtime_production_profile.py` defaults
@@ -215,11 +217,21 @@ def rollout(tmp_path: Path) -> Rollout:
     world.manifests = candidate_manifests
     world.generation_id = second.generation_hash
     plan_ids: list[str] = []
-    for channel_id in changed_runtime_schema_channels(
-        root,
-        previous_generation_id=first.generation_hash,
-        target_generation_id=second.generation_hash,
-    ):
+    #: Every channel, not `changed_runtime_schema_channels`: that reports none for two
+    #: generations whose channels keep their shape (#228), and these plans are the ones a
+    #: build before that fix staged for exactly such a pair.
+    assert (
+        changed_runtime_schema_channels(
+            root,
+            previous_generation_id=first.generation_hash,
+            target_generation_id=second.generation_hash,
+        )
+        == ()
+    )
+    target_bundle = bundle._load_generation_schema_bundle(
+        root, generation_id=second.generation_hash
+    )
+    for channel_id in (channel.channel_id for channel in target_bundle.channels):
         try:
             authority = prepare_runtime_schema_rollout(
                 root,

@@ -51,6 +51,7 @@ from rquant.runtime_schema_registry import (
     RuntimeSchemaV1MigrationAudit,
     build_runtime_schema_rollout,
     build_runtime_schema_v1_migration_audit,
+    changed_runtime_schema_channel_ids,
     parse_runtime_schema_contract_bundle,
 )
 from rquant.runtime_schema_registry import (
@@ -2006,14 +2007,9 @@ def changed_runtime_schema_channels(
         generation_id=previous_generation_id,
     )
     target = _load_generation_schema_bundle(root, generation_id=target_generation_id)
-    return tuple(
-        channel.channel_id
-        for channel in target.channels
-        if (
-            channel.declaration.schema_fingerprint
-            != previous.channel(channel.channel_id).declaration.schema_fingerprint
-        )
-    )
+    #: By shape, not by `schema_fingerprint`: that one carries `producer_commit`, which every
+    #: release changes, and comparing it made every install stage sixteen plans (#228).
+    return changed_runtime_schema_channel_ids(previous=previous, candidate=target)
 
 
 def runtime_schema_rollout_plan_ids_for_generation(
