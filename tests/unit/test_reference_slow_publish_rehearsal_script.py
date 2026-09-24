@@ -149,6 +149,7 @@ def test_the_rehearsal_publishes_a_copied_batch_visible_at_0925_and_writes_only_
         "09:21:26",
         "--slow-commit-seconds",
         "1",
+        "--full-auction-assembly",
         capsys=capsys,
     )
 

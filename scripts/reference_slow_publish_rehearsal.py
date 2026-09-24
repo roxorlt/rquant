@@ -3,10 +3,12 @@
 Copies one sealed reference-slow batch out of a runtime root, re-seals it into a fresh spool
 with the current source rule (the envelope's `available_at`), publishes it with the current
 `publish_reference_slow_batches` into a fresh registry, and checks what
-`auction_gap_candidate_input` would say at 09:29 -- everything under one private rehearsal
-root. Nothing outside that root is written: the production spool, registry and DuckDB files
-are only read (the batch, the calendar generation and, optionally, the auction-match spool are
-copied first), and the only DuckDB this opens is a synthetic one it creates in the root.
+`auction_gap_candidate_input` would say at 09:29 (its reference lookups for
+`--auction-sample` codes, and with `--full-auction-assembly` the whole input over the copied
+auction-match batch) -- everything under one private rehearsal root. Nothing outside that
+root is written: the production spool, registry and DuckDB files are only read (the batch,
+the calendar generation and, optionally, the auction-match spool are copied first), and the
+only DuckDB this opens is a synthetic one it creates in the root.
 
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=<checkout>/src <venv>/bin/python \\
         <checkout>/scripts/reference_slow_publish_rehearsal.py \\
@@ -139,6 +141,8 @@ def run_rehearsal(
     round_interval_seconds: float,
     auction: bool,
     auction_observed: str,
+    auction_sample: int = 500,
+    full_auction_assembly: bool = False,
     out: Callable[[str], None] = print,
 ) -> int:
     from rquant.live_contracts import BatchEnvelope, LiveChannel
@@ -414,6 +418,7 @@ def run_rehearsal(
     codes = tuple(fact.ts_code for fact in snapshot.security_facts)
     auction_copy = root / "live" / "auction-match"
     auction_envelope = None
+    auction_spool = None
     if auction:
         source_auction = runtime_root / "live" / "auction-match"
         if source_auction.is_dir():
@@ -428,10 +433,10 @@ def run_rehearsal(
                     )
                     auction_envelope = auction_record.envelope
             except Exception as error:  # noqa: BLE001 - reported, then the reference-only check runs
-                out(f"auction-match copy unusable ({error}); checking every snapshot code instead")
+                out(f"auction-match copy unusable ({error}); checking snapshot codes instead")
     observed = _local(trade_date, auction_observed)
     event_time = observed
-    if auction_envelope is not None:
+    if auction_envelope is not None and auction_spool is not None:
         from rquant.auction_match_gateway import AuctionMatchGateway
 
         frame = AuctionMatchGateway.decode_payload(auction_spool.read_payload(auction_record))
@@ -444,18 +449,27 @@ def run_rehearsal(
             {
                 "sequence": auction_envelope.sequence,
                 "quality_status": auction_envelope.quality_status,
+                "trade_date": auction_envelope.event_time_end.astimezone(_SHANGHAI).date(),
                 "available_at": auction_envelope.available_at,
                 "rows": len(codes),
             },
         )
+        if auction_envelope.event_time_end.astimezone(_SHANGHAI).date() != trade_date:
+            out("auction-match batch belongs to another session; checking its codes only")
+            auction_envelope = None
 
-    def reference_checks(at: datetime) -> dict[str, object]:
+    def reference_checks(at: datetime, checked: tuple[str, ...]) -> dict[str, object]:
+        """The reference half of `assemble_auction_gap_candidate_batch`, lookup for lookup."""
+
         pointer = readonly.current_pointer()
         manifest = readonly.current_manifest()
+        if pointer.generation_id != manifest.generation_id:
+            return {"observed_at": at, "refused": "reference pointer and manifest disagree"}
         if pointer.switched_at > at or manifest.published_at > at:
             return {"observed_at": at, "refused": "reference generation is future evidence"}
         missing: dict[str, int] = {}
-        for code in codes:
+        started = time.monotonic()
+        for code in checked:
             for dataset in (
                 ReferenceDataset.ST_STATUS,
                 ReferenceDataset.SUSPENSION_STATUS,
@@ -472,10 +486,21 @@ def run_rehearsal(
                     )
                 except ReferenceDataUnavailableError:
                     missing[dataset.value] = missing.get(dataset.value, 0) + 1
-        return {"observed_at": at, "codes": len(codes), "unavailable": missing}
+        elapsed = time.monotonic() - started
+        per_lookup = elapsed / max(1, 4 * len(checked))
+        return {
+            "observed_at": at,
+            "codes_checked": len(checked),
+            "unavailable": missing,
+            "seconds": round(elapsed, 3),
+            "ms_per_lookup": round(per_lookup * 1000, 2),
+            #: what one `assemble_auction_gap_candidate_batch` round spends on these lookups
+            "projected_seconds_for_all_codes": round(per_lookup * 4 * len(codes), 1),
+        }
 
-    early = reference_checks(decision - timedelta(seconds=1))
-    late = reference_checks(observed)
+    sample = codes if auction_sample <= 0 else codes[:auction_sample]
+    early = reference_checks(decision - timedelta(seconds=1), sample)
+    late = reference_checks(observed, sample)
     _show(out, "auction_gap reference checks at 09:24:59", early)
     _show(out, "auction_gap reference checks", late)
     if "refused" not in early:
@@ -483,7 +508,7 @@ def run_rehearsal(
     if "refused" in late or late["unavailable"]:
         raise RehearsalRefusedError(f"auction_gap reference checks refuse the generation: {late}")
 
-    if auction_envelope is not None:
+    if full_auction_assembly and auction_envelope is not None and auction_spool is not None:
         import duckdb
 
         from rquant.auction_gap_candidate_input import (
@@ -504,6 +529,7 @@ def run_rehearsal(
         synthetic.chmod(0o600)
         replica_time = _local(trade_date, "09:00:00").timestamp()
         os.utime(synthetic, (replica_time, replica_time))
+        started = time.monotonic()
         try:
             batch = assemble_auction_gap_candidate_batch(
                 auction_spool=auction_spool,
@@ -518,7 +544,7 @@ def run_rehearsal(
             raise RehearsalRefusedError(f"auction_gap_candidate_input refused: {error}") from error
         _show(
             out,
-            "auction_gap_candidate_input (synthetic prior-5 volumes)",
+            "auction_gap_candidate_input (full batch, synthetic prior-5 volumes)",
             {
                 "observed_at": observed,
                 "facts": len(batch.facts),
@@ -526,6 +552,7 @@ def run_rehearsal(
                 "st": sum(fact.is_st for fact in batch.facts),
                 "suspended": sum(fact.is_suspended for fact in batch.facts),
                 "captured_at": batch.authority.captured_at,
+                "seconds": round(time.monotonic() - started, 1),
             },
         )
     out("REHEARSAL OK")
@@ -550,6 +577,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="local time of the auction_gap checks (later if the auction batch is)",
     )
     parser.add_argument("--no-auction", action="store_true", help="skip the auction-match copy")
+    parser.add_argument(
+        "--auction-sample",
+        type=int,
+        default=500,
+        help="codes to run the reference lookups for (0 = every auction row); each lookup "
+        "is a registry round trip, so every row takes minutes",
+    )
+    parser.add_argument(
+        "--full-auction-assembly",
+        action="store_true",
+        help="also run assemble_auction_gap_candidate_batch over the whole copied batch "
+        "(synthetic prior-5 volumes) and time it -- as long as one production round",
+    )
     arguments = parser.parse_args(argv)
     if arguments.slow_commit_seconds < 0 or arguments.round_interval_seconds <= 0:
         parser.error("seconds must be positive")
@@ -567,6 +607,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             round_interval_seconds=arguments.round_interval_seconds,
             auction=not arguments.no_auction,
             auction_observed=arguments.auction_observed,
+            auction_sample=arguments.auction_sample,
+            full_auction_assembly=arguments.full_auction_assembly,
         )
     except RehearsalRefusedError as error:
         print(f"REHEARSAL REFUSED: {error}")
