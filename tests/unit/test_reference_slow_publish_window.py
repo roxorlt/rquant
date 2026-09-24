@@ -1098,3 +1098,135 @@ def test_a_published_batch_reaches_the_authority_when_the_next_one_is_not_yet_vi
     assert (result.processed_count, result.input_sequence) == (1, 0)
     authority = _authority(spool, at(9, 25))
     assert authority.payload.reference_generation_id == registry.current_manifest().generation_id
+
+
+# ---------------------------------------------------------------------------------------
+# The serving authority never regresses to a past trading day (review S-6(b))
+# ---------------------------------------------------------------------------------------
+
+
+def _seal_revisions(spool: LiveBatchSpool, loader: object, *moments: datetime) -> None:
+    """Run the 09:24 revision scan once per moment, each capture one second after it."""
+
+    for moment in moments:
+        capture_reference_slow_batch(
+            spool=spool,
+            calendar=_calendar(),
+            observed_at=moment,
+            producer_commit=COMMIT,
+            producer_version="test-v1",
+            snapshot_loader=lambda: pytest.fail("today's batch is already sealed"),
+            revision_snapshot_loader=lambda target, moment=moment: loader(target, moment),  # type: ignore[operator]
+            revision_lookback_sessions=2,
+            completion_clock=lambda moment=moment: moment + timedelta(seconds=2),
+        )
+
+
+def _past_day_revision(target: date, moment: datetime) -> ReferenceSlowSourceSnapshot:
+    """Today's scan finds nothing new for today and a correction for the previous session."""
+
+    captured = moment + timedelta(seconds=1)
+    if target == TARGET_DATE:
+        return _snapshot(captured_at=captured)
+    return _snapshot(
+        captured_at=captured,
+        target_trade_date=PRIOR_DATE,
+        prior_trade_date=date(2026, 7, 29),
+        codes=("300001.SZ", "600000.SH"),
+    )
+
+
+def _authority_session(spool: LiveBatchSpool, as_of: datetime) -> tuple[str, ...]:
+    authority = _authority(spool, as_of)
+    (calendar_rows,) = (
+        projection.rows
+        for projection in authority.payload.projections
+        if projection.table_name == "trade_calendar"
+    )
+    return tuple(str(row["trade_date"]) for row in calendar_rows)
+
+
+@pytest.mark.parametrize("rounds", ["one", "two"])
+def test_a_past_day_revision_never_moves_the_authority_off_today(
+    tmp_path: Path,
+    rounds: str,
+) -> None:
+    """2026-09-28: the 09:24 scan may seal a 09-24 revision after the 09-28 batch.
+
+    It compares 09-24's data with the batch 0 that was never published, finds it different
+    and seals it -- discovered today, so it is **not** passed over as expired, and it is
+    published. The serving authority must still carry today's projections, whether both
+    batches are published in one round or today's first and the revision one round later.
+    """
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+    }
+    if rounds == "two":
+        first = publish_reference_slow_batches(
+            observed_at=at(9, 22), completion_clock=lambda: at(9, 22), **common
+        )
+        assert first.processed_count == 1
+        assert _authority_session(spool, at(9, 25)) == ("2026-07-31",)
+    _seal_revisions(spool, _past_day_revision, at(9, 24), at(9, 24, 3))
+    records = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1)
+    assert [record.envelope.sequence for record in records] == [0, 1]
+
+    result = publish_reference_slow_batches(
+        observed_at=at(9, 24, 40), completion_clock=lambda: at(9, 24, 40), **common
+    )
+
+    assert result.processed_count == (2 if rounds == "one" else 1)
+    assert result.degraded_reasons == ()
+    assert (result.input_sequence, result.output_sequence) == (1, 1)
+    (revision_record,) = registry.records(dataset_id=ReferenceDataset.ST_STATUS, key="600000.SH")
+    assert revision_record.effective_from == datetime(2026, 7, 29, 16, tzinfo=UTC)
+    authority = _authority(spool, at(9, 25))
+    assert authority.payload.reference_generation_id == registry.current_manifest().generation_id
+    assert authority.event_time == at(9, 20, 30)
+    assert _authority_session(spool, at(9, 25)) == ("2026-07-31",)
+    #: two generations either way (one per published batch), numbered by ancestry
+    assert authority.sequence == 2
+
+
+def test_a_same_day_correction_still_replaces_the_authority(tmp_path: Path) -> None:
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+    }
+    publish_reference_slow_batches(
+        observed_at=at(9, 22), completion_clock=lambda: at(9, 22), **common
+    )
+
+    def corrected(target: date, moment: datetime) -> ReferenceSlowSourceSnapshot:
+        assert target == TARGET_DATE
+        return _snapshot(
+            captured_at=moment + timedelta(seconds=1), codes=("300001.SZ", "600000.SH")
+        )
+
+    _seal_revisions(spool, corrected, at(9, 24))
+    publish_reference_slow_batches(
+        observed_at=at(9, 24, 40), completion_clock=lambda: at(9, 24, 40), **common
+    )
+
+    authority = _authority(spool, at(9, 25))
+    assert authority.event_time == at(9, 24, 1)
+    (stock_rows,) = (
+        projection.rows
+        for projection in authority.payload.projections
+        if projection.table_name == "stock_basic"
+    )
+    assert {row["ts_code"] for row in stock_rows} == {"300001.SZ", "600000.SH"}
