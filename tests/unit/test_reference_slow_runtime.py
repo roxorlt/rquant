@@ -808,8 +808,10 @@ def test_source_revision_scan_cursor_advances_through_bounded_history(
 def test_source_batch_distinguishes_evidence_completion_from_atomic_availability(
     tmp_path: Path,
 ) -> None:
+    #: the batch promises visibility 30 s after it is prepared (#297: five seconds held on
+    #: 2026-09-24 with ~2.5 s to spare, in the slice where the publisher's five did not)
     spool = LiveBatchSpool(tmp_path / "spool")
-    completed_at = OBSERVED_AT.replace(minute=24, second=30)
+    completed_at = OBSERVED_AT.replace(minute=21, second=30)
     snapshot = _snapshot(captured_at=completed_at)
     clock_values = iter(
         (
@@ -836,7 +838,7 @@ def test_source_batch_distinguishes_evidence_completion_from_atomic_availability
     assert current is not None
     records = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1)
     assert records[0].envelope.source_time == completed_at
-    assert records[0].envelope.available_at == completed_at.replace(second=48)
+    assert records[0].envelope.available_at == completed_at.replace(minute=22, second=13)
     assert records[0].envelope.received_at == records[0].envelope.available_at
 
 
@@ -854,7 +856,9 @@ def _registry_publication_counts(registry: ReferenceRegistry) -> tuple[int, int,
 
 def _captured_consumer_spool(tmp_path: Path) -> tuple[LiveBatchSpool, Path]:
     producer = LiveBatchSpool(tmp_path / "spool")
-    completed_at = OBSERVED_AT.replace(minute=24, second=30)
+    #: sealed at 09:24:15, visible from 09:24:45 (the source's 30 s guard, #297), so a
+    #: publisher that starts at 09:24:59 sees it and then races the 09:25 cutoff
+    completed_at = OBSERVED_AT.replace(minute=24, second=0)
     capture_reference_slow_batch(
         spool=producer,
         calendar=_calendar(),
@@ -862,7 +866,7 @@ def _captured_consumer_spool(tmp_path: Path) -> tuple[LiveBatchSpool, Path]:
         producer_commit=COMMIT,
         producer_version="test-v1",
         snapshot_loader=lambda: _snapshot(captured_at=completed_at),
-        completion_clock=lambda: completed_at.replace(second=45),
+        completion_clock=lambda: completed_at.replace(second=15),
     )
     cursor_root = tmp_path / "publisher-state" / "cursors"
     return (
@@ -1871,7 +1875,8 @@ def test_production_builder_discovers_bounded_revisions_with_pit_availability(
     )
     assert [record.envelope.revision for record in source_records] == [1, 2, 1]
 
-    publisher_started = OBSERVED_AT.replace(minute=24, second=20)
+    #: the last revision is visible from 09:24:40 (sealed 09:24:10 + the 30 s source guard)
+    publisher_started = OBSERVED_AT.replace(minute=24, second=45)
     now[0] = publisher_started
     published = runtime.build(publisher)()
 
@@ -1888,4 +1893,5 @@ def test_production_builder_discovers_bounded_revisions_with_pit_availability(
     )
     assert len(historical_records) == 1
     assert historical_records[0].payload["name"] == "历史修订"
-    assert historical_records[0].first_available_at == publisher_started + timedelta(seconds=5)
+    #: every record the window publishes becomes visible at the 09:25 decision time (#297)
+    assert historical_records[0].first_available_at == PUBLISHED_AT

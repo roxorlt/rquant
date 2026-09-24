@@ -319,18 +319,28 @@ def daily_close_source_builder(
             transport_observer=transport_observer,
         )
 
+        #: 这个进程已经报到的位置。**窗外那一轮照抄它**：15:00 之后采到一批（`high_watermark`
+        #: >= 0），零点换日的第一轮原来返回默认的 -1，`record_success` 拒绝回退的序号，
+        #: 进程退出、`OnFailure` 推一条（#298 同一类）
+        last_result = RuntimeStepResult()
+
         def step() -> RuntimeStepResult:
+            nonlocal last_result
             observed = normalize_aware_utc(clock())
             gateway.recover_stale_source_attempts(observed_at=observed)
             trade_date = observed.astimezone(_SHANGHAI).date()
             market_close = datetime.combine(trade_date, time(15), tzinfo=_SHANGHAI).astimezone(UTC)
             if trade_date not in calendar.open_dates or observed < market_close:
-                return RuntimeStepResult()
-            return capture_daily_close_step(
+                return RuntimeStepResult(
+                    input_sequence=last_result.input_sequence,
+                    output_sequence=last_result.output_sequence,
+                )
+            last_result = capture_daily_close_step(
                 gateway,
                 trade_date=trade_date,
                 observed_at=observed,
             )
+            return last_result
 
         return step
 

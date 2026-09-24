@@ -165,6 +165,15 @@ class ReferencePublicationDeadlineError(RuntimeError):
     """A publication could not become durable before its hard deadline."""
 
 
+class ReferencePublicationVisibilityError(ReferencePublicationDeadlineError):
+    """A publication became durable after the visibility instant it promised, before its deadline.
+
+    A subclass so every caller that already fails closed on a deadline keeps doing so; it
+    exists so the refusal can say which bound it crossed. On 2026-09-24 a commit that missed
+    a five-second visibility guard at 09:22 was reported as "completed after 09:25" (#297).
+    """
+
+
 class ReferencePublicationAuthenticationError(RuntimeError):
     """A cross-store publication proof is missing or cannot be authenticated."""
 
@@ -1811,7 +1820,11 @@ class ReferenceRegistry:
                 except BaseException:
                     connection.rollback()
                     raise
-                raise ReferencePublicationDeadlineError("publication completed after deadline")
+                if completed > deadline:
+                    raise ReferencePublicationDeadlineError("publication completed after deadline")
+                raise ReferencePublicationVisibilityError(
+                    "publication completed after its promised visibility instant"
+                )
 
             if not retain_intent:
                 connection.execute("BEGIN IMMEDIATE")
@@ -1956,7 +1969,7 @@ class ReferenceRegistry:
         )
         completed = normalize_aware_utc(durable_completed_at or manifest.published_at)
         if completed > manifest.published_at:
-            raise ReferencePublicationDeadlineError(
+            raise ReferencePublicationVisibilityError(
                 "durable completion is after staged visibility horizon"
             )
         connection.execute(

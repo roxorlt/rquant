@@ -194,6 +194,86 @@
 
 ### Fixed
 
+- **参考慢源第一次采到了数，发布者却一次也没发出去，源在 09:25 之后还崩了一次、推了一条（#297、#298，包 AF）**：
+  2026-09-24 是 #293 修好之后（v0.33.20 = `304f6ed1`）的第一个生产日，采集成功了，当天的参考代却没有发布。
+  - **生产证据（协调者 2026-09-24 只读核查）**：09:20:27–09:20:31 采集，09:21:00 写出第 0 批，
+    `published`、5,556 行、`available_at` 09:21:03.52。发布者 09:21:26 第一次撞「source batch is
+    future evidence」（这一轮开始时批次还不可见，良性竞争）；09:22:52、约 09:24:24、09:25:30 三次都报
+    「reference slow publisher completed after 09:25」，其中前两次明明在 09:25 之前就结束了；
+    `reference.sqlite3` 从 77 KB 涨到 26 MB（写入后又被补偿）；09:25:56 起「started after 09:25」（设计如此）。
+    源这边窗内各轮报 `input_sequence = output_sequence = 0`，09:25 之后第一轮（09:26:12）在
+    `record_success` 抛 `ValueError: input sequence cannot regress`，退出码 1 → `OnFailure` → **09:26:17
+    给 owner 推了一条** → systemd 重启，重启后从 -1 起算、当天稳定。
+  - **#297 的原因**：发布者承诺的可见时刻是 `min(prepared_at + 5 秒, 09:25)`，注册表对「提交完成晚于承诺
+    时刻」一律拒。当天约 3.3 万条记录的提交跑在 `rquant-live-runtime.slice` 里（`CPUQuota=60%`、20 个
+    role 共用，约 26% 的墙钟时间被节流），5 秒装不下；本机不节流时同一规模的提交要 2.6 秒（见下）。
+    拒绝又被映射成「completed after 09:25」，日志看不出是 5 秒保护而不是 09:25 截止触发的。
+  - **现在的规则**：只要 `prepared_at` 不晚于 09:25，记录的 `first_available_at`、代的 `published_at`、
+    指针的 `switched_at` 一律是当天 09:25。唯一的期限就是 09:25 本身；「提交完成之前任何记录都不可见」
+    照旧成立（注册表仍拒绝提交完成晚于可见时刻的发布，而可见时刻就是截止时刻），09:25 之后才开始的一轮仍然拒。
+    **消费方盘点**：09:25 之前没有谁读当天这一代——模拟盘约束要 09:30 起的分钟证据，auction_gap 输入只在
+    09:29 起的装配窗里跑，serving 在 09:25 之前读到的是上一代（和今天 09:21 之前一样）。唯一的语义差别：
+    同一个窗口里的当日修订和原版一起在 09:25 变得可见，09:25 之前的决策两者都看不到（原来 09:23 的决策能看到原版），
+    没有消费方读这个区别。
+  - **两种报错分开**：注册表新增 `ReferencePublicationVisibilityError`（`ReferencePublicationDeadlineError`
+    的子类，原有的 fail-closed 捕获照旧生效），心跳里「commit ended after its promised visibility instant
+    (before 09:25)」与「completed after 09:25」是两句话；源这边同理（`LiveSpoolVisibilityHorizonError`，
+    「reference slow atomic publication ended after its promised visibility instant (before 09:25)」）。
+  - **源的保护时间 5 秒 → 30 秒**：源给批次写的 `available_at = min(prepared_at + 保护时间, 09:25)` 是同一种
+    形状。09-24 这 5 秒还剩约 2.5 秒余量，而源这边一旦没赶上当天就救不回来（配额账本拒绝同日第二次请求，#295）。
+    30 秒是观察值的十倍以上；发布者自己一轮在主机上要约 80 秒才写到完成回执，09:23:30 之后封好的批次本来就发不出去，
+    所以多等的 25 秒不会让它错过任何一个本来发得出去的批次。仍然封顶在 09:25，源的 `available_at` 不会按规则等于 09:25。
+  - **#298 的原因与修法**：`capture_reference_slow_batch` 的两个早退分支（非交易日、窗口外）返回默认的
+    `input_sequence=-1`，而窗内那几轮返回的是当前批次的序号。现在窗口外、非交易日也报 spool 当前指针的序号
+    （spool 为空才是 -1），新增的 `LiveBatchSpool.current_sequence()` 只读已提交的指针文件、不重新哈希
+    保留下来的批次（`current()` 会把最多 128 个、每个约 3 MB 的载荷全读一遍再哈希，而空闲轮全天每 30 秒一次）；
+    有未完成的发布意图时先走 `current()` 的恢复。发布者 spool 为空那条早退改报持久游标。
+  - **同一类的其他 role（逐个查过）**：auction-match 源在 09-23 窗口之后没崩，是因为空闲轮照抄 `last_result`；
+    但换日那一轮把 `last_result` 重置成 -1，**任何采到过批次的交易日之后的零点第一轮都会退出、推一条**（进程当天
+    没重启的话），现在换日只清当天的留痕、序号照抄。daily-close 源 15:00 之后采到一批，零点之后窗外那一轮返回 -1，
+    **每个交易日的夜里一次**，现在照抄。market-minute 源一次取数失败发 STALE 批（新序号），下一次取回的内容与当前
+    PUBLISHED 批相同时走重复分支、答 `spool.current()`，低一号，现在夹住不低于上一次。其余 role（watchlist-quote、
+    候选发布者、feature、strategy、notifier、paper、paper 约束、runtime-health、lab、promotions、artifact 两个、
+    shadow、daily 编排器、auction-universe、signal_router、serving）不会在稳态下回退；signal_router 的追赶分支、
+    serving 在可选源读失败时回退到 0、artifact_retention 的 0 回退是潜在的，前两者今天走不到，后者 `once=True` 挡住了。
+  - **修 #297 还不够，下一个交易日会被 09-24 那一批卡住（本包顺带修）**：09-24 的第 0 批封好了却没发布，下一个交易日（09-28）发布者
+    第一个列出来的就是它；发布它会被拒（「source evidence must complete on its discovery session」，而今晚换版本
+    之后它的 `producer_commit` 先被拒），于是每一轮都抛在它身上，第 1 批永远发不出去。现在**采集日已经过去的批次
+    直接跳过**（只看信封，跳过不发布任何东西），心跳记 `expired_source_batch:<序号>`，游标随下一个发布的批次越过它；
+    整页都是过期批次时继续往后翻，连续失败超过一页（16 天）也卡不住。**还没可见的批次改成「本轮到此为止」而不是抛错**
+    （09:21:26 那一轮），并且在解析 3 MB 载荷之前就判断；本轮已经发布的批次照样写进 serving 权威。
+  - **第二个交易日的 serving 权威会被当成回滚拒掉（本包顺带修）**：serving 权威按发布回执的 `revision` 编号、
+    拒绝同号或更小号的不同代；而这个 `revision` 是记录的谱系修订号，每个交易日从 1 重新开始，于是第二天的权威在注册表
+    和游标都已提交之后被拒（「different generation at the current sequence is a rollback」），只有下一轮的恢复分支
+    用代的祖先序号重建才发得出去——那一轮若在 09:25 之后开始就永远发不出去。生产还没发布过第二次，第一次发布之后的下一个交易日就会撞上。
+    现在主路径也按代在注册表祖先链上的位置编号（恢复分支本来就这么编），恢复分支重建出来的结果逐字节相同。恢复分支读
+    权威时改用 `max(started, 当前代 published_at)`，09:25 之前的各轮认得出当天已经发出的权威，不再每轮重建。
+  - **实测提交时间（本机 Apple Silicon、不节流，5,556 只证券 = 33,336 条记录，用下面的演练脚本在同形状的合成
+    运行根上跑）**：源的 spool 写入 0.015–0.02 秒（载荷 3.2 MB）；发布者一整轮 10.8 秒，其中暂存提交
+    （`append_many_and_publish_before`，即原来要塞进 5 秒的那一段）2.7 秒、`commit_publication_stage` 1.8 秒、
+    `finalize_publication` 1.5 秒；注册表 69 MB。`--slow-commit-seconds 10` 时暂存提交 12.8 秒，照样在 09:25
+    可见地发布；从 09:24:45 起跑、`--slow-commit-seconds 20` 时拒成「completed after 09:25」并回滚。主机上
+    09-24 同一段超过了 5 秒，按当天日志推算整轮约 80 秒写到回执。
+  - **演练脚本 `scripts/reference_slow_publish_rehearsal.py`**：把运行根里一个已封好的参考慢批次与它指名的日历代
+    复制到私有演练根，用新的源规则重新封批（临时签名钥）、用新的发布者发布到新注册表（临时 HMAC 钥），打印每一轮、
+    实测提交秒数、`first_available_at` / `switched_at` / `published_at`、serving 权威，以及 auction_gap 输入在
+    09:24:59（必须拒）与 09:29（必须接受）的参考检查；只写演练根，生产文件只读，演练根不许与运行根重叠。
+    命令与预期见 DEPLOY 2026-09-24 那条。
+  - **另一个发现（本包未修，报给协调者）**：`auction_gap_candidate_input` 每一行做 4 次 `as_of`，每次都是一次新的
+    SQLite 连接加锁加祖先链递归查询，本机空闲时约 20 毫秒一次；5,556 行约 7.5 分钟，6,077 行约 8 分钟，主机上
+    只会更慢，而装配窗是 09:29–09:49。参考代一直没有发布过，所以这条路径从来没真的跑满过。
+  - **用例**：`tests/unit/test_reference_slow_publish_rehearsal_script.py`（3 个：演练在 09:25 可见地发布、只写
+    演练根；慢过 09:25 的提交被拒并回滚；演练根落在运行根里被拒）；`tests/unit/test_reference_slow_publish_window.py`（19 个：两个真 `RuntimeServiceControl` 走过两个交易日；
+    暂存提交跑 6 秒 / 60 秒照样在 09:25 可见地发布；09:25 之后结束的提交与 09:25 之后开始的一轮仍然拒；两种报错；
+    09:25 之前各轮不重建权威；第二天的权威；09:29 的 auction_gap 输入接受慢提交的代；源写入 20 秒照封、31 秒与越过
+    09:25 两种报错；过期批次、上一版本 commit 的过期批次、超过一页的过期批次；未可见批次结束本轮不抛；已发布批次
+    在下一批未可见时照样进权威），外加 auction-match 零点、daily-close 零点、market-minute STALE+重复三个用例。
+    19 个变异（恢复 5 秒规则、去掉 09:25 起始截止、注册表放行截止之后的提交、两处早退回 -1、合并两种报错 ×3、三个
+    其他 role 的修复各回退一次、恢复分支按 `started` 读、权威按谱系修订号、过期批次不跳过、未可见批次重新抛错、
+    不翻页、源保护时间回 5 秒、空闲轮重新哈希、`current_sequence` 跳过恢复）全部被杀。
+  - **没改的**：`deploy/systemd`（`CPUQuota` 由 owner 决定）、#295（一天只有一次采集机会）、#290；发布者 09:25
+    之后整天每一轮都报「started after 09:25」算失败，这是设计，本包不动。
+
 - **参考慢源从来没有发布过一次：`stock_basic` 没要 `delist_date`，退市名单里还有一行历史代码（#293，包 AE）**：
   serving 的 `reference_slow_authority` 是硬源（永远不是可选源），而主机上
   `authorities/reference-slow` 一代都没有，于是 serving 每一轮都拒，③b 过不了。

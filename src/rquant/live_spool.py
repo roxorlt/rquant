@@ -50,6 +50,29 @@ class LiveSpoolIntegrityError(RuntimeError):
     pass
 
 
+class LiveSpoolVisibilityHorizonError(LiveSpoolIntegrityError):
+    """A deadline publication became durable after its envelope's `available_at`, not its deadline.
+
+    The envelope promised visibility at `available_at`, earlier than `not_after`, and the
+    commit ran past that promise while there was still time before the deadline. Split from
+    the deadline refusal so a caller can say which bound was crossed (#297).
+    """
+
+
+def _publication_horizon_error(
+    observed: datetime,
+    *,
+    not_after: datetime,
+    phase: str,
+    deadline_message: str,
+) -> LiveSpoolIntegrityError:
+    if observed > not_after:
+        return LiveSpoolIntegrityError(deadline_message)
+    return LiveSpoolVisibilityHorizonError(
+        f"atomic publication {phase} missed its visibility horizon"
+    )
+
+
 _SSH_KEYGEN_PATH = Path("/usr/bin/ssh-keygen")
 _SSH_KEYGEN_TIMEOUT_SECONDS = 5.0
 
@@ -978,7 +1001,12 @@ class LiveBatchSpool:
             visibility_horizon = min(not_after, envelope.available_at)
             if before_replace > visibility_horizon:
                 self._recover_publication_intent_locked(envelope.channel)
-                raise LiveSpoolIntegrityError("atomic publication missed pre-commit deadline")
+                raise _publication_horizon_error(
+                    before_replace,
+                    not_after=not_after,
+                    phase="pre-commit",
+                    deadline_message="atomic publication missed pre-commit deadline",
+                )
 
         current_path = self._current_path(envelope.channel)
         current_pointer: CurrentPointer | None = None
@@ -991,7 +1019,12 @@ class LiveBatchSpool:
             visibility_horizon = min(not_after, envelope.available_at)
             if completed > visibility_horizon:
                 self._recover_publication_intent_locked(envelope.channel)
-                raise LiveSpoolIntegrityError("atomic publication completed after deadline")
+                raise _publication_horizon_error(
+                    completed,
+                    not_after=not_after,
+                    phase="commit",
+                    deadline_message="atomic publication completed after deadline",
+                )
             if completed < envelope.source_time:
                 self._recover_publication_intent_locked(envelope.channel)
                 raise LiveSpoolIntegrityError(
@@ -1020,7 +1053,12 @@ class LiveBatchSpool:
             receipt_durable_at = normalize_aware_utc(completion_clock())
             if receipt_durable_at > visibility_horizon:
                 self._recover_publication_intent_locked(envelope.channel)
-                raise LiveSpoolIntegrityError("atomic publication receipt completed after deadline")
+                raise _publication_horizon_error(
+                    receipt_durable_at,
+                    not_after=not_after,
+                    phase="receipt",
+                    deadline_message="atomic publication receipt completed after deadline",
+                )
             if envelope.channel is LiveChannel.REFERENCE_SLOW and self.source_signer is not None:
                 self._write_reference_source_signature(
                     envelope=envelope,
@@ -1039,9 +1077,10 @@ class LiveBatchSpool:
         if requires_receipt and completion_clock is not None and not_after is not None:
             final_durable_at = normalize_aware_utc(completion_clock())
             visibility_horizon = min(not_after, envelope.available_at)
-            if final_durable_at > visibility_horizon or (
+            monotonic_expired = (
                 monotonic_deadline is not None and time.monotonic() > monotonic_deadline
-            ):
+            )
+            if final_durable_at > visibility_horizon or monotonic_expired:
                 self._atomic_write(
                     self._intent_path(envelope.channel),
                     self._json_bytes(intent),
@@ -1054,8 +1093,15 @@ class LiveBatchSpool:
                     receipt_path.unlink()
                 self._fsync_directory(receipt_path.parent)
                 self._recover_publication_intent_locked(envelope.channel)
-                raise LiveSpoolIntegrityError(
-                    "atomic publication finalization completed after deadline"
+                if monotonic_expired:
+                    raise LiveSpoolIntegrityError(
+                        "atomic publication finalization completed after deadline"
+                    )
+                raise _publication_horizon_error(
+                    final_durable_at,
+                    not_after=not_after,
+                    phase="finalization",
+                    deadline_message="atomic publication finalization completed after deadline",
                 )
         return pointer if current_pointer is None else current_pointer
 
@@ -1118,6 +1164,36 @@ class LiveBatchSpool:
             with self._exclusive_lock():
                 self._recover_publication_intent_locked(channel)
         return self._read_current(channel)
+
+    def current_sequence(self, channel: LiveChannel) -> int | None:
+        """The committed current pointer's sequence, without re-hashing the retained batches.
+
+        Only for reporting a position (a heartbeat's `input_sequence` / `output_sequence`) on
+        a path that reads no batch content (#298). `current()` re-reads and re-hashes every
+        retained payload -- up to 128 reference batches of ~3 MB each -- which an idle round
+        repeated all day cannot afford. A pending publication intent means the pointer may be
+        half-committed, so that case goes through `current()` and its writer recovery.
+        """
+
+        if self._intent_path(channel).exists():
+            pointer = self.current(channel)
+            return None if pointer is None else pointer.sequence
+        path = self._current_path(channel)
+        if not path.exists():
+            return None
+        try:
+            pointer = CurrentPointer.model_validate_json(
+                _secure_read_regular_file(
+                    path,
+                    label="current pointer",
+                    max_bytes=64 * 1024,
+                )
+            )
+        except (OSError, ValueError) as exc:
+            raise LiveSpoolIntegrityError("current pointer is invalid") from exc
+        if pointer.channel is not channel:
+            raise LiveSpoolIntegrityError("current pointer channel does not match its path")
+        return pointer.sequence
 
     def _read_current(self, channel: LiveChannel) -> CurrentPointer | None:
         path = self._current_path(channel)
