@@ -758,6 +758,15 @@ def test_profile_install_retry_excludes_terminal_schema_rollout_plans(
         environ={"TUSHARE_TOKEN_MAIN": "secret"},
         schema_bootstrap_reason="reviewed profile bootstrap",
     )
+    #: The subject is the retry, not the change detection: two generations that differ only in
+    #: their commit get no plan since #228, so the channel is reported as changed here.
+    import rquant.runtime_deployment_profile as profile_module
+
+    monkeypatch.setattr(
+        profile_module,
+        "changed_runtime_schema_channels",
+        lambda *_args, **_kwargs: ("runtime.market_minute.batch-envelope",),
+    )
     started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
     candidate = install_runtime_deployment_profile(
         new_profile,

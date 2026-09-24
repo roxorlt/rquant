@@ -210,6 +210,12 @@ class RuntimeSchemaDualWriteBinding:
             raise RuntimeError("rolled-back schema producer must stop before publishing")
         if phase is RolloutPhase.PREPARE:
             raise RuntimeError("schema producer cannot publish before dual_write")
+        #: `commit_payload` runs after the producer's publish, and the store checks the
+        #: plan's window again there. Asking the same question here, with the same
+        #: `observed_at`, is what keeps a closed window from refusing a record whose batch is
+        #: already published — the market-minute retry then collides with its own publish on
+        #: every later iteration (#304).
+        store.validate_dual_write_time(self.plan.plan_id, observed_at)
         candidate = dict(values)
         if old_values is None:
             old_fields = self.old_declaration.available_fields()
@@ -568,6 +574,47 @@ class RuntimeSchemaContractBundle(RuntimeContractModel):
             return next(channel for channel in self.channels if channel.channel_id == channel_id)
         except StopIteration as exc:
             raise KeyError(f"unknown runtime schema channel: {channel_id}") from exc
+
+    def channel_shape_fingerprint(self, channel_id: str) -> str:
+        """The schema facts a rollout plan on this channel binds, and nothing about the release.
+
+        A plan exists so that a changed schema reaches every participant in order: the
+        producers write both declarations, the trusted consumers acknowledge the new one, and
+        only then does authority move. `build_runtime_schema_rollout` binds exactly two schema
+        facts into a plan — the declarations, and the physical schema the consumers'
+        receipts must name (the channel's own, or for a channel the serving publisher
+        consumes, the serving read model's) — so those two decide whether the channel changed:
+
+        * the declaration's semantic fingerprint: payload model, reader and current version,
+          and every field's type, nullability, requirement and lifecycle;
+        * the channel's physical schema, and the serving physical schema when the serving
+          publisher is one of the consumers.
+
+        Not in it: `producer_commit`, the manifest fingerprints and the participant lists.
+        The first two change on every release by construction, so a fingerprint that carried
+        them (the declaration's `schema_fingerprint`) reported every channel as changed on
+        every install and staged sixteen plans for releases that changed no schema at all
+        (#228). Participants change when a release adds a strategy or a consumer; that is not
+        a schema transition (the new participant reads the very declaration the old ones do,
+        and `validate_runtime_schema_transition` still checks it can), and turning it into a
+        plan would bind the producers to a dual-write window for nothing. All three stay in
+        the plan as provenance.
+        """
+
+        channel = self.channel(channel_id)
+        serving_bound = any(
+            binding.requires_serving_generation_ack for binding in channel.consumers
+        )
+        return canonical_sha256(
+            {
+                "payload_model": channel.payload_model,
+                "declaration": channel.declaration.semantic_fingerprint,
+                "physical_schema": channel.physical_schema.physical_schema_fingerprint,
+                "serving_physical_schema_fingerprint": (
+                    self.serving_physical_schema_fingerprint if serving_bound else None
+                ),
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -999,6 +1046,28 @@ def build_runtime_schema_rollout(
     return plan, registry
 
 
+def changed_runtime_schema_channel_ids(
+    *,
+    previous: RuntimeSchemaContractBundle,
+    candidate: RuntimeSchemaContractBundle,
+) -> tuple[str, ...]:
+    """The channels whose contract differs between two bundles, release identity aside (#228).
+
+    See `RuntimeSchemaContractBundle.channel_shape_fingerprint` for what counts. Installing a
+    generation whose channels all keep their shape prepares no rollout plan, so none of its
+    producers is bound to a dual-write plan it would have to carry through a trading session.
+    """
+
+    previous = RuntimeSchemaContractBundle.model_validate(previous)
+    candidate = RuntimeSchemaContractBundle.model_validate(candidate)
+    return tuple(
+        channel.channel_id
+        for channel in candidate.channels
+        if candidate.channel_shape_fingerprint(channel.channel_id)
+        != previous.channel_shape_fingerprint(channel.channel_id)
+    )
+
+
 def _raise_incompatible(
     *,
     direction: str,
@@ -1196,6 +1265,7 @@ __all__ = [
     "build_runtime_schema_contract_bundle",
     "build_runtime_schema_rollout",
     "build_runtime_schema_v1_migration_audit",
+    "changed_runtime_schema_channel_ids",
     "current_runtime_schema_consumer_acknowledgers",
     "current_runtime_schema_dual_writer",
     "parse_runtime_schema_contract_bundle",

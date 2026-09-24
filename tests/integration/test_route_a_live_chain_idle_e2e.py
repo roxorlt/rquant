@@ -357,13 +357,17 @@ def cold_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RouteAWorld:
         producer_commit=world.commit,
         runtime_root=runtime_root,
         #: only the first install into an empty root may carry a bootstrap reason, and
-        #: the second install without one is what prepares the rollout plans
+        #: the second install without one is what used to prepare the rollout plans
         schema_bootstrap_reason=None,
         #: one registry root cannot hold two commits' definitions (#225)
         definition_registry_root=runtime_root.parent / f"definitions-{world.commit[:7]}",
     )
     assert receipt.previous_generation_hash is not None
-    assert receipt.schema_rollout_plan_ids
+    #: Since #228 the second install prepares none: the two generations differ only in their
+    #: commit, so no channel's shape moved. This is the v0.33.22 install on the host; the
+    #: plans older installs left behind are the subject of
+    #: `test_route_a_schema_rollout_sandbox_e2e.py` and `test_schema_rollout_no_op_plans_e2e.py`.
+    assert receipt.schema_rollout_plan_ids == ()
 
     #: `_production_bundle` relocates every external input under `<runtime root>/../external`
     #: when it is given a runtime root, and the roles read the relocated paths. The two
@@ -418,9 +422,9 @@ def test_the_world_is_the_second_generation_installed_over_the_first(
     """The premise, asserted before anything is asserted about the roles.
 
     The window this file is built out of was the second generation installed over the
-    first, which is also the install that prepares the schema rollout plans every
-    kind-backed role opens on its way in. A one-generation world would quietly leave
-    that surface out.
+    first, which until #228 was fixed was also the install that prepared sixteen schema
+    rollout plans every kind-backed role opened on its way in. It prepares none now, and
+    this pins that; a one-generation world would quietly leave the question out.
     """
 
     generations = sorted(
@@ -437,9 +441,8 @@ def test_the_world_is_the_second_generation_installed_over_the_first(
     )
 
     rollouts = idle_chain.runtime_root / "control" / "schema-rollouts"
-    assert sorted(path.name for path in rollouts.iterdir()) == sorted(
-        idle_chain.receipt.schema_rollout_plan_ids
-    )
+    staged = sorted(path.name for path in rollouts.iterdir()) if rollouts.exists() else []
+    assert staged == sorted(idle_chain.receipt.schema_rollout_plan_ids) == []
 
 
 

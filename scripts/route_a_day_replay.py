@@ -1102,6 +1102,26 @@ def _history_before(payload: bytes, trade_date: date, target: Path) -> tuple[byt
     return target.read_bytes(), facts
 
 
+def _schema_rollout_facts(runtime_root: Path, *, receipt: Any) -> dict[str, Any]:
+    """Every plan under the sandbox's `control/schema-rollouts`, by channel and phase."""
+
+    from rquant.runtime_deployment_bundle import load_runtime_schema_rollout
+
+    rollouts = runtime_root / "control" / "schema-rollouts"
+    plans: dict[str, str] = {}
+    if rollouts.is_dir():
+        for directory in sorted(rollouts.iterdir()):
+            authority, store = load_runtime_schema_rollout(
+                runtime_root, plan_id=directory.name, read_only=True
+            )
+            plans[authority.plan.dataset_id] = store.get_state(directory.name).phase.value
+    return {
+        "plans": len(plans),
+        "receipt_plan_ids": len(receipt.schema_rollout_plan_ids),
+        "phases": plans,
+    }
+
+
 def build_world(
     *,
     sandbox: Path,
@@ -1199,6 +1219,10 @@ def build_world(
         acknowledge_runtime_schema_rollout_preparation(
             route.runtime_root, now=rollout_started_at + timedelta(seconds=37)
         )
+    #: What the second install staged. Since package AJ (#228) a generation whose channels keep
+    #: their shape gets no plan, so with `--generations 2` this is `plans: 0`; before it, the
+    #: sixteen plans here are what wedged market_minute_source at the first capture (F5, #304).
+    facts["schema_rollout"] = _schema_rollout_facts(route.runtime_root, receipt=receipt)
     facts["world_commit"] = world.commit
     facts["generations"] = sorted(
         path.name for path in (route.runtime_root / "generations").iterdir() if path.is_dir()

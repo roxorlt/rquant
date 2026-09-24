@@ -52,6 +52,9 @@ ROUTE_A_COMMANDS = (
     # the three above and out of the same `.env`-less worktree, because the deployed checkout
     # does not carry the command yet. Its own parser is the one that knows `acknowledge`.
     ("runtime-schema-rollout", "acknowledge"),
+    # Package AJ, 2026-09-25: `close-unchanged` is a second action of the same command, run
+    # from the same worktree in the same window.
+    ("runtime-schema-rollout", "close-unchanged"),
 )
 
 #: Sibling runtime commands that are *not* config-free: they keep failing closed.
