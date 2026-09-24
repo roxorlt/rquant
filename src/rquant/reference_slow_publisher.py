@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -18,6 +18,7 @@ from rquant.reference_data_registry import (
     ReferenceDataset,
     ReferencePublicationDeadlineError,
     ReferencePublicationRollback,
+    ReferencePublicationVisibilityError,
     ReferenceRecord,
     ReferenceRegistry,
 )
@@ -46,7 +47,6 @@ CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 _TS_CODE_PATTERN = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 _SOURCE_KEYS = frozenset({"daily", "security", "suspension", "calendar"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_COMMIT_VISIBILITY_GUARD = timedelta(seconds=5)
 _REFERENCE_PROJECTION_TABLES = frozenset(
     {
         "stock_basic",
@@ -530,6 +530,10 @@ def publish_reference_slow_snapshot(
             completion_receipt_path=None,
             target_cursor=None,
         )
+    except ReferencePublicationVisibilityError as exc:
+        raise ReferenceSlowPublicationError(
+            "publication missed its commit visibility instant before 09:25"
+        ) from exc
     except ReferencePublicationDeadlineError as exc:
         raise ReferenceSlowPublicationError("publication completed after 09:25") from exc
     return receipt
@@ -627,7 +631,16 @@ def _publish_reference_slow_snapshot_with_rollback(
         raise ReferenceSlowPublicationError("publication availability precedes source evidence")
     if prepared_at > decision_time:
         raise ReferencePublicationDeadlineError("publication completed after deadline")
-    available = min(prepared_at + _COMMIT_VISIBILITY_GUARD, decision_time)
+    #: Every record, the manifest and the pointer become visible at the 09:25 decision time,
+    #: not at `prepared_at + 5 s` (#297). The registry refuses a commit that ends after the
+    #: visibility it promised, so the old guard made commit latency a second deadline: on
+    #: 2026-09-24 the ~33k-record commit ran in the live slice under `CPUQuota=60%` and missed
+    #: its five seconds three times before 09:25. With visibility at the cutoff the only
+    #: deadline is 09:25 itself, and "nothing is visible before its commit completed" still
+    #: holds because the commit must complete by then. Nothing reads today's generation
+    #: before 09:25: paper constraints need minute evidence (09:30), the auction-gap input
+    #: its 09:29 window, and serving reads the previous generation until then.
+    available = decision_time
     pending = tuple(
         ReferenceRecord(
             dataset_id=dataset_id,

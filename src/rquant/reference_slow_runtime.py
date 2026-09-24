@@ -17,6 +17,7 @@ from rquant.live_contracts import (
 from rquant.live_spool import LiveBatchRecord, LiveBatchSpool, LiveSpoolIntegrityError
 from rquant.reference_data_registry import (
     ReferencePublicationDeadlineError,
+    ReferencePublicationVisibilityError,
     ReferenceRegistry,
 )
 from rquant.reference_slow_publisher import (
@@ -36,6 +37,13 @@ _CAPTURE_START = time(9, 20)
 _CAPTURE_END = time(9, 25)
 _REVISION_SCAN_START = time(9, 24)
 _COMMIT_VISIBILITY_GUARD = timedelta(seconds=5)
+#: The two ways a publication attempt can end after it started, told apart in the heartbeat
+#: (#297): on 2026-09-24 a commit that missed its visibility guard at 09:22:52 and 09:24:24
+#: was reported with the second text, as if it had run past the cutoff.
+_PUBLISHER_AFTER_CUTOFF = "reference slow publisher completed after 09:25"
+_PUBLISHER_VISIBILITY_MISSED = (
+    "reference slow publisher commit ended after its promised visibility instant (before 09:25)"
+)
 
 SnapshotLoader = Callable[[], ReferenceSlowSourceSnapshot]
 RevisionSnapshotLoader = Callable[[date], ReferenceSlowSourceSnapshot]
@@ -504,10 +512,10 @@ def publish_reference_slow_batches(
                     completion_receipt_path=completion_receipt_path,
                     target_cursor=cursor,
                 )
+            except ReferencePublicationVisibilityError as exc:
+                raise ReferenceSlowRuntimeError(_PUBLISHER_VISIBILITY_MISSED) from exc
             except ReferencePublicationDeadlineError as exc:
-                raise ReferenceSlowRuntimeError(
-                    "reference slow publisher completed after 09:25"
-                ) from exc
+                raise ReferenceSlowRuntimeError(_PUBLISHER_AFTER_CUTOFF) from exc
             generation_id = receipt.generation_id
             stage_sha256 = registry.pending_publication_stage_sha256(rollback)
             registry_staged = False
@@ -562,9 +570,9 @@ def publish_reference_slow_batches(
                             publication_id,
                             durable_completed_at=clock(),
                         )
-                    raise ReferenceSlowRuntimeError(
-                        "reference slow publisher completed after 09:25"
-                    ) from exc
+                    raise ReferenceSlowRuntimeError(_PUBLISHER_AFTER_CUTOFF) from exc
+                if isinstance(exc, ReferencePublicationVisibilityError):
+                    raise ReferenceSlowRuntimeError(_PUBLISHER_VISIBILITY_MISSED) from exc
                 raise
         authority_snapshot = snapshot
         authority_receipt = receipt
@@ -599,12 +607,16 @@ def publish_reference_slow_batches(
 
         current_manifest = registry.current_manifest()
         try:
+            #: "Does the authority already carry the registry's current generation?" is a
+            #: question about the authority, not about the wall clock: a generation this
+            #: window published earlier is visible from 09:25 (#297), so read as of whichever
+            #: is later. Reading at `started` saw yesterday's and rebuilt today's every round.
             current_authority = ServingSourceAuthorityReader(
                 root=authority_root,
                 expected_producer_commit=producer_commit,
                 expected_dataset_id=REFERENCE_SLOW_AUTHORITY_DATASET_ID,
                 expected_payload_kind="reference_slow",
-            )(started)
+            )(max(started, current_manifest.published_at))
         except ServingSourceAuthorityUnavailableError:
             current_authority = None
         if (

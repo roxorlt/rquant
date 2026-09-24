@@ -15,21 +15,40 @@ Every case below drives the real spool, registry, serving authority and service 
 
 from __future__ import annotations
 
+import os
+import sqlite3
+from contextlib import closing
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import duckdb
+import pandas as pd
 import pytest
 
+import rquant.reference_slow_runtime as reference_slow_runtime
+from rquant.auction_gap_candidate_input import assemble_auction_gap_candidate_batch
+from rquant.auction_match_gateway import AuctionMatchGateway, AuctionMatchGatewayConfig
 from rquant.live_contracts import LiveChannel
 from rquant.live_spool import LiveBatchSpool
+from rquant.reference_data_registry import (
+    ReadonlyReferenceRegistry,
+    ReferenceDataset,
+    ReferenceDataUnavailableError,
+    ReferencePublicationDeadlineError,
+    ReferencePublicationVisibilityError,
+    ReferenceRecord,
+    ReferenceRegistry,
+)
 from rquant.reference_slow_publisher import (
     ReferenceDailyFact,
     ReferenceSecurityFact,
     ReferenceSlowSourceSnapshot,
 )
 from rquant.reference_slow_runtime import (
+    ReferenceSlowRuntimeError,
     capture_reference_slow_batch,
+    publish_reference_slow_batches,
 )
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.runtime_service_builtin import build_builtin_registry
@@ -40,6 +59,11 @@ from rquant.runtime_service_control import (
     RuntimeStepResult,
 )
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
+from rquant.runtime_serving_authority import (
+    ServingSourceAuthorityReader,
+    ServingSourceAuthorityUnavailableError,
+)
+from rquant.runtime_serving_snapshot import REFERENCE_SLOW_AUTHORITY_DATASET_ID
 from rquant.strict_json import canonical_json_bytes
 from tests.unit.test_reference_slow_runtime import (
     COMMIT,
@@ -393,3 +417,411 @@ def test_an_idle_round_with_a_pending_intent_recovers_before_it_reports(tmp_path
     restarted = LiveBatchSpool(tmp_path / "spool")
     assert restarted.current_sequence(LiveChannel.REFERENCE_SLOW) is None
     assert not restarted._intent_path(LiveChannel.REFERENCE_SLOW).exists()
+
+
+# ---------------------------------------------------------------------------------------
+# #297: the only publication deadline is 09:25
+# ---------------------------------------------------------------------------------------
+
+
+def _registry(tmp_path: Path) -> ReferenceRegistry:
+    return ReferenceRegistry(tmp_path / "authorities" / "reference.sqlite3")
+
+
+def _consumer(spool: LiveBatchSpool, tmp_path: Path) -> LiveBatchSpool:
+    return LiveBatchSpool(
+        spool.root,
+        cursor_root=tmp_path / "publisher-state" / "cursors",
+        source_read_only=True,
+    )
+
+
+def _sealed_spool(tmp_path: Path, *, sealed_at: datetime | None = None) -> LiveBatchSpool:
+    """Today's batch, sealed the way 2026-09-24's was: captured 09:20:30, prepared 09:21:00."""
+
+    prepared = sealed_at or at(9, 21)
+    spool = LiveBatchSpool(tmp_path / "spool")
+    capture_reference_slow_batch(
+        spool=spool,
+        calendar=_calendar(),
+        observed_at=prepared - timedelta(seconds=60),
+        producer_commit=COMMIT,
+        producer_version="test-v1",
+        snapshot_loader=lambda: _snapshot(captured_at=prepared - timedelta(seconds=30)),
+        completion_clock=lambda: prepared,
+    )
+    return spool
+
+
+def _slow_registry_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: ReferenceRegistry,
+    clock: _Clock,
+    seconds: float,
+) -> None:
+    """The registry's stage commit takes `seconds` of wall time (the host's throttled slice)."""
+
+    original = registry.append_many_and_publish_before
+
+    def slow(records: object, *, completion_clock: object, **kwargs: object) -> object:
+        readings = 0
+
+        def inside() -> datetime:
+            nonlocal readings
+            readings += 1
+            if readings == 2:
+                #: the reading after `COMMIT`: this is where the 09-24 commit ran long
+                clock.now += timedelta(seconds=seconds)
+            return completion_clock()  # type: ignore[operator]
+
+        return original(records, completion_clock=inside, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry, "append_many_and_publish_before", slow)
+
+
+def _authority(spool: LiveBatchSpool, as_of: datetime) -> object:
+    return ServingSourceAuthorityReader(
+        root=spool.root / "serving-authority",
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=REFERENCE_SLOW_AUTHORITY_DATASET_ID,
+        expected_payload_kind="reference_slow",
+    )(as_of)
+
+
+@pytest.mark.parametrize("commit_seconds", [6, 60])
+def test_a_slow_registry_commit_before_the_cutoff_publishes_visible_at_0925(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_seconds: int,
+) -> None:
+    """09-24 09:22:52 and ~09:24:24: the commit outran `prepared_at + 5 s`, not 09:25."""
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    clock = _Clock(at(9, 22))
+    _slow_registry_commit(monkeypatch, registry, clock, commit_seconds)
+
+    result = publish_reference_slow_batches(
+        spool=_consumer(spool, tmp_path),
+        registry=registry,
+        calendar=_calendar(),
+        consumer_id="reference-slow-publisher",
+        observed_at=clock.now,
+        producer_commit=COMMIT,
+        completion_clock=clock,
+    )
+
+    assert result.processed_count == 1
+    assert clock.now == at(9, 22) + timedelta(seconds=commit_seconds)
+    decision = at(9, 25)
+    manifest = registry.current_manifest()
+    pointer = registry.current_pointer()
+    assert manifest.published_at == decision
+    assert pointer.switched_at == decision
+    for dataset in ReferenceDataset:
+        (record,) = registry.records(dataset_id=dataset, key="300001.SZ")
+        assert record.first_available_at == decision
+    with closing(sqlite3.connect(registry.path)) as connection:
+        ((completed_at, visible_at),) = connection.execute(
+            "SELECT completed_at, visible_at FROM reference_publication_receipt"
+        ).fetchall()
+    assert datetime.fromisoformat(completed_at) <= datetime.fromisoformat(visible_at)
+    assert datetime.fromisoformat(visible_at) == decision
+    #: the serving authority says the same instant, and nobody sees today's generation early
+    today = _authority(spool, decision)
+    assert today.payload.reference_generation_id == manifest.generation_id
+    assert today.published_at == decision
+    with pytest.raises(ServingSourceAuthorityUnavailableError, match="not yet available"):
+        _authority(spool, decision - timedelta(microseconds=1))
+    with pytest.raises(ReferenceDataUnavailableError, match="not available at decision_time"):
+        registry.as_of(
+            dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
+            key="300001.SZ",
+            event_time=decision,
+            decision_time=decision - timedelta(microseconds=1),
+        )
+
+
+def test_a_commit_that_ends_after_0925_still_refuses_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    clock = _Clock(at(9, 24, 30))
+    _slow_registry_commit(monkeypatch, registry, clock, 40)
+
+    with pytest.raises(ReferenceSlowRuntimeError) as refused:
+        publish_reference_slow_batches(
+            spool=consumer,
+            registry=registry,
+            calendar=_calendar(),
+            consumer_id="reference-slow-publisher",
+            observed_at=clock.now,
+            producer_commit=COMMIT,
+            completion_clock=clock,
+        )
+
+    assert str(refused.value) == "reference slow publisher completed after 09:25"
+    assert consumer.load_cursor("reference-slow-publisher", LiveChannel.REFERENCE_SLOW) is None
+    with pytest.raises(ReferenceDataUnavailableError, match="missing"):
+        registry.current_pointer()
+
+
+def test_a_start_after_0925_still_refuses(tmp_path: Path) -> None:
+    spool = _sealed_spool(tmp_path)
+    late = at(9, 25) + timedelta(milliseconds=1)
+
+    with pytest.raises(ReferenceSlowRuntimeError, match="started after 09:25"):
+        publish_reference_slow_batches(
+            spool=_consumer(spool, tmp_path),
+            registry=_registry(tmp_path),
+            calendar=_calendar(),
+            consumer_id="reference-slow-publisher",
+            observed_at=late,
+            producer_commit=COMMIT,
+            completion_clock=lambda: late,
+        )
+
+
+def test_a_missed_visibility_instant_and_a_missed_cutoff_read_differently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry still refuses a commit that outruns the visibility it was handed.
+
+    The publisher no longer hands it an instant before 09:25, but a caller that does must
+    hear which bound it crossed: on 09-24 the guard miss was reported as "after 09:25".
+    """
+
+    registry = _registry(tmp_path)
+    record = ReferenceRecord(
+        dataset_id=ReferenceDataset.ST_STATUS,
+        key="300001.SZ",
+        effective_from=datetime(2026, 7, 30, 16, tzinfo=UTC),
+        revision=1,
+        source="test.reference",
+        first_available_at=at(9, 22, 5),
+        payload={"is_st": False, "name": "成长样本"},
+    )
+    ticks = iter((at(9, 22), at(9, 22, 6)))
+    with pytest.raises(ReferencePublicationVisibilityError) as visibility:
+        registry.append_many_and_publish_before(
+            (record,),
+            published_at=at(9, 22, 5),
+            completion_clock=lambda: next(ticks),
+            not_after=at(9, 25),
+        )
+    assert str(visibility.value) == "publication completed after its promised visibility instant"
+    late = iter((at(9, 24, 59), at(9, 25, 1)))
+    with pytest.raises(ReferencePublicationDeadlineError) as deadline:
+        registry.append_many_and_publish_before(
+            (record,),
+            published_at=at(9, 22, 5),
+            completion_clock=lambda: next(late),
+            not_after=at(9, 25),
+        )
+    assert not isinstance(deadline.value, ReferencePublicationVisibilityError)
+    assert str(deadline.value) == "publication completed after deadline"
+
+    #: and the publisher's heartbeat carries two different texts for the two
+    spool = _sealed_spool(tmp_path)
+    for error, text in (
+        (
+            ReferencePublicationVisibilityError("guard"),
+            "reference slow publisher commit ended after its promised visibility instant "
+            "(before 09:25)",
+        ),
+        (
+            ReferencePublicationDeadlineError("cutoff"),
+            "reference slow publisher completed after 09:25",
+        ),
+    ):
+        publisher_registry = ReferenceRegistry(tmp_path / f"{type(error).__name__}.sqlite3")
+
+        def refuse(*_args: object, error: Exception = error, **_kwargs: object) -> object:
+            raise error
+
+        monkeypatch.setattr(publisher_registry, "append_many_and_publish_before", refuse)
+        with pytest.raises(ReferenceSlowRuntimeError) as refused:
+            publish_reference_slow_batches(
+                spool=LiveBatchSpool(
+                    spool.root,
+                    cursor_root=tmp_path / type(error).__name__ / "cursors",
+                    source_read_only=True,
+                ),
+                registry=publisher_registry,
+                calendar=_calendar(),
+                consumer_id="reference-slow-publisher",
+                observed_at=at(9, 22),
+                producer_commit=COMMIT,
+                completion_clock=lambda: at(9, 22),
+            )
+        assert str(refused.value) == text
+
+
+def test_rounds_between_the_commit_and_0925_recognise_the_authority_without_rebuilding_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Today's authority is visible from 09:25; the recovery branch must still recognise it.
+
+    Read at `started`, a 09:23 round would see yesterday's authority, decide the authority
+    lagged the registry, and rebuild today's result from the 3 MB payload every five seconds.
+    """
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    publish = publish_reference_slow_batches
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+    }
+    first = publish(observed_at=at(9, 22), completion_clock=lambda: at(9, 22), **common)
+    rebuilt: list[object] = []
+    original_build = reference_slow_runtime.build_reference_slow_serving_result
+
+    def counted_build(**kwargs: object) -> object:
+        rebuilt.append(kwargs)
+        return original_build(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        reference_slow_runtime, "build_reference_slow_serving_result", counted_build
+    )
+
+    later = [
+        publish(observed_at=moment, completion_clock=lambda moment=moment: moment, **common)
+        for moment in (at(9, 23, 30), at(9, 24, 50))
+    ]
+
+    assert rebuilt == []
+    assert {item.source_generations["reference_slow_authority"] for item in later} == {
+        first.source_generations["reference_slow_authority"]
+    }
+    assert [(item.input_sequence, item.processed_count) for item in later] == [(0, 0), (0, 0)]
+
+
+def test_the_second_session_authority_is_not_refused_as_a_rollback(tmp_path: Path) -> None:
+    """Record lineage revisions restart at 1 every session; the authority numbers generations.
+
+    Before, the second session's authority reused sequence 1 and was refused ("different
+    generation at the current sequence is a rollback"); only a later round's recovery branch
+    published it, and never when that round started after 09:25.
+    """
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+    }
+    publish_reference_slow_batches(
+        observed_at=at(9, 22), completion_clock=lambda: at(9, 22), **common
+    )
+    capture_reference_slow_batch(
+        spool=spool,
+        calendar=_calendar(),
+        observed_at=at(9, 20, day=NEXT_DATE),
+        producer_commit=COMMIT,
+        producer_version="test-v1",
+        snapshot_loader=lambda: _snapshot(
+            captured_at=at(9, 20, 30, day=NEXT_DATE),
+            target_trade_date=NEXT_DATE,
+            prior_trade_date=TARGET_DATE,
+        ),
+        completion_clock=lambda: at(9, 21, day=NEXT_DATE),
+    )
+
+    second = publish_reference_slow_batches(
+        observed_at=at(9, 22, day=NEXT_DATE),
+        completion_clock=lambda: at(9, 22, day=NEXT_DATE),
+        **common,
+    )
+
+    assert second.processed_count == 1
+    authority = _authority(spool, at(9, 25, day=NEXT_DATE))
+    assert authority.payload.reference_generation_id == registry.current_manifest().generation_id
+    assert authority.sequence == 2
+    assert _authority(spool, at(9, 30)).sequence == 1
+
+
+def test_the_auction_gap_input_at_0929_accepts_a_generation_committed_slowly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What 09-24 lost: `auction_gap_candidate_input` refused every row for want of it."""
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    clock = _Clock(at(9, 22))
+    _slow_registry_commit(monkeypatch, registry, clock, 60)
+    publish_reference_slow_batches(
+        spool=_consumer(spool, tmp_path),
+        registry=registry,
+        calendar=_calendar(),
+        consumer_id="reference-slow-publisher",
+        observed_at=clock.now,
+        producer_commit=COMMIT,
+        completion_clock=clock,
+    )
+    auction_spool = LiveBatchSpool(tmp_path / "auction-spool")
+    frame = pd.DataFrame(
+        [
+            {
+                "ts_code": "300001.SZ",
+                "trade_date": TARGET_DATE,
+                "price": 10.5,
+                "vol": 20_000.0,
+                "amount": 210_000.0,
+                "pre_close": 10.0,
+                "turnover_rate": 0.2,
+                "volume_ratio": 9.9,
+            }
+        ]
+    )
+    capture = AuctionMatchGateway(
+        spool=auction_spool,
+        fetcher=lambda _trade_date: frame,
+        config=AuctionMatchGatewayConfig(
+            producer_version="auction-match-v1",
+            producer_commit=COMMIT,
+            min_coverage_ratio=1.0,
+        ),
+    ).capture_once(trade_date=TARGET_DATE, received_at=at(9, 29), expected_codes=("300001.SZ",))
+    assert capture.published is True
+    daily = tmp_path / "rquant_ro.duckdb"
+    with duckdb.connect(str(daily)) as connection:
+        connection.execute("CREATE TABLE daily_bar(ts_code VARCHAR, trade_date DATE, vol DOUBLE)")
+        connection.executemany(
+            "INSERT INTO daily_bar VALUES (?, ?, ?)",
+            [("300001.SZ", day, 1_000.0) for day in OPEN_DATES[:5]],
+        )
+    daily.chmod(0o600)
+    replica_time = at(8, 0).timestamp()
+    os.utime(daily, (replica_time, replica_time))
+
+    batch = assemble_auction_gap_candidate_batch(
+        auction_spool=auction_spool,
+        daily_database_path=daily,
+        reference_registry=ReadonlyReferenceRegistry(registry.path),
+        calendar=_calendar(),
+        trade_date=TARGET_DATE,
+        observed_at=at(9, 29, 30),
+        producer_commit=COMMIT,
+    )
+
+    (fact,) = batch.facts
+    assert fact.ts_code == "300001.SZ"
+    assert fact.is_listed is True
+    assert fact.limit_up_price_session_raw == 12.0
+    assert fact.available_at == at(9, 29)
+    assert batch.authority.captured_at == at(9, 29)

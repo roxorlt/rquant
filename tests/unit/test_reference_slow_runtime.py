@@ -1888,4 +1888,5 @@ def test_production_builder_discovers_bounded_revisions_with_pit_availability(
     )
     assert len(historical_records) == 1
     assert historical_records[0].payload["name"] == "历史修订"
-    assert historical_records[0].first_available_at == publisher_started + timedelta(seconds=5)
+    #: every record the window publishes becomes visible at the 09:25 decision time (#297)
+    assert historical_records[0].first_available_at == PUBLISHED_AT
