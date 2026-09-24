@@ -233,8 +233,8 @@
     另记一条观察（未改）：对既有生产者又有消费者的 channel，`validate_runtime_schema_transition` 会拒掉任何声明变化
     （升版本号超出旧消费者的读取范围，不升版本号又有语义变化），所以今天能装上的「真变化」只有 serving 物理 schema 这一种。
   - **测试**：`tests/unit/test_schema_rollout_no_op_plans.py`（6）、`tests/integration/test_schema_rollout_no_op_plans_e2e.py`
-    （4，按主机时间线：09-24 16:21 承认、周一 09:30 开盘）、回放新增 `--generations 2` 一例（0 份计划、分钟线零失败、
-    当日 serving 代带信号）。依赖「换提交就有计划」的旧夹具改成：走完整协议的用真变化；讲主机上已有计划的，用
+    （5，按主机时间线：09-24 16:21 承认、周一 09:30 开盘；含生产画像 16 条策略换提交 0 份计划）、回放新增
+    `--generations 2` 一例（0 份计划、分钟线零失败、当日 serving 代带信号）。store 单测里「DUAL_WRITE 过了 `plan.deadline` 就拒」那一段改成先写一条双写记录开窗再越过窗口。依赖「换提交就有计划」的旧夹具改成：走完整协议的用真变化；讲主机上已有计划的，用
     `tests/schema_rollout_legacy_plans.py` 按旧安装器的原样循环把计划放上去；链路世界断言第二次安装 0 份计划。
   - **装机与回滚**：见 `DEPLOY.md` 2026-09-25「热修 AJ」一条。
 
