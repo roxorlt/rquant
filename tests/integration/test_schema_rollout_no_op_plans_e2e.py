@@ -21,6 +21,8 @@ A real schema change still goes the whole way: dual write, consumer receipt, cut
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +30,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from rquant import runtime_deployment_bundle as deployment_module
 from rquant.live_contracts import LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
@@ -143,6 +146,17 @@ class _Minute:
             return self.gateway.capture_once(received_at=bar_at + timedelta(seconds=5))
 
 
+def _tree_state(root: Path) -> dict[str, tuple[int, int, str]]:
+    """Every entry under `root`: mode, mtime and, for files, a content hash."""
+
+    state: dict[str, tuple[int, int, str]] = {}
+    for path in sorted((root, *root.rglob("*"))):
+        observed = path.lstat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        state[str(path.relative_to(root))] = (observed.st_mode, observed.st_mtime_ns, digest)
+    return state
+
+
 def _stage_host_plans(root: Path, profile: RuntimeDeploymentProfile, previous, target) -> str:
     """The 09-24 window: one pre-#228 plan per policy channel, acknowledged into DUAL_WRITE."""
 
@@ -217,7 +231,24 @@ def test_the_generation_the_old_plans_bind_publishes_after_close_unchanged(
     legacy = _stage_host_plans(root, thursday_profile, first, thursday)
     _weekend_profile, weekend = _install(root, COMMITS[2])
 
+    #: the preview opens every store read-only: no writer open (which would run the schema
+    #: DDL and the journal pragma), no side file, no directory entry or mtime moved
+    opened: list[bool] = []
+
+    class _Recording(deployment_module.SchemaRolloutStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            opened.append(bool(kwargs.get("read_only", False)))
+            super().__init__(*args, **kwargs)
+
+    rollouts = root / "control" / "schema-rollouts"
+    before = _tree_state(rollouts)
+    monkeypatch.setattr(deployment_module, "SchemaRolloutStore", _Recording)
     preview = close_unchanged_runtime_schema_rollouts(root, now=MONDAY_OPEN, dry_run=True)
+    monkeypatch.undo()
+    _disable_test_credential_sealer(monkeypatch)
+    assert opened and all(opened), opened
+    assert _tree_state(rollouts) == before
+    assert not list(rollouts.glob("*/state.sqlite3-*"))
     (item,) = preview
     assert item.plan_id == legacy
     assert item.shape_unchanged is True
@@ -262,6 +293,57 @@ def test_the_generation_the_old_plans_bind_publishes_after_close_unchanged(
     assert store.consumer_capability_receipts(legacy) == ()
     for index in range(15):
         assert minute.capture(MONDAY_OPEN + timedelta(minutes=index)).published is True
+
+
+def test_close_unchanged_leaves_a_plan_that_reached_cutover_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authority has already moved to the new declaration there, and nothing is bound."""
+
+    _disable_test_credential_sealer(monkeypatch)
+    root = tmp_path / "runtime"
+    _first_profile, first = _install(root, COMMITS[0], bootstrap=True)
+    thursday_profile, thursday = _install(root, COMMITS[1])
+    plan_id = _stage_host_plans(root, thursday_profile, first, thursday)
+    minute = _Minute(root, thursday_profile, thursday.generation_hash)
+    assert minute.capture(MONDAY_OPEN).published is True
+    _authority, store = load_runtime_schema_rollout(root, plan_id=plan_id)
+    advance_runtime_schema_rollout(
+        root,
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        target_phase=RolloutPhase.CONSUMER_ACK,
+        now=MONDAY_OPEN + timedelta(seconds=10),
+        operation_id="package-aj-cutover-case-consumer-ack",
+    )
+    #: the consumer's startup receipt
+    load_runtime_schema_service_bindings(
+        root,
+        manifest=_feature_manifest(thursday_profile),
+        generation_id=thursday.generation_hash,
+        observed_at=MONDAY_OPEN + timedelta(seconds=20),
+    )
+    advance_runtime_schema_rollout(
+        root,
+        plan_id=plan_id,
+        expected_revision=store.get_state(plan_id).revision,
+        target_phase=RolloutPhase.CUTOVER,
+        now=MONDAY_OPEN + timedelta(seconds=30),
+        operation_id="package-aj-cutover-case-cutover",
+    )
+    revision = store.get_state(plan_id).revision
+
+    for dry_run in (True, False):
+        (item,) = close_unchanged_runtime_schema_rollouts(
+            root, now=MONDAY_OPEN + timedelta(minutes=1), dry_run=dry_run
+        )
+        assert item.shape_unchanged is True
+        assert item.skipped_reason == "past_cutover"
+        assert item.closed is False
+        assert item.phase_after is RolloutPhase.CUTOVER
+    assert store.get_state(plan_id).phase is RolloutPhase.CUTOVER
+    assert store.get_state(plan_id).revision == revision
 
 
 # ---------------------------------------------------------------------------------------
@@ -361,8 +443,8 @@ def test_a_bound_producer_re_sending_an_older_batch_is_a_retry_not_a_refusal(
 def test_a_real_schema_change_stages_one_plan_that_waits_for_monday_and_needs_every_step(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from rquant import runtime_deployment_bundle as deployment_module
 
     class _Transaction:
         sealed_instances: tuple[str, ...] = ()
@@ -401,10 +483,22 @@ def test_a_real_schema_change_stages_one_plan_that_waits_for_monday_and_needs_ev
     assert store.get_state(plan_id).phase is RolloutPhase.DUAL_WRITE
     assert store.effective_deadline(plan_id) is None
 
-    #: close-unchanged leaves a plan that protects a real change alone
+    #: close-unchanged leaves a plan that protects a real change alone, and says so in its
+    #: exit status as well as in the report
     (closure,) = close_unchanged_runtime_schema_rollouts(root, now=ACKNOWLEDGED_AT, dry_run=True)
     assert closure.skipped_reason == "schema_changed"
     assert closure.closed is False
+    from rquant.cli import build_parser, cmd_runtime_schema_rollout
+
+    for extra in (["--dry-run"], []):
+        arguments = build_parser().parse_args(
+            ["runtime-schema-rollout", "close-unchanged", "--runtime-root", str(root), *extra]
+        )
+        assert cmd_runtime_schema_rollout(arguments) == 2
+        report = json.loads(capsys.readouterr().out)
+        assert report["schema_changed"] == 1
+        assert report["closed"] == 0
+    assert store.get_state(plan_id).phase is RolloutPhase.DUAL_WRITE
 
     notifier = next(
         item for item in new_profile.manifests if item.service_kind is RuntimeServiceKind.NOTIFIER
@@ -473,7 +567,6 @@ def test_the_production_profile_s_sixteen_policies_stage_no_plan_for_a_commit_on
 ) -> None:
     """The host's own profile: sixteen rollout policies, a release that changes only the commit."""
 
-    from rquant import runtime_deployment_bundle as deployment_module
     from rquant.runtime_definition_bootstrap import plan_builtin_definitions
     from rquant.runtime_production_profile import build_production_runtime_profile
     from tests.unit.test_runtime_production_profile import _inputs as production_inputs
