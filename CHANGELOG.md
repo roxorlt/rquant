@@ -194,6 +194,50 @@
 
 ### Fixed
 
+- **schema rollout 不再卡死路线 A 链：形状没变的 channel 不建计划，DUAL_WRITE 的期限从生产者第一次双写起算，
+  过期先拒后发（#304、#228，包 AJ）**：协调者 2026-09-25 01:01 在主机上只读查了 `data/runtime/control/schema-rollouts`：
+  **208 份计划，全部过期**，192 份停在 DUAL_WRITE、16 份停在 PREPARE。09-07 以来每个装机窗口都承认了整整 16 份，每份
+  600 秒后过期；当前代（09-24 16:21 承认）的 `runtime.market_minute.batch-envelope` 计划期限是 16:31:32，早已过期。
+  之前的交易日链没走到分钟线发布，所以没暴露；包 AI 的回放 `--generations 2` 复现了：周一第一批分钟线先写进 spool、
+  再在 `commit_payload` 抛 `rollout deadline has expired`，之后每一轮都是 `immutable sequence already contains different
+  content`（重启也一样），`feature_live` 每一轮失败，整条链没有特征、没有信号。本包改三处：
+  - **形状没变就不建计划（#228）**（`runtime_schema_registry.py` `channel_shape_fingerprint` /
+    `changed_runtime_schema_channel_ids`，`runtime_deployment_bundle.py` `changed_runtime_schema_channels`）：原来比的是
+    声明的 `schema_fingerprint`，它把 `producer_commit` 算在里面，每次发版都变，于是每个既有生产者又有消费者的 channel
+    每次都算「变了」。现在比的是计划真正绑定的 schema 事实：声明的语义指纹（载荷模型、读者版本与当前版本、每个字段的
+    类型 / 可空 / 必填 / 生命周期）、channel 的物理 schema，以及 serving 消费的 channel 上 serving 的物理 schema。
+    `producer_commit`、manifest 指纹、参与者名单都不算（加一个策略不是 schema 变化），照旧作为出处留在计划里。
+    **v0.33.21 与本分支的 21 个 channel 形状、serving 物理 schema 逐一相同（本地实测），所以 v0.33.22 装在主机当前代之上
+    一份计划都不会建**。
+  - **DUAL_WRITE 的窗口从生产者第一次双写起算，窗口关了先拒后发（#304）**（`schema_compatibility.py`
+    `_effective_deadline` / `validate_dual_write_time`，`runtime_schema_registry.py` `prepare_payload`）：PREPARE 仍按安装
+    时的墙钟窗口（含安装器那一次重开）；DUAL_WRITE / CONSUMER_ACK 的窗口从第一条 `dual_write_values` /
+    `dual_write_evidence` 起算、长度仍是计划自己的窗口（生产画像 600 秒），且不早于 PREPARE 的期限；在那之前计划没有
+    期限——市场时段的生产者只有开盘后才可能写证据，按安装时刻算，收盘后装的计划还没开盘就过期了。数据真正开始按两份
+    声明流动之后，后面的消费者回执、切换仍然只有一个窗口，所以边界还在。`expire()` 用同一个有效期限。生产者在发布
+    **之前**用只读句柄按同一个 `observed_at` 问一次窗口，窗口关了就在碰 spool 之前拒绝——原来是先发布、后被拒，重试时
+    撞上自己刚发布的那一批，这才变成每一轮 `immutable sequence already contains different content`。
+  - **准入只读别的代计划的 `authority.json`**（`runtime_deployment_bundle.py` `load_runtime_schema_service_bindings`）：
+    原来先把每份计划都完整加载（从两代 bundle 重新推导、打开状态库、校验哈希链）再判断是不是本代的；208 份旧计划
+    一份都绑不到新代，但任何一份加载失败都会挡住每个 kind-backed role 的启动。现在先读目标代，不是本代就跳过。
+  - **新增 `rquant runtime-schema-rollout close-unchanged [--dry-run]`**：对形状没变、仍在 PREPARE / DUAL_WRITE /
+    CONSUMER_ACK 的计划，在计划自己的哈希链上追加一条 store 回滚（原因
+    `no_schema_change: ... (#228); old authority retained`）；**不动 `current`**、不重新激活任何代、不写别的文件
+    （`rollback_runtime_schema_rollout` 会把 `current` 指回上一代，这里不能用）。形状真的变了的计划报
+    `schema_changed`、不碰。幂等；`--dry-run` 只读打开、一个字节不写；和 `acknowledge` 一样不需要 `.env`。
+    ROLLBACK 阶段的计划既不绑生产者（准入只在 DUAL_WRITE / CONSUMER_ACK 绑）、也不向消费者要回执（只在
+    CONSUMER_ACK 要），本版与之前每一版都一样，所以它是让「被旧计划绑住的那一代」（09-24 那代，万一 `current` 退回去）
+    周一也能发布的办法。前进路径（装 v0.33.22）不需要它。
+  - **真正的 schema 变化仍然走完整协议**：e2e 用 serving 读模型的物理 schema 变化造一次真变化——只建一份计划，承认进
+    DUAL_WRITE 后跨周末不过期，周一第一次发布被接受并开窗，CONSUMER_ACK 之后没有 serving 的回执不许切换，有了才切换。
+    另记一条观察（未改）：对既有生产者又有消费者的 channel，`validate_runtime_schema_transition` 会拒掉任何声明变化
+    （升版本号超出旧消费者的读取范围，不升版本号又有语义变化），所以今天能装上的「真变化」只有 serving 物理 schema 这一种。
+  - **测试**：`tests/unit/test_schema_rollout_no_op_plans.py`（6）、`tests/integration/test_schema_rollout_no_op_plans_e2e.py`
+    （4，按主机时间线：09-24 16:21 承认、周一 09:30 开盘）、回放新增 `--generations 2` 一例（0 份计划、分钟线零失败、
+    当日 serving 代带信号）。依赖「换提交就有计划」的旧夹具改成：走完整协议的用真变化；讲主机上已有计划的，用
+    `tests/schema_rollout_legacy_plans.py` 按旧安装器的原样循环把计划放上去；链路世界断言第二次安装 0 份计划。
+  - **装机与回滚**：见 `DEPLOY.md` 2026-09-25「热修 AJ」一条。
+
 - **路线 A 链上的五处阻断：9 月 24 日真实数据回放暴露，修完后本地回放同一形状能走到当日 serving 代并带信号（包 AI）**：
   协调者在主机上用 v0.33.21 的代码回放 2026-09-24（只读副本 + 录下的批次，不打补丁，到 10:30 为止），结果是参考慢源
   09:21:31 正常发出当日参考代，但 `candidate.auction_gap` 在 09:29–09:48 的 20 轮装配**每一轮都**返回
@@ -240,8 +284,8 @@
     333 轮，前两轮量到的是 14 秒和 11 秒），出场永远评估不到。上限改成两个分钟线周期（`EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS`
     = 2 × 60 秒）：一个周期给状态所依据的行情证据（它本身被限制在 60 秒内），一个给特征批次到证据之间策略、路由、队列、
     撮合每轮 2–5 秒的几跳；仍然 `fail_closed`。超限的报错现在写出实际延迟和上限。
-  - **没修、另开 issue 的**：schema rollout 计划在收盘后承认进 DUAL_WRITE、周一第一次发布时已过期（F5，#304，周一开盘前
-    必须先处置）；北交所代码没有成本选择器、CDR 按 A_SHARE 归类（#305）；生命周期特征迟到仍整批失败（#306）；
+  - **没修、另开 issue 的**：schema rollout 计划在收盘后承认进 DUAL_WRITE、周一第一次发布时已过期（F5，#304，由包 AJ
+    处理，见上一条）；北交所代码没有成本选择器、CDR 按 A_SHARE 归类（#305）；生命周期特征迟到仍整批失败（#306）；
     模拟盘约束午休与收盘后每轮失败、一只代码拒整批（F6，#307）。
   - **装机与回滚**：见 `DEPLOY.md` 2026-09-24「热修 AI」一条。新增两个心跳文件字段，回滚到本包之前要先挪心跳；
     特征契约与策略注册指纹随之改变，这和每次发版改 `producer_commit` 带来的变化是同一种，生产输入文档照常按新提交生成。
