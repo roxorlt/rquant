@@ -160,9 +160,50 @@ def test_the_rehearsal_publishes_a_copied_batch_visible_at_0925_and_writes_only_
     assert '"records_written": 12' in out
     assert '"refused": "reference generation is future evidence"' in out
     assert '"facts": 2' in out
+    #: #299: every auction code through one snapshot, cross-checked against as_of
+    assert '"codes_checked": 2, "lookups": 8' in out
+    assert '"mismatches_with_bulk": []' in out
+    #: one production round: the open's connection, pointer, manifest (2) and the snapshot
+    assert '"registry_connections": 5' in out
     assert _tree(runtime) == before
     (root,) = (tmp_path / "rehearsal").iterdir()
     assert (root / "authorities" / "reference-slow" / "reference.sqlite3").is_file()
+
+
+def test_the_production_registry_copy_is_timed_from_a_read_only_backup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _runtime_root(tmp_path)
+    #: no live registry yet: the step reports and the rehearsal still passes
+    code, out = _run(tmp_path, runtime, "--production-registry-copy", capsys=capsys)
+    assert code == 0, out
+    assert "production registry copy: unusable" in out
+    #: a published registry standing in for the live one
+    (first,) = (tmp_path / "rehearsal").iterdir()
+    live = runtime / "authorities" / "reference-slow"
+    live.mkdir(mode=0o700, parents=True)
+    (live / "reference.sqlite3").write_bytes(
+        (first / "authorities" / "reference-slow" / "reference.sqlite3").read_bytes()
+    )
+    (live / "reference.sqlite3").chmod(0o600)
+    before = _tree(runtime)
+
+    code, out = _run(
+        tmp_path,
+        runtime,
+        "--production-registry-copy",
+        "--single-key-sample",
+        "0",
+        capsys=capsys,
+    )
+
+    assert code == 0, out
+    assert '"records": 12' in out
+    assert '"unavailable_at_switched_at": 0' in out
+    assert "single_key_as_of" not in out
+    assert _tree(runtime) == before
+    assert sorted(path.name for path in live.iterdir()) == ["reference.sqlite3"]
 
 
 def test_a_commit_slowed_past_0925_is_refused_and_rolled_back(

@@ -3,11 +3,13 @@
 Copies one sealed reference-slow batch out of a runtime root, re-seals it into a fresh spool
 with the current source rule (the envelope's `available_at`), publishes it with the current
 `publish_reference_slow_batches` into a fresh registry, and checks what
-`auction_gap_candidate_input` would say at 09:29 (its reference lookups for
-`--auction-sample` codes, and with `--full-auction-assembly` the whole input over the copied
-auction-match batch) -- everything under one private rehearsal root. Nothing outside that
-root is written: the production spool, registry and DuckDB files are only read (the batch,
-the calendar generation and, optionally, the auction-match spool are copied first), and the
+`auction_gap_candidate_input` would say at 09:29 (its reference lookups for every auction
+code through the one-read `as_of_snapshot` path of #299, cross-checked against the old
+single-key `as_of` for `--single-key-sample` codes, and with `--full-auction-assembly` one
+whole production round over the copied auction-match batch) -- everything under one private
+rehearsal root. Nothing outside that root is written: the production spool, registry and
+DuckDB files are only read (the batch, the calendar generation, optionally the auction-match
+spool and, with `--production-registry-copy`, the live registry are copied first), and the
 only DuckDB this opens is a synthetic one it creates in the root.
 
     PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=<checkout>/src <venv>/bin/python \\
@@ -20,6 +22,11 @@ the 2026-09-24 first attempt) and then advances with real wall time, so commit l
 real. `--slow-commit-seconds N` sleeps N real seconds right after the registry's stage
 `COMMIT`, i.e. makes the commit N seconds slower: N=10 must still publish (the five-second
 guard is gone), N large enough to cross 09:25 must be refused and rolled back.
+
+`--production-registry-copy` also copies the live reference registry (SQLite backup API, read
+from a `mode=ro` connection) and times what the auction_gap publisher pays on it every round:
+opening it (the reader's integrity pass reads every record the registry has ever held) and
+one snapshot over all codes of its current generation. That step only reports.
 
 Exit status: 0 when the batch was published visible at 09:25 and the 09:29 reference checks
 accept it; 1 on any refusal (including the one `--slow-commit-seconds` is meant to provoke --
@@ -131,6 +138,86 @@ def _read_sqlite(path: Path, query: str) -> list[tuple[Any, ...]]:
         return connection.execute(query).fetchall()
 
 
+def _time_production_registry(
+    *,
+    runtime_root: Path,
+    root: Path,
+    codes: tuple[str, ...],
+    datasets: tuple[Any, ...],
+    out: Callable[[str], None],
+) -> None:
+    """What the live registry costs the auction_gap publisher per round; reports only.
+
+    The rehearsal registry holds one generation, the live one every session since the first
+    publication, and the reader's integrity pass at open reads all of it. The copy is taken
+    with SQLite's backup API from a `mode=ro` connection, so the live file is only read.
+    """
+
+    from rquant.reference_data_registry import (
+        ReadonlyReferenceRegistry,
+        ReferenceDataUnavailableError,
+    )
+
+    source = runtime_root / "authorities" / "reference-slow" / "reference.sqlite3"
+    target = root / "production-registry" / "reference.sqlite3"
+    try:
+        target.parent.mkdir(mode=0o700)
+        with (
+            closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as reader,
+            closing(sqlite3.connect(target)) as writer,
+        ):
+            reader.backup(writer)
+        target.chmod(0o600)
+        (records, generations) = _read_sqlite(
+            target,
+            "SELECT (SELECT COUNT(*) FROM reference_record), "
+            "(SELECT COUNT(*) FROM reference_generation)",
+        )[0]
+        started = time.monotonic()
+        copy = ReadonlyReferenceRegistry(target)
+        open_seconds = time.monotonic() - started
+        pointer = copy.current_pointer()
+        started = time.monotonic()
+        snapshot = copy.as_of_snapshot(
+            dataset_ids=datasets,
+            keys=codes,
+            generation_id=pointer.generation_id,
+        )
+        read_seconds = time.monotonic() - started
+        unavailable = 0
+        for code in codes:
+            for dataset in datasets:
+                try:
+                    snapshot.as_of(
+                        dataset_id=dataset,
+                        key=code,
+                        event_time=pointer.switched_at,
+                        decision_time=pointer.switched_at,
+                    )
+                except ReferenceDataUnavailableError:
+                    unavailable += 1
+        lookups_seconds = time.monotonic() - started
+    except Exception as error:  # noqa: BLE001 - this step only reports
+        out(f"production registry copy: unusable ({type(error).__name__}: {error})")
+        return
+    _show(
+        out,
+        "production registry copy",
+        {
+            "records": records,
+            "generations": generations,
+            "current_generation_id": pointer.generation_id,
+            "current_switched_at": pointer.switched_at,
+            #: paid by every auction_gap round (load_live_auction_candidate_input)
+            "open_seconds": round(open_seconds, 3),
+            "codes": len(codes),
+            "snapshot_read_seconds": round(read_seconds, 3),
+            "snapshot_and_lookups_seconds": round(lookups_seconds, 3),
+            "unavailable_at_switched_at": unavailable,
+        },
+    )
+
+
 def run_rehearsal(
     *,
     runtime_root: Path,
@@ -141,8 +228,10 @@ def run_rehearsal(
     round_interval_seconds: float,
     auction: bool,
     auction_observed: str,
-    auction_sample: int = 500,
+    auction_sample: int = 0,
+    single_key_sample: int = 50,
     full_auction_assembly: bool = False,
+    production_registry_copy: bool = False,
     out: Callable[[str], None] = print,
 ) -> int:
     from rquant.live_contracts import BatchEnvelope, LiveChannel
@@ -458,8 +547,25 @@ def run_rehearsal(
             out("auction-match batch belongs to another session; checking its codes only")
             auction_envelope = None
 
-    def reference_checks(at: datetime, checked: tuple[str, ...]) -> dict[str, object]:
-        """The reference half of `assemble_auction_gap_candidate_batch`, lookup for lookup."""
+    datasets = (
+        ReferenceDataset.ST_STATUS,
+        ReferenceDataset.SUSPENSION_STATUS,
+        ReferenceDataset.LISTING_STATUS,
+        ReferenceDataset.PRICE_LIMIT_REGIME,
+    )
+
+    def reference_checks(
+        at: datetime,
+        checked: tuple[str, ...],
+        *,
+        single_key_codes: int = 0,
+    ) -> dict[str, object]:
+        """The reference half of `assemble_auction_gap_candidate_batch`, as it reads now.
+
+        One `as_of_snapshot` for the four datasets and every checked code, then four
+        lookups per code from it (#299). The first `single_key_codes` codes are also read
+        the pre-#299 way -- one `as_of` round trip per lookup -- and must answer the same.
+        """
 
         pointer = readonly.current_pointer()
         manifest = readonly.current_manifest()
@@ -468,53 +574,86 @@ def run_rehearsal(
         if pointer.switched_at > at or manifest.published_at > at:
             return {"observed_at": at, "refused": "reference generation is future evidence"}
         missing: dict[str, int] = {}
+        answers: dict[tuple[str, str], str] = {}
         started = time.monotonic()
+        snapshot = readonly.as_of_snapshot(
+            dataset_ids=datasets,
+            keys=checked,
+            generation_id=manifest.generation_id,
+        )
+        read_seconds = time.monotonic() - started
         for code in checked:
-            for dataset in (
-                ReferenceDataset.ST_STATUS,
-                ReferenceDataset.SUSPENSION_STATUS,
-                ReferenceDataset.LISTING_STATUS,
-                ReferenceDataset.PRICE_LIMIT_REGIME,
-            ):
+            for dataset in datasets:
                 try:
-                    readonly.as_of(
+                    answers[(code, dataset.value)] = snapshot.as_of(
                         dataset_id=dataset,
                         key=code,
                         event_time=event_time,
                         decision_time=at,
-                        generation_id=manifest.generation_id,
-                    )
-                except ReferenceDataUnavailableError:
+                    ).record.record_id
+                except ReferenceDataUnavailableError as error:
                     missing[dataset.value] = missing.get(dataset.value, 0) + 1
+                    answers[(code, dataset.value)] = f"unavailable: {error}"
         elapsed = time.monotonic() - started
-        per_lookup = elapsed / max(1, 4 * len(checked))
-        return {
+        result: dict[str, object] = {
             "observed_at": at,
             "codes_checked": len(checked),
+            "lookups": 4 * len(checked),
             "unavailable": missing,
+            "snapshot_read_seconds": round(read_seconds, 3),
+            #: what one `assemble_auction_gap_candidate_batch` round now spends on them
             "seconds": round(elapsed, 3),
-            "ms_per_lookup": round(per_lookup * 1000, 2),
-            #: what one `assemble_auction_gap_candidate_batch` round spends on these lookups
-            "projected_seconds_for_all_codes": round(per_lookup * 4 * len(codes), 1),
         }
+        if single_key_codes > 0:
+            sample = checked[:single_key_codes]
+            mismatches: list[str] = []
+            started = time.monotonic()
+            for code in sample:
+                for dataset in datasets:
+                    try:
+                        single = readonly.as_of(
+                            dataset_id=dataset,
+                            key=code,
+                            event_time=event_time,
+                            decision_time=at,
+                            generation_id=manifest.generation_id,
+                        ).record.record_id
+                    except ReferenceDataUnavailableError as error:
+                        single = f"unavailable: {error}"
+                    if single != answers[(code, dataset.value)]:
+                        mismatches.append(f"{code}/{dataset.value}")
+            single_elapsed = time.monotonic() - started
+            per_lookup = single_elapsed / max(1, 4 * len(sample))
+            result["single_key_as_of"] = {
+                "codes": len(sample),
+                "seconds": round(single_elapsed, 3),
+                "ms_per_lookup": round(per_lookup * 1000, 2),
+                #: what the pre-#299 per-row reads would have spent on every checked code
+                "projected_seconds_for_all_codes": round(per_lookup * 4 * len(checked), 1),
+                "mismatches_with_bulk": mismatches,
+            }
+        return result
 
     sample = codes if auction_sample <= 0 else codes[:auction_sample]
     early = reference_checks(decision - timedelta(seconds=1), sample)
-    late = reference_checks(observed, sample)
+    late = reference_checks(observed, sample, single_key_codes=single_key_sample)
     _show(out, "auction_gap reference checks at 09:24:59", early)
     _show(out, "auction_gap reference checks", late)
     if "refused" not in early:
         raise RehearsalRefusedError("today's generation was usable before 09:25")
     if "refused" in late or late["unavailable"]:
         raise RehearsalRefusedError(f"auction_gap reference checks refuse the generation: {late}")
+    single_key = late.get("single_key_as_of")
+    if isinstance(single_key, dict) and single_key["mismatches_with_bulk"]:
+        raise RehearsalRefusedError(
+            f"bulk and single-key reference reads disagree: {single_key['mismatches_with_bulk']}"
+        )
 
     if full_auction_assembly and auction_envelope is not None and auction_spool is not None:
         import duckdb
 
-        from rquant.auction_gap_candidate_input import (
-            AuctionGapCandidateInputError,
-            assemble_auction_gap_candidate_batch,
-        )
+        from rquant.auction_gap_candidate_input import AuctionGapCandidateInputError
+        from rquant.runtime_builder_candidate import load_live_auction_candidate_input
 
         prior = sorted(item for item in calendar.open_dates if item < trade_date)[-5:]
         synthetic = root / "synthetic-daily.duckdb"
@@ -529,22 +668,42 @@ def run_rehearsal(
         synthetic.chmod(0o600)
         replica_time = _local(trade_date, "09:00:00").timestamp()
         os.utime(synthetic, (replica_time, replica_time))
+        #: the candidate publisher calls load_live_auction_candidate_input every round: it
+        #: opens the registry afresh (the reader's integrity pass) and assembles. The open
+        #: is timed on its own first; `registry_connections` counts the round's, open
+        #: included (pre-#299 that was 4 per auction row more)
+        started = time.monotonic()
+        ReadonlyReferenceRegistry(registry_path)
+        open_seconds = time.monotonic() - started
+        connections = [0]
+        original_connect = ReadonlyReferenceRegistry._connect
+
+        def counted_connect(self: Any) -> Any:
+            connections[0] += 1
+            return original_connect(self)
+
+        ReadonlyReferenceRegistry._connect = counted_connect  # type: ignore[method-assign]
         started = time.monotonic()
         try:
-            batch = assemble_auction_gap_candidate_batch(
-                auction_spool=auction_spool,
+            batch = load_live_auction_candidate_input(
+                auction_spool_root=auction_copy,
                 daily_database_path=synthetic,
-                reference_registry=readonly,
-                calendar=calendar,
+                reference_registry_path=registry_path,
+                calendar_path=calendar_copy,
+                calendar_expected_commit=calendar_commit,
+                calendar_content_sha256=calendar.content_sha256,
                 trade_date=trade_date,
                 observed_at=observed,
                 producer_commit=auction_envelope.producer_commit,
             )
         except AuctionGapCandidateInputError as error:
             raise RehearsalRefusedError(f"auction_gap_candidate_input refused: {error}") from error
+        finally:
+            ReadonlyReferenceRegistry._connect = original_connect  # type: ignore[method-assign]
+        round_seconds = time.monotonic() - started
         _show(
             out,
-            "auction_gap_candidate_input (full batch, synthetic prior-5 volumes)",
+            "auction_gap_candidate_input (one production round, synthetic prior-5 volumes)",
             {
                 "observed_at": observed,
                 "facts": len(batch.facts),
@@ -552,8 +711,20 @@ def run_rehearsal(
                 "st": sum(fact.is_st for fact in batch.facts),
                 "suspended": sum(fact.is_suspended for fact in batch.facts),
                 "captured_at": batch.authority.captured_at,
-                "seconds": round(time.monotonic() - started, 1),
+                "registry_open_seconds": round(open_seconds, 3),
+                "registry_connections": connections[0],
+                #: load_live_auction_candidate_input: calendar + registry open + assembly
+                "seconds": round(round_seconds, 3),
             },
+        )
+
+    if production_registry_copy:
+        _time_production_registry(
+            runtime_root=runtime_root,
+            root=root,
+            codes=codes,
+            datasets=datasets,
+            out=out,
         )
     out("REHEARSAL OK")
     return 0
@@ -580,19 +751,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--auction-sample",
         type=int,
-        default=500,
-        help="codes to run the reference lookups for (0 = every auction row); each lookup "
-        "is a registry round trip, so every row takes minutes",
+        default=0,
+        help="codes to run the reference lookups for (default 0 = every auction row, "
+        "through one as_of_snapshot read)",
+    )
+    parser.add_argument(
+        "--single-key-sample",
+        type=int,
+        default=50,
+        help="of those, how many codes to also read the pre-#299 way (one as_of round trip "
+        "per lookup) to time it and compare its answers (0 = skip)",
     )
     parser.add_argument(
         "--full-auction-assembly",
         action="store_true",
-        help="also run assemble_auction_gap_candidate_batch over the whole copied batch "
-        "(synthetic prior-5 volumes) and time it -- as long as one production round",
+        help="also run one production round of the auction_gap input "
+        "(load_live_auction_candidate_input: registry open + assembly) over the whole "
+        "copied batch with synthetic prior-5 volumes, and time it",
+    )
+    parser.add_argument(
+        "--production-registry-copy",
+        action="store_true",
+        help="also copy the live reference registry (read-only backup) and time its open "
+        "and one snapshot over all codes -- the per-round cost at its real size",
     )
     arguments = parser.parse_args(argv)
     if arguments.slow_commit_seconds < 0 or arguments.round_interval_seconds <= 0:
         parser.error("seconds must be positive")
+    if arguments.single_key_sample < 0:
+        parser.error("--single-key-sample must not be negative")
 
     import rquant
 
@@ -608,7 +795,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             auction=not arguments.no_auction,
             auction_observed=arguments.auction_observed,
             auction_sample=arguments.auction_sample,
+            single_key_sample=arguments.single_key_sample,
             full_auction_assembly=arguments.full_auction_assembly,
+            production_registry_copy=arguments.production_registry_copy,
         )
     except RehearsalRefusedError as error:
         print(f"REHEARSAL REFUSED: {error}")
