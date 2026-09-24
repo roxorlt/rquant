@@ -210,6 +210,12 @@ class RuntimeSchemaDualWriteBinding:
             raise RuntimeError("rolled-back schema producer must stop before publishing")
         if phase is RolloutPhase.PREPARE:
             raise RuntimeError("schema producer cannot publish before dual_write")
+        #: `commit_payload` runs after the producer's publish, and the store checks the
+        #: plan's window again there. Asking the same question here, with the same
+        #: `observed_at`, is what keeps a closed window from refusing a record whose batch is
+        #: already published — the market-minute retry then collides with its own publish on
+        #: every later iteration (#304).
+        store.validate_dual_write_time(self.plan.plan_id, observed_at)
         candidate = dict(values)
         if old_values is None:
             old_fields = self.old_declaration.available_fields()

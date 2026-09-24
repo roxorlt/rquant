@@ -740,7 +740,9 @@ def test_an_expired_plan_is_reopened_once_and_then_carried(rollout: Rollout) -> 
         )
         reopened = store.deadline_reopened_until(plan_id)
         assert reopened == EXPIRED + STAGE_TIMEOUT
-        assert store.effective_deadline(plan_id) == reopened
+        #: in DUAL_WRITE the window waits for the producers' first record (#304), so the
+        #: plan has no deadline until one of them publishes
+        assert store.effective_deadline(plan_id) is None
 
 
 def test_the_reopen_is_on_the_hash_chain_and_says_who_did_it(rollout: Rollout) -> None:
@@ -1020,9 +1022,12 @@ def test_reopening_a_window_that_is_still_open_is_refused(rollout: Rollout) -> N
 def test_a_reopen_moves_the_later_phases_windows_too(rollout: Rollout) -> None:
     """Stated because it is a consequence an operator has to know, not a side effect.
 
-    `_validate_time` gates every later mutation of the plan, so restarting the clock moves
-    the whole remaining rollout — the producers' dual-write records and the consumers'
-    receipts — later by the same one window.
+    `_validate_time` gates every later mutation of the plan. Since #304 the DUAL_WRITE stage
+    has its own clock, which starts at the producers' first dual-write record, so a plan the
+    installer carried to DUAL_WRITE is not stopped by the clock before any producer has
+    written — past the reopened window as much as inside it; what stops it is the evidence
+    rule. The stage is still bounded: see
+    `test_the_dual_write_window_opens_at_the_first_record_and_then_closes`.
     """
 
     acknowledge_runtime_schema_rollout_preparation(rollout.root, now=EXPIRED)
@@ -1041,12 +1046,13 @@ def test_a_reopen_moves_the_later_phases_windows_too(rollout: Rollout) -> None:
             operation_id="inside-the-reopened-window",
         )
 
-    #: past the reopened one, the clock is what stops it again
-    with pytest.raises(ValueError, match="deadline has expired"):
+    #: past the reopened one too, days later: no producer has written, so the window has not
+    #: opened and the refusal is still the evidence rule, not the clock
+    with pytest.raises(ValueError, match="dual_write lacks consistency evidence"):
         store.advance(
             plan_id=plan_id,
             expected_revision=store.get_state(plan_id).revision,
             target_phase=RolloutPhase.CONSUMER_ACK,
-            now=EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1),
+            now=EXPIRED + timedelta(days=3),
             operation_id="past-the-reopened-window",
         )

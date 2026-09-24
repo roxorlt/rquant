@@ -2591,6 +2591,8 @@ def _acknowledge_one_plan(
     #: window has closed cannot be acknowledged or advanced — `_validate_time` refuses both —
     #: so finding that out here is the difference between a report and a half-written run.
     deadline = store.effective_deadline(plan_id)
+    if deadline is None:  # pragma: no cover - a PREPARE plan's window is always the install's
+        raise RuntimeSchemaCompatibilityError("a preparing rollout plan has no deadline")
     reopening = now > deadline
     if reopening and store.deadline_reopened_until(plan_id) is not None:
         fields["skipped_reason"] = "deadline_expired"
