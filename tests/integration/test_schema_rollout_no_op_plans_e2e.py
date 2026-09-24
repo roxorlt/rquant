@@ -425,3 +425,61 @@ def test_a_real_schema_change_stages_one_plan_that_waits_for_monday_and_needs_ev
     )
     assert state.phase is RolloutPhase.CUTOVER
     assert len(store.consumer_capability_receipts(plan_id)) == 1
+
+
+def test_the_production_profile_s_sixteen_policies_stage_no_plan_for_a_commit_only_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host's own profile: sixteen rollout policies, a release that changes only the commit."""
+
+    from rquant import runtime_deployment_bundle as deployment_module
+    from rquant.runtime_definition_bootstrap import plan_builtin_definitions
+    from rquant.runtime_production_profile import build_production_runtime_profile
+    from tests.unit.test_runtime_production_profile import _inputs as production_inputs
+
+    class _Transaction:
+        sealed_instances: tuple[str, ...] = ()
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            pass
+
+    class _Recovery:
+        outcome = "none"
+        transaction_id = None
+
+    monkeypatch.setattr(deployment_module, "_seal_runtime_credentials", lambda _i: _Transaction())
+    monkeypatch.setattr(deployment_module, "_recover_runtime_credentials", lambda **_k: _Recovery())
+
+    def full_profile(commit: str) -> RuntimeDeploymentProfile:
+        payload = production_inputs(tmp_path).model_dump(mode="python")
+        payload["producer_commit"] = commit
+        payload["strategies"] = tuple(
+            binding.model_dump(mode="python")
+            for binding in plan_builtin_definitions(producer_commit=commit).strategies
+        )
+        return build_production_runtime_profile(payload)
+
+    root = tmp_path / "source" / "runtime"
+    previous = full_profile(COMMITS[0])
+    assert len(previous.schema_rollout_policies) == 16
+    install_runtime_deployment_profile(
+        previous,
+        runtime_root=root,
+        environ=_production_environment(),
+        schema_bootstrap_reason="package AJ production-profile bootstrap",
+    )
+    candidate = install_runtime_deployment_profile(
+        full_profile(COMMITS[1]),
+        runtime_root=root,
+        environ=_production_environment(),
+        schema_rollout_started_at=STAGED_AT,
+    )
+
+    assert candidate.previous_generation_hash is not None
+    assert candidate.schema_rollout_plan_ids == ()
+    rollouts = root / "control" / "schema-rollouts"
+    assert not rollouts.exists() or not any(rollouts.iterdir())
