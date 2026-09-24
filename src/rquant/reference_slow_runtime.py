@@ -571,6 +571,23 @@ def publish_reference_slow_batches(
         last_sequence = envelope.sequence
         processed += 1
 
+    if authority_receipt is not None:
+        #: The serving authority numbers its results by `revision` and refuses a different
+        #: generation at the same or a lower one. The receipt's revision is the highest record
+        #: lineage revision, which starts again at 1 every session, so the second session's
+        #: authority was refused as a rollback ("different generation at the current sequence
+        #: is a rollback") and only the recovery branch below, one round later, published it --
+        #: never, when that round started after 09:25. The generation's place in the
+        #: registry's ancestry only grows, and it is the number the recovery branch uses.
+        authority_receipt = authority_receipt.model_copy(
+            update={
+                "revision": _reference_generation_revision(
+                    registry,
+                    authority_receipt.generation_id,
+                )
+            }
+        )
+
     authority_root = spool.root / "serving-authority"
     authority_generation_id: str | None = None
     if authority_snapshot is None or authority_receipt is None:

@@ -278,6 +278,7 @@ def test_source_and_publisher_heartbeats_never_regress_across_the_window_and_the
     source_round(at(9, 19, day=NEXT_DATE))
     publisher_round(at(9, 19, 30, day=NEXT_DATE))
     source_round(at(9, 21, day=NEXT_DATE))
+    publisher_round(at(9, 22, day=NEXT_DATE))
     source_round(at(9, 26, day=NEXT_DATE))
 
     assert source_positions == [
@@ -295,6 +296,7 @@ def test_source_and_publisher_heartbeats_never_regress_across_the_window_and_the
         ("07-31 09:22:00", 0, 0),
         ("07-31 09:24:30", 0, 0),
         ("08-03 09:19:30", 0, 0),
+        ("08-03 09:22:00", 1, 1),
     ]
     assert publisher_refusals == ["reference slow publisher started after 09:25"]
     source_control.stop(reason="test complete")
