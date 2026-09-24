@@ -852,6 +852,10 @@ class RoleState:
     max_iteration_seconds: float = 0.0
     errors: dict[str, dict[str, Any]] = field(default_factory=dict)
     degraded: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: the cause a degraded round gave (`degraded_detail`), and the last informational
+    #: counts (`observations`), both heartbeat file fields since package AI
+    degraded_details: dict[str, dict[str, Any]] = field(default_factory=dict)
+    observations: dict[str, int] = field(default_factory=dict)
     last_heartbeat: Any = None
     max_processed: int = 0
     first_output_at: datetime | None = None
@@ -900,45 +904,14 @@ def install_runner_patches(
     monkeypatch.setattr(control_module, "_wait_for_stop", single_wait)
 
 
-_EXCHANGE_BY_SUFFIX = {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}
-
-
-def install_listing_classification_stub(monkeypatch: Any) -> dict[str, int]:
-    """Opt-in stub: derive the four listing-classification fields from the ts_code.
-
-    `paper_execution_constraint_producer._required_a_share_instrument_context` requires
-    `market`, `exchange`, `instrument_class` and `security_class` on the LISTING_STATUS
-    record, and `reference_slow_publisher` writes none of them (its listing payload is
-    `delist_date / list_date / source_list_status / status`). Only the record the producer
-    reads is widened, in memory; the registry is not touched, and the fields a record does
-    carry are never overridden.
-    """
-
-    import rquant.paper_execution_constraint_producer as producer
-
-    real = producer._required_a_share_instrument_context
-    fields = ("market", "exchange", "instrument_class", "security_class")
-    counts = {"lookups": 0, "derived": 0}
-
-    def derived(lookup: Any) -> Any:
-        counts["lookups"] += 1
-        payload = dict(lookup.record.payload)
-        if all(isinstance(payload.get(name), str) and payload[name].strip() for name in fields):
-            return real(lookup)
-        suffix = str(lookup.record.key).rsplit(".", 1)[-1]
-        filled = {
-            "market": "CN",
-            "exchange": _EXCHANGE_BY_SUFFIX.get(suffix, suffix),
-            "instrument_class": "EQUITY",
-            "security_class": "A_SHARE",
-        }
-        payload = {**filled, **{key: value for key, value in payload.items() if value}}
-        counts["derived"] += 1
-        record = lookup.record.model_copy(update={"payload": payload})
-        return real(lookup.model_copy(update={"record": record}))
-
-    monkeypatch.setattr(producer, "_required_a_share_instrument_context", derived)
-    return counts
+#: What `--assume-listing-classification` is now (package AI). The flag stays accepted so
+#: an existing command line keeps working, and does nothing: `reference_slow_publisher`
+#: writes `market` / `exchange` / `instrument_class` / `security_class` on every
+#: LISTING_STATUS record itself, so nothing is left for a stub to derive.
+LISTING_CLASSIFICATION_FLAG_WARNING = (
+    "--assume-listing-classification is a no-op since package AI: the reference-slow "
+    "publisher writes the four listing-classification fields itself; nothing is stubbed"
+)
 
 
 class RoleRunner:
@@ -1057,6 +1030,14 @@ class RoleRunner:
             entry = state.degraded.setdefault(reason[:300], {"first": local, "count": 0})
             entry["count"] += 1
             entry["last"] = local
+        detail = getattr(heartbeat, "degraded_detail", None)
+        if detail:
+            entry = state.degraded_details.setdefault(detail[:600], {"first": local, "count": 0})
+            entry["count"] += 1
+            entry["last"] = local
+        observations = getattr(heartbeat, "observations", None)
+        if observations:
+            state.observations = dict(observations)
 
     def stop_all(self) -> None:
         for state in reversed(self.states):
@@ -1796,15 +1777,14 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             trade_date=trade_date,
         )
         install_runner_patches(monkeypatch, clock, adapter)
-        stub_counts = (
-            install_listing_classification_stub(monkeypatch)
-            if arguments.assume_listing_classification
-            else None
-        )
+        if arguments.assume_listing_classification:
+            out(f"WARNING: {LISTING_CLASSIFICATION_FLAG_WARNING}")
         summary["stubs"] = {
-            "listing_classification": "derived from ts_code suffix"
-            if stub_counts is not None
-            else "off",
+            "listing_classification": (
+                "off (flag given, a no-op since package AI)"
+                if arguments.assume_listing_classification
+                else "off"
+            ),
         }
         states = role_states(route, credentials)
         runner = RoleRunner(
@@ -1879,6 +1859,8 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
                 else state.last_heartbeat.total_failures,
                 "errors": state.errors,
                 "degraded_reasons": state.degraded,
+                "degraded_details": state.degraded_details,
+                "observations": state.observations,
                 "crashes": state.crashes,
             }
             for state in states
@@ -1891,8 +1873,6 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         summary["chain"] = summarize_chain(route, trade_date, adapter)
         summary["chain"]["serving"]["retention"] = retention.facts()
         summary["notifier_provider_deliveries"] = len(recorder.deliveries)
-        if stub_counts is not None:
-            summary["stubs"]["listing_classification_counts"] = dict(stub_counts)
         fetched = adapter.fetched_frame()
         if fetched is not None:
             fetched.to_parquet(sandbox / "inputs" / "minutes-tushare.parquet", index=False)
@@ -2111,10 +2091,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--assume-listing-classification",
         action="store_true",
-        help="STUB, off by default: when a LISTING_STATUS record carries no market / "
-        "exchange / instrument_class / security_class (the reference-slow publisher writes "
-        "none of the four), let paper_constraint_publisher derive them from the ts_code "
-        "suffix so the chain past it can be observed. Recorded in summary.json",
+        help="accepted and ignored (a warning is printed): the reference-slow publisher "
+        "writes market / exchange / instrument_class / security_class on LISTING_STATUS "
+        "itself since package AI, so there is nothing left to stub",
     )
     parser.add_argument("--replica-synced-at", default="09:12:00")
     parser.add_argument("--replica-daily-sessions", type=int, default=60)

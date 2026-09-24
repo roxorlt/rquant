@@ -304,7 +304,6 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
         "300",
         "--until",
         "10:10",
-        "--assume-listing-classification",
     )
 
     output = result.stdout + result.stderr
@@ -346,8 +345,13 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     assert summary["candidates_per_family"]["auction_gap"] == 2
     assert minute["watchlist_codes_ever"] == 2
     assert minute["codes_without_minutes"] == [CODES[1]]
-    #: the listing-classification stub was asked for, is recorded, and was needed
-    assert summary["stubs"]["listing_classification"] == "derived from ts_code suffix"
-    assert summary["stubs"]["listing_classification_counts"]["derived"] >= 1
+    #: no stub any more (package AI): the reference-slow publisher the replay really ran
+    #: wrote the listing classification, and paper constraints never refused a code for it
+    assert summary["stubs"]["listing_classification"] == "off"
+    assert not any(
+        "listing classification" in message
+        for role in summary["roles"].values()
+        for message in role["errors"]
+    ), summary["roles"]
     #: the replica extract dropped the trade date's own daily row
     assert summary["world"]["replica"]["rows"]["daily_bar"] == 2 * 5
