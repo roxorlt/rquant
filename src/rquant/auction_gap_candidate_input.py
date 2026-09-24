@@ -16,6 +16,7 @@ from rquant.live_spool import LiveBatchSpool, LiveSpoolIntegrityError
 from rquant.readside_replica_gate import ReplicaReadGate
 from rquant.reference_data_registry import (
     ReadonlyReferenceRegistry,
+    ReferenceAsOfSnapshot,
     ReferenceDataIntegrityError,
     ReferenceDataset,
     ReferenceDataUnavailableError,
@@ -33,6 +34,12 @@ from rquant.strategy_candidate_publish_service import AuctionGapCandidateBatch
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_REFERENCE_DATASETS = (
+    ReferenceDataset.ST_STATUS,
+    ReferenceDataset.SUSPENSION_STATUS,
+    ReferenceDataset.LISTING_STATUS,
+    ReferenceDataset.PRICE_LIMIT_REGIME,
+)
 
 
 class AuctionGapCandidateInputError(RuntimeError):
@@ -330,41 +337,52 @@ def assemble_auction_gap_candidate_batch(
             "rows": daily_rows,
         }
     )
-    volumes_by_code = {
-        code: tuple(row for row in daily_rows if row[0] == code) for code in ts_codes
-    }
+    #: one pass over the rows, in their order: filtering all of them once per code was
+    #: 5,475 x 27,375 tuple comparisons per round (#299)
+    grouped_volumes: dict[str, list[tuple[str, date, float]]] = {code: [] for code in ts_codes}
+    for daily_row in daily_rows:
+        bucket = grouped_volumes.get(daily_row[0])
+        if bucket is not None:
+            bucket.append(daily_row)
+    volumes_by_code = {code: tuple(rows) for code, rows in grouped_volumes.items()}
 
     facts: list[AuctionMatchFact] = []
+    #: #299: one registry read for every row instead of four per row. It is made where the
+    #: first row's first lookup used to be, so a registry that cannot be read still refuses
+    #: as that row, with the same message.
+    references: ReferenceAsOfSnapshot | None = None
     for row in frame.itertuples(index=False):
         event_time = envelope.event_time_end
         try:
-            st = reference_registry.as_of(
+            if references is None:
+                references = reference_registry.as_of_snapshot(
+                    dataset_ids=_REFERENCE_DATASETS,
+                    keys=ts_codes,
+                    generation_id=manifest.generation_id,
+                )
+            st = references.as_of(
                 dataset_id=ReferenceDataset.ST_STATUS,
                 key=row.ts_code,
                 event_time=event_time,
                 decision_time=observed,
-                generation_id=manifest.generation_id,
             )
-            suspension = reference_registry.as_of(
+            suspension = references.as_of(
                 dataset_id=ReferenceDataset.SUSPENSION_STATUS,
                 key=row.ts_code,
                 event_time=event_time,
                 decision_time=observed,
-                generation_id=manifest.generation_id,
             )
-            listing = reference_registry.as_of(
+            listing = references.as_of(
                 dataset_id=ReferenceDataset.LISTING_STATUS,
                 key=row.ts_code,
                 event_time=event_time,
                 decision_time=observed,
-                generation_id=manifest.generation_id,
             )
-            price_limit = reference_registry.as_of(
+            price_limit = references.as_of(
                 dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
                 key=row.ts_code,
                 event_time=event_time,
                 decision_time=observed,
-                generation_id=manifest.generation_id,
             )
         except (ReferenceDataIntegrityError, ReferenceDataUnavailableError) as exc:
             raise AuctionGapCandidateInputError(

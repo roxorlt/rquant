@@ -7,10 +7,17 @@ CPUAccounting=true
 # 「一个同侪」，而不是 20 个。加上下面的 quota，monitor / daily / alert@ 不会被 role 数量稀释。
 CPUWeight=100
 # 裁决 21 要限的「运行时工作面」就是这些 role，闸门下沉到这个子 slice：
-# 2 vCPU = 200%，live-runtime 60% + serving 30% = 90% ≤ 一个核；8 个基线 role 空转
-# 各 3–5%（合计 24–40%）跑得开，20 个 role（60–100%）会被限流——这正是目的。
-# 限额压在 role 身上，live 面本身不设 quota，常驻服务因此保持优先。
-CPUQuota=60%
+# 8 个基线 role 空转各 3–5%（合计 24–40%）跑得开，20 个 role（60–100%）会被
+# 限流——这正是目的。限额压在 role 身上，live 面本身不设 quota，常驻服务因此
+# 保持优先。
+# 2026-09-24 owner 裁决（"cpu可以调到2个"，issue #297）：09-24 开盘前 20 个 Route A
+# role 挤在 0.6 核里，cpu.stat 的 nr_throttled 从 00:28 的 9,610 涨到 10:42 的
+# 127,336（开盘前约 26% 的墙钟时间在被限流，00:10 冷启动期间 CPU PSI 一度约
+# 93%，首轮迭代耗时 22 分钟），reference-slow publisher 约 26MB 的 registry
+# commit 来不及在 5s 可见性护栏内跑完，当天的 reference 生成从未发布；同期
+# 4 核主机整体仍有约 85% 空闲。父 slice rquant-live.slice 与 rquant.slice 都不设
+# CPUQuota，200% 能被完整吃下，因此把这个子 slice 从 60% 提到 200%（2 个核）。
+CPUQuota=200%
 IOAccounting=true
 IOWeight=100
 MemoryAccounting=true

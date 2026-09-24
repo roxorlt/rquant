@@ -94,7 +94,15 @@ WORKLOAD_SLICE_LIMITS: Mapping[str, Mapping[str, str]] = {
     # collectively instead of capping the plane they share with monitor/daily/alert@.
     "rquant-live-runtime.slice": {
         "CPUWeight": "100",
-        "CPUQuota": "60%",
+        # 2026-09-24 owner decision ("cpu可以调到2个", issue #297): 60% -> 200%.
+        # Pre-market 09-24, cpu.stat nr_throttled went from 9,610 (00:28) to
+        # 127,336 (10:42) - ~26% of wall time throttled - while the 20 Route A
+        # roles shared 0.6 CPU on a 4-core host that was ~85% idle; the
+        # reference-slow publisher's ~26MB registry commit could not finish
+        # inside its 5s visibility guard and that day's reference generation
+        # was never published. Neither parent slice (rquant-live.slice,
+        # rquant.slice) carries a CPUQuota, so 200% fits.
+        "CPUQuota": "200%",
         "IOWeight": "100",
         # 2026-09-20 owner decision (#268 / #271): 1536M -> 4096M, now an
         # independent budget (not a share carved out of the parent's 3840M)

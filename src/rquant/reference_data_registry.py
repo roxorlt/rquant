@@ -11,7 +11,7 @@ import os
 import sqlite3
 import stat
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -53,6 +53,8 @@ _ROLLBACK_JOURNAL_LAYOUT = 1
 _WAL_JOURNAL_LAYOUT = 2
 #: the sidecars either journal layout can leave next to the database
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+#: keys bound per `as_of_snapshot` query: under SQLite's 999-variable limit on old builds
+_AS_OF_SNAPSHOT_KEYS_PER_QUERY = 500
 
 
 def _persisted_journal_layout(descriptor: int) -> int | None:
@@ -163,6 +165,15 @@ class ReferenceDataUnavailableError(RuntimeError):
 
 class ReferencePublicationDeadlineError(RuntimeError):
     """A publication could not become durable before its hard deadline."""
+
+
+class ReferencePublicationVisibilityError(ReferencePublicationDeadlineError):
+    """A publication became durable after the visibility instant it promised, before its deadline.
+
+    A subclass so every caller that already fails closed on a deadline keeps doing so; it
+    exists so the refusal can say which bound it crossed. On 2026-09-24 a commit that missed
+    a five-second visibility guard at 09:22 was reported as "completed after 09:25" (#297).
+    """
 
 
 class ReferencePublicationAuthenticationError(RuntimeError):
@@ -1811,7 +1822,11 @@ class ReferenceRegistry:
                 except BaseException:
                     connection.rollback()
                     raise
-                raise ReferencePublicationDeadlineError("publication completed after deadline")
+                if completed > deadline:
+                    raise ReferencePublicationDeadlineError("publication completed after deadline")
+                raise ReferencePublicationVisibilityError(
+                    "publication completed after its promised visibility instant"
+                )
 
             if not retain_intent:
                 connection.execute("BEGIN IMMEDIATE")
@@ -1956,7 +1971,7 @@ class ReferenceRegistry:
         )
         completed = normalize_aware_utc(durable_completed_at or manifest.published_at)
         if completed > manifest.published_at:
-            raise ReferencePublicationDeadlineError(
+            raise ReferencePublicationVisibilityError(
                 "durable completion is after staged visibility horizon"
             )
         connection.execute(
@@ -2569,6 +2584,27 @@ class ReferenceRegistry:
         if not rows:
             raise ReferenceDataUnavailableError("reference key is not present in generation")
         records = tuple(self._record_from_row(row) for row in rows)
+        return self._select_as_of(
+            records,
+            generation_id=selected_generation,
+            event=event,
+            decision=decision,
+        )
+
+    @staticmethod
+    def _select_as_of(
+        records: tuple[ReferenceRecord, ...],
+        *,
+        generation_id: str,
+        event: datetime,
+        decision: datetime,
+    ) -> ReferenceLookup:
+        """The one record `as_of` answers with, from a key's records in a generation.
+
+        Shared by `as_of` and `ReferenceAsOfSnapshot.as_of`, so a bulk read can only differ
+        from N single reads in which rows it hands here, never in how it chooses among them.
+        """
+
         visible = tuple(record for record in records if record.first_available_at <= decision)
         if not visible:
             raise ReferenceDataUnavailableError("reference value is not available at decision_time")
@@ -2590,9 +2626,158 @@ class ReferenceRegistry:
             raise ReferenceDataIntegrityError("overlapping effective reference values")
         return ReferenceLookup(
             record=effective[0],
-            generation_id=selected_generation,
+            generation_id=generation_id,
             event_time=event,
             decision_time=decision,
+        )
+
+    def as_of_snapshot(
+        self,
+        *,
+        dataset_ids: Iterable[str],
+        keys: Iterable[str],
+        generation_id: str | None = None,
+    ) -> ReferenceAsOfSnapshot:
+        """Read every record `as_of` could need for these keys, once (#299).
+
+        `as_of` pays for the publication lock, a new connection, the pending-publication
+        check, the pointer, the generation's manifest validation and the ancestry walk on
+        every call; the manifest validation alone hashes the generation's whole
+        `added_record_ids` list (~33k ids on a real session), which made one lookup 74 ms
+        on the host and the auction_gap input's 4 x 5,475 lookups ~27 minutes. Here all of
+        that happens once, inside one read transaction, and then each dataset's records for
+        all keys are fetched in `_AS_OF_SNAPSHOT_KEYS_PER_QUERY`-key chunks (SQLite's bound
+        variable limit is 999 on older builds). Records outside the generation's ancestry
+        are dropped exactly as `as_of`'s join drops them, and the snapshot answers each
+        lookup with `_select_as_of`, so every answer and every refusal is the one `as_of`
+        gives -- except that all of them come from one consistent view.
+        """
+
+        requested_datasets = frozenset(str(dataset_id) for dataset_id in dataset_ids)
+        requested_keys = tuple(sorted({str(key) for key in keys}))
+        with self.publication_commit_lock(exclusive=False), self._connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                self._fail_closed_on_pending_publication(connection)
+                selected_generation = generation_id
+                if selected_generation is None:
+                    pointer_row = connection.execute(
+                        "SELECT * FROM reference_current WHERE singleton = 1"
+                    ).fetchone()
+                    if pointer_row is None:
+                        raise ReferenceDataUnavailableError(
+                            "current reference generation is missing"
+                        )
+                    selected_generation = self._pointer_from_row(pointer_row).generation_id
+                self._generation_in_connection(connection, selected_generation)
+                #: UNION, not `as_of`'s UNION ALL: identical on every acyclic ancestry, and
+                #: it terminates on a cyclic one instead of recursing without end
+                ancestry = frozenset(
+                    str(row["generation_id"])
+                    for row in connection.execute(
+                        """
+                        WITH RECURSIVE ancestry(generation_id, previous_generation_id) AS (
+                            SELECT generation_id, previous_generation_id
+                            FROM reference_generation WHERE generation_id = ?
+                            UNION
+                            SELECT parent.generation_id, parent.previous_generation_id
+                            FROM reference_generation AS parent
+                            JOIN ancestry AS child
+                              ON parent.generation_id = child.previous_generation_id
+                        )
+                        SELECT generation_id FROM ancestry
+                        """,
+                        (selected_generation,),
+                    ).fetchall()
+                )
+                rows: dict[tuple[str, str], list[sqlite3.Row]] = {}
+                for dataset_id in sorted(requested_datasets):
+                    for start in range(0, len(requested_keys), _AS_OF_SNAPSHOT_KEYS_PER_QUERY):
+                        chunk = requested_keys[start : start + _AS_OF_SNAPSHOT_KEYS_PER_QUERY]
+                        placeholders = ",".join("?" for _ in chunk)
+                        for row in connection.execute(
+                            f"""
+                            SELECT r.*, m.generation_id AS member_generation_id
+                            FROM reference_record AS r
+                            JOIN reference_generation_member AS m
+                              ON m.record_id = r.record_id
+                            WHERE r.dataset_id = ? AND r.business_key IN ({placeholders})
+                            ORDER BY r.business_key, r.effective_from, r.revision
+                            """,  # noqa: S608 - placeholders bind every key
+                            (dataset_id, *chunk),
+                        ):
+                            if row["member_generation_id"] in ancestry:
+                                rows.setdefault((dataset_id, str(row["business_key"])), []).append(
+                                    row
+                                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ReferenceAsOfSnapshot(
+            generation_id=selected_generation,
+            dataset_ids=requested_datasets,
+            keys=frozenset(requested_keys),
+            rows={lookup: tuple(found) for lookup, found in rows.items()},
+        )
+
+
+class ReferenceAsOfSnapshot:
+    """Point-in-time lookups over one validated read of one generation (#299).
+
+    Built by `ReferenceRegistry.as_of_snapshot`; it holds the rows that read returned and
+    touches neither the registry nor its lock again. `as_of` answers exactly as
+    `ReferenceRegistry.as_of` would have for the same generation -- the same record, and the
+    same `ReferenceDataUnavailableError` / `ReferenceDataIntegrityError` with the same
+    message for a missing, not-yet-available, not-effective, undecodable or overlapping key.
+    Asking for a dataset or key the snapshot was not built for is a `LookupError`: that is a
+    caller bug, and answering "not present" would turn it into a silent refusal.
+    """
+
+    def __init__(
+        self,
+        *,
+        generation_id: str,
+        dataset_ids: frozenset[str],
+        keys: frozenset[str],
+        rows: Mapping[tuple[str, str], tuple[sqlite3.Row, ...]],
+    ) -> None:
+        self.generation_id = generation_id
+        self.dataset_ids = dataset_ids
+        self.keys = keys
+        self._rows = MappingProxyType(dict(rows))
+        #: decoded once per key; a record that fails to decode is not cached, so every
+        #: lookup of that key refuses, as every `as_of` call on it would
+        self._records: dict[tuple[str, str], tuple[ReferenceRecord, ...]] = {}
+
+    def as_of(
+        self,
+        *,
+        dataset_id: str,
+        key: str,
+        event_time: datetime,
+        decision_time: datetime,
+    ) -> ReferenceLookup:
+        event = normalize_aware_utc(event_time)
+        decision = normalize_aware_utc(decision_time)
+        if dataset_id not in self.dataset_ids or key not in self.keys:
+            raise LookupError(
+                f"reference snapshot of generation {self.generation_id} was not read for "
+                f"{dataset_id}/{key}"
+            )
+        lookup = (str(dataset_id), str(key))
+        records = self._records.get(lookup)
+        if records is None:
+            rows = self._rows.get(lookup, ())
+            if not rows:
+                raise ReferenceDataUnavailableError("reference key is not present in generation")
+            records = tuple(ReferenceRegistry._record_from_row(row) for row in rows)
+            self._records[lookup] = records
+        return ReferenceRegistry._select_as_of(
+            records,
+            generation_id=self.generation_id,
+            event=event,
+            decision=decision,
         )
 
 

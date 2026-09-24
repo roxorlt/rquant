@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rquant.reference_data_registry import ReferenceDataset, ReferenceRegistry
+from rquant.reference_data_registry import (
+    ReferenceDataset,
+    ReferenceDataUnavailableError,
+    ReferenceRegistry,
+)
 from rquant.reference_slow_publisher import (
     ReferenceDailyFact,
     ReferenceSecurityFact,
@@ -23,7 +27,9 @@ TARGET_DATE = date(2026, 7, 31)
 PRIOR_DATE = date(2026, 7, 30)
 CAPTURED_AT = datetime(2026, 7, 31, 1, 20, tzinfo=UTC)
 VISIBLE_AT = datetime(2026, 7, 31, 1, 24, 40, tzinfo=UTC)
-AVAILABLE_AT = VISIBLE_AT + timedelta(seconds=5)
+#: every record a window publishes becomes visible at the 09:25 decision time, however long
+#: its commit takes (#297; it used to be `prepared_at + 5 s`)
+AVAILABLE_AT = datetime(2026, 7, 31, 1, 25, tzinfo=UTC)
 
 
 def _calendar() -> MarketCalendarAuthority:
@@ -337,7 +343,27 @@ def test_full_market_publication_uses_two_connections_and_one_delta_membership(
     assert registry.current_manifest().added_record_ids
 
 
+def _corrected(
+    original: ReferenceSlowSourceSnapshot, captured_at: datetime
+) -> ReferenceSlowSourceSnapshot:
+    corrected_daily = tuple(
+        fact.model_copy(update={"close_raw": 21.0}) if fact.ts_code == "300001.SZ" else fact
+        for fact in original.daily_facts
+    )
+    return ReferenceSlowSourceSnapshot.create(
+        target_trade_date=TARGET_DATE,
+        captured_at=captured_at,
+        producer_commit=COMMIT,
+        source_snapshot_ids={**original.source_snapshot_ids, "daily": "9" * 64},
+        daily_facts=corrected_daily,
+        security_facts=original.security_facts,
+        suspended_codes=original.suspended_codes,
+    )
+
+
 def test_later_correction_keeps_old_point_in_time_decision_visible(tmp_path: Path) -> None:
+    """A correction discovered on a later session leaves the earlier decision where it was."""
+
     registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
     original = _snapshot()
     publish_reference_slow_snapshot(
@@ -346,19 +372,8 @@ def test_later_correction_keeps_old_point_in_time_decision_visible(tmp_path: Pat
         snapshot=original,
         completion_clock=lambda: original.captured_at,
     )
-    corrected_daily = tuple(
-        fact.model_copy(update={"close_raw": 21.0}) if fact.ts_code == "300001.SZ" else fact
-        for fact in original.daily_facts
-    )
-    corrected = ReferenceSlowSourceSnapshot.create(
-        target_trade_date=TARGET_DATE,
-        captured_at=CAPTURED_AT + timedelta(minutes=2),
-        producer_commit=COMMIT,
-        source_snapshot_ids={**original.source_snapshot_ids, "daily": "9" * 64},
-        daily_facts=corrected_daily,
-        security_facts=original.security_facts,
-        suspended_codes=original.suspended_codes,
-    )
+    #: the next session's revision scan finds the target session's close was wrong
+    corrected = _corrected(original, datetime(2026, 8, 3, 1, 24, 10, tzinfo=UTC))
 
     receipt = publish_reference_slow_snapshot(
         registry=registry,
@@ -373,20 +388,68 @@ def test_later_correction_keeps_old_point_in_time_decision_visible(tmp_path: Pat
         dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
         key="300001.SZ",
         event_time=event_time,
-        decision_time=CAPTURED_AT + timedelta(minutes=1),
+        decision_time=datetime(2026, 7, 31, 1, 30, tzinfo=UTC),
         generation_id=receipt.generation_id,
     )
     new = registry.as_of(
         dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
         key="300001.SZ",
         event_time=event_time,
-        decision_time=corrected.captured_at + timedelta(seconds=5),
+        decision_time=datetime(2026, 8, 3, 1, 25, tzinfo=UTC),
         generation_id=receipt.generation_id,
     )
     assert old.record.payload["limit_up_price"] == 12.0
     assert new.record.payload["limit_up_price"] == 12.6
     assert old.record.revision == 1
     assert new.record.revision == 2
+    assert new.record.first_available_at == datetime(2026, 8, 3, 1, 25, tzinfo=UTC)
+
+
+def test_a_same_window_correction_becomes_visible_with_the_original_at_0925(
+    tmp_path: Path,
+) -> None:
+    """Inside one window both revisions are visible from the 09:25 decision time (#297).
+
+    Nothing decides before 09:25, so a decision there sees neither; from 09:25 on it sees the
+    correction. Under the old `prepared_at + 5 s` rule a 09:23 decision would have seen the
+    original -- a distinction no consumer read.
+    """
+
+    registry = ReferenceRegistry(tmp_path / "reference.sqlite3")
+    original = _snapshot()
+    publish_reference_slow_snapshot(
+        registry=registry,
+        calendar=_calendar(),
+        snapshot=original,
+        completion_clock=lambda: original.captured_at,
+    )
+    corrected = _corrected(original, CAPTURED_AT + timedelta(minutes=2))
+    receipt = publish_reference_slow_snapshot(
+        registry=registry,
+        calendar=_calendar(),
+        snapshot=corrected,
+        completion_clock=lambda: corrected.captured_at,
+    )
+    event_time = datetime(2026, 7, 31, 1, 25, tzinfo=UTC)
+
+    with pytest.raises(ReferenceDataUnavailableError, match="not available at decision_time"):
+        registry.as_of(
+            dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
+            key="300001.SZ",
+            event_time=event_time,
+            decision_time=AVAILABLE_AT - timedelta(microseconds=1),
+            generation_id=receipt.generation_id,
+        )
+    at_decision = registry.as_of(
+        dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
+        key="300001.SZ",
+        event_time=event_time,
+        decision_time=AVAILABLE_AT,
+        generation_id=receipt.generation_id,
+    )
+    assert at_decision.record.revision == 2
+    assert at_decision.record.payload["limit_up_price"] == 12.6
+    assert registry.current_pointer().switched_at == AVAILABLE_AT
 
 
 def test_first_five_listing_sessions_are_not_limit_eligible(tmp_path: Path) -> None:
@@ -431,7 +494,7 @@ def test_first_five_listing_sessions_are_not_limit_eligible(tmp_path: Path) -> N
         dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
         key=security.ts_code,
         event_time=datetime(2026, 7, 31, 1, 25, tzinfo=UTC),
-        decision_time=CAPTURED_AT + timedelta(seconds=5),
+        decision_time=AVAILABLE_AT,
         generation_id=receipt.generation_id,
     )
     assert price_limit.record.payload["limit_eligible"] is False
@@ -534,7 +597,7 @@ def test_price_limits_use_target_session_adjusted_reference_close(tmp_path: Path
         dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
         key=code,
         event_time=datetime(2026, 7, 31, 1, 25, tzinfo=UTC),
-        decision_time=CAPTURED_AT + timedelta(seconds=5),
+        decision_time=AVAILABLE_AT,
         generation_id=receipt.generation_id,
     )
 

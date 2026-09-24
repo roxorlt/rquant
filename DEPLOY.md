@@ -5,6 +5,219 @@
 
 ---
 
+## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ 参考批量查表（#299）+ `rquant-live-runtime.slice` CPUQuota 200%
+
+**状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；AF 与 slice 两处改动各自的背景、预期与细节在紧接着的
+两条里（「rquant-live-runtime.slice CPUQuota 提额」与「参考慢源发布窗口只剩 09:25 一个期限」）；热修 AG
+没有单独的装机条目（没有 schema、unit、manifest 字段或运行时配置变化），它的演练输出写在 AF 那条里。
+
+**这一版装的是三处改动**：
+
+| 改动 | 落在哪 | 细节 |
+|---|---|---|
+| 热修 AG（#299）：auction_gap 候选输入一轮的参考查表（约 2.2 万次）与模拟盘约束一个请求的参考查表，改成一次读注册表（`ReferenceRegistry.as_of_snapshot`），答案与逐次 `as_of` 逐字相同；主机上整轮装配 13.99 秒（原来单键 74 毫秒一次、一轮约 27 分钟，比 09:29–09:49 的装配窗还长） | `src/rquant/reference_data_registry.py`、`auction_gap_candidate_input.py`、`paper_execution_constraint_producer.py` + 演练脚本第 5 步 | CHANGELOG `[Unreleased]/Fixed` 的 #299 一条；演练输出见下面 AF 那条 |
+| 热修 AF：参考慢源当天的记录、代、指针一律在 09:25 可见，唯一期限就是 09:25；源的保护时间 5 秒 → 30 秒；09:25 之后源不再崩（#298），auction-match / daily-close 零点换日与 market-minute STALE 之后的同类序号回退一起修；跳过 09-24 留下的过期批次；第二个交易日的 serving 权威不再被当成回滚 | `src/rquant/` 六个模块 + `scripts/reference_slow_publish_rehearsal.py` | 下面「参考慢源发布窗口只剩 09:25 一个期限」一条 |
+| `rquant-live-runtime.slice` 的 `CPUQuota` 60% → 200%（owner 2026-09-24 授权「cpu可以调到2个」；主机 10:42 已用 `set-property` 生效，本版把同样的值写回仓库） | `deploy/systemd/rquant-live-runtime.slice`，`src/rquant/workload_isolation.py` 里的镜像 | 下面「rquant-live-runtime.slice CPUQuota 提额」一条 |
+
+**slice 文件为什么要手工装**：diff 里有 `deploy/systemd/`，`scripts/deploy-production.sh` 按设计拒收
+（`docs/production-release.md`「自动拒绝」），CLAUDE.md 也把 `deploy/systemd/` 列为要 owner 单独授权的改动。
+与 09-20、09-21 两次 slice 提额一样，slice 文件手工装；owner 授权的是 200% 这个值，装机这一步照例由协调者
+向 owner 确认后执行。
+
+**时间**：收盘后装（部署器在工作日 09:15–15:10 会延期需要重启的发布）。09-25（中秋）到 09-27 休市，
+**下一个交易日是 2026-09-28（周一），09:20 是第一次真跑**。
+
+**步骤**：
+
+1. 代码切到 v0.33.21（按路线 A 窗口的做法）。
+2. 在主机上跑热修 AF 的两条演练（命令与逐行判据见下面 AF 那条）：第一条退出码 0、最后一行 `REHEARSAL OK`；
+   第二条退出码 1、拒成 `reference slow publisher completed after 09:25` 并打印
+   `registry rolled back (no current generation): true`。第一条的输出里 `auction_gap reference checks` 的
+   `single_key_as_of.mismatches_with_bulk` 必须是 `[]`（热修 AG 的对照）。演练只写
+   `/home/lighthouse/rquant/var/rehearsal/`，不碰生产注册表与 spool；**不要在 09:15–09:30 之间加
+   `--production-registry-copy` 跑**。
+3. 装 slice 文件。主机当前生效值已经是 200%，这一步只是让 `/etc/systemd/system/` 里的文件与生效值一致、
+   并去掉 10:42 留下的 drop-in；不停 role、不重启任何服务（10:42 的 `set-property` 也没有重启）。
+
+```bash
+# 0. 装前核对：在主机上解析新文件；确认核数（deploy/systemd/README.md 里 #243 的推演按 2 vCPU 写，
+#    09-24 的观测是 4 核，两者不一致时 README 那段 RPO 推演要重算）
+systemd-analyze verify /home/lighthouse/rquant/deploy/systemd/rquant-live-runtime.slice
+nproc
+
+# 1. 备份当前生效文件，再用仓库版本覆盖
+sudo cp /etc/systemd/system/rquant-live-runtime.slice \
+    /etc/systemd/system/rquant-live-runtime.slice.bak-20260924
+sudo cp /home/lighthouse/rquant/deploy/systemd/rquant-live-runtime.slice \
+    /etc/systemd/system/rquant-live-runtime.slice
+sudo systemctl daemon-reload
+
+# 2. 只删 10:42 那次 set-property 留下的这一个 drop-in（否则它优先级更高，文件改了不生效）
+sudo rm /etc/systemd/system.control/rquant-live-runtime.slice.d/50-CPUQuota.conf
+sudo systemctl daemon-reload
+
+# 3. 核对（读 cgroup 真值，不看 systemd 缓存）
+systemctl show -p CPUQuotaPerSecUSec rquant-live-runtime.slice
+    # 期望 CPUQuotaPerSecUSec=2s
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.max
+    # 期望 200000 100000
+```
+
+4. 装上之后应该看到什么：代码这一侧见下面 AF 那条的「装上之后应该看到什么」（休市日与 09-28 09:25 之前
+   发布者每轮 `current reference generation is missing` 是预期的；09-28 可能多出一个目标日为 09-24 的修订批次；
+   此后每次发版后的第一个交易日约 09:22–09:25 serving 每轮报 `historical publication producer_commit is not
+   trusted`、09:25 起自动恢复，是已知限制 #300，09-28 是第一次发布、没有历史，不会出现）；slice 这一侧，`systemctl cat
+   rquant-live-runtime.slice` 只剩仓库这一份 `CPUQuota=200%`，`/etc/systemd/system.control/` 下不再有
+   `rquant-live-runtime.slice.d/50-CPUQuota.conf`。
+
+**回滚**（两处互相独立，可以只回其中一处）：
+
+- **代码（热修 AG）**：回到上一个版本就是回到逐次查询，没有落盘格式变化；但逐次查询在主机上一轮约 27 分钟，装配窗 09:29–09:49 跑不完，③a 过不了。AG 与 AF 同一个 tag，回代码就是两个一起回。
+- **代码（热修 AF）**：回到 v0.33.20 就回到 09-24 的行为（5 秒保护、09:26 崩一次推一条、被 09-24 那一批卡住）。
+  新版本写出的注册表与 serving 权威 v0.33.20 读得懂（列与模型都没变），但 serving 权威改成按代的祖先序号编号：
+  **回滚之后的第一个发布日**，旧版本主路径算出的编号更小，权威那一步会被拒成回滚，要等下一轮的恢复分支重建——
+  下一轮若在 09:25 之后开始，当天就没有 serving 参考权威（注册表那一代照样在）。所以**代码回滚在收盘后做，
+  并且当晚就装回修好的版本**。完整说明见下面 AF 那条的「回滚」。
+- **slice**：把第 3 步备份的 `/etc/systemd/system/rquant-live-runtime.slice.bak-20260924`（`CPUQuota=60%`）
+  覆盖回 `/etc/systemd/system/rquant-live-runtime.slice`，`sudo systemctl daemon-reload`，核对
+  `CPUQuotaPerSecUSec=600ms`、`cpu.max` 为 `60000 100000`；不涉及数据落盘，无需额外挪状态。只回 slice 不回代码
+  不会让 AF 失效（它只要求提交在 09:25 之前完成），但会回到 09-24 开盘前约 26% 墙钟时间被限流的状态。
+
+---
+
+## 2026-09-24 · 待安装 · rquant-live-runtime.slice CPUQuota 提额（issue #297）
+
+**状态**：**尚未安装**。`deploy/systemd/rquant-live-runtime.slice` 的 `CPUQuota` 已于
+2026-09-24 10:42 经 owner 授权（"cpu可以调到2个"），用 `systemctl set-property
+rquant-live-runtime.slice CPUQuota=200%`（未带 `--runtime`）在生产主机上直接生效
+（60%→200%），持久化落在
+`/etc/systemd/system.control/rquant-live-runtime.slice.d/50-CPUQuota.conf` 这个 drop-in，
+cgroup `cpu.max` 现在是 `200000 100000`；没有重启任何服务。本条只是把同样的值写回
+checked-in 的 slice 文件，还没有装到服务器上——装上之前，仓库里的文件和主机的真实生效值
+不一致，改 git 也暂时看不出效果（drop-in 优先级更高）。
+
+背景：09-24 开盘前 20 个 Route A role 挤在 0.6 核里，`cpu.stat` 的 `nr_throttled` 从 00:28 的
+9,610 涨到 10:42 的 127,336（开盘前约 26% 的墙钟时间在被限流，00:10 冷启动期间 CPU PSI 一度
+约 93%，首轮迭代耗时 22 分钟），同期主机整体仍有约 85% 空闲；reference-slow publisher
+约 26MB 的 registry commit 来不及在 5s 可见性护栏内跑完，当天的 reference 生成从未发布
+（issue #297）。父 slice `rquant-live.slice` 与 `rquant.slice` 都不设 `CPUQuota`，200% 能被
+完整吃下；`MemoryHigh` 与其余限额都不动。
+
+**本条只做仓库这一侧的持久化，不 SSH、不重启、不动 `.env`**；装机命令只写在上面 v0.33.21 总览的
+第 3 步一处（与 hotfix AF 同一次装），这里不再重复一份，免得两处走样。
+
+**回滚**：恢复装机时（总览第 3 步）备份的 `rquant-live-runtime.slice.bak-20260924`（`CPUQuota=60%`）覆盖回
+`/etc/systemd/system/rquant-live-runtime.slice` + `daemon-reload`；不涉及数据落盘，无需额外
+挪状态。
+
+---
+
+## 2026-09-24 · 待安装 · 参考慢源发布窗口只剩 09:25 一个期限，09:25 之后不再崩（#297、#298）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。09-25（中秋）到周末休市，**下一个交易日是
+2026-09-28（周一）**，所以当天装、当天用下面的演练脚本在主机上验证，周一 09:20 是第一次真跑。部署器
+09:15–15:10 会自动延期需要重启的发布，收盘后装。
+
+**现象**：09-24 源在 09:21 封好第 0 批，发布者 09:22:52 / 约 09:24:24 / 09:25:30 三次都被 5 秒可见保护拒掉
+（报成「completed after 09:25」），当天没有参考代；源 09:26:12 抛 `input sequence cannot regress` 退出、
+**推了一条**、被重启。修了什么见 CHANGELOG `[Unreleased] / Fixed` 的 #297、#298 一条。不改 `deploy/`，
+不改 spool、注册表、serving 权威的落盘格式（只是写进去的时刻与编号不同，见下）。`rquant-live-runtime.slice`
+的 `CPUQuota` 已由 owner 在 10:42 提到 200%，不是本包的改动。
+
+**09-24 留下的那一批**：`live/reference-slow/` 里的第 0 批（`producer_commit` = `304f6ed1`）没有发布过，
+新版本的发布者会**跳过它**（采集日已过），不需要手工清理。
+
+**装机前 / 装机后的主机演练（只写演练根，不碰生产注册表与 spool）**：
+
+```bash
+cd /home/lighthouse/rquant
+# 1) 发布照常：提交人为拖慢 10 秒，仍须在 09:25 可见地发布，09:29 的参考检查接受（退出码 0，最后一行 REHEARSAL OK）
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/lighthouse/rquant/src /home/lighthouse/rquant/.venv/bin/python \
+  /home/lighthouse/rquant/scripts/reference_slow_publish_rehearsal.py \
+  --runtime-root /home/lighthouse/rquant/data/runtime \
+  --rehearsal-root /home/lighthouse/rquant/var/rehearsal \
+  --slow-commit-seconds 10
+# 2) 截止照旧：09:24:30 起跑、提交拖慢 60 秒，必须拒成 "reference slow publisher completed after 09:25"
+#    并打印 "registry rolled back (no current generation): true"（退出码 1 是这一次的预期结果）
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/lighthouse/rquant/src /home/lighthouse/rquant/.venv/bin/python \
+  /home/lighthouse/rquant/scripts/reference_slow_publish_rehearsal.py \
+  --runtime-root /home/lighthouse/rquant/data/runtime \
+  --rehearsal-root /home/lighthouse/rquant/var/rehearsal \
+  --publisher-start 09:24:30 --slow-commit-seconds 60
+```
+
+装机前在另一个 checkout 里跑时，把 `PYTHONPATH` 和脚本路径换成那个 checkout（`rquant imported from ...`
+那一行会说实际导入的是哪一份）。第一条的输出里应该看到：`publisher rounds` 先是一轮
+`not yet: current reference generation is missing`（09:21:26 时重新封好的批次还不可见，可见时刻是
+09:20:58.52 + 30 秒），下一轮 `published`；`registry` 的 `first_available_at`、`pointer_switched_at`、
+`manifest_published_at` 都是 09:25:00（`2026-09-24T01:25:00Z`），`records_written` 约 33,336；
+`serving authority` 在 09:24:59.999999 不可见、09:25 可见；`auction_gap reference checks at 09:24:59` 是
+`refused: reference generation is future evidence`，09:29 那一次 `unavailable: {}`。
+
+同一版里的热修 AG（#299）把 auction_gap 输入的参考查表改成一次读注册表，演练的第 5 步跟着改了（下面这几项是
+AG 之后的输出；AF 原来写的 `ms_per_lookup` / `projected_seconds_for_all_codes` 两项现在只作为单键对照出现）：
+
+- `auction_gap reference checks` 默认对**全部**竞价代码走快照路径（`--auction-sample` 默认 0 = 全部）：`codes_checked`
+  是查了多少只、`lookups` 是 4 倍、`snapshot_read_seconds` 是读一次快照的秒数、`seconds` 是这一轮参考查表的总秒数。
+- 其中的 `single_key_as_of` 是对照：前 `--single-key-sample` 只（默认 50）再用旧的逐次 `as_of` 读一遍并计时
+  （`ms_per_lookup`、`projected_seconds_for_all_codes` 是旧读法全量的推算），**`mismatches_with_bulk` 必须是 `[]`**，
+  不是空就以 `bulk and single-key reference reads disagree` 拒、退出码 1。
+- 加 `--full-auction-assembly` 会真跑一整轮生产调用（`load_live_auction_candidate_input`：日历 + 打开注册表 + 装配）并计时：
+  `registry_open_seconds` 是打开注册表那一次完整性检查的秒数，`registry_connections` 是这一轮开的注册表连接数（#299 之前每行
+  竞价多 4 个），`seconds` 是整轮秒数。
+- 加 `--production-registry-copy` 会用 SQLite 备份接口从 `mode=ro` 连接把**生产**注册表复制到演练根，计时打开与全部代码的
+  一次快照，只报告、不影响退出码。**不要在 09:15–09:30 之间跑 `--production-registry-copy`**（那段时间发布者正在写这个注册表）。
+- 协调者 09-24 在主机上的实测：AF 那条（提交拖慢 10 秒）`REHEARSAL OK`，09:25 可见，截止照样拒；AG 那条 5,475 只代码、21,900 次
+  查询 4.1 秒，旧读法单键一次 74 毫秒，整轮生产 auction_gap 装配 13.99 秒。
+- 还没解决的一条（#302）：候选发布者每一轮都重新打开注册表，打开时的完整性检查解码注册表里曾有过的每一条记录，
+  每个交易日约多 3.3 万条，整轮每个交易日约多 6–7 秒；`registry_open_seconds` 就是看它的。
+
+脚本以 lighthouse 读生产文件；若某个文件读不了，会以
+`REHEARSAL REFUSED: PermissionError ...` 退出。演练根留在 `/home/lighthouse/rquant/var/rehearsal/<时刻>-<随机>/`，
+看完可以删掉。
+
+**装上之后应该看到什么**：
+
+- **休市日（09-25 到 09-27）与 09-28 00:00–09:21 前后**：发布者 09:25 之前每一轮都失败，`last_error` 是
+  `current reference generation is missing`（注册表里一代都还没有、又没有可发的批次）；09:25 之后是
+  「started after 09:25」。**都是预期的**，不退出、不推送；backoff 封顶 20 秒。源在休市日报 `input_sequence=
+  output_sequence=0`，不崩。
+- **09-28 09:20**：源照 #293 那条采集；批次 `sequence` 是 **1**（第 0 批还在），`available_at` 是
+  `prepared_at + 30 秒`（原来是 5 秒）。
+- **批次可见之后的第一轮发布者**：心跳 `processed_count=1`、`input_sequence=output_sequence=1`、
+  `degraded_reasons=["expired_source_batch:0"]`（只有这一轮带，下一轮起是干净的）。
+  `authorities/reference-slow/reference.sqlite3` 的 `reference_current.switched_at` 与代的 `published_at`
+  都是当天 09:25:00（`01:25:00Z`），`reference_publication_receipt.completed_at` 不晚于它；
+  `live/reference-slow/serving-authority/current.json` 出现，`published_at` 同样是 01:25:00Z、`sequence` 为 1。
+  09:25 之前 serving 读到的仍是「没有参考代」（第一次发布，没有历史，报 `Unavailable`），09:25 起读到当天这一代。
+- **之后每逢发版后的第一个交易日（已知限制，#300）**：发布者约 09:22 写出权威、`published_at` 是 09:25，serving 在这
+  几分钟里沿历史读到上一个交易日由旧版本 commit 写的那一条并拒绝它，心跳报
+  `reference_slow_authority reader failed: ... historical publication producer_commit is not trusted`
+  （`ServingSourceAuthorityIntegrityError`），**每一轮失败，09:25 起自动恢复**；不退出、不推送。字面上像「被篡改」，
+  不是篡改。没有发版的交易日不会出现（历史与当前是同一个 commit）。
+- **09-28 可能多出一个修订批次**：09:24 起的修订扫描拿 09-24 的数据与没发布过的第 0 批比较，若内容不同会封一个
+  **目标日是 09-24** 的修订批次（采集日是 09-28，不算过期，会被发布、心跳里没有 `expired_source_batch` 字样）。
+  serving 权威照样带 09-28 的投影（取目标日最晚的快照），注册表里多一代 09-24 的更正。
+- **若提交确实拖过了 09:25**：心跳报「reference slow publisher completed after 09:25」，注册表与游标都被补偿；
+  若只是超出承诺的可见时刻（新规则下不会发生），报「commit ended after its promised visibility instant (before 09:25)」。
+  源那边对应的两句是「atomic publication completed after 09:25」与「atomic publication ended after its promised
+  visibility instant (before 09:25)」。
+- **09:25:xx 起**：发布者每一轮「started after 09:25」（设计如此，一整天）。**源在 09:25 之后不再崩**：
+  `NRestarts` 保持 0，09:26 附近没有 `OnFailure` 推送，心跳 `input_sequence=output_sequence=1` 一整天。
+- **09:29 之后**：`candidate.auction_gap` 不再因为「required reference evidence is unavailable」整批拒；
+  但它一轮要做约 2.4 万次参考查表（见上），出结果可能要好几分钟。
+- **零点**：auction-match 源、daily-close 源换日那一轮不再抛「output sequence cannot regress」。**建议顺手查一下**
+  主机 journal 里 00:00 附近这两个 unit 有没有这条（代码上 09-23→09-24 的零点 auction-match 应该崩过一次，
+  除非当晚部署重启了它）。
+
+**回滚**：回到 v0.33.20 就回到 09-24 的行为（5 秒保护、09:26 崩一次推一条、被 09-24 那一批卡住）。新版本写出的
+注册表与 serving 权威 v0.33.20 读得懂（列与模型都没变），两处差别：代的 `published_at` 是 09:25 而不是
+`prepared_at + 5 秒`（旧读者不关心），serving 权威按代的祖先序号编号；**回滚之后第一个发布日**，旧版本主路径
+算出的编号更小，权威那一步会被拒成回滚，要等下一轮的恢复分支重建——下一轮若在 09:25 之后开始，当天就没有
+serving 参考权威（注册表那一代照样在）。所以**回滚最好在收盘后做，并且当晚就装回修好的版本**。
+
+---
+
 ## 2026-09-23 · 待安装 · 参考慢源第一次能发布（#293）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。

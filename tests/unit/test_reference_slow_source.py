@@ -1236,7 +1236,7 @@ def test_builtin_registry_registers_reference_source_and_publisher(
 ) -> None:
     adapter = _Adapter()
     source_manifest, publisher_manifest = _runtime_manifests(tmp_path)
-    observed_at = [datetime(2026, 7, 31, 1, 24, 20, tzinfo=UTC)]
+    observed_at = [datetime(2026, 7, 31, 1, 24, 0, tzinfo=UTC)]
     monkeypatch.setattr("rquant.reference_slow_runtime._utc_now", lambda: observed_at[0])
     registry = build_builtin_registry(
         reference_adapter_factory=lambda: adapter,
@@ -1245,7 +1245,8 @@ def test_builtin_registry_registers_reference_source_and_publisher(
     )
 
     captured = registry.build(source_manifest)()
-    observed_at[0] += timedelta(seconds=20)
+    #: the batch is visible 30 s after it is sealed (#297)
+    observed_at[0] += timedelta(seconds=40)
     published = registry.build(publisher_manifest)()
 
     assert captured.processed_count == 1

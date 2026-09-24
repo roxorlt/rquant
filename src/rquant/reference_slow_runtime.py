@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
@@ -14,9 +14,15 @@ from rquant.live_contracts import (
     ConsumerCursor,
     LiveChannel,
 )
-from rquant.live_spool import LiveBatchRecord, LiveBatchSpool, LiveSpoolIntegrityError
+from rquant.live_spool import (
+    LiveBatchRecord,
+    LiveBatchSpool,
+    LiveSpoolIntegrityError,
+    LiveSpoolVisibilityHorizonError,
+)
 from rquant.reference_data_registry import (
     ReferencePublicationDeadlineError,
+    ReferencePublicationVisibilityError,
     ReferenceRegistry,
 )
 from rquant.reference_slow_publisher import (
@@ -35,7 +41,28 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CAPTURE_START = time(9, 20)
 _CAPTURE_END = time(9, 25)
 _REVISION_SCAN_START = time(9, 24)
-_COMMIT_VISIBILITY_GUARD = timedelta(seconds=5)
+#: How long after `prepared_at` a source batch promises to be visible. The spool refuses a
+#: publication that becomes durable after `available_at`, so this is the time the batch
+#: write (payload, manifest, pointer, receipt, `ssh-keygen -Y sign`, fsyncs) gets. Five
+#: seconds held on 2026-09-24 with ~2.5 s to spare, in the same throttled slice where the
+#: publisher's five seconds did not (#297); a miss here is final for the day, because the
+#: quota ledger refuses a second same-day request. 30 s is >10x the observed write and costs
+#: the publisher nothing it could use: its own round needs about 80 s on the host to reach its
+#: completion receipt, so a batch sealed after ~09:23:30 could not be published in any case.
+#: Capped at the cutoff -- the source's `available_at` is never 09:25 by rule, because the
+#: publisher refuses future evidence and would then never start before the cutoff.
+_SOURCE_VISIBILITY_GUARD = timedelta(seconds=30)
+#: The two ways a publication attempt can end after it started, told apart in the heartbeat
+#: (#297): on 2026-09-24 a commit that missed its visibility guard at 09:22:52 and 09:24:24
+#: was reported with the second text, as if it had run past the cutoff.
+_PUBLISHER_AFTER_CUTOFF = "reference slow publisher completed after 09:25"
+_PUBLISHER_VISIBILITY_MISSED = (
+    "reference slow publisher commit ended after its promised visibility instant (before 09:25)"
+)
+_SOURCE_AFTER_CUTOFF = "reference slow atomic publication completed after 09:25"
+_SOURCE_VISIBILITY_MISSED = (
+    "reference slow atomic publication ended after its promised visibility instant (before 09:25)"
+)
 
 SnapshotLoader = Callable[[], ReferenceSlowSourceSnapshot]
 RevisionSnapshotLoader = Callable[[date], ReferenceSlowSourceSnapshot]
@@ -146,6 +173,28 @@ def _store_revision_scan_state(
     )
 
 
+def _idle_capture_result(
+    spool: LiveBatchSpool,
+    authority: MarketCalendarAuthority,
+) -> RuntimeStepResult:
+    """A round outside the capture window still reports where the spool already is (#298).
+
+    `RuntimeServiceControl.record_success` refuses a sequence lower than the one this process
+    reported before. The first round after 09:25 on the first day a capture succeeded
+    (2026-09-24) returned the default -1 after the in-window rounds had reported 0, raised
+    `input sequence cannot regress`, exited 1 and pushed the owner. `reference_slow` stays out
+    of `source_generations` here: the builder reads its presence as "today's batch is sealed".
+    """
+
+    sequence = spool.current_sequence(LiveChannel.REFERENCE_SLOW)
+    position = -1 if sequence is None else sequence
+    return RuntimeStepResult(
+        input_sequence=position,
+        output_sequence=position,
+        source_generations={"market_calendar": authority.content_sha256},
+    )
+
+
 def capture_reference_slow_batch(
     *,
     spool: LiveBatchSpool,
@@ -167,10 +216,10 @@ def capture_reference_slow_batch(
         raise ReferenceSlowRuntimeError("calendar is future evidence")
     local = observed.astimezone(_SHANGHAI)
     if local.date() not in authority.open_dates:
-        return RuntimeStepResult(source_generations={"market_calendar": authority.content_sha256})
+        return _idle_capture_result(spool, authority)
     local_time = local.timetz().replace(tzinfo=None)
     if local_time < _CAPTURE_START or local_time > _CAPTURE_END:
-        return RuntimeStepResult(source_generations={"market_calendar": authority.content_sha256})
+        return _idle_capture_result(spool, authority)
     if revision_lookback_sessions < 1 or revision_lookback_sessions > 20:
         raise ReferenceSlowRuntimeError("revision lookback must be between 1 and 20 sessions")
     if history_page_size < revision_lookback_sessions or history_page_size > 256:
@@ -292,12 +341,12 @@ def capture_reference_slow_batch(
             "reference slow atomic availability precedes source evidence"
         )
     if prepared_at > decision_cutoff:
-        raise ReferenceSlowRuntimeError("reference slow atomic publication completed after 09:25")
+        raise ReferenceSlowRuntimeError(_SOURCE_AFTER_CUTOFF)
     monotonic_deadline = monotonic() + max(
         0.0,
         (decision_cutoff - prepared_at).total_seconds(),
     )
-    available_at = min(prepared_at + _COMMIT_VISIBILITY_GUARD, decision_cutoff)
+    available_at = min(prepared_at + _SOURCE_VISIBILITY_GUARD, decision_cutoff)
     current = spool.current(LiveChannel.REFERENCE_SLOW)
     sequence = 0 if current is None else current.sequence + 1
     envelope = BatchEnvelope(
@@ -337,11 +386,11 @@ def capture_reference_slow_batch(
             not_after=decision_cutoff,
             monotonic_deadline=monotonic_deadline,
         )
+    except LiveSpoolVisibilityHorizonError as exc:
+        raise ReferenceSlowRuntimeError(_SOURCE_VISIBILITY_MISSED) from exc
     except LiveSpoolIntegrityError as exc:
         if "deadline" in str(exc):
-            raise ReferenceSlowRuntimeError(
-                "reference slow atomic publication completed after 09:25"
-            ) from exc
+            raise ReferenceSlowRuntimeError(_SOURCE_AFTER_CUTOFF) from exc
         raise
     if revision_mode:
         assert revision_state is not None
@@ -361,6 +410,103 @@ def capture_reference_slow_batch(
             "reference_slow": snapshot.content_sha256,
         },
     )
+
+
+def _publishable_records(
+    spool: LiveBatchSpool,
+    *,
+    after: int,
+    page_size: int,
+    started: datetime,
+    expired: list[int],
+) -> Iterator[LiveBatchRecord]:
+    """The unconsumed batches this round may publish, oldest first, one page of real work.
+
+    A batch captured on an earlier session can never be published: its discovery session is
+    over, `_publish_reference_slow_snapshot_with_rollback` refuses it ("source evidence must
+    complete on its discovery session"), and after a release its `producer_commit` is refused
+    first. Before this such a batch held the cursor for good -- 2026-09-24's batch 0 was sealed
+    and never published, so every 09-25 round would have raised on it and never reached batch
+    1. It is passed over here and named on the heartbeat (`expired_source_batch:<sequence>`);
+    the cursor moves past it with the next batch that is published. The check reads the
+    envelope only: passing a batch over publishes nothing, so it needs no verified payload.
+
+    A batch not yet visible at `started` ends the round instead of failing it (09-24 09:21:26,
+    "future evidence"): a later round takes it, and what this round did publish still reaches
+    the serving authority below. It is also checked before the payload is parsed, which on the
+    host was the expensive part of that failing round.
+    """
+
+    session = started.astimezone(_SHANGHAI).date()
+    listed_after = after
+    while True:
+        page = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=listed_after, limit=page_size)
+        yielded = False
+        for record in page:
+            envelope = record.envelope
+            listed_after = envelope.sequence
+            if envelope.source_time.astimezone(_SHANGHAI).date() < session:
+                expired.append(envelope.sequence)
+                continue
+            if envelope.available_at > started:
+                return
+            yielded = True
+            yield record
+        #: a page of nothing but expired batches is not work; keep paging past it so a run of
+        #: failed sessions longer than one page cannot stall the cursor either
+        if yielded or len(page) < page_size:
+            return
+
+
+def _authority_source(
+    spool: LiveBatchSpool,
+    *,
+    last_sequence: int,
+    cached: dict[int, tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]],
+) -> tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]:
+    """The published snapshot the serving authority carries: the newest trading day's.
+
+    The authority used to carry whichever snapshot was published last. A revision batch for a
+    past trading day is sealed after today's batch (the scan starts at 09:24), so publishing it
+    -- in the same round or a later one -- put that past day's projections into today's
+    authority. On 2026-09-28 the scan compares 09-24's data with the never-published batch 0 and
+    may seal exactly such a batch. Now the authority carries, among the batches published on the
+    discovery session of the batch at `last_sequence`, the one with the latest
+    `target_trade_date`; a same-day correction (same target, later sequence) still replaces the
+    original. Every batch discovered on that session with a sequence at or below the cursor was
+    published on it: a batch is only passed over as expired on a later session.
+    """
+
+    def load(sequence: int) -> tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]:
+        if sequence not in cached:
+            records = spool.list_after(
+                LiveChannel.REFERENCE_SLOW,
+                sequence=sequence - 1,
+                limit=1,
+            )
+            if len(records) != 1 or records[0].envelope.sequence != sequence:
+                raise ReferenceSlowRuntimeError(
+                    "reference serving authority source batch is unavailable"
+                )
+            cached[sequence] = (records[0], _record_snapshot(spool, records[0]))
+        return cached[sequence]
+
+    best = load(last_sequence)
+    session = best[0].envelope.source_time.astimezone(_SHANGHAI).date()
+    sequence = last_sequence - 1
+    #: a snapshot never targets a session after its discovery, so one that targets the
+    #: discovery session itself cannot be beaten by an earlier (lower-sequence) batch
+    while sequence >= 0 and best[1].target_trade_date < session:
+        try:
+            candidate = load(sequence)
+        except (LiveSpoolIntegrityError, ReferenceSlowRuntimeError):
+            break
+        if candidate[0].envelope.source_time.astimezone(_SHANGHAI).date() != session:
+            break
+        if candidate[1].target_trade_date > best[1].target_trade_date:
+            best = candidate
+        sequence -= 1
+    return best
 
 
 def publish_reference_slow_batches(
@@ -395,7 +541,16 @@ def publish_reference_slow_batches(
         (decision_cutoff - started).total_seconds(),
     )
     if spool.current(LiveChannel.REFERENCE_SLOW) is None:
-        return RuntimeStepResult(source_generations={"market_calendar": authority.content_sha256})
+        #: an empty spool with a durable cursor is a regenerated source; the cursor is still
+        #: the furthest this consumer got, so the heartbeat never reads lower than it (#298)
+        with registry.publication_commit_lock():
+            empty_cursor = spool.load_cursor(consumer_id, LiveChannel.REFERENCE_SLOW)
+        position = -1 if empty_cursor is None else empty_cursor.last_sequence
+        return RuntimeStepResult(
+            input_sequence=position,
+            output_sequence=position,
+            source_generations={"market_calendar": authority.content_sha256},
+        )
     descriptor = spool.source_descriptor(LiveChannel.REFERENCE_SLOW)
     with registry.publication_commit_lock():
         pending = registry.pending_publication()
@@ -426,10 +581,14 @@ def publish_reference_slow_batches(
     generation_id: str | None = None
     authority_snapshot: ReferenceSlowSourceSnapshot | None = None
     authority_receipt: ReferenceSlowPublishReceipt | None = None
-    for record in spool.list_after(
-        LiveChannel.REFERENCE_SLOW,
-        sequence=last_sequence,
-        limit=page_size,
+    expired: list[int] = []
+    published_snapshots: dict[int, tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]] = {}
+    for record in _publishable_records(
+        spool,
+        after=last_sequence,
+        page_size=page_size,
+        started=started,
+        expired=expired,
     ):
         envelope = record.envelope
         if envelope.quality_status is not BatchQualityStatus.PUBLISHED:
@@ -438,8 +597,6 @@ def publish_reference_slow_batches(
             raise ReferenceSlowRuntimeError("reference slow batch producer_commit does not match")
         spool.verify_reference_source_record(record)
         snapshot = _record_snapshot(spool, record)
-        if envelope.available_at > started:
-            raise ReferenceSlowRuntimeError("reference slow source batch is future evidence")
         publication_id = canonical_sha256(
             {
                 "contract": "reference-slow-publication/v1",
@@ -473,10 +630,10 @@ def publish_reference_slow_batches(
                     completion_receipt_path=completion_receipt_path,
                     target_cursor=cursor,
                 )
+            except ReferencePublicationVisibilityError as exc:
+                raise ReferenceSlowRuntimeError(_PUBLISHER_VISIBILITY_MISSED) from exc
             except ReferencePublicationDeadlineError as exc:
-                raise ReferenceSlowRuntimeError(
-                    "reference slow publisher completed after 09:25"
-                ) from exc
+                raise ReferenceSlowRuntimeError(_PUBLISHER_AFTER_CUTOFF) from exc
             generation_id = receipt.generation_id
             stage_sha256 = registry.pending_publication_stage_sha256(rollback)
             registry_staged = False
@@ -531,14 +688,40 @@ def publish_reference_slow_batches(
                             publication_id,
                             durable_completed_at=clock(),
                         )
-                    raise ReferenceSlowRuntimeError(
-                        "reference slow publisher completed after 09:25"
-                    ) from exc
+                    raise ReferenceSlowRuntimeError(_PUBLISHER_AFTER_CUTOFF) from exc
+                if isinstance(exc, ReferencePublicationVisibilityError):
+                    raise ReferenceSlowRuntimeError(_PUBLISHER_VISIBILITY_MISSED) from exc
                 raise
         authority_snapshot = snapshot
         authority_receipt = receipt
+        published_snapshots[envelope.sequence] = (record, snapshot)
         last_sequence = envelope.sequence
         processed += 1
+
+    if authority_receipt is not None:
+        _source_record, authority_snapshot = _authority_source(
+            spool,
+            last_sequence=last_sequence,
+            cached=published_snapshots,
+        )
+        #: The serving authority numbers its results by `revision` and refuses a different
+        #: generation at the same or a lower one. The receipt's revision is the highest record
+        #: lineage revision, which starts again at 1 every session, so the second session's
+        #: authority was refused as a rollback ("different generation at the current sequence
+        #: is a rollback") and only the recovery branch below, one round later, published it --
+        #: never, when that round started after 09:25. The generation's place in the
+        #: registry's ancestry only grows, and it is the number the recovery branch uses.
+        authority_receipt = authority_receipt.model_copy(
+            update={
+                "revision": _reference_generation_revision(
+                    registry,
+                    authority_receipt.generation_id,
+                ),
+                "target_trade_date": authority_snapshot.target_trade_date,
+                "source_snapshot_id": authority_snapshot.content_sha256,
+                "security_count": len(authority_snapshot.security_facts),
+            }
+        )
 
     authority_root = spool.root / "serving-authority"
     authority_generation_id: str | None = None
@@ -551,12 +734,16 @@ def publish_reference_slow_batches(
 
         current_manifest = registry.current_manifest()
         try:
+            #: "Does the authority already carry the registry's current generation?" is a
+            #: question about the authority, not about the wall clock: a generation this
+            #: window published earlier is visible from 09:25 (#297), so read as of whichever
+            #: is later. Reading at `started` saw yesterday's and rebuilt today's every round.
             current_authority = ServingSourceAuthorityReader(
                 root=authority_root,
                 expected_producer_commit=producer_commit,
                 expected_dataset_id=REFERENCE_SLOW_AUTHORITY_DATASET_ID,
                 expected_payload_kind="reference_slow",
-            )(started)
+            )(max(started, current_manifest.published_at))
         except ServingSourceAuthorityUnavailableError:
             current_authority = None
         if (
@@ -583,7 +770,11 @@ def publish_reference_slow_batches(
                 raise ReferenceSlowRuntimeError(
                     "reference serving authority source batch is unavailable"
                 )
-            authority_snapshot = _record_snapshot(spool, records[0])
+            _source_record, authority_snapshot = _authority_source(
+                spool,
+                last_sequence=cursor.last_sequence,
+                cached={cursor.last_sequence: (records[0], _record_snapshot(spool, records[0]))},
+            )
             authority_receipt = ReferenceSlowPublishReceipt(
                 target_trade_date=authority_snapshot.target_trade_date,
                 generation_id=current_manifest.generation_id,
@@ -627,6 +818,7 @@ def publish_reference_slow_batches(
         output_sequence=last_sequence,
         processed_count=processed,
         source_generations=generations,
+        degraded_reasons=tuple(f"expired_source_batch:{sequence}" for sequence in expired),
     )
 
 

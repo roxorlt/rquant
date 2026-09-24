@@ -123,6 +123,8 @@
 
 ### Changed
 
+- deploy(systemd): raise rquant-live-runtime.slice CPUQuota 60%→200% (owner-authorized "cpu可以调到2个", issue #297). Pre-market 2026-09-24, cpu.stat nr_throttled went from 9,610 (00:28) to 127,336 (10:42) — ~26% of wall time throttled — while the 20 Route A roles shared 0.6 CPU on a 4-core host that was ~85% idle, and the reference-slow publisher's ~26MB registry commit could not finish inside its 5s visibility guard, so that day's reference generation was never published. Neither parent slice (rquant-live.slice, rquant.slice) carries a CPUQuota, so 200% fits; MemoryHigh and every other limit are unchanged. Already applied on the host via `systemctl set-property` at 10:42; this only persists it to the repo — see DEPLOY.md for the install steps
+
 - deploy(systemd): raise rquant.slice 11264M→12288M and rquant-live.slice 7680M→9216M after the 2026-09-21 acceptance day peaks (live 7,634/7,680 MB during the daily, top 10,763/11,264 MB during backups)
 
 - **deploy(systemd): raise slice MemoryHigh ceilings (rquant 6144M→11264M, live 3840M→7680M, live-runtime 1536M→4096M, serving 512M→1536M) so the production monitor/daily and the dashboard no longer share memory.high reclaim pressure with the Route A roles (fixes the 09-14 open-time stall and the 09-16 17:00 daily stall root cause: cgroup memory.high throttling, not I/O)** (#268, #271)
@@ -191,6 +193,142 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **auction_gap 候选输入一轮要做约 2.2 万次单键参考查询，主机上一次 74 毫秒、一轮约 27 分钟，比 09:29–09:49 的装配窗还长（#299，包 AG）**：
+  AF 的演练在主机上（普通 lighthouse 进程，不受 runtime slice 节流）量到：一代真实的 5,556 只证券发布之后，
+  `auction_gap_candidate_input` 在 09:29:01.9 的参考检查 500 只代码用了 148.1 秒，即 74.04 毫秒一次，全量推算
+  1,621.6 秒。有了 #297 的修复，09-28 09:25 当天的参考代会在，但装配跑不完窗口，③a 照样过不了。
+  - **原因**：装配每一行查 4 个数据集（ST、停牌、上市状态、涨跌停），每次 `ReferenceRegistry.as_of` 都拿一次发布锁、
+    开一个新 SQLite 连接、查待决发布、读指针、校验代清单、递归走祖先链。本机剖析：一次调用 14 毫秒里约 95% 花在
+    重新校验代清单上（`ReferenceGenerationManifest` 对整张 `added_record_ids` 做规范哈希，一代真实数据约 3.3 万个 id），
+    SQL 本身只要几微秒。
+  - **修法**：注册表新增 `as_of_snapshot(dataset_ids=..., keys=..., generation_id=...)`：一把共享锁、一个连接、一个读事务里
+    只做一次待决发布检查、指针读取、代校验和祖先链解析，然后每个数据集按 500 个键一组（旧版 SQLite 的绑定变量上限是 999）
+    取回全部键的记录，祖先链之外的成员行照 `as_of` 的连接条件丢掉。返回的 `ReferenceAsOfSnapshot` 用 `as_of` 同一个选择函数
+    `_select_as_of` 回答每次查询，所以答案和拒绝（键不存在、决策时刻不可见、事件时刻不生效、记录解码失败、生效期重叠，
+    以及待决发布、指针缺失、代不存在、代清单被改）与逐次调用逐字相同；没读进快照的数据集或键抛 `LookupError`——那是调用方
+    的错，不能被当成「不存在」静默拒掉。祖先链递归用 `UNION`（`as_of` 用 `UNION ALL`），无环时结果相同，有环时能终止。
+  - **消费方**：auction_gap 输入每轮只读一次快照，读的位置就是原来第一行第一次查询的位置，注册表读不了时仍以第一行、
+    同一句话拒；前五日成交量的分组从「每只代码把全部行过滤一遍」（5,475 × 27,375 次比较）改成一遍分组。模拟盘约束发布者
+    （每 2 秒一轮，每只代码的每个可见分钟批次 4 次 `as_of`）改成每个请求一次快照，同样在第一次查询时才读，并且读的是请求
+    指名的那一代。仓库里调 `as_of` 的只有这两处加演练脚本；`reference_slow_publisher._reference_generation_revision`
+    每轮按祖先链逐代调一次 `generation()`，次数随代数增长、与代码数无关，未改。
+  - **实测（本机 Apple Silicon，5,556 只证券 × 4 个数据集、两代，合成运行根）**：旧版（`a30b27ec`）整轮装配 326.2 秒
+    （单键 14.0 毫秒一次）；新版 2.5 秒，其中快照读取 0.15 秒、22,224 次查询 1.4 秒。一轮装配打开注册表连接的次数从
+    `4 × 行数 + 3` 降到 4（指针一次、清单两次、快照一次）。
+  - **还没解决、报给协调者**：候选发布者每一轮 `load_live_auction_candidate_input` 都新开一个 `ReadonlyReferenceRegistry`，
+    打开时的完整性检查会解码注册表里曾经有过的每一条记录（本机 4.4 万条约 2.6 秒），而每个交易日新增约 3.3 万条。主机上
+    的实际代价用演练脚本的 `--production-registry-copy` 量。
+  - **演练脚本 `scripts/reference_slow_publish_rehearsal.py`**：第 5 步对全部竞价代码走快照路径并打印总秒数（`--auction-sample`
+    默认改成 0 = 全部）；前 `--single-key-sample` 只（默认 50）再用旧的单键 `as_of` 读一遍、计时并逐条比对，不一致就拒；
+    `--full-auction-assembly` 计时一整轮生产调用（`load_live_auction_candidate_input`：日历 + 打开注册表 + 装配）并数注册表
+    连接数；新增 `--production-registry-copy`：用 SQLite 备份接口从 `mode=ro` 连接复制生产注册表到演练根，计时打开和全部代码
+    的一次快照，只报告、不影响退出码。
+  - **用例**：新增 `tests/unit/test_reference_as_of_snapshot.py`（8 个：三个随机种子生成四代注册表——跨代修订、跨代新谱系、
+    回滚后的兄弟分支、缺键、空数据集与未知数据集、逐键完整性故障——在两种注册表类上逐条比对快照与单键查询；待决发布两者同样
+    拒、补偿后恢复；指针缺失、代不存在、代清单被改两者同一句；未读进快照的查询是 `LookupError`；1,203 个键是一个连接、每个
+    数据集 3 条分组查询、每个分组末尾的键都在）；`test_auction_gap_candidate_input.py` +8（5,556 只注册、5,475 行竞价的整轮
+    装配只开 4 个连接、4 × 11 条分组查询，逐代码核对字段；40 只代码带修订的会话与逐行单键装配逐字相同；缺停牌、ST 从未发布、
+    上市状态不生效、状态类型错在前而缺证据在后四种拒绝与逐行单键同一行同一句；快照读失败以第一行拒；未来代在读快照之前就拒）；
+    `test_paper_execution_constraint_producer.py` +8（六种参考情形与逐次查询发布同一批或同一句拒；四个分钟批次的请求只开 2 个
+    连接，原来 17 个；请求读的是它指名的那一代）；`test_reference_slow_publish_rehearsal_script.py` +1（生产注册表复制步骤）。
+    9 个变异全部被杀：快照不看时刻返回最新修订、快照去掉待决发布检查、空数据集从快照里消失、auction_gap 跳过缺证据的代码、
+    快照不按祖先链过滤、分组丢掉每组最后一个键、成交量分组倒序、模拟盘约束读当前代而不是指名代、auction_gap 只为第一只代码读快照。
+  - **装机与回滚不受影响**：没有 schema、unit、manifest 字段或运行时配置变化，回滚到上一个版本就是回到逐次查询。
+
+- **参考慢源第一次采到了数，发布者却一次也没发出去，源在 09:25 之后还崩了一次、推了一条（#297、#298，包 AF）**：
+  2026-09-24 是 #293 修好之后（v0.33.20 = `304f6ed1`）的第一个生产日，采集成功了，当天的参考代却没有发布。
+  - **生产证据（协调者 2026-09-24 只读核查）**：09:20:27–09:20:31 采集，09:21:00 写出第 0 批，
+    `published`、5,556 行、`available_at` 09:21:03.52。发布者 09:21:26 第一次撞「source batch is
+    future evidence」（这一轮开始时批次还不可见，良性竞争）；09:22:52、约 09:24:24、09:25:30 三次都报
+    「reference slow publisher completed after 09:25」，其中前两次明明在 09:25 之前就结束了；
+    `reference.sqlite3` 从 77 KB 涨到 26 MB（写入后又被补偿）；09:25:56 起「started after 09:25」（设计如此）。
+    源这边窗内各轮报 `input_sequence = output_sequence = 0`，09:25 之后第一轮（09:26:12）在
+    `record_success` 抛 `ValueError: input sequence cannot regress`，退出码 1 → `OnFailure` → **09:26:17
+    给 owner 推了一条** → systemd 重启，重启后从 -1 起算、当天稳定。
+  - **#297 的原因**：发布者承诺的可见时刻是 `min(prepared_at + 5 秒, 09:25)`，注册表对「提交完成晚于承诺
+    时刻」一律拒。当天约 3.3 万条记录的提交跑在 `rquant-live-runtime.slice` 里（`CPUQuota=60%`、20 个
+    role 共用，约 26% 的墙钟时间被节流），5 秒装不下；本机不节流时同一规模的提交要 2.6 秒（见下）。
+    拒绝又被映射成「completed after 09:25」，日志看不出是 5 秒保护而不是 09:25 截止触发的。
+  - **现在的规则**：只要 `prepared_at` 不晚于 09:25，记录的 `first_available_at`、代的 `published_at`、
+    指针的 `switched_at` 一律是当天 09:25。唯一的期限就是 09:25 本身；「提交完成之前任何记录都不可见」
+    照旧成立（注册表仍拒绝提交完成晚于可见时刻的发布，而可见时刻就是截止时刻），09:25 之后才开始的一轮仍然拒。
+    **消费方盘点**：09:25 之前没有谁读当天这一代——模拟盘约束要 09:30 起的分钟证据，auction_gap 输入只在
+    09:29 起的装配窗里跑，serving 在 09:25 之前读到的是上一代——**发版之后的第一个交易日除外**：发布者约 09:22
+    就写出 serving 权威、`published_at` 却是 09:25，serving 的读者于是沿发布历史往回找，找到上一个交易日由**旧版本
+    commit** 写的那一条，而它的历史信任集合只有自己的 commit 与当前指针的 commit（`runtime_serving_authority.py:385`、
+    `:503`，serving 构造读者时没有传 `trusted_historical_producer_commits`，`runtime_builder_serving.py:290-300`），
+    在 `runtime_serving_authority.py:667` 抛 `ServingSourceAuthorityIntegrityError: historical publication
+    producer_commit is not trusted`。`reference_slow_authority` 是硬源，所以那天约 09:22–09:25 serving **每一轮失败**，
+    09:25 起自动恢复；不退出、不推送，是已知限制（复核 MF-1，代码修法见 #300，本包不改这个六种 payload 共用的读者）。
+    09-28 不受影响：那天是第一次发布，没有历史，读者报 `Unavailable`，和 09-24 09:21 之前一样。唯一的语义差别：
+    同一个窗口里的当日修订和原版一起在 09:25 变得可见，09:25 之前的决策两者都看不到（原来 09:23 的决策能看到原版），
+    没有消费方读这个区别。
+  - **serving 权威永远带最新交易日的快照（复核 S-6(b)）**：原来权威带的是「本轮最后处理的那个快照」（基线行为）。
+    09:24 起的修订扫描在当日批次之后才封批，于是一个**针对过去交易日**的修订批次一旦发布（同一轮或之后一轮），
+    当天的权威就带上了那个过去交易日的投影。09-28 可能遇到：扫描拿 09-24 的数据与 spool 里没发布过的第 0 批比较，
+    内容不同就封一个 09-24 的修订批次——它的采集日是今天，**不会被当作过期批次跳过**，会被发布。现在权威在「与游标
+    所指批次同一采集日发布的批次」里取 `target_trade_date` 最晚的那个（同一目标日的更正按序号取后者，照样替换），
+    恢复分支同一规则。
+  - **两种报错分开**：注册表新增 `ReferencePublicationVisibilityError`（`ReferencePublicationDeadlineError`
+    的子类，原有的 fail-closed 捕获照旧生效），心跳里「commit ended after its promised visibility instant
+    (before 09:25)」与「completed after 09:25」是两句话；源这边同理（`LiveSpoolVisibilityHorizonError`，
+    「reference slow atomic publication ended after its promised visibility instant (before 09:25)」）。
+  - **源的保护时间 5 秒 → 30 秒**：源给批次写的 `available_at = min(prepared_at + 保护时间, 09:25)` 是同一种
+    形状。09-24 这 5 秒还剩约 2.5 秒余量，而源这边一旦没赶上当天就救不回来（配额账本拒绝同日第二次请求，#295）。
+    30 秒是观察值的十倍以上；发布者自己一轮在主机上要约 80 秒才写到完成回执，09:23:30 之后封好的批次本来就发不出去，
+    所以多等的 25 秒不会让它错过任何一个本来发得出去的批次。仍然封顶在 09:25，源的 `available_at` 不会按规则等于 09:25。
+  - **#298 的原因与修法**：`capture_reference_slow_batch` 的两个早退分支（非交易日、窗口外）返回默认的
+    `input_sequence=-1`，而窗内那几轮返回的是当前批次的序号。现在窗口外、非交易日也报 spool 当前指针的序号
+    （spool 为空才是 -1），新增的 `LiveBatchSpool.current_sequence()` 只读已提交的指针文件、不重新哈希
+    保留下来的批次（`current()` 会把最多 128 个、每个约 3 MB 的载荷全读一遍再哈希，而空闲轮全天每 30 秒一次）；
+    有未完成的发布意图时先走 `current()` 的恢复。发布者 spool 为空那条早退改报持久游标。
+  - **同一类的其他 role（逐个查过）**：auction-match 源在 09-23 窗口之后没崩，是因为空闲轮照抄 `last_result`；
+    但换日那一轮把 `last_result` 重置成 -1，**任何采到过批次的交易日之后的零点第一轮都会退出、推一条**（进程当天
+    没重启的话），现在换日只清当天的留痕、序号照抄。daily-close 源 15:00 之后采到一批，零点之后窗外那一轮返回 -1，
+    **每个交易日的夜里一次**，现在照抄。market-minute 源一次取数失败发 STALE 批（新序号），下一次取回的内容与当前
+    PUBLISHED 批相同时走重复分支、答 `spool.current()`，低一号，现在夹住不低于上一次。其余 role（watchlist-quote、
+    候选发布者、feature、strategy、notifier、paper、paper 约束、runtime-health、lab、promotions、artifact 两个、
+    shadow、daily 编排器、auction-universe、signal_router、serving）不会在稳态下回退；signal_router 的追赶分支、
+    serving 在可选源读失败时回退到 0、artifact_retention 的 0 回退是潜在的，前两者今天走不到，后者 `once=True` 挡住了。
+  - **修 #297 还不够，下一个交易日会被 09-24 那一批卡住（本包顺带修）**：09-24 的第 0 批封好了却没发布，下一个交易日（09-28）发布者
+    第一个列出来的就是它；发布它会被拒（「source evidence must complete on its discovery session」，而今晚换版本
+    之后它的 `producer_commit` 先被拒），于是每一轮都抛在它身上，第 1 批永远发不出去。现在**采集日已经过去的批次
+    直接跳过**（只看信封，跳过不发布任何东西），心跳记 `expired_source_batch:<序号>`，游标随下一个发布的批次越过它；
+    整页都是过期批次时继续往后翻，连续失败超过一页（16 天）也卡不住。**还没可见的批次改成「本轮到此为止」而不是抛错**
+    （09:21:26 那一轮），并且在解析 3 MB 载荷之前就判断；本轮已经发布的批次照样写进 serving 权威。
+  - **第二个交易日的 serving 权威会被当成回滚拒掉（本包顺带修）**：serving 权威按发布回执的 `revision` 编号、
+    拒绝同号或更小号的不同代；而这个 `revision` 是记录的谱系修订号，每个交易日从 1 重新开始，于是第二天的权威在注册表
+    和游标都已提交之后被拒（「different generation at the current sequence is a rollback」），只有下一轮的恢复分支
+    用代的祖先序号重建才发得出去——那一轮若在 09:25 之后开始就永远发不出去。生产还没发布过第二次，第一次发布之后的下一个交易日就会撞上。
+    现在主路径也按代在注册表祖先链上的位置编号（恢复分支本来就这么编），恢复分支重建出来的结果逐字节相同。恢复分支读
+    权威时改用 `max(started, 当前代 published_at)`，09:25 之前的各轮认得出当天已经发出的权威，不再每轮重建。
+  - **实测提交时间（本机 Apple Silicon、不节流，5,556 只证券 = 33,336 条记录，用下面的演练脚本在同形状的合成
+    运行根上跑）**：源的 spool 写入 0.015–0.02 秒（载荷 3.2 MB）；发布者一整轮 10.8 秒，其中暂存提交
+    （`append_many_and_publish_before`，即原来要塞进 5 秒的那一段）2.7 秒、`commit_publication_stage` 1.8 秒、
+    `finalize_publication` 1.5 秒；注册表 69 MB。`--slow-commit-seconds 10` 时暂存提交 12.8 秒，照样在 09:25
+    可见地发布；从 09:24:45 起跑、`--slow-commit-seconds 20` 时拒成「completed after 09:25」并回滚。主机上
+    09-24 同一段超过了 5 秒，按当天日志推算整轮约 80 秒写到回执。
+  - **演练脚本 `scripts/reference_slow_publish_rehearsal.py`**：把运行根里一个已封好的参考慢批次与它指名的日历代
+    复制到私有演练根，用新的源规则重新封批（临时签名钥）、用新的发布者发布到新注册表（临时 HMAC 钥），打印每一轮、
+    实测提交秒数、`first_available_at` / `switched_at` / `published_at`、serving 权威，以及 auction_gap 输入在
+    09:24:59（必须拒）与 09:29（必须接受）的参考检查；只写演练根，生产文件只读，演练根不许与运行根重叠。
+    命令与预期见 DEPLOY 2026-09-24 那条。
+  - **另一个发现（本包未修，报给协调者；同一版 v0.33.21 里 #299 那一条已修）**：`auction_gap_candidate_input` 每一行做 4 次 `as_of`，每次都是一次新的
+    SQLite 连接加锁加祖先链递归查询，本机空闲时约 20 毫秒一次；5,556 行约 7.5 分钟，6,077 行约 8 分钟，主机上
+    只会更慢，而装配窗是 09:29–09:49。参考代一直没有发布过，所以这条路径从来没真的跑满过。
+  - **用例**：`tests/unit/test_reference_slow_publish_rehearsal_script.py`（3 个：演练在 09:25 可见地发布、只写
+    演练根；慢过 09:25 的提交被拒并回滚；演练根落在运行根里被拒）；`tests/unit/test_reference_slow_publish_window.py`（19 个：两个真 `RuntimeServiceControl` 走过两个交易日；
+    暂存提交跑 6 秒 / 60 秒照样在 09:25 可见地发布；09:25 之后结束的提交与 09:25 之后开始的一轮仍然拒；两种报错；
+    09:25 之前各轮不重建权威；第二天的权威；09:29 的 auction_gap 输入接受慢提交的代；源写入 20 秒照封、31 秒与越过
+    09:25 两种报错；过期批次、上一版本 commit 的过期批次、超过一页的过期批次；未可见批次结束本轮不抛；已发布批次
+    在下一批未可见时照样进权威），外加 auction-match 零点、daily-close 零点、market-minute STALE+重复三个用例。
+    19 个变异（恢复 5 秒规则、去掉 09:25 起始截止、注册表放行截止之后的提交、两处早退回 -1、合并两种报错 ×3、三个
+    其他 role 的修复各回退一次、恢复分支按 `started` 读、权威按谱系修订号、过期批次不跳过、未可见批次重新抛错、
+    不翻页、源保护时间回 5 秒、空闲轮重新哈希、`current_sequence` 跳过恢复）全部被杀。
+  - **没改的**：`deploy/systemd`（`CPUQuota` 由 owner 决定；同一版 v0.33.21 里另一条 Changed 把它提到了 200%）、#295（一天只有一次采集机会）、#290；发布者 09:25
+    之后整天每一轮都报「started after 09:25」算失败，这是设计，本包不动。复核提的四条后续（今天的批次没发出去在发布者心跳上看不见、修订批次的
+    可发布死区、market-minute 夹持范围过宽、源 spool 被清空时读成干净的一轮）记在 #301，本包不做。
 
 - **参考慢源从来没有发布过一次：`stock_basic` 没要 `delist_date`，退市名单里还有一行历史代码（#293，包 AE）**：
   serving 的 `reference_slow_authority` 是硬源（永远不是可选源），而主机上

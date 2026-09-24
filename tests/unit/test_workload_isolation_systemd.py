@@ -207,7 +207,8 @@ def test_the_runtime_role_plane_is_a_child_slice_and_resident_services_stay_outs
         assert "Slice=rquant-live.slice\n" in content, unit
 
     # The ceiling is on the roles; the plane the resident services share has none.
-    assert WORKLOAD_SLICE_LIMITS[runtime_plane]["CPUQuota"] == "60%"
+    # 2026-09-24 owner decision ("cpu可以调到2个", issue #297): 60% -> 200%.
+    assert WORKLOAD_SLICE_LIMITS[runtime_plane]["CPUQuota"] == "200%"
     assert "CPUQuota" not in WORKLOAD_SLICE_LIMITS["rquant-live.slice"]
     # And the checked-in declarations still satisfy the static verifier with the new slice.
     assert verify_workload_unit_declarations(SYSTEMD).status == "warn"
