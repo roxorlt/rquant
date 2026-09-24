@@ -1576,8 +1576,10 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # And this refreeze to 2ca5607 leaves it out once more: the Route A chain-blockers release
     # (the day replay tool, hotfix AI and hotfix AJ, with the nginx /preview/ location) adds no
     # module under src/rquant/ and changes fourteen, adds seven test files and one test helper
-    # module and touches twenty existing test modules, adds one script (route_a_day_replay.py, a
-    # sandboxed replay that is read-only against production, which the assertion below holds to
+    # module and touches twenty-one existing test modules (the twenty-first is the all-roles
+    # sandbox e2e's pre-window collection, a CI flake fix whose policy was regenerated onto this
+    # same baseline, so it is not a refreeze of its own), adds one script (route_a_day_replay.py,
+    # a sandboxed replay that is read-only against production, which the assertion below holds to
     # architecture), changes deploy/nginx/rquant-backup.conf (architecture as well), marks
     # nothing ``linux_exact``, adds no job and does not touch .github/workflows/ci.yml. It
     # regenerates the shard manifest because the test count changed (14836 -> 14894); the matrix
