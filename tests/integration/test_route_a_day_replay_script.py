@@ -1,0 +1,353 @@
+"""`scripts/route_a_day_replay.py`: a recorded day through the real roles, in a sandbox only.
+
+The host layout the script reads is built here the way the host holds it, at fixture size:
+a sealed reference-slow batch and an auction-match batch written by their real writers
+(`tests/unit/test_reference_slow_publish_rehearsal_script._runtime_root`), the calendar
+generation the batch names, an auction universe, a read-only replica with `daily_bar`,
+`screen_result` and the day's `minute_bar`, and the runtime-inputs document with the three
+frozen inputs it points at (the routing policy and the PIT calendar from the production
+generator, the minute history from `scripts/export_intraday_snapshot.py`).
+
+The script then runs as its own process, as it will on the host, and three claims are
+checked against what it left: it wrote nothing outside its replay root (every file of the
+fake host is byte- and mtime-identical afterwards), serving cut a generation for the
+replayed session, and the notifier ran shadow-only (every attempt receipt `shadow:`, and
+the provider that could speak was never called).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import UTC, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.unit.test_reference_slow_publish_rehearsal_script import CODES, _runtime_root
+from tests.unit.test_reference_slow_publish_window import OPEN_DATES, TARGET_DATE, _calendar
+
+pytestmark = pytest.mark.integration
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "route_a_day_replay.py"
+#: the code the replica has the day's minutes for; the other one is reported as missing
+MINUTE_CODE = CODES[0]
+
+
+def _tree(root: Path) -> dict[str, tuple[int, int, int]]:
+    return {
+        str(path.relative_to(root)): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_mode,
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file() or path.is_dir()
+    }
+
+
+def _replica(path: Path) -> None:
+    import duckdb
+
+    prior = [day for day in OPEN_DATES if day < TARGET_DATE]
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE daily_bar(ts_code VARCHAR, trade_date DATE, close DOUBLE, vol DOUBLE);
+            CREATE TABLE screen_result (
+                trade_date DATE, preset_name VARCHAR, ts_code VARCHAR, name VARCHAR,
+                close DOUBLE, pct_chg DOUBLE, extra JSON, created_at TIMESTAMP
+            );
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR, trade_time TIMESTAMP, freq VARCHAR, open DOUBLE,
+                high DOUBLE, low DOUBLE, close DOUBLE, vol DOUBLE, amount DOUBLE,
+                source VARCHAR, created_at TIMESTAMP
+            );
+            """
+        )
+        #: 200 lots a day against the 20,000-share auction: an auction ratio of 1.0, inside
+        #: auction_gap's 0.15..5 band. The host's replica already carries the day's own
+        #: close; the extract must drop it
+        connection.executemany(
+            "INSERT INTO daily_bar VALUES (?, ?, 10.0, 200.0)",
+            [(code, day) for code in CODES for day in (*prior, TARGET_DATE)],
+        )
+        connection.execute(
+            "INSERT INTO screen_result VALUES (?, 'n-shape-pool1', ?, 'sample', 10.0, 1.0, "
+            "'{}', ?)",
+            [prior[-1], MINUTE_CODE, datetime.combine(prior[-1], time(15, 5))],
+        )
+        rows: list[tuple[Any, ...]] = []
+        for day in (prior[-1], TARGET_DATE):
+            codes = CODES if day != TARGET_DATE else (MINUTE_CODE,)
+            for code in codes:
+                for session_start, count in ((time(9, 30), 120), (time(13, 0), 120)):
+                    for step in range(count):
+                        stamp = datetime.combine(day, session_start) + timedelta(minutes=step)
+                        close = round(10.5 + 0.002 * step, 4)
+                        rows.append(
+                            (
+                                code,
+                                stamp,
+                                "1min",
+                                close - 0.01,
+                                close + 0.02,
+                                close - 0.02,
+                                close,
+                                1000.0 + step,
+                                (1000.0 + step) * close,
+                                "tushare_rt",
+                                stamp,
+                            )
+                        )
+        connection.executemany(
+            "INSERT INTO minute_bar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    path.chmod(0o644)
+
+
+def _history(path: Path, work: Path) -> bytes:
+    """The sealed minute history, generated by the production exporter itself."""
+
+    import duckdb
+
+    scripts = REPO_ROOT / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from export_intraday_snapshot import read_snapshot_frame, write_snapshot
+
+    prior = [day for day in OPEN_DATES if day < TARGET_DATE][-2:]
+    database = work / "rquant_ro.duckdb"
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR NOT NULL, trade_time TIMESTAMP NOT NULL, freq VARCHAR NOT NULL,
+                open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, vol DOUBLE, amount DOUBLE,
+                source VARCHAR DEFAULT 'tushare', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ts_code, trade_time, freq, source)
+            )
+            """
+        )
+        for day in prior:
+            for code in CODES:
+                for step in range(30):
+                    stamp = datetime.combine(day, time(9, 31)) + timedelta(minutes=step)
+                    close = round(10.0 + 0.01 * step, 4)
+                    connection.execute(
+                        "INSERT INTO minute_bar (ts_code, trade_time, freq, open, high, low, "
+                        "close, vol, amount, source) VALUES (?, ?, '1min', ?, ?, ?, ?, ?, ?, "
+                        "'tushare')",
+                        [
+                            code,
+                            stamp,
+                            close - 0.01,
+                            close + 0.02,
+                            close - 0.02,
+                            close,
+                            1000.0,
+                            1000.0 * close,
+                        ],
+                    )
+    finally:
+        connection.close()
+    exported, _dates = read_snapshot_frame(
+        database,
+        sessions=2,
+        source="tushare",
+        freq="1min",
+        availability_lag_seconds=0,
+        allow_primary_database=False,
+    )
+    write_snapshot(exported, path)
+    return path.read_bytes()
+
+
+def _host(tmp_path: Path) -> dict[str, Path]:
+    """The host's `data/` at fixture size, in the layout the script's defaults name."""
+
+    import hashlib
+
+    scripts = REPO_ROOT / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from build_runtime_production_inputs import (
+        build_pit_trade_calendar_payload,
+        build_routing_policy_payload,
+    )
+
+    data = tmp_path / "host" / "data"
+    data.mkdir(parents=True)
+    runtime = _runtime_root(data)
+    universe = runtime / "authorities" / "auction-universe" / "generations"
+    universe.mkdir(mode=0o700, parents=True)
+    (universe / ("a" * 64 + ".json")).write_text(
+        json.dumps(
+            {
+                "effective_trade_date": TARGET_DATE.isoformat(),
+                "available_at": "2026-07-30T09:30:07Z",
+                "codes": list(CODES),
+            }
+        ),
+        encoding="utf-8",
+    )
+    replica = data / "rquant_ro.duckdb"
+    _replica(replica)
+    inputs = data / "runtime-inputs"
+    inputs.mkdir()
+    policy = build_routing_policy_payload(
+        recipient_id="admin", channel="pushdeer", default_no_target_reason="no_target"
+    )
+    calendar = build_pit_trade_calendar_payload(
+        tuple((day, True, datetime(2026, 7, 1, tzinfo=UTC)) for day in OPEN_DATES)
+    )
+    work = tmp_path / "history-work"
+    work.mkdir()
+    history = _history(inputs / "minute.parquet", work)
+    (inputs / "signal-routing.json").write_bytes(policy)
+    (inputs / "trade-calendar.json").write_bytes(calendar)
+    document = {
+        "routing_policy_path": str(inputs / "signal-routing.json"),
+        "routing_policy_fingerprint": hashlib.sha256(policy).hexdigest(),
+        "trade_calendar_path": str(inputs / "trade-calendar.json"),
+        "trade_calendar_sha256": hashlib.sha256(calendar).hexdigest(),
+        "historical_minutes_snapshot_path": str(inputs / "minute.parquet"),
+        "historical_minutes_snapshot_id": hashlib.sha256(history).hexdigest(),
+    }
+    production_inputs = data / "runtime-production-inputs.json"
+    production_inputs.write_text(json.dumps(document), encoding="utf-8")
+    assert _calendar().content_sha256
+    return {"data": data, "runtime": runtime, "replica": replica, "inputs": production_inputs}
+
+
+def _run(host: dict[str, Path], replay_root: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("RQ_", "CREDENTIALS_DIRECTORY"))
+    }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--trade-date",
+            TARGET_DATE.isoformat(),
+            "--replay-root",
+            str(replay_root),
+            "--runtime-root",
+            str(host["runtime"]),
+            "--replica",
+            str(host["replica"]),
+            "--production-inputs",
+            str(host["inputs"]),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=str(REPO_ROOT),
+        timeout=900,
+        check=False,
+    )
+
+
+@pytest.fixture
+def host(tmp_path: Path) -> dict[str, Path]:
+    return _host(tmp_path)
+
+
+def test_the_dry_plan_lists_what_it_would_read_and_writes_nothing(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    before = _tree(host["data"])
+    replay_root = tmp_path / "replay"
+
+    result = _run(host, replay_root, "--dry-plan")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "nothing is written" in result.stdout
+    assert str(host["replica"]) in result.stdout
+    assert "00000000000000000000.payload" in result.stdout
+    assert not replay_root.exists()
+    assert _tree(host["data"]) == before
+
+
+def test_a_replay_root_inside_production_is_refused(host: dict[str, Path]) -> None:
+    result = _run(host, host["runtime"] / "replay")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "overlaps production path" in result.stdout
+    assert not (host["runtime"] / "replay").exists()
+
+
+def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandbox_only(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    before = _tree(host["data"])
+    siblings_before = sorted(path.name for path in tmp_path.iterdir())
+    replay_root = tmp_path / "replay"
+
+    result = _run(
+        host,
+        replay_root,
+        "--step-seconds",
+        "300",
+        "--until",
+        "10:10",
+        "--assume-listing-classification",
+    )
+
+    output = result.stdout + result.stderr
+    (sandbox,) = replay_root.iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert result.returncode == 0, output[-6000:]
+
+    #: sandbox-only writes: the fake host is untouched, and the replay root is the only
+    #: new thing next to it
+    assert _tree(host["data"]) == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted([*siblings_before, "replay"])
+    assert summary["verdict"]["production_untouched"] is True
+    audit = summary["production_audit"]
+    assert audit["paths_read"] >= 8
+    assert audit["changed_during_our_read"] == []
+    assert audit["changed_in_place_later"] == []
+    assert all(str(host["data"]) in path for path in audit["reads"])
+
+    #: a same-day serving generation, cut by the real serving publisher
+    serving = summary["chain"]["serving"]
+    assert serving["same_day"] is True, serving
+    assert serving["generations"], serving
+    assert Path(serving["serving_root"]).is_relative_to(sandbox)
+
+    #: shadow-only notifier: the manifest says so, every receipt says so, and the provider
+    #: that could speak was never called
+    notifier = summary["chain"]["notifier"]
+    assert notifier["suppress_delivery"] is True
+    assert notifier["all_receipts_shadow"] is True
+    assert summary["notifier_provider_deliveries"] == 0
+
+    #: the roles really ran the day, and none of them crashed
+    assert summary["verdict"]["crashed_roles"] == []
+    assert summary["roles"]["reference-slow.publisher.v1"]["first_output_at"] is not None
+    minute = summary["chain"]["market_minute"]
+    assert minute["batches"] >= 1, minute
+    #: the watchlist is the auction_gap universe the real candidate publisher cut, and the
+    #: replica carries minutes for only one of its two codes while `--tushare` is off
+    assert summary["candidates_per_family"]["auction_gap"] == 2
+    assert minute["watchlist_codes_ever"] == 2
+    assert minute["codes_without_minutes"] == [CODES[1]]
+    #: the listing-classification stub was asked for, is recorded, and was needed
+    assert summary["stubs"]["listing_classification"] == "derived from ts_code suffix"
+    assert summary["stubs"]["listing_classification_counts"]["derived"] >= 1
+    #: the replica extract dropped the trade date's own daily row
+    assert summary["world"]["replica"]["rows"]["daily_bar"] == 2 * 5
