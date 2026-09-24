@@ -5,6 +5,51 @@
 
 ---
 
+## 2026-09-24 · 待安装 · rquant-live-runtime.slice CPUQuota 提额（issue #297）
+
+**状态**：**尚未安装**。`deploy/systemd/rquant-live-runtime.slice` 的 `CPUQuota` 已于
+2026-09-24 10:42 经 owner 授权（"cpu可以调到2个"），用 `systemctl set-property
+rquant-live-runtime.slice CPUQuota=200%`（未带 `--runtime`）在生产主机上直接生效
+（60%→200%），持久化落在
+`/etc/systemd/system.control/rquant-live-runtime.slice.d/50-CPUQuota.conf` 这个 drop-in，
+cgroup `cpu.max` 现在是 `200000 100000`；没有重启任何服务。本条只是把同样的值写回
+checked-in 的 slice 文件，还没有装到服务器上——装上之前，仓库里的文件和主机的真实生效值
+不一致，改 git 也暂时看不出效果（drop-in 优先级更高）。
+
+背景：09-24 开盘前 20 个 Route A role 挤在 0.6 核里，`cpu.stat` 的 `nr_throttled` 从 00:28 的
+9,610 涨到 10:42 的 127,336（开盘前约 26% 的墙钟时间在被限流，00:10 冷启动期间 CPU PSI 一度
+约 93%，首轮迭代耗时 22 分钟），同期主机整体仍有约 85% 空闲；reference-slow publisher
+约 26MB 的 registry commit 来不及在 5s 可见性护栏内跑完，当天的 reference 生成从未发布
+（issue #297）。父 slice `rquant-live.slice` 与 `rquant.slice` 都不设 `CPUQuota`，200% 能被
+完整吃下；`MemoryHigh` 与其余限额都不动。
+
+**本条只做仓库这一侧的持久化，不 SSH、不重启、不动 `.env`**；今晚随发布一起装机的步骤（与
+hotfix AF 合并安装，由集成方一次做）：
+
+```bash
+# 1. 备份当前生效文件，再用仓库版本覆盖
+sudo cp /etc/systemd/system/rquant-live-runtime.slice \
+    /etc/systemd/system/rquant-live-runtime.slice.bak-20260924
+sudo cp deploy/systemd/rquant-live-runtime.slice /etc/systemd/system/rquant-live-runtime.slice
+sudo systemctl daemon-reload
+
+# 2. 删掉 10:42 那次 set-property 留下的 drop-in（否则它优先级更高，文件改了不生效）
+sudo rm /etc/systemd/system.control/rquant-live-runtime.slice.d/50-CPUQuota.conf
+sudo systemctl daemon-reload
+
+# 3. 核对（读 cgroup 真值，不看 systemd 缓存）
+systemctl show -p CPUQuotaPerSecUSec rquant-live-runtime.slice
+    # 期望 CPUQuotaPerSecUSec=2s
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.max
+    # 期望 200000 100000
+```
+
+**回滚**：恢复上面备份的 `rquant-live-runtime.slice.bak-20260924`（`CPUQuota=60%`）覆盖回
+`/etc/systemd/system/rquant-live-runtime.slice` + `daemon-reload`；不涉及数据落盘，无需额外
+挪状态。
+
+---
+
 ## 2026-09-23 · 待安装 · 参考慢源第一次能发布（#293）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。

@@ -123,6 +123,8 @@
 
 ### Changed
 
+- deploy(systemd): raise rquant-live-runtime.slice CPUQuota 60%→200% (owner-authorized "cpu可以调到2个", issue #297). Pre-market 2026-09-24, cpu.stat nr_throttled went from 9,610 (00:28) to 127,336 (10:42) — ~26% of wall time throttled — while the 20 Route A roles shared 0.6 CPU on a 4-core host that was ~85% idle, and the reference-slow publisher's ~26MB registry commit could not finish inside its 5s visibility guard, so that day's reference generation was never published. Neither parent slice (rquant-live.slice, rquant.slice) carries a CPUQuota, so 200% fits; MemoryHigh and every other limit are unchanged. Already applied on the host via `systemctl set-property` at 10:42; this only persists it to the repo — see DEPLOY.md for the install steps
+
 - deploy(systemd): raise rquant.slice 11264M→12288M and rquant-live.slice 7680M→9216M after the 2026-09-21 acceptance day peaks (live 7,634/7,680 MB during the daily, top 10,763/11,264 MB during backups)
 
 - **deploy(systemd): raise slice MemoryHigh ceilings (rquant 6144M→11264M, live 3840M→7680M, live-runtime 1536M→4096M, serving 512M→1536M) so the production monitor/daily and the dashboard no longer share memory.high reclaim pressure with the Route A roles (fixes the 09-14 open-time stall and the 09-16 17:00 daily stall root cause: cgroup memory.high throttling, not I/O)** (#268, #271)
