@@ -614,6 +614,21 @@ def test_rollout_store_requires_complete_registry_and_consecutive_cas_phases(
             declaration_fingerprint=new.schema_fingerprint,
             now=started_at + timedelta(minutes=4),
         )
+    #: Since #304 the DUAL_WRITE window opens at the producers' first dual-write record, so
+    #: the clock is only checked here once one exists: open it, then step past it.
+    opened_at = started_at + timedelta(minutes=5)
+    state = store.record_dual_write_values(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1.0},
+        generation_id="4" * 64,
+        observed_at=opened_at,
+        operation_id="batch:opens-the-window",
+    )
+    assert store.effective_deadline(plan.plan_id) == opened_at + (plan.deadline - started_at)
     with pytest.raises(ValueError, match="deadline"):
         store.acknowledge(
             plan_id=plan.plan_id,
@@ -622,7 +637,7 @@ def test_rollout_store_requires_complete_registry_and_consecutive_cas_phases(
             participant_id="gateway",
             participant_fingerprint="1" * 64,
             declaration_fingerprint=new.schema_fingerprint,
-            now=plan.deadline + timedelta(seconds=1),
+            now=opened_at + (plan.deadline - started_at) + timedelta(seconds=1),
         )
     with pytest.raises(ValueError, match="time cannot precede"):
         store.acknowledge(
