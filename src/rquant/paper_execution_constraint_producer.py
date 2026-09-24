@@ -22,6 +22,7 @@ from rquant.paper_execution_constraints import (
     PaperExecutionConstraintSnapshot,
 )
 from rquant.reference_data_registry import (
+    ReferenceAsOfSnapshot,
     ReferenceDataset,
     ReferenceDataUnavailableError,
     ReferenceLookup,
@@ -38,6 +39,12 @@ from rquant.runtime_contracts import (
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_REFERENCE_DATASETS = (
+    ReferenceDataset.ST_STATUS,
+    ReferenceDataset.SUSPENSION_STATUS,
+    ReferenceDataset.PRICE_LIMIT_REGIME,
+    ReferenceDataset.LISTING_STATUS,
+)
 
 
 class PaperExecutionConstraintEvidenceError(RuntimeError):
@@ -94,6 +101,49 @@ class _ReferenceState(RuntimeContractModel):
     instrument_context: InstrumentContext
 
 
+class _RequestReferences:
+    """One production request's reference reads: one registry read, on first use (#299).
+
+    `_reference_state` runs once per visible minute batch per code -- codes x batches x 4
+    `as_of` calls per two-second round, each one a lock, a connection and a validation of
+    the generation's whole manifest. The snapshot is read where the first of those calls
+    used to be, so a registry that cannot be read still refuses as that code's lookup did.
+    """
+
+    def __init__(
+        self,
+        registry: ReferenceRegistry,
+        *,
+        keys: tuple[str, ...],
+        generation_id: str,
+    ) -> None:
+        self._registry = registry
+        self._keys = keys
+        self._generation_id = generation_id
+        self._snapshot: ReferenceAsOfSnapshot | None = None
+
+    def as_of(
+        self,
+        *,
+        dataset_id: str,
+        key: str,
+        event_time: datetime,
+        decision_time: datetime,
+    ) -> ReferenceLookup:
+        if self._snapshot is None:
+            self._snapshot = self._registry.as_of_snapshot(
+                dataset_ids=_REFERENCE_DATASETS,
+                keys=self._keys,
+                generation_id=self._generation_id,
+            )
+        return self._snapshot.as_of(
+            dataset_id=dataset_id,
+            key=key,
+            event_time=event_time,
+            decision_time=decision_time,
+        )
+
+
 class PaperExecutionConstraintProducer:
     """Build and atomically publish broker constraints without future evidence."""
 
@@ -138,6 +188,11 @@ class PaperExecutionConstraintProducer:
             trade_date=validated.trade_date,
             observed_at=observed_at,
         )
+        references = _RequestReferences(
+            self.reference_registry,
+            keys=validated.ts_codes,
+            generation_id=validated.reference_generation_id,
+        )
         records: list[PaperExecutionConstraintSnapshot] = []
         for ts_code in validated.ts_codes:
             code_evidence = minute_evidence.get(ts_code, ())
@@ -151,6 +206,7 @@ class PaperExecutionConstraintProducer:
                     trade_date=validated.trade_date,
                     evidence=code_evidence,
                     observed_at=observed_at,
+                    references=references,
                     reference_generation_id=validated.reference_generation_id,
                     reference_published_at=manifest.published_at,
                 )
@@ -249,6 +305,7 @@ class PaperExecutionConstraintProducer:
         trade_date: date,
         evidence: tuple[_MinuteEvidence, ...],
         observed_at: datetime,
+        references: _RequestReferences,
         reference_generation_id: str,
         reference_published_at: datetime,
     ) -> tuple[PaperExecutionConstraintSnapshot, ...]:
@@ -259,6 +316,7 @@ class PaperExecutionConstraintProducer:
                     "reference generation was not visible when minute evidence arrived"
                 )
             state = self._reference_state(
+                references=references,
                 ts_code=ts_code,
                 event_time=minute.trade_time,
                 decision_time=minute.available_at,
@@ -317,44 +375,41 @@ class PaperExecutionConstraintProducer:
     def _reference_state(
         self,
         *,
+        references: _RequestReferences,
         ts_code: str,
         event_time: datetime,
         decision_time: datetime,
         generation_id: str,
     ) -> _ReferenceState:
         try:
-            st = self.reference_registry.as_of(
+            st = references.as_of(
                 dataset_id=ReferenceDataset.ST_STATUS,
                 key=ts_code,
                 event_time=event_time,
                 decision_time=decision_time,
-                generation_id=generation_id,
             )
-            suspension = self.reference_registry.as_of(
+            suspension = references.as_of(
                 dataset_id=ReferenceDataset.SUSPENSION_STATUS,
                 key=ts_code,
                 event_time=event_time,
                 decision_time=decision_time,
-                generation_id=generation_id,
             )
-            price_limit = self.reference_registry.as_of(
+            price_limit = references.as_of(
                 dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
                 key=ts_code,
                 event_time=event_time,
                 decision_time=decision_time,
-                generation_id=generation_id,
             )
         except ReferenceDataUnavailableError as exc:
             raise PaperExecutionConstraintEvidenceError(
                 f"{ts_code} required reference evidence is unavailable"
             ) from exc
         try:
-            listing = self.reference_registry.as_of(
+            listing = references.as_of(
                 dataset_id=ReferenceDataset.LISTING_STATUS,
                 key=ts_code,
                 event_time=event_time,
                 decision_time=decision_time,
-                generation_id=generation_id,
             )
         except ReferenceDataUnavailableError as exc:
             raise PaperExecutionConstraintEvidenceError(
