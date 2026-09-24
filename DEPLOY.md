@@ -20,7 +20,10 @@ unit。改了什么见 CHANGELOG `[Unreleased]/Fixed` 的「包 AI」一条。
   （实例目录名是 `svc-<哈希>`，按文件里的 `service_id` 找）。
 - 如果装配仍然被拒，心跳的 `degraded_reasons` 是 `auction_gap_input_unavailable:AuctionGapCandidateInputError`，
   **原因原文在 `degraded_detail`**；超过 5% 的代码缺日线时原文是 `... N of M auction codes lack it, more than 5% ...`，
-  那说明副本少了一个交易日，要查日终管线，不是改阈值。
+  某个交易所超过 5% 时是 `... N of M BJ auction codes lack it ...`（SH / SZ 同理）。两种都说明副本少了一个交易日
+  （或少了一个交易所的一天），要查日终管线，不是改阈值。
+- 三个策略的心跳里有 `observations.strategy_skipped_candidates`：最新一个特征批次里因行情过期（STALE）或必需特征
+  缺失而没评估的候选数。持仓那只停牌或断流时这里会是非零，出场评估要等它的行情恢复。
 - 模拟盘约束不再出现 `listing classification market is missing`；第一批分钟线之后 `authorities/paper-execution`
   有 current 指针，serving 在收到第一条信号后切出当日代。
 - 某只候选分钟线停更时，策略心跳不再出现 `exceeds max_delay_seconds without stale status`；第一条入场信号之后也不再
@@ -44,7 +47,9 @@ unit。改了什么见 CHANGELOG `[Unreleased]/Fixed` 的「包 AI」一条。
 
 **回滚**：与 v0.33.21 同一条路径，**外加一步挪心跳**：本包给心跳文件加了 `observations` 与 `degraded_detail` 两个字段，
 心跳模型是 `extra="forbid"`，旧代码读到新心跳会报 `runtime heartbeat is invalid` 而起不来（与 #231 那一包同一类，
-见下文「①b 为什么是必须的」）。所以回滚前先停 unit，再把 `$ROOT/control/*/*/heartbeats/*.json` 挪走留档。
+见下文「①b 为什么是必须的」）。新代码**每个 role 的每一份心跳**都写这两个键（值为空时也写），独立复核实测过
+v0.33.21 连默认值的心跳也拒收，所以这一步对**所有** role 都必须做：回滚前先停 unit，再把
+`$ROOT/control/*/*/heartbeats/*.json` 挪走留档。
 参考注册表里新代码写的 LISTING_STATUS 多四个键，旧代码照读（载荷是自由映射，auction_gap 只读 `status`）；特征契约与
 策略注册指纹的变化与每次发版改 `producer_commit` 带来的变化相同，生产输入文档照常按目标提交重新生成。
 
