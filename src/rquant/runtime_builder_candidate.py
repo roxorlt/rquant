@@ -674,6 +674,9 @@ def candidate_publisher_builder(
         #: 本进程最近一次发出的批次留下的计数（例如缺五日日线被排除的竞价代码数）。窗外与
         #: 已发之后的空闲轮照抄它，否则 09:49 之后心跳上就再也看不到当天排除了几只。
         last_observations: Mapping[str, int] = MappingProxyType({})
+        #: 上面那份计数属于哪个交易日。进程跨夜不重启时，次日窗口之前的空闲轮不能还报昨天
+        #: 的排除数（复核 S4）：本地日期一变就清空，直到当天第一次装配再写。
+        observations_trade_date: date | None = None
 
         def _replica_cost() -> dict[str, object]:
             """What **this** iteration did with the replica, for the heartbeat (#256).
@@ -695,6 +698,7 @@ def candidate_publisher_builder(
 
         def step() -> RuntimeStepResult:
             nonlocal published_trade_date, last_output_sequence, last_observations
+            nonlocal observations_trade_date
 
             def idle_result(
                 degraded_reasons: tuple[str, ...] = (),
@@ -762,6 +766,9 @@ def candidate_publisher_builder(
                 observed_at = normalize_aware_utc(clock())
                 local = observed_at.astimezone(_SHANGHAI)
                 local_time = local.timetz().replace(tzinfo=None)
+                if observations_trade_date != local.date():
+                    last_observations = MappingProxyType({})
+                    observations_trade_date = None
                 #: 与 auction-match 的采集窗共用同一份整秒算术（复核代码质量 1）
                 if not local_window_contains(
                     local_time,
@@ -806,6 +813,7 @@ def candidate_publisher_builder(
                             codes=", ".join(incomplete),
                         )
                     last_observations = MappingProxyType(observations)
+                    observations_trade_date = local.date()
                     loaded = loaded.batch
             else:
                 if settings.candidate_input_path is None:

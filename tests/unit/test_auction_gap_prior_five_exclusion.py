@@ -289,3 +289,27 @@ def test_a_refused_round_names_the_class_and_carries_the_message(tmp_path: Path)
         "(caused by OSError: replica went away)"
     )
     assert dict(result.observations) == {}
+
+
+def test_the_carried_count_is_cleared_when_the_local_trade_date_changes(tmp_path: Path) -> None:
+    """Review S4: a publisher that survives the night must not show yesterday's count."""
+
+    assembly = _assemble(tmp_path / "world", sessions_per_code=SHORT)
+    clock = {"now": datetime(2026, 7, 31, 1, 40, tzinfo=UTC)}
+    step = candidate_publisher_builder(
+        auction_input_loader=lambda **_: assembly,
+        clock=lambda: clock["now"],
+    )(_auction_manifest(tmp_path / "publisher"))
+
+    published = step()
+    #: 23:59 the same local day: still that day's count
+    clock["now"] = datetime(2026, 7, 31, 15, 59, tzinfo=UTC)
+    late_same_day = step()
+    #: 00:01 the next local day, before its window: nothing measured yet today
+    clock["now"] = datetime(2026, 7, 31, 16, 1, tzinfo=UTC)
+    next_day = step()
+
+    assert dict(published.observations) == {PRIOR_FIVE_INCOMPLETE_OBSERVATION: 6}
+    assert dict(late_same_day.observations) == {PRIOR_FIVE_INCOMPLETE_OBSERVATION: 6}
+    assert dict(next_day.observations) == {}
+    assert next_day.output_sequence == published.output_sequence
