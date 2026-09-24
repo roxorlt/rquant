@@ -6,6 +6,18 @@
 
 ### Added
 
+- **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
+  （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
+  竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
+  通知只走影子档、真实 provider 一次都不会被调用。对生产**只读**：生产文件只用 `open(rb)` 读、副本只
+  `ATTACH ... (READ_ONLY)`，加一个审计钩子拒绝保护路径下的任何写、改名、chmod、删除，读前读后逐个比对 stat；
+  沙箱与生产路径重叠时直接拒（退出码 2）。`summary.json` 按 role 列出轮数、失败与降级原因、首次产出时刻，以及候选、
+  分钟线、特征、信号、模拟盘、通知 outbox 与 serving 当日代的计数。`--dry-plan` 只列计划、什么都不写；
+  `--generations 2` 连上一代与 rollout 计划一起装。退出码 0 表示出了当日 serving 代、通知只走影子、没有 role 崩、
+  生产没被碰。同包修了测试辅助：root 属主的祖先目录（主机的 `/` 是 0555）按生产的 `(0, None)` 规则记，而不是
+  记下观察到的精确 mode——否则在主机上一跑就被 `deployment lock ancestor / is unsafe` 拒掉。本版的热修 AI、AJ
+  都是用它在主机上回放 2026-09-24 找到的。**没有 `src/` 改动**。
+
 - **notifier 影子档：写库、出 `signals` 权威、不发一个字节（#281）**：`notifier.admin.shadow.v1`
   的 `"paused": True` 原来硬编码在 `runtime_production_profile.py` 里，要让一条信号走到
   serving 的 `signals` 数据集只能改代码重新发版。现在它是画像输入
@@ -122,6 +134,12 @@
   bootstrap worktree。
 
 ### Changed
+
+- deploy(nginx): `deploy/nginx/rquant-backup.conf` 加 `location /preview/`（新版看板预览，路线 A，读
+  `RQUANT_SERVING_ROOT` 指向的 serving 代，只读），反代 Streamlit `127.0.0.1:8509`（lighthouse 进程，非 systemd），
+  与 `/dashboard/` 共用 htpasswd。owner 2026-09-24 授权「nginx 加登录路径」，主机上 09-24 21:42 已生效（备份
+  `/root/rquant-backup.conf.bak-20260924-preview`）；本版只把同一块逐字写回仓库，装机只核对仓库与主机文件 `diff` 为空，
+  见 DEPLOY.md
 
 - deploy(systemd): raise rquant-live-runtime.slice CPUQuota 60%→200% (owner-authorized "cpu可以调到2个", issue #297). Pre-market 2026-09-24, cpu.stat nr_throttled went from 9,610 (00:28) to 127,336 (10:42) — ~26% of wall time throttled — while the 20 Route A roles shared 0.6 CPU on a 4-core host that was ~85% idle, and the reference-slow publisher's ~26MB registry commit could not finish inside its 5s visibility guard, so that day's reference generation was never published. Neither parent slice (rquant-live.slice, rquant.slice) carries a CPUQuota, so 200% fits; MemoryHigh and every other limit are unchanged. Already applied on the host via `systemctl set-property` at 10:42; this only persists it to the repo — see DEPLOY.md for the install steps
 
