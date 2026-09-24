@@ -14,11 +14,16 @@ schema for a channel the serving publisher consumes), and nothing about the rele
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from rquant.runtime_contracts import canonical_sha256
+from rquant.runtime_deployment_bundle import (
+    acknowledge_runtime_schema_rollout_preparation,
+    load_runtime_schema_service_bindings,
+)
 from rquant.runtime_deployment_profile import install_runtime_deployment_profile
 from rquant.runtime_schema_registry import (
     RuntimeSchemaConsumerBinding,
@@ -26,6 +31,7 @@ from rquant.runtime_schema_registry import (
     SchemaField,
     changed_runtime_schema_channel_ids,
 )
+from rquant.schema_compatibility import RolloutPhase
 from tests.unit.test_runtime_deployment_profile import (
     COMMIT,
     _disable_test_credential_sealer,
@@ -37,6 +43,12 @@ from tests.unit.test_runtime_schema_registry import (
     _bundle,
     _replace_channel,
     _replace_declaration,
+)
+from tests.unit.test_runtime_schema_rollout_acknowledge import (
+    Rollout,
+    _run_cli,
+    isolated_root_credential_sealer,  # noqa: F401 - autouse fixture, imported to apply here
+    rollout,  # noqa: F401 - the host's 09-24 generation, with its pre-#228 plans
 )
 
 MARKET_MINUTE = "runtime.market_minute.batch-envelope"
@@ -177,3 +189,59 @@ def test_installing_a_release_with_unchanged_shapes_stages_zero_plans(
     assert second.schema_rollout_plan_ids == ()
     rollouts = root / "control" / "schema-rollouts"
     assert not rollouts.exists() or not any(rollouts.iterdir())
+
+
+def test_close_unchanged_previews_then_closes_the_current_generation_s_old_plans(
+    rollout: Rollout,  # noqa: F811 - the fixture imported above
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The command the coordinator runs on the host: `--dry-run` first, then the apply.
+
+    The fixture is the host's 09-24 generation: every two-sided channel carries a plan the
+    pre-#228 installer staged, the installer's acknowledgement has carried them to
+    DUAL_WRITE, and the generation is current — the one case where closing a plan reaches a
+    running producer, which is why the report says so per plan.
+    """
+
+    #: the CLI stamps its own clock, so the acknowledgement has to precede it
+    acknowledge_runtime_schema_rollout_preparation(rollout.root, now=datetime.now(UTC))
+    before = rollout.digest()
+    root = str(rollout.root)
+
+    preview = _run_cli(
+        ["runtime-schema-rollout", "close-unchanged", "--runtime-root", root, "--dry-run"],
+        capsys,
+    )
+    assert preview["status"] == "dry_run"
+    assert preview["plans"] == len(rollout.plan_ids) == preview["closed"]
+    assert preview["closed_current_generation"] == len(rollout.plan_ids)
+    assert preview["schema_changed"] == 0
+    assert rollout.digest() == before
+    assert all(rollout.phase(plan_id) is RolloutPhase.DUAL_WRITE for plan_id in rollout.plan_ids)
+
+    applied = _run_cli(
+        ["runtime-schema-rollout", "close-unchanged", "--runtime-root", root], capsys
+    )
+    assert applied["status"] == "applied"
+    assert applied["closed"] == len(rollout.plan_ids)
+    assert {item["phase_after"] for item in applied["closures"]} == {"rollback"}
+    assert all(rollout.phase(plan_id) is RolloutPhase.ROLLBACK for plan_id in rollout.plan_ids)
+    assert (rollout.root / "current").readlink() == Path("generations") / rollout.generation_id
+
+    repeated = _run_cli(
+        ["runtime-schema-rollout", "close-unchanged", "--runtime-root", root], capsys
+    )
+    assert repeated["closed"] == 0
+    assert {item["skipped_reason"] for item in repeated["closures"]} == {"terminal"}
+
+    #: and the generation's producers are bound to nothing any more
+    for manifest in rollout.manifests:
+        assert (
+            load_runtime_schema_service_bindings(
+                rollout.root,
+                manifest=manifest,
+                generation_id=rollout.generation_id,
+                observed_at=datetime.now(UTC) + timedelta(days=3),
+            )
+            == ()
+        )
