@@ -393,7 +393,7 @@ def read_recorded_day(
     audit: ProductionAudit,
 ) -> RecordedDay:
     from rquant.runtime_market_session import MarketCalendarAuthority
-    from rquant.strict_json import strict_canonical_json_loads
+    from rquant.strict_json import strict_json_loads
 
     envelope, snapshot, reference_manifest = _read_reference(
         runtime_root, trade_date, reference_sequence, audit
@@ -403,7 +403,8 @@ def read_recorded_day(
         runtime_root / "authorities" / "market-calendar" / "generations" / f"{calendar_sha}.json"
     )
     calendar_bytes = audit.read_bytes(calendar_path)
-    calendar = MarketCalendarAuthority.model_validate(strict_canonical_json_loads(calendar_bytes))
+    #: the loader's own decoding (`load_market_calendar_authority`), not a canonical-form one
+    calendar = MarketCalendarAuthority.model_validate(strict_json_loads(calendar_bytes))
     if calendar.content_sha256 != calendar_sha:
         raise ReplayRefusedError("the calendar generation does not match the batch's calendar id")
     if trade_date not in calendar.open_dates:
@@ -421,6 +422,9 @@ def read_recorded_day(
         ("trade_calendar", "trade_calendar_path", "trade_calendar_sha256"),
         ("history", "historical_minutes_snapshot_path", "historical_minutes_snapshot_id"),
     ):
+        if not isinstance(document, dict) or not document.get(path_key):
+            keys = sorted(document) if isinstance(document, dict) else type(document).__name__
+            raise ReplayRefusedError(f"{production_inputs} names no {path_key} (keys: {keys})")
         source = Path(str(document[path_key]))
         payload = audit.read_bytes(source)
         observed = hashlib.sha256(payload).hexdigest()
@@ -480,6 +484,8 @@ def extract_replica(
     minute_sessions: int,
     synced_at: datetime,
     audit: ProductionAudit,
+    threads: int = 2,
+    memory_limit: str = "2GB",
 ) -> dict[str, Any]:
     """The replica as it stood before the session opened, and the session's minutes aside.
 
@@ -503,6 +509,9 @@ def extract_replica(
     counts: dict[str, int] = {}
     connection = duckdb.connect(str(target))
     try:
+        #: gentle on a host whose own services keep running beside the replay
+        connection.execute(f"SET threads = {int(threads)}")
+        connection.execute(f"SET memory_limit = '{memory_limit}'")
         connection.execute(f"ATTACH '{replica}' AS source_replica (READ_ONLY)")
         present = {
             str(row[0])
@@ -1073,28 +1082,39 @@ def _backdate(path: Path, when: datetime) -> None:
 
 
 def _history_before(payload: bytes, trade_date: date, target: Path) -> tuple[bytes, dict[str, Any]]:
-    """The sealed minute history, with nothing from the trade date or later in it."""
+    """The sealed minute history, with nothing from the trade date or later in it.
+
+    Only `trade_time` and `ts_code` are read to check it; the whole frame is loaded (and
+    rewritten through the production exporter's own writer) only when rows on or after
+    the trade date have to go, which changes the id the profile records.
+    """
 
     import io
 
+    import pyarrow.compute as compute
+    import pyarrow.parquet as parquet
+
+    table = parquet.read_table(io.BytesIO(payload), columns=["trade_time", "ts_code"])
+    facts: dict[str, Any] = {"rows": table.num_rows, "bytes": len(payload)}
+    if table.num_rows == 0:
+        return payload, facts
+    stamps = table.column("trade_time")
+    facts["first"] = compute.min(stamps).as_py()
+    facts["last"] = compute.max(stamps).as_py()
+    facts["codes"] = len(compute.unique(table.column("ts_code")))
+    last = facts["last"]
+    last_day = last.date() if isinstance(last, datetime) else last
+    if last_day < trade_date:
+        return payload, facts
     import pandas as pd
+    from export_intraday_snapshot import write_snapshot
 
     frame = pd.read_parquet(io.BytesIO(payload))
-    facts: dict[str, Any] = {"rows": len(frame), "bytes": len(payload)}
-    if len(frame):
-        stamps = pd.to_datetime(frame["trade_time"])
-        facts["first"] = stamps.min()
-        facts["last"] = stamps.max()
-        facts["codes"] = int(frame["ts_code"].nunique())
-        late = stamps.dt.date >= trade_date
-        if bool(late.any()):
-            from export_intraday_snapshot import write_snapshot
-
-            kept = frame[~late].reset_index(drop=True)
-            write_snapshot(kept, target)
-            facts["dropped_same_day_or_later_rows"] = int(late.sum())
-            return target.read_bytes(), facts
-    return payload, facts
+    late = pd.to_datetime(frame["trade_time"]).dt.date >= trade_date
+    kept = frame[~late].reset_index(drop=True)
+    write_snapshot(kept, target)
+    facts["dropped_same_day_or_later_rows"] = int(late.sum())
+    return target.read_bytes(), facts
 
 
 def build_world(
@@ -1189,6 +1209,7 @@ def build_world(
     route.receipt = receipt
     route.sealed_credentials = sealed
     route.stage_and_publish()
+    recorded.history = b""
     if generations == 2:
         acknowledge_runtime_schema_rollout_preparation(
             route.runtime_root, now=rollout_started_at + timedelta(seconds=37)
@@ -1867,6 +1888,7 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         if runner is not None:
             runner.stop_all()
         summary["production_audit"] = audit.finish()
+        summary["peak_rss_bytes"] = _peak_rss_bytes()
         summary["stage_seconds"]["total"] = round(time.monotonic() - wall_started, 2)
         summary["sandbox_bytes"] = _tree_bytes(sandbox)
         audit_ok = (
@@ -1892,6 +1914,14 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
     out(f"summary: {sandbox / 'summary.json'}")
     out(f"REPLAY {'OK' if exit_code == 0 else 'FAILED'}")
     return exit_code
+
+
+def _peak_rss_bytes() -> int:
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    #: kilobytes on Linux, bytes on macOS
+    return int(peak if sys.platform == "darwin" else peak * 1024)
 
 
 def _tree_bytes(root: Path) -> int:
