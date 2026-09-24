@@ -1119,6 +1119,36 @@ class LiveBatchSpool:
                 self._recover_publication_intent_locked(channel)
         return self._read_current(channel)
 
+    def current_sequence(self, channel: LiveChannel) -> int | None:
+        """The committed current pointer's sequence, without re-hashing the retained batches.
+
+        Only for reporting a position (a heartbeat's `input_sequence` / `output_sequence`) on
+        a path that reads no batch content (#298). `current()` re-reads and re-hashes every
+        retained payload -- up to 128 reference batches of ~3 MB each -- which an idle round
+        repeated all day cannot afford. A pending publication intent means the pointer may be
+        half-committed, so that case goes through `current()` and its writer recovery.
+        """
+
+        if self._intent_path(channel).exists():
+            pointer = self.current(channel)
+            return None if pointer is None else pointer.sequence
+        path = self._current_path(channel)
+        if not path.exists():
+            return None
+        try:
+            pointer = CurrentPointer.model_validate_json(
+                _secure_read_regular_file(
+                    path,
+                    label="current pointer",
+                    max_bytes=64 * 1024,
+                )
+            )
+        except (OSError, ValueError) as exc:
+            raise LiveSpoolIntegrityError("current pointer is invalid") from exc
+        if pointer.channel is not channel:
+            raise LiveSpoolIntegrityError("current pointer channel does not match its path")
+        return pointer.sequence
+
     def _read_current(self, channel: LiveChannel) -> CurrentPointer | None:
         path = self._current_path(channel)
         if not path.exists():

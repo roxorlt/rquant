@@ -33,7 +33,11 @@ from rquant.runtime_service_builtin import (
     AuctionMatchSourceSettings,
     auction_match_source_builder,
 )
-from rquant.runtime_service_control import RuntimeServicePlane
+from rquant.runtime_service_control import (
+    RuntimeServiceControl,
+    RuntimeServicePlane,
+    RuntimeServiceSpec,
+)
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
 from rquant.source_quota_store import SourceQuotaAttemptOutcome, SourceQuotaStore
 
@@ -724,6 +728,46 @@ def test_the_two_calendar_refusals_are_told_apart_by_the_shared_helper() -> None
 
     assert uncovered == ("calendar_uncovered:2026-08-10", False)
     assert regressed == ("calendar_clock_regressed:2026-07-30T08:00:00+00:00", True)
+
+
+def test_the_heartbeat_position_survives_the_midnight_rollover(tmp_path: Path) -> None:
+    """#298 同一类：换日那一轮把 `last_result` 重置成默认的 -1。
+
+    09-23 采到第 0 批之后，窗外各轮照抄 `last_result`，心跳一直是 0；零点换日那一轮原来
+    `last_result = RuntimeStepResult(source_generations=...)`，输出序号回到 -1，
+    `record_success` 抛「output sequence cannot regress」，进程退出、`OnFailure` 推一条。
+    这里用一个真的 `RuntimeServiceControl` 走过零点。
+    """
+
+    clock = _Clock(at(9, 29))
+    step = auction_match_source_builder(
+        adapter_factory=_Adapter,
+        clock=clock,
+    )(_manifest(tmp_path))
+    control = RuntimeServiceControl(
+        tmp_path / "control",
+        spec=RuntimeServiceSpec(
+            service_id="source.auction-match",
+            plane=RuntimeServicePlane.LIVE,
+            stale_after=timedelta(minutes=5),
+            producer_commit=COMMIT,
+        ),
+        clock=clock,
+    )
+    control.start()
+    positions: list[int] = []
+    for moment in (
+        at(9, 29),
+        at(15, 30),
+        at(23, 59, 59),
+        at(0, 0, 2, day=date(2026, 8, 1)),
+        at(8, 0, day=NEXT_TRADE_DATE),
+    ):
+        clock.now = moment
+        positions.append(control.record_success(step()).output_sequence)
+    control.stop(reason="test complete")
+
+    assert positions == [0, 0, 0, 0, 0]
 
 
 def test_an_idle_day_reports_nothing_at_all(tmp_path: Path) -> None:

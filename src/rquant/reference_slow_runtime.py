@@ -146,6 +146,28 @@ def _store_revision_scan_state(
     )
 
 
+def _idle_capture_result(
+    spool: LiveBatchSpool,
+    authority: MarketCalendarAuthority,
+) -> RuntimeStepResult:
+    """A round outside the capture window still reports where the spool already is (#298).
+
+    `RuntimeServiceControl.record_success` refuses a sequence lower than the one this process
+    reported before. The first round after 09:25 on the first day a capture succeeded
+    (2026-09-24) returned the default -1 after the in-window rounds had reported 0, raised
+    `input sequence cannot regress`, exited 1 and pushed the owner. `reference_slow` stays out
+    of `source_generations` here: the builder reads its presence as "today's batch is sealed".
+    """
+
+    sequence = spool.current_sequence(LiveChannel.REFERENCE_SLOW)
+    position = -1 if sequence is None else sequence
+    return RuntimeStepResult(
+        input_sequence=position,
+        output_sequence=position,
+        source_generations={"market_calendar": authority.content_sha256},
+    )
+
+
 def capture_reference_slow_batch(
     *,
     spool: LiveBatchSpool,
@@ -167,10 +189,10 @@ def capture_reference_slow_batch(
         raise ReferenceSlowRuntimeError("calendar is future evidence")
     local = observed.astimezone(_SHANGHAI)
     if local.date() not in authority.open_dates:
-        return RuntimeStepResult(source_generations={"market_calendar": authority.content_sha256})
+        return _idle_capture_result(spool, authority)
     local_time = local.timetz().replace(tzinfo=None)
     if local_time < _CAPTURE_START or local_time > _CAPTURE_END:
-        return RuntimeStepResult(source_generations={"market_calendar": authority.content_sha256})
+        return _idle_capture_result(spool, authority)
     if revision_lookback_sessions < 1 or revision_lookback_sessions > 20:
         raise ReferenceSlowRuntimeError("revision lookback must be between 1 and 20 sessions")
     if history_page_size < revision_lookback_sessions or history_page_size > 256:
@@ -395,7 +417,16 @@ def publish_reference_slow_batches(
         (decision_cutoff - started).total_seconds(),
     )
     if spool.current(LiveChannel.REFERENCE_SLOW) is None:
-        return RuntimeStepResult(source_generations={"market_calendar": authority.content_sha256})
+        #: an empty spool with a durable cursor is a regenerated source; the cursor is still
+        #: the furthest this consumer got, so the heartbeat never reads lower than it (#298)
+        with registry.publication_commit_lock():
+            empty_cursor = spool.load_cursor(consumer_id, LiveChannel.REFERENCE_SLOW)
+        position = -1 if empty_cursor is None else empty_cursor.last_sequence
+        return RuntimeStepResult(
+            input_sequence=position,
+            output_sequence=position,
+            source_generations={"market_calendar": authority.content_sha256},
+        )
     descriptor = spool.source_descriptor(LiveChannel.REFERENCE_SLOW)
     with registry.publication_commit_lock():
         pending = registry.pending_publication()

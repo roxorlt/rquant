@@ -24,7 +24,12 @@ from rquant.runtime_service_builtin import (
     market_minute_source_builder,
     watchlist_quote_source_builder,
 )
-from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
+from rquant.runtime_service_control import (
+    RuntimeServiceControl,
+    RuntimeServicePlane,
+    RuntimeServiceSpec,
+    RuntimeStepResult,
+)
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceKind,
     RuntimeServiceManifest,
@@ -1097,6 +1102,163 @@ def test_daily_close_source_is_built_from_the_allowlisted_tushare_capability(
     assert calls == [NOW.date()]
     assert result.processed_count == 1
     assert set(result.source_generations) == {"daily_close"}
+
+
+def test_daily_close_idle_round_after_a_capture_keeps_the_heartbeat_position(
+    tmp_path: Path,
+) -> None:
+    """#298 同一类：15:00 之后采到一批，零点之后第一轮原来返回默认的 -1。
+
+    `record_success` 拒绝回退的序号，进程退出、`OnFailure` 推一条——每个交易日的夜里一次。
+    """
+
+    calendar_path, calendar = _write_calendar(tmp_path / "calendar.json")
+    manifest = RuntimeServiceManifest(
+        service_id="daily-close.source.v1",
+        service_kind=RuntimeServiceKind.DAILY_CLOSE_SOURCE,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=60,
+        stale_after_seconds=3_600,
+        producer_commit=COMMIT,
+        settings={
+            "spool_root": str(tmp_path / "daily-close"),
+            "producer_version": "daily-close-source-v1",
+            "calendar_path": str(calendar_path),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": calendar.content_sha256,
+        },
+    )
+    now = [datetime(2026, 7, 31, 7, 10, tzinfo=UTC)]
+
+    def fetcher(request: object) -> object:
+        trade_date = request.trade_date  # type: ignore[attr-defined]
+        return {
+            "daily_bar": [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": trade_date,
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.9,
+                    "close": 10.1,
+                    "pre_close": 10.0,
+                    "change": 0.1,
+                    "pct_chg": 1.0,
+                    "vol": 1_000.0,
+                    "amount": 10_100.0,
+                }
+            ],
+            "daily_basic": [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": trade_date,
+                    "turnover_rate": 1.0,
+                    "volume_ratio": 1.2,
+                    "total_mv": 1_000_000.0,
+                    "circ_mv": 800_000.0,
+                }
+            ],
+            "adj_factor": [{"ts_code": "600000.SH", "trade_date": trade_date, "adj_factor": 1.0}],
+            "index_daily": [
+                {
+                    "ts_code": "000001.SH",
+                    "trade_date": trade_date,
+                    "open": 3_000.0,
+                    "high": 3_010.0,
+                    "low": 2_990.0,
+                    "close": 3_005.0,
+                    "pre_close": 3_000.0,
+                    "change": 5.0,
+                    "pct_chg": 0.17,
+                    "vol": 100_000.0,
+                    "amount": 300_000_000.0,
+                }
+            ],
+            "security_status": [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": trade_date,
+                    "name": "PF Bank",
+                    "is_st": False,
+                    "listing_status": "L",
+                }
+            ],
+            "suspension_status": [],
+        }
+
+    step = build_builtin_registry(
+        runtime_capabilities={"TUSHARE_TOKEN_MAIN": "tushare-secret"},
+        daily_close_fetcher=fetcher,
+        clock=lambda: now[0],
+    ).build(manifest)
+    control = RuntimeServiceControl(
+        tmp_path / "control",
+        spec=RuntimeServiceSpec(
+            service_id="daily-close.source.v1",
+            plane=RuntimeServicePlane.LIVE,
+            stale_after=timedelta(hours=1),
+            producer_commit=COMMIT,
+        ),
+        clock=lambda: now[0],
+    )
+    control.start()
+    positions: list[int] = []
+    for moment in (
+        datetime(2026, 7, 31, 7, 10, tzinfo=UTC),
+        datetime(2026, 7, 31, 12, 0, tzinfo=UTC),
+        datetime(2026, 7, 31, 16, 0, 30, tzinfo=UTC),
+        datetime(2026, 8, 1, 1, 0, tzinfo=UTC),
+    ):
+        now[0] = moment
+        positions.append(control.record_success(step()).output_sequence)
+    control.stop(reason="test complete")
+
+    assert positions == [0, 0, 0, 0]
+
+
+def test_market_minute_heartbeat_survives_a_stale_batch_then_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    """#298 同一类：分钟源一次取数失败发一个 STALE 批（新序号），下一次取回的内容与当前
+    PUBLISHED 批相同，走重复分支、答 `spool.current()`——低一号，`record_success` 拒收。
+    """
+
+    responses: list[object] = ["ok", RuntimeError("rt_min timed out"), "ok"]
+
+    class _FlakyAdapter(_Adapter):
+        def rt_min(self, codes: list[str], freq: str = "1min") -> pd.DataFrame:
+            response = responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return super().rt_min(codes, freq)
+
+    clock = _advancing_clock(NOW)
+    step = market_minute_source_builder(
+        adapter_factory=_FlakyAdapter,
+        universe_loader=lambda: ["600000.SH"],
+        clock=clock,
+    )(_manifest(tmp_path))
+    control = RuntimeServiceControl(
+        tmp_path / "control",
+        spec=RuntimeServiceSpec(
+            service_id="source.market-minute",
+            plane=RuntimeServicePlane.LIVE,
+            stale_after=timedelta(seconds=45),
+            producer_commit=COMMIT,
+        ),
+        clock=lambda: NOW,
+    )
+    control.start()
+    results = [step() for _ in range(3)]
+    positions = [control.record_success(result).output_sequence for result in results]
+    control.stop(reason="test complete")
+
+    records = LiveBatchSpool(tmp_path / "live").list_after(LiveChannel.MARKET_MINUTE, sequence=-1)
+    assert [record.envelope.quality_status for record in records] == [
+        BatchQualityStatus.PUBLISHED,
+        BatchQualityStatus.STALE,
+    ]
+    assert positions == [0, 1, 1]
 
 
 def test_builtin_registry_wires_shadow_to_its_production_session_boundary(

@@ -97,6 +97,23 @@ _TS_CODE_PATTERN = re.compile(r"^[0-9]{6}\.(?:BJ|SH|SZ)$")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _never_below(result: RuntimeStepResult, previous: RuntimeStepResult) -> RuntimeStepResult:
+    """Keep a heartbeat position at or above what this process already reported (#298).
+
+    A market-minute capture that fails mid-minute publishes a STALE batch under a new sequence;
+    the next fetch that returns the same window as the current PUBLISHED batch takes the
+    duplicate branch and answers with `spool.current()` -- one lower. `record_success` refuses
+    that (`output sequence cannot regress`) and the role exits.
+    """
+
+    return result.model_copy(
+        update={
+            "input_sequence": max(result.input_sequence, previous.input_sequence),
+            "output_sequence": max(result.output_sequence, previous.output_sequence),
+        }
+    )
+
+
 class MarketMinuteAdapter(Protocol):
     def rt_min(self, codes: list[str], freq: str = "1min") -> pd.DataFrame: ...
 
@@ -908,7 +925,13 @@ def auction_match_source_builder(
                 completed = False
                 capture_failed = False
                 capture_missed = False
-                last_result = RuntimeStepResult(source_generations=evidence)
+                #: 换日只清当天的留痕，**序号照抄**：`record_success` 拒绝回退的序号，而
+                #: 09-23 采到第 0 批之后，零点换日那一轮原来回到默认的 -1（#298 同一类）
+                last_result = RuntimeStepResult(
+                    input_sequence=last_result.input_sequence,
+                    output_sequence=last_result.output_sequence,
+                    source_generations=evidence,
+                )
             local_time = decision.observed_at.astimezone(_SHANGHAI).timetz().replace(tzinfo=None)
             now_seconds = seconds_of_day(local_time)
             exhausted = attempts >= settings.max_attempts
@@ -1162,7 +1185,7 @@ def market_minute_source_builder(
                 if universe_loader is None:
                     raise RuntimeError("market-minute universe loader is unavailable")
                 universe = _load_universe(universe_loader)
-            result = capture_current_universe(observed_at)
+            result = _never_below(capture_current_universe(observed_at), last_result)
             if not evidence:
                 last_result = result
                 return result
