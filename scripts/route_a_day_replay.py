@@ -1001,6 +1001,8 @@ class RoleRunner:
         saved = dict(os.environ)
         os.environ.clear()
         os.environ.update(state.environment)
+        if "HOME" in saved:
+            os.environ["HOME"] = saved["HOME"]
         started = time.perf_counter()
         try:
             alive = state.thread is not None and state.thread.is_alive() and state.crash is None
@@ -1063,6 +1065,8 @@ class RoleRunner:
             saved = dict(os.environ)
             os.environ.clear()
             os.environ.update(state.environment)
+            if "HOME" in saved:
+                os.environ["HOME"] = saved["HOME"]
             try:
                 state.baton.set()
                 state.thread.join(timeout=60)
@@ -1679,6 +1683,16 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
     os.environ["RQUANT_DISABLE_DOTENV"] = "1"
     if not os.environ.get("TUSHARE_TOKEN_MAIN"):
         os.environ["TUSHARE_TOKEN_MAIN"] = "replay-placeholder-token-000000000000"
+    #: `tests/conftest.py` does these two for the suite; this process imports the test
+    #: helpers without it. No delivery key of the operator's shell ever reaches `Settings`,
+    #: and legacy notification paths are off even if something reads them.
+    for name in [key for key in os.environ if key.startswith(("PUSHDEER", "PUSHPLUS"))]:
+        os.environ.pop(name)
+    os.environ["NOTIFY_ENABLED"] = "false"
+    #: anything that writes under `~` (git config lookups, a DuckDB extension autoload,
+    #: tushare's token file) lands in the sandbox; the roles get the same HOME
+    (sandbox / "home").mkdir(mode=0o700)
+    os.environ["HOME"] = str(sandbox / "home")
     for name, value in (
         ("DATA_DIR", sandbox / "scratch"),
         ("DUCKDB_PATH", sandbox / "scratch" / "rquant.duckdb"),
@@ -1687,6 +1701,24 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
     ):
         os.environ[name] = str(value)
     monkeypatch = pytest.MonkeyPatch()
+    #: The replay is not a systemd unit, whatever cgroup the operator's shell sits in: an SSH
+    #: session scope reads as no unit, but a shell inside some `*.service` (a panel's web
+    #: terminal, `systemd-run`) would make every credstore role refuse its credential as
+    #: "belongs to another unit" -- the reason `tests/conftest.py` points this probe away
+    #: for the suite (`_the_suite_is_not_a_runtime_unit`).
+    import rquant.runtime_capabilities as capabilities_module
+
+    host_facts = {
+        "platform": sys.platform,
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "root_mode": oct(os.stat("/").st_mode & 0o7777),
+        "cpu_count": os.cpu_count(),
+        "shell_systemd_unit": capabilities_module._systemd_unit_name(),
+    }
+    monkeypatch.setattr(
+        capabilities_module, "_SYSTEMD_CGROUP_PATH", sandbox / "not-a-systemd-unit" / "cgroup"
+    )
     audit = ProductionAudit(roots=tuple(Path(root) for root in protected))
     summary: dict[str, Any] = {
         "trade_date": trade_date,
@@ -1702,6 +1734,7 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             "runner": "in-process threads, one role at a time, no unit sandbox",
         },
         "stage_seconds": {},
+        "host": host_facts,
     }
     exit_code = 1
     runner: RoleRunner | None = None
