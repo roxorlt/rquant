@@ -1026,8 +1026,11 @@ def test_a_reopen_moves_the_later_phases_windows_too(rollout: Rollout) -> None:
     has its own clock, which starts at the producers' first dual-write record, so a plan the
     installer carried to DUAL_WRITE is not stopped by the clock before any producer has
     written — past the reopened window as much as inside it; what stops it is the evidence
-    rule. The stage is still bounded: see
-    `test_the_dual_write_window_opens_at_the_first_record_and_then_closes`.
+    rule. The stage is still bounded, from the first record on: see
+    `tests/integration/test_schema_rollout_no_op_plans_e2e.py::`
+    `test_a_bound_plan_accepts_monday_s_first_publish_and_then_refuses_before_publishing`
+    and `tests/unit/test_schema_compatibility.py::`
+    `test_expire_uses_the_dual_write_window_that_opens_at_the_first_record`.
     """
 
     acknowledge_runtime_schema_rollout_preparation(rollout.root, now=EXPIRED)

@@ -521,7 +521,7 @@ def test_two_generations_reach_a_same_day_generation_with_signals_past_the_rollo
     assert summary["world"]["schema_rollout"] == {
         "plans": 0,
         "receipt_plan_ids": 0,
-        "phases": {},
+        "phases_by_channel": {},
     }
     roles = summary["roles"]
     for label in ("market-minute.source.v1", "feature.intraday-pit.v1"):

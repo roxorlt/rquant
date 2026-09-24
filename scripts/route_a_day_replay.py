@@ -1103,22 +1103,28 @@ def _history_before(payload: bytes, trade_date: date, target: Path) -> tuple[byt
 
 
 def _schema_rollout_facts(runtime_root: Path, *, receipt: Any) -> dict[str, Any]:
-    """Every plan under the sandbox's `control/schema-rollouts`, by channel and phase."""
+    """Every plan directory under the sandbox's `control/schema-rollouts`, with its phase.
+
+    `plans` counts plan directories, not channels: two installs' plans on the same channel
+    are two plans. `phases_by_channel` lists each channel's plans' phases.
+    """
 
     from rquant.runtime_deployment_bundle import load_runtime_schema_rollout
 
     rollouts = runtime_root / "control" / "schema-rollouts"
-    plans: dict[str, str] = {}
-    if rollouts.is_dir():
-        for directory in sorted(rollouts.iterdir()):
-            authority, store = load_runtime_schema_rollout(
-                runtime_root, plan_id=directory.name, read_only=True
-            )
-            plans[authority.plan.dataset_id] = store.get_state(directory.name).phase.value
+    directories = sorted(rollouts.iterdir()) if rollouts.is_dir() else []
+    by_channel: dict[str, list[str]] = {}
+    for directory in directories:
+        authority, store = load_runtime_schema_rollout(
+            runtime_root, plan_id=directory.name, read_only=True
+        )
+        by_channel.setdefault(authority.plan.dataset_id, []).append(
+            store.get_state(directory.name).phase.value
+        )
     return {
-        "plans": len(plans),
+        "plans": len(directories),
         "receipt_plan_ids": len(receipt.schema_rollout_plan_ids),
-        "phases": plans,
+        "phases_by_channel": {channel: sorted(phases) for channel, phases in by_channel.items()},
     }
 
 

@@ -3949,6 +3949,9 @@ def _cmd_runtime_schema_rollout_close_unchanged(args: argparse.Namespace) -> int
     that is — one `current` is pointed back at, or one an older installer stages again — so
     that no producer of it is held to an expired dual-write window (#304). A plan whose shape
     really changed is reported and left alone. Idempotent; `--dry-run` writes nothing.
+
+    Exits 2 when any plan protects a real schema change (`schema_changed`), so a script or
+    an operator reading only the status stops there; 0 otherwise.
     """
 
     from rquant.runtime_deployment_bundle import close_unchanged_runtime_schema_rollouts
@@ -3958,6 +3961,7 @@ def _cmd_runtime_schema_rollout_close_unchanged(args: argparse.Namespace) -> int
         now=datetime.now(UTC),
         dry_run=bool(args.dry_run),
     )
+    schema_changed = [item for item in results if item.skipped_reason == "schema_changed"]
     print(
         json.dumps(
             {
@@ -3967,9 +3971,7 @@ def _cmd_runtime_schema_rollout_close_unchanged(args: argparse.Namespace) -> int
                 "closed_current_generation": len(
                     [item for item in results if item.closed and item.target_is_current]
                 ),
-                "schema_changed": len(
-                    [item for item in results if item.skipped_reason == "schema_changed"]
-                ),
+                "schema_changed": len(schema_changed),
                 "closures": [item.model_dump(mode="json") for item in results],
             },
             ensure_ascii=False,
@@ -3977,6 +3979,12 @@ def _cmd_runtime_schema_rollout_close_unchanged(args: argparse.Namespace) -> int
             sort_keys=True,
         )
     )
+    if schema_changed:
+        logger.error(
+            "schema rollout 有 %d 份计划保护的是真实的 schema 变化，本命令未动它们，需人工裁决",
+            len(schema_changed),
+        )
+        return 2
     return 0
 
 

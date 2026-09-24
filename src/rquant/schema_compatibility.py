@@ -1893,7 +1893,13 @@ class SchemaRolloutStore:
             self._load(connection, plan_id)
             return self._first_dual_write_at(connection, plan_id)
 
-    def validate_dual_write_time(self, plan_id: str, observed_at: AwareUtcDatetime) -> None:
+    def validate_dual_write_time(
+        self,
+        plan_id: str,
+        observed_at: AwareUtcDatetime,
+        *,
+        write_id: str | None = None,
+    ) -> None:
         """Refuse, before anything is published, a dual-write the store would refuse after.
 
         `record_dual_write_values` checks the plan's window at the moment it is called, and a
@@ -1903,11 +1909,25 @@ class SchemaRolloutStore:
         market-minute iteration). The same check, made on a read-only handle with the same
         `observed_at` before the publish, turns that into a refusal that leaves nothing
         behind. Readable read-only.
+
+        In the writer's order: a record the store already holds (`write_id`) is a retry, and
+        the writer accepts a retry before it looks at the clock, so this does too. Otherwise a
+        producer re-sending an identical older batch — the market-minute same-content
+        re-capture, `observed_at` = that batch's own `available_at` — would be refused here
+        with `rollout time cannot precede the current state` although the commit accepts it.
         """
 
         observed_at = normalize_aware_utc(observed_at)
         with self._connect() as connection:
             row, plan = self._load(connection, plan_id)
+            if write_id is not None and (
+                connection.execute(
+                    "SELECT 1 FROM schema_dual_write_value WHERE plan_id = ? AND write_id = ?",
+                    (plan_id, write_id),
+                ).fetchone()
+                is not None
+            ):
+                return
             phase = RolloutPhase(row["phase"])
             if phase not in {RolloutPhase.DUAL_WRITE, RolloutPhase.CONSUMER_ACK}:
                 raise ValueError("dual-write values require the dual_write phase")
