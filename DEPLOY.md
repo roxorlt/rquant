@@ -60,7 +60,9 @@ cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.
 ```
 
 4. 装上之后应该看到什么：代码这一侧见下面 AF 那条的「装上之后应该看到什么」（休市日与 09-28 09:25 之前
-   发布者每轮 `current reference generation is missing` 是预期的）；slice 这一侧，`systemctl cat
+   发布者每轮 `current reference generation is missing` 是预期的；09-28 可能多出一个目标日为 09-24 的修订批次；
+   此后每次发版后的第一个交易日约 09:22–09:25 serving 每轮报 `historical publication producer_commit is not
+   trusted`、09:25 起自动恢复，是已知限制 #300，09-28 是第一次发布、没有历史，不会出现）；slice 这一侧，`systemctl cat
    rquant-live-runtime.slice` 只剩仓库这一份 `CPUQuota=200%`，`/etc/systemd/system.control/` 下不再有
    `rquant-live-runtime.slice.d/50-CPUQuota.conf`。
 
