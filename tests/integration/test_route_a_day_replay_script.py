@@ -50,10 +50,21 @@ def _tree(root: Path) -> dict[str, tuple[int, int, int]]:
     }
 
 
-def _replica(path: Path) -> None:
+def _replica(
+    path: Path,
+    *,
+    codes: tuple[str, ...] = CODES,
+    prior_sessions: dict[str, int] | None = None,
+    day_minutes: dict[str, time] | None = None,
+) -> None:
+    """`prior_sessions[code]` keeps only that many of the five prior sessions' daily rows;
+    `day_minutes[code]` gives that code the day's minutes up to and including the time."""
+
     import duckdb
 
     prior = [day for day in OPEN_DATES if day < TARGET_DATE]
+    sessions = prior_sessions or {}
+    minutes_until = day_minutes if day_minutes is not None else {MINUTE_CODE: time(15, 0)}
     connection = duckdb.connect(str(path))
     try:
         connection.execute(
@@ -75,7 +86,11 @@ def _replica(path: Path) -> None:
         #: close; the extract must drop it
         connection.executemany(
             "INSERT INTO daily_bar VALUES (?, ?, 10.0, 200.0)",
-            [(code, day) for code in CODES for day in (*prior, TARGET_DATE)],
+            [
+                (code, day)
+                for code in codes
+                for day in (*prior[len(prior) - sessions.get(code, len(prior)) :], TARGET_DATE)
+            ],
         )
         connection.execute(
             "INSERT INTO screen_result VALUES (?, 'n-shape-pool1', ?, 'sample', 10.0, 1.0, "
@@ -84,11 +99,13 @@ def _replica(path: Path) -> None:
         )
         rows: list[tuple[Any, ...]] = []
         for day in (prior[-1], TARGET_DATE):
-            codes = CODES if day != TARGET_DATE else (MINUTE_CODE,)
-            for code in codes:
+            day_codes = CODES if day != TARGET_DATE else tuple(minutes_until)
+            for code in day_codes:
                 for session_start, count in ((time(9, 30), 120), (time(13, 0), 120)):
                     for step in range(count):
                         stamp = datetime.combine(day, session_start) + timedelta(minutes=step)
+                        if day == TARGET_DATE and stamp.time() > minutes_until[code]:
+                            continue
                         close = round(10.5 + 0.002 * step, 4)
                         rows.append(
                             (
@@ -172,7 +189,14 @@ def _history(path: Path, work: Path) -> bytes:
     return path.read_bytes()
 
 
-def _host(tmp_path: Path) -> dict[str, Path]:
+def _host(
+    tmp_path: Path,
+    *,
+    codes: tuple[str, ...] = CODES,
+    auction_price: dict[str, float] | None = None,
+    prior_sessions: dict[str, int] | None = None,
+    day_minutes: dict[str, time] | None = None,
+) -> dict[str, Path]:
     """The host's `data/` at fixture size, in the layout the script's defaults name."""
 
     import hashlib
@@ -187,7 +211,7 @@ def _host(tmp_path: Path) -> dict[str, Path]:
 
     data = tmp_path / "host" / "data"
     data.mkdir(parents=True)
-    runtime = _runtime_root(data)
+    runtime = _runtime_root(data, codes=codes, auction_price=auction_price)
     universe = runtime / "authorities" / "auction-universe" / "generations"
     universe.mkdir(mode=0o700, parents=True)
     (universe / ("a" * 64 + ".json")).write_text(
@@ -195,13 +219,13 @@ def _host(tmp_path: Path) -> dict[str, Path]:
             {
                 "effective_trade_date": TARGET_DATE.isoformat(),
                 "available_at": "2026-07-30T09:30:07Z",
-                "codes": list(CODES),
+                "codes": list(codes),
             }
         ),
         encoding="utf-8",
     )
     replica = data / "rquant_ro.duckdb"
-    _replica(replica)
+    _replica(replica, codes=codes, prior_sessions=prior_sessions, day_minutes=day_minutes)
     inputs = data / "runtime-inputs"
     inputs.mkdir()
     policy = build_routing_policy_payload(
@@ -355,3 +379,86 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     ), summary["roles"]
     #: the replica extract dropped the trade date's own daily row
     assert summary["world"]["replica"]["rows"]["daily_bar"] == 2 * 5
+
+
+#: 120 auction codes: the two the other cases use, the host's six without one daily row on
+#: each of the five prior sessions (2026-09-24: 920025.BJ 1, 601995.SH 1, 301686.SZ 2,
+#: 920229.BJ 2, 600825.SH 3, 600301.SH 3), and 112 that open below their pre-close and so
+#: are no auction_gap candidate. Six of 120 is the 5 % the assembly allows.
+WIDE_CODES = CODES + tuple(f"{600100 + index:06d}.SH" for index in range(118))
+SHORT_CODES = dict(zip(WIDE_CODES[2:8], (1, 1, 2, 2, 3, 3), strict=True))
+#: trades until 09:45 and never again: from 09:47 its newest bar is more than 60 s old in
+#: every feature batch, so it is STALE while MINUTE_CODE stays fresh
+STALE_CODE = CODES[1]
+
+
+def test_six_short_codes_and_a_stale_candidate_still_reach_a_same_day_generation_with_signals(
+    tmp_path: Path,
+) -> None:
+    """Package AI: the 2026-09-24 host blockers, at fixture size, with no stub at all.
+
+    On v0.33.21 this day stops at the first link: the six short codes refuse the whole
+    auction_gap batch (`auction_gap_input_unavailable` all window), so no candidate, no
+    minute universe, nothing downstream. Past that, the stale candidate would fail every
+    strategy round from 09:47 (F2), the first entry signal every round after it (F3), and
+    the reference-slow publisher's listing records would refuse every paper constraint (F1).
+    """
+
+    from rquant.feature_contracts import FeatureAvailability
+    from rquant.feature_spool import FeatureBatchSpool
+    from rquant.intraday_feature_engine import SOURCE_EVENT_LATE_REASON
+
+    host = _host(
+        tmp_path,
+        codes=WIDE_CODES,
+        auction_price={code: 9.9 for code in WIDE_CODES[8:]},
+        prior_sessions=SHORT_CODES,
+        day_minutes={MINUTE_CODE: time(15, 0), STALE_CODE: time(9, 45)},
+    )
+    before = _tree(host["data"])
+
+    result = _run(host, tmp_path / "replay", "--step-seconds", "60", "--until", "10:30")
+
+    output = result.stdout + result.stderr
+    (sandbox,) = (tmp_path / "replay").iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert result.returncode == 0, output[-6000:]
+    assert _tree(host["data"]) == before
+    assert summary["stubs"]["listing_classification"] == "off"
+    roles = summary["roles"]
+
+    #: 1. the six are left out and counted, the day is not refused, and nothing says degraded
+    candidate = roles["candidate.auction_gap.v1"]
+    assert candidate["observations"] == {"auction_gap_prior5_incomplete_codes": 6}
+    assert candidate["degraded_reasons"] == {}
+    assert candidate["errors"] == {}
+    assert summary["candidates_per_family"]["auction_gap"] == 2
+    assert summary["chain"]["market_minute"]["watchlist_codes_ever"] == 2
+
+    #: 2. the stale candidate is STALE in the last feature batch, and no strategy round failed
+    features = FeatureBatchSpool(
+        Path(summary["chain"]["serving"]["serving_root"]).parent / "live" / "features"
+    )
+    last = features.list_after(sequence=-1)[-1]
+    stale = last.envelope.field_status("latest_close", candidate_id=STALE_CODE)
+    fresh = last.envelope.field_status("latest_close", candidate_id=MINUTE_CODE)
+    assert stale is not None and stale.status is FeatureAvailability.STALE
+    assert stale.reason is not None and stale.reason.startswith(SOURCE_EVENT_LATE_REASON)
+    assert fresh is not None and fresh.status is FeatureAvailability.AVAILABLE
+    for label in ("strategy.auction_gap.v1", "paper-constraint.market.v1", "serving.publisher.v1"):
+        assert not any(
+            marker in message
+            for message in roles[label]["errors"]
+            for marker in ("max_delay_seconds", "listing classification", "prior-five")
+        ), (label, roles[label]["errors"])
+    assert roles["strategy.auction_gap.v1"]["total_failures"] == 0
+
+    #: 3. signals, paper, and a same-day serving generation that carries them
+    chain = summary["chain"]
+    assert chain["signals_per_strategy"]["auction_gap"] >= 1
+    assert chain["paper"]["paper_fill"] >= 1
+    serving = chain["serving"]
+    assert serving["same_day"] is True, serving
+    assert serving["signals_rows_today"] >= 1, serving
+    assert summary["notifier_provider_deliveries"] == 0
+    assert summary["verdict"]["crashed_roles"] == []
