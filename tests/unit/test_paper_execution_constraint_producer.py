@@ -605,3 +605,40 @@ def test_a_request_reads_the_reference_registry_once_however_many_minutes(
     assert len(publication.batch.records) == 4
     assert io.connections == 2
     assert sum("business_key IN" in statement for statement in io.statements) == 4
+
+
+def test_a_request_reads_the_generation_it_names_not_the_current_one(tmp_path: Path) -> None:
+    """The snapshot is of `reference_generation_id`, even after a newer generation lands."""
+
+    registry, first_generation = _complete_reference_registry(tmp_path)
+    registry.append(
+        ReferenceRecord(
+            dataset_id=ReferenceDataset.PRICE_LIMIT_REGIME,
+            key=CODE,
+            effective_from=DEFAULT_EFFECTIVE_FROM,
+            effective_to=DEFAULT_EFFECTIVE_TO,
+            revision=2,
+            source="test.reference",
+            first_available_at=_cn(9, 24, 20),
+            replacement_reason="exchange correction",
+            payload={"limit_up_price": 10.8, "limit_down_price": 9.2},
+        )
+    )
+    registry.publish(published_at=_cn(9, 24, 30))
+    spool = _minute_spool(tmp_path, ((31, 11.0),))
+
+    outcomes = [
+        _production_outcome(
+            tmp_path / label,
+            registry_path=registry.path,
+            spool=spool,
+            generation_id=first_generation,
+            observed_at=_cn(9, 31, 30),
+            per_lookup=per_lookup,
+        )
+        for label, per_lookup in (("bulk", False), ("per-lookup", True))
+    ]
+
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == "batch"
+    assert outcomes[0][1].records[0].buy_limit_locked is True  # type: ignore[union-attr]
