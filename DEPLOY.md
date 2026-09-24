@@ -5,6 +5,85 @@
 
 ---
 
+## 2026-09-24 · 待安装 · 参考慢源发布窗口只剩 09:25 一个期限，09:25 之后不再崩（#297、#298）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。09-25（中秋）到周末休市，**下一个交易日是
+2026-09-28（周一）**，所以当天装、当天用下面的演练脚本在主机上验证，周一 09:20 是第一次真跑。部署器
+09:15–15:10 会自动延期需要重启的发布，收盘后装。
+
+**现象**：09-24 源在 09:21 封好第 0 批，发布者 09:22:52 / 约 09:24:24 / 09:25:30 三次都被 5 秒可见保护拒掉
+（报成「completed after 09:25」），当天没有参考代；源 09:26:12 抛 `input sequence cannot regress` 退出、
+**推了一条**、被重启。修了什么见 CHANGELOG `[Unreleased] / Fixed` 的 #297、#298 一条。不改 `deploy/`，
+不改 spool、注册表、serving 权威的落盘格式（只是写进去的时刻与编号不同，见下）。`rquant-live-runtime.slice`
+的 `CPUQuota` 已由 owner 在 10:42 提到 200%，不是本包的改动。
+
+**09-24 留下的那一批**：`live/reference-slow/` 里的第 0 批（`producer_commit` = `304f6ed1`）没有发布过，
+新版本的发布者会**跳过它**（采集日已过），不需要手工清理。
+
+**装机前 / 装机后的主机演练（只写演练根，不碰生产注册表与 spool）**：
+
+```bash
+cd /home/lighthouse/rquant
+# 1) 发布照常：提交人为拖慢 10 秒，仍须在 09:25 可见地发布，09:29 的参考检查接受（退出码 0，最后一行 REHEARSAL OK）
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/lighthouse/rquant/src /home/lighthouse/rquant/.venv/bin/python \
+  /home/lighthouse/rquant/scripts/reference_slow_publish_rehearsal.py \
+  --runtime-root /home/lighthouse/rquant/data/runtime \
+  --rehearsal-root /home/lighthouse/rquant/var/rehearsal \
+  --slow-commit-seconds 10
+# 2) 截止照旧：09:24:30 起跑、提交拖慢 60 秒，必须拒成 "reference slow publisher completed after 09:25"
+#    并打印 "registry rolled back (no current generation): true"（退出码 1 是这一次的预期结果）
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/lighthouse/rquant/src /home/lighthouse/rquant/.venv/bin/python \
+  /home/lighthouse/rquant/scripts/reference_slow_publish_rehearsal.py \
+  --runtime-root /home/lighthouse/rquant/data/runtime \
+  --rehearsal-root /home/lighthouse/rquant/var/rehearsal \
+  --publisher-start 09:24:30 --slow-commit-seconds 60
+```
+
+装机前在另一个 checkout 里跑时，把 `PYTHONPATH` 和脚本路径换成那个 checkout（`rquant imported from ...`
+那一行会说实际导入的是哪一份）。第一条的输出里应该看到：`publisher rounds` 先是一轮
+`not yet: current reference generation is missing`（09:21:26 时重新封好的批次还不可见，可见时刻是
+09:20:58.52 + 30 秒），下一轮 `published`；`registry` 的 `first_available_at`、`pointer_switched_at`、
+`manifest_published_at` 都是 09:25:00（`2026-09-24T01:25:00Z`），`records_written` 约 33,336；
+`serving authority` 在 09:24:59.999999 不可见、09:25 可见；`auction_gap reference checks at 09:24:59` 是
+`refused: reference generation is future evidence`，09:29 那一次 `unavailable: {}`。它还会打印
+`ms_per_lookup` 和 `projected_seconds_for_all_codes`：这是 auction_gap 输入一轮花在参考查表上的时间
+（本机约 20 毫秒一次、全量约 7.5 分钟），**周一 ③a 之前值得看一眼**；加 `--full-auction-assembly` 会把整份
+输入真跑一遍并计时（与生产一轮一样长）。脚本以 lighthouse 读生产文件；若某个文件读不了，会以
+`REHEARSAL REFUSED: PermissionError ...` 退出。演练根留在 `/home/lighthouse/rquant/var/rehearsal/<时刻>-<随机>/`，
+看完可以删掉。
+
+**装上之后应该看到什么**：
+
+- **休市日（09-25 到 09-27）与 09-28 00:00–09:21 前后**：发布者 09:25 之前每一轮都失败，`last_error` 是
+  `current reference generation is missing`（注册表里一代都还没有、又没有可发的批次）；09:25 之后是
+  「started after 09:25」。**都是预期的**，不退出、不推送；backoff 封顶 20 秒。源在休市日报 `input_sequence=
+  output_sequence=0`，不崩。
+- **09-28 09:20**：源照 #293 那条采集；批次 `sequence` 是 **1**（第 0 批还在），`available_at` 是
+  `prepared_at + 30 秒`（原来是 5 秒）。
+- **批次可见之后的第一轮发布者**：心跳 `processed_count=1`、`input_sequence=output_sequence=1`、
+  `degraded_reasons=["expired_source_batch:0"]`（只有这一轮带，下一轮起是干净的）。
+  `authorities/reference-slow/reference.sqlite3` 的 `reference_current.switched_at` 与代的 `published_at`
+  都是当天 09:25:00（`01:25:00Z`），`reference_publication_receipt.completed_at` 不晚于它；
+  `live/reference-slow/serving-authority/current.json` 出现，`published_at` 同样是 01:25:00Z、`sequence` 为 1。
+  09:25 之前 serving 读到的仍是「没有参考代」，09:25 起读到当天这一代。
+- **若提交确实拖过了 09:25**：心跳报「reference slow publisher completed after 09:25」，注册表与游标都被补偿；
+  若只是超出承诺的可见时刻（新规则下不会发生），报「commit ended after its promised visibility instant (before 09:25)」。
+  源那边对应的两句是「atomic publication completed after 09:25」与「atomic publication ended after its promised
+  visibility instant (before 09:25)」。
+- **09:25:xx 起**：发布者每一轮「started after 09:25」（设计如此，一整天）。**源在 09:25 之后不再崩**：
+  `NRestarts` 保持 0，09:26 附近没有 `OnFailure` 推送，心跳 `input_sequence=output_sequence=1` 一整天。
+- **09:29 之后**：`candidate.auction_gap` 不再因为「required reference evidence is unavailable」整批拒；
+  但它一轮要做约 2.4 万次参考查表（见上），出结果可能要好几分钟。
+- **零点**：auction-match 源、daily-close 源换日那一轮不再抛「output sequence cannot regress」。**建议顺手查一下**
+  主机 journal 里 00:00 附近这两个 unit 有没有这条（代码上 09-23→09-24 的零点 auction-match 应该崩过一次，
+  除非当晚部署重启了它）。
+
+**回滚**：回到 v0.33.20 就回到 09-24 的行为（5 秒保护、09:26 崩一次推一条、被 09-24 那一批卡住）。新版本写出的
+注册表与 serving 权威 v0.33.20 读得懂（列与模型都没变），两处差别：代的 `published_at` 是 09:25 而不是
+`prepared_at + 5 秒`（旧读者不关心），serving 权威按代的祖先序号编号；**回滚之后第一个发布日**，旧版本主路径
+算出的编号更小，权威那一步会被拒成回滚，要等下一轮的恢复分支重建——下一轮若在 09:25 之后开始，当天就没有
+serving 参考权威（注册表那一代照样在）。所以**回滚最好在收盘后做，并且当晚就装回修好的版本**。
+
 ## 2026-09-23 · 待安装 · 参考慢源第一次能发布（#293）
 
 **状态**：**尚未安装**。本条是安装前必读，不是部署记录。
