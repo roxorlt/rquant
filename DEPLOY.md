@@ -5,6 +5,79 @@
 
 ---
 
+## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ `rquant-live-runtime.slice` CPUQuota 200%
+
+**状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；两处改动各自的背景、预期与细节在紧接着的
+两条里（「rquant-live-runtime.slice CPUQuota 提额」与「参考慢源发布窗口只剩 09:25 一个期限」）。
+
+**这一版装的是两处改动**：
+
+| 改动 | 落在哪 | 细节 |
+|---|---|---|
+| 热修 AF：参考慢源当天的记录、代、指针一律在 09:25 可见，唯一期限就是 09:25；源的保护时间 5 秒 → 30 秒；09:25 之后源不再崩（#298），auction-match / daily-close 零点换日与 market-minute STALE 之后的同类序号回退一起修；跳过 09-24 留下的过期批次；第二个交易日的 serving 权威不再被当成回滚 | `src/rquant/` 六个模块 + `scripts/reference_slow_publish_rehearsal.py` | 下面「参考慢源发布窗口只剩 09:25 一个期限」一条 |
+| `rquant-live-runtime.slice` 的 `CPUQuota` 60% → 200%（owner 2026-09-24 授权「cpu可以调到2个」；主机 10:42 已用 `set-property` 生效，本版把同样的值写回仓库） | `deploy/systemd/rquant-live-runtime.slice`，`src/rquant/workload_isolation.py` 里的镜像 | 下面「rquant-live-runtime.slice CPUQuota 提额」一条 |
+
+**slice 文件为什么要手工装**：diff 里有 `deploy/systemd/`，`scripts/deploy-production.sh` 按设计拒收
+（`docs/production-release.md`「自动拒绝」），CLAUDE.md 也把 `deploy/systemd/` 列为要 owner 单独授权的改动。
+与 09-20、09-21 两次 slice 提额一样，slice 文件手工装；owner 授权的是 200% 这个值，装机这一步照例由协调者
+向 owner 确认后执行。
+
+**时间**：收盘后装（部署器在工作日 09:15–15:10 会延期需要重启的发布）。09-25（中秋）到 09-27 休市，
+**下一个交易日是 2026-09-28（周一），09:20 是第一次真跑**。
+
+**步骤**：
+
+1. 代码切到 v0.33.21（按路线 A 窗口的做法）。
+2. 在主机上跑热修 AF 的两条演练（命令与逐行判据见下面 AF 那条）：第一条退出码 0、最后一行 `REHEARSAL OK`；
+   第二条退出码 1、拒成 `reference slow publisher completed after 09:25` 并打印
+   `registry rolled back (no current generation): true`。演练只写 `/home/lighthouse/rquant/var/rehearsal/`，
+   不碰生产注册表与 spool。
+3. 装 slice 文件。主机当前生效值已经是 200%，这一步只是让 `/etc/systemd/system/` 里的文件与生效值一致、
+   并去掉 10:42 留下的 drop-in；不停 role、不重启任何服务（10:42 的 `set-property` 也没有重启）。
+
+```bash
+# 0. 装前核对：在主机上解析新文件；确认核数（deploy/systemd/README.md 里 #243 的推演按 2 vCPU 写，
+#    09-24 的观测是 4 核，两者不一致时 README 那段 RPO 推演要重算）
+systemd-analyze verify /home/lighthouse/rquant/deploy/systemd/rquant-live-runtime.slice
+nproc
+
+# 1. 备份当前生效文件，再用仓库版本覆盖
+sudo cp /etc/systemd/system/rquant-live-runtime.slice \
+    /etc/systemd/system/rquant-live-runtime.slice.bak-20260924
+sudo cp /home/lighthouse/rquant/deploy/systemd/rquant-live-runtime.slice \
+    /etc/systemd/system/rquant-live-runtime.slice
+sudo systemctl daemon-reload
+
+# 2. 只删 10:42 那次 set-property 留下的这一个 drop-in（否则它优先级更高，文件改了不生效）
+sudo rm /etc/systemd/system.control/rquant-live-runtime.slice.d/50-CPUQuota.conf
+sudo systemctl daemon-reload
+
+# 3. 核对（读 cgroup 真值，不看 systemd 缓存）
+systemctl show -p CPUQuotaPerSecUSec rquant-live-runtime.slice
+    # 期望 CPUQuotaPerSecUSec=2s
+cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.max
+    # 期望 200000 100000
+```
+
+4. 装上之后应该看到什么：代码这一侧见下面 AF 那条的「装上之后应该看到什么」（休市日与 09-28 09:25 之前
+   发布者每轮 `current reference generation is missing` 是预期的）；slice 这一侧，`systemctl cat
+   rquant-live-runtime.slice` 只剩仓库这一份 `CPUQuota=200%`，`/etc/systemd/system.control/` 下不再有
+   `rquant-live-runtime.slice.d/50-CPUQuota.conf`。
+
+**回滚**（两处互相独立，可以只回其中一处）：
+
+- **代码（热修 AF）**：回到 v0.33.20 就回到 09-24 的行为（5 秒保护、09:26 崩一次推一条、被 09-24 那一批卡住）。
+  新版本写出的注册表与 serving 权威 v0.33.20 读得懂（列与模型都没变），但 serving 权威改成按代的祖先序号编号：
+  **回滚之后的第一个发布日**，旧版本主路径算出的编号更小，权威那一步会被拒成回滚，要等下一轮的恢复分支重建——
+  下一轮若在 09:25 之后开始，当天就没有 serving 参考权威（注册表那一代照样在）。所以**代码回滚在收盘后做，
+  并且当晚就装回修好的版本**。完整说明见下面 AF 那条的「回滚」。
+- **slice**：把第 3 步备份的 `/etc/systemd/system/rquant-live-runtime.slice.bak-20260924`（`CPUQuota=60%`）
+  覆盖回 `/etc/systemd/system/rquant-live-runtime.slice`，`sudo systemctl daemon-reload`，核对
+  `CPUQuotaPerSecUSec=600ms`、`cpu.max` 为 `60000 100000`；不涉及数据落盘，无需额外挪状态。只回 slice 不回代码
+  不会让 AF 失效（它只要求提交在 09:25 之前完成），但会回到 09-24 开盘前约 26% 墙钟时间被限流的状态。
+
+---
+
 ## 2026-09-24 · 待安装 · rquant-live-runtime.slice CPUQuota 提额（issue #297）
 
 **状态**：**尚未安装**。`deploy/systemd/rquant-live-runtime.slice` 的 `CPUQuota` 已于
@@ -23,28 +96,10 @@ checked-in 的 slice 文件，还没有装到服务器上——装上之前，�
 （issue #297）。父 slice `rquant-live.slice` 与 `rquant.slice` 都不设 `CPUQuota`，200% 能被
 完整吃下；`MemoryHigh` 与其余限额都不动。
 
-**本条只做仓库这一侧的持久化，不 SSH、不重启、不动 `.env`**；今晚随发布一起装机的步骤（与
-hotfix AF 合并安装，由集成方一次做）：
+**本条只做仓库这一侧的持久化，不 SSH、不重启、不动 `.env`**；装机命令只写在上面 v0.33.21 总览的
+第 3 步一处（与 hotfix AF 同一次装），这里不再重复一份，免得两处走样。
 
-```bash
-# 1. 备份当前生效文件，再用仓库版本覆盖
-sudo cp /etc/systemd/system/rquant-live-runtime.slice \
-    /etc/systemd/system/rquant-live-runtime.slice.bak-20260924
-sudo cp deploy/systemd/rquant-live-runtime.slice /etc/systemd/system/rquant-live-runtime.slice
-sudo systemctl daemon-reload
-
-# 2. 删掉 10:42 那次 set-property 留下的 drop-in（否则它优先级更高，文件改了不生效）
-sudo rm /etc/systemd/system.control/rquant-live-runtime.slice.d/50-CPUQuota.conf
-sudo systemctl daemon-reload
-
-# 3. 核对（读 cgroup 真值，不看 systemd 缓存）
-systemctl show -p CPUQuotaPerSecUSec rquant-live-runtime.slice
-    # 期望 CPUQuotaPerSecUSec=2s
-cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.max
-    # 期望 200000 100000
-```
-
-**回滚**：恢复上面备份的 `rquant-live-runtime.slice.bak-20260924`（`CPUQuota=60%`）覆盖回
+**回滚**：恢复装机时（总览第 3 步）备份的 `rquant-live-runtime.slice.bak-20260924`（`CPUQuota=60%`）覆盖回
 `/etc/systemd/system/rquant-live-runtime.slice` + `daemon-reload`；不涉及数据落盘，无需额外
 挪状态。
 
