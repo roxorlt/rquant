@@ -52,7 +52,7 @@ monitor current 2415 MiB、monitor peak 2814 MiB、backup peak 1303 MiB。父级
 |---|---:|---:|---:|---:|
 | `rquant.slice` | 100 / 100 | 3072 MiB | 12288 MiB | 不设 |
 | live | 1000 / 1000，**不设 `CPUQuota`** | 3072 MiB | 9216 MiB | 不设 |
-| live-runtime（live 的子 slice） | 100 / 100，`CPUQuota=60%` | 0 | 4096 MiB | 不设 |
+| live-runtime（live 的子 slice） | 100 / 100，`CPUQuota=200%` | 0 | 4096 MiB | 不设 |
 | serving | 500 / 500，`CPUQuota=30%` | 0 | 1536 MiB | 不设 |
 | research | 100 / 100，`CPUQuota=100%` | 0 | 512 MiB | 768 MiB |
 | maintenance | 300 / 50，不设 `CPUQuota` | 0 | **待校准，不设** | 不设 |
@@ -69,6 +69,18 @@ CPU 一列的 quota 与 maintenance 权重是 #243 / owner 裁决 21（2026-09-0
 约 13–16 分钟，撞上 15 分钟的触发间隔（systemd 不并发启动，这一跳等于被跳过 ⇒ 有效节奏
 退化成 30 分钟 ⇒ 最坏 RPO age ≈ 45 分钟 > 1800 秒）。现有实测负载（19 role + gzip 同跑时
 整机 load ≈1.9）离这个场景很远，但**装机后必须记录每轮实际时长**，见 DEPLOY.md 的观察项。
+
+**2026-09-24 owner 裁决（"cpu可以调到2个"，issue #297）：`live-runtime` 的 `CPUQuota` 从
+60% 提到 200%，上面「两个受限面之和 ≤ 一个核」的框架不再成立**：09-24 开盘前 20 个 Route A
+role 挤在 0.6 核里，`cpu.stat` 的 `nr_throttled` 从 00:28 的 9,610 涨到 10:42 的 127,336（开盘前
+约 26% 的墙钟时间在被限流，00:10 冷启动期间 CPU PSI 一度约 93%，首轮迭代耗时 22 分钟）；
+reference-slow publisher 约 26 MB 的 registry commit 来不及在 5s 可见性护栏内跑完，当天的
+reference 生成从未发布。同期主机整体仍有约 85% 空闲。live-runtime + serving 现在是
+200% + 30% = 230%，`rquant-live.slice` 与 `rquant.slice` 两个父 slice 都不设 `CPUQuota`，
+230% 能被完整吃下，因此本次不再要求两个受限面之和 ≤ 100%——这一框架本身建立在 #243（
+2026-09-08）「2 vCPU 主机」的估计之上；`DEPLOY.md` 里同一批记录写的也是「Intel Xeon Platinum
+8255C，2 vCPU」，与今天「4 核主机」的观测不一致，谁在部署这次改动时应先用 `nproc` /
+`/proc/cpuinfo` 在主机上确认核数，再判断这份「备份一定拿得到一核」的 RPO 推演是否需要重算。
 
 research 仍是精确 `CPUQuota=100%`，它与 maintenance 由 arbiter 跨 plane 互斥，永远不会和备份
 重叠。maintenance 在 `rquant.slice` 内部的权重从 50 提到 300（备份跑时 research 必然不在跑，
