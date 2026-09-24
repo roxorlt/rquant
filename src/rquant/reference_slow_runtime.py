@@ -14,7 +14,12 @@ from rquant.live_contracts import (
     ConsumerCursor,
     LiveChannel,
 )
-from rquant.live_spool import LiveBatchRecord, LiveBatchSpool, LiveSpoolIntegrityError
+from rquant.live_spool import (
+    LiveBatchRecord,
+    LiveBatchSpool,
+    LiveSpoolIntegrityError,
+    LiveSpoolVisibilityHorizonError,
+)
 from rquant.reference_data_registry import (
     ReferencePublicationDeadlineError,
     ReferencePublicationVisibilityError,
@@ -36,13 +41,27 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CAPTURE_START = time(9, 20)
 _CAPTURE_END = time(9, 25)
 _REVISION_SCAN_START = time(9, 24)
-_COMMIT_VISIBILITY_GUARD = timedelta(seconds=5)
+#: How long after `prepared_at` a source batch promises to be visible. The spool refuses a
+#: publication that becomes durable after `available_at`, so this is the time the batch
+#: write (payload, manifest, pointer, receipt, `ssh-keygen -Y sign`, fsyncs) gets. Five
+#: seconds held on 2026-09-24 with ~2.5 s to spare, in the same throttled slice where the
+#: publisher's five seconds did not (#297); a miss here is final for the day, because the
+#: quota ledger refuses a second same-day request. 30 s is >10x the observed write and costs
+#: the publisher nothing it could use: its own round needs about 80 s on the host to reach its
+#: completion receipt, so a batch sealed after ~09:23:30 could not be published in any case.
+#: Capped at the cutoff -- the source's `available_at` is never 09:25 by rule, because the
+#: publisher refuses future evidence and would then never start before the cutoff.
+_SOURCE_VISIBILITY_GUARD = timedelta(seconds=30)
 #: The two ways a publication attempt can end after it started, told apart in the heartbeat
 #: (#297): on 2026-09-24 a commit that missed its visibility guard at 09:22:52 and 09:24:24
 #: was reported with the second text, as if it had run past the cutoff.
 _PUBLISHER_AFTER_CUTOFF = "reference slow publisher completed after 09:25"
 _PUBLISHER_VISIBILITY_MISSED = (
     "reference slow publisher commit ended after its promised visibility instant (before 09:25)"
+)
+_SOURCE_AFTER_CUTOFF = "reference slow atomic publication completed after 09:25"
+_SOURCE_VISIBILITY_MISSED = (
+    "reference slow atomic publication ended after its promised visibility instant (before 09:25)"
 )
 
 SnapshotLoader = Callable[[], ReferenceSlowSourceSnapshot]
@@ -322,12 +341,12 @@ def capture_reference_slow_batch(
             "reference slow atomic availability precedes source evidence"
         )
     if prepared_at > decision_cutoff:
-        raise ReferenceSlowRuntimeError("reference slow atomic publication completed after 09:25")
+        raise ReferenceSlowRuntimeError(_SOURCE_AFTER_CUTOFF)
     monotonic_deadline = monotonic() + max(
         0.0,
         (decision_cutoff - prepared_at).total_seconds(),
     )
-    available_at = min(prepared_at + _COMMIT_VISIBILITY_GUARD, decision_cutoff)
+    available_at = min(prepared_at + _SOURCE_VISIBILITY_GUARD, decision_cutoff)
     current = spool.current(LiveChannel.REFERENCE_SLOW)
     sequence = 0 if current is None else current.sequence + 1
     envelope = BatchEnvelope(
@@ -367,11 +386,11 @@ def capture_reference_slow_batch(
             not_after=decision_cutoff,
             monotonic_deadline=monotonic_deadline,
         )
+    except LiveSpoolVisibilityHorizonError as exc:
+        raise ReferenceSlowRuntimeError(_SOURCE_VISIBILITY_MISSED) from exc
     except LiveSpoolIntegrityError as exc:
         if "deadline" in str(exc):
-            raise ReferenceSlowRuntimeError(
-                "reference slow atomic publication completed after 09:25"
-            ) from exc
+            raise ReferenceSlowRuntimeError(_SOURCE_AFTER_CUTOFF) from exc
         raise
     if revision_mode:
         assert revision_state is not None

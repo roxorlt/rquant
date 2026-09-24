@@ -825,3 +825,67 @@ def test_the_auction_gap_input_at_0929_accepts_a_generation_committed_slowly(
     assert fact.limit_up_price_session_raw == 12.0
     assert fact.available_at == at(9, 29)
     assert batch.authority.captured_at == at(9, 29)
+
+
+# ---------------------------------------------------------------------------------------
+# #297, source side: the batch write gets 30 s, and a miss says which bound it crossed
+# ---------------------------------------------------------------------------------------
+
+
+def _capture_with_write_taking(
+    spool: LiveBatchSpool,
+    clock: _Clock,
+    seconds: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> RuntimeStepResult:
+    original = spool.publish
+
+    def slow_publish(*args: object, **kwargs: object) -> object:
+        clock.now += timedelta(seconds=seconds)
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(spool, "publish", slow_publish)
+    prepared = clock.now
+    return capture_reference_slow_batch(
+        spool=spool,
+        calendar=_calendar(),
+        observed_at=prepared - timedelta(seconds=60),
+        producer_commit=COMMIT,
+        producer_version="test-v1",
+        snapshot_loader=lambda: _snapshot(captured_at=prepared - timedelta(seconds=30)),
+        completion_clock=clock,
+    )
+
+
+def test_a_source_batch_write_of_twenty_seconds_is_sealed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LiveBatchSpool(tmp_path / "spool")
+    clock = _Clock(at(9, 21))
+
+    result = _capture_with_write_taking(spool, clock, 20, monkeypatch)
+
+    assert result.processed_count == 1
+    (record,) = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1)
+    assert record.envelope.available_at == at(9, 21, 30)
+
+
+def test_a_source_batch_write_past_its_guard_or_the_cutoff_reads_differently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard_spool = LiveBatchSpool(tmp_path / "guard")
+    with pytest.raises(ReferenceSlowRuntimeError) as guard:
+        _capture_with_write_taking(guard_spool, _Clock(at(9, 21)), 31, monkeypatch)
+    assert str(guard.value) == (
+        "reference slow atomic publication ended after its promised visibility instant "
+        "(before 09:25)"
+    )
+    assert guard_spool.current(LiveChannel.REFERENCE_SLOW) is None
+
+    cutoff_spool = LiveBatchSpool(tmp_path / "cutoff")
+    with pytest.raises(ReferenceSlowRuntimeError) as cutoff:
+        _capture_with_write_taking(cutoff_spool, _Clock(at(9, 24, 50)), 11, monkeypatch)
+    assert str(cutoff.value) == "reference slow atomic publication completed after 09:25"
+    assert cutoff_spool.current(LiveChannel.REFERENCE_SLOW) is None
