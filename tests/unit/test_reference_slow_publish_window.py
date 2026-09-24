@@ -85,6 +85,8 @@ OPEN_DATES = (
     TARGET_DATE,
     NEXT_DATE,
     date(2026, 8, 4),
+    date(2026, 8, 5),
+    date(2026, 8, 6),
 )
 
 
@@ -120,11 +122,12 @@ def _snapshot(
     target_trade_date: date = TARGET_DATE,
     prior_trade_date: date = PRIOR_DATE,
     codes: tuple[str, ...] = ("300001.SZ",),
+    producer_commit: str = COMMIT,
 ) -> ReferenceSlowSourceSnapshot:
     return ReferenceSlowSourceSnapshot.create(
         target_trade_date=target_trade_date,
         captured_at=captured_at,
-        producer_commit=COMMIT,
+        producer_commit=producer_commit,
         source_snapshot_ids={
             "daily": "1" * 64,
             "security": "2" * 64,
@@ -889,3 +892,209 @@ def test_a_source_batch_write_past_its_guard_or_the_cutoff_reads_differently(
         _capture_with_write_taking(cutoff_spool, _Clock(at(9, 24, 50)), 11, monkeypatch)
     assert str(cutoff.value) == "reference slow atomic publication completed after 09:25"
     assert cutoff_spool.current(LiveChannel.REFERENCE_SLOW) is None
+
+
+# ---------------------------------------------------------------------------------------
+# A batch whose session ended unpublished must not hold the cursor; a batch not yet visible
+# ends the round instead of failing it
+# ---------------------------------------------------------------------------------------
+
+
+def _capture_session(
+    spool: LiveBatchSpool,
+    day: date = NEXT_DATE,
+    *,
+    producer_commit: str = COMMIT,
+) -> None:
+    prior = max(item for item in OPEN_DATES if item < day)
+    capture_reference_slow_batch(
+        spool=spool,
+        calendar=_calendar(),
+        observed_at=at(9, 20, day=day),
+        producer_commit=producer_commit,
+        producer_version="test-v2",
+        snapshot_loader=lambda: _snapshot(
+            captured_at=at(9, 20, 30, day=day),
+            target_trade_date=day,
+            prior_trade_date=prior,
+            producer_commit=producer_commit,
+        ),
+        completion_clock=lambda: at(9, 21, day=day),
+    )
+
+
+def test_a_batch_whose_session_ended_unpublished_does_not_hold_the_next_session(
+    tmp_path: Path,
+) -> None:
+    """2026-09-24's batch 0 was sealed and never published.
+
+    On 09-25 the publisher lists it first; publishing it is refused ("source evidence must
+    complete on its discovery session", and after tonight's release its producer_commit is
+    refused before that), so every round would have raised on it and batch 1 would never
+    have been published. It is passed over and named on the heartbeat instead.
+    """
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    _capture_session(spool)
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+    }
+
+    result = publish_reference_slow_batches(
+        observed_at=at(9, 22, day=NEXT_DATE),
+        completion_clock=lambda: at(9, 22, day=NEXT_DATE),
+        **common,
+    )
+
+    assert result.processed_count == 1
+    assert (result.input_sequence, result.output_sequence) == (1, 1)
+    assert result.degraded_reasons == ("expired_source_batch:0",)
+    cursor = consumer.load_cursor("reference-slow-publisher", LiveChannel.REFERENCE_SLOW)
+    assert cursor is not None and cursor.last_sequence == 1
+    (record,) = registry.records(dataset_id=ReferenceDataset.ST_STATUS, key="300001.SZ")
+    assert record.effective_from == datetime(2026, 8, 2, 16, tzinfo=UTC)
+    #: and the round after that is clean: the cursor is past the expired batch
+    after = publish_reference_slow_batches(
+        observed_at=at(9, 23, day=NEXT_DATE),
+        completion_clock=lambda: at(9, 23, day=NEXT_DATE),
+        **common,
+    )
+    assert after.degraded_reasons == ()
+    assert after.input_sequence == 1
+
+
+def test_an_expired_batch_from_the_previous_release_is_passed_over_before_its_commit_check(
+    tmp_path: Path,
+) -> None:
+    """Tonight's release changes `producer_commit`; 09-24's batch carries v0.33.20's."""
+
+    spool = LiveBatchSpool(tmp_path / "spool")
+    _capture_session(spool, TARGET_DATE, producer_commit="b" * 40)
+    _capture_session(spool)
+
+    result = publish_reference_slow_batches(
+        spool=_consumer(spool, tmp_path),
+        registry=_registry(tmp_path),
+        calendar=_calendar(),
+        consumer_id="reference-slow-publisher",
+        observed_at=at(9, 22, day=NEXT_DATE),
+        producer_commit=COMMIT,
+        completion_clock=lambda: at(9, 22, day=NEXT_DATE),
+    )
+
+    assert result.processed_count == 1
+    assert result.degraded_reasons == ("expired_source_batch:0",)
+
+
+def test_more_expired_batches_than_one_page_cannot_stall_the_cursor(tmp_path: Path) -> None:
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+        "page_size": 1,
+    }
+    publish_reference_slow_batches(
+        observed_at=at(9, 22), completion_clock=lambda: at(9, 22), **common
+    )
+    for day in (NEXT_DATE, date(2026, 8, 4), date(2026, 8, 5)):
+        _capture_session(spool, day)
+
+    result = publish_reference_slow_batches(
+        observed_at=at(9, 22, day=date(2026, 8, 5)),
+        completion_clock=lambda: at(9, 22, day=date(2026, 8, 5)),
+        **common,
+    )
+
+    assert result.processed_count == 1
+    assert (result.input_sequence, result.output_sequence) == (3, 3)
+    assert result.degraded_reasons == ("expired_source_batch:1", "expired_source_batch:2")
+
+
+def test_a_batch_not_yet_visible_ends_the_round_without_failing_it(tmp_path: Path) -> None:
+    """09-24 09:21:26: the round that listed the batch before it was visible raised."""
+
+    spool = _sealed_spool(tmp_path)
+    registry = _registry(tmp_path)
+    consumer = _consumer(spool, tmp_path)
+    common = {
+        "spool": consumer,
+        "registry": registry,
+        "calendar": _calendar(),
+        "consumer_id": "reference-slow-publisher",
+        "producer_commit": COMMIT,
+    }
+    publish_reference_slow_batches(
+        observed_at=at(9, 22), completion_clock=lambda: at(9, 22), **common
+    )
+    _capture_session(spool)
+    parsed: list[int] = []
+    original_snapshot = reference_slow_runtime._record_snapshot
+
+    def counted_snapshot(spool_arg: LiveBatchSpool, record: object) -> object:
+        parsed.append(record.envelope.sequence)  # type: ignore[attr-defined]
+        return original_snapshot(spool_arg, record)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(reference_slow_runtime, "_record_snapshot", counted_snapshot)
+        early = publish_reference_slow_batches(
+            observed_at=at(9, 21, 10, day=NEXT_DATE),
+            completion_clock=lambda: at(9, 21, 10, day=NEXT_DATE),
+            **common,
+        )
+
+    assert parsed == []
+    assert (early.processed_count, early.input_sequence, early.degraded_reasons) == (0, 0, ())
+    visible = publish_reference_slow_batches(
+        observed_at=at(9, 21, 30, day=NEXT_DATE),
+        completion_clock=lambda: at(9, 21, 30, day=NEXT_DATE),
+        **common,
+    )
+    assert (visible.processed_count, visible.input_sequence) == (1, 1)
+
+
+def test_a_published_batch_reaches_the_authority_when_the_next_one_is_not_yet_visible(
+    tmp_path: Path,
+) -> None:
+    spool = _sealed_spool(tmp_path)
+    capture_reference_slow_batch(
+        spool=spool,
+        calendar=_calendar(),
+        observed_at=at(9, 24),
+        producer_commit=COMMIT,
+        producer_version="test-v1",
+        snapshot_loader=lambda: pytest.fail("today's batch is already sealed"),
+        revision_snapshot_loader=lambda _target: _snapshot(
+            captured_at=at(9, 24, 5),
+            codes=("300001.SZ", "600000.SH"),
+        ),
+        revision_lookback_sessions=1,
+        completion_clock=lambda: at(9, 24, 10),
+    )
+    records = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1)
+    assert [record.envelope.available_at for record in records] == [at(9, 21, 30), at(9, 24, 40)]
+    registry = _registry(tmp_path)
+
+    result = publish_reference_slow_batches(
+        spool=_consumer(spool, tmp_path),
+        registry=registry,
+        calendar=_calendar(),
+        consumer_id="reference-slow-publisher",
+        observed_at=at(9, 24, 20),
+        producer_commit=COMMIT,
+        completion_clock=lambda: at(9, 24, 20),
+    )
+
+    assert (result.processed_count, result.input_sequence) == (1, 0)
+    authority = _authority(spool, at(9, 25))
+    assert authority.payload.reference_generation_id == registry.current_manifest().generation_id

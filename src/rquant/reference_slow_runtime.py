@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
@@ -412,6 +412,52 @@ def capture_reference_slow_batch(
     )
 
 
+def _publishable_records(
+    spool: LiveBatchSpool,
+    *,
+    after: int,
+    page_size: int,
+    started: datetime,
+    expired: list[int],
+) -> Iterator[LiveBatchRecord]:
+    """The unconsumed batches this round may publish, oldest first, one page of real work.
+
+    A batch captured on an earlier session can never be published: its discovery session is
+    over, `_publish_reference_slow_snapshot_with_rollback` refuses it ("source evidence must
+    complete on its discovery session"), and after a release its `producer_commit` is refused
+    first. Before this such a batch held the cursor for good -- 2026-09-24's batch 0 was sealed
+    and never published, so every 09-25 round would have raised on it and never reached batch
+    1. It is passed over here and named on the heartbeat (`expired_source_batch:<sequence>`);
+    the cursor moves past it with the next batch that is published. The check reads the
+    envelope only: passing a batch over publishes nothing, so it needs no verified payload.
+
+    A batch not yet visible at `started` ends the round instead of failing it (09-24 09:21:26,
+    "future evidence"): a later round takes it, and what this round did publish still reaches
+    the serving authority below. It is also checked before the payload is parsed, which on the
+    host was the expensive part of that failing round.
+    """
+
+    session = started.astimezone(_SHANGHAI).date()
+    listed_after = after
+    while True:
+        page = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=listed_after, limit=page_size)
+        yielded = False
+        for record in page:
+            envelope = record.envelope
+            listed_after = envelope.sequence
+            if envelope.source_time.astimezone(_SHANGHAI).date() < session:
+                expired.append(envelope.sequence)
+                continue
+            if envelope.available_at > started:
+                return
+            yielded = True
+            yield record
+        #: a page of nothing but expired batches is not work; keep paging past it so a run of
+        #: failed sessions longer than one page cannot stall the cursor either
+        if yielded or len(page) < page_size:
+            return
+
+
 def publish_reference_slow_batches(
     *,
     spool: LiveBatchSpool,
@@ -484,10 +530,13 @@ def publish_reference_slow_batches(
     generation_id: str | None = None
     authority_snapshot: ReferenceSlowSourceSnapshot | None = None
     authority_receipt: ReferenceSlowPublishReceipt | None = None
-    for record in spool.list_after(
-        LiveChannel.REFERENCE_SLOW,
-        sequence=last_sequence,
-        limit=page_size,
+    expired: list[int] = []
+    for record in _publishable_records(
+        spool,
+        after=last_sequence,
+        page_size=page_size,
+        started=started,
+        expired=expired,
     ):
         envelope = record.envelope
         if envelope.quality_status is not BatchQualityStatus.PUBLISHED:
@@ -496,8 +545,6 @@ def publish_reference_slow_batches(
             raise ReferenceSlowRuntimeError("reference slow batch producer_commit does not match")
         spool.verify_reference_source_record(record)
         snapshot = _record_snapshot(spool, record)
-        if envelope.available_at > started:
-            raise ReferenceSlowRuntimeError("reference slow source batch is future evidence")
         publication_id = canonical_sha256(
             {
                 "contract": "reference-slow-publication/v1",
@@ -706,6 +753,7 @@ def publish_reference_slow_batches(
         output_sequence=last_sequence,
         processed_count=processed,
         source_generations=generations,
+        degraded_reasons=tuple(f"expired_source_batch:{sequence}" for sequence in expired),
     )
 
 
