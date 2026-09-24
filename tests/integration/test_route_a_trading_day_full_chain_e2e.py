@@ -137,11 +137,12 @@ MINUTE_RECEIVED_AT = _at(9, 47, 11)
 #: when the candidate snapshots were captured: before the open, as a publisher that ran in
 #: its 08:45 window would have left them
 CANDIDATES_CAPTURED_AT = _at(8, 47, 11)
-#: The second install's schema rollout window. A producer records its dual-write with
-#: the *service's* clock and `SchemaRolloutStore` refuses a record outside
-#: `[started_at, deadline]`, so the window is opened at the market clock and early
-#: enough that the whole chain -- `HOP_CLOCKS`, 09:47:17 to 09:48:53 -- runs inside the
-#: profile's 600-second stage timeout.
+#: The second install's schema rollout start. It used to have to be opened at the market
+#: clock and early enough that the whole chain -- `HOP_CLOCKS`, 09:47:17 to 09:48:53 -- ran
+#: inside the profile's 600-second stage timeout, because the install staged a plan for
+#: every two-sided channel and every producer dual-wrote under it. Since #228 the install
+#: stages none (the two generations differ only in their commit), so nothing here depends on
+#: it any more; it is kept so the install and the acknowledgement run at the same instants.
 SCHEMA_ROLLOUT_STARTED_AT = _at(9, 44, 11)
 #: when the replica-sync timer last replaced the read-only replica the notifier reads
 REPLICA_SYNCED_AT = _at(9, 22, 47)
@@ -665,7 +666,7 @@ def build_trading_day_chain(
         producer_commit=world.commit,
         runtime_root=runtime_root,
         #: only the first install into an empty root may carry a bootstrap reason, and the
-        #: second install without one is what prepares the rollout plans
+        #: second install without one is what used to prepare the rollout plans
         schema_bootstrap_reason=None,
         #: one registry root cannot hold two commits' definitions (#225)
         definition_registry_root=runtime_root.parent / f"definitions-{world.commit[:7]}",
@@ -673,7 +674,9 @@ def build_trading_day_chain(
         schema_rollout_started_at=SCHEMA_ROLLOUT_STARTED_AT,
     )
     assert receipt.previous_generation_hash is not None
-    assert receipt.schema_rollout_plan_ids
+    #: no channel's shape moved, so no plan (#228) and no producer bound to a dual-write
+    #: window it would have to carry through the session (#304)
+    assert receipt.schema_rollout_plan_ids == ()
 
     #: `_production_bundle` relocates every external input under `<runtime root>/../external`
     #: and the roles read the relocated paths, so the documents the profile carries only a
