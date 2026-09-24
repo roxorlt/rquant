@@ -41,17 +41,20 @@ _REFERENCE_DATASETS = (
     ReferenceDataset.LISTING_STATUS,
     ReferenceDataset.PRICE_LIMIT_REGIME,
 )
-#: The largest share of the day's auction codes that may be left out for lacking exactly
-#: one `daily_bar` row on each of the five prior sessions before the snapshot itself is
-#: distrusted and the whole batch refused.
+#: The largest share of the auction codes -- of the whole day's, and of each exchange's --
+#: that may be left out for lacking exactly one `daily_bar` row on each of the five prior
+#: sessions before the snapshot itself is distrusted and the whole batch refused.
 #:
 #: The codes this is meant to let through are individual securities: a new listing has
 #: fewer than five sessions, and a suspension or resumption leaves a hole. On 2026-09-24
-#: that was 6 of 5,475 (0.11 %); a heavy IPO week and a few dozen suspensions stay under
-#: 1 %. What it must still refuse is a snapshot that is itself incomplete: a prior session
-#: the daily pipeline never loaded makes ~100 % of codes short, and one exchange's rows
-#: missing for a day makes ~30-45 % short. 5 % sits an order of magnitude above the first
-#: and well below the second, so neither case is ambiguous.
+#: that was 6 of 5,475 (0.11 %; per exchange 2 of ~280 BSE, 3 of ~2,300 SSE, 1 of ~2,900
+#: SZSE, all under 1 %); a heavy IPO week and a few dozen suspensions stay under 1 %. What
+#: it must still refuse is a snapshot that is itself incomplete: a prior session the daily
+#: pipeline never loaded makes ~100 % of codes short, and one exchange's rows missing for a
+#: day make 100 % of *that exchange's* codes short. Measured against the whole batch the
+#: second is ~40-53 % for SSE or SZSE but only ~5 % for BSE (~280 of ~5,475 codes), right
+#: at the bound -- which is why the share is checked per exchange (ts_code suffix) as well
+#: (review S1). 5 % sits well above the securities case and far below the snapshot cases.
 PRIOR_FIVE_INCOMPLETE_MAX_FRACTION = 0.05
 #: `RuntimeStepResult.observations` key under which the publisher reports the count.
 PRIOR_FIVE_INCOMPLETE_OBSERVATION = "auction_gap_prior5_incomplete_codes"
@@ -272,8 +275,9 @@ def _partition_prior_five(
 
     A code is complete when its rows are exactly one per date in `trade_dates`: a missing
     session (new listing, suspension) and a duplicated one both leave it out. The whole
-    batch is refused only when the share left out says the snapshot, not the security, is
-    what is wrong (`PRIOR_FIVE_INCOMPLETE_MAX_FRACTION`).
+    batch is refused only when the share left out -- of all codes, or of one exchange's --
+    says the snapshot, not the security, is what is wrong
+    (`PRIOR_FIVE_INCOMPLETE_MAX_FRACTION`).
     """
 
     by_code: dict[str, list[tuple[str, date, float]]] = {code: [] for code in ts_codes}
@@ -288,13 +292,34 @@ def _partition_prior_five(
             complete.extend(code_rows)
         else:
             incomplete.append(code)
-    if len(incomplete) > PRIOR_FIVE_INCOMPLETE_MAX_FRACTION * len(ts_codes):
-        raise AuctionGapCandidateInputError(
-            "daily snapshot must contain exactly one row for every prior-five session: "
-            f"{len(incomplete)} of {len(ts_codes)} auction codes lack it, more than "
-            f"{PRIOR_FIVE_INCOMPLETE_MAX_FRACTION:.0%} (first: {', '.join(incomplete[:5])})"
+    _refuse_when_too_many_short(incomplete, ts_codes, scope="")
+    for exchange in sorted({_exchange_of(code) for code in ts_codes}):
+        _refuse_when_too_many_short(
+            [code for code in incomplete if _exchange_of(code) == exchange],
+            [code for code in ts_codes if _exchange_of(code) == exchange],
+            scope=f"{exchange} ",
         )
     return tuple(complete), tuple(incomplete)
+
+
+def _exchange_of(ts_code: str) -> str:
+    """The exchange suffix of a ts_code (`SH` / `SZ` / `BJ`)."""
+
+    return ts_code.rpartition(".")[2]
+
+
+def _refuse_when_too_many_short(
+    incomplete: list[str],
+    codes: list[str] | tuple[str, ...],
+    *,
+    scope: str,
+) -> None:
+    if len(incomplete) > PRIOR_FIVE_INCOMPLETE_MAX_FRACTION * len(codes):
+        raise AuctionGapCandidateInputError(
+            "daily snapshot must contain exactly one row for every prior-five session: "
+            f"{len(incomplete)} of {len(codes)} {scope}auction codes lack it, more than "
+            f"{PRIOR_FIVE_INCOMPLETE_MAX_FRACTION:.0%} (first: {', '.join(incomplete[:5])})"
+        )
 
 
 def _required_bool(lookup: ReferenceLookup, field: str) -> bool:

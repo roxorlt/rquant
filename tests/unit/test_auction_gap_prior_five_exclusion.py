@@ -9,7 +9,7 @@ still refuses a snapshot that is itself incomplete.
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -86,6 +86,7 @@ def _daily_snapshot(
     *,
     sessions_per_code: dict[str, int] | None = None,
     duplicated: tuple[str, ...] = (),
+    synced_at: datetime = datetime(2026, 7, 31, 1, 0, tzinfo=UTC),
 ) -> Path:
     """Every code gets the last `sessions_per_code[code]` prior sessions (default five)."""
 
@@ -100,7 +101,7 @@ def _daily_snapshot(
         connection.execute("CREATE TABLE daily_bar(ts_code VARCHAR, trade_date DATE, vol DOUBLE)")
         connection.executemany("INSERT INTO daily_bar VALUES (?, ?, ?)", rows)
     path.chmod(0o600)
-    snapshot_time = datetime(2026, 7, 31, 1, 0, tzinfo=UTC).timestamp()
+    snapshot_time = synced_at.timestamp()
     os.utime(path, (snapshot_time, snapshot_time))
     return path
 
@@ -147,6 +148,7 @@ def _assemble(
     codes: tuple[str, ...] = CODES,
     sessions_per_code: dict[str, int] | None = None,
     duplicated: tuple[str, ...] = (),
+    synced_at: datetime = datetime(2026, 7, 31, 1, 0, tzinfo=UTC),
 ) -> AuctionGapCandidateAssembly:
     return assemble_auction_gap_candidate_input(
         auction_spool=_auction_spool(tmp_path, codes),
@@ -155,6 +157,7 @@ def _assemble(
             codes,
             sessions_per_code=sessions_per_code,
             duplicated=duplicated,
+            synced_at=synced_at,
         ),
         reference_registry=_registry(tmp_path, codes),
         calendar=_calendar(),
@@ -214,6 +217,51 @@ def test_a_single_code_day_still_refuses_its_one_short_code(tmp_path: Path) -> N
 
     with pytest.raises(AuctionGapCandidateInputError, match="1 of 1 auction codes"):
         _assemble(tmp_path, codes=CODES[:1], sessions_per_code={CODES[0]: 4})
+
+
+#: 120 codes by exchange so that the host's six, spread the way they were on 2026-09-24
+#: (2 BSE, 3 SSE, 1 SZSE), are exactly 5 % of every exchange and of the day
+BJ = tuple(f"{920100 + index}.BJ" for index in range(40))
+SH = tuple(f"{600100 + index}.SH" for index in range(60))
+SZ = tuple(f"{300100 + index:06d}.SZ" for index in range(20))
+HOST_SHAPE = {BJ[0]: 1, BJ[1]: 2, SH[0]: 1, SH[1]: 3, SH[2]: 3, SZ[0]: 2}
+
+
+def test_the_host_s_six_spread_over_three_exchanges_still_pass(tmp_path: Path) -> None:
+    assembly = _assemble(tmp_path, codes=(*BJ, *SH, *SZ), sessions_per_code=HOST_SHAPE)
+
+    assert assembly.prior_five_incomplete_codes == tuple(sorted(HOST_SHAPE))
+    assert len(assembly.batch.facts) == 120 - 6
+
+
+def test_a_whole_missing_bse_session_is_refused_although_it_is_five_percent_of_the_day(
+    tmp_path: Path,
+) -> None:
+    """Review S1: BSE is ~5 % of the auction codes, so its missing day slipped under 5 %."""
+
+    bj = BJ[:6]
+    codes = (*bj, *SH, *(f"{300100 + index:06d}.SZ" for index in range(54)))
+    assert len(codes) == 120 and len(bj) == PRIOR_FIVE_INCOMPLETE_MAX_FRACTION * len(codes)
+
+    with pytest.raises(AuctionGapCandidateInputError) as refused:
+        _assemble(tmp_path, codes=codes, sessions_per_code=dict.fromkeys(bj, 4))
+
+    assert "6 of 6 BJ auction codes lack it" in str(refused.value)
+
+
+def test_a_daily_snapshot_written_after_the_observation_is_future_evidence(
+    tmp_path: Path,
+) -> None:
+    """Review S2: the replica's mtime is its availability; a later one is refused."""
+
+    with pytest.raises(AuctionGapCandidateInputError, match="daily snapshot is future evidence"):
+        _assemble(
+            tmp_path,
+            codes=CODES[:10],
+            synced_at=OBSERVED_AT + timedelta(seconds=1),
+        )
+    #: and one written at the observation itself is not
+    assert _assemble(tmp_path / "at", codes=CODES[:10], synced_at=OBSERVED_AT).batch.facts
 
 
 def test_the_daily_snapshot_identity_names_what_was_left_out(tmp_path: Path) -> None:

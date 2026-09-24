@@ -381,12 +381,24 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     assert summary["world"]["replica"]["rows"]["daily_bar"] == 2 * 5
 
 
-#: 120 auction codes: the two the other cases use, the host's six without one daily row on
-#: each of the five prior sessions (2026-09-24: 920025.BJ 1, 601995.SH 1, 301686.SZ 2,
-#: 920229.BJ 2, 600825.SH 3, 600301.SH 3), and 112 that open below their pre-close and so
-#: are no auction_gap candidate. Six of 120 is the 5 % the assembly allows.
-WIDE_CODES = CODES + tuple(f"{600100 + index:06d}.SH" for index in range(118))
-SHORT_CODES = dict(zip(WIDE_CODES[2:8], (1, 1, 2, 2, 3, 3), strict=True))
+#: 120 auction codes: the two the other cases use (one SZSE, one SSE), and 118 that open
+#: below their pre-close and so are no auction_gap candidate -- 40 BSE, 59 SSE, 19 SZSE, so
+#: each exchange holds 40 / 60 / 20. Six of them lack one daily row on some of the five
+#: prior sessions, in the 2026-09-24 host's shapes and spread (920025.BJ 1, 920229.BJ 2,
+#: 601995.SH 1, 600825.SH 3, 600301.SH 3, 301686.SZ 2): exactly the 5 % the assembly
+#: allows of the day and of every exchange.
+_WIDE_BJ = tuple(f"{920100 + index}.BJ" for index in range(40))
+_WIDE_SH = tuple(f"{600100 + index:06d}.SH" for index in range(59))
+_WIDE_SZ = tuple(f"{300100 + index:06d}.SZ" for index in range(19))
+WIDE_CODES = CODES + _WIDE_BJ + _WIDE_SH + _WIDE_SZ
+SHORT_CODES = {
+    _WIDE_BJ[0]: 1,
+    _WIDE_BJ[1]: 2,
+    _WIDE_SH[0]: 1,
+    _WIDE_SH[1]: 3,
+    _WIDE_SH[2]: 3,
+    _WIDE_SZ[0]: 2,
+}
 #: trades until 09:45 and never again: from 09:47 its newest bar is more than 60 s old in
 #: every feature batch, so it is STALE while MINUTE_CODE stays fresh
 STALE_CODE = CODES[1]
@@ -411,7 +423,7 @@ def test_six_short_codes_and_a_stale_candidate_still_reach_a_same_day_generation
     host = _host(
         tmp_path,
         codes=WIDE_CODES,
-        auction_price={code: 9.9 for code in WIDE_CODES[8:]},
+        auction_price={code: 9.9 for code in WIDE_CODES[2:] if code not in SHORT_CODES},
         prior_sessions=SHORT_CODES,
         day_minutes={MINUTE_CODE: time(15, 0), STALE_CODE: time(9, 45)},
     )
