@@ -194,6 +194,68 @@
 
 ### Fixed
 
+- **路线 A 链上的五处阻断：9 月 24 日真实数据回放暴露，修完后本地回放同一形状能走到当日 serving 代并带信号（包 AI）**：
+  协调者在主机上用 v0.33.21 的代码回放 2026-09-24（只读副本 + 录下的批次，不打补丁，到 10:30 为止），结果是参考慢源
+  09:21:31 正常发出当日参考代，但 `candidate.auction_gap` 在 09:29–09:48 的 20 轮装配**每一轮都**返回
+  `idle_result(("auction_gap_input_unavailable",))`，原因被吞掉；在沙箱里直接调 `load_live_auction_candidate_input`
+  （09:29:08 / 09:35:08 / 09:48:08）拿到的是 `AuctionGapCandidateInputError: daily snapshot must contain exactly one row
+  for every prior-five session`。5,475 只竞价代码里有 5,469 只在前五个交易日（09-17/18/21/22/23）各有且仅有一行
+  `daily_bar`，另外 6 只没有：`920025.BJ` 1 行、`601995.SH` 1 行、`301686.SZ` 2 行、`920229.BJ` 2 行、`600825.SH` 3 行、
+  `600301.SH` 3 行（新股与停复牌）。万分之十一的代码拒掉了一整天，下游于是全部空转：market-minute 报
+  `required authority has no not_visible snapshot`，特征报 `read-only spool source identity is missing`，模拟盘约束报
+  `paper constraints require a visible market-minute batch`，模拟盘撮合报 `current pointer is unavailable`，serving 报
+  `paper_accounts reader failed`。包 AH 回放报告里的 F1 在真实数据上根本没走到。本包修五处：
+  - **缺五日日线的代码逐只排除、计数，不再拒整批**（`auction_gap_candidate_input.py`）：前五个交易日不是每天恰好一行
+    `daily_bar` 的代码（缺一天或重一天）不进候选批次——auction_gap 的量比按五天算，这样的代码当天本来就不可能是候选。
+    被排除的数量超过竞价代码的 `PRIOR_FIVE_INCOMPLETE_MAX_FRACTION`（5%）时仍然拒整批：那说明是快照本身缺了一个交易日
+    （约 100% 的代码都缺）或缺了一个交易所的一天（约 30%–45%），不是几只证券的事；09-24 是 0.11%，新股密集周加几十只
+    停牌也在 1% 以下。拒绝的消息里写明「N of M auction codes」和前五只代码。当天的日线快照 id 在有代码被排除时把
+    这些代码也算进去（没有排除时与旧版逐字相同）。
+    **按交易所再查一遍**（独立复核 S1）：北交所只有约 280 只，占全部竞价代码约 5%，缺整整一天的北交所日线在全局
+    口径下正好卡在 5% 上限，拦不住；现在除了全局比例，SH / SZ / BJ 每个交易所自己的缺行比例超过 5% 也整批拒，
+    消息写 `N of M BJ auction codes lack it`。09-24 那 6 只按交易所算是北交所 2 / 约 280、上交所 3 / 约 2,300、
+    深交所 1 / 约 2,900，都在 1% 以下。日线快照 mtime 晚于观察时刻时拒（`daily snapshot is future evidence`）
+    这条原有检查补上了测试（S2）。
+  - **计数是心跳上的「观察值」，不让角色变成降级**：`RuntimeStepResult` 与心跳文件模型新增 `observations`（非负整数计数，
+    不影响状态）与 `degraded_detail`（降级轮的原因文字，不是 `last_error`，也不计失败次数），失败轮两者都清空；两个字段都
+    **只在心跳文件里**，不进冻结的 serving 投影（#237）。auction_gap 发布者每轮报
+    `observations.auction_gap_prior5_incomplete_codes`，窗外的空闲轮照抄当天最后一次的值，另外在计数变化时用 loguru
+    记一行被排除的代码清单；本地交易日一变这份计数就清空（S4），跨夜不重启的进程不会在次日窗口前还报昨天的数。选这个而不是写进候选批次元数据，是因为候选批次文档是 `extra="forbid"` 的发布内容，加字段
+    会让回滚后的读者拒收；心跳字段的回滚面已经有现成的「挪心跳」步骤。#290（auction-match 丢行数一整天显示降级）
+    可以用同一个字段修，本包没改。
+  - **降级轮说出原因**（`runtime_builder_candidate.py`、`runtime_builder_shadow.py`）：候选发布者两处
+    `except ...: return idle_result((reason,))` 改成 `auction_gap_input_unavailable:<异常类名>` /
+    `session_candidate_input_unavailable:<异常类名>`，异常消息和它的 `__cause__` 写进 `degraded_detail`；影子对账角色的
+    三处保留原来的原因字符串（没有消费者，改了只会动测试），只补上 `degraded_detail`。
+  - **参考慢源写上市分类四字段（F1）**（`reference_slow_publisher.py`）：模拟盘约束要求每条 LISTING_STATUS 带
+    `market` / `exchange` / `instrument_class` / `security_class`，发布者一个都没写，所以真实数据上每只代码都被拒
+    （`listing classification market is missing`），撮合拿不到约束指针，serving 出不了代。现在写
+    `market=CN`、`exchange` 按代码后缀（SH→SSE、SZ→SZSE、BJ→BSE，与成本选择器的名字一致）、`EQUITY`、`A_SHARE`。
+    stock_basic 自己的 `market` 列是板块（主板 / 创业板 / 科创板 / 北交所 / CDR），不是模拟盘要的国家代码，它照旧写在
+    BOARD_MEMBERSHIP 里。旧版写的、不带这四个字段的记录仍按原样被拒（主机上还没有已发布的参考代，周一是第一次发布）。
+    回放脚本的 `--assume-listing-classification` 改成「接受、打印警告、什么都不做」。
+  - **特征引擎按代码标 STALE（F2）**（`intraday_feature_engine.py`）：每个分钟线特征发布时都是
+    `max_delay_seconds=60`、`late_policy=mark_stale`，但引擎只写过 AVAILABLE / UNAVAILABLE，于是一只最新分钟线超过
+    60 秒的候选（停牌、成交稀疏、某只代码抓取失败）让策略拒掉**整个**特征批次，而批次按顺序消费，这一只代码会让其余候选
+    当天剩下的时间都评估不了。现在这只代码的每个字段都标 STALE，原因 `source_event_late`（值本来就缺时后面接缺的原因），
+    策略跳过它、照常评估其余候选。上限是一个常量 `MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS`，定义引导直接用它发布。
+    被跳过的候选数写在策略心跳的 `observations.strategy_skipped_candidates`（最新一个特征批次的数，没有新批次的轮次
+    照抄；S3）：持仓那只行情停更时出场评估会暂停，以前这是整批失败、很显眼，现在要从这里看。
+  - **生命周期特征的延迟上限从 1 秒放到 120 秒（F3）**（`runtime_definition_bootstrap.py`）：模拟盘生命周期特征的延迟是
+    证据自己的 `available_at - source_event_time`——挂单等成交时就是那条入场信号（由一根分钟线生成），最高价就是那根线的
+    `session_high`——这条路径上没有任何证据能在 1 秒内，所以第一条入场信号之后策略每一轮都失败（本地整日回放 350 轮里
+    333 轮，前两轮量到的是 14 秒和 11 秒），出场永远评估不到。上限改成两个分钟线周期（`EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS`
+    = 2 × 60 秒）：一个周期给状态所依据的行情证据（它本身被限制在 60 秒内），一个给特征批次到证据之间策略、路由、队列、
+    撮合每轮 2–5 秒的几跳；仍然 `fail_closed`。超限的报错现在写出实际延迟和上限。
+  - **没修、另开 issue 的**：schema rollout 计划在收盘后承认进 DUAL_WRITE、周一第一次发布时已过期（F5，#304，周一开盘前
+    必须先处置）；北交所代码没有成本选择器、CDR 按 A_SHARE 归类（#305）；生命周期特征迟到仍整批失败（#306）；
+    模拟盘约束午休与收盘后每轮失败、一只代码拒整批（F6，#307）。
+  - **装机与回滚**：见 `DEPLOY.md` 2026-09-24「热修 AI」一条。新增两个心跳文件字段，回滚到本包之前要先挪心跳；
+    特征契约与策略注册指纹随之改变，这和每次发版改 `producer_commit` 带来的变化是同一种，生产输入文档照常按新提交生成。
+  - **本地回放**：`tests/integration/test_route_a_day_replay_script.py` 新增一个 120 只竞价代码的夹具日（上面那 6 只的
+    1/1/2/2/3/3 行形状、1 只 09:45 之后不再成交的候选、112 只低开的非候选），不带任何桩回放到 10:30：6 只被排除且计数为 6、
+    候选 2 只、那只候选在最后一个特征批次里是 STALE、策略零失败、模拟盘成交 1 笔、当日 serving 代带当天的信号。
+
 - **auction_gap 候选输入一轮要做约 2.2 万次单键参考查询，主机上一次 74 毫秒、一轮约 27 分钟，比 09:29–09:49 的装配窗还长（#299，包 AG）**：
   AF 的演练在主机上（普通 lighthouse 进程，不受 runtime slice 节流）量到：一代真实的 5,556 只证券发布之后，
   `auction_gap_candidate_input` 在 09:29:01.9 的参考检查 500 只代码用了 148.1 秒，即 74.04 毫秒一次，全量推算

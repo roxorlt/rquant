@@ -5,6 +5,56 @@
 
 ---
 
+## 2026-09-24 · 待安装 · 热修 AI：路线 A 链上的五处阻断（9 月 24 日真实数据回放）
+
+**状态**：**尚未安装**，分支 `cc/20260924-route-a-chain-blockers`，建在包 AH（回放工具）之上。改的都是 `src/rquant/`
+与测试、回放脚本，**`deploy/` 一个字没改**，所以走受控发布器即可（`deploy-production.sh --target <tag>`），不需要手工装
+unit。改了什么见 CHANGELOG `[Unreleased]/Fixed` 的「包 AI」一条。
+
+**装上之后当场应该看到什么**（周一 2026-09-28 开盘）：
+
+- `candidate.auction_gap.v1` 的心跳文件里多出 `"observations": {"auction_gap_prior5_incomplete_codes": N}`，N 是当天缺
+  五日日线被排除的竞价代码数（09-24 是 6），**状态照样是 running**；journald 里有一行 `auction_gap left out N of M
+  auction codes ...` 列出这些代码。看法：
+  `grep -l candidate.auction_gap.v1 <runtime>/control/candidates/svc-*/heartbeats/*.json | xargs jq '.observations, .degraded_reasons, .degraded_detail'`
+  （实例目录名是 `svc-<哈希>`，按文件里的 `service_id` 找）。
+- 如果装配仍然被拒，心跳的 `degraded_reasons` 是 `auction_gap_input_unavailable:AuctionGapCandidateInputError`，
+  **原因原文在 `degraded_detail`**；超过 5% 的代码缺日线时原文是 `... N of M auction codes lack it, more than 5% ...`，
+  某个交易所超过 5% 时是 `... N of M BJ auction codes lack it ...`（SH / SZ 同理）。两种都说明副本少了一个交易日
+  （或少了一个交易所的一天），要查日终管线，不是改阈值。
+- 三个策略的心跳里有 `observations.strategy_skipped_candidates`：最新一个特征批次里因行情过期（STALE）或必需特征
+  缺失而没评估的候选数。持仓那只停牌或断流时这里会是非零，出场评估要等它的行情恢复。
+- 模拟盘约束不再出现 `listing classification market is missing`；第一批分钟线之后 `authorities/paper-execution`
+  有 current 指针，serving 在收到第一条信号后切出当日代。
+- 某只候选分钟线停更时，策略心跳不再出现 `exceeds max_delay_seconds without stale status`；第一条入场信号之后也不再
+  每轮报 `feature entry_fill_status exceeds max_delay_seconds`。
+
+**⚠️ 本包没有解决、周一开盘前必须先看的一件事：schema rollout 计划的期限（回放报告 F5）**。计划的期限是
+`started_at + schema_rollout_stage_timeout_seconds`（生产画像 600 秒），安装器最多只能在 PREPARE 阶段把它重开一次、
+再给 600 秒；进了 DUAL_WRITE 之后期限不能再延长，而 DUAL_WRITE 往 CONSUMER_ACK 走需要生产者真的发布过数据。主机
+09-24 16:21 把 16 个计划承认到 DUAL_WRITE，那时已收盘，所以这些计划的期限**最晚 09-24 16:31 就已经过了**——不是
+「周一盘中可能过期」，而是周一第一次发布时已经过期。只要 `runtime.market_minute.batch-envelope` 与
+`runtime.intraday_feature.batch-envelope` 两个频道的计划还停在 DUAL_WRITE / CONSUMER_ACK，`market_minute_source`
+在 09:30 第一批就会在 `spool.publish` 之后抛 `rollout deadline has expired`，之后每一轮都是
+`immutable sequence already contains different content`（重启也一样），`feature_live` 每一轮都失败，整条链没有特征、
+没有信号。只读检查命令写在 #304 里；怎么处置（回滚这些计划、或者换一个期限策略）要 owner 决定，也在 #304。
+
+**同样要在周一之前看一眼：副本里 09-24 的日线在不在**。周一的前五个交易日是 09-18、09-21、09-22、09-23、09-24；
+如果日终管线没把 09-24 的 `daily_bar` 写进副本，几乎每只代码都缺一天，超过 5% 的上限，装配照样整批拒（这时
+`degraded_detail` 会写明 `N of M auction codes lack it`）。只读查法：
+`python -c "import duckdb; c=duckdb.connect('/home/lighthouse/rquant/data/rquant_ro.duckdb', read_only=True); print(c.execute(\"SELECT trade_date, count(*) FROM daily_bar WHERE trade_date >= DATE '2026-09-17' GROUP BY 1 ORDER BY 1\").fetchall())"`
+（用部署 venv 的 python；`read_only=True` 连副本不连主库）。
+
+**回滚**：与 v0.33.21 同一条路径，**外加一步挪心跳**：本包给心跳文件加了 `observations` 与 `degraded_detail` 两个字段，
+心跳模型是 `extra="forbid"`，旧代码读到新心跳会报 `runtime heartbeat is invalid` 而起不来（与 #231 那一包同一类，
+见下文「①b 为什么是必须的」）。新代码**每个 role 的每一份心跳**都写这两个键（值为空时也写），独立复核实测过
+v0.33.21 连默认值的心跳也拒收，所以这一步对**所有** role 都必须做：回滚前先停 unit，再把
+`$ROOT/control/*/*/heartbeats/*.json` 挪走留档。
+参考注册表里新代码写的 LISTING_STATUS 多四个键，旧代码照读（载荷是自由映射，auction_gap 只读 `status`）；特征契约与
+策略注册指纹的变化与每次发版改 `producer_commit` 带来的变化相同，生产输入文档照常按目标提交重新生成。
+
+---
+
 ## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ 参考批量查表（#299）+ `rquant-live-runtime.slice` CPUQuota 200%
 
 **状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；AF 与 slice 两处改动各自的背景、预期与细节在紧接着的

@@ -45,6 +45,17 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 
 _TS_CODE_PATTERN = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
+#: The listing classification `paper_execution_constraint_producer` and the paper broker
+#: require on every LISTING_STATUS record (`_required_a_share_instrument_context`), in the
+#: values they accept. Until package AI nothing wrote them, so on real data every code was
+#: refused ("listing classification market is missing") and no serving generation was ever
+#: cut. `market` is the country the security trades in, not stock_basic's `market` column:
+#: that one is the board segment (主板 / 创业板 / 科创板 / 北交所 / CDR), which stays in
+#: BOARD_MEMBERSHIP. The exchange names are the ones the v3 cost selectors use.
+_LISTING_MARKET = "CN"
+_LISTING_INSTRUMENT_CLASS = "EQUITY"
+_LISTING_SECURITY_CLASS = "A_SHARE"
+_EXCHANGE_BY_SUFFIX = {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}
 _SOURCE_KEYS = frozenset({"daily", "security", "suspension", "calendar"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _REFERENCE_PROJECTION_TABLES = frozenset(
@@ -458,7 +469,11 @@ def _record_payloads(
                 "delist_date": (
                     security.delist_date.isoformat() if security.delist_date is not None else None
                 ),
+                "exchange": _EXCHANGE_BY_SUFFIX[security.ts_code.rsplit(".", 1)[1]],
+                "instrument_class": _LISTING_INSTRUMENT_CLASS,
                 "list_date": security.list_date.isoformat(),
+                "market": _LISTING_MARKET,
+                "security_class": _LISTING_SECURITY_CLASS,
                 "source_list_status": security.source_list_status,
                 "status": "listed",
             },

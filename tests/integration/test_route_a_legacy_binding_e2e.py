@@ -97,6 +97,7 @@ def _production_bundle(
     definition_registry_root: Path | None = None,
     market_calendar_open_dates: tuple[Any, ...] | None = None,
     schema_rollout_started_at: Any = None,
+    market_calendar_authority: Any = None,
 ) -> tuple[Any, Any, Any, dict[str, bytes]]:
     """Install a real production deployment bundle at a temporary runtime root.
 
@@ -118,7 +119,10 @@ def _production_bundle(
     recorded with the service's clock and refused outside the window.
     `definition_registry_root` is the caller's for the same reason: one root cannot hold
     two commits' definitions (#225), and production gives each commit its own
-    `definitions-<commit>`.
+    `definitions-<commit>`. `market_calendar_authority` installs a calendar the caller
+    already has -- `scripts/route_a_day_replay.py` hands in the host's own generation, byte
+    for byte, so its content id is the one the host's sealed reference batch names -- and
+    the profile then expects that calendar's own producer commit rather than this bundle's.
 
     The credential plaintexts the bundle built for that seam are kept and returned rather
     than dropped. They are the real thing — `serialize_runtime_credential` over the real
@@ -157,7 +161,7 @@ def _production_bundle(
 
     sealed: dict[str, bytes] = {}
 
-    authority = MarketCalendarAuthority.create(
+    authority = market_calendar_authority or MarketCalendarAuthority.create(
         schema_version=1,
         exchange="SSE",
         producer_commit=producer_commit,
@@ -198,7 +202,7 @@ def _production_bundle(
     inputs = inputs.model_copy(
         update={
             "producer_commit": producer_commit,
-            "market_calendar_producer_commit": producer_commit,
+            "market_calendar_producer_commit": authority.producer_commit,
             "market_calendar_content_sha256": authority.content_sha256,
             "historical_minutes_snapshot_id": hashlib.sha256(
                 inputs.historical_minutes_snapshot_path.read_bytes()
@@ -212,8 +216,10 @@ def _production_bundle(
     if definition_registry_root is not None:
         inputs = inputs.model_copy(update={"definition_registry_root": definition_registry_root})
     inputs.market_calendar_authority_path.parent.mkdir(parents=True, exist_ok=True)
-    inputs.market_calendar_authority_path.write_text(
-        authority.model_dump_json(), encoding="utf-8"
+    inputs.market_calendar_authority_path.write_bytes(
+        _calendar_document_bytes(authority)
+        if market_calendar_authority is not None
+        else authority.model_dump_json().encode("utf-8")
     )
     inputs.market_calendar_authority_path.chmod(0o600)
     install_production_runtime_prerequisites(inputs)
@@ -269,6 +275,14 @@ def _production_bundle(
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     ReferenceRegistry(registry_path)
     return inputs, profile, receipt, sealed
+
+
+def _calendar_document_bytes(authority: Any) -> bytes:
+    """A calendar handed in by the caller, written in the canonical form its generation uses."""
+
+    from rquant.strict_json import canonical_json_bytes
+
+    return canonical_json_bytes(authority.model_dump(mode="json"))
 
 
 class _StopAfterOneIteration(Event):

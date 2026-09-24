@@ -703,7 +703,13 @@ def test_the_publisher_survives_an_atomic_replica_replacement_between_iterations
 
     assert third_code == 0
     assert third is not None
-    assert third.degraded_reasons == ("auction_gap_input_unavailable",)
+    #: the whole snapshot is short, not a handful of securities, so it is still refused,
+    #: and the heartbeat now says why
+    assert third.degraded_reasons == (
+        "auction_gap_input_unavailable:AuctionGapCandidateInputError",
+    )
+    assert third.degraded_detail is not None
+    assert "exactly one row for every prior-five session" in third.degraded_detail
 
 
 def test_the_generator_refuses_a_read_side_role_on_the_main_database(

@@ -2297,6 +2297,88 @@ def test_runner_applies_max_delay_to_each_candidate_feature_instance(
         )
 
 
+def test_a_late_candidate_marked_stale_is_skipped_and_the_others_are_evaluated(
+    tmp_path: Path,
+) -> None:
+    """Package AI (replay finding F2), on the runner side of the contract.
+
+    The same two candidates as the test above, under the published `mark_stale` policy
+    and with the late one STALE as the feature engine now emits it: the batch is
+    processed, the late candidate is skipped without calling the evaluator, and the fresh
+    one is evaluated and signals. Before, the engine never wrote STALE, so this batch
+    raised "exceeds max_delay_seconds without stale status" for both.
+    """
+
+    frame = pd.DataFrame(
+        {
+            "ts_code": ["300001.SZ", "600000.SH"],
+            "rel_same_minute": [2.0, 2.0],
+        }
+    )
+    statuses = tuple(
+        FeatureFieldStatus(
+            candidate_id=candidate_id,
+            name="rel_same_minute",
+            status=status,
+            source_event_time=source_event_time,
+            available_at=NOW,
+            decision_cutoff=NOW,
+            actual_delay_seconds=(NOW - source_event_time).total_seconds(),
+            reason=None if status is FeatureAvailability.AVAILABLE else "source_event_late",
+        )
+        for candidate_id, source_event_time, status in (
+            ("300001.SZ", NOW - timedelta(seconds=61), FeatureAvailability.STALE),
+            ("600000.SH", NOW, FeatureAvailability.AVAILABLE),
+        )
+    )
+    contract = FeatureContract(
+        contract_id="intraday-pit",
+        version=1,
+        features=(
+            FeatureDefinition(
+                name="rel_same_minute",
+                dtype="float64",
+                source_datasets=("market_minute",),
+                lookback=20,
+                pit_rule="available_at <= decision_time",
+                price_basis="raw",
+                availability_contract={
+                    "source_available_at_basis": "per_candidate_source_available_at",
+                    "max_delay_seconds": 60,
+                    "missing_policy": "mark_unavailable",
+                    "late_policy": "mark_stale",
+                    "decision_visibility_gate": "available_at_lte_decision_time",
+                },
+            ),
+        ),
+        producer_commit="c" * 40,
+    )
+    store = StrategyRunnerStore(
+        tmp_path / "runner.sqlite3",
+        spec=_spec(),
+        evaluator_contract_fingerprint=EVALUATOR_FINGERPRINT,
+        feature_contract=contract,
+    )
+    evaluated: list[str] = []
+
+    def evaluator(_spec: object, state: object, _features: object) -> StrategyDecision:
+        evaluated.append(str(state.candidate_id))  # type: ignore[attr-defined]
+        return _entry_decision()
+
+    result = store.process_batch(
+        _envelope(content_hash=_payload_hash(frame), field_statuses=statuses, row_count=2),
+        frame,
+        dataset_snapshot_id="d" * 64,
+        observed_at=NOW,
+        evaluator=evaluator,
+    )
+
+    assert evaluated == ["600000.SH"]
+    assert result.skipped_candidates == 1
+    assert [record.signal.candidate_id for record in result.signals] == ["600000.SH"]
+    assert store.candidate_state("300001.SZ").state is StrategyLifecycleState.IDLE
+
+
 def test_evaluator_only_sees_declared_currently_usable_features(tmp_path: Path) -> None:
     optional = (
         FeatureRequirement(

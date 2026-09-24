@@ -892,3 +892,41 @@ def test_prefix_live_processing_matches_single_pass_replay(tmp_path: Path) -> No
     assert prefix.candidate_occurrence_state(occurrence_id) == (
         single_pass.candidate_occurrence_state(occurrence_id)
     )
+
+
+def test_the_summary_says_how_many_candidates_of_the_newest_batch_were_skipped(
+    tmp_path: Path,
+) -> None:
+    """Review S3: since package AI a stale candidate is skipped, not batch-fatal.
+
+    So the heartbeat has to be able to say so: a held position whose feed went stale gets
+    no exit evaluation, and nothing else on this path records that.
+    """
+
+    features = FeatureBatchSpool(tmp_path / "features")
+    _publish(features, status=FeatureAvailability.STALE)
+    runner = _runner(tmp_path / "runner.sqlite3")
+    loader = _candidate_loader(tmp_path)
+
+    stale = run_strategy_live_batch(
+        feature_spool=features,
+        candidate_universe_loader=loader,
+        runner=runner,
+        evaluator=_evaluator,
+        observed_at=NOW,
+        limit=10,
+    )
+    nothing_new = run_strategy_live_batch(
+        feature_spool=features,
+        candidate_universe_loader=loader,
+        runner=runner,
+        evaluator=_evaluator,
+        observed_at=NOW + timedelta(seconds=2),
+        limit=10,
+    )
+
+    assert stale.processed_count == 1
+    assert stale.signal_count == 0
+    assert stale.last_batch_skipped_candidates == 1
+    assert nothing_new.processed_count == 0
+    assert nothing_new.last_batch_skipped_candidates is None

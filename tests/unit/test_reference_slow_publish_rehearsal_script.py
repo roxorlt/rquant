@@ -52,12 +52,21 @@ def _tree(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
-def _runtime_root(tmp_path: Path) -> Path:
+def _runtime_root(
+    tmp_path: Path,
+    *,
+    codes: tuple[str, ...] = CODES,
+    auction_price: dict[str, float] | None = None,
+) -> Path:
     """The production layout the script reads: one sealed batch, its calendar, auction-match.
 
     The batch is sealed the way v0.33.20 sealed 2026-09-24's -- visible five seconds after it
-    was prepared -- because that is what the host's batch 0 looks like.
+    was prepared -- because that is what the host's batch 0 looks like. `codes` and
+    `auction_price` (per code, default 10.5 against a 10.0 pre-close) let a caller build a
+    wider auction day in which most codes are not auction_gap candidates.
     """
+
+    prices = auction_price or {}
 
     runtime = tmp_path / "runtime"
     key = tmp_path / "keys" / "source"
@@ -81,7 +90,7 @@ def _runtime_root(tmp_path: Path) -> Path:
             observed_at=at(9, 20, 27),
             producer_commit=COMMIT,
             producer_version="reference-slow-source-v1",
-            snapshot_loader=lambda: _snapshot(captured_at=at(9, 20, 31), codes=CODES),
+            snapshot_loader=lambda: _snapshot(captured_at=at(9, 20, 31), codes=codes),
             completion_clock=lambda: at(9, 20, 58),
         )
     calendar = _calendar()
@@ -95,14 +104,14 @@ def _runtime_root(tmp_path: Path) -> Path:
             {
                 "ts_code": code,
                 "trade_date": TARGET_DATE,
-                "price": 10.5,
+                "price": prices.get(code, 10.5),
                 "vol": 20_000.0,
-                "amount": 210_000.0,
+                "amount": 20_000.0 * prices.get(code, 10.5),
                 "pre_close": 10.0,
                 "turnover_rate": 0.2,
                 "volume_ratio": 9.9,
             }
-            for code in CODES
+            for code in codes
         ]
     )
     AuctionMatchGateway(
@@ -113,7 +122,7 @@ def _runtime_root(tmp_path: Path) -> Path:
             producer_commit=COMMIT,
             min_coverage_ratio=1.0,
         ),
-    ).capture_once(trade_date=TARGET_DATE, received_at=at(9, 29), expected_codes=CODES)
+    ).capture_once(trade_date=TARGET_DATE, received_at=at(9, 29), expected_codes=codes)
     return runtime
 
 

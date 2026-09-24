@@ -1148,3 +1148,87 @@ def test_config_and_result_contracts_are_frozen_and_forbid_unknown_fields() -> N
         IntradayFeatureConfig(producer_commit=PRODUCER_COMMIT, future_option=True)
     with pytest.raises(ValidationError):
         result.mode = FeatureComputationMode.REPLAY
+
+
+def test_a_code_whose_newest_bar_is_older_than_the_contract_bound_is_stale_per_code() -> None:
+    """Package AI (replay finding F2): lateness is the late code's, not the batch's.
+
+    Until then every field was AVAILABLE or UNAVAILABLE whatever its delay, and the
+    strategy runner refused the whole batch for one late candidate ("exceeds
+    max_delay_seconds without stale status"). The late code is now STALE in every field,
+    with the reason naming the lateness (and the missing value, where there is one); the
+    code whose newest bar is exactly at the bound is not late.
+    """
+
+    from rquant.intraday_feature_engine import (
+        MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS,
+        SOURCE_EVENT_LATE_REASON,
+    )
+
+    assert MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS == 60
+    decision = datetime(2026, 7, 31, 9, 33, 0, tzinfo=SHANGHAI)
+    late_bar = datetime(2026, 7, 31, 9, 31)
+    bound_bar = datetime(2026, 7, 31, 9, 32)
+    current = pd.DataFrame(
+        [
+            _minute("600000.SH", late_bar, open_=10.0, close=10.1, vol=100.0, amount=1_000.0),
+            _minute("600001.SH", bound_bar, open_=20.0, close=20.1, vol=100.0, amount=2_000.0),
+            _minute(
+                "600002.SH",
+                datetime(2026, 7, 31, 9, 33),
+                open_=30.0,
+                close=30.1,
+                vol=100.0,
+                amount=3_000.0,
+                available_at=decision,
+            ),
+        ]
+    )
+    historical = pd.concat(
+        [_historical_minutes(ts_code=code) for code in ("600000.SH", "600001.SH", "600002.SH")],
+        ignore_index=True,
+    )
+
+    result = _compute(current=current, historical=historical, decision_time=decision)
+
+    by_code: dict[str, list[object]] = {}
+    for status in result.envelope.field_statuses:
+        by_code.setdefault(str(status.candidate_id), []).append(status)
+    late = by_code["600000.SH"]
+    assert {status.status for status in late} == {FeatureAvailability.STALE}
+    assert all(status.actual_delay_seconds == pytest.approx(120.0) for status in late)
+    assert all(status.reason.split(";")[0] == SOURCE_EVENT_LATE_REASON for status in late)
+    #: a value that is missing as well says so after the lateness
+    opening = result.envelope.field_status("session_open", candidate_id="600000.SH")
+    assert opening is not None and opening.reason == "source_event_late;missing_opening_bar"
+    #: exactly at the bound: not late; the other two keep the lattice they always had
+    for code in ("600001.SH", "600002.SH"):
+        assert FeatureAvailability.STALE not in {status.status for status in by_code[code]}
+        latest = result.envelope.field_status("latest_close", candidate_id=code)
+        assert latest is not None and latest.status is FeatureAvailability.AVAILABLE
+    bound = result.envelope.field_status("latest_close", candidate_id="600001.SH")
+    assert bound is not None and bound.actual_delay_seconds == pytest.approx(60.0)
+    #: the values themselves are untouched: STALE is a status, not a redaction
+    assert set(result.frame["ts_code"]) == {"600000.SH", "600001.SH", "600002.SH"}
+
+
+def test_the_published_contract_bound_is_the_engine_s_bound() -> None:
+    from rquant.intraday_feature_engine import MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
+    from rquant.runtime_definition_bootstrap import _feature_contracts
+    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+
+    contracts = _feature_contracts(
+        BuiltinStrategyEvaluatorRegistry(producer_commit=PRODUCER_COMMIT),
+        producer_commit=PRODUCER_COMMIT,
+    )
+    market = [
+        feature
+        for contract in contracts
+        for feature in contract.features
+        if feature.source_datasets == ("market_minute",)
+    ]
+    assert market
+    assert {feature.availability_contract.max_delay_seconds for feature in market} == {
+        MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
+    }
+    assert {feature.availability_contract.late_policy.value for feature in market} == {"mark_stale"}

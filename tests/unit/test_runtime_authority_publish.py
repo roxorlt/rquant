@@ -151,14 +151,40 @@ def _load_builder() -> Any:
 
 
 def _directory_policy(*directories: Path, extra: dict[Path, tuple[int, int]] | None = None) -> dict:
-    policy: dict[Path, tuple[int, int]] = {}
+    """The trusted-ancestor policy for a test root: every ancestor as the host really has it.
+
+    Two kinds of ancestor sit above a test root, and they get production's two rules:
+
+    * **root-owned ones** (`/`, `/home`, `/Users`, `/private` ...) are the distribution's,
+      exactly like production's `/`, `/etc`, `/var`, `/var/lib`: owner root, mode *not
+      legislated* (`None`, #198 BLK-2). `_require_directory_stat` still refuses a symlink,
+      a non-directory, any other owner, and any group or other write bit on them;
+    * **every other one** -- the test user's own home (`/home/lighthouse` is 0711 on the
+      host, `/Users/<me>` 0750 on a Mac), the replay or pytest roots, the world's own tree --
+      keeps its exact `(uid, mode)` as observed, which is what a directory the publisher
+      created itself gets in production.
+
+    Recording `/` by its exact mode was the one host-only failure: `World` then installs
+    `_mark_daily_keyring_root_owned`, whose `os.stat` answers `mode=0o755` for every
+    ancestor of the keyring -- `/` included -- and the deployment lock's walk stats `/` by
+    name (every deeper component is stat'ed through its parent's descriptor, which the fake
+    leaves alone). `/` is 0755 on macOS and Ubuntu CI, so the fake and the record agreed;
+    OpenCloudOS ships it `dr-xr-xr-x`, so the lock refused with
+    `deployment lock ancestor / is unsafe` before any role ran.
+    """
+
+    policy: dict[Path, tuple[int, int | None]] = {}
     for directory in directories:
         current = Path("/")
         for component in (None, *directory.parts[1:]):
             if component is not None:
                 current /= component
             observed = os.stat(current, follow_symlinks=False)
-            policy[current] = (observed.st_uid, stat.S_IMODE(observed.st_mode))
+            policy[current] = (
+                (0, None)
+                if observed.st_uid == 0
+                else (observed.st_uid, stat.S_IMODE(observed.st_mode))
+            )
     policy.update(extra or {})
     return policy
 
@@ -2057,6 +2083,94 @@ def test_blk2_a_directory_the_publisher_declares_a_mode_for_stays_exact(
         _mode(anchor, 0o555),
         pytest.raises(RuntimeAuthorityPublishError, match="ancestor"),
     ):
+        authority_module.acquire_runtime_deployment_lock()
+
+
+def _host_like_stat(
+    monkeypatch: pytest.MonkeyPatch, faked: dict[Path, tuple[int, int]]
+) -> None:
+    """`os.stat` / `os.fstat` answering `(uid, mode)` for `faked` as the host would.
+
+    Keyed by inode, so a directory reads the same whether it is stat'ed by name, through its
+    parent's descriptor, or by its own descriptor -- the three ways the lock's walk looks.
+    """
+
+    real_stat = os.stat
+    real_fstat = os.fstat
+    identities = {
+        (real_stat(path).st_dev, real_stat(path).st_ino): values for path, values in faked.items()
+    }
+
+    def rewrite(observed: os.stat_result) -> os.stat_result:
+        values = identities.get((observed.st_dev, observed.st_ino))
+        if values is None:
+            return observed
+        fields = list(tuple(observed))
+        fields[stat.ST_UID] = values[0]
+        fields[stat.ST_MODE] = (observed.st_mode & ~0o7777) | values[1]
+        return os.stat_result(fields)
+
+    def fake_stat(target: object, *args: object, **kwargs: Any) -> os.stat_result:
+        return rewrite(real_stat(target, *args, **kwargs))  # type: ignore[arg-type]
+
+    def fake_fstat(descriptor: int) -> os.stat_result:
+        return rewrite(real_fstat(descriptor))
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    monkeypatch.setattr(os, "fstat", fake_fstat)
+
+
+@pytest.mark.parametrize("keyring_fake", (False, True), ids=("plain", "world-keyring-fake"))
+def test_the_world_policy_holds_on_a_host_whose_root_is_0555_and_home_is_0711(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keyring_fake: bool
+) -> None:
+    """The replay's host (package AH): `/` is root 0555, `/home/lighthouse` is 0711.
+
+    `_directory_policy` is what `World` hands the deployment lock, recorded before `World`
+    installs `_mark_daily_keyring_root_owned`, whose `os.stat` answers 0755 for `/`. On
+    OpenCloudOS that disagreed with an exact `(0, 0o555)` record, and the replay stopped at
+    `deployment lock ancestor / is unsafe`. A stand-in `home` (root 0755) and a real 0711
+    `home/lighthouse` sit between `/` and the anchor, so both kinds of ancestor are walked.
+    """
+
+    home = tmp_path / "home"
+    user_home = home / "lighthouse"
+    anchor = user_home / "replay" / "root" / "var" / "lib" / "rquant" / "runtime-authority"
+    anchor.mkdir(parents=True)
+    for path in anchor.parents:
+        if path == user_home:
+            break
+        path.chmod(0o755)
+    anchor.chmod(0o755)
+    user_home.chmod(0o711)
+    _host_like_stat(monkeypatch, {Path("/"): (0, 0o555), home: (0, 0o755)})
+    policy = _directory_policy(anchor)
+    assert policy[Path("/")] == (0, None)
+    assert policy[home] == (0, None)
+    assert policy[user_home] == (UID, 0o711)
+    if keyring_fake:
+        keyring = user_home / "replay" / "root" / "etc" / "rquant" / "keys.json"
+        keyring.parent.mkdir(parents=True)
+        keyring.write_text("{}", encoding="utf-8")
+        _mark_daily_keyring_root_owned(monkeypatch, keyring)
+        assert stat.S_IMODE(os.stat("/").st_mode) == 0o755
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_ANCHOR", anchor)
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_LOCK_PATH", anchor / "deployment.lock")
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", UID)
+    monkeypatch.setattr(authority_module, "_PRODUCTION_RUNTIME_DIRECTORY_POLICY", policy)
+
+    with authority_module.acquire_runtime_deployment_lock() as lock:
+        lock.assert_current()
+
+    #: the record the helper used to make is the one the host refused
+    policy[Path("/")] = (0, 0o555)
+    if keyring_fake:
+        with pytest.raises(RuntimeAuthorityPublishError, match="ancestor / is unsafe"):
+            authority_module.acquire_runtime_deployment_lock()
+    #: and a root-owned ancestor that anyone can write is still refused under the relaxed rule
+    policy[Path("/")] = (0, None)
+    _host_like_stat(monkeypatch, {home: (0, 0o775)})
+    with pytest.raises(RuntimeAuthorityPublishError, match=f"ancestor {home} is unsafe"):
         authority_module.acquire_runtime_deployment_lock()
 
 
