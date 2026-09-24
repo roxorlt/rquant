@@ -212,6 +212,13 @@
 
 ### Fixed
 
+- **全角色沙箱 e2e 的间歇失败（CI run 36059539009，3.11 分片 2；只改测试）**：
+  `tests/integration/test_route_a_all_roles_sandbox_e2e.py` 的 `run_role` 在拍 `trees_before` 快照之前先做一次完整的
+  `gc.collect()`。前面的 role 没关闭的 SQLite 连接和它自己的语句缓存互相引用，引用计数归零也不会关，只能等循环垃圾回收；
+  回收的时机跟着内存分配次数走，落进后面哪个 role 的测量窗口，WAL 旁路文件被删的这次变化就算到哪个 role 头上（这次是
+  paper broker 留下的 `broker.sqlite3` / `consumer.sqlite3`，算到了 `lab_artifact_catalog` 头上）。现在这些残留在窗口外
+  关掉；「role 不许在沙箱外写」的断言不变，`KNOWN_C_LEVEL_WRITES` 不加项。
+
 - **schema rollout 不再卡死路线 A 链：形状没变的 channel 不建计划，DUAL_WRITE 的期限从生产者第一次双写起算，
   过期先拒后发（#304、#228，包 AJ）**：协调者 2026-09-25 01:01 在主机上只读查了 `data/runtime/control/schema-rollouts`：
   **208 份计划，全部过期**，192 份停在 DUAL_WRITE、16 份停在 PREPARE。09-07 以来每个装机窗口都承认了整整 16 份，每份
