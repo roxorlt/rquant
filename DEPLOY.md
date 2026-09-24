@@ -22,11 +22,24 @@
 **怎么装**：
 
 - **时间**：收盘后或休市期间。09-25（中秋）到 09-27 休市，**下一个交易日是 2026-09-28（周一）**。
-- **步骤 = 正常的路线 A 窗口**（同 v0.33.21 那条的第 1 步：代码切到 v0.33.22，按路线 A 窗口的做法），不加新步骤，
-  没有 unit 要重装（`deploy/systemd/` 没变）。相对 v0.33.21，`deploy/` 的 diff **只有** `deploy/nginx/rquant-backup.conf`，
-  而这份主机上已经是同一内容，所以装机时这一项只做一次核对：仓库与主机文件 `diff` 为空（命令在下一条）。
+- **步骤 = 正常的路线 A 窗口**（同 v0.33.21 那条的第 1 步：代码切到 v0.33.22，按路线 A 窗口的做法），只在第 ④ 步前
+  加一次只读检查（下面），没有 unit 要重装（`deploy/systemd/` 没变）。相对 v0.33.21，`deploy/` 的 diff **只有** `deploy/nginx/rquant-backup.conf`，
+  而这份主机上已经是同一内容，所以装机时这一项只做一次核对：仓库与主机文件 `diff` 为空（命令在下面「nginx `/preview/` 登录路径」一条）。
   `scripts/deploy-production.sh` 按设计拒收 diff 含 `deploy/nginx/` 的 target（`docs/production-release.md`「自动拒绝」，
   与 v0.33.21 的 `deploy/systemd/` 同理），所以本版照 v0.33.21 那样走路线 A 窗口。
+- **装前只读检查（第 ④ 步 `runtime-deployment-profile` 之前，必做）**：在无 `.env` 的 bootstrap worktree
+  （v0.33.22 的检出）里先跑一次 `close-unchanged` 的 dry-run，它只读打开每份计划、一个字节不写：
+
+```bash
+cd "${WT}"
+./.venv/bin/rquant runtime-schema-rollout close-unchanged \
+  --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
+```
+
+  **只有报 `schema_changed: 0` 才往下走第 ④ 步**。预期 `plans: 208`、`schema_changed: 0`；`closed` 是「apply 时会关掉」
+  的份数（dry-run 不关任何一份），此时 `current` 还是 09-24 那代，所以 `closed_current_generation` 应为 16（那代自己的
+  16 份计划）——这只是预览，这一步不 apply。仍是 WAL 的库在这里报 `state_unreadable`（`acknowledge` 转换之前本来就读不了），
+  不算阻断；阻断条件只有 `schema_changed` 不为 0——那说明主机上有一份计划保护的是真实的 schema 变化，停下来找协调者。
 - **第 ④ 步 `runtime-deployment-profile --apply`**：新代装在 09-24 代之上，**一份 rollout 计划都不建**（热修 AJ：
   v0.33.21 与 v0.33.22 的 21 个 channel 形状和 serving 物理 schema 逐一相同）。回执里 `schema_rollout_plan_ids` 是 `[]`，
   `control/schema-rollouts` 仍是 208 个目录。
