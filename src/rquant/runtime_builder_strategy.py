@@ -48,6 +48,10 @@ from rquant.strategy_runner import (
 )
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+#: `RuntimeStepResult.observations` key: candidates of the newest feature batch the
+#: strategy did not evaluate (a required feature STALE or unavailable). Informational,
+#: never a degradation.
+STRATEGY_SKIPPED_CANDIDATES_OBSERVATION = "strategy_skipped_candidates"
 
 
 class _DeferredLifecycleFeatureSource:
@@ -456,6 +460,12 @@ def strategy_live_builder(
                 producer_manifest_fingerprint=manifest.manifest_fingerprint,
             )
 
+        #: the newest feature batch's skipped-candidate count, carried through the
+        #: iterations that find no new batch: batches arrive once a minute and the loop
+        #: runs every two seconds, so reporting only "this iteration" would read 0 on 29 of
+        #: every 30 heartbeats while a held position's feed is stale
+        skipped_observation: dict[str, int] = {}
+
         def step() -> RuntimeStepResult:
             summary = run_strategy_live_batch(
                 feature_spool=feature_spool.get(),
@@ -480,6 +490,10 @@ def strategy_live_builder(
                 0,
                 summary.source_high_watermark - summary.last_feature_sequence,
             )
+            if summary.last_batch_skipped_candidates is not None:
+                skipped_observation[STRATEGY_SKIPPED_CANDIDATES_OBSERVATION] = (
+                    summary.last_batch_skipped_candidates
+                )
             return RuntimeStepResult(
                 input_sequence=summary.last_feature_sequence,
                 output_sequence=summary.runner_signal_high_watermark,
@@ -489,6 +503,7 @@ def strategy_live_builder(
                     "feature_spool": summary.source_generation_id,
                     "runner_signal": runner.source_generation_id,
                 },
+                observations=skipped_observation,
             )
 
         if runner.identity_rotation is not None:
@@ -500,6 +515,7 @@ def strategy_live_builder(
 
 
 __all__ = [
+    "STRATEGY_SKIPPED_CANDIDATES_OBSERVATION",
     "StrategyEvaluatorBinding",
     "StrategyEvaluatorLoader",
     "StrategyLiveRuntimeSettings",
