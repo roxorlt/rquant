@@ -2255,9 +2255,18 @@ def load_runtime_schema_service_bindings(
         )
     bindings: list[RuntimeSchemaServiceBinding] = []
     for plan_id in _schema_rollout_plan_ids(root):
-        authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
-        if authority.target_generation_id != generation_id:
+        #: A plan of another generation binds nothing here, so it is not opened either: only
+        #: its authority file is read, to learn which generation it targets. Every release
+        #: before #228 was fixed left a full set of plans behind (208 on the host by
+        #: 2026-09-25, all past their window), and loading one re-derives it from both of its
+        #: generations' bundles and opens its store — none of which can tell this generation
+        #: anything, and any of which failing used to stop this service's admission.
+        target = _read_schema_rollout_authority(
+            _schema_rollout_root(root, plan_id) / "authority.json"
+        ).target_generation_id
+        if target != generation_id:
             continue
+        authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
         state = store.get_state(plan_id)
         recorder: SchemaRolloutStore | None = None
 
@@ -2496,11 +2505,12 @@ def _convert_rollout_journal(
 ) -> _RolloutJournalConversion:
     """Open one plan's store as a writer so its header stops saying WAL.
 
-    Every plan, not only the current generation's. `load_runtime_schema_service_bindings`
-    walks `control/schema-rollouts` and opens each plan's store *before* it knows whether the
-    plan belongs to the current generation, so one WAL store left by an older build stops
-    every kind-backed role — which is #227 exactly, and leaving last generation's plans in WAL
-    would bring it straight back the next time a bundle is installed.
+    Every plan, not only the current generation's. Up to v0.33.21
+    `load_runtime_schema_service_bindings` opened each plan's store *before* it knew whether
+    the plan belonged to the current generation, so one WAL store left by an older build
+    stopped every kind-backed role — which is #227 exactly. Since #304 admission reads only
+    the other generations' authority files, but a generation that is rolled back to runs the
+    older admission again, so converting every store is still what keeps that path open.
 
     Nothing but the journal header changes: no phase moves, no event is appended, and the
     plan is not even read. `journal_mode` lives in the database header, so the writable open
