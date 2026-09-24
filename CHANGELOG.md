@@ -231,7 +231,13 @@
   - **真正的 schema 变化仍然走完整协议**：e2e 用 serving 读模型的物理 schema 变化造一次真变化——只建一份计划，承认进
     DUAL_WRITE 后跨周末不过期，周一第一次发布被接受并开窗，CONSUMER_ACK 之后没有 serving 的回执不许切换，有了才切换。
     另记一条观察（未改）：对既有生产者又有消费者的 channel，`validate_runtime_schema_transition` 会拒掉任何声明变化
-    （升版本号超出旧消费者的读取范围，不升版本号又有语义变化），所以今天能装上的「真变化」只有 serving 物理 schema 这一种。
+    （升版本号超出旧消费者的读取范围，不升版本号又有语义变化），所以今天能装上的「真变化」只有 serving 物理 schema 这一种；
+    而那五个 serving 生产者从不写双写记录，这种计划走不出 DUAL_WRITE；当前代若有一份没走完的真变化计划，形状相同的
+    下一次安装会把它丢下（#308，评审第 7、8 条）。
+  - **评审后补的（PASS-WITH-NOTES）**：生产者发布前的窗口检查先认幂等重试（库里已有同一 `write_id` 就放行，与写者的
+    顺序一致；原来重送一根更早的相同分钟线会被报 `rollout time cannot precede the current state`）；`close-unchanged`
+    发现 `schema_changed` 时退 2（其余退 0）；补了 `expire()`、CUTOVER 计划不关、dry-run 只读打开且不留旁路文件三处测试；
+    回放摘要的 `plans` 改数计划目录（`phases_by_channel` 按 channel 列阶段）；第 30 条里过时的两段改指向本条。
   - **测试**：`tests/unit/test_schema_rollout_no_op_plans.py`（6）、`tests/integration/test_schema_rollout_no_op_plans_e2e.py`
     （5，按主机时间线：09-24 16:21 承认、周一 09:30 开盘；含生产画像 16 条策略换提交 0 份计划）、回放新增
     `--generations 2` 一例（0 份计划、分钟线零失败、当日 serving 代带信号）。store 单测里「DUAL_WRITE 过了 `plan.deadline` 就拒」那一段改成先写一条双写记录开窗再越过窗口。依赖「换提交就有计划」的旧夹具改成：走完整协议的用真变化；讲主机上已有计划的，用

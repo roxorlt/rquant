@@ -28,6 +28,11 @@
   不会出现 `rollout deadline has expired` / `immutable sequence already contains different content`。
 - **那 208 份旧计划：安装不改它们**。它们指向已被取代的代，本版不会被它们绑住。
 
+**第 ④ 步之前先跑一次 dry-run 当作前置检查（只读，不需要写授权）**：`close-unchanged --dry-run`（命令见下）
+退 0 且 `schema_changed: 0`，说明当前代没有一份保护真实变化、还没走完的计划。这一条要紧：新代与当前代形状相同就不建
+计划，准入也不看旧代的计划，所以若当前代真有一份没走完的真变化计划，装上新代后那次变化会在没有消费者回执的情况下
+生效（评审第 7 条，#308）。退 2 就停下，不装。
+
 **建议紧跟第 30 条多做一步（生产数据库写入，按受控自动发布模式第 7 条需 owner 单独授权）**：把这 208 份关掉，
 这样万一窗口失败、`current` 退回 09-24 那代，那代的生产者也不会被已过期的计划绑住（09-24 代跑的是 v0.33.21 的准入，
 会绑）。命令跑在无 `.env` 的 bootstrap worktree（v0.33.22 的检出）里：
@@ -40,13 +45,15 @@ cd "${WT}"
   --runtime-root /home/lighthouse/rquant/data/runtime
 ```
 
-- dry-run 只读、一个字节不写。预期 `plans: 208`、`closed: 208`、`closed_current_generation: 0`、`schema_changed: 0`；
+- dry-run 只读、一个字节不写（也不以写者身份打开任何库、不留旁路文件）。预期 `plans: 208`、`closed: 208`、
+  `closed_current_generation: 0`、`schema_changed: 0`，**退出码 0**；
   每份 `shape_unchanged: true`，`phase_before` 是 `dual_write` 或 `prepare`，`phase_after: rollback`。若有库仍是 WAL，
   dry-run 对它报 `state_unreadable`——先跑一次 `acknowledge`（它会转换），再 dry-run。
 - apply 之后每份计划的哈希链末尾多一条 `rollback` 事件，原因
   `no_schema_change: the channel keeps its shape between the plan's generations (#228); old authority retained`；
   **`data/runtime/current` 不动**，不激活任何代，不写别的文件。再跑一次：`closed: 0`，每份 `skipped_reason: terminal`。
-- 只要报出任何 `schema_changed`，那份计划保护的是真实的 schema 变化，命令不碰它——停下来找协调者。
+- 只要报出任何 `schema_changed`，那份计划保护的是真实的 schema 变化，命令不碰它，**并且以退出码 2 结束**
+  （dry-run 与 apply 都是）——停下来找协调者。其余情况退 0。
 - 对消费者的影响：ROLLBACK 阶段的计划不绑生产者、不向消费者要回执（本版与 v0.33.21 都一样）。唯一要知道的是：
   如果关的是**当前代**的计划（`target_is_current: true`），正在跑、启动时已绑上它的生产者下一次发布会停下
   （`rolled-back schema producer must stop before publishing`），重启一次即不再绑定。按上面的顺序（起 unit 之前）跑，
@@ -2436,12 +2443,11 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       `operation_id` 是 `installer-deadline-reopen:<plan>`，输出里 `deadline_reopened: true`。
       **每份计划只有一次**；已越过 PREPARE 的计划一律不动 deadline；**窗口还没关的计划不许提前
       重开**（会白白花掉那一次），签名前缀不对也拒——这三条都由状态库自己守，命令绕不过去。
-    - **重开一次之后，这份计划后续每个阶段的窗口也同步后移一个窗口长度**：
-      `_validate_time` 管着这份计划**此后所有**的变更，所以 DUAL_WRITE 阶段生产者写双写记录、
-      CONSUMER_ACK 阶段消费者写回执，用的都是重开之后的那个 deadline。换句话说重开是
-      **把整份计划的时钟往后拨一个窗口**，不是只给承认这一步开口子。
-      实务含义：起 unit、跑双写、收回执这几步的时间预算，从重开那一刻起重新计时 600 秒；
-      超了就不是重开能解决的了（额度已用尽），要人工裁决。
+    - **重开只管 PREPARE 这一段（v0.33.22 / 热修 AJ 起）**：DUAL_WRITE 与 CONSUMER_ACK 的窗口
+      **从生产者第一条双写记录起算**、长度仍是计划自己的 600 秒、不早于 PREPARE 的期限；第一条
+      记录之前计划没有期限。所以收盘后、周末装的计划不会在开盘前过期，重开与否也不再决定下一个
+      交易日第一次发布能不能被接受。生产者在发布**之前**先问一次窗口，窗口关了就在碰 spool 之前拒绝
+      （不再先发布、后被拒）。细节见上方「2026-09-25 · 热修 AJ」一条。
     - 重开额度用尽还过期的计划报 `skipped_reason: deadline_expired`，**报告照样打完整、其余计划
       照样推进**，命令**退 2**。这时需要人工裁决（重新 `prepare` 是另一次生产写入，要 owner 单独授权）。
 
@@ -2453,9 +2459,12 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     - 第 28 条那条启动顺序仍然照走。acknowledge 只消掉「等其他生产者承认」这一类失败；
       `strategy_live` ↔ `signal_router` 那个互等已经由 #231/#232/#220 那一包在代码里拆掉，
       两边现在都在主循环里等对端制品，不再退出。
-    - **#228 仍然在**：只要 `changed_runtime_schema_channels` 的指纹里带 `producer_commit`，
-      今后每一次纯代码发布都会凭空生出十六份计划，acknowledge 就得每次都跑一遍，
-      `control/schema-rollouts` 下的目录数每发一版加十六（没有任何代码清理旧计划目录）。
+    - **#228 已由热修 AJ 修掉（v0.33.22 起）**：`changed_runtime_schema_channels` 按 channel 的
+      形状比较（声明语义、物理 schema、serving 消费的 channel 再加 serving 物理 schema），不再带
+      `producer_commit`，所以**纯代码发布不建任何计划**，第 ④ 步回执的 `schema_rollout_plan_ids`
+      是 `[]`，这一步照跑但什么都不推进（旧计划全报 `not_current_generation`）。之前各版留下的
+      旧计划怎么处置（`runtime-schema-rollout close-unchanged`，先 `--dry-run`；有 `schema_changed`
+      时退 2），见上方「2026-09-25 · 热修 AJ」一条。
 
 31. **十六个 runtime unit 文件必须按 A-7 的做法重装一次，否则第 30 条做完 unit 还是写不了**
     （#227，owner 2026-09-07 授权 A）。第 30 条把计划推到了 DUAL_WRITE，而 DUAL_WRITE 阶段
