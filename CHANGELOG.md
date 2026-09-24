@@ -212,9 +212,22 @@
     指针的 `switched_at` 一律是当天 09:25。唯一的期限就是 09:25 本身；「提交完成之前任何记录都不可见」
     照旧成立（注册表仍拒绝提交完成晚于可见时刻的发布，而可见时刻就是截止时刻），09:25 之后才开始的一轮仍然拒。
     **消费方盘点**：09:25 之前没有谁读当天这一代——模拟盘约束要 09:30 起的分钟证据，auction_gap 输入只在
-    09:29 起的装配窗里跑，serving 在 09:25 之前读到的是上一代（和今天 09:21 之前一样）。唯一的语义差别：
+    09:29 起的装配窗里跑，serving 在 09:25 之前读到的是上一代——**发版之后的第一个交易日除外**：发布者约 09:22
+    就写出 serving 权威、`published_at` 却是 09:25，serving 的读者于是沿发布历史往回找，找到上一个交易日由**旧版本
+    commit** 写的那一条，而它的历史信任集合只有自己的 commit 与当前指针的 commit（`runtime_serving_authority.py:385`、
+    `:503`，serving 构造读者时没有传 `trusted_historical_producer_commits`，`runtime_builder_serving.py:290-300`），
+    在 `runtime_serving_authority.py:667` 抛 `ServingSourceAuthorityIntegrityError: historical publication
+    producer_commit is not trusted`。`reference_slow_authority` 是硬源，所以那天约 09:22–09:25 serving **每一轮失败**，
+    09:25 起自动恢复；不退出、不推送，是已知限制（复核 MF-1，代码修法见 #300，本包不改这个六种 payload 共用的读者）。
+    09-28 不受影响：那天是第一次发布，没有历史，读者报 `Unavailable`，和 09-24 09:21 之前一样。唯一的语义差别：
     同一个窗口里的当日修订和原版一起在 09:25 变得可见，09:25 之前的决策两者都看不到（原来 09:23 的决策能看到原版），
     没有消费方读这个区别。
+  - **serving 权威永远带最新交易日的快照（复核 S-6(b)）**：原来权威带的是「本轮最后处理的那个快照」（基线行为）。
+    09:24 起的修订扫描在当日批次之后才封批，于是一个**针对过去交易日**的修订批次一旦发布（同一轮或之后一轮），
+    当天的权威就带上了那个过去交易日的投影。09-28 可能遇到：扫描拿 09-24 的数据与 spool 里没发布过的第 0 批比较，
+    内容不同就封一个 09-24 的修订批次——它的采集日是今天，**不会被当作过期批次跳过**，会被发布。现在权威在「与游标
+    所指批次同一采集日发布的批次」里取 `target_trade_date` 最晚的那个（同一目标日的更正按序号取后者，照样替换），
+    恢复分支同一规则。
   - **两种报错分开**：注册表新增 `ReferencePublicationVisibilityError`（`ReferencePublicationDeadlineError`
     的子类，原有的 fail-closed 捕获照旧生效），心跳里「commit ended after its promised visibility instant
     (before 09:25)」与「completed after 09:25」是两句话；源这边同理（`LiveSpoolVisibilityHorizonError`，
@@ -272,7 +285,8 @@
     其他 role 的修复各回退一次、恢复分支按 `started` 读、权威按谱系修订号、过期批次不跳过、未可见批次重新抛错、
     不翻页、源保护时间回 5 秒、空闲轮重新哈希、`current_sequence` 跳过恢复）全部被杀。
   - **没改的**：`deploy/systemd`（`CPUQuota` 由 owner 决定；同一版 v0.33.21 里另一条 Changed 把它提到了 200%）、#295（一天只有一次采集机会）、#290；发布者 09:25
-    之后整天每一轮都报「started after 09:25」算失败，这是设计，本包不动。
+    之后整天每一轮都报「started after 09:25」算失败，这是设计，本包不动。复核提的四条后续（今天的批次没发出去在发布者心跳上看不见、修订批次的
+    可发布死区、market-minute 夹持范围过宽、源 spool 被清空时读成干净的一轮）记在 #301，本包不做。
 
 - **参考慢源从来没有发布过一次：`stock_basic` 没要 `delist_date`，退市名单里还有一行历史代码（#293，包 AE）**：
   serving 的 `reference_slow_authority` 是硬源（永远不是可选源），而主机上

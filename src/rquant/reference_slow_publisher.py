@@ -637,9 +637,14 @@ def _publish_reference_slow_snapshot_with_rollback(
     #: 2026-09-24 the ~33k-record commit ran in the live slice under `CPUQuota=60%` and missed
     #: its five seconds three times before 09:25. With visibility at the cutoff the only
     #: deadline is 09:25 itself, and "nothing is visible before its commit completed" still
-    #: holds because the commit must complete by then. Nothing reads today's generation
-    #: before 09:25: paper constraints need minute evidence (09:30), the auction-gap input
-    #: its 09:29 window, and serving reads the previous generation until then.
+    #: holds because the commit must complete by then. Nothing needs today's generation
+    #: before 09:25: paper constraints need minute evidence (09:30) and the auction-gap input
+    #: runs from its 09:29 window. Serving reads the previous generation until then -- except
+    #: on the first trading day after a release: the authority is written at ~09:22 with
+    #: `published_at` 09:25, so serving walks the authority history, finds the previous
+    #: session's publication stamped with the old producer_commit, and refuses it
+    #: ("historical publication producer_commit is not trusted") every round until 09:25.
+    #: It recovers at 09:25; no exit, no push (tracked separately).
     available = decision_time
     pending = tuple(
         ReferenceRecord(

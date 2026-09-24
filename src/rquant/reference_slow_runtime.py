@@ -458,6 +458,57 @@ def _publishable_records(
             return
 
 
+def _authority_source(
+    spool: LiveBatchSpool,
+    *,
+    last_sequence: int,
+    cached: dict[int, tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]],
+) -> tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]:
+    """The published snapshot the serving authority carries: the newest trading day's.
+
+    The authority used to carry whichever snapshot was published last. A revision batch for a
+    past trading day is sealed after today's batch (the scan starts at 09:24), so publishing it
+    -- in the same round or a later one -- put that past day's projections into today's
+    authority. On 2026-09-28 the scan compares 09-24's data with the never-published batch 0 and
+    may seal exactly such a batch. Now the authority carries, among the batches published on the
+    discovery session of the batch at `last_sequence`, the one with the latest
+    `target_trade_date`; a same-day correction (same target, later sequence) still replaces the
+    original. Every batch discovered on that session with a sequence at or below the cursor was
+    published on it: a batch is only passed over as expired on a later session.
+    """
+
+    def load(sequence: int) -> tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]:
+        if sequence not in cached:
+            records = spool.list_after(
+                LiveChannel.REFERENCE_SLOW,
+                sequence=sequence - 1,
+                limit=1,
+            )
+            if len(records) != 1 or records[0].envelope.sequence != sequence:
+                raise ReferenceSlowRuntimeError(
+                    "reference serving authority source batch is unavailable"
+                )
+            cached[sequence] = (records[0], _record_snapshot(spool, records[0]))
+        return cached[sequence]
+
+    best = load(last_sequence)
+    session = best[0].envelope.source_time.astimezone(_SHANGHAI).date()
+    sequence = last_sequence - 1
+    #: a snapshot never targets a session after its discovery, so one that targets the
+    #: discovery session itself cannot be beaten by an earlier (lower-sequence) batch
+    while sequence >= 0 and best[1].target_trade_date < session:
+        try:
+            candidate = load(sequence)
+        except (LiveSpoolIntegrityError, ReferenceSlowRuntimeError):
+            break
+        if candidate[0].envelope.source_time.astimezone(_SHANGHAI).date() != session:
+            break
+        if candidate[1].target_trade_date > best[1].target_trade_date:
+            best = candidate
+        sequence -= 1
+    return best
+
+
 def publish_reference_slow_batches(
     *,
     spool: LiveBatchSpool,
@@ -531,6 +582,7 @@ def publish_reference_slow_batches(
     authority_snapshot: ReferenceSlowSourceSnapshot | None = None
     authority_receipt: ReferenceSlowPublishReceipt | None = None
     expired: list[int] = []
+    published_snapshots: dict[int, tuple[LiveBatchRecord, ReferenceSlowSourceSnapshot]] = {}
     for record in _publishable_records(
         spool,
         after=last_sequence,
@@ -642,10 +694,16 @@ def publish_reference_slow_batches(
                 raise
         authority_snapshot = snapshot
         authority_receipt = receipt
+        published_snapshots[envelope.sequence] = (record, snapshot)
         last_sequence = envelope.sequence
         processed += 1
 
     if authority_receipt is not None:
+        _source_record, authority_snapshot = _authority_source(
+            spool,
+            last_sequence=last_sequence,
+            cached=published_snapshots,
+        )
         #: The serving authority numbers its results by `revision` and refuses a different
         #: generation at the same or a lower one. The receipt's revision is the highest record
         #: lineage revision, which starts again at 1 every session, so the second session's
@@ -658,7 +716,10 @@ def publish_reference_slow_batches(
                 "revision": _reference_generation_revision(
                     registry,
                     authority_receipt.generation_id,
-                )
+                ),
+                "target_trade_date": authority_snapshot.target_trade_date,
+                "source_snapshot_id": authority_snapshot.content_sha256,
+                "security_count": len(authority_snapshot.security_facts),
             }
         )
 
@@ -709,7 +770,11 @@ def publish_reference_slow_batches(
                 raise ReferenceSlowRuntimeError(
                     "reference serving authority source batch is unavailable"
                 )
-            authority_snapshot = _record_snapshot(spool, records[0])
+            _source_record, authority_snapshot = _authority_source(
+                spool,
+                last_sequence=cursor.last_sequence,
+                cached={cursor.last_sequence: (records[0], _record_snapshot(spool, records[0]))},
+            )
             authority_receipt = ReferenceSlowPublishReceipt(
                 target_trade_date=authority_snapshot.target_trade_date,
                 generation_id=current_manifest.generation_id,

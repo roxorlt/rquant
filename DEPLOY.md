@@ -165,7 +165,15 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/lighthouse/rquant/src /home/lighthous
   `authorities/reference-slow/reference.sqlite3` 的 `reference_current.switched_at` 与代的 `published_at`
   都是当天 09:25:00（`01:25:00Z`），`reference_publication_receipt.completed_at` 不晚于它；
   `live/reference-slow/serving-authority/current.json` 出现，`published_at` 同样是 01:25:00Z、`sequence` 为 1。
-  09:25 之前 serving 读到的仍是「没有参考代」，09:25 起读到当天这一代。
+  09:25 之前 serving 读到的仍是「没有参考代」（第一次发布，没有历史，报 `Unavailable`），09:25 起读到当天这一代。
+- **之后每逢发版后的第一个交易日（已知限制，#300）**：发布者约 09:22 写出权威、`published_at` 是 09:25，serving 在这
+  几分钟里沿历史读到上一个交易日由旧版本 commit 写的那一条并拒绝它，心跳报
+  `reference_slow_authority reader failed: ... historical publication producer_commit is not trusted`
+  （`ServingSourceAuthorityIntegrityError`），**每一轮失败，09:25 起自动恢复**；不退出、不推送。字面上像「被篡改」，
+  不是篡改。没有发版的交易日不会出现（历史与当前是同一个 commit）。
+- **09-28 可能多出一个修订批次**：09:24 起的修订扫描拿 09-24 的数据与没发布过的第 0 批比较，若内容不同会封一个
+  **目标日是 09-24** 的修订批次（采集日是 09-28，不算过期，会被发布、心跳里没有 `expired_source_batch` 字样）。
+  serving 权威照样带 09-28 的投影（取目标日最晚的快照），注册表里多一代 09-24 的更正。
 - **若提交确实拖过了 09:25**：心跳报「reference slow publisher completed after 09:25」，注册表与游标都被补偿；
   若只是超出承诺的可见时刻（新规则下不会发生），报「commit ended after its promised visibility instant (before 09:25)」。
   源那边对应的两句是「atomic publication completed after 09:25」与「atomic publication ended after its promised

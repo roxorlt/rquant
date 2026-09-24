@@ -131,7 +131,31 @@ def _read_sqlite(path: Path, query: str) -> list[tuple[Any, ...]]:
         return connection.execute(query).fetchall()
 
 
-def run_rehearsal(
+def run_rehearsal(**arguments: Any) -> int:
+    """Run the rehearsal and put the process-wide temp directory back afterwards.
+
+    The rehearsal points `TMPDIR` and `tempfile.tempdir` at its own root so nothing it or
+    the code under rehearsal creates lands outside that root. Both are process-wide: the
+    suite calls `main` in-process, and without this every later test in the same process
+    would have made its temporary files under the first rehearsal's `tmp/` (review S-5).
+    """
+
+    import tempfile
+
+    had_tmpdir = "TMPDIR" in os.environ
+    previous_tmpdir = os.environ.get("TMPDIR")
+    previous_tempdir = tempfile.tempdir
+    try:
+        return _run_rehearsal(**arguments)
+    finally:
+        if had_tmpdir:
+            os.environ["TMPDIR"] = previous_tmpdir  # type: ignore[assignment]
+        else:
+            os.environ.pop("TMPDIR", None)
+        tempfile.tempdir = previous_tempdir
+
+
+def _run_rehearsal(
     *,
     runtime_root: Path,
     rehearsal_root: Path,
