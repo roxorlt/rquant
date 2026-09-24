@@ -313,6 +313,46 @@ def test_a_bound_plan_accepts_monday_s_first_publish_and_then_refuses_before_pub
     assert restarted.capture(MONDAY_OPEN + timedelta(minutes=15)).published is True
 
 
+def test_a_bound_producer_re_sending_an_older_batch_is_a_retry_not_a_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review item 1: the pre-publish check keeps the store's retry-first order.
+
+    The market-minute source re-captures a window it already published when the source hands
+    the same bar back, and re-records it with that batch's own `available_at` — older than
+    the plan's last record. The store accepts that as a retry; the pre-publish check has to
+    as well, inside the window and past it.
+    """
+
+    _disable_test_credential_sealer(monkeypatch)
+    root = tmp_path / "runtime"
+    _first_profile, first = _install(root, COMMITS[0], bootstrap=True)
+    thursday_profile, thursday = _install(root, COMMITS[1])
+    plan_id = _stage_host_plans(root, thursday_profile, first, thursday)
+    _authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
+    minute = _Minute(root, thursday_profile, thursday.generation_hash)
+    assert len(minute.bindings) == 1
+
+    assert minute.capture(MONDAY_OPEN).published is True
+    assert minute.capture(MONDAY_OPEN + timedelta(minutes=1)).published is True
+    records = len(store.dual_write_records(plan_id))
+    revision = store.get_state(plan_id).revision
+
+    again = minute.capture(MONDAY_OPEN)
+    assert again.published is False
+    assert minute.spool.current(LiveChannel.MARKET_MINUTE).sequence == 1
+    assert len(store.dual_write_records(plan_id)) == records
+    assert store.get_state(plan_id).revision == revision
+
+    #: past the window a new batch is refused before publishing, and a retry of a recorded
+    #: one is still a retry, as it is for the writer
+    with pytest.raises(ValueError, match="rollout deadline has expired"):
+        minute.capture(MONDAY_OPEN + timedelta(minutes=11))
+    assert minute.capture(MONDAY_OPEN + timedelta(minutes=1)).published is False
+    assert minute.spool.current(LiveChannel.MARKET_MINUTE).sequence == 1
+
+
 # ---------------------------------------------------------------------------------------
 # A real schema change still takes the whole protocol, across a weekend
 # ---------------------------------------------------------------------------------------

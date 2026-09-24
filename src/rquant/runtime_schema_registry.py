@@ -47,6 +47,7 @@ from rquant.schema_compatibility import (
     ConsumerCapabilityReceipt,
     ConsumerFieldCapability,
     ConsumerSchemaRequirement,
+    DualWriteValueRecord,
     LiveSchemaRolloutPlan,
     ProducerSchemaCapability,
     ProductionConsumerCapability,
@@ -210,12 +211,6 @@ class RuntimeSchemaDualWriteBinding:
             raise RuntimeError("rolled-back schema producer must stop before publishing")
         if phase is RolloutPhase.PREPARE:
             raise RuntimeError("schema producer cannot publish before dual_write")
-        #: `commit_payload` runs after the producer's publish, and the store checks the
-        #: plan's window again there. Asking the same question here, with the same
-        #: `observed_at`, is what keeps a closed window from refusing a record whose batch is
-        #: already published — the market-minute retry then collides with its own publish on
-        #: every later iteration (#304).
-        store.validate_dual_write_time(self.plan.plan_id, observed_at)
         candidate = dict(values)
         if old_values is None:
             old_fields = self.old_declaration.available_fields()
@@ -228,13 +223,28 @@ class RuntimeSchemaDualWriteBinding:
                     "runtime schema producer emitted undeclared fields: " + ", ".join(unknown)
                 )
             new_values = {name: candidate[name] for name in new_fields if name in candidate}
-        validate_dual_write_values(
+        evidence = validate_dual_write_values(
             old_declaration=self.old_declaration,
             new_declaration=self.new_declaration,
             old_values=old_values,
             new_values=new_values,
             generation_id=self.plan.target_generation_id,
             observed_at=observed_at,
+        )
+        #: `commit_payload` runs after the producer's publish, and the store checks the
+        #: plan's window again there. Asking the same question here, with the same
+        #: `observed_at`, is what keeps a closed window from refusing a record whose batch is
+        #: already published — the market-minute retry then collides with its own publish on
+        #: every later iteration (#304). The record's own identity goes with it, so a record
+        #: the store already holds is a retry here exactly as it is in the writer.
+        store.validate_dual_write_time(
+            self.plan.plan_id,
+            observed_at,
+            write_id=DualWriteValueRecord.create(
+                evidence=evidence,
+                old_values=old_values,
+                new_values=new_values,
+            ).write_id,
         )
         return RuntimeSchemaPreparedDualWrite(
             plan_id=self.plan.plan_id,
