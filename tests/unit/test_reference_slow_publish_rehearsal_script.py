@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
@@ -119,6 +121,8 @@ def _run(
     tmp_path: Path, runtime: Path, *extra: str, capsys: pytest.CaptureFixture[str]
 ) -> tuple[int, str]:
     script = _load_script()
+    tmpdir_before = os.environ.get("TMPDIR")
+    tempdir_before = tempfile.tempdir
     code = script.main(
         [
             "--runtime-root",
@@ -130,6 +134,10 @@ def _run(
             *extra,
         ]
     )
+    #: the rehearsal points both at its own root while it runs; neither may outlive it,
+    #: or every later test in this process makes its temporary files there (review S-5)
+    assert os.environ.get("TMPDIR") == tmpdir_before
+    assert tempfile.tempdir == tempdir_before
     return code, capsys.readouterr().out
 
 
@@ -205,3 +213,31 @@ def test_the_rehearsal_refuses_a_root_inside_the_runtime_root(
     assert code == 1
     assert "must not overlap the runtime root" in capsys.readouterr().out
     assert not (runtime / "var").exists()
+
+
+def test_the_temp_directory_is_restored_when_tmpdir_was_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Success and refusal both put the process-wide temp directory back, set or unset."""
+
+    runtime = _runtime_root(tmp_path)
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", None)
+
+    succeeded, _out = _run(tmp_path, runtime, "--no-auction", capsys=capsys)
+    refused, _out = _run(
+        tmp_path,
+        runtime,
+        "--publisher-start",
+        "09:24:57",
+        "--slow-commit-seconds",
+        "4",
+        "--no-auction",
+        capsys=capsys,
+    )
+
+    assert (succeeded, refused) == (0, 1)
+    assert "TMPDIR" not in os.environ
+    assert tempfile.tempdir is None
