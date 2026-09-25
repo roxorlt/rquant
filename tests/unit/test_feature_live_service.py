@@ -391,6 +391,65 @@ def test_stale_raw_batch_becomes_explicit_stale_empty_feature_batch(tmp_path: Pa
     assert all(statuses[name].reason.startswith("source_stale:") for name in GEOMETRY_FIELDS)
 
 
+def test_a_stale_raw_batch_in_the_middle_of_the_day_does_not_wedge_the_feature_spool(
+    tmp_path: Path,
+) -> None:
+    """A source failure between two good minutes used to stop `feature_live` for the day.
+
+    The STALE batch adds no row, so its input identity was the previous feature batch's;
+    `_next_feature_sequence` took it for a crash replay of that batch, and every round
+    refused with "immutable feature sequence already contains different content".
+    """
+
+    frames: list[pd.DataFrame | Exception] = [
+        _raw_frame(minute=40),
+        TimeoutError("source down"),
+        _raw_frame(minute=42),
+    ]
+
+    def fetch() -> pd.DataFrame:
+        item = frames.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    gateway = MarketMinuteGateway(
+        spool=LiveBatchSpool(tmp_path / "live"),
+        fetcher=fetch,
+        config=MarketMinuteGatewayConfig(
+            producer_version="market-minute-v1",
+            producer_commit="a" * 40,
+        ),
+    )
+    features = FeatureBatchSpool(tmp_path / "features")
+    for minute in (40, 41, 42):
+        received = datetime(2026, 7, 31, 1, minute, 2, tzinfo=UTC)
+        gateway.capture_once(received_at=received)
+        summary = run_feature_live_batch(
+            raw_spool=gateway.spool,
+            feature_spool=features,
+            historical_minutes=_history(),
+            historical_snapshot_id="history-20260730",
+            config=_config(),
+            observed_at=received,
+            limit=10,
+        )
+        assert summary.processed_count == 1
+
+    records = features.list_after(sequence=-1)
+    assert [record.envelope.sequence for record in records] == [0, 1, 2]
+    stale = features.read_result(records[1])
+    assert stale.frame.empty
+    assert all(
+        status.status is FeatureAvailability.STALE for status in stale.envelope.field_statuses
+    )
+    raw = gateway.spool.list_after(LiveChannel.MARKET_MINUTE, sequence=-1)
+    assert raw[1].envelope.quality_status is BatchQualityStatus.STALE
+    assert raw[1].envelope.batch_id in stale.envelope.input_batch_ids
+    assert raw[1].envelope.batch_id not in records[2].envelope.input_batch_ids
+    assert features.read_result(records[2]).frame.iloc[0]["latest_close"] == pytest.approx(10.1)
+
+
 def test_published_empty_raw_batch_is_consumed_as_unavailable_feature_batch(
     tmp_path: Path,
 ) -> None:

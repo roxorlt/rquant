@@ -209,8 +209,15 @@ def _feature_input_identity(
         frames.append(frame)
         input_ids.append(envelope.batch_id)
     input_cache.retire_before(target_date)
+    #: The target's own batch is always part of the identity. A batch that adds no row of its
+    #: date -- the STALE batch of a source failure, an empty answer -- used to leave it equal
+    #: to the previous feature batch's, which `_next_feature_sequence` reads as the crash
+    #: replay of that batch: the publish then met different content at its sequence and
+    #: `feature_live` refused every round for the rest of the day. A batch that does add rows
+    #: is already in the identity, and so is every target of a day with no rows yet.
+    input_ids.append(target.envelope.batch_id)
     if not frames:
-        return pd.DataFrame(), tuple(sorted(set(input_ids + [target.envelope.batch_id])))
+        return pd.DataFrame(), tuple(sorted(set(input_ids)))
     current = pd.concat(frames, ignore_index=True)
     current = current.sort_values(
         ["ts_code", "trade_time", "_source_sequence"],
