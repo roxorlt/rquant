@@ -9,6 +9,7 @@ import os
 import secrets
 import stat
 import threading
+import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, date, datetime
@@ -49,6 +50,23 @@ class PaperExecutionConstraintUnavailableError(RuntimeError):
 
 class PaperExecutionConstraintIntegrityError(RuntimeError):
     """The authority path, pointer, or immutable content failed verification."""
+
+
+class PaperExecutionConstraintReadRaceError(PaperExecutionConstraintIntegrityError):
+    """Something the reader checks changed between the start and the end of one read.
+
+    The publisher's own atomic replace does exactly that (a temporary file and a rename in
+    `current.json`'s directory, a link in `generations/`), and so does any entry created or
+    removed in an ancestor directory -- which on the host includes `data/`, where the
+    read-only replica is swapped in every five minutes. `PaperExecutionConstraintAuthority`
+    reads again, a bounded number of times; a change that persists is still refused, with
+    this same error.
+    """
+
+
+#: attempts of one authority read, and the pause between them (#307's broker errors)
+_READ_RACE_ATTEMPTS = 3
+_READ_RACE_RETRY_DELAY_SECONDS = 0.05
 
 
 class _StrictContractModel(RuntimeContractModel):
@@ -390,6 +408,20 @@ class PaperExecutionConstraintAuthority:
         observed_at: datetime,
     ) -> tuple[PaperExecutionConstraintBatch, PaperExecutionConstraintPointer]:
         observed = _normalize_observed_at(observed_at)
+        for attempt in range(1, _READ_RACE_ATTEMPTS + 1):
+            try:
+                return self._load_generation_once(observed=observed)
+            except PaperExecutionConstraintReadRaceError:
+                if attempt == _READ_RACE_ATTEMPTS:
+                    raise
+                time.sleep(_READ_RACE_RETRY_DELAY_SECONDS)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _load_generation_once(
+        self,
+        *,
+        observed: datetime,
+    ) -> tuple[PaperExecutionConstraintBatch, PaperExecutionConstraintPointer]:
         try:
             chain = _open_existing_directory_chain(self.root)
         except FileNotFoundError as exc:
@@ -455,7 +487,7 @@ class PaperExecutionConstraintAuthority:
                 missing_unavailable=True,
             )
             if current_after != pointer_bytes:
-                raise PaperExecutionConstraintIntegrityError(
+                raise PaperExecutionConstraintReadRaceError(
                     "current pointer changed while reading generation"
                 )
             _verify_directory_chain(chain)
@@ -811,6 +843,9 @@ def _read_regular_file_at(
         before = os.fstat(descriptor)
         at_path_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if not _same_regular_file(before, at_path_before):
+            if (before.st_dev, before.st_ino) != (at_path_before.st_dev, at_path_before.st_ino):
+                #: the name was replaced between the open and the stat: a publication
+                raise PaperExecutionConstraintReadRaceError(f"{label} identity is unsafe")
             raise PaperExecutionConstraintIntegrityError(f"{label} identity is unsafe")
         if before.st_size > max_bytes:
             raise PaperExecutionConstraintIntegrityError(f"{label} exceeds configured size limit")
@@ -831,7 +866,7 @@ def _read_regular_file_at(
             after,
             at_path_after,
         ):
-            raise PaperExecutionConstraintIntegrityError(f"{label} changed while being read")
+            raise PaperExecutionConstraintReadRaceError(f"{label} changed while being read")
         return payload
     except FileNotFoundError as exc:
         if optional:
@@ -857,7 +892,7 @@ def _verify_directory_chain(chain: list[DirectoryEntry]) -> None:
     for index, (directory_fd, name, initial) in enumerate(chain):
         current = os.fstat(directory_fd)
         if not _same_observation(initial, current) or not stat.S_ISDIR(current.st_mode):
-            raise PaperExecutionConstraintIntegrityError(
+            raise PaperExecutionConstraintReadRaceError(
                 "authority directory changed while being read"
             )
         if index == 0:
@@ -866,7 +901,7 @@ def _verify_directory_chain(chain: list[DirectoryEntry]) -> None:
         assert name is not None
         at_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_directory(current, at_path):
-            raise PaperExecutionConstraintIntegrityError(
+            raise PaperExecutionConstraintReadRaceError(
                 "authority directory changed while being read"
             )
 
@@ -992,6 +1027,7 @@ __all__ = [
     "PaperExecutionConstraintIntegrityError",
     "PaperExecutionConstraintPointer",
     "PaperExecutionConstraintPublisher",
+    "PaperExecutionConstraintReadRaceError",
     "PaperExecutionConstraintSnapshot",
     "PaperExecutionConstraintUnavailableError",
 ]

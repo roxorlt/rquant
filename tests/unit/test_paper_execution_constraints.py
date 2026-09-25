@@ -16,6 +16,7 @@ from rquant.paper_execution_constraints import (
     PaperExecutionConstraintIntegrityError,
     PaperExecutionConstraintPointer,
     PaperExecutionConstraintPublisher,
+    PaperExecutionConstraintReadRaceError,
     PaperExecutionConstraintSnapshot,
     PaperExecutionConstraintUnavailableError,
 )
@@ -543,38 +544,155 @@ def test_reader_rejects_symlinks_anywhere_in_authority_chain(
         _authority(root).load(observed_at=AVAILABLE_AT)
 
 
+def _replace_during_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    selected: Path,
+    replace_on_read: int,
+    every_attempt: bool,
+) -> list[int]:
+    """Replace `selected` with a byte-identical copy while the reader is reading it.
+
+    `replace_on_read` counts the non-empty reads of one authority read (one `load`
+    attempt reads `current.json`, the generation, then `current.json` again). Once, the
+    publisher's own rename landing mid-read; on every attempt, a path that never settles.
+    Returns the list the replacements are counted in.
+    """
+
+    original_read = constraint_module.os.read
+    replacements: list[int] = []
+    nonempty_reads = 0
+
+    def replace_matching_read(file_descriptor: int, size: int) -> bytes:
+        nonlocal nonempty_reads
+        data = original_read(file_descriptor, size)
+        if data:
+            nonempty_reads += 1
+        per_attempt = (nonempty_reads - 1) % 3 + 1
+        if data and per_attempt == replace_on_read and (every_attempt or not replacements):
+            replacement = tmp_path / f"replacement-{len(replacements)}.json"
+            replacement.write_bytes(selected.read_bytes())
+            os.replace(replacement, selected)
+            replacements.append(nonempty_reads)
+        return data
+
+    monkeypatch.setattr(constraint_module.os, "read", replace_matching_read)
+    monkeypatch.setattr(constraint_module, "_READ_RACE_RETRY_DELAY_SECONDS", 0.0)
+    return replacements
+
+
 @pytest.mark.parametrize("target", ["current", "generation"])
 def test_reader_detects_pointer_or_generation_replacement_during_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target: str,
 ) -> None:
+    """A path that changes under every attempt is still refused, as the same integrity error.
+
+    Until #307 the first change refused the read; the reader now reads again a bounded
+    number of times, so what it refuses is a change that does not stop.
+    """
+
     root, pointer = _publish_authority(tmp_path)
     selected = (
         root / "current.json"
         if target == "current"
         else root / "generations" / f"{pointer.batch_hash}.json"
     )
-    replacement = tmp_path / f"replacement-{target}.json"
-    replacement.write_bytes(selected.read_bytes())
-    original_read = constraint_module.os.read
-    replaced = False
-    nonempty_reads = 0
-    replace_on_read = 1 if target == "current" else 2
+    replacements = _replace_during_read(
+        monkeypatch,
+        tmp_path,
+        selected=selected,
+        replace_on_read=1 if target == "current" else 2,
+        every_attempt=True,
+    )
 
-    def replace_matching_read(file_descriptor: int, size: int) -> bytes:
-        nonlocal nonempty_reads, replaced
+    with pytest.raises(PaperExecutionConstraintIntegrityError, match="changed") as refused:
+        _authority(root).load(observed_at=AVAILABLE_AT)
+
+    assert isinstance(refused.value, PaperExecutionConstraintReadRaceError)
+    assert len(replacements) == constraint_module._READ_RACE_ATTEMPTS
+
+
+@pytest.mark.parametrize("target", ["current", "generation"])
+def test_a_replacement_during_one_read_is_read_again_and_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    """#307's broker errors: a publication landing mid-read costs a second read, not a round."""
+
+    root, pointer = _publish_authority(tmp_path)
+    selected = (
+        root / "current.json"
+        if target == "current"
+        else root / "generations" / f"{pointer.batch_hash}.json"
+    )
+    replacements = _replace_during_read(
+        monkeypatch,
+        tmp_path,
+        selected=selected,
+        replace_on_read=1 if target == "current" else 2,
+        every_attempt=False,
+    )
+
+    batch = _authority(root).load(observed_at=AVAILABLE_AT)
+
+    assert len(replacements) == 1
+    assert batch == _batch()
+
+
+def test_an_ancestor_that_changes_once_during_a_read_is_read_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host's `data/` gains and loses entries (the replica swap) while the broker reads.
+
+    `_verify_directory_chain` compares every ancestor's mtime; one entry created in the
+    authority root's parent mid-read used to refuse the round with "authority directory
+    changed while being read".
+    """
+
+    root, _pointer = _publish_authority(tmp_path)
+    original_read = constraint_module.os.read
+    touched: list[Path] = []
+
+    def touch_parent_once(file_descriptor: int, size: int) -> bytes:
         data = original_read(file_descriptor, size)
-        if data:
-            nonempty_reads += 1
-        if data and nonempty_reads == replace_on_read and not replaced:
-            replaced = True
-            os.replace(replacement, selected)
+        if data and not touched:
+            marker = root.parent / "replica-swap.tmp"
+            marker.write_text("x", encoding="utf-8")
+            touched.append(marker)
         return data
 
-    monkeypatch.setattr(constraint_module.os, "read", replace_matching_read)
+    monkeypatch.setattr(constraint_module.os, "read", touch_parent_once)
+    monkeypatch.setattr(constraint_module, "_READ_RACE_RETRY_DELAY_SECONDS", 0.0)
 
-    with pytest.raises(PaperExecutionConstraintIntegrityError, match="changed"):
+    assert _authority(root).load(observed_at=AVAILABLE_AT) == _batch()
+    assert len(touched) == 1
+
+
+def test_an_ancestor_that_never_settles_is_still_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _pointer = _publish_authority(tmp_path)
+    original_read = constraint_module.os.read
+    touched: list[Path] = []
+
+    def touch_parent_every_read(file_descriptor: int, size: int) -> bytes:
+        data = original_read(file_descriptor, size)
+        if data:
+            marker = root.parent / f"churn-{len(touched)}.tmp"
+            marker.write_text("x", encoding="utf-8")
+            touched.append(marker)
+        return data
+
+    monkeypatch.setattr(constraint_module.os, "read", touch_parent_every_read)
+    monkeypatch.setattr(constraint_module, "_READ_RACE_RETRY_DELAY_SECONDS", 0.0)
+
+    with pytest.raises(PaperExecutionConstraintReadRaceError, match="directory changed"):
         _authority(root).load(observed_at=AVAILABLE_AT)
 
 
