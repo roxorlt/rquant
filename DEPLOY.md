@@ -5,6 +5,49 @@
 
 ---
 
+## 2026-09-25 · 待安装 · 参考慢源一次采集失败，当天还能再试（#295）
+
+**状态**：**尚未安装**。本条是安装前必读，不是部署记录。分支 `cc/20260925-reference-slow-retry`，由协调者与其他分支合在一起装；
+目标是 **2026-09-28（周一）09:15 之前**装上，09:20 是第一次真跑。部署器 09:15–15:10 会延期需要重启的发布，所以最晚周一 09:15 前装完。
+
+**主机上会变的只有一处**：`reference-slow.source.v1` 这个 role 的采集代码（`src/rquant/runtime_service_builtin.py`，外加
+`reference_slow_runtime.py` 里一句注释）。不改 `deploy/`，不改 manifest 设置（生产画像里的 `retry_ordinal: 0` 照旧），
+**不加心跳字段**，不改 spool、注册表、serving 权威、配额账本的表结构。账本 `data/runtime/live/reference-slow/quota.sqlite3`
+里会多出新的请求号（第二次及以后的尝试），同一张表、同样的列。
+
+**装上之后应该看到什么**（每个交易日 09:20–09:25）：
+
+- **第一次就成功的早上**：和 v0.33.23 完全一样——09:20 那一轮采集，约 09:21 封好当日批次，09:25 参考代可见，09:29 起
+  auction_gap 有输入。这一次发的请求号也与 v0.33.23 逐字相同。
+- **09:20 第一次失败的早上**（比如当日 `adj_factor` 还没入库、Tushare 报错、超时）：那一轮心跳是失败，`last_error` 是真实原因
+  （例如 `adj_factor source is missing columns`）。**约 30 秒后的下一轮会再采一次**：`journalctl -u 'rquant-runtime-reference-slow-source@*'`
+  里能看到又一组 `stock_st`、三次 `stock_basic`（L / D / P）、`adj_factor`、`suspend_d`。成功后心跳回到 running、
+  `processed_count=1`，`capture_failed:<类名>` 那条降级理由消失；发布者照常在 09:25 发布参考代。
+- **每次都失败的早上**（09-23 那种缺陷）：最多试 6 次（大约到 09:23），之后每一轮报
+  `SourceQuotaConflictError: reference source attempt already exists: <结果>; all 6 capture attempts for 2026-09-28 are used`，
+  心跳挂 `capture_failed:<第一次失败的类名>` 直到换交易日。原因看 journal 里**第一次**失败的那一条。
+- **进程在采集中途被杀**（OOM、停机超时被 `SIGKILL`）：当天**仍然不重发**，60 秒内报 `already exists: pending`，
+  之后或重启之后报 `already exists: unknown`。这是有意保留的：那一次的答复丢了，不重发。
+- **09:24 起的修订扫描**：扫当天的那一轮照旧；**扫前一交易日的那一轮会失败**，`last_error` 是
+  `daily source must use the exact prior open date`。这是另一个已知缺陷（采集函数封不了过去交易日，见 CHANGELOG 同名一条），
+  只出现在当天批次封好之后，不影响当天参考代，不退出、不推送。v0.33.23 在同一轮报的是 `reference source attempt already exists: success`。
+- **Tushare 用量**：一次尝试约 6–7 次调用；全部失败也最多约 40 次，远低于每分钟 500 的额度。
+
+**周一 09:26 之后的只读核对**：
+
+```bash
+# 当天试了几次：每次尝试的第一个请求都是 stock_st（09:24 起的修订扫描也各算一次）
+journalctl -u 'rquant-runtime-reference-slow-source@*' --since '2026-09-28 09:19' --until '2026-09-28 09:26' \
+  | grep -c 'Tushare stock_st 请求'
+# 当日批次：batches/ 下应有一个 09-28 的批次；发布者心跳 processed_count=1
+ls -l /home/lighthouse/rquant/data/runtime/live/reference-slow/batches/ | tail -3
+```
+
+**回滚**：回到上一个版本即可，**不需要挪心跳文件**（没有新字段），也没有别的文件要一起回。回滚之后旧版本只认每天第一次的
+请求号：若当天第一次已经失败，旧版本照旧拒到换日（回到 #295 的行为）；新版本写下的第二次及以后的请求号旧版本不会去读。
+
+---
+
 ## 2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）
 
 **状态**：**已安装并启动**。代码 `df621ef2`（tag `v0.33.22`，PR #309 merge commit），路线 A bundle 第十五代

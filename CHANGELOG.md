@@ -212,6 +212,49 @@
 
 ### Fixed
 
+- **参考慢源一次采集失败不再赔掉整个交易日：同一天最多再试到第 6 次（#295）**：
+  - **现象**：2026-09-14/18/21/22/23 每天 09:20 的第一次采集失败之后，09:20–09:25 窗内后面每一轮都报
+    `SourceQuotaConflictError: reference source attempt already exists: success`（或 `: failure`），一次 Tushare 都没再问。
+    当天没有参考批次、没有参考代，auction_gap 整天拒，没有候选、没有信号。
+  - **原因**：`_capture_reference_with_quota`（`src/rquant/runtime_service_builtin.py`，v0.33.23 的 221–249 行）把请求号
+    算成（source、目标交易日、manifest 里的常量 `retry_ordinal`）的哈希，builder 每一轮传的都是同一个常量（444 行传
+    `retry_ordinal`、464 行传 `retry_ordinal + 1`，生产画像里是 0），配额账本里一个请求号只能出现一次。生产用 `transport`
+    记账，每次 Tushare 调用单独记一条、调用返回就记 `success`，所以「调用都返回了、校验没过」（09-23 的 `delist_date`，
+    或 09:20 那一刻当日 `adj_factor` 还没入库）在账本里也是 `success`，下一轮查到已存在就拒（246 行，`request` 记账是 293 行）。
+  - **修法**：请求号里加上「当天第几次」。当天目标的第一次与 v0.33.23 发的请求号逐字相同（好的早上什么都没变，旧账本照样读）；
+    第二次起、以及对过去交易日的任何一次，都带上采集日和序号。每一轮先按序号查账本：前面的尝试都已结束（`success` 或
+    `failure`）才用下一个号；遇到 `pending` / `unknown`（进程在调用中途被杀、答复丢了）当天不再发；中间缺一个号而后面有记录
+    （账本被改过）直接拒；6 次用完就拒，报 `...; all 6 capture attempts for <日期> are used`。上限是模块常量
+    `REFERENCE_SLOW_MAX_CAPTURE_ATTEMPTS = 6`：30 秒一轮，第 6 次大约在 09:23 开始，差不多是发布者（主机上约 80 秒一轮）还来得及
+    在 09:25 之前提交的最后一次；一直失败时最多多花约 40 次 Tushare 调用（额度每分钟 500）。
+  - **原有的保证都还在**：成功的那次不会再发（当天批次一进 spool，`capture_reference_slow_batch` 就不再调采集）；不会重复发布
+    （spool 仍是唯一的裁决，写入没赶上 30 秒保护会整体回滚，下一轮重新采、只封一批）；序号不回退（#298）；09:25 可见规则、
+    发布者 09:25 之后不开始新一轮、过期批次跳过都没动；进程被杀之后仍然不重发（`test_reference_kill_is_durable_and_same_request_cannot_refetch`
+    等原有用例不改一字照过）；校验、签名、spool 完整性检查都照旧拒绝。
+  - **顺带修掉的同一个缺陷的另一条路：修订扫描跨天撞号**。第二个交易日 09:24 起扫前一交易日时，用的正是前一天扫自己时已经
+    用过的请求号，被拒成 `already exists: success`，一张 Tushare 都没问（主机上 09-24 扫过自己，09-28 会是第一次撞上）。
+    现在对过去交易日的扫描请求号带采集日，每天各算各的。
+  - **发现但没修（报给协调者，另开 issue）**：真实的采集函数封不了过去交易日的批次——`assemble_reference_slow_source_snapshot`
+    （`src/rquant/reference_slow_source.py:140`）按完成时刻取目标交易日，目标是过去的交易日时报
+    `daily source must use the exact prior open date`。所以 09:24 之后扫前一交易日的那一轮仍然失败，只是原因从「请求号已存在」
+    变成了这一句；它只出现在当天批次封好之后，不影响当天的参考代。原有的修订用例（`test_production_builder_discovers_bounded_revisions_with_pit_availability`）
+    替换了采集函数，所以从来没走到这里。
+  - **#279 没有一起修**：daily-close 源是同一种机制（`daily_close_gateway.py:421` 的请求号带常量 `retry_ordinal`，
+    `daily_close_source_service.py:19` 每轮都用 0，1362 行遇到已结束的尝试就返回已存的 STALE 批次），但它要的不是同一个小改动：
+    Tushare 当日 `daily` 15:30–17:00 才出，需要 15:00 之后按间隔重试的时间表和日配额预算，网关里还有 STALE 批次与待恢复文件
+    两条分支要一起改。
+  - **没有新增任何心跳字段、manifest 设置字段或落盘格式**；账本表结构不变，只是多出新的请求号。回滚不需要挪心跳文件。
+  - **用例**：`tests/unit/test_reference_slow_capture_retry.py`（14 个，真实 builder + 真实采集函数 + 真实 DuckDB 副本 + 生产的
+    `transport` 记账 + 真实 `RuntimeServiceControl` 与发布者，只替换 Tushare）：四种失败（当日 `adj_factor` 未入库、`stock_basic`
+    缺 `delist_date`、Tushare 报错、超时）× 两种记账，第一次失败、30 秒后第二次成功、09:25 参考权威可见、09:29 auction_gap 输入
+    接受这一代；第一次的请求号与 v0.33.23 相同；一直失败到第 6 次封顶、第二天重新开始；写入没赶上保护时重采且只封一批；
+    进程被杀后同进程报 `pending`、重启后报 `unknown`、都不重发；账本缺号拒绝；第二天扫前一天不再撞号。改动前 14 个里 12 个失败
+    （剩下两个是改动前后都必须成立的保证：第一次请求号不变、被杀不重发）。原来钉住 #295 行为的
+    `test_reference_slow_source.py::test_a_failed_capture_stays_on_the_heartbeat_until_the_trade_date_rolls_over`
+    改成：窗内第二轮真的再问一次 Tushare、以同样的原因失败，心跳仍只挂第一次失败的类名。
+  - **合并注意**：`runtime_service_builtin.py` 在 R07 的源文件快照清单里、新测试文件不在全量分片清单里，本分支**没有**重新冻结，
+    由集成时统一做。
+
 - **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
   汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、
   `latest_screen`）还没接进来，这些字段是 `NULL` 本身正常；但代码直接 `int(row['daily_bar_rows'])` 之类，一撞
