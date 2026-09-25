@@ -11,3 +11,17 @@ export const SERVING_ROOT =
 export const APP_URL = `http://127.0.0.1:${WEB_PORT}/app/`;
 /** Runs the repository's Python without re-syncing the environment. */
 export const UV_RUN = process.env.RQ_E2E_UV_RUN ?? "uv run --no-sync";
+
+/**
+ * A copy of a replayed production Serving root (never committed: the repo is public).
+ * When set, the API serves it instead of the synthetic fixture and the specs expect the
+ * replay's rows (6 signals, 6 deliveries, 2 paper holdings on 2026-09-24).
+ */
+export const REPLAY_ROOT = process.env.RQ_E2E_REPLAY_ROOT ?? null;
+/**
+ * The API clock starts here and runs (scripts/serve_web_fixture.py): 5 minutes after the
+ * synthetic generation (2026-09-24 15:36 in Shanghai, after the close), or 40 seconds
+ * after the replay generation (13:24, mid-session).
+ */
+export const API_NOW =
+  process.env.RQ_E2E_NOW ?? (REPLAY_ROOT ? "2026-09-24T05:24:01Z" : "2026-09-24T07:36:00Z");

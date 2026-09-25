@@ -1,9 +1,27 @@
 import { defineConfig, devices } from "@playwright/test";
-import { API_PORT, APP_URL, REPO_ROOT, SERVING_ROOT, UV_RUN, WEB_PORT } from "./env.ts";
+import {
+  API_NOW,
+  API_PORT,
+  APP_URL,
+  REPLAY_ROOT,
+  REPO_ROOT,
+  SERVING_ROOT,
+  UV_RUN,
+  WEB_PORT,
+} from "./env.ts";
+
+const serve = (root: string) =>
+  `${UV_RUN} python scripts/serve_web_fixture.py --root "${root}" --now ${API_NOW}` +
+  ` --bind 127.0.0.1:${API_PORT}`;
+const buildFixture =
+  `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama` +
+  " --replace";
 
 // Two servers, like production: the web API over a synthetic Serving generation
-// (scripts/build_web_fixture.py, invented data) and the built web/dist behind a
-// small nginx stand-in at /app/ (e2e/static-server.mjs, same CSP and headers).
+// (scripts/build_web_fixture.py, invented data) — or over a replay copy when
+// RQ_E2E_REPLAY_ROOT is set — with its clock pinned (scripts/serve_web_fixture.py), and
+// the built web/dist behind a small nginx stand-in at /app/ (e2e/static-server.mjs,
+// same CSP and headers).
 export default defineConfig({
   testDir: ".",
   outputDir: "../test-results",
@@ -25,16 +43,12 @@ export default defineConfig({
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: [
     {
-      command:
-        `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama --replace` +
-        ` && ${UV_RUN} rquant web-serve --bind 127.0.0.1:${API_PORT}`,
+      command: REPLAY_ROOT ? serve(REPLAY_ROOT) : `${buildFixture} && ${serve(SERVING_ROOT)}`,
       cwd: REPO_ROOT,
       url: `http://127.0.0.1:${API_PORT}/api/v1/meta`,
       env: {
         RQUANT_DISABLE_DOTENV: "1",
-        RQUANT_SERVING_ROOT: SERVING_ROOT,
-        // The fixture is dated 2026-09-24; keep it "ready" whenever the tests run.
-        RQUANT_WEB_STALE_AFTER_SECONDS: String(10 * 365 * 24 * 3600),
+        RQUANT_SERVING_ROOT: REPLAY_ROOT ?? SERVING_ROOT,
       },
       reuseExistingServer: false,
       timeout: 180_000,

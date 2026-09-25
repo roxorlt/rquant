@@ -1,58 +1,13 @@
 import { execSync } from "node:child_process";
 import { expect, type Page, test } from "@playwright/test";
 import { NAV_GROUPS, PAGES } from "../src/app/pages.ts";
-import { APP_URL, REPO_ROOT, SERVING_ROOT, UV_RUN } from "./env.ts";
+import { REPLAY_ROOT, REPO_ROOT, SERVING_ROOT, UV_RUN } from "./env.ts";
+import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
 const VIEWPORTS = [
   { name: "desktop", width: 1440, height: 900 },
   { name: "phone", width: 390, height: 844 },
 ] as const;
-
-interface PageWatch {
-  problems: string[];
-}
-
-/**
- * Playwright's trace snapshotter injects a script into every frame; Chrome blocks it
- * in the report's script-less sandbox and logs this. Verified with a bare page:
- * the message appears only while tracing. The report itself carries no script (the
- * test asserts that), so this one message is not an application error.
- */
-const TRACE_SANDBOX_NOISE =
-  /^Blocked script execution in 'http:\/\/127\.0\.0\.1:\d+\/app\/reports\/[\w.-]+\.html' because the document's frame is sandboxed and the 'allow-scripts' permission is not set\.$/;
-
-/** Collects console errors, uncaught errors, failed and cross-origin requests. */
-function watch(page: Page): PageWatch {
-  const problems: string[] = [];
-  const origin = new URL(APP_URL).origin;
-  page.on("console", (message) => {
-    if (message.type() === "error" && !TRACE_SANDBOX_NOISE.test(message.text())) {
-      problems.push(`console error: ${message.text()}`);
-    }
-  });
-  page.on("pageerror", (error) => problems.push(`page error: ${error.message}`));
-  page.on("requestfailed", (request) => problems.push(`request failed: ${request.url()}`));
-  page.on("request", (request) => {
-    const url = request.url();
-    if (!url.startsWith("data:") && !url.startsWith(origin)) {
-      problems.push(`cross-origin request: ${url}`);
-    }
-  });
-  page.on("response", (response) => {
-    if (response.status() >= 400) {
-      problems.push(`HTTP ${response.status()}: ${response.url()}`);
-    }
-  });
-  return { problems };
-}
-
-async function expectNoHorizontalOverflow(page: Page, where: string): Promise<void> {
-  const overflow = await page.evaluate(() => {
-    const root = document.documentElement;
-    return { scroll: root.scrollWidth, client: root.clientWidth };
-  });
-  expect(overflow.scroll, `horizontal overflow on ${where}`).toBeLessThanOrEqual(overflow.client);
-}
 
 async function expectPage(page: Page, path: string, title: string): Promise<void> {
   await expect(page.getByRole("heading", { level: 1, name: title })).toBeVisible();
@@ -70,8 +25,8 @@ for (const viewport of VIEWPORTS) {
       const watcher = watch(page);
       await page.goto("./");
       await expectPage(page, "/overview", "总览");
-      await expect(page.locator(".gen-tag")).toContainText("正常");
-      await expect(page.locator(".gen-tag .mono")).toHaveText(/^[0-9a-f]{8}$/);
+      await expect(page.locator(".gen-tag")).toHaveAttribute("data-state", "ready");
+      await expect(page.locator(".gen-tag")).toContainText(/^数据 (刚刚|\d+ 分钟前)更新$/);
 
       for (const target of PAGES) {
         if (viewport.name === "desktop") {
@@ -80,7 +35,7 @@ for (const viewport of VIEWPORTS) {
             .getByRole("link", { name: target.title })
             .click();
         } else {
-          await page.getByRole("button", { name: "打开导航" }).click();
+          await page.getByRole("button", { name: "更多页面" }).click();
           const sheet = page.getByRole("navigation", { name: "页面导航" });
           await expect(sheet.getByRole("group")).toHaveCount(NAV_GROUPS.length);
           await sheet.getByRole("link", { name: target.title }).click();
@@ -142,15 +97,12 @@ test("the rail collapses and the theme choice survives a reload", async ({ page 
   expect(watcher.problems).toEqual([]);
 });
 
-test("the longest phase label and a long unbroken serving detail fit a 390 px phone", async ({
-  page,
-}) => {
+test("the longest phase label and a stale-data banner fit a 390 px phone", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const watcher = watch(page);
   const generationId = "f".repeat(64);
-  // Real degraded details are comma-joined ids with no spaces; this one has no hyphen
-  // either, so the browser finds no break opportunity of its own.
-  const detail = `serving generation degraded: runtime_health:degraded:${Array.from(
+  // Real details are long comma-joined ids with no spaces; they stay in the tooltip.
+  const detail = `serving generation stale: ${Array.from(
     { length: 12 },
     (_, index) => `missing:service_${index}.source.v1`,
   ).join(",")}`;
@@ -162,12 +114,12 @@ test("the longest phase label and a long unbroken serving detail fit a 390 px ph
           viewer: "e2e",
           generation: {
             generation_id: generationId,
-            built_at: "2026-09-24T06:57:00Z",
+            built_at: "2026-09-24T06:40:00Z",
             published_at: null,
             previous_generation_id: null,
             producer_commit: "0".repeat(40),
             schema_version: 3,
-            age_seconds: 60,
+            age_seconds: 1080,
           },
           datasets: [],
           projections: [],
@@ -176,30 +128,37 @@ test("the longest phase label and a long unbroken serving detail fit a 390 px ph
             phase: "closing_auction",
             phase_label: "尾盘集合竞价",
             is_trading_day: true,
+            previous_trading_day: "2026-09-23",
+            next_trading_day: "2026-09-28",
           },
         },
         serving: {
           generation_id: generationId,
-          built_at: "2026-09-24T06:57:00Z",
-          state: "degraded",
+          built_at: "2026-09-24T06:40:00Z",
+          age_seconds: 1080,
+          state: "stale",
+          message: "数据已 18 分钟没有更新，页面上的数字可能不是最新的。",
           detail,
         },
       },
     }),
   );
-  await page.goto("./#/overview");
-  await expect(page.getByRole("status")).toContainText("运行时数据处于降级状态");
+  await page.goto("./#/datacenter");
+  const banner = page.locator(".banner");
+  await expect(banner).toContainText("数据已 18 分钟没有更新");
+  await expect(banner).not.toContainText("service_0");
   await expect(page.getByText("尾盘集合竞价")).toBeVisible();
   await expectNoHorizontalOverflow(page, "phone top bar and banner");
   expect(watcher.problems).toEqual([]);
 });
 
 test("a newly published generation reaches the page within 20 seconds", async ({ page }) => {
+  test.skip(Boolean(REPLAY_ROOT), "the replay copy is read-only; nothing is published into it");
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("./#/overview");
-  const marker = page.locator(".gen-tag .mono");
-  await expect(marker).toHaveText(/^[0-9a-f]{8}$/);
-  const before = await marker.textContent();
+  const marker = page.locator(".gen-tag");
+  await expect(marker).toHaveAttribute("data-generation", /^[0-9a-f]{12}$/);
+  const before = await marker.getAttribute("data-generation");
 
   const output = execSync(
     `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama --publish-next`,
@@ -208,7 +167,9 @@ test("a newly published generation reaches the page within 20 seconds", async ({
   const published = JSON.parse(output.trim().split("\n").pop() ?? "{}") as {
     generation_id: string;
   };
-  expect(published.generation_id.slice(0, 8)).not.toBe(before);
+  expect(published.generation_id.slice(0, 12)).not.toBe(before);
 
-  await expect(marker).toHaveText(published.generation_id.slice(0, 8), { timeout: 20_000 });
+  await expect(marker).toHaveAttribute("data-generation", published.generation_id.slice(0, 12), {
+    timeout: 20_000,
+  });
 });
