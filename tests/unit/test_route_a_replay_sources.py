@@ -136,6 +136,9 @@ class _FakeTushare:
     def stk_mins(self, code: str, freq: str, start: datetime, end: datetime) -> Any:
         return self._answer("stk_mins", code)
 
+    def namechange_raw(self, start_date: date, end_date: date, ts_code: str | None = None) -> Any:
+        return self._answer("namechange", ts_code)
+
 
 def _stock_basic(codes: tuple[str, ...], *, names: dict[str, str] | None = None) -> pd.DataFrame:
     from rquant.adapter.tushare import STOCK_BASIC_COLUMNS
@@ -297,12 +300,11 @@ def test_a_question_about_another_day_than_the_replayed_one_is_refused(tmp_path:
         source.stk_auction(PRIOR)
 
 
-def test_minute_gaps_are_one_cached_answer_per_code_and_day(tmp_path: Path) -> None:
-    sources = _sources()
-    bars = pd.DataFrame(
+def _bars(code: str) -> pd.DataFrame:
+    return pd.DataFrame(
         [
             {
-                "ts_code": "600000.SH",
+                "ts_code": code,
                 "trade_time": datetime.combine(DAY, time(9, 31)),
                 "open": 1.0,
                 "high": 1.0,
@@ -315,7 +317,15 @@ def test_minute_gaps_are_one_cached_answer_per_code_and_day(tmp_path: Path) -> N
             }
         ]
     )
-    fake = _FakeTushare(stk_mins=lambda code: bars if code == "600000.SH" else pd.DataFrame())
+
+
+def test_minute_bars_are_cached_per_code_and_day_but_an_empty_answer_never_is(
+    tmp_path: Path,
+) -> None:
+    sources = _sources()
+    fake = _FakeTushare(
+        stk_mins=lambda code: _bars(code) if code == "600000.SH" else pd.DataFrame()
+    )
     cache = sources.TushareCache(tmp_path / "cache", token="dummy", adapter_factory=lambda _t: fake)
     fetch = sources.cached_minute_fetcher(cache, DAY)
 
@@ -324,9 +334,80 @@ def test_minute_gaps_are_one_cached_answer_per_code_and_day(tmp_path: Path) -> N
     fetch("600000.SH")
     fetch("300001.SZ")
 
-    assert fake.calls == [("stk_mins", "600000.SH"), ("stk_mins", "300001.SZ")]
-    assert (tmp_path / "cache" / "stk_mins" / "1min" / "20260918" / "600000.SH.parquet").is_file()
-    assert cache.summary()["by_endpoint"]["stk_mins"] == {"cache": 2, "tushare": 2, "empty": 2}
+    #: the bars are asked once; the empty answer is asked again, and nothing is kept for it
+    assert fake.calls == [
+        ("stk_mins", "600000.SH"),
+        ("stk_mins", "300001.SZ"),
+        ("stk_mins", "300001.SZ"),
+    ]
+    minutes = tmp_path / "cache" / "stk_mins" / "1min" / "20260918"
+    assert (minutes / "600000.SH.parquet").is_file()
+    assert not (minutes / "300001.SZ.parquet").exists()
+    assert fetch.report()["empty_not_traded_in_auction"] == ["300001.SZ"]
+
+
+def test_an_empty_answer_for_a_code_that_traded_is_retried_with_backoff(tmp_path: Path) -> None:
+    """Host 2026-09-24: 920003.BJ matched in the auction, and one empty stk_mins answer --
+    cached by the first cut -- removed it from every later replay of the day."""
+
+    sources = _sources()
+    answers = {"920003.BJ": [pd.DataFrame(), pd.DataFrame(), _bars("920003.BJ")]}
+    fake = _FakeTushare(
+        stk_mins=lambda code: answers[code].pop(0) if answers.get(code) else pd.DataFrame()
+    )
+    cache = sources.TushareCache(tmp_path / "cache", token="dummy", adapter_factory=lambda _t: fake)
+    waits: list[float] = []
+    fetch = sources.MinuteFetcher(
+        cache=cache,
+        trade_date=DAY,
+        expected_codes=frozenset({"920003.BJ", "430017.BJ"}),
+        retries=3,
+        backoff_seconds=5.0,
+        sleep=waits.append,
+    )
+
+    assert len(fetch("920003.BJ")) == 1
+    assert fetch("430017.BJ").empty
+
+    #: two empty answers, then the bars: waited 5 s and 10 s; the other code gave up after
+    #: 1 + 3 attempts (5, 10, 20 s) and is named
+    assert [call for call in fake.calls if call[1] == "920003.BJ"] == [
+        ("stk_mins", "920003.BJ")
+    ] * 3
+    assert [call for call in fake.calls if call[1] == "430017.BJ"] == [
+        ("stk_mins", "430017.BJ")
+    ] * 4
+    assert waits == [5.0, 10.0, 5.0, 10.0, 20.0]
+    report = fetch.report()
+    assert report["asked_more_than_once"] == {"430017.BJ": 4, "920003.BJ": 3}
+    assert report["empty_after_retries"] == ["430017.BJ"]
+    minutes = tmp_path / "cache" / "stk_mins" / "1min" / "20260918"
+    assert (minutes / "920003.BJ.parquet").is_file()
+    assert not (minutes / "430017.BJ.parquet").exists()
+
+
+def test_an_empty_answer_an_earlier_version_cached_is_ignored_and_asked_again(
+    tmp_path: Path,
+) -> None:
+    sources = _sources()
+    cache = sources.TushareCache(tmp_path / "cache", token="dummy")
+    #: what package AK's first cut left behind for 920003.BJ on the host
+    cache.store("stk_mins", "1min/20260918/920003.BJ", pd.DataFrame())
+    fake = _FakeTushare(stk_mins=_bars)
+    cache.adapter_factory = lambda _token: fake
+    fetch = sources.cached_minute_fetcher(cache, DAY, expected_codes={"920003.BJ"})
+
+    assert len(fetch("920003.BJ")) == 1
+
+    assert fake.calls == [("stk_mins", "920003.BJ")]
+    assert fetch.report()["ignored_cached_empty"] == ["920003.BJ"]
+    stored, receipt = cache.load("stk_mins", "1min/20260918/920003.BJ")
+    assert len(stored) == 1 and receipt["rows"] == 1
+    #: offline, a stale empty entry is not an answer either: the code stays missing, said so
+    offline = sources.TushareCache(tmp_path / "cold", offline=True)
+    offline.store("stk_mins", "1min/20260918/920003.BJ", pd.DataFrame())
+    with pytest.raises(sources.TushareCacheMissError, match="--tushare-offline"):
+        sources.cached_minute_fetcher(offline, DAY, expected_codes={"920003.BJ"})("920003.BJ")
 
 
 # ---------------------------------------------------------------------------------------
@@ -1171,3 +1252,148 @@ def test_a_full_day_suspension_of_a_code_that_matched_in_the_auction_is_left_out
     }
     assert report["full_day_suspended"] == {"count": 1, "codes": [ST_TODAY]}
     assert report["partial_or_resumption_events"]["events"] == ["300001.SZ S 10:00-10:30"]
+
+
+# ---------------------------------------------------------------------------------------
+# Today's listing, put back to the day's
+# ---------------------------------------------------------------------------------------
+
+
+def _namechanges(code: str | None) -> pd.DataFrame:
+    """ST_TODAY became `ST样本` on 09-21, after the day; 600000.SH was renamed on the day."""
+
+    columns = ("ts_code", "name", "start_date", "end_date", "ann_date", "change_reason")
+    window = [
+        (ST_TODAY, "ST样本", "20260921", None, "20260919", "ST"),
+        ("600000.SH", "样本新名", "20260918", None, "20260915", "改名"),
+    ]
+    histories = {
+        ST_TODAY: [
+            (ST_TODAY, "样本股份", "20100104", "20260920", "20100101", "上市"),
+            (ST_TODAY, "ST样本", "20260921", None, "20260919", "ST"),
+        ]
+    }
+    rows = window if code is None else histories.get(code, [])
+    return pd.DataFrame(rows, columns=list(columns))
+
+
+def test_renamed_codes_carry_the_name_they_had_on_the_day(tmp_path: Path) -> None:
+    """Host 2026-09-24: security_name_differ, and the one candidate input that differed
+    (601091.SH), came from today's names in stock_basic. A code renamed -- or made ST --
+    after the day gets the name its history says it had; the name-derived ST follows."""
+
+    sources = _sources()
+    calendar = _calendar(generated_at=_local(date(2026, 9, 1), 9))
+    evidence = sources.extract_reference_evidence(
+        replica=_replica(tmp_path / "rquant_ro.duckdb"),
+        target=tmp_path / "sandbox" / "reference-evidence.duckdb",
+        trade_date=DAY,
+        calendar=calendar,
+        audit=_Audit(),
+    )
+    source = _source(tmp_path, _FakeTushare(**{**_day_answers(), "namechange": _namechanges}))
+    listing = source.stock_basic("L")
+
+    names, facts = sources.names_as_of_day(source, set(listing["ts_code"]))
+
+    assert names == {ST_TODAY: "样本股份"}
+    assert facts["renamed_after_the_day"] == 1
+    assert facts["unresolved"] == []
+    assert facts["renamed_on_the_day_itself_keep_the_new_name"] == ["600000.SH"]
+    known = sources.KnownAtCapture(source, traded_in_auction=frozenset(), names_on_day=names)
+    snapshot = sources.synthesize_reference_snapshot(
+        evidence_database=Path(evidence["path"]),
+        source=known,
+        calendar=calendar,
+        trade_date=DAY,
+        producer_commit=COMMIT,
+    )
+    by_code = {fact.ts_code: fact for fact in snapshot.security_facts}
+    assert by_code[ST_TODAY].name == "样本股份"
+    assert by_code[ST_TODAY].is_st is False
+    assert sources.reference_anachronisms(snapshot, known)["st_by_todays_name_only"]["count"] == 0
+
+
+def test_the_evidence_listing_gets_the_days_names_and_codes_delisted_since(
+    tmp_path: Path,
+) -> None:
+    import duckdb
+
+    sources = _sources()
+    calendar = _calendar(generated_at=_local(date(2026, 9, 1), 9))
+    replica = _replica(tmp_path / "rquant_ro.duckdb")
+    replica.chmod(0o600)
+    connection = duckdb.connect(str(replica))
+    try:
+        connection.execute(
+            "CREATE TABLE stock_basic(ts_code VARCHAR, symbol VARCHAR, name VARCHAR, "
+            "area VARCHAR, industry VARCHAR, list_date DATE, market VARCHAR)"
+        )
+        #: today's table: ST_TODAY under its new name, 600000.SH gone (delisted 09-22)
+        connection.execute(
+            "INSERT INTO stock_basic VALUES (?, '600001', 'ST样本', '上海', '银行', "
+            "DATE '2010-01-04', '主板'), ('300001.SZ', '300001', '样本股份', '深圳', '软件', "
+            "DATE '2010-01-04', '创业板')",
+            [ST_TODAY],
+        )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    evidence = sources.extract_reference_evidence(
+        replica=replica,
+        target=tmp_path / "sandbox" / "reference-evidence.duckdb",
+        trade_date=DAY,
+        calendar=calendar,
+        audit=_Audit(),
+    )
+    delisted = _stock_basic(("600000.SH", "000009.SZ"))
+    delisted["delist_date"] = ["20260922", "20260915"]
+    delisted["list_status"] = "D"
+
+    facts = sources.restore_listing_in_evidence(
+        Path(evidence["path"]),
+        listing=delisted,
+        names_on_day={ST_TODAY: "样本股份"},
+        trade_date=DAY,
+        prior_trade_date=PRIOR,
+    )
+
+    assert facts["renamed_restored"] == 1
+    assert facts["delisted_since_codes"] == ["600000.SH"]
+    connection = duckdb.connect(str(evidence["path"]), read_only=True)
+    try:
+        rows = dict(connection.execute("SELECT ts_code, name FROM stock_basic").fetchall())
+    finally:
+        connection.close()
+    #: 000009.SZ was delisted before the day and never traded on the prior session
+    assert rows == {ST_TODAY: "样本股份", "300001.SZ": "样本股份", "600000.SH": "样本股份"}
+
+
+def test_every_differing_projection_says_why() -> None:
+    from types import SimpleNamespace
+
+    sources = _sources()
+
+    def snapshot(table: str, rows: list[dict[str, Any]]) -> Any:
+        return SimpleNamespace(projections=[SimpleNamespace(table_name=table, rows=tuple(rows))])
+
+    recorded = snapshot(
+        "risk_blacklist",
+        [{"list_label": "ST", "ts_code": ST_TODAY, "expires_at": None, "imported_at": "a"}],
+    )
+    synthesized = snapshot(
+        "risk_blacklist",
+        [{"list_label": "ST", "ts_code": ST_TODAY, "expires_at": None, "imported_at": "b"}],
+    )
+
+    report = sources.compare_projections(recorded, synthesized)["risk_blacklist"]
+
+    assert report["values_differ_fields"] == {"imported_at": 1}
+    assert report["explained_by"] == sources.PROJECTION_ANACHRONISMS["risk_blacklist"]
+    assert set(sources.PROJECTION_ANACHRONISMS) >= {
+        "stock_basic",
+        "nl_screen_universe",
+        "risk_blacklist",
+        "kpl_concept_member",
+        "market_liquidity",
+    }

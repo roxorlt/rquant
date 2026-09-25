@@ -378,6 +378,12 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     assert summary["candidates_per_family"]["auction_gap"] == 2
     assert minute["watchlist_codes_ever"] == 2
     assert minute["codes_without_minutes"] == [CODES[1]]
+    #: and it matched in the auction, so the day is not production-faithful for it: said so
+    assert summary["verdict"]["unfaithful_codes"] == [CODES[1]]
+    assert summary["verdict"]["production_faithful"] is False
+    assert summary["mode"]["production_faithful"] is True
+    assert "NOT PRODUCTION-FAITHFUL: no minute bars for 1 watchlist code(s)" in result.stdout
+    assert "REPLAY OK (NOT PRODUCTION-FAITHFUL, see above)" in result.stdout
     #: no stub any more (package AI): the reference-slow publisher the replay really ran
     #: wrote the listing classification, and paper constraints never refused a code for it
     assert summary["stubs"]["listing_classification"] == "off"
@@ -717,6 +723,17 @@ def _fill_tushare_cache(
         key,
         pd.DataFrame(auction, columns=[*STK_AUCTION_COLUMNS, "auction_type", "source"]),
     )
+    #: no name changed since the day (the window key is the replay's own today)
+    sources = _sources()
+    today = datetime.now(sources._SHANGHAI).date()
+    start = day - timedelta(days=sources.NAMECHANGE_LOOKBACK_DAYS)
+    cache.store(
+        "namechange",
+        f"window/{start:%Y%m%d}_{today:%Y%m%d}",
+        pd.DataFrame(
+            columns=["ts_code", "name", "start_date", "end_date", "ann_date", "change_reason"]
+        ),
+    )
 
 
 def test_a_day_the_host_never_recorded_is_synthesized_by_the_live_code_and_labelled(
@@ -780,6 +797,14 @@ def test_a_day_the_host_never_recorded_is_synthesized_by_the_live_code_and_label
     reference = summary["world"]["reference"]
     assert reference["origin"] == "synthesized"
     assert reference["captured_at"] == "2026-08-03T01:20:22+00:00"
+    assert reference["captured_at_aligned_to_recording"] is False
+    assert reference["anachronisms"]["names_on_day"]["renamed_after_the_day"] == 0
+    #: the code the replica has no minutes for traded in the auction; offline, stk_mins
+    #: cannot be asked, so the day says it is not faithful for that code
+    assert summary["verdict"]["unfaithful_codes"] == [CODES[1]]
+    assert summary["inputs"]["provenance"]["minute_bar"][
+        "watchlist_codes_traded_without_minutes"
+    ] == [CODES[1]]
     assert reference["securities"] == len(CODES)
     assert reference["evidence"]["prior_trade_date"] == "2026-07-31"
     auction = summary["world"]["auction"]
@@ -962,7 +987,15 @@ def test_synthesizing_a_recorded_day_reports_how_far_it_is_from_the_recording(
     assert provenance["calendar"]["origin"] == "recorded"
     assert provenance["calendar"]["heuristic_check"]["matches_recorded"] is True
 
+    #: captured at the recorded instant, so only the data can differ
+    assert summary["world"]["reference"]["captured_at"] == "2026-07-31T01:20:31+00:00"
+    assert summary["world"]["reference"]["captured_at_aligned_to_recording"] is True
     reference = summary["world"]["reference"]["fidelity_vs_recorded"]
+    assert reference["explanations"]["security_market_differ"].startswith("stock_basic answers")
+    assert all(
+        "unexplained" not in entry.get("explained_by", "")
+        for entry in reference["projection_rows"].values()
+    ), reference["projection_rows"]
     assert reference["securities"] == {"recorded": 2, "synthesized": 2}
     assert reference["only_recorded_count"] == reference["only_synthesized_count"] == 0
     for field in ("close_raw", "prior_adj_factor", "adj_factor"):

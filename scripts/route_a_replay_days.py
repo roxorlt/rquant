@@ -304,7 +304,11 @@ def day_report(run: DayRun) -> dict[str, Any]:
                 "OK" if run.exit_code == 0 else ("REFUSED" if run.exit_code == 2 else "FAILED")
             ),
             "verdict_detail": verdict,
-            "production_faithful": (summary.get("mode") or {}).get("production_faithful"),
+            "production_faithful": verdict.get(
+                "production_faithful", (summary.get("mode") or {}).get("production_faithful")
+            ),
+            "unfaithful_codes": verdict.get("unfaithful_codes") or [],
+            "not_production_faithful_because": verdict.get("not_production_faithful_because") or [],
             "inputs": {
                 label: {"origin": entry.get("origin"), "source": entry.get("source")}
                 for label, entry in ((summary.get("inputs") or {}).get("provenance") or {}).items()
@@ -351,9 +355,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"exit: {report['exit_code']}; passed to each day: "
         f"`{' '.join(report['passthrough']) or '-'}`",
         "",
-        "| date | verdict | exit | inputs synthesized | candidates | signals | paper fills "
-        "| shadow only | serving same day | failing roles | wall s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| date | verdict | exit | faithful | inputs synthesized | candidates | signals "
+        "| paper fills | shadow only | serving same day | failing roles | wall s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for day in report["days"]:
         synthesized = sorted(
@@ -381,6 +385,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                     day["trade_date"],
                     verdict,
                     day.get("exit_code"),
+                    day.get("production_faithful")
+                    if not day.get("unfaithful_codes")
+                    else f"NO: {', '.join(day['unfaithful_codes'][:5])}",
                     ", ".join(synthesized) or "none",
                     day.get("candidates_per_family"),
                     day.get("signals_per_strategy"),
@@ -401,6 +408,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             or ([day["refused"]] if day.get("refused") else [])
         )
     ]
+    unfaithful = [
+        (day["trade_date"], reason)
+        for day in report["days"]
+        for reason in day.get("not_production_faithful_because") or ()
+    ]
+    if unfaithful:
+        lines += ["", "## Not production-faithful", ""]
+        lines += [f"- {day}: {reason}" for day, reason in unfaithful]
     if refusals:
         lines += ["", "## Refused or cannot be produced", ""]
         lines += [f"- {day}: {reason}" for day, reason in refusals]

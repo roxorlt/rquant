@@ -178,6 +178,22 @@ class TushareCache:
             self._adapter = self.adapter_factory(self.token)
         return self._adapter
 
+    def request(self, endpoint: str, key: str, request: Callable[[Any], Any]) -> Any:
+        """One request, recorded in the ledger and **not** stored (the caller decides)."""
+
+        import pandas as pd
+
+        if self.offline:
+            raise TushareCacheMissError(
+                f"{endpoint}/{key} is not in the Tushare cache {self.root} and "
+                "--tushare-offline forbids a request"
+            )
+        frame = request(self.adapter())
+        if frame is None:
+            frame = pd.DataFrame()
+        self._record(endpoint, key, "tushare", len(frame), self.clock().isoformat())
+        return frame
+
     def get(
         self,
         endpoint: str,
@@ -232,7 +248,7 @@ class TushareCache:
             counts = by_endpoint.setdefault(
                 entry["endpoint"], {"cache": 0, "tushare": 0, "empty": 0}
             )
-            counts[entry["origin"]] += 1
+            counts[entry["origin"]] = counts.get(entry["origin"], 0) + 1
             if not entry["rows"]:
                 counts["empty"] += 1
             if entry["endpoint"] != "stk_mins":
@@ -319,40 +335,217 @@ class CachedDaySource:
             cache_empty=False,
         )
 
+    def namechange_since(self) -> Any:
+        """Every name change announced from `NAMECHANGE_LOOKBACK_DAYS` before the day to
+        today (Tushare's window is by announcement date)."""
 
-def cached_minute_fetcher(cache: TushareCache, trade_date: date) -> Callable[[str], Any]:
-    """`stk_mins` for one code over the trade date, one cached answer per (code, day)."""
-
-    start = datetime.combine(trade_date, clock_time(9, 0))
-    end = datetime.combine(trade_date, clock_time(15, 30))
-    columns = (
-        "ts_code",
-        "trade_time",
-        "freq",
-        "open",
-        "high",
-        "low",
-        "close",
-        "vol",
-        "amount",
-        "source",
-    )
-
-    def fetch(code: str) -> Any:
-        frame = cache.get(
-            "stk_mins",
-            f"1min/{_day_key(trade_date)}/{code}",
-            lambda adapter: adapter.stk_mins(code, "1min", start, end),
+        start = self.trade_date - timedelta(days=NAMECHANGE_LOOKBACK_DAYS)
+        return self.cache.get(
+            "namechange",
+            f"window/{_day_key(start)}_{_day_key(self.today)}",
+            lambda adapter: adapter.namechange_raw(start, self.today),
             cache_empty=True,
         )
-        if frame is None or not len(frame):
-            return frame
+
+    def namechange_history(self, code: str) -> Any:
+        """One code's whole name history, as Tushare answers it today."""
+
+        return self.cache.get(
+            "namechange",
+            f"code/{code}/{_day_key(self.today)}",
+            lambda adapter: adapter.namechange_raw(date(1990, 1, 1), self.today, ts_code=code),
+            cache_empty=True,
+        )
+
+
+#: how far back of the day a name change's announcement is looked for
+NAMECHANGE_LOOKBACK_DAYS = 60
+
+
+def _as_date(value: object) -> date | None:
+    import pandas as pd
+
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").date()
+    return date.fromisoformat(text[:10])
+
+
+def names_as_of_day(
+    source: CachedDaySource, listing_codes: Iterable[str]
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """The names the day's 09:20 listing carried, for codes renamed since.
+
+    `stock_basic` only answers today's names, and a name matters to the capture beyond its
+    text: an `ST` / `*ST` prefix is read as ST (`security_status.normalize_name`), and the
+    publisher's ST record carries the name. So every listed code with a name change that took
+    effect after the day gets the name its own history says it had on the day. A change that
+    took effect on the day itself keeps the new name (the day's listing already had it); a
+    code whose history does not cover the day keeps today's and is listed as unresolved.
+    """
+
+    day = source.trade_date
+    listed = set(listing_codes)
+    window = source.namechange_since()
+    renamed: set[str] = set()
+    on_the_day: set[str] = set()
+    for row in window.to_dict("records") if window is not None and len(window) else ():
+        code = str(row.get("ts_code", "")).strip()
+        start = _as_date(row.get("start_date"))
+        if code not in listed or start is None:
+            continue
+        if start > day:
+            renamed.add(code)
+        elif start == day:
+            on_the_day.add(code)
+    names: dict[str, str] = {}
+    unresolved: list[str] = []
+    for code in sorted(renamed):
+        history = source.namechange_history(code)
+        intervals = [
+            (_as_date(row.get("start_date")), _as_date(row.get("end_date")), str(row.get("name")))
+            for row in (history.to_dict("records") if history is not None and len(history) else ())
+        ]
+        before = [item for item in intervals if item[0] is not None and item[0] <= day]
+        covering = [item for item in before if item[1] is None or item[1] >= day] or before
+        chosen = max(covering, key=lambda item: item[0]) if covering else None
+        if chosen is not None and chosen[2].strip() and chosen[2] != "None":
+            names[code] = chosen[2].strip()
+        else:
+            unresolved.append(code)
+    return names, {
+        "renamed_after_the_day": len(renamed),
+        "restored": dict(sorted(names.items())[:60]),
+        "restored_count": len(names),
+        "unresolved": unresolved,
+        "renamed_on_the_day_itself_keep_the_new_name": sorted(on_the_day)[:60],
+    }
+
+
+_MINUTE_COLUMNS = (
+    "ts_code",
+    "trade_time",
+    "freq",
+    "open",
+    "high",
+    "low",
+    "close",
+    "vol",
+    "amount",
+    "source",
+)
+
+
+def _has_rows_on(frame: Any, day: date) -> bool:
+    import pandas as pd
+
+    if frame is None or not len(frame) or "trade_time" not in frame.columns:
+        return False
+    return bool((pd.to_datetime(frame["trade_time"]).dt.date == day).any())
+
+
+@dataclass
+class MinuteFetcher:
+    """`stk_mins` for one code over the trade date, through the cache -- but only an answer
+    with bars on the day is ever kept.
+
+    An empty answer is never stored (before package AK's second fix it was, and one
+    transient empty answer for 920003.BJ was then replayed by every later run of 09-24), and
+    an empty answer already in the cache is ignored and asked again (`ignored_cached_empty`).
+    For a code that matched in the day's opening auction (`expected_codes`) an empty answer
+    cannot be the truth -- it traded -- so it is asked again `retries` times, `backoff_seconds`
+    doubling between attempts; if it is still empty, the code is listed in
+    `empty_after_retries` and the replay reports the day not production-faithful for it.
+    """
+
+    cache: TushareCache
+    trade_date: date
+    expected_codes: frozenset[str] = frozenset()
+    retries: int = 3
+    backoff_seconds: float = 5.0
+    sleep: Callable[[float], None] = field(default=lambda seconds: _sleep(seconds))
+    attempts: dict[str, int] = field(default_factory=dict)
+    ignored_cached_empty: list[str] = field(default_factory=list)
+    empty_after_retries: list[str] = field(default_factory=list)
+    empty_not_traded: list[str] = field(default_factory=list)
+
+    def __call__(self, code: str) -> Any:
+        key = f"1min/{_day_key(self.trade_date)}/{code}"
+        cached = self.cache.load("stk_mins", key)
+        if cached is not None:
+            frame, receipt = cached
+            if _has_rows_on(frame, self.trade_date):
+                self.cache._record("stk_mins", key, "cache", len(frame), receipt.get("fetched_at"))
+                return self._shaped(frame)
+            self.ignored_cached_empty.append(code)
+            self.cache._record("stk_mins", key, "ignored", len(frame), receipt.get("fetched_at"))
+        start = datetime.combine(self.trade_date, clock_time(9, 0))
+        end = datetime.combine(self.trade_date, clock_time(15, 30))
+        traded = code in self.expected_codes
+        attempt = 0
+        while True:
+            attempt += 1
+            self.attempts[code] = attempt
+            frame = self.cache.request(
+                "stk_mins", key, lambda adapter: adapter.stk_mins(code, "1min", start, end)
+            )
+            if _has_rows_on(frame, self.trade_date):
+                self.cache.store("stk_mins", key, frame)
+                return self._shaped(frame)
+            if not traded:
+                self.empty_not_traded.append(code)
+                return frame
+            if attempt > self.retries:
+                self.empty_after_retries.append(code)
+                return frame
+            self.sleep(self.backoff_seconds * 2 ** (attempt - 1))
+
+    @staticmethod
+    def _shaped(frame: Any) -> Any:
         frame = frame.copy()
         if "source" not in frame.columns:
             frame["source"] = "tushare"
-        return frame[[column for column in columns if column in frame.columns]]
+        return frame[[column for column in _MINUTE_COLUMNS if column in frame.columns]]
 
-    return fetch
+    def report(self) -> dict[str, Any]:
+        return {
+            "expected_codes_traded_in_auction": len(self.expected_codes),
+            "retries": self.retries,
+            "backoff_seconds": self.backoff_seconds,
+            "asked_more_than_once": {
+                code: count for code, count in sorted(self.attempts.items()) if count > 1
+            },
+            "ignored_cached_empty": sorted(set(self.ignored_cached_empty)),
+            "empty_after_retries": sorted(set(self.empty_after_retries)),
+            "empty_not_traded_in_auction": sorted(set(self.empty_not_traded)),
+        }
+
+
+def _sleep(seconds: float) -> None:
+    import time
+
+    time.sleep(seconds)
+
+
+def cached_minute_fetcher(
+    cache: TushareCache,
+    trade_date: date,
+    *,
+    expected_codes: Iterable[str] = (),
+    retries: int = 3,
+    backoff_seconds: float = 5.0,
+) -> MinuteFetcher:
+    return MinuteFetcher(
+        cache=cache,
+        trade_date=trade_date,
+        expected_codes=frozenset(expected_codes),
+        retries=retries,
+        backoff_seconds=backoff_seconds,
+    )
 
 
 def cached_answers(
@@ -373,7 +566,11 @@ def cached_answers(
             status[endpoint] = cache.path(endpoint, day).is_file()
     if auction:
         status["stk_auction"] = cache.path("stk_auction", day).is_file()
-    status["stk_mins_codes"] = len(cache.keys("stk_mins", f"1min/{day}"))
+    status["stk_mins_codes"] = sum(
+        1
+        for key in cache.keys("stk_mins", f"1min/{day}")
+        if (cache.load("stk_mins", key) or (None, {}))[1].get("rows")
+    )
     return status
 
 
@@ -419,6 +616,11 @@ def prefetch_day(source: CachedDaySource, *, reference: bool, auction: bool) -> 
         ask("stock_st", lambda: source.stock_st_raw(day), required_rows=True)
         ask("adj_factor", lambda: source.adj_factor_by_date(day), required_rows=True)
         ask("suspend_d", lambda: source.suspend_d_raw(day), required_rows=False)
+        try:
+            ask("namechange", source.namechange_since, required_rows=False)
+        except InputUnavailableError as error:
+            #: names then stay today's, and the provenance says so
+            facts["namechange"] = f"unavailable: {error}"
     if auction:
         ask("stk_auction", lambda: source.stk_auction(day), required_rows=True)
     return facts
@@ -763,6 +965,23 @@ def extract_reference_evidence(
             if "daily_bar" in counts
             else 0
         )
+        blacklist_columns = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'risk_blacklist' AND table_catalog = current_database()"
+            ).fetchall()
+        }
+        reimported = (
+            int(
+                connection.execute(
+                    "SELECT count(*) FROM risk_blacklist WHERE CAST(imported_at AS DATE) > ?",
+                    [trade_date],
+                ).fetchone()[0]
+            )
+            if "imported_at" in blacklist_columns and "risk_blacklist" in counts
+            else None
+        )
         connection.execute("DETACH source_replica")
         connection.execute("CHECKPOINT")
     finally:
@@ -783,11 +1002,104 @@ def extract_reference_evidence(
         "prior_trade_date": prior_trade_date,
         "daily_bar_rows_per_code": REFERENCE_EVIDENCE_DAILY_ROWS_PER_CODE,
         "codes_not_trading_on_prior_session": stale,
+        "risk_blacklist_imported_after_the_day": reimported,
         "rows": counts,
         "undated_tables_as_of_today": sorted(set(_UNDATED_EVIDENCE_TABLES) & set(counts)),
         "note": "rows dated before the trade date but written after its 09:20 capture "
         "(a backfill) cannot be told apart and are included",
     }
+
+
+def restore_listing_in_evidence(
+    evidence_database: Path,
+    *,
+    listing: Any,
+    names_on_day: Mapping[str, str],
+    trade_date: date,
+    prior_trade_date: date,
+) -> dict[str, Any]:
+    """Put the day's listing back into the evidence's (today's) `stock_basic` table.
+
+    The capture's `stock_basic` and `nl_screen_universe` projections read that table, which
+    the daily pipeline keeps as of *today*: renamed codes carry their new name, and a code
+    delisted since the day may be gone. Renamed codes get the name they had on the day; a
+    code that traded on the prior session, is missing from the table and was delisted
+    *after* the day (Tushare's D list says when) is put back from the listing. A code that
+    is missing for any other reason is left missing: it was most likely missing then too.
+    Industries stay today's.
+    """
+
+    import duckdb
+
+    counts = {"renamed_restored": 0, "delisted_since_restored": 0}
+    connection = duckdb.connect(str(evidence_database))
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        if "stock_basic" not in tables or listing is None or not len(listing):
+            return {**counts, "skipped": "no stock_basic table or no listing"}
+        columns = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'stock_basic' ORDER BY ordinal_position"
+            ).fetchall()
+        ]
+        present = {
+            str(row[0]) for row in connection.execute("SELECT ts_code FROM stock_basic").fetchall()
+        }
+        for code, name in sorted(names_on_day.items()):
+            if code in present and "name" in columns:
+                connection.execute(
+                    "UPDATE stock_basic SET name = ? WHERE ts_code = ?", [name, code]
+                )
+                counts["renamed_restored"] += 1
+        traded_prior = (
+            {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT ts_code FROM daily_bar WHERE trade_date = ?",
+                    [prior_trade_date],
+                ).fetchall()
+            }
+            if "daily_bar" in tables
+            else set()
+        )
+        restored: list[str] = []
+        for row in listing.to_dict("records"):
+            code = str(row.get("ts_code", "")).strip()
+            delisted = _as_date(row.get("delist_date"))
+            if code in present or code not in traded_prior or delisted is None:
+                continue
+            if delisted <= trade_date:
+                continue
+            values = {
+                "ts_code": code,
+                "symbol": row.get("symbol"),
+                "name": names_on_day.get(code, row.get("name")),
+                "area": row.get("area"),
+                "industry": row.get("industry"),
+                "list_date": _as_date(row.get("list_date")),
+                "market": row.get("market"),
+            }
+            insert = [column for column in columns if column in values]
+            connection.execute(
+                f"INSERT INTO stock_basic ({', '.join(insert)}) "
+                f"VALUES ({', '.join('?' for _ in insert)})",
+                [values[column] for column in insert],
+            )
+            present.add(code)
+            restored.append(code)
+        counts["delisted_since_restored"] = len(restored)
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    evidence_database.chmod(0o600)
+    return {**counts, "delisted_since_codes": restored[:40]}
 
 
 # ---------------------------------------------------------------------------------------
@@ -822,14 +1134,33 @@ class KnownAtCapture:
     listed (`dropped_suspensions`). Every other answer passes through unchanged.
     """
 
-    def __init__(self, source: CachedDaySource, *, traded_in_auction: frozenset[str]) -> None:
+    def __init__(
+        self,
+        source: CachedDaySource,
+        *,
+        traded_in_auction: frozenset[str],
+        names_on_day: Mapping[str, str] | None = None,
+    ) -> None:
         self._source = source
         self.trade_date = source.trade_date
         self.traded_in_auction = traded_in_auction
+        self.names_on_day = dict(names_on_day or {})
         self.dropped_suspensions: list[str] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._source, name)
+
+    def stock_basic(self, list_status: str = "L") -> Any:
+        """Today's listing, with each renamed code's name as it was on the day."""
+
+        frame = self._source.stock_basic(list_status)
+        if frame is None or not len(frame) or not self.names_on_day:
+            return frame
+        frame = frame.copy()
+        codes = frame["ts_code"].astype(str).str.strip()
+        restored = codes.map(self.names_on_day)
+        frame["name"] = restored.where(restored.notna(), frame["name"])
+        return frame
 
     def suspend_d_raw(self, trade_date: date) -> Any:
         from rquant.suspension import _session_scope
@@ -861,16 +1192,27 @@ def synthesize_reference_snapshot(
     trade_date: date,
     producer_commit: str,
     limits: Mapping[str, Any] | None = None,
+    completed_at: datetime | None = None,
 ) -> Any:
-    """The live capture over the evidence and the day's Tushare answers, observed 09:20:07."""
+    """The live capture over the evidence and the day's Tushare answers, observed 09:20:07
+    and completed 15 s later -- or, on a recorded day, completed at the recorded capture's
+    own instant (`completed_at`), so the rows that carry the capture instant (the derived
+    ST rows of `risk_blacklist`) compare as equal."""
 
     from rquant.reference_slow_source import (
         ReferenceSlowSourceLimits,
         capture_reference_slow_source_snapshot,
     )
 
-    observed = local_instant(trade_date, SYNTHETIC_REFERENCE_OBSERVED)
-    completed = observed + timedelta(seconds=SYNTHETIC_REFERENCE_CAPTURE_SECONDS)
+    if completed_at is None:
+        observed = local_instant(trade_date, SYNTHETIC_REFERENCE_OBSERVED)
+        completed = observed + timedelta(seconds=SYNTHETIC_REFERENCE_CAPTURE_SECONDS)
+    else:
+        completed = completed_at
+        observed = max(
+            local_instant(trade_date, "09:20:00"),
+            completed - timedelta(seconds=SYNTHETIC_REFERENCE_CAPTURE_SECONDS),
+        )
     try:
         return capture_reference_slow_source_snapshot(
             database_path=evidence_database,
@@ -1109,6 +1451,12 @@ def compare_projections(recorded: Any, synthesized: Any) -> dict[str, Any]:
         changed = sorted(
             key for key in set(left_rows) & set(right_rows) if left_rows[key] != right_rows[key]
         )
+        fields: dict[str, int] = {}
+        for key in changed:
+            before, after = json.loads(left_rows[key]), json.loads(right_rows[key])
+            for field_name in set(before) | set(after):
+                if before.get(field_name) != after.get(field_name):
+                    fields[field_name] = fields.get(field_name, 0) + 1
         result[table] = {
             "recorded": len(left.get(table, ())),
             "synthesized": len(right.get(table, ())),
@@ -1119,9 +1467,58 @@ def compare_projections(recorded: Any, synthesized: Any) -> dict[str, Any]:
             "only_synthesized": only_synthesized[:60],
             "values_differ_count": len(changed),
             "values_differ": changed[:20],
+            "values_differ_fields": dict(sorted(fields.items())),
             "identical": not (only_recorded or only_synthesized or changed),
         }
+        if not result[table]["identical"]:
+            result[table]["explained_by"] = PROJECTION_ANACHRONISMS.get(
+                table, "not expected to differ: unexplained"
+            )
     return result
+
+
+#: Why a synthesized projection can still differ from the one the host recorded that day,
+#: table by table -- each an input the replay can only have as it stands *today*. Any
+#: difference outside these is a defect of the synthesis.
+PROJECTION_ANACHRONISMS: Mapping[str, str] = {
+    "stock_basic": (
+        "the replica's stock_basic table is today's: industries are today's; names are "
+        "restored to the day's from the namechange history (`evidence.listing_restored`), and "
+        "a code delisted after the day is put back, so what remains is industry changes, "
+        "names the history could not resolve, and codes missing from the table for another "
+        "reason"
+    ),
+    "nl_screen_universe": (
+        "joins the replica's stock_basic for the name (see stock_basic); its daily_bar / "
+        "daily_state / daily_indicator / daily_basic columns are the prior session's and exact"
+    ),
+    "risk_blacklist": (
+        "the replica's risk_blacklist is today's: a list re-imported after the day carries an "
+        "imported_at after it and falls out of the capture's imported_at <= day filter, and a "
+        "list removed since is gone (`evidence.risk_blacklist_imported_after_the_day`); the "
+        "derived ST rows carry the capture instant, aligned to the recorded one on a recorded "
+        "day"
+    ),
+    "kpl_concept_member": (
+        "the replica's kpl_concept_member is today's membership snapshot, with no per-day "
+        "history; the capture reads its first 10,000 (board_code, con_code) rows, so a board "
+        "added or dropped since also shifts that window"
+    ),
+    "dc_board": "the replica's dc_board is today's board snapshot",
+    "dc_board_member": (
+        "the replica's dc_board_member is today's membership snapshot; the capture reads its "
+        "first 10,000 (board_code, con_code) rows"
+    ),
+    "market_liquidity": (
+        "not expected to differ (per-code windows): only rows dated before the day but "
+        "written after its capture (a backfill) can make it"
+    ),
+    "daily_bar": "not expected to differ: only a backfill of rows dated before the day",
+    "trade_calendar": (
+        "built from the calendar generation's open dates: the same when both captures used the "
+        "same calendar (a recorded day keeps its recorded one)"
+    ),
+}
 
 
 def compare_reference(recorded: Any, synthesized: Any) -> dict[str, Any]:
@@ -1198,7 +1595,37 @@ def compare_reference(recorded: Any, synthesized: Any) -> dict[str, Any]:
         f"projection:{table}" for table, entry in projections.items() if not entry["identical"]
     ]
     result["differing"] = sorted(differ)
+    result["explanations"] = {
+        label: SECURITY_ANACHRONISMS.get(label, "not expected to differ: unexplained")
+        for label in result["differing"]
+        if not label.startswith("projection:")
+    }
     return result
+
+
+#: Why a synthesized fact can differ from the recorded one (projections: PROJECTION_ANACHRONISMS)
+SECURITY_ANACHRONISMS: Mapping[str, str] = {
+    "security_name_differ": (
+        "stock_basic answers today's names; codes renamed after the day get the day's name "
+        "from their namechange history (`anachronisms.names_on_day`), so what remains is a "
+        "change the history does not record, or one that took effect on the day itself"
+    ),
+    "security_is_st_differ": (
+        "is_st = the name says ST or stock_st(day) lists it; follows security_name_differ"
+    ),
+    "security_market_differ": "stock_basic answers today's market (board segment)",
+    "security_list_date_differ": "stock_basic answers today's list_date",
+    "security_delist_date_differ": "stock_basic answers today's delist_date",
+    "security_source_list_status_differ": "stock_basic answers today's list status",
+    "securities": (
+        "the universe is the prior session's daily_bar codes tradable on the day by today's "
+        "listing: a code whose list or delist date Tushare has revised since"
+    ),
+    "suspended": (
+        "suspend_d(day) asked afterwards: a full-day row the 09:20 view did not have "
+        "(`anachronisms.suspend_d_asked_after_the_day`)"
+    ),
+}
 
 
 def _record_view(snapshot: Any, calendar: Any) -> dict[str, dict[str, dict[str, Any]]]:
@@ -1373,6 +1800,9 @@ __all__ = [
     "CalendarChoice",
     "InputUnavailableError",
     "KnownAtCapture",
+    "MinuteFetcher",
+    "PROJECTION_ANACHRONISMS",
+    "SECURITY_ANACHRONISMS",
     "TushareCache",
     "TushareCacheMissError",
     "cached_answers",
@@ -1385,10 +1815,12 @@ __all__ = [
     "compare_signal_lists",
     "extract_reference_evidence",
     "local_instant",
+    "names_as_of_day",
     "prefetch_day",
     "probe_replica",
     "reference_anachronisms",
     "replica_refusals",
+    "restore_listing_in_evidence",
     "seal_reference_snapshot",
     "synthesize_auction_batch",
     "synthesize_auction_universe",

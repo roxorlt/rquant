@@ -65,6 +65,11 @@ else:
             "same_day_serving_generation": True,
             "notifier_shadow_only": True,
             "crashed_roles": crashed,
+            **({
+                "production_faithful": False,
+                "unfaithful_codes": ["920003.BJ"],
+                "not_production_faithful_because": ["no minute bars for 920003.BJ"],
+            } if day == "2026-09-23" else {}),
         },
         "roles": {
             "strategy.n_shape.v1": {
@@ -215,7 +220,12 @@ def test_days_run_as_separate_processes_at_most_parallel_at_a_time(tmp_path: Pat
     assert by_day["2026-09-22"]["roles"]["strategy.n_shape.v1"]["crashes"] == 1
 
     markdown = (root / "report.md").read_text(encoding="utf-8")
-    assert "| 2026-09-18 | OK | 0 | reference_slow |" in markdown
+    assert "| 2026-09-18 | OK | 0 | yes | reference_slow |" in markdown
+    #: a day that ran but lost a code's minutes says so in its row and in its own section
+    assert "| 2026-09-23 | OK | 0 | NO: 920003.BJ | reference_slow |" in markdown
+    assert "## Not production-faithful\n\n- 2026-09-23: no minute bars for 920003.BJ" in markdown
+    assert by_day["2026-09-23"]["production_faithful"] is False
+    assert by_day["2026-09-18"]["production_faithful"] is True
     assert "| 2026-09-22 | FAILED | 1 |" in markdown
     assert "strategy.n_shape.v1" in markdown.split("| 2026-09-22 | FAILED | 1 |")[1].split("\n")[0]
     assert "- 2026-09-21: no reference-slow batch targets 2026-09-21" in markdown
@@ -262,7 +272,7 @@ def test_the_dry_plans_of_several_days_are_one_report(tmp_path: Path) -> None:
     }
     assert by_day["2026-09-21"]["dry_plan"]["cannot"] == ["reference_slow: no batch"]
     markdown = (root / "report.md").read_text(encoding="utf-8")
-    assert "| 2026-09-18 | PLAN OK | 0 | reference_slow |" in markdown
+    assert "| 2026-09-18 | PLAN OK | 0 | - | reference_slow |" in markdown
     assert "| 2026-09-21 | CANNOT | 2 |" in markdown
 
 

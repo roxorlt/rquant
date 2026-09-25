@@ -919,7 +919,10 @@ class ReplayMinuteAdapter:
                     self.tushare_fetched[code] = len(rows)
                     self._install(code, rows, origin="tushare")
                     return self._bars[code]
-            self.tushare_failed[code] = "no rows for the trade date"
+            asked = (getattr(self._fetch, "attempts", None) or {}).get(code)
+            self.tushare_failed[code] = "no rows for the trade date" + (
+                f" (asked {asked} time(s), never cached)" if asked else ""
+            )
         return None
 
     def rt_min(self, codes: list[str], freq: str = "1min") -> Any:
@@ -1599,6 +1602,24 @@ def build_world(
     return route, facts, credentials, recorder
 
 
+def day_auction_frame(recorded: RecordedDay, synthesis: SynthesisInputs | None) -> Any:
+    """The day's auction rows this run published: the synthesized batch, else the recorded."""
+
+    from rquant.auction_match_gateway import AuctionMatchGateway
+
+    if synthesis is not None and synthesis.auction_payload is not None:
+        return AuctionMatchGateway.decode_payload(synthesis.auction_payload)
+    if recorded.auction_target is not None:
+        return AuctionMatchGateway.decode_payload(
+            next(
+                payload
+                for envelope, payload, _ in recorded.auction_records
+                if envelope.sequence == recorded.auction_target.sequence
+            )
+        )
+    return None
+
+
 def candidate_input_fidelity(recorded: RecordedDay, synthesis: SynthesisInputs) -> dict[str, Any]:
     """Per auction code, what the candidate input reads under the recorded batches against
     what it reads under this run's (either side may be the recorded one)."""
@@ -1730,9 +1751,32 @@ def synthesize_reference_batch(
         if recorded.auction_target is not None
         else synthesis.source.stk_auction(recorded.trade_date)
     )
-    known = sources.KnownAtCapture(
-        synthesis.source, traded_in_auction=sources.auction_traded_codes(auction_frame)
+    import pandas as pd
+
+    #: the day's names for codes renamed since (stock_basic answers today's); if Tushare
+    #: cannot answer the history, the names stay today's and the provenance says so
+    listing = pd.concat(
+        [synthesis.source.stock_basic(status) for status in ("L", "D", "P")], ignore_index=True
     )
+    try:
+        names, names_facts = sources.names_as_of_day(
+            synthesis.source, {str(code).strip() for code in listing["ts_code"]}
+        )
+    except Exception as error:  # noqa: BLE001 - a labelled degradation, not a refusal
+        names, names_facts = {}, {"unavailable": f"{type(error).__name__}: {error}"}
+    known = sources.KnownAtCapture(
+        synthesis.source,
+        traded_in_auction=sources.auction_traded_codes(auction_frame),
+        names_on_day=names,
+    )
+    listing_facts = sources.restore_listing_in_evidence(
+        synthesis.evidence_database,
+        listing=known.stock_basic("D"),
+        names_on_day=names,
+        trade_date=recorded.trade_date,
+        prior_trade_date=synthesis.evidence["prior_trade_date"],
+    )
+    synthesis.evidence["listing_restored"] = listing_facts
     snapshot = sources.synthesize_reference_snapshot(
         evidence_database=synthesis.evidence_database,
         source=known,
@@ -1740,6 +1784,10 @@ def synthesize_reference_batch(
         trade_date=recorded.trade_date,
         producer_commit=commit,
         limits=settings.limits.model_dump(mode="python"),
+        #: a recorded day is captured at the recorded instant, so only the data can differ
+        completed_at=None
+        if recorded.reference_snapshot is None
+        else recorded.reference_snapshot.captured_at,
     )
     synthesis.reference_snapshot = snapshot
     spool = _reference_spool(route, key_root)
@@ -1776,7 +1824,11 @@ def synthesize_reference_batch(
         "resealed_available_at": record.envelope.available_at,
         "output_sequence": result.output_sequence,
         "evidence": synthesis.evidence,
-        "anachronisms": sources.reference_anachronisms(snapshot, known),
+        "anachronisms": {
+            **sources.reference_anachronisms(snapshot, known),
+            "names_on_day": names_facts,
+        },
+        "captured_at_aligned_to_recording": recorded.reference_snapshot is not None,
     }
     if recorded.reference_snapshot is not None:
         facts["fidelity_vs_recorded"] = sources.compare_reference(
@@ -2443,7 +2495,7 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             "assume_listing_classification": bool(arguments.assume_listing_classification),
             "runner": "in-process threads, one role at a time, no unit sandbox",
             "production_faithful": not unfaithful,
-            "not_production_faithful_because": unfaithful,
+            "not_production_faithful_because": list(unfaithful),
         },
         "stage_seconds": {},
         "host": host_facts,
@@ -2560,13 +2612,25 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         import pandas as pd
 
         clock = ReplayClock(_local(trade_date, arguments.start))
+        #: a code that matched in the day's opening auction traded that day: an empty
+        #: stk_mins answer for it is retried, and never kept
+        traded_in_auction = sources.auction_traded_codes(day_auction_frame(recorded, synthesis))
+        minute_fetcher = (
+            None
+            if cache is None
+            else sources.cached_minute_fetcher(
+                cache,
+                trade_date,
+                expected_codes=traded_in_auction,
+                retries=arguments.stk_mins_retries,
+                backoff_seconds=arguments.stk_mins_backoff_seconds,
+            )
+        )
         adapter = ReplayMinuteAdapter(
             pd.read_parquet(minutes_path),
             clock=clock,
             lag_seconds=arguments.minute_lag_seconds,
-            tushare_fetch=None
-            if cache is None
-            else sources.cached_minute_fetcher(cache, trade_date),
+            tushare_fetch=minute_fetcher,
             trade_date=trade_date,
         )
         install_runner_patches(monkeypatch, clock, adapter)
@@ -2700,6 +2764,20 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         recorded.provenance["minute_bar"]["codes_by_origin"] = summary["chain"]["market_minute"][
             "codes_by_origin"
         ]
+        #: The day is not production-faithful for a watchlist code that traded in the
+        #: opening auction and still has no minute bars: the host's rt_min had them, the
+        #: replay's features, strategies and signals for that code are missing.
+        minute_gaps = sorted(set(adapter.missing) & traded_in_auction)
+        if minute_fetcher is not None:
+            recorded.provenance["minute_bar"]["tushare"] = minute_fetcher.report()
+        recorded.provenance["minute_bar"]["watchlist_codes_traded_without_minutes"] = minute_gaps
+        summary["chain"]["market_minute"]["watchlist_codes_traded_without_minutes"] = minute_gaps
+        if minute_gaps:
+            unfaithful.append(
+                f"no minute bars for {len(minute_gaps)} watchlist code(s) that traded in the "
+                f"opening auction: {minute_gaps[:20]} -- their features, strategy rounds and "
+                "signals are missing from this replay"
+            )
         if arguments.compare_signals_with is not None:
             summary["signal_fidelity"] = signal_fidelity(
                 summary,
@@ -2720,6 +2798,8 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             "hung": runner.hung,
             "synthesized_inputs": synthesized_inputs(recorded.provenance),
             "production_faithful": not unfaithful,
+            "not_production_faithful_because": list(unfaithful),
+            "unfaithful_codes": minute_gaps,
         }
         exit_code = 0 if serving_ok and shadow_ok and not crashed and runner.hung is None else 1
     except (ReplayRefusedError, sources.InputUnavailableError) as error:
@@ -2764,7 +2844,13 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         _PROTECTED_ROOTS = ()
     print_summary(summary, out=out)
     out(f"summary: {sandbox / 'summary.json'}")
-    out(f"REPLAY {'OK' if exit_code == 0 else 'FAILED'}")
+    reasons = (summary.get("verdict") or {}).get("not_production_faithful_because") or []
+    for reason in reasons:
+        out(f"NOT PRODUCTION-FAITHFUL: {reason}")
+    out(
+        f"REPLAY {'OK' if exit_code == 0 else 'FAILED'}"
+        + (" (NOT PRODUCTION-FAITHFUL, see above)" if reasons else "")
+    )
     return exit_code
 
 
@@ -3105,6 +3191,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="where Tushare answers are kept, one parquet per (endpoint, day[, code]) "
         "(default: <replay-root>/tushare-cache; shared by every run under that root)",
+    )
+    parser.add_argument(
+        "--stk-mins-retries",
+        type=int,
+        default=3,
+        help="times an empty stk_mins answer is asked again for a code that traded in the "
+        "opening auction (an empty answer is never cached)",
+    )
+    parser.add_argument(
+        "--stk-mins-backoff-seconds",
+        type=float,
+        default=5.0,
+        help="wait before the first such retry, doubled for each next one",
     )
     parser.add_argument(
         "--synthesize-sources",
