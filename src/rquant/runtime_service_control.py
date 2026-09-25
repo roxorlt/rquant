@@ -30,6 +30,8 @@ from rquant.runtime_read_interrupt import READ_INTERRUPT_STOP_REASON, is_read_in
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 StepDuration = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+#: a count: a bool is not one, and neither is a float that happens to be whole
+ObservationCount = Annotated[int, Field(strict=True, ge=0)]
 _STEP_DURATION_WINDOW = 20
 
 
@@ -98,6 +100,17 @@ class RuntimeStepResult(RuntimeContractModel):
     #: Whether this iteration actually took the daily writer lease, which is one fencing
     #: token per acquisition. `None` for every role but the daily orchestrator (#271).
     writer_lease_acquired: bool | None = None
+    #: Counts this iteration wants on record that do **not** make the role degraded, such
+    #: as the auction codes the candidate publisher left out for lacking five prior daily
+    #: rows. A count in `degraded_reasons` keeps the role `degraded` for the rest of the
+    #: day although nothing is wrong (#290); here it is only read.
+    observations: Mapping[str, ObservationCount] = Field(default_factory=dict)
+    #: The cause behind this iteration's `degraded_reasons`, when a role reports a
+    #: degradation instead of raising: the exception class and its message. Not a failure,
+    #: so it is not `last_error` and counts nothing. Until 2026-09-24 the candidate
+    #: publisher reduced every refusal to `auction_gap_input_unavailable`, and a day of
+    #: "exactly one row for every prior-five session" was invisible on the host.
+    degraded_detail: str | None = Field(default=None, min_length=1)
 
     @field_validator("source_generations")
     @classmethod
@@ -110,6 +123,15 @@ class RuntimeStepResult(RuntimeContractModel):
     def serialize_source_generations(self, value: Mapping[str, str]) -> dict[str, str]:
         return dict(value)
 
+    @field_validator("observations")
+    @classmethod
+    def freeze_observations(cls, value: Mapping[str, int]) -> Mapping[str, int]:
+        return _frozen_observations(value)
+
+    @field_serializer("observations")
+    def serialize_observations(self, value: Mapping[str, int]) -> dict[str, int]:
+        return dict(value)
+
     @field_validator("degraded_reasons")
     @classmethod
     def validate_degraded_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -118,6 +140,21 @@ class RuntimeStepResult(RuntimeContractModel):
         if len(value) != len(set(value)):
             raise ValueError("degraded reasons must be unique")
         return tuple(sorted(value))
+
+    @model_validator(mode="after")
+    def validate_degraded_detail(self) -> Self:
+        if self.degraded_detail is not None and not self.degraded_reasons:
+            raise ValueError("degraded_detail explains degraded_reasons and needs one")
+        return self
+
+
+def _frozen_observations(value: Mapping[str, int]) -> Mapping[str, int]:
+    for key, count in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("observation names cannot be empty")
+        if type(count) is not int or count < 0:
+            raise ValueError("observation counts must be non-negative integers")
+    return MappingProxyType(dict(sorted(value.items())))
 
 
 class RuntimeServiceHeartbeat(RuntimeContractModel):
@@ -226,6 +263,21 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     watermark_advanced: bool | None = None
     batch_published: bool | None = None
     writer_lease_acquired: bool | None = None
+    #: `RuntimeStepResult.observations` and `.degraded_detail` of the last successful
+    #: iteration: counts that do not make the role degraded, and the cause behind the
+    #: degraded reasons it reported. Empty / `None` after a failed iteration, whose cause
+    #: is `last_error`. *File* fields, for the reason `generation_events` gives above.
+    observations: Mapping[str, ObservationCount] = Field(default_factory=dict)
+    degraded_detail: str | None = Field(default=None, min_length=1)
+
+    @field_validator("observations")
+    @classmethod
+    def freeze_observations(cls, value: Mapping[str, int]) -> Mapping[str, int]:
+        return _frozen_observations(value)
+
+    @field_serializer("observations")
+    def serialize_observations(self, value: Mapping[str, int]) -> dict[str, int]:
+        return dict(value)
 
     @field_validator("failure_kind")
     @classmethod
@@ -464,6 +516,27 @@ Clock = Callable[[], datetime]
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return type(error).__name__ if not message else f"{type(error).__name__}: {message}"
+
+
+def degraded_cause(reason: str, error: BaseException) -> tuple[tuple[str, ...], str]:
+    """`<reason>:<ErrorClass>` for `degraded_reasons`, and the message for `degraded_detail`.
+
+    For a role that turns an exception into a degraded idle round instead of raising. The
+    class goes into the reason, which is short and stable enough to group on; the message
+    is free text and goes beside it, with the cause the error was raised from when there is
+    one (the DuckDB error behind "daily snapshot query failed", say).
+    """
+
+    return (f"{reason}:{type(error).__name__}",), degraded_detail_of(error)
+
+
+def degraded_detail_of(error: BaseException) -> str:
+    """The `degraded_detail` text for an exception a role turned into a degradation."""
+
+    detail = _error_text(error)
+    if error.__cause__ is not None:
+        detail = f"{detail} (caused by {_error_text(error.__cause__)})"
+    return detail
 
 
 def _nearest_rank_p95(durations: tuple[float, ...]) -> float:
@@ -722,6 +795,8 @@ class RuntimeServiceControl:
                 watermark_advanced=result.watermark_advanced,
                 batch_published=result.batch_published,
                 writer_lease_acquired=result.writer_lease_acquired,
+                observations=result.observations,
+                degraded_detail=result.degraded_detail,
                 **_duration_updates(current, duration_seconds),
             )
         )
@@ -765,6 +840,8 @@ class RuntimeServiceControl:
                 watermark_advanced=None,
                 batch_published=None,
                 writer_lease_acquired=None,
+                observations={},
+                degraded_detail=None,
                 **_waiting_updates(current, error, now=now),
                 **_duration_updates(current, duration_seconds),
             )
@@ -1107,6 +1184,8 @@ __all__ = [
     "RuntimeServiceSpec",
     "RuntimeServiceStatus",
     "RuntimeStepResult",
+    "degraded_cause",
+    "degraded_detail_of",
     "failure_kind_of",
     "inspect_runtime_health",
     "is_peer_wait",

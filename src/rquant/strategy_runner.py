@@ -2495,7 +2495,8 @@ class StrategyRunnerStore:
                     continue
                 if availability.late_policy is LateFeaturePolicy.FAIL_CLOSED:
                     raise ValueError(
-                        f"feature {candidate_id}:{requirement.name} exceeds max_delay_seconds"
+                        f"feature {candidate_id}:{requirement.name} exceeds max_delay_seconds "
+                        f"({status.actual_delay_seconds:g} s > {availability.max_delay_seconds} s)"
                     )
                 expected_status = (
                     FeatureAvailability.STALE
@@ -2662,7 +2663,10 @@ class StrategyRunnerStore:
         availability = definition.availability_contract
         if status.actual_delay_seconds > availability.max_delay_seconds:
             if availability.late_policy is LateFeaturePolicy.FAIL_CLOSED:
-                raise ValueError(f"feature {name} exceeds max_delay_seconds")
+                raise ValueError(
+                    f"feature {name} exceeds max_delay_seconds "
+                    f"({status.actual_delay_seconds:g} s > {availability.max_delay_seconds} s)"
+                )
             expected_status = (
                 FeatureAvailability.STALE
                 if availability.late_policy is LateFeaturePolicy.MARK_STALE

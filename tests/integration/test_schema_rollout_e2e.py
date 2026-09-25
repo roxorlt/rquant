@@ -454,6 +454,36 @@ def _production_profile(
     return RuntimeDeploymentProfile.model_validate(payload)
 
 
+def _serving_read_model_changes(monkeypatch: pytest.MonkeyPatch) -> str:
+    """From here on, the serving read model has a different physical schema.
+
+    That is a real schema change on `runtime.serving.signals`: its plan binds the serving
+    physical schema, and the serving publisher's acknowledgement has to name it. Since #228 a
+    second generation that differs only in its commit gets no plan at all, so the cases that
+    walk a plan end to end make the change they need — the one fingerprint the bundle and the
+    serving acknowledgement both read — instead of relying on the commit.
+    """
+
+    import rquant.runtime_builder_serving as runtime_builder_serving
+    import rquant.serving_read_models as serving_read_models
+
+    changed = canonical_sha256(
+        {
+            "serving_physical_table_specs": (
+                serving_read_models.serving_physical_table_specs_fingerprint()
+            ),
+            "change": "one more serving column",
+        }
+    )
+    monkeypatch.setattr(
+        serving_read_models, "serving_physical_table_specs_fingerprint", lambda: changed
+    )
+    monkeypatch.setattr(
+        runtime_builder_serving, "serving_physical_table_specs_fingerprint", lambda: changed
+    )
+    return changed
+
+
 def _production_environment() -> dict[str, str]:
     return {
         "TUSHARE_TOKEN_MAIN": "tushare-secret",
@@ -554,6 +584,7 @@ def test_production_profile_six_owner_serving_ack_cutover_and_rollback(
         environ=_production_environment(),
         schema_bootstrap_reason="reviewed six-owner production bootstrap",
     )
+    _serving_read_model_changes(monkeypatch)
     started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
     candidate = install_runtime_deployment_profile(
         new_profile,
@@ -701,6 +732,7 @@ def test_production_rollout_orchestrates_schema_cutover_and_binds_audit(
         environ=_production_environment(),
         schema_bootstrap_reason="reviewed production rollout bootstrap",
     )
+    _serving_read_model_changes(monkeypatch)
     started_at = datetime(2026, 8, 2, 2, 0, tzinfo=UTC)
     candidate = install_runtime_deployment_profile(
         new_profile,

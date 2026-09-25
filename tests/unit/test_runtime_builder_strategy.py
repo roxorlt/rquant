@@ -33,6 +33,7 @@ from rquant.paper_broker import (
 )
 from rquant.paper_contracts import PaperOrderIntent, PaperOrderType, PaperSide
 from rquant.runtime_builder_strategy import (
+    STRATEGY_SKIPPED_CANDIDATES_OBSERVATION,
     StrategyEvaluatorBinding,
     strategy_live_builder,
 )
@@ -240,6 +241,7 @@ def _publish(
     available_at: datetime | None = None,
     source_event_time: datetime | None = None,
     decision_cutoff: datetime | None = None,
+    stale: bool = False,
 ) -> None:
     if strategy_id == "n_shape":
         values: dict[str, object] = {
@@ -312,7 +314,9 @@ def _publish(
                     candidate_id="600000.SH",
                     name=name,
                     status=(
-                        FeatureAvailability.UNAVAILABLE
+                        FeatureAvailability.STALE
+                        if stale
+                        else FeatureAvailability.UNAVAILABLE
                         if pd.isna(frame.iloc[0][name])
                         else FeatureAvailability.AVAILABLE
                     ),
@@ -321,7 +325,11 @@ def _publish(
                     decision_cutoff=resolved_decision_cutoff,
                     actual_delay_seconds=actual_delay_seconds,
                     reason=(
-                        "not applicable to entry state" if pd.isna(frame.iloc[0][name]) else None
+                        "source_event_late"
+                        if stale
+                        else "not applicable to entry state"
+                        if pd.isna(frame.iloc[0][name])
+                        else None
                     ),
                 )
                 for name in frame.columns
@@ -934,6 +942,48 @@ def test_strategy_builder_defers_future_feature_and_reports_exact_backlog(
     assert result.processed_count == 0
     assert result.backlog_count == 1
     assert result.degraded_reasons == ()
+
+
+def test_the_heartbeat_carries_how_many_candidates_the_newest_batch_skipped(
+    tmp_path: Path,
+) -> None:
+    """Review S3: a candidate whose feed went stale is visible on the strategy heartbeat.
+
+    The count is the newest feature batch's, carried through the iterations that find no
+    new batch (one a minute against a two-second loop), and it is an observation: the role
+    is not degraded by it.
+    """
+
+    manifest = _manifest(tmp_path)
+    feature_spool = FeatureBatchSpool(tmp_path / "features")
+    _publish(
+        feature_spool,
+        sequence=0,
+        available_at=NOW,
+        source_event_time=NOW - timedelta(seconds=61),
+        stale=True,
+    )
+    _publish_candidates(
+        tmp_path / "candidates",
+        definition_fingerprint=str(manifest.settings["strategy_registration_fingerprint"]),
+        executable_fingerprint=str(manifest.settings["strategy_executable_fingerprint"]),
+        candidate_schema_fingerprint=str(manifest.settings["candidate_schema_fingerprint"]),
+    )
+    current_time = [NOW + timedelta(seconds=1)]
+    step = strategy_live_builder(clock=lambda: current_time[0])(manifest)
+
+    stale = step()
+    current_time[0] = NOW + timedelta(seconds=3)
+    idle = step()
+    _publish(feature_spool, sequence=1, available_at=NOW + timedelta(seconds=4))
+    current_time[0] = NOW + timedelta(seconds=5)
+    fresh = step()
+
+    key = STRATEGY_SKIPPED_CANDIDATES_OBSERVATION
+    assert stale.processed_count == 1 and stale.degraded_reasons == ()
+    assert dict(stale.observations) == {key: 1}
+    assert idle.processed_count == 0 and dict(idle.observations) == {key: 1}
+    assert fresh.processed_count == 1 and dict(fresh.observations) == {key: 0}
 
 
 def test_strategy_builder_rejects_feature_cutoff_after_runner_decision(

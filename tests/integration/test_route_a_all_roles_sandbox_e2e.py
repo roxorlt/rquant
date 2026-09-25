@@ -43,6 +43,7 @@ The sandbox itself is not the host's. It is a Python-level simulation (`os.*` an
 from __future__ import annotations
 
 import errno
+import gc
 import os
 import re
 import sys
@@ -317,6 +318,16 @@ def run_role(
             for granted in writable
         )
     )
+    #: close what earlier roles in this process left open *before* the window opens. A
+    #: `sqlite3.Connection` and its own statement cache refer to each other, so a
+    #: connection nobody closed is not freed when its last reference goes: it waits for the
+    #: cyclic collector, and when that runs, SQLite checkpoints the WAL and deletes the
+    #: `-wal`/`-shm` sidecars in the producer's directory. Left to the collector's own
+    #: allocation-driven schedule, that lands in whichever later role's window happens to
+    #: be open -- `notifier`'s on one run, `lab_artifact_catalog`'s on CI run 36059539009 --
+    #: and `tree_state` charges it to that role. A full collection here makes the window
+    #: measure the role it names and nothing an earlier role left behind.
+    gc.collect()
     trees_before = {path: tree_state(path) for path in unowned}
     outside: list[SandboxViolation] = []
     try:
@@ -595,18 +606,26 @@ KNOWN_OUT_OF_SANDBOX: dict[str, str] = {}
 #:   there. Under systemd each role is its own process, so neither can happen. #245 closed
 #:   the quota-ledger half of this: `SourceQuotaStore` now closes each operation's
 #:   connection, so the reference-slow sidecars go when the operation does rather than
-#:   whenever the collector runs. The containment below is unchanged -- the paper broker
-#:   still holds its connection, and the entry is allowed, not required.
+#:   whenever the collector runs. The paper broker still leaves `broker.sqlite3` and
+#:   `consumer.sqlite3` unclosed, and CI run 36059539009 (3.11, shard 2) showed the same
+#:   removal inside `lab_artifact_catalog`'s window instead: an unclosed connection is
+#:   cyclic garbage, and which window the collector reaches it in follows the allocation
+#:   count, not the role order. `run_role` now runs a full `gc.collect()` before it takes
+#:   `trees_before`, so what an earlier role left is closed before any window opens, and
+#:   neither entry is expected to appear any more.
 #:
 #: All three stay as tripwires -- a *new* role appearing here is a regression worth
-#: reading -- but the assertion is a containment, because whether a peer's sidecars are
-#: already on disk depends on when the producer in the same pass closed its connection
-#: (`reference_slow_publisher` showed up on Linux and not on macOS for exactly that
-#: reason). The one entry that must never be absent is asserted on its own.
+#: reading -- and the assertion stays a containment: the two harness entries are allowed,
+#: not required. `lab_artifact_catalog` is not added, because what it showed was the same
+#: artifact in another window, which the collection removes rather than records. The same
+#: collection is also what closes the strategies' own `runner.sqlite3` connections before
+#: `signal_router`'s window, so the one entry that must never be absent -- asserted on its
+#: own -- no longer depends on the collector's schedule either.
 KNOWN_C_LEVEL_WRITES: dict[str, tuple[str, ...]] = {
     #: a real out-of-sandbox write
     "signal_router": ("live/strategies",),
-    #: harness artifacts: a same-process producer connection closed during the window
+    #: harness artifacts: an earlier role's unclosed connection, now collected before the
+    #: window opens (see `run_role`); allowed, not required
     "notifier": ("live/paper-brokers",),
     "reference_slow_publisher": ("live/reference-slow",),
 }

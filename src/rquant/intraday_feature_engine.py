@@ -70,6 +70,15 @@ FEATURE_COLUMNS = (
     "same_clock_sessions",
 )
 STATUS_COLUMNS = FEATURE_COLUMNS[2:]
+#: The published contract's `max_delay_seconds` for every market-minute feature, whose
+#: `late_policy` is `mark_stale` (`runtime_definition_bootstrap` takes it from here). A
+#: code whose newest bar is older than this at the batch's `available_at` has every field
+#: marked STALE, so the strategy runner skips that candidate. Until package AI the engine
+#: only ever wrote AVAILABLE / UNAVAILABLE, and the runner refused the *whole* batch for
+#: one late candidate ("exceeds max_delay_seconds without stale status") -- a suspended
+#: or thinly traded code stopped every other candidate's evaluation (replay finding F2).
+MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS = 60
+SOURCE_EVENT_LATE_REASON = "source_event_late"
 
 
 class IntradayFeatureValidationError(ValueError):
@@ -490,22 +499,30 @@ def _field_statuses(
     for row, reason_map in zip(rows, row_reasons, strict=True):
         candidate_id = str(row["ts_code"])
         source_event_time = source_event_times[candidate_id]
+        delay = (available_at - source_event_time).total_seconds()
+        late = delay > MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
         for name in STATUS_COLUMNS:
             present = row[name] is not None
+            missing_reason = None if present else reason_map[name] or "missing_value"
+            if late:
+                status = FeatureAvailability.STALE
+                reason = ";".join(
+                    part for part in (SOURCE_EVENT_LATE_REASON, missing_reason) if part
+                )
+            elif present:
+                status, reason = FeatureAvailability.AVAILABLE, None
+            else:
+                status, reason = FeatureAvailability.UNAVAILABLE, missing_reason
             statuses.append(
                 FeatureFieldStatus(
                     candidate_id=candidate_id,
                     name=name,
-                    status=(
-                        FeatureAvailability.AVAILABLE
-                        if present
-                        else FeatureAvailability.UNAVAILABLE
-                    ),
+                    status=status,
                     source_event_time=source_event_time,
                     available_at=available_at,
                     decision_cutoff=decision_cutoff,
-                    actual_delay_seconds=(available_at - source_event_time).total_seconds(),
-                    reason=None if present else reason_map[name] or "missing_value",
+                    actual_delay_seconds=delay,
+                    reason=reason,
                 )
             )
     return tuple(statuses)

@@ -51,6 +51,7 @@ from rquant.runtime_schema_registry import (
     RuntimeSchemaV1MigrationAudit,
     build_runtime_schema_rollout,
     build_runtime_schema_v1_migration_audit,
+    changed_runtime_schema_channel_ids,
     parse_runtime_schema_contract_bundle,
 )
 from rquant.runtime_schema_registry import (
@@ -2006,14 +2007,9 @@ def changed_runtime_schema_channels(
         generation_id=previous_generation_id,
     )
     target = _load_generation_schema_bundle(root, generation_id=target_generation_id)
-    return tuple(
-        channel.channel_id
-        for channel in target.channels
-        if (
-            channel.declaration.schema_fingerprint
-            != previous.channel(channel.channel_id).declaration.schema_fingerprint
-        )
-    )
+    #: By shape, not by `schema_fingerprint`: that one carries `producer_commit`, which every
+    #: release changes, and comparing it made every install stage sixteen plans (#228).
+    return changed_runtime_schema_channel_ids(previous=previous, candidate=target)
 
 
 def runtime_schema_rollout_plan_ids_for_generation(
@@ -2259,9 +2255,18 @@ def load_runtime_schema_service_bindings(
         )
     bindings: list[RuntimeSchemaServiceBinding] = []
     for plan_id in _schema_rollout_plan_ids(root):
-        authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
-        if authority.target_generation_id != generation_id:
+        #: A plan of another generation binds nothing here, so it is not opened either: only
+        #: its authority file is read, to learn which generation it targets. Every release
+        #: before #228 was fixed left a full set of plans behind (208 on the host by
+        #: 2026-09-25, all past their window), and loading one re-derives it from both of its
+        #: generations' bundles and opens its store — none of which can tell this generation
+        #: anything, and any of which failing used to stop this service's admission.
+        target = _read_schema_rollout_authority(
+            _schema_rollout_root(root, plan_id) / "authority.json"
+        ).target_generation_id
+        if target != generation_id:
             continue
+        authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
         state = store.get_state(plan_id)
         recorder: SchemaRolloutStore | None = None
 
@@ -2500,11 +2505,12 @@ def _convert_rollout_journal(
 ) -> _RolloutJournalConversion:
     """Open one plan's store as a writer so its header stops saying WAL.
 
-    Every plan, not only the current generation's. `load_runtime_schema_service_bindings`
-    walks `control/schema-rollouts` and opens each plan's store *before* it knows whether the
-    plan belongs to the current generation, so one WAL store left by an older build stops
-    every kind-backed role — which is #227 exactly, and leaving last generation's plans in WAL
-    would bring it straight back the next time a bundle is installed.
+    Every plan, not only the current generation's. Up to v0.33.21
+    `load_runtime_schema_service_bindings` opened each plan's store *before* it knew whether
+    the plan belonged to the current generation, so one WAL store left by an older build
+    stopped every kind-backed role — which is #227 exactly. Since #304 admission reads only
+    the other generations' authority files, but a generation that is rolled back to runs the
+    older admission again, so converting every store is still what keeps that path open.
 
     Nothing but the journal header changes: no phase moves, no event is appended, and the
     plan is not even read. `journal_mode` lives in the database header, so the writable open
@@ -2595,6 +2601,8 @@ def _acknowledge_one_plan(
     #: window has closed cannot be acknowledged or advanced — `_validate_time` refuses both —
     #: so finding that out here is the difference between a report and a half-written run.
     deadline = store.effective_deadline(plan_id)
+    if deadline is None:  # pragma: no cover - a PREPARE plan's window is always the install's
+        raise RuntimeSchemaCompatibilityError("a preparing rollout plan has no deadline")
     reopening = now > deadline
     if reopening and store.deadline_reopened_until(plan_id) is not None:
         fields["skipped_reason"] = "deadline_expired"
@@ -2710,6 +2718,177 @@ def acknowledge_runtime_schema_rollout_preparation(
             conversion=conversions[plan_id],
         )
         for plan_id in plan_ids
+    )
+
+
+#: Why `close_unchanged_runtime_schema_rollouts` rolls a plan back, on the plan's own chain.
+SCHEMA_ROLLOUT_UNCHANGED_CLOSE_REASON: Final[str] = (
+    "no_schema_change: the channel keeps its shape between the plan's generations (#228); "
+    "old authority retained"
+)
+#: The phases in which a plan can still bind or block a service: a producer is held at
+#: startup in PREPARE, bound to dual-write in DUAL_WRITE and CONSUMER_ACK, and a consumer
+#: appends a receipt in CONSUMER_ACK. CUTOVER binds nothing (authority has already moved), and
+#: RETIRE / ROLLBACK are terminal.
+_CLOSABLE_ROLLOUT_PHASES = frozenset(
+    {RolloutPhase.PREPARE, RolloutPhase.DUAL_WRITE, RolloutPhase.CONSUMER_ACK}
+)
+
+
+class RuntimeSchemaRolloutClosure(RuntimeContractModel):
+    """What `close_unchanged_runtime_schema_rollouts` did, or would do, to one plan."""
+
+    plan_id: GenerationHash
+    dataset_id: str
+    previous_generation_id: GenerationHash
+    target_generation_id: GenerationHash
+    #: a plan of the generation `current` names binds that generation's services; closing it
+    #: takes effect for a running producer only when it restarts (until then its next publish
+    #: stops with `rolled-back schema producer must stop before publishing`)
+    target_is_current: bool
+    shape_unchanged: bool | None
+    phase_before: RolloutPhase | None
+    phase_after: RolloutPhase | None
+    closed: bool
+    #: A closed set: `schema_changed` — the channel's shape really moved, so the plan is doing
+    #: its job and is left for the rollout protocol; `terminal` — already RETIRE or ROLLBACK;
+    #: `past_cutover` — authority has already moved to the new declaration and nothing is bound;
+    #: `state_unreadable` — preview only, a WAL store cannot be read without writing beside it.
+    skipped_reason: Literal["schema_changed", "terminal", "past_cutover", "state_unreadable"] | None
+    detail: str | None
+
+
+def _close_one_unchanged_plan(
+    root: Path,
+    *,
+    plan_id: str,
+    current_generation_id: str | None,
+    now: datetime,
+    dry_run: bool,
+) -> RuntimeSchemaRolloutClosure:
+    authority = _read_schema_rollout_authority(
+        _schema_rollout_root(root, plan_id) / "authority.json"
+    )
+    fields: dict[str, object] = {
+        "plan_id": plan_id,
+        "dataset_id": authority.plan.dataset_id,
+        "previous_generation_id": authority.previous_generation_id,
+        "target_generation_id": authority.target_generation_id,
+        "target_is_current": authority.target_generation_id == current_generation_id,
+        "shape_unchanged": None,
+        "phase_before": None,
+        "phase_after": None,
+        "closed": False,
+        "skipped_reason": None,
+        "detail": None,
+    }
+    state_path = _schema_rollout_root(root, plan_id) / "state.sqlite3"
+    if dry_run and persisted_rollout_journal_layout(state_path) == "wal":
+        fields["skipped_reason"] = "state_unreadable"
+        fields["detail"] = (
+            "store is in WAL journal mode, so its phase cannot be read without writing beside "
+            "it; `runtime-schema-rollout acknowledge` converts it, and so does applying this"
+        )
+        return RuntimeSchemaRolloutClosure(**fields)
+    #: the full loader: the authority is re-derived from both generations' bundles and the
+    #: store's hash chain is verified before anything here trusts either
+    _authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=dry_run)
+    previous = _load_generation_schema_bundle(root, generation_id=authority.previous_generation_id)
+    target = _load_generation_schema_bundle(root, generation_id=authority.target_generation_id)
+    channel_id = authority.plan.dataset_id
+    unchanged = previous.channel_shape_fingerprint(channel_id) == target.channel_shape_fingerprint(
+        channel_id
+    )
+    state = store.get_state(plan_id)
+    fields["shape_unchanged"] = unchanged
+    fields["phase_before"] = state.phase
+    fields["phase_after"] = state.phase
+    if not unchanged:
+        fields["skipped_reason"] = "schema_changed"
+        fields["detail"] = (
+            f"{channel_id} changes shape between {authority.previous_generation_id} and "
+            f"{authority.target_generation_id}; this plan protects a real schema transition "
+            "and is left to the rollout protocol"
+        )
+        return RuntimeSchemaRolloutClosure(**fields)
+    if state.phase in {RolloutPhase.RETIRE, RolloutPhase.ROLLBACK}:
+        fields["skipped_reason"] = "terminal"
+        fields["detail"] = f"plan is already {state.phase.value}"
+        return RuntimeSchemaRolloutClosure(**fields)
+    if state.phase not in _CLOSABLE_ROLLOUT_PHASES:
+        fields["skipped_reason"] = "past_cutover"
+        fields["detail"] = (
+            f"plan is in {state.phase.value}: authority is already the new declaration and "
+            "the plan binds no service"
+        )
+        return RuntimeSchemaRolloutClosure(**fields)
+    fields["closed"] = True
+    fields["phase_after"] = RolloutPhase.ROLLBACK
+    if dry_run:
+        return RuntimeSchemaRolloutClosure(**fields)
+    #: `store.rollback`, not `rollback_runtime_schema_rollout`: that one also points `current`
+    #: back at the plan's previous generation, which is the right answer for a failed real
+    #: rollout and the wrong one here — nothing about these generations is being undone.
+    closed = store.rollback(
+        plan_id=plan_id,
+        expected_revision=state.revision,
+        reason=SCHEMA_ROLLOUT_UNCHANGED_CLOSE_REASON,
+        now=now,
+        operation_id=f"close-unchanged:{plan_id}",
+    )
+    fields["phase_after"] = closed.phase
+    return RuntimeSchemaRolloutClosure(**fields)
+
+
+def close_unchanged_runtime_schema_rollouts(
+    runtime_root: Path,
+    *,
+    now: datetime,
+    dry_run: bool = False,
+) -> tuple[RuntimeSchemaRolloutClosure, ...]:
+    """Roll back every still-open plan that describes no schema change (#228, #304).
+
+    Every install before the #228 fix prepared one plan per two-sided channel whether or not
+    the channel's shape moved; the host carries 208 of them (192 in DUAL_WRITE, 16 in
+    PREPARE, all past their window). A generation installed by this build ignores them — they
+    target superseded generations, and admission no longer even opens those. But a generation
+    that *is* bound to such a plan (the one installed on 2026-09-24, if `current` is ever
+    pointed back at it, and whatever an older installer stages if it is reinstalled) runs
+    code that holds a producer to the plan's expired window: on the first market-minute
+    publish of the next session the chain stops (#304).
+
+    So this closes them: for every plan whose channel has the same shape in the plan's
+    previous and target generation (`RuntimeSchemaContractBundle.channel_shape_fingerprint`)
+    and which is still in PREPARE, DUAL_WRITE or CONSUMER_ACK, it appends a rollback with
+    `SCHEMA_ROLLOUT_UNCHANGED_CLOSE_REASON` to the plan's own hash chain. That is the store's
+    rollback and nothing else: `current` is not touched, no generation is re-activated, no
+    other file is written. A plan in ROLLBACK binds no producer (admission only binds in
+    DUAL_WRITE / CONSUMER_ACK) and no consumer (receipts only in CONSUMER_ACK), in this build
+    and in every earlier one, and "old authority retained" is, for an unchanged shape, the
+    same schema as the new one.
+
+    A plan whose shape really changed is reported (`schema_changed`) and never touched.
+    Idempotent: a closed plan is `terminal` on the next run. `dry_run=True` opens every store
+    read-only and writes nothing.
+    """
+
+    root = _absolute_runtime_root(runtime_root)
+    now = normalize_aware_utc(now)
+    target = _current_target(root)
+    current_generation_id = (
+        target.removeprefix("generations/")
+        if target is not None and target.startswith("generations/")
+        else None
+    )
+    return tuple(
+        _close_one_unchanged_plan(
+            root,
+            plan_id=plan_id,
+            current_generation_id=current_generation_id,
+            now=now,
+            dry_run=dry_run,
+        )
+        for plan_id in _schema_rollout_plan_ids(root)
     )
 
 
@@ -3691,10 +3870,13 @@ __all__ = [
     "RuntimeDeploymentRollbackError",
     "RuntimeSchemaBootstrapRequiredError",
     "RuntimeSchemaRolloutAcknowledgement",
+    "RuntimeSchemaRolloutClosure",
     "RuntimeSchemaRolloutAuthority",
     "RuntimeSchemaV1MigrationAuthorization",
     "SCHEMA_ROLLOUT_INSTALLER_PHASE_CEILING",
+    "SCHEMA_ROLLOUT_UNCHANGED_CLOSE_REASON",
     "acknowledge_runtime_schema_rollout_preparation",
+    "close_unchanged_runtime_schema_rollouts",
     "activate_runtime_deployment_generation",
     "advance_runtime_schema_rollout",
     "changed_runtime_schema_channels",

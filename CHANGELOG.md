@@ -6,6 +6,18 @@
 
 ### Added
 
+- **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
+  （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
+  竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
+  通知只走影子档、真实 provider 一次都不会被调用。对生产**只读**：生产文件只用 `open(rb)` 读、副本只
+  `ATTACH ... (READ_ONLY)`，加一个审计钩子拒绝保护路径下的任何写、改名、chmod、删除，读前读后逐个比对 stat；
+  沙箱与生产路径重叠时直接拒（退出码 2）。`summary.json` 按 role 列出轮数、失败与降级原因、首次产出时刻，以及候选、
+  分钟线、特征、信号、模拟盘、通知 outbox 与 serving 当日代的计数。`--dry-plan` 只列计划、什么都不写；
+  `--generations 2` 连上一代与 rollout 计划一起装。退出码 0 表示出了当日 serving 代、通知只走影子、没有 role 崩、
+  生产没被碰。同包修了测试辅助：root 属主的祖先目录（主机的 `/` 是 0555）按生产的 `(0, None)` 规则记，而不是
+  记下观察到的精确 mode——否则在主机上一跑就被 `deployment lock ancestor / is unsafe` 拒掉。本版的热修 AI、AJ
+  都是用它在主机上回放 2026-09-24 找到的。**没有 `src/` 改动**。
+
 - **notifier 影子档：写库、出 `signals` 权威、不发一个字节（#281）**：`notifier.admin.shadow.v1`
   的 `"paused": True` 原来硬编码在 `runtime_production_profile.py` 里，要让一条信号走到
   serving 的 `signals` 数据集只能改代码重新发版。现在它是画像输入
@@ -123,6 +135,12 @@
 
 ### Changed
 
+- deploy(nginx): `deploy/nginx/rquant-backup.conf` 加 `location /preview/`（新版看板预览，路线 A，读
+  `RQUANT_SERVING_ROOT` 指向的 serving 代，只读），反代 Streamlit `127.0.0.1:8509`（lighthouse 进程，非 systemd），
+  与 `/dashboard/` 共用 htpasswd。owner 2026-09-24 授权「nginx 加登录路径」，主机上 09-24 21:42 已生效（备份
+  `/root/rquant-backup.conf.bak-20260924-preview`）；本版只把同一块逐字写回仓库，装机只核对仓库与主机文件 `diff` 为空，
+  见 DEPLOY.md
+
 - deploy(systemd): raise rquant-live-runtime.slice CPUQuota 60%→200% (owner-authorized "cpu可以调到2个", issue #297). Pre-market 2026-09-24, cpu.stat nr_throttled went from 9,610 (00:28) to 127,336 (10:42) — ~26% of wall time throttled — while the 20 Route A roles shared 0.6 CPU on a 4-core host that was ~85% idle, and the reference-slow publisher's ~26MB registry commit could not finish inside its 5s visibility guard, so that day's reference generation was never published. Neither parent slice (rquant-live.slice, rquant.slice) carries a CPUQuota, so 200% fits; MemoryHigh and every other limit are unchanged. Already applied on the host via `systemctl set-property` at 10:42; this only persists it to the repo — see DEPLOY.md for the install steps
 
 - deploy(systemd): raise rquant.slice 11264M→12288M and rquant-live.slice 7680M→9216M after the 2026-09-21 acceptance day peaks (live 7,634/7,680 MB during the daily, top 10,763/11,264 MB during backups)
@@ -193,6 +211,125 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **全角色沙箱 e2e 的间歇失败（CI run 36059539009，3.11 分片 2；只改测试）**：
+  `tests/integration/test_route_a_all_roles_sandbox_e2e.py` 的 `run_role` 在拍 `trees_before` 快照之前先做一次完整的
+  `gc.collect()`。前面的 role 没关闭的 SQLite 连接和它自己的语句缓存互相引用，引用计数归零也不会关，只能等循环垃圾回收；
+  回收的时机跟着内存分配次数走，落进后面哪个 role 的测量窗口，WAL 旁路文件被删的这次变化就算到哪个 role 头上（这次是
+  paper broker 留下的 `broker.sqlite3` / `consumer.sqlite3`，算到了 `lab_artifact_catalog` 头上）。现在这些残留在窗口外
+  关掉；「role 不许在沙箱外写」的断言不变，`KNOWN_C_LEVEL_WRITES` 不加项。
+
+- **schema rollout 不再卡死路线 A 链：形状没变的 channel 不建计划，DUAL_WRITE 的期限从生产者第一次双写起算，
+  过期先拒后发（#304、#228，包 AJ）**：协调者 2026-09-25 01:01 在主机上只读查了 `data/runtime/control/schema-rollouts`：
+  **208 份计划，全部过期**，192 份停在 DUAL_WRITE、16 份停在 PREPARE。09-07 以来每个装机窗口都承认了整整 16 份，每份
+  600 秒后过期；当前代（09-24 16:21 承认）的 `runtime.market_minute.batch-envelope` 计划期限是 16:31:32，早已过期。
+  之前的交易日链没走到分钟线发布，所以没暴露；包 AI 的回放 `--generations 2` 复现了：周一第一批分钟线先写进 spool、
+  再在 `commit_payload` 抛 `rollout deadline has expired`，之后每一轮都是 `immutable sequence already contains different
+  content`（重启也一样），`feature_live` 每一轮失败，整条链没有特征、没有信号。本包改三处：
+  - **形状没变就不建计划（#228）**（`runtime_schema_registry.py` `channel_shape_fingerprint` /
+    `changed_runtime_schema_channel_ids`，`runtime_deployment_bundle.py` `changed_runtime_schema_channels`）：原来比的是
+    声明的 `schema_fingerprint`，它把 `producer_commit` 算在里面，每次发版都变，于是每个既有生产者又有消费者的 channel
+    每次都算「变了」。现在比的是计划真正绑定的 schema 事实：声明的语义指纹（载荷模型、读者版本与当前版本、每个字段的
+    类型 / 可空 / 必填 / 生命周期）、channel 的物理 schema，以及 serving 消费的 channel 上 serving 的物理 schema。
+    `producer_commit`、manifest 指纹、参与者名单都不算（加一个策略不是 schema 变化），照旧作为出处留在计划里。
+    **v0.33.21 与本分支的 21 个 channel 形状、serving 物理 schema 逐一相同（本地实测），所以 v0.33.22 装在主机当前代之上
+    一份计划都不会建**。
+  - **DUAL_WRITE 的窗口从生产者第一次双写起算，窗口关了先拒后发（#304）**（`schema_compatibility.py`
+    `_effective_deadline` / `validate_dual_write_time`，`runtime_schema_registry.py` `prepare_payload`）：PREPARE 仍按安装
+    时的墙钟窗口（含安装器那一次重开）；DUAL_WRITE / CONSUMER_ACK 的窗口从第一条 `dual_write_values` /
+    `dual_write_evidence` 起算、长度仍是计划自己的窗口（生产画像 600 秒），且不早于 PREPARE 的期限；在那之前计划没有
+    期限——市场时段的生产者只有开盘后才可能写证据，按安装时刻算，收盘后装的计划还没开盘就过期了。数据真正开始按两份
+    声明流动之后，后面的消费者回执、切换仍然只有一个窗口，所以边界还在。`expire()` 用同一个有效期限。生产者在发布
+    **之前**用只读句柄按同一个 `observed_at` 问一次窗口，窗口关了就在碰 spool 之前拒绝——原来是先发布、后被拒，重试时
+    撞上自己刚发布的那一批，这才变成每一轮 `immutable sequence already contains different content`。
+  - **准入只读别的代计划的 `authority.json`**（`runtime_deployment_bundle.py` `load_runtime_schema_service_bindings`）：
+    原来先把每份计划都完整加载（从两代 bundle 重新推导、打开状态库、校验哈希链）再判断是不是本代的；208 份旧计划
+    一份都绑不到新代，但任何一份加载失败都会挡住每个 kind-backed role 的启动。现在先读目标代，不是本代就跳过。
+  - **新增 `rquant runtime-schema-rollout close-unchanged [--dry-run]`**：对形状没变、仍在 PREPARE / DUAL_WRITE /
+    CONSUMER_ACK 的计划，在计划自己的哈希链上追加一条 store 回滚（原因
+    `no_schema_change: ... (#228); old authority retained`）；**不动 `current`**、不重新激活任何代、不写别的文件
+    （`rollback_runtime_schema_rollout` 会把 `current` 指回上一代，这里不能用）。形状真的变了的计划报
+    `schema_changed`、不碰。幂等；`--dry-run` 只读打开、一个字节不写；和 `acknowledge` 一样不需要 `.env`。
+    ROLLBACK 阶段的计划既不绑生产者（准入只在 DUAL_WRITE / CONSUMER_ACK 绑）、也不向消费者要回执（只在
+    CONSUMER_ACK 要），本版与之前每一版都一样，所以它是让「被旧计划绑住的那一代」（09-24 那代，万一 `current` 退回去）
+    周一也能发布的办法。前进路径（装 v0.33.22）不需要它。
+  - **真正的 schema 变化仍然走完整协议**：e2e 用 serving 读模型的物理 schema 变化造一次真变化——只建一份计划，承认进
+    DUAL_WRITE 后跨周末不过期，周一第一次发布被接受并开窗，CONSUMER_ACK 之后没有 serving 的回执不许切换，有了才切换。
+    另记一条观察（未改）：对既有生产者又有消费者的 channel，`validate_runtime_schema_transition` 会拒掉任何声明变化
+    （升版本号超出旧消费者的读取范围，不升版本号又有语义变化），所以今天能装上的「真变化」只有 serving 物理 schema 这一种；
+    而那五个 serving 生产者从不写双写记录，这种计划走不出 DUAL_WRITE；当前代若有一份没走完的真变化计划，形状相同的
+    下一次安装会把它丢下（#308，评审第 7、8 条）。
+  - **评审后补的（PASS-WITH-NOTES）**：生产者发布前的窗口检查先认幂等重试（库里已有同一 `write_id` 就放行，与写者的
+    顺序一致；原来重送一根更早的相同分钟线会被报 `rollout time cannot precede the current state`）；`close-unchanged`
+    发现 `schema_changed` 时退 2（其余退 0）；补了 `expire()`、CUTOVER 计划不关、dry-run 只读打开且不留旁路文件三处测试；
+    回放摘要的 `plans` 改数计划目录（`phases_by_channel` 按 channel 列阶段）；第 30 条里过时的两段改指向本条。
+  - **测试**：`tests/unit/test_schema_rollout_no_op_plans.py`（6）、`tests/integration/test_schema_rollout_no_op_plans_e2e.py`
+    （5，按主机时间线：09-24 16:21 承认、周一 09:30 开盘；含生产画像 16 条策略换提交 0 份计划）、回放新增
+    `--generations 2` 一例（0 份计划、分钟线零失败、当日 serving 代带信号）。store 单测里「DUAL_WRITE 过了 `plan.deadline` 就拒」那一段改成先写一条双写记录开窗再越过窗口。依赖「换提交就有计划」的旧夹具改成：走完整协议的用真变化；讲主机上已有计划的，用
+    `tests/schema_rollout_legacy_plans.py` 按旧安装器的原样循环把计划放上去；链路世界断言第二次安装 0 份计划。
+  - **装机与回滚**：见 `DEPLOY.md` 2026-09-25「热修 AJ」一条。
+
+- **路线 A 链上的五处阻断：9 月 24 日真实数据回放暴露，修完后本地回放同一形状能走到当日 serving 代并带信号（包 AI）**：
+  协调者在主机上用 v0.33.21 的代码回放 2026-09-24（只读副本 + 录下的批次，不打补丁，到 10:30 为止），结果是参考慢源
+  09:21:31 正常发出当日参考代，但 `candidate.auction_gap` 在 09:29–09:48 的 20 轮装配**每一轮都**返回
+  `idle_result(("auction_gap_input_unavailable",))`，原因被吞掉；在沙箱里直接调 `load_live_auction_candidate_input`
+  （09:29:08 / 09:35:08 / 09:48:08）拿到的是 `AuctionGapCandidateInputError: daily snapshot must contain exactly one row
+  for every prior-five session`。5,475 只竞价代码里有 5,469 只在前五个交易日（09-17/18/21/22/23）各有且仅有一行
+  `daily_bar`，另外 6 只没有：`920025.BJ` 1 行、`601995.SH` 1 行、`301686.SZ` 2 行、`920229.BJ` 2 行、`600825.SH` 3 行、
+  `600301.SH` 3 行（新股与停复牌）。万分之十一的代码拒掉了一整天，下游于是全部空转：market-minute 报
+  `required authority has no not_visible snapshot`，特征报 `read-only spool source identity is missing`，模拟盘约束报
+  `paper constraints require a visible market-minute batch`，模拟盘撮合报 `current pointer is unavailable`，serving 报
+  `paper_accounts reader failed`。包 AH 回放报告里的 F1 在真实数据上根本没走到。本包修五处：
+  - **缺五日日线的代码逐只排除、计数，不再拒整批**（`auction_gap_candidate_input.py`）：前五个交易日不是每天恰好一行
+    `daily_bar` 的代码（缺一天或重一天）不进候选批次——auction_gap 的量比按五天算，这样的代码当天本来就不可能是候选。
+    被排除的数量超过竞价代码的 `PRIOR_FIVE_INCOMPLETE_MAX_FRACTION`（5%）时仍然拒整批：那说明是快照本身缺了一个交易日
+    （约 100% 的代码都缺）或缺了一个交易所的一天（约 30%–45%），不是几只证券的事；09-24 是 0.11%，新股密集周加几十只
+    停牌也在 1% 以下。拒绝的消息里写明「N of M auction codes」和前五只代码。当天的日线快照 id 在有代码被排除时把
+    这些代码也算进去（没有排除时与旧版逐字相同）。
+    **按交易所再查一遍**（独立复核 S1）：北交所只有约 280 只，占全部竞价代码约 5%，缺整整一天的北交所日线在全局
+    口径下正好卡在 5% 上限，拦不住；现在除了全局比例，SH / SZ / BJ 每个交易所自己的缺行比例超过 5% 也整批拒，
+    消息写 `N of M BJ auction codes lack it`。09-24 那 6 只按交易所算是北交所 2 / 约 280、上交所 3 / 约 2,300、
+    深交所 1 / 约 2,900，都在 1% 以下。日线快照 mtime 晚于观察时刻时拒（`daily snapshot is future evidence`）
+    这条原有检查补上了测试（S2）。
+  - **计数是心跳上的「观察值」，不让角色变成降级**：`RuntimeStepResult` 与心跳文件模型新增 `observations`（非负整数计数，
+    不影响状态）与 `degraded_detail`（降级轮的原因文字，不是 `last_error`，也不计失败次数），失败轮两者都清空；两个字段都
+    **只在心跳文件里**，不进冻结的 serving 投影（#237）。auction_gap 发布者每轮报
+    `observations.auction_gap_prior5_incomplete_codes`，窗外的空闲轮照抄当天最后一次的值，另外在计数变化时用 loguru
+    记一行被排除的代码清单；本地交易日一变这份计数就清空（S4），跨夜不重启的进程不会在次日窗口前还报昨天的数。选这个而不是写进候选批次元数据，是因为候选批次文档是 `extra="forbid"` 的发布内容，加字段
+    会让回滚后的读者拒收；心跳字段的回滚面已经有现成的「挪心跳」步骤。#290（auction-match 丢行数一整天显示降级）
+    可以用同一个字段修，本包没改。
+  - **降级轮说出原因**（`runtime_builder_candidate.py`、`runtime_builder_shadow.py`）：候选发布者两处
+    `except ...: return idle_result((reason,))` 改成 `auction_gap_input_unavailable:<异常类名>` /
+    `session_candidate_input_unavailable:<异常类名>`，异常消息和它的 `__cause__` 写进 `degraded_detail`；影子对账角色的
+    三处保留原来的原因字符串（没有消费者，改了只会动测试），只补上 `degraded_detail`。
+  - **参考慢源写上市分类四字段（F1）**（`reference_slow_publisher.py`）：模拟盘约束要求每条 LISTING_STATUS 带
+    `market` / `exchange` / `instrument_class` / `security_class`，发布者一个都没写，所以真实数据上每只代码都被拒
+    （`listing classification market is missing`），撮合拿不到约束指针，serving 出不了代。现在写
+    `market=CN`、`exchange` 按代码后缀（SH→SSE、SZ→SZSE、BJ→BSE，与成本选择器的名字一致）、`EQUITY`、`A_SHARE`。
+    stock_basic 自己的 `market` 列是板块（主板 / 创业板 / 科创板 / 北交所 / CDR），不是模拟盘要的国家代码，它照旧写在
+    BOARD_MEMBERSHIP 里。旧版写的、不带这四个字段的记录仍按原样被拒（主机上还没有已发布的参考代，周一是第一次发布）。
+    回放脚本的 `--assume-listing-classification` 改成「接受、打印警告、什么都不做」。
+  - **特征引擎按代码标 STALE（F2）**（`intraday_feature_engine.py`）：每个分钟线特征发布时都是
+    `max_delay_seconds=60`、`late_policy=mark_stale`，但引擎只写过 AVAILABLE / UNAVAILABLE，于是一只最新分钟线超过
+    60 秒的候选（停牌、成交稀疏、某只代码抓取失败）让策略拒掉**整个**特征批次，而批次按顺序消费，这一只代码会让其余候选
+    当天剩下的时间都评估不了。现在这只代码的每个字段都标 STALE，原因 `source_event_late`（值本来就缺时后面接缺的原因），
+    策略跳过它、照常评估其余候选。上限是一个常量 `MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS`，定义引导直接用它发布。
+    被跳过的候选数写在策略心跳的 `observations.strategy_skipped_candidates`（最新一个特征批次的数，没有新批次的轮次
+    照抄；S3）：持仓那只行情停更时出场评估会暂停，以前这是整批失败、很显眼，现在要从这里看。
+  - **生命周期特征的延迟上限从 1 秒放到 120 秒（F3）**（`runtime_definition_bootstrap.py`）：模拟盘生命周期特征的延迟是
+    证据自己的 `available_at - source_event_time`——挂单等成交时就是那条入场信号（由一根分钟线生成），最高价就是那根线的
+    `session_high`——这条路径上没有任何证据能在 1 秒内，所以第一条入场信号之后策略每一轮都失败（本地整日回放 350 轮里
+    333 轮，前两轮量到的是 14 秒和 11 秒），出场永远评估不到。上限改成两个分钟线周期（`EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS`
+    = 2 × 60 秒）：一个周期给状态所依据的行情证据（它本身被限制在 60 秒内），一个给特征批次到证据之间策略、路由、队列、
+    撮合每轮 2–5 秒的几跳；仍然 `fail_closed`。超限的报错现在写出实际延迟和上限。
+  - **没修、另开 issue 的**：schema rollout 计划在收盘后承认进 DUAL_WRITE、周一第一次发布时已过期（F5，#304，由包 AJ
+    处理，见上一条）；北交所代码没有成本选择器、CDR 按 A_SHARE 归类（#305）；生命周期特征迟到仍整批失败（#306）；
+    模拟盘约束午休与收盘后每轮失败、一只代码拒整批（F6，#307）。
+  - **装机与回滚**：见 `DEPLOY.md` 2026-09-24「热修 AI」一条。新增两个心跳文件字段，回滚到本包之前要先挪心跳；
+    特征契约与策略注册指纹随之改变，这和每次发版改 `producer_commit` 带来的变化是同一种，生产输入文档照常按新提交生成。
+  - **本地回放**：`tests/integration/test_route_a_day_replay_script.py` 新增一个 120 只竞价代码的夹具日（上面那 6 只的
+    1/1/2/2/3/3 行形状、1 只 09:45 之后不再成交的候选、112 只低开的非候选），不带任何桩回放到 10:30：6 只被排除且计数为 6、
+    候选 2 只、那只候选在最后一个特征批次里是 STALE、策略零失败、模拟盘成交 1 笔、当日 serving 代带当天的信号。
 
 - **auction_gap 候选输入一轮要做约 2.2 万次单键参考查询，主机上一次 74 毫秒、一轮约 27 分钟，比 09:29–09:49 的装配窗还长（#299，包 AG）**：
   AF 的演练在主机上（普通 lighthouse 进程，不受 runtime slice 节流）量到：一代真实的 5,556 只证券发布之后，

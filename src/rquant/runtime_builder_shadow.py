@@ -20,7 +20,11 @@ from rquant.legacy_shadow_export import (
 )
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_market_session import load_market_calendar_authority
-from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
+from rquant.runtime_service_control import (
+    RuntimeServicePlane,
+    RuntimeStepResult,
+    degraded_detail_of,
+)
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
     RuntimeServiceKind,
@@ -383,11 +387,14 @@ def shadow_session_builder(
                     evaluated_at=observed_at,
                     maximum_sessions=20,
                 )
-            except (OSError, TypeError, ValueError):
+            except (OSError, TypeError, ValueError) as error:
                 return RuntimeStepResult(
                     processed_count=0,
                     source_generations={"shadow_session": settings.calendar_content_sha256},
                     degraded_reasons=("shadow:legacy_export_unavailable",),
+                    #: the reason stays the one reason this role has always reported,
+                    #: and the exception behind it is now on record beside it
+                    degraded_detail=degraded_detail_of(error),
                 )
             trade_date = selection.latest_closed_session
             try:
@@ -401,11 +408,14 @@ def shadow_session_builder(
                     trade_date=trade_date,
                     completion_keyring=completion_keyring,
                 )
-            except LegacyShadowExportUnavailableError:
+            except LegacyShadowExportUnavailableError as error:
                 return RuntimeStepResult(
                     processed_count=0,
                     source_generations={"shadow_session": calendar.content_sha256},
                     degraded_reasons=("shadow:legacy_export_unavailable",),
+                    #: the reason stays the one reason this role has always reported,
+                    #: and the exception behind it is now on record beside it
+                    degraded_detail=degraded_detail_of(error),
                 )
             try:
                 report = resolved_executor(
@@ -427,11 +437,14 @@ def shadow_session_builder(
                     report_producer_service_id=settings.report_producer_service_id,
                     report_producer_instance_id=settings.report_producer_instance_id,
                 )
-            except (LegacyShadowExportUnavailableError, ShadowInputUnavailableError):
+            except (LegacyShadowExportUnavailableError, ShadowInputUnavailableError) as error:
                 return RuntimeStepResult(
                     processed_count=0,
                     source_generations={"shadow_session": calendar.content_sha256},
                     degraded_reasons=("shadow:legacy_export_unavailable",),
+                    #: the reason stays the one reason this role has always reported,
+                    #: and the exception behind it is now on record beside it
+                    degraded_detail=degraded_detail_of(error),
                 )
             if not isinstance(report, ShadowSessionReport):
                 raise TypeError("Shadow production executor returned an invalid report")

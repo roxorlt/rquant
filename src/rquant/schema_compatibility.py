@@ -46,6 +46,8 @@ _DEADLINE_REOPEN_EVENT = "deadline_reopen"
 #: make every reopen identifiable in `receipts()` afterwards, and a rule the caller could
 #: choose to skip would not survive the first other caller.
 _DEADLINE_REOPEN_OPERATION_PREFIX = "installer-deadline-reopen:"
+#: The producers' own evidence events. The first of them opens a DUAL_WRITE plan's window.
+_DUAL_WRITE_RECORD_EVENTS = ("dual_write_values", "dual_write_evidence")
 
 
 class RolloutPhase(StrEnum):
@@ -1109,10 +1111,11 @@ class SchemaRolloutStore:
         Everything else about the plan — participants, fingerprints, phase — is untouched.
 
         One consequence to be clear about: `_validate_time` gates *every* later mutation of
-        this plan, so a reopen moves the whole remaining rollout — the producers' dual-write
-        records at DUAL_WRITE and the consumers' receipts at CONSUMER_ACK — later by the same
-        one window. It restarts the plan's clock, it does not carve out an exception for the
-        acknowledgement alone.
+        this plan, and the DUAL_WRITE / CONSUMER_ACK window is never earlier than the reopened
+        deadline, so a reopen can only move the remaining rollout later. Since #304 those two
+        stages have their own clock as well — it starts at the producers' first dual-write
+        record (`_effective_deadline`) — so a reopen no longer decides whether the next
+        trading session's first publish is accepted; it only restarts the installer's stage.
         """
 
         now = normalize_aware_utc(now)
@@ -1136,8 +1139,8 @@ class SchemaRolloutStore:
                 raise ValueError("only a preparing rollout may have its deadline reopened")
             if self._deadline_reopened_until(connection, plan_id) is not None:
                 raise ValueError("rollout deadline has already been reopened once")
-            deadline = self._effective_deadline(connection, plan)
-            if now <= deadline:
+            deadline = self._effective_deadline(connection, plan, phase=phase)
+            if deadline is None or now <= deadline:
                 #: A window that is still open needs nothing, and reopening it early would
                 #: quietly hand the plan more than one window — which is the one thing the
                 #: single-use rule exists to prevent.
@@ -1541,7 +1544,10 @@ class SchemaRolloutStore:
         now = normalize_aware_utc(now)
         with self._connect() as connection:
             row, plan = self._load(connection, plan_id)
-            if now <= plan.deadline:
+            #: the same deadline `_validate_time` enforces: a reopened window, or a DUAL_WRITE
+            #: window no producer has opened yet, has not expired (#304)
+            deadline = self._effective_deadline(connection, plan, phase=RolloutPhase(row["phase"]))
+            if deadline is None or now <= deadline:
                 raise ValueError("rollout deadline has not expired")
             if RolloutPhase(row["phase"]) in {RolloutPhase.RETIRE, RolloutPhase.ROLLBACK}:
                 raise ValueError("terminal rollout cannot expire")
@@ -1808,21 +1814,124 @@ class SchemaRolloutStore:
         return max(_decode_time(json.loads(row[0])["reopened_until"]) for row in rows)
 
     @staticmethod
+    def _first_dual_write_at(
+        connection: sqlite3.Connection,
+        plan_id: str,
+    ) -> datetime | None:
+        """When a producer first recorded dual-write evidence for this plan, if one has.
+
+        Read off the append-only chain, like the reopen: the first `dual_write_values` or
+        `dual_write_evidence` event is the moment the producers' half of the rollout began.
+        """
+
+        row = connection.execute(
+            """
+            SELECT recorded_at FROM schema_rollout_event
+            WHERE plan_id = ? AND event_type IN (?, ?) ORDER BY revision LIMIT 1
+            """,
+            (plan_id, *_DUAL_WRITE_RECORD_EVENTS),
+        ).fetchone()
+        return None if row is None else _decode_time(row[0])
+
+    @staticmethod
     def _effective_deadline(
         connection: sqlite3.Connection,
         plan: LiveSchemaRolloutPlan,
-    ) -> datetime:
-        reopened = SchemaRolloutStore._deadline_reopened_until(connection, plan.plan_id)
-        if reopened is None or reopened <= plan.deadline:
-            return plan.deadline
-        return reopened
+        *,
+        phase: RolloutPhase,
+    ) -> datetime | None:
+        """The deadline that governs a plan in `phase`, or `None` while its window is unopened.
 
-    def effective_deadline(self, plan_id: str) -> datetime:
-        """The deadline that governs this plan now, reopen included. Readable read-only."""
+        PREPARE is the installer's stage and keeps the wall-clock window it always had:
+        `plan.deadline`, or the installer's single reopen.
+
+        DUAL_WRITE and CONSUMER_ACK are the producers' and consumers' stages, and their window
+        is measured from the producers' first dual-write record, for the plan's own length
+        (`deadline - started_at`, i.e. the profile's `schema_rollout_stage_timeout_seconds`).
+        Until that record exists the window has not opened and there is no deadline (#304).
+        The reason is what the evidence is: a producer can only dual-write when it publishes,
+        and a market-hours producer publishes during a trading session, not when the
+        installer happens to run. Measured from the install, a plan acknowledged into
+        DUAL_WRITE after the close (the host did it at 16:21 on 2026-09-24) had expired ten
+        minutes later, before any producer could have written a record, and the first publish
+        of the next session was refused — on the market-minute path after the spool publish,
+        which then wedged every later iteration. What stays bounded is what the window is
+        for: once data is flowing under both declarations, the rest of the rollout (consumer
+        receipts, cutover) still has exactly one window, and a plan that sits in DUAL_WRITE
+        without any producer writing has nothing flowing to bound.
+
+        Never earlier than the PREPARE-stage deadline, so opening the window can only give a
+        plan more time than the install already granted, never take it away.
+        """
+
+        reopened = SchemaRolloutStore._deadline_reopened_until(connection, plan.plan_id)
+        prepare_deadline = (
+            plan.deadline if reopened is None or reopened <= plan.deadline else reopened
+        )
+        if phase not in {RolloutPhase.DUAL_WRITE, RolloutPhase.CONSUMER_ACK}:
+            return prepare_deadline
+        opened_at = SchemaRolloutStore._first_dual_write_at(connection, plan.plan_id)
+        if opened_at is None:
+            return None
+        return max(prepare_deadline, opened_at + (plan.deadline - plan.started_at))
+
+    def effective_deadline(self, plan_id: str) -> datetime | None:
+        """The deadline that governs this plan now, or `None` while its window is unopened.
+
+        Reopen included, and for DUAL_WRITE / CONSUMER_ACK measured from the producers' first
+        dual-write record (see `_effective_deadline`). Readable read-only.
+        """
 
         with self._connect() as connection:
-            _row, plan = self._load(connection, plan_id)
-            return self._effective_deadline(connection, plan)
+            row, plan = self._load(connection, plan_id)
+            return self._effective_deadline(connection, plan, phase=RolloutPhase(row["phase"]))
+
+    def dual_write_window_opened_at(self, plan_id: str) -> datetime | None:
+        """When the producers' first dual-write record landed, or `None`. Readable read-only."""
+
+        with self._connect() as connection:
+            self._load(connection, plan_id)
+            return self._first_dual_write_at(connection, plan_id)
+
+    def validate_dual_write_time(
+        self,
+        plan_id: str,
+        observed_at: AwareUtcDatetime,
+        *,
+        write_id: str | None = None,
+    ) -> None:
+        """Refuse, before anything is published, a dual-write the store would refuse after.
+
+        `record_dual_write_values` checks the plan's window at the moment it is called, and a
+        producer calls it after its own publish. A refusal there leaves a published batch
+        without its rollout record, and the producer's retry then meets its own earlier
+        publish (#304: `immutable sequence already contains different content` on every later
+        market-minute iteration). The same check, made on a read-only handle with the same
+        `observed_at` before the publish, turns that into a refusal that leaves nothing
+        behind. Readable read-only.
+
+        In the writer's order: a record the store already holds (`write_id`) is a retry, and
+        the writer accepts a retry before it looks at the clock, so this does too. Otherwise a
+        producer re-sending an identical older batch — the market-minute same-content
+        re-capture, `observed_at` = that batch's own `available_at` — would be refused here
+        with `rollout time cannot precede the current state` although the commit accepts it.
+        """
+
+        observed_at = normalize_aware_utc(observed_at)
+        with self._connect() as connection:
+            row, plan = self._load(connection, plan_id)
+            if write_id is not None and (
+                connection.execute(
+                    "SELECT 1 FROM schema_dual_write_value WHERE plan_id = ? AND write_id = ?",
+                    (plan_id, write_id),
+                ).fetchone()
+                is not None
+            ):
+                return
+            phase = RolloutPhase(row["phase"])
+            if phase not in {RolloutPhase.DUAL_WRITE, RolloutPhase.CONSUMER_ACK}:
+                raise ValueError("dual-write values require the dual_write phase")
+            self._validate_time(connection, plan, row, observed_at)
 
     def deadline_reopened_until(self, plan_id: str) -> datetime | None:
         """When the installer's single reopen runs out, or `None` if it was never used."""
@@ -1839,8 +1948,8 @@ class SchemaRolloutStore:
         now: AwareUtcDatetime,
     ) -> None:
         current_phase = RolloutPhase(row["phase"])
-        deadline = self._effective_deadline(connection, plan)
-        if now > deadline and current_phase is not RolloutPhase.CUTOVER:
+        deadline = self._effective_deadline(connection, plan, phase=current_phase)
+        if deadline is not None and now > deadline and current_phase is not RolloutPhase.CUTOVER:
             raise ValueError("rollout deadline has expired")
         if now < max(plan.started_at, SchemaRolloutStore._state_from_row(row).updated_at):
             raise ValueError("rollout time cannot precede the current state")

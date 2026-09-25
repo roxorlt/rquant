@@ -614,6 +614,21 @@ def test_rollout_store_requires_complete_registry_and_consecutive_cas_phases(
             declaration_fingerprint=new.schema_fingerprint,
             now=started_at + timedelta(minutes=4),
         )
+    #: Since #304 the DUAL_WRITE window opens at the producers' first dual-write record, so
+    #: the clock is only checked here once one exists: open it, then step past it.
+    opened_at = started_at + timedelta(minutes=5)
+    state = store.record_dual_write_values(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1.0},
+        generation_id="4" * 64,
+        observed_at=opened_at,
+        operation_id="batch:opens-the-window",
+    )
+    assert store.effective_deadline(plan.plan_id) == opened_at + (plan.deadline - started_at)
     with pytest.raises(ValueError, match="deadline"):
         store.acknowledge(
             plan_id=plan.plan_id,
@@ -622,7 +637,7 @@ def test_rollout_store_requires_complete_registry_and_consecutive_cas_phases(
             participant_id="gateway",
             participant_fingerprint="1" * 64,
             declaration_fingerprint=new.schema_fingerprint,
-            now=plan.deadline + timedelta(seconds=1),
+            now=opened_at + (plan.deadline - started_at) + timedelta(seconds=1),
         )
     with pytest.raises(ValueError, match="time cannot precede"):
         store.acknowledge(
@@ -1020,6 +1035,83 @@ def test_timeout_and_consumer_reject_roll_back_without_erasing_new_data(
     assert rolled_back.authority_declaration_fingerprint == plan.old_declaration_fingerprint
     assert rolled_back.new_data_preserved is True
     assert any("deadline" in event.payload_json for event in store.receipts(plan.plan_id))
+
+
+def test_expire_uses_the_dual_write_window_that_opens_at_the_first_record(
+    tmp_path: Path,
+) -> None:
+    """#304: a DUAL_WRITE plan no producer has written to has not expired, days later.
+
+    `expire()` judges the same effective deadline `_validate_time` enforces: with no dual-write
+    record the window has not opened, so it refuses; one window after the first record it
+    rolls the plan back with the old authority retained.
+    """
+
+    old = _declaration(current_version=1, fields=_base_fields())
+    new = _declaration(
+        current_version=2,
+        fields=(*_base_fields(), _field("amount", required=False, introduced_in=2)),
+    )
+    started_at = datetime(2026, 9, 24, 8, 21, 32, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    window = plan.deadline - plan.started_at
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    state = store.create_plan(plan, now=started_at, operation_id="create")
+    state = store.acknowledge(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        phase=RolloutPhase.PREPARE,
+        participant_id="gateway",
+        participant_fingerprint="1" * 64,
+        declaration_fingerprint=plan.new_declaration_fingerprint,
+        now=started_at + timedelta(seconds=30),
+    )
+    state = store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.DUAL_WRITE,
+        now=started_at + timedelta(seconds=38),
+    )
+    days_later = plan.deadline + timedelta(days=3)
+    assert store.effective_deadline(plan.plan_id) is None
+    with pytest.raises(ValueError, match="has not expired"):
+        store.expire(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            now=days_later,
+            operation_id="expire-too-early",
+        )
+
+    opened_at = days_later + timedelta(hours=1)
+    state = store.record_dual_write_values(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1.0},
+        generation_id="4" * 64,
+        observed_at=opened_at,
+        operation_id="batch:opens-the-window",
+    )
+    with pytest.raises(ValueError, match="has not expired"):
+        store.expire(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            now=opened_at + window,
+            operation_id="expire-inside-the-window",
+        )
+    rolled_back = store.expire(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        now=opened_at + window + timedelta(seconds=1),
+        operation_id="expire-past-the-window",
+    )
+    assert rolled_back.phase is RolloutPhase.ROLLBACK
+    assert rolled_back.authority_declaration_fingerprint == plan.old_declaration_fingerprint
 
 
 def test_cutover_rejects_stale_or_untrusted_consumer_receipt(tmp_path: Path) -> None:

@@ -3904,6 +3904,9 @@ def cmd_runtime_schema_rollout(args: argparse.Namespace) -> int:
     from the plan, so neither is signed for here.
     """
 
+    if args.rollout_action == "close-unchanged":
+        return _cmd_runtime_schema_rollout_close_unchanged(args)
+
     from rquant.runtime_deployment_bundle import (
         acknowledge_runtime_schema_rollout_preparation,
     )
@@ -3934,6 +3937,53 @@ def cmd_runtime_schema_rollout(args: argparse.Namespace) -> int:
     #: one reopen is spent cannot be carried by this command at all.
     if expired:
         logger.error("schema rollout 有 %d 份计划已过期且重开额度用尽，需人工裁决", len(expired))
+        return 2
+    return 0
+
+
+def _cmd_runtime_schema_rollout_close_unchanged(args: argparse.Namespace) -> int:
+    """Roll back every open plan whose channel keeps its shape (#228), leaving `current` alone.
+
+    The plans every install before #228 was fixed staged for releases that changed no schema.
+    A generation installed by this build is bound to none of them; this is for a generation
+    that is — one `current` is pointed back at, or one an older installer stages again — so
+    that no producer of it is held to an expired dual-write window (#304). A plan whose shape
+    really changed is reported and left alone. Idempotent; `--dry-run` writes nothing.
+
+    Exits 2 when any plan protects a real schema change (`schema_changed`), so a script or
+    an operator reading only the status stops there; 0 otherwise.
+    """
+
+    from rquant.runtime_deployment_bundle import close_unchanged_runtime_schema_rollouts
+
+    results = close_unchanged_runtime_schema_rollouts(
+        Path(args.runtime_root),
+        now=datetime.now(UTC),
+        dry_run=bool(args.dry_run),
+    )
+    schema_changed = [item for item in results if item.skipped_reason == "schema_changed"]
+    print(
+        json.dumps(
+            {
+                "status": "dry_run" if args.dry_run else "applied",
+                "plans": len(results),
+                "closed": len([item for item in results if item.closed]),
+                "closed_current_generation": len(
+                    [item for item in results if item.closed and item.target_is_current]
+                ),
+                "schema_changed": len(schema_changed),
+                "closures": [item.model_dump(mode="json") for item in results],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if schema_changed:
+        logger.error(
+            "schema rollout 有 %d 份计划保护的是真实的 schema 变化，本命令未动它们，需人工裁决",
+            len(schema_changed),
+        )
         return 2
     return 0
 
@@ -8233,6 +8283,12 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_schema_acknowledge_p = runtime_schema_rollout_sub.add_parser("acknowledge")
     runtime_schema_acknowledge_p.add_argument("--runtime-root", type=Path, required=True)
     runtime_schema_acknowledge_p.add_argument("--dry-run", action="store_true")
+    runtime_schema_close_p = runtime_schema_rollout_sub.add_parser(
+        "close-unchanged",
+        help="把形状未变的 channel 上仍未结束的 rollout 计划回滚关闭（#228/#304），不动 current",
+    )
+    runtime_schema_close_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_schema_close_p.add_argument("--dry-run", action="store_true")
 
     runtime_retirement_p = sub.add_parser(
         "runtime-schema-retirement",

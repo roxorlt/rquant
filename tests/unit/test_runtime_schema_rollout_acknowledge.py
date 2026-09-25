@@ -59,10 +59,12 @@ from tests.unit.test_runtime_deployment_bundle import (
     isolated_root_credential_sealer,  # noqa: F401 - autouse fixture, imported to apply here
 )
 
-#: The commit the second generation is built at. A declaration fingerprint is
-#: `semantic_fingerprint + producer_commit`, so a different commit is what makes every
-#: two-sided channel a changed channel — the same reason the production host staged sixteen
-#: plans for a release that changed no schema at all (#228).
+#: The commit the second generation is built at. Until #228 was fixed a declaration's
+#: change fingerprint carried `producer_commit`, so a different commit made every two-sided
+#: channel a changed channel and the host staged sixteen plans for every release. The
+#: installer no longer does that, but the host still carries every one of those plans, and
+#: they are what this module's command walks — so the fixture prepares the same set
+#: directly, one plan per two-sided channel, instead of asking the installer for it.
 NEXT_COMMIT = "b" * 40
 
 #: The production profile's own window: `runtime_production_profile.py` defaults
@@ -215,11 +217,21 @@ def rollout(tmp_path: Path) -> Rollout:
     world.manifests = candidate_manifests
     world.generation_id = second.generation_hash
     plan_ids: list[str] = []
-    for channel_id in changed_runtime_schema_channels(
-        root,
-        previous_generation_id=first.generation_hash,
-        target_generation_id=second.generation_hash,
-    ):
+    #: Every channel, not `changed_runtime_schema_channels`: that reports none for two
+    #: generations whose channels keep their shape (#228), and these plans are the ones a
+    #: build before that fix staged for exactly such a pair.
+    assert (
+        changed_runtime_schema_channels(
+            root,
+            previous_generation_id=first.generation_hash,
+            target_generation_id=second.generation_hash,
+        )
+        == ()
+    )
+    target_bundle = bundle._load_generation_schema_bundle(
+        root, generation_id=second.generation_hash
+    )
+    for channel_id in (channel.channel_id for channel in target_bundle.channels):
         try:
             authority = prepare_runtime_schema_rollout(
                 root,
@@ -728,7 +740,9 @@ def test_an_expired_plan_is_reopened_once_and_then_carried(rollout: Rollout) -> 
         )
         reopened = store.deadline_reopened_until(plan_id)
         assert reopened == EXPIRED + STAGE_TIMEOUT
-        assert store.effective_deadline(plan_id) == reopened
+        #: in DUAL_WRITE the window waits for the producers' first record (#304), so the
+        #: plan has no deadline until one of them publishes
+        assert store.effective_deadline(plan_id) is None
 
 
 def test_the_reopen_is_on_the_hash_chain_and_says_who_did_it(rollout: Rollout) -> None:
@@ -1008,9 +1022,15 @@ def test_reopening_a_window_that_is_still_open_is_refused(rollout: Rollout) -> N
 def test_a_reopen_moves_the_later_phases_windows_too(rollout: Rollout) -> None:
     """Stated because it is a consequence an operator has to know, not a side effect.
 
-    `_validate_time` gates every later mutation of the plan, so restarting the clock moves
-    the whole remaining rollout — the producers' dual-write records and the consumers'
-    receipts — later by the same one window.
+    `_validate_time` gates every later mutation of the plan. Since #304 the DUAL_WRITE stage
+    has its own clock, which starts at the producers' first dual-write record, so a plan the
+    installer carried to DUAL_WRITE is not stopped by the clock before any producer has
+    written — past the reopened window as much as inside it; what stops it is the evidence
+    rule. The stage is still bounded, from the first record on: see
+    `tests/integration/test_schema_rollout_no_op_plans_e2e.py::`
+    `test_a_bound_plan_accepts_monday_s_first_publish_and_then_refuses_before_publishing`
+    and `tests/unit/test_schema_compatibility.py::`
+    `test_expire_uses_the_dual_write_window_that_opens_at_the_first_record`.
     """
 
     acknowledge_runtime_schema_rollout_preparation(rollout.root, now=EXPIRED)
@@ -1029,12 +1049,13 @@ def test_a_reopen_moves_the_later_phases_windows_too(rollout: Rollout) -> None:
             operation_id="inside-the-reopened-window",
         )
 
-    #: past the reopened one, the clock is what stops it again
-    with pytest.raises(ValueError, match="deadline has expired"):
+    #: past the reopened one too, days later: no producer has written, so the window has not
+    #: opened and the refusal is still the evidence rule, not the clock
+    with pytest.raises(ValueError, match="dual_write lacks consistency evidence"):
         store.advance(
             plan_id=plan_id,
             expected_revision=store.get_state(plan_id).revision,
             target_phase=RolloutPhase.CONSUMER_ACK,
-            now=EXPIRED + STAGE_TIMEOUT + timedelta(seconds=1),
+            now=EXPIRED + timedelta(days=3),
             operation_id="past-the-reopened-window",
         )

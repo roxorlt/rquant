@@ -406,7 +406,12 @@ def test_a_torn_read_in_the_auction_window_is_reported_as_the_open_it_was(
 
     degraded = step()
 
-    assert degraded.degraded_reasons == ("auction_gap_input_unavailable",)
+    assert degraded.degraded_reasons == (
+        "auction_gap_input_unavailable:AuctionGapCandidateInputError",
+    )
+    assert degraded.degraded_detail == (
+        "AuctionGapCandidateInputError: daily snapshot changed while reading"
+    )
     assert degraded.replica_opened is True
 
 
@@ -1690,7 +1695,12 @@ def test_a_replica_that_cannot_answer_is_a_named_degradation(tmp_path: Path) -> 
 
     result = step()
 
-    assert result.degraded_reasons == ("session_candidate_input_unavailable",)
+    assert result.degraded_reasons == (
+        "session_candidate_input_unavailable:SessionCandidateInputError",
+    )
+    assert result.degraded_detail == (
+        "SessionCandidateInputError: the read-only replica has no daily result"
+    )
     assert result.output_sequence == -1
 
 

@@ -5,6 +5,263 @@
 
 ---
 
+## 2026-09-25 · 待安装 · v0.33.22 总览：回放工具（AH）+ 路线 A 链五处阻断（热修 AI）+ schema rollout 不再卡链（热修 AJ，#304、#228）+ nginx `/preview/` 入库
+
+**状态**：**尚未安装**。本条是 v0.33.22 的装机总览，先读本条；各改动的背景、预期与细节在紧接着的几条里
+（「nginx `/preview/` 登录路径」「热修 AJ」「热修 AI」）。
+
+**这一版装的是四处改动**：
+
+| 改动 | 落在哪 | 细节 |
+|---|---|---|
+| 包 AH：`scripts/route_a_day_replay.py`，在沙箱里用真实 role 回放一个录下的交易日，对生产只读；测试辅助把 root 属主的祖先目录（主机 `/` 是 0555）按生产的 `(0, None)` 规则记 | `scripts/`、`tests/`，**没有 `src/` 改动** | CHANGELOG `[Unreleased]/Added` 的「包 AH」一条；热修 AI、AJ 都是用它在主机上回放 2026-09-24 找到的 |
+| 热修 AI：缺五日日线的竞价代码逐只排除（全天与每个交易所各 5% 上限）；心跳新增 `observations` / `degraded_detail`；参考慢源写上市分类四字段（F1）；特征按代码标 STALE（F2）；生命周期证据可晚 120 秒（F3）；复核 S1–S4 | `src/rquant/` 十个模块（`auction_gap_candidate_input`、`intraday_feature_engine`、`reference_slow_publisher`、`runtime_builder_candidate`、`runtime_builder_shadow`、`runtime_builder_strategy`、`runtime_definition_bootstrap`、`runtime_service_control`、`strategy_live_service`、`strategy_runner`） | 下面「热修 AI」一条 |
+| 热修 AJ：形状没变的 channel 不建 rollout 计划（#228）；DUAL_WRITE 窗口从生产者第一次双写起算、关了先拒后发（#304）；准入只读别的代计划的 `authority.json`；新增 `runtime-schema-rollout close-unchanged` | `src/rquant/` 四个模块（`schema_compatibility`、`runtime_schema_registry`、`runtime_deployment_bundle`、`cli`） | 下面「热修 AJ」一条 |
+| nginx `/preview/`（owner 2026-09-24 授权「nginx 加登录路径」） | `deploy/nginx/rquant-backup.conf` | 下面「nginx `/preview/` 登录路径」一条；**主机上 09-24 21:42 已生效** |
+
+**怎么装**：
+
+- **时间**：收盘后或休市期间。09-25（中秋）到 09-27 休市，**下一个交易日是 2026-09-28（周一）**。
+- **步骤 = 正常的路线 A 窗口**（同 v0.33.21 那条的第 1 步：代码切到 v0.33.22，按路线 A 窗口的做法），只在第 ④ 步前
+  加一次只读检查（下面），没有 unit 要重装（`deploy/systemd/` 没变）。相对 v0.33.21，`deploy/` 的 diff **只有** `deploy/nginx/rquant-backup.conf`，
+  而这份主机上已经是同一内容，所以装机时这一项只做一次核对：仓库与主机文件 `diff` 为空（命令在下面「nginx `/preview/` 登录路径」一条）。
+  `scripts/deploy-production.sh` 按设计拒收 diff 含 `deploy/nginx/` 的 target（`docs/production-release.md`「自动拒绝」，
+  与 v0.33.21 的 `deploy/systemd/` 同理），所以本版照 v0.33.21 那样走路线 A 窗口。
+- **装前只读检查（第 ④ 步 `runtime-deployment-profile` 之前，必做）**：在无 `.env` 的 bootstrap worktree
+  （v0.33.22 的检出）里先跑一次 `close-unchanged` 的 dry-run，它只读打开每份计划、一个字节不写：
+
+```bash
+cd "${WT}"
+./.venv/bin/rquant runtime-schema-rollout close-unchanged \
+  --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
+```
+
+  **只有退出码 0 且报 `schema_changed: 0` 才往下走第 ④ 步；退 2（有计划报 `schema_changed`）就停下，不装**，找协调者。
+  这一步要紧：新代与当前代形状相同就不建计划、准入也不看旧代的计划，若当前代真有一份没走完的真变化计划，装上新代后
+  那次变化会在没有消费者回执的情况下生效（#308，细节见「热修 AJ」一条）。预期 `plans: 208`、`schema_changed: 0`；
+  `closed` 是「apply 时会关掉」的份数（dry-run 不关任何一份），此时 `current` 还是 09-24 那代，所以
+  `closed_current_generation` 应为 16（那代自己的 16 份计划）——这只是预览，这一步不 apply。仍是 WAL 的库在这里报
+  `state_unreadable`（`acknowledge` 转换之前本来就读不了），不算阻断。
+- **第 ④ 步 `runtime-deployment-profile --apply`**：新代装在 09-24 代之上，**一份 rollout 计划都不建**（热修 AJ：
+  v0.33.21 与 v0.33.22 的 21 个 channel 形状和 serving 物理 schema 逐一相同）。回执里 `schema_rollout_plan_ids` 是 `[]`，
+  `control/schema-rollouts` 仍是 208 个目录。
+- **第 30 条 `runtime-schema-rollout acknowledge`**：照跑，**什么都不推进**——dry-run 与 apply 都报 `plans: 208`，每份
+  `skipped_reason: not_current_generation`，`deadline_expired: 0`，退出码 0。新建 0 份、推进 0 份就是对的；若有任何一份的
+  `skipped_reason` 不是 `not_current_generation`（或 `plans` 不是 208），说明第 ④ 步建了计划，停下来找协调者。
+- **（可选，生产数据库写入，按受控自动发布模式第 7 条需 owner 单独授权）紧跟第 30 条关掉那 208 份旧计划**。前进路径
+  不需要这一步；它的作用是万一窗口失败、`current` 退回 09-24 那代时，那代（跑 v0.33.21 的准入，会绑计划）的生产者
+  不会被已过期的计划绑住。跑在无 `.env` 的 bootstrap worktree（v0.33.22 的检出）里，先 dry-run：
+
+```bash
+cd "${WT}"
+./.venv/bin/rquant runtime-schema-rollout close-unchanged \
+  --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
+./.venv/bin/rquant runtime-schema-rollout close-unchanged \
+  --runtime-root /home/lighthouse/rquant/data/runtime
+```
+
+  dry-run 预期 `plans: 208`、`closed: 208`、`closed_current_generation: 0`、`schema_changed: 0`、退出码 0（仍是 WAL 的库报
+  `state_unreadable`，先跑一次 `acknowledge` 转换再 dry-run）；apply 后每份 `phase_after: rollback`，`current` 不动；
+  再跑一次 `closed: 0`、全部 `terminal`。**只要出现 `schema_changed`（退出码 2）就停下**，那份计划保护的是真实的 schema 变化。
+- **起 unit 之后**：心跳文件多出 `observations` 与 `degraded_detail` 两个键（每个 role 都写）；
+  `candidate.auction_gap.v1` 的 `observations.auction_gap_prior5_incomplete_codes` 是当天被排除的代码数、状态仍是 running。
+  其余「应该看到什么」见热修 AI 一条。
+- **周一开盘前仍要看一眼**：副本里有没有 09-24 的 `daily_bar`（周一的前五个交易日是 09-18/21/22/23/24；缺一天就几乎每只
+  代码都缺，超过 5% 上限，装配整批拒）。只读查法在热修 AI 一条里。热修 AI 那条里「schema rollout 计划的期限」那段警告
+  在本版由热修 AJ 解决，不再是开盘前的待办。
+
+**回滚到 v0.33.21**（代码回滚按 v0.33.21 的路径，外加两步，顺序不能反）：
+
+1. **先停 unit，再把所有 role 的心跳文件挪走留档**：`$ROOT/control/*/*/heartbeats/*.json`。v0.33.22 每个 role 的每一份
+   心跳都写 `observations` / `degraded_detail`（值为空也写），v0.33.21 的心跳模型是 `extra="forbid"`，连默认值的新心跳也
+   拒收（独立复核实测，AI 复核 S6），不挪就起不来。**这一步必须在起 v0.33.21 的 unit 之前做完**。
+2. **v0.33.21 若重新建了计划，起 unit 之前用 v0.33.22 的检出跑 `close-unchanged`**：经部署器 / 窗口重装 v0.33.21 时，
+   它的安装器会为重装的那代再建 16 份形状没变的计划（#228），它的 acknowledge 把它们推进 DUAL_WRITE，600 秒后过期，
+   周一照样卡在第一批分钟线（#304）。所以重装之后、起 unit 之前，在 v0.33.22 的 bootstrap worktree 里跑上面两条
+   `close-unchanged`（先 dry-run），预期 `closed_current_generation: 16`（加上先前没关过的旧计划）。只把 `current` 指回
+   09-24 那代而不重装：那代的 16 份计划若还没关，同样先跑这一步；装 v0.33.22 时已跑过可选那一步的话，这里什么都不用做。
+   本版没有写任何新的事件类型（`rollback` 是已有的），v0.33.21 照常读这些库、把 ROLLBACK 当终态。
+3. nginx 不随代码回滚：`/preview/` 那一块与代码版本无关，回滚后只是仓库（v0.33.21 没有这一块）与主机不一致；要摘掉它
+   需 owner 单独授权，见下一条。
+
+---
+
+## 2026-09-24 · 已在主机生效 · nginx `/preview/` 登录路径（新版看板预览，owner 授权「nginx 加登录路径」）
+
+**状态**：**主机上已生效**（2026-09-24 21:42，owner 授权「nginx 加登录路径」）。在主机的
+`/www/server/panel/vhost/nginx/rquant-backup.conf` 里，`/canvas/` 那一块之后、`/upload/` 的注释之前插入了
+`location /preview/`：反代 Streamlit `127.0.0.1:8509`（lighthouse 进程，非 systemd；新版看板预览，路线 A，读
+`RQUANT_SERVING_ROOT` 指向的 serving 代，只读），与 `/dashboard/` 共用 htpasswd
+`/www/server/nginx/conf/.rquant-backup.htpasswd`。改之前的主机文件备份在 `/root/rquant-backup.conf.bak-20260924-preview`。
+改之前仓库的 `deploy/nginx/rquant-backup.conf` 与主机文件逐字节相同；v0.33.22 把同一块逐字写回仓库，所以装上 v0.33.22
+之后两者应当再次逐字节相同。
+
+**装机这一步只做核对**（不改文件、不 reload nginx）：代码切到 v0.33.22 之后，
+
+```bash
+sudo diff /home/lighthouse/rquant/deploy/nginx/rquant-backup.conf \
+    /www/server/panel/vhost/nginx/rquant-backup.conf && echo "nginx: repo == host"
+```
+
+预期没有任何 diff 输出、打印 `nginx: repo == host`。有差异就停下找协调者（说明主机文件在 09-24 21:42 之后又被改过，
+或检出的不是 v0.33.22），**不要**用仓库版本覆盖主机文件。
+
+**回滚（摘掉 `/preview/`，需 owner 单独授权；代码回滚不需要做这一步）**：
+
+```bash
+sudo cp /root/rquant-backup.conf.bak-20260924-preview /www/server/panel/vhost/nginx/rquant-backup.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+---
+
+## 2026-09-25 · 待安装 · 热修 AJ：schema rollout 不再卡死路线 A 链（#304、#228）
+
+**状态**：**尚未安装**，分支 `cc/20260925-schema-rollout-no-op-plans`，建在热修 AI（`cc/20260924-route-a-chain-blockers`）之上，
+和 AH、AI 一起作为 v0.33.22 装。改的是 `src/rquant/`（`runtime_schema_registry.py`、`schema_compatibility.py`、
+`runtime_deployment_bundle.py`、`cli.py`）、测试与回放脚本，**`deploy/` 一个字没改**。改了什么见 CHANGELOG
+`[Unreleased]/Fixed` 的「包 AJ」一条。
+
+**主机现状（协调者 2026-09-25 01:01 只读查）**：`/home/lighthouse/rquant/data/runtime/control/schema-rollouts` 下
+**208 份计划，全部过期**（192 份 DUAL_WRITE、16 份 PREPARE）；当前代（09-24 装、16:21 承认）那 16 份停在 DUAL_WRITE，
+`runtime.market_minute.batch-envelope` 的期限 16:31:32 早已过。不装本包，周一 09:30 第一批分钟线就卡死（#304）。
+
+**装 v0.33.22 时会发生什么（窗口步骤不变，不加新步骤）**：
+
+- 第 ④ 步 `runtime-deployment-profile --apply`：新代装在 09-24 代之上，**一份计划都不建**——v0.33.21 与本分支 21 个
+  channel 的形状和 serving 物理 schema 逐一相同（本地实测）。回执里 `schema_rollout_plan_ids` 是 `[]`，
+  `control/schema-rollouts` 仍是 208 个目录，一个不多。
+- 第 30 条 `runtime-schema-rollout acknowledge`：照跑，**什么都不推进**。dry-run 与 apply 都报 `plans: 208`，每份
+  `skipped_reason: not_current_generation`，`deadline_expired: 0`，退 0；只有仍是 WAL 的库会被转换（`converted` 计数）。
+- 起 unit 后：新代的生产者、消费者**不绑任何计划**。准入对这 208 份只读 `authority.json`（知道目标代不是本代就跳过），
+  不再打开它们的库、也不再从两代 bundle 重新推导它们。周一 `market_minute_source`、`feature_live` 发布时不做双写，
+  不会出现 `rollout deadline has expired` / `immutable sequence already contains different content`。
+- **那 208 份旧计划：安装不改它们**。它们指向已被取代的代，本版不会被它们绑住。
+
+**第 ④ 步之前先跑一次 dry-run 当作前置检查（只读，不需要写授权）**：`close-unchanged --dry-run`（命令见下）
+退 0 且 `schema_changed: 0`，说明当前代没有一份保护真实变化、还没走完的计划。这一条要紧：新代与当前代形状相同就不建
+计划，准入也不看旧代的计划，所以若当前代真有一份没走完的真变化计划，装上新代后那次变化会在没有消费者回执的情况下
+生效（评审第 7 条，#308）。退 2 就停下，不装。
+
+**建议紧跟第 30 条多做一步（生产数据库写入，按受控自动发布模式第 7 条需 owner 单独授权）**：把这 208 份关掉，
+这样万一窗口失败、`current` 退回 09-24 那代，那代的生产者也不会被已过期的计划绑住（09-24 代跑的是 v0.33.21 的准入，
+会绑）。命令跑在无 `.env` 的 bootstrap worktree（v0.33.22 的检出）里：
+
+```bash
+cd "${WT}"
+./.venv/bin/rquant runtime-schema-rollout close-unchanged \
+  --runtime-root /home/lighthouse/rquant/data/runtime --dry-run
+./.venv/bin/rquant runtime-schema-rollout close-unchanged \
+  --runtime-root /home/lighthouse/rquant/data/runtime
+```
+
+- dry-run 只读、一个字节不写（也不以写者身份打开任何库、不留旁路文件）。预期 `plans: 208`、`closed: 208`、
+  `closed_current_generation: 0`、`schema_changed: 0`，**退出码 0**；
+  每份 `shape_unchanged: true`，`phase_before` 是 `dual_write` 或 `prepare`，`phase_after: rollback`。若有库仍是 WAL，
+  dry-run 对它报 `state_unreadable`——先跑一次 `acknowledge`（它会转换），再 dry-run。
+- apply 之后每份计划的哈希链末尾多一条 `rollback` 事件，原因
+  `no_schema_change: the channel keeps its shape between the plan's generations (#228); old authority retained`；
+  **`data/runtime/current` 不动**，不激活任何代，不写别的文件。再跑一次：`closed: 0`，每份 `skipped_reason: terminal`。
+- 只要报出任何 `schema_changed`，那份计划保护的是真实的 schema 变化，命令不碰它，**并且以退出码 2 结束**
+  （dry-run 与 apply 都是）——停下来找协调者。其余情况退 0。
+- 对消费者的影响：ROLLBACK 阶段的计划不绑生产者、不向消费者要回执（本版与 v0.33.21 都一样）。唯一要知道的是：
+  如果关的是**当前代**的计划（`target_is_current: true`），正在跑、启动时已绑上它的生产者下一次发布会停下
+  （`rolled-back schema producer must stop before publishing`），重启一次即不再绑定。按上面的顺序（起 unit 之前）跑，
+  碰不到这种情况。
+
+**只读检查（替代 #304 里那段；用 v0.33.22 的 venv，`read_only=True`，不写任何东西）**：
+
+```bash
+PY="${WT}/.venv/bin/python"
+$PY - <<'PYEOF'
+from collections import Counter
+from datetime import UTC, datetime
+from pathlib import Path
+from rquant.runtime_deployment_bundle import _schema_rollout_plan_ids, load_runtime_schema_rollout
+root = Path("/home/lighthouse/rquant/data/runtime")
+current = (root / "current").readlink().name
+seen = Counter()
+for plan_id in _schema_rollout_plan_ids(root):
+    authority, store = load_runtime_schema_rollout(root, plan_id=plan_id, read_only=True)
+    phase = store.get_state(plan_id).phase.value
+    deadline = store.effective_deadline(plan_id)
+    window = "window-not-opened" if deadline is None else ("EXPIRED" if deadline < datetime.now(UTC) else "open")
+    seen[(authority.target_generation_id == current, phase, window)] += 1
+for key, count in sorted(seen.items()):
+    print("current-gen" if key[0] else "superseded", key[1], key[2], count)
+PYEOF
+```
+
+装完之后（没跑 close-unchanged）预期只有 `superseded ...` 行、没有 `current-gen` 行；跑过之后全是 `superseded rollback`。
+DUAL_WRITE 的旧计划现在显示 `window-not-opened`（它们的生产者从没写过双写证据，按本版的规则窗口没开），这不影响
+结论：它们不是当前代的。
+
+**周一（2026-09-28）开盘后应该看到**：`market-minute.source.v1` 与 `feature.intraday-pit.v1` 的心跳没有
+`rollout deadline` / `immutable sequence` 字样；分钟线 spool 的 sequence 每分钟加一。
+
+**回滚**：
+
+- **回滚到 v0.33.21 的代码（经部署器重装）会把 #228 / #304 带回来**：v0.33.21 的安装器会为重装的那代再建 16 份形状没变的
+  计划，它的 acknowledge 把它们推进 DUAL_WRITE，600 秒后过期，周一照样卡在第一批分钟线。所以这种回滚之后、起 unit 之前，
+  **必须**在 v0.33.22 的 bootstrap worktree 里跑上面那两条 `close-unchanged`（先 dry-run）：这次预期
+  `closed_current_generation: 16`（加上先前没关过的旧计划）。本包没有写任何新的事件类型（`rollback` 是已有的），
+  v0.33.21 照常读这些库，把 ROLLBACK 当作终态。
+- **只把 `current` 指回 09-24 那代（不重装）**：那代的 16 份计划若还没关，会绑住它的生产者，同样先跑 `close-unchanged`。
+  装 v0.33.22 时已按建议跑过的话，这里什么都不用做。
+- 热修 AI 那一条的回滚步骤（先挪心跳文件）照旧适用。
+
+---
+
+## 2026-09-24 · 待安装 · 热修 AI：路线 A 链上的五处阻断（9 月 24 日真实数据回放）
+
+**状态**：**尚未安装**，分支 `cc/20260924-route-a-chain-blockers`，建在包 AH（回放工具）之上。改的都是 `src/rquant/`
+与测试、回放脚本，**`deploy/` 一个字没改**，所以走受控发布器即可（`deploy-production.sh --target <tag>`），不需要手工装
+unit。改了什么见 CHANGELOG `[Unreleased]/Fixed` 的「包 AI」一条。
+
+**装上之后当场应该看到什么**（周一 2026-09-28 开盘）：
+
+- `candidate.auction_gap.v1` 的心跳文件里多出 `"observations": {"auction_gap_prior5_incomplete_codes": N}`，N 是当天缺
+  五日日线被排除的竞价代码数（09-24 是 6），**状态照样是 running**；journald 里有一行 `auction_gap left out N of M
+  auction codes ...` 列出这些代码。看法：
+  `grep -l candidate.auction_gap.v1 <runtime>/control/candidates/svc-*/heartbeats/*.json | xargs jq '.observations, .degraded_reasons, .degraded_detail'`
+  （实例目录名是 `svc-<哈希>`，按文件里的 `service_id` 找）。
+- 如果装配仍然被拒，心跳的 `degraded_reasons` 是 `auction_gap_input_unavailable:AuctionGapCandidateInputError`，
+  **原因原文在 `degraded_detail`**；超过 5% 的代码缺日线时原文是 `... N of M auction codes lack it, more than 5% ...`，
+  某个交易所超过 5% 时是 `... N of M BJ auction codes lack it ...`（SH / SZ 同理）。两种都说明副本少了一个交易日
+  （或少了一个交易所的一天），要查日终管线，不是改阈值。
+- 三个策略的心跳里有 `observations.strategy_skipped_candidates`：最新一个特征批次里因行情过期（STALE）或必需特征
+  缺失而没评估的候选数。持仓那只停牌或断流时这里会是非零，出场评估要等它的行情恢复。
+- 模拟盘约束不再出现 `listing classification market is missing`；第一批分钟线之后 `authorities/paper-execution`
+  有 current 指针，serving 在收到第一条信号后切出当日代。
+- 某只候选分钟线停更时，策略心跳不再出现 `exceeds max_delay_seconds without stale status`；第一条入场信号之后也不再
+  每轮报 `feature entry_fill_status exceeds max_delay_seconds`。
+
+**⚠️ 本包没有解决、周一开盘前必须先看的一件事：schema rollout 计划的期限（回放报告 F5）**。（**v0.33.22 里由热修 AJ 解决**，见上面「热修 AJ」一条；本段保留作背景。）计划的期限是
+`started_at + schema_rollout_stage_timeout_seconds`（生产画像 600 秒），安装器最多只能在 PREPARE 阶段把它重开一次、
+再给 600 秒；进了 DUAL_WRITE 之后期限不能再延长，而 DUAL_WRITE 往 CONSUMER_ACK 走需要生产者真的发布过数据。主机
+09-24 16:21 把 16 个计划承认到 DUAL_WRITE，那时已收盘，所以这些计划的期限**最晚 09-24 16:31 就已经过了**——不是
+「周一盘中可能过期」，而是周一第一次发布时已经过期。只要 `runtime.market_minute.batch-envelope` 与
+`runtime.intraday_feature.batch-envelope` 两个频道的计划还停在 DUAL_WRITE / CONSUMER_ACK，`market_minute_source`
+在 09:30 第一批就会在 `spool.publish` 之后抛 `rollout deadline has expired`，之后每一轮都是
+`immutable sequence already contains different content`（重启也一样），`feature_live` 每一轮都失败，整条链没有特征、
+没有信号。只读检查命令写在 #304 里；怎么处置（回滚这些计划、或者换一个期限策略）要 owner 决定，也在 #304。
+
+**同样要在周一之前看一眼：副本里 09-24 的日线在不在**。周一的前五个交易日是 09-18、09-21、09-22、09-23、09-24；
+如果日终管线没把 09-24 的 `daily_bar` 写进副本，几乎每只代码都缺一天，超过 5% 的上限，装配照样整批拒（这时
+`degraded_detail` 会写明 `N of M auction codes lack it`）。只读查法：
+`python -c "import duckdb; c=duckdb.connect('/home/lighthouse/rquant/data/rquant_ro.duckdb', read_only=True); print(c.execute(\"SELECT trade_date, count(*) FROM daily_bar WHERE trade_date >= DATE '2026-09-17' GROUP BY 1 ORDER BY 1\").fetchall())"`
+（用部署 venv 的 python；`read_only=True` 连副本不连主库）。
+
+**回滚**：与 v0.33.21 同一条路径，**外加一步挪心跳**：本包给心跳文件加了 `observations` 与 `degraded_detail` 两个字段，
+心跳模型是 `extra="forbid"`，旧代码读到新心跳会报 `runtime heartbeat is invalid` 而起不来（与 #231 那一包同一类，
+见下文「①b 为什么是必须的」）。新代码**每个 role 的每一份心跳**都写这两个键（值为空时也写），独立复核实测过
+v0.33.21 连默认值的心跳也拒收，所以这一步对**所有** role 都必须做：回滚前先停 unit，再把
+`$ROOT/control/*/*/heartbeats/*.json` 挪走留档。
+参考注册表里新代码写的 LISTING_STATUS 多四个键，旧代码照读（载荷是自由映射，auction_gap 只读 `status`）；特征契约与
+策略注册指纹的变化与每次发版改 `producer_commit` 带来的变化相同，生产输入文档照常按目标提交重新生成。
+
+---
+
 ## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ 参考批量查表（#299）+ `rquant-live-runtime.slice` CPUQuota 200%
 
 **状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；AF 与 slice 两处改动各自的背景、预期与细节在紧接着的
@@ -2301,12 +2558,11 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
       `operation_id` 是 `installer-deadline-reopen:<plan>`，输出里 `deadline_reopened: true`。
       **每份计划只有一次**；已越过 PREPARE 的计划一律不动 deadline；**窗口还没关的计划不许提前
       重开**（会白白花掉那一次），签名前缀不对也拒——这三条都由状态库自己守，命令绕不过去。
-    - **重开一次之后，这份计划后续每个阶段的窗口也同步后移一个窗口长度**：
-      `_validate_time` 管着这份计划**此后所有**的变更，所以 DUAL_WRITE 阶段生产者写双写记录、
-      CONSUMER_ACK 阶段消费者写回执，用的都是重开之后的那个 deadline。换句话说重开是
-      **把整份计划的时钟往后拨一个窗口**，不是只给承认这一步开口子。
-      实务含义：起 unit、跑双写、收回执这几步的时间预算，从重开那一刻起重新计时 600 秒；
-      超了就不是重开能解决的了（额度已用尽），要人工裁决。
+    - **重开只管 PREPARE 这一段（v0.33.22 / 热修 AJ 起）**：DUAL_WRITE 与 CONSUMER_ACK 的窗口
+      **从生产者第一条双写记录起算**、长度仍是计划自己的 600 秒、不早于 PREPARE 的期限；第一条
+      记录之前计划没有期限。所以收盘后、周末装的计划不会在开盘前过期，重开与否也不再决定下一个
+      交易日第一次发布能不能被接受。生产者在发布**之前**先问一次窗口，窗口关了就在碰 spool 之前拒绝
+      （不再先发布、后被拒）。细节见上方「2026-09-25 · 热修 AJ」一条。
     - 重开额度用尽还过期的计划报 `skipped_reason: deadline_expired`，**报告照样打完整、其余计划
       照样推进**，命令**退 2**。这时需要人工裁决（重新 `prepare` 是另一次生产写入，要 owner 单独授权）。
 
@@ -2318,9 +2574,12 @@ Release A 工具链本体是 PR #194，已于合入 main 时产生 merge commit
     - 第 28 条那条启动顺序仍然照走。acknowledge 只消掉「等其他生产者承认」这一类失败；
       `strategy_live` ↔ `signal_router` 那个互等已经由 #231/#232/#220 那一包在代码里拆掉，
       两边现在都在主循环里等对端制品，不再退出。
-    - **#228 仍然在**：只要 `changed_runtime_schema_channels` 的指纹里带 `producer_commit`，
-      今后每一次纯代码发布都会凭空生出十六份计划，acknowledge 就得每次都跑一遍，
-      `control/schema-rollouts` 下的目录数每发一版加十六（没有任何代码清理旧计划目录）。
+    - **#228 已由热修 AJ 修掉（v0.33.22 起）**：`changed_runtime_schema_channels` 按 channel 的
+      形状比较（声明语义、物理 schema、serving 消费的 channel 再加 serving 物理 schema），不再带
+      `producer_commit`，所以**纯代码发布不建任何计划**，第 ④ 步回执的 `schema_rollout_plan_ids`
+      是 `[]`，这一步照跑但什么都不推进（旧计划全报 `not_current_generation`）。之前各版留下的
+      旧计划怎么处置（`runtime-schema-rollout close-unchanged`，先 `--dry-run`；有 `schema_changed`
+      时退 2），见上方「2026-09-25 · 热修 AJ」一条。
 
 31. **十六个 runtime unit 文件必须按 A-7 的做法重装一次，否则第 30 条做完 unit 还是写不了**
     （#227，owner 2026-09-07 授权 A）。第 30 条把计划推到了 DUAL_WRITE，而 DUAL_WRITE 阶段

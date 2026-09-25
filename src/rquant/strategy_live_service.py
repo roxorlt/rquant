@@ -50,6 +50,12 @@ class StrategyLiveBatchSummary(RuntimeContractModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    #: How many candidates of the newest feature batch this call handled were not
+    #: evaluated because a required feature was not usable (STALE or unavailable); `None`
+    #: when the call handled no batch. Since package AI a candidate whose feed went stale
+    #: is skipped instead of failing the whole batch, so this is where a held position
+    #: whose exits are not being evaluated shows up.
+    last_batch_skipped_candidates: int | None = Field(default=None, ge=0)
 
 
 StrategyLiveFaultHook = Callable[[str], None]
@@ -154,6 +160,7 @@ def run_strategy_live_batch(
     processed = 0
     replayed = 0
     signal_count = 0
+    last_batch_skipped: int | None = None
     last_sequence = started_after
     for record in records:
         envelope = record.envelope
@@ -212,6 +219,7 @@ def run_strategy_live_batch(
         replayed += int(was_processed)
         if not was_processed:
             signal_count += len(result.signals)
+        last_batch_skipped = result.skipped_candidates
         last_sequence = envelope.sequence
 
     runner_signal_high_watermark = runner.signal_high_watermark()
@@ -310,6 +318,7 @@ def run_strategy_live_batch(
         runner_signal_high_watermark=runner_signal_high_watermark,
         has_deferred_batches=has_deferred_batches,
         completion_receipt_id=completion_receipt_id,
+        last_batch_skipped_candidates=last_batch_skipped,
     )
 
 

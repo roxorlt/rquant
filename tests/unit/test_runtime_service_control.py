@@ -1324,3 +1324,66 @@ def test_an_ordinary_failure_during_a_stop_is_still_recorded(tmp_path: Path) -> 
     assert final.status is RuntimeServiceStatus.STOPPED
     assert final.stop_reason == "loop completed"
     assert final.total_failures == 1
+
+
+def test_observations_and_the_degraded_detail_are_file_fields_that_decide_nothing(
+    tmp_path: Path,
+) -> None:
+    """Package AI: a count that is not a fault, and the cause behind a degraded round.
+
+    An observation never changes the status (a count in `degraded_reasons` kept the
+    auction-match source `degraded` all day, #290). The detail is what a degraded idle
+    round now says about its cause; it is not `last_error` and is not a failure. Neither
+    reaches the frozen serving projection (#237).
+    """
+
+    for name in ("observations", "degraded_detail"):
+        assert name in RuntimeServiceHeartbeat.model_fields
+        assert name not in RuntimeServiceHeartbeatProjection.model_fields
+
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+    counted = control.record_success(
+        RuntimeStepResult(observations={"auction_gap_prior5_incomplete_codes": 6})
+    )
+    degraded = control.record_success(
+        RuntimeStepResult(
+            degraded_reasons=("auction_gap_input_unavailable:AuctionGapCandidateInputError",),
+            degraded_detail="AuctionGapCandidateInputError: daily snapshot query failed",
+        )
+    )
+    failed = control.record_failure(RuntimeError("the loader raised"))
+
+    assert counted.status is RuntimeServiceStatus.RUNNING
+    assert dict(counted.observations) == {"auction_gap_prior5_incomplete_codes": 6}
+    assert counted.degraded_detail is None
+    assert degraded.status is RuntimeServiceStatus.DEGRADED
+    assert degraded.degraded_detail == "AuctionGapCandidateInputError: daily snapshot query failed"
+    assert degraded.last_error is None
+    assert degraded.total_failures == 0
+    assert dict(degraded.observations) == {}
+    assert failed.degraded_detail is None
+    assert dict(failed.observations) == {}
+    #: the file round-trips, and a heartbeat without the fields (an older writer) still reads
+    stored = RuntimeServiceControl.read_heartbeat(tmp_path, _spec())
+    assert stored is not None and stored.last_error == "RuntimeError: the loader raised"
+    legacy = counted.model_dump(mode="json")
+    del legacy["observations"], legacy["degraded_detail"]
+    assert dict(RuntimeServiceHeartbeat.model_validate(legacy).observations) == {}
+    control.stop(reason="done")
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"observations": {"": 1}}, "observation names cannot be empty"),
+        ({"observations": {"codes": -1}}, "greater than or equal to 0"),
+        ({"observations": {"codes": True}}, "valid integer"),
+        ({"degraded_detail": "a cause with nothing degraded"}, "needs one"),
+    ],
+)
+def test_a_step_result_refuses_a_malformed_observation_or_a_detail_without_a_reason(
+    fields: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        RuntimeStepResult(**fields)

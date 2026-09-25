@@ -16,6 +16,7 @@ from rquant.definition_registry import (
     _strategy_executable_fingerprint,
 )
 from rquant.feature_contracts import FeatureContract, FeatureDefinition
+from rquant.intraday_feature_engine import MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -24,6 +25,20 @@ from rquant.runtime_contracts import (
 from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 
 StrategyId = Literal["n_shape", "growth_board_surge", "auction_gap"]
+#: How late a paper-execution lifecycle feature's evidence may be (`available_at -
+#: source_event_time`) before the strategy refuses it. It was 1 s, which no evidence on
+#: this path can meet: a pending entry's evidence is its own entry signal, minted from a
+#: minute bar whose features may be up to MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS late
+#: and then observed on the runner's next loop, and the eligible high is that bar's
+#: `session_high` -- so from the first entry signal every later round of the strategy
+#: failed (333 of 350 in the fixture day replay; 14 s and 11 s on the first ones), and
+#: no exit could ever be evaluated (replay finding F3). Two minute-bar cadences: one for
+#: the market evidence the state is derived from (itself bounded at 60 s), one for the
+#: 2-5 s hops between that feature batch and the evidence (runner, router, paper queue,
+#: broker), with room to spare. The broker's own evidence (intent persisted, fill
+#: executed and persisted by one observation) is ~0 s. Still `fail_closed`: evidence
+#: minutes old is refused.
+EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS = 2 * MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
 _FEATURE_CONTRACT_ID = "intraday-pit"
 _FEATURE_CONTRACT_VERSIONS = (1, 2, 3)
 _LIFECYCLE_FEATURES = frozenset(
@@ -123,7 +138,7 @@ def _feature_contracts(
             source_datasets = ("paper_execution",)
             lookback = 0
             pit_rule = "latest execution authority available_at <= decision_time"
-            max_delay_seconds = 1
+            max_delay_seconds = EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS
             missing_policy = "fail_closed"
             late_policy = "fail_closed"
         elif name in static_dtypes:
@@ -137,7 +152,8 @@ def _feature_contracts(
             source_datasets = ("market_minute",)
             lookback = 90
             pit_rule = "all source available_at values <= decision_time"
-            max_delay_seconds = 60
+            #: the bound the feature engine marks STALE at, from one constant
+            max_delay_seconds = MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
             missing_policy = "mark_unavailable"
             late_policy = "mark_stale"
         features.append(
@@ -295,6 +311,7 @@ def bootstrap_builtin_definitions(
 
 
 __all__ = [
+    "EXECUTION_LIFECYCLE_MAX_DELAY_SECONDS",
     "BuiltinDefinitionBootstrapPlan",
     "BuiltinDefinitionStrategyBinding",
     "bootstrap_builtin_definitions",
