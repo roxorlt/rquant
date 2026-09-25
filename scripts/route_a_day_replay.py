@@ -500,7 +500,11 @@ def read_recorded_day(
         raise ReplayRefusedError(" | ".join(missing))
 
     provenance: dict[str, dict[str, Any]] = {}
-    if reference is not None and not synthesize_reference:
+    #: A recorded day keeps the calendar its recorded batch names even when the batches are
+    #: synthesized over it: `--synthesize-sources` measures the batches, and the calendar the
+    #: host really used is known. The choice a day without a recording gets is still run, and
+    #: reported as `heuristic_check`, so the recorded day also tests that choice.
+    if reference is not None:
         envelope, snapshot, _manifest_path = reference
         calendar_sha = snapshot.source_snapshot_ids["calendar"]
         calendar_path: Path | None = (
@@ -523,6 +527,19 @@ def read_recorded_day(
             "generated_at": calendar.generated_at,
             "why": "the generation the recorded reference-slow batch names",
         }
+        if synthesize_reference:
+            try:
+                check = sources.choose_calendar(
+                    runtime_root=runtime_root, trade_date=trade_date, audit=audit
+                )
+            except sources.InputUnavailableError as error:
+                provenance["calendar"]["heuristic_check"] = {"refused": str(error)}
+            else:
+                provenance["calendar"]["heuristic_check"] = {
+                    "would_pick": check.calendar.content_sha256,
+                    "would_pick_origin": check.provenance["origin"],
+                    "matches_recorded": check.calendar.content_sha256 == calendar.content_sha256,
+                }
     else:
         try:
             choice = sources.choose_calendar(
@@ -1428,13 +1445,16 @@ def _schema_rollout_facts(runtime_root: Path, *, receipt: Any) -> dict[str, Any]
 
 @dataclass
 class SynthesisInputs:
-    """What the two synthesized source batches are made of, prepared before the world."""
+    """What the two synthesized source batches are made of, prepared before the world,
+    and -- once sealed -- what they came out as, for the candidate-input comparison."""
 
     source: Any
     evidence_database: Path
     evidence: dict[str, Any]
     universe_root: Path
     phase_seconds: float
+    reference_snapshot: Any = None
+    auction_payload: bytes | None = None
 
 
 def build_world(
@@ -1568,9 +1588,34 @@ def build_world(
         )
     else:
         facts["auction"] = republish_auction_batches(route, recorded, commit=world.commit)
+    if (
+        synthesis is not None
+        and recorded.reference_snapshot is not None
+        and (recorded.auction_target is not None)
+    ):
+        facts["fidelity_candidate_inputs"] = candidate_input_fidelity(recorded, synthesis)
     credentials = deliver_credentials(route, sandbox / "credentials", monkeypatch)
     recorder = confirm_deliveries_without_the_network(monkeypatch)
     return route, facts, credentials, recorder
+
+
+def candidate_input_fidelity(recorded: RecordedDay, synthesis: SynthesisInputs) -> dict[str, Any]:
+    """Per auction code, what the candidate input reads under the recorded batches against
+    what it reads under this run's (either side may be the recorded one)."""
+
+    recorded_payload = next(
+        payload
+        for envelope, payload, _ in recorded.auction_records
+        if envelope.sequence == recorded.auction_target.sequence
+    )
+    return sources.compare_candidate_inputs(
+        recorded_snapshot=recorded.reference_snapshot,
+        recorded_calendar=recorded.calendar,
+        synthesized_snapshot=synthesis.reference_snapshot or recorded.reference_snapshot,
+        synthesized_calendar=recorded.calendar,
+        recorded_auction_payload=recorded_payload,
+        synthesized_auction_payload=synthesis.auction_payload or recorded_payload,
+    )
 
 
 def _manifest(route: Any, service_id: str) -> Any:
@@ -1666,19 +1711,37 @@ def synthesize_reference_batch(
     prepared five seconds after the capture completed.
     """
 
+    from rquant.auction_match_gateway import AuctionMatchGateway
     from rquant.live_contracts import LiveChannel
     from rquant.runtime_service_builtin import ReferenceSlowSourceSettings
 
     source_manifest = _manifest(route, "reference-slow.source.v1")
     settings = ReferenceSlowSourceSettings.model_validate(dict(source_manifest.settings))
+    #: which codes matched in the opening auction: the recorded batch when the host has one,
+    #: else Tushare's `stk_auction(D)` (already asked for, since the auction is synthesized)
+    auction_frame = (
+        AuctionMatchGateway.decode_payload(
+            next(
+                payload
+                for envelope, payload, _ in recorded.auction_records
+                if envelope.sequence == recorded.auction_target.sequence
+            )
+        )
+        if recorded.auction_target is not None
+        else synthesis.source.stk_auction(recorded.trade_date)
+    )
+    known = sources.KnownAtCapture(
+        synthesis.source, traded_in_auction=sources.auction_traded_codes(auction_frame)
+    )
     snapshot = sources.synthesize_reference_snapshot(
         evidence_database=synthesis.evidence_database,
-        source=synthesis.source,
+        source=known,
         calendar=recorded.calendar,
         trade_date=recorded.trade_date,
         producer_commit=commit,
         limits=settings.limits.model_dump(mode="python"),
     )
+    synthesis.reference_snapshot = snapshot
     spool = _reference_spool(route, key_root)
     prepared_at = snapshot.captured_at + timedelta(
         seconds=sources.SYNTHETIC_REFERENCE_PREPARE_SECONDS
@@ -1713,7 +1776,7 @@ def synthesize_reference_batch(
         "resealed_available_at": record.envelope.available_at,
         "output_sequence": result.output_sequence,
         "evidence": synthesis.evidence,
-        "anachronisms": sources.reference_anachronisms(snapshot, synthesis.source),
+        "anachronisms": sources.reference_anachronisms(snapshot, known),
     }
     if recorded.reference_snapshot is not None:
         facts["fidelity_vs_recorded"] = sources.compare_reference(
@@ -1778,6 +1841,7 @@ def synthesize_auction_batches(
         received_at=received_at,
     )
     payload = facts.pop("payload")
+    synthesis.auction_payload = payload
     facts["origin"] = "synthesized"
     facts["universe"] = universe_facts
     if recorded.auction_target is not None:
@@ -1940,6 +2004,17 @@ def summarize_chain(route: Any, trade_date: date, adapter: ReplayMinuteAdapter) 
         "tushare_failed": adapter.tushare_failed,
         "adapter_calls": adapter.calls,
         "rows_served": adapter.rows_served,
+        #: per watchlist code, where its minutes came from (what a signal diff needs)
+        "watchlist_codes": sorted(adapter.requested),
+        "origin_by_watchlist_code": {
+            code: adapter.sources.get(code)
+            or (
+                f"tushare_failed: {adapter.tushare_failed[code]}"
+                if code in adapter.tushare_failed
+                else "missing"
+            )
+            for code in sorted(adapter.requested)
+        },
     }
     summary["feature_batches_high_watermark"] = feature_batches(route)
     strategies = {
@@ -2003,6 +2078,7 @@ def _serving_signal_rows(serving_root: Path, trade_date: date) -> dict[str, Any]
 
     opened = datetime.combine(trade_date, clock_time(9, 15), tzinfo=_SHANGHAI)
     literal = opened.isoformat()
+    listed: list[dict[str, Any]] = []
     with ServingReader(serving_root).open_current_readonly() as connection:
         total = int(connection.execute("SELECT count(*) FROM signals").fetchone()[0])
         today = (
@@ -2015,11 +2091,100 @@ def _serving_signal_rows(serving_root: Path, trade_date: date) -> dict[str, Any]
             if total
             else 0
         )
+        if today:
+            rows = connection.execute(
+                "SELECT epoch_ms(TRY_CAST(event_time AS TIMESTAMPTZ)), strategy_id, "
+                "candidate_id, action FROM signals WHERE TRY_CAST(event_time AS TIMESTAMPTZ) "
+                f">= TIMESTAMPTZ '{literal}' ORDER BY 1, 2, 3, 4 LIMIT 5000"
+            ).fetchall()
+            listed = [
+                {
+                    "event_time_local": datetime.fromtimestamp(stamp / 1000, _SHANGHAI)
+                    .replace(tzinfo=None)
+                    .isoformat(),
+                    "strategy_id": str(strategy),
+                    "candidate_id": str(candidate),
+                    "action": str(action),
+                }
+                for stamp, strategy, candidate, action in rows
+            ]
     return {
         "signals_rows_total": total,
         "signals_rows_today": today,
         "signals_filter": f">= {literal}",
+        "signals_today_list": listed,
     }
+
+
+def signal_fidelity(
+    summary: Mapping[str, Any], other_path: Path, *, until: str, trade_date: date
+) -> dict[str, Any]:
+    """This run's serving signals against another run's of the same day, up to the earlier
+    run's last tick, with what each run knew about every code that differs.
+
+    `other_path` is a `summary.json` or the sandbox holding one. A summary written before
+    `signals_today_list` existed is read through its sandbox's serving generation instead.
+    """
+
+    other_file = other_path / "summary.json" if other_path.is_dir() else other_path
+    other = json.loads(other_file.read_text(encoding="utf-8"))
+    if str(other.get("trade_date")) != trade_date.isoformat():
+        return {
+            "other": str(other_file),
+            "refused": f"the other run replayed {other.get('trade_date')}, not {trade_date}",
+        }
+    other_serving = (other.get("chain") or {}).get("serving") or {}
+    other_list = other_serving.get("signals_today_list")
+    if other_list is None:
+        root = other_serving.get("serving_root")
+        if not root:
+            return {"other": str(other_file), "refused": "the other run has no serving root"}
+        other_list = _serving_signal_rows(Path(root), trade_date)["signals_today_list"]
+    other_until = str((other.get("mode") or {}).get("until") or "15:05:00")
+    window = min(clock_time.fromisoformat(until), clock_time.fromisoformat(other_until))
+    diff = sources.compare_signal_lists(
+        (summary.get("chain") or {}).get("serving", {}).get("signals_today_list") or [],
+        other_list,
+        until_local=window.isoformat(),
+    )
+    mine = (summary.get("chain") or {}).get("market_minute") or {}
+    theirs = (other.get("chain") or {}).get("market_minute") or {}
+    candidates = (summary.get("world") or {}).get("fidelity_candidate_inputs") or {}
+
+    def minutes_of(chain: Mapping[str, Any], code: str) -> str | None:
+        origin = (chain.get("origin_by_watchlist_code") or {}).get(code)
+        if origin is not None:
+            return str(origin)
+        if code in (chain.get("tushare_failed") or {}):
+            return f"tushare_failed: {chain['tushare_failed'][code]}"
+        if code in (chain.get("codes_without_minutes") or ()):
+            return "missing"
+        return None
+
+    diff["by_code"] = {
+        code: {
+            "candidate_input_differs": code in set(candidates.get("codes_differ") or ()),
+            "candidate_input": (candidates.get("by_code") or {}).get(code),
+            "in_watchlist": {
+                "this_run": code in set(mine.get("watchlist_codes") or ()),
+                "other_run": (
+                    code in set(theirs["watchlist_codes"]) if "watchlist_codes" in theirs else None
+                ),
+            },
+            "minutes": {"this_run": minutes_of(mine, code), "other_run": minutes_of(theirs, code)},
+        }
+        for code in diff["codes_differ"]
+    }
+    diff["other"] = str(other_file)
+    diff["other_mode"] = {
+        key: (other.get("mode") or {}).get(key)
+        for key in ("until", "synthesize_sources", "tushare", "serving_every_ticks")
+    }
+    diff["other_inputs"] = {
+        label: entry.get("origin")
+        for label, entry in ((other.get("inputs") or {}).get("provenance") or {}).items()
+    }
+    return diff
 
 
 class ServingRetention:
@@ -2535,6 +2700,13 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         recorded.provenance["minute_bar"]["codes_by_origin"] = summary["chain"]["market_minute"][
             "codes_by_origin"
         ]
+        if arguments.compare_signals_with is not None:
+            summary["signal_fidelity"] = signal_fidelity(
+                summary,
+                arguments.compare_signals_with.resolve(),
+                until=arguments.until,
+                trade_date=trade_date,
+            )
         crashed = [state.label for state in states if state.crashes]
         serving_ok = bool(summary["chain"]["serving"].get("same_day"))
         shadow_ok = (
@@ -2647,6 +2819,47 @@ def print_summary(summary: dict[str, Any], *, out: Callable[[str], None]) -> Non
     ]
     for label, entry in sorted(((summary.get("inputs") or {}).get("provenance") or {}).items()):
         lines.append(f"  input {label:<17} {entry.get('origin', '?'):<11} {entry.get('source')}")
+    world = summary.get("world") or {}
+    reference_fidelity = (world.get("reference") or {}).get("fidelity_vs_recorded")
+    if reference_fidelity is not None:
+        lines.append(
+            f"fidelity reference vs recorded: differing={reference_fidelity['differing'] or 'none'}"
+        )
+        for table, entry in reference_fidelity["projection_rows"].items():
+            if not entry["identical"]:
+                lines.append(
+                    f"  projection {table}: recorded {entry['recorded']} synthesized "
+                    f"{entry['synthesized']}, only recorded {entry['only_recorded_count']} "
+                    f"{entry['only_recorded'][:8]}, only synthesized "
+                    f"{entry['only_synthesized_count']} {entry['only_synthesized'][:8]}, "
+                    f"values differ {entry['values_differ_count']}"
+                )
+    auction_fidelity = (world.get("auction") or {}).get("fidelity_vs_recorded")
+    if auction_fidelity is not None:
+        lines.append(f"fidelity auction vs recorded: {_brief(auction_fidelity, drop=())}")
+    candidates = world.get("fidelity_candidate_inputs")
+    if candidates is not None:
+        lines.append(
+            f"fidelity candidate inputs: {candidates['codes_differ_count']} of "
+            f"{candidates['codes_compared']} auction codes read different evidence "
+            f"{candidates['codes_differ'][:10]}"
+        )
+    signals = summary.get("signal_fidelity")
+    if signals is not None:
+        lines.append(
+            f"signal fidelity vs {signals.get('other')}: "
+            + (
+                signals["refused"]
+                if "refused" in signals
+                else f"identical={signals['identical']} common={signals['common']} "
+                f"until {signals['until_local']}; only this run {signals['only_this_run']}; "
+                f"only the other run {signals['only_other_run']}"
+            )
+        )
+        for code, entry in (signals.get("by_code") or {}).items():
+            lines.append(
+                f"  {code}: {json.dumps(entry, default=_json_default, ensure_ascii=False)}"
+            )
     profile = summary.get("profile") or {}
     if profile:
         lines.append(
@@ -2913,6 +3126,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SERVICE_ID[,SERVICE_ID]",
         help="cProfile these roles' iterations; <sandbox>/profile/<service>.<n>.pstats and "
         "a top-40 text beside it",
+    )
+    parser.add_argument(
+        "--compare-signals-with",
+        type=Path,
+        default=None,
+        metavar="SUMMARY_OR_SANDBOX",
+        help="diff this run's serving signals against another run of the same day (its "
+        "summary.json or sandbox), up to the earlier run's last tick: summary.signal_fidelity",
     )
     parser.add_argument("--dry-plan", action="store_true")
     return parser

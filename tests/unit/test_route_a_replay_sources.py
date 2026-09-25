@@ -736,3 +736,438 @@ def test_the_fidelity_report_counts_what_differs(tmp_path: Path) -> None:
     assert auction["only_recorded"] == ["600000.SH"]
     assert auction["price_differ"] == 1
     assert auction["pre_close_differ"] == 0
+
+
+# ---------------------------------------------------------------------------------------
+# The evidence answers every capture query as the replica before the day did (2026-09-24)
+# ---------------------------------------------------------------------------------------
+
+#: a quarter and a half of weekday sessions, so a code can stop trading 140 sessions back
+LONG_OPEN_DATES = tuple(
+    day
+    for day in (date(2026, 2, 2) + timedelta(days=offset) for offset in range(245))
+    if day.weekday() < 5
+)
+LONG_DAY = date(2026, 9, 18)
+LONG_PRIOR = max(day for day in LONG_OPEN_DATES if day < LONG_DAY)
+#: every shape a calendar window cuts off, as the host's 54 market_liquidity rows were:
+#: code -> (sessions before the day its daily_bar stops, sessions its daily_basic stops,
+#: sessions it has traded at all)
+LIQUIDITY_SHAPES = {
+    "600000.SH": (0, 0, None),  # trades every session, before and after the day
+    "000001.SZ": (0, 0, None),
+    "920003.BJ": (0, 15, None),  # a BSE code whose daily_basic lags three weeks
+    "430017.BJ": (40, 40, None),  # a pre-920 BSE code whose history ends at the migration
+    "600999.SH": (140, 140, None),  # suspended for more than half a year
+    "301999.SZ": (0, 0, 3),  # listed three sessions ago
+}
+
+
+def _liquidity_replica(path: Path, *, until: date | None = None) -> Path:
+    """A replica holding the day and the sessions after it (`until=None`), or -- the
+    ground truth of what the 09:20 capture read -- only the sessions before `until`."""
+
+    import duckdb
+
+    before = [day for day in LONG_OPEN_DATES if day < LONG_DAY]
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            "CREATE TABLE daily_bar(ts_code VARCHAR, trade_date DATE, open DOUBLE, high DOUBLE, "
+            "low DOUBLE, close DOUBLE, pre_close DOUBLE, pct_chg DOUBLE, vol DOUBLE, "
+            "amount DOUBLE, PRIMARY KEY (ts_code, trade_date))"
+        )
+        connection.execute(
+            "CREATE TABLE daily_basic(ts_code VARCHAR, trade_date DATE, turnover_rate DOUBLE, "
+            "volume_ratio DOUBLE, total_mv DOUBLE, circ_mv DOUBLE, "
+            "PRIMARY KEY (ts_code, trade_date))"
+        )
+        connection.execute(
+            "CREATE TABLE adj_factor(ts_code VARCHAR, trade_date DATE, adj_factor DOUBLE)"
+        )
+        connection.execute(
+            "CREATE TABLE daily_state(ts_code VARCHAR, trade_date DATE, is_st BOOLEAN, "
+            "is_bj BOOLEAN, board_type VARCHAR, is_limit_up BOOLEAN)"
+        )
+        connection.execute(
+            "CREATE TABLE stock_basic(ts_code VARCHAR, name VARCHAR, industry VARCHAR)"
+        )
+        connection.execute(
+            "CREATE TABLE risk_blacklist(list_label VARCHAR, ts_code VARCHAR, "
+            "expires_at DATE, imported_at DATE)"
+        )
+        bars, basics, factors, states = [], [], [], []
+        for index, (code, (bar_gap, basic_gap, listed)) in enumerate(LIQUIDITY_SHAPES.items()):
+            connection.execute(
+                "INSERT INTO stock_basic VALUES (?, ?, ?)", [code, f"样本{index}", "银行"]
+            )
+            sessions = list(LONG_OPEN_DATES) if listed is None else list(before[-listed:])
+            if listed is not None:
+                sessions += [day for day in LONG_OPEN_DATES if day >= LONG_DAY]
+            for position, day in enumerate(sessions):
+                if day < LONG_DAY and before.index(day) >= len(before) - bar_gap:
+                    continue
+                close = 10.0 + index + 0.01 * position
+                bars.append(
+                    (
+                        code,
+                        day,
+                        close,
+                        close + 0.1,
+                        close - 0.1,
+                        close,
+                        close - 0.05,
+                        0.5,
+                        1000.0 + position,
+                        (1000.0 + position) * close * (index + 1),
+                    )
+                )
+                factors.append((code, day, 1.0 + 0.001 * index))
+                states.append((code, day, False, code.endswith(".BJ"), "main", False))
+                if not (day < LONG_DAY and before.index(day) >= len(before) - basic_gap):
+                    basics.append((code, day, 1.5, 1.1, 1e9 * (index + 1), 5e8 * (index + 1)))
+        connection.executemany("INSERT INTO daily_bar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", bars)
+        connection.executemany("INSERT INTO daily_basic VALUES (?, ?, ?, ?, ?, ?)", basics)
+        connection.executemany("INSERT INTO adj_factor VALUES (?, ?, ?)", factors)
+        connection.executemany("INSERT INTO daily_state VALUES (?, ?, ?, ?, ?, ?)", states)
+        connection.execute(
+            "INSERT INTO risk_blacklist VALUES ('430黑名单', '600999.SH', ?, ?), "
+            "('430黑名单', '000001.SZ', ?, ?)",
+            [date(2026, 12, 31), date(2026, 6, 1), date(2026, 12, 31), date(2026, 9, 21)],
+        )
+        if until is not None:
+            for table in ("daily_bar", "daily_basic", "adj_factor", "daily_state"):
+                connection.execute(f"DELETE FROM {table} WHERE trade_date >= ?", [until])
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    path.chmod(0o600)
+    return path
+
+
+def _capture_reads(database: Path) -> Any:
+    """Every query the live reference-slow capture makes of its database, answered."""
+
+    from rquant.reference_slow_source import _query_database_reference_evidence
+
+    return _query_database_reference_evidence(
+        database, prior_trade_date=LONG_PRIOR, projection_as_of_date=LONG_DAY
+    )
+
+
+def _long_calendar() -> Any:
+    from rquant.runtime_market_session import MarketCalendarAuthority
+
+    return MarketCalendarAuthority.create(
+        schema_version=1,
+        exchange="SSE",
+        producer_commit=COMMIT,
+        coverage_start=LONG_OPEN_DATES[0],
+        coverage_end=LONG_OPEN_DATES[-1],
+        open_dates=LONG_OPEN_DATES,
+        generated_at=_local(date(2026, 1, 5), 9),
+    )
+
+
+def test_the_evidence_answers_every_capture_query_as_the_replica_before_the_day_did(
+    tmp_path: Path,
+) -> None:
+    """Host 2026-09-24: `market_liquidity` was 5,565 synthesized rows against 5,619 recorded.
+
+    The capture reads each code's latest `daily_basic` row and last five `daily_bar` rows
+    wherever they fall; the first cut kept ten sessions of one and 130 of the other, so every
+    code whose history ends earlier -- a lagging BSE code, a pre-920 BSE code, a long
+    suspension -- fell out. Now the extract of a replica that already holds the day and the
+    sessions after it answers every query exactly as the replica did at 09:20.
+    """
+
+    sources = _sources()
+    replica = _liquidity_replica(tmp_path / "rquant_ro.duckdb")
+    truth = _liquidity_replica(tmp_path / "as-of-0920.duckdb", until=LONG_DAY)
+    evidence = sources.extract_reference_evidence(
+        replica=replica,
+        target=tmp_path / "sandbox" / "reference-evidence.duckdb",
+        trade_date=LONG_DAY,
+        calendar=_long_calendar(),
+        audit=_Audit(),
+    )
+
+    expected_rows, expected_projections = _capture_reads(truth)
+    rows, projections = _capture_reads(Path(evidence["path"]))
+
+    #: the fixture really has the shapes that were lost
+    liquidity = {row["ts_code"] for row in expected_projections["market_liquidity"]}
+    assert liquidity == set(LIQUIDITY_SHAPES)
+    assert evidence["codes_not_trading_on_prior_session"] == 2
+    #: and the extract answers every one of them, row for row
+    assert rows == expected_rows
+    assert projections.keys() == expected_projections.keys()
+    for table in expected_projections:
+        assert projections[table] == expected_projections[table], table
+    assert {row["ts_code"] for row in projections["daily_bar"]} == set(LIQUIDITY_SHAPES)
+    assert (
+        max(
+            sum(1 for row in projections["daily_bar"] if row["ts_code"] == code)
+            for code in LIQUIDITY_SHAPES
+        )
+        == sources.REFERENCE_EVIDENCE_DAILY_ROWS_PER_CODE
+    )
+
+
+def test_a_calendar_window_is_what_lost_the_liquidity_rows(tmp_path: Path) -> None:
+    """The negative control: the first cut's windows, applied to the same replica."""
+
+    import duckdb
+
+    replica = _liquidity_replica(tmp_path / "rquant_ro.duckdb")
+    before = [day for day in LONG_OPEN_DATES if day < LONG_DAY]
+    first_cut = tmp_path / "first-cut.duckdb"
+    connection = duckdb.connect(str(first_cut))
+    try:
+        connection.execute(f"ATTACH '{replica}' AS source_replica (READ_ONLY)")
+        for table, since in (("daily_bar", before[-130]), ("daily_basic", before[-10])):
+            connection.execute(
+                f"CREATE TABLE {table} AS SELECT * FROM source_replica.{table} "
+                "WHERE trade_date >= ? AND trade_date < ?",
+                [since, LONG_DAY],
+            )
+        for table in ("adj_factor", "daily_state"):
+            connection.execute(
+                f"CREATE TABLE {table} AS SELECT * FROM source_replica.{table} "
+                "WHERE trade_date = ?",
+                [LONG_PRIOR],
+            )
+        for table in ("stock_basic", "risk_blacklist"):
+            connection.execute(f"CREATE TABLE {table} AS SELECT * FROM source_replica.{table}")
+        connection.execute("DETACH source_replica")
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    first_cut.chmod(0o600)
+
+    _rows, projections = _capture_reads(first_cut)
+
+    assert set(LIQUIDITY_SHAPES) - {row["ts_code"] for row in projections["market_liquidity"]} == {
+        "920003.BJ",
+        "430017.BJ",
+        "600999.SH",
+    }
+
+
+def test_the_projection_report_names_the_rows_only_one_side_has() -> None:
+    from types import SimpleNamespace
+
+    sources = _sources()
+
+    def snapshot(rows: list[dict[str, Any]]) -> Any:
+        return SimpleNamespace(
+            projections=[
+                SimpleNamespace(table_name="market_liquidity", rows=tuple(rows)),
+                SimpleNamespace(table_name="dc_board", rows=()),
+            ]
+        )
+
+    recorded = snapshot(
+        [
+            {"ts_code": "920003.BJ", "circ_mv": 1.0, "avg_amount_5d": 2.0},
+            {"ts_code": "600000.SH", "circ_mv": 3.0, "avg_amount_5d": 4.0},
+            {"ts_code": "000001.SZ", "circ_mv": 5.0, "avg_amount_5d": 6.0},
+        ]
+    )
+    synthesized = snapshot(
+        [
+            {"ts_code": "600000.SH", "circ_mv": 3.0, "avg_amount_5d": 4.0},
+            {"ts_code": "000001.SZ", "circ_mv": 5.0, "avg_amount_5d": 6.5},
+        ]
+    )
+
+    report = sources.compare_projections(recorded, synthesized)
+
+    liquidity = report["market_liquidity"]
+    assert liquidity["key"] == ["ts_code"]
+    assert liquidity["only_recorded"] == ["920003.BJ"]
+    assert liquidity["only_synthesized_count"] == 0
+    assert liquidity["values_differ"] == ["000001.SZ"]
+    assert liquidity["identical"] is False
+    assert report["dc_board"]["identical"] is True
+
+
+def test_the_candidate_input_report_names_each_code_that_reads_different_evidence() -> None:
+    from rquant.auction_match_gateway import AuctionMatchGateway
+    from rquant.reference_slow_publisher import (
+        ReferenceDailyFact,
+        ReferenceSecurityFact,
+        ReferenceSlowSourceSnapshot,
+    )
+
+    sources = _sources()
+    calendar = _calendar(generated_at=_local(date(2026, 9, 1), 9))
+    codes = ("300001.SZ", "600000.SH", "920003.BJ")
+
+    def snapshot(*, suspended: tuple[str, ...], market: dict[str, str]) -> Any:
+        return ReferenceSlowSourceSnapshot.create(
+            target_trade_date=DAY,
+            captured_at=_local(DAY, 9, 20, 22),
+            producer_commit=COMMIT,
+            source_snapshot_ids={
+                "calendar": calendar.content_sha256,
+                "daily": "1" * 64,
+                "security": "2" * 64,
+                "suspension": "3" * 64,
+            },
+            daily_facts=tuple(
+                ReferenceDailyFact(
+                    ts_code=code,
+                    trade_date=PRIOR,
+                    close_raw=10.0,
+                    prior_adj_factor=1.0,
+                    adj_factor=1.0,
+                )
+                for code in codes
+            ),
+            security_facts=tuple(
+                ReferenceSecurityFact(
+                    ts_code=code,
+                    name="样本",
+                    list_date=date(2010, 1, 4),
+                    market=market.get(code, "主板"),
+                )
+                for code in codes
+            ),
+            suspended_codes=suspended,
+        )
+
+    auction = AuctionMatchGateway.normalize_frame(
+        _auction(codes), trade_date=DAY, expected_codes=codes
+    )
+    moved = auction.copy()
+    moved.loc[moved["ts_code"] == "300001.SZ", "vol"] = 1.0
+
+    report = sources.compare_candidate_inputs(
+        recorded_snapshot=snapshot(suspended=(), market={}),
+        recorded_calendar=calendar,
+        synthesized_snapshot=snapshot(suspended=("920003.BJ",), market={"600000.SH": "科创板"}),
+        synthesized_calendar=calendar,
+        recorded_auction_payload=AuctionMatchGateway.encode_payload(auction),
+        synthesized_auction_payload=AuctionMatchGateway.encode_payload(moved),
+    )
+
+    assert report["codes_compared"] == 3
+    assert report["codes_differ"] == ["300001.SZ", "600000.SH", "920003.BJ"]
+    assert report["by_code"]["300001.SZ"] == {"auction_columns": ["vol"]}
+    assert report["by_code"]["600000.SH"]["reference_records"] == {
+        "security_board_membership": {"market": ["主板", "科创板"]}
+    }
+    assert report["by_code"]["920003.BJ"]["reference_records"] == {
+        "security_suspension_status": {"is_suspended": [False, True]}
+    }
+    assert report["calendar_differs"] is False
+
+
+def test_two_runs_signals_are_diffed_up_to_the_earlier_runs_last_tick() -> None:
+    sources = _sources()
+
+    def signal(at: str, code: str, action: str = "watch") -> dict[str, str]:
+        return {
+            "event_time_local": f"2026-09-24T{at}",
+            "strategy_id": "auction_gap",
+            "candidate_id": code,
+            "action": action,
+        }
+
+    recorded = [
+        signal("09:30:00", "002819.SZ"),
+        signal("09:30:00", "920003.BJ"),
+        signal("09:31:00", "603937.SH", "b_intent"),
+        signal("13:04:00", "002238.SZ"),
+    ]
+    synthesized = [
+        signal("09:30:00", "002819.SZ"),
+        signal("09:31:00", "603937.SH", "b_intent"),
+    ]
+
+    report = sources.compare_signal_lists(synthesized, recorded, until_local="09:45:00")
+
+    assert report["common"] == 2
+    assert report["only_this_run"] == []
+    assert report["only_other_run"] == [
+        {
+            "event_time_local": "2026-09-24T09:30:00",
+            "strategy_id": "auction_gap",
+            "candidate_id": "920003.BJ",
+            "action": "watch",
+        }
+    ]
+    assert report["codes_differ"] == ["920003.BJ"]
+    assert report["identical"] is False
+
+
+def test_a_full_day_suspension_of_a_code_that_matched_in_the_auction_is_left_out(
+    tmp_path: Path,
+) -> None:
+    """suspend_d(D), asked after the day, lists what happened during it. An intraday halt
+    recorded without a timing reads as a full-day suspension and would mark a code the 09:20
+    capture saw trading as suspended -- auction_gap then drops it. A code that matched in the
+    opening auction was trading at 09:25: its full-day row is left out and listed."""
+
+    sources = _sources()
+    calendar = _calendar(generated_at=_local(date(2026, 9, 1), 9))
+    evidence = sources.extract_reference_evidence(
+        replica=_replica(tmp_path / "rquant_ro.duckdb"),
+        target=tmp_path / "sandbox" / "reference-evidence.duckdb",
+        trade_date=DAY,
+        calendar=calendar,
+        audit=_Audit(),
+    )
+    suspensions = pd.DataFrame(
+        [
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "20260918",
+                "suspend_timing": None,
+                "suspend_type": "S",
+            },
+            {
+                "ts_code": ST_TODAY,
+                "trade_date": "20260918",
+                "suspend_timing": None,
+                "suspend_type": "S",
+            },
+            {
+                "ts_code": "300001.SZ",
+                "trade_date": "20260918",
+                "suspend_timing": "10:00-10:30",
+                "suspend_type": "S",
+            },
+        ]
+    )
+    source = _source(tmp_path, _FakeTushare(**{**_day_answers(), "suspend_d": suspensions}))
+    auction = source.stk_auction(DAY)
+    known = sources.KnownAtCapture(source, traded_in_auction=sources.auction_traded_codes(auction))
+
+    snapshot = sources.synthesize_reference_snapshot(
+        evidence_database=Path(evidence["path"]),
+        source=known,
+        calendar=calendar,
+        trade_date=DAY,
+        producer_commit=COMMIT,
+    )
+    naive = sources.synthesize_reference_snapshot(
+        evidence_database=Path(evidence["path"]),
+        source=source,
+        calendar=calendar,
+        trade_date=DAY,
+        producer_commit=COMMIT,
+    )
+
+    #: the NaN-priced auction row of 000005.SZ did not match; the two others did
+    assert sources.auction_traded_codes(auction) == frozenset(CODES)
+    assert naive.suspended_codes == ("600000.SH", ST_TODAY)
+    assert snapshot.suspended_codes == (ST_TODAY,)
+    report = sources.reference_anachronisms(snapshot, known)["suspend_d_asked_after_the_day"]
+    assert report["left_out_traded_in_the_opening_auction"] == {
+        "count": 1,
+        "events": ["600000.SH S (no timing)"],
+    }
+    assert report["full_day_suspended"] == {"count": 1, "codes": [ST_TODAY]}
+    assert report["partial_or_resumption_events"]["events"] == ["300001.SZ S 10:00-10:30"]

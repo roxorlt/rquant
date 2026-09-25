@@ -41,7 +41,7 @@ import hashlib
 import json
 import os
 import secrets
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as clock_time
@@ -63,9 +63,12 @@ SYNTHETIC_UNIVERSE_OBSERVED = "09:10:07"
 #: The earliest instant any synthesized input is observed at: a calendar generated later
 #: than this is future evidence for the whole replayed day.
 CALENDAR_NOT_AFTER = SYNTHETIC_UNIVERSE_OBSERVED
-#: `daily_bar` sessions the reference evidence keeps: the capture's `daily_bar` projection
-#: reads the last 120 sessions of the 80 most liquid codes.
-REFERENCE_EVIDENCE_DAILY_SESSIONS = 130
+#: The deepest per-code look-back of any query the reference-slow capture makes: its
+#: `daily_bar` projection reads each liquid code's last 120 rows (`rn <= 120`), and
+#: `market_liquidity` / the liquidity ranking read each code's last 5 -- rows counted *per
+#: code*, not sessions of the calendar, so a code that stopped trading long ago still has
+#: them (host 2026-09-24: 54 such codes in `market_liquidity`).
+REFERENCE_EVIDENCE_DAILY_ROWS_PER_CODE = 120
 #: The five sessions `auction_gap_candidate_input` reads volumes for.
 PRIOR_SESSIONS_AUCTION_GAP = 5
 
@@ -677,17 +680,31 @@ def extract_reference_evidence(
     trade_date: date,
     calendar: Any,
     audit: Any,
-    daily_sessions: int = REFERENCE_EVIDENCE_DAILY_SESSIONS,
     require_adj_factor: bool = True,
     threads: int = 2,
     memory_limit: str = "2GB",
 ) -> dict[str, Any]:
-    """The tables `capture_reference_slow_source_snapshot` reads, before the trade date.
+    """Every row `capture_reference_slow_source_snapshot` could read at 09:20 on the day.
 
-    Dated tables keep only sessions before the day, so a 09:20 capture never reads the day's
-    own close (the replica today already has it). Undated tables (`stock_basic`,
-    `risk_blacklist` -- whose query filters by `imported_at` itself --, the board membership
-    snapshots) are today's, which the provenance says.
+    Equivalent, query for query, to the replica with every row dated on or after the trade
+    date removed -- which is what the live capture read, since the replica does not carry
+    the day's own close until that evening. The capture's windows are per code, not per
+    calendar session: `market_liquidity` takes each code's *latest* `daily_basic` row and
+    *last five* `daily_bar` rows wherever they fall, so a calendar window (package AK's
+    first cut: ten sessions of `daily_basic`, 130 of `daily_bar`) silently dropped every code
+    whose history ends before it -- 54 of 5,619 rows on 2026-09-24. So:
+
+    * `daily_bar`: each code's last `REFERENCE_EVIDENCE_DAILY_ROWS_PER_CODE` rows before the
+      day (the deepest window any of the capture's queries reads; the prior-session joins
+      are each code's newest row);
+    * `daily_basic`: each code's newest row before the day (`market_liquidity`'s `rn = 1`;
+      the `nl_screen_universe` join on the prior session is that same row or none);
+    * `adj_factor`, `daily_state`, `daily_indicator`: the prior session, the only one read;
+    * undated tables (`stock_basic`, `risk_blacklist` -- whose query filters by
+      `imported_at` itself --, the board membership snapshots): today's, as labelled.
+
+    What cannot be undone is a row dated before the day but written after the capture (a
+    backfill): it is indistinguishable here, and the provenance says so.
     """
 
     import duckdb
@@ -696,8 +713,6 @@ def extract_reference_evidence(
     if not prior:
         raise InputUnavailableError(f"the calendar has no open session before {trade_date}")
     prior_trade_date = prior[-1]
-    daily_from = prior[-daily_sessions] if len(prior) >= daily_sessions else prior[0]
-    basic_from = prior[-10] if len(prior) >= 10 else prior[0]
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.exists():
         target.unlink()
@@ -709,10 +724,15 @@ def extract_reference_evidence(
         connection.execute(f"SET memory_limit = '{memory_limit}'")
         connection.execute(f"ATTACH '{replica}' AS source_replica (READ_ONLY)")
         present = _tables(connection)
+        newest_first = "ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY trade_date DESC)"
         dated = {
-            "daily_bar": ("trade_date >= ? AND trade_date < ?", [daily_from, trade_date]),
+            "daily_bar": (
+                f"trade_date < ? QUALIFY {newest_first} <= "
+                f"{int(REFERENCE_EVIDENCE_DAILY_ROWS_PER_CODE)}",
+                [trade_date],
+            ),
+            "daily_basic": (f"trade_date < ? QUALIFY {newest_first} = 1", [trade_date]),
             "adj_factor": ("trade_date = ?", [prior_trade_date]),
-            "daily_basic": ("trade_date >= ? AND trade_date < ?", [basic_from, trade_date]),
             "daily_state": ("trade_date = ?", [prior_trade_date]),
             "daily_indicator": ("trade_date = ?", [prior_trade_date]),
         }
@@ -732,6 +752,17 @@ def extract_reference_evidence(
                 counts[table] = int(
                     connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                 )
+        stale = (
+            int(
+                connection.execute(
+                    "SELECT count(*) FROM (SELECT ts_code, max(trade_date) AS last "
+                    "FROM daily_bar GROUP BY ts_code) WHERE last < ?",
+                    [prior_trade_date],
+                ).fetchone()[0]
+            )
+            if "daily_bar" in counts
+            else 0
+        )
         connection.execute("DETACH source_replica")
         connection.execute("CHECKPOINT")
     finally:
@@ -750,9 +781,12 @@ def extract_reference_evidence(
     return {
         "path": str(target),
         "prior_trade_date": prior_trade_date,
-        "daily_bar_from": daily_from,
+        "daily_bar_rows_per_code": REFERENCE_EVIDENCE_DAILY_ROWS_PER_CODE,
+        "codes_not_trading_on_prior_session": stale,
         "rows": counts,
         "undated_tables_as_of_today": sorted(set(_UNDATED_EVIDENCE_TABLES) & set(counts)),
+        "note": "rows dated before the trade date but written after its 09:20 capture "
+        "(a backfill) cannot be told apart and are included",
     }
 
 
@@ -761,10 +795,68 @@ def extract_reference_evidence(
 # ---------------------------------------------------------------------------------------
 
 
+def auction_traded_codes(frame: Any) -> frozenset[str]:
+    """Codes that matched in the day's opening call auction: a positive volume at a finite
+    price. None of them can have been suspended for the whole day at 09:20."""
+
+    import numpy as np
+    import pandas as pd
+
+    if frame is None or not len(frame):
+        return frozenset()
+    price = pd.to_numeric(frame["price"], errors="coerce").to_numpy(dtype="float64")
+    volume = pd.to_numeric(frame["vol"], errors="coerce").to_numpy(dtype="float64")
+    traded = np.isfinite(price) & (price > 0) & np.isfinite(volume) & (volume > 0)
+    return frozenset(str(code).strip() for code in frame.loc[traded, "ts_code"])
+
+
+class KnownAtCapture:
+    """The day's answers as the 09:20 capture could have had them.
+
+    `suspend_d(D)` asked afterwards also lists what happened *during* the day. An intraday
+    halt with a timing range is `partial` and changes no record, but one recorded without a
+    timing reads as a full-day suspension (`suspension._session_scope`), and the reference
+    publisher then marks the code suspended for the whole day -- and auction_gap drops it.
+    A code that matched in the day's opening auction was trading at 09:25, so a full-day
+    suspension of it cannot have been what the live capture saw: such rows are left out and
+    listed (`dropped_suspensions`). Every other answer passes through unchanged.
+    """
+
+    def __init__(self, source: CachedDaySource, *, traded_in_auction: frozenset[str]) -> None:
+        self._source = source
+        self.trade_date = source.trade_date
+        self.traded_in_auction = traded_in_auction
+        self.dropped_suspensions: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+    def suspend_d_raw(self, trade_date: date) -> Any:
+        from rquant.suspension import _session_scope
+
+        frame = self._source.suspend_d_raw(trade_date)
+        if frame is None or not len(frame) or not self.traded_in_auction:
+            return frame
+        keep: list[bool] = []
+        for row in frame.to_dict("records"):
+            code = str(row.get("ts_code", "")).strip()
+            kind = str(row.get("suspend_type", "")).strip().upper()
+            raw_timing = row.get("suspend_timing")
+            timing = (
+                "" if raw_timing is None or raw_timing != raw_timing else str(raw_timing).strip()
+            )
+            full_day = _session_scope(kind, timing) == "full_day"
+            drop = full_day and code in self.traded_in_auction
+            keep.append(not drop)
+            if drop:
+                self.dropped_suspensions.append(f"{code} {kind} {timing or '(no timing)'}".strip())
+        return frame.loc[keep].reset_index(drop=True)
+
+
 def synthesize_reference_snapshot(
     *,
     evidence_database: Path,
-    source: CachedDaySource,
+    source: CachedDaySource | KnownAtCapture,
     calendar: Any,
     trade_date: date,
     producer_commit: str,
@@ -821,7 +913,9 @@ def seal_reference_snapshot(
     )
 
 
-def reference_anachronisms(snapshot: Any, source: CachedDaySource) -> dict[str, Any]:
+def reference_anachronisms(
+    snapshot: Any, source: CachedDaySource | KnownAtCapture
+) -> dict[str, Any]:
     """What today's `stock_basic` may have put into a past day's facts, counted.
 
     `is_st` is `name says ST or stock_st(D) lists it`; the name is today's, so a code that
@@ -839,9 +933,48 @@ def reference_anachronisms(snapshot: Any, source: CachedDaySource) -> dict[str, 
         for fact in snapshot.security_facts
         if fact.is_st and fact.ts_code not in listed and normalize_name(fact.name)[1]
     )
+    #: suspend_d(D) asked afterwards also lists what happened *during* the day: an intraday
+    #: halt (a partial timing) changes no record; a full-day S the 09:20 view may not have
+    #: known would make the code suspended -- `fidelity_vs_recorded.suspended` says whether
+    #: the host's own capture agreed
+    full_day: list[str] = []
+    partial: list[str] = []
+    #: what the capture was given, after `KnownAtCapture` (if any) left rows out
+    suspensions = source.suspend_d_raw(source.trade_date)
+    if isinstance(source, KnownAtCapture):
+        source.dropped_suspensions = sorted(set(source.dropped_suspensions))
+    if suspensions is not None and len(suspensions):
+        from rquant.suspension import normalize_suspend_d_snapshot
+
+        events = normalize_suspend_d_snapshot(
+            suspensions, trade_date=source.trade_date, queried_at=snapshot.captured_at
+        ).events
+        full_day = sorted(
+            {
+                event.ts_code
+                for event in events
+                if event.suspend_type == "S" and event.session_scope == "full_day"
+            }
+        )
+        partial = sorted(
+            {
+                f"{event.ts_code} {event.suspend_type} {event.suspend_timing}".strip()
+                for event in events
+                if event.session_scope != "full_day"
+            }
+        )
+    dropped = list(getattr(source, "dropped_suspensions", ()))
     return {
         "stock_basic_is_todays_listing": True,
         "st_by_todays_name_only": {"count": len(name_only), "codes": name_only[:20]},
+        "suspend_d_asked_after_the_day": {
+            "full_day_suspended": {"count": len(full_day), "codes": full_day[:40]},
+            "partial_or_resumption_events": {"count": len(partial), "events": partial[:40]},
+            "left_out_traded_in_the_opening_auction": {
+                "count": len(dropped),
+                "events": dropped[:40],
+            },
+        },
     }
 
 
@@ -943,8 +1076,57 @@ def synthesize_auction_batch(
 # ---------------------------------------------------------------------------------------
 
 
+def _row_key(row: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    return "|".join(str(row.get(key)) for key in keys)
+
+
+def _row_value(row: Mapping[str, Any]) -> str:
+    return json.dumps(dict(row), sort_keys=True, default=str, ensure_ascii=False)
+
+
+def compare_projections(recorded: Any, synthesized: Any) -> dict[str, Any]:
+    """Row by row, per projection: rows only one side has, by the contract's key, and rows
+    both have with different values -- not just the counts."""
+
+    from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
+
+    left = {projection.table_name: projection.rows for projection in recorded.projections}
+    right = {projection.table_name: projection.rows for projection in synthesized.projections}
+    result: dict[str, Any] = {}
+    for table in sorted(set(left) | set(right)):
+        contract = PAGE_PROJECTION_CONTRACTS.get(table)
+        keys = tuple(contract.sort_keys) if contract is not None else ()
+        left_rows = {
+            (_row_key(row, keys) if keys else _row_value(row)): _row_value(row)
+            for row in left.get(table, ())
+        }
+        right_rows = {
+            (_row_key(row, keys) if keys else _row_value(row)): _row_value(row)
+            for row in right.get(table, ())
+        }
+        only_recorded = sorted(set(left_rows) - set(right_rows))
+        only_synthesized = sorted(set(right_rows) - set(left_rows))
+        changed = sorted(
+            key for key in set(left_rows) & set(right_rows) if left_rows[key] != right_rows[key]
+        )
+        result[table] = {
+            "recorded": len(left.get(table, ())),
+            "synthesized": len(right.get(table, ())),
+            "key": list(keys),
+            "only_recorded_count": len(only_recorded),
+            "only_recorded": only_recorded[:60],
+            "only_synthesized_count": len(only_synthesized),
+            "only_synthesized": only_synthesized[:60],
+            "values_differ_count": len(changed),
+            "values_differ": changed[:20],
+            "identical": not (only_recorded or only_synthesized or changed),
+        }
+    return result
+
+
 def compare_reference(recorded: Any, synthesized: Any) -> dict[str, Any]:
-    """How far a synthesized reference snapshot is from the host's own, fact by fact."""
+    """How far a synthesized reference snapshot is from the host's own, fact by fact and
+    projection row by projection row; `differing` names everything that is not identical."""
 
     recorded_codes = {fact.ts_code for fact in recorded.security_facts}
     synthesized_codes = {fact.ts_code for fact in synthesized.security_facts}
@@ -965,6 +1147,8 @@ def compare_reference(recorded: Any, synthesized: Any) -> dict[str, Any]:
     security_pairs = [
         (recorded_security[code], synthesized_security[code]) for code in sorted(both)
     ]
+    suspended_differ = sorted(set(recorded.suspended_codes) ^ set(synthesized.suspended_codes))
+    projections = compare_projections(recorded, synthesized)
     result: dict[str, Any] = {
         "securities": {"recorded": len(recorded_codes), "synthesized": len(synthesized_codes)},
         "only_recorded": sorted(recorded_codes - synthesized_codes)[:20],
@@ -974,8 +1158,15 @@ def compare_reference(recorded: Any, synthesized: Any) -> dict[str, Any]:
         "suspended": {
             "recorded": len(recorded.suspended_codes),
             "synthesized": len(synthesized.suspended_codes),
-            "differ": sorted(set(recorded.suspended_codes) ^ set(synthesized.suspended_codes))[:20],
+            "differ": suspended_differ[:20],
+            "differ_count": len(suspended_differ),
         },
+        "source_snapshot_ids_differ": sorted(
+            key
+            for key in set(recorded.source_snapshot_ids) | set(synthesized.source_snapshot_ids)
+            if recorded.source_snapshot_ids.get(key) != synthesized.source_snapshot_ids.get(key)
+        ),
+        "projection_rows": projections,
         "projections": {
             projection.table_name: len(projection.rows) for projection in synthesized.projections
         },
@@ -986,10 +1177,165 @@ def compare_reference(recorded: Any, synthesized: Any) -> dict[str, Any]:
     for attribute in ("close_raw", "prior_adj_factor", "adj_factor"):
         codes = differing(daily_pairs, attribute)
         result[f"daily_{attribute}_differ"] = {"count": len(codes), "codes": codes[:20]}
-    for attribute in ("name", "is_st", "market", "list_date", "delist_date"):
+    for attribute in (
+        "name",
+        "is_st",
+        "market",
+        "list_date",
+        "delist_date",
+        "source_list_status",
+    ):
         codes = differing(security_pairs, attribute)
         result[f"security_{attribute}_differ"] = {"count": len(codes), "codes": codes[:20]}
+    differ = [
+        label for label, entry in result.items() if isinstance(entry, dict) and entry.get("count")
+    ]
+    if result["only_recorded_count"] or result["only_synthesized_count"]:
+        differ.append("securities")
+    if suspended_differ:
+        differ.append("suspended")
+    differ += [
+        f"projection:{table}" for table, entry in projections.items() if not entry["identical"]
+    ]
+    result["differing"] = sorted(differ)
     return result
+
+
+def _record_view(snapshot: Any, calendar: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    """Each code's registry payloads, exactly as the reference publisher derives them."""
+
+    from rquant.reference_slow_publisher import _record_payloads
+
+    daily = {fact.ts_code: fact for fact in snapshot.daily_facts}
+    suspended = set(snapshot.suspended_codes)
+    view: dict[str, dict[str, dict[str, Any]]] = {}
+    for security in snapshot.security_facts:
+        try:
+            payloads = _record_payloads(
+                daily=daily[security.ts_code],
+                security=security,
+                suspended=security.ts_code in suspended,
+                target_trade_date=snapshot.target_trade_date,
+                open_dates=calendar.open_dates,
+            )
+        except Exception as error:  # noqa: BLE001 - the publisher would refuse it too
+            view[security.ts_code] = {"_error": {"error": f"{type(error).__name__}: {error}"}}
+            continue
+        view[security.ts_code] = {
+            str(getattr(dataset, "value", dataset)): dict(payload) for dataset, payload in payloads
+        }
+    return view
+
+
+def compare_candidate_inputs(
+    *,
+    recorded_snapshot: Any,
+    recorded_calendar: Any,
+    synthesized_snapshot: Any,
+    synthesized_calendar: Any,
+    recorded_auction_payload: bytes,
+    synthesized_auction_payload: bytes,
+) -> dict[str, Any]:
+    """Per auction code: does anything auction_gap's candidate input reads differ?
+
+    The candidate input reads, per code, the auction row and four registry records (ST,
+    suspension, listing, price limit; the reference publisher also writes board membership
+    and the adjustment factor). The records are derived here by the publisher's own
+    `_record_payloads` from each snapshot and its calendar, so a code listed here reads
+    different evidence in the two runs, and a code not listed reads the same. The prior
+    five sessions' volumes come from the same replica extract in both runs.
+    """
+
+    from rquant.auction_match_gateway import AuctionMatchGateway
+
+    recorded_rows = AuctionMatchGateway.decode_payload(recorded_auction_payload).set_index(
+        "ts_code"
+    )
+    synthesized_rows = AuctionMatchGateway.decode_payload(synthesized_auction_payload).set_index(
+        "ts_code"
+    )
+    auction_columns = [column for column in recorded_rows.columns if column in synthesized_rows]
+    recorded_view = _record_view(recorded_snapshot, recorded_calendar)
+    synthesized_view = _record_view(synthesized_snapshot, synthesized_calendar)
+    codes = sorted(
+        {str(code) for code in recorded_rows.index} | {str(code) for code in synthesized_rows.index}
+    )
+    by_code: dict[str, dict[str, Any]] = {}
+    for code in codes:
+        entry: dict[str, Any] = {}
+        in_recorded, in_synthesized = code in recorded_rows.index, code in synthesized_rows.index
+        if in_recorded != in_synthesized:
+            entry["auction_row_only_in"] = "recorded" if in_recorded else "synthesized"
+        elif in_recorded:
+            columns = []
+            for column in auction_columns:
+                left, right = recorded_rows.at[code, column], synthesized_rows.at[code, column]
+                if not (left == right or (left != left and right != right)):
+                    columns.append(column)
+            if columns:
+                entry["auction_columns"] = columns
+        left_records = recorded_view.get(code)
+        right_records = synthesized_view.get(code)
+        if (left_records is None) != (right_records is None):
+            entry["reference_only_in"] = "recorded" if left_records is not None else "synthesized"
+        elif left_records is not None and right_records is not None:
+            fields: dict[str, dict[str, list[Any]]] = {}
+            for dataset in sorted(set(left_records) | set(right_records)):
+                left_payload = left_records.get(dataset, {})
+                right_payload = right_records.get(dataset, {})
+                changed = {
+                    field: [left_payload.get(field), right_payload.get(field)]
+                    for field in sorted(set(left_payload) | set(right_payload))
+                    if left_payload.get(field) != right_payload.get(field)
+                }
+                if changed:
+                    fields[dataset] = changed
+            if fields:
+                entry["reference_records"] = fields
+        if entry:
+            by_code[code] = entry
+    return {
+        "codes_compared": len(codes),
+        "codes_differ_count": len(by_code),
+        "codes_differ": sorted(by_code)[:200],
+        "by_code": {code: by_code[code] for code in sorted(by_code)[:60]},
+        "calendar_differs": recorded_calendar.content_sha256 != synthesized_calendar.content_sha256,
+        "not_compared": "prior-five daily volumes: the same replica extract feeds both runs",
+    }
+
+
+def compare_signal_lists(
+    this: Sequence[Mapping[str, Any]],
+    other: Sequence[Mapping[str, Any]],
+    *,
+    until_local: str,
+) -> dict[str, Any]:
+    """Serving signals of two runs of one day, up to the earlier run's last tick."""
+
+    def keyed(rows: Sequence[Mapping[str, Any]]) -> set[tuple[str, str, str, str]]:
+        return {
+            (
+                str(row["event_time_local"]),
+                str(row["strategy_id"]),
+                str(row["candidate_id"]),
+                str(row["action"]),
+            )
+            for row in rows
+            if str(row["event_time_local"])[11:19] <= until_local
+        }
+
+    mine, theirs = keyed(this), keyed(other)
+    only_this = sorted(mine - theirs)
+    only_other = sorted(theirs - mine)
+    fields = ("event_time_local", "strategy_id", "candidate_id", "action")
+    return {
+        "until_local": until_local,
+        "common": len(mine & theirs),
+        "only_this_run": [dict(zip(fields, row, strict=True)) for row in only_this],
+        "only_other_run": [dict(zip(fields, row, strict=True)) for row in only_other],
+        "identical": not (only_this or only_other),
+        "codes_differ": sorted({row[2] for row in only_this} | {row[2] for row in only_other}),
+    }
 
 
 def compare_auction(recorded_payload: bytes, synthesized_payload: bytes) -> dict[str, Any]:
@@ -1022,16 +1368,21 @@ def compare_auction(recorded_payload: bytes, synthesized_payload: bytes) -> dict
 
 __all__ = [
     "CALENDAR_NOT_AFTER",
+    "auction_traded_codes",
     "CachedDaySource",
     "CalendarChoice",
     "InputUnavailableError",
+    "KnownAtCapture",
     "TushareCache",
     "TushareCacheMissError",
     "cached_answers",
     "cached_minute_fetcher",
     "choose_calendar",
     "compare_auction",
+    "compare_candidate_inputs",
+    "compare_projections",
     "compare_reference",
+    "compare_signal_lists",
     "extract_reference_evidence",
     "local_instant",
     "prefetch_day",

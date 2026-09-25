@@ -912,14 +912,24 @@ def test_the_dry_plan_resolves_each_date_and_says_what_cannot_be_produced(
 def test_synthesizing_a_recorded_day_reports_how_far_it_is_from_the_recording(
     host: dict[str, Path], tmp_path: Path
 ) -> None:
-    """`--synthesize-sources` on the recorded day: the fidelity check the host can run on
-    2026-09-24. The fixture's Tushare answers match its recording except `market`, which the
-    recording's fixture set to 创业板 for the SSE code too, so exactly that one field differs."""
+    """`--synthesize-sources` on the recorded day: the fidelity check the host runs on
+    2026-09-24, down to the signals.
+
+    The fixture's Tushare answers match its recording except `market`, which the recording's
+    fixture set to 创业板 for the SSE code too, so exactly that one field differs -- in the
+    facts, in the one registry record derived from it (board membership), and in nothing
+    auction_gap reads, so the recorded run and the synthesized one serve the same signals.
+    """
 
     _extend_replica_for(host["replica"], TARGET_DATE, minutes=False)
     cache = tmp_path / "tushare-cache"
     _fill_tushare_cache(cache, TARGET_DATE)
     before = _tree(host["data"])
+    window = ("--step-seconds", "300", "--until", "10:10")
+
+    recorded_run = _run(host, tmp_path / "recorded", *window)
+    assert recorded_run.returncode == 0, (recorded_run.stdout + recorded_run.stderr)[-6000:]
+    (recorded_sandbox,) = (tmp_path / "recorded").iterdir()
 
     result = _run(
         host,
@@ -928,10 +938,9 @@ def test_synthesizing_a_recorded_day_reports_how_far_it_is_from_the_recording(
         "--tushare-offline",
         "--tushare-cache",
         str(cache),
-        "--step-seconds",
-        "300",
-        "--until",
-        "09:45",
+        *window,
+        "--compare-signals-with",
+        str(recorded_sandbox),
     )
 
     output = result.stdout + result.stderr
@@ -948,6 +957,10 @@ def test_synthesizing_a_recorded_day_reports_how_far_it_is_from_the_recording(
     assert summary["inputs"]["auction_batches"] == []
     #: the host's universe generation for the day is the expected-code set
     assert summary["world"]["auction"]["universe"]["origin"] == "recorded"
+    #: the calendar stays the one the host used, and the day-without-a-recording choice
+    #: is checked against it
+    assert provenance["calendar"]["origin"] == "recorded"
+    assert provenance["calendar"]["heuristic_check"]["matches_recorded"] is True
 
     reference = summary["world"]["reference"]["fidelity_vs_recorded"]
     assert reference["securities"] == {"recorded": 2, "synthesized": 2}
@@ -956,13 +969,62 @@ def test_synthesizing_a_recorded_day_reports_how_far_it_is_from_the_recording(
         assert reference[f"daily_{field}_differ"]["count"] == 0, reference
     assert reference["security_name_differ"]["count"] == 0
     assert reference["security_market_differ"] == {"count": 1, "codes": ["600000.SH"]}
+    assert reference["suspended"]["differ_count"] == 0
+    assert "security_market_differ" in reference["differing"]
+    assert set(reference["projection_rows"]) == {
+        projection for projection in reference["projections"]
+    }
     auction = summary["world"]["auction"]["fidelity_vs_recorded"]
     assert auction["rows"] == {"recorded": 2, "synthesized": 2}
     assert all(
         auction[f"{column}_differ"] == 0
         for column in ("price", "vol", "amount", "pre_close", "turnover_rate", "volume_ratio")
     ), auction
+
+    candidates = summary["world"]["fidelity_candidate_inputs"]
+    assert candidates["codes_compared"] == 2
+    assert candidates["codes_differ"] == ["600000.SH"]
+    assert candidates["by_code"]["600000.SH"] == {
+        "reference_records": {"security_board_membership": {"market": ["创业板", "主板"]}}
+    }
+
+    #: and the signals: both runs' serving signals up to 10:10, the same ones
+    signals = summary["signal_fidelity"]
+    assert signals["until_local"] == "10:10:00"
+    assert signals["other"] == str(recorded_sandbox / "summary.json")
+    assert signals["other_inputs"]["reference_slow"] == "recorded"
+    assert signals["common"] >= 1, signals
+    assert signals["identical"] is True, signals
+    listed = summary["chain"]["serving"]["signals_today_list"]
+    assert len(listed) == summary["chain"]["serving"]["signals_rows_today"]
+    assert {row["candidate_id"] for row in listed} <= set(CODES)
+    minutes = summary["chain"]["market_minute"]
+    assert minutes["watchlist_codes"] == sorted(CODES)
+    origins = minutes["origin_by_watchlist_code"]
+    assert origins[MINUTE_CODE] == "replica:tushare_rt"
+    #: offline, and the cache has no stk_mins for the code the replica lacks: said so
+    assert origins[CODES[1]].startswith("tushare_failed: TushareCacheMissError")
+    assert "signal fidelity vs" in result.stdout
     assert summary["chain"]["serving"]["same_day"] is True
+
+    #: a summary written before `signals_today_list` existed (f8f171e7's full-day runs) is
+    #: read through its sandbox's serving generation instead, with the same answer
+    older = json.loads((recorded_sandbox / "summary.json").read_text(encoding="utf-8"))
+    del older["chain"]["serving"]["signals_today_list"]
+    del older["chain"]["market_minute"]["watchlist_codes"]
+    del older["chain"]["market_minute"]["origin_by_watchlist_code"]
+    older_path = tmp_path / "older-summary.json"
+    older_path.write_text(json.dumps(older), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("route_a_day_replay_signal_diff", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    replay = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = replay
+    spec.loader.exec_module(replay)
+    again = replay.signal_fidelity(summary, older_path, until="10:10", trade_date=TARGET_DATE)
+    assert {key: again[key] for key in ("common", "identical", "only_this_run")} == {
+        key: signals[key] for key in ("common", "identical", "only_this_run")
+    }
+    assert _tree(host["data"]) == before
 
 
 def test_a_coarser_serving_cadence_is_flagged_and_the_profile_says_where_the_time_went(
