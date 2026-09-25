@@ -14,6 +14,7 @@ from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway
 from rquant.paper_execution_constraint_producer import (
+    PaperExecutionConstraintNoEvidenceError,
     PaperExecutionConstraintProducer,
     PaperExecutionConstraintProductionRequest,
 )
@@ -39,6 +40,12 @@ if TYPE_CHECKING:
     from rquant.serving_read_models import ServingProjectionPayload
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+#: `RuntimeStepResult.observations` keys of `paper_constraint_publisher` (#307): codes of
+#: the latest minute batch whose newest interval does not cover the round's instant (the
+#: lunch break, the minutes after the close), and codes with no same-day minute at all.
+#: Neither is tradable, neither fails the round; only a non-zero count is reported.
+PAPER_CONSTRAINT_STALE_CODES_OBSERVATION = "paper_constraint_stale_codes"
+PAPER_CONSTRAINT_CODES_WITHOUT_EVIDENCE_OBSERVATION = "paper_constraint_codes_without_evidence"
 
 
 class PaperConstraintRuntimeSettings(RuntimeContractModel):
@@ -183,7 +190,10 @@ def paper_execution_constraint_publisher_builder(
             quote_ttl=timedelta(seconds=settings.quote_ttl_seconds),
         )
 
+        last_output_sequence = -1
+
         def step() -> RuntimeStepResult:
+            nonlocal last_output_sequence
             observed_at = clock()
             latest = _latest_visible_market_batch(spool, observed_at=observed_at)
             frame = MarketMinuteGateway.decode_payload(spool.read_payload(latest))
@@ -195,15 +205,40 @@ def paper_execution_constraint_publisher_builder(
             reference = registry.current_pointer()
             if reference.switched_at > observed_at:
                 raise RuntimeError("current reference generation is future evidence")
-            publication = producer.produce(
-                PaperExecutionConstraintProductionRequest(
-                    trade_date=observed_at.astimezone(_SHANGHAI).date(),
-                    ts_codes=codes,
-                    observed_at=observed_at,
-                    reference_generation_id=reference.generation_id,
-                    sequence=latest.envelope.sequence,
-                )
+            request = PaperExecutionConstraintProductionRequest(
+                trade_date=observed_at.astimezone(_SHANGHAI).date(),
+                ts_codes=codes,
+                observed_at=observed_at,
+                reference_generation_id=reference.generation_id,
+                sequence=latest.envelope.sequence,
             )
+            try:
+                publication, coverage = producer.produce_with_coverage(request)
+            except PaperExecutionConstraintNoEvidenceError:
+                #: #307: nothing to constrain; the last generation stays, expired
+                return RuntimeStepResult(
+                    input_sequence=latest.envelope.sequence,
+                    output_sequence=last_output_sequence,
+                    source_generations={
+                        "market_minute": latest.envelope.identity_sha256,
+                        "reference_slow": reference.generation_id,
+                    },
+                    observations={
+                        PAPER_CONSTRAINT_CODES_WITHOUT_EVIDENCE_OBSERVATION: len(codes),
+                    },
+                )
+            observations = {
+                key: count
+                for key, count in (
+                    (PAPER_CONSTRAINT_STALE_CODES_OBSERVATION, len(coverage.stale_codes)),
+                    (
+                        PAPER_CONSTRAINT_CODES_WITHOUT_EVIDENCE_OBSERVATION,
+                        len(coverage.codes_without_evidence),
+                    ),
+                )
+                if count
+            }
+            last_output_sequence = publication.pointer.sequence
             return RuntimeStepResult(
                 input_sequence=latest.envelope.sequence,
                 output_sequence=publication.pointer.sequence,
@@ -213,6 +248,7 @@ def paper_execution_constraint_publisher_builder(
                     "reference_slow": reference.generation_id,
                     "paper_execution_constraints": publication.pointer.batch_hash,
                 },
+                observations=observations,
             )
 
         return step
@@ -273,9 +309,7 @@ def runtime_health_publisher_builder(
                 input_sequence=source.sequence,
                 output_sequence=source.sequence,
                 processed_count=len(settings.sources),
-                source_generations={
-                    RUNTIME_HEALTH_DATASET_ID: publication.pointer.generation_id
-                },
+                source_generations={RUNTIME_HEALTH_DATASET_ID: publication.pointer.generation_id},
                 generation_published=publication.written,
             )
 
