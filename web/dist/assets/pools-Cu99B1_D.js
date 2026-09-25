@@ -1,1 +1,0 @@
-import{t as e}from"./PlaceholderPage-BLIdvUuf.js";import{i as t}from"./index-MhfqG-N3.js";var n=t();function r(){return(0,n.jsx)(e,{id:`pools`})}export{r as default};

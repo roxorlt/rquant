@@ -142,6 +142,58 @@ test("the rail collapses and the theme choice survives a reload", async ({ page 
   expect(watcher.problems).toEqual([]);
 });
 
+test("the longest phase label and a long unbroken serving detail fit a 390 px phone", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const watcher = watch(page);
+  const generationId = "f".repeat(64);
+  // Real degraded details are comma-joined ids with no spaces; this one has no hyphen
+  // either, so the browser finds no break opportunity of its own.
+  const detail = `serving generation degraded: runtime_health:degraded:${Array.from(
+    { length: 12 },
+    (_, index) => `missing:service_${index}.source.v1`,
+  ).join(",")}`;
+  await page.route("**/app/api/v1/meta", (route) =>
+    route.fulfill({
+      json: {
+        data: {
+          server_time: "2026-09-24T06:58:00Z",
+          viewer: "e2e",
+          generation: {
+            generation_id: generationId,
+            built_at: "2026-09-24T06:57:00Z",
+            published_at: null,
+            previous_generation_id: null,
+            producer_commit: "0".repeat(40),
+            schema_version: 3,
+            age_seconds: 60,
+          },
+          datasets: [],
+          projections: [],
+          market: {
+            trade_date: "2026-09-24",
+            phase: "closing_auction",
+            phase_label: "尾盘集合竞价",
+            is_trading_day: true,
+          },
+        },
+        serving: {
+          generation_id: generationId,
+          built_at: "2026-09-24T06:57:00Z",
+          state: "degraded",
+          detail,
+        },
+      },
+    }),
+  );
+  await page.goto("./#/overview");
+  await expect(page.getByRole("status")).toContainText("运行时数据处于降级状态");
+  await expect(page.getByText("尾盘集合竞价")).toBeVisible();
+  await expectNoHorizontalOverflow(page, "phone top bar and banner");
+  expect(watcher.problems).toEqual([]);
+});
+
 test("a newly published generation reaches the page within 20 seconds", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("./#/overview");

@@ -123,6 +123,7 @@
   letter-spacing: 0.08em;
 }
 .ph-note {
+  overflow-wrap: anywhere;
   font-size: 13px;
   color: var(--muted);
   max-width: 110ch;
@@ -197,6 +198,12 @@
   font-size: 13px;
   line-height: 1.55;
   color: var(--ink);
+}
+/* Serving details are long comma-joined identifiers with no spaces; let them break
+   anywhere instead of widening the page on phones. */
+.banner > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .banner .d {
   width: 8px;

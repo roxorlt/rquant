@@ -1,1 +1,0 @@
-import{i as e}from"./index-MhfqG-N3.js";var t=e();function n({kind:e=`plain`,children:n}){return(0,t.jsxs)(`span`,{className:e===`plain`?`pill`:`pill ${e}`,children:[(0,t.jsx)(`span`,{className:`d`,"aria-hidden":`true`}),n]})}export{n as t};
