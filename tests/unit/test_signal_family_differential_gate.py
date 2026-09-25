@@ -690,10 +690,10 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     # Each pull request refreezes the baseline to the merge commit its predecessor left on
-    # main; this one moves it from PR #303's to PR #309's. It is the merge base of the
+    # main; this one moves it from PR #309's to PR #310's. It is the merge base of the
     # endpoints an R07 run states, not something rediscovered from a ref.
-    assert BASELINE_COMMIT_SHA == "df621ef2eaaec3a3fc929d9be8a84d1bfa1249bd"
-    assert BASELINE_TREE_SHA == "7c4d17c98344f96c5c63c8858b323336abf9c5d9"
+    assert BASELINE_COMMIT_SHA == "793092fa11a963b044314ee134865748d8bb5530"
+    assert BASELINE_TREE_SHA == "f238a41b438940b18d85e4197bb09969c56c3ff0"
     assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -787,7 +787,7 @@ def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor(
     baseline ``9699827b``, ``45d0b57c`` was *not* its ancestor, so a candidate could descend
     from the baseline while having lost the historical one, and passing the baseline itself as
     the candidate reached exactly that state. Every baseline from Release B's ``2df97ed`` on -
-    including this topic's ``df621ef`` - does have ``45d0b57c`` behind it, so on this
+    including this topic's ``793092f`` - does have ``45d0b57c`` behind it, so on this
     repository the historical check is now implied by the
     baseline-descent check and cannot be reached through it - asserted below, so nobody reads
     the change as the constraint having been relaxed.
@@ -1589,7 +1589,7 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # them move with it; no boundary probe lives in either file, and the one in
     # strategy_runner.py (probe-r07-b01) sits above every change there - all statically
     # re-derived rather than asserted here.
-    # And this refreeze to df621ef leaves it out once more: the dashboard null-safe topic (the
+    # The refreeze to df621ef left it out once more: the dashboard null-safe topic (the
     # serving NA values and stale date bounds that crashed the health page, and a delivery
     # success rate that compared against a status OutboxStatus never had) adds no module under
     # src/rquant/ and changes one (dashboard/app.py), adds no test file and touches three
@@ -1599,8 +1599,25 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     # touch .github/workflows/ci.yml. It regenerates the shard manifest because the test count
     # changed (14894 -> 14896); the matrix is unchanged at five shards. It changes none of the
     # nine source_file_snapshots modules and no file a root or a boundary probe lives in, so no
-    # snapshot, root or probe moves. That is five refreezes in a row without a flip, and a
-    # named path would have flipped truth value eleven times in thirty-four refreezes: naming one
+    # snapshot, root or probe moves.
+    # And this refreeze to 793092f leaves it out once more: the v0.33.24 release (the
+    # reference-slow capture retry of #295, the per-device PushDeer recipients with the notifier
+    # cutover tooling, and the preview runtime console) adds three modules under src/rquant/
+    # (dashboard/preview_app.py, dashboard/preview_state.py, dashboard/runtime_console.py) and
+    # changes four (dashboard/app.py, reference_slow_runtime.py, runtime_service_builtin.py,
+    # serving_read_models.py), adds seven test files and one test helper module
+    # (tests/support/outbound_network_guard.py) and touches seven existing test modules (the
+    # seventh is this one), adds one script (notifier_delivery_cutover.py, stdlib-only checks
+    # that write nothing but the inputs document they are pointed at, which the assertion below
+    # holds to architecture), changes nothing under deploy/, marks nothing ``linux_exact``, adds
+    # no job and does not touch .github/workflows/ci.yml. It regenerates the shard manifest
+    # because the test count changed (14896 -> 14938); the matrix is unchanged at five shards.
+    # Of the nine source_file_snapshots modules it changes one, runtime_service_builtin.py (the
+    # per-day capture-attempt identities), so that snapshot moves with it; the root that lives
+    # in it, build_builtin_registry, sits below every change and keeps its digests, and
+    # probe-r07-b19 on that same function moves only its span - all statically re-derived
+    # rather than asserted here. That is six refreezes in a row without a flip, and a
+    # named path would have flipped truth value eleven times in thirty-five refreezes: naming one
     # asserts the shape of one particular diff, and the shape is not the property. The
     # property - tooling that runs in the production chain but lives outside the
     # declaration-scanned universe is categorized architecture, never production - is asserted
