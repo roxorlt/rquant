@@ -1,0 +1,128 @@
+name: Web
+
+# The React front end under web/ and the read-only web API it talks to.
+# One Linux job, path-filtered, independent of ci.yml (whose R07 evidence jobs are
+# bound to ci.yml's own path): lint, types, unit tests, rebuild of the committed
+# web/dist, OpenAPI → TypeScript type chain, then the browser smoke tests against
+# the web API over a synthetic Serving generation.
+
+on:
+  pull_request:
+    paths:
+      - "web/**"
+      - "src/rquant/web/**"
+      - "src/rquant/cli.py"
+      - "src/rquant/serving_*.py"
+      - "src/rquant/dashboard/serving_*"
+      - "src/rquant/panorama_data.py"
+      - "scripts/build_web_fixture.py"
+      - "tests/support/web_serving_fixture.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/web.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "src/rquant/web/**"
+      - "src/rquant/cli.py"
+      - "src/rquant/serving_*.py"
+      - "src/rquant/dashboard/serving_*"
+      - "src/rquant/panorama_data.py"
+      - "scripts/build_web_fixture.py"
+      - "tests/support/web_serving_fixture.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/web.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  web:
+    name: Web front end (lint, types, unit, dist, API types, e2e)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install locked front-end dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint and format check (Biome)
+        run: pnpm run lint
+
+      - name: Type check
+        run: pnpm run typecheck
+
+      - name: Unit and component tests (Vitest)
+        run: pnpm run test
+
+      - name: Rebuild web/dist, compare with the committed copy, check the size budget
+        run: pnpm run verify:dist
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv and the locked Python environment
+        working-directory: .
+        run: |
+          python -m pip install uv==0.10.11
+          uv sync --frozen
+
+      - name: OpenAPI snapshot matches the API
+        run: |
+          uv run --no-sync rquant web-openapi > "$RUNNER_TEMP/openapi.json"
+          diff -u src/api/openapi.json "$RUNNER_TEMP/openapi.json"
+
+      - name: Generated TypeScript types match the snapshot
+        run: |
+          pnpm run gen:api
+          git diff --exit-code -- src/api/schema.d.ts
+
+      - name: Cache the Playwright browser
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+
+      - name: Install headless Chromium and its system libraries
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      - name: Browser smoke tests (Playwright, synthetic Serving generation)
+        env:
+          CI: "true"
+          RQ_E2E_SERVING_ROOT: ${{ runner.temp }}/web-e2e/serving
+        run: pnpm run e2e
+
+      - name: Upload the Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: web-playwright-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
