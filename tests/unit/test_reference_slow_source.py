@@ -1775,9 +1775,11 @@ def test_a_failed_capture_stays_on_the_heartbeat_until_the_trade_date_rolls_over
 
     with pytest.raises(ReferenceSlowSourceError, match="missing columns: delist_date"):
         step()
-    #: the retry in the window: the same logical request id was already used (#295)
+    #: the retry in the window asks Tushare again under the day's next attempt (#295) --
+    #: before the fix it was refused `reference source attempt already exists` -- and this
+    #: adapter fails it the same way
     now[0] = datetime(2026, 7, 31, 1, 20, 51, tzinfo=UTC)
-    with pytest.raises(Exception, match="reference source attempt already exists"):
+    with pytest.raises(ReferenceSlowSourceError, match="missing columns: delist_date"):
         step()
 
     now[0] = datetime(2026, 7, 31, 1, 25, 30, tzinfo=UTC)

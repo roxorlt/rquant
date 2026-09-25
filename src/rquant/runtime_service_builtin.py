@@ -43,7 +43,7 @@ from rquant.runtime_candidate_universe import (
     RuntimeCandidateUniverseConfig,
     RuntimeCandidateUniverseLoader,
 )
-from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
+from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256, normalize_aware_utc
 from rquant.runtime_market_session import (
     MarketCalendarAuthority,
     MarketSessionCalendarError,
@@ -208,6 +208,83 @@ class ReferenceSlowPublisherSettings(RuntimeContractModel):
         return value
 
 
+#: How many captures one trading day may send for one target session and logical revision
+#: (#295). Before this the attempt identity was (source, target session, the manifest's
+#: constant `retry_ordinal`), so the ledger held one attempt per session: a capture that
+#: failed once -- a validation defect (09-14/18/21/22/23), `adj_factor` not published yet at
+#: 09:20, a transport error -- turned every later round of the 09:20-09:25 window into
+#: `reference source attempt already exists` and the day had no reference generation.
+#: At the thirty-second interval a failing morning reaches its sixth attempt around 09:23,
+#: about the last start whose batch the publisher (~80 s a round on the host, #297) can still
+#: commit before 09:25; the cap only ever binds on a defect that fails every attempt, and
+#: bounds it at six captures (about forty transport units, against 500 a minute).
+REFERENCE_SLOW_MAX_CAPTURE_ATTEMPTS = 6
+
+
+def _reference_attempt_request_id(
+    *,
+    source: str,
+    target_trade_date: date,
+    retry_ordinal: int,
+    capture_trade_date: date,
+    capture_attempt: int,
+) -> str:
+    """The ledger identity of one capture: the target, the revision, and which try of which day.
+
+    The first try of a same-day capture keeps the identity v0.33.23 sent, so a good morning
+    sends exactly what it sent before and a ledger written by either version is read the same
+    way. Every other try -- a retry, or any try at a past session (the revision scan) -- names
+    the day it belongs to: a revision of session T asked on T+1 used to be the identity T had
+    already used for its own scan, and was refused `already exists: success` (#295).
+    """
+
+    identity: dict[str, object] = {
+        "protocol": "reference-source-attempt-v2",
+        "source": source,
+        "target_trade_date": target_trade_date,
+        "logical_revision": retry_ordinal,
+    }
+    if capture_attempt or capture_trade_date != target_trade_date:
+        identity["capture_trade_date"] = capture_trade_date
+        identity["capture_attempt"] = capture_attempt
+    return canonical_sha256(identity)
+
+
+def _next_reference_attempt(
+    request_ids: tuple[str, ...],
+    *,
+    outcome_of: Callable[[str], SourceQuotaAttemptOutcome | None],
+    capture_trade_date: date,
+) -> str:
+    """The first try the ledger has not seen, after tries that all ended (#295).
+
+    A try that ended -- `success` or `failure` -- leaves room for the next one: what a capture
+    produced stands only once it is in the spool, and `capture_reference_slow_batch` stops asking
+    as soon as it is -- the session's batch for the capture, the revision-scan cursor for a
+    revision -- so the only tries that can precede this call are ones whose capture or
+    publication did not stand. In `transport` accounting `success` does not
+    even mean that much: every Tushare call returned, and the validation after them may have
+    refused (2026-09-23). A try that is `pending` or `unknown` may have reached Tushare and
+    its answer is lost, so nothing is sent after it that day: the kill guarantee. A missing
+    try followed by a recorded one is a ledger this code did not write, and is refused.
+    """
+
+    outcomes = tuple(outcome_of(request_id) for request_id in request_ids)
+    for index, outcome in enumerate(outcomes):
+        if outcome is None:
+            if any(later is not None for later in outcomes[index + 1 :]):
+                raise SourceQuotaConflictError("reference source attempt ledger skips an attempt")
+            return request_ids[index]
+        if outcome in {SourceQuotaAttemptOutcome.PENDING, SourceQuotaAttemptOutcome.UNKNOWN}:
+            raise SourceQuotaConflictError(
+                f"reference source attempt already exists: {outcome.value}"
+            )
+    raise SourceQuotaConflictError(
+        f"reference source attempt already exists: {outcomes[-1].value}; all "
+        f"{len(request_ids)} capture attempts for {capture_trade_date.isoformat()} are used"
+    )
+
+
 def _capture_reference_with_quota(
     *,
     settings: ReferenceSlowSourceSettings,
@@ -219,6 +296,7 @@ def _capture_reference_with_quota(
     completion_clock: Callable[[], datetime],
     producer_commit: str,
     retry_ordinal: int = 0,
+    max_attempts: int = 1,
     transport_observer: QuotaBoundTransportObserver | None = None,
     read_gate: ReplicaReadGate[Any] | None = None,
 ) -> ReferenceSlowSourceSnapshot | ReferenceSlowQuotaCapture:
@@ -226,14 +304,19 @@ def _capture_reference_with_quota(
 
     if type(retry_ordinal) is not int or retry_ordinal < 0:
         raise ValueError("retry_ordinal must be a nonnegative int")
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive int")
 
-    logical_request_id = canonical_sha256(
-        {
-            "protocol": "reference-source-attempt-v2",
-            "source": settings.source,
-            "target_trade_date": target_trade_date,
-            "logical_revision": retry_ordinal,
-        }
+    capture_trade_date = normalize_aware_utc(observed_at).astimezone(_SHANGHAI).date()
+    request_ids = tuple(
+        _reference_attempt_request_id(
+            source=settings.source,
+            target_trade_date=target_trade_date,
+            retry_ordinal=retry_ordinal,
+            capture_trade_date=capture_trade_date,
+            capture_attempt=capture_attempt,
+        )
+        for capture_attempt in range(max_attempts)
     )
     if settings.quota_accounting_mode == "transport":
         if transport_observer is None:
@@ -243,11 +326,11 @@ def _capture_reference_with_quota(
             now=observed_at,
             min_age=timedelta(seconds=settings.pending_recovery_min_age_seconds),
         )
-        existing_outcome = transport_observer.request_outcome(logical_request_id)
-        if existing_outcome is not None:
-            raise SourceQuotaConflictError(
-                f"reference source attempt already exists: {existing_outcome.value}"
-            )
+        logical_request_id = _next_reference_attempt(
+            request_ids,
+            outcome_of=transport_observer.request_outcome,
+            capture_trade_date=capture_trade_date,
+        )
         with transport_observer.scope(
             logical_request_id=logical_request_id,
             observed_at=observed_at,
@@ -289,12 +372,16 @@ def _capture_reference_with_quota(
         now=observed_at,
         min_age=timedelta(seconds=settings.pending_recovery_min_age_seconds),
     )
-    attempt_id = logical_request_id
-    existing = quota_store.get_attempt(attempt_id)
-    if existing is not None:
-        raise SourceQuotaConflictError(
-            f"reference source attempt already exists: {existing.outcome.value}"
-        )
+
+    def recorded_outcome(request_id: str) -> SourceQuotaAttemptOutcome | None:
+        existing = quota_store.get_attempt(request_id)
+        return None if existing is None else existing.outcome
+
+    attempt_id = _next_reference_attempt(
+        request_ids,
+        outcome_of=recorded_outcome,
+        capture_trade_date=capture_trade_date,
+    )
     attempt = quota_store.begin_attempt(
         source=settings.source,
         owner=f"reference-slow:{attempt_id}",
@@ -415,8 +502,9 @@ def reference_slow_source_builder(
         #: 「今天的采集失败过、而且今天一次都没成」一直挂到交易日切换为止（#293，#277 的
         #: 同一类）。改动前失败的那一轮把心跳写成 failed，09:25 窗口一过，早退分支返回的
         #: 干净结果就把它洗成 running：09-14 起每天 09:20 都失败，09:25 起心跳又是干净的，
-        #: 看心跳看不出参考慢源从来没发布过。只记第一次失败的异常类名——之后几轮撞的是
-        #: `SourceQuotaConflictError`（同一天的请求号已经用过），它不是原因。
+        #: 看心跳看不出参考慢源从来没发布过。只记第一次失败的异常类名——之后几轮可能撞的是
+        #: `SourceQuotaConflictError`（当天的尝试次数用完、或上一次尝试结果未知，#295），
+        #: 它不是原因。
         capture_failed_trade_date: date | None = None
         capture_failed_reason: str | None = None
         captured_trade_date: date | None = None
@@ -442,6 +530,7 @@ def reference_slow_source_builder(
                     completion_clock=clock,
                     producer_commit=manifest.producer_commit,
                     retry_ordinal=settings.retry_ordinal,
+                    max_attempts=REFERENCE_SLOW_MAX_CAPTURE_ATTEMPTS,
                     transport_observer=transport_observer,
                     read_gate=replica_gate,
                 )
@@ -462,6 +551,7 @@ def reference_slow_source_builder(
                     completion_clock=clock,
                     producer_commit=manifest.producer_commit,
                     retry_ordinal=settings.retry_ordinal + 1,
+                    max_attempts=REFERENCE_SLOW_MAX_CAPTURE_ATTEMPTS,
                     transport_observer=transport_observer,
                     read_gate=replica_gate,
                 )
