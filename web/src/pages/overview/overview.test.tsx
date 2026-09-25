@@ -48,12 +48,19 @@ describe("总览", () => {
     expect(rows[1]?.querySelector('.status[data-state="crit"]')).not.toBeNull();
   });
 
-  it("explains shadow deliveries in a tooltip", async () => {
+  it("explains shadow deliveries and the paper valuation in tooltips", async () => {
     const user = userEvent.setup();
     await renderOverview();
     const table = screen.getByRole("table", { name: "最新信号" });
     await user.hover(within(table).getAllByText("仅记录")[0] as HTMLElement);
     expect(await screen.findByRole("tooltip")).toHaveTextContent("正式推送开通前只记录不发送");
+    await user.unhover(within(table).getAllByText("仅记录")[0] as HTMLElement);
+    await user.hover(screen.getByText("99,990.00"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("tooltip").some((tip) => tip.textContent?.includes("最近成交价")),
+      ).toBe(true),
+    );
   });
 
   it("renders every missing value as a dash", async () => {
@@ -84,6 +91,7 @@ describe("总览", () => {
     expect(holdings).toHaveTextContent("丽岛新材603937.SH10012.7612.711,270.64−5.00−0.39%");
     const attention = screen.getByText("1 条推送失败").closest("li") as HTMLElement;
     expect(attention).toHaveTextContent("需处理1 条推送失败手机可能没有收到这些信号看健康");
+    expect(screen.queryByText(/模拟账户/)).not.toBeInTheDocument();
     expect(within(attention).getByRole("link", { name: "看健康" })).toHaveAttribute(
       "href",
       "/health",

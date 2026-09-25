@@ -17,6 +17,9 @@ from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.web.labels import dataset_label, split_service_id
 from rquant.web.market import MARKET_TIMEZONE, MarketPhase
 
+#: The paper broker's watermark reason when holdings are marked at the last fill.
+PAPER_VALUATION_REASON = "last execution price"
+PAPER_VALUATION_NOTE = "持仓按最近成交价估值，不是实时价"
 #: The reference publisher's deadline (#297 / #298, #301 S-1): today's reference
 #: generation must be visible by 09:25; every round after that refuses by design.
 REFERENCE_DEADLINE = time(9, 25)
@@ -222,8 +225,9 @@ def watermark_status(watermark: ServingDatasetWatermark) -> Status:
             # The dataset is on time; "degraded" means some service is, and the
             # services table already says which.
             return Status(UserState.OK, "按时", "按时更新；个别服务的状态见运行服务表")
-        if "last execution price" in reason:
-            return Status(UserState.WARN, "注意", "持仓按最近成交价估值，不是实时价")
+        if PAPER_VALUATION_REASON in reason:
+            # Nothing to act on: the account is on time, only valued at the last fill.
+            return Status(UserState.OK, "按时", f"按时更新；{PAPER_VALUATION_NOTE}")
         return Status(UserState.WARN, "注意", "数据不完整")
     name = dataset_label(watermark.dataset_id)
     return Status(UserState.IDLE, "未发布", f"{name}服务没有运行，暂时没有数据")
@@ -281,6 +285,8 @@ __all__ = [
     "CRIT_FAILURES",
     "SHADOW_NOTE",
     "DeliveryMode",
+    "PAPER_VALUATION_NOTE",
+    "PAPER_VALUATION_REASON",
     "REFERENCE_DEADLINE",
     "STATE_ORDER",
     "Status",

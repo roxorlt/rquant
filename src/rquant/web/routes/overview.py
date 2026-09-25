@@ -53,6 +53,8 @@ from rquant.web.routes.health import (
 from rquant.web.security import current_user
 from rquant.web.serving import serving_meta
 from rquant.web.status import (
+    PAPER_VALUATION_NOTE,
+    PAPER_VALUATION_REASON,
     SHADOW_NOTE,
     DeliveryMode,
     UserState,
@@ -295,10 +297,11 @@ def _paper(context: GenerationContext, names: dict[str, str]) -> PaperSummary | 
     ]
     note = None
     for watermark in context.manifest.watermarks:
-        if watermark.dataset_id == "paper_accounts":
-            status = watermark_status(watermark)
-            if status.state is UserState.WARN:
-                note = status.reason
+        if (
+            watermark.dataset_id == "paper_accounts"
+            and PAPER_VALUATION_REASON in (watermark.reason or "").lower()
+        ):
+            note = PAPER_VALUATION_NOTE
     items = []
     for row in holdings:
         cost = _float(row.average_cost) * _float(row.quantity)
@@ -536,9 +539,13 @@ def _attention(
             )
             for item in warn
         )
-    warned = [item for item in freshness if item.status.state is UserState.WARN]
-    late = [item for item in warned if item.status.label != "注意"]
-    caveats = [item for item in warned if item.status.label == "注意"]
+    # Only what the owner should look at: late data. Caveats (e.g. how the paper account
+    # is valued) live in tooltips next to the numbers they qualify.
+    late = [
+        item
+        for item in freshness
+        if item.status.state is UserState.WARN and item.status.label != "注意"
+    ]
     if len(late) > 2:
         items.append(
             AttentionItem(
@@ -560,16 +567,6 @@ def _attention(
             )
             for item in late
         )
-    items.extend(
-        AttentionItem(
-            level="warn",
-            title=f"{item.name}需要注意",
-            reason=item.status.reason,
-            to="/health",
-            action="看健康",
-        )
-        for item in caveats
-    )
     return items[:_MAX_ATTENTION]
 
 

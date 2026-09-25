@@ -120,8 +120,13 @@ function kpis(data: OverviewData): Kpi[] {
     {
       key: "paper",
       label: "模拟盘净值",
-      value: paper ? formatNumber(paper.nav, 2) : EMPTY,
-      tip: paper ? (paper.note ?? `账户 ${paper.account_id}`) : "还没有模拟账户数据",
+      value: paper ? (
+        <Tip content={[paper.note, `账户 ${paper.account_id}`].filter(Boolean).join("；")}>
+          <span>{formatNumber(paper.nav, 2)}</span>
+        </Tip>
+      ) : (
+        EMPTY
+      ),
       sub: paper ? (
         <>
           浮动盈亏{" "}
@@ -163,8 +168,6 @@ function kpis(data: OverviewData): Kpi[] {
             ? `${freshness.late.slice(0, 2).join("、")}等 ${freshness.late.length} 项没按时`
             : `${freshness.late.join("、")}没按时`}
         </span>
-      ) : freshness.caveats.length ? (
-        <span className="t-warn">{freshness.caveats.join("、")}需要注意</span>
       ) : (
         "全部按时"
       ),

@@ -148,11 +148,9 @@ def test_overview_attention_lists_what_needs_a_look(baseline: Path) -> None:
     attention = _get(baseline, "/api/v1/overview", AFTER_CLOSE)["data"]["attention"]
 
     titles = [item["title"] for item in attention]
-    # Shadow delivery is one plain item instead of the notifier's generic 注意; the
-    # reference publisher's by-design refusals are not in the list.
-    assert "推送还没有正式开通" in titles
-    assert "通知推送需要注意" not in titles
-    assert not any("参考数据" in title for title in titles)
+    # Shadow delivery is one plain item; the reference publisher's by-design refusals and
+    # the paper account's valuation are not in the list at all.
+    assert titles == ["推送还没有正式开通"]
     assert all(item["to"] == "/health" for item in attention)
     assert all(not _SHA256.search(item["title"] + item["reason"]) for item in attention)
 
@@ -436,3 +434,27 @@ def test_a_live_notifier_reports_real_deliveries_as_delivered() -> None:
 
     assert _delivery_state([Row()], live) == "delivered"  # type: ignore[list-item]
     assert _delivery_state([Row()], shadow) == "recorded"  # type: ignore[list-item]
+
+
+def test_the_paper_valuation_caveat_is_a_tooltip_not_an_attention_item(
+    degraded: Path,
+) -> None:
+    from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
+    from rquant.web.status import watermark_status
+
+    watermark = ServingDatasetWatermark(
+        dataset_id="paper_accounts",
+        generation_id="a" * 64,
+        event_time=AFTER_CLOSE,
+        published_at=AFTER_CLOSE,
+        sequence=1,
+        status=FreshnessStatus.DEGRADED,
+        reason="paper account marks use last execution prices",
+    )
+
+    status = watermark_status(watermark)
+
+    assert (status.state.value, status.label) == ("ok", "按时")
+    assert "持仓按最近成交价估值" in status.reason
+    attention = _get(degraded, "/api/v1/overview", AFTER_CLOSE)["data"]["attention"]
+    assert not any("模拟账户" in item["title"] for item in attention)

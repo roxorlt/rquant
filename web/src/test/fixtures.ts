@@ -216,7 +216,7 @@ export function overviewEnvelope(
         checked: 10,
         no_source: 2,
         late: ["日线", "分钟线"],
-        caveats: ["模拟账户"],
+        caveats: [],
       },
       attention: [
         {
