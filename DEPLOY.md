@@ -112,7 +112,7 @@ jq '{status,degraded_reasons,consecutive_failures,backlog_count,last_error}' \
   "$ROOT"/control/notifiers/$NSVC/heartbeats/*.json
 #   期望：degraded_reasons 含 notifier:shadow_transport（可能还有 notifier:recipient_ids_inferred:pushdeer）；
 #   consecutive_failures 0；backlog_count 0；last_error null
-jq '{sequence,generation_id,producer_commit}' \
+jq '{publication_id,generation_id,published_at,producer_commit}' \
   "$ROOT"/live/notifications/$NSVC/serving-authority/current.json   # 期望 producer_commit == $COMMIT
 "$WT/.venv/bin/python" - "$ROOT/live/notifications/$NSVC/notification_state.sqlite3" <<'EOF'
 import sqlite3, sys
@@ -226,7 +226,7 @@ diff <(cut -f1,2 /tmp/cutover-before.tsv) <(cut -f1,2 /tmp/cutover-after.tsv)
 ```
 
 之后每条新信号：`delivery_attempt.provider_receipt` 以 `pushdeer:` 开头，每条信号两台设备各一行、各推一次；
-serving-authority 的 `sequence` 跟着前进。
+`serving-authority/current.json` 的 `published_at` 与 `generation_id` 跟着变。
 
 **停止条件**（出现任何一条就按下面「回滚」做 R1，然后再判断）：
 
