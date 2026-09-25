@@ -6,6 +6,28 @@
 
 ### Added
 
+- **Preview 多页导航：运行控制台上线到看板同一进程（`preview_app.py`）**：owner 打开的 Streamlit
+  preview 之前只有健康看板一页，看不到路线 A 新 runtime 的信号、模拟盘、服务健康和推送。新增
+  `src/rquant/dashboard/runtime_console.py`，把 `codex/lab-job-center` 分支上 2026-07-31 写的
+  只读运行控制台页面（该分支未合并、已过时）搬到 main 上，改接 main 当前的
+  `runtime_console_data.load_runtime_console` API 和当前 serving schema：服务健康（按 live /
+  serving / research 三个 plane 分列）、信号（策略、动作、标的、时间、原因）、推送（渠道、状态、
+  尝试次数）、模拟账户（现金、净值、盈亏）、模拟持仓、Lab Jobs 与策略晋级（这两个 projection 当前
+  serving 侧多为空表，走占位文案而不是报错）。所有空值 / NA 统一渲染成"—"，不让页面崩。
+  新增 `src/rquant/dashboard/preview_app.py`，用 `st.navigation` 把健康看板（`app.py`）和运行
+  控制台挂进同一个 session（两个子页各自调用一次 `st.set_page_config`——已确认当前
+  streamlit==1.57.0 里这个调用是仅追加式更新，不要求是脚本第一条命令，两页都能正常渲染）。
+  **Strategy Lab（`lab/app.py`）没有挂进来**：它没有"未配置凭据则拒绝写入"的只读开关，唯一挡着
+  写入的是 `_job_center_runtime()` 要求 `RQUANT_RUNTIME_ROOT` 且 Job Center 权威 manifest 验证
+  通过——这是当前部署没有任何 systemd unit 给它设那个环境变量的副作用，不是代码里设计好的安全
+  模式，一旦环境变量被设置，`PageControlClient`（默认 POST 到生产常驻的
+  `rquant-page-control.service`，`127.0.0.1:8767`）就会直接把提交/暂停/恢复/取消/导出命令送进
+  生产 Job Center（写路径：`src/rquant/dashboard/lab/app.py:124,299,607,1450,1475`、
+  `src/rquant/page_control.py:2545`）。在这一点被证伪之前，preview 只挂两个只读页。
+  新增 `tests/unit/test_runtime_console_page.py`（AppTest 子进程渲染最小 serving root，覆盖
+  信号/推送/模拟盘/占位）与 `tests/unit/test_preview_app.py`（两页都能渲染且互相切换不报错），
+  恢复 `tests/unit/test_runtime_console_import.py`（导入零副作用）。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
