@@ -1876,6 +1876,67 @@ def test_notifier_does_not_consume_routes_beyond_observed_at(tmp_path: Path) -> 
     assert result.backlog_count == 1
 
 
+
+@pytest.mark.parametrize("suppress_delivery", [True, False], ids=["shadow", "live"])
+def test_a_two_device_credential_still_publishes_the_signals_authority(
+    tmp_path: Path,
+    suppress_delivery: bool,
+) -> None:
+    """The host's credential shape, with the serving authority the host configures.
+
+    `PUSHDEER_KEYS` on the host carries the owner's two devices and the sealed credential
+    carries no recipient ids, so the loader infers `admin.device-01` / `admin.device-02`
+    and the frozen alias migration turns every routed `admin` row into two device rows.
+    Every other case with two devices here runs without `serving_authority_root`, so the
+    publish that follows the batch was never exercised with them: it built
+    `ServingReadModelInput` over the device rows, refused them as "outside the frozen route
+    manifest", and failed the round -- after the batch had already run, so in live mode the
+    push went out and the `signals` authority never followed, on every round from the first
+    routed signal on. The route receipt is published unchanged; the deliveries are the two
+    device rows.
+    """
+
+    state = _seed_outbox(tmp_path)
+    transport = _RecordingTransport()
+    provider_loader = build_environment_notification_provider_loader(
+        environment={"PUSHDEER_KEYS": "iphone-key,mac-key"},
+        transport=transport,
+    )
+    authority_root = (tmp_path / "serving-signals").resolve()
+    step = notifier_builder(provider_loader=provider_loader, clock=lambda: NOW)(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+            suppress_delivery=suppress_delivery,
+        )
+    )
+
+    result = step()
+    published = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    assert result.processed_count == 2
+    assert "notifier:recipient_ids_inferred:pushdeer" in result.degraded_reasons
+    assert ("notifier:shadow_transport" in result.degraded_reasons) is suppress_delivery
+    assert transport.calls == (
+        [] if suppress_delivery
+        else [(DeliveryChannel.PUSHDEER, "iphone-key"), (DeliveryChannel.PUSHDEER, "mac-key")]
+    )
+    (route,) = published.payload.routes
+    assert [target.recipient_id for target in route.targets] == ["admin"]
+    assert sorted(delivery.target.recipient_id for delivery in published.payload.deliveries) == [
+        "admin.device-01",
+        "admin.device-02",
+    ]
+    assert all(
+        delivery.status is OutboxStatus.SUCCEEDED for delivery in published.payload.deliveries
+    )
+    assert state.recipient_migration_audits()[0].outcome == "migrated"
+
 def test_notifier_serving_authority_preserves_complete_no_target_receipt(
     tmp_path: Path,
 ) -> None:
