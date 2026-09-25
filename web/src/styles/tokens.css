@@ -1,0 +1,171 @@
+/*
+ * rQuant design tokens (light / dark): the approved platform prototype's :root
+ * variables (2026-09-25), with the font stacks switched to the bundled Latin
+ * faces plus system Chinese fonts.
+ *
+ * This is the only copy of the palette: the chart wrappers (charts/tokens.ts)
+ * and antd (ui/theme.ts) read these variables at runtime.
+ *
+ * Colour convention: A-share red-up / green-down (--up is red, --down green).
+ * Dark mode follows the system unless the viewer picked a theme, which sets
+ * data-theme="light" | "dark" on <html> (theme/ThemeProvider.tsx).
+ */
+:root {
+  --ground: #f4f6f8;
+  --surface: #ffffff;
+  --surface-2: #f8f9fb;
+  --sunken: #edf0f3;
+  --ink: #151922;
+  --ink-2: #2e3542;
+  --muted: #5b6474;
+  --faint: #7f8898;
+  --rule: #e1e5ea;
+  --rule-strong: #c9d0d9;
+  --grid: #edf0f3;
+  --accent: #2e58e6;
+  --accent-hover: #2449c9;
+  --accent-weak: #e9eefd;
+  --accent-t: #2447c2;
+  --accent-ink: #ffffff;
+  --up: #d6333b;
+  --up-t: #c4262f;
+  --up-weak: #fcebec;
+  --down: #17975a;
+  --down-t: #0f7c48;
+  --down-weak: #e3f3ea;
+  --warn: #c4870a;
+  --warn-t: #8c5f05;
+  --warn-weak: #fbf2de;
+  --crit: #d6333b;
+  --crit-t: #b3242c;
+  --crit-weak: #fcebec;
+  --ok: #17975a;
+  --ok-t: #0e7642;
+  --ok-weak: #e3f3ea;
+  --idle: #8a93a3;
+  --idle-t: #5b6474;
+  --idle-weak: #edf0f3;
+  --s1: #2e58e6;
+  --s2: #e0781f;
+  --s3: #1f9bb8;
+  --q1: #9db2f5;
+  --q2: #6f8dee;
+  --q3: #2e58e6;
+  --q4: #1e3fb3;
+  --q5: #122978;
+  --neutral: #e6e9ed;
+  --shadow-pop: 0 12px 32px rgba(21, 25, 34, 0.14), 0 2px 6px rgba(21, 25, 34, 0.06);
+  --scrim: rgba(14, 17, 22, 0.36);
+
+  /* Chinese text uses system fonts; only the Latin IBM Plex faces are bundled. */
+  --font-sans:
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", "Noto Sans CJK SC",
+    "Noto Sans SC", system-ui, sans-serif;
+  --font-head: "IBM Plex Sans Condensed", var(--font-sans);
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --topbar-h: 56px;
+  --rail-w: 212px;
+  --rail-w-min: 60px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #0e1116;
+    --surface: #161a21;
+    --surface-2: #1a1f27;
+    --sunken: #11151b;
+    --ink: #e7eaf0;
+    --ink-2: #c7cdd8;
+    --muted: #8a94a6;
+    --faint: #6e7889;
+    --rule: #262c36;
+    --rule-strong: #363d49;
+    --grid: #1f242c;
+    --accent: #7090ff;
+    --accent-hover: #8aa4ff;
+    --accent-weak: #1b2442;
+    --accent-t: #9db2ff;
+    --accent-ink: #0e1116;
+    --up: #f2555d;
+    --up-t: #f46a71;
+    --up-weak: #3a1c20;
+    --down: #2fbf7a;
+    --down-t: #3ccb86;
+    --down-weak: #122c1f;
+    --warn: #e0a93a;
+    --warn-t: #edbe5e;
+    --warn-weak: #33280f;
+    --crit: #f2555d;
+    --crit-t: #ff8a90;
+    --crit-weak: #3a1c20;
+    --ok: #2fbf7a;
+    --ok-t: #5fd39a;
+    --ok-weak: #122c1f;
+    --idle: #6e7889;
+    --idle-t: #a3acbc;
+    --idle-weak: #1f242c;
+    --s1: #5a7bf2;
+    --s2: #c96a1c;
+    --s3: #1c9da8;
+    --q1: #2e4a9e;
+    --q2: #4a6bd8;
+    --q3: #7090ff;
+    --q4: #9db2ff;
+    --q5: #c9d5ff;
+    --neutral: #2a303a;
+    --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.3);
+    --scrim: rgba(0, 0, 0, 0.55);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ground: #0e1116;
+  --surface: #161a21;
+  --surface-2: #1a1f27;
+  --sunken: #11151b;
+  --ink: #e7eaf0;
+  --ink-2: #c7cdd8;
+  --muted: #8a94a6;
+  --faint: #6e7889;
+  --rule: #262c36;
+  --rule-strong: #363d49;
+  --grid: #1f242c;
+  --accent: #7090ff;
+  --accent-hover: #8aa4ff;
+  --accent-weak: #1b2442;
+  --accent-t: #9db2ff;
+  --accent-ink: #0e1116;
+  --up: #f2555d;
+  --up-t: #f46a71;
+  --up-weak: #3a1c20;
+  --down: #2fbf7a;
+  --down-t: #3ccb86;
+  --down-weak: #122c1f;
+  --warn: #e0a93a;
+  --warn-t: #edbe5e;
+  --warn-weak: #33280f;
+  --crit: #f2555d;
+  --crit-t: #ff8a90;
+  --crit-weak: #3a1c20;
+  --ok: #2fbf7a;
+  --ok-t: #5fd39a;
+  --ok-weak: #122c1f;
+  --idle: #6e7889;
+  --idle-t: #a3acbc;
+  --idle-weak: #1f242c;
+  --s1: #5a7bf2;
+  --s2: #c96a1c;
+  --s3: #1c9da8;
+  --q1: #2e4a9e;
+  --q2: #4a6bd8;
+  --q3: #7090ff;
+  --q4: #9db2ff;
+  --q5: #c9d5ff;
+  --neutral: #2a303a;
+  --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.3);
+  --scrim: rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
