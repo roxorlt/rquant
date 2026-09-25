@@ -61,6 +61,179 @@
         "title": "AttentionItem",
         "type": "object"
       },
+      "BoardRow": {
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "board_code": {
+            "title": "Board Code",
+            "type": "string"
+          },
+          "board_name": {
+            "title": "Board Name",
+            "type": "string"
+          },
+          "broken_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Broken Count"
+          },
+          "leading_stock": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leading Stock"
+          },
+          "limit_up_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up Count"
+          },
+          "limit_up_ratio_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up Ratio Pct"
+          },
+          "main_net_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main Net Amount"
+          },
+          "main_net_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main Net Rate"
+          },
+          "pct_chg_median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg Median"
+          },
+          "stock_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stock Count"
+          }
+        },
+        "required": [
+          "board_code",
+          "board_name",
+          "amount",
+          "main_net_amount",
+          "main_net_rate",
+          "pct_chg_median",
+          "limit_up_count",
+          "broken_count",
+          "limit_up_ratio_pct",
+          "stock_count",
+          "leading_stock"
+        ],
+        "title": "BoardRow",
+        "type": "object"
+      },
+      "BoardsData": {
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "has_flow": {
+            "title": "Has Flow",
+            "type": "boolean"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/BoardRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "system": {
+            "title": "System",
+            "type": "string"
+          },
+          "systems": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Systems",
+            "type": "array"
+          }
+        },
+        "required": [
+          "system",
+          "systems",
+          "has_flow",
+          "as_of",
+          "rows"
+        ],
+        "title": "BoardsData",
+        "type": "object"
+      },
       "CandidateGroup": {
         "properties": {
           "as_of": {
@@ -207,6 +380,126 @@
         "title": "CandidatesSummary",
         "type": "object"
       },
+      "DailyBar": {
+        "properties": {
+          "close": {
+            "title": "Close",
+            "type": "number"
+          },
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "high": {
+            "title": "High",
+            "type": "number"
+          },
+          "low": {
+            "title": "Low",
+            "type": "number"
+          },
+          "ma10": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ma10"
+          },
+          "ma20": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ma20"
+          },
+          "ma5": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ma5"
+          },
+          "open": {
+            "title": "Open",
+            "type": "number"
+          },
+          "provisional": {
+            "title": "Provisional",
+            "type": "boolean"
+          },
+          "volume": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Volume"
+          }
+        },
+        "required": [
+          "date",
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume",
+          "ma5",
+          "ma10",
+          "ma20",
+          "provisional"
+        ],
+        "title": "DailyBar",
+        "type": "object"
+      },
+      "DailyData": {
+        "properties": {
+          "bars": {
+            "items": {
+              "$ref": "#/components/schemas/DailyBar"
+            },
+            "title": "Bars",
+            "type": "array"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts_code",
+          "name",
+          "bars"
+        ],
+        "title": "DailyData",
+        "type": "object"
+      },
       "DatasetWatermarkInfo": {
         "properties": {
           "dataset_id": {
@@ -329,6 +622,38 @@
         "title": "DeliveriesSummary",
         "type": "object"
       },
+      "Envelope_BoardsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BoardsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BoardsData]",
+        "type": "object"
+      },
+      "Envelope_DailyData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DailyData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[DailyData]",
+        "type": "object"
+      },
       "Envelope_HealthData_": {
         "properties": {
           "data": {
@@ -343,6 +668,38 @@
           "serving"
         ],
         "title": "Envelope[HealthData]",
+        "type": "object"
+      },
+      "Envelope_IntradayData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/IntradayData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[IntradayData]",
+        "type": "object"
+      },
+      "Envelope_MembersData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MembersData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MembersData]",
         "type": "object"
       },
       "Envelope_MetaData_": {
@@ -375,6 +732,54 @@
           "serving"
         ],
         "title": "Envelope[OverviewData]",
+        "type": "object"
+      },
+      "Envelope_PulseData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PulseData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PulseData]",
+        "type": "object"
+      },
+      "Envelope_SurgeData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SurgeData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[SurgeData]",
+        "type": "object"
+      },
+      "Envelope_SurgeSearchData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SurgeSearchData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[SurgeSearchData]",
         "type": "object"
       },
       "ErrorItem": {
@@ -573,6 +978,19 @@
         "title": "GenerationInfo",
         "type": "object"
       },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
       "HealthData": {
         "properties": {
           "counts": {
@@ -680,6 +1098,56 @@
         "title": "HoldingItem",
         "type": "object"
       },
+      "IntradayData": {
+        "properties": {
+          "bars": {
+            "items": {
+              "$ref": "#/components/schemas/MinuteBar"
+            },
+            "title": "Bars",
+            "type": "array"
+          },
+          "days": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "marks": {
+            "items": {
+              "$ref": "#/components/schemas/SurgeMark"
+            },
+            "title": "Marks",
+            "type": "array"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts_code",
+          "name",
+          "days",
+          "bars",
+          "marks"
+        ],
+        "title": "IntradayData",
+        "type": "object"
+      },
       "MarketInfo": {
         "properties": {
           "is_trading_day": {
@@ -755,6 +1223,149 @@
         "title": "MarketPhase",
         "type": "string"
       },
+      "MemberRow": {
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "is_limit_up": {
+            "title": "Is Limit Up",
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          },
+          "pools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "rel_volume_5d": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rel Volume 5D"
+          },
+          "strength": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strength"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          },
+          "turnover_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Pct"
+          }
+        },
+        "required": [
+          "ts_code",
+          "name",
+          "price",
+          "pct_chg",
+          "amount",
+          "strength",
+          "turnover_pct",
+          "rel_volume_5d",
+          "is_limit_up",
+          "pools"
+        ],
+        "title": "MemberRow",
+        "type": "object"
+      },
+      "MembersData": {
+        "properties": {
+          "board_code": {
+            "title": "Board Code",
+            "type": "string"
+          },
+          "board_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Board Name"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/MemberRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "board_code",
+          "board_name",
+          "rows"
+        ],
+        "title": "MembersData",
+        "type": "object"
+      },
       "MetaData": {
         "properties": {
           "datasets": {
@@ -810,6 +1421,69 @@
           "market"
         ],
         "title": "MetaData",
+        "type": "object"
+      },
+      "MinuteBar": {
+        "properties": {
+          "avg_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Price"
+          },
+          "day": {
+            "format": "date",
+            "title": "Day",
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "up",
+              "down",
+              "flat"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "price": {
+            "title": "Price",
+            "type": "number"
+          },
+          "slot": {
+            "title": "Slot",
+            "type": "integer"
+          },
+          "t": {
+            "title": "T",
+            "type": "string"
+          },
+          "volume": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Volume"
+          }
+        },
+        "required": [
+          "day",
+          "t",
+          "slot",
+          "price",
+          "avg_price",
+          "volume",
+          "direction"
+        ],
+        "title": "MinuteBar",
         "type": "object"
       },
       "OverviewData": {
@@ -1116,6 +1790,254 @@
           "available_at"
         ],
         "title": "ProjectionInfo",
+        "type": "object"
+      },
+      "PulseAlert": {
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "kind_label": {
+            "title": "Kind Label",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "t": {
+            "title": "T",
+            "type": "string"
+          }
+        },
+        "required": [
+          "t",
+          "kind",
+          "kind_label",
+          "message"
+        ],
+        "title": "PulseAlert",
+        "type": "object"
+      },
+      "PulseCounts": {
+        "properties": {
+          "broken": {
+            "title": "Broken",
+            "type": "integer"
+          },
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "flat": {
+            "title": "Flat",
+            "type": "integer"
+          },
+          "limit_down": {
+            "title": "Limit Down",
+            "type": "integer"
+          },
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          },
+          "up_ratio_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Up Ratio Pct"
+          }
+        },
+        "required": [
+          "limit_up",
+          "limit_down",
+          "broken",
+          "up",
+          "down",
+          "flat",
+          "total",
+          "up_ratio_pct"
+        ],
+        "title": "PulseCounts",
+        "type": "object"
+      },
+      "PulseData": {
+        "properties": {
+          "age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Seconds"
+          },
+          "alerts": {
+            "items": {
+              "$ref": "#/components/schemas/PulseAlert"
+            },
+            "title": "Alerts",
+            "type": "array"
+          },
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PulseCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "freshness": {
+            "$ref": "#/components/schemas/StatusInfo"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/PulsePoint"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "recent_alert": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PulseAlert"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "snapshot",
+                  "history"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "trade_date",
+          "as_of",
+          "age_seconds",
+          "freshness",
+          "counts",
+          "source",
+          "history",
+          "alerts",
+          "recent_alert"
+        ],
+        "title": "PulseData",
+        "type": "object"
+      },
+      "PulsePoint": {
+        "properties": {
+          "broken": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Broken"
+          },
+          "limit_down": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Down"
+          },
+          "limit_up": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up"
+          },
+          "t": {
+            "title": "T",
+            "type": "string"
+          },
+          "up_ratio_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Up Ratio Pct"
+          }
+        },
+        "required": [
+          "t",
+          "limit_up",
+          "broken",
+          "limit_down",
+          "up_ratio_pct"
+        ],
+        "title": "PulsePoint",
         "type": "object"
       },
       "ServiceItem": {
@@ -1515,6 +2437,276 @@
         "title": "StatusInfo",
         "type": "object"
       },
+      "SurgeConfig": {
+        "properties": {
+          "boards": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Boards",
+            "type": "array"
+          },
+          "k_cum": {
+            "title": "K Cum",
+            "type": "number"
+          },
+          "ratio_cap": {
+            "title": "Ratio Cap",
+            "type": "number"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "boards",
+          "k_cum",
+          "ratio_cap",
+          "summary"
+        ],
+        "title": "SurgeConfig",
+        "type": "object"
+      },
+      "SurgeData": {
+        "properties": {
+          "config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SurgeConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Dates",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/SurgeRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "trade_date",
+          "dates",
+          "rows",
+          "config"
+        ],
+        "title": "SurgeData",
+        "type": "object"
+      },
+      "SurgeMark": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "day": {
+            "format": "date",
+            "title": "Day",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "slot": {
+            "title": "Slot",
+            "type": "integer"
+          },
+          "t": {
+            "title": "T",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day",
+          "t",
+          "slot",
+          "price",
+          "label",
+          "count"
+        ],
+        "title": "SurgeMark",
+        "type": "object"
+      },
+      "SurgeRow": {
+        "properties": {
+          "confirmed_at": {
+            "title": "Confirmed At",
+            "type": "string"
+          },
+          "cum_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cum Amount"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "rel_cum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rel Cum"
+          },
+          "room_to_limit_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Room To Limit Pct"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "theme": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Theme"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "confirmed_at",
+          "ts_code",
+          "name",
+          "theme",
+          "price",
+          "pct_chg",
+          "rel_cum",
+          "cum_amount",
+          "room_to_limit_pct",
+          "status",
+          "status_label"
+        ],
+        "title": "SurgeRow",
+        "type": "object"
+      },
+      "SurgeSearchData": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/SurgeRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query",
+          "rows",
+          "truncated"
+        ],
+        "title": "SurgeSearchData",
+        "type": "object"
+      },
       "TableItem": {
         "properties": {
           "key": {
@@ -1543,6 +2735,46 @@
         ],
         "title": "UserState",
         "type": "string"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
       }
     }
   },
@@ -1612,6 +2844,336 @@
         "summary": "总览",
         "tags": [
           "overview"
+        ]
+      }
+    },
+    "/api/v1/panorama/boards": {
+      "get": {
+        "operationId": "get_boards_api_v1_panorama_boards_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "system",
+            "required": false,
+            "schema": {
+              "default": "开盘啦题材",
+              "maxLength": 16,
+              "title": "System",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BoardsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "板块总表",
+        "tags": [
+          "panorama"
+        ]
+      }
+    },
+    "/api/v1/panorama/boards/{board_code}/members": {
+      "get": {
+        "operationId": "get_members_api_v1_panorama_boards__board_code__members_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "board_code",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Board Code",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MembersData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "板块成分",
+        "tags": [
+          "panorama"
+        ]
+      }
+    },
+    "/api/v1/panorama/pulse": {
+      "get": {
+        "operationId": "get_pulse_api_v1_panorama_pulse_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PulseData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "市场脉搏",
+        "tags": [
+          "panorama"
+        ]
+      }
+    },
+    "/api/v1/panorama/stocks/{ts_code}/daily": {
+      "get": {
+        "operationId": "get_daily_api_v1_panorama_stocks__ts_code__daily_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ts_code",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9A-Z]{6}\\.(SH|SZ|BJ)$",
+              "title": "Ts Code",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "count",
+            "required": false,
+            "schema": {
+              "default": 120,
+              "maximum": 240,
+              "minimum": 20,
+              "title": "Count",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DailyData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "个股日 K",
+        "tags": [
+          "panorama"
+        ]
+      }
+    },
+    "/api/v1/panorama/stocks/{ts_code}/intraday": {
+      "get": {
+        "operationId": "get_intraday_api_v1_panorama_stocks__ts_code__intraday_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ts_code",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9A-Z]{6}\\.(SH|SZ|BJ)$",
+              "title": "Ts Code",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 5,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_IntradayData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "个股分时 / 5 日",
+        "tags": [
+          "panorama"
+        ]
+      }
+    },
+    "/api/v1/panorama/surge": {
+      "get": {
+        "operationId": "get_surge_api_v1_panorama_surge_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_SurgeData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "爆量记录（按日）",
+        "tags": [
+          "panorama"
+        ]
+      }
+    },
+    "/api/v1/panorama/surge/search": {
+      "get": {
+        "operationId": "search_surge_api_v1_panorama_surge_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 32,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_SurgeSearchData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "爆量记录（跨日搜索）",
+        "tags": [
+          "panorama"
         ]
       }
     }

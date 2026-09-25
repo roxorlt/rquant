@@ -55,6 +55,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/panorama/boards": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 板块总表 */
+        get: operations["get_boards_api_v1_panorama_boards_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/panorama/boards/{board_code}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 板块成分 */
+        get: operations["get_members_api_v1_panorama_boards__board_code__members_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/panorama/pulse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 市场脉搏 */
+        get: operations["get_pulse_api_v1_panorama_pulse_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/panorama/stocks/{ts_code}/daily": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 个股日 K */
+        get: operations["get_daily_api_v1_panorama_stocks__ts_code__daily_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/panorama/stocks/{ts_code}/intraday": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 个股分时 / 5 日 */
+        get: operations["get_intraday_api_v1_panorama_stocks__ts_code__intraday_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/panorama/surge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 爆量记录（按日） */
+        get: operations["get_surge_api_v1_panorama_surge_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/panorama/surge/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 爆量记录（跨日搜索） */
+        get: operations["search_surge_api_v1_panorama_surge_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -83,6 +202,44 @@ export interface components {
             title: string;
             /** To */
             to: string;
+        };
+        /** BoardRow */
+        BoardRow: {
+            /** Amount */
+            amount: number | null;
+            /** Board Code */
+            board_code: string;
+            /** Board Name */
+            board_name: string;
+            /** Broken Count */
+            broken_count: number | null;
+            /** Leading Stock */
+            leading_stock: string | null;
+            /** Limit Up Count */
+            limit_up_count: number | null;
+            /** Limit Up Ratio Pct */
+            limit_up_ratio_pct: number | null;
+            /** Main Net Amount */
+            main_net_amount: number | null;
+            /** Main Net Rate */
+            main_net_rate: number | null;
+            /** Pct Chg Median */
+            pct_chg_median: number | null;
+            /** Stock Count */
+            stock_count: number | null;
+        };
+        /** BoardsData */
+        BoardsData: {
+            /** As Of */
+            as_of: string | null;
+            /** Has Flow */
+            has_flow: boolean;
+            /** Rows */
+            rows: components["schemas"]["BoardRow"][];
+            /** System */
+            system: string;
+            /** Systems */
+            systems: string[];
         };
         /** CandidateGroup */
         CandidateGroup: {
@@ -125,6 +282,41 @@ export interface components {
             items: components["schemas"]["CandidateItem"][];
             /** Total */
             total: number;
+        };
+        /** DailyBar */
+        DailyBar: {
+            /** Close */
+            close: number;
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** High */
+            high: number;
+            /** Low */
+            low: number;
+            /** Ma10 */
+            ma10: number | null;
+            /** Ma20 */
+            ma20: number | null;
+            /** Ma5 */
+            ma5: number | null;
+            /** Open */
+            open: number;
+            /** Provisional */
+            provisional: boolean;
+            /** Volume */
+            volume: number | null;
+        };
+        /** DailyData */
+        DailyData: {
+            /** Bars */
+            bars: components["schemas"]["DailyBar"][];
+            /** Name */
+            name: string | null;
+            /** Ts Code */
+            ts_code: string;
         };
         /** DatasetWatermarkInfo */
         DatasetWatermarkInfo: {
@@ -175,9 +367,29 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** Envelope[BoardsData] */
+        Envelope_BoardsData_: {
+            data: components["schemas"]["BoardsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DailyData] */
+        Envelope_DailyData_: {
+            data: components["schemas"]["DailyData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[HealthData] */
         Envelope_HealthData_: {
             data: components["schemas"]["HealthData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[IntradayData] */
+        Envelope_IntradayData_: {
+            data: components["schemas"]["IntradayData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MembersData] */
+        Envelope_MembersData_: {
+            data: components["schemas"]["MembersData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[MetaData] */
@@ -188,6 +400,21 @@ export interface components {
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PulseData] */
+        Envelope_PulseData_: {
+            data: components["schemas"]["PulseData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[SurgeData] */
+        Envelope_SurgeData_: {
+            data: components["schemas"]["SurgeData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[SurgeSearchData] */
+        Envelope_SurgeSearchData_: {
+            data: components["schemas"]["SurgeSearchData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** ErrorItem */
@@ -253,6 +480,11 @@ export interface components {
             /** Schema Version */
             schema_version: number;
         };
+        /** HTTPValidationError */
+        HTTPValidationError: {
+            /** Detail */
+            detail?: components["schemas"]["ValidationError"][];
+        };
         /** HealthData */
         HealthData: {
             counts: components["schemas"]["StateCounts"];
@@ -285,6 +517,19 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: number;
         };
+        /** IntradayData */
+        IntradayData: {
+            /** Bars */
+            bars: components["schemas"]["MinuteBar"][];
+            /** Days */
+            days: string[];
+            /** Marks */
+            marks: components["schemas"]["SurgeMark"][];
+            /** Name */
+            name: string | null;
+            /** Ts Code */
+            ts_code: string;
+        };
         /** MarketInfo */
         MarketInfo: {
             /** Is Trading Day */
@@ -307,6 +552,38 @@ export interface components {
          * @enum {string}
          */
         MarketPhase: "pre_open" | "call_auction" | "continuous" | "noon_break" | "closing_auction" | "after_close" | "non_trading_day" | "unknown";
+        /** MemberRow */
+        MemberRow: {
+            /** Amount */
+            amount: number | null;
+            /** Is Limit Up */
+            is_limit_up: boolean;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+            /** Pools */
+            pools: string[];
+            /** Price */
+            price: number | null;
+            /** Rel Volume 5D */
+            rel_volume_5d: number | null;
+            /** Strength */
+            strength: number | null;
+            /** Ts Code */
+            ts_code: string;
+            /** Turnover Pct */
+            turnover_pct: number | null;
+        };
+        /** MembersData */
+        MembersData: {
+            /** Board Code */
+            board_code: string;
+            /** Board Name */
+            board_name: string | null;
+            /** Rows */
+            rows: components["schemas"]["MemberRow"][];
+        };
         /** MetaData */
         MetaData: {
             /** Datasets */
@@ -322,6 +599,29 @@ export interface components {
             server_time: string;
             /** Viewer */
             viewer: string | null;
+        };
+        /** MinuteBar */
+        MinuteBar: {
+            /** Avg Price */
+            avg_price: number | null;
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /**
+             * Direction
+             * @enum {string}
+             */
+            direction: "up" | "down" | "flat";
+            /** Price */
+            price: number;
+            /** Slot */
+            slot: number;
+            /** T */
+            t: string;
+            /** Volume */
+            volume: number | null;
         };
         /** OverviewData */
         OverviewData: {
@@ -410,6 +710,67 @@ export interface components {
             reason: string | null;
             /** Table Name */
             table_name: string;
+        };
+        /** PulseAlert */
+        PulseAlert: {
+            /** Kind */
+            kind: string;
+            /** Kind Label */
+            kind_label: string;
+            /** Message */
+            message: string;
+            /** T */
+            t: string;
+        };
+        /** PulseCounts */
+        PulseCounts: {
+            /** Broken */
+            broken: number;
+            /** Down */
+            down: number;
+            /** Flat */
+            flat: number;
+            /** Limit Down */
+            limit_down: number;
+            /** Limit Up */
+            limit_up: number;
+            /** Total */
+            total: number;
+            /** Up */
+            up: number;
+            /** Up Ratio Pct */
+            up_ratio_pct: number | null;
+        };
+        /** PulseData */
+        PulseData: {
+            /** Age Seconds */
+            age_seconds: number | null;
+            /** Alerts */
+            alerts: components["schemas"]["PulseAlert"][];
+            /** As Of */
+            as_of: string | null;
+            counts: components["schemas"]["PulseCounts"] | null;
+            freshness: components["schemas"]["StatusInfo"];
+            /** History */
+            history: components["schemas"]["PulsePoint"][];
+            recent_alert: components["schemas"]["PulseAlert"] | null;
+            /** Source */
+            source: ("snapshot" | "history") | null;
+            /** Trade Date */
+            trade_date: string | null;
+        };
+        /** PulsePoint */
+        PulsePoint: {
+            /** Broken */
+            broken: number | null;
+            /** Limit Down */
+            limit_down: number | null;
+            /** Limit Up */
+            limit_up: number | null;
+            /** T */
+            t: string;
+            /** Up Ratio Pct */
+            up_ratio_pct: number | null;
         };
         /** ServiceItem */
         ServiceItem: {
@@ -549,6 +910,84 @@ export interface components {
             reason: string;
             state: components["schemas"]["UserState"];
         };
+        /** SurgeConfig */
+        SurgeConfig: {
+            /** Boards */
+            boards: string[];
+            /** K Cum */
+            k_cum: number;
+            /** Ratio Cap */
+            ratio_cap: number;
+            /** Summary */
+            summary: string;
+        };
+        /** SurgeData */
+        SurgeData: {
+            config: components["schemas"]["SurgeConfig"] | null;
+            /** Dates */
+            dates: string[];
+            /** Rows */
+            rows: components["schemas"]["SurgeRow"][];
+            /** Trade Date */
+            trade_date: string | null;
+        };
+        /** SurgeMark */
+        SurgeMark: {
+            /** Count */
+            count: number;
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Label */
+            label: string;
+            /** Price */
+            price: number | null;
+            /** Slot */
+            slot: number;
+            /** T */
+            t: string;
+        };
+        /** SurgeRow */
+        SurgeRow: {
+            /** Confirmed At */
+            confirmed_at: string;
+            /** Cum Amount */
+            cum_amount: number | null;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+            /** Price */
+            price: number | null;
+            /** Rel Cum */
+            rel_cum: number | null;
+            /** Room To Limit Pct */
+            room_to_limit_pct: number | null;
+            /** Status */
+            status: string;
+            /** Status Label */
+            status_label: string;
+            /** Theme */
+            theme: string | null;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** SurgeSearchData */
+        SurgeSearchData: {
+            /** Query */
+            query: string;
+            /** Rows */
+            rows: components["schemas"]["SurgeRow"][];
+            /** Truncated */
+            truncated: boolean;
+        };
         /** TableItem */
         TableItem: {
             /** Key */
@@ -561,6 +1000,19 @@ export interface components {
          * @enum {string}
          */
         UserState: "ok" | "warn" | "crit" | "idle" | "waiting";
+        /** ValidationError */
+        ValidationError: {
+            /** Context */
+            ctx?: Record<string, never>;
+            /** Input */
+            input?: unknown;
+            /** Location */
+            loc: (string | number)[];
+            /** Message */
+            msg: string;
+            /** Error Type */
+            type: string;
+        };
     };
     responses: never;
     parameters: never;
@@ -626,6 +1078,217 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_OverviewData_"];
+                };
+            };
+        };
+    };
+    get_boards_api_v1_panorama_boards_get: {
+        parameters: {
+            query?: {
+                system?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BoardsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_members_api_v1_panorama_boards__board_code__members_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                board_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MembersData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_pulse_api_v1_panorama_pulse_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PulseData_"];
+                };
+            };
+        };
+    };
+    get_daily_api_v1_panorama_stocks__ts_code__daily_get: {
+        parameters: {
+            query?: {
+                count?: number;
+            };
+            header?: never;
+            path: {
+                ts_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DailyData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_intraday_api_v1_panorama_stocks__ts_code__intraday_get: {
+        parameters: {
+            query?: {
+                days?: number;
+                date?: string | null;
+            };
+            header?: never;
+            path: {
+                ts_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_IntradayData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_surge_api_v1_panorama_surge_get: {
+        parameters: {
+            query?: {
+                date?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_SurgeData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_surge_api_v1_panorama_surge_search_get: {
+        parameters: {
+            query: {
+                q: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_SurgeSearchData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

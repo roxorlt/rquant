@@ -636,36 +636,66 @@ def _daily_bars() -> list[dict[str, object]]:
     return rows
 
 
+#: The first two chart codes carry five trading days of minute bars (the 5-day chart);
+#: the others carry the fixture day only.
+_FIVE_DAY_CODES = _CHART_CODES[:2]
+
+
 def _intraday_bars() -> list[dict[str, object]]:
-    stamps = _session_minute_stamps(pd.Timestamp(FIXTURE_TRADE_DATE))
-    x = np.arange(len(stamps))
-    base = np.round(20.0 + 2.0 * np.sin(x / 30.0) + x * 0.001, 2)
-    volume = np.round(10_000.0 + (np.sin(x / 10.0) + 1.0) * 5_000.0, 0)
+    days = _trading_days(CALENDAR_START, FIXTURE_TRADE_DATE)[-5:]
     pre_close = dict(zip(_snapshot_frame()["ts_code"], _snapshot_frame()["pre_close"], strict=True))
     rows: list[dict[str, object]] = []
     for code in _CHART_CODES:
-        scale = float(pre_close[code]) / 20.0
-        previous = round(float(base[0]) * scale, 2)
-        for stamp, price, vol in zip(stamps, base, volume, strict=True):
-            close = round(float(price) * scale, 2)
-            trade_time = stamp.to_pydatetime().replace(tzinfo=_SHANGHAI)
-            rows.append(
-                {
-                    "ts_code": code,
-                    "trade_time": _utc_iso(trade_time),
-                    "open": previous,
-                    "high": round(max(previous, close) + 0.01, 2),
-                    "low": round(min(previous, close) - 0.01, 2),
-                    "close": close,
-                    "vol": float(vol),
-                }
-            )
-            previous = close
+        code_days = days if code in _FIVE_DAY_CODES else days[-1:]
+        for offset, day in enumerate(code_days):
+            rows.extend(_intraday_day(code, day, float(pre_close[code]), offset))
+    return rows
+
+
+def _intraday_day(code: str, day: date, pre_close: float, offset: int) -> list[dict[str, object]]:
+    stamps = _session_minute_stamps(pd.Timestamp(day))
+    x = np.arange(len(stamps)) + offset * 240
+    base = np.round(20.0 + 2.0 * np.sin(x / 30.0) + x * 0.001, 2)
+    volume = np.round(10_000.0 + (np.sin(x / 10.0) + 1.0) * 5_000.0, 0)
+    scale = pre_close / 20.0
+    previous = round(float(base[0]) * scale, 2)
+    rows: list[dict[str, object]] = []
+    for stamp, price, vol in zip(stamps, base, volume, strict=True):
+        close = round(float(price) * scale, 2)
+        trade_time = stamp.to_pydatetime().replace(tzinfo=_SHANGHAI)
+        rows.append(
+            {
+                "ts_code": code,
+                "trade_time": _utc_iso(trade_time),
+                "open": previous,
+                "high": round(max(previous, close) + 0.01, 2),
+                "low": round(min(previous, close) - 0.01, 2),
+                "close": close,
+                "vol": float(vol),
+            }
+        )
+        previous = close
     return rows
 
 
 def _surge_events() -> list[dict[str, object]]:
-    return [
+    earlier = {
+        # 600001 also surged the day before (cross-day search), and twice on the fixture day.
+        "trade_date": "2026-09-23",
+        "confirmed_at": "10:31",
+        "ts_code": "600001.SH",
+        "name": "假票600001",
+        "theme": "人形机器人",
+        "price": 10.2,
+        "pct_chg": 3.1,
+        "cum_amount": 2.1e8,
+        "rel_cum": 2.9,
+        "room_to_limit_pct": 6.8,
+        "status": "confirmed",
+    }
+    repeat = {**earlier, "trade_date": FIXTURE_TRADE_DATE.isoformat(), "confirmed_at": "09:52"}
+    repeat.update({"price": 11.0, "pct_chg": 10.0, "rel_cum": 3.6, "status": "unbuyable"})
+    return [earlier, repeat] + [
         {
             "trade_date": FIXTURE_TRADE_DATE.isoformat(),
             "confirmed_at": str(row.confirmed_at),
@@ -726,7 +756,7 @@ def _surge_runtime_config(as_of: datetime) -> list[dict[str, object]]:
             "snapshot_key": "current",
             "trade_date": FIXTURE_TRADE_DATE.isoformat(),
             "as_of": _utc_iso(as_of),
-            "boards_json": json.dumps(["主板", "创业板", "科创板"], ensure_ascii=False),
+            "boards_json": json.dumps(["main", "gem", "star"]),
             "k_rough": 2.0,
             "k_cum": 3.0,
             "ratio_cap": 12.0,
@@ -802,6 +832,37 @@ def _projections(
                 signal_owned("pulse_history", _pulse_history()),
                 signal_owned("pulse_alert", _pulse_alerts()),
                 signal_owned("surge_runtime_config", _surge_runtime_config(as_of)),
+                # 池内 marks for the board members: one daily-screen pick, one pool-2 watch.
+                signal_owned(
+                    "screen_result",
+                    [
+                        {
+                            "trade_date": _SCREEN_DATE.isoformat(),
+                            "ts_code": "600001.SH",
+                            "preset_name": "n-shape-pool1",
+                            "name": "样本01",
+                            "close": 8.0,
+                            "pct_chg": 1.2,
+                        }
+                    ],
+                ),
+                signal_owned(
+                    "pool2_watch",
+                    [
+                        {
+                            "ts_code": "600005.SH",
+                            "entry_date": "2026-09-18",
+                            "body_lower": 14.2,
+                            "body_upper": 15.1,
+                            "level_40": 14.6,
+                            "level_30": 14.5,
+                            "level_20": 14.4,
+                            "stop_strong": 14.0,
+                            "stop_weak": 13.8,
+                            "status": "active",
+                        }
+                    ],
+                ),
             )
         )
     return tuple(sorted(projections, key=lambda item: item.table_name))

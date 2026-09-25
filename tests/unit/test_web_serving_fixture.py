@@ -54,7 +54,8 @@ def test_panorama_publishes_every_panorama_projection(tmp_path: Path) -> None:
     manifest = build_web_fixture(root, "panorama")
 
     assert all(manifest.row_counts[table] > 0 for table in _PANORAMA_TABLES)
-    assert manifest.row_counts["intraday_kline"] == 5 * 240
+    # Two codes carry five trading days (the 5-day chart), three carry the fixture day.
+    assert manifest.row_counts["intraday_kline"] == 2 * 5 * 240 + 3 * 240
     assert manifest.row_counts["daily_bar"] == 5 * 120
     with ServingReader(root).acquire_generation() as lease:
         unavailable = lease.connection.execute(
