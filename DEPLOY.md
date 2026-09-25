@@ -5,6 +5,164 @@
 
 ---
 
+## 2026-09-25 · 待安装 · 网页 `/app/` 第一次安装（M1 第一段：总览 + 系统健康；owner 授权「新 nginx 路径 /app/」）
+
+**装什么**：新网页 `http://82.156.0.68:8081/app/`（React 静态文件由 nginx 直接发送，`/app/api/` 转到只读网页 API `127.0.0.1:8768`）。
+四样东西：发布目录 `/home/lighthouse/rquant-web/`（`scripts/web-release.sh` 建）、`rquant-web.service`、sudoers drop-in
+`/etc/sudoers.d/rquant-web`（只有 `systemctl restart rquant-web.service` 一条）、nginx 里 `/preview/` 之后新增的四个 `/app` location。
+结构、权限和以后每次发布的做法见 `docs/deploy/web-app.md`。**不碰**：生产检出 `/home/lighthouse/rquant`、路线 A 各 unit、
+`/preview/`（8509）、8506、`.env`、主库和副本。重启 `rquant-web` 不受交易时段限制（新的只读服务，见 CLAUDE.md「不按交易时段排期」），
+nginx `reload` 不断开现有连接，所以整套可以任何时间装。
+
+**先定 tag**：`TAG` 是协调者把本分支合入 main 后打的精确 tag（下文以 `v0.34.0` 为例）。发布脚本拒绝不在 main 上的 tag。
+
+### 装前核对（只读，Mac 上做不了的都在这里）
+
+```bash
+# 云服务器 82.156.0.68，lighthouse 用户
+TAG=v0.34.0
+id www                                        # 预期：uid=…(www) gid=…(www)，宝塔 nginx 的运行用户
+ps -o user= -C nginx | sort -u                # 预期：root 和 www（worker 进程是 www）
+getenforce 2>/dev/null || echo "no selinux"   # 预期：Disabled / Permissive / no selinux；是 Enforcing 就停下找协调者
+systemctl --version | head -1                 # 预期：systemd 25x（ProtectProc、IPAddressDeny 需要 ≥ 247）
+command -v uv setfacl getfacl curl python3 namei   # 预期：六个路径都打印出来
+uv python find 3.11                           # 预期：一个 python3.11 的路径
+df -h /home | tail -1                         # 预期：可用空间 > 3G（每个版本一个 worktree + venv，venv 大多是 uv 缓存的硬链接）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8768/   # 预期：000（8768 端口没人用）
+sudo diff /home/lighthouse/rquant/deploy/nginx/rquant-backup.conf \
+    /www/server/panel/vhost/nginx/rquant-backup.conf && echo "nginx: repo == host"
+                                              # 预期：nginx: repo == host（与 v0.33.22 一致）；有差异就停下
+```
+
+### 1. 建裸仓库，取出这一版的发布脚本
+
+```bash
+mkdir -p /home/lighthouse/rquant-web && chmod 0700 /home/lighthouse/rquant-web
+timeout 300 git clone --quiet --bare "$(git -C /home/lighthouse/rquant remote get-url origin)" \
+    /home/lighthouse/rquant-web/repo.git && echo cloned        # 预期：cloned（超时就重跑这一条）
+git -C /home/lighthouse/rquant-web/repo.git rev-parse --verify "refs/tags/$TAG^{commit}"
+                                                                # 预期：40 位提交号
+git -C /home/lighthouse/rquant-web/repo.git show "$TAG:scripts/web-release.sh" \
+    > /home/lighthouse/rquant-web/web-release.sh && echo ok     # 预期：ok
+```
+
+以后发布用 `current/scripts/web-release.sh`；这个副本只用于第一次。
+
+### 2. 预演，再发布（先不重启：服务还没装）
+
+```bash
+bash /home/lighthouse/rquant-web/web-release.sh --target "$TAG" --no-restart --dry-run
+# 预期（7 行，什么都不改）：
+#   web-release: [dry-run] tag v0.34.0 exists on https://github.com/…
+#   web-release: [dry-run] fetch main and tags into /home/lighthouse/rquant-web/repo.git; refuse v0.34.0 unless it is on main
+#   web-release: [dry-run] worktree /home/lighthouse/rquant-web/releases/v0.34.0; uv sync --frozen --python 3.11 --no-dev; rquant web-serve --self-check
+#   web-release: [dry-run] grant www traverse on the parents and read on /home/lighthouse/rquant-web/releases/v0.34.0/web/dist (setfacl, else chmod)
+#   web-release: [dry-run] switch current -> releases/v0.34.0 (now: none)
+#   web-release: [dry-run] --no-restart: leave rquant-web.service alone
+#   web-release: [dry-run] switch app -> releases/v0.34.0/web/dist; append /home/lighthouse/rquant-web/releases.jsonl; keep the newest 3 releases
+bash /home/lighthouse/rquant-web/web-release.sh --target "$TAG" --no-restart
+# 预期：几分钟（uv sync）后最后一行
+#   web-release: published v0.34.0 (<提交号前 12 位>); previous: none; nginx access: acl
+# 中间有一行 self-check 的 JSON：{"ok": true, "serving_root": "/home/lighthouse/rquant/data/runtime/serving", "generation_id": "…", "detail": null}
+getfacl -p /home/lighthouse/rquant-web/app/index.html | grep www     # 预期：user:www:r--（没有 #effective:---）
+namei -l /home/lighthouse/rquant-web/app/index.html                  # 预期：每一级目录都能看到，最后是 index.html
+```
+
+`nginx access: chmod` 表示主机不支持 ACL，脚本改用了 `o+x` / `o+rX`（只放开 `web/dist`，其余不变）；照常往下装，并在本条记录里注明。
+
+### 3. 装网页 API 单元
+
+```bash
+R=/home/lighthouse/rquant-web/releases/$TAG
+sudo systemd-analyze verify "$R/deploy/systemd/rquant-web.service"
+# 预期：没有关于 rquant-web.service 的报错（别的 unit 的旧警告可以忽略）
+sudo install -m 0644 -o root -g root "$R/deploy/systemd/rquant-web.service" /etc/systemd/system/rquant-web.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now rquant-web.service
+systemctl is-active rquant-web.service                              # 预期：active
+curl -s http://127.0.0.1:8768/api/v1/meta | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); print(d["serving"]["state"], d["data"]["generation"]["generation_id"][:12], d["data"]["market"]["phase_label"])'
+# 预期：ready <当前生产数据代前 12 位> <市场阶段，如 休市 / 连续竞价>
+systemctl show rquant-web.service -p Slice -p MemoryHigh -p MemoryMax -p IPAddressDeny
+# 预期：Slice=rquant-serving.slice、MemoryHigh=402653184、MemoryMax=671088640、IPAddressDeny=0.0.0.0/0 ::/0
+cat "/sys/fs/cgroup$(systemctl show -p ControlGroup --value rquant-web.service)/memory.max"   # 预期：671088640
+journalctl -u rquant-web.service -n 20 --no-pager | grep -i "firewall\|error" || echo "no errors"
+                                                                     # 预期：no errors（没有 "IP firewalling is not supported"）
+sudo nsenter -t "$(systemctl show -p MainPID --value rquant-web.service)" -m \
+    cat /home/lighthouse/rquant/.env >/dev/null 2>&1 && echo "LEAK" || echo ".env hidden"
+                                                                     # 预期：.env hidden
+systemctl show rquant-web.service -p MemoryCurrent                   # 预期：MemoryCurrent < 402653184（Mac 上约 150 MiB）
+```
+
+### 4. 装 sudoers drop-in（发布脚本重启 API 用）
+
+```bash
+sudo visudo -cf "$R/deploy/sudoers/rquant-web"                     # 预期：…/rquant-web: parsed OK
+sudo install -m 0440 -o root -g root "$R/deploy/sudoers/rquant-web" /etc/sudoers.d/rquant-web
+sudo visudo -c                                                     # 预期：每个文件都 parsed OK
+sudo -n -l /usr/bin/systemctl restart rquant-web.service           # 预期：/usr/bin/systemctl restart rquant-web.service
+sudo -n /usr/bin/systemctl restart rquant-web.service && sleep 3 && \
+  curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8768/api/v1/meta     # 预期：200
+bash "$R/scripts/web-release.sh" --target "$TAG"
+# 预期：web-release: v0.34.0 is already current; re-checking nginx access and the API … nothing to do
+```
+
+### 5. nginx 加 `/app/`
+
+```bash
+BAK=/root/rquant-backup.conf.bak-$(date +%Y%m%d)-app
+sudo cp /www/server/panel/vhost/nginx/rquant-backup.conf "$BAK"
+sudo diff "$BAK" "$R/deploy/nginx/rquant-backup.conf"
+# 预期：只有一段新增（以 "> # /app/ — rQuant 投研平台新前端" 开头，到 /app/ 那个 location 结束，约 47 行），没有删除行
+sudo cp "$R/deploy/nginx/rquant-backup.conf" /www/server/panel/vhost/nginx/rquant-backup.conf
+sudo nginx -t                                  # 预期：syntax is ok / test is successful
+sudo systemctl reload nginx
+sudo diff "$R/deploy/nginx/rquant-backup.conf" /www/server/panel/vhost/nginx/rquant-backup.conf && echo "nginx: repo == host"
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8081/app/            # 预期：401（location 生效，要登录）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8081/app            # 预期：301
+curl -s -o /dev/null -w '%{http_code}\n' -u <登录名> http://127.0.0.1:8081/app/   # 输入密码后预期：200
+curl -sI -u <登录名> http://127.0.0.1:8081/app/ | grep -i "content-security-policy\|x-frame-options"   # 预期：两行都在
+curl -s -u <登录名> -H 'X-Rquant-User: evil' http://127.0.0.1:8081/app/api/v1/meta | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); print(d["serving"]["state"], d["data"]["viewer"])'
+# 预期：ready <登录名>（浏览器伪造的 X-Rquant-User 被 nginx 覆盖）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8081/preview/        # 预期：401（旧入口照常）
+```
+
+然后在浏览器打开 `http://82.156.0.68:8081/app/`：总览显示今天（或最近一个交易日）的链路、信号、推送和模拟盘；系统健康列出全部服务；
+今天休市时顶栏显示「休市」和下一交易日。
+
+### 装后必须在主机上确认、Mac 上验证不了的
+
+1. `systemd-analyze verify` 对 `rquant-web.service` 没有报错（第 3 步）。
+2. 沙箱指令被主机 systemd 接受：`IPAddressDeny` 生效且日志里没有 "IP firewalling is not supported"；`.env` 在服务里不可见（第 3 步 nsenter）。
+3. 内存上限真的落到 cgroup：`memory.max` = 671088640，`MemoryHigh` = 402653184；`rquant-serving.slice` 总量（1536M）里还有余量：
+   `systemctl show rquant-serving.slice -p MemoryCurrent`。
+4. 在服务的只读沙箱里能读 serving 根（第 3 步 meta 返回当前数据代）。
+5. 文件系统支持 ACL，www 能穿过 `/home/lighthouse` 各级并只读 `web/dist`（第 2 步 getfacl / namei，第 5 步 200）；SELinux 不拦（装前核对）。
+6. nginx 接受 `Host $host:$server_port`（`nginx -t`）。端口真的带到 API 这件事，要等 M2 第一个写接口上线时用浏览器提交一次来验证；
+   本次没有写接口，不影响使用。
+7. sudoers drop-in 通过 `visudo -c`，`sudo -n -l` 只列出这一条命令。
+8. 宝塔 nginx 的运行用户确实叫 `www`（装前核对）；不是的话把发布脚本的 `RQUANT_WEB_NGINX_USER` 设成实际用户名再跑第 2 步。
+
+### 回滚
+
+- **只回代码**（以后有上一版时）：`bash /home/lighthouse/rquant-web/current/scripts/web-release.sh --rollback`
+  （预期最后一行 `web-release: rolled back to <上一版>`）。
+- **整体撤掉 `/app/`**（第一次安装后没有上一版可回，或 owner 要求撤掉）：
+
+```bash
+sudo cp /root/rquant-backup.conf.bak-<日期>-app /www/server/panel/vhost/nginx/rquant-backup.conf
+sudo nginx -t && sudo systemctl reload nginx          # 之后 /app/ 返回 404，其他入口不变
+sudo systemctl disable --now rquant-web.service
+sudo rm /etc/systemd/system/rquant-web.service && sudo systemctl daemon-reload
+sudo rm /etc/sudoers.d/rquant-web && sudo visudo -c
+# 目录可以留着；确定不用了再删：rm -rf /home/lighthouse/rquant-web
+```
+
+装完把本条改成「已安装」，写上实际 tag、每步的输出摘要、`nginx access` 是 acl 还是 chmod、服务内存和错误数。
+
+---
+
 ## 2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）
 
 **状态**：**已安装并启动**。代码 `df621ef2`（tag `v0.33.22`，PR #309 merge commit），路线 A bundle 第十五代
