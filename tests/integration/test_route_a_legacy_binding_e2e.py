@@ -98,6 +98,8 @@ def _production_bundle(
     market_calendar_open_dates: tuple[Any, ...] | None = None,
     schema_rollout_started_at: Any = None,
     market_calendar_authority: Any = None,
+    capabilities_out: dict[str, str] | None = None,
+    capability_overrides: dict[str, str] | None = None,
 ) -> tuple[Any, Any, Any, dict[str, bytes]]:
     """Install a real production deployment bundle at a temporary runtime root.
 
@@ -128,6 +130,12 @@ def _production_bundle(
     than dropped. They are the real thing — `serialize_runtime_credential` over the real
     capability values, stamped with this bundle's own generation — and the credstore
     acceptance (`test_route_a_credstore_roles_e2e`) seals and unseals exactly those.
+
+    `capabilities_out`, when given, receives the capability environment the install was
+    handed -- the stand-in for the host's `.env` plus exported `RQ_*` values -- so a caller
+    that installs the *next* generation over this one (the notifier cutover rehearsal) can
+    hand the installer the same environment, as the operator does. `capability_overrides`
+    replaces individual values of it (the host's two-device `PUSHDEER_KEYS`, for one).
     """
 
     import base64
@@ -244,6 +252,9 @@ def _production_bundle(
         .strip(),
         "RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL": _retention_writer_capability(),
     }
+    capabilities.update(capability_overrides or {})
+    if capabilities_out is not None:
+        capabilities_out.update(capabilities)
     monkeypatch.setattr(
         "rquant.runtime_deployment_bundle._recover_runtime_credentials",
         lambda **_kwargs: _NoCredentialRecovery(),

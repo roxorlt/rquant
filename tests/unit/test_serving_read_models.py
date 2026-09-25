@@ -196,6 +196,98 @@ def test_serving_snapshot_rejects_evidence_from_the_future() -> None:
         raise AssertionError("future serving evidence must be rejected")
 
 
+
+def _routed_snapshot(
+    *delivery_recipients: str,
+    channel: DeliveryChannel = DeliveryChannel.PUSHDEER,
+) -> ServingReadModelInput:
+    """A signal routed to `admin` on PushDeer, with deliveries to `delivery_recipients`."""
+
+    signal = _signal()
+    routed = DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER)
+    route = SignalRouteReceipt(
+        source_id="n-shape-v1",
+        source_sequence=1,
+        signal_id=signal.signal_id,
+        decision_fingerprint="e" * 64,
+        disposition=RouteReceiptDisposition.ROUTED,
+        target_manifest_hash="f" * 64,
+        targets=(routed,),
+        target_count=1,
+        routed_at=NOW,
+    )
+    deliveries = tuple(
+        OutboxRecord(
+            outbox_id=DeliveryTarget(recipient_id=recipient, channel=channel).delivery_key(
+                signal.signal_id
+            ),
+            signal_id=signal.signal_id,
+            target=DeliveryTarget(recipient_id=recipient, channel=channel),
+            status=OutboxStatus.SUCCEEDED,
+            expires_at=signal.expires_at,
+            attempt_count=1,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        for recipient in delivery_recipients
+    )
+    return ServingReadModelInput(
+        observed_at=NOW,
+        signals=(ServingSignalRecord(global_sequence=1, signal=signal),),
+        routes=(route,),
+        deliveries=deliveries,
+    )
+
+
+def test_a_route_target_fanned_out_to_its_devices_is_inside_the_route_manifest() -> None:
+    """The host's own shape: one routed `admin`, delivered to the owner's two devices.
+
+    The routing policy names one logical recipient per channel, `admin`. The notifier's
+    PushDeer credential carries two keys (the owner's iPhone and Mac) and no recipient ids,
+    so `build_environment_notification_provider_loader` infers `admin.device-01` and
+    `admin.device-02`, and the frozen alias migration replaces every routed `admin` row by
+    one row per device before anything is claimed. Both the notifier and serving build this
+    model over those rows; refusing them failed the notifier's `signals` publish on every
+    round from the first routed signal on -- in shadow as much as in live -- and so no
+    serving generation ever carried a signal.
+    """
+
+    snapshot = _routed_snapshot("admin.device-01", "admin.device-02")
+
+    assert {delivery.target.recipient_id for delivery in snapshot.deliveries} == {
+        "admin.device-01",
+        "admin.device-02",
+    }
+    tables = build_serving_read_models(snapshot)
+    assert len(tables["deliveries"]) == 2
+    #: explicitly named devices of the same recipient are its devices too
+    assert len(_routed_snapshot("admin.iphone", "admin.mac").deliveries) == 2
+    #: and the route target itself is still admitted
+    assert len(_routed_snapshot("admin").deliveries) == 1
+
+
+@pytest.mark.parametrize(
+    ("recipient", "channel"),
+    [
+        #: somebody the router never named
+        ("observer", DeliveryChannel.PUSHDEER),
+        #: a name that merely starts with the routed one is not one of its devices
+        ("administrator", DeliveryChannel.PUSHDEER),
+        ("admin-device-01", DeliveryChannel.PUSHDEER),
+        #: an empty device name
+        ("admin.", DeliveryChannel.PUSHDEER),
+        #: the routed recipient, or one of its devices, on a channel the router did not pick
+        ("admin", DeliveryChannel.PUSHPLUS),
+        ("admin.device-01", DeliveryChannel.PUSHPLUS),
+    ],
+)
+def test_a_delivery_outside_the_route_and_its_devices_is_still_refused(
+    recipient: str,
+    channel: DeliveryChannel,
+) -> None:
+    with pytest.raises(ValueError, match="outside the frozen route manifest"):
+        _routed_snapshot(recipient, channel=channel)
+
 def _projection(
     table_name: str,
     rows: tuple[dict[str, object], ...],

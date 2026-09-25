@@ -597,6 +597,8 @@ def build_trading_day_chain(
     *,
     notifier_delivery_mode: str = "shadow",
     unpublished_authorities: frozenset[str] = frozenset(),
+    bundle_out: dict[str, Any] | None = None,
+    capability_overrides: dict[str, str] | None = None,
 ) -> RouteAWorld:
     """Two acknowledged generations on an open day, with all four inputs real.
 
@@ -615,6 +617,11 @@ def build_trading_day_chain(
       window;
     * the historical minute parquet is the real export, installed through `_inputs` and
       kept -- which it could not be until `_production_bundle` stopped overwriting it.
+
+    `bundle_out`, when given, receives what installing the next generation over this world
+    needs and the world does not otherwise keep: the target bundle's `inputs` and the
+    capability environment it was installed with (the notifier cutover rehearsal), and
+    `capability_overrides` is handed to both installs unchanged.
     """
 
     import tests.unit.test_runtime_production_profile as profile_fixtures
@@ -652,6 +659,7 @@ def build_trading_day_chain(
 
     world = World(tmp_path / "root", monkeypatch).build()
     runtime_root = tmp_path / "host" / "data" / "runtime"
+    capabilities: dict[str, str] = {}
     _production_bundle(
         tmp_path / "previous",
         monkeypatch,
@@ -659,6 +667,7 @@ def build_trading_day_chain(
         runtime_root=runtime_root,
         schema_bootstrap_reason="criterion (3b) acceptance bootstrap",
         market_calendar_open_dates=OPEN_DATES,
+        capability_overrides=capability_overrides,
     )
     inputs, profile, receipt, sealed = _production_bundle(
         tmp_path / "target",
@@ -672,7 +681,12 @@ def build_trading_day_chain(
         definition_registry_root=runtime_root.parent / f"definitions-{world.commit[:7]}",
         market_calendar_open_dates=OPEN_DATES,
         schema_rollout_started_at=SCHEMA_ROLLOUT_STARTED_AT,
+        capabilities_out=capabilities,
+        capability_overrides=capability_overrides,
     )
+    if bundle_out is not None:
+        bundle_out["inputs"] = inputs
+        bundle_out["capabilities"] = capabilities
     assert receipt.previous_generation_hash is not None
     #: no channel's shape moved, so no plan (#228) and no producer bound to a dual-write
     #: window it would have to carry through the session (#304)
