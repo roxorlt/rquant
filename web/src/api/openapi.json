@@ -1,0 +1,375 @@
+{
+  "components": {
+    "schemas": {
+      "DatasetWatermarkInfo": {
+        "properties": {
+          "dataset_id": {
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "event_time": {
+            "format": "date-time",
+            "title": "Event Time",
+            "type": "string"
+          },
+          "published_at": {
+            "format": "date-time",
+            "title": "Published At",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "fresh",
+              "stale",
+              "degraded",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "status",
+          "event_time",
+          "published_at",
+          "sequence",
+          "reason"
+        ],
+        "title": "DatasetWatermarkInfo",
+        "type": "object"
+      },
+      "Envelope_MetaData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MetaData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MetaData]",
+        "type": "object"
+      },
+      "GenerationInfo": {
+        "properties": {
+          "age_seconds": {
+            "title": "Age Seconds",
+            "type": "number"
+          },
+          "built_at": {
+            "format": "date-time",
+            "title": "Built At",
+            "type": "string"
+          },
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "previous_generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Generation Id"
+          },
+          "producer_commit": {
+            "title": "Producer Commit",
+            "type": "string"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
+          },
+          "schema_version": {
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation_id",
+          "built_at",
+          "published_at",
+          "previous_generation_id",
+          "producer_commit",
+          "schema_version",
+          "age_seconds"
+        ],
+        "title": "GenerationInfo",
+        "type": "object"
+      },
+      "MarketInfo": {
+        "properties": {
+          "is_trading_day": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Trading Day"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/MarketPhase"
+          },
+          "phase_label": {
+            "title": "Phase Label",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "phase",
+          "phase_label",
+          "is_trading_day"
+        ],
+        "title": "MarketInfo",
+        "type": "object"
+      },
+      "MarketPhase": {
+        "enum": [
+          "pre_open",
+          "call_auction",
+          "continuous",
+          "noon_break",
+          "closing_auction",
+          "after_close",
+          "non_trading_day",
+          "unknown"
+        ],
+        "title": "MarketPhase",
+        "type": "string"
+      },
+      "MetaData": {
+        "properties": {
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetWatermarkInfo"
+            },
+            "title": "Datasets",
+            "type": "array"
+          },
+          "generation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GenerationInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "market": {
+            "$ref": "#/components/schemas/MarketInfo"
+          },
+          "projections": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectionInfo"
+            },
+            "title": "Projections",
+            "type": "array"
+          },
+          "server_time": {
+            "format": "date-time",
+            "title": "Server Time",
+            "type": "string"
+          },
+          "viewer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Viewer"
+          }
+        },
+        "required": [
+          "server_time",
+          "viewer",
+          "generation",
+          "datasets",
+          "projections",
+          "market"
+        ],
+        "title": "MetaData",
+        "type": "object"
+      },
+      "ProjectionInfo": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "owner_dataset_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Dataset Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "table_name": {
+            "title": "Table Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "table_name",
+          "available",
+          "reason",
+          "owner_dataset_id",
+          "available_at"
+        ],
+        "title": "ProjectionInfo",
+        "type": "object"
+      },
+      "ServingMeta": {
+        "properties": {
+          "built_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Built At"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ServingState"
+          }
+        },
+        "required": [
+          "generation_id",
+          "built_at",
+          "state",
+          "detail"
+        ],
+        "title": "ServingMeta",
+        "type": "object"
+      },
+      "ServingState": {
+        "enum": [
+          "ready",
+          "stale",
+          "degraded",
+          "unavailable"
+        ],
+        "title": "ServingState",
+        "type": "string"
+      }
+    }
+  },
+  "info": {
+    "title": "rQuant Web API",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/meta": {
+      "get": {
+        "operationId": "get_meta_api_v1_meta_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MetaData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "数据代、数据集水位与市场阶段",
+        "tags": [
+          "meta"
+        ]
+      }
+    }
+  }
+}
