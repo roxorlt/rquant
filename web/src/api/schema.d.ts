@@ -135,6 +135,8 @@ export interface components {
              * Format: date-time
              */
             event_time: string;
+            /** Name */
+            name: string;
             /**
              * Published At
              * Format: date-time
@@ -149,6 +151,7 @@ export interface components {
              * @enum {string}
              */
             status: "fresh" | "stale" | "degraded" | "unavailable";
+            user_status: components["schemas"]["StatusInfo"];
         };
         /** DeliveriesSummary */
         DeliveriesSummary: {
@@ -210,6 +213,8 @@ export interface components {
         };
         /** FreshnessSummary */
         FreshnessSummary: {
+            /** Caveats */
+            caveats: string[];
             /** Checked */
             checked: number;
             /** Late */

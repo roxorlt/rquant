@@ -218,6 +218,10 @@
             "title": "Event Time",
             "type": "string"
           },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
           "published_at": {
             "format": "date-time",
             "title": "Published At",
@@ -247,10 +251,15 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "user_status": {
+            "$ref": "#/components/schemas/StatusInfo"
           }
         },
         "required": [
           "dataset_id",
+          "name",
+          "user_status",
           "status",
           "event_time",
           "published_at",
@@ -441,6 +450,13 @@
       },
       "FreshnessSummary": {
         "properties": {
+          "caveats": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Caveats",
+            "type": "array"
+          },
           "checked": {
             "title": "Checked",
             "type": "integer"
@@ -465,7 +481,8 @@
           "on_time",
           "checked",
           "no_source",
-          "late"
+          "late",
+          "caveats"
         ],
         "title": "FreshnessSummary",
         "type": "object"

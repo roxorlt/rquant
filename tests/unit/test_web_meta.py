@@ -55,6 +55,9 @@ def test_ready_generation_carries_marker_watermarks_projections_and_phase(
     assert data["generation"]["producer_commit"] == manifest.producer_commit
     assert {item["dataset_id"] for item in data["datasets"]} >= {"signals", "runtime_health"}
     assert all(item["status"] == "fresh" for item in data["datasets"])
+    signals = next(item for item in data["datasets"] if item["dataset_id"] == "signals")
+    assert signals["name"] == "盘中信号"
+    assert signals["user_status"] == {"state": "ok", "label": "按时", "reason": "按时更新"}
     projections = {item["table_name"]: item for item in data["projections"]}
     assert projections["dashboard_summary"]["available"] is True
     assert projections["market_snapshot"]["available"] is False

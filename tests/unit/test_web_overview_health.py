@@ -247,7 +247,7 @@ def test_daily_data_is_late_once_its_evening_job_is_due(baseline: Path) -> None:
 
     screen = rows["canvas_latest_trade_date"]["status"]
     assert (screen["state"], screen["label"]) == ("warn", "延迟")
-    assert screen["reason"].startswith("落后 1 个交易日")
+    assert screen["reason"] == "落后 1 个交易日"
 
 
 def test_degraded_watermarks_become_plain_rows_not_a_banner(degraded: Path) -> None:
@@ -308,3 +308,15 @@ def test_replayed_production_errors_are_summarised_with_the_raw_text_kept() -> N
     [error] = error_items([item])
     assert error.summary == "连续失败 239 次"
     assert error.message.startswith("ReferenceSlowRuntimeError")
+
+
+def test_several_late_datasets_collapse_into_one_attention_item(baseline: Path) -> None:
+    # 2026-09-28 20:00 in Shanghai: 09-28's daily bars, minutes and screen are all due.
+    attention = _get(
+        baseline, "/api/v1/overview", datetime(2026, 9, 28, 12, 0, tzinfo=UTC), stale_after=1e9
+    )["data"]["attention"]
+
+    late = [item for item in attention if "没有按时更新" in item["title"]]
+    assert len(late) == 1
+    assert late[0]["title"] == "3 项数据没有按时更新"
+    assert late[0]["reason"] == "日线、分钟线、选股结果"

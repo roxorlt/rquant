@@ -14,9 +14,12 @@ from pydantic import BaseModel, ConfigDict
 
 from rquant.web.calendar import calendar_day
 from rquant.web.envelope import Envelope
+from rquant.web.labels import dataset_label
 from rquant.web.market import PHASE_LABELS, MarketPhase, market_phase, shanghai_trade_date
+from rquant.web.models.common import StatusInfo
 from rquant.web.security import current_user
 from rquant.web.serving import BorrowedGeneration, serving_meta
+from rquant.web.status import watermark_status
 
 router = APIRouter()
 
@@ -39,6 +42,9 @@ class DatasetWatermarkInfo(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     dataset_id: str
+    #: Plain name and user-level status for the data chip's tooltip.
+    name: str
+    user_status: StatusInfo
     status: Literal["fresh", "stale", "degraded", "unavailable"]
     event_time: datetime
     published_at: datetime
@@ -148,6 +154,8 @@ def build_meta(
         datasets=[
             DatasetWatermarkInfo(
                 dataset_id=item.dataset_id,
+                name=dataset_label(item.dataset_id),
+                user_status=StatusInfo.of(watermark_status(item)),
                 status=item.status.value,
                 event_time=item.event_time,
                 published_at=item.published_at,

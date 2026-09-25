@@ -148,7 +148,10 @@ class FreshnessSummary(BaseModel):
     on_time: int
     checked: int
     no_source: int
+    #: Not updated in time (延迟 / 快到期).
     late: list[str]
+    #: On time but with a caveat (注意), e.g. paper holdings valued at the last fill.
+    caveats: list[str]
 
 
 class AttentionItem(BaseModel):

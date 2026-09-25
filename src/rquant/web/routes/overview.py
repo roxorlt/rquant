@@ -484,16 +484,39 @@ def _attention(
             )
             for item in warn
         )
+    warned = [item for item in freshness if item.status.state is UserState.WARN]
+    late = [item for item in warned if item.status.label != "注意"]
+    caveats = [item for item in warned if item.status.label == "注意"]
+    if len(late) > 2:
+        items.append(
+            AttentionItem(
+                level="warn",
+                title=f"{len(late)} 项数据没有按时更新",
+                reason="、".join(item.name for item in late),
+                to="/health",
+                action="看健康",
+            )
+        )
+    else:
+        items.extend(
+            AttentionItem(
+                level="warn",
+                title=f"{item.name}{item.status.label}",
+                reason=item.status.reason,
+                to="/health",
+                action="看健康",
+            )
+            for item in late
+        )
     items.extend(
         AttentionItem(
             level="warn",
-            title=f"{item.name}{'延迟' if item.status.label == '延迟' else '需要注意'}",
+            title=f"{item.name}需要注意",
             reason=item.status.reason,
             to="/health",
             action="看健康",
         )
-        for item in freshness
-        if item.status.state is UserState.WARN
+        for item in caveats
     )
     return items[:_MAX_ATTENTION]
 
@@ -504,7 +527,16 @@ def _freshness_summary(items: Sequence[FreshnessItem]) -> FreshnessSummary:
         on_time=sum(item.status.state is UserState.OK for item in checked),
         checked=len(checked),
         no_source=sum(item.status.state is UserState.IDLE for item in items),
-        late=[item.name for item in checked if item.status.state is UserState.WARN],
+        late=[
+            item.name
+            for item in checked
+            if item.status.state is UserState.WARN and item.status.label != "注意"
+        ],
+        caveats=[
+            item.name
+            for item in checked
+            if item.status.state is UserState.WARN and item.status.label == "注意"
+        ],
     )
 
 
@@ -572,7 +604,7 @@ def empty_overview(now: datetime, meta: ServingMeta) -> OverviewData:
         deliveries=DeliveriesSummary(total=0, delivered=0, sending=0, failed=0, expired=0),
         paper=None,
         services=StateCounts(total=0, ok=0, warn=0, crit=0, idle=0, waiting=0),
-        freshness=FreshnessSummary(on_time=0, checked=0, no_source=0, late=[]),
+        freshness=FreshnessSummary(on_time=0, checked=0, no_source=0, late=[], caveats=[]),
         attention=_attention(
             meta,
             (),

@@ -180,8 +180,11 @@ def daily_status(
     if latest >= expected:
         return Status(UserState.OK, "按时", ready_note)
     days = behind_days if behind_days is not None and behind_days > 0 else None
-    behind = f"落后 {days} 个交易日" if days else "没有更新到最近交易日"
-    return Status(UserState.WARN, "延迟", f"{behind}；{ready_note}")
+    return Status(
+        UserState.WARN,
+        "延迟",
+        f"落后 {days} 个交易日" if days else "没有更新到最近交易日",
+    )
 
 
 def generation_status(age_seconds: float | None, stale_after: timedelta) -> Status:
