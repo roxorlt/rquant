@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/v1/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 系统健康 */
+        get: operations["get_health_api_v1_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/meta": {
         parameters: {
             query?: never;
@@ -21,10 +38,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 总览 */
+        get: operations["get_overview_api_v1_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** ActionCount */
+        ActionCount: {
+            /** Action */
+            action: string;
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+        };
+        /** AttentionItem */
+        AttentionItem: {
+            /** Action */
+            action: string;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "crit" | "warn";
+            /** Reason */
+            reason: string;
+            /** Title */
+            title: string;
+            /** To */
+            to: string;
+        };
+        /** CandidateGroup */
+        CandidateGroup: {
+            /** As Of */
+            as_of: string | null;
+            /** Count */
+            count: number;
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "screen" | "signals";
+        };
+        /** CandidateItem */
+        CandidateItem: {
+            /** Close */
+            close: number | null;
+            /** Code */
+            code: string;
+            /** First Seen At */
+            first_seen_at: string | null;
+            /** Group */
+            group: string;
+            /** Group Name */
+            group_name: string;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+        };
+        /** CandidatesSummary */
+        CandidatesSummary: {
+            /** Groups */
+            groups: components["schemas"]["CandidateGroup"][];
+            /** Items */
+            items: components["schemas"]["CandidateItem"][];
+            /** Total */
+            total: number;
+        };
         /** DatasetWatermarkInfo */
         DatasetWatermarkInfo: {
             /** Dataset Id */
@@ -49,10 +150,74 @@ export interface components {
              */
             status: "fresh" | "stale" | "degraded" | "unavailable";
         };
+        /** DeliveriesSummary */
+        DeliveriesSummary: {
+            /** Delivered */
+            delivered: number;
+            /** Expired */
+            expired: number;
+            /** Failed */
+            failed: number;
+            /** Sending */
+            sending: number;
+            /** Total */
+            total: number;
+        };
+        /** Envelope[HealthData] */
+        Envelope_HealthData_: {
+            data: components["schemas"]["HealthData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[MetaData] */
         Envelope_MetaData_: {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[OverviewData] */
+        Envelope_OverviewData_: {
+            data: components["schemas"]["OverviewData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** ErrorItem */
+        ErrorItem: {
+            /** At */
+            at: string | null;
+            /** Message */
+            message: string;
+            /** Name */
+            name: string;
+            /** Service Id */
+            service_id: string;
+            /** Summary */
+            summary: string;
+        };
+        /** FreshnessItem */
+        FreshnessItem: {
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "dataset" | "market";
+            /** Latest At */
+            latest_at: string | null;
+            /** Latest Date */
+            latest_date: string | null;
+            /** Name */
+            name: string;
+            status: components["schemas"]["StatusInfo"];
+        };
+        /** FreshnessSummary */
+        FreshnessSummary: {
+            /** Checked */
+            checked: number;
+            /** Late */
+            late: string[];
+            /** No Source */
+            no_source: number;
+            /** On Time */
+            on_time: number;
         };
         /** GenerationInfo */
         GenerationInfo: {
@@ -73,6 +238,38 @@ export interface components {
             published_at: string | null;
             /** Schema Version */
             schema_version: number;
+        };
+        /** HealthData */
+        HealthData: {
+            counts: components["schemas"]["StateCounts"];
+            /** Errors */
+            errors: components["schemas"]["ErrorItem"][];
+            /** Freshness */
+            freshness: components["schemas"]["FreshnessItem"][];
+            page_data: components["schemas"]["PageDataStatus"];
+            /** Services */
+            services: components["schemas"]["ServiceItem"][];
+        };
+        /** HoldingItem */
+        HoldingItem: {
+            /** Available Quantity */
+            available_quantity: number;
+            /** Average Cost */
+            average_cost: number;
+            /** Code */
+            code: string;
+            /** Market Price */
+            market_price: number;
+            /** Market Value */
+            market_value: number;
+            /** Name */
+            name: string | null;
+            /** Quantity */
+            quantity: number;
+            /** Unrealized Pct */
+            unrealized_pct: number | null;
+            /** Unrealized Pnl */
+            unrealized_pnl: number;
         };
         /** MarketInfo */
         MarketInfo: {
@@ -112,6 +309,81 @@ export interface components {
             /** Viewer */
             viewer: string | null;
         };
+        /** OverviewData */
+        OverviewData: {
+            /** Attention */
+            attention: components["schemas"]["AttentionItem"][];
+            candidates: components["schemas"]["CandidatesSummary"];
+            deliveries: components["schemas"]["DeliveriesSummary"];
+            freshness: components["schemas"]["FreshnessSummary"];
+            paper: components["schemas"]["PaperSummary"] | null;
+            /** Pipeline */
+            pipeline: components["schemas"]["PipelineStage"][];
+            services: components["schemas"]["StateCounts"];
+            session: components["schemas"]["SessionInfo"];
+            signals: components["schemas"]["SignalsSummary"];
+        };
+        /**
+         * PageDataStatus
+         * @description The Serving generation, in the owner's words (页面数据).
+         */
+        PageDataStatus: {
+            /** Age Seconds */
+            age_seconds: number | null;
+            /** Built At */
+            built_at: string | null;
+            /** Generation Id */
+            generation_id: string | null;
+            /** Published At */
+            published_at: string | null;
+            status: components["schemas"]["StatusInfo"];
+            /** Tables Total */
+            tables_total: number;
+            /** Unpublished */
+            unpublished: components["schemas"]["TableItem"][];
+        };
+        /** PaperSummary */
+        PaperSummary: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Cash */
+            cash: number;
+            /** Holdings */
+            holdings: components["schemas"]["HoldingItem"][];
+            /** Nav */
+            nav: number;
+            /** Note */
+            note: string | null;
+            /** Realized Pnl */
+            realized_pnl: number;
+            /** Unrealized Pnl */
+            unrealized_pnl: number;
+        };
+        /** PipelineStage */
+        PipelineStage: {
+            /** Hint */
+            hint: string;
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "done" | "running" | "waiting" | "paused" | "late";
+            /** State Label */
+            state_label: string;
+            /** Value */
+            value: string | null;
+            /** Window */
+            window: string;
+        };
         /** ProjectionInfo */
         ProjectionInfo: {
             /** Available */
@@ -124,6 +396,39 @@ export interface components {
             reason: string | null;
             /** Table Name */
             table_name: string;
+        };
+        /** ServiceItem */
+        ServiceItem: {
+            /** Backlog Count */
+            backlog_count: number;
+            /** Consecutive Failures */
+            consecutive_failures: number;
+            /** Heartbeat At */
+            heartbeat_at: string | null;
+            /** Input Sequence */
+            input_sequence: number;
+            /** Last Error */
+            last_error: string | null;
+            /** Name */
+            name: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Output Sequence */
+            output_sequence: number;
+            /** Plane */
+            plane: string;
+            /** Plane Label */
+            plane_label: string;
+            /** Raw Status */
+            raw_status: string;
+            /** Service Id */
+            service_id: string;
+            /** Stale */
+            stale: boolean;
+            status: components["schemas"]["StatusInfo"];
         };
         /** ServingMeta */
         ServingMeta: {
@@ -144,6 +449,104 @@ export interface components {
          * @enum {string}
          */
         ServingState: "ready" | "stale" | "degraded" | "unavailable";
+        /**
+         * SessionInfo
+         * @description Which trading day the numbers are for.
+         */
+        SessionInfo: {
+            /** Is Today */
+            is_today: boolean;
+            /** Next Trading Day */
+            next_trading_day: string | null;
+            phase: components["schemas"]["MarketPhase"];
+            /**
+             * Today
+             * Format: date
+             */
+            today: string;
+            /** Trade Date */
+            trade_date: string | null;
+        };
+        /** SignalItem */
+        SignalItem: {
+            /** Action */
+            action: string;
+            /** Action Label */
+            action_label: string;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /**
+             * Delivery
+             * @enum {string}
+             */
+            delivery: "delivered" | "sending" | "failed" | "expired" | "none";
+            /** Delivery Label */
+            delivery_label: string;
+            /** Name */
+            name: string | null;
+            /** Reasons */
+            reasons: string[];
+            /** Sequence */
+            sequence: number;
+            /** Signal Id */
+            signal_id: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Strategy Name */
+            strategy_name: string;
+        };
+        /** SignalsSummary */
+        SignalsSummary: {
+            /** By Action */
+            by_action: components["schemas"]["ActionCount"][];
+            /** Items */
+            items: components["schemas"]["SignalItem"][];
+            /** Total */
+            total: number;
+        };
+        /** StateCounts */
+        StateCounts: {
+            /** Crit */
+            crit: number;
+            /** Idle */
+            idle: number;
+            /** Ok */
+            ok: number;
+            /** Total */
+            total: number;
+            /** Waiting */
+            waiting: number;
+            /** Warn */
+            warn: number;
+        };
+        /**
+         * StatusInfo
+         * @description One user-level status: state (colour + icon), a short word, a one-line reason.
+         */
+        StatusInfo: {
+            /** Label */
+            label: string;
+            /** Reason */
+            reason: string;
+            state: components["schemas"]["UserState"];
+        };
+        /** TableItem */
+        TableItem: {
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+        };
+        /**
+         * UserState
+         * @enum {string}
+         */
+        UserState: "ok" | "warn" | "crit" | "idle" | "waiting";
     };
     responses: never;
     parameters: never;
@@ -153,6 +556,26 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_health_api_v1_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_HealthData_"];
+                };
+            };
+        };
+    };
     get_meta_api_v1_meta_get: {
         parameters: {
             query?: never;
@@ -169,6 +592,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MetaData_"];
+                };
+            };
+        };
+    };
+    get_overview_api_v1_overview_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_OverviewData_"];
                 };
             };
         };

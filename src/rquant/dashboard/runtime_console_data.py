@@ -317,6 +317,76 @@ def _read_rows(
     return tuple(model.model_validate(dict(zip(spec.columns, row, strict=True))) for row in rows)
 
 
+class RuntimeConsoleSections(RuntimeContractModel):
+    """The seven bounded read-only sections of one generation, without load state."""
+
+    services: tuple[RuntimeServiceRow, ...] = ()
+    signals: tuple[SignalRow, ...] = ()
+    deliveries: tuple[DeliveryRow, ...] = ()
+    paper_accounts: tuple[PaperAccountRow, ...] = ()
+    paper_holdings: tuple[PaperHoldingRow, ...] = ()
+    lab_jobs: tuple[LabJobRow, ...] = ()
+    promotions: tuple[PromotionRow, ...] = ()
+
+
+def read_runtime_console_sections(
+    connection: _ReadonlyConnection,
+    *,
+    limits: ConsoleLimits | None = None,
+) -> RuntimeConsoleSections:
+    """Run the console's fixed, bounded queries on an already verified connection.
+
+    The caller owns the generation lease (the web API borrows one cursor per request from
+    a lease it shares across requests); this function neither opens nor closes anything.
+    """
+
+    query_limits = limits or ConsoleLimits()
+    return RuntimeConsoleSections(
+        services=_read_rows(
+            connection,
+            section="services",
+            limit=query_limits.services,
+            model=RuntimeServiceRow,
+        ),
+        signals=_read_rows(
+            connection,
+            section="signals",
+            limit=query_limits.signals,
+            model=SignalRow,
+        ),
+        deliveries=_read_rows(
+            connection,
+            section="deliveries",
+            limit=query_limits.deliveries,
+            model=DeliveryRow,
+        ),
+        paper_accounts=_read_rows(
+            connection,
+            section="paper_accounts",
+            limit=query_limits.paper_accounts,
+            model=PaperAccountRow,
+        ),
+        paper_holdings=_read_rows(
+            connection,
+            section="paper_holdings",
+            limit=query_limits.paper_holdings,
+            model=PaperHoldingRow,
+        ),
+        lab_jobs=_read_rows(
+            connection,
+            section="lab_jobs",
+            limit=query_limits.lab_jobs,
+            model=LabJobRow,
+        ),
+        promotions=_read_rows(
+            connection,
+            section="promotions",
+            limit=query_limits.promotions,
+            model=PromotionRow,
+        ),
+    )
+
+
 def _error_detail(error: Exception) -> str:
     message = " ".join(str(error).split())
     return f"{type(error).__name__}: {message or 'serving read failed'}"[:300]
@@ -369,51 +439,10 @@ def load_runtime_console(
                 age=age,
                 stale_after=stale_after,
             )
-            connection = acquired.connection
-            sections = {
-                "services": _read_rows(
-                    connection,
-                    section="services",
-                    limit=query_limits.services,
-                    model=RuntimeServiceRow,
-                ),
-                "signals": _read_rows(
-                    connection,
-                    section="signals",
-                    limit=query_limits.signals,
-                    model=SignalRow,
-                ),
-                "deliveries": _read_rows(
-                    connection,
-                    section="deliveries",
-                    limit=query_limits.deliveries,
-                    model=DeliveryRow,
-                ),
-                "paper_accounts": _read_rows(
-                    connection,
-                    section="paper_accounts",
-                    limit=query_limits.paper_accounts,
-                    model=PaperAccountRow,
-                ),
-                "paper_holdings": _read_rows(
-                    connection,
-                    section="paper_holdings",
-                    limit=query_limits.paper_holdings,
-                    model=PaperHoldingRow,
-                ),
-                "lab_jobs": _read_rows(
-                    connection,
-                    section="lab_jobs",
-                    limit=query_limits.lab_jobs,
-                    model=LabJobRow,
-                ),
-                "promotions": _read_rows(
-                    connection,
-                    section="promotions",
-                    limit=query_limits.promotions,
-                    model=PromotionRow,
-                ),
-            }
+            sections = read_runtime_console_sections(
+                acquired.connection,
+                limits=query_limits,
+            )
     except Exception as error:
         if manifest is None:
             return _unavailable(error)
@@ -440,7 +469,7 @@ def load_runtime_console(
         generated_at=manifest.built_at,
         age_seconds=int(age.total_seconds()),
         producer_commit=manifest.producer_commit,
-        **sections,
+        **{name: getattr(sections, name) for name in RuntimeConsoleSections.model_fields},
     )
 
 
@@ -453,12 +482,14 @@ __all__ = [
     "PaperAccountRow",
     "PaperHoldingRow",
     "PromotionRow",
+    "RuntimeConsoleSections",
     "RuntimeConsoleSnapshot",
     "RuntimeServiceRow",
     "SignalRow",
     "ServingFrameResult",
     "ServingFrameState",
     "load_runtime_console",
+    "read_runtime_console_sections",
     "query_serving_frame",
     "query_acquired_serving_frame",
     "require_serving_projections",

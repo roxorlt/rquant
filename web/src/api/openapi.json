@@ -1,6 +1,212 @@
 {
   "components": {
     "schemas": {
+      "ActionCount": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "label",
+          "count"
+        ],
+        "title": "ActionCount",
+        "type": "object"
+      },
+      "AttentionItem": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "level": {
+            "enum": [
+              "crit",
+              "warn"
+            ],
+            "title": "Level",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "to": {
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "level",
+          "title",
+          "reason",
+          "to",
+          "action"
+        ],
+        "title": "AttentionItem",
+        "type": "object"
+      },
+      "CandidateGroup": {
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "screen",
+              "signals"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "count",
+          "as_of",
+          "source"
+        ],
+        "title": "CandidateGroup",
+        "type": "object"
+      },
+      "CandidateItem": {
+        "properties": {
+          "close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Close"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "first_seen_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Seen At"
+          },
+          "group": {
+            "title": "Group",
+            "type": "string"
+          },
+          "group_name": {
+            "title": "Group Name",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "group",
+          "group_name",
+          "close",
+          "pct_chg",
+          "first_seen_at"
+        ],
+        "title": "CandidateItem",
+        "type": "object"
+      },
+      "CandidatesSummary": {
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateGroup"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "groups",
+          "items"
+        ],
+        "title": "CandidatesSummary",
+        "type": "object"
+      },
       "DatasetWatermarkInfo": {
         "properties": {
           "dataset_id": {
@@ -54,6 +260,55 @@
         "title": "DatasetWatermarkInfo",
         "type": "object"
       },
+      "DeliveriesSummary": {
+        "properties": {
+          "delivered": {
+            "title": "Delivered",
+            "type": "integer"
+          },
+          "expired": {
+            "title": "Expired",
+            "type": "integer"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "sending": {
+            "title": "Sending",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "delivered",
+          "sending",
+          "failed",
+          "expired"
+        ],
+        "title": "DeliveriesSummary",
+        "type": "object"
+      },
+      "Envelope_HealthData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/HealthData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[HealthData]",
+        "type": "object"
+      },
       "Envelope_MetaData_": {
         "properties": {
           "data": {
@@ -68,6 +323,151 @@
           "serving"
         ],
         "title": "Envelope[MetaData]",
+        "type": "object"
+      },
+      "Envelope_OverviewData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/OverviewData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[OverviewData]",
+        "type": "object"
+      },
+      "ErrorItem": {
+        "properties": {
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "service_id": {
+            "title": "Service Id",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "name",
+          "at",
+          "summary",
+          "message"
+        ],
+        "title": "ErrorItem",
+        "type": "object"
+      },
+      "FreshnessItem": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "dataset",
+              "market"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "latest_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest At"
+          },
+          "latest_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Date"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusInfo"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "kind",
+          "latest_at",
+          "latest_date",
+          "status"
+        ],
+        "title": "FreshnessItem",
+        "type": "object"
+      },
+      "FreshnessSummary": {
+        "properties": {
+          "checked": {
+            "title": "Checked",
+            "type": "integer"
+          },
+          "late": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Late",
+            "type": "array"
+          },
+          "no_source": {
+            "title": "No Source",
+            "type": "integer"
+          },
+          "on_time": {
+            "title": "On Time",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "on_time",
+          "checked",
+          "no_source",
+          "late"
+        ],
+        "title": "FreshnessSummary",
         "type": "object"
       },
       "GenerationInfo": {
@@ -127,6 +527,113 @@
           "age_seconds"
         ],
         "title": "GenerationInfo",
+        "type": "object"
+      },
+      "HealthData": {
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/StateCounts"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ErrorItem"
+            },
+            "title": "Errors",
+            "type": "array"
+          },
+          "freshness": {
+            "items": {
+              "$ref": "#/components/schemas/FreshnessItem"
+            },
+            "title": "Freshness",
+            "type": "array"
+          },
+          "page_data": {
+            "$ref": "#/components/schemas/PageDataStatus"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceItem"
+            },
+            "title": "Services",
+            "type": "array"
+          }
+        },
+        "required": [
+          "counts",
+          "services",
+          "freshness",
+          "page_data",
+          "errors"
+        ],
+        "title": "HealthData",
+        "type": "object"
+      },
+      "HoldingItem": {
+        "properties": {
+          "available_quantity": {
+            "title": "Available Quantity",
+            "type": "number"
+          },
+          "average_cost": {
+            "title": "Average Cost",
+            "type": "number"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "market_price": {
+            "title": "Market Price",
+            "type": "number"
+          },
+          "market_value": {
+            "title": "Market Value",
+            "type": "number"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "quantity": {
+            "title": "Quantity",
+            "type": "number"
+          },
+          "unrealized_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unrealized Pct"
+          },
+          "unrealized_pnl": {
+            "title": "Unrealized Pnl",
+            "type": "number"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "quantity",
+          "available_quantity",
+          "average_cost",
+          "market_price",
+          "market_value",
+          "unrealized_pnl",
+          "unrealized_pct"
+        ],
+        "title": "HoldingItem",
         "type": "object"
       },
       "MarketInfo": {
@@ -261,6 +768,257 @@
         "title": "MetaData",
         "type": "object"
       },
+      "OverviewData": {
+        "properties": {
+          "attention": {
+            "items": {
+              "$ref": "#/components/schemas/AttentionItem"
+            },
+            "title": "Attention",
+            "type": "array"
+          },
+          "candidates": {
+            "$ref": "#/components/schemas/CandidatesSummary"
+          },
+          "deliveries": {
+            "$ref": "#/components/schemas/DeliveriesSummary"
+          },
+          "freshness": {
+            "$ref": "#/components/schemas/FreshnessSummary"
+          },
+          "paper": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pipeline": {
+            "items": {
+              "$ref": "#/components/schemas/PipelineStage"
+            },
+            "title": "Pipeline",
+            "type": "array"
+          },
+          "services": {
+            "$ref": "#/components/schemas/StateCounts"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionInfo"
+          },
+          "signals": {
+            "$ref": "#/components/schemas/SignalsSummary"
+          }
+        },
+        "required": [
+          "session",
+          "pipeline",
+          "candidates",
+          "signals",
+          "deliveries",
+          "paper",
+          "services",
+          "freshness",
+          "attention"
+        ],
+        "title": "OverviewData",
+        "type": "object"
+      },
+      "PageDataStatus": {
+        "description": "The Serving generation, in the owner's words (页面数据).",
+        "properties": {
+          "age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Seconds"
+          },
+          "built_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Built At"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusInfo"
+          },
+          "tables_total": {
+            "title": "Tables Total",
+            "type": "integer"
+          },
+          "unpublished": {
+            "items": {
+              "$ref": "#/components/schemas/TableItem"
+            },
+            "title": "Unpublished",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "built_at",
+          "published_at",
+          "age_seconds",
+          "generation_id",
+          "tables_total",
+          "unpublished"
+        ],
+        "title": "PageDataStatus",
+        "type": "object"
+      },
+      "PaperSummary": {
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "as_of": {
+            "format": "date-time",
+            "title": "As Of",
+            "type": "string"
+          },
+          "cash": {
+            "title": "Cash",
+            "type": "number"
+          },
+          "holdings": {
+            "items": {
+              "$ref": "#/components/schemas/HoldingItem"
+            },
+            "title": "Holdings",
+            "type": "array"
+          },
+          "nav": {
+            "title": "Nav",
+            "type": "number"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "realized_pnl": {
+            "title": "Realized Pnl",
+            "type": "number"
+          },
+          "unrealized_pnl": {
+            "title": "Unrealized Pnl",
+            "type": "number"
+          }
+        },
+        "required": [
+          "account_id",
+          "as_of",
+          "nav",
+          "cash",
+          "unrealized_pnl",
+          "realized_pnl",
+          "holdings",
+          "note"
+        ],
+        "title": "PaperSummary",
+        "type": "object"
+      },
+      "PipelineStage": {
+        "properties": {
+          "hint": {
+            "title": "Hint",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "done",
+              "running",
+              "waiting",
+              "paused",
+              "late"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "state_label": {
+            "title": "State Label",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          },
+          "window": {
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "window",
+          "state",
+          "state_label",
+          "value",
+          "hint"
+        ],
+        "title": "PipelineStage",
+        "type": "object"
+      },
       "ProjectionInfo": {
         "properties": {
           "available": {
@@ -314,6 +1072,99 @@
           "available_at"
         ],
         "title": "ProjectionInfo",
+        "type": "object"
+      },
+      "ServiceItem": {
+        "properties": {
+          "backlog_count": {
+            "title": "Backlog Count",
+            "type": "integer"
+          },
+          "consecutive_failures": {
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "input_sequence": {
+            "title": "Input Sequence",
+            "type": "integer"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "output_sequence": {
+            "title": "Output Sequence",
+            "type": "integer"
+          },
+          "plane": {
+            "title": "Plane",
+            "type": "string"
+          },
+          "plane_label": {
+            "title": "Plane Label",
+            "type": "string"
+          },
+          "raw_status": {
+            "title": "Raw Status",
+            "type": "string"
+          },
+          "service_id": {
+            "title": "Service Id",
+            "type": "string"
+          },
+          "stale": {
+            "title": "Stale",
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusInfo"
+          }
+        },
+        "required": [
+          "service_id",
+          "name",
+          "plane",
+          "plane_label",
+          "status",
+          "heartbeat_at",
+          "observed_at",
+          "raw_status",
+          "stale",
+          "input_sequence",
+          "output_sequence",
+          "backlog_count",
+          "consecutive_failures",
+          "last_error"
+        ],
+        "title": "ServiceItem",
         "type": "object"
       },
       "ServingMeta": {
@@ -391,6 +1242,261 @@
         ],
         "title": "ServingState",
         "type": "string"
+      },
+      "SessionInfo": {
+        "description": "Which trading day the numbers are for.",
+        "properties": {
+          "is_today": {
+            "title": "Is Today",
+            "type": "boolean"
+          },
+          "next_trading_day": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Trading Day"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/MarketPhase"
+          },
+          "today": {
+            "format": "date",
+            "title": "Today",
+            "type": "string"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "today",
+          "trade_date",
+          "is_today",
+          "phase",
+          "next_trading_day"
+        ],
+        "title": "SessionInfo",
+        "type": "object"
+      },
+      "SignalItem": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "action_label": {
+            "title": "Action Label",
+            "type": "string"
+          },
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "delivery": {
+            "enum": [
+              "delivered",
+              "sending",
+              "failed",
+              "expired",
+              "none"
+            ],
+            "title": "Delivery",
+            "type": "string"
+          },
+          "delivery_label": {
+            "title": "Delivery Label",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "signal_id": {
+            "title": "Signal Id",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "strategy_name": {
+            "title": "Strategy Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "signal_id",
+          "sequence",
+          "at",
+          "code",
+          "name",
+          "strategy_id",
+          "strategy_name",
+          "action",
+          "action_label",
+          "delivery",
+          "delivery_label",
+          "reasons"
+        ],
+        "title": "SignalItem",
+        "type": "object"
+      },
+      "SignalsSummary": {
+        "properties": {
+          "by_action": {
+            "items": {
+              "$ref": "#/components/schemas/ActionCount"
+            },
+            "title": "By Action",
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SignalItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "by_action",
+          "items"
+        ],
+        "title": "SignalsSummary",
+        "type": "object"
+      },
+      "StateCounts": {
+        "properties": {
+          "crit": {
+            "title": "Crit",
+            "type": "integer"
+          },
+          "idle": {
+            "title": "Idle",
+            "type": "integer"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "waiting": {
+            "title": "Waiting",
+            "type": "integer"
+          },
+          "warn": {
+            "title": "Warn",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "ok",
+          "warn",
+          "crit",
+          "idle",
+          "waiting"
+        ],
+        "title": "StateCounts",
+        "type": "object"
+      },
+      "StatusInfo": {
+        "description": "One user-level status: state (colour + icon), a short word, a one-line reason.",
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/UserState"
+          }
+        },
+        "required": [
+          "state",
+          "label",
+          "reason"
+        ],
+        "title": "StatusInfo",
+        "type": "object"
+      },
+      "TableItem": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "name"
+        ],
+        "title": "TableItem",
+        "type": "object"
+      },
+      "UserState": {
+        "enum": [
+          "ok",
+          "warn",
+          "crit",
+          "idle",
+          "waiting"
+        ],
+        "title": "UserState",
+        "type": "string"
       }
     }
   },
@@ -400,6 +1506,27 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/health": {
+      "get": {
+        "operationId": "get_health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_HealthData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "系统健康",
+        "tags": [
+          "health"
+        ]
+      }
+    },
     "/api/v1/meta": {
       "get": {
         "operationId": "get_meta_api_v1_meta_get",
@@ -418,6 +1545,27 @@
         "summary": "数据代、数据集水位与市场阶段",
         "tags": [
           "meta"
+        ]
+      }
+    },
+    "/api/v1/overview": {
+      "get": {
+        "operationId": "get_overview_api_v1_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_OverviewData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "总览",
+        "tags": [
+          "overview"
         ]
       }
     }

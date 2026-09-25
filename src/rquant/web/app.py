@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from rquant.web.routes import meta
+from rquant.web.routes import health, meta, overview
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 
@@ -88,6 +88,8 @@ def create_app(
         return JSONResponse(status_code=500, content={"detail": "网页 API 内部错误"})
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
+    app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
+    app.include_router(health.router, prefix="/api/v1", tags=["health"])
     return app
 
 
