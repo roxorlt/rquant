@@ -224,7 +224,15 @@
   `expires_at` 为 `NULL`，`(expires - today_d).days` 撞 `None` 抛 `TypeError`，现在识别为「长期有效」，不再算
   过期 / 临期。新增
   `tests/unit/test_serving_page_isolation.py::test_dashboard_page_renders_null_freshness_row_as_dash_placeholders`
-  复现并锁定这个场景。
+  复现并锁定这个场景。③ 「通知通道」24 小时成功率一直显示 0%：`deliveries.status` 是
+  `OutboxRecord.status`（`rquant/delivery_contracts.py` 的 `OutboxStatus`）序列化出来的，成功态的字面值是
+  `OutboxStatus.SUCCEEDED == "succeeded"`，代码却拿字符串 `"delivered"` 去判等——这个值从来都不是
+  `OutboxStatus` 的合法成员（枚举只有 `pending`/`leased`/`retry`/`succeeded`/`expired`/`dead_letter`
+  六种），查过旧的 `notification_log` 表（v0.13.x 起已弃用，迁移到 `logs/notification_log.jsonl`，跟现在这张
+  serving 投影完全不是一条链路）也没有产出过 `"delivered"`，所以不用兼容旧值，直接改成按
+  `OutboxStatus.SUCCEEDED.value` 判等。新增
+  `tests/unit/test_serving_page_isolation.py::test_dashboard_page_renders_succeeded_delivery_as_full_success_rate`
+  锁定「一条 `succeeded` 记录渲染成 1/1、100% 成功」。
 
 - **全角色沙箱 e2e 的间歇失败（CI run 36059539009，3.11 分片 2；只改测试）**：
   `tests/integration/test_route_a_all_roles_sandbox_e2e.py` 的 `run_role` 在拍 `trees_before` 快照之前先做一次完整的

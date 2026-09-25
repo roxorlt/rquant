@@ -26,6 +26,7 @@ from rquant.dashboard.serving_page_ui import (
     render_serving_root_failure,
     render_serving_state_banner,
 )
+from rquant.delivery_contracts import OutboxStatus
 from rquant.serving_paths import serving_root_from_env
 
 REFRESH_SECONDS = 30
@@ -1044,7 +1045,7 @@ try:
     elif last24h.empty:
         st.info("最近 24h 无推送记录")
     else:
-        last24h = last24h.assign(success=last24h["status"].eq("delivered"))
+        last24h = last24h.assign(success=last24h["status"].eq(OutboxStatus.SUCCEEDED.value))
         rate = (
             last24h.groupby("channel")
             .agg(
