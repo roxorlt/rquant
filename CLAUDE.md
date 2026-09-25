@@ -2,9 +2,10 @@
 
 ## 项目定位
 
-rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
-- 只做「条件筛选 + 实时监控 + 告警通知」
-- **明确暂时不做**：实盘下单、高频策略、Tick 级微观结构、Level2
+rQuant 是一个**个人自用**的 A 股**投研平台（不含下单）**：
+- 数据、选股、因子、策略、回测、实验、模拟盘、盯盘告警、调度、运维
+- **明确不做**：实盘下单、高频策略、Tick 级微观结构、Level2
+- 2026-09-25 owner 决定：范围从「条件筛选 + 实时监控 + 告警通知」扩为投研平台（新前端计划 v2），新网页入口 `/app/`
 
 ## 开发环境
 
@@ -24,8 +25,15 @@ uv run pytest -q                         # 全量测试（约 13.4k 用例，本
 uv run pytest tests/unit/test_xxx.py -q  # 改哪块测哪块（秒级）
 uv run ruff check <改动的文件>            # lint 只查改动文件——全库存量约 980 个历史告警，全量跑会误判为本次改动引入
 uv run rquant --help                     # CLI 入口（serve / run-daily / monitor / notify-test 等 40+ 子命令）
-uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard
+uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard（逐步停用）
+pnpm -C web install --frozen-lockfile    # 前端依赖（Node 22.22.2 + pnpm 10，版本见 web/.nvmrc 与 package.json）
+pnpm -C web check                        # Biome + tsc + Vitest
+pnpm -C web build                        # 编译到 web/dist（要提交）；pnpm -C web verify:dist 核对提交的是最新编译结果
+pnpm -C web e2e                          # Playwright：合成数据代 + 网页 API + /app/ 静态服务
+uv run rquant web-serve --bind 127.0.0.1:8768      # 只读网页 API（读 RQUANT_SERVING_ROOT，不读 .env）
 ```
+
+前端的目录约定和代理规则见 `web/CLAUDE.md`。
 
 ## 技术栈约束
 
@@ -38,7 +46,7 @@ uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard
 | 指标 | pandas-ta | TA-Lib（Mac 装麻烦） |
 | 调度 | APScheduler | Celery / Airflow（个人项目用不上） |
 | 日志 | loguru | 标准 logging（手动配置烦） |
-| UI | Streamlit | React/Vue 从零写（先别开分支） |
+| UI | React + TypeScript + Vite（`web/`，入口 `/app/`）；Streamlit 页面逐步停用（2026-09-25 owner 决定） | Vue、新的 Streamlit 页面 |
 | 通知 | PushDeer（参考 30-projects/xueqiuFollow/src/notifier.py），现阶段只推 admin（刘彤） | cc2im（受限于微信 token 限制）、企业微信 webhook、新搭通知系统 |
 
 ## 代码风格
@@ -227,7 +235,8 @@ chore: init pyproject.toml with uv
 用户已授权 Codex 代管日常 PR merge、tag 和腾讯云代码部署。自动化必须走固定安全链路，
 不是任意生产权限：
 
-1. PR 仅在 mergeable 且 Python 3.11/3.12 CI 全绿后 squash merge；随后创建 annotated
+1. PR 仅在 mergeable 且 Python 3.11/3.12 CI（改到前端时还有 `web.yml`）全绿后用「Create a merge commit」
+   合并（main 上都是两父合并提交，R07 证据要求第一父等于冻结基线，不用 squash）；随后创建 annotated
    SemVer tag，tag 必须指向合并后的 `origin/main` commit。
 2. 腾讯云日常发布只允许通过
    `bash scripts/deploy-production.sh --target <exact-tag-or-full-sha>`；禁止盲拉 main。
@@ -252,10 +261,10 @@ chore: init pyproject.toml with uv
 
 ## 边界守则（重要）
 
-当讨论到新功能时，先问：**这个需求是否属于「条件筛选 + 监控 + 告警」这个核心范围？**
+当讨论到新功能时，先问：**这个需求是否属于「投研平台（不含下单）」这个范围？**
 
 - 属于 → 可以做
-- 不属于（如：下单、高频、Tick 分析、策略自动优化）→ 提醒用户这超出了项目边界，是否要扩张
+- 不属于（如：实盘下单、高频、Tick 级分析、Level2）→ 提醒用户这超出了项目边界，是否要扩张
 
 这是个人项目最容易阵亡的原因——功能无限扩张。
 
