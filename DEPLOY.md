@@ -15,7 +15,7 @@
 
 | 步 | 什么时候 | 做什么 | 需要谁 |
 |---|---|---|---|
-| 第一部分 | **周一 09:20 之前**（最好周末休市时做） | 按平常的路线 A 窗口把 v0.33.24 装上，**仍是影子档** | owner 授权装机窗口 + 读 `.env` |
+| 第一部分 | **最好周末休市时做**；最晚周一 08:00 开始，保证 09:00 前 20 个 unit 全部起来 | 按平常的路线 A 窗口把 v0.33.24 装上，**仍是影子档** | owner 授权装机窗口 + 读 `.env` |
 | 第二部分 | **周一 09:52 检查点通过之后**（约 09:55–10:15） | 只改输入文档里的一个键，装一代新画像，**只重启 notifier** | owner 授权盘中改权威链、重启一个 unit + 读 `.env` |
 
 不做第一部分就**不要**做第二部分：没有修复时切正式，推送会发出去，但 notifier 每一轮都记失败、serving 永远拿不到信号。
@@ -23,7 +23,7 @@
 ### 为什么必须先装 v0.33.24（新发现的阻断）
 
 路由策略给每个通道只写一个收件人 `admin`。主机的 `PUSHDEER_KEYS` 是 owner 的 iPhone 和 Mac 两把 key
-（CLAUDE.md；旧告警日志里的「2/3 成功」也是 2 个 PushDeer + 1 个 PushPlus），而密封给 notifier 的凭据里只有 key、
+（CLAUDE.md 这样写；09-07 旧告警日志里的「2/3 成功」也与 2 个 PushDeer + 1 个 PushPlus 相符；下面有只读确认方法），而密封给 notifier 的凭据里只有 key、
 没有收件人 id，所以 notifier 自己推断出 `admin.device-01` / `admin.device-02` 两个收件人，把每条路由来的 `admin`
 待发行换成两台设备各一行。批次发完之后，notifier 要发布 `signals` 权威，这一步用的数据模型要求「每条投递的收件人
 必须是路由回执里写的收件人」，于是把两台设备的行判成 `delivery target is outside the frozen route manifest`，整轮
@@ -61,7 +61,7 @@ jq -c '.degraded_reasons' "$ROOT"/control/notifiers/$NSVC/heartbeats/*.json
   就算它停机时被 SIGKILL，新进程也照常接着那份心跳起来（演练里专门把心跳改成 `running` 再起，照样起来）。
   **第二部分碰不到 #270。** 第一部分换代码、每个 role 的 spec 都变，会碰到，靠平常的 R-32 挡住（见下）。
 
-### 第一部分：装 v0.33.24（影子档），周一 09:20 之前
+### 第一部分：装 v0.33.24（影子档），最好周末做，最晚周一 09:00 前起齐
 
 就是平常的路线 A 窗口（v0.33.22 那条的 1–7 步），只列与平常不同或要特别看的地方：
 
@@ -154,7 +154,8 @@ $CUT diff-profiles "$PROFILES/$P_SHADOW.json" "$PROFILES/$P_LIVE.json"
 #   "notifier_differences": ["settings.suppress_delivery"]，"notifier_after": {"paused": false, "suppress_delivery": false}
 ```
 
-**第 3 步：新一代 bundle**（需要 `.env` 与 capability 导出，同平常窗口）
+**第 3 步：新一代 bundle**（需要 `.env` 与 capability 导出，同平常窗口；`.env` 里的值必须与第一部分装机时相同，
+否则 7 个凭据角色的密封值也会跟着变）
 
 ```bash
 set -a; . /home/lighthouse/rquant/.env; set +a
@@ -251,6 +252,8 @@ $CUT set-mode --inputs "$INPUTS" --from live --to shadow     # 期望 sha256_aft
 ./.venv/bin/rquant runtime-deployment-profile --profile "$PROFILES/$P_SHADOW.json" \
   --runtime-root "$ROOT" --expected-commit "$COMMIT" --apply --profile-id "$P_SHADOW"
 readlink "$ROOT/current"                                     # 期望 generations/<N>（原来那一代被原样复用）
+#   回执的 generation_hash 必须等于 <N>。不相等说明 .env 里的值变过（凭据摘要是这一代内容的一部分），
+#   这时不要做 R4，停在 R1 的状态找协调者
 # R4：起 notifier，心跳里重新出现 notifier:shadow_transport
 sudo systemctl start "$NUNIT"
 ```
@@ -271,23 +274,24 @@ sudo systemctl start "$NUNIT"
   如果主机的 `.env` 把 `PUSHDEER_ENDPOINT` 改成了别的服务器，请 owner 告诉我们，那时正式档会发到官方地址、对不上。
   `PUSHPLUS_TOKENS` 也密封了，但路由里没有 PushPlus 目标，所以**美丞收不到路线 A 的推送**。
   `install-runtime-credential-keys.sh` 管的是 `RQ_*` 签名 key，与 PushDeer 无关。
-- **不会重复发**：每条信号对每台设备只有一行（行 id 由信号 id + 收件人 + 通道算出）；结果不确定（超时、对端没回）
-  的行留在 leased 状态，**生产代码里没有任何地方回收它们**，所以不会重试；这个发送器从不报「对端明确拒绝」，所以
-  也不存在按失败重试。换句话说：每条信号每台设备最多推一次。
+- **不会重复发**：每条信号对每台设备只有一行（行 id 由信号 id + 收件人 + 通道算出）。这个发送器把「对端没回答」
+  和「回答不明确」都记成结果不确定，这样的行留在 leased 状态，**生产代码里没有任何地方回收它们**，所以不会重发；
+  会重试的只有发送之前就能确定的失败（例如收件人没有凭据），那种失败本来就发不出去。换句话说：每条信号每台设备
+  最多推一次。
 - **影子档发过的不会再发**：影子档把行标成 succeeded，这是终态，不会再被认领；设备迁移也原样保留 succeeded 行。
   演练里切换前的每一行在切换后逐字段不变，记录器一次都没收到它们。
 - **没有「切换时刻」截止线**：代码里没有「只发某个时刻之后的信号」这种规则。实际的截止线是「影子档 notifier 停下时
   已经认领的那些」。第 5 步 stop 到 start 之间（十几秒）路由来的新信号，会在正式档第一轮发出去——它们是新鲜的当天
   信号，不是积压。第 0 步要求 backlog 为 0，就是为了保证第一轮不会冒出一批旧信号。
-- **没有限流**：每 2 秒一轮、一轮最多 128 行。影子档一直在消耗，所以正常情况下第一轮只有新信号；09-24 的回放一整天
-  是 6 条信号，两台设备就是 12 条推送。
+- **没有限流**：每 2 秒一轮、一轮最多 128 行。影子档一直在消耗，所以正常情况下第一轮只有新信号；09-24 的回放到 13:23
+  为止是 6 条信号，两台设备就是 12 条推送。
 
 ### 与旧版 monitor（v0.28.3）会不会重复推送
 
 旧 monitor 不改。它推的是：`price_level`（pool1 / pool2 股票碰到档位，PushDeer + PushPlus）、`pool2_exit`、
 17:00 的 `daily_summary`、`surge_watch`（创业 / 科创爆量，只推 PushDeer）、`pulse_alert`、早报 / 午报、心跳和
-故障告警。路线 A 推的是三个策略的信号：`auction_gap`（竞价缺口，旧版没有对应推送）、`n_shape`（候选**就来自同一批
-pool1 / pool2**）、`growth_board_surge`（创业 / 科创放量，和旧版爆量是同一类现象）。
+故障告警。路线 A 推的是三个策略的信号：`auction_gap`（竞价缺口，旧版没有对应推送）、`n_shape`（候选来自**同样的
+pool1 / pool2 池子**）、`growth_board_surge`（创业 / 科创放量，和旧版爆量是同一类现象）。
 
 所以同一只股票可能先后收到两条意思相近的推送：比如一条旧版「600000.SH 名称 40档 ¥x」，一条路线 A
 「[rQuant] 600000.SH 买入观察」。两套系统触发条件不同、标题不同、互不去重，但**不是告警风暴**：路线 A 每条信号
