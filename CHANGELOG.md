@@ -27,6 +27,16 @@
   新增 `tests/unit/test_runtime_console_page.py`（AppTest 子进程渲染最小 serving root，覆盖
   信号/推送/模拟盘/占位）与 `tests/unit/test_preview_app.py`（两页都能渲染且互相切换不报错），
   恢复 `tests/unit/test_runtime_console_import.py`（导入零副作用）。
+  **补充（同一未发布功能内自修）**：`app.py` 原有的 30 秒 `<meta http-equiv="refresh">` 是整页
+  文档级刷新，被 `st.navigation` 挂载后，切到运行控制台停留超过 30 秒会被这个残留的刷新计时器
+  拉回健康看板（`st.navigation` 切页不是真正的文档导航，浏览器的刷新计时器不会因为切页被取消）。
+  新增 `src/rquant/dashboard/preview_state.py`，只放一个 `PREVIEW_MOUNTED_SESSION_KEY` 常量；
+  `preview_app.py` 在 `pages.run()` 之前把这个 key 写进 `st.session_state`（`st.navigation` 切页
+  时唯一保证保留的状态，不去猜 URL），`app.py` 只在这个标记不存在时才注入 meta refresh——独立跑
+  （生产 `rquant-dashboard.service` 直接跑 `app.py`，端口 8501）行为完全不变；被 preview 挂载时
+  改成页头一个「🔄 刷新」按钮 + `st.rerun()`，`runtime_console.py` 同样加了这个按钮（它本来就没有
+  自动刷新，不需要额外判断挂载状态）。新增 `tests/unit/test_dashboard_preview_refresh.py`
+  验证独立跑时 HTML 里有 refresh meta、挂载跑时没有。
 
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与

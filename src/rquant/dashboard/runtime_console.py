@@ -7,6 +7,12 @@
 
 本页面只读取 ``runtime_console_data.load_runtime_console`` 返回的一份 serving
 generation 快照，不做任何写入；不可用 / 缺失的字段一律渲染为「—」，不让页面崩溃。
+
+不用 meta refresh 或 ``st.fragment(run_every=...)`` 自动刷新：本页跟健康看板
+（``app.py``）挂在同一个 ``preview_app.py`` 多页 session 里，meta refresh 是整页
+文档级刷新，会把用户从这一页拉回默认页（见 ``app.py`` 里的说明）；一个只读快照
+页也不值得为了自动刷新去做 fragment 化重构。改用页头一个「🔄 刷新」按钮
++ ``st.rerun()``，跟 ``app.py`` 挂进 preview 时的做法一致。
 """
 
 from __future__ import annotations
@@ -257,22 +263,29 @@ def _render_header(snapshot: RuntimeConsoleSnapshot) -> None:
     }[snapshot.freshness]
     generation = snapshot.generation_id[:12] if snapshot.generation_id else "无可用 generation"
     commit = (snapshot.producer_commit or "")[:12] or _DASH
-    st.markdown(
-        f"""
-        <div class="rq-head">
-          <h1>🖥️ rQuant 运行控制台</h1>
-          <div class="rq-meta">generation {generation}</div>
-        </div>
-        <div class="rq-meta">
-          生成 {_time(snapshot.generated_at)} ·
-          <span class="rq-status {freshness_class}">
-            {_FRESHNESS_LABELS[snapshot.freshness]}
-          </span>
-          · commit {commit}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    col_head, col_refresh = st.columns([6, 1])
+    with col_head:
+        st.markdown(
+            f"""
+            <div class="rq-head">
+              <h1>🖥️ rQuant 运行控制台</h1>
+              <div class="rq-meta">generation {generation}</div>
+            </div>
+            <div class="rq-meta">
+              生成 {_time(snapshot.generated_at)} ·
+              <span class="rq-status {freshness_class}">
+                {_FRESHNESS_LABELS[snapshot.freshness]}
+              </span>
+              · commit {commit}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col_refresh:
+        # 本页不做自动刷新（无 meta refresh，也没有用 fragment 轮询）——只读快照，
+        # 手动点一下比后台定时拉更省事，也不会有任何页面被自动拉走的风险。
+        if st.button("🔄 刷新", key="runtime_console_manual_refresh"):
+            st.rerun()
     if snapshot.state is ConsoleLoadState.DEGRADED:
         st.error(f"Serving 降级：{snapshot.detail}")
 

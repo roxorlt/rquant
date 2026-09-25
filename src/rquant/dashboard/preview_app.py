@@ -23,6 +23,17 @@ Strategy Lab（``lab/app.py``）**没有**挂进来：它通过
 1475 行，``src/rquant/page_control.py`` 的 2545 行）。在把这一判断证伪之前，
 Lab 页面不挂进 preview。
 
+健康看板独立跑时（生产 8501 就是这样）用 30 秒 ``<meta http-equiv="refresh">``
+整页刷新；这个 tag 一旦渲染进 DOM，浏览器计时器不会因为 ``st.navigation`` 之后
+切到另一个子页面（同一个 SPA session，没有真正的文档级导航）就被取消，到点会把
+标签页整页拉回健康看板，用户体验上等于"看着看着自动跳走"。所以本文件在调用
+``pages.run()`` 之前，先在 ``st.session_state`` 写一个明确的挂载标记
+（``rquant.dashboard.preview_state.PREVIEW_MOUNTED_SESSION_KEY``）；``app.py``
+只认这个标记来决定要不要注入那个 meta refresh tag，不去猜 URL 或者猜自己是不是
+被谁 import 的。``st.session_state`` 是 ``st.navigation`` 在切页时唯一保证跨页
+保留的状态，所以这个检测在预览会话内是可靠的，也不能被直接深链接到子页面绕过
+（深链接同样先经过本文件的顶层脚本体，标记照样会被设置）。
+
 启动方式::
 
     RQUANT_SERVING_ROOT=data/runtime/serving uv run streamlit run \\
@@ -32,6 +43,10 @@ Lab 页面不挂进 preview。
 from __future__ import annotations
 
 import streamlit as st
+
+from rquant.dashboard.preview_state import PREVIEW_MOUNTED_SESSION_KEY
+
+st.session_state[PREVIEW_MOUNTED_SESSION_KEY] = True
 
 _pages = st.navigation(
     [
