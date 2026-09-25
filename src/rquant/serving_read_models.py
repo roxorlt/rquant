@@ -28,7 +28,7 @@ from pydantic import (
     model_validator,
 )
 
-from rquant.delivery_contracts import OutboxRecord
+from rquant.delivery_contracts import DeliveryTarget, OutboxRecord
 from rquant.experiment_registry import PromotionDecision
 from rquant.lab_eta import LabEtaEstimate
 from rquant.lab_jobs import LabJobSummary
@@ -806,6 +806,36 @@ class ServingLabJobRecord(RuntimeContractModel):
         return self
 
 
+def _delivery_target_is_routed(
+    target: DeliveryTarget,
+    routed: tuple[DeliveryTarget, ...],
+) -> bool:
+    """Whether a delivery went to a route target, or to one of that target's devices.
+
+    The router names one logical recipient per channel (`admin`). A notifier whose
+    credential carries several device keys for that channel fans the routed row out to one
+    row per device before anything is claimed -- the frozen recipient alias migration of
+    `NotificationStateStore.apply_recipient_alias_migrations` -- and the devices are named
+    `<recipient>.<device>`: `admin.device-01` / `admin.device-02` when the ids are inferred
+    from the keys (`build_environment_notification_provider_loader`, the only form a
+    production credential can take), `admin.iphone` style when they are configured. Those
+    rows are the deliveries of the route target, so they are inside its manifest; a
+    recipient the router never named, or any recipient on a channel it did not pick, is
+    not. Refusing the device rows made the notifier's `signals` publish fail on every round
+    from the first routed signal on, shadow and live alike, on the host's two-key PushDeer
+    credential.
+    """
+
+    if target in routed:
+        return True
+    return any(
+        candidate.channel is target.channel
+        and target.recipient_id.startswith(f"{candidate.recipient_id}.")
+        and len(target.recipient_id) > len(candidate.recipient_id) + 1
+        for candidate in routed
+    )
+
+
 class ServingReadModelInput(RuntimeContractModel):
     observed_at: AwareUtcDatetime
     signals: tuple[ServingSignalRecord, ...] = ()
@@ -890,7 +920,7 @@ class ServingReadModelInput(RuntimeContractModel):
             route = routes.get(delivery.signal_id)
             if route is None:
                 raise ValueError("delivery references a signal without a route receipt")
-            if delivery.target not in route.targets:
+            if not _delivery_target_is_routed(delivery.target, route.targets):
                 raise ValueError("delivery target is outside the frozen route manifest")
         return self
 

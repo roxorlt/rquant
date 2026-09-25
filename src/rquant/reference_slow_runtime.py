@@ -45,8 +45,9 @@ _REVISION_SCAN_START = time(9, 24)
 #: publication that becomes durable after `available_at`, so this is the time the batch
 #: write (payload, manifest, pointer, receipt, `ssh-keygen -Y sign`, fsyncs) gets. Five
 #: seconds held on 2026-09-24 with ~2.5 s to spare, in the same throttled slice where the
-#: publisher's five seconds did not (#297); a miss here is final for the day, because the
-#: quota ledger refuses a second same-day request. 30 s is >10x the observed write and costs
+#: publisher's five seconds did not (#297); a miss here costs one of the day's capture attempts
+#: (six since #295; before that the ledger refused any second same-day request, so a miss was
+#: final for the day). 30 s is >10x the observed write and costs
 #: the publisher nothing it could use: its own round needs about 80 s on the host to reach its
 #: completion receipt, so a batch sealed after ~09:23:30 could not be published in any case.
 #: Capped at the cutoff -- the source's `available_at` is never 09:25 by rule, because the

@@ -18,6 +18,7 @@ import pandas as pd
 import streamlit as st
 from loguru import logger
 
+from rquant.dashboard.preview_state import PREVIEW_MOUNTED_SESSION_KEY
 from rquant.dashboard.runtime_console_data import (
     ServingFrameState,
 )
@@ -40,10 +41,21 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-st.markdown(
-    f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">',
-    unsafe_allow_html=True,
-)
+
+# preview_app.py sets this in st.session_state before pages.run(); it is only
+# ever true when this script is mounted as a sub-page of that multipage app.
+# Standalone (production's rquant-dashboard.service runs this file directly on
+# port 8501) it is always False, so the 30s meta refresh below is unchanged.
+# A meta refresh tag survives st.navigation's client-side page switches (no
+# real document navigation happens), so injecting it unconditionally would
+# bounce the browser tab back to this page every 30s even while the owner is
+# looking at a different mounted page -- see 2026-09-25 preview bug report.
+_mounted_in_preview = st.session_state.get(PREVIEW_MOUNTED_SESSION_KEY, False)
+if not _mounted_in_preview:
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">',
+        unsafe_allow_html=True,
+    )
 
 # 紧凑型 CSS 美化（参考 Linear / Vercel 风格）
 st.markdown(
@@ -478,7 +490,7 @@ try:
         if health_row is not None
         else "serving-unavailable"
     )
-    col_title, col_meta = st.columns([3, 2])
+    col_title, col_meta, col_refresh = st.columns([3, 2, 1])
     with col_title:
         st.markdown(
             "<div style='display:flex;align-items:baseline;gap:10px;'>"
@@ -489,14 +501,18 @@ try:
             unsafe_allow_html=True,
         )
     with col_meta:
+        _refresh_note = "" if _mounted_in_preview else f" · 每 {REFRESH_SECONDS}s 自动刷新"
         st.markdown(
             f"<div style='text-align:right;color:#9ca3af;font-size:0.72rem;line-height:1.4;'>"
             f"<span style='color:#6b7280;font-weight:500;'>{hostname}</span>"
             f" · 渲染 {datetime.now(CST).strftime('%H:%M:%S')}"
-            f" · 每 {REFRESH_SECONDS}s 自动刷新"
+            f"{_refresh_note}"
             f"</div>",
             unsafe_allow_html=True,
         )
+    with col_refresh:
+        if _mounted_in_preview and st.button("🔄 刷新", key="health_manual_refresh"):
+            st.rerun()
 
     today_iso = date.today().isoformat()
 
@@ -1458,9 +1474,10 @@ try:
                         )
 
     st.divider()
+    _refresh_caption = "manual (preview)" if _mounted_in_preview else f"{REFRESH_SECONDS}s"
     st.caption(
         f"Serving: {serving_root_from_env()}  ·  "
-        f"Refresh: {REFRESH_SECONDS}s  ·  "
+        f"Refresh: {_refresh_caption}  ·  "
         f"Last render: {datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}"
     )
 

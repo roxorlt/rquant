@@ -6,6 +6,57 @@
 
 ### Added
 
+- **notifier 切正式推送的三项核对脚本 + 不联网的切换演练（2026-09-28 窗口）**：
+  `scripts/notifier_delivery_cutover.py`（只用标准库，可以从新 tag 用 `git show` 取出来，在停在已装 tag 的
+  bootstrap worktree 旁边跑）三个子命令：`set-mode` 只改输入文档里的 `notifier_delivery_mode` 一个键，写出的是
+  规范 JSON、0600、单链接、原子替换，改回去逐字节还原（2026-09-21 DEPLOY 里的「改法 A」写的是 `indent=2` 加换行，
+  `load_production_runtime_profile_inputs` 按「persistent JSON is not canonical」直接拒，从来切不动）；
+  `diff-profiles` 只放行「profile_id + notifier 的投递开关」这一处不同；`diff-generations` 只放行两代 bundle 之间
+  notifier manifest 的投递开关，以及 `schema-contracts.json` 里 notifier 的 manifest 指纹和它自己的哈希。
+  演练 `tests/integration/test_route_a_notifier_live_cutover_e2e.py` 在开盘日世界（两代 bundle、真实发布的
+  权威链、每个 role 在自己 unit 的 `ReadWritePaths` 里、两台设备的 PushDeer 凭据）上按周一的顺序走完：影子档先
+  投递一批（全是 `shadow:` 回执）→ 改一个键 → 前置 / 画像 / 第三代 bundle（同一个 commit）/ ack / stage /
+  root 发布，**authority profile id 不变、sequence +1**（#190 比的是装机闭包画像，投递档位动不了它）→ 只重启
+  notifier：它压着一份被非干净停机留下的 `running` 心跳照样起来（服务 spec 是
+  `(service_id, plane, stale_after, producer_commit)`，不含 settings，#270 触发不了），影子期投递过的行一行不变，
+  切换之后路由的信号经真实 provider → transport → PushDeer 客户端按设备各发一次；另有八个常驻 role 在自己的循环
+  里跨过这次切换、不重启就把切换后的信号送到 serving；回滚（root 单级回滚 + 重新应用切换前的画像）回到影子档，
+  之后的版本照常能发布。**一个字节都不出网**：`rquant.notify.client` 里的 `requests.post` 换成记录器，
+  `tests/support/outbound_network_guard.py` 用审计钩子拒绝并记下用例运行期间的每一次 DNS 查询和非 AF_UNIX 连接，
+  收尾断言为空，另有反向对照证明真客户端会在 `getaddrinfo` 被拦下。
+
+- **Preview 多页导航：运行控制台上线到看板同一进程（`preview_app.py`）**：owner 打开的 Streamlit
+  preview 之前只有健康看板一页，看不到路线 A 新 runtime 的信号、模拟盘、服务健康和推送。新增
+  `src/rquant/dashboard/runtime_console.py`，把 `codex/lab-job-center` 分支上 2026-07-31 写的
+  只读运行控制台页面（该分支未合并、已过时）搬到 main 上，改接 main 当前的
+  `runtime_console_data.load_runtime_console` API 和当前 serving schema：服务健康（按 live /
+  serving / research 三个 plane 分列）、信号（策略、动作、标的、时间、原因）、推送（渠道、状态、
+  尝试次数）、模拟账户（现金、净值、盈亏）、模拟持仓、Lab Jobs 与策略晋级（这两个 projection 当前
+  serving 侧多为空表，走占位文案而不是报错）。所有空值 / NA 统一渲染成"—"，不让页面崩。
+  新增 `src/rquant/dashboard/preview_app.py`，用 `st.navigation` 把健康看板（`app.py`）和运行
+  控制台挂进同一个 session（两个子页各自调用一次 `st.set_page_config`——已确认当前
+  streamlit==1.57.0 里这个调用是仅追加式更新，不要求是脚本第一条命令，两页都能正常渲染）。
+  **Strategy Lab（`lab/app.py`）没有挂进来**：它没有"未配置凭据则拒绝写入"的只读开关，唯一挡着
+  写入的是 `_job_center_runtime()` 要求 `RQUANT_RUNTIME_ROOT` 且 Job Center 权威 manifest 验证
+  通过——这是当前部署没有任何 systemd unit 给它设那个环境变量的副作用，不是代码里设计好的安全
+  模式，一旦环境变量被设置，`PageControlClient`（默认 POST 到生产常驻的
+  `rquant-page-control.service`，`127.0.0.1:8767`）就会直接把提交/暂停/恢复/取消/导出命令送进
+  生产 Job Center（写路径：`src/rquant/dashboard/lab/app.py:124,299,607,1450,1475`、
+  `src/rquant/page_control.py:2545`）。在这一点被证伪之前，preview 只挂两个只读页。
+  新增 `tests/unit/test_runtime_console_page.py`（AppTest 子进程渲染最小 serving root，覆盖
+  信号/推送/模拟盘/占位）与 `tests/unit/test_preview_app.py`（两页都能渲染且互相切换不报错），
+  恢复 `tests/unit/test_runtime_console_import.py`（导入零副作用）。
+  **补充（同一未发布功能内自修）**：`app.py` 原有的 30 秒 `<meta http-equiv="refresh">` 是整页
+  文档级刷新，被 `st.navigation` 挂载后，切到运行控制台停留超过 30 秒会被这个残留的刷新计时器
+  拉回健康看板（`st.navigation` 切页不是真正的文档导航，浏览器的刷新计时器不会因为切页被取消）。
+  新增 `src/rquant/dashboard/preview_state.py`，只放一个 `PREVIEW_MOUNTED_SESSION_KEY` 常量；
+  `preview_app.py` 在 `pages.run()` 之前把这个 key 写进 `st.session_state`（`st.navigation` 切页
+  时唯一保证保留的状态，不去猜 URL），`app.py` 只在这个标记不存在时才注入 meta refresh——独立跑
+  （生产 `rquant-dashboard.service` 直接跑 `app.py`，端口 8501）行为完全不变；被 preview 挂载时
+  改成页头一个「🔄 刷新」按钮 + `st.rerun()`，`runtime_console.py` 同样加了这个按钮（它本来就没有
+  自动刷新，不需要额外判断挂载状态）。新增 `tests/unit/test_dashboard_preview_refresh.py`
+  验证独立跑时 HTML 里有 refresh meta、挂载跑时没有。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
@@ -211,6 +262,61 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **参考慢源一次采集失败不再赔掉整个交易日：同一天最多再试到第 6 次（#295）**：
+  - **现象**：2026-09-14/18/21/22/23 每天 09:20 的第一次采集失败之后，09:20–09:25 窗内后面每一轮都报
+    `SourceQuotaConflictError: reference source attempt already exists: success`（或 `: failure`），一次 Tushare 都没再问。
+    当天没有参考批次、没有参考代，auction_gap 整天拒，没有候选、没有信号。
+  - **原因**：`_capture_reference_with_quota`（`src/rquant/runtime_service_builtin.py`，v0.33.23 的 221–249 行）把请求号
+    算成（source、目标交易日、manifest 里的常量 `retry_ordinal`）的哈希，builder 每一轮传的都是同一个常量（444 行传
+    `retry_ordinal`、464 行传 `retry_ordinal + 1`，生产画像里是 0），配额账本里一个请求号只能出现一次。生产用 `transport`
+    记账，每次 Tushare 调用单独记一条、调用返回就记 `success`，所以「调用都返回了、校验没过」（09-23 的 `delist_date`，
+    或 09:20 那一刻当日 `adj_factor` 还没入库）在账本里也是 `success`，下一轮查到已存在就拒（246 行，`request` 记账是 293 行）。
+  - **修法**：请求号里加上「当天第几次」。当天目标的第一次与 v0.33.23 发的请求号逐字相同（好的早上什么都没变，旧账本照样读）；
+    第二次起、以及对过去交易日的任何一次，都带上采集日和序号。每一轮先按序号查账本：前面的尝试都已结束（`success` 或
+    `failure`）才用下一个号；遇到 `pending` / `unknown`（进程在调用中途被杀、答复丢了）当天不再发；中间缺一个号而后面有记录
+    （账本被改过）直接拒；6 次用完就拒，报 `...; all 6 capture attempts for <日期> are used`。上限是模块常量
+    `REFERENCE_SLOW_MAX_CAPTURE_ATTEMPTS = 6`：30 秒一轮，第 6 次大约在 09:23 开始，差不多是发布者（主机上约 80 秒一轮）还来得及
+    在 09:25 之前提交的最后一次；一直失败时最多多花约 40 次 Tushare 调用（额度每分钟 500）。
+  - **原有的保证都还在**：成功的那次不会再发（当天批次一进 spool，`capture_reference_slow_batch` 就不再调采集）；不会重复发布
+    （spool 仍是唯一的裁决，写入没赶上 30 秒保护会整体回滚，下一轮重新采、只封一批）；序号不回退（#298）；09:25 可见规则、
+    发布者 09:25 之后不开始新一轮、过期批次跳过都没动；进程被杀之后仍然不重发（`test_reference_kill_is_durable_and_same_request_cannot_refetch`
+    等原有用例不改一字照过）；校验、签名、spool 完整性检查都照旧拒绝。
+  - **顺带修掉的同一个缺陷的另一条路：修订扫描跨天撞号**。第二个交易日 09:24 起扫前一交易日时，用的正是前一天扫自己时已经
+    用过的请求号，被拒成 `already exists: success`，一张 Tushare 都没问（主机上 09-24 扫过自己，09-28 会是第一次撞上）。
+    现在对过去交易日的扫描请求号带采集日，每天各算各的。
+  - **发现但没修（报给协调者，另开 issue）**：真实的采集函数封不了过去交易日的批次——`assemble_reference_slow_source_snapshot`
+    （`src/rquant/reference_slow_source.py:140`）按完成时刻取目标交易日，目标是过去的交易日时报
+    `daily source must use the exact prior open date`。所以 09:24 之后扫前一交易日的那一轮仍然失败，只是原因从「请求号已存在」
+    变成了这一句；它只出现在当天批次封好之后，不影响当天的参考代。原有的修订用例（`test_production_builder_discovers_bounded_revisions_with_pit_availability`）
+    替换了采集函数，所以从来没走到这里。
+  - **#279 没有一起修**：daily-close 源是同一种机制（`daily_close_gateway.py:421` 的请求号带常量 `retry_ordinal`，
+    `daily_close_source_service.py:19` 每轮都用 0，1362 行遇到已结束的尝试就返回已存的 STALE 批次），但它要的不是同一个小改动：
+    Tushare 当日 `daily` 15:30–17:00 才出，需要 15:00 之后按间隔重试的时间表和日配额预算，网关里还有 STALE 批次与待恢复文件
+    两条分支要一起改。
+  - **没有新增任何心跳字段、manifest 设置字段或落盘格式**；账本表结构不变，只是多出新的请求号。回滚不需要挪心跳文件。
+  - **用例**：`tests/unit/test_reference_slow_capture_retry.py`（14 个，真实 builder + 真实采集函数 + 真实 DuckDB 副本 + 生产的
+    `transport` 记账 + 真实 `RuntimeServiceControl` 与发布者，只替换 Tushare）：四种失败（当日 `adj_factor` 未入库、`stock_basic`
+    缺 `delist_date`、Tushare 报错、超时）× 两种记账，第一次失败、30 秒后第二次成功、09:25 参考权威可见、09:29 auction_gap 输入
+    接受这一代；第一次的请求号与 v0.33.23 相同；一直失败到第 6 次封顶、第二天重新开始；写入没赶上保护时重采且只封一批；
+    进程被杀后同进程报 `pending`、重启后报 `unknown`、都不重发；账本缺号拒绝；第二天扫前一天不再撞号。改动前 14 个里 12 个失败
+    （剩下两个是改动前后都必须成立的保证：第一次请求号不变、被杀不重发）。原来钉住 #295 行为的
+    `test_reference_slow_source.py::test_a_failed_capture_stays_on_the_heartbeat_until_the_trade_date_rolls_over`
+    改成：窗内第二轮真的再问一次 Tushare、以同样的原因失败，心跳仍只挂第一次失败的类名。
+  - **合并注意**：`runtime_service_builtin.py` 在 R07 的源文件快照清单里、新测试文件不在全量分片清单里，本分支**没有**重新冻结，
+    由集成时统一做。
+
+- **两台设备的 PushDeer 凭据让 notifier 每一轮都发布失败，影子档也一样**：路由策略只给每个通道写一个逻辑收件人
+  `admin`；主机的 `PUSHDEER_KEYS` 是 owner 的 iPhone 与 Mac 两把 key，密封进 capability 的只有 key、没有收件人
+  id，于是 notifier 推断出 `admin.device-01` / `admin.device-02`，冻结的别名迁移在认领之前把每一条路由来的
+  `admin` 行换成两台设备各一行。`ServingReadModelInput` 却要求每条投递的目标都在路由回执的目标里，于是批次跑完
+  之后的 `signals` 发布把设备行判成「delivery target is outside the frozen route manifest」，整轮失败——从第一条
+  路由信号起每一轮都失败，影子档与正式档一样；正式档下推送已经发出，两档下 serving 都永远拿不到信号。生产上
+  至今没有路由过一条信号（09-28 是第一天），所有 e2e 与主机回放都只用一把测试 key，所以没有任何东西走到过这条路。
+  现在投递目标是路由目标本身，**或者是它的设备**（同一通道、收件人 id 为 `<路由收件人>.<设备>`，即推断出的
+  `admin.device-NN` 或显式配置的 `admin.iphone` 这类）就算在路由清单之内；路由从没点过的收件人、只是前缀相像的
+  名字（`administrator`、`admin-device-01`）、空设备名、以及别的通道上的任何收件人仍然拒。载荷模型、表结构、
+  schema 契约都不变（`src/rquant/serving_read_models.py`）。
 
 - **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
   汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、
