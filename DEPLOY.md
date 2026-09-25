@@ -5,6 +5,89 @@
 
 ---
 
+## 2026-09-25 · 待安装 · v0.33.24 总览：参考慢源失败后当天还能再试（#295）+ 两台设备的 PushDeer 收件人不再让 notifier 每轮失败 + 切正式推送的核对脚本 + 预览页加运行控制台
+
+**状态**：**尚未安装**。本条是 v0.33.24 的装机总览，先读本条。主机现在跑的是 **v0.33.22**（`df621ef2`，09-25 第十六窗口装上）；
+**v0.33.23（`793092fa`，PR #310）从没装过**，它的改动随本版第一次装上主机。各改动的背景、预期与细节在紧接着的两条里：
+「2026-09-28 · 待执行 · notifier 切正式推送」与「2026-09-25 · 待安装 · 参考慢源一次采集失败，当天还能再试（#295）」。
+
+**分两部分做**：
+
+| 部分 | 什么时候 | 做什么 |
+|---|---|---|
+| 第一部分（本条） | **tag 打好就装**：09-26、09-27 休市，不用等交易日；最晚周一 2026-09-28 08:00 开始，保证 09:00 前 20 个 unit 全部起来（参考慢源 09:20 第一次真跑；受控部署器 09:15–15:10 会延期需要重启的发布） | 按平常的路线 A 窗口把 v0.33.24 装上，**notifier 仍是影子档** |
+| 第二部分 | **只有第一部分装完、并且周一 09:31 与 09:52 两个检查点都通过之后才允许做** | 下一条「notifier 切正式推送」的「第二部分」：只改输入文档里一个键、装一代新画像、只重启 notifier |
+
+没装 v0.33.24 就做第二部分：推送会真的发出去，但 notifier 每一轮都记失败、serving 永远拿不到信号（下一条「为什么必须先装 v0.33.24」）。
+
+**相对主机上的 v0.33.22，这一版装的是四处改动**：
+
+| 改动 | 落在哪 | 主机上影响谁 | 细节 |
+|---|---|---|---|
+| #295：参考慢源一次采集失败后，09:20–09:25 窗内最多再试到第 6 次；扫前一交易日的修订请求号带上采集日，不再跨天撞号 | `src/rquant/runtime_service_builtin.py`（`reference_slow_runtime.py` 只改一句注释） | `reference-slow.source.v1` 一个 role | 下面「参考慢源一次采集失败……（#295）」一条；CHANGELOG `[Unreleased]/Fixed` 同名一条 |
+| 投递目标是路由收件人的设备（`admin.device-01` / `admin.device-02` 这类）时算在路由清单之内 | `src/rquant/serving_read_models.py`，**只改校验规则** | notifier 发布 `signals` 权威、serving 读它，两处用的是同一个校验 | 下一条「为什么必须先装 v0.33.24」；CHANGELOG `[Unreleased]/Fixed`「两台设备的 PushDeer 凭据……」 |
+| 切正式推送的三项核对脚本 `scripts/notifier_delivery_cutover.py`（只用标准库）与不联网的切换演练 | `scripts/`、`tests/` | 装机不跑它，第二部分才用 | 下一条第二部分；CHANGELOG `[Unreleased]/Added`「notifier 切正式推送的三项核对脚本……」 |
+| 预览页多页导航：运行控制台（只读）与健康看板挂在同一个进程，挂载时健康看板不再用 30 秒整页刷新把人拉回去；v0.33.23 的健康看板空值显示为「—」、投递成功率按 `SUCCEEDED` 计也在这一版第一次装上 | `src/rquant/dashboard/`（`app.py`，新增 `preview_app.py`、`preview_state.py`、`runtime_console.py`） | 只有 8509 预览进程；不是路线 A 的 role，生产 8501 旧看板（v0.28.3）不受影响 | CHANGELOG `[Unreleased]/Added`「Preview 多页导航」、`[Unreleased]/Fixed`「健康看板……直接崩溃」 |
+
+另有两处和主机运行无关：`CLAUDE.md` 新增「不按交易时段排期（owner 硬性要求）」一节；R07 差分门的基线常量
+（`signal_family_differential_gate.py`）照例重冻结。下一条第一部分第 1 步列的 `src/` 改动只写到它自己的分支为止，
+完整清单以本条表格为准。
+
+**没变的东西**：
+
+- **`deploy/` 相对 v0.33.22（也相对 v0.33.23）一个字没改**，`uv.lock`、`pyproject.toml` 也没变。没有 unit 要重装，
+  不需要 `systemd-analyze verify`，nginx 不用动。
+- **心跳没有新字段**（#295 作者核实；notifier 的修复只改 `serving_read_models.py` 的校验，载荷模型、表结构、schema
+  契约都不变）。所以装机和回滚都**不用**像 v0.33.22 那样挪走全部心跳文件，只做每次换代码都要做的 R-32。
+- 参考慢源配额账本 `data/runtime/live/reference-slow/quota.sqlite3` 还是同一张表、同样的列，只是多出第二次及以后的请求号。
+
+**怎么装 = 正常的路线 A 窗口**（v0.33.22 那条的 1–7 步）。和 v0.33.21、v0.33.22 一样不走 `scripts/deploy-production.sh`：
+路线 A 的 role 从来不经它安装（下一条 #284 的核实结论）。要特别看的地方已经写在下一条的「第一部分」，这里只列顺序：
+
+1. `${WT}`（bootstrap worktree）切到 v0.33.24；`git diff --stat v0.33.22 v0.33.24 -- deploy/` 应为空。
+2. 停 20 个 unit（逐个阻塞式 stop，先看 `vmstat 1 3` 的 b 列为 0）。
+3. inputs 两跑，`--notifier-delivery-mode shadow`；记下 inputs 的 sha256 和运行时画像 id `P_SHADOW`（第二部分和回滚要用）。
+4. 第 ④ 步之前的只读检查 `runtime-schema-rollout close-unchanged --dry-run`：退出码 0、`schema_changed: 0` 才往下走。
+   `runtime-deployment-profile --apply` 的回执应为 `schema_rollout_plan_ids: []`；第 30 条 acknowledge 全部 `not_current_generation`。
+5. stage（`--legacy-generation current`）+ root publish。stage 的 dry-run 里 `profile_id` 必须等于
+   `jq -r .profile_id /etc/rquant/production-runtime-profile.json`（本版不动 pyz，#190 不触发）。
+6. R-32（#270）：起任何 unit 之前，`$ROOT/control/*/*/heartbeats/*.json` 里 `status` 不是 `stopped` 的文件全部挪开留档。
+7. 六组起 20 个 unit。
+
+**装上之后应该看到什么**：
+
+- **装完到周一开盘前**（休市）：和 v0.33.22 装完时一样的 degraded，不是故障——`paper-constraint`（没有可见的分钟批次）→
+  `paper-broker` → `serving.publisher`，周一 09:30 出第一批分钟线后依次恢复；`reference-slow.publisher` 09:25 之后每轮报
+  `started after 09:25`。心跳的键和 v0.33.22 一样（带 `observations` / `degraded_detail`，没有别的新键）。
+- **notifier 心跳**：`notifier:shadow_transport` 在；主机是两把 PushDeer key，所以还有
+  `notifier:recipient_ids_inferred:pushdeer`；`consecutive_failures` 0。
+- **周一 09:20–09:25 参考慢源**：按下面 #295 一条的「装上之后应该看到什么」。第一次就成功的早上和 v0.33.22 完全一样；
+  第一次失败的早上约 30 秒后再采一次，最多 6 次；进程被杀后当天不重发。
+- **周一 09:24 起扫前一交易日的那一轮仍会失败**，`last_error` 是 `daily source must use the exact prior open date`
+  （#313，本版不修）。它只在当天批次封好之后出现，不影响当天参考代，不退出、不推送。
+- **周一 09:30 之后第一条信号路由出来时**：影子档 notifier 带着当天信号**成功**发布 `signals` 权威，`consecutive_failures`
+  仍是 0，`delivery_attempt` 里每条信号两台设备各一行、全是 `shadow:` 回执，serving 当日代里能看到这些信号。这就是修复在主机上
+  生效的证据，也是第二部分第 0 步要查的前提。
+- **8509 预览**：装机不动这个进程（lighthouse 进程，非 systemd）。要在 `/preview/` 看到运行控制台，得把它换成从 v0.33.24 的检出跑
+  `streamlit run src/rquant/dashboard/preview_app.py`（端口 8509、`RQUANT_SERVING_ROOT` 与现在相同）。这一步不重启任何 unit、
+  不写库，和装机窗口无关，随时可以做。
+
+**回滚到 v0.33.22**（主机现在跑的版本；v0.33.23 从没装过，不回到它）：
+
+1. **已经做了第二部分（正式档）时，先按下一条「回滚：几分钟内回到影子档」的 R1–R4 回到影子档，再回滚代码。**
+   不要在正式档下回到 v0.33.22：那样推送照样发出去，notifier 却每一轮都失败。
+2. 代码回滚走路线 A 窗口：`${WT}` 切回 v0.33.22，按平常的 1–7 步重装（`deploy/` 两版相同，没有 unit 要重装）；
+   起 unit 之前照常做 R-32。**不需要挪走全部心跳文件**（本版没有新字段）。两版的 channel 形状相同，v0.33.22 的安装器
+   已含热修 AJ（形状没变不建计划），所以重装 v0.33.22 不会新建 rollout 计划，回滚也不用跑 `close-unchanged`。
+3. 回滚之后的已知后果：
+   - 参考慢源回到 #295 的行为：当天第一次失败就拒到换日；v0.33.24 写下的第二次及以后的请求号 v0.33.22 不会去读。
+   - **两台设备的阻断会回来**：一旦有信号被路由，v0.33.22 的 notifier 每一轮都在发布 `signals` 权威时失败；v0.33.24
+     已经写下的设备投递行，v0.33.22 也按旧规则拒（`notification_state.py` 与 `runtime_serving_snapshot.py` 用的是同一个
+     `ServingReadModelInput` 校验）。所以回滚只在当天还没有信号时是干净的；有信号之后回滚，serving 当天就拿不到信号。
+   - 8509 预览若已换成 `preview_app.py`，与代码回滚无关，可以留着，也可以换回 `app.py`。
+
+---
+
 ## 2026-09-28 · 待执行 · notifier 切正式推送（影子档 → 正式档），先装含修复的新版本
 
 **状态**：等你操作。本条写在执行之前，不是部署记录；执行完在它上面另写一条「已安装」记录。
