@@ -5,6 +5,79 @@
 
 ---
 
+## 2026-09-25 · 待安装 · 盘中四个 role 只处理新批次（#302）、约束发布器按代码处理过期（#307）、serving 60 s 一轮
+
+**状态**：**尚未安装**。分支 `cc/20260925-intraday-incremental`（基于 origin/main `793092fa`），与
+`cc/20260925-release-v0.33.24` 的 `git merge-tree` 无冲突，`src/` 与 v0.33.24 的各分支不重叠（那边动的是
+`reference_slow_runtime`、`runtime_service_builtin`、`serving_read_models`、看板）。集成时要做：R07 重冻、full-suite 分片清单
+重生成（新增 `tests/unit/test_route_a_incremental_rounds.py`、`tests/unit/test_route_a_replay_output_diff.py`、
+`scripts/route_a_replay_output_diff.py`、`docs/architecture/serving-incremental-publish.md`）。
+
+**改了什么**（细节见 CHANGELOG `[Unreleased]` 同名各条）：
+
+| 改动 | 模块 | 对主机的影响 |
+|---|---|---|
+| 分钟 spool 与特征 spool 认出没变的保留批次（lstat），不再每轮整读整验 | `live_spool`、`feature_spool` | 所有读分钟 spool 的 role（含 `market_minute_source` 自己）每轮的读盘量不再随当天批次数增长 |
+| `feature_live` 每个分钟批次只解码一次、历史快照每个进程只规范化一次 | `feature_live_service`、`intraday_feature_engine`、`runtime_builder_feature` | 主机回放 feature 每步约 14 s，几乎全是规范化历史（48 万行本机 4.5 s）；之后一步在 1 s 以内 |
+| 约束发布器每轮只算新证据；过期代码不再整批拒（#307） | `paper_execution_constraint_producer`、`paper_execution_constraints`、`runtime_builder_authority` | 午休与收盘后不再每轮失败、不再退避；新增两个心跳 observation 键 |
+| broker 读约束权威遇到「读的过程中目录变了」最多读三次 | `paper_execution_constraints` | `authority directory changed while being read` 不再让 broker 整轮失败 |
+| 盘中一个 STALE / 空分钟批次不再让 feature_live 卡死一天 | `feature_live_service` | v0.33.22 起就有：任何一次 `rt_min` 失败之后 feature 全天报 `immutable feature sequence already contains different content` |
+| serving 每 60 s 一轮（原 30 s） | `runtime_production_profile` | 当日信号进 serving 最多约 76 s（原约 46 s）；profile 会与 v0.33.22 不同 |
+
+**心跳与落盘**：心跳**没有新字段**。约束发布器在已有的 `observations` 映射里多两个键（非零才出现）：
+`paper_constraint_stale_codes`、`paper_constraint_codes_without_evidence`；v0.33.22 的读取方接受任意键。所有缓存都只在进程内存里，
+重启从 spool 重建。
+
+**怎么装**：正常的路线 A 窗口，`deploy/` 没有变化，没有 unit 要重装。第 ③ 步生成的 profile 里 `serving.publisher.v1` 的
+`interval_seconds` 应为 `60`，其余 role 的间隔不变。
+
+**装前建议在主机上回放 09-24（只读生产，写回放根）**，与 v0.33.22 那次 `/home/lighthouse/replay/runs/20260925T173059-13cb88`
+（6 条信号、2 笔成交）对比：
+
+```bash
+cd /home/lighthouse/rquant
+git fetch origin cc/20260925-intraday-incremental cc/20260925-replay-any-day
+git worktree add --detach /home/lighthouse/replay/wt-302 origin/cc/20260925-intraday-incremental
+cd /home/lighthouse/replay/wt-302
+git checkout origin/cc/20260925-replay-any-day -- \
+  scripts/route_a_day_replay.py scripts/route_a_replay_sources.py scripts/route_a_replay_days.py
+uv sync --frozen --python 3.11 && grep version_info .venv/pyvenv.cfg        # 3.11.x
+# 参考那次用的参数（下一条命令照它补齐；它用过 --tushare 就改用 --tushare-offline，答案全从同一份缓存来）
+python3 -c "import json; print(json.load(open('/home/lighthouse/replay/runs/20260925T173059-13cb88/summary.json'))['mode'])"
+PYTHONDONTWRITEBYTECODE=1 nohup setsid ./.venv/bin/python scripts/route_a_day_replay.py \
+  --trade-date 2026-09-24 --replay-root /home/lighthouse/replay/runs --tushare-offline \
+  --compare-signals-with /home/lighthouse/replay/runs/20260925T173059-13cb88/summary.json \
+  > /home/lighthouse/replay/wt-302.log 2>&1 &
+# 跑完之后
+NEW=$(ls -dt /home/lighthouse/replay/runs/2026*/ | head -1)
+./.venv/bin/python scripts/route_a_replay_output_diff.py \
+  /home/lighthouse/replay/runs/20260925T173059-13cb88 "$NEW"
+python3 -c "import json,sys; s=json.load(open(sys.argv[1]+'/summary.json')); print(s['signal_fidelity']['identical'], s['chain']['paper']); print({k: (v['total'], v['max']) for k, v in s['profile']['roles'].items()})" "$NEW"
+```
+
+「相同」的含义：`route_a_replay_output_diff.py` 五项全 `identical`（原始分钟批次与特征批次的 payload 字节相同、envelope 去掉 commit 相关字段后相同；
+每条策略信号相同；每笔成交相同；约束权威发布过的各代序号与当前代记录相同），`signal_fidelity.identical` 为真。允许的差别只有一处：
+若 09-24 有某只代码在最新分钟批次里只有前一日的 K 线，本分支会在 v0.33.22 报错的那些轮照常发布其余代码，约束的代数会多出几代。
+`profile.roles` 里 feature、约束、三个策略的合计应比参考那次小得多（本机主机规模夹具：feature 135 s → 18 s、约束 180 s → 71 s、
+策略各约 112 s → 8–12 s），serving 在回放里仍是每个 tick 一轮，数值不变。
+
+**装后要看（周一 09-28 盘中）**：
+
+1. **CPU**：10:00、13:30、14:50 各看一次 `systemd-cgtop -b -n 2 -d 5 --depth=3 | grep rquant`（看第二轮的 %CPU）。按本分支的估算，整个路线 A 下午峰值约 0.6–0.7 个核
+   （v0.33.22 同样负载估算约 3 个核，超出 200% 配额）；若 `rquant-live-runtime.slice` 超过 150%，截图各 unit 的占比。
+2. **`paper-constraint.market.v1`**：11:32–13:00 与 15:02 之后心跳是 `running` 而不是 `degraded`，`observations` 里有
+   `paper_constraint_stale_codes`（等于分钟观察名单的代码数）；13:01 之后这个键消失。全天没有 `latest visible minute evidence is stale`。
+3. **`paper-broker.shadow-main.v1`**：没有 `authority directory changed while being read`。
+4. **`feature.intraday-pit.v1`**：没有 `immutable feature sequence already contains different content`；若盘中分钟源失败过一次（分钟 spool 里出现
+   STALE 批次），特征 spool 在那一处多一个全 STALE 的空批次，之后照常。
+5. **serving**：盘中大约每 60–80 s 切一代；当日信号在通知器写出之后约 80 s 内出现在 serving。
+6. **内存**：14:50 看一次 feature 与约束两个进程的 RSS，与 09:35 相比增长应在几十 MB 以内（缓存只存当天的解码结果与记录）。
+
+**回滚到 v0.33.22**：按路线 A 窗口把代码与 profile 装回 v0.33.22（serving 间隔随 profile 回到 30 s）。没有新增的心跳字段、没有新增的落盘状态，
+**不需要挪心跳文件**。
+
+---
+
 ## 2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）
 
 **状态**：**已安装并启动**。代码 `df621ef2`（tag `v0.33.22`，PR #309 merge commit），路线 A bundle 第十五代

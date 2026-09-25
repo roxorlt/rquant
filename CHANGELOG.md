@@ -6,6 +6,12 @@
 
 ### Added
 
+- **两次单日回放的产出逐项对比 `scripts/route_a_replay_output_diff.py`（#302 等价证明的回放一半）**：读两个
+  `scripts/route_a_day_replay.py` 沙箱（只读，SQLite 用 `immutable=1`），比较与沙箱 commit 无关的内容：原始分钟批次与特征批次的
+  payload 字节和 envelope（去掉 `producer_commit`，特征再去掉由 commit 算出的 `batch_id`）、特征收盘标记、每个策略的每条信号
+  （evidence 去掉 `*_id` / `*_sha256` / `*_fingerprint` / `*_hash` 这类只指向产物的键）、每笔模拟盘成交、约束权威发布过的各代序号
+  与当前代的全部记录（去掉三个绑定 commit 的字段）。五项全同才退 0。本机夹具整日：v0.33.22 与本分支五项全同。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
@@ -135,6 +141,30 @@
 
 ### Changed
 
+- **路线 A 盘中四个 role 每轮只处理新到的批次（#302）**：`feature_live`、三个 `strategy_live`、`paper_constraint_publisher`
+  此前每轮都把当天（实际上是 spool 里所有天）的批次从头读一遍，下午每轮的花费约是上午的 2.3 倍；09-24 主机回放里 feature 合计
+  4,899 s、单步最长 23.1 s。现在：
+  - `LiveBatchSpool` 与 `FeatureBatchSpool` 每个实例记住自己完整读过并验过的每个保留批次的文件身份（设备、inode、模式、大小、
+    mtime、ctime，分钟 spool 另加 uid 与链接数）；身份一字不差就只做一次 `lstat`，否则照旧整读整验，所以每一种拒绝都不变。
+    参考慢源不走这条路。
+  - `feature_live` 每轮只列一次分钟 spool，每个分钟批次只解码一次（`FeatureLiveInputCache`），历史快照每个进程只规范化一次
+    （`NormalizedHistoricalMinutes`，按代码拆分，行序不变）。
+  - `paper_constraint_publisher` 按交易日记住每个分钟批次的逐代码证据、每个（代码, 分钟）的参考状态与约束记录，以及上一轮的产出；
+    可见批次、代码、参考代、序号都与上一轮相同时直接发布上一轮那个批次对象。发布器记住自己确认过的那一代，靠 `current.json`
+    的字节与代文件的身份认出它，不再每轮重读重解析几 MB 的代文件。任何可能拒绝的东西都不记，下一轮照旧重算。
+  - 什么都不落盘，重启从 spool 重建；心跳没有新字段。
+  - **等价证明**：本机合成整日（午休、一只 10:31 才出现的代码、一只 09:45 起停更的代码、一段下午缺口、一只 ST、两次中途重启、
+    固定 commit 与 spool 代号），v0.33.22 与本分支写出的 1,213 个文件逐字节相同；新旧的唯一行为差是午休与收盘后那 184 轮
+    约束发布从「报错」变成「成功、发布的是同一代」（#307）。本机夹具整日回放（120 只竞价代码、350 个 tick）与主机规模夹具整日回放
+    （5,470 只竞价代码）用 `scripts/route_a_replay_output_diff.py` 比，五项产出全同，信号 16 条、成交 6 笔两边一样。主机规模夹具：
+    驱动墙钟 1,277 s → 762 s，feature 135 s → 18 s，约束 180 s → 71 s，三个策略各约 112 s → 8–12 s（serving 不变，约 460 s）；
+    下午每个 tick 的中位数 4.6 s → 2.2 s。空闲轮（什么都没新到，生产上每分钟约 29 轮）在收盘时的花费：feature 43 ms → 22 ms、
+    约束 1.03 s → 58 ms、策略的 spool 读 0.57 s → 1.7 ms。
+- **serving 每 60 s 发布一次（原 30 s）**：`runtime_production_profile.SERVING_PUBLISHER_INTERVAL_SECONDS`。serving 每轮都把六个
+  来源权威重新读、重新校验（全市场参考投影一轮校验约四次），09-24 主机回放每轮 13.7 s，30 s 间隔下约占 0.31 个核，60 s 下约
+  0.19 个核。当日信号进 serving 的延迟上限从约 46 s 变成约 76 s（一次等待加一步），心跳仍在 120 s 的 `stale_after` 之内；
+  随下次装机的 profile 生效。增量发布的设计见 `docs/architecture/serving-incremental-publish.md`。
+
 - deploy(nginx): `deploy/nginx/rquant-backup.conf` 加 `location /preview/`（新版看板预览，路线 A，读
   `RQUANT_SERVING_ROOT` 指向的 serving 代，只读），反代 Streamlit `127.0.0.1:8509`（lighthouse 进程，非 systemd），
   与 `/dashboard/` 共用 htpasswd。owner 2026-09-24 授权「nginx 加登录路径」，主机上 09-24 21:42 已生效（备份
@@ -211,6 +241,22 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **约束发布器不再因为一只代码的分钟证据过期而整批拒绝（#307）**：午休（11:30–13:00 没有分钟批次，每条记录在最后一批之后
+  `quote_ttl` 即 120 s 过期）与收盘后，排在最前面的那只代码（09-24 是 002238.SZ，夹具是 300001.SZ）报
+  `latest visible minute evidence is stale`，整轮失败，一天约 93 轮，还带失败退避。现在：最新一条记录覆盖不到本轮时刻的代码，
+  记录照旧发布（已过期，broker 按「constraint has expired」拒绝，所以不可交易），计入 `paper_constraint_stale_codes`；当天
+  一条分钟都没有的代码（重复送来的前一日 K 线）不出记录、同样不可交易，计入 `paper_constraint_codes_without_evidence`；其余代码
+  照常发布。只有所有代码都没有当天证据时才不发布（`PaperExecutionConstraintNoEvidenceError`，step 报空闲轮、不算失败）。两个
+  计数只在非零时出现在心跳的 `observations` 里。午休时发布的正是上午最后那一代，权威目录一个字节都不变。
+- **broker 读约束权威时遇到「目录在读的过程中变了」会重读（#307 附带）**：`_verify_directory_chain` 比较从 `/` 到权威根每一级目录的
+  mtime 与 ctime，发布器自己的临时文件与改名、`generations/` 里的链接、任何祖先目录里新增或删除的条目（主机上 `data/` 每 5 分钟
+  换一次只读副本）都会让一次正常的读报 `authority directory changed while being read`（09-24 回放 6 次）。这几类检查改抛它的
+  子类 `PaperExecutionConstraintReadRaceError`（消息不变），读取方最多读三次、间隔 50 ms；一直在变的仍然拒绝，错误不变。
+- **盘中一个 STALE（或空）分钟批次不再让 feature_live 卡死一整天**（v0.33.22 已有）：分钟网关在 `rt_min` 任何一次失败时发布一个
+  STALE 批次，它不带任何一行，于是它的输入身份与上一个特征批次相同，`_next_feature_sequence` 把它当成上一批的崩溃重放，
+  发布时撞上同序号的不同内容，此后每轮都报 `immutable feature sequence already contains different content`，游标不再前进。现在
+  目标批次自己的 id 总在输入身份里；带行的批次本来就在，其余特征批次的字节都不变。
 
 - **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
   汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、
