@@ -73,7 +73,30 @@
       serving 代读信号。`chain.serving.signals_today_list` 与 `chain.market_minute.origin_by_watchlist_code` 为此新增。
     - **录到日保留录到的日历**：`--synthesize-sources` 只替换两个批次，日历仍用录到批次指名的那一代；没录到的日子用的
       选择规则照样跑一遍，结果写在 `provenance.calendar.heuristic_check`，用 09-24 顺带检验这条规则。
-  - **集成时要做的两件事（本包没做）**：新增 31 个用例（`tests/unit/test_route_a_replay_sources.py` 21 个、
+  - **主机 09-24 第二次复跑后的修正（同包第三轮）**：候选输入只剩 601091.SH 不同，被拿掉的盘中临停为 0，但
+    920003.BJ 09:30 的 watch 仍然缺；`signal_fidelity.by_code` 给出的原因是分钟线：`tushare_failed: no rows for the
+    trade date`。
+    - **原因**：第一版的 `stk_mins` 缓存把空回答也存了下来（`cache_empty=True`）。某一次运行里 Tushare 对 920003.BJ
+      回了一次空，之后每一次回放 09-24 都从缓存里读到这份空回答。
+    - **修法**：分钟线缓存只保存「当天确有 K 线」的回答，空回答一律不存；缓存里已有的空回答（旧版本留下的）自动忽略、
+      重新请求，并记进 `provenance.minute_bar.tushare.ignored_cached_empty`。当天集合竞价里有成交的代码不可能真的
+      没有分钟线，对它的空回答按 `--stk-mins-retries`（默认 3 次）、`--stk-mins-backoff-seconds`（默认 5 秒、逐次翻倍）
+      重试，次数写进 `asked_more_than_once`。
+    - **重试后仍缺就明说**：关注列表里在竞价有成交、最终却没有分钟线的代码，写进 `verdict.unfaithful_codes`，
+      `verdict.production_faithful` 变成 false，并写明原因；屏幕末尾逐条打印 `NOT PRODUCTION-FAITHFUL: ...`，结论行
+      变成 `REPLAY OK (NOT PRODUCTION-FAITHFUL, see above)`。多天报告加一列「faithful」和一节「Not production-faithful」。
+      （`mode.production_faithful` 只描述运行节奏，不随数据变化。）
+    - **名字按当天还原**：`stock_basic` 只给今天的名字，而名字会影响 ST 判定，也写进 ST 记录。现在对当天之后才改名的
+      代码，按 Tushare `namechange` 的历史取它当天的名字，同时用在采集拿到的名单和证据库的 `stock_basic` 表里；当天
+      生效的改名保留新名字，历史里查不到的列为 unresolved（`anachronisms.names_on_day`）。证据库里缺失、且在当天之后
+      才退市的代码，从退市名单补回（`evidence.listing_restored`）。
+    - **录到日按录到的采集时刻合成**：`risk_blacklist` 里由事实推出的 ST 行带有采集时刻，这一项因此不再算作差异
+      （`captured_at_aligned_to_recording`）。
+    - **每处差异都写明原因**：`fidelity_vs_recorded.projection_rows.*` 新增 `values_differ_fields`（哪些列不同、各几行）
+      和 `explained_by`；事实层面的差异写在 `explanations` 里。`PROJECTION_ANACHRONISMS` / `SECURITY_ANACHRONISMS`
+      逐表逐字段写明为什么只能拿到「今天」的数据；不在表里的差异标为 `unexplained`，那就是合成本身的缺陷。
+      `evidence.risk_blacklist_imported_after_the_day` 统计导入日期晚于当天的黑名单行数。
+  - **集成时要做的两件事（本包没做）**：新增 36 个用例（`tests/unit/test_route_a_replay_sources.py` 26 个、
     `tests/unit/test_route_a_replay_days.py` 5 个、回放集成用例 5 个），full-suite 分片清单要重生成；新增两个脚本与两个
     测试文件、改了一个脚本与一个测试文件，R07 基线要重冻。
 
