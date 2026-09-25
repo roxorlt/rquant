@@ -6,6 +6,25 @@
 
 ### Added
 
+- **新前端 M1 第一段：总览、系统健康和 `/app/` 装机套件（2026-09-25）**：
+  - `GET /api/v1/overview`：显示的交易日按交易日历定（今天开盘后是今天，休市、周末、09:15 前是最近一个交易日）；
+    返回今日链路（参考数据 → 竞价候选 → 盘中信号 → 模拟成交 → 通知推送）、候选（最近一次收盘选股 + 各策略当天候选）、
+    信号及推送状态、模拟账户与持仓、服务计数、数据按时情况和「需要关注」清单。
+  - `GET /api/v1/health`：运行服务用中文名和五种状态（正常 / 注意 / 异常 / 未运行 / 等待开盘或已收盘；盘中服务在交易时段外
+    没有心跳是预期状态，不标红），数据新鲜度（日线、分钟线、选股结果、交易日历余量、各数据集水位），页面数据（数据代年龄、
+    还没有数据来源的模块）和最近错误。技术 id 单独成字段，只进 tooltip 和详情抽屉。
+  - 全部复用已有读取函数（`runtime_console_data` 新增 `read_runtime_console_sections()`，一次请求一个游标），不新增 serving 投影。
+  - 前端两页按原型实现（`DataTable`、缺失值一律「—」），外框按 owner 的界面与文案要求改：数据标记改成「数据 3 分钟前更新」、
+    版本号和各数据集状态放 tooltip；顶栏的休市与下一交易日取自交易日历；未完成的页面只显示「即将上线」；手机底部常用页面栏；
+    新组件 `Tip`、`StatusBadge`、`RelativeTime`、`EmptyState`、骨架屏。规则写进 `web/CLAUDE.md`「界面与文案原则」，
+    `src/test/jargon.ts` 在 Vitest 和 Playwright 里检查正文不出现内部词。
+  - 装机套件：`deploy/nginx/rquant-backup.conf` 的 `/app/` 四个 location（`Host $host:$server_port`）、
+    `deploy/systemd/rquant-web.service`（serving 面、384M / 640M、只读、无 `.env`）、`deploy/sudoers/rquant-web`（只允许重启这一个服务）、
+    `scripts/web-release.sh`（精确 tag、原子切换、ACL 与 chmod 兜底、失败自动回滚、幂等、`--dry-run`），`docs/deploy/web-app.md`，
+    `DEPLOY.md`「待安装」一条。
+  - 浏览器测试：`scripts/serve_web_fixture.py` 固定 API 时钟；`RQ_E2E_REPLAY_ROOT` 指向回放副本时按真实数据验证
+    （6 条信号、6 条推送、2 只持仓）。
+
 - **新前端 M0：`web/` 网页外框、只读网页 API、合成数据代与 `web.yml`（2026-09-25 owner 决定用
   React + TypeScript + Vite，入口 `/app/`）**：只改仓库，不碰服务器，nginx `/app/` 块在 M1 装机时再加。
   - `web/`：Vite 8 + React 19.3 + TypeScript 5.9（严格模式），antd 6（`zh_CN`，只经 `src/ui/` 封装）、
@@ -160,6 +179,13 @@
   bootstrap worktree。
 
 ### Changed
+
+- **数据状态横幅只看数据代本身**：`serving_meta()` 只在没有数据代、数据代过期、或更新的一代没通过校验时报状态；
+  数据集水位不再参与（生产上 `runtime_health` 一直是 degraded、`lab_jobs` 一直 unavailable，按水位判会让每页都挂横幅）。
+  外壳新增 `age_seconds` 和给横幅用的一句话 `message`。
+- **合成数据代用 2026 年上交所真实交易日历**（原来按工作日算，把 09-25 中秋算成交易日），服务 id 和策略 id 改成生产格式，
+  并带上最近一次收盘选股；`/api/v1/meta` 增加 `previous_trading_day`、`next_trading_day`。
+- 写接口的同源检查改为比较 Origin 与 Host 的主机和端口（nginx 现在转发端口）。
 
 - deploy(nginx): `deploy/nginx/rquant-backup.conf` 加 `location /preview/`（新版看板预览，路线 A，读
   `RQUANT_SERVING_ROOT` 指向的 serving 代，只读），反代 Streamlit `127.0.0.1:8509`（lighthouse 进程，非 systemd），
