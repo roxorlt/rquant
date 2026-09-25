@@ -6,6 +6,50 @@
 
 ### Added
 
+- **回放任意一个近期交易日，并可一次回放多天（包 AK，`scripts/route_a_replay_sources.py`、
+  `scripts/route_a_replay_days.py`）**：主机的 spool 每个源每天只留一批、留得很少（09-25 实测：参考慢源只有
+  09-24 一批，竞价只有 09-23 的零行降级批与 09-24 一批），所以包 AH 的回放只能放 09-24，其他日子在读参考批次那一步
+  就以退出码 2 拒绝（没有借用别的日子的批次）；而 `--dry-plan` 对任何日期都原样列出 spool 里的全部文件，看起来像能放。
+  现在：
+  - **没有录到的日子由线上代码现场合成两个源批次**：参考慢源用真实的 `capture_reference_slow_source_snapshot`
+    （输入是只读副本「开盘前」的抽取——前一交易日的 `daily_bar` ⋈ `adj_factor` 与各投影表，外加 Tushare 当天的
+    `stock_st` / `adj_factor` / `suspend_d` 历史接口；`stock_basic` 只能拿到今天的名单，这是唯一的时代错位，按名字
+    判出、但 `stock_st(D)` 没列的 ST 代码逐只列出），再由真实的 `capture_reference_slow_batch` 封签，观测于 09:20:07；
+    竞价批次用真实的 `AuctionMatchGateway.capture_once` 吃 Tushare 历史 `stk_auction(D)`（与 #277 修过的
+    `pre_close` 列、09-23 那种 NaN 行丢弃规则完全同一段代码），收于 09:29:07；期望代码集用主机当天的 universe 代，
+    没有就用真实的 universe 发布函数从前一交易日的 `daily_bar` 算。日历用「开盘前主机已装的那一代」，每一代都晚于开盘
+    时，改用最新一代并把生成时刻改到前一晚 20:00（标成合成）。
+  - **每个输入都标来源**：`summary.json` 的 `inputs.provenance` 逐项写 recorded / synthesized 与出处；主机录到了就用录到的，
+    `--synthesize-sources` 强制合成并输出与录到批次的逐字段差异（`world.*.fidelity_vs_recorded`），用来在 09-24 上验证
+    合成的保真度。分钟历史快照仍用主机那一份、删掉当天及以后的行，`provenance.history.sessions_before_trade_date` 写明
+    还剩几个交易日（特征的同时刻中位数最多用 20 个，越早的日子剩得越少）。
+  - **缺什么就精确地说什么、退出码 2**：spool 里有什么、缺哪一天的 `daily_bar`（auction_gap 要前五个交易日）、前一交易日
+    没有 `adj_factor`、当天没有分钟线又没开 Tushare、Tushare 某个接口失败或历史回答为空、离线缓存缺哪一项、日历没有一代
+    覆盖当天，都在拒绝信息里逐条写明，绝不换用别的日子的批次。`--dry-plan` 按日期逐项解析（与真跑同一套判定），不写任何
+    东西、不发 Tushare 请求，末行输出一行 `DRY-PLAN {json}`。
+  - **Tushare 只经缓存**：`--tushare-cache`（默认 `<replay-root>/tushare-cache`），每个（接口, 日期[, 代码]）一个 parquet
+    加一份回执（取数时刻、sha256）；同一天再放、多天之间共用，一次都不重复请求；`--tushare-offline` 只读缓存、一个请求
+    都不发。分钟线缺口（`stk_mins`）也走这个缓存。
+  - **多天回放 `scripts/route_a_replay_days.py`**：`--trade-dates` 或 `--last-n-sessions N`，每天一个独立进程，
+    `--parallel`（默认 2）封顶；`--` 之后的参数原样传给每一天。输出 `days-<时刻>/report.json` 与 `report.md`：按天、按 role
+    列轮数、失败、首次产出时刻、候选数、各策略信号数、模拟盘成交、通知是否只走影子、serving 当日代、每个输入的来源与结论。
+  - **耗时剖析与一个显式标注的提速开关**：`summary.json` 新增 `profile`（每个 role 每步的 p50 / p95 / 最大 / 分时段合计、
+    每个时段每个 tick 的墙钟、驱动器自身开销）；`--cprofile <service_id>` 只在该 role 自己的迭代期间开 cProfile，输出
+    `.pstats` 与前 40 行文本；`--serving-every-ticks N`（默认 1）让 serving 只每 N 个 tick 与最后一个 tick 跑一次，
+    N>1 时 `mode.production_faithful=false` 并写明原因（生产是每 30 秒一次）。本地夹具整日（120 个竞价代码、350 个
+    tick）实测两轮：驱动器自身开销 1.8–2.1 秒，约占驱动墙钟的 0.6%，新旧版本在同一份代码的轮间波动（约 ±9%）之内
+    没有差别；`--serving-every-ticks 5` 把 serving 的合计从约 50 秒降到约 11 秒（驱动墙钟少 8%–13%，夹具上 serving
+    只占 role 时间的 14%，主机上约占 30%）。墙钟几乎全部花在 role 自己的步骤上，而且下午每个 tick 比上午贵 2.3 倍：
+    `paper_constraint_publisher`、`feature_live`、三个 `strategy_live` 每一步都把当天已有的分钟批次 / 特征批次
+    从头读一遍（夹具整日：paper constraint 解码分钟批次 parquet 41,255 次，feature 读特征批次控制文件 30,306 次，
+    `strategy.auction_gap` 读 42,404 次）。这是
+    role 自己的代价，生产上同样存在，本包不改 `src/`。
+  - **只读生产不变**：新增的读取（日历各代、副本探查与参考证据抽取）同样走 `open(rb)` / `ATTACH ... (READ_ONLY)` 与读前读后
+    的 stat 比对，审计钩子也装在 dry-plan 与多天回放进程里；Tushare 缓存目录与生产路径重叠时直接拒绝。**没有 `src/` 改动。**
+  - **集成时要做的两件事（本包没做）**：新增 25 个用例（`tests/unit/test_route_a_replay_sources.py` 15 个、
+    `tests/unit/test_route_a_replay_days.py` 5 个、回放集成用例 5 个），full-suite 分片清单要重生成；新增两个脚本与两个
+    测试文件、改了一个脚本与一个测试文件，R07 基线要重冻。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
