@@ -95,12 +95,65 @@ def _trusted_ssh_keygen_path() -> str:
     return str(_SSH_KEYGEN_PATH)
 
 
+#: `(st_dev, st_ino, st_mode, st_uid, st_nlink, st_size, st_mtime_ns, st_ctime_ns)` of one
+#: spool file. Every write here is a temporary file renamed over the name, so a changed file
+#: is a new inode; an in-place rewrite, chmod, chown or link changes `st_ctime_ns`, which
+#: user space cannot set back.
+_FileIdentity = tuple[int, int, int, int, int, int, int, int]
+
+
+def _file_identity(observed: os.stat_result) -> _FileIdentity:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_uid,
+        observed.st_nlink,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+def _path_identity(path: Path) -> _FileIdentity | None:
+    try:
+        return _file_identity(os.stat(path, follow_symlinks=False))
+    except OSError:
+        return None
+
+
+@dataclass(frozen=True)
+class _VerifiedPrefixBatch:
+    """One immutable batch `_validate_immutable_prefix` read in full and accepted (#302).
+
+    The identities are those of the descriptors the bytes were read through, so the entry
+    stands for exactly the bytes that were hashed and validated; `None` for a receipt that
+    was absent. A later validation that finds the same generation and the same three
+    identities at the three names accepts the batch without reading it again.
+    """
+
+    source_generation_id: str
+    manifest_identity: _FileIdentity
+    payload_identity: _FileIdentity
+    receipt_identity: _FileIdentity | None
+    envelope: BatchEnvelope
+
+
 def _secure_read_regular_file(
     path: Path,
     *,
     label: str,
     max_bytes: int = 256 * 1024 * 1024,
 ) -> bytes:
+    return _secure_read_regular_file_with_identity(path, label=label, max_bytes=max_bytes)[0]
+
+
+def _secure_read_regular_file_with_identity(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = 256 * 1024 * 1024,
+) -> tuple[bytes, _FileIdentity]:
     descriptor = -1
     try:
         descriptor = os.open(
@@ -134,7 +187,7 @@ def _secure_read_regular_file(
             before.st_mtime_ns,
         ):
             raise LiveSpoolIntegrityError(f"{label} identity changed while reading")
-        return b"".join(chunks)
+        return b"".join(chunks), _file_identity(before)
     except LiveSpoolIntegrityError:
         raise
     except OSError as exc:
@@ -480,6 +533,13 @@ class LiveBatchSpool:
             self.cursor_root / ".reference-publication.commit.lock"
         )
         self._thread_lock = RLock()
+        #: (channel, sequence) -> the batch `_validate_immutable_prefix` last accepted in
+        #: full. Every `current()`, `list_after()` and publication re-validates the whole
+        #: prefix; until #302 that re-read and re-hashed every retained batch each time, so a
+        #: consumer's two-second round grew with every batch of the day (and of every day
+        #: before it: nothing retires market-minute batches). An unchanged batch is now
+        #: recognised by `lstat` of its three names; anything else is read in full as before.
+        self._verified_prefix: dict[tuple[LiveChannel, int], _VerifiedPrefixBatch] = {}
         self._ensure_private_directories()
 
     def _ensure_private_directories(self) -> None:
@@ -1666,11 +1726,22 @@ class LiveBatchSpool:
         *,
         source_generation_id: str,
     ) -> None:
+        self._validate_publication_receipt_with_identity(
+            envelope,
+            source_generation_id=source_generation_id,
+        )
+
+    def _validate_publication_receipt_with_identity(
+        self,
+        envelope: BatchEnvelope,
+        *,
+        source_generation_id: str,
+    ) -> _FileIdentity | None:
         path = self._publication_receipt_path(envelope.channel, envelope.sequence)
         if not path.exists():
             if envelope.channel is LiveChannel.REFERENCE_SLOW:
                 raise LiveSpoolIntegrityError("reference slow current lacks a completion receipt")
-            return
+            return None
         try:
             observed = path.lstat()
             if (
@@ -1679,14 +1750,13 @@ class LiveBatchSpool:
                 or stat.S_IMODE(observed.st_mode) != 0o600
             ):
                 raise LiveSpoolIntegrityError("spool completion receipt is unsafe")
+            receipt_bytes, receipt_identity = _secure_read_regular_file_with_identity(
+                path,
+                label="spool completion receipt",
+                max_bytes=64 * 1024,
+            )
             receipt = _SpoolCompletionReceipt.model_validate(
-                strict_canonical_json_loads(
-                    _secure_read_regular_file(
-                        path,
-                        label="spool completion receipt",
-                        max_bytes=64 * 1024,
-                    )
-                )
+                strict_canonical_json_loads(receipt_bytes)
             )
         except (OSError, ValueError) as exc:
             raise LiveSpoolIntegrityError("spool completion receipt is invalid") from exc
@@ -1727,6 +1797,30 @@ class LiveBatchSpool:
             raise LiveSpoolIntegrityError(
                 "spool completion receipt does not match immutable manifest"
             )
+        return receipt_identity
+
+    def _unchanged_prefix_batch(
+        self,
+        channel: LiveChannel,
+        sequence: int,
+        *,
+        channel_dir: Path,
+        source_generation_id: str,
+    ) -> BatchEnvelope | None:
+        """The accepted envelope of `sequence`, when none of its three files has changed."""
+
+        verified = self._verified_prefix.get((channel, sequence))
+        if verified is None or verified.source_generation_id != source_generation_id:
+            return None
+        name = f"{sequence:020d}"
+        if (
+            _path_identity(channel_dir / f"{name}.json") != verified.manifest_identity
+            or _path_identity(channel_dir / f"{name}.payload") != verified.payload_identity
+            or _path_identity(self._publication_receipt_path(channel, sequence))
+            != verified.receipt_identity
+        ):
+            return None
+        return verified.envelope
 
     def _validate_immutable_prefix(
         self,
@@ -1768,17 +1862,29 @@ class LiveBatchSpool:
 
         envelopes: list[BatchEnvelope] = []
         source_generation_id = self._source_generation(channel)
+        #: A reference-slow batch is re-read in full every time: its window is at most 128
+        #: batches, and its signature and retirement rules are not what #302 is about.
+        memoize = channel is not LiveChannel.REFERENCE_SLOW
         for sequence in expected_sequences:
+            if memoize:
+                unchanged = self._unchanged_prefix_batch(
+                    channel,
+                    sequence,
+                    channel_dir=channel_dir,
+                    source_generation_id=source_generation_id,
+                )
+                if unchanged is not None:
+                    envelopes.append(unchanged)
+                    continue
             manifest_path = self._manifest_path(channel, sequence)
             payload_path = self._payload_path(channel, sequence)
             try:
-                envelope = BatchEnvelope.model_validate_json(
-                    _secure_read_regular_file(
-                        manifest_path,
-                        label="immutable batch manifest",
-                    )
+                manifest_bytes, manifest_identity = _secure_read_regular_file_with_identity(
+                    manifest_path,
+                    label="immutable batch manifest",
                 )
-                payload = _secure_read_regular_file(
+                envelope = BatchEnvelope.model_validate_json(manifest_bytes)
+                payload, payload_identity = _secure_read_regular_file_with_identity(
                     payload_path,
                     label="immutable batch payload",
                 )
@@ -1788,6 +1894,7 @@ class LiveBatchSpool:
                 raise LiveSpoolIntegrityError("immutable prefix identity changed")
             if hashlib.sha256(payload).hexdigest() != envelope.content_sha256:
                 raise LiveSpoolIntegrityError("immutable prefix payload is corrupt")
+            receipt_identity: _FileIdentity | None = None
             if (
                 channel is LiveChannel.REFERENCE_SLOW
                 or self._publication_receipt_path(
@@ -1795,9 +1902,17 @@ class LiveBatchSpool:
                     sequence,
                 ).exists()
             ):
-                self._validate_publication_receipt(
+                receipt_identity = self._validate_publication_receipt_with_identity(
                     envelope,
                     source_generation_id=source_generation_id,
+                )
+            if memoize:
+                self._verified_prefix[(channel, sequence)] = _VerifiedPrefixBatch(
+                    source_generation_id=source_generation_id,
+                    manifest_identity=manifest_identity,
+                    payload_identity=payload_identity,
+                    receipt_identity=receipt_identity,
+                    envelope=envelope,
                 )
             envelopes.append(envelope)
         return tuple(envelopes)
@@ -1864,12 +1979,22 @@ class LiveBatchSpool:
         records: list[LiveBatchRecord] = []
         self._next_sequence_locked(channel)
         for path in sorted(self._channel_dir(channel).glob("*.json")):
-            try:
-                envelope = BatchEnvelope.model_validate_json(
-                    _secure_read_regular_file(path, label="batch manifest")
-                )
-            except (OSError, ValueError) as exc:
-                raise LiveSpoolIntegrityError(f"invalid batch manifest: {path.name}") from exc
+            #: `_next_sequence_locked` has just validated every one of these manifests; the
+            #: one whose file is still the bytes it accepted is not read a second time
+            verified = (
+                self._verified_prefix.get((channel, int(path.stem)))
+                if path.stem.isdigit()
+                else None
+            )
+            if verified is not None and _path_identity(path) == verified.manifest_identity:
+                envelope = verified.envelope
+            else:
+                try:
+                    envelope = BatchEnvelope.model_validate_json(
+                        _secure_read_regular_file(path, label="batch manifest")
+                    )
+                except (OSError, ValueError) as exc:
+                    raise LiveSpoolIntegrityError(f"invalid batch manifest: {path.name}") from exc
             if envelope.channel is not channel:
                 raise LiveSpoolIntegrityError("batch manifest channel does not match its directory")
             if envelope.sequence > sequence:
