@@ -212,6 +212,20 @@
 
 ### Fixed
 
+- **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
+  汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、
+  `latest_screen`）还没接进来，这些字段是 `NULL` 本身正常；但代码直接 `int(row['daily_bar_rows'])` 之类，一撞
+  `None` 就是 `TypeError: int() argument must be a string, a bytes-like object or a real number, not
+  'NoneType'`，Streamlit 顶层脚本从崩溃处往下全部不渲染。新增 `fmt_or_dash()` 小工具函数（NA 一律显示「—」，
+  非空值按 `cast`/`spec` 原样格式化），统一替换掉「数据新鲜度」四个 metric 和「分钟线行数 / 覆盖股票 / 时间范围」
+  三处裸 `int()` / 日期格式化。同批顺手修了浏览器自测撞到的两处同类崩溃：① 分钟策略实验室的默认日期区间硬编码
+  `date(2026, 6, 22)`，早已落在真实 `screen_bounds` 窗口之外，`st.date_input` 的 `value` 越界直接抛
+  `StreamlitAPIException`，现在 clamp 到 `[bounds_min, bounds_max]`；② 风险黑名单里没有到期日的名单（如 `ST`）
+  `expires_at` 为 `NULL`，`(expires - today_d).days` 撞 `None` 抛 `TypeError`，现在识别为「长期有效」，不再算
+  过期 / 临期。新增
+  `tests/unit/test_serving_page_isolation.py::test_dashboard_page_renders_null_freshness_row_as_dash_placeholders`
+  复现并锁定这个场景。
+
 - **全角色沙箱 e2e 的间歇失败（CI run 36059539009，3.11 分片 2；只改测试）**：
   `tests/integration/test_route_a_all_roles_sandbox_e2e.py` 的 `run_role` 在拍 `trees_before` 快照之前先做一次完整的
   `gc.collect()`。前面的 role 没关闭的 SQLite 连接和它自己的语句缓存互相引用，引用计数归零也不会关，只能等循环垃圾回收；
