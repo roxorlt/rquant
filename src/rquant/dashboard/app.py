@@ -26,6 +26,7 @@ from rquant.dashboard.serving_page_ui import (
     render_serving_root_failure,
     render_serving_state_banner,
 )
+from rquant.delivery_contracts import OutboxStatus
 from rquant.serving_paths import serving_root_from_env
 
 REFRESH_SECONDS = 30
@@ -374,6 +375,16 @@ def time_diff_human(target_us: int | str | datetime | pd.Timestamp) -> str:
         return ""
 
 
+def fmt_or_dash(value: object, spec: str = "", *, cast: type | None = None) -> object:
+    """serving 汇总行里的数值可能是 NA（新运行时字段暂未接入旧库计数）；
+    为空时返回 '—' 占位，而不是让 int()/float() 直接崩溃拖垮整页渲染。"""
+    if pd.isna(value):
+        return "—"
+    if cast is not None:
+        value = cast(value)
+    return format(value, spec) if spec else value
+
+
 def get_realtime_quotes_batch(ts_codes: tuple[str, ...]) -> pd.DataFrame:
     """从同一 serving generation 的最新市场快照读取 watchlist 价格。"""
     if not ts_codes:
@@ -648,10 +659,10 @@ try:
         else:
             row = freshness.iloc[0]
             fcols = st.columns(4)
-            fcols[0].metric("最新 daily_bar", row["latest_daily_bar"] or "—")
-            fcols[1].metric("最新 screen_result", row["latest_screen"] or "—")
-            fcols[2].metric("daily_bar 总行数", f"{int(row['daily_bar_rows']):,}")
-            fcols[3].metric("monitor_event 总行数", f"{int(row['event_rows']):,}")
+            fcols[0].metric("最新 daily_bar", fmt_or_dash(row["latest_daily_bar"]))
+            fcols[1].metric("最新 screen_result", fmt_or_dash(row["latest_screen"]))
+            fcols[2].metric("daily_bar 总行数", fmt_or_dash(row["daily_bar_rows"], ",", cast=int))
+            fcols[3].metric("monitor_event 总行数", fmt_or_dash(row["event_rows"], ",", cast=int))
 
     # ── Section 3: Watchlist ──
 
@@ -812,7 +823,7 @@ try:
         if bounds_min is None or bounds_max is None:
             st.info("暂无 Pool 1 日期范围")
         else:
-            default_end = min(bounds_max, date(2026, 6, 22))
+            default_end = max(bounds_min, min(bounds_max, date(2026, 6, 22)))
             default_start = max(bounds_min, default_end - timedelta(days=21))
             with st.container(border=True):
                 c1, c2, c3, c4, c5 = st.columns([1.0, 1.0, 0.9, 1.8, 2.2])
@@ -1003,13 +1014,12 @@ try:
                             else:
                                 row = overview.iloc[0]
                                 d1, d2, d3 = st.columns(3)
-                                d1.metric("分钟线行数", int(row["rows_count"]))
-                                d2.metric("覆盖股票", int(row["codes_count"]))
+                                d1.metric("分钟线行数", fmt_or_dash(row["rows_count"], cast=int))
+                                d2.metric("覆盖股票", fmt_or_dash(row["codes_count"], cast=int))
                                 d3.metric(
                                     "时间范围",
-                                    f"{row['min_time']:%m-%d} → {row['max_time']:%m-%d}"
-                                    if pd.notna(row["min_time"])
-                                    else "—",
+                                    f"{fmt_or_dash(row['min_time'], '%m-%d')} → "
+                                    f"{fmt_or_dash(row['max_time'], '%m-%d')}",
                                 )
                                 st.caption(
                                     "90 日价量分布已接入入场过滤、止损、止盈和移动止盈参数；"
@@ -1035,7 +1045,7 @@ try:
     elif last24h.empty:
         st.info("最近 24h 无推送记录")
     else:
-        last24h = last24h.assign(success=last24h["status"].eq("delivered"))
+        last24h = last24h.assign(success=last24h["status"].eq(OutboxStatus.SUCCEEDED.value))
         rate = (
             last24h.groupby("channel")
             .agg(
@@ -1392,16 +1402,22 @@ try:
                     expires = r["expires_at"]
                     if hasattr(expires, "date"):
                         expires = expires.date()
-                    days_left = (expires - today_d).days
-                    expired = days_left < 0
-                    near = 0 <= days_left <= 30
-
-                    badge_color = "#dc2626" if expired else ("#f59e0b" if near else "#16a34a")
-                    badge_text = (
-                        f"已过期 {-days_left}d"
-                        if expired
-                        else (f"剩 {days_left}d" if near else f"剩 {days_left}d")
-                    )
+                    if expires is None:
+                        # 部分名单（如 ST）没有到期日，永久生效，不做过期/临期判断。
+                        expired = False
+                        near = False
+                        badge_color = "#6b7280"
+                        badge_text = "长期有效"
+                    else:
+                        days_left = (expires - today_d).days
+                        expired = days_left < 0
+                        near = 0 <= days_left <= 30
+                        badge_color = "#dc2626" if expired else ("#f59e0b" if near else "#16a34a")
+                        badge_text = (
+                            f"已过期 {-days_left}d"
+                            if expired
+                            else (f"剩 {days_left}d" if near else f"剩 {days_left}d")
+                        )
 
                     st.markdown(
                         f"<div style='display:flex;align-items:baseline;"
@@ -1417,8 +1433,8 @@ try:
                     st.markdown(
                         f"<div style='color:#6b7280;font-size:0.78rem;"
                         f"margin-top:4px;'>"
-                        f"{r['n_total']} 只 · 导入 {r['imported_at']} → "
-                        f"失效 {expires}"
+                        f"{r['n_total']} 只 · 导入 {fmt_or_dash(r['imported_at'])} → "
+                        f"失效 {fmt_or_dash(expires)}"
                         f"</div>",
                         unsafe_allow_html=True,
                     )

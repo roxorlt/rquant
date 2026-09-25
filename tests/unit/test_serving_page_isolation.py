@@ -599,6 +599,234 @@ def test_serving_query_scopes_watermark_state_to_required_projection_owner(
     assert "signals:degraded:signal-source-delayed" in screen.detail
 
 
+def test_dashboard_page_renders_null_freshness_row_as_dash_placeholders(
+    tmp_path: Path,
+) -> None:
+    """A ``dashboard_summary`` row full of NA counts must not crash the health page.
+
+    2026-09-24 production incident: the runtime_health authority started publishing
+    ``dashboard_summary`` before the legacy daily_bar / monitor_event counts were
+    wired into the new runtime, so ``daily_bar_rows``, ``monitor_event_rows``,
+    ``latest_daily_bar`` and ``latest_screen`` come back NULL. The page bombed with
+    ``TypeError: int() argument must be a string, a bytes-like object or a real
+    number, not 'NoneType'`` and rendering stopped dead at that point. This must
+    render every section with '—' placeholders instead.
+    """
+
+    app_path = _PROJECT_ROOT / "src/rquant/dashboard/app.py"
+    root = tmp_path / "serving"
+    built_at = datetime(2026, 9, 24, 5, 0, tzinfo=UTC)
+    null_dashboard_summary_row = {
+        "snapshot_key": "current",
+        "latest_daily_bar": None,
+        "latest_screen": None,
+        "daily_bar_rows": None,
+        "monitor_event_rows": None,
+        "minute_bar_rows": None,
+        "minute_codes": None,
+        "minute_min_time": None,
+        "minute_max_time": None,
+        "host_name": "test-host",
+        "monitor_state": "running",
+        "monitor_substate": "healthy",
+        "monitor_next_at": None,
+        "monitor_last_at": None,
+        "daily_state": "missing",
+        "daily_exec_status": "stale",
+        "daily_next_at": None,
+        "daily_last_at": None,
+        "dashboard_state": "unavailable",
+        "backup_snapshot_at": None,
+        "backup_source_bytes": None,
+        "backup_compressed_bytes": None,
+        "backup_last_download_at": None,
+        "backup_last_download_ip": None,
+        "backup_last_download_bytes": None,
+    }
+    ServingPublisher(
+        root,
+        producer_commit="a" * 40,
+        table_specs={
+            "dashboard_summary": ServingTableSpec(sort_keys=("snapshot_key",)),
+            "projection_status": ServingTableSpec(sort_keys=("table_name",)),
+        },
+    ).publish(
+        {
+            "dashboard_summary": pd.DataFrame([null_dashboard_summary_row]),
+            "projection_status": pd.DataFrame(
+                {
+                    "table_name": ["dashboard_summary"],
+                    "available": [True],
+                    "reason": [None],
+                    "owner_dataset_id": ["runtime_health"],
+                    "available_at": [built_at],
+                }
+            ),
+        },
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="runtime_health",
+                generation_id="runtime-1",
+                event_time=built_at,
+                published_at=built_at,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"runtime_health": "runtime-1"},
+        built_at=built_at,
+    )
+
+    harness = textwrap.dedent(
+        f"""
+        import json
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_file({str(app_path)!r}).run(timeout=30)
+        result = {{
+            "exceptions": [str(item.value) for item in app.exception],
+            "metrics": {{metric.label: metric.value for metric in app.metric}},
+        }}
+        print("RESULT_JSON=" + json.dumps(result, ensure_ascii=False))
+        """
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "DATA_DIR": str(tmp_path / "data"),
+            "DUCKDB_PATH": str(tmp_path / "data" / "rquant.duckdb"),
+            "DUCKDB_READONLY_PATH": str(tmp_path / "data" / "rquant_ro.duckdb"),
+            "DEEPSEEK_API_KEY": "test-only-key",
+            "RQUANT_DISABLE_DOTENV": "1",
+            "PYTHONPATH": str(_PROJECT_ROOT / "src"),
+            "RQUANT_SERVING_ROOT": str(root),
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", harness],
+        cwd=_PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    [result_line] = [
+        line for line in completed.stdout.splitlines() if line.startswith("RESULT_JSON=")
+    ]
+    result = json.loads(result_line.removeprefix("RESULT_JSON="))
+
+    assert result["exceptions"] == [], result["exceptions"]
+    metrics = result["metrics"]
+    assert metrics["最新 daily_bar"] == "—"
+    assert metrics["最新 screen_result"] == "—"
+    assert metrics["daily_bar 总行数"] == "—"
+    assert metrics["monitor_event 总行数"] == "—"
+
+
+def test_dashboard_page_renders_succeeded_delivery_as_full_success_rate(
+    tmp_path: Path,
+) -> None:
+    """``deliveries.status`` is populated from ``OutboxRecord.status`` (``OutboxStatus``,
+    in ``rquant/delivery_contracts.py``) -- see ``serving_read_models.py``'s
+    ``"status": record.status.value``. That enum has never had a ``"delivered"`` member
+    (its terminal success value is ``OutboxStatus.SUCCEEDED == "succeeded"``), so the
+    dashboard's 24h success-rate card compared against a string that could never match
+    and always showed 0% even when every delivery in the window had in fact succeeded.
+    This does not crash the page, so it needs an assertion on the rendered metric text
+    rather than on ``app.exception``.
+    """
+
+    app_path = _PROJECT_ROOT / "src/rquant/dashboard/app.py"
+    root = tmp_path / "serving"
+    built_at = datetime.now(UTC) - timedelta(seconds=5)
+    ServingPublisher(
+        root,
+        producer_commit="a" * 40,
+        table_specs={"deliveries": ServingTableSpec(sort_keys=("outbox_id",))},
+    ).publish(
+        {
+            "deliveries": pd.DataFrame(
+                [
+                    {
+                        "outbox_id": "outbox-1",
+                        "signal_id": "sig-1",
+                        "recipient_id": "admin",
+                        "channel": "pushdeer",
+                        "status": "succeeded",
+                        "attempt_count": 1,
+                        "updated_at": built_at,
+                        "last_error": None,
+                    }
+                ]
+            ),
+        },
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="signals",
+                generation_id="signals-1",
+                event_time=built_at,
+                published_at=built_at,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"signals": "signals-1"},
+        built_at=built_at,
+    )
+
+    harness = textwrap.dedent(
+        f"""
+        import json
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_file({str(app_path)!r}).run(timeout=30)
+        result = {{
+            "exceptions": [str(item.value) for item in app.exception],
+            "metrics": {{
+                metric.label: {{"value": metric.value, "delta": metric.delta}}
+                for metric in app.metric
+            }},
+        }}
+        print("RESULT_JSON=" + json.dumps(result, ensure_ascii=False))
+        """
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "DATA_DIR": str(tmp_path / "data"),
+            "DUCKDB_PATH": str(tmp_path / "data" / "rquant.duckdb"),
+            "DUCKDB_READONLY_PATH": str(tmp_path / "data" / "rquant_ro.duckdb"),
+            "DEEPSEEK_API_KEY": "test-only-key",
+            "RQUANT_DISABLE_DOTENV": "1",
+            "PYTHONPATH": str(_PROJECT_ROOT / "src"),
+            "RQUANT_SERVING_ROOT": str(root),
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", harness],
+        cwd=_PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    [result_line] = [
+        line for line in completed.stdout.splitlines() if line.startswith("RESULT_JSON=")
+    ]
+    result = json.loads(result_line.removeprefix("RESULT_JSON="))
+
+    assert result["exceptions"] == [], result["exceptions"]
+    metric = result["metrics"]["pushdeer (24h)"]
+    assert metric["value"] == "1/1"
+    assert metric["delta"] == "100% 成功"
+
+
 def test_serving_query_fails_closed_when_projection_owner_watermark_is_missing(
     tmp_path: Path,
 ) -> None:

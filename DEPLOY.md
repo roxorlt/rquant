@@ -5,9 +5,46 @@
 
 ---
 
-## 2026-09-25 · 待安装 · v0.33.22 总览：回放工具（AH）+ 路线 A 链五处阻断（热修 AI）+ schema rollout 不再卡链（热修 AJ，#304、#228）+ nginx `/preview/` 入库
+## 2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）
 
-**状态**：**尚未安装**。本条是 v0.33.22 的装机总览，先读本条；各改动的背景、预期与细节在紧接着的几条里
+**状态**：**已安装并启动**。代码 `df621ef2`（tag `v0.33.22`，PR #309 merge commit），路线 A bundle 第十五代
+`e458c47d…`，authority sequence 14（generation `50cb0d5c…`）。下一个交易日 2026-09-28（周一）做第一次同日验收。
+
+**装机前处理（owner 当场授权「现在重启，再装机」）**：旧版 8501 看板 `rquant-dashboard.service`（v0.28.3）自 09-24 00:00
+启动后内存涨到 1.54 GB，把 `rquant-serving.slice`（MemoryHigh 1536M）占满，同一 slice 的 canvas / nl-screen / panorama /
+panorama-auth 以及路线 A 的 `runtime-health`、`serving` 两个 unit 都卡在内存回收节流里（D 态 `mem_cgroup_handle_over_high`），
+宿主机 swap 1024/1024 全满、load 12。11:16 只重启这一个服务（rc 0，91 s），slice 降到 231 MB，节流解除。看板内存随页面渲染
+增长（重启后无人访问时稳定在 50 MB），**周一开盘前要再看一眼**。
+
+| 步 | 结果（2026-09-25 11:19–11:45） |
+|---|---|
+| 1 `${WT}`→v0.33.22 | HEAD `df621ef2`；`deploy/` diff 仅 `deploy/nginx/rquant-backup.conf`，`sudo diff` 仓库 == 主机；uv.lock 不变（96 包）；20 active / 0 failed |
+| 2 停机 | 11:19:37–11:20:52，20 个全 success、NRestarts 全 0，76 s |
+| 3 inputs / profile | 两跑仅 `market-calendar-authority.json` 与 inputs 文件不同（墙钟，同 v0.33.21）；producer_commit `df621ef2`；profile `f4710550…`（26 service，published）；副本 6 / 主库 0；notifier `paused=false` ×3、`suppress_delivery=true` |
+| 装前只读检查 | `runtime-schema-rollout close-unchanged --dry-run` rc 0：plans 208、closed 208（预览）、closed_current_generation 16、schema_changed 0 |
+| 4 deployment-profile | 第十五代 `e458c47d…`（previous `4ff0b255…`）；`schema_rollout_plan_ids: []`，计划仍 208 份 |
+| acknowledge | dry / apply / 复跑：208 份全部 `not_current_generation`，changed 0、converted 0、deadline_expired 0 |
+| 5 stage `eighteenth` | seq 14、gen `50cb0d5c…`、25 role、plan `f1278bc4…` |
+| 6 publish | dry rc 0；正式 `nohup setsid` + 采样器：rc 0，94 s，sequence 14，prior `b9cc094e…`；load 峰值 1.15；删 `seventeenth`；R-32 非 stopped 心跳 0；DF-1 378,490,880 B / projection_authority 63,208 / outbox 0 / attempt 0 / unknown 0 |
+| 7 起 unit | 11:28:17–11:44:58 六组，1001 s，`rqup.log` FAIL 0；20 active / 0 failed / NRestarts 0；oneshot ×7 exit 0；每份心跳都带 `observations` / `degraded_detail`；推送 0 |
+
+休市日预期的 degraded（不是故障）：`paper-constraint`（没有可见的分钟批次）→ `paper-broker`（无 current pointer）→
+`serving.publisher`（paper_accounts 读不到），开盘 09:30 出第一批分钟线后依次恢复；`reference-slow.publisher` 09:25 之后
+每轮报 `started after 09:25`（#301 S-1 记录的设计行为）。
+
+**同一天装机前的回放（v0.33.22 候选代码 `9ff9f65f`）**：`scripts/route_a_day_replay.py --trade-date 2026-09-24 --tushare`，
+沙箱 `/home/lighthouse/replay/runs/20260925T051331-7abbff`，模拟到 13:23 时被 2 小时上限停下（单进程约 50 s 墙钟 / 模拟分钟）。
+15 个 role 零崩溃；serving 当日信号 6 条（auction_gap：watch 002819.SZ / 603937.SH / 920003.BJ @09:30、b_intent 603937.SH
+@09:31、watch 002238.SZ @13:04、b_intent 002238.SZ @13:05）；deliveries 6 条全是 `shadow:` 回执；模拟盘成交 2 笔各 100 股。
+
+**回滚到 v0.33.21**：按上面「v0.33.22 总览」一条的「回滚到 v0.33.21」做（先停 unit，**先挪走所有 role 的心跳文件**，
+再按 v0.33.21 的路径重装），不要只切代码。
+
+---
+
+## 2026-09-25 · 已安装 · v0.33.22 总览：回放工具（AH）+ 路线 A 链五处阻断（热修 AI）+ schema rollout 不再卡链（热修 AJ，#304、#228）+ nginx `/preview/` 入库
+
+**状态**：已于 **2026-09-25 11:19–11:45** 在第十六窗口装上主机，实际安装记录见本文件最上面「2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）」一条，本段其余文字是装机前写的。**尚未安装**。本条是 v0.33.22 的装机总览，先读本条；各改动的背景、预期与细节在紧接着的几条里
 （「nginx `/preview/` 登录路径」「热修 AJ」「热修 AI」）。
 
 **这一版装的是四处改动**：
@@ -115,9 +152,9 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ---
 
-## 2026-09-25 · 待安装 · 热修 AJ：schema rollout 不再卡死路线 A 链（#304、#228）
+## 2026-09-25 · 已安装 · 热修 AJ：schema rollout 不再卡死路线 A 链（#304、#228）
 
-**状态**：**尚未安装**，分支 `cc/20260925-schema-rollout-no-op-plans`，建在热修 AI（`cc/20260924-route-a-chain-blockers`）之上，
+**状态**：已于 **2026-09-25 11:19–11:45** 在第十六窗口装上主机，实际安装记录见本文件最上面「2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）」一条，本段其余文字是装机前写的。**尚未安装**，分支 `cc/20260925-schema-rollout-no-op-plans`，建在热修 AI（`cc/20260924-route-a-chain-blockers`）之上，
 和 AH、AI 一起作为 v0.33.22 装。改的是 `src/rquant/`（`runtime_schema_registry.py`、`schema_compatibility.py`、
 `runtime_deployment_bundle.py`、`cli.py`）、测试与回放脚本，**`deploy/` 一个字没改**。改了什么见 CHANGELOG
 `[Unreleased]/Fixed` 的「包 AJ」一条。
@@ -212,9 +249,9 @@ DUAL_WRITE 的旧计划现在显示 `window-not-opened`（它们的生产者从�
 
 ---
 
-## 2026-09-24 · 待安装 · 热修 AI：路线 A 链上的五处阻断（9 月 24 日真实数据回放）
+## 2026-09-24 · 已安装 · 热修 AI：路线 A 链上的五处阻断（9 月 24 日真实数据回放）
 
-**状态**：**尚未安装**，分支 `cc/20260924-route-a-chain-blockers`，建在包 AH（回放工具）之上。改的都是 `src/rquant/`
+**状态**：已于 **2026-09-25 11:19–11:45** 在第十六窗口装上主机，实际安装记录见本文件最上面「2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）」一条，本段其余文字是装机前写的。**尚未安装**，分支 `cc/20260924-route-a-chain-blockers`，建在包 AH（回放工具）之上。改的都是 `src/rquant/`
 与测试、回放脚本，**`deploy/` 一个字没改**，所以走受控发布器即可（`deploy-production.sh --target <tag>`），不需要手工装
 unit。改了什么见 CHANGELOG `[Unreleased]/Fixed` 的「包 AI」一条。
 
@@ -262,9 +299,9 @@ v0.33.21 连默认值的心跳也拒收，所以这一步对**所有** role 都�
 
 ---
 
-## 2026-09-24 · 待安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ 参考批量查表（#299）+ `rquant-live-runtime.slice` CPUQuota 200%
+## 2026-09-24 · 已安装 · v0.33.21 总览：参考慢源发布窗口热修（#297、#298）+ 参考批量查表（#299）+ `rquant-live-runtime.slice` CPUQuota 200%
 
-**状态**：**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；AF 与 slice 两处改动各自的背景、预期与细节在紧接着的
+**状态**：已于 **2026-09-24 16:17–16:41** 在第十五窗口装上主机（本文件没有单列这一窗口的安装记录），本段其余文字是装机前写的。**尚未安装**。本条是 v0.33.21 的装机总览，先读本条；AF 与 slice 两处改动各自的背景、预期与细节在紧接着的
 两条里（「rquant-live-runtime.slice CPUQuota 提额」与「参考慢源发布窗口只剩 09:25 一个期限」）；热修 AG
 没有单独的装机条目（没有 schema、unit、manifest 字段或运行时配置变化），它的演练输出写在 AF 那条里。
 
@@ -342,9 +379,9 @@ cat /sys/fs/cgroup/rquant.slice/rquant-live.slice/rquant-live-runtime.slice/cpu.
 
 ---
 
-## 2026-09-24 · 待安装 · rquant-live-runtime.slice CPUQuota 提额（issue #297）
+## 2026-09-24 · 已安装 · rquant-live-runtime.slice CPUQuota 提额（issue #297）
 
-**状态**：**尚未安装**。`deploy/systemd/rquant-live-runtime.slice` 的 `CPUQuota` 已于
+**状态**：已于 **2026-09-24 16:17–16:41** 在第十五窗口装上主机（本文件没有单列这一窗口的安装记录），本段其余文字是装机前写的。**尚未安装**。`deploy/systemd/rquant-live-runtime.slice` 的 `CPUQuota` 已于
 2026-09-24 10:42 经 owner 授权（"cpu可以调到2个"），用 `systemctl set-property
 rquant-live-runtime.slice CPUQuota=200%`（未带 `--runtime`）在生产主机上直接生效
 （60%→200%），持久化落在
@@ -369,9 +406,9 @@ checked-in 的 slice 文件，还没有装到服务器上——装上之前，�
 
 ---
 
-## 2026-09-24 · 待安装 · 参考慢源发布窗口只剩 09:25 一个期限，09:25 之后不再崩（#297、#298）
+## 2026-09-24 · 已安装 · 参考慢源发布窗口只剩 09:25 一个期限，09:25 之后不再崩（#297、#298）
 
-**状态**：**尚未安装**。本条是安装前必读，不是部署记录。09-25（中秋）到周末休市，**下一个交易日是
+**状态**：已于 **2026-09-24 16:17–16:41** 在第十五窗口装上主机（本文件没有单列这一窗口的安装记录），本段其余文字是装机前写的。**尚未安装**。本条是安装前必读，不是部署记录。09-25（中秋）到周末休市，**下一个交易日是
 2026-09-28（周一）**，所以当天装、当天用下面的演练脚本在主机上验证，周一 09:20 是第一次真跑。部署器
 09:15–15:10 会自动延期需要重启的发布，收盘后装。
 
@@ -475,9 +512,9 @@ serving 参考权威（注册表那一代照样在）。所以**回滚最好在�
 
 ---
 
-## 2026-09-23 · 待安装 · 参考慢源第一次能发布（#293）
+## 2026-09-23 · 已安装 · 参考慢源第一次能发布（#293）
 
-**状态**：**尚未安装**。本条是安装前必读，不是部署记录。
+**状态**：已于 **2026-09-23 夜间到 09-24 00:10 冷启动** 在第十四窗口装上主机（本文件没有单列这一窗口的安装记录），本段其余文字是装机前写的。**尚未安装**。本条是安装前必读，不是部署记录。
 
 **现象**：`reference-slow.source.v1` 从 09-14 起每个交易日 09:20 都失败，一次都没发布过
 （`stock_basic source is missing columns: delist_date`），`authorities/reference-slow` 一代都没有。
