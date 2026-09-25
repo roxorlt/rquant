@@ -142,12 +142,36 @@
             ],
             "title": "Is Trading Day"
           },
+          "next_trading_day": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Trading Day"
+          },
           "phase": {
             "$ref": "#/components/schemas/MarketPhase"
           },
           "phase_label": {
             "title": "Phase Label",
             "type": "string"
+          },
+          "previous_trading_day": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Trading Day"
           },
           "trade_date": {
             "format": "date",
@@ -159,7 +183,9 @@
           "trade_date",
           "phase",
           "phase_label",
-          "is_trading_day"
+          "is_trading_day",
+          "previous_trading_day",
+          "next_trading_day"
         ],
         "title": "MarketInfo",
         "type": "object"
@@ -292,6 +318,17 @@
       },
       "ServingMeta": {
         "properties": {
+          "age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Seconds"
+          },
           "built_at": {
             "anyOf": [
               {
@@ -319,6 +356,17 @@
             ],
             "title": "Generation Id"
           },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
           "state": {
             "$ref": "#/components/schemas/ServingState"
           }
@@ -326,7 +374,9 @@
         "required": [
           "generation_id",
           "built_at",
+          "age_seconds",
           "state",
+          "message",
           "detail"
         ],
         "title": "ServingMeta",

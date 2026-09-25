@@ -34,12 +34,16 @@ export function metaEnvelope(
         phase: overrides.phase ?? "continuous",
         phase_label: overrides.phaseLabel ?? "连续竞价",
         is_trading_day: overrides.isTradingDay === undefined ? true : overrides.isTradingDay,
+        previous_trading_day: "2026-09-23",
+        next_trading_day: "2026-09-25",
       },
     },
     serving: {
       generation_id: generationId,
       built_at: "2026-09-24T07:31:00Z",
+      age_seconds: 190,
       state: overrides.state ?? "ready",
+      message: null,
       detail: overrides.detail ?? "serving generation verified",
     },
   };

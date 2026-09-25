@@ -12,6 +12,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict
 
+from rquant.web.calendar import calendar_day
 from rquant.web.envelope import Envelope
 from rquant.web.market import PHASE_LABELS, MarketPhase, market_phase, shanghai_trade_date
 from rquant.web.security import current_user
@@ -19,7 +20,6 @@ from rquant.web.serving import BorrowedGeneration, serving_meta
 
 router = APIRouter()
 
-CALENDAR_EXCHANGE = "SSE"
 _MAX_PROJECTIONS = 256
 
 
@@ -64,6 +64,9 @@ class MarketInfo(BaseModel):
     phase_label: str
     #: None when the Serving trade calendar is missing or does not cover the date.
     is_trading_day: bool | None
+    #: Open days either side of ``trade_date`` from the same calendar; None when unknown.
+    previous_trading_day: date | None
+    next_trading_day: date | None
 
 
 class MetaData(BaseModel):
@@ -102,28 +105,6 @@ def _projections(borrowed: BorrowedGeneration) -> list[ProjectionInfo]:
     ]
 
 
-def _is_trading_day(
-    borrowed: BorrowedGeneration,
-    projections: list[ProjectionInfo],
-    trade_date: date,
-) -> bool | None:
-    calendar = next((item for item in projections if item.table_name == "trade_calendar"), None)
-    if calendar is None or not calendar.available:
-        return None
-    row = borrowed.cursor.execute(
-        "SELECT min(trade_date), max(trade_date), "
-        "coalesce(bool_or(trade_date = ? AND is_open), false) "
-        "FROM trade_calendar WHERE exchange = ?",
-        (trade_date, CALENDAR_EXCHANGE),
-    ).fetchone()
-    if row is None or row[0] is None or row[1] is None:
-        return None
-    if not row[0] <= trade_date <= row[1]:
-        return None
-    # The calendar lists open dates; a covered date that is not listed as open is closed.
-    return bool(row[2])
-
-
 def build_meta(
     borrowed: BorrowedGeneration | None,
     *,
@@ -143,13 +124,15 @@ def build_meta(
                 phase=MarketPhase.UNKNOWN,
                 phase_label=PHASE_LABELS[MarketPhase.UNKNOWN],
                 is_trading_day=None,
+                previous_trading_day=None,
+                next_trading_day=None,
             ),
         )
     manifest = borrowed.manifest
     pointer = borrowed.pointer
     projections = _projections(borrowed)
-    is_trading_day = _is_trading_day(borrowed, projections, trade_date)
-    phase = market_phase(now, is_trading_day)
+    day = calendar_day(borrowed.cursor, trade_date)
+    phase = market_phase(now, day.is_trading_day)
     return MetaData(
         server_time=now,
         viewer=viewer,
@@ -178,7 +161,9 @@ def build_meta(
             trade_date=trade_date,
             phase=phase,
             phase_label=PHASE_LABELS[phase],
-            is_trading_day=is_trading_day,
+            is_trading_day=day.is_trading_day,
+            previous_trading_day=day.previous_trading_day,
+            next_trading_day=day.next_trading_day,
         ),
     )
 

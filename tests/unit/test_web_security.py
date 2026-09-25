@@ -57,7 +57,9 @@ _GOOD = {
     "Content-Type": "application/json",
     "X-Rquant-Csrf": "1",
     "Sec-Fetch-Site": "same-origin",
-    "Origin": "http://testserver:8081",
+    # nginx forwards `Host $host:$server_port`, so the API sees the browser's port.
+    "Host": "82.156.0.68:8081",
+    "Origin": "http://82.156.0.68:8081",
     "X-Rquant-User": "liutong",
 }
 
@@ -76,6 +78,11 @@ def test_a_same_site_json_write_with_the_csrf_header_passes() -> None:
         ({"X-Rquant-Csrf": "0"}, 403),
         ({"Sec-Fetch-Site": "cross-site"}, 403),
         ({"Origin": "http://evil.example"}, 403),
+        # Same host, another port: another origin (e.g. a Streamlit page on :8501).
+        ({"Origin": "http://82.156.0.68:8501"}, 403),
+        ({"Origin": "null"}, 403),
+        # nginx without the port (`Host $host`) must not pass as :8081.
+        ({"Host": "82.156.0.68"}, 403),
     ),
 )
 def test_writes_without_the_guard_conditions_are_refused(
@@ -85,3 +92,11 @@ def test_writes_without_the_guard_conditions_are_refused(
     with TestClient(_app()) as client:
         response = client.post("/write", headers=headers, content="{}")
     assert response.status_code == status
+
+
+def test_default_ports_match_an_origin_without_an_explicit_port() -> None:
+    headers = {**_GOOD, "Host": "rquant.example", "Origin": "http://rquant.example"}
+    with TestClient(_app()) as client:
+        assert client.post("/write", headers=headers, content="{}").status_code == 200
+        explicit = {**headers, "Host": "rquant.example:80"}
+        assert client.post("/write", headers=explicit, content="{}").status_code == 200

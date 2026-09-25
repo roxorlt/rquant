@@ -23,9 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from rquant.dashboard.serving_only_page_data import ServingFreshness, manifest_freshness
 from rquant.serving_contracts import (
-    FreshnessStatus,
     ServingCurrentPointer,
     ServingGenerationManifest,
 )
@@ -216,6 +214,14 @@ class GenerationTracker:
             current.lease.close()
 
 
+def _age_text(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{max(int(seconds // 60), 1)} 分钟"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} 小时"
+    return f"{int(seconds // 86400)} 天"
+
+
 def serving_meta(
     borrowed: BorrowedGeneration | None,
     *,
@@ -223,18 +229,31 @@ def serving_meta(
     stale_after: timedelta,
     failure: str | None = None,
 ) -> ServingMeta:
-    """The envelope's ``serving`` block, with the Streamlit pages' state rules.
+    """The envelope's ``serving`` block, decided by the generation itself.
 
-    ``manifest_freshness`` decides fresh / stale / degraded from the generation's age and
-    every dataset watermark, exactly as ``query_acquired_serving_frame`` does; a newer
-    generation that failed verification additionally marks the answer degraded.
+    Rule (``web/CLAUDE.md`` 「数据状态横幅」):
+
+    * ``unavailable``: no generation can be served, or its ``built_at`` is in the future;
+    * ``stale``: the served generation is older than ``stale_after``, i.e. the publisher
+      has stopped publishing and every number on the page may be out of date;
+    * ``degraded``: a newer generation exists but failed verification, so an older one is
+      being served;
+    * ``ready`` otherwise.
+
+    Dataset watermarks do not change the state. In production ``runtime_health`` is
+    ``degraded`` whenever any runtime service is (always, today) and ``lab_jobs`` is
+    ``unavailable`` until the research serving role runs, so a rule over every watermark
+    would put a banner on every page all the time. Watermarks are shown as data instead:
+    in the 系统健康 data-freshness table and next to the numbers they qualify.
     """
 
     if borrowed is None:
         return ServingMeta(
             generation_id=None,
             built_at=None,
+            age_seconds=None,
             state=ServingState.UNAVAILABLE,
+            message="暂时读不到数据，请检查页面数据发布服务。",
             detail=(failure or "没有可用的 serving 数据代")[:_MAX_DETAIL_CHARS],
         )
     manifest = borrowed.manifest
@@ -242,40 +261,35 @@ def serving_meta(
         return ServingMeta(
             generation_id=manifest.generation_id,
             built_at=manifest.built_at,
+            age_seconds=0.0,
             state=ServingState.UNAVAILABLE,
+            message="数据时间晚于服务器时间，暂不显示，请检查服务器时钟。",
             detail="serving generation contains future evidence",
         )
-    freshness = manifest_freshness(
-        manifest,
-        age=max(now - manifest.built_at, timedelta(0)),
-        stale_after=stale_after,
-    )
-    state = {
-        ServingFreshness.FRESH: ServingState.READY,
-        ServingFreshness.STALE: ServingState.STALE,
-        ServingFreshness.DEGRADED: ServingState.DEGRADED,
-        ServingFreshness.UNAVAILABLE: ServingState.DEGRADED,
-    }[freshness]
-    if state is ServingState.READY:
-        detail = "serving generation verified"
-    else:
-        non_fresh = tuple(
-            f"{item.dataset_id}:{item.status.value}:{item.reason or 'unspecified'}"
-            for item in manifest.watermarks
-            if item.status is not FreshnessStatus.FRESH
-        )
-        detail = f"serving generation {state.value}: " + (
-            "; ".join(non_fresh) or "built_at exceeded freshness budget"
+    age = max(now - manifest.built_at, timedelta(0))
+    age_seconds = age.total_seconds()
+    state = ServingState.READY
+    message: str | None = None
+    detail = "serving generation verified"
+    if age > stale_after:
+        state = ServingState.STALE
+        message = f"数据已 {_age_text(age_seconds)}没有更新，页面上的数字可能不是最新的。"
+        detail = (
+            f"serving generation stale: built_at {manifest.built_at.isoformat()} is "
+            f"{int(age_seconds)}s old (budget {int(stale_after.total_seconds())}s)"
         )
     if borrowed.fallback_detail:
         if state is ServingState.READY:
             state = ServingState.DEGRADED
+            message = "最新一批数据没有通过校验，暂时显示上一批。"
             detail = borrowed.fallback_detail
         else:
             detail = f"{detail}; {borrowed.fallback_detail}"
     return ServingMeta(
         generation_id=manifest.generation_id,
         built_at=manifest.built_at,
+        age_seconds=age_seconds,
         state=state,
+        message=message,
         detail=detail[:_MAX_DETAIL_CHARS],
     )

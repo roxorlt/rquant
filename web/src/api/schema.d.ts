@@ -78,9 +78,13 @@ export interface components {
         MarketInfo: {
             /** Is Trading Day */
             is_trading_day: boolean | null;
+            /** Next Trading Day */
+            next_trading_day: string | null;
             phase: components["schemas"]["MarketPhase"];
             /** Phase Label */
             phase_label: string;
+            /** Previous Trading Day */
+            previous_trading_day: string | null;
             /**
              * Trade Date
              * Format: date
@@ -123,12 +127,16 @@ export interface components {
         };
         /** ServingMeta */
         ServingMeta: {
+            /** Age Seconds */
+            age_seconds: number | null;
             /** Built At */
             built_at: string | null;
             /** Detail */
             detail: string;
             /** Generation Id */
             generation_id: string | null;
+            /** Message */
+            message: string | null;
             state: components["schemas"]["ServingState"];
         };
         /**

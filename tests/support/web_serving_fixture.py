@@ -1,17 +1,23 @@
 """Synthetic Serving generations for the web API and the browser tests.
 
 Everything here is invented: stock codes 600001-600030.SH named 样本01-样本30, prices and
-board members from ``rquant.panorama_data``'s test-only fixtures, a weekday-only trade
-calendar. No real market data. Generations go through the production path —
-``ServingReadModelInput`` validation, ``build_serving_read_models`` and a
-``ServingPublisher`` over ``SERVING_TABLE_SPECS`` — so what the API reads has exactly the
-shape a real generation has.
+board members from ``rquant.panorama_data``'s test-only fixtures. No real market data.
+The one real thing is the trade calendar: the published 2026 SSE schedule (weekdays minus
+the exchange holidays, e.g. 2026-09-25 中秋 is closed and the next open day is 09-28),
+because the top bar and the overview read it and a weekday rule would call a holiday a
+trading day. Like the production calendar it lists open dates only and ends 2026-12-31.
+
+Generations go through the production path — ``ServingReadModelInput`` validation,
+``build_serving_read_models`` and a ``ServingPublisher`` over ``SERVING_TABLE_SPECS`` — so
+what the API reads has exactly the shape a real generation has.
 
 Scenarios:
 
 * ``baseline``: runtime services running / degraded / missing, two signals with route
   receipts and deliveries, one paper account with holdings, ``dashboard_summary``,
-  ``minute_coverage``, ``trade_calendar`` and ``stock_basic``; every watermark fresh.
+  ``minute_coverage``, the latest daily screen (``canvas_hit``,
+  ``canvas_latest_trade_date``, ``screen_bounds``), ``trade_calendar`` and
+  ``stock_basic``; every watermark fresh.
 * ``panorama``: ``baseline`` plus every table the market panorama reads.
 * ``degraded``: ``baseline`` with degraded / unavailable watermarks and two page
   projections left unpublished.
@@ -117,11 +123,41 @@ def _cst(day: date, hour: int, minute: int, second: int = 0) -> datetime:
     return datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=_SHANGHAI)
 
 
-def _weekdays(start: date, end: date) -> list[date]:
+#: Weekday closures of the 2026 SSE calendar (the exchange's published holiday schedule;
+#: the same dates the production ``trade_calendar`` projection leaves out).
+SSE_2026_WEEKDAY_CLOSURES = frozenset(
+    date.fromisoformat(day)
+    for day in (
+        "2026-01-01",
+        "2026-01-02",
+        "2026-02-16",
+        "2026-02-17",
+        "2026-02-18",
+        "2026-02-19",
+        "2026-02-20",
+        "2026-02-23",
+        "2026-04-06",
+        "2026-05-01",
+        "2026-05-04",
+        "2026-05-05",
+        "2026-06-19",
+        "2026-09-25",
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-05",
+        "2026-10-06",
+        "2026-10-07",
+    )
+)
+CALENDAR_START = date(2026, 1, 1)
+CALENDAR_END = date(2026, 12, 31)
+
+
+def _trading_days(start: date, end: date) -> list[date]:
     days: list[date] = []
     current = start
     while current <= end:
-        if current.weekday() < 5:
+        if current.weekday() < 5 and current not in SSE_2026_WEEKDAY_CLOSURES:
             days.append(current)
         current += timedelta(days=1)
     return days
@@ -131,17 +167,39 @@ def _weekdays(start: date, end: date) -> list[date]:
 
 
 def _runtime_services(observed_at: datetime) -> tuple[RuntimeServiceHealth, ...]:
+    # Service ids shaped like production's (``<role>.<instance>.v1``).
     rows = (
-        ("feature-live.v1", RuntimeServicePlane.LIVE, RuntimeServiceStatus.RUNNING, False),
-        ("signal-router.v1", RuntimeServicePlane.LIVE, RuntimeServiceStatus.RUNNING, False),
+        ("feature.intraday-pit.v1", RuntimeServicePlane.LIVE, RuntimeServiceStatus.RUNNING, False),
+        (
+            "signal-router.all-strategies.v1",
+            RuntimeServicePlane.LIVE,
+            RuntimeServiceStatus.RUNNING,
+            False,
+        ),
         (
             "notifier.admin.shadow.v1",
             RuntimeServicePlane.LIVE,
             RuntimeServiceStatus.DEGRADED,
             False,
         ),
-        ("paper-broker.primary.v1", RuntimeServicePlane.LIVE, RuntimeServiceStatus.RUNNING, False),
-        ("serving-publisher.v1", RuntimeServicePlane.SERVING, RuntimeServiceStatus.RUNNING, False),
+        (
+            "paper-broker.shadow-main.v1",
+            RuntimeServicePlane.LIVE,
+            RuntimeServiceStatus.RUNNING,
+            False,
+        ),
+        (
+            "auction-match.source.v1",
+            RuntimeServicePlane.LIVE,
+            RuntimeServiceStatus.MISSING,
+            True,
+        ),
+        (
+            "serving-publisher.primary.v1",
+            RuntimeServicePlane.SERVING,
+            RuntimeServiceStatus.RUNNING,
+            False,
+        ),
         ("lab-jobs.serving.v1", RuntimeServicePlane.RESEARCH, RuntimeServiceStatus.MISSING, True),
     )
     return tuple(
@@ -189,9 +247,10 @@ def _signal_bundle(
     tuple[OutboxRecord, ...],
 ]:
     target = DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER)
+    # Strategy ids as production writes them (``strategy.<id>.v1`` sources).
     specs = (
-        ("n-shape", "600001.SH", SignalAction.B_INTENT, _cst(FIXTURE_TRADE_DATE, 9, 47)),
-        ("auction-gap", "600003.SH", SignalAction.WATCH, _cst(FIXTURE_TRADE_DATE, 9, 29)),
+        ("n_shape", "600001.SH", SignalAction.B_INTENT, _cst(FIXTURE_TRADE_DATE, 9, 47)),
+        ("auction_gap", "600003.SH", SignalAction.WATCH, _cst(FIXTURE_TRADE_DATE, 9, 29)),
     )
     signals: list[ServingSignalRecord] = []
     routes: list[SignalRouteReceipt] = []
@@ -207,7 +266,7 @@ def _signal_bundle(
         signals.append(ServingSignalRecord(global_sequence=index, signal=signal))
         routes.append(
             SignalRouteReceipt(
-                source_id=f"{strategy_id}-v1",
+                source_id=f"strategy.{strategy_id}.v1",
                 source_sequence=1,
                 signal_id=signal.signal_id,
                 decision_fingerprint=_digest("decision", strategy_id),
@@ -349,10 +408,62 @@ def _minute_coverage() -> list[dict[str, object]]:
 
 
 def _trade_calendar() -> list[dict[str, object]]:
-    # Synthetic: every weekday of 2026-2027 is open (the real calendar lists only open dates).
+    # Open dates only, like the production projection.
     return [
         {"trade_date": day.isoformat(), "exchange": "SSE", "is_open": True}
-        for day in _weekdays(date(2026, 1, 1), date(2027, 12, 31))
+        for day in _trading_days(CALENDAR_START, CALENDAR_END)
+    ]
+
+
+#: The latest daily screen: selected after the 2026-09-23 close for the 09-24 session.
+_SCREEN_DATE = date(2026, 9, 23)
+_SCREEN_MEMBERS = (
+    ("n-shape-pool1", "600002.SH"),
+    ("n-shape-pool1", "600004.SH"),
+    ("n-shape-pool1", "600006.SH"),
+    ("n-shape-pool2", "600008.SH"),
+    ("n-shape-pool2", "600010.SH"),
+)
+
+
+def _canvas_hits() -> list[dict[str, object]]:
+    frame = _snapshot_frame().set_index("ts_code")
+    rows: list[dict[str, object]] = []
+    for preset, code in _SCREEN_MEMBERS:
+        quote = frame.loc[code]
+        rows.append(
+            {
+                "trade_date": _SCREEN_DATE.isoformat(),
+                "preset_name": preset,
+                "ts_code": code,
+                "row_json": json.dumps(
+                    {
+                        "close": float(quote["pre_close"]),
+                        "name": str(quote["name"]),
+                        "pct_chg": round(float(quote["pct_chg"]) / 2, 2),
+                        "ts_code": code,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            }
+        )
+    return rows
+
+
+def _screen_bounds() -> list[dict[str, object]]:
+    counts: dict[str, int] = {}
+    for preset, _code in _SCREEN_MEMBERS:
+        counts[preset] = counts.get(preset, 0) + 1
+    return [
+        {
+            "preset_name": preset,
+            "min_date": "2026-09-10",
+            "max_date": _SCREEN_DATE.isoformat(),
+            "candidate_count": count * 8,
+        }
+        for preset, count in sorted(counts.items())
     ]
 
 
@@ -475,7 +586,7 @@ def _market_liquidity() -> list[dict[str, object]]:
 
 def _daily_bars() -> list[dict[str, object]]:
     curve = _fake_daily_kline(_CHART_CODES[0])
-    days = _weekdays(date(2026, 1, 1), FIXTURE_TRADE_DATE)[-len(curve) :]
+    days = _trading_days(CALENDAR_START, FIXTURE_TRADE_DATE)[-len(curve) :]
     pre_close = dict(zip(_snapshot_frame()["ts_code"], _snapshot_frame()["pre_close"], strict=True))
     rows: list[dict[str, object]] = []
     for code in _CHART_CODES:
@@ -634,6 +745,16 @@ def _projections(
             )
         )
         projections.append(signal_owned("minute_coverage", _minute_coverage()))
+        projections.extend(
+            (
+                signal_owned("canvas_hit", _canvas_hits()),
+                signal_owned(
+                    "canvas_latest_trade_date",
+                    [{"snapshot_key": "current", "trade_date": _SCREEN_DATE.isoformat()}],
+                ),
+                signal_owned("screen_bounds", _screen_bounds()),
+            )
+        )
     if scenario == "panorama":
         as_of = _cst(FIXTURE_TRADE_DATE, 15, 0, 3).astimezone(UTC)
         board_rows, member_rows = _dc_boards()
@@ -746,10 +867,12 @@ def build_web_fixture(
 
 
 __all__ = [
+    "CALENDAR_END",
     "FIXTURE_BUILT_AT",
     "FIXTURE_PRODUCER_COMMIT",
     "FIXTURE_TRADE_DATE",
     "SCENARIOS",
+    "SSE_2026_WEEKDAY_CLOSURES",
     "build_web_fixture",
     "fixture_built_at",
 ]

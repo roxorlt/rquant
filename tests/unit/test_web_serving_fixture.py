@@ -116,3 +116,22 @@ def test_the_command_line_wrapper_refuses_to_overwrite_foreign_directories(
     assert (first["sequence"], second["sequence"]) == (0, 1)
     assert fixture_cli.main(["--out", str(root), "--scenario", "baseline", "--replace"]) == 0
     assert json.loads(capsys.readouterr().out)["sequence"] == 0
+
+
+def test_the_trade_calendar_is_the_2026_sse_schedule_not_a_weekday_rule(tmp_path: Path) -> None:
+    root = tmp_path / "baseline"
+    build_web_fixture(root, "baseline")
+    with ServingReader(root).acquire_generation() as lease:
+        rows = lease.connection.execute(
+            "SELECT trade_date FROM trade_calendar WHERE exchange = 'SSE' AND is_open "
+            "ORDER BY trade_date"
+        ).fetchall()
+    open_days = {row[0] for row in rows}
+
+    assert len(open_days) == 242
+    assert min(open_days).isoformat() == "2026-01-05"
+    assert max(open_days).isoformat() == "2026-12-31"
+    # 中秋 (Friday 09-25) and the National Day week are closed; the Monday after is open.
+    closed = ("2026-09-25", "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07")
+    assert not {day for day in open_days if day.isoformat() in closed}
+    assert {day.isoformat() for day in open_days} >= {"2026-09-24", "2026-09-28", "2026-10-08"}

@@ -1,7 +1,10 @@
 """The response shell every API endpoint returns: ``{"data": ..., "serving": ...}``.
 
-``serving.state`` uses the four states of the Streamlit pages' ``ServingFrameResult``
-so the front end's ``ServingBanner`` and ``render_serving_state_banner`` agree.
+``serving.state`` uses the four state names of the Streamlit pages' ``ServingFrameResult``,
+but it describes the generation being served, not every dataset watermark inside it (see
+``rquant.web.serving.serving_meta``): per-dataset freshness is data, shown where it matters.
+``message`` is the one short sentence the page banner shows (None when there is nothing
+to say); ``detail`` is the technical reason, for tooltips and logs.
 """
 
 from __future__ import annotations
@@ -27,7 +30,10 @@ class ServingMeta(BaseModel):
 
     generation_id: str | None
     built_at: datetime | None
+    #: Seconds since ``built_at`` at the time of the request; None without a generation.
+    age_seconds: float | None
     state: ServingState
+    message: str | None
     detail: str
 
 
