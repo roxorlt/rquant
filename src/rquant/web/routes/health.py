@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response
 
 from rquant.dashboard.runtime_console_data import RuntimeConsoleSections, RuntimeServiceRow
-from rquant.serving_contracts import ServingGenerationManifest
+from rquant.serving_contracts import FreshnessStatus, ServingGenerationManifest
 from rquant.web import readers
 from rquant.web.calendar import CalendarDay, calendar_day
 from rquant.web.envelope import Envelope
@@ -35,6 +35,8 @@ from rquant.web.status import (
     daily_status,
     expected_daily_date,
     generation_status,
+    is_reference_publisher,
+    reference_publisher_status,
     service_status,
     watermark_status,
 )
@@ -81,7 +83,25 @@ def generation_context(borrowed: BorrowedGeneration, now: datetime) -> Generatio
 # ------------------------------------------------------------------ services
 
 
-def service_item(row: RuntimeServiceRow, *, phase: MarketPhase, now: datetime) -> ServiceItem:
+def reference_published_on(manifest: ServingGenerationManifest) -> date | None:
+    """The Shanghai date of the visible reference generation (None when not fresh)."""
+
+    for watermark in manifest.watermarks:
+        if watermark.dataset_id == "reference_slow":
+            if watermark.status is not FreshnessStatus.FRESH:
+                return None
+            return shanghai_trade_date(watermark.event_time)
+    return None
+
+
+def service_item(
+    row: RuntimeServiceRow,
+    *,
+    phase: MarketPhase,
+    now: datetime,
+    day: CalendarDay | None = None,
+    reference_on: date | None = None,
+) -> ServiceItem:
     status = service_status(
         service_id=row.service_id,
         plane=row.plane,
@@ -93,6 +113,15 @@ def service_item(row: RuntimeServiceRow, *, phase: MarketPhase, now: datetime) -
         phase=phase,
         now=now,
     )
+    if day is not None and is_reference_publisher(row.service_id):
+        status = reference_publisher_status(
+            status,
+            is_trading_day=day.is_trading_day,
+            today=day.trade_date,
+            now=now,
+            published_on=reference_on,
+            last_error=row.last_error,
+        )
     return ServiceItem(
         service_id=row.service_id,
         name=service_label(row.service_id),
@@ -112,8 +141,16 @@ def service_item(row: RuntimeServiceRow, *, phase: MarketPhase, now: datetime) -
 
 
 def service_items(context: GenerationContext) -> list[ServiceItem]:
+    reference_on = reference_published_on(context.manifest)
     items = [
-        service_item(row, phase=context.phase, now=context.now) for row in context.sections.services
+        service_item(
+            row,
+            phase=context.phase,
+            now=context.now,
+            day=context.day,
+            reference_on=reference_on,
+        )
+        for row in context.sections.services
     ]
     return sorted(
         items,
@@ -145,7 +182,11 @@ def _error_summary(item: ServiceItem) -> str:
 
 
 def error_items(services: Sequence[ServiceItem]) -> list[ErrorItem]:
-    with_errors = [item for item in services if item.last_error]
+    # A service judged 正常 / 已完成 with an error text is refusing by design (the reference
+    # publisher after 09:25); its text stays in the drawer, not in 最近错误.
+    with_errors = [
+        item for item in services if item.last_error and item.status.state is not UserState.OK
+    ]
     with_errors.sort(
         key=lambda item: item.heartbeat_at or item.observed_at,
         reverse=True,

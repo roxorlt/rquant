@@ -60,6 +60,7 @@ from rquant.panorama_data import (
 from rquant.paper_contracts import PaperAccountSnapshot, PaperHolding
 from rquant.runtime_service_control import (
     RuntimeServiceHealth,
+    RuntimeServiceHeartbeatProjection,
     RuntimeServicePlane,
     RuntimeServiceStatus,
 )
@@ -202,7 +203,7 @@ def _runtime_services(observed_at: datetime) -> tuple[RuntimeServiceHealth, ...]
         ),
         ("lab-jobs.serving.v1", RuntimeServicePlane.RESEARCH, RuntimeServiceStatus.MISSING, True),
     )
-    return tuple(
+    services = [
         RuntimeServiceHealth(
             service_id=service_id,
             plane=plane,
@@ -211,7 +212,36 @@ def _runtime_services(observed_at: datetime) -> tuple[RuntimeServiceHealth, ...]
             observed_at=observed_at,
         )
         for service_id, plane, status, stale in rows
+    ]
+    # The reference publisher after 09:25 once today's generation is out: it refuses every
+    # round by design (#301 S-1), so it is degraded with a long failure streak.
+    reference_id = "reference-slow.publisher.v1"
+    services.append(
+        RuntimeServiceHealth(
+            service_id=reference_id,
+            plane=RuntimeServicePlane.LIVE,
+            status=RuntimeServiceStatus.DEGRADED,
+            stale=False,
+            observed_at=observed_at,
+            heartbeat=RuntimeServiceHeartbeatProjection(
+                service_id=reference_id,
+                spec_fingerprint=_digest("spec", reference_id),
+                run_id=_digest("run", reference_id),
+                generation=1,
+                status=RuntimeServiceStatus.DEGRADED,
+                started_at=observed_at - timedelta(hours=6),
+                heartbeat_at=observed_at - timedelta(seconds=10),
+                input_sequence=0,
+                output_sequence=0,
+                consecutive_failures=239,
+                degraded_reasons=("reference_slow:ReferenceSlowRuntimeError",),
+                last_error=(
+                    "ReferenceSlowRuntimeError: reference slow publisher started after 09:25"
+                ),
+            ),
+        )
     )
+    return tuple(services)
 
 
 def _signal(

@@ -102,7 +102,7 @@ def test_overview_after_the_close_shows_today(baseline: Path) -> None:
     assert paper["holdings"][0]["name"] == "样本05"
     assert paper["holdings"][0]["unrealized_pnl"] == pytest.approx(42.0)
     assert paper["note"] is None
-    assert data["services"]["total"] == 7
+    assert data["services"]["total"] == 8
 
 
 def test_overview_mid_session_is_running(baseline: Path) -> None:
@@ -132,8 +132,10 @@ def test_overview_on_a_holiday_shows_the_last_trading_day(baseline: Path) -> Non
     }
     assert data["signals"]["total"] == 2
     assert {stage["state"] for stage in data["pipeline"]} == {"done"}
-    # A market-hours service with no heartbeat on a holiday is expected, not a fault.
-    assert data["services"]["waiting"] == 1
+    # Market-hours services idle on a holiday are expected, not faults (the auction
+    # source and the reference publisher).
+    assert data["services"]["waiting"] == 2
+    assert data["services"]["crit"] == 0
     assert not any("竞价撮合" in item["title"] for item in data["attention"])
 
 
@@ -206,8 +208,8 @@ def test_health_names_services_in_plain_words_and_keeps_ids_for_tooltips(
     auction = services["auction-match.source.v1"]
     assert (auction["status"]["state"], auction["status"]["label"]) == ("waiting", "已收盘")
     assert body["data"]["counts"] == {
-        "total": 7,
-        "ok": 4,
+        "total": 8,
+        "ok": 5,
         "warn": 1,
         "crit": 0,
         "idle": 1,
@@ -320,3 +322,75 @@ def test_several_late_datasets_collapse_into_one_attention_item(baseline: Path) 
     assert len(late) == 1
     assert late[0]["title"] == "3 项数据没有按时更新"
     assert late[0]["reason"] == "日线、分钟线、选股结果"
+
+
+# ------------------------------------------------------------------ slice-1 UX rules
+
+
+_REFUSAL = "ReferenceSlowRuntimeError: reference slow publisher started after 09:25"
+
+
+def test_the_reference_publisher_after_0925_is_done_when_todays_data_is_out(
+    baseline: Path,
+) -> None:
+    body = _get(baseline, "/api/v1/health", AFTER_CLOSE)
+    publisher = _services(body)["reference-slow.publisher.v1"]
+
+    assert (publisher["status"]["state"], publisher["status"]["label"]) == ("ok", "已完成")
+    # The raw refusal stays in the tooltip reason and the drawer fields.
+    assert _REFUSAL in publisher["status"]["reason"]
+    assert publisher["last_error"] == _REFUSAL
+    assert publisher["consecutive_failures"] == 239
+    assert body["data"]["errors"] == []
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "published_on", "expected"),
+    (
+        # After 09:25: done if today's reference generation is visible, a fault if not.
+        (10, 0, "2026-09-24", ("ok", "已完成")),
+        (10, 0, "2026-09-23", ("crit", "异常")),
+        (10, 0, None, ("crit", "异常")),
+        # Before 09:25 the ordinary rules decide (a degraded streak is a fault).
+        (9, 20, None, ("crit", "异常")),
+    ),
+)
+def test_the_reference_publisher_rule(
+    hour: int, minute: int, published_on: str | None, expected: tuple[str, str]
+) -> None:
+    from datetime import date
+
+    from rquant.web.status import Status, UserState, reference_publisher_status
+
+    base = Status(UserState.CRIT, "异常", "连续失败 239 次")
+    now = datetime(2026, 9, 24, hour - 8, minute, tzinfo=UTC)
+
+    status = reference_publisher_status(
+        base,
+        is_trading_day=True,
+        today=date(2026, 9, 24),
+        now=now,
+        published_on=None if published_on is None else date.fromisoformat(published_on),
+        last_error=_REFUSAL,
+    )
+
+    assert (status.state.value, status.label) == expected
+    if expected[1] == "异常" and hour >= 10:
+        assert status.reason.startswith("09:25 已过，今天的参考数据还没有发布")
+
+
+def test_the_reference_publisher_waits_on_a_closed_day() -> None:
+    from datetime import date
+
+    from rquant.web.status import Status, UserState, reference_publisher_status
+
+    status = reference_publisher_status(
+        Status(UserState.CRIT, "异常", "x"),
+        is_trading_day=False,
+        today=date(2026, 9, 25),
+        now=HOLIDAY,
+        published_on=date(2026, 9, 24),
+        last_error=None,
+    )
+
+    assert (status.state.value, status.label) == ("waiting", "等待开盘")

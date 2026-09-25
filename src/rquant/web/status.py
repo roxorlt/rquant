@@ -16,6 +16,9 @@ from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.web.labels import dataset_label, split_service_id
 from rquant.web.market import MARKET_TIMEZONE, MarketPhase
 
+#: The reference publisher's deadline (#297 / #298, #301 S-1): today's reference
+#: generation must be visible by 09:25; every round after that refuses by design.
+REFERENCE_DEADLINE = time(9, 25)
 #: Consecutive failures from which a degraded service counts as 异常, not 注意.
 CRIT_FAILURES = 3
 #: Backlog from which a running service needs attention.
@@ -124,6 +127,45 @@ def service_status(
     return Status(UserState.WARN, "注意", "状态未知")
 
 
+def is_reference_publisher(service_id: str) -> bool:
+    role, instance = split_service_id(service_id)
+    return role == "reference-slow" and instance.split(".", 1)[0] == "publisher"
+
+
+def reference_publisher_status(
+    base: Status,
+    *,
+    is_trading_day: bool | None,
+    today: date,
+    now: datetime,
+    published_on: date | None,
+    last_error: str | None,
+) -> Status:
+    """The reference publisher, judged by whether today's reference data exists.
+
+    After 09:25 the publisher refuses every round ("reference slow publisher started after
+    09:25", #301 S-1): that is the design once today's generation is out, not a fault. So
+    on a trading day after 09:25 it is 已完成 when today's reference data is published and
+    异常 only when it is not; before 09:25 the ordinary rules apply; on a closed day it
+    waits. The raw refusal stays in the reason (tooltip) and the detail drawer.
+    """
+
+    raw = f"。原始信息：{last_error}" if last_error else ""
+    if is_trading_day is None:
+        return base
+    if not is_trading_day:
+        return Status(UserState.WAITING, "等待开盘", "休市日不发布参考数据")
+    if now.astimezone(MARKET_TIMEZONE).time() < REFERENCE_DEADLINE:
+        return base
+    if published_on is not None and published_on >= today:
+        return Status(
+            UserState.OK,
+            "已完成",
+            f"今天的参考数据已发布；09:25 之后按设计不再重复发布{raw}",
+        )
+    return Status(UserState.CRIT, "异常", f"09:25 已过，今天的参考数据还没有发布{raw}")
+
+
 # ------------------------------------------------------------------ data freshness
 
 
@@ -198,12 +240,15 @@ def generation_status(age_seconds: float | None, stale_after: timedelta) -> Stat
 __all__ = [
     "BACKLOG_WARN",
     "CRIT_FAILURES",
+    "REFERENCE_DEADLINE",
     "STATE_ORDER",
     "Status",
     "UserState",
     "daily_status",
     "expected_daily_date",
     "generation_status",
+    "is_reference_publisher",
+    "reference_publisher_status",
     "service_status",
     "watermark_status",
 ]

@@ -7,7 +7,7 @@ import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 // copy of production (RQ_E2E_REPLAY_ROOT) locally. The API clock is pinned (env.ts).
 const EXPECTED = REPLAY_ROOT
   ? { signals: 6, deliveries: 6, holdings: 2, firstStock: "天威视讯", services: 24 }
-  : { signals: 2, deliveries: 2, holdings: 2, firstStock: "样本01", services: 7 };
+  : { signals: 2, deliveries: 2, holdings: 2, firstStock: "样本01", services: 8 };
 
 // The browser's clock matches the API's, so relative times read as they would have then.
 test.beforeEach(async ({ page }) => {

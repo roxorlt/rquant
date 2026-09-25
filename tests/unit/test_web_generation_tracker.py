@@ -42,7 +42,7 @@ def test_unavailable_until_a_generation_is_published_then_follows_it(tmp_path: P
             assert borrowed is not None
             assert borrowed.manifest.generation_id == first.generation_id
             assert borrowed.cursor.execute("SELECT count(*) FROM runtime_services").fetchone() == (
-                7,
+                8,
             )
         assert tracker.failure is None
     finally:
