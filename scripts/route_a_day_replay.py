@@ -22,7 +22,11 @@ real `runtime_service_main.run`, entering the real service loop. What is replace
   latest *complete* recorded bar of that code (replica `minute_bar`, else Tushare
   `stk_mins` for the day with `--tushare`), never a bar the clock has not reached;
 * **the two upstream sources** -- `reference_slow_source` and `auction_match_source` are not
-  run: their recorded batches are re-sealed under the sandbox commit and throwaway keys;
+  run: their recorded batches are re-sealed under the sandbox commit and throwaway keys; on a
+  day the host holds no recording of (or with `--synthesize-sources`), the batches are
+  *synthesized* by the live capture code from the replica as it stood before the session and
+  from Tushare's historical endpoints (`route_a_replay_sources.py` says exactly how), and
+  `summary.json` labels every input recorded or synthesized, with its source;
 * **the service loop's wait** -- one iteration per tick, handed out by the driver, instead of
   the manifest interval;
 * **the unit sandbox** -- roles run as threads of this process, one at a time, without
@@ -31,23 +35,30 @@ real `runtime_service_main.run`, entering the real service loop. What is replace
 Nothing outside the sandbox is written. Production files are opened read-only (plain
 `open(..., "rb")`, DuckDB `read_only=True` through `ATTACH ... (READ_ONLY)`), an audit hook
 refuses any Python-level write under a production root, and every production path read is
-stat'ed before, right after and at the end of the run.
+stat'ed before, right after and at the end of the run. Tushare answers are kept in a cache
+under the replay root (`--tushare-cache`), never anywhere else.
 
     PYTHONDONTWRITEBYTECODE=1 <checkout>/.venv/bin/python \\
         <checkout>/scripts/route_a_day_replay.py --trade-date 2026-09-24 \\
         --replay-root /home/lighthouse/replay [--tushare] [--until 11:30]
 
+Several days, each in its own process: `scripts/route_a_replay_days.py`.
+
 Exit status: 0 when a same-day serving generation exists at the end (even with no signal);
 1 when none does, or when any role crashed (its thread ended with an exception); 2 on a
-usage error or a refused setup.
+usage error or a refused setup -- including a day for which some input cannot be produced,
+which is named in the message; no day ever borrows another day's batch.
 """
 
 from __future__ import annotations
 
 import argparse
+import cProfile
 import hashlib
+import io
 import json
 import os
+import pstats
 import secrets
 import shutil
 import sqlite3
@@ -55,7 +66,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -69,6 +80,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 for _entry in (REPO_ROOT, REPO_ROOT / "scripts", REPO_ROOT / "src"):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
+
+import route_a_replay_sources as sources  # noqa: E402 - needs `scripts/` on the path
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
@@ -269,21 +282,32 @@ def _audit_hook(event: str, arguments: tuple[Any, ...]) -> None:
 
 @dataclass
 class RecordedDay:
+    """The day's inputs: what the host recorded, and which of them the replay synthesizes.
+
+    A recorded batch is kept even when it is synthesized over (`--synthesize-sources`): the
+    replay then reports how far the synthesized one is from it (`fidelity_vs_recorded`).
+    """
+
     trade_date: date
-    reference_envelope: Any
-    reference_snapshot: Any
-    reference_manifest_path: Path
     calendar: Any
     calendar_bytes: bytes
-    calendar_path: Path
-    auction_records: list[tuple[Any, bytes, Path]]
-    auction_target: Any
+    calendar_path: Path | None
     universe: dict[str, Any] | None
     routing_policy: bytes
     trade_calendar: bytes
     history: bytes
     history_source: Path
     inputs_fingerprints: dict[str, dict[str, str | bool]]
+    reference_envelope: Any = None
+    reference_snapshot: Any = None
+    reference_manifest_path: Path | None = None
+    auction_records: list[tuple[Any, bytes, Path]] = field(default_factory=list)
+    auction_target: Any = None
+    synthesize_reference: bool = False
+    synthesize_auction: bool = False
+    provenance: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: why a synthesis needs Tushare that this run has not got (the dry plan reports them)
+    tushare_needed: list[str] = field(default_factory=list)
 
 
 def _envelopes(directory: Path, audit: ProductionAudit) -> list[tuple[Any, Path]]:
@@ -299,16 +323,22 @@ def _envelopes(directory: Path, audit: ProductionAudit) -> list[tuple[Any, Path]
     return found
 
 
+REFERENCE_BATCHES = Path("live") / "reference-slow" / "batches" / "reference_slow"
+AUCTION_BATCHES = Path("live") / "auction-match" / "batches" / "auction_match"
+
+
 def _read_reference(
     runtime_root: Path,
     trade_date: date,
     sequence: int | None,
     audit: ProductionAudit,
-) -> tuple[Any, Any, Path]:
+) -> tuple[tuple[Any, Any, Path] | None, list[str]]:
+    """The host batch that targets the day, or None; and what the spool holds."""
+
     from rquant.reference_slow_publisher import ReferenceSlowSourceSnapshot
     from rquant.strict_json import strict_model_validate_canonical_json
 
-    directory = runtime_root / "live" / "reference-slow" / "batches" / "reference_slow"
+    directory = runtime_root / REFERENCE_BATCHES
     candidates = _envelopes(directory, audit)
     if sequence is not None:
         candidates = [item for item in candidates if item[0].sequence == sequence]
@@ -320,12 +350,10 @@ def _read_reference(
         snapshot = strict_model_validate_canonical_json(ReferenceSlowSourceSnapshot, payload)
         if snapshot.content_sha256 != envelope.batch_id:
             raise ReplayRefusedError(f"{manifest}: payload does not match batch_id")
-        seen.append(f"{envelope.sequence}:{snapshot.target_trade_date}")
+        seen.append(f"seq {envelope.sequence} targets {snapshot.target_trade_date}")
         if snapshot.target_trade_date == trade_date:
-            return envelope, snapshot, manifest
-    raise ReplayRefusedError(
-        f"no reference-slow batch in {directory} targets {trade_date} (seen: {seen})"
-    )
+            return (envelope, snapshot, manifest), seen
+    return None, seen
 
 
 def _read_auction(
@@ -333,11 +361,18 @@ def _read_auction(
     trade_date: date,
     sequence: int | None,
     audit: ProductionAudit,
-) -> tuple[list[tuple[Any, bytes, Path]], Any]:
+) -> tuple[tuple[list[tuple[Any, bytes, Path]], Any] | None, list[str]]:
+    """The host's PUBLISHED batch for the day and every batch before it, or None."""
+
     from rquant.live_contracts import BatchQualityStatus
 
-    directory = runtime_root / "live" / "auction-match" / "batches" / "auction_match"
+    directory = runtime_root / AUCTION_BATCHES
     envelopes = _envelopes(directory, audit)
+    seen = [
+        f"seq {envelope.sequence} {envelope.event_time_end.astimezone(_SHANGHAI).date()} "
+        f"{envelope.quality_status.value} rows={envelope.row_count}"
+        for envelope, _ in sorted(envelopes, key=lambda item: item[0].sequence)
+    ]
     today = [
         envelope
         for envelope, _ in envelopes
@@ -346,10 +381,7 @@ def _read_auction(
         and (sequence is None or envelope.sequence == sequence)
     ]
     if not today:
-        raise ReplayRefusedError(
-            f"no published auction-match batch for {trade_date} in {directory} "
-            f"(sequences: {[envelope.sequence for envelope, _ in envelopes]})"
-        )
+        return None, seen
     target = max(today, key=lambda envelope: envelope.sequence)
     records: list[tuple[Any, bytes, Path]] = []
     for envelope, manifest in sorted(envelopes, key=lambda item: item[0].sequence):
@@ -359,7 +391,7 @@ def _read_auction(
         if hashlib.sha256(payload).hexdigest() != envelope.content_sha256:
             raise ReplayRefusedError(f"{manifest}: payload does not match content_sha256")
         records.append((envelope, payload, manifest))
-    return records, target
+    return (records, target), seen
 
 
 def _read_universe(
@@ -383,6 +415,34 @@ def _read_universe(
     return best
 
 
+#: what `--tushare` / `--tushare-offline` unlock, said the same way in every refusal
+_TUSHARE_HINT = (
+    "synthesizing it needs Tushare: pass --tushare (with TUSHARE_TOKEN_MAIN in the "
+    "environment) or --tushare-offline with a filled --tushare-cache"
+)
+
+
+def history_sessions_before(payload: bytes, trade_date: date) -> dict[str, Any]:
+    """How many sessions of the sealed minute history precede the day (only
+    `trade_time` is read)."""
+
+    import pyarrow.compute as compute
+    import pyarrow.parquet as parquet
+
+    table = parquet.read_table(io.BytesIO(payload), columns=["trade_time"])
+    if table.num_rows == 0:
+        return {"sessions_before_trade_date": 0, "sessions_total": 0}
+    days = {
+        (value.date() if isinstance(value, datetime) else value)
+        for value in compute.unique(table.column("trade_time")).to_pylist()
+    }
+    return {
+        "sessions_before_trade_date": sum(1 for day in days if day < trade_date),
+        "sessions_total": len(days),
+        "sessions_on_or_after_trade_date_dropped": sum(1 for day in days if day >= trade_date),
+    }
+
+
 def read_recorded_day(
     *,
     runtime_root: Path,
@@ -391,28 +451,142 @@ def read_recorded_day(
     reference_sequence: int | None,
     auction_sequence: int | None,
     audit: ProductionAudit,
+    synthesize: bool = False,
+    tushare: bool = False,
+    refuse_without_tushare: bool = True,
 ) -> RecordedDay:
+    """What the host recorded for the day, and which source batch the replay synthesizes.
+
+    A batch is synthesized when the host holds none for the day, or with `synthesize`
+    (`--synthesize-sources`). Synthesizing needs Tushare; without it the day is refused here,
+    with the exact spool contents, before anything is built (or, for the dry plan, the
+    reasons are kept in `tushare_needed` and every other input is still resolved). The
+    calendar is the one the recorded reference batch names, or -- for a synthesized one --
+    the generation the host had installed before the day opened
+    (`route_a_replay_sources.choose_calendar`).
+    """
+
     from rquant.runtime_market_session import MarketCalendarAuthority
     from rquant.strict_json import strict_json_loads
 
-    envelope, snapshot, reference_manifest = _read_reference(
-        runtime_root, trade_date, reference_sequence, audit
-    )
-    calendar_sha = snapshot.source_snapshot_ids["calendar"]
-    calendar_path = (
-        runtime_root / "authorities" / "market-calendar" / "generations" / f"{calendar_sha}.json"
-    )
-    calendar_bytes = audit.read_bytes(calendar_path)
-    #: the loader's own decoding (`load_market_calendar_authority`), not a canonical-form one
-    calendar = MarketCalendarAuthority.model_validate(strict_json_loads(calendar_bytes))
-    if calendar.content_sha256 != calendar_sha:
-        raise ReplayRefusedError("the calendar generation does not match the batch's calendar id")
+    reference, reference_seen = _read_reference(runtime_root, trade_date, reference_sequence, audit)
+    auction, auction_seen = _read_auction(runtime_root, trade_date, auction_sequence, audit)
+    synthesize_reference = synthesize or reference is None
+    synthesize_auction = synthesize or auction is None
+    missing: list[str] = []
+    if synthesize_reference and not tushare:
+        missing.append(
+            "reference_slow: "
+            + (
+                f"no reference-slow batch in {runtime_root / REFERENCE_BATCHES} targets "
+                f"{trade_date} (the spool holds: {reference_seen or 'nothing'})"
+                if reference is None
+                else "--synthesize-sources"
+            )
+            + f"; {_TUSHARE_HINT}"
+        )
+    if synthesize_auction and not tushare:
+        missing.append(
+            "auction_match: "
+            + (
+                f"no PUBLISHED auction-match batch for {trade_date} in "
+                f"{runtime_root / AUCTION_BATCHES} (the spool holds: {auction_seen or 'nothing'})"
+                if auction is None
+                else "--synthesize-sources"
+            )
+            + f"; {_TUSHARE_HINT}"
+        )
+    if missing and refuse_without_tushare:
+        raise ReplayRefusedError(" | ".join(missing))
+
+    provenance: dict[str, dict[str, Any]] = {}
+    if reference is not None and not synthesize_reference:
+        envelope, snapshot, _manifest_path = reference
+        calendar_sha = snapshot.source_snapshot_ids["calendar"]
+        calendar_path: Path | None = (
+            runtime_root
+            / "authorities"
+            / "market-calendar"
+            / "generations"
+            / f"{calendar_sha}.json"
+        )
+        calendar_bytes = audit.read_bytes(calendar_path)
+        #: the loader's own decoding (`load_market_calendar_authority`), not a canonical-form one
+        calendar = MarketCalendarAuthority.model_validate(strict_json_loads(calendar_bytes))
+        if calendar.content_sha256 != calendar_sha:
+            raise ReplayRefusedError(
+                "the calendar generation does not match the batch's calendar id"
+            )
+        provenance["calendar"] = {
+            "origin": "recorded",
+            "source": str(calendar_path),
+            "generated_at": calendar.generated_at,
+            "why": "the generation the recorded reference-slow batch names",
+        }
+    else:
+        try:
+            choice = sources.choose_calendar(
+                runtime_root=runtime_root, trade_date=trade_date, audit=audit
+            )
+        except sources.InputUnavailableError as error:
+            raise ReplayRefusedError(f"calendar: {error}") from error
+        calendar, calendar_bytes, calendar_path = choice.calendar, choice.payload, choice.path
+        provenance["calendar"] = choice.provenance
     if trade_date not in calendar.open_dates:
-        raise ReplayRefusedError(f"{trade_date} is not an open date of calendar {calendar_sha}")
-    auction_records, auction_target = _read_auction(
-        runtime_root, trade_date, auction_sequence, audit
-    )
+        raise ReplayRefusedError(
+            f"{trade_date} is not an open date of calendar {calendar.content_sha256}"
+        )
     universe = _read_universe(runtime_root, trade_date, audit)
+
+    if reference is not None:
+        provenance["reference_slow"] = {
+            "origin": "synthesized" if synthesize_reference else "recorded",
+            "source": (
+                "the live capture over the replica before the session + Tushare "
+                "stock_basic / stock_st / adj_factor / suspend_d"
+                if synthesize_reference
+                else str(reference[2])
+            ),
+            "recorded_batch": str(reference[2]),
+            "recorded_sequence": reference[0].sequence,
+            "recorded_captured_at": reference[1].captured_at,
+        }
+    else:
+        provenance["reference_slow"] = {
+            "origin": "synthesized",
+            "source": (
+                "the live capture over the replica before the session + Tushare "
+                "stock_basic / stock_st / adj_factor / suspend_d"
+            ),
+            "recorded_batch": None,
+            "spool_holds": reference_seen,
+        }
+    provenance["auction_match"] = {
+        "origin": "synthesized" if synthesize_auction else "recorded",
+        "source": (
+            "the live gateway capture over Tushare stk_auction"
+            if synthesize_auction
+            else str(auction[0][-1][2])
+        ),
+        "recorded_batch": None if auction is None else str(auction[0][-1][2]),
+        "spool_holds": auction_seen,
+    }
+    provenance["auction_universe"] = (
+        {
+            "origin": "recorded",
+            "source": universe.get("_path"),
+            "codes": len(universe.get("codes", ())),
+        }
+        if universe is not None
+        else {
+            "origin": "synthesized" if synthesize_auction else "absent",
+            "source": (
+                "the live universe publisher over the replica's prior-session daily_bar"
+                if synthesize_auction
+                else "no host generation for the day (only reported, never read by the chain)"
+            ),
+        }
+    )
 
     document = json.loads(audit.read_bytes(production_inputs))
     fingerprints: dict[str, dict[str, str | bool]] = {}
@@ -435,22 +609,46 @@ def read_recorded_day(
             "matches": observed == document.get(sha_key),
         }
         loaded[label] = (payload, source)
+    history = history_sessions_before(loaded["history"][0], trade_date)
+    if not history["sessions_before_trade_date"]:
+        raise ReplayRefusedError(
+            f"history: the sealed minute history {loaded['history'][1]} holds no session before "
+            f"{trade_date} ({history['sessions_total']} sessions, all on or after it); "
+            "feature_live would start without any prior minutes"
+        )
+    from rquant.intraday_feature_engine import IntradayFeatureConfig
+
+    for label in ("routing_policy", "trade_calendar"):
+        provenance[label] = {"origin": "recorded", "source": str(loaded[label][1])}
+    provenance["history"] = {
+        "origin": "recorded",
+        "source": str(loaded["history"][1]),
+        **history,
+        #: the same-clock medians use up to this many prior sessions
+        "lookback_sessions": IntradayFeatureConfig.model_fields["lookback_sessions"].default,
+        "note": "rows on or after the trade date are dropped; fewer prior sessions than the "
+        "lookback make the same-clock medians use the sessions there are",
+    }
     return RecordedDay(
         trade_date=trade_date,
-        reference_envelope=envelope,
-        reference_snapshot=snapshot,
-        reference_manifest_path=reference_manifest,
+        reference_envelope=None if reference is None else reference[0],
+        reference_snapshot=None if reference is None else reference[1],
+        reference_manifest_path=None if reference is None else reference[2],
         calendar=calendar,
         calendar_bytes=calendar_bytes,
         calendar_path=calendar_path,
-        auction_records=auction_records,
-        auction_target=auction_target,
+        auction_records=[] if auction is None else auction[0],
+        auction_target=None if auction is None else auction[1],
         universe=universe,
         routing_policy=loaded["routing_policy"][0],
         trade_calendar=loaded["trade_calendar"][0],
         history=loaded["history"][0],
         history_source=loaded["history"][1],
         inputs_fingerprints=fingerprints,
+        synthesize_reference=synthesize_reference,
+        synthesize_auction=synthesize_auction,
+        provenance=provenance,
+        tushare_needed=missing,
     )
 
 
@@ -754,27 +952,6 @@ class ReplayMinuteAdapter:
         return pd.concat(frames, ignore_index=True) if frames else None
 
 
-def tushare_day_fetcher(token: str, trade_date: date) -> Callable[[str], Any]:
-    """`stk_mins` for one code over the trade date, through `rquant.adapter.tushare`."""
-
-    from rquant.adapter.tushare import TushareAdapter
-
-    adapter = TushareAdapter(token=token, backup_token="")
-    start = datetime.combine(trade_date, clock_time(9, 0))
-    end = datetime.combine(trade_date, clock_time(15, 30))
-
-    def fetch(code: str) -> Any:
-        frame = adapter.stk_mins(code, "1min", start, end)
-        if frame is None or not len(frame):
-            return frame
-        frame = frame.copy()
-        if "source" not in frame.columns:
-            frame["source"] = "tushare"
-        return frame[[column for column in _MINUTE_COLUMNS if column in frame.columns]]
-
-    return fetch
-
-
 # ---------------------------------------------------------------------------------------
 # The clock and the role runner
 # ---------------------------------------------------------------------------------------
@@ -799,11 +976,14 @@ class TickBaton:
     the driver hands out the next tick, or asks the role to stop.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, profiler: cProfile.Profile | None = None) -> None:
         self._grant = threading.Semaphore(0)
         self.done = threading.Semaphore(0)
         self._stopped = False
         self.iterations = 0
+        #: `--cprofile`: on only while this role's own iteration runs, so the profile holds
+        #: this role alone whether the interpreter profiles per thread (3.11) or not
+        self.profiler = profiler
 
     def is_set(self) -> bool:
         return self._stopped
@@ -817,8 +997,12 @@ class TickBaton:
 
     def wait(self, timeout: float | None = None) -> bool:  # noqa: ARG002 - ticks, not time
         self.iterations += 1
+        if self.profiler is not None:
+            self.profiler.disable()
         self.done.release()
         self._grant.acquire()
+        if self.profiler is not None and not self._stopped:
+            self.profiler.enable()
         return self._stopped
 
 
@@ -859,6 +1043,93 @@ class RoleState:
     last_heartbeat: Any = None
     max_processed: int = 0
     first_output_at: datetime | None = None
+    #: wall seconds of every step, and the session phase of the tick it ran at
+    step_seconds: list[float] = field(default_factory=list)
+    step_phases: list[str] = field(default_factory=list)
+    #: ticks the driver did not hand this role (`--serving-every-ticks`)
+    skipped_ticks: int = 0
+    profile_path: Path | None = None
+
+
+#: The session phases a tick falls in, by local wall time.
+_PHASES = (
+    ("pre_open", clock_time(9, 30)),
+    ("morning", clock_time(11, 30, 59)),
+    ("lunch", clock_time(13, 0)),
+    ("afternoon", clock_time(15, 0, 59)),
+)
+
+
+def session_phase(moment: datetime) -> str:
+    local = moment.astimezone(_SHANGHAI).time()
+    for name, end in _PHASES:
+        if local < end:
+            return name
+    return "post_close"
+
+
+def _percentile(values: Sequence[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def step_profile(
+    states: Sequence[RoleState], tick_walls: Sequence[tuple[str, float]], drive_seconds: float
+) -> dict[str, Any]:
+    """Where the drive's wall time went: per role, per phase, and outside every role.
+
+    `harness_seconds` is the drive minus every role's steps -- the driver's own bookkeeping
+    (heartbeat reads, serving retention, the clock, the environment swap).
+    """
+
+    roles: dict[str, Any] = {}
+    phase_totals: dict[str, float] = {}
+    for state in states:
+        by_phase: dict[str, float] = {}
+        for seconds, phase in zip(state.step_seconds, state.step_phases, strict=True):
+            by_phase[phase] = by_phase.get(phase, 0.0) + seconds
+            phase_totals[phase] = phase_totals.get(phase, 0.0) + seconds
+        roles[state.label] = {
+            "steps": len(state.step_seconds),
+            "total": round(sum(state.step_seconds), 3),
+            "p50": round(_percentile(state.step_seconds, 0.5), 4),
+            "p95": round(_percentile(state.step_seconds, 0.95), 4),
+            "max": round(max(state.step_seconds, default=0.0), 4),
+            "by_phase": {phase: round(value, 3) for phase, value in sorted(by_phase.items())},
+            "skipped_ticks": state.skipped_ticks,
+        }
+    role_seconds = sum(sum(state.step_seconds) for state in states)
+    tick_by_phase: dict[str, list[float]] = {}
+    for phase, seconds in tick_walls:
+        tick_by_phase.setdefault(phase, []).append(seconds)
+    return {
+        "drive_seconds": round(drive_seconds, 2),
+        "role_seconds": round(role_seconds, 2),
+        "harness_seconds": round(drive_seconds - role_seconds, 2),
+        "harness_share": round((drive_seconds - role_seconds) / drive_seconds, 4)
+        if drive_seconds
+        else 0.0,
+        "ticks": len(tick_walls),
+        "tick_seconds": {
+            phase: {
+                "ticks": len(values),
+                "total": round(sum(values), 2),
+                "p50": round(_percentile(values, 0.5), 3),
+                "p95": round(_percentile(values, 0.95), 3),
+            }
+            for phase, values in sorted(tick_by_phase.items())
+        },
+        "role_seconds_by_phase": {
+            phase: round(value, 2) for phase, value in sorted(phase_totals.items())
+        },
+        "slowest_roles": [
+            label for label, _ in sorted(roles.items(), key=lambda item: -item[1]["total"])[:5]
+        ],
+        "roles": roles,
+    }
 
 
 def install_runner_patches(
@@ -925,6 +1196,8 @@ class RoleRunner:
         role_timeout_seconds: float,
         max_restarts: int,
         log: Callable[[str], None],
+        cprofile: frozenset[str] = frozenset(),
+        profile_root: Path | None = None,
     ) -> None:
         self.states = states
         self.clock = clock
@@ -932,17 +1205,22 @@ class RoleRunner:
         self.max_restarts = max_restarts
         self.log = log
         self.hung: str | None = None
+        self.cprofile = cprofile
+        self.profile_root = profile_root
 
     def _start(self, state: RoleState) -> None:
         import rquant.runtime_service_main as service_main
 
-        baton = TickBaton()
+        profiler = cProfile.Profile() if state.label in self.cprofile else None
+        baton = TickBaton(profiler)
         state.baton = baton
         state.crash = None
         arguments = service_main.build_parser().parse_args(state.argv)
 
         def target() -> None:
             _THREAD.baton = baton
+            if profiler is not None:
+                profiler.enable()
             try:
                 service_main.run(arguments)
             except BaseException as error:  # noqa: BLE001 - recorded, reported, exit 1
@@ -950,10 +1228,28 @@ class RoleRunner:
                     traceback.format_exception(type(error), error, error.__traceback__)
                 )
             finally:
+                if profiler is not None:
+                    profiler.disable()
+                    self._dump_profile(state, profiler)
                 baton.done.release()
 
         state.thread = threading.Thread(target=target, name=state.label, daemon=True)
         state.thread.start()
+
+    def _dump_profile(self, state: RoleState, profiler: cProfile.Profile) -> None:
+        """`<label>.<start>.pstats`, and the top of it as text beside it."""
+
+        if self.profile_root is None:
+            return
+        self.profile_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stem = f"{state.label}.{len(state.crashes)}"
+        profiler.dump_stats(str(self.profile_root / f"{stem}.pstats"))
+        text = io.StringIO()
+        for order in ("cumulative", "tottime"):
+            text.write(f"== {state.label}: top 40 by {order} ==\n")
+            pstats.Stats(profiler, stream=text).sort_stats(order).print_stats(40)
+        state.profile_path = self.profile_root / f"{stem}.txt"
+        state.profile_path.write_text(text.getvalue(), encoding="utf-8")
 
     def _await(self, state: RoleState) -> bool:
         assert state.baton is not None and state.thread is not None
@@ -994,6 +1290,8 @@ class RoleRunner:
         elapsed = time.perf_counter() - started
         state.wall_seconds += elapsed
         state.max_iteration_seconds = max(state.max_iteration_seconds, elapsed)
+        state.step_seconds.append(elapsed)
+        state.step_phases.append(session_phase(now))
         if state.crash is not None:
             state.crashes.append({"at": now, "traceback": state.crash})
             self.log(
@@ -1128,6 +1426,17 @@ def _schema_rollout_facts(runtime_root: Path, *, receipt: Any) -> dict[str, Any]
     }
 
 
+@dataclass
+class SynthesisInputs:
+    """What the two synthesized source batches are made of, prepared before the world."""
+
+    source: Any
+    evidence_database: Path
+    evidence: dict[str, Any]
+    universe_root: Path
+    phase_seconds: float
+
+
 def build_world(
     *,
     sandbox: Path,
@@ -1136,6 +1445,7 @@ def build_world(
     generations: int,
     replica_extract: Callable[[Path], dict[str, Any]],
     log: Callable[[str], None],
+    synthesis: SynthesisInputs | None = None,
 ) -> tuple[Any, dict[str, Any], dict[str, Path], Any]:
     """The e2e's world (`build_trading_day_chain`), around the host's recorded inputs."""
 
@@ -1238,10 +1548,26 @@ def build_world(
     )
     facts["replica"] = replica_extract(Path(inputs.readonly_replica_database_path))
 
-    facts["reference"] = reseal_reference_batch(
-        route, recorded, key_root=bundle_root, commit=world.commit
-    )
-    facts["auction"] = republish_auction_batches(route, recorded, commit=world.commit)
+    if (recorded.synthesize_reference or recorded.synthesize_auction) and synthesis is None:
+        raise ReplayRefusedError("a synthesized source batch needs its prepared inputs")
+    if recorded.synthesize_reference:
+        assert synthesis is not None
+        log("synthesizing the reference-slow batch through the live capture")
+        facts["reference"] = synthesize_reference_batch(
+            route, recorded, synthesis, key_root=bundle_root, commit=world.commit
+        )
+    else:
+        facts["reference"] = reseal_reference_batch(
+            route, recorded, key_root=bundle_root, commit=world.commit
+        )
+    if recorded.synthesize_auction:
+        assert synthesis is not None
+        log("synthesizing the auction-match batch through the live gateway")
+        facts["auction"] = synthesize_auction_batches(
+            route, recorded, synthesis, commit=world.commit
+        )
+    else:
+        facts["auction"] = republish_auction_batches(route, recorded, commit=world.commit)
     credentials = deliver_credentials(route, sandbox / "credentials", monkeypatch)
     recorder = confirm_deliveries_without_the_network(monkeypatch)
     return route, facts, credentials, recorder
@@ -1266,13 +1592,8 @@ def reseal_reference_batch(
     so the real publisher role verifies it the way it verifies the host's.
     """
 
-    from rquant.live_spool import (
-        LiveBatchSpool,
-        ReferenceSourceBatchSigner,
-        ReferenceSourceBatchVerifier,
-    )
+    from rquant.live_contracts import LiveChannel
     from rquant.reference_slow_publisher import ReferenceSlowSourceSnapshot
-    from rquant.reference_slow_runtime import capture_reference_slow_batch
     from rquant.runtime_contracts import canonical_sha256
 
     original = recorded.reference_envelope
@@ -1282,6 +1603,40 @@ def reseal_reference_batch(
     resealed = ReferenceSlowSourceSnapshot.model_validate(
         {**identity, "content_sha256": canonical_sha256(identity)}
     )
+    spool = _reference_spool(route, key_root)
+    prepared_at = original.available_at - _OLD_SOURCE_GUARD
+    result = sources.seal_reference_snapshot(
+        spool=spool,
+        calendar=recorded.calendar,
+        snapshot=resealed,
+        producer_commit=commit,
+        producer_version=original.producer_version,
+        prepared_at=prepared_at,
+    )
+    (record,) = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1)
+    return {
+        "origin": "recorded",
+        "host_sequence": original.sequence,
+        "host_available_at": original.available_at,
+        "host_producer_commit": original.producer_commit,
+        "captured_at": snapshot.captured_at,
+        "securities": len(snapshot.security_facts),
+        "daily_facts": len(snapshot.daily_facts),
+        "resealed_available_at": record.envelope.available_at,
+        "output_sequence": result.output_sequence,
+    }
+
+
+def _reference_spool(route: Any, key_root: Path) -> Any:
+    """The sandbox reference-slow spool, signing with the source key the sandbox bundle
+    sealed into `reference_slow_publisher`'s credential, so the real publisher verifies it."""
+
+    from rquant.live_spool import (
+        LiveBatchSpool,
+        ReferenceSourceBatchSigner,
+        ReferenceSourceBatchVerifier,
+    )
+
     key = key_root / "reference-source-ed25519"
     signer = ReferenceSourceBatchSigner(
         key_id=_REFERENCE_SOURCE_KEY_ID, private_key=key.read_text("ascii")
@@ -1292,30 +1647,152 @@ def reseal_reference_batch(
     )
     publisher = _manifest(route, "reference-slow.publisher.v1")
     spool_root = Path(str(publisher.settings["spool_root"]))
-    spool = LiveBatchSpool(spool_root, source_signer=signer, source_verifier=verifier)
-    prepared_at = original.available_at - _OLD_SOURCE_GUARD
-    result = capture_reference_slow_batch(
-        spool=spool,
-        calendar=recorded.calendar,
-        observed_at=snapshot.captured_at,
-        producer_commit=commit,
-        producer_version=original.producer_version,
-        snapshot_loader=lambda: resealed,
-        completion_clock=lambda: prepared_at,
-    )
-    from rquant.live_contracts import LiveChannel
+    return LiveBatchSpool(spool_root, source_signer=signer, source_verifier=verifier)
 
+
+def synthesize_reference_batch(
+    route: Any,
+    recorded: RecordedDay,
+    synthesis: SynthesisInputs,
+    *,
+    key_root: Path,
+    commit: str,
+) -> dict[str, Any]:
+    """The day's reference-slow batch, captured and sealed by the live code (never copied).
+
+    `capture_reference_slow_source_snapshot` runs under the sandbox commit with the limits
+    of the sandbox's own `reference-slow.source.v1` manifest, over the evidence extract and
+    the day's Tushare answers; `capture_reference_slow_batch` seals it with the source key,
+    prepared five seconds after the capture completed.
+    """
+
+    from rquant.live_contracts import LiveChannel
+    from rquant.runtime_service_builtin import ReferenceSlowSourceSettings
+
+    source_manifest = _manifest(route, "reference-slow.source.v1")
+    settings = ReferenceSlowSourceSettings.model_validate(dict(source_manifest.settings))
+    snapshot = sources.synthesize_reference_snapshot(
+        evidence_database=synthesis.evidence_database,
+        source=synthesis.source,
+        calendar=recorded.calendar,
+        trade_date=recorded.trade_date,
+        producer_commit=commit,
+        limits=settings.limits.model_dump(mode="python"),
+    )
+    spool = _reference_spool(route, key_root)
+    prepared_at = snapshot.captured_at + timedelta(
+        seconds=sources.SYNTHETIC_REFERENCE_PREPARE_SECONDS
+    )
+    try:
+        result = sources.seal_reference_snapshot(
+            spool=spool,
+            calendar=recorded.calendar,
+            snapshot=snapshot,
+            producer_commit=commit,
+            producer_version=settings.producer_version,
+            prepared_at=prepared_at,
+        )
+    except Exception as error:  # noqa: BLE001 - a refusal, named
+        raise ReplayRefusedError(
+            f"reference_slow: the synthesized snapshot could not be sealed: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     (record,) = spool.list_after(LiveChannel.REFERENCE_SLOW, sequence=-1)
-    return {
-        "host_sequence": original.sequence,
-        "host_available_at": original.available_at,
-        "host_producer_commit": original.producer_commit,
+    facts: dict[str, Any] = {
+        "origin": "synthesized",
+        "observed_at": sources.local_instant(
+            recorded.trade_date, sources.SYNTHETIC_REFERENCE_OBSERVED
+        ),
         "captured_at": snapshot.captured_at,
         "securities": len(snapshot.security_facts),
         "daily_facts": len(snapshot.daily_facts),
+        "suspended_codes": len(snapshot.suspended_codes),
+        "projections": {
+            projection.table_name: len(projection.rows) for projection in snapshot.projections
+        },
         "resealed_available_at": record.envelope.available_at,
         "output_sequence": result.output_sequence,
+        "evidence": synthesis.evidence,
+        "anachronisms": sources.reference_anachronisms(snapshot, synthesis.source),
     }
+    if recorded.reference_snapshot is not None:
+        facts["fidelity_vs_recorded"] = sources.compare_reference(
+            recorded.reference_snapshot, snapshot
+        )
+    return facts
+
+
+def synthesize_auction_batches(
+    route: Any, recorded: RecordedDay, synthesis: SynthesisInputs, *, commit: str
+) -> dict[str, Any]:
+    """The day's auction-match batch, captured by the live gateway over `stk_auction(D)`.
+
+    Expected codes are the host's universe generation for the day when it has one, else the
+    live universe publisher's answer over the evidence extract. Received at the auction
+    source's `capture_start` plus the tick phase -- its first attempt of the day.
+    """
+
+    from rquant.live_spool import LiveBatchSpool
+    from rquant.runtime_service_builtin import AuctionMatchSourceSettings
+
+    candidate = next(
+        item
+        for item in _manifest_of_kind(route, "candidate_publisher")
+        if item.settings["strategy_id"] == "auction_gap"
+    )
+    source_manifest = _manifest(route, "auction-match.source.v1")
+    settings = AuctionMatchSourceSettings.model_validate(dict(source_manifest.settings))
+    if recorded.universe is not None:
+        codes = tuple(str(code) for code in recorded.universe.get("codes", ()))
+        universe_facts: dict[str, Any] = {
+            "origin": "recorded",
+            "source": recorded.universe.get("_path"),
+            "codes": len(codes),
+        }
+    else:
+        codes, universe_facts = sources.synthesize_auction_universe(
+            evidence_database=synthesis.evidence_database,
+            authority_root=synthesis.universe_root,
+            calendar=recorded.calendar,
+            trade_date=recorded.trade_date,
+            producer_commit=commit,
+        )
+        recorded.provenance["auction_universe"] = {
+            key: value for key, value in universe_facts.items() if key != "observed_at"
+        }
+    received_at = sources.local_instant(recorded.trade_date, settings.capture_start) + timedelta(
+        seconds=synthesis.phase_seconds
+    )
+    facts = sources.synthesize_auction_batch(
+        spool=LiveBatchSpool(Path(str(candidate.settings["auction_spool_root"]))),
+        source=synthesis.source,
+        trade_date=recorded.trade_date,
+        expected_codes=codes,
+        settings={
+            "source": settings.source,
+            "dataset_id": settings.dataset_id,
+            "producer_version": settings.producer_version,
+            "min_coverage_ratio": settings.min_coverage_ratio,
+        },
+        producer_commit=commit,
+        received_at=received_at,
+    )
+    payload = facts.pop("payload")
+    facts["origin"] = "synthesized"
+    facts["universe"] = universe_facts
+    if recorded.auction_target is not None:
+        recorded_payload = next(
+            item_payload
+            for envelope, item_payload, _ in recorded.auction_records
+            if envelope.sequence == recorded.auction_target.sequence
+        )
+        facts["fidelity_vs_recorded"] = sources.compare_auction(recorded_payload, payload)
+    if facts["quality_status"] != "published":
+        facts["warning"] = (
+            "the synthesized batch is not PUBLISHED, so auction_gap has no candidates today: "
+            f"{facts['degraded_reasons']}"
+        )
+    return facts
 
 
 def republish_auction_batches(route: Any, recorded: RecordedDay, *, commit: str) -> dict[str, Any]:
@@ -1353,6 +1830,7 @@ def republish_auction_batches(route: Any, recorded: RecordedDay, *, commit: str)
     universe = recorded.universe
     codes = set(str(code) for code in frame["ts_code"])
     return {
+        "origin": "recorded",
         "sequences": [envelope.sequence for envelope, _, _ in recorded.auction_records],
         "target_sequence": target.sequence,
         "rows": int(target.row_count),
@@ -1632,6 +2110,57 @@ def schedule(
     return sorted(events, key=lambda item: item[0])
 
 
+def _cprofile_labels(arguments: argparse.Namespace) -> frozenset[str]:
+    return frozenset(
+        label.strip()
+        for value in (arguments.cprofile or ())
+        for label in value.split(",")
+        if label.strip()
+    )
+
+
+def not_production_faithful_because(arguments: argparse.Namespace) -> list[str]:
+    """What this run's cadence changes against production, one reason per line.
+
+    Inputs are labelled separately (`inputs.provenance`); this is about the harness.
+    """
+
+    reasons: list[str] = []
+    if int(arguments.serving_every_ticks) > 1:
+        reasons.append(
+            f"serving.publisher.v1 runs every {int(arguments.serving_every_ticks)} ticks "
+            f"({int(arguments.serving_every_ticks) * arguments.step_seconds:.0f} s) and on the "
+            "last one; production runs it every 30 s"
+        )
+    return reasons
+
+
+def synthesized_inputs(provenance: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    return sorted(
+        label for label, entry in provenance.items() if entry.get("origin") == "synthesized"
+    )
+
+
+def production_roots(runtime_root: Path, replica: Path, production_inputs: Path) -> list[str]:
+    """Every directory the audit hook refuses writes under."""
+
+    return sorted(
+        {
+            str(runtime_root),
+            str(replica.parent),
+            str(production_inputs.parent),
+            str(runtime_root.parent),
+        }
+    )
+
+
+def refuse_overlap(label: str, path: Path, protected: Iterable[str]) -> None:
+    for root in protected:
+        candidate = Path(root)
+        if path.is_relative_to(candidate) or candidate.is_relative_to(path):
+            raise ReplayRefusedError(f"the {label} {path} overlaps production path {root}")
+
+
 def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = print) -> int:
     import tempfile
 
@@ -1640,42 +2169,42 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
     global _PROTECTED_ROOTS
 
     trade_date = date.fromisoformat(arguments.trade_date)
+    today = datetime.now(_SHANGHAI).date()
+    if trade_date > today:
+        raise ReplayRefusedError(f"{trade_date} has not happened yet (today is {today})")
     runtime_root = arguments.runtime_root.resolve()
     replica = arguments.replica.resolve()
     production_inputs = arguments.production_inputs.resolve()
-    protected = sorted(
-        {
-            str(runtime_root),
-            str(replica.parent),
-            str(production_inputs.parent),
-            str(runtime_root.parent),
-        }
-    )
+    protected = production_roots(runtime_root, replica, production_inputs)
     replay_root = arguments.replay_root.resolve()
     stamp = datetime.now(_SHANGHAI).strftime("%Y%m%dT%H%M%S")
     sandbox = replay_root / f"{stamp}-{secrets.token_hex(3)}"
-    for root in protected:
-        candidate = Path(root)
-        if sandbox.is_relative_to(candidate) or candidate.is_relative_to(sandbox):
-            raise ReplayRefusedError(f"the replay root {sandbox} overlaps production path {root}")
+    cache_root = (arguments.tushare_cache or replay_root / "tushare-cache").resolve()
+    for label, path in (("replay root", sandbox), ("Tushare cache", cache_root)):
+        refuse_overlap(label, path, protected)
 
     token = os.environ.get("TUSHARE_TOKEN_MAIN") if arguments.tushare else None
-    if arguments.tushare and not token:
+    if arguments.tushare and not arguments.tushare_offline and not token:
         raise ReplayRefusedError("--tushare needs TUSHARE_TOKEN_MAIN in the process environment")
-
-    if arguments.dry_plan:
-        return dry_plan(
-            arguments,
-            trade_date=trade_date,
-            runtime_root=runtime_root,
-            replica=replica,
-            production_inputs=production_inputs,
-            sandbox=sandbox,
-            out=out,
-        )
+    tushare_mode = "offline" if arguments.tushare_offline else ("online" if token else None)
 
     _PROTECTED_ROOTS = tuple(protected)
     sys.addaudithook(_audit_hook)
+    if arguments.dry_plan:
+        try:
+            return dry_plan(
+                arguments,
+                trade_date=trade_date,
+                runtime_root=runtime_root,
+                replica=replica,
+                production_inputs=production_inputs,
+                sandbox=sandbox,
+                cache_root=cache_root,
+                tushare_mode=tushare_mode,
+                out=out,
+            )
+        finally:
+            _PROTECTED_ROOTS = ()
     replay_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     sandbox.mkdir(mode=0o700)
     sandbox.chmod(0o700)
@@ -1731,6 +2260,7 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         capabilities_module, "_SYSTEMD_CGROUP_PATH", sandbox / "not-a-systemd-unit" / "cgroup"
     )
     audit = ProductionAudit(roots=tuple(Path(root) for root in protected))
+    unfaithful = not_production_faithful_because(arguments)
     summary: dict[str, Any] = {
         "trade_date": trade_date,
         "sandbox": str(sandbox),
@@ -1738,15 +2268,28 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             "step_seconds": arguments.step_seconds,
             "phase_seconds": arguments.phase_seconds,
             "until": arguments.until,
-            "tushare": bool(arguments.tushare),
+            "tushare": tushare_mode,
+            "tushare_cache": str(cache_root) if tushare_mode else None,
+            "synthesize_sources": bool(arguments.synthesize_sources),
             "generations": arguments.generations,
             "minute_lag_seconds": arguments.minute_lag_seconds,
+            "serving_every_ticks": arguments.serving_every_ticks,
+            "cprofile": sorted(_cprofile_labels(arguments)),
             "assume_listing_classification": bool(arguments.assume_listing_classification),
             "runner": "in-process threads, one role at a time, no unit sandbox",
+            "production_faithful": not unfaithful,
+            "not_production_faithful_because": unfaithful,
         },
         "stage_seconds": {},
         "host": host_facts,
     }
+    for reason in unfaithful:
+        out(f"WARNING: not production-faithful: {reason}")
+    cache = (
+        sources.TushareCache(cache_root, token=token, offline=tushare_mode == "offline")
+        if tushare_mode
+        else None
+    )
     exit_code = 1
     runner: RoleRunner | None = None
     try:
@@ -1758,13 +2301,65 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             reference_sequence=arguments.reference_sequence,
             auction_sequence=arguments.auction_sequence,
             audit=audit,
+            synthesize=arguments.synthesize_sources,
+            tushare=cache is not None,
         )
+        #: only what this run re-seals; a recorded batch kept for the comparison is in
+        #: `provenance.*.recorded_batch`
         summary["inputs"] = {
-            "reference_batch": str(recorded.reference_manifest_path),
-            "calendar": str(recorded.calendar_path),
-            "auction_batches": [str(path) for _, _, path in recorded.auction_records],
+            "reference_batch": None
+            if recorded.reference_manifest_path is None or recorded.synthesize_reference
+            else str(recorded.reference_manifest_path),
+            "calendar": None if recorded.calendar_path is None else str(recorded.calendar_path),
+            "auction_batches": []
+            if recorded.synthesize_auction
+            else [str(path) for _, _, path in recorded.auction_records],
             "production_inputs": recorded.inputs_fingerprints,
+            "provenance": recorded.provenance,
         }
+        probe = sources.probe_replica(
+            replica=replica, trade_date=trade_date, calendar=recorded.calendar, audit=audit
+        )
+        summary["inputs"]["replica_probe"] = probe
+        reasons = sources.replica_refusals(
+            probe,
+            trade_date=trade_date,
+            synthesize_reference=recorded.synthesize_reference,
+            tushare_minutes=cache is not None,
+        )
+        if reasons:
+            raise ReplayRefusedError("replica: " + " | ".join(reasons))
+        recorded.provenance["minute_bar"] = {
+            "origin": "recorded",
+            "source": f"replica minute_bar ({probe['trade_date_minute_rows']} rows, "
+            f"{probe['trade_date_minute_codes']} codes)",
+            "gaps": "Tushare stk_mins through the cache" if cache is not None else "left missing",
+        }
+        synthesis: SynthesisInputs | None = None
+        if recorded.synthesize_reference or recorded.synthesize_auction:
+            assert cache is not None
+            day_source = sources.CachedDaySource(cache, trade_date=trade_date, today=today)
+            out(f"asking Tushare (cache {cache_root}) for the day's source answers")
+            summary["inputs"]["tushare_prefetch"] = sources.prefetch_day(
+                day_source,
+                reference=recorded.synthesize_reference,
+                auction=recorded.synthesize_auction,
+            )
+            evidence = sources.extract_reference_evidence(
+                replica=replica,
+                target=sandbox / "inputs" / "reference-evidence.duckdb",
+                trade_date=trade_date,
+                calendar=recorded.calendar,
+                audit=audit,
+                require_adj_factor=recorded.synthesize_reference,
+            )
+            synthesis = SynthesisInputs(
+                source=day_source,
+                evidence_database=Path(evidence["path"]),
+                evidence=evidence,
+                universe_root=sandbox / "inputs" / "auction-universe",
+                phase_seconds=arguments.phase_seconds,
+            )
         minutes_path = sandbox / "inputs" / "minutes-replica.parquet"
         summary["stage_seconds"]["read_host"] = round(time.monotonic() - started, 2)
 
@@ -1792,6 +2387,7 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             generations=arguments.generations,
             replica_extract=extract,
             log=out,
+            synthesis=synthesis,
         )
         summary["world"] = facts
         summary["stage_seconds"]["build_world"] = round(time.monotonic() - started, 2)
@@ -1803,7 +2399,9 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             pd.read_parquet(minutes_path),
             clock=clock,
             lag_seconds=arguments.minute_lag_seconds,
-            tushare_fetch=tushare_day_fetcher(token, trade_date) if token else None,
+            tushare_fetch=None
+            if cache is None
+            else sources.cached_minute_fetcher(cache, trade_date),
             trade_date=trade_date,
         )
         install_runner_patches(monkeypatch, clock, adapter)
@@ -1823,7 +2421,15 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             role_timeout_seconds=arguments.role_timeout_seconds,
             max_restarts=arguments.max_restarts,
             log=out,
+            cprofile=_cprofile_labels(arguments),
+            profile_root=sandbox / "profile",
         )
+        unknown = _cprofile_labels(arguments) - {state.label for state in states}
+        if unknown:
+            raise ReplayRefusedError(
+                f"--cprofile names no role of this chain: {sorted(unknown)} "
+                f"(roles: {sorted(state.label for state in states)})"
+            )
         events = schedule(
             trade_date,
             start=arguments.start,
@@ -1842,6 +2448,11 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         started = time.monotonic()
         reference = next(state for state in states if state.role == "reference_slow_publisher")
         stopped = False
+        tick_indexes = [index for index, (_, kind) in enumerate(events) if kind == "tick"]
+        last_tick = tick_indexes[-1] if tick_indexes else -1
+        serving_every = max(1, int(arguments.serving_every_ticks))
+        tick_number = 0
+        tick_walls: list[tuple[str, float]] = []
         for index, (moment, kind) in enumerate(events):
             if kind == "reference":
                 if reference.first_output_at is not None:
@@ -1850,12 +2461,22 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
                     stopped = True
                     break
                 continue
+            tick_started = time.perf_counter()
             for position, state in enumerate(states):
+                if (
+                    state.role == "serving_publisher"
+                    and tick_number % serving_every
+                    and index != last_tick
+                ):
+                    state.skipped_ticks += 1
+                    continue
                 if not runner.step(state, moment + timedelta(seconds=spacing * position)):
                     stopped = True
                     break
                 if state.role == "serving_publisher":
                     retention.after_step()
+            tick_walls.append((session_phase(moment), time.perf_counter() - tick_started))
+            tick_number += 1
             if stopped:
                 break
             if index % max(1, int(1800 / arguments.step_seconds)) == 0 or index == len(events) - 1:
@@ -1865,8 +2486,13 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
                     f"failing={_failing(states)} "
                     f"crashes={sum(len(state.crashes) for state in states)}"
                 )
-        summary["stage_seconds"]["drive_the_day"] = round(time.monotonic() - started, 2)
+        drive_seconds = time.monotonic() - started
+        summary["stage_seconds"]["drive_the_day"] = round(drive_seconds, 2)
         runner.stop_all()
+        summary["profile"] = step_profile(states, tick_walls, drive_seconds)
+        profiles = {state.label: str(state.profile_path) for state in states if state.profile_path}
+        if profiles:
+            summary["profile"]["cprofile"] = profiles
         summary["hung"] = runner.hung
         summary["roles"] = {
             state.label: {
@@ -1906,6 +2532,9 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
         fetched = adapter.fetched_frame()
         if fetched is not None:
             fetched.to_parquet(sandbox / "inputs" / "minutes-tushare.parquet", index=False)
+        recorded.provenance["minute_bar"]["codes_by_origin"] = summary["chain"]["market_minute"][
+            "codes_by_origin"
+        ]
         crashed = [state.label for state in states if state.crashes]
         serving_ok = bool(summary["chain"]["serving"].get("same_day"))
         shadow_ok = (
@@ -1917,10 +2546,16 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
             "notifier_shadow_only": shadow_ok,
             "crashed_roles": crashed,
             "hung": runner.hung,
+            "synthesized_inputs": synthesized_inputs(recorded.provenance),
+            "production_faithful": not unfaithful,
         }
         exit_code = 0 if serving_ok and shadow_ok and not crashed and runner.hung is None else 1
-    except ReplayRefusedError:
-        raise
+    except (ReplayRefusedError, sources.InputUnavailableError) as error:
+        summary["refused"] = str(error)
+        out(f"summary: {sandbox / 'summary.json'}")
+        if isinstance(error, ReplayRefusedError):
+            raise
+        raise ReplayRefusedError(str(error)) from error
     except Exception as error:  # noqa: BLE001 - reported in the summary, exit 1
         summary["fatal"] = "".join(
             traceback.format_exception(type(error), error, error.__traceback__)
@@ -1930,6 +2565,8 @@ def run_replay(arguments: argparse.Namespace, *, out: Callable[[str], None] = pr
     finally:
         if runner is not None:
             runner.stop_all()
+        if cache is not None:
+            summary.setdefault("inputs", {})["tushare_cache"] = cache.summary()
         summary["production_audit"] = audit.finish()
         summary["peak_rss_bytes"] = _peak_rss_bytes()
         summary["stage_seconds"]["total"] = round(time.monotonic() - wall_started, 2)
@@ -2008,6 +2645,20 @@ def print_summary(summary: dict[str, Any], *, out: Callable[[str], None]) -> Non
         f"stage seconds: {summary.get('stage_seconds')}",
         f"verdict: {summary.get('verdict')}",
     ]
+    for label, entry in sorted(((summary.get("inputs") or {}).get("provenance") or {}).items()):
+        lines.append(f"  input {label:<17} {entry.get('origin', '?'):<11} {entry.get('source')}")
+    profile = summary.get("profile") or {}
+    if profile:
+        lines.append(
+            f"profile: drive {profile['drive_seconds']}s = roles {profile['role_seconds']}s + "
+            f"harness {profile['harness_seconds']}s over {profile['ticks']} ticks; "
+            f"slowest: {profile['slowest_roles']}"
+        )
+        for phase, entry in profile["tick_seconds"].items():
+            lines.append(
+                f"  ticks {phase:<10} n={entry['ticks']:<4} total={entry['total']:>9}s "
+                f"p50={entry['p50']:>7}s p95={entry['p95']:>7}s"
+            )
     for label, role in (summary.get("roles") or {}).items():
         lines.append(
             f"  {label:<40} it={role['iterations']:<4} wall={role['wall_seconds']:>8}s "
@@ -2024,6 +2675,10 @@ def print_summary(summary: dict[str, Any], *, out: Callable[[str], None]) -> Non
         out(line)
 
 
+#: the line a dry plan ends with, for `route_a_replay_days.py` to read
+DRY_PLAN_PREFIX = "DRY-PLAN "
+
+
 def dry_plan(
     arguments: argparse.Namespace,
     *,
@@ -2032,9 +2687,17 @@ def dry_plan(
     replica: Path,
     production_inputs: Path,
     sandbox: Path,
+    cache_root: Path,
+    tushare_mode: str | None,
     out: Callable[[str], None],
 ) -> int:
-    """What would be read and copied, and where the sandbox would go. Writes nothing."""
+    """For this one day: every input, recorded or synthesized and from what, and whether it
+    can be produced. Writes nothing and asks Tushare nothing; 2 when some input cannot be.
+
+    It resolves the day exactly as a run does (`read_recorded_day`, `probe_replica`,
+    `replica_refusals`), so a day the dry plan passes is refused by a run only for what
+    only a run can find out: a Tushare answer, or a live capture's own refusal.
+    """
 
     def describe(path: Path) -> str:
         try:
@@ -2044,52 +2707,126 @@ def dry_plan(
         modified = datetime.fromtimestamp(observed.st_mtime, _SHANGHAI)
         return f"{observed.st_size} bytes, mtime {modified:%Y-%m-%d %H:%M:%S}"
 
-    out(f"dry plan for trade date {trade_date} (nothing is written)")
+    audit = ProductionAudit(roots=())
+    plan: dict[str, Any] = {"trade_date": trade_date, "cannot": [], "inputs": {}}
+    out(f"dry plan for trade date {trade_date} (nothing is written, Tushare is not asked)")
     out(f"sandbox would be: {sandbox} (0700)")
-    reference_dir = runtime_root / "live" / "reference-slow" / "batches" / "reference_slow"
-    auction_dir = runtime_root / "live" / "auction-match" / "batches" / "auction_match"
-    out("read (plain open rb), copied into the sandbox:")
-    for directory in (reference_dir, auction_dir):
-        if directory.is_dir():
-            for path in sorted(directory.iterdir()):
-                if path.suffix in {".json", ".payload"} and path.stem.isdigit():
-                    out(f"  {path}: {describe(path)}")
-        else:
-            out(f"  {directory}: MISSING")
-    for directory in (
-        runtime_root / "authorities" / "market-calendar" / "generations",
-        runtime_root / "authorities" / "auction-universe" / "generations",
-    ):
-        count = len(list(directory.glob("*.json"))) if directory.is_dir() else 0
-        out(f"  {directory}/*.json: {count} generations (the one named / effective {trade_date})")
-    out(f"  {production_inputs}: {describe(production_inputs)}")
+    tushare = tushare_mode is not None
+    out(f"Tushare: {tushare_mode or 'off'}" + (f" (cache {cache_root})" if tushare else ""))
+    recorded: RecordedDay | None = None
     try:
-        document = json.loads(production_inputs.read_text(encoding="utf-8"))
-        for key in (
-            "routing_policy_path",
-            "trade_calendar_path",
-            "historical_minutes_snapshot_path",
-        ):
-            path = Path(str(document.get(key)))
-            out(f"  {key} -> {path}: {describe(path)}")
-    except (OSError, ValueError) as error:
-        out(f"  cannot read the inputs document: {error}")
-    out("read through DuckDB ATTACH ... (READ_ONLY), extracted into the sandbox:")
-    out(f"  {replica}: {describe(replica)}")
-    out(f"    daily_bar: the {arguments.replica_daily_sessions} sessions before {trade_date}")
-    out("    screen_result: the 10 sessions before the trade date")
-    out(
-        f"    minute_bar: the {arguments.replica_minute_sessions} session(s) before it, and "
-        f"{trade_date}'s 1min rows kept aside for the minute replay"
-    )
-    out(f"tushare stk_mins for codes the replica lacks: {'yes' if arguments.tushare else 'no'}")
+        recorded = read_recorded_day(
+            runtime_root=runtime_root,
+            production_inputs=production_inputs,
+            trade_date=trade_date,
+            reference_sequence=arguments.reference_sequence,
+            auction_sequence=arguments.auction_sequence,
+            audit=audit,
+            synthesize=arguments.synthesize_sources,
+            tushare=tushare,
+            refuse_without_tushare=False,
+        )
+    except ReplayRefusedError as error:
+        plan["cannot"].append(str(error))
+    if recorded is not None:
+        plan["cannot"].extend(recorded.tushare_needed)
+        plan["inputs"] = recorded.provenance
+        out("recorded inputs, read with plain open(rb) and copied into the sandbox:")
+        if recorded.reference_manifest_path is not None and not recorded.synthesize_reference:
+            for path in (
+                recorded.reference_manifest_path,
+                recorded.reference_manifest_path.with_suffix(".payload"),
+            ):
+                out(f"  reference_slow {path}: {describe(path)}")
+        if not recorded.synthesize_auction:
+            for _, _, manifest in recorded.auction_records:
+                for path in (manifest, manifest.with_suffix(".payload")):
+                    out(f"  auction_match  {path}: {describe(path)}")
+        if recorded.calendar_path is not None:
+            out(f"  calendar       {recorded.calendar_path}: {describe(recorded.calendar_path)}")
+        out(f"  inputs doc     {production_inputs}: {describe(production_inputs)}")
+        for label, fingerprint in recorded.inputs_fingerprints.items():
+            path = Path(str(fingerprint["path"]))
+            out(f"  {label:<14} {path}: {describe(path)}")
+        out("per input:")
+        for label, entry in sorted(recorded.provenance.items()):
+            details = {
+                key: value
+                for key, value in entry.items()
+                if key not in {"origin", "source", "spool_holds", "note"}
+                and value is not None
+                and not (key == "recorded_batch" and value == entry.get("source"))
+            }
+            out(f"  {label:<17} {entry.get('origin', '?'):<11} {entry.get('source')}")
+            if entry.get("spool_holds") is not None and entry.get("origin") == "synthesized":
+                out(f"                    host spool holds: {entry['spool_holds'] or 'nothing'}")
+            if details:
+                rendered = json.dumps(details, default=_json_default, ensure_ascii=False)
+                out(f"                    {rendered}")
+        try:
+            probe = sources.probe_replica(
+                replica=replica, trade_date=trade_date, calendar=recorded.calendar, audit=audit
+            )
+        except Exception as error:  # noqa: BLE001 - reported as a refusal
+            plan["cannot"].append(f"replica: cannot be read: {type(error).__name__}: {error}")
+        else:
+            plan["replica_probe"] = probe
+            out(f"replica {replica} ({describe(replica)}), through ATTACH ... (READ_ONLY):")
+            out(f"  prior five sessions' daily_bar rows: {probe['prior_five']}")
+            out(
+                f"  adj_factor rows on {probe['prior_trade_date']}: "
+                f"{probe.get('prior_adj_factor_rows')}; {trade_date}'s 1min minute_bar: "
+                f"{probe['trade_date_minute_rows']} rows, {probe['trade_date_minute_codes']} codes"
+            )
+            plan["cannot"].extend(
+                f"replica: {reason}"
+                for reason in sources.replica_refusals(
+                    probe,
+                    trade_date=trade_date,
+                    synthesize_reference=recorded.synthesize_reference,
+                    tushare_minutes=tushare,
+                )
+            )
+        if tushare and (recorded.synthesize_reference or recorded.synthesize_auction):
+            cache = sources.TushareCache(cache_root, offline=True)
+            cached = sources.cached_answers(
+                cache,
+                trade_date,
+                reference=recorded.synthesize_reference,
+                auction=recorded.synthesize_auction,
+            )
+            plan["tushare_cache"] = cached
+            out(f"Tushare answers already cached: {cached}")
+            if tushare_mode == "offline":
+                plan["cannot"].extend(
+                    f"tushare: --tushare-offline and {name} for {trade_date} is not cached in "
+                    f"{cache_root}"
+                    for name, present in cached.items()
+                    if name != "stk_mins_codes" and not present
+                )
     out(
         f"clock: {arguments.start} + {arguments.phase_seconds}s phase, "
         f"every {arguments.step_seconds}s, until {arguments.until}; "
-        f"reference publisher rounds from {arguments.reference_start}"
+        f"reference publisher rounds from {arguments.reference_start}; serving every "
+        f"{arguments.serving_every_ticks} tick(s)"
     )
     out(f"roles, in order: {', '.join(CHAIN)}")
-    return 0
+    audited = audit.finish()
+    plan["production_untouched"] = not (
+        audited["changed_during_our_read"] or audited["changed_in_place_later"]
+    )
+    plan["paths_read"] = audited["paths_read"]
+    if plan["cannot"]:
+        out(f"CANNOT REPLAY {trade_date}:")
+        for reason in plan["cannot"]:
+            out(f"  - {reason}")
+    else:
+        out(f"every input of {trade_date} can be produced")
+    out(
+        DRY_PLAN_PREFIX
+        + json.dumps(plan, default=_json_default, sort_keys=True, ensure_ascii=False)
+    )
+    return 2 if plan["cannot"] else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2137,7 +2874,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--role-timeout-seconds", type=float, default=900.0)
     parser.add_argument("--max-restarts", type=int, default=3)
-    parser.add_argument("--tushare", action="store_true")
+    parser.add_argument(
+        "--tushare",
+        action="store_true",
+        help="ask Tushare (TUSHARE_TOKEN_MAIN) for what the replica and the host spool lack: "
+        "stk_mins for missing minute codes, and the source answers a synthesized batch needs",
+    )
+    parser.add_argument(
+        "--tushare-offline",
+        action="store_true",
+        help="as --tushare, but answer only from --tushare-cache and never make a request; "
+        "an answer the cache lacks refuses the day (a minute code stays missing)",
+    )
+    parser.add_argument(
+        "--tushare-cache",
+        type=Path,
+        default=None,
+        help="where Tushare answers are kept, one parquet per (endpoint, day[, code]) "
+        "(default: <replay-root>/tushare-cache; shared by every run under that root)",
+    )
+    parser.add_argument(
+        "--synthesize-sources",
+        action="store_true",
+        help="synthesize the reference-slow and auction-match batches even when the host "
+        "recorded them, and report how far they are from the recorded ones",
+    )
+    parser.add_argument(
+        "--serving-every-ticks",
+        type=int,
+        default=1,
+        help="step serving.publisher.v1 only every N ticks (and on the last one); N > 1 "
+        "marks the run not production-faithful (production publishes every 30 s)",
+    )
+    parser.add_argument(
+        "--cprofile",
+        action="append",
+        default=None,
+        metavar="SERVICE_ID[,SERVICE_ID]",
+        help="cProfile these roles' iterations; <sandbox>/profile/<service>.<n>.pstats and "
+        "a top-40 text beside it",
+    )
     parser.add_argument("--dry-plan", action="store_true")
     return parser
 
@@ -2147,12 +2923,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.step_seconds <= 0:
         parser.error("--step-seconds must be positive")
+    if arguments.serving_every_ticks < 1:
+        parser.error("--serving-every-ticks must be at least 1")
     import rquant
 
     print(f"rquant imported from {Path(rquant.__file__).resolve().parent}")
     try:
         return run_replay(arguments)
-    except ReplayRefusedError as error:
+    except (ReplayRefusedError, sources.InputUnavailableError) as error:
         print(f"REPLAY REFUSED: {error}")
         return 2
 

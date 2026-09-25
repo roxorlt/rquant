@@ -17,18 +17,25 @@ the provider that could speak was never called).
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 
 from tests.unit.test_reference_slow_publish_rehearsal_script import CODES, _runtime_root
-from tests.unit.test_reference_slow_publish_window import OPEN_DATES, TARGET_DATE, _calendar
+from tests.unit.test_reference_slow_publish_window import (
+    NEXT_DATE,
+    OPEN_DATES,
+    TARGET_DATE,
+    _calendar,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -253,7 +260,9 @@ def _host(
     return {"data": data, "runtime": runtime, "replica": replica, "inputs": production_inputs}
 
 
-def _run(host: dict[str, Path], replay_root: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    host: dict[str, Path], replay_root: Path, *extra: str, trade_date: date = TARGET_DATE
+) -> subprocess.CompletedProcess[str]:
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -265,7 +274,7 @@ def _run(host: dict[str, Path], replay_root: Path, *extra: str) -> subprocess.Co
             sys.executable,
             str(SCRIPT),
             "--trade-date",
-            TARGET_DATE.isoformat(),
+            trade_date.isoformat(),
             "--replay-root",
             str(replay_root),
             "--runtime-root",
@@ -539,3 +548,464 @@ def test_two_generations_reach_a_same_day_generation_with_signals_past_the_rollo
     assert serving["signals_rows_today"] >= 1, serving
     assert summary["notifier_provider_deliveries"] == 0
     assert summary["verdict"]["crashed_roles"] == []
+
+
+# ---------------------------------------------------------------------------------------
+# A day the host holds no recording of: the source batches are synthesized
+# ---------------------------------------------------------------------------------------
+
+#: The fake host recorded 07-31 only, as the real one recorded 09-24 only. 08-03 is the next
+#: session: its five prior sessions (07-27..07-31) are in the replica, it recorded nothing.
+UNRECORDED_DATE = NEXT_DATE
+#: in stk_auction(D) with a NaN price, the 09-23 shape: dropped and counted, not refused
+NAN_AUCTION_CODE = "000005.SZ"
+
+
+def _sources() -> ModuleType:
+    name = "route_a_replay_sources_under_test"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, REPO_ROOT / "scripts" / "route_a_replay_sources.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _extend_replica_for(
+    path: Path, day: date, *, codes: tuple[str, ...] = CODES, minutes: bool = True
+) -> None:
+    """What the host replica has that the recorded-day cases never needed: `adj_factor` (the
+    reference-slow capture joins it to `daily_bar` on the prior session) and the day's minutes."""
+
+    import duckdb
+
+    path.chmod(0o600)
+    connection = duckdb.connect(str(path))
+    try:
+        connection.execute(
+            "CREATE TABLE adj_factor(ts_code VARCHAR, trade_date DATE, adj_factor DOUBLE)"
+        )
+        connection.executemany(
+            "INSERT INTO adj_factor VALUES (?, ?, 1.0)",
+            [(code, session) for code in codes for session in OPEN_DATES if session < day],
+        )
+        rows: list[tuple[Any, ...]] = []
+        for session_start, count in ((time(9, 30), 120), (time(13, 0), 120)) if minutes else ():
+            for step in range(count):
+                stamp = datetime.combine(day, session_start) + timedelta(minutes=step)
+                close = round(10.5 + 0.002 * step, 4)
+                rows.append(
+                    (
+                        MINUTE_CODE,
+                        stamp,
+                        "1min",
+                        close - 0.01,
+                        close + 0.02,
+                        close - 0.02,
+                        close,
+                        1000.0 + step,
+                        (1000.0 + step) * close,
+                        "tushare_rt",
+                        stamp,
+                    )
+                )
+        if rows:
+            connection.executemany(
+                "INSERT INTO minute_bar VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+            )
+        connection.execute("CHECKPOINT")
+    finally:
+        connection.close()
+    path.chmod(0o644)
+
+
+def _fill_tushare_cache(
+    root: Path, day: date, *, codes: tuple[str, ...] = CODES, fetched: date | None = None
+) -> None:
+    """The Tushare answers the live sources would get for the day, in the adapter's shapes."""
+
+    import pandas as pd
+
+    from rquant.adapter.tushare import STK_AUCTION_COLUMNS, STOCK_BASIC_COLUMNS
+
+    cache = _sources().TushareCache(root)
+    key = day.strftime("%Y%m%d")
+    listed = (fetched or day).strftime("%Y%m%d")
+    basic = pd.DataFrame(
+        [
+            {
+                "ts_code": code,
+                "symbol": code[:6],
+                "name": "成长样本",
+                "area": "深圳",
+                "industry": "软件服务",
+                "list_date": "20200102",
+                "delist_date": None,
+                "market": "创业板" if code.endswith(".SZ") else "主板",
+                "list_status": "L",
+            }
+            for code in codes
+        ],
+        columns=list(STOCK_BASIC_COLUMNS),
+    )
+    empty_basic = pd.DataFrame(
+        {column: pd.Series(dtype="object") for column in STOCK_BASIC_COLUMNS}
+    )
+    cache.store("stock_basic", f"L/{listed}", basic)
+    cache.store("stock_basic", f"D/{listed}", empty_basic)
+    cache.store("stock_basic", f"P/{listed}", empty_basic)
+    cache.store(
+        "stock_st",
+        key,
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "000004.SZ",
+                    "name": "*ST样本",
+                    "trade_date": key,
+                    "type": "ST",
+                    "type_name": "风险警示",
+                }
+            ]
+        ),
+    )
+    cache.store(
+        "adj_factor",
+        key,
+        pd.DataFrame([{"ts_code": code, "trade_date": day, "adj_factor": 1.0} for code in codes]),
+    )
+    cache.store(
+        "suspend_d",
+        key,
+        pd.DataFrame(
+            {
+                column: pd.Series(dtype="object")
+                for column in ("ts_code", "trade_date", "suspend_timing", "suspend_type")
+            }
+        ),
+    )
+    auction = [
+        {
+            "ts_code": code,
+            "trade_date": day,
+            "price": 10.5,
+            "vol": 20_000.0,
+            "amount": 210_000.0,
+            "pre_close": 10.0,
+            "turnover_rate": 0.2,
+            "volume_ratio": 9.9,
+            "auction_type": "open_realtime",
+            "source": "tushare",
+        }
+        for code in codes
+    ]
+    auction.append(
+        {
+            **auction[0],
+            "ts_code": NAN_AUCTION_CODE,
+            "price": float("nan"),
+            "vol": 0.0,
+            "amount": 0.0,
+        }
+    )
+    cache.store(
+        "stk_auction",
+        key,
+        pd.DataFrame(auction, columns=[*STK_AUCTION_COLUMNS, "auction_type", "source"]),
+    )
+
+
+def test_a_day_the_host_never_recorded_is_synthesized_by_the_live_code_and_labelled(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    """The replay of any day, not only the recorded one (package AK).
+
+    The fake host recorded 07-31 alone. Replaying 08-03 must neither refuse nor borrow
+    07-31's batches: both source batches are captured by the live code from the replica as
+    it stood before 08-03 and from Tushare's answers for 08-03 (here a filled cache and
+    `--tushare-offline`, so no request leaves the machine), every input says where it came
+    from, and the day still reaches a same-day serving generation.
+    """
+
+    _extend_replica_for(host["replica"], UNRECORDED_DATE)
+    cache = tmp_path / "tushare-cache"
+    _fill_tushare_cache(cache, UNRECORDED_DATE)
+    before = _tree(host["data"])
+
+    result = _run(
+        host,
+        tmp_path / "replay",
+        "--tushare-offline",
+        "--tushare-cache",
+        str(cache),
+        "--step-seconds",
+        "300",
+        "--until",
+        "10:10",
+        trade_date=UNRECORDED_DATE,
+    )
+
+    output = result.stdout + result.stderr
+    (sandbox,) = (tmp_path / "replay").iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert result.returncode == 0, output[-6000:]
+    assert _tree(host["data"]) == before
+    assert summary["verdict"]["production_untouched"] is True
+
+    #: every input labelled, and the host's 07-31 batches used for nothing
+    provenance = summary["inputs"]["provenance"]
+    assert provenance["reference_slow"]["origin"] == "synthesized"
+    assert provenance["reference_slow"]["recorded_batch"] is None
+    assert provenance["reference_slow"]["spool_holds"] == ["seq 0 targets 2026-07-31"]
+    assert provenance["auction_match"]["origin"] == "synthesized"
+    assert provenance["auction_match"]["recorded_batch"] is None
+    assert provenance["auction_universe"]["origin"] == "synthesized"
+    assert provenance["calendar"]["origin"] == "recorded"
+    assert provenance["minute_bar"]["origin"] == "recorded"
+    assert provenance["history"]["sessions_before_trade_date"] == 2
+    assert summary["inputs"]["reference_batch"] is None
+    assert summary["inputs"]["auction_batches"] == []
+    assert summary["verdict"]["synthesized_inputs"] == [
+        "auction_match",
+        "auction_universe",
+        "reference_slow",
+    ]
+
+    #: the live capture's own output: observed 09:20:07, completed 15 s later, the prior
+    #: session's close, and a stk_auction batch that dropped the NaN row and published
+    reference = summary["world"]["reference"]
+    assert reference["origin"] == "synthesized"
+    assert reference["captured_at"] == "2026-08-03T01:20:22+00:00"
+    assert reference["securities"] == len(CODES)
+    assert reference["evidence"]["prior_trade_date"] == "2026-07-31"
+    auction = summary["world"]["auction"]
+    assert auction["origin"] == "synthesized"
+    assert auction["quality_status"] == "published"
+    assert auction["rows"] == len(CODES)
+    assert auction["rows_dropped_non_finite"] == 1
+    assert auction["available_at"] == "2026-08-03T01:29:07+00:00"
+    assert auction["universe"]["origin"] == "synthesized"
+    assert auction["universe"]["codes"] == len(CODES)
+
+    #: the Tushare answers came from the cache alone
+    tushare = summary["inputs"]["tushare_cache"]
+    assert tushare["offline"] is True
+    assert all(counts["tushare"] == 0 for counts in tushare["by_endpoint"].values())
+
+    #: and the chain ran the day
+    assert summary["roles"]["reference-slow.publisher.v1"]["first_output_at"] is not None
+    assert summary["candidates_per_family"]["auction_gap"] == len(CODES)
+    serving = summary["chain"]["serving"]
+    assert serving["same_day"] is True, serving
+    assert summary["chain"]["notifier"]["all_receipts_shadow"] is True
+    assert summary["notifier_provider_deliveries"] == 0
+    assert summary["verdict"]["crashed_roles"] == []
+
+
+def test_a_day_without_a_recording_is_refused_without_tushare_and_says_what_the_spool_holds(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    _extend_replica_for(host["replica"], UNRECORDED_DATE)
+    before = _tree(host["data"])
+
+    result = _run(host, tmp_path / "replay", trade_date=UNRECORDED_DATE)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "REPLAY REFUSED" in result.stdout
+    assert "no reference-slow batch" in result.stdout
+    assert "seq 0 targets 2026-07-31" in result.stdout
+    assert "no PUBLISHED auction-match batch for 2026-08-03" in result.stdout
+    assert "--tushare" in result.stdout
+    (sandbox,) = (tmp_path / "replay").iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert "no reference-slow batch" in summary["refused"]
+    assert "world" not in summary
+    assert _tree(host["data"]) == before
+
+    #: offline, with a cache that lacks the day: refused too, naming the missing answer
+    offline = _run(
+        host,
+        tmp_path / "replay-offline",
+        "--tushare-offline",
+        "--tushare-cache",
+        str(tmp_path / "empty-cache"),
+        trade_date=UNRECORDED_DATE,
+    )
+    assert offline.returncode == 2, offline.stdout + offline.stderr
+    assert "is not in the Tushare cache" in offline.stdout
+    assert _tree(host["data"]) == before
+
+
+def test_the_dry_plan_resolves_each_date_and_says_what_cannot_be_produced(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    """The 09-25 dry plans listed 09-24's two spool files for 09-18, 09-21, 09-22 and 09-23
+    alike. Now each date says, input by input, recorded or synthesized or impossible."""
+
+    _extend_replica_for(host["replica"], UNRECORDED_DATE)
+    cache = tmp_path / "tushare-cache"
+    before = _tree(host["data"])
+
+    def plan(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+        (line,) = [item for item in result.stdout.splitlines() if item.startswith("DRY-PLAN ")]
+        return json.loads(line[len("DRY-PLAN ") :])
+
+    recorded = _run(host, tmp_path / "replay", "--dry-plan")
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    assert {label: entry["origin"] for label, entry in plan(recorded)["inputs"].items()} == {
+        "auction_match": "recorded",
+        "auction_universe": "recorded",
+        "calendar": "recorded",
+        "history": "recorded",
+        "reference_slow": "recorded",
+        "routing_policy": "recorded",
+        "trade_calendar": "recorded",
+    }
+
+    without_tushare = _run(host, tmp_path / "replay", "--dry-plan", trade_date=UNRECORDED_DATE)
+    assert without_tushare.returncode == 2
+    cannot = plan(without_tushare)["cannot"]
+    assert len(cannot) == 2 and all("synthesizing it needs Tushare" in item for item in cannot)
+    #: the other day's spool files are not offered as this day's input
+    assert "00000000000000000000.payload" not in without_tushare.stdout
+
+    cold = _run(
+        host,
+        tmp_path / "replay",
+        "--dry-plan",
+        "--tushare-offline",
+        "--tushare-cache",
+        str(cache),
+        trade_date=UNRECORDED_DATE,
+    )
+    assert cold.returncode == 2
+    assert any("stk_auction" in item for item in plan(cold)["cannot"])
+
+    _fill_tushare_cache(cache, UNRECORDED_DATE)
+    warm = _run(
+        host,
+        tmp_path / "replay",
+        "--dry-plan",
+        "--tushare-offline",
+        "--tushare-cache",
+        str(cache),
+        trade_date=UNRECORDED_DATE,
+    )
+    assert warm.returncode == 0, warm.stdout + warm.stderr
+    assert "every input of 2026-08-03 can be produced" in warm.stdout
+    assert plan(warm)["inputs"]["reference_slow"]["origin"] == "synthesized"
+    assert plan(warm)["replica_probe"]["prior_five"] == {
+        "2026-07-27": len(CODES),
+        "2026-07-28": len(CODES),
+        "2026-07-29": len(CODES),
+        "2026-07-30": len(CODES),
+        "2026-07-31": len(CODES),
+    }
+    assert not (tmp_path / "replay").exists()
+    assert _tree(host["data"]) == before
+
+
+def test_synthesizing_a_recorded_day_reports_how_far_it_is_from_the_recording(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    """`--synthesize-sources` on the recorded day: the fidelity check the host can run on
+    2026-09-24. The fixture's Tushare answers match its recording except `market`, which the
+    recording's fixture set to 创业板 for the SSE code too, so exactly that one field differs."""
+
+    _extend_replica_for(host["replica"], TARGET_DATE, minutes=False)
+    cache = tmp_path / "tushare-cache"
+    _fill_tushare_cache(cache, TARGET_DATE)
+    before = _tree(host["data"])
+
+    result = _run(
+        host,
+        tmp_path / "replay",
+        "--synthesize-sources",
+        "--tushare-offline",
+        "--tushare-cache",
+        str(cache),
+        "--step-seconds",
+        "300",
+        "--until",
+        "09:45",
+    )
+
+    output = result.stdout + result.stderr
+    (sandbox,) = (tmp_path / "replay").iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert result.returncode == 0, output[-6000:]
+    assert _tree(host["data"]) == before
+    provenance = summary["inputs"]["provenance"]
+    assert provenance["reference_slow"]["origin"] == "synthesized"
+    assert provenance["reference_slow"]["recorded_batch"].endswith("00000000000000000000.json")
+    assert provenance["auction_match"]["origin"] == "synthesized"
+    #: the recording is compared against, never re-sealed
+    assert summary["inputs"]["reference_batch"] is None
+    assert summary["inputs"]["auction_batches"] == []
+    #: the host's universe generation for the day is the expected-code set
+    assert summary["world"]["auction"]["universe"]["origin"] == "recorded"
+
+    reference = summary["world"]["reference"]["fidelity_vs_recorded"]
+    assert reference["securities"] == {"recorded": 2, "synthesized": 2}
+    assert reference["only_recorded_count"] == reference["only_synthesized_count"] == 0
+    for field in ("close_raw", "prior_adj_factor", "adj_factor"):
+        assert reference[f"daily_{field}_differ"]["count"] == 0, reference
+    assert reference["security_name_differ"]["count"] == 0
+    assert reference["security_market_differ"] == {"count": 1, "codes": ["600000.SH"]}
+    auction = summary["world"]["auction"]["fidelity_vs_recorded"]
+    assert auction["rows"] == {"recorded": 2, "synthesized": 2}
+    assert all(
+        auction[f"{column}_differ"] == 0
+        for column in ("price", "vol", "amount", "pre_close", "turnover_rate", "volume_ratio")
+    ), auction
+    assert summary["chain"]["serving"]["same_day"] is True
+
+
+def test_a_coarser_serving_cadence_is_flagged_and_the_profile_says_where_the_time_went(
+    host: dict[str, Path], tmp_path: Path
+) -> None:
+    result = _run(
+        host,
+        tmp_path / "replay",
+        "--step-seconds",
+        "300",
+        "--until",
+        "09:50",
+        "--serving-every-ticks",
+        "3",
+        "--cprofile",
+        "serving.publisher.v1",
+    )
+
+    output = result.stdout + result.stderr
+    (sandbox,) = (tmp_path / "replay").iterdir()
+    summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
+    assert result.returncode == 0, output[-6000:]
+    assert "WARNING: not production-faithful" in result.stdout
+    assert summary["mode"]["production_faithful"] is False
+    assert summary["verdict"]["production_faithful"] is False
+    assert "every 3 ticks" in summary["mode"]["not_production_faithful_because"][0]
+
+    #: 09:15:07..09:45:07 every 300 s is seven ticks; serving takes the 1st, the 4th and the
+    #: 7th (the last one always), and the day still ends on a same-day generation
+    profile = summary["profile"]
+    assert profile["ticks"] == 7
+    serving = profile["roles"]["serving.publisher.v1"]
+    assert serving["steps"] == 3
+    assert serving["skipped_ticks"] == 4
+    assert profile["roles"]["feature.intraday-pit.v1"]["steps"] == 7
+    assert profile["tick_seconds"]["pre_open"]["ticks"] == 3
+    assert set(profile["tick_seconds"]) == {"pre_open", "morning"}
+    assert (
+        abs(profile["drive_seconds"] - profile["role_seconds"] - profile["harness_seconds"]) < 0.02
+    )
+    assert summary["chain"]["serving"]["same_day"] is True
+
+    text = Path(profile["cprofile"]["serving.publisher.v1"])
+    assert text == sandbox / "profile" / "serving.publisher.v1.0.txt"
+    assert "top 40 by cumulative" in text.read_text(encoding="utf-8")
+    assert (sandbox / "profile" / "serving.publisher.v1.0.pstats").is_file()
