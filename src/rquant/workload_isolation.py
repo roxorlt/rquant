@@ -219,6 +219,7 @@ WORKLOAD_UNIT_SLICES: Mapping[str, str] = {
     "rquant-runtime-watchlist-quote@.service": "rquant-live-runtime.slice",
     "rquant-surge-watch.service": "rquant-live.slice",
     "rquant-tushare-token-reminder.service": "rquant-live.slice",
+    "rquant-web.service": "rquant-serving.slice",
     "rquant-workload-sample.service": "rquant-serving.slice",
 }
 
