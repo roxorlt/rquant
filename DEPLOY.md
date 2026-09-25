@@ -5,6 +5,325 @@
 
 ---
 
+## 2026-09-28 · 待执行 · notifier 切正式推送（影子档 → 正式档），先装含修复的新版本
+
+**状态**：等你操作。本条写在执行之前，不是部署记录；执行完在它上面另写一条「已安装」记录。
+分支 `cc/20260925-notifier-live-cutover`（在 v0.33.23 = `793092fa` 之上），合并、打 tag 之后本文称它 **v0.33.24**。
+
+**一句话**：切正式推送本身只改一个设置、只重启 notifier 一个 unit，代码里没有东西挡住它；但演练发现
+**主机的两台设备 PushDeer 凭据会让 notifier 从第一条信号起每一轮都失败（影子档也一样）**，所以要分两步：
+
+| 步 | 什么时候 | 做什么 | 需要谁 |
+|---|---|---|---|
+| 第一部分 | **周一 09:20 之前**（最好周末休市时做） | 按平常的路线 A 窗口把 v0.33.24 装上，**仍是影子档** | owner 授权装机窗口 + 读 `.env` |
+| 第二部分 | **周一 09:52 检查点通过之后**（约 09:55–10:15） | 只改输入文档里的一个键，装一代新画像，**只重启 notifier** | owner 授权盘中改权威链、重启一个 unit + 读 `.env` |
+
+不做第一部分就**不要**做第二部分：没有修复时切正式，推送会发出去，但 notifier 每一轮都记失败、serving 永远拿不到信号。
+
+### 为什么必须先装 v0.33.24（新发现的阻断）
+
+路由策略给每个通道只写一个收件人 `admin`。主机的 `PUSHDEER_KEYS` 是 owner 的 iPhone 和 Mac 两把 key
+（CLAUDE.md；旧告警日志里的「2/3 成功」也是 2 个 PushDeer + 1 个 PushPlus），而密封给 notifier 的凭据里只有 key、
+没有收件人 id，所以 notifier 自己推断出 `admin.device-01` / `admin.device-02` 两个收件人，把每条路由来的 `admin`
+待发行换成两台设备各一行。批次发完之后，notifier 要发布 `signals` 权威，这一步用的数据模型要求「每条投递的收件人
+必须是路由回执里写的收件人」，于是把两台设备的行判成 `delivery target is outside the frozen route manifest`，整轮
+失败；之后每一轮都带着这几条信号，每一轮都失败。影子档和正式档一样；正式档下推送其实已经发出去了。
+
+生产到现在一条信号都没路由过（周一是第一天），所有测试和 09-25 的主机回放都只用一把测试 key，所以之前没有任何
+东西走到过这里。修复只改了判断规则：收件人是路由收件人本身，或者是它的设备（同一通道、名字为 `admin.<设备>`）
+就放行；别的收件人、只是前缀像的名字（`administrator`、`admin-device-01`）、别的通道仍然拒。数据结构、表结构、
+schema 契约都不变（`src/rquant/serving_read_models.py`，提交 `48ab346e`）。
+
+**主机上可以只读确认自己是不是受影响**（第一部分之前做一次）：
+
+```bash
+ROOT=/home/lighthouse/rquant/data/runtime
+NSVC=svc-f2518f7a4231460f183242dfbaaf34b78603c9f9212c8c76046ab2ef06fd11cc   # notifier.admin.shadow.v1
+jq -c '.degraded_reasons' "$ROOT"/control/notifiers/$NSVC/heartbeats/*.json
+# 出现 "notifier:recipient_ids_inferred:pushdeer" ⇒ 两把以上 key ⇒ 受影响，第一部分必须先做
+```
+
+### 三个旧问题单的核实结论
+
+- **#284（`deploy-production` 同一个 tag 时只跑 preflight）**：问题属实（`src/rquant/ops/production_deploy.py`
+  `deploy()` 在 `previous_sha == target_sha` 时直接返回 `already_current`），但**路线 A 从来不走
+  `deploy-production.sh`**，走的是手工窗口，而手工窗口每一步都从输入文档重新生成画像。所以 #284 对这次切换**不构成
+  阻断**；2026-09-21 那条里「② 卡住（#284）」的说法作废。
+- **#190（发布时 profile_id 不同就拒）**：比的是 root 装在 `/etc/rquant/production-runtime-profile.json` 的
+  **闭包画像**。它的 id 只由解释器闭包（系统 python、ELF 加载器、标准库、共享库、两个 pyz 的摘要、祖先目录）和
+  每个 role 的实例名算出来。每次发版都变的那个 `f4710550…` 是 26 个服务的**运行时画像**，在
+  `data/runtime-profiles/` 下，#190 不看它。投递档位、`suppress_delivery`、凭据、收件人都不进闭包画像；notifier 的
+  服务 id 在三档下都是 `notifier.admin.shadow.v1`（名字里带 shadow 是历史原因，**不能改名**：改名会改实例名，
+  进而改闭包画像 id，那时 #190 才会触发）。演练里 stage 出来的 profile_id 与已装的相同，发布成功，sequence +1。
+  **不触发，不需要改发布原语。**
+- **#270（被 SIGKILL 留下的非 stopped 心跳，新进程拒绝启动 → OnFailure 真推送）**：进程比对的是服务 spec
+  `(service_id, plane, stale_after, producer_commit)`，**不含 settings**。第二部分不换代码，notifier 的 spec 不变，
+  就算它停机时被 SIGKILL，新进程也照常接着那份心跳起来（演练里专门把心跳改成 `running` 再起，照样起来）。
+  **第二部分碰不到 #270。** 第一部分换代码、每个 role 的 spec 都变，会碰到，靠平常的 R-32 挡住（见下）。
+
+### 第一部分：装 v0.33.24（影子档），周一 09:20 之前
+
+就是平常的路线 A 窗口（v0.33.22 那条的 1–7 步），只列与平常不同或要特别看的地方：
+
+1. `${WT}`（bootstrap worktree）切到 v0.33.24。`deploy/` 相对 v0.33.22 **没有任何改动**；`src/` 的改动是
+   `dashboard/app.py`、`signal_family_differential_gate.py`（v0.33.23）和 `serving_read_models.py`（本分支）。
+2. 停 20 个 unit（逐个阻塞式 stop，先看 `vmstat 1 3` 的 b 列为 0）。
+3. inputs 两跑，`--notifier-delivery-mode shadow`；两跑只应在墙钟相关的文件上不同。记下 inputs 的 sha256 和
+   运行时画像 id（下文叫 `P_SHADOW`），第二部分和回滚都要用。
+4. 装前只读检查 `runtime-schema-rollout close-unchanged --dry-run`：`schema_changed: 0`。本版不改任何 channel 形状，
+   `runtime-deployment-profile --apply` 的回执应为 `schema_rollout_plan_ids: []`；ack 全部 `not_current_generation`。
+5. stage（`--legacy-generation current`）+ root publish。stage 的 dry-run 里 `profile_id` 必须等于
+   `jq -r .profile_id /etc/rquant/production-runtime-profile.json`（#190 的前提，本版不动 pyz，应当相等）。
+6. **R-32（#270）**：起任何 unit 之前，`$ROOT/control/*/*/heartbeats/*.json` 里 `status` 不是 `stopped` 的文件
+   全部挪到 `/home/lighthouse/rquant-heartbeats-aside-<日期>/`。这次换代码，每个 role 的 spec 都变，漏挪一份
+   就是一条真推送。
+7. 六组起 20 个 unit。之后看 notifier 心跳：`notifier:shadow_transport` 在、`consecutive_failures` 0。
+
+周一 09:30 之后出第一批信号时，**影子档 notifier 必须能带着当天信号发布 `signals` 权威**——这就是修复在主机上
+生效的证据，也是第二部分的前提（下面第 0 步会查）。
+
+### 第二部分：切正式（只改一个键、只重启 notifier）
+
+**前提**：第一部分已完成；09:31 与 09:52 两个检查点已通过；owner 当场同意。整段只写输入文档、`data/runtime`
+下新的一代 bundle、root 权威链，只停启一个 unit，不碰主库、不动 `deploy/`。
+
+```bash
+WT=/home/lighthouse/rquant-relA            # bootstrap worktree，停在 v0.33.24
+ROOT=/home/lighthouse/rquant/data/runtime
+INPUTS=/home/lighthouse/rquant/data/runtime-production-inputs.json
+PROFILES=/home/lighthouse/rquant/data/runtime-profiles
+NSVC=svc-f2518f7a4231460f183242dfbaaf34b78603c9f9212c8c76046ab2ef06fd11cc
+NUNIT="rquant-runtime-notifier@${NSVC}.service"
+CUT="/usr/bin/python3.11 ${WT}/scripts/notifier_delivery_cutover.py"
+COMMIT=$(git -C "$WT" rev-parse HEAD)      # 必须等于 v0.33.24 的完整 sha
+P_SHADOW=<第一部分记下的运行时画像 id>
+cd "$WT"
+```
+
+**第 0 步：只读预检（任何一条不满足就不切）**
+
+```bash
+git -C "$WT" describe --tags --exact-match          # 期望 v0.33.24
+git -C "$WT" status --porcelain                     # 期望空
+readlink "$ROOT/current"                            # 记下 generations/<N>，回滚要用
+jq '{sequence,state,operation_id,current_generation_id,current_profile_id}' \
+  /var/lib/rquant/runtime-authority/current.json    # 记下 sequence、current_generation_id
+jq '{status,degraded_reasons,consecutive_failures,backlog_count,last_error}' \
+  "$ROOT"/control/notifiers/$NSVC/heartbeats/*.json
+#   期望：degraded_reasons 含 notifier:shadow_transport（可能还有 notifier:recipient_ids_inferred:pushdeer）；
+#   consecutive_failures 0；backlog_count 0；last_error null
+jq '{sequence,generation_id,producer_commit}' \
+  "$ROOT"/live/notifications/$NSVC/serving-authority/current.json   # 期望 producer_commit == $COMMIT
+"$WT/.venv/bin/python" - "$ROOT/live/notifications/$NSVC/notification_state.sqlite3" <<'EOF'
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+print("outbox", dict(c.execute("SELECT status, count(*) FROM delivery_outbox GROUP BY status")))
+print("non-shadow receipts", c.execute(
+    "SELECT count(*) FROM delivery_attempt WHERE provider_receipt NOT LIKE 'shadow:%'").fetchone()[0])
+print("unknown", c.execute("SELECT count(*) FROM delivery_unknown").fetchone()[0])
+EOF
+#   期望：outbox 里只有 succeeded（或 expired），没有 pending / retry / leased；non-shadow 0；unknown 0
+for f in "$ROOT"/control/*/*/heartbeats/*.json; do
+  jq -r '[.service_id,.run_id,.status,.consecutive_failures]|@tsv' "$f"; done | sort > /tmp/cutover-before.tsv
+cp -p "$INPUTS" /home/lighthouse/rquant-inputs-before-live-20260928.json   # 另一份独立副本，留档
+```
+
+`backlog_count` 不是 0，或者有 pending / retry 行，**先等它们在影子档下被消耗完**；这些行在正式档下会真的发出去。
+
+**第 1 步：改一个键**（只写输入文档）
+
+```bash
+$CUT set-mode --inputs "$INPUTS" --from shadow --to live --dry-run
+$CUT set-mode --inputs "$INPUTS" --from shadow --to live
+#   期望："changed_keys": ["notifier_delivery_mode"]，"written": true；记下 sha256_before
+```
+
+**第 2 步：前置 + 运行时画像**
+
+```bash
+./.venv/bin/rquant runtime-production-prerequisites --inputs "$INPUTS" \
+  --expected-commit "$COMMIT" --runtime-mode linux-production          # dry-run，记下 profile_id = P_LIVE
+./.venv/bin/rquant runtime-production-prerequisites --inputs "$INPUTS" \
+  --expected-commit "$COMMIT" --runtime-mode linux-production --apply --profile-id "$P_LIVE"
+./.venv/bin/rquant runtime-production-profile --inputs "$INPUTS" --output-dir "$PROFILES" \
+  --expected-commit "$COMMIT" --runtime-mode linux-production          # dry-run，profile_id 应同为 P_LIVE
+./.venv/bin/rquant runtime-production-profile --inputs "$INPUTS" --output-dir "$PROFILES" \
+  --expected-commit "$COMMIT" --runtime-mode linux-production --apply --profile-id "$P_LIVE"
+$CUT diff-profiles "$PROFILES/$P_SHADOW.json" "$PROFILES/$P_LIVE.json"
+#   期望退出码 0："ok": true，"manifests_compared": 26，
+#   "notifier_differences": ["settings.suppress_delivery"]，"notifier_after": {"paused": false, "suppress_delivery": false}
+```
+
+**第 3 步：新一代 bundle**（需要 `.env` 与 capability 导出，同平常窗口）
+
+```bash
+set -a; . /home/lighthouse/rquant/.env; set +a
+while IFS= read -r line; do export "$line"; done \
+  < <(sudo bash scripts/install-runtime-credential-keys.sh export-capabilities)
+./.venv/bin/rquant runtime-deployment-profile --profile "$PROFILES/$P_LIVE.json" \
+  --runtime-root "$ROOT" --expected-commit "$COMMIT"                   # dry-run
+./.venv/bin/rquant runtime-deployment-profile --profile "$PROFILES/$P_LIVE.json" \
+  --runtime-root "$ROOT" --expected-commit "$COMMIT" --apply --profile-id "$P_LIVE"
+#   期望：previous_generation_hash == 第 0 步的 <N>，schema_rollout_plan_ids == []；记下 generation_hash = <N1>
+$CUT diff-generations "$ROOT/generations/<N>" "$ROOT/generations/<N1>"
+#   期望退出码 0："manifests_byte_identical": 25，schema_contract_differences 只有
+#   content_hash 与 manifest_fingerprints.notifier.admin.shadow.v1
+./.venv/bin/rquant runtime-schema-rollout acknowledge --runtime-root "$ROOT" --dry-run
+./.venv/bin/rquant runtime-schema-rollout acknowledge --runtime-root "$ROOT"
+#   期望：每份计划 not_current_generation，changed 0
+```
+
+> ⚠️ **从这一步 apply 到第 4 步 publish 完成（约 3–5 分钟）之间，任何 runtime unit 都不能重启**：
+> `data/runtime/current` 已经指向 `<N1>`，而权威链还绑着 `<N>`，这时起来的进程会因为「对不上 current」退出，
+> 触发 OnFailure 真推送。正在跑的 20 个进程不受影响（它们只在启动时核对），影子档 notifier 在这段时间里照常消耗
+> 新信号。所以这一段要连着做完，中间不要停下来。
+
+**第 4 步：stage + root 发布**
+
+```bash
+OP=$(/usr/bin/python3.11 -c 'import secrets; print(secrets.token_hex(16))')
+STAGING=/home/lighthouse/rquant/var/authority-staging/twentieth      # 先 ls 确认不存在
+./.venv/bin/python -m rquant.runtime_authority_stage --checkout-root "$WT" --commit "$COMMIT" \
+  --runtime-pyz /usr/local/libexec/rquant-runtime-exec.pyz \
+  --deploy-pyz /usr/local/libexec/rquant-production-deploy.pyz \
+  --system-python /usr/bin/python3.11 --venv-source "$WT/.venv" --staging "$STAGING" \
+  --operation-id "$OP" --legacy-runtime-root /home/lighthouse/rquant/data/runtime \
+  --legacy-generation current | jq '{profile_id,sequence,previous_operation_id,generation_id}'
+#   期望：profile_id == $(jq -r .profile_id /etc/rquant/production-runtime-profile.json)（#190 不触发的前提）；
+#   sequence == 第 0 步 +1；previous_operation_id == 第 0 步的 operation_id
+# 同一条命令加 --apply，stderr 打印 plan.json sha256 = PS
+sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz publish \
+  --staging "$STAGING" --expect-plan-sha256 "$PS" --dry-run
+sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz publish \
+  --staging "$STAGING" --expect-plan-sha256 "$PS"                     # 照平常用 nohup setsid + 采样器
+#   期望：result committed，sequence +1，prior_generation_id == 第 0 步的 current_generation_id
+```
+
+**第 5 步：只重启 notifier**
+
+```bash
+vmstat 1 3                                   # b 列为 0 再动
+sudo systemctl stop "$NUNIT"
+systemctl show -p Result,ExecMainStatus "$NUNIT"      # 期望 Result=success
+jq '{status,stopped_at}' "$ROOT"/control/notifiers/$NSVC/heartbeats/*.json   # 期望 stopped（不是也能起，见 #270）
+sudo systemctl start "$NUNIT"
+```
+
+**第 6 步：切完看什么**（起来后 1–3 分钟内看，第一轮要读一次副本）
+
+```bash
+jq '{status,degraded_reasons,consecutive_failures,last_error,run_id}' \
+  "$ROOT"/control/notifiers/$NSVC/heartbeats/*.json
+#   期望：没有 notifier:shadow_transport；两把 key 时只剩 notifier:recipient_ids_inferred:pushdeer
+#   （有新信号的那一轮还会多一条 notifier:recipient_migration:<n>-><2n>）；consecutive_failures 0；last_error null
+for f in "$ROOT"/control/*/*/heartbeats/*.json; do
+  jq -r '[.service_id,.run_id,.status,.consecutive_failures]|@tsv' "$f"; done | sort > /tmp/cutover-after.tsv
+diff <(cut -f1,2 /tmp/cutover-before.tsv) <(cut -f1,2 /tmp/cutover-after.tsv)
+#   期望：只有 notifier.admin.shadow.v1 一行不同（它换了进程），其余常驻 role 的 run_id 全部不变。
+#   由 timer 触发的 oneshot（retention、lab-jobs、promotions、artifact-catalog、daily-orchestrator、
+#   recovery）这段时间里若正好跑过一次，run_id 本来就会变，不算异常
+```
+
+之后每条新信号：`delivery_attempt.provider_receipt` 以 `pushdeer:` 开头，每条信号两台设备各一行、各推一次；
+serving-authority 的 `sequence` 跟着前进。
+
+**停止条件**（出现任何一条就按下面「回滚」做 R1，然后再判断）：
+
+- 第 0–3 步任何一个「期望」不成立：notifier 还没动，直接停下，用 R3 的 `set-mode` 把输入文档改回 shadow；
+  若第 3 步已经 apply，再做 R3 的 `runtime-deployment-profile` 那条，让 current 回到 `<N>`；
+- 第 4 步发布之后、第 5 步之前发现问题：做 R2–R3（notifier 还是原来的影子档进程，R1、R4 不用做）；
+- 心跳里出现 `notifier:unknown_outcomes:*` / `notifier:confirmed_failures:*` / `notifier:not_attempted:*`，
+  或者 `consecutive_failures` > 0（影子档永远看不见这两类对端失败，切正式后第一轮才可能第一次出现）；
+- 手机收到的推送里有切换之前的信号；
+- 除 notifier 外有别的 role 换了 run_id 或开始连续失败。
+
+### 回滚：几分钟内回到影子档
+
+```bash
+# R1（几秒，立刻不再推送）：干净停机不触发 OnFailure
+sudo systemctl stop "$NUNIT"
+# R2（root，约 1 分钟）：权威链单级回滚，current 回到切换前那一代（它就是现在的 prior）
+OP_RB=$(/usr/bin/python3.11 -c 'import secrets; print(secrets.token_hex(16))')
+sudo /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-production-deploy.pyz rollback --operation-id "$OP_RB"
+#   期望："state": "rolled_back"，"generation_id" == 第 0 步的 current_generation_id，"result": "committed"
+# R3（约 1–2 分钟，要 .env 与 capability 导出）：输入文档改回去，bundle 的 current 回到 <N>
+$CUT set-mode --inputs "$INPUTS" --from live --to shadow     # 期望 sha256_after == 第 1 步的 sha256_before
+./.venv/bin/rquant runtime-deployment-profile --profile "$PROFILES/$P_SHADOW.json" \
+  --runtime-root "$ROOT" --expected-commit "$COMMIT" --apply --profile-id "$P_SHADOW"
+readlink "$ROOT/current"                                     # 期望 generations/<N>（原来那一代被原样复用）
+# R4：起 notifier，心跳里重新出现 notifier:shadow_transport
+sudo systemctl start "$NUNIT"
+```
+
+- **为什么不是「重新 stage 一次 shadow」**：输入全是切换前的，stage 出来的就是切换前那一代，它正是权威链的
+  prior，发布器拒成 `next generation is already recorded`。只能用 R2 的单级回滚。R2 之后状态是 `rolled_back`，
+  下一次正常窗口照常能发布（演练验证过）。
+- R2 与 R3 之间同样有一两分钟「current 与权威链对不上」，这段时间不能有 unit 重启，所以 R2、R3 连着做。
+- 当场拿不到 `.env` 授权时，停在 R1 就是安全状态：不推送，其余 role 照跑，只是 serving 的信号不再更新；
+  收盘后再做 R2–R4。
+
+### 切正式之后，推送怎么走
+
+- **谁发、发给谁**：路由策略只把三个策略的全部动作路由到 `admin` / PushDeer。notifier 用的凭据是第 3 步从 `.env`
+  的 `PUSHDEER_KEYS` 密封进 `/etc/credstore.encrypted/rquant-runtime/instances/<NSVC>/current.cred` 的那几把 key
+  （每个窗口都会重新密封，影子档每一轮也在真的读它），地址是默认的 `https://api2.pushdeer.com/message/push`——
+  **`.env` 里的 `PUSHDEER_ENDPOINT` 不会进 notifier 的凭据**（运行时画像只密封 `PUSHDEER_KEYS` / `PUSHPLUS_TOKENS`）。
+  如果主机的 `.env` 把 `PUSHDEER_ENDPOINT` 改成了别的服务器，请 owner 告诉我们，那时正式档会发到官方地址、对不上。
+  `PUSHPLUS_TOKENS` 也密封了，但路由里没有 PushPlus 目标，所以**美丞收不到路线 A 的推送**。
+  `install-runtime-credential-keys.sh` 管的是 `RQ_*` 签名 key，与 PushDeer 无关。
+- **不会重复发**：每条信号对每台设备只有一行（行 id 由信号 id + 收件人 + 通道算出）；结果不确定（超时、对端没回）
+  的行留在 leased 状态，**生产代码里没有任何地方回收它们**，所以不会重试；这个发送器从不报「对端明确拒绝」，所以
+  也不存在按失败重试。换句话说：每条信号每台设备最多推一次。
+- **影子档发过的不会再发**：影子档把行标成 succeeded，这是终态，不会再被认领；设备迁移也原样保留 succeeded 行。
+  演练里切换前的每一行在切换后逐字段不变，记录器一次都没收到它们。
+- **没有「切换时刻」截止线**：代码里没有「只发某个时刻之后的信号」这种规则。实际的截止线是「影子档 notifier 停下时
+  已经认领的那些」。第 5 步 stop 到 start 之间（十几秒）路由来的新信号，会在正式档第一轮发出去——它们是新鲜的当天
+  信号，不是积压。第 0 步要求 backlog 为 0，就是为了保证第一轮不会冒出一批旧信号。
+- **没有限流**：每 2 秒一轮、一轮最多 128 行。影子档一直在消耗，所以正常情况下第一轮只有新信号；09-24 的回放一整天
+  是 6 条信号，两台设备就是 12 条推送。
+
+### 与旧版 monitor（v0.28.3）会不会重复推送
+
+旧 monitor 不改。它推的是：`price_level`（pool1 / pool2 股票碰到档位，PushDeer + PushPlus）、`pool2_exit`、
+17:00 的 `daily_summary`、`surge_watch`（创业 / 科创爆量，只推 PushDeer）、`pulse_alert`、早报 / 午报、心跳和
+故障告警。路线 A 推的是三个策略的信号：`auction_gap`（竞价缺口，旧版没有对应推送）、`n_shape`（候选**就来自同一批
+pool1 / pool2**）、`growth_board_surge`（创业 / 科创放量，和旧版爆量是同一类现象）。
+
+所以同一只股票可能先后收到两条意思相近的推送：比如一条旧版「600000.SH 名称 40档 ¥x」，一条路线 A
+「[rQuant] 600000.SH 买入观察」。两套系统触发条件不同、标题不同、互不去重，但**不是告警风暴**：路线 A 每条信号
+每台设备只推一次，量级是一天几条到十几条。建议：先保持两套并行几天，由 owner 决定以后是否停掉旧版里被路线 A
+覆盖的场景（`price_level` 与 `surge_watch`）；这需要改旧版配置，本分支不动。
+
+### 需要 owner 单独授权的事项
+
+1. 第一部分的装机窗口（新代码 v0.33.24 装进路线 A 的 role；`deploy/` 不变），以及读生产 `.env`。
+2. 第二部分在盘中写 root 权威链、重启 notifier 一个 unit，以及再读一次 `.env`。
+3. 回滚 R2 用 root 单级回滚（与发布同一类操作）。
+4. 本分支**没有**改 `deploy/systemd`、`deploy/nginx`，**没有**改权威链发布原语（#190 不需要改），不需要任何 unit 改动。
+
+### 演练证据（不联网）
+
+`tests/integration/test_route_a_notifier_live_cutover_e2e.py`，两台设备的 PushDeer 凭据：
+
+| 用例 | 证明了什么 |
+|---|---|
+| `test_the_switch_changes_one_setting_and_publishes_under_the_same_authority_profile` | 改一个键 → 26 个 manifest 只差 notifier 的 `suppress_delivery` → 第三代 bundle（同一个 commit）只差这一份 manifest、零 rollout 计划 → stage 的 profile_id 与已装相同 → 发布 committed、sequence +1 |
+| `test_the_live_notifier_sends_only_what_was_routed_after_the_switch` | 正式档 notifier 压着一份 `running` 旧心跳照常起来；切换前影子档发过的行逐字段不变、一次都没发；切换后的 3 条信号 × 2 台设备 = 6 次推送，经真实 provider → transport → PushDeer 客户端，每次带对应设备的 key |
+| `test_resident_roles_run_through_the_switch_and_only_the_notifier_restarts` | 8 个 role 在自己的循环里跨过切换，run_id 不变、不重启，把切换后的信号送到 serving 并发布新一代 |
+| `test_the_rollback_returns_the_notifier_to_shadow_and_a_later_release_still_publishes` | R2 单级回滚 + R3 复用原来那一代 bundle → notifier 回到影子档；之后下一个版本照常发布 |
+| `test_the_guard_catches_a_real_pushdeer_post` | 反向对照：真客户端被审计钩子在 `getaddrinfo` 拦下并记录 |
+
+「一个字节都不出网」有两层保证：`rquant.notify.client` 里的 `requests.post` 换成记录器；
+`tests/support/outbound_network_guard.py` 的审计钩子拒绝并记下用例运行期间的每一次 DNS 查询和非 AF_UNIX 连接，
+每个用例收尾都断言记录为空。
+
+另有单元测试：`tests/unit/test_serving_read_models.py`、`tests/unit/test_runtime_builder_signal.py`
+（两台设备在影子 / 正式两档都能发布 `signals` 权威，修复前 3 条失败、修复后通过）、
+`tests/unit/test_notifier_delivery_cutover_script.py`（脚本的每个判断对照生产 loader；2026-09-21 条里的「改法 A」
+写出的文档被 loader 拒绝）。
+
+---
+
 ## 2026-09-25 · 已安装 · v0.33.22（第十六窗口，协调者主会话，休市日）
 
 **状态**：**已安装并启动**。代码 `df621ef2`（tag `v0.33.22`，PR #309 merge commit），路线 A bundle 第十五代
@@ -635,6 +954,11 @@ capability 里、凭据仓库读不到，这几类失败在 shadow 下与 live �
 切 live 之后的第一轮心跳要专门看这两个字符串。
 
 ### 档位写在哪儿
+
+> **2026-09-25 补记（以「2026-09-28 · 待执行 · notifier 切正式推送」一条为准）**：下面「改法 A」写出的是
+> `indent=2` 加换行的 JSON，`runtime-production-profile` 读输入文档时要求规范 JSON，会报
+> `persistent JSON is not canonical`，照着敲切不动；改用 `scripts/notifier_delivery_cutover.py set-mode`。
+> 下面关于 #284 的「卡住」只对 `deploy-production.sh` 成立，路线 A 走手工窗口，不受 #284 影响。
 
 发布器不吃命令行档位参数。它读的是 `RQUANT_RUNTIME_PRODUCTION_INPUTS` 指的那份输入文档
 （生产机上是 `/home/lighthouse/rquant/data/runtime-production-inputs.json`），用

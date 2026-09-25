@@ -6,6 +6,25 @@
 
 ### Added
 
+- **notifier 切正式推送的三项核对脚本 + 不联网的切换演练（2026-09-28 窗口）**：
+  `scripts/notifier_delivery_cutover.py`（只用标准库，可以从新 tag 用 `git show` 取出来，在停在已装 tag 的
+  bootstrap worktree 旁边跑）三个子命令：`set-mode` 只改输入文档里的 `notifier_delivery_mode` 一个键，写出的是
+  规范 JSON、0600、单链接、原子替换，改回去逐字节还原（2026-09-21 DEPLOY 里的「改法 A」写的是 `indent=2` 加换行，
+  `load_production_runtime_profile_inputs` 按「persistent JSON is not canonical」直接拒，从来切不动）；
+  `diff-profiles` 只放行「profile_id + notifier 的投递开关」这一处不同；`diff-generations` 只放行两代 bundle 之间
+  notifier manifest 的投递开关，以及 `schema-contracts.json` 里 notifier 的 manifest 指纹和它自己的哈希。
+  演练 `tests/integration/test_route_a_notifier_live_cutover_e2e.py` 在开盘日世界（两代 bundle、真实发布的
+  权威链、每个 role 在自己 unit 的 `ReadWritePaths` 里、两台设备的 PushDeer 凭据）上按周一的顺序走完：影子档先
+  投递一批（全是 `shadow:` 回执）→ 改一个键 → 前置 / 画像 / 第三代 bundle（同一个 commit）/ ack / stage /
+  root 发布，**authority profile id 不变、sequence +1**（#190 比的是装机闭包画像，投递档位动不了它）→ 只重启
+  notifier：它压着一份被非干净停机留下的 `running` 心跳照样起来（服务 spec 是
+  `(service_id, plane, stale_after, producer_commit)`，不含 settings，#270 触发不了），影子期投递过的行一行不变，
+  切换之后路由的信号经真实 provider → transport → PushDeer 客户端按设备各发一次；另有八个常驻 role 在自己的循环
+  里跨过这次切换、不重启就把切换后的信号送到 serving；回滚（root 单级回滚 + 重新应用切换前的画像）回到影子档，
+  之后的版本照常能发布。**一个字节都不出网**：`rquant.notify.client` 里的 `requests.post` 换成记录器，
+  `tests/support/outbound_network_guard.py` 用审计钩子拒绝并记下用例运行期间的每一次 DNS 查询和非 AF_UNIX 连接，
+  收尾断言为空，另有反向对照证明真客户端会在 `getaddrinfo` 被拦下。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
@@ -211,6 +230,18 @@
   **`deploy/systemd/` 改动，部署前必须在云端 `systemd-analyze verify` 通过。**
 
 ### Fixed
+
+- **两台设备的 PushDeer 凭据让 notifier 每一轮都发布失败，影子档也一样**：路由策略只给每个通道写一个逻辑收件人
+  `admin`；主机的 `PUSHDEER_KEYS` 是 owner 的 iPhone 与 Mac 两把 key，密封进 capability 的只有 key、没有收件人
+  id，于是 notifier 推断出 `admin.device-01` / `admin.device-02`，冻结的别名迁移在认领之前把每一条路由来的
+  `admin` 行换成两台设备各一行。`ServingReadModelInput` 却要求每条投递的目标都在路由回执的目标里，于是批次跑完
+  之后的 `signals` 发布把设备行判成「delivery target is outside the frozen route manifest」，整轮失败——从第一条
+  路由信号起每一轮都失败，影子档与正式档一样；正式档下推送已经发出，两档下 serving 都永远拿不到信号。生产上
+  至今没有路由过一条信号（09-28 是第一天），所有 e2e 与主机回放都只用一把测试 key，所以没有任何东西走到过这条路。
+  现在投递目标是路由目标本身，**或者是它的设备**（同一通道、收件人 id 为 `<路由收件人>.<设备>`，即推断出的
+  `admin.device-NN` 或显式配置的 `admin.iphone` 这类）就算在路由清单之内；路由从没点过的收件人、只是前缀相像的
+  名字（`administrator`、`admin-device-01`）、空设备名、以及别的通道上的任何收件人仍然拒。载荷模型、表结构、
+  schema 契约都不变（`src/rquant/serving_read_models.py`）。
 
 - **健康看板 `dashboard/app.py` 遇到新运行时的空值 / 过期日期直接崩溃，往下所有 section 都不渲染**：`dashboard_summary`
   汇总行由新 runtime_health 权威产出，旧库计数（`daily_bar_rows`、`monitor_event_rows`、`latest_daily_bar`、

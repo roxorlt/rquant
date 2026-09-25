@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,8 @@ from typing import Any
 import pytest
 
 import scripts.build_runtime_production_inputs as generator
+from rquant.delivery_contracts import DeliveryChannel, OutboxStatus
+from rquant.runtime_builder_signal import notifier_builder
 from rquant.runtime_production_profile import (
     build_production_runtime_profile,
     load_production_runtime_profile_inputs,
@@ -31,6 +34,7 @@ from tests.unit.test_build_runtime_production_inputs import (
     _argv,
     _write_calendar_database,
 )
+from tests.unit.test_runtime_builder_signal import NOW, _notifier_manifest, _Provider, _seed_outbox
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "notifier_delivery_cutover.py"
@@ -330,3 +334,41 @@ def test_diff_generations_allows_the_notifier_fingerprint_and_refuses_a_channel(
     assert code == 1
     assert summary is not None
     assert summary["unexpected_differences"] == ["schema-contracts.json: channels[0].shape"]
+
+
+def test_the_deploy_entry_outbox_check_runs_against_a_real_notifier_store(tmp_path: Path) -> None:
+    """The read-only outbox check of the 2026-09-28 DEPLOY entry, lifted out of the file.
+
+    The step-0 gate reads the notifier's own store with a Python heredoc; this case runs
+    that heredoc, byte for byte as DEPLOY.md has it, against a real `NotificationStateStore`
+    holding one shadow delivery, so a renamed table or column makes this red instead of
+    making the operator's gate fail on Monday.
+    """
+
+    deploy = (REPO_ROOT / "DEPLOY.md").read_text(encoding="utf-8")
+    (snippet,) = re.findall(
+        r"<<'EOF'\n(import sqlite3, sys\n.*?non-shadow receipts.*?)\nEOF", deploy, re.S
+    )
+    assert "mode=ro" in snippet
+
+    state = _seed_outbox(tmp_path)
+    notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path, suppress_delivery=True))()
+    (record,) = state.outbox_records()
+    assert record.status is OutboxStatus.SUCCEEDED
+
+    completed = subprocess.run(
+        [sys.executable, "-", str(tmp_path / "notification-state.sqlite3")],
+        input=snippet,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        "outbox {'succeeded': 1}",
+        "non-shadow receipts 0",
+        "unknown 0",
+    ]
