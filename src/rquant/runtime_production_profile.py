@@ -815,6 +815,18 @@ def _instance_name(service_id: str) -> str:
     return "svc-" + hashlib.sha256(service_id.encode("utf-8")).hexdigest()
 
 
+#: `serving.publisher.v1`'s pause between two rounds (the loop sleeps this long after each
+#: step). Every round reads and re-validates all six source authorities -- the market-wide
+#: reference-slow projections above all -- whether or not anything changed, which the
+#: 2026-09-24 host replay measured at 13.7 s a round (max 15.9 s): at 30 s that is about a
+#: third of a core of the two the whole runtime is given. 60 s keeps it near a fifth until
+#: the incremental publish exists (docs/architecture/serving-incremental-publish.md), and
+#: bounds the delay from a signal reaching the notifier's authority to a serving
+#: generation that carries it by 60 s plus one step (about 76 s on the host, 46 s before);
+#: the heartbeat stays inside `stale_after_seconds` (120 s).
+SERVING_PUBLISHER_INTERVAL_SECONDS = 60
+
+
 def _manifest(
     inputs: ProductionRuntimeProfileInputs,
     *,
@@ -2016,7 +2028,7 @@ def build_production_runtime_profile(
             service_id=serving_id,
             kind=RuntimeServiceKind.SERVING_PUBLISHER,
             plane=RuntimeServicePlane.SERVING,
-            interval_seconds=30,
+            interval_seconds=SERVING_PUBLISHER_INTERVAL_SECONDS,
             stale_after_seconds=120,
             settings={
                 "serving_root": str(root / "serving"),
