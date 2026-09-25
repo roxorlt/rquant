@@ -41,8 +41,10 @@ function run(command, args) {
   }
 }
 
+// --full-name: paths relative to the repository root ("web/..."), whatever the cwd.
 const ignored = git(
   "ls-files",
+  "--full-name",
   "--others",
   "--ignored",
   "--exclude-standard",
