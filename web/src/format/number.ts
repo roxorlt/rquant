@@ -61,3 +61,20 @@ export function formatSignedPercent(value: number | null | undefined, digits = 2
   }
   return `${value > 0 ? "+" : MINUS}${fixed}%`;
 }
+
+/** A whole count with thousands separators, e.g. 5,556. */
+export function formatCount(value: number | null | undefined): string {
+  return formatNumber(value, 0);
+}
+
+/** A money amount with a sign, e.g. +42.00 / −10.00 (colour it with toneOf). */
+export function formatSignedNumber(value: number | null | undefined, digits = 2): string {
+  if (isMissing(value)) {
+    return EMPTY;
+  }
+  const fixed = formatNumber(Math.abs(value), digits);
+  if (Number(Math.abs(value).toFixed(digits)) === 0) {
+    return formatNumber(0, digits);
+  }
+  return `${value > 0 ? "+" : MINUS}${fixed}`;
+}

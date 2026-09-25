@@ -27,7 +27,7 @@ export function UserMenu({ viewer }: { viewer: string | null | undefined }) {
     },
     { key: "d2", type: "divider" },
     { key: "reports", label: "报告", onSelect: () => navigate("/reports") },
-    { key: "audit", label: "操作记录（S1 批次后开放）", disabled: true },
+    { key: "audit", label: "操作记录 · 即将上线", disabled: true },
     { key: "licenses", label: "开源许可", onSelect: () => navigate("/licenses") },
   ];
   return (

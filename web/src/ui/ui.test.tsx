@@ -7,30 +7,48 @@ import { ChangeText } from "./ChangeText";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { KpiStrip } from "./KpiStrip";
 import { ServingBanner, servingBannerMessage } from "./ServingBanner";
+import { StatusBadge } from "./StatusBadge";
 import { antdThemeFor } from "./theme";
 import { UiProvider } from "./UiProvider";
 
 describe("ServingBanner", () => {
-  it("matches the Streamlit wording for the four states", () => {
-    expect(servingBannerMessage("ready", "ok", "数据")).toBeNull();
-    expect(servingBannerMessage("stale", "built_at 旧", "数据")).toEqual({
+  it("shows the envelope's one-sentence message, with a fallback per state", () => {
+    expect(servingBannerMessage("ready", "ignored")).toBeNull();
+    expect(servingBannerMessage("stale", "数据已 12 分钟没有更新。")).toEqual({
       tone: "warn",
-      text: "数据已过期：built_at 旧",
+      text: "数据已 12 分钟没有更新。",
     });
-    expect(servingBannerMessage("degraded", "x", "数据")?.text).toBe("数据处于降级状态：x");
-    expect(servingBannerMessage("unavailable", "  ", "数据")).toEqual({
+    expect(servingBannerMessage("degraded", null)?.text).toBe(
+      "最新一批数据没有通过校验，暂时显示上一批。",
+    );
+    expect(servingBannerMessage("unavailable", "  ")).toEqual({
       tone: "crit",
-      text: "数据不可用：未提供状态详情",
+      text: "暂时读不到数据，请稍后刷新。",
     });
   });
 
-  it("renders nothing when ready, a status when degraded and an alert when unavailable", () => {
-    const { rerender, container } = render(<ServingBanner state="ready" detail="" label="数据" />);
+  it("renders nothing when ready, a status when stale and an alert when unavailable", () => {
+    const { rerender, container } = render(<ServingBanner state="ready" message={null} />);
     expect(container).toBeEmptyDOMElement();
-    rerender(<ServingBanner state="degraded" detail="x" label="数据" />);
-    expect(screen.getByRole("status")).toHaveAttribute("data-state", "degraded");
-    rerender(<ServingBanner state="unavailable" detail="y" label="数据" />);
-    expect(screen.getByRole("alert")).toHaveTextContent("数据不可用：y");
+    rerender(<ServingBanner state="stale" message="数据已 12 分钟没有更新。" detail="x" />);
+    expect(screen.getByRole("status")).toHaveAttribute("data-state", "stale");
+    expect(screen.getByRole("status")).toHaveTextContent("数据已 12 分钟没有更新。详情");
+    rerender(<ServingBanner state="unavailable" message="暂时读不到数据。" action="看系统健康" />);
+    expect(screen.getByRole("alert")).toHaveTextContent("暂时读不到数据。看系统健康");
+  });
+
+  it("keeps the technical detail out of the text until hovered", async () => {
+    const user = userEvent.setup();
+    render(
+      <ThemeProvider>
+        <UiProvider>
+          <ServingBanner state="stale" message="数据没有按时更新。" detail="built_at 900s old" />
+        </UiProvider>
+      </ThemeProvider>,
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent("built_at");
+    await user.hover(screen.getByText("详情"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("built_at 900s old");
   });
 });
 
@@ -58,11 +76,38 @@ describe("small building blocks", () => {
     expect(screen.getByRole("region", { name: "今日关键数字" })).toHaveTextContent("今日候选18只");
   });
 
-  it("disables a button with a visible reason", () => {
-    render(<Button disabledReason="S1 批次后开放">操作记录</Button>);
+  it("disables a button and explains why in a tooltip", async () => {
+    const user = userEvent.setup();
+    render(
+      <ThemeProvider>
+        <UiProvider>
+          <Button disabledReason="即将上线">操作记录</Button>
+        </UiProvider>
+      </ThemeProvider>,
+    );
     const button = screen.getByRole("button", { name: "操作记录" });
     expect(button).toBeDisabled();
-    expect(button).toHaveAttribute("title", "S1 批次后开放");
+    expect(button).toHaveAccessibleDescription("即将上线");
+    expect(button).not.toHaveAttribute("title");
+    await user.hover(button.parentElement as HTMLElement);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("即将上线");
+  });
+
+  it("draws a status as icon, colour and a short word, with the reason on hover", async () => {
+    const user = userEvent.setup();
+    render(
+      <ThemeProvider>
+        <UiProvider>
+          <StatusBadge state="waiting" label="等待开盘" reason="盘中服务，休市日不运行" />
+        </UiProvider>
+      </ThemeProvider>,
+    );
+    const badge = screen.getByText("等待开盘").closest(".status");
+    expect(badge).toHaveAttribute("data-state", "waiting");
+    expect(badge?.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    expect(document.body).not.toHaveTextContent("休市日不运行");
+    await user.hover(screen.getByText("等待开盘"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("盘中服务，休市日不运行");
   });
 });
 

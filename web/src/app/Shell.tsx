@@ -1,8 +1,8 @@
 import { Suspense, useCallback, useEffect, useState } from "react";
-import { Outlet, ScrollRestoration, useLocation, useMatches } from "react-router";
+import { Link, Outlet, ScrollRestoration, useLocation, useMatches } from "react-router";
 import { useMeta } from "@/api/useMeta";
 import { readPreference, writePreference } from "@/theme/storage";
-import { ServingBanner } from "@/ui";
+import { PageSkeleton, ServingBanner } from "@/ui";
 import { PhoneNav } from "./PhoneNav";
 import { APP_TITLE } from "./pages";
 import { RAIL_STORAGE_KEY, Rail } from "./Rail";
@@ -25,12 +25,13 @@ function usePageTitle(): void {
   }, [title]);
 }
 
-function PageLoading() {
-  return (
-    <div className="page" aria-busy="true">
-      <p className="hint">页面加载中…</p>
-    </div>
-  );
+/** The banner's way out: to 系统健康, unless the reader is already there. */
+function HealthLink() {
+  const location = useLocation();
+  if (location.pathname === "/health") {
+    return null;
+  }
+  return <Link to="/health">看系统健康</Link>;
 }
 
 /** The app frame: top bar, left rail, content column and the phone sheet. */
@@ -60,12 +61,7 @@ export function Shell() {
 
   return (
     <div className="shell">
-      <Topbar
-        meta={envelope}
-        metaFailed={failed}
-        navOpen={navOpen}
-        onOpenNav={() => setNavOpen(true)}
-      />
+      <Topbar meta={envelope} metaReceivedAt={meta.dataUpdatedAt} metaFailed={failed} />
       <div className={railCollapsed ? "app rail-min" : "app"}>
         <Rail collapsed={railCollapsed} onToggle={toggleRail} />
         <main className="content" id="content">
@@ -73,23 +69,24 @@ export function Shell() {
             {failed ? (
               <ServingBanner
                 state="unavailable"
-                label="网页接口"
+                message="连不上网页接口，请稍后刷新页面。"
                 detail={meta.error instanceof Error ? meta.error.message : "无法连接"}
               />
             ) : envelope ? (
               <ServingBanner
                 state={envelope.serving.state}
+                message={envelope.serving.message}
                 detail={envelope.serving.detail}
-                label="运行时数据"
+                action={<HealthLink />}
               />
             ) : null}
-            <Suspense fallback={<PageLoading />}>
+            <Suspense fallback={<PageSkeleton />}>
               <Outlet />
             </Suspense>
           </div>
         </main>
       </div>
-      <PhoneNav open={navOpen} onClose={() => setNavOpen(false)} />
+      <PhoneNav open={navOpen} onOpen={() => setNavOpen(true)} onClose={() => setNavOpen(false)} />
       <ScrollRestoration />
     </div>
   );

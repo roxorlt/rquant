@@ -66,3 +66,13 @@ export function formatAge(seconds: number): string {
   }
   return `${Math.floor(seconds / 86400)} 天前`;
 }
+
+/** "09-24 周四" for a "YYYY-MM-DD" trade date. */
+export function formatTradeDate(isoDate: string): string {
+  return `${isoDate.slice(5)} ${weekdayOf(isoDate)}`;
+}
+
+/** "YYYY-MM-DD" of an instant, in Shanghai. */
+export function shanghaiDateOf(at: string): string {
+  return DATE_FORMAT.format(new Date(at));
+}

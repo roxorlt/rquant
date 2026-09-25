@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { metaEnvelope } from "@/test/fixtures";
+import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { metaHandler, server } from "@/test/server";
 import { NAV_GROUPS, PAGES } from "./pages";
@@ -20,16 +21,17 @@ describe("app shell", () => {
       "aria-current",
       "page",
     );
-    expect(screen.getByText("M1 开发中")).toBeInTheDocument();
     await waitFor(() => expect(document.title).toBe("总览 · rQuant 投研"));
   });
 
-  it.each(PAGES.map((page) => [page.path, page.title, page.schedule] as const))(
-    "route %s renders the %s placeholder",
-    async (path, title, schedule) => {
+  it.each(PAGES.filter((page) => !page.ready).map((page) => [page.path, page.title] as const))(
+    "route %s shows a clean 即将上线 card for %s",
+    async (path, title) => {
       renderApp(path);
       expect(await screen.findByRole("heading", { level: 1, name: title })).toBeInTheDocument();
-      expect(screen.getByText(schedule)).toBeInTheDocument();
+      const card = screen.getByRole("region", { name: "即将上线" });
+      expect(card).toHaveTextContent(PAGES.find((page) => page.path === path)?.summary ?? "");
+      expect(findJargon(document.body.textContent ?? "")).toEqual([]);
     },
   );
 
@@ -44,34 +46,71 @@ describe("app shell", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the generation marker, market phase and viewer from /api/v1/meta", async () => {
+  it("shows the data chip in plain words and keeps the version in its tooltip", async () => {
+    const user = userEvent.setup();
     renderApp("/overview");
-    expect(await screen.findByText("a1b2c3d4")).toBeInTheDocument();
-    expect(screen.getByText("· 3 分钟前")).toBeInTheDocument();
-    expect(screen.getByText("· 正常")).toBeInTheDocument();
+    const chip = await screen.findByText("数据 3 分钟前更新");
+    expect(chip.closest(".gen-tag")).toHaveAttribute("data-state", "ready");
+    expect(screen.queryByText(/a1b2c3d4/)).not.toBeInTheDocument();
     expect(screen.getByText("连续竞价").closest(".phase")).toHaveTextContent("市场阶段：连续竞价");
     expect(screen.getByText("2026-09-24")).toBeInTheDocument();
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(document.querySelector(".banner")).toBeNull();
+    await user.hover(chip);
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent("数据版本a1b2c3d4e5f6");
+    expect(tip).toHaveTextContent("2026-09-24 15:31:00");
   });
 
-  it("shows the serving banner when the generation is degraded", async () => {
-    server.use(
-      metaHandler(metaEnvelope({ state: "degraded", detail: "serving generation degraded: x" })),
+  it("calls a holiday 休市 from the calendar and names the next trading day", async () => {
+    const holiday = metaEnvelope({
+      phase: "non_trading_day",
+      phaseLabel: "休市",
+      isTradingDay: false,
+    });
+    holiday.data.market = {
+      ...holiday.data.market,
+      trade_date: "2026-09-25",
+      previous_trading_day: "2026-09-24",
+      next_trading_day: "2026-09-28",
+    };
+    server.use(metaHandler(holiday));
+    renderApp("/overview");
+    expect(await screen.findByText("休市")).toBeInTheDocument();
+    expect(screen.getByText("2026-09-25")).toBeInTheDocument();
+    expect(screen.getByText("下一交易日 09-28 周一")).toBeInTheDocument();
+    const topbar = document.querySelector(".topbar") as HTMLElement;
+    expect(topbar).not.toHaveTextContent("· 交易日");
+    expect(topbar).toHaveTextContent("2026-09-25 周五");
+  });
+
+  it("shows the banner's one sentence and a way to 系统健康 when the data is stale", async () => {
+    const stale = metaEnvelope({ state: "stale", detail: "serving generation stale: 900s" });
+    stale.serving.message = "数据已 15 分钟没有更新，页面上的数字可能不是最新的。";
+    server.use(metaHandler(stale));
+    renderApp("/overview");
+    const text = await screen.findByText("数据已 15 分钟没有更新，页面上的数字可能不是最新的。");
+    const banner = text.closest(".banner") as HTMLElement;
+    expect(banner).toHaveAttribute("role", "status");
+    expect(banner).not.toHaveTextContent("serving");
+    expect(within(banner).getByRole("link", { name: "看系统健康" })).toHaveAttribute(
+      "href",
+      "/health",
     );
+  });
+
+  it("shows no banner for degraded datasets inside a fresh generation", async () => {
+    server.use(metaHandler(metaEnvelope({ state: "ready" })));
     renderApp("/health");
-    expect(await screen.findByRole("status")).toHaveTextContent(
-      "运行时数据处于降级状态：serving generation degraded: x",
-    );
+    expect(await screen.findByRole("heading", { level: 1, name: "系统健康" })).toBeInTheDocument();
+    expect(document.querySelector(".banner")).toBeNull();
   });
 
   it("says the API is unreachable instead of showing a quiet page", async () => {
     const { http, HttpResponse } = await import("msw");
     server.use(http.get("*/api/v1/meta", () => HttpResponse.json({}, { status: 502 })));
-    renderApp("/overview");
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "网页接口不可用：网页 API 返回 HTTP 502",
-    );
-    expect(screen.getByText("数据代 未连接")).toBeInTheDocument();
+    renderApp("/datacenter");
+    expect(await screen.findByRole("alert")).toHaveTextContent("连不上网页接口，请稍后刷新页面。");
+    expect(screen.getByText("数据 未连接")).toBeInTheDocument();
   });
 });
 
@@ -137,10 +176,21 @@ describe("navigation", () => {
     expect(window.localStorage.getItem("rq.rail")).toBe("full");
   });
 
+  it("puts the most used pages in the phone tab bar", async () => {
+    renderApp("/overview");
+    const bar = screen.getByRole("navigation", { name: "常用页面" });
+    expect(
+      within(bar)
+        .getAllByRole("link")
+        .map((link) => link.textContent),
+    ).toEqual(["总览", "盯盘", "全景", "健康"]);
+    expect(within(bar).getByRole("link", { name: "总览" })).toHaveAttribute("aria-current", "page");
+  });
+
   it("opens the phone navigation sheet and closes it after choosing a page", async () => {
     const user = userEvent.setup();
     const { router } = renderApp("/overview");
-    const opener = screen.getByRole("button", { name: "打开导航" });
+    const opener = screen.getByRole("button", { name: "更多页面" });
     await user.click(opener);
     const sheet = await screen.findByRole("navigation", { name: "页面导航" });
     expect(opener).toHaveAttribute("aria-expanded", "true");

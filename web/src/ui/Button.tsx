@@ -1,11 +1,12 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { Tip } from "./Tip";
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: "default" | "primary" | "ghost";
   size?: "md" | "sm";
   /**
-   * Why the button cannot be used right now. Disables it and shows the reason as
-   * its tooltip and accessible description (v2: no silent grey buttons).
+   * Why the button cannot be used right now. Disables it and shows the reason in a
+   * tooltip and as its accessible description (v2: no silent grey buttons).
    */
   disabledReason?: string;
   children: ReactNode;
@@ -30,16 +31,18 @@ export function Button({
   ]
     .filter(Boolean)
     .join(" ");
-  return (
+  const button = (
     <button
       {...rest}
       type={type}
       className={classes}
       disabled={disabled || disabledReason !== undefined}
-      title={disabledReason ?? title}
+      title={disabledReason === undefined ? title : undefined}
       aria-description={disabledReason}
     >
       {children}
     </button>
   );
+  // A disabled button gets no pointer events, so the tip hangs on a wrapper.
+  return disabledReason === undefined ? button : <Tip content={disabledReason}>{button}</Tip>;
 }

@@ -1,12 +1,14 @@
 /**
- * Data-state banner for every page that reads Serving data. The wording and
- * the four states match the Streamlit pages' render_serving_state_banner
- * (src/rquant/dashboard/serving_page_ui.py): nothing is shown when the data
- * is ready, a warning when it is stale or degraded, an error when it is
- * unavailable.
+ * The data-state banner. It appears only when the page data itself is in question (the
+ * generation is stale, a newer one failed verification, or nothing can be read) and says
+ * so in one short sentence with what to do; the technical reason is in a tooltip.
+ * Per-dataset freshness is not a banner: it is shown as data where it matters
+ * (web/CLAUDE.md 「数据状态横幅」).
  */
 
+import type { ReactNode } from "react";
 import type { components } from "@/api/schema";
+import { Tip } from "./Tip";
 
 export type ServingState = components["schemas"]["ServingState"];
 
@@ -15,44 +17,53 @@ export interface ServingBannerMessage {
   text: string;
 }
 
+const FALLBACK: Record<Exclude<ServingState, "ready">, string> = {
+  stale: "数据已经一段时间没有更新，页面上的数字可能不是最新的。",
+  degraded: "最新一批数据没有通过校验，暂时显示上一批。",
+  unavailable: "暂时读不到数据，请稍后刷新。",
+};
+
 export function servingBannerMessage(
   state: ServingState,
-  detail: string,
-  label: string,
+  message: string | null | undefined,
 ): ServingBannerMessage | null {
-  const reason = detail.trim() || "未提供状态详情";
-  switch (state) {
-    case "ready":
-      return null;
-    case "stale":
-      return { tone: "warn", text: `${label}已过期：${reason}` };
-    case "degraded":
-      return { tone: "warn", text: `${label}处于降级状态：${reason}` };
-    case "unavailable":
-      return { tone: "crit", text: `${label}不可用：${reason}` };
+  if (state === "ready") {
+    return null;
   }
+  return {
+    tone: state === "unavailable" ? "crit" : "warn",
+    text: message?.trim() || FALLBACK[state],
+  };
 }
 
 export interface ServingBannerProps {
   state: ServingState;
-  detail: string;
-  /** What the data is, e.g. "运行控制台数据". */
-  label: string;
+  message?: string | null;
+  /** Technical reason, for the tooltip. */
+  detail?: string | null;
+  /** What to do, e.g. a link to 系统健康. */
+  action?: ReactNode;
 }
 
-export function ServingBanner({ state, detail, label }: ServingBannerProps) {
-  const message = servingBannerMessage(state, detail, label);
-  if (message === null) {
+export function ServingBanner({ state, message, detail, action }: ServingBannerProps) {
+  const banner = servingBannerMessage(state, message);
+  if (banner === null) {
     return null;
   }
   return (
     <div
-      className={`banner ${message.tone}`}
-      role={message.tone === "crit" ? "alert" : "status"}
+      className={`banner ${banner.tone}`}
+      role={banner.tone === "crit" ? "alert" : "status"}
       data-state={state}
     >
       <span className="d" aria-hidden="true" />
-      <span>{message.text}</span>
+      <span className="banner-text">{banner.text}</span>
+      {detail ? (
+        <Tip content={<span className="tip-detail">{detail}</span>} placement="bottom">
+          <span className="banner-more">详情</span>
+        </Tip>
+      ) : null}
+      {action ? <span className="banner-action">{action}</span> : null}
     </div>
   );
 }

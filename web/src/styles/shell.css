@@ -37,6 +37,9 @@
 .brand-name {
   font: 600 16px / 1 var(--font-head);
 }
+.tb-status {
+  display: contents;
+}
 .tb-day {
   font-size: 13px;
   color: var(--muted);
@@ -75,7 +78,12 @@
   color: var(--muted);
   font-size: 12px;
 }
-/* Serving generation marker (replaces the prototype's "示例数据" tag). */
+.tb-next {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* Page-data chip: "数据 1 分钟前更新"; version and datasets in its tooltip. */
 .gen-tag {
   display: inline-flex;
   align-items: center;
@@ -88,6 +96,13 @@
   white-space: nowrap;
   background: var(--idle-weak);
   color: var(--idle-t);
+  cursor: default;
+}
+.gen-tag .gdot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
 }
 .gen-tag[data-state="ready"] {
   background: var(--ok-weak);
@@ -108,6 +123,11 @@
   width: 260px;
   max-width: 100%;
   margin-block: 0;
+}
+.search .search-tip {
+  position: relative;
+  display: block;
+  width: 100%;
 }
 .search svg {
   position: absolute;
@@ -265,6 +285,11 @@
   }
 }
 
+/* ---------- phone tab bar (bottom, within thumb reach) ---------- */
+.tabbar {
+  display: none;
+}
+
 /* ---------- phone navigation sheet (content of the bottom drawer) ---------- */
 .sheet-nav .nav-group {
   padding-inline: 4px;
@@ -286,31 +311,75 @@
   }
   .content {
     padding-inline: 16px;
-    padding-block: 16px 64px;
+    padding-block: 16px calc(88px + env(safe-area-inset-bottom, 0px));
   }
-  .topbar {
-    flex-wrap: wrap;
-    gap: 8px;
-    padding-inline: 12px;
+  .tabbar {
+    position: fixed;
+    inset: auto 0 0;
+    z-index: 45;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    background: var(--surface);
+    border-top: 1px solid var(--rule);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
-  .phase {
-    margin-left: auto;
+  .tabbar .tab {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-height: 56px;
+    border: 0;
+    background: none;
+    color: var(--muted);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
   }
-  .tb-day {
-    order: 5;
-    font-size: 12px;
+  .tabbar .tab:hover {
+    text-decoration: none;
   }
-  .tb-day .long {
+  .tabbar .tab[aria-current="page"] {
+    color: var(--accent-t);
+    font-weight: 500;
+  }
+  .tb-next {
     display: none;
   }
-  .gen-tag {
-    order: 6;
+  /* Two rows: brand + actions, then the day, the phase and the data chip. */
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    padding-inline: 12px;
+  }
+  .brand {
+    margin-right: auto;
+  }
+  .tb-status {
+    order: 9;
+    flex: 1 1 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .tb-day {
+    font-size: 12px;
+  }
+  .phase {
+    height: 24px;
+    font-size: 12px;
   }
   .search {
-    order: 7;
+    order: 8;
     flex: 1 1 140px;
     margin-left: 0;
     width: auto;
+  }
+  /* A disabled search only takes room on a phone. */
+  .search.is-soon {
+    display: none;
   }
   .ai-btn .lbl,
   .theme-btn {

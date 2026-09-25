@@ -23,6 +23,8 @@ export interface DataColumn<T> {
   /** Long text that wraps instead of widening the table. */
   wrap?: boolean;
   sortable?: boolean;
+  /** Secondary columns are hidden on phones (≤ 760 px) to keep rows one-hand readable. */
+  secondary?: boolean;
 }
 
 export interface DataTableProps<T> {
@@ -35,7 +37,7 @@ export interface DataTableProps<T> {
   /** Enables single-row selection (click, Enter or Space; arrows move). */
   onSelect?: (row: T) => void;
   selectedKey?: string | null;
-  emptyText?: string;
+  emptyText?: ReactNode;
   /**
    * Scroll height in px. With a height the header sticks and, above
    * `virtualizeFrom` rows, only the visible rows are rendered.
@@ -119,10 +121,11 @@ export function DataTable<T>({
   const byId = useMemo(() => new Map(columns.map((column) => [column.id, column])), [columns]);
   const cellClass = (id: string): string | undefined => {
     const column = byId.get(id);
-    if (column?.numeric) {
-      return "num";
-    }
-    return column?.wrap ? "wrap" : undefined;
+    const classes = [
+      column?.numeric ? "num" : column?.wrap ? "wrap" : "",
+      column?.secondary ? "col-secondary" : "",
+    ].filter(Boolean);
+    return classes.length ? classes.join(" ") : undefined;
   };
 
   const sortedRows = table.getRowModel().rows;
@@ -189,7 +192,7 @@ export function DataTable<T>({
                   <th
                     key={header.id}
                     scope="col"
-                    className={byId.get(header.column.id)?.numeric ? "num" : undefined}
+                    className={cellClass(header.column.id)}
                     aria-sort={sorted ? ARIA_SORT[sorted] : undefined}
                   >
                     {header.column.getCanSort() ? (

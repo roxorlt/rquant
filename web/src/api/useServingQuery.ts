@@ -12,7 +12,10 @@ export interface ServingQueryResult<T> {
   /** The envelope's serving block; pass it to <ServingBanner>. */
   serving: ServingMeta | undefined;
   isLoading: boolean;
+  /** A refetch is in flight (the refresh button spins). */
+  isFetching: boolean;
   error: Error | null;
+  refetch: () => void;
 }
 
 /**
@@ -30,6 +33,10 @@ export function useServingQuery<T>(
     data: query.data?.data,
     serving: query.data?.serving,
     isLoading: query.isLoading,
+    isFetching: query.isFetching,
     error: query.error,
+    refetch: () => {
+      void query.refetch();
+    },
   };
 }
