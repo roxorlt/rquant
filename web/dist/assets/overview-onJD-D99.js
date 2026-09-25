@@ -1,1 +1,0 @@
-import{t as e}from"./PlaceholderPage-BadSpunw.js";import{i as t}from"./index-WVFtO_Oc.js";var n=t();function r(){return(0,n.jsx)(e,{id:`overview`})}export{r as default};

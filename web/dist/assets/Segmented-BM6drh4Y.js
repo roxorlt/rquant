@@ -1,0 +1,1 @@
+import{n as e}from"./PageHeader-BqojKuFQ.js";var t=e();function n({options:e,value:n,onChange:r,label:i}){return(0,t.jsx)(`fieldset`,{className:`seg`,"aria-label":i,children:e.map(e=>(0,t.jsx)(`button`,{type:`button`,"aria-pressed":e.value===n,onClick:()=>r(e.value),children:e.label},e.value))})}export{n as t};
