@@ -728,8 +728,8 @@ cursor, drain, or cutover is outside Phase A and blocks.
 ##### Frozen Inputs And Policy
 
 Amended for Release B. The frozen baseline is the merge base of the two commits the run
-*states*, currently commit `2ca5607aa77e0b9db74cd832d23133087cf2b52d` and Git tree
-`60bdfad9f96f386564126b7ff2d90b0fcd90b0cd`, so `baseline..candidate` is the complete pull
+*states*, currently commit `df621ef2eaaec3a3fc929d9be8a84d1bfa1249bd` and Git tree
+`7c4d17c98344f96c5c63c8858b323336abf9c5d9`, so `baseline..candidate` is the complete pull
 request merge face rather than a branch-local subset. It is no longer rediscovered inside the
 checkout as `merge_base(origin/main, candidate)`. That formulation denied itself: the merge
 that freezes a baseline is also what makes `origin/main` equal to the candidate, after which
