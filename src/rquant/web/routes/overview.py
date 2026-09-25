@@ -21,7 +21,7 @@ from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
 from rquant.web import readers
 from rquant.web.calendar import session_date
 from rquant.web.envelope import Envelope, ServingMeta, ServingState
-from rquant.web.labels import ACTION_LABELS, PRESET_LABELS, strategy_label
+from rquant.web.labels import ACTION_LABELS, PRESET_LABELS, split_service_id, strategy_label
 from rquant.web.market import MarketPhase, shanghai_trade_date
 from rquant.web.models.common import StateCounts
 from rquant.web.models.health import FreshnessItem, ServiceItem
@@ -52,7 +52,13 @@ from rquant.web.routes.health import (
 )
 from rquant.web.security import current_user
 from rquant.web.serving import serving_meta
-from rquant.web.status import UserState, watermark_status
+from rquant.web.status import (
+    SHADOW_NOTE,
+    DeliveryMode,
+    UserState,
+    delivery_mode,
+    watermark_status,
+)
 
 router = APIRouter()
 
@@ -86,7 +92,14 @@ def _on(day: date | None, at: datetime) -> bool:
 # ------------------------------------------------------------------ signals & deliveries
 
 
-def _delivery_state(rows: Sequence[DeliveryRow]) -> DeliveryState:
+_FINISHED: dict[str, DeliveryState] = {
+    "live": "delivered",
+    "shadow": "recorded",
+    "unknown": "unconfirmed",
+}
+
+
+def _delivery_state(rows: Sequence[DeliveryRow], mode: DeliveryMode) -> DeliveryState:
     statuses = {row.status for row in rows}
     if not statuses:
         return "none"
@@ -94,20 +107,30 @@ def _delivery_state(rows: Sequence[DeliveryRow]) -> DeliveryState:
         return "failed"
     if statuses & _SENDING:
         return "sending"
-    if statuses == {"succeeded"}:
-        return "delivered"
-    if "expired" in statuses:
-        return "expired"
-    return "delivered" if "succeeded" in statuses else "sending"
+    if "succeeded" in statuses:
+        return _FINISHED[mode.mode]
+    return "expired"
 
 
 _DELIVERY_STATE_LABELS: dict[DeliveryState, str] = {
     "delivered": "已送达",
+    "recorded": "仅记录",
+    "unconfirmed": "未确认",
     "sending": "发送中",
     "failed": "失败",
     "expired": "已过期",
     "none": "未推送",
 }
+
+
+def _delivery_mode(context: GenerationContext) -> DeliveryMode:
+    return delivery_mode(
+        [
+            (row.status, row.stale, row.consecutive_failures, row.last_error)
+            for row in context.sections.services
+            if split_service_id(row.service_id)[0] == "notifier"
+        ]
+    )
 
 
 def _reasons(signal: SignalRow) -> list[str]:
@@ -126,6 +149,7 @@ def _signals(
     signals: Sequence[SignalRow],
     deliveries: Sequence[DeliveryRow],
     names: dict[str, str],
+    mode: DeliveryMode,
 ) -> SignalsSummary:
     by_signal: dict[str, list[DeliveryRow]] = defaultdict(list)
     for delivery in deliveries:
@@ -134,7 +158,7 @@ def _signals(
     actions = Counter(row.action for row in signals)
     items = []
     for row in ordered[:_MAX_SIGNAL_ITEMS]:
-        state = _delivery_state(by_signal.get(row.signal_id, ()))
+        state = _delivery_state(by_signal.get(row.signal_id, ()), mode)
         items.append(
             SignalItem(
                 signal_id=row.signal_id,
@@ -161,7 +185,7 @@ def _signals(
     )
 
 
-def _deliveries(deliveries: Sequence[DeliveryRow]) -> DeliveriesSummary:
+def _deliveries(deliveries: Sequence[DeliveryRow], mode: DeliveryMode) -> DeliveriesSummary:
     statuses = Counter(row.status for row in deliveries)
     return DeliveriesSummary(
         total=len(deliveries),
@@ -169,6 +193,22 @@ def _deliveries(deliveries: Sequence[DeliveryRow]) -> DeliveriesSummary:
         sending=sum(statuses[name] for name in _SENDING),
         failed=statuses["dead_letter"],
         expired=statuses["expired"],
+        mode=mode.mode,  # type: ignore[arg-type]
+        mode_label=mode.label,
+        mode_note=mode.note,
+    )
+
+
+def _empty_deliveries() -> DeliveriesSummary:
+    return DeliveriesSummary(
+        total=0,
+        delivered=0,
+        sending=0,
+        failed=0,
+        expired=0,
+        mode="unknown",
+        mode_label="未确认",
+        mode_note=None,
     )
 
 
@@ -415,8 +455,8 @@ def _pipeline(
                 starts=frozenset(),
                 runs=_BEFORE_OPEN | _AUCTION | _SESSION | _NOON,
             ),
-            f"{deliveries.delivered} 条送达",
-            "信号推送到手机",
+            f"{deliveries.delivered} 条{deliveries.mode_label}",
+            "信号推送到手机" + (f"；{deliveries.mode_note}" if deliveries.mode_note else ""),
         ),
     ]
 
@@ -453,6 +493,18 @@ def _attention(
         )
     crit = [item for item in services if item.status.state is UserState.CRIT]
     warn = [item for item in services if item.status.state is UserState.WARN]
+    if deliveries.mode == "shadow":
+        # One plain item instead of the notifier's generic 注意.
+        warn = [item for item in warn if split_service_id(item.service_id)[0] != "notifier"]
+        items.append(
+            AttentionItem(
+                level="warn",
+                title="推送还没有正式开通",
+                reason=SHADOW_NOTE,
+                to="/health",
+                action="看健康",
+            )
+        )
     items.extend(
         AttentionItem(
             level="crit",
@@ -556,8 +608,9 @@ def build_overview(context: GenerationContext, meta: ServingMeta) -> OverviewDat
     }
     names = readers.stock_names(context.borrowed.cursor, context.tables, codes)
     candidates = _candidates(context, session_signals, names)
-    signals = _signals(session_signals, session_deliveries, names)
-    deliveries = _deliveries(session_deliveries)
+    mode = _delivery_mode(context)
+    signals = _signals(session_signals, session_deliveries, names, mode)
+    deliveries = _deliveries(session_deliveries, mode)
     paper = _paper(context, names)
     services = service_items(context)
     freshness = freshness_items(context)
@@ -601,7 +654,7 @@ def empty_overview(now: datetime, meta: ServingMeta) -> OverviewData:
         pipeline=[],
         candidates=CandidatesSummary(total=0, groups=[], items=[]),
         signals=SignalsSummary(total=0, by_action=[], items=[]),
-        deliveries=DeliveriesSummary(total=0, delivered=0, sending=0, failed=0, expired=0),
+        deliveries=_empty_deliveries(),
         paper=None,
         services=StateCounts(total=0, ok=0, warn=0, crit=0, idle=0, waiting=0),
         freshness=FreshnessSummary(on_time=0, checked=0, no_source=0, late=[], caveats=[]),
@@ -609,7 +662,7 @@ def empty_overview(now: datetime, meta: ServingMeta) -> OverviewData:
             meta,
             (),
             (),
-            DeliveriesSummary(total=0, delivered=0, sending=0, failed=0, expired=0),
+            _empty_deliveries(),
         ),
     )
 

@@ -161,6 +161,15 @@ export interface components {
             expired: number;
             /** Failed */
             failed: number;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "live" | "shadow" | "unknown";
+            /** Mode Label */
+            mode_label: string;
+            /** Mode Note */
+            mode_note: string | null;
             /** Sending */
             sending: number;
             /** Total */
@@ -489,7 +498,7 @@ export interface components {
              * Delivery
              * @enum {string}
              */
-            delivery: "delivered" | "sending" | "failed" | "expired" | "none";
+            delivery: "delivered" | "recorded" | "unconfirmed" | "sending" | "failed" | "expired" | "none";
             /** Delivery Label */
             delivery_label: string;
             /** Name */

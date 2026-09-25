@@ -30,7 +30,7 @@ describe("总览", () => {
     const kpis = screen.getByRole("region", { name: "今日关键数字" });
     expect(kpis).toHaveTextContent("候选3只N 字一池 2 · 竞价跳空 1");
     expect(kpis).toHaveTextContent("信号2条买入意向 1 · 观察 1");
-    expect(kpis).toHaveTextContent("推送2条送达 1 · 失败 1");
+    expect(kpis).toHaveTextContent("推送2条 · 仅记录正式推送未开通 · 失败 1");
     expect(kpis).toHaveTextContent("模拟盘净值99,990.00浮动盈亏 −10.00 · 持仓 1 只");
     expect(kpis).toHaveTextContent("服务11/ 24 正常异常 1 · 注意 1");
     expect(kpis).toHaveTextContent("数据按时6/ 10日线、分钟线没按时");
@@ -42,9 +42,18 @@ describe("总览", () => {
     const table = screen.getByRole("table", { name: "最新信号" });
     const rows = within(table).getAllByRole("row").slice(1);
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveTextContent("13:05天威视讯002238.SZ竞价跳空买入意向已送达");
+    expect(rows[0]).toHaveTextContent("13:05天威视讯002238.SZ竞价跳空买入意向仅记录");
+    expect(rows[0]).not.toHaveTextContent("已送达");
     expect(rows[1]).toHaveTextContent("失败");
     expect(rows[1]?.querySelector('.status[data-state="crit"]')).not.toBeNull();
+  });
+
+  it("explains shadow deliveries in a tooltip", async () => {
+    const user = userEvent.setup();
+    await renderOverview();
+    const table = screen.getByRole("table", { name: "最新信号" });
+    await user.hover(within(table).getAllByText("仅记录")[0] as HTMLElement);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("正式推送开通前只记录不发送");
   });
 
   it("renders every missing value as a dash", async () => {
@@ -73,8 +82,8 @@ describe("总览", () => {
     const holdings = screen.getByRole("table", { name: "模拟盘持仓" });
     expect(within(holdings).getAllByRole("row")).toHaveLength(2);
     expect(holdings).toHaveTextContent("丽岛新材603937.SH10012.7612.711,270.64−5.00−0.39%");
-    const attention = screen.getByText("参考数据发布异常").closest("li") as HTMLElement;
-    expect(attention).toHaveTextContent("需处理参考数据发布异常连续失败 239 次看健康");
+    const attention = screen.getByText("1 条推送失败").closest("li") as HTMLElement;
+    expect(attention).toHaveTextContent("需处理1 条推送失败手机可能没有收到这些信号看健康");
     expect(within(attention).getByRole("link", { name: "看健康" })).toHaveAttribute(
       "href",
       "/health",

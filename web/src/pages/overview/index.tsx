@@ -40,6 +40,8 @@ const ACTION_KIND: Record<string, PillKind> = {
 
 const DELIVERY_STATE = {
   delivered: "ok",
+  recorded: "idle",
+  unconfirmed: "idle",
   sending: "waiting",
   failed: "crit",
   expired: "idle",
@@ -100,11 +102,16 @@ function kpis(data: OverviewData): Kpi[] {
       key: "deliveries",
       label: "推送",
       value: formatCount(deliveries.total),
-      unit: "条",
+      unit: deliveries.mode === "shadow" ? "条 · 仅记录" : "条",
       tone: deliveries.failed > 0 ? "crit" : undefined,
+      tip: deliveries.mode_note ?? undefined,
       sub: (
         <>
-          送达 {deliveries.delivered}
+          {deliveries.mode === "live"
+            ? `送达 ${deliveries.delivered}`
+            : deliveries.mode === "shadow"
+              ? "正式推送未开通"
+              : `未确认 ${deliveries.delivered}`}
           {deliveries.sending ? ` · 发送中 ${deliveries.sending}` : ""}
           {deliveries.failed ? <span className="t-crit"> · 失败 {deliveries.failed}</span> : ""}
         </>
@@ -163,6 +170,25 @@ function kpis(data: OverviewData): Kpi[] {
       ),
     },
   ];
+}
+
+function signalColumns(modeNote: string | null): DataColumn<SignalItem>[] {
+  return SIGNAL_COLUMNS.map((column) =>
+    column.id === "delivery"
+      ? {
+          ...column,
+          cell: (row: SignalItem) => (
+            <StatusBadge
+              state={DELIVERY_STATE[row.delivery]}
+              label={row.delivery_label}
+              reason={
+                row.delivery === "recorded" || row.delivery === "unconfirmed" ? modeNote : null
+              }
+            />
+          ),
+        }
+      : column,
+  );
 }
 
 const SIGNAL_COLUMNS: DataColumn<SignalItem>[] = [
@@ -393,7 +419,7 @@ export default function OverviewPage() {
           <DataTable
             label="最新信号"
             rows={data.signals.items}
-            columns={SIGNAL_COLUMNS}
+            columns={signalColumns(data.deliveries.mode_note)}
             rowKey={(row) => row.signal_id}
             emptyText={signalEmpty(data)}
           />

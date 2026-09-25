@@ -8,6 +8,7 @@ detail (ids, error text) travels separately and is shown only in tooltips or dra
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import StrEnum
@@ -72,9 +73,10 @@ def _waiting(phase: MarketPhase) -> Status:
 
 
 def _known_degraded_reason(service_id: str) -> str | None:
-    role, instance = split_service_id(service_id)
-    if role == "notifier" and "shadow" in instance.split("."):
-        return "影子模式：只记录，不真正推送"
+    role, _instance = split_service_id(service_id)
+    if role == "notifier":
+        # See delivery_mode(): a degraded notifier without failures is the shadow mode.
+        return "影子模式：" + SHADOW_NOTE
     return None
 
 
@@ -112,11 +114,11 @@ def service_status(
     if status == "degraded":
         if consecutive_failures >= CRIT_FAILURES:
             return Status(UserState.CRIT, "异常", f"连续失败 {consecutive_failures} 次")
+        if consecutive_failures > 0:
+            return Status(UserState.WARN, "注意", f"最近失败 {consecutive_failures} 次")
         known = _known_degraded_reason(service_id)
         if known is not None:
             return Status(UserState.WARN, "注意", known)
-        if consecutive_failures > 0:
-            return Status(UserState.WARN, "注意", f"最近失败 {consecutive_failures} 次")
         return Status(UserState.WARN, "注意", "功能降级运行")
     if status == "running":
         if consecutive_failures > 0:
@@ -164,6 +166,43 @@ def reference_publisher_status(
             f"今天的参考数据已发布；09:25 之后按设计不再重复发布{raw}",
         )
     return Status(UserState.CRIT, "异常", f"09:25 已过，今天的参考数据还没有发布{raw}")
+
+
+@dataclass(frozen=True)
+class DeliveryMode:
+    mode: str  # "live" | "shadow" | "unknown"
+    label: str
+    note: str | None
+
+
+SHADOW_NOTE = "正式推送开通前只记录不发送"
+
+
+def delivery_mode(
+    notifiers: Sequence[tuple[str, bool, int, str | None]],
+) -> DeliveryMode:
+    """Whether a finished delivery reached the phone, from the notifiers' heartbeats.
+
+    ``notifiers`` is ``(status, stale, consecutive_failures, last_error)`` per notifier.
+    A shadow notifier's heartbeat never reads as a clean live one: with
+    ``suppress_delivery`` it always reports ``notifier:shadow_transport`` and so is
+    ``degraded`` (``runtime_builder_signal``), and its receipts are ``shadow:<outbox_id>``.
+    Serving publishes neither the receipts nor the degraded reasons, so: every notifier
+    ``running`` → live (已送达); every notifier degraded with no failure and no error →
+    shadow (仅记录), the standing production state; anything else → unknown (未确认).
+    Publishing the degraded reasons (next serving batch) makes shadow exact.
+    """
+
+    if not notifiers:
+        return DeliveryMode("unknown", "未确认", "看不到推送服务的状态，无法确认手机是否收到")
+    if all(status == "running" and not stale for status, stale, _f, _e in notifiers):
+        return DeliveryMode("live", "已送达", None)
+    if all(
+        status == "degraded" and not stale and failures == 0 and not error
+        for status, stale, failures, error in notifiers
+    ):
+        return DeliveryMode("shadow", "仅记录", SHADOW_NOTE)
+    return DeliveryMode("unknown", "未确认", "推送服务状态异常，无法确认手机是否收到")
 
 
 # ------------------------------------------------------------------ data freshness
@@ -240,11 +279,14 @@ def generation_status(age_seconds: float | None, stale_after: timedelta) -> Stat
 __all__ = [
     "BACKLOG_WARN",
     "CRIT_FAILURES",
+    "SHADOW_NOTE",
+    "DeliveryMode",
     "REFERENCE_DEADLINE",
     "STATE_ORDER",
     "Status",
     "UserState",
     "daily_status",
+    "delivery_mode",
     "expected_daily_date",
     "generation_status",
     "is_reference_publisher",

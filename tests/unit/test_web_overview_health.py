@@ -81,7 +81,8 @@ def test_overview_after_the_close_shows_today(baseline: Path) -> None:
         "N 字",
         "买入意向",
     )
-    assert first["delivery"] == "delivered"
+    # The fixture's notifier is in shadow mode: a finished delivery was only recorded.
+    assert (first["delivery"], first["delivery_label"]) == ("recorded", "仅记录")
     assert signals["items"][1]["delivery"] == "sending"
     assert data["deliveries"] == {
         "total": 2,
@@ -89,7 +90,11 @@ def test_overview_after_the_close_shows_today(baseline: Path) -> None:
         "sending": 1,
         "failed": 0,
         "expired": 0,
+        "mode": "shadow",
+        "mode_label": "仅记录",
+        "mode_note": "正式推送开通前只记录不发送",
     }
+    assert data["pipeline"][-1]["value"] == "1 条仅记录"
     groups = {group["key"]: group for group in data["candidates"]["groups"]}
     assert groups["screen:n-shape-pool1"]["count"] == 3
     assert groups["screen:n-shape-pool1"]["as_of"] == "2026-09-23"
@@ -143,7 +148,11 @@ def test_overview_attention_lists_what_needs_a_look(baseline: Path) -> None:
     attention = _get(baseline, "/api/v1/overview", AFTER_CLOSE)["data"]["attention"]
 
     titles = [item["title"] for item in attention]
-    assert "通知推送需要注意" in titles
+    # Shadow delivery is one plain item instead of the notifier's generic 注意; the
+    # reference publisher's by-design refusals are not in the list.
+    assert "推送还没有正式开通" in titles
+    assert "通知推送需要注意" not in titles
+    assert not any("参考数据" in title for title in titles)
     assert all(item["to"] == "/health" for item in attention)
     assert all(not _SHA256.search(item["title"] + item["reason"]) for item in attention)
 
@@ -193,7 +202,7 @@ def test_health_names_services_in_plain_words_and_keeps_ids_for_tooltips(
     assert notifier["status"] == {
         "state": "warn",
         "label": "注意",
-        "reason": "影子模式：只记录，不真正推送",
+        "reason": "影子模式：正式推送开通前只记录不发送",
     }
     assert services["paper-broker.shadow-main.v1"]["name"] == "模拟撮合"
     assert services["paper-broker.shadow-main.v1"]["status"]["label"] == "正常"
@@ -394,3 +403,36 @@ def test_the_reference_publisher_waits_on_a_closed_day() -> None:
     )
 
     assert (status.state.value, status.label) == ("waiting", "等待开盘")
+
+
+@pytest.mark.parametrize(
+    ("notifiers", "mode"),
+    (
+        ([("running", False, 0, None)], "live"),
+        ([("degraded", False, 0, None)], "shadow"),
+        ([("degraded", False, 2, "boom")], "unknown"),
+        ([("running", False, 0, None), ("degraded", False, 0, None)], "unknown"),
+        ([("running", True, 0, None)], "unknown"),
+        ([], "unknown"),
+    ),
+)
+def test_delivery_mode_is_read_from_the_notifier_heartbeats(
+    notifiers: list[tuple[str, bool, int, str | None]], mode: str
+) -> None:
+    from rquant.web.status import delivery_mode
+
+    assert delivery_mode(notifiers).mode == mode
+
+
+def test_a_live_notifier_reports_real_deliveries_as_delivered() -> None:
+    from rquant.web.routes.overview import _delivery_state
+    from rquant.web.status import delivery_mode
+
+    class Row:
+        status = "succeeded"
+
+    live = delivery_mode([("running", False, 0, None)])
+    shadow = delivery_mode([("degraded", False, 0, None)])
+
+    assert _delivery_state([Row()], live) == "delivered"  # type: ignore[list-item]
+    assert _delivery_state([Row()], shadow) == "recorded"  # type: ignore[list-item]

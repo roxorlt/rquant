@@ -11,7 +11,10 @@ from rquant.web.market import MarketPhase
 from rquant.web.models.common import StateCounts
 
 StageState = Literal["done", "running", "waiting", "paused", "late"]
-DeliveryState = Literal["delivered", "sending", "failed", "expired", "none"]
+DeliveryState = Literal[
+    "delivered", "recorded", "unconfirmed", "sending", "failed", "expired", "none"
+]
+DeliveryMode = Literal["live", "shadow", "unknown"]
 
 
 class SessionInfo(BaseModel):
@@ -108,10 +111,16 @@ class DeliveriesSummary(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     total: int
+    #: Outbox rows that finished successfully (in shadow mode: recorded, not sent).
     delivered: int
     sending: int
     failed: int
     expired: int
+    #: Whether a finished delivery reached the phone (see rquant.web.status.delivery_mode).
+    mode: DeliveryMode
+    mode_label: str
+    #: One sentence for the tooltip; None when there is nothing to explain.
+    mode_note: str | None
 
 
 class HoldingItem(BaseModel):

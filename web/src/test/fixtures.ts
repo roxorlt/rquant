@@ -158,8 +158,8 @@ export function overviewEnvelope(
             strategy_name: "竞价跳空",
             action: "b_intent",
             action_label: "买入意向",
-            delivery: "delivered",
-            delivery_label: "已送达",
+            delivery: "recorded",
+            delivery_label: "仅记录",
             reasons: ["竞价跳空确认", "均价线支撑"],
           },
           {
@@ -178,7 +178,16 @@ export function overviewEnvelope(
           },
         ],
       },
-      deliveries: { total: 2, delivered: 1, sending: 0, failed: 1, expired: 0 },
+      deliveries: {
+        total: 2,
+        delivered: 1,
+        sending: 0,
+        failed: 1,
+        expired: 0,
+        mode: "shadow",
+        mode_label: "仅记录",
+        mode_note: "正式推送开通前只记录不发送",
+      },
       paper: {
         account_id: "shadow-main",
         as_of: "2026-09-24T05:06:18Z",
@@ -212,8 +221,15 @@ export function overviewEnvelope(
       attention: [
         {
           level: "crit",
-          title: "参考数据发布异常",
-          reason: "连续失败 239 次",
+          title: "1 条推送失败",
+          reason: "手机可能没有收到这些信号",
+          to: "/health",
+          action: "看健康",
+        },
+        {
+          level: "warn",
+          title: "推送还没有正式开通",
+          reason: "正式推送开通前只记录不发送",
           to: "/health",
           action: "看健康",
         },

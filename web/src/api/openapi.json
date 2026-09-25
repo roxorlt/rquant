@@ -283,6 +283,30 @@
             "title": "Failed",
             "type": "integer"
           },
+          "mode": {
+            "enum": [
+              "live",
+              "shadow",
+              "unknown"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "mode_label": {
+            "title": "Mode Label",
+            "type": "string"
+          },
+          "mode_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode Note"
+          },
           "sending": {
             "title": "Sending",
             "type": "integer"
@@ -297,7 +321,10 @@
           "delivered",
           "sending",
           "failed",
-          "expired"
+          "expired",
+          "mode",
+          "mode_label",
+          "mode_note"
         ],
         "title": "DeliveriesSummary",
         "type": "object"
@@ -1332,6 +1359,8 @@
           "delivery": {
             "enum": [
               "delivered",
+              "recorded",
+              "unconfirmed",
               "sending",
               "failed",
               "expired",
