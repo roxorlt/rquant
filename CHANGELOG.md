@@ -6,6 +6,32 @@
 
 ### Added
 
+- **新前端 M0：`web/` 网页外框、只读网页 API、合成数据代与 `web.yml`（2026-09-25 owner 决定用
+  React + TypeScript + Vite，入口 `/app/`）**：只改仓库，不碰服务器，nginx `/app/` 块在 M1 装机时再加。
+  - `web/`：Vite 8 + React 19.3 + TypeScript 5.9（严格模式），antd 6（`zh_CN`，只经 `src/ui/` 封装）、
+    TanStack Query / Table 8.21 / Virtual、openapi-fetch、lightweight-charts 5、ECharts 6（按需注册）、React Flow + dagre、
+    React Router 8（hash 路由）。外框按原型：顶栏（交易日、市场阶段、数据代标记、搜索与 AI 占位、主题、「我的」菜单）、
+    可收起的左侧导航（6 组 13 页）、手机底部导航抽屉、浅色 / 深色 / 跟随系统、红涨绿跌、IBM Plex Mono 数字字体（自带拉丁子集）。
+    13 个页面是占位页（M1 的总览、系统健康、市场全景写「M1 开发中」）；调研报告与差距总览按 owner 决定不进导航，
+    放在「我的 → 报告」（差距总览是可筛选的 `gap-status.json`，随发布列车更新）。编译结果 `web/dist/` 提交进仓库，
+    `pnpm -C web verify:dist` 重新编译并核对，首屏 gzip 约 245 KB（上限 550 KB）。Vitest 59 个用例，Playwright 在
+    1440 与 390 两种宽度逐页检查无报错、无横向溢出，并测新数据代 20 秒内到达页面。
+  - `src/rquant/web/`：FastAPI 只读网页 API（`rquant web-serve`，只允许回环地址，默认 `127.0.0.1:8768`；
+    `rquant web-openapi` 输出 OpenAPI 快照 `web/src/api/openapi.json`）。`GET /api/v1/meta` 返回数据代、数据集水位、
+    投影可用状态和市场阶段，外壳 `{data, serving}` 的四种状态与 Streamlit 页面一致；`GenerationTracker` 跟随新数据代，
+    校验失败的新一代不会顶替正在用的一代（标 `degraded`），进行中的请求用完旧租约才关闭。不读 `rquant.config` /
+    `.env`、不引用 `rquant.storage`、不直连 DuckDB（导入隔离测试钉住）；两个命令在 `rquant.cli.main` 里先于配置构造分派。
+    新依赖只有 `fastapi` 与 `annotated-doc`（另把已在锁里的 `uvicorn` 写成直接依赖）。
+  - `tests/support/web_serving_fixture.py` 与 `scripts/build_web_fixture.py`：经生产路径
+    （`ServingReadModelInput` → `build_serving_read_models` → `ServingPublisher`）发布合成数据代，场景
+    `baseline` / `panorama` / `degraded`，`--publish-next` 发第二代；数据全部编造。
+  - `.github/workflows/web.yml`：单个 Linux 任务，按路径触发：Biome、tsc、Vitest、`verify:dist`、OpenAPI 与 TS 类型比对、
+    Playwright 冒烟。`ci.yml` 未改。
+  - R07：`diff_category` 把 `web/` 登记为 architecture 目录（仿 #175），测试钉住 `web/src/main.tsx`、`web/dist/index.html`、
+    `web/pnpm-lock.yaml`，并确认 `webapp/` 之类的兄弟目录仍然报「未分类」。根 `.gitignore` 加 `!web/dist/` 与前端缓存目录。
+  - `CLAUDE.md` / `AGENTS.md`：项目定位改为「投研平台（不含下单）」，UI 一行改为 React（Streamlit 逐步停用），
+    合并方式写明「Create a merge commit」，加前端命令；新增 `web/CLAUDE.md` / `web/AGENTS.md` / `web/README.md`。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
