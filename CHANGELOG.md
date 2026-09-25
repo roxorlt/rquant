@@ -46,7 +46,34 @@
     role 自己的代价，生产上同样存在，本包不改 `src/`。
   - **只读生产不变**：新增的读取（日历各代、副本探查与参考证据抽取）同样走 `open(rb)` / `ATTACH ... (READ_ONLY)` 与读前读后
     的 stat 比对，审计钩子也装在 dry-plan 与多天回放进程里；Tushare 缓存目录与生产路径重叠时直接拒绝。**没有 `src/` 改动。**
-  - **集成时要做的两件事（本包没做）**：新增 25 个用例（`tests/unit/test_route_a_replay_sources.py` 15 个、
+  - **主机 09-24 保真度复核后的修正（同包第二轮）**：主机上用 `--synthesize-sources` 回放 09-24，竞价 5475/5475 行逐字段
+    相同，但参考慢源的 `market_liquidity` 投影合成 5565 行、录到 5619 行，而且截至 09:44 的 serving 信号少了
+    920003.BJ 09:30 的 watch。
+    - **`market_liquidity` 少 54 行的原因与修法**：线上采集按「每只代码」取最新一行 `daily_basic`、最近五行 `daily_bar`，
+      不管那几行落在哪天；第一版证据抽取却按日历切窗（`daily_basic` 十个交易日、`daily_bar` 130 个交易日），历史在窗口
+      之前就断了的代码整只丢掉——长期停牌、已退市、`daily_basic` 滞后的代码，以及 920 迁移前的老北交所代码。现在
+      `daily_bar` 按代码取当天之前的最后 120 行（采集最深的窗口）、`daily_basic` 按代码取当天之前的最新一行。新用例
+      用北交所、老北交所、长期停牌、新上市与 `daily_basic` 滞后的代码证明：对这份抽取，线上采集的每一条查询（前一交易日
+      证据与九张投影）都与「当天 09:20 的副本」逐行相同；另一条用例证明旧窗口恰好丢掉这三类代码。仍无法还原的只有「日期
+      在当天之前、但在采集之后才写进去的行」（回补），已在证据的 `note` 里写明。
+    - **`market_liquidity` 不在信号路径上**：它只进 serving 的投影表给看板用，auction_gap 的候选输入读的是竞价行与
+      参考注册表的 ST / 停牌 / 上市 / 涨跌停四类记录，所以 920003.BJ 的信号差异另有原因。代码里能找到的最可能原因是：
+      事后问的 `suspend_d(D)` 会把当天盘中的临时停牌也列进来，没有时段的那种会被 `suspension._session_scope` 判成全天
+      停牌，参考发布者就把这只代码标成停牌、auction_gap 把它排除——北交所股票涨幅异常时正会盘中临停。现在合成时，
+      在当天集合竞价里有成交（价格有限、量大于零）的代码，它的「全天停牌」行不交给采集，逐条列在
+      `world.reference.anachronisms.suspend_d_asked_after_the_day.left_out_traded_in_the_opening_auction`。
+      这是推断，主机复跑会用下面两项确认或否定。
+    - **逐代码的候选输入差异** `world.fidelity_candidate_inputs`：录到日加 `--synthesize-sources` 时，对每只竞价代码
+      比较竞价行和由参考发布者自己的 `_record_payloads` 从两份快照推出的注册表记录，列出每只读到不同证据的代码及差在
+      哪个字段。`fidelity_vs_recorded` 也改成逐行比较每张投影（只在一边的键、值不同的键），并用 `differing` 汇总所有
+      不相同的项。
+    - **信号级比对 `--compare-signals-with <另一次运行的 summary.json 或沙箱>`**：把本次与另一次同日运行的 serving 信号
+      比到两者较早的收尾时刻，写进 `summary.signal_fidelity`，对每只有差异的代码附上候选输入是否不同、是否在分钟线
+      关注列表里、分钟线从哪来（副本 / Tushare / 缺失 / Tushare 失败原因）。对没有新字段的旧 summary，改从它沙箱里的
+      serving 代读信号。`chain.serving.signals_today_list` 与 `chain.market_minute.origin_by_watchlist_code` 为此新增。
+    - **录到日保留录到的日历**：`--synthesize-sources` 只替换两个批次，日历仍用录到批次指名的那一代；没录到的日子用的
+      选择规则照样跑一遍，结果写在 `provenance.calendar.heuristic_check`，用 09-24 顺带检验这条规则。
+  - **集成时要做的两件事（本包没做）**：新增 31 个用例（`tests/unit/test_route_a_replay_sources.py` 21 个、
     `tests/unit/test_route_a_replay_days.py` 5 个、回放集成用例 5 个），full-suite 分片清单要重生成；新增两个脚本与两个
     测试文件、改了一个脚本与一个测试文件，R07 基线要重冻。
 
