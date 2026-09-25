@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
-from datetime import datetime, time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import date, datetime, time
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -23,9 +25,11 @@ from rquant.intraday_feature_engine import (
     FeatureComputationMode,
     FeatureComputationResult,
     IntradayFeatureConfig,
+    NormalizedHistoricalMinutes,
     live_compute,
 )
 from rquant.live_contracts import (
+    BatchEnvelope,
     BatchQualityStatus,
     ConsumerCursor,
     LiveChannel,
@@ -76,16 +80,117 @@ class FeatureLiveBatchSummary(RuntimeContractModel):
 FeatureLiveFaultHook = Callable[[str], None]
 
 
+def _decoded_identity(envelope: BatchEnvelope) -> tuple[str, str, datetime, int]:
+    #: everything the decoded rows depend on: the payload (its hash) and the two columns
+    #: added to it; `batch_id` binds the sequence, revision and event window as well
+    return (envelope.batch_id, envelope.content_sha256, envelope.available_at, envelope.sequence)
+
+
+@dataclass(frozen=True)
+class _DecodedMinuteBatch:
+    identity: tuple[str, str, datetime, int]
+    #: the batch's rows of each Asia/Shanghai trade date, each already carrying the
+    #: `available_at` / `_source_sequence` columns the day frame is assembled from
+    frames_by_date: Mapping[date, pd.DataFrame]
+
+
+class FeatureLiveInputCache:
+    """Market-minute batches one `feature_live` process has already read and decoded (#302).
+
+    Every feature batch is computed from all of the day's minute batches up to its target,
+    and until #302 each one re-read, re-hashed and re-decoded all of them: the per-batch
+    cost grew with every minute of the day. A batch is decoded here once, on the first
+    target that needs it, from bytes `read_payload` verified against its manifest's hash;
+    later targets reuse the decoded rows as long as the spool still lists the batch with the
+    same batch id, content hash and availability -- and `list_after`, which lists it, still
+    checks every retained file on every call. Nothing here is persisted: a restart starts
+    empty and rebuilds from the spool, exactly as every batch did before.
+
+    Rows of a trade date before the newest target's are dropped as the day advances; a
+    target of an earlier date than one already processed (which a single spool never
+    produces) is served by decoding again, without keeping the result.
+    """
+
+    def __init__(self) -> None:
+        self._source_generation_id: str | None = None
+        self._batches: dict[int, _DecodedMinuteBatch] = {}
+        self._floor: date | None = None
+
+    def frame(
+        self,
+        raw_spool: LiveBatchSpool,
+        record: LiveBatchRecord,
+        *,
+        source_generation_id: str,
+        target_date: date,
+    ) -> pd.DataFrame | None:
+        if source_generation_id != self._source_generation_id:
+            self._batches.clear()
+            self._floor = None
+            self._source_generation_id = source_generation_id
+        envelope = record.envelope
+        below_floor = self._floor is not None and target_date < self._floor
+        cached = None if below_floor else self._batches.get(envelope.sequence)
+        if cached is None or cached.identity != _decoded_identity(envelope):
+            cached = _decode_minute_batch(raw_spool, record)
+            if not below_floor:
+                self._batches[envelope.sequence] = cached
+        return cached.frames_by_date.get(target_date)
+
+    def retire_before(self, target_date: date) -> None:
+        if self._floor is not None and target_date <= self._floor:
+            return
+        self._floor = target_date
+        for sequence, batch in tuple(self._batches.items()):
+            if any(day < target_date for day in batch.frames_by_date):
+                self._batches[sequence] = _DecodedMinuteBatch(
+                    identity=batch.identity,
+                    frames_by_date=MappingProxyType(
+                        {
+                            day: frame
+                            for day, frame in batch.frames_by_date.items()
+                            if day >= target_date
+                        }
+                    ),
+                )
+
+
+def _decode_minute_batch(raw_spool: LiveBatchSpool, record: LiveBatchRecord) -> _DecodedMinuteBatch:
+    envelope = record.envelope
+    frame = MarketMinuteGateway.decode_payload(raw_spool.read_payload(record))
+    frames: dict[date, pd.DataFrame] = {}
+    if not frame.empty:
+        local_dates = (
+            pd.to_datetime(frame["trade_time"], utc=True).dt.tz_convert("Asia/Shanghai").dt.date
+        )
+        for day in set(local_dates):
+            if not isinstance(day, date):
+                continue
+            selected = frame.loc[local_dates == day].copy()
+            if selected.empty:
+                continue
+            selected["available_at"] = envelope.available_at
+            selected["_source_sequence"] = envelope.sequence
+            frames[day] = selected
+    return _DecodedMinuteBatch(
+        identity=_decoded_identity(envelope),
+        frames_by_date=MappingProxyType(frames),
+    )
+
+
 def _feature_input_identity(
     raw_spool: LiveBatchSpool,
     *,
     target: LiveBatchRecord,
     historical_snapshot_id: str,
+    records: tuple[LiveBatchRecord, ...],
+    source_generation_id: str,
+    input_cache: FeatureLiveInputCache,
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
     target_date = pd.Timestamp(target.envelope.event_time_end).tz_convert("Asia/Shanghai").date()
     frames: list[pd.DataFrame] = []
     input_ids: list[str] = [historical_snapshot_id]
-    for record in raw_spool.list_after(LiveChannel.MARKET_MINUTE, sequence=-1):
+    for record in records:
         envelope = record.envelope
         if envelope.sequence > target.envelope.sequence:
             break
@@ -93,19 +198,17 @@ def _feature_input_identity(
             continue
         if envelope.quality_status is BatchQualityStatus.STALE:
             continue
-        frame = MarketMinuteGateway.decode_payload(raw_spool.read_payload(record))
-        if frame.empty:
-            continue
-        local_dates = (
-            pd.to_datetime(frame["trade_time"], utc=True).dt.tz_convert("Asia/Shanghai").dt.date
+        frame = input_cache.frame(
+            raw_spool,
+            record,
+            source_generation_id=source_generation_id,
+            target_date=target_date,
         )
-        frame = frame.loc[local_dates == target_date].copy()
-        if frame.empty:
+        if frame is None:
             continue
-        frame["available_at"] = envelope.available_at
-        frame["_source_sequence"] = envelope.sequence
         frames.append(frame)
         input_ids.append(envelope.batch_id)
+    input_cache.retire_before(target_date)
     if not frames:
         return pd.DataFrame(), tuple(sorted(set(input_ids + [target.envelope.batch_id])))
     current = pd.concat(frames, ignore_index=True)
@@ -240,7 +343,7 @@ def run_feature_live_batch(
     *,
     raw_spool: LiveBatchSpool,
     feature_spool: FeatureBatchSpool,
-    historical_minutes: pd.DataFrame,
+    historical_minutes: pd.DataFrame | NormalizedHistoricalMinutes,
     historical_snapshot_id: str,
     config: IntradayFeatureConfig,
     observed_at: datetime,
@@ -249,7 +352,15 @@ def run_feature_live_batch(
     fault_hook: FeatureLiveFaultHook | None = None,
     schema_dual_writer: RuntimeSchemaDualWriter | None = None,
     calendar: MarketCalendarAuthority | None = None,
+    input_cache: FeatureLiveInputCache | None = None,
 ) -> FeatureLiveBatchSummary:
+    """Publish the feature batches of the raw minute batches after this consumer's cursor.
+
+    `input_cache` and a `NormalizedHistoricalMinutes` history are what a long-lived caller
+    (the runtime step) passes to keep one round's cost proportional to the batches that are
+    new (#302); without them every call decodes the day and normalizes the history afresh,
+    and the batches it publishes are the same bytes either way.
+    """
     observed = normalize_aware_utc(observed_at)
     if not historical_snapshot_id:
         raise ValueError("historical_snapshot_id cannot be empty")
@@ -260,10 +371,13 @@ def run_feature_live_batch(
     descriptor = raw_spool.source_descriptor(LiveChannel.MARKET_MINUTE)
     cursor = raw_spool.load_cursor(consumer_id, LiveChannel.MARKET_MINUTE)
     started_after = -1 if cursor is None else cursor.last_sequence
-    records = raw_spool.list_after(
-        LiveChannel.MARKET_MINUTE,
-        sequence=started_after,
-    )[:limit]
+    cache = FeatureLiveInputCache() if input_cache is None else input_cache
+    #: one listing per call: every feature batch of this call reads its inputs from it, where
+    #: each one used to list (and so re-validate) the whole spool again
+    day_records = raw_spool.list_after(LiveChannel.MARKET_MINUTE, sequence=-1)
+    records = tuple(record for record in day_records if record.envelope.sequence > started_after)[
+        :limit
+    ]
 
     processed = 0
     replayed = 0
@@ -277,6 +391,9 @@ def run_feature_live_batch(
             raw_spool,
             target=record,
             historical_snapshot_id=historical_snapshot_id,
+            records=day_records,
+            source_generation_id=descriptor.generation_id,
+            input_cache=cache,
         )
         feature_sequence, is_replay = _next_feature_sequence(
             feature_spool,
@@ -305,7 +422,11 @@ def run_feature_live_batch(
         else:
             result = live_compute(
                 current_minutes,
-                historical_minutes.copy(deep=True),
+                (
+                    historical_minutes
+                    if isinstance(historical_minutes, NormalizedHistoricalMinutes)
+                    else historical_minutes.copy(deep=True)
+                ),
                 decision_time=envelope.available_at,
                 input_available_at=envelope.available_at,
                 input_batch_ids=input_batch_ids,
@@ -405,4 +526,4 @@ def run_feature_live_batch(
     )
 
 
-__all__ = ["FeatureLiveBatchSummary", "run_feature_live_batch"]
+__all__ = ["FeatureLiveBatchSummary", "FeatureLiveInputCache", "run_feature_live_batch"]
