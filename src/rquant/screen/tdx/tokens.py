@@ -48,7 +48,11 @@ def _name_part(character: str) -> bool:
     return _name_start(character) or (character.isascii() and character.isdigit())
 
 
-def tokenize(source: str) -> list[Token]:
+def _ascii_digit(character: str) -> bool:
+    return len(character) == 1 and "0" <= character <= "9"
+
+
+def check_source_budget(source: str) -> None:
     if len(source) > MAX_SOURCE_BYTES:
         _reject(source, 0, "limit", "公式太长，请删减后重试。")
     try:
@@ -57,6 +61,10 @@ def tokenize(source: str) -> list[Token]:
         _reject(source, error.start, "syntax", "这里有无效文字，请修改公式。")
     if len(source_bytes) > MAX_SOURCE_BYTES:
         _reject(source, 0, "limit", "公式太长，请删减后重试。")
+
+
+def tokenize(source: str) -> list[Token]:
+    check_source_budget(source)
     tokens: list[Token] = []
     index = 0
     while index < len(source):
@@ -73,18 +81,28 @@ def tokenize(source: str) -> list[Token]:
             if len(value) > MAX_IDENTIFIER_CHARS:
                 _reject(source, start, "limit", "名称太长，请缩短后重试。")
             kind = "identifier"
-        elif character.isascii() and (
-            character.isdigit() or (character == "." and source[index + 1 : index + 2].isdigit())
+        elif _ascii_digit(character) or (
+            character == "." and _ascii_digit(source[index + 1 : index + 2])
         ):
-            index += 1
-            while index < len(source) and source[index].isascii() and source[index].isdigit():
+            if character == ".":
                 index += 1
-            if index < len(source) and source[index] == ".":
-                index += 1
-                while index < len(source) and source[index].isascii() and source[index].isdigit():
+                while index < len(source) and _ascii_digit(source[index]):
                     index += 1
+            else:
+                index += 1
+                while index < len(source) and _ascii_digit(source[index]):
+                    index += 1
+                if index < len(source) and source[index] == "." and _ascii_digit(
+                    source[index + 1 : index + 2]
+                ):
+                    index += 1
+                    while index < len(source) and _ascii_digit(source[index]):
+                        index += 1
             value = source[start:index]
-            converted = float(value)
+            try:
+                converted = float(value)
+            except (ValueError, OverflowError):
+                _reject(source, start, "syntax", "数字写法有误，请修改公式。")
             if not math.isfinite(converted):
                 _reject(source, start, "range", "数字过大，请改小后重试。")
             if converted == 0 and Decimal(value) != 0:

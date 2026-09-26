@@ -173,6 +173,27 @@ def test_unpaired_unicode_is_a_positioned_rejection() -> None:
     assert result.issues[0].code == "syntax"
 
 
+@pytest.mark.parametrize(
+    ("source", "column"),
+    [(".7.>0", 3), (".５>0", 1)],
+)
+def test_malformed_decimal_is_rejected_at_its_position(source: str, column: int) -> None:
+    result = parse_formula(source)
+
+    assert result.status == "rejected"
+    assert result.issues[0].code == "syntax"
+    assert result.issues[0].position.column == column
+    assert "修改" in result.issues[0].message
+
+
+def test_original_whitespace_counts_toward_source_byte_limit() -> None:
+    result = parse_formula(" " * 4097)
+
+    assert result.status == "rejected"
+    assert result.issues[0].code == "limit"
+    assert "太长" in result.issues[0].message
+
+
 def test_ast_rejects_non_finite_numbers_and_extra_fields() -> None:
     with pytest.raises(ValidationError):
         NumberExpr(value=float("inf"))

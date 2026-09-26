@@ -21,7 +21,7 @@ from rquant.screen.tdx.ast import (
     UnsupportedItem,
 )
 from rquant.screen.tdx.parser import ParsedFormula, parse_syntax
-from rquant.screen.tdx.tokens import FormulaError
+from rquant.screen.tdx.tokens import FormulaError, check_source_budget
 
 MAX_HISTORY_BARS = 500
 MARKET_FIELDS = frozenset({"CLOSE", "OPEN", "HIGH", "LOW", "VOL", "AMOUNT"})
@@ -263,6 +263,13 @@ class Validator:
 
 
 def parse_formula(source: str) -> ParseResult:
+    try:
+        check_source_budget(source)
+    except FormulaError as error:
+        return ParseResult(
+            status="rejected", ast=None, translation=None,
+            issues=[error.issue], unsupported=[],
+        )
     if not source.strip():
         return ParseResult(
             status="rejected", ast=None, translation=None, unsupported=[],

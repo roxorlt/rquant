@@ -107,6 +107,38 @@ def test_tdx_parse_reports_unsupported_and_positioned_errors(tmp_path: Path) -> 
     assert without_csrf.status_code == 403
 
 
+def test_tdx_parse_rejects_bad_json_fields_in_short_chinese_without_echo(tmp_path: Path) -> None:
+    with _client(tmp_path / "absent") as client:
+        wrong_type = client.post(
+            "/api/v1/screen/tdx/parse",
+            json={"source": 123},
+            headers={"X-Rquant-Csrf": "1"},
+        )
+        extra_field = client.post(
+            "/api/v1/screen/tdx/parse",
+            json={"source": "CLOSE>0", "comment": "SECRET_MARKER"},
+            headers={"X-Rquant-Csrf": "1"},
+        )
+
+    for response in (wrong_type, extra_field):
+        assert response.status_code == 422
+        assert response.json() == {"detail": "公式输入有误，请只填写文本公式。"}
+        assert "input" not in response.text
+        assert "SECRET_MARKER" not in response.text
+
+
+@pytest.mark.parametrize("source", [".7.>0", ".５>0"])
+def test_tdx_parse_malformed_number_stays_a_positioned_client_error(
+    tmp_path: Path, source: str,
+) -> None:
+    with _client(tmp_path / "absent") as client:
+        response = _parse(client, source)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert response.json()["issues"][0]["code"] == "syntax"
+
+
 def test_catalog_exposes_all_registered_rules_with_plain_chinese_labels(
     serving_root: Path,
 ) -> None:
