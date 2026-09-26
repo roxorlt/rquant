@@ -142,7 +142,7 @@ def test_cent_remainder_uses_stable_rank_tie_break() -> None:
     [
         (PortfolioWeightRule(max_positions=2, max_stock_weight=Decimal("0.40")), "单票"),
         (PortfolioWeightRule(max_positions=2, max_industry_weight=Decimal("0.60")), "行业"),
-        (PortfolioWeightRule(max_positions=2, min_target_amount=Decimal("60.00")), "最小"),
+        (PortfolioWeightRule(max_positions=1, min_target_amount=Decimal("101.00")), "最小"),
     ],
 )
 def test_infeasible_constraints_raise_clear_domain_error(
@@ -154,6 +154,36 @@ def test_infeasible_constraints_raise_clear_domain_error(
             rule,
             capital=Decimal("100.00"),
         )
+
+
+def test_equal_weight_minimum_drops_lower_ranked_tie_then_reallocates() -> None:
+    result = allocate_target_weights(
+        [candidate("B", "1", "X"), candidate("A", "2", "X")],
+        PortfolioWeightRule(max_positions=2, min_target_amount=Decimal("60.00")),
+        capital=Decimal("100.00"),
+    )
+
+    assert [
+        (item.ts_code, item.target_amount, item.exclusion_reason) for item in result.positions
+    ] == [
+        ("A", Decimal("100.00"), None),
+        ("B", Decimal("0.00"), "below_minimum"),
+    ]
+
+
+def test_high_precision_score_order_keeps_the_real_higher_score() -> None:
+    lower = candidate("A", "1.0000000000000000000000000000")
+    higher = candidate("B", "1.0000000000000000000000000001")
+    rule = PortfolioWeightRule(method="rank_score", max_positions=1)
+
+    forward = allocate_target_weights([lower, higher], rule, capital=Decimal("100.00"))
+    backward = allocate_target_weights([higher, lower], rule, capital=Decimal("100.00"))
+
+    assert forward == backward
+    assert [(item.ts_code, item.target_amount) for item in forward.positions] == [
+        ("B", Decimal("100.00")),
+        ("A", Decimal("0.00")),
+    ]
 
 
 def test_unknown_industry_cannot_bypass_industry_cap() -> None:

@@ -236,7 +236,8 @@ def allocate_target_weights(
         not isinstance(item, PortfolioCandidate) for item in candidates
     ):
         raise PortfolioAllocationError("候选与仓位规则必须使用已校验的数据模型")
-    ranked = sorted(candidates, key=lambda item: (-item.rank_score, item.ts_code))
+    ranked = sorted(candidates, key=lambda item: item.ts_code)
+    ranked.sort(key=lambda item: item.rank_score, reverse=True)
     if len({item.ts_code for item in ranked}) != len(ranked):
         raise PortfolioAllocationError("候选股票代码重复")
 
@@ -278,9 +279,9 @@ def allocate_target_weights(
             below_minimum = {index for index in eligible if amounts[index] < minimum_cents}
             if not below_minimum:
                 break
-            for index in below_minimum:
-                reasons[index] = "below_minimum"
-                eligible.remove(index)
+            drop_index = min(below_minimum, key=lambda index: (amounts[index], -index))
+            reasons[drop_index] = "below_minimum"
+            eligible.remove(drop_index)
         for index in eligible:
             if amounts[index] == 0:
                 reasons[index] = "zero_weight"
