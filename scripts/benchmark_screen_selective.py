@@ -33,7 +33,11 @@ from rquant.replica_generation import (  # noqa: E402
 )
 from rquant.screen.loader import load_universe  # noqa: E402
 from rquant.screen.replica_source import VerifiedReplicaScreenSource  # noqa: E402
-from rquant.screen.rules import has_prior_limit_up, volume_ratio_gte  # noqa: E402
+from rquant.screen.rules import (  # noqa: E402
+    has_lower_shadow,  # noqa: E402
+    has_prior_limit_up,
+    volume_ratio_gte,
+)
 from rquant.storage.duckdb import DuckDBStore  # noqa: E402
 
 TRADE_DATE = "2026-09-25"
@@ -155,6 +159,7 @@ def query(root: Path, mode: str) -> None:
     replica = root / "replica.duckdb"
     rule = volume_ratio_gte(2, offset=30, window=60)
     rules = [rule]
+    include_columns: list[str] = []
     started = time.perf_counter()
     if mode in {"full", "full-aggregate"}:
         aggregate_requests = (
@@ -166,14 +171,20 @@ def query(root: Path, mode: str) -> None:
                 TRADE_DATE, lookback=90, store=store,
                 aggregate_requests=aggregate_requests,
             )
-    elif mode in {"selective", "selective-aggregate"}:
-        if mode == "selective-aggregate":
+    elif mode in {"selective", "selective-aggregate", "bounded-max", "bounded-max-aggregate"}:
+        if mode.startswith("bounded-max"):
+            rules = [volume_ratio_gte(2, offset=0, window=60), rule]
+            rules.extend(has_lower_shadow(offset=offset) for offset in range(6))
+            include_columns = ["CIRC_MV[0]", "TURNOVER_RATE[0]"]
+        if mode.endswith("aggregate"):
             rules.append(has_prior_limit_up(window=500))
         frame = VerifiedReplicaScreenSource(
             primary_path=primary, replica_path=replica
-        ).load(date.fromisoformat(TRADE_DATE), rules).frame
+        ).load(
+            date.fromisoformat(TRADE_DATE), rules, include_columns=include_columns
+        ).frame
     else:
-        raise ValueError("mode must be full, selective, full-aggregate or selective-aggregate")
+        raise ValueError("unsupported benchmark mode")
     elapsed = time.perf_counter() - started
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     rss_bytes = rss if platform.system() == "Darwin" else rss * 1024

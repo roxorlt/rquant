@@ -19,6 +19,7 @@ from rquant.replica_generation import (
 )
 from rquant.screen.rules import (
     gt,
+    has_lower_shadow,
     has_prior_limit_up,
     not_limit_up,
     volume_ratio_gte,
@@ -373,6 +374,66 @@ def test_condition_and_universe_budgets_prevent_unbounded_load(tmp_path: Path) -
     )
     with pytest.raises(module.ScreenReplicaBudgetError):
         _reader(primary, replica).load(dates[0], [not_limit_up()])
+
+
+def test_effective_wide_budget_rejects_oversized_history_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.screen.loader import (
+        BASIC_COLS_MAP,
+        IND_COLS_MAP,
+        PRICE_COLS_MAP,
+        STATE_COLS_MAP,
+    )
+
+    primary, replica, dates = _world(tmp_path, days=91)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date) "
+            "SELECT 'X' || CAST(i AS VARCHAR), ? FROM range(7999) AS t(i)",
+            [dates[0]],
+        )
+    shutil.copy2(primary, replica)
+    write_replica_generation_metadata(
+        primary_path=primary, replica_path=replica,
+        output_path=replica_generation_path(replica),
+        source_before=capture_database_watermark(primary),
+    )
+    module = _source_module()
+    monkeypatch.setattr(
+        module, "load_universe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("loader called")),
+    )
+    all_fields = {
+        *PRICE_COLS_MAP.values(), *IND_COLS_MAP.values(),
+        *STATE_COLS_MAP.values(), *BASIC_COLS_MAP.values(),
+    }
+    too_wide = [
+        f"{field}[{offset}]" for field in sorted(all_fields)
+        for offset in range(91)
+    ]
+    with pytest.raises(module.ScreenReplicaBudgetError, match="historical columns"):
+        _reader(primary, replica).load(dates[0], [], include_columns=too_wide)
+
+    monkeypatch.setattr(
+        module, "load_universe",
+        lambda *args, **kwargs: pd.DataFrame({"ts_code": ["600001.SH"]}),
+    )
+    legal_rules = [has_lower_shadow(offset=offset) for offset in range(26)]
+    accepted = _reader(primary, replica).load(
+        dates[0], legal_rules,
+        include_columns=["CIRC_MV[0]", "TURNOVER_RATE[0]"],
+    )
+    assert accepted.frame["ts_code"].tolist() == ["600001.SH"]
+    monkeypatch.undo()
+    actual = _reader(primary, replica).load(
+        dates[0], legal_rules,
+        include_columns=["CIRC_MV[0]", "TURNOVER_RATE[0]"],
+    )
+    assert len(actual.frame) == 8000
+    assert {"BODY_LOWER[25]", "HIGH[25]", "CIRC_MV[0]", "TURNOVER_RATE[0]"}.issubset(
+        actual.frame.columns
+    )
 
 
 def test_volume_ratio_missing_day_fails_closed() -> None:

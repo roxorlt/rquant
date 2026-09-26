@@ -31,7 +31,7 @@ MAX_CONDITIONS = 26
 MAX_STOCKS = 8_000
 MAX_LOOKBACK = 90
 MAX_AGGREGATE_WINDOW = 500
-MAX_WIDE_CELLS = 24_000_000
+MAX_WIDE_CELLS = 1_000_000
 MAX_AGGREGATE_FACTS = 8_000_000
 MAX_SIDECAR_BYTES = 16 * 1024
 
@@ -275,9 +275,12 @@ class VerifiedReplicaScreenSource:
             if row_count == 0:
                 self._finish(descriptor, generation)
                 raise ScreenReplicaDataError("screening facts are unavailable")
+            if row_count * (len(wide_columns) + 5) > MAX_WIDE_CELLS:
+                raise ScreenReplicaBudgetError(
+                    "screen needs too many historical columns; narrow conditions or ranking"
+                )
             if (
                 row_count > MAX_STOCKS
-                or row_count * (len(wide_columns) + 5) > MAX_WIDE_CELLS
                 or row_count * sum(req.window for req in aggregates) > MAX_AGGREGATE_FACTS
             ):
                 raise ScreenReplicaBudgetError("screen data exceeds the allowed budget")

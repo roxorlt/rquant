@@ -687,6 +687,31 @@ class TestLoadUniverseBodyAndBasic:
 
 
 class TestLoadUniverseAggregates:
+    def test_duplicate_history_cannot_replace_a_missing_aggregate_date(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute("CREATE TABLE daily_state_copy AS SELECT * FROM daily_state")
+        store._conn.execute("DROP TABLE daily_state")
+        store._conn.execute("ALTER TABLE daily_state_copy RENAME TO daily_state")
+        store._conn.execute(
+            "DELETE FROM daily_state WHERE ts_code = '000001.SZ' "
+            "AND trade_date = '2026-04-09'"
+        )
+        store._conn.execute(
+            "INSERT INTO daily_state SELECT * FROM daily_state "
+            "WHERE ts_code = '000001.SZ' AND trade_date = '2026-04-08'"
+        )
+        rule = no_limit_down_in_window(window=8)
+        for required_columns in (None, []):
+            frame = load_universe(
+                "2026-04-15", lookback=0, store=store,
+                aggregate_requests=rule.aggregate_requests,
+                required_columns=required_columns,
+            )
+            stock = frame.loc[frame["ts_code"] == "000001.SZ"]
+            assert pd.isna(stock["has_limit_down_8d"].iloc[0])
+            assert not bool(rule(stock).iloc[0])
+
     def test_selective_aggregate_column_survives_empty_source_table(
         self, store: DuckDBStore
     ) -> None:

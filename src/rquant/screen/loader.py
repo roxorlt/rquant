@@ -288,7 +288,11 @@ def _compute_aggregate(
             }
         )
 
-    complete_predicate = "? AND COUNT(*) FILTER (WHERE fact_known) = ?"
+    complete_predicate = (
+        "? AND COUNT(DISTINCT fact_date) = ? "
+        "AND COUNT(*) = COUNT(DISTINCT fact_date) "
+        "AND COUNT(*) FILTER (WHERE fact_known) = ?"
+    )
     if req.agg_func == "max":
         agg_expr = (
             f"CASE WHEN {complete_predicate} "
@@ -303,17 +307,19 @@ def _compute_aggregate(
         agg_expr = """
         CASE
             WHEN NOT ? THEN NULL
+            WHEN COUNT(*) != COUNT(DISTINCT fact_date) THEN NULL
             WHEN COUNT(*) FILTER (
                 WHERE fact_known AND CAST(source_value AS BOOLEAN)
             ) > 0 THEN TRUE
-            WHEN COUNT(*) FILTER (WHERE fact_known) = ? THEN FALSE
+            WHEN COUNT(DISTINCT fact_date) = ?
+             AND COUNT(*) FILTER (WHERE fact_known) = ? THEN FALSE
             ELSE NULL
         END
         """
     elif req.agg_func == "count_nonzero":
-        agg_expr = """
+        agg_expr = f"""
         CASE
-            WHEN ? AND COUNT(*) FILTER (WHERE fact_known) = ?
+            WHEN {complete_predicate}
             THEN COUNT(*) FILTER (
                 WHERE fact_known AND CAST(source_value AS BOOLEAN)
             )
@@ -334,7 +340,8 @@ def _compute_aggregate(
         date_slots = ",".join("?" for _ in window_dates)
         sql = f"""
         WITH facts AS (
-            SELECT source.ts_code, source.{req.source_col} AS source_value,
+            SELECT source.ts_code, source.trade_date AS fact_date,
+                   source.{req.source_col} AS source_value,
                    source.{req.source_col} IS NOT NULL
                      AND status.ts_code IS NOT NULL
                      AND status.conflict_reason IS NULL
@@ -364,6 +371,7 @@ def _compute_aggregate(
         facts AS (
             SELECT
                 expected.ts_code,
+                expected.trade_date AS fact_date,
                 source.{req.source_col} AS source_value,
                 source.ts_code IS NOT NULL
                     AND source.{req.source_col} IS NOT NULL
@@ -388,7 +396,7 @@ def _compute_aggregate(
         ORDER BY ts_code
         """
         params = [ts_codes, window_dates, decision_at]
-    params.extend([calendar_complete, expected_count])
+    params.extend([calendar_complete, expected_count, expected_count])
     result = store._conn.execute(sql, params).fetchdf()
     result = result.rename(columns={"aggregate_value": req.name})
     return result
