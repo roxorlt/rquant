@@ -6,6 +6,7 @@
 export { Button, type ButtonProps } from "./Button";
 export { ChangeText } from "./ChangeText";
 export { ConfirmDialog, type ConfirmDialogProps, type ConfirmLevel } from "./ConfirmDialog";
+export { DatePicker, type DatePickerProps } from "./DatePicker";
 export { BottomSheet, type BottomSheetProps, SideDrawer, type SideDrawerProps } from "./Drawer";
 export { DropdownMenu, type DropdownMenuItem } from "./DropdownMenu";
 export { EmptyState } from "./EmptyState";
@@ -14,7 +15,9 @@ export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { PagePlaceholder, type PagePlaceholderProps } from "./PagePlaceholder";
 export { Panel, type PanelProps } from "./Panel";
 export { Pill, type PillKind } from "./Pill";
+export { Popover, type PopoverProps } from "./Popover";
 export { RelativeTime, useNow } from "./RelativeTime";
+export { SearchInput, type SearchInputProps } from "./SearchInput";
 export { Segmented, type SegmentedOption } from "./Segmented";
 export { ServingBanner, type ServingState, servingBannerMessage } from "./ServingBanner";
 export { PageSkeleton, SkeletonKpis, SkeletonLine, SkeletonRows } from "./Skeleton";

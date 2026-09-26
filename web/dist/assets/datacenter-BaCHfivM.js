@@ -1,1 +1,0 @@
-import{n as e}from"./PageHeader-BqojKuFQ.js";import{t}from"./PlaceholderPage-D6jh6Ep7.js";var n=e();function r(){return(0,n.jsx)(t,{id:`datacenter`})}export{r as default};

@@ -204,7 +204,7 @@ class SurgeData(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     trade_date: date | None
-    #: Days with at least one record, newest first (for the date picker).
+    #: Open trading days through the current session, newest first (for the date picker).
     dates: list[date]
     rows: list[SurgeRow]
     config: SurgeConfig | None

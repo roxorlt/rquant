@@ -34,6 +34,7 @@ from rquant.panorama_data import (
     compute_market_pulse,
     volume_directions,
 )
+from rquant.web.calendar import CALENDAR_EXCHANGE
 from rquant.web.labels import PRESET_LABELS
 from rquant.web.market import MARKET_TIMEZONE
 from rquant.web.models.panorama import (
@@ -636,11 +637,14 @@ def _surge_row(row: Any) -> SurgeRow:
     )
 
 
-def surge_dates(cursor: Any, tables: Mapping[str, TableState]) -> list[date]:
-    if not _readable(tables, "surge_event"):
+def surge_dates(cursor: Any, tables: Mapping[str, TableState], through: date) -> list[date]:
+    if not _readable(tables, "trade_calendar"):
         return []
     rows = cursor.execute(
-        "SELECT DISTINCT trade_date FROM surge_event ORDER BY trade_date DESC LIMIT 120"
+        "SELECT trade_date FROM trade_calendar "
+        "WHERE exchange = ? AND is_open AND trade_date <= ? "
+        "ORDER BY trade_date DESC LIMIT 120",
+        (CALENDAR_EXCHANGE, through),
     ).fetchall()
     return [pd.Timestamp(row[0]).date() for row in rows]
 

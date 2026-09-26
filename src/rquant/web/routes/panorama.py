@@ -314,7 +314,7 @@ def get_surge(
         chosen = day or context.day
         return SurgeData(
             trade_date=chosen,
-            dates=panorama.surge_dates(context.cursor, context.tables),
+            dates=panorama.surge_dates(context.cursor, context.tables, context.day),
             rows=panorama.surge_day(context.cursor, context.tables, chosen),
             config=panorama.surge_config(context.cursor, context.tables),
         )

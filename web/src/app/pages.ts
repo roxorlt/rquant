@@ -136,7 +136,7 @@ export const PAGES: readonly PageDef[] = [
     path: "/panorama",
     title: "市场全景",
     group: "跟踪与告警",
-    ready: false,
+    ready: true,
     summary: "涨跌停脉搏、板块强弱、个股分时和爆量记录。",
     phoneTab: "全景",
   },

@@ -279,7 +279,8 @@ def test_the_surge_ledger_keeps_each_stocks_first_confirmation_of_the_day(pano: 
     data = _get(pano, "/api/v1/panorama/surge")["data"]
 
     assert data["trade_date"] == "2026-09-24"
-    assert data["dates"] == ["2026-09-24", "2026-09-23"]
+    assert data["dates"][:3] == ["2026-09-24", "2026-09-23", "2026-09-22"]
+    assert "2026-09-25" not in data["dates"]
     assert [(row["confirmed_at"], row["ts_code"]) for row in data["rows"]] == [
         ("09:47", "600001.SH"),
         ("10:12", "600003.SH"),
@@ -294,6 +295,13 @@ def test_the_surge_ledger_keeps_each_stocks_first_confirmation_of_the_day(pano: 
 def test_another_day_of_the_ledger(pano: Path) -> None:
     data = _get(pano, "/api/v1/panorama/surge?date=2026-09-23")["data"]
     assert [row["ts_code"] for row in data["rows"]] == ["600001.SH"]
+
+
+def test_open_day_without_surge_can_be_selected(pano: Path) -> None:
+    data = _get(pano, "/api/v1/panorama/surge?date=2026-09-22")["data"]
+    assert data["trade_date"] == "2026-09-22"
+    assert "2026-09-22" in data["dates"]
+    assert data["rows"] == []
 
 
 def test_cross_day_search_by_code_or_name(pano: Path) -> None:
