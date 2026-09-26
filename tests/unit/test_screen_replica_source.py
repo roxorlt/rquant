@@ -288,6 +288,26 @@ def test_missing_calendar_does_not_report_an_empty_success(tmp_path: Path) -> No
         _reader(primary, replica).load(dates[0], [gt("CLOSE[0]", "CLOSE[2]")])
 
 
+def test_open_trade_date_without_daily_rows_is_data_unavailable_not_zero_hits(
+    tmp_path: Path,
+) -> None:
+    primary, replica, dates = _world(tmp_path)
+    with DuckDBStore(primary) as store:
+        store._conn.execute("DELETE FROM daily_bar WHERE trade_date = ?", [dates[0]])
+    shutil.copy2(primary, replica)
+    write_replica_generation_metadata(
+        primary_path=primary,
+        replica_path=replica,
+        output_path=replica_generation_path(replica),
+        source_before=capture_database_watermark(primary),
+    )
+
+    with pytest.raises(_source_module().ScreenReplicaDataError) as failed:
+        _reader(primary, replica).load(dates[0], [gt("CLOSE[0]", 1000.0)])
+    assert "rquant_ro.duckdb" not in str(failed.value)
+    assert "daily_bar" not in str(failed.value)
+
+
 def test_condition_and_universe_budgets_prevent_unbounded_load(tmp_path: Path) -> None:
     primary, replica, dates = _world(tmp_path)
     module = _source_module()

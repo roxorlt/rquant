@@ -264,6 +264,9 @@ class VerifiedReplicaScreenSource:
                     "SELECT COUNT(*) FROM daily_bar WHERE trade_date = ?", [trade_date]
                 ).fetchone()[0]
             )
+            if row_count == 0:
+                self._finish(descriptor, generation)
+                raise ScreenReplicaDataError("screening facts are unavailable")
             if (
                 row_count > MAX_STOCKS
                 or row_count * (lookback + 1) * _WIDE_FIELD_COUNT > MAX_WIDE_CELLS
