@@ -505,6 +505,24 @@ def _stock_basic() -> list[dict[str, object]]:
     ]
 
 
+def _nl_screen_universe() -> list[dict[str, object]]:
+    return [
+        {
+            "trade_date": FIXTURE_TRADE_DATE.isoformat(),
+            "ts_code": stock["ts_code"],
+            "name": stock["name"],
+            "is_st": index % 10 == 0,
+            "is_bj": False,
+            "board_type": "main",
+            "CLOSE[0]": float(10 + index),
+            "PCT_CHG[0]": float(index - 15),
+            "CIRC_MV[0]": float(index * 50_000),
+            "MA5[0]": float(20 + index // 2),
+        }
+        for index, stock in enumerate(_stock_basic(), start=1)
+    ]
+
+
 def _snapshot_frame() -> pd.DataFrame:
     return _fake_snapshot()
 
@@ -793,6 +811,7 @@ def _projections(
     projections = [
         reference("trade_calendar", _trade_calendar()),
         reference("stock_basic", _stock_basic()),
+        reference("nl_screen_universe", _nl_screen_universe()),
     ]
     if scenario != "degraded":
         projections.append(

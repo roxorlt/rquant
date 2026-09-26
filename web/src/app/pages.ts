@@ -71,8 +71,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/screener",
     title: "选股器",
     group: "研究",
-    ready: false,
-    summary: "用一句话或条件积木选股，逐条看剩下多少只，再按分数排序。",
+    ready: true,
+    summary: "组合条件筛选股票，逐条查看剩余数量与结果。",
   },
   {
     id: "pools",

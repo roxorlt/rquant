@@ -20,10 +20,10 @@ def test_openapi_snapshot_matches_the_app_byte_for_byte() -> None:
     assert SNAPSHOT.read_text(encoding="utf-8") == openapi_document(app)
 
 
-def test_every_api_path_is_versioned_and_read_only() -> None:
+def test_every_api_path_is_versioned_and_only_screen_run_uses_read_only_post() -> None:
     app = create_app(WebSettings(serving_root=Path("data/runtime/serving")), background=False)
     paths = app.openapi()["paths"]
     assert paths
     for path, operations in paths.items():
         assert path.startswith("/api/v1/")
-        assert set(operations) == {"get"}
+        assert set(operations) == ({"post"} if path == "/api/v1/screen/run" else {"get"})

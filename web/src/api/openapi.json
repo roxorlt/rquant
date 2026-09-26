@@ -750,6 +750,38 @@
         "title": "Envelope[PulseData]",
         "type": "object"
       },
+      "Envelope_ScreenCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ScreenCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ScreenCatalogData]",
+        "type": "object"
+      },
+      "Envelope_ScreenRunData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ScreenRunData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ScreenRunData]",
+        "type": "object"
+      },
       "Envelope_StockSearchData_": {
         "properties": {
           "data": {
@@ -2072,6 +2104,407 @@
         "title": "PulsePoint",
         "type": "object"
       },
+      "ScreenBlock": {
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "category_label": {
+            "title": "Category Label",
+            "type": "string"
+          },
+          "hint": {
+            "title": "Hint",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "parameters": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenParameter"
+            },
+            "title": "Parameters",
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "hint",
+          "category",
+          "category_label",
+          "parameters"
+        ],
+        "title": "ScreenBlock",
+        "type": "object"
+      },
+      "ScreenCatalogData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenBlock"
+            },
+            "title": "Blocks",
+            "type": "array"
+          },
+          "dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Dates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "blocks",
+          "dates",
+          "available"
+        ],
+        "title": "ScreenCatalogData",
+        "type": "object"
+      },
+      "ScreenCondition": {
+        "properties": {
+          "args": {
+            "additionalProperties": true,
+            "title": "Args",
+            "type": "object"
+          },
+          "key": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "ScreenCondition",
+        "type": "object"
+      },
+      "ScreenOption": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "title": "ScreenOption",
+        "type": "object"
+      },
+      "ScreenParameter": {
+        "properties": {
+          "hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hint"
+          },
+          "initial": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Initial"
+          },
+          "input": {
+            "enum": [
+              "number",
+              "integer",
+              "choice",
+              "multi_choice",
+              "field",
+              "operand"
+            ],
+            "title": "Input",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "maximum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum"
+          },
+          "minimum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenOption"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "required": {
+            "title": "Required",
+            "type": "boolean"
+          },
+          "scale": {
+            "default": 1,
+            "title": "Scale",
+            "type": "number"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "input",
+          "initial",
+          "required"
+        ],
+        "title": "ScreenParameter",
+        "type": "object"
+      },
+      "ScreenRow": {
+        "properties": {
+          "close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Close"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts_code",
+          "name",
+          "close",
+          "pct_chg"
+        ],
+        "title": "ScreenRow",
+        "type": "object"
+      },
+      "ScreenRunData": {
+        "properties": {
+          "base_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Count"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "unavailable",
+              "no_date"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "status",
+          "base_count",
+          "total",
+          "steps",
+          "rows",
+          "next_cursor"
+        ],
+        "title": "ScreenRunData",
+        "type": "object"
+      },
+      "ScreenRunRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenCondition"
+            },
+            "maxItems": 26,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "page_size": {
+            "default": 20,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "conditions"
+        ],
+        "title": "ScreenRunRequest",
+        "type": "object"
+      },
+      "ScreenStep": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "count"
+        ],
+        "title": "ScreenStep",
+        "type": "object"
+      },
       "ServiceItem": {
         "properties": {
           "backlog_count": {
@@ -3313,6 +3746,68 @@
         "summary": "爆量记录（跨日搜索）",
         "tags": [
           "panorama"
+        ]
+      }
+    },
+    "/api/v1/screen/blocks": {
+      "get": {
+        "operationId": "get_blocks_api_v1_screen_blocks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ScreenCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "选股条件目录",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/run": {
+      "post": {
+        "operationId": "run_screen_api_v1_screen_run_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ScreenRunData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "运行选股条件",
+        "tags": [
+          "screen"
         ]
       }
     },

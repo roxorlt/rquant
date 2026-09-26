@@ -42,7 +42,7 @@ describe("总览", () => {
     const table = screen.getByRole("table", { name: "最新信号" });
     const rows = within(table).getAllByRole("row").slice(1);
     expect(rows).toHaveLength(2);
-    expect(rows[0]).toHaveTextContent("13:05天威视讯002238.SZ竞价跳空买入意向仅记录");
+    expect(rows[0]).toHaveTextContent("13:05天威视讯 002238.SZ竞价跳空买入意向仅记录");
     expect(rows[0]).not.toHaveTextContent("已送达");
     expect(rows[1]).toHaveTextContent("失败");
     expect(rows[1]?.querySelector('.status[data-state="crit"]')).not.toBeNull();
@@ -88,7 +88,7 @@ describe("总览", () => {
     await renderOverview();
     const holdings = screen.getByRole("table", { name: "模拟盘持仓" });
     expect(within(holdings).getAllByRole("row")).toHaveLength(2);
-    expect(holdings).toHaveTextContent("丽岛新材603937.SH10012.7612.711,270.64−5.00−0.39%");
+    expect(holdings).toHaveTextContent("丽岛新材 603937.SH10012.7612.711,270.64−5.00−0.39%");
     const attention = screen.getByText("1 条推送失败").closest("li") as HTMLElement;
     expect(attention).toHaveTextContent("需处理1 条推送失败手机可能没有收到这些信号看健康");
     expect(screen.queryByText(/模拟账户/)).not.toBeInTheDocument();

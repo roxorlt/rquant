@@ -47,7 +47,11 @@ function proxy(clientRequest, clientResponse, path) {
       port: api.port,
       path,
       method: clientRequest.method,
-      headers: { ...clientRequest.headers, host: api.host, "x-rquant-user": values.user },
+      headers: {
+        ...clientRequest.headers,
+        host: clientRequest.headers.host ?? api.host,
+        "x-rquant-user": values.user,
+      },
     },
     (upstreamResponse) => {
       clientResponse.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);

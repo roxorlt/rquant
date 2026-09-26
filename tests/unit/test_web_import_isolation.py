@@ -24,6 +24,7 @@ FORBIDDEN_PREFIXES = ("rquant.config", "rquant.storage", "duckdb")
 CONFIGURATION_FREE_ENVIRONMENT = {
     "PATH": os.environ.get("PATH", os.defpath),
     "LANG": "C",
+    "PYTHONPATH": str(REPO_ROOT / "src"),
     "RQUANT_DISABLE_DOTENV": "1",
 }
 

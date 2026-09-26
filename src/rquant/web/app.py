@@ -8,6 +8,8 @@ stripped, so this app only knows ``/api/v1/...``. No static files, no CORS, no d
 from __future__ import annotations
 
 import json
+import secrets
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -19,7 +21,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from rquant.web.routes import health, meta, overview, panorama, stocks
+from rquant.web.routes import health, meta, overview, panorama, screen, stocks
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 
@@ -38,6 +40,8 @@ class WebContext:
     settings: WebSettings
     tracker: GenerationTracker
     clock: Callable[[], datetime]
+    cursor_key: bytes
+    screen_gate: threading.BoundedSemaphore
 
 
 def create_app(
@@ -73,7 +77,13 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
-    app.state.web = WebContext(settings=settings, tracker=generation_tracker, clock=clock)
+    app.state.web = WebContext(
+        settings=settings,
+        tracker=generation_tracker,
+        clock=clock,
+        cursor_key=secrets.token_bytes(32),
+        screen_gate=threading.BoundedSemaphore(1),
+    )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.middleware("http")
@@ -91,6 +101,7 @@ def create_app(
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
+    app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     return app
 

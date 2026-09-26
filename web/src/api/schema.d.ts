@@ -174,6 +174,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/blocks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 选股条件目录 */
+        get: operations["get_blocks_api_v1_screen_blocks_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 运行选股条件 */
+        post: operations["run_screen_api_v1_screen_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stocks/search": {
         parameters: {
             query?: never;
@@ -439,6 +473,16 @@ export interface components {
         /** Envelope[PulseData] */
         Envelope_PulseData_: {
             data: components["schemas"]["PulseData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ScreenCatalogData] */
+        Envelope_ScreenCatalogData_: {
+            data: components["schemas"]["ScreenCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ScreenRunData] */
+        Envelope_ScreenRunData_: {
+            data: components["schemas"]["ScreenRunData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[StockSearchData] */
@@ -815,6 +859,133 @@ export interface components {
             t: string;
             /** Up Ratio Pct */
             up_ratio_pct: number | null;
+        };
+        /** ScreenBlock */
+        ScreenBlock: {
+            /** Category */
+            category: string;
+            /** Category Label */
+            category_label: string;
+            /** Hint */
+            hint: string;
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Parameters */
+            parameters: components["schemas"]["ScreenParameter"][];
+        };
+        /** ScreenCatalogData */
+        ScreenCatalogData: {
+            /** Available */
+            available: boolean;
+            /** Blocks */
+            blocks: components["schemas"]["ScreenBlock"][];
+            /** Dates */
+            dates: string[];
+        };
+        /** ScreenCondition */
+        ScreenCondition: {
+            /** Args */
+            args?: {
+                [key: string]: unknown;
+            };
+            /** Key */
+            key: string;
+        };
+        /** ScreenOption */
+        ScreenOption: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
+        /** ScreenParameter */
+        ScreenParameter: {
+            /** Hint */
+            hint?: string | null;
+            /** Initial */
+            initial: string | number | string[] | null;
+            /**
+             * Input
+             * @enum {string}
+             */
+            input: "number" | "integer" | "choice" | "multi_choice" | "field" | "operand";
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Maximum */
+            maximum?: number | null;
+            /** Minimum */
+            minimum?: number | null;
+            /** Options */
+            options?: components["schemas"]["ScreenOption"][];
+            /** Required */
+            required: boolean;
+            /**
+             * Scale
+             * @default 1
+             */
+            scale: number;
+        };
+        /** ScreenRow */
+        ScreenRow: {
+            /** Close */
+            close: number | null;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** ScreenRunData */
+        ScreenRunData: {
+            /** Base Count */
+            base_count: number | null;
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Rows */
+            rows: components["schemas"]["ScreenRow"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "unavailable" | "no_date";
+            /** Steps */
+            steps: components["schemas"]["ScreenStep"][];
+            /** Total */
+            total: number | null;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenRunRequest */
+        ScreenRunRequest: {
+            /** Conditions */
+            conditions: components["schemas"]["ScreenCondition"][];
+            /** Cursor */
+            cursor?: string | null;
+            /**
+             * Page Size
+             * @default 20
+             */
+            page_size: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenStep */
+        ScreenStep: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
         };
         /** ServiceItem */
         ServiceItem: {
@@ -1355,6 +1526,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_SurgeSearchData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_blocks_api_v1_screen_blocks_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenCatalogData_"];
+                };
+            };
+        };
+    };
+    run_screen_api_v1_screen_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenRunData_"];
                 };
             };
             /** @description Validation Error */

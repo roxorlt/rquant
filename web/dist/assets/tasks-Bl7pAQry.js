@@ -1,0 +1,1 @@
+import{n as e}from"./PageHeader-YKnkR1W_.js";import{t}from"./PlaceholderPage-B68pPDbm.js";var n=e();function r(){return(0,n.jsx)(t,{id:`tasks`})}export{r as default};
