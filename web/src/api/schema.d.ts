@@ -4,6 +4,40 @@
  */
 
 export interface paths {
+    "/api/v1/catalog/datasets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据目录 */
+        get: operations["list_datasets_api_v1_catalog_datasets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalog/datasets/{dataset_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据集字段说明 */
+        get: operations["get_dataset_api_v1_catalog_datasets__dataset_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -351,6 +385,73 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** CatalogDataset */
+        CatalogDataset: {
+            /** Category */
+            category: string;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Fields */
+            fields: components["schemas"]["CatalogField"][];
+            /** Name */
+            name: string;
+            /** Primary Key */
+            primary_key: string[];
+            /** Purpose */
+            purpose: string;
+            /**
+             * Sample Available
+             * @default false
+             */
+            sample_available: boolean;
+            /** Schema Available */
+            schema_available: boolean;
+            /** Sources */
+            sources: string[];
+            /** Table Name */
+            table_name: string;
+            /** Update Note */
+            update_note: string;
+            /** Visibility Note */
+            visibility_note: string;
+        };
+        /** CatalogField */
+        CatalogField: {
+            /** Data Type */
+            data_type: string;
+            /** Description */
+            description: string;
+            /** Is Primary Key */
+            is_primary_key: boolean;
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+            /** Unit */
+            unit: string | null;
+        };
+        /** CatalogList */
+        CatalogList: {
+            /** Datasets */
+            datasets: components["schemas"]["CatalogSummary"][];
+            /** Version */
+            version: number;
+        };
+        /** CatalogSummary */
+        CatalogSummary: {
+            /** Category */
+            category: string;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Name */
+            name: string;
+            /** Purpose */
+            purpose: string;
+            /** Schema Available */
+            schema_available: boolean;
+            /** Sources */
+            sources: string[];
+        };
         /** DailyBar */
         DailyBar: {
             /** Close */
@@ -438,6 +539,16 @@ export interface components {
         /** Envelope[BoardsData] */
         Envelope_BoardsData_: {
             data: components["schemas"]["BoardsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[CatalogDataset] */
+        Envelope_CatalogDataset_: {
+            data: components["schemas"]["CatalogDataset"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[CatalogList] */
+        Envelope_CatalogList_: {
+            data: components["schemas"]["CatalogList"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[DailyData] */
@@ -1293,6 +1404,57 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_datasets_api_v1_catalog_datasets_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CatalogList_"];
+                };
+            };
+        };
+    };
+    get_dataset_api_v1_catalog_datasets__dataset_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CatalogDataset_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_health_api_v1_health_get: {
         parameters: {
             query?: never;

@@ -15,6 +15,10 @@ export type StatusInfo = Schemas["StatusInfo"];
 export type StockSearchData = Schemas["StockSearchData"];
 export type StockSearchRow = Schemas["StockSearchRow"];
 export type StockSummaryData = Schemas["StockSummaryData"];
+export type CatalogList = Schemas["CatalogList"];
+export type CatalogDataset = Schemas["CatalogDataset"];
+export type CatalogSummary = Schemas["CatalogSummary"];
+export type CatalogField = Schemas["CatalogField"];
 
 function unwrap<T>(data: T | undefined, response: Response): T {
   if (data === undefined) {
@@ -39,6 +43,26 @@ export function useOverview(): ServingQueryResult<OverviewData> {
 
 export function useHealth(): ServingQueryResult<HealthData> {
   return useServingQuery(["health"], fetchHealth);
+}
+
+export function useCatalog(): ServingQueryResult<CatalogList> {
+  return useServingQuery(["catalog", "datasets"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/catalog/datasets");
+    return unwrap(data, response);
+  });
+}
+
+export function useCatalogDataset(datasetId: string | null): ServingQueryResult<CatalogDataset> {
+  return useServingQuery(
+    ["catalog", "dataset", datasetId],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/catalog/datasets/{dataset_id}", {
+        params: { path: { dataset_id: datasetId ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: datasetId !== null },
+  );
 }
 
 export function useStockSearch(query: string): ServingQueryResult<StockSearchData> {

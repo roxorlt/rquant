@@ -19,7 +19,7 @@ test.beforeEach(async ({ page }) => {
 const PAGES = [
   { route: "overview", title: "总览", ready: "table[aria-label='最新信号'] tbody tr" },
   { route: "health", title: "系统健康", ready: "table[aria-label='运行服务'] tbody tr" },
-  { route: "datacenter", title: "数据中心", ready: ".soon" },
+  { route: "datacenter", title: "数据中心", ready: ".dc-dataset" },
 ] as const;
 
 async function settle(page: Page, selector: string): Promise<void> {

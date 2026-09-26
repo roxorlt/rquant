@@ -63,8 +63,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/datacenter",
     title: "数据中心",
     group: "数据",
-    ready: false,
-    summary: "看每份数据有多少、到哪天、缺了哪几段，以及怎么补。",
+    ready: true,
+    summary: "查看数据目录和字段说明。",
   },
   {
     id: "screener",

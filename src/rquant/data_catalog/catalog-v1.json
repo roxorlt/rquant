@@ -1,0 +1,2507 @@
+{
+  "version": 1,
+  "datasets": [
+    {
+      "dataset_id": "daily_bar",
+      "table_name": "daily_bar",
+      "name": "股票日线",
+      "purpose": "查看股票每天的开收盘价、成交量与涨跌",
+      "category": "行情",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "open",
+          "name": "开盘价",
+          "description": "该交易日或时段开始时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "high",
+          "name": "最高价",
+          "description": "该交易日或时段内的最高价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "low",
+          "name": "最低价",
+          "description": "该交易日或时段内的最低价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pre_close",
+          "name": "前收盘价",
+          "description": "上一交易日的收盘价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "change",
+          "name": "涨跌额",
+          "description": "相对前收盘价的价格变化",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_chg",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "vol",
+          "name": "成交量",
+          "description": "该交易日或时段的成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "amount",
+          "name": "成交额",
+          "description": "该时段的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "stock_status_daily",
+      "table_name": "stock_status_daily",
+      "name": "股票状态",
+      "purpose": "核对股票名称和 ST 状态在盘中的变化",
+      "category": "股票资料",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "记录时间之后可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "is_st",
+          "name": "ST 状态",
+          "description": "股票是否被标记为 ST 或 *ST",
+          "data_type": "BOOLEAN",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "name_source",
+          "name": "名称来源",
+          "description": "股票名称所采用的数据来源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "st_source",
+          "name": "ST 来源",
+          "description": "ST 状态所采用的数据来源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "available_at",
+          "name": "可用时间",
+          "description": "这条记录在研究中最早可使用的时间",
+          "data_type": "TIMESTAMP WITH TIME ZONE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "ingested_at",
+          "name": "入库时间",
+          "description": "该记录写入本地数据集的时间",
+          "data_type": "TIMESTAMP WITH TIME ZONE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "conflict_reason",
+          "name": "冲突原因",
+          "description": "多来源股票状态发生分歧时的原因",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "minute_bar",
+      "table_name": "minute_bar",
+      "name": "股票分钟线",
+      "purpose": "查看盘中每分钟的价格与成交",
+      "category": "行情",
+      "sources": [
+        "Tushare Pro",
+        "Tushare 实时行情",
+        "Tushare 实时日线"
+      ],
+      "update_note": "最多延迟 5 分钟",
+      "visibility_note": "记录时间之后可见",
+      "primary_key": [
+        "ts_code",
+        "trade_time",
+        "freq",
+        "source"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_time",
+          "name": "交易时间",
+          "description": "该条分钟行情对应的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "freq",
+          "name": "分钟周期",
+          "description": "这一条分钟行情的时间周期",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "open",
+          "name": "开盘价",
+          "description": "该交易日或时段开始时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "high",
+          "name": "最高价",
+          "description": "该交易日或时段内的最高价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "low",
+          "name": "最低价",
+          "description": "该交易日或时段内的最低价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "vol",
+          "name": "成交量",
+          "description": "该交易日或时段的成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "amount",
+          "name": "成交额",
+          "description": "该时段的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "source",
+          "name": "数据来源",
+          "description": "这条记录实际采用的数据源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "auction_bar",
+      "table_name": "auction_bar",
+      "name": "集合竞价",
+      "purpose": "查看开盘竞价价格、成交与量比",
+      "category": "行情",
+      "sources": [
+        "Tushare Pro",
+        "09:30 分钟行情兜底"
+      ],
+      "update_note": "交易日数据需在当日可用",
+      "visibility_note": "竞价后可见（Tushare Pro 09:26, 09:30 分钟行情兜底 09:31）",
+      "primary_key": [
+        "ts_code",
+        "trade_date",
+        "auction_type",
+        "source"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "auction_type",
+          "name": "竞价类型",
+          "description": "标识开盘或收盘竞价",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "price",
+          "name": "竞价价格",
+          "description": "集合竞价形成的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "vol",
+          "name": "成交量",
+          "description": "该交易日或时段的成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "amount",
+          "name": "成交额",
+          "description": "该时段的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "turnover_rate",
+          "name": "换手率",
+          "description": "成交股份占流通股份的比例",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "volume_ratio",
+          "name": "量比",
+          "description": "当前成交量与历史同期成交量的比值",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "source",
+          "name": "数据来源",
+          "description": "这条记录实际采用的数据源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "stock_suspend_event",
+      "table_name": "stock_suspend_event",
+      "name": "停复牌事件",
+      "purpose": "追踪股票停牌与复牌公告对应的交易日",
+      "category": "股票资料",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "有事件时更新",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "source",
+        "ts_code",
+        "trade_date",
+        "suspend_type",
+        "suspend_timing"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "source",
+          "name": "数据来源",
+          "description": "这条记录实际采用的数据源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "suspend_type",
+          "name": "停复牌类型",
+          "description": "标识停牌或复牌",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "suspend_timing",
+          "name": "停复牌时点",
+          "description": "停复牌事件发生在交易日内的时点",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "session_scope",
+          "name": "交易时段范围",
+          "description": "停复牌事件影响的交易时段",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "available_at",
+          "name": "可用时间",
+          "description": "这条记录在研究中最早可使用的时间",
+          "data_type": "TIMESTAMP WITH TIME ZONE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "ingested_at",
+          "name": "入库时间",
+          "description": "该记录写入本地数据集的时间",
+          "data_type": "TIMESTAMP WITH TIME ZONE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "stock_suspend_coverage",
+      "table_name": "stock_suspend_coverage",
+      "name": "停复牌采集记录",
+      "purpose": "检查每日停复牌信息是否采集完成",
+      "category": "数据质量",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "交易日数据需在当日可用",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "source",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "source",
+          "name": "数据来源",
+          "description": "这条记录实际采用的数据源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "coverage_state",
+          "name": "采集状态",
+          "description": "该交易日停复牌采集的完成情况",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "row_count",
+          "name": "记录条数",
+          "description": "该次采集得到的停复牌记录数",
+          "data_type": "BIGINT",
+          "unit": "条",
+          "is_primary_key": false
+        },
+        {
+          "key": "snapshot_hash",
+          "name": "采集摘要",
+          "description": "该次采集结果的校验摘要",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "queried_at",
+          "name": "查询时间",
+          "description": "完成该次源端查询的时间",
+          "data_type": "TIMESTAMP WITH TIME ZONE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "adj_factor",
+      "table_name": "adj_factor",
+      "name": "复权因子",
+      "purpose": "为历史价格复权提供调整系数",
+      "category": "行情",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "adj_factor",
+          "name": "复权因子",
+          "description": "用于历史价格调整的因子",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "limit_list_daily",
+      "table_name": "limit_list_daily",
+      "name": "涨跌停明细",
+      "purpose": "查看涨跌停股票及封单、开板情况",
+      "category": "行情",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date",
+        "limit_status"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "industry",
+          "name": "行业",
+          "description": "数据源给出的行业名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_chg",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "amount",
+          "name": "成交额",
+          "description": "该时段的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "limit_amount",
+          "name": "板上成交额",
+          "description": "封板期间的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "float_mv",
+          "name": "流通市值",
+          "description": "流通股市值；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "total_mv",
+          "name": "总市值",
+          "description": "全部股份的市值；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "turnover_ratio",
+          "name": "换手率",
+          "description": "该交易日股票的换手率",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "fd_amount",
+          "name": "封单额",
+          "description": "涨停或跌停封单金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "first_time",
+          "name": "首次封板时间",
+          "description": "该交易日首次封板的时间",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "last_time",
+          "name": "最后封板时间",
+          "description": "该交易日最后一次封板的时间",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "open_times",
+          "name": "开板次数",
+          "description": "该交易日封板后再次打开的次数",
+          "data_type": "INTEGER",
+          "unit": "次",
+          "is_primary_key": false
+        },
+        {
+          "key": "up_stat",
+          "name": "连板统计",
+          "description": "数据源给出的连续涨停统计",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "limit_times",
+          "name": "连续涨停次数",
+          "description": "数据源给出的连续涨停次数",
+          "data_type": "INTEGER",
+          "unit": "次",
+          "is_primary_key": false
+        },
+        {
+          "key": "limit_status",
+          "name": "涨跌停状态",
+          "description": "标识涨停或跌停状态",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "ths_daily",
+      "table_name": "ths_index_daily",
+      "name": "同花顺板块日线",
+      "purpose": "查看同花顺板块每天的行情",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "open",
+          "name": "开盘价",
+          "description": "该交易日或时段开始时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "high",
+          "name": "最高价",
+          "description": "该交易日或时段内的最高价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "low",
+          "name": "最低价",
+          "description": "该交易日或时段内的最低价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pre_close",
+          "name": "前收盘价",
+          "description": "上一交易日的收盘价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "avg_price",
+          "name": "均价",
+          "description": "该交易日的平均成交价",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "change",
+          "name": "涨跌额",
+          "description": "相对前收盘价的价格变化",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "vol",
+          "name": "成交量",
+          "description": "该交易日或时段的成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "turnover_rate",
+          "name": "换手率",
+          "description": "成交股份占流通股份的比例",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "dc_daily",
+      "table_name": "dc_index_daily",
+      "name": "东方财富板块日线",
+      "purpose": "查看东方财富板块每天的行情",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "open",
+          "name": "开盘价",
+          "description": "该交易日或时段开始时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "high",
+          "name": "最高价",
+          "description": "该交易日或时段内的最高价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "low",
+          "name": "最低价",
+          "description": "该交易日或时段内的最低价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "change",
+          "name": "涨跌额",
+          "description": "相对前收盘价的价格变化",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "vol",
+          "name": "成交量",
+          "description": "该交易日或时段的成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "amount",
+          "name": "成交额",
+          "description": "该时段的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "swing",
+          "name": "振幅",
+          "description": "该交易日最高与最低价形成的价格振幅",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "turnover_rate",
+          "name": "换手率",
+          "description": "成交股份占流通股份的比例",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "category",
+          "name": "板块分类",
+          "description": "数据源给出的板块类别",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "ths_index",
+      "table_name": "ths_board",
+      "name": "同花顺板块",
+      "purpose": "查询同花顺板块名称与基础资料",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "更新要求待确认",
+      "visibility_note": "可见时刻待确认",
+      "primary_key": [
+        "ts_code"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "member_count",
+          "name": "成分数量",
+          "description": "板块内的成分股票数量",
+          "data_type": "INTEGER",
+          "unit": "只",
+          "is_primary_key": false
+        },
+        {
+          "key": "exchange",
+          "name": "交易所",
+          "description": "数据源给出的交易所",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "list_date",
+          "name": "上市日期",
+          "description": "股票或板块的上市日期",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "board_type",
+          "name": "板块类型",
+          "description": "数据源给出的板块分类",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "updated_at",
+          "name": "最近更新时间",
+          "description": "这条资料最近一次更新的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "ths_member",
+      "table_name": "ths_board_member",
+      "name": "同花顺板块成分",
+      "purpose": "查找股票所属的同花顺板块",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "更新要求待确认",
+      "visibility_note": "可见时刻待确认",
+      "primary_key": [
+        "board_code",
+        "con_code"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "board_code",
+          "name": "板块代码",
+          "description": "该板块在数据源中的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "con_code",
+          "name": "成分股代码",
+          "description": "板块成分股票的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "con_name",
+          "name": "成分股名称",
+          "description": "板块成分股票的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "updated_at",
+          "name": "最近更新时间",
+          "description": "这条资料最近一次更新的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "dc_index",
+      "table_name": "dc_board",
+      "name": "东方财富板块",
+      "purpose": "查询东方财富板块的当日概况",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "leading_name",
+          "name": "领涨股名称",
+          "description": "板块领涨股票的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "leading_code",
+          "name": "领涨股代码",
+          "description": "板块领涨股票的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "leading_pct",
+          "name": "领涨股涨跌幅",
+          "description": "板块领涨股票的涨跌幅",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "total_mv",
+          "name": "总市值",
+          "description": "全部股份的市值；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "turnover_rate",
+          "name": "换手率",
+          "description": "成交股份占流通股份的比例",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "up_num",
+          "name": "上涨家数",
+          "description": "板块内上涨的股票数量",
+          "data_type": "INTEGER",
+          "unit": "只",
+          "is_primary_key": false
+        },
+        {
+          "key": "down_num",
+          "name": "下跌家数",
+          "description": "板块内下跌的股票数量",
+          "data_type": "INTEGER",
+          "unit": "只",
+          "is_primary_key": false
+        },
+        {
+          "key": "idx_type",
+          "name": "指数类型",
+          "description": "数据源给出的板块指数类型",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "level",
+          "name": "板块层级",
+          "description": "数据源给出的板块层级",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "updated_at",
+          "name": "最近更新时间",
+          "description": "这条资料最近一次更新的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "dc_member",
+      "table_name": "dc_board_member",
+      "name": "东方财富板块成分",
+      "purpose": "查找股票所属的东方财富板块",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "board_code",
+        "con_code"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "board_code",
+          "name": "板块代码",
+          "description": "该板块在数据源中的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "con_code",
+          "name": "成分股代码",
+          "description": "板块成分股票的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "con_name",
+          "name": "成分股名称",
+          "description": "板块成分股票的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "updated_at",
+          "name": "最近更新时间",
+          "description": "这条资料最近一次更新的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "kpl_concept",
+      "table_name": "kpl_concept_member",
+      "name": "概念成分",
+      "purpose": "查找概念板块的股票与热度",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 30 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "board_code",
+        "con_code"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "board_code",
+          "name": "板块代码",
+          "description": "该板块在数据源中的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "board_name",
+          "name": "板块名称",
+          "description": "该板块在数据源中的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "con_code",
+          "name": "成分股代码",
+          "description": "板块成分股票的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "con_name",
+          "name": "成分股名称",
+          "description": "板块成分股票的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "description",
+          "name": "说明",
+          "description": "数据源给出的板块说明",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "hot_num",
+          "name": "热度",
+          "description": "数据源给出的概念热度值",
+          "data_type": "BIGINT",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "kpl_concept_daily",
+      "table_name": "kpl_concept_member_daily",
+      "name": "概念成分历史",
+      "purpose": "按交易日查看概念板块成分与热度",
+      "category": "板块",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 30 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "trade_date",
+        "board_code",
+        "con_code"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "board_code",
+          "name": "板块代码",
+          "description": "该板块在数据源中的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "board_name",
+          "name": "板块名称",
+          "description": "该板块在数据源中的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "con_code",
+          "name": "成分股代码",
+          "description": "板块成分股票的代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "con_name",
+          "name": "成分股名称",
+          "description": "板块成分股票的名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "hot_num",
+          "name": "热度",
+          "description": "数据源给出的概念热度值",
+          "data_type": "BIGINT",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow",
+      "table_name": "moneyflow_daily",
+      "name": "个股资金流向",
+      "purpose": "查看个股按单量划分的买卖资金",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date",
+        "source"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "buy_lg_vol",
+          "name": "大单买入量",
+          "description": "大单买入成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_lg_vol",
+          "name": "大单卖出量",
+          "description": "大单卖出成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_vol",
+          "name": "超大单买入量",
+          "description": "超大单买入成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_elg_vol",
+          "name": "超大单卖出量",
+          "description": "超大单卖出成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "large_net_vol",
+          "name": "大单净量",
+          "description": "大单与超大单合计的买卖净量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "large_net_amount",
+          "name": "大单净额",
+          "description": "大单与超大单合计的买卖净额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "source",
+          "name": "数据来源",
+          "description": "这条记录实际采用的数据源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_vol",
+          "name": "小单买入量",
+          "description": "小单买入成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount",
+          "name": "小单买入额",
+          "description": "小单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_sm_vol",
+          "name": "小单卖出量",
+          "description": "小单卖出成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_sm_amount",
+          "name": "小单卖出额",
+          "description": "小单卖出金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_vol",
+          "name": "中单买入量",
+          "description": "中单买入成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount",
+          "name": "中单买入额",
+          "description": "中单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_md_vol",
+          "name": "中单卖出量",
+          "description": "中单卖出成交量；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_md_amount",
+          "name": "中单卖出额",
+          "description": "中单卖出金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount",
+          "name": "大单买入额",
+          "description": "大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_lg_amount",
+          "name": "大单卖出额",
+          "description": "大单卖出金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount",
+          "name": "超大单买入额",
+          "description": "超大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "sell_elg_amount",
+          "name": "超大单卖出额",
+          "description": "超大单卖出金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow_dc",
+      "table_name": "moneyflow_dc_daily",
+      "name": "东方财富个股资金",
+      "purpose": "查看东方财富口径的个股资金流向",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount",
+          "name": "资金净额",
+          "description": "买入与卖出金额之差；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount_rate",
+          "name": "资金净额占比",
+          "description": "资金净额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount",
+          "name": "超大单买入额",
+          "description": "超大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount_rate",
+          "name": "超大单买入占比",
+          "description": "超大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount",
+          "name": "大单买入额",
+          "description": "大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount_rate",
+          "name": "大单买入占比",
+          "description": "大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount",
+          "name": "中单买入额",
+          "description": "中单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount_rate",
+          "name": "中单买入占比",
+          "description": "中单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount",
+          "name": "小单买入额",
+          "description": "小单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount_rate",
+          "name": "小单买入占比",
+          "description": "小单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow_ths",
+      "table_name": "moneyflow_ths_daily",
+      "name": "同花顺个股资金",
+      "purpose": "查看同花顺口径的个股资金流向",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "latest",
+          "name": "最新价",
+          "description": "数据源给出的最新成交价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount",
+          "name": "资金净额",
+          "description": "买入与卖出金额之差；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_d5_amount",
+          "name": "近五日资金净额",
+          "description": "近五个交易日资金净额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount",
+          "name": "大单买入额",
+          "description": "大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount_rate",
+          "name": "大单买入占比",
+          "description": "大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount",
+          "name": "中单买入额",
+          "description": "中单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount_rate",
+          "name": "中单买入占比",
+          "description": "中单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount",
+          "name": "小单买入额",
+          "description": "小单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount_rate",
+          "name": "小单买入占比",
+          "description": "小单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow_ind_ths",
+      "table_name": "moneyflow_ind_ths_daily",
+      "name": "同花顺行业资金",
+      "purpose": "比较同花顺行业的资金流向",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "industry",
+          "name": "行业",
+          "description": "数据源给出的行业名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "lead_stock",
+          "name": "领涨股票",
+          "description": "板块内领涨股票名称或代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "company_num",
+          "name": "公司数量",
+          "description": "板块包含的上市公司数量",
+          "data_type": "INTEGER",
+          "unit": "家",
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change_stock",
+          "name": "领涨股涨跌幅",
+          "description": "板块领涨股票的涨跌幅",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "close_price",
+          "name": "领涨股最新价",
+          "description": "板块领涨股票的最新价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_buy_amount",
+          "name": "净买入额",
+          "description": "数据源给出的净买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_sell_amount",
+          "name": "净卖出额",
+          "description": "数据源给出的净卖出金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount",
+          "name": "资金净额",
+          "description": "买入与卖出金额之差；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow_ind_dc",
+      "table_name": "moneyflow_ind_dc_daily",
+      "name": "东方财富行业资金",
+      "purpose": "比较东方财富行业的资金流向",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "content_type",
+          "name": "内容类型",
+          "description": "数据源给出的行业内容分类",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount",
+          "name": "资金净额",
+          "description": "买入与卖出金额之差；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount_rate",
+          "name": "资金净额占比",
+          "description": "资金净额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount",
+          "name": "超大单买入额",
+          "description": "超大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount_rate",
+          "name": "超大单买入占比",
+          "description": "超大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount",
+          "name": "大单买入额",
+          "description": "大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount_rate",
+          "name": "大单买入占比",
+          "description": "大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount",
+          "name": "中单买入额",
+          "description": "中单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount_rate",
+          "name": "中单买入占比",
+          "description": "中单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount",
+          "name": "小单买入额",
+          "description": "小单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount_rate",
+          "name": "小单买入占比",
+          "description": "小单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount_stock",
+          "name": "主力净流入最大股",
+          "description": "板块中主力资金净流入最多的股票",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount_rank",
+          "name": "资金净额排名",
+          "description": "按资金净额排列的来源排名",
+          "data_type": "INTEGER",
+          "unit": "名",
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow_cnt_ths",
+      "table_name": "moneyflow_cnt_ths_daily",
+      "name": "同花顺概念资金",
+      "purpose": "比较同花顺概念板块的资金流向",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "lead_stock",
+          "name": "领涨股票",
+          "description": "板块内领涨股票名称或代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "close_price",
+          "name": "领涨股最新价",
+          "description": "板块领涨股票的最新价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "industry_index",
+          "name": "行业指数",
+          "description": "数据源给出的行业指数值",
+          "data_type": "DOUBLE",
+          "unit": "点",
+          "is_primary_key": false
+        },
+        {
+          "key": "company_num",
+          "name": "公司数量",
+          "description": "板块包含的上市公司数量",
+          "data_type": "INTEGER",
+          "unit": "家",
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change_stock",
+          "name": "领涨股涨跌幅",
+          "description": "板块领涨股票的涨跌幅",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "net_buy_amount",
+          "name": "净买入额",
+          "description": "数据源给出的净买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_sell_amount",
+          "name": "净卖出额",
+          "description": "数据源给出的净卖出金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount",
+          "name": "资金净额",
+          "description": "买入与卖出金额之差；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
+    },
+    {
+      "dataset_id": "moneyflow_mkt_dc",
+      "table_name": "moneyflow_mkt_daily",
+      "name": "东方财富市场资金",
+      "purpose": "查看沪深市场整体资金流向",
+      "category": "资金",
+      "sources": [
+        "Tushare Pro"
+      ],
+      "update_note": "最多落后 1 个交易日",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "trade_date"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "close_sh",
+          "name": "沪市收盘点位",
+          "description": "上证指数的收盘点位",
+          "data_type": "DOUBLE",
+          "unit": "点",
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change_sh",
+          "name": "沪市涨跌幅",
+          "description": "上证指数当日涨跌幅",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "close_sz",
+          "name": "深市收盘点位",
+          "description": "深证成指的收盘点位",
+          "data_type": "DOUBLE",
+          "unit": "点",
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_change_sz",
+          "name": "深市涨跌幅",
+          "description": "深证成指当日涨跌幅",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount",
+          "name": "资金净额",
+          "description": "买入与卖出金额之差；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "net_amount_rate",
+          "name": "资金净额占比",
+          "description": "资金净额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount",
+          "name": "超大单买入额",
+          "description": "超大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_elg_amount_rate",
+          "name": "超大单买入占比",
+          "description": "超大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount",
+          "name": "大单买入额",
+          "description": "大单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_lg_amount_rate",
+          "name": "大单买入占比",
+          "description": "大单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount",
+          "name": "中单买入额",
+          "description": "中单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_md_amount_rate",
+          "name": "中单买入占比",
+          "description": "中单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount",
+          "name": "小单买入额",
+          "description": "小单买入金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "buy_sm_amount_rate",
+          "name": "小单买入占比",
+          "description": "小单买入额的来源占比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        }
+      ]
+    }
+  ]
+}

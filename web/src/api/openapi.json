@@ -380,6 +380,194 @@
         "title": "CandidatesSummary",
         "type": "object"
       },
+      "CatalogDataset": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "dataset_id": {
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogField"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "primary_key": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Primary Key",
+            "type": "array"
+          },
+          "purpose": {
+            "title": "Purpose",
+            "type": "string"
+          },
+          "sample_available": {
+            "default": false,
+            "title": "Sample Available",
+            "type": "boolean"
+          },
+          "schema_available": {
+            "title": "Schema Available",
+            "type": "boolean"
+          },
+          "sources": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
+          "table_name": {
+            "title": "Table Name",
+            "type": "string"
+          },
+          "update_note": {
+            "title": "Update Note",
+            "type": "string"
+          },
+          "visibility_note": {
+            "title": "Visibility Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "table_name",
+          "name",
+          "purpose",
+          "category",
+          "sources",
+          "update_note",
+          "visibility_note",
+          "primary_key",
+          "schema_available",
+          "fields"
+        ],
+        "title": "CatalogDataset",
+        "type": "object"
+      },
+      "CatalogField": {
+        "additionalProperties": false,
+        "properties": {
+          "data_type": {
+            "title": "Data Type",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "is_primary_key": {
+            "title": "Is Primary Key",
+            "type": "boolean"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "description",
+          "data_type",
+          "unit",
+          "is_primary_key"
+        ],
+        "title": "CatalogField",
+        "type": "object"
+      },
+      "CatalogList": {
+        "additionalProperties": false,
+        "properties": {
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogSummary"
+            },
+            "title": "Datasets",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "datasets"
+        ],
+        "title": "CatalogList",
+        "type": "object"
+      },
+      "CatalogSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "dataset_id": {
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "purpose": {
+            "title": "Purpose",
+            "type": "string"
+          },
+          "schema_available": {
+            "title": "Schema Available",
+            "type": "boolean"
+          },
+          "sources": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "name",
+          "purpose",
+          "category",
+          "sources",
+          "schema_available"
+        ],
+        "title": "CatalogSummary",
+        "type": "object"
+      },
       "DailyBar": {
         "properties": {
           "close": {
@@ -636,6 +824,38 @@
           "serving"
         ],
         "title": "Envelope[BoardsData]",
+        "type": "object"
+      },
+      "Envelope_CatalogDataset_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/CatalogDataset"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[CatalogDataset]",
+        "type": "object"
+      },
+      "Envelope_CatalogList_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/CatalogList"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[CatalogList]",
         "type": "object"
       },
       "Envelope_DailyData_": {
@@ -3461,6 +3681,69 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/catalog/datasets": {
+      "get": {
+        "operationId": "list_datasets_api_v1_catalog_datasets_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_CatalogList_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "数据目录",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/api/v1/catalog/datasets/{dataset_id}": {
+      "get": {
+        "operationId": "get_dataset_api_v1_catalog_datasets__dataset_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "dataset_id",
+            "required": true,
+            "schema": {
+              "title": "Dataset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_CatalogDataset_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "数据集字段说明",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
     "/api/v1/health": {
       "get": {
         "operationId": "get_health_api_v1_health_get",
