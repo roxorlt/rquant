@@ -1,0 +1,369 @@
+"""One bounded screening application over either the legacy page or a verified replica."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+
+import pandas as pd
+from pydantic import ValidationError
+
+from rquant.llm.compile import compile_screen_plan
+from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
+from rquant.screen.core import _collect_aggregates
+from rquant.screen.ranking import RankingCondition
+from rquant.screen.replica_source import (
+    ScreenReplicaBudgetError,
+    ScreenReplicaDataError,
+    ScreenReplicaUnavailableError,
+    VerifiedReplicaScreenSource,
+)
+from rquant.screen.rules import Rule, required_rule_columns
+from rquant.serving_read_models import (
+    PAGE_PROJECTION_CONTRACTS,
+    NlScreenPageError,
+    NlScreenProjectionFeatureError,
+    paginate_nl_screen_projection,
+    paginate_ranked_nl_screen_projection,
+)
+from rquant.web import readers
+from rquant.web.models.screen import (
+    ScreenCatalogData,
+    ScreenRow,
+    ScreenRunData,
+    ScreenRunRequest,
+    ScreenSourceInfo,
+    ScreenStep,
+)
+from rquant.web.screen_catalog import (
+    RANKING_METRIC_LABELS,
+    available_ranking_metrics,
+    screen_blocks,
+    validate_screen_choices,
+)
+from rquant.web.serving import BorrowedGeneration
+
+_REPLICA_RANK_COLUMNS = frozenset({"TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]"})
+
+
+@dataclass(frozen=True, slots=True)
+class ScreenApplicationError(Exception):
+    status_code: int
+    detail: str
+
+
+def _empty_run(trade_date: date, status: str) -> ScreenRunData:
+    return ScreenRunData(
+        trade_date=trade_date,
+        status=status,
+        base_count=None,
+        total=None,
+        steps=[],
+        rows=[],
+        next_cursor=None,
+        source=None,
+    )
+
+
+def _number(value: object) -> float | None:
+    return None if value is None or bool(pd.isna(value)) else float(value)
+
+
+def _known_rule(rule: Rule, dependencies: tuple[str, ...]) -> Rule:
+    def apply(frame: pd.DataFrame) -> pd.Series:
+        present = frame.loc[:, dependencies].notna().all(axis=1)
+        return rule(frame).astype("boolean").fillna(False) & present
+
+    return apply
+
+
+def _replica_rule_state(
+    universe: pd.DataFrame, rules: list[Rule],
+) -> tuple[list[Rule], list[int]]:
+    confirmed = pd.Series(True, index=universe.index, dtype="boolean")
+    possible = confirmed.copy()
+    safe_rules: list[Rule] = []
+    unknown_counts: list[int] = []
+    for rule in rules:
+        dependencies = tuple(sorted(
+            required_rule_columns([rule]) | {
+                request.name for request in _collect_aggregates([rule])
+            }
+        ))
+        present = universe.loc[:, dependencies].notna().all(axis=1)
+        passed = rule(universe).astype("boolean").fillna(False) & present
+        confirmed &= passed
+        possible &= passed | ~present
+        unknown_counts.append(int((possible & ~confirmed).sum()))
+        safe_rules.append(_known_rule(rule, dependencies))
+    return safe_rules, unknown_counts
+
+
+class ScreenApplicationService:
+    def __init__(
+        self,
+        *,
+        cursor_key: bytes,
+        replica: VerifiedReplicaScreenSource | None = None,
+    ) -> None:
+        self.cursor_key = cursor_key
+        self.replica = replica
+
+    def catalog(self, borrowed: BorrowedGeneration | None) -> ScreenCatalogData:
+        blocks = screen_blocks()
+        if self.replica is not None:
+            try:
+                snapshot = self.replica.available_dates()
+            except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
+                return ScreenCatalogData(
+                    source_kind="replica", blocks=blocks, dates=[], available=False,
+                    ranking_metrics=[], source=None,
+                )
+            return ScreenCatalogData(
+                source_kind="replica",
+                blocks=blocks,
+                dates=snapshot.dates,
+                available=bool(snapshot.dates),
+                ranking_metrics=available_ranking_metrics(_REPLICA_RANK_COLUMNS),
+                source=ScreenSourceInfo(
+                    identity=snapshot.identity, updated_at=snapshot.updated_at,
+                ),
+            )
+
+        available = False
+        dates: list[date] = []
+        ranking_metrics = []
+        source = None
+        if borrowed is not None:
+            state = readers.table_states(borrowed.cursor).get("nl_screen_universe")
+            available = state is not None and state.available
+            if available:
+                columns = {
+                    item[0]
+                    for item in borrowed.cursor.execute(
+                        "SELECT * FROM nl_screen_universe LIMIT 0"
+                    ).description
+                }
+                ranking_metrics = available_ranking_metrics(columns)
+                dates = [
+                    row[0]
+                    for row in borrowed.cursor.execute(
+                        "SELECT DISTINCT trade_date FROM nl_screen_universe "
+                        "ORDER BY trade_date DESC LIMIT 30"
+                    ).fetchall()
+                ]
+                source = ScreenSourceInfo(
+                    identity=borrowed.manifest.generation_id,
+                    updated_at=borrowed.manifest.built_at,
+                )
+        return ScreenCatalogData(
+            source_kind="serving",
+            blocks=blocks,
+            dates=dates,
+            available=available,
+            ranking_metrics=ranking_metrics,
+            source=source,
+        )
+
+    def run(
+        self,
+        body: ScreenRunRequest,
+        *,
+        borrowed: BorrowedGeneration | None,
+        serving_unavailable: bool,
+    ) -> ScreenRunData:
+        try:
+            validate_screen_choices(body.conditions)
+        except ValueError as error:
+            detail = (
+                "当前仅支持已列出的均线和 RSI 周期，请调整条件。"
+                if "indicator period" in str(error)
+                else "请从条件目录选择数据项或板块。"
+            )
+            raise ScreenApplicationError(422, detail) from error
+        if body.ranking is not None and any(
+            condition.metric not in RANKING_METRIC_LABELS
+            for condition in body.ranking.conditions
+        ):
+            raise ScreenApplicationError(422, "请从排名指标目录选择。")
+
+        labels = {block.key: block.label for block in screen_blocks()}
+        try:
+            plan = ScreenPlan(
+                trade_date=body.trade_date.isoformat(),
+                stages=[Stage(label="条件", rules=[
+                    RuleCall(name=condition.key, args=condition.args)
+                    for condition in body.conditions
+                ])],
+            )
+            compiled = compile_screen_plan(plan)
+            rule_labels = [labels[condition.key] for condition in body.conditions]
+        except KeyError as error:
+            raise ScreenApplicationError(422, "没有找到这条条件，请重新选择。") from error
+        except ValidationError as error:
+            raise ScreenApplicationError(422, "条件填写有误，请检查后重试。") from error
+        except ValueError as error:
+            raise ScreenApplicationError(422, "没有找到这条条件，请重新选择。") from error
+
+        ranking = body.ranking
+        rank_columns = [condition.metric for condition in ranking.conditions] if ranking else []
+        page_rules = compiled.rules
+        unknown_counts = [0] * len(compiled.rules)
+        if self.replica is not None:
+            unsupported_metric = next(
+                (metric for metric in rank_columns if metric not in _REPLICA_RANK_COLUMNS),
+                None,
+            )
+            if unsupported_metric is not None:
+                label = RANKING_METRIC_LABELS[unsupported_metric]
+                raise ScreenApplicationError(
+                    422, f"当前数据还没有「{label}」，请换一个排名指标。",
+                )
+            try:
+                snapshot = self.replica.load(
+                    body.trade_date,
+                    compiled.rules,
+                    include_columns=rank_columns,
+                )
+            except ScreenReplicaUnavailableError as error:
+                raise ScreenApplicationError(
+                    409 if body.cursor else 503,
+                    "选股数据已更新，请重新筛选。"
+                    if body.cursor else "选股数据暂不可用，请稍后重试。",
+                ) from error
+            except ScreenReplicaDataError as error:
+                raise ScreenApplicationError(
+                    409 if body.cursor else 503,
+                    "选股数据已更新，请重新筛选。"
+                    if body.cursor else "所选日期的数据不完整，请换日期或稍后重试。",
+                ) from error
+            except ScreenReplicaBudgetError as error:
+                raise ScreenApplicationError(
+                    422, "条件组合超出单次筛选范围，请减少条件或回看天数。",
+                ) from error
+            except ValueError as error:
+                raise ScreenApplicationError(
+                    422, "当前数据还不支持这个条件，请换一条或稍后重试。",
+                ) from error
+            universe = snapshot.frame
+            # An entirely unknown input would read as zero hits for a valid rule.
+            required_columns = required_rule_columns(compiled.rules) | {
+                request.name for request in _collect_aggregates(compiled.rules)
+            }
+            if any(
+                column not in universe.columns or universe[column].isna().all()
+                for column in required_columns
+            ):
+                raise ScreenApplicationError(
+                    503, "所选日期的数据不完整，请换日期或稍后重试。",
+                )
+            page_rules, unknown_counts = _replica_rule_state(universe, compiled.rules)
+            source = ScreenSourceInfo(
+                identity=snapshot.identity, updated_at=snapshot.updated_at,
+            )
+        else:
+            if borrowed is None or serving_unavailable:
+                if body.cursor is not None:
+                    raise ScreenApplicationError(409, "数据已更新，请重新筛选。")
+                return _empty_run(body.trade_date, "unavailable")
+            state = readers.table_states(borrowed.cursor).get("nl_screen_universe")
+            if state is None or not state.available:
+                if body.cursor is not None:
+                    raise ScreenApplicationError(409, "数据已更新，请重新筛选。")
+                return _empty_run(body.trade_date, "unavailable")
+            max_rows = PAGE_PROJECTION_CONTRACTS["nl_screen_universe"].max_rows
+            universe = borrowed.cursor.execute(
+                "SELECT * FROM nl_screen_universe WHERE trade_date = ? "
+                "ORDER BY trade_date, ts_code LIMIT ?",
+                (body.trade_date, max_rows + 1),
+            ).fetchdf()
+            if len(universe) > max_rows:
+                raise ScreenApplicationError(503, "可筛选股票暂时过多，请稍后重试。")
+            if universe.empty:
+                if body.cursor is not None:
+                    raise ScreenApplicationError(409, "数据已更新，请重新筛选。")
+                return _empty_run(body.trade_date, "no_date")
+            source = ScreenSourceInfo(
+                identity=borrowed.manifest.generation_id,
+                updated_at=borrowed.manifest.built_at,
+            )
+
+        missing_metrics = [metric for metric in rank_columns if metric not in universe.columns]
+        if missing_metrics:
+            label = RANKING_METRIC_LABELS[missing_metrics[0]]
+            raise ScreenApplicationError(
+                422, f"当前数据还没有「{label}」，请换一个排名指标。",
+            )
+        if self.replica is not None and any(
+            universe[metric].isna().all() for metric in rank_columns
+        ):
+            raise ScreenApplicationError(503, "当前排名数据不完整，请换一个指标或稍后重试。")
+
+        try:
+            page_args = dict(
+                generation_id=source.identity,
+                trade_date=body.trade_date.isoformat(),
+                rules=page_rules,
+                rule_labels=rule_labels,
+                normalized_plan=compiled.normalized_plan,
+                page_size=body.page_size,
+                signing_key=self.cursor_key,
+                cursor=body.cursor,
+            )
+            if ranking is None:
+                page = paginate_nl_screen_projection(universe, **page_args)
+            else:
+                page = paginate_ranked_nl_screen_projection(
+                    universe,
+                    ranking=[RankingCondition(
+                        column=condition.metric,
+                        ascending=condition.ascending,
+                        weight=condition.weight,
+                    ) for condition in ranking.conditions],
+                    top_n=ranking.top_n,
+                    **page_args,
+                )
+        except NlScreenPageError as error:
+            raise ScreenApplicationError(
+                409,
+                "选股数据已更新，请重新筛选。" if self.replica else "数据已更新，请重新筛选。",
+            ) from error
+        except NlScreenProjectionFeatureError as error:
+            raise ScreenApplicationError(
+                422, "当前数据还不支持这个条件，请换一条或稍后重试。",
+            ) from error
+        except ValueError as error:
+            raise ScreenApplicationError(
+                422,
+                "当前数据还不支持这个条件，请换一条或稍后重试。"
+                if ranking is None else "当前数据还不支持这项排名，请换一个指标。",
+            ) from error
+
+        rows = [
+            ScreenRow(
+                ts_code=str(row["ts_code"]),
+                name=str(row["name"]) if pd.notna(row["name"]) else None,
+                close=_number(row["CLOSE[0]"]),
+                pct_chg=_number(row["PCT_CHG[0]"]),
+                ranking_score=_number(row.get("ranking_score")),
+                rank_position=int(row["rank_position"]) if "rank_position" in row else None,
+            )
+            for row in page.rows.to_dict(orient="records")
+        ]
+        steps = [
+            ScreenStep(label=label, count=count, unknown_count=unknown)
+            for (label, count), unknown in zip(page.diagnostics, unknown_counts, strict=True)
+        ]
+        total = steps[-1].count if steps else len(universe)
+        return ScreenRunData(
+            trade_date=body.trade_date,
+            status="ready",
+            base_count=len(universe),
+            total=total,
+            unknown_count=steps[-1].unknown_count if steps else 0,
+            ranked_count=min(total, ranking.top_n) if ranking is not None else None,
+            steps=steps,
+            rows=rows,
+            next_cursor=page.next_cursor,
+            source=source,
+        )

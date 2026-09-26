@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Schemas } from "../src/api/client.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
@@ -65,5 +66,170 @@ test("排名条件可编辑、折算并按分数稳定翻页，手机上可修�
   await expect(page.getByRole("button", { name: "下一页" })).toBeDisabled();
   await expectNoHorizontalOverflow(page, "ranked screener phone");
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+  expect(watcher.problems).toEqual([]);
+});
+
+test("手机宽度明确展示未判定股票，不把未知写成零命中", async ({ page }) => {
+  const watcher = watch(page);
+  await page.route("**/api/v1/screen/run", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
+    body.data.total = 0;
+    body.data.unknown_count = 1;
+    body.data.steps = [{ label: "排除 ST", count: 0, unknown_count: 1 }];
+    body.data.rows = [];
+    body.data.next_cursor = null;
+    await route.fulfill({ response, json: body });
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect(page.getByText("未判定 1 只")).toBeVisible();
+  await expect(page.getByRole("region", { name: "逐条命中" })).toContainText("未知 1 只");
+  await expect(page.getByText("没有命中股票")).toHaveCount(0);
+  await expectNoHorizontalOverflow(page, "screen unknown phone");
+  expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+  expect(watcher.problems).toEqual([]);
+});
+
+test("选股来源独立换代后保留条件，失效时桌面与手机都要求重试", async ({ page }, testInfo) => {
+  const watcher = watch(page);
+  let identity = "a".repeat(64);
+  let unavailable = false;
+  let catalogReads = 0;
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    catalogReads += 1;
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    body.data.source_kind = "replica";
+    body.data.source = unavailable ? null : { identity, updated_at: "2026-09-24T07:31:00Z" };
+    body.data.available = !unavailable;
+    if (unavailable) body.data.dates = [];
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/run", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
+    body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
+    await route.fulfill({ response, json: body });
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.clock.install();
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect(page.getByText("命中 27 只")).toBeVisible();
+  await expect(page.locator(".screen-source")).toContainText("选股数据");
+  expect(await page.locator("main").innerText()).not.toContain(identity);
+  await page.screenshot({ path: testInfo.outputPath("screen-source-desktop.png") });
+
+  await page.clock.fastForward(31_000);
+  await page.waitForTimeout(100);
+  expect(catalogReads).toBe(1);
+
+  identity = "b".repeat(64);
+  await page.getByRole("button", { name: "刷新选股数据" }).click();
+  await expect.poll(() => catalogReads).toBe(2);
+  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(page.getByRole("button", { name: "下一页" })).toBeDisabled();
+  await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect(page.getByText("命中 27 只")).toBeVisible();
+  await expect(page.getByRole("status")).toHaveCount(0);
+
+  unavailable = true;
+  await page.getByRole("button", { name: "刷新选股数据" }).click();
+  await expect.poll(() => catalogReads).toBe(3);
+  await expect(page.getByText("选股数据暂不可用")).toBeVisible();
+  await expect(page.getByRole("button", { name: "运行筛选" })).toBeDisabled();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expectNoHorizontalOverflow(page, "screen source unavailable phone");
+  expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+  expect(await page.locator("main").innerText()).not.toContain(identity);
+  await page.screenshot({ path: testInfo.outputPath("screen-source-phone.png") });
+  expect(watcher.problems).toEqual([]);
+});
+
+test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选", async ({ page }) => {
+  const watcher = watch(page);
+  let generationId = "a".repeat(64);
+  let catalogReads = 0;
+  await page.route("**/api/v1/meta", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_MetaData_"];
+    if (body.data.generation) body.data.generation.generation_id = generationId;
+    body.serving.generation_id = generationId;
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    catalogReads += 1;
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    body.data.source_kind = "serving";
+    body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/run", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
+    body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
+    await route.fulfill({ response, json: body });
+  });
+
+  await page.clock.install();
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect(page.getByText("命中 27 只")).toBeVisible();
+  expect(catalogReads).toBe(1);
+  generationId = "b".repeat(64);
+  await page.clock.fastForward(31_000);
+  await expect.poll(() => catalogReads).toBe(2);
+  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(page.getByRole("button", { name: "下一页" })).toBeDisabled();
+  await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
+  expect(watcher.problems).toEqual([]);
+});
+
+test("首次 Serving 数据代到来后，无需手动刷新即可运行选股", async ({ page }) => {
+  const watcher = watch(page);
+  let generationId: string | null = null;
+  let catalogReads = 0;
+  await page.route("**/api/v1/meta", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_MetaData_"];
+    if (generationId === null) {
+      body.data.generation = null;
+      body.serving.generation_id = null;
+      body.serving.state = "unavailable";
+    } else {
+      if (body.data.generation) body.data.generation.generation_id = generationId;
+      body.serving.generation_id = generationId;
+    }
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    catalogReads += 1;
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    if (generationId === null) {
+      body.data.available = false;
+      body.data.dates = [];
+      body.data.source = null;
+    } else {
+      body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
+    }
+    await route.fulfill({ response, json: body });
+  });
+
+  await page.clock.install();
+  await page.goto("./#/screener");
+  await expect(page.getByText("选股数据暂不可用")).toBeVisible();
+  await expect(page.getByRole("button", { name: "运行筛选" })).toBeDisabled();
+  expect(catalogReads).toBe(1);
+  generationId = "a".repeat(64);
+  await page.clock.fastForward(31_000);
+  await expect.poll(() => catalogReads).toBe(2);
+  await expect(page.getByRole("button", { name: "运行筛选" })).toBeEnabled();
   expect(watcher.problems).toEqual([]);
 });

@@ -1308,6 +1308,12 @@ export interface components {
             dates: string[];
             /** Ranking Metrics */
             ranking_metrics: components["schemas"]["ScreenOption"][];
+            source: components["schemas"]["ScreenSourceInfo"] | null;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
         };
         /** ScreenCondition */
         ScreenCondition: {
@@ -1395,6 +1401,7 @@ export interface components {
             ranked_count?: number | null;
             /** Rows */
             rows: components["schemas"]["ScreenRow"][];
+            source: components["schemas"]["ScreenSourceInfo"] | null;
             /**
              * Status
              * @enum {string}
@@ -1409,6 +1416,11 @@ export interface components {
              * Format: date
              */
             trade_date: string;
+            /**
+             * Unknown Count
+             * @default 0
+             */
+            unknown_count: number;
         };
         /** ScreenRunRequest */
         ScreenRunRequest: {
@@ -1428,12 +1440,27 @@ export interface components {
              */
             trade_date: string;
         };
+        /** ScreenSourceInfo */
+        ScreenSourceInfo: {
+            /** Identity */
+            identity: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
         /** ScreenStep */
         ScreenStep: {
             /** Count */
             count: number;
             /** Label */
             label: string;
+            /**
+             * Unknown Count
+             * @default 0
+             */
+            unknown_count: number;
         };
         /** ServiceItem */
         ServiceItem: {

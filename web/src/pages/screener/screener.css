@@ -1,3 +1,13 @@
+.screen-source {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-height: 28px;
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .screen-date {
   min-width: 160px;
 }
@@ -138,13 +148,20 @@
 }
 .screen-funnel li {
   display: grid;
-  grid-template-columns: minmax(120px, 190px) minmax(50px, 1fr) 55px;
+  grid-template-columns: minmax(120px, 190px) minmax(50px, 1fr) minmax(70px, auto);
   align-items: center;
   gap: 12px;
   font-size: 12px;
 }
-.screen-funnel li strong {
-  text-align: right;
+.screen-step-count {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  white-space: nowrap;
+}
+.screen-step-count small {
+  color: var(--warn-t);
+  font-size: 10px;
 }
 .screen-funnel-track {
   height: 7px;
@@ -230,7 +247,7 @@
     width: 100%;
   }
   .screen-funnel li {
-    grid-template-columns: minmax(90px, 140px) minmax(35px, 1fr) 42px;
+    grid-template-columns: minmax(80px, 140px) minmax(30px, 1fr) minmax(70px, auto);
     gap: 7px;
   }
 }

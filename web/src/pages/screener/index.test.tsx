@@ -8,6 +8,7 @@ import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
 
 const serving = metaEnvelope().serving;
+const source = { identity: "a".repeat(64), updated_at: "2026-09-24T07:30:00Z" };
 const blocks: Schemas["ScreenBlock"][] = [
   {
     key: "not_st",
@@ -52,6 +53,7 @@ function catalog(available = true) {
                 { value: "PCT_CHG[0]", label: "今日涨跌幅" },
               ]
             : [],
+          source: available ? source : null,
         },
         serving,
       }),
@@ -74,6 +76,34 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("局部条件未知时在结果和逐条计数中明示未判定数量", async () => {
+    catalog();
+    server.use(
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 3,
+            total: 0,
+            unknown_count: 1,
+            steps: [{ label: "排除 ST", count: 0, unknown_count: 1 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText(/未判定 1 只/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "逐条命中" })).toHaveTextContent("未知 1 只");
+    expect(screen.queryByText("没有命中股票")).not.toBeInTheDocument();
+  });
+
   it("添加并编辑中文条件，运行后展示逐条命中、分页和个股详情", async () => {
     catalog();
     stockDrawer();
@@ -101,6 +131,7 @@ describe("选股器", () => {
               },
             ],
             next_cursor: body.cursor ? null : "next-page-token",
+            source,
           },
           serving,
         });
@@ -157,6 +188,7 @@ describe("选股器", () => {
                 steps: [{ label: "排除 ST", count: 27 }],
                 rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1.2 }],
                 next_cursor: null,
+                source,
               },
               serving,
             }),
@@ -180,8 +212,55 @@ describe("选股器", () => {
   it("没有已发布选股数据时解释原因并禁用运行", async () => {
     catalog(false);
     renderApp("/screener");
-    expect(await screen.findByText("选股数据还没有发布")).toBeInTheDocument();
+    expect(await screen.findByText("选股数据暂不可用")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新选股数据" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "运行筛选" })).toBeDisabled();
+  });
+
+  it("独立选股数据更新后保留条件并要求重跑，不显示来源身份", async () => {
+    let identity = "a".repeat(64);
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source: { ...source, identity },
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1.2 }],
+            next_cursor: "next-page",
+            source: { ...source, identity },
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
+    expect(document.querySelector(".screen-source")).toHaveTextContent(/选股数据.*更新/);
+    expect(document.body.textContent).not.toContain(identity);
+    identity = "b".repeat(64);
+    await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("选股数据已更新，请重新筛选");
+    expect(screen.getByRole("button", { name: "下一页" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
+    expect(document.body.textContent).not.toContain(identity);
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
   });
 
   it("编辑多项排名及前 N，展示比例折算、分数、翻页和旧结果提示", async () => {
@@ -210,6 +289,7 @@ describe("选股器", () => {
               },
             ],
             next_cursor: body.cursor ? null : "rank-page-token",
+            source,
           },
           serving,
         });

@@ -10,13 +10,17 @@ export type ScreenRunData = Schemas["ScreenRunData"];
 export type ScreenRow = Schemas["ScreenRow"];
 
 export function useScreenCatalog(): ServingQueryResult<ScreenCatalogData> {
-  return useServingQuery(["screen", "blocks"], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/screen/blocks");
-    if (data === undefined) {
-      throw new ApiError(response.status, "条件目录暂时无法加载");
-    }
-    return data;
-  });
+  return useServingQuery(
+    ["screen", "blocks"],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/screen/blocks");
+      if (data === undefined) {
+        throw new ApiError(response.status, "条件目录暂时无法加载");
+      }
+      return data;
+    },
+    { staleTime: Infinity },
+  );
 }
 
 export async function fetchScreenRun(body: ScreenRunRequest) {

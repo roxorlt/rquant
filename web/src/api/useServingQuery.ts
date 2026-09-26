@@ -21,14 +21,19 @@ export interface ServingQueryResult<T> {
 /**
  * The one data hook for pages: runs the query and splits the envelope into its
  * data and its serving state. Queries are invalidated when /meta reports a new
- * generation (see useMeta), so no page polls on its own.
+ * Serving generation (see useMeta). Independent sources set their own freshness policy.
  */
 export function useServingQuery<T>(
   key: QueryKey,
   fetcher: () => Promise<ServingEnvelope<T>>,
-  options: { enabled?: boolean } = {},
+  options: { enabled?: boolean; staleTime?: number } = {},
 ): ServingQueryResult<T> {
-  const query = useQuery({ queryKey: key, queryFn: fetcher, enabled: options.enabled ?? true });
+  const query = useQuery({
+    queryKey: key,
+    queryFn: fetcher,
+    enabled: options.enabled ?? true,
+    staleTime: options.staleTime,
+  });
   return {
     data: query.data?.data,
     serving: query.data?.serving,

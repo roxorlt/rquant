@@ -130,19 +130,14 @@ class VerifiedReplicaScreenSource:
         if any(
             not path.is_absolute()
             or path != Path(os.path.abspath(path))
-            or path.parent.resolve(strict=False) != path.parent
             for path in (self.primary_path, self.replica_path)
-        ):
+        ) or self.replica_path.parent.resolve(strict=False) != self.replica_path.parent:
             raise ValueError("screen database paths must be absolute and canonical")
+        if self.primary_path == self.replica_path:
+            raise ValueError("screen replica must differ from the primary database")
 
     def _verify(self) -> _VerifiedGeneration:
         replica_stat = _regular_stat(self.replica_path)
-        primary_stat = _regular_stat(self.primary_path)
-        if (replica_stat.st_dev, replica_stat.st_ino) == (
-            primary_stat.st_dev,
-            primary_stat.st_ino,
-        ):
-            raise ScreenReplicaUnavailableError("screening replica aliases the primary database")
         if os.path.lexists(f"{self.replica_path}.wal"):
             raise ScreenReplicaUnavailableError("screening replica has an uncheckpointed WAL")
 
@@ -156,8 +151,10 @@ class VerifiedReplicaScreenSource:
             mtime_ns=replica_stat.st_mtime_ns,
         )
         if (
-            metadata.source_database != self.primary_path.resolve()
+            metadata.source_database != self.primary_path
             or metadata.source_before != metadata.source_after
+            or (metadata.source_before.main.device, metadata.source_before.main.inode)
+            == (replica_stat.st_dev, replica_stat.st_ino)
             or metadata.replica != observed
             or replica_stat.st_ctime_ns > sidecar_identity[4]
         ):

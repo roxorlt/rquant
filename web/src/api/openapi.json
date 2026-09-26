@@ -3295,13 +3295,33 @@
             },
             "title": "Ranking Metrics",
             "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_kind": {
+            "enum": [
+              "serving",
+              "replica"
+            ],
+            "title": "Source Kind",
+            "type": "string"
           }
         },
         "required": [
+          "source_kind",
           "blocks",
           "dates",
           "available",
-          "ranking_metrics"
+          "ranking_metrics",
+          "source"
         ],
         "title": "ScreenCatalogData",
         "type": "object"
@@ -3616,6 +3636,16 @@
             "title": "Rows",
             "type": "array"
           },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "enum": [
               "ready",
@@ -3647,6 +3677,12 @@
             "format": "date",
             "title": "Trade Date",
             "type": "string"
+          },
+          "unknown_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
           }
         },
         "required": [
@@ -3656,7 +3692,8 @@
           "total",
           "steps",
           "rows",
-          "next_cursor"
+          "next_cursor",
+          "source"
         ],
         "title": "ScreenRunData",
         "type": "object"
@@ -3715,6 +3752,25 @@
         "title": "ScreenRunRequest",
         "type": "object"
       },
+      "ScreenSourceInfo": {
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity",
+          "updated_at"
+        ],
+        "title": "ScreenSourceInfo",
+        "type": "object"
+      },
       "ScreenStep": {
         "properties": {
           "count": {
@@ -3724,6 +3780,12 @@
           "label": {
             "title": "Label",
             "type": "string"
+          },
+          "unknown_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
           }
         },
         "required": [

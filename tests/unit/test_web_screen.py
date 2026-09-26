@@ -147,6 +147,7 @@ def test_catalog_exposes_all_registered_rules_with_plain_chinese_labels(
 
     assert response.status_code == 200, response.text
     body = response.json()
+    assert body["data"]["source_kind"] == "serving"
     blocks = body["data"]["blocks"]
     assert {item["key"] for item in blocks} == {item.name for item in REGISTRY}
     assert len(blocks) == 26
@@ -307,6 +308,7 @@ def test_missing_published_data_is_not_mistaken_for_zero_hits(tmp_path: Path) ->
         result = _run(client, conditions=[{"key": "not_st", "args": {}}])
 
     assert catalog.json()["data"]["available"] is False
+    assert catalog.json()["data"]["source_kind"] == "serving"
     assert catalog.json()["data"]["dates"] == []
     assert result.status_code == 200, result.text
     assert result.json()["data"]["status"] == "unavailable"
@@ -335,7 +337,9 @@ def test_ranked_pages_keep_score_order_and_bind_plan_top_n_and_generation(
             27,
             25,
         )
-        assert first_data["steps"] == [{"label": "排除 ST", "count": 27}]
+        assert first_data["steps"] == [
+            {"label": "排除 ST", "count": 27, "unknown_count": 0}
+        ]
         assert [row["ts_code"] for row in first_data["rows"]] == [
             "600029.SH", "600028.SH", "600027.SH", "600026.SH", "600025.SH"
         ]

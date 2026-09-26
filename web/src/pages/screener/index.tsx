@@ -8,7 +8,7 @@ import {
   useScreenCatalog,
 } from "@/api/screen";
 import { StockDrawer } from "@/app/StockDrawer";
-import { Button, EmptyState, PageHeader, PageSkeleton, Panel, Tip } from "@/ui";
+import { Button, EmptyState, PageHeader, PageSkeleton, Panel, RelativeTime, Tip } from "@/ui";
 import { ParamControl, type ParameterValue } from "./ParamControl";
 import { type RankingDraft, RankingEditor } from "./RankingEditor";
 import { ScreenResults } from "./ScreenResults";
@@ -38,7 +38,6 @@ export default function ScreenerPage() {
   const [rankDraft, setRankDraft] = useState<RankingDraft[]>([]);
   const [topN, setTopN] = useState("20");
   const [result, setResult] = useState<ScreenRunData | null>(null);
-  const [resultGeneration, setResultGeneration] = useState<string | null>(null);
   const [applied, setApplied] = useState<ScreenRunRequest | null>(null);
   const [appliedKey, setAppliedKey] = useState<string | null>(null);
   const [forceStale, setForceStale] = useState(false);
@@ -97,10 +96,10 @@ export default function ScreenerPage() {
     result !== null &&
     (forceStale ||
       snapshotKey !== appliedKey ||
-      resultGeneration !== catalog.serving?.generation_id);
+      (result.source?.identity ?? null) !== (catalog.data?.source?.identity ?? null));
   const staleText =
-    forceStale || (result !== null && resultGeneration !== catalog.serving?.generation_id)
-      ? "数据已更新，请重新筛选。旧结果仅供参考。"
+    forceStale || (result !== null && result.source?.identity !== catalog.data?.source?.identity)
+      ? "选股数据已更新，请重新筛选。旧结果仅供参考。"
       : "条件已改，请重新运行。旧结果仅供参考。";
   const canRun =
     catalog.data?.available === true &&
@@ -152,7 +151,6 @@ export default function ScreenerPage() {
     try {
       const envelope = await fetchScreenRun(body);
       setResult(envelope.data);
-      setResultGeneration(envelope.serving.generation_id);
       setForceStale(false);
       if (nextIndex === 0) {
         setApplied({ ...body, cursor: null });
@@ -168,7 +166,9 @@ export default function ScreenerPage() {
       setPageIndex(nextIndex);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "筛选暂时无法完成，请稍后重试。");
-      if (caught instanceof ApiError && caught.status === 409) setForceStale(true);
+      if (caught instanceof ApiError && (caught.status === 409 || caught.status === 503)) {
+        setForceStale(true);
+      }
     } finally {
       setRunning(false);
     }
@@ -206,6 +206,16 @@ export default function ScreenerPage() {
   return (
     <>
       <PageHeader eyebrow="研究" title="选股器" />
+      <div className="screen-source">
+        {catalog.data?.source ? (
+          <span>
+            选股数据 <RelativeTime at={catalog.data.source.updated_at} suffix="更新" />
+          </span>
+        ) : null}
+        <Button size="sm" variant="ghost" aria-label="刷新选股数据" onClick={catalog.refetch}>
+          刷新
+        </Button>
+      </div>
       {catalog.error ? (
         <Panel>
           <div className="screen-error" role="alert">
@@ -240,7 +250,7 @@ export default function ScreenerPage() {
             }
           >
             {!catalog.data?.available || dates.length === 0 ? (
-              <EmptyState title="选股数据还没有发布" hint="数据发布后就能运行条件。" />
+              <EmptyState title="选股数据暂不可用" hint="稍后点「刷新」重试。" />
             ) : null}
             <div className="screen-conditions">
               {draft.map((condition, index) => {
