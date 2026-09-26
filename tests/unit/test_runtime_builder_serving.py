@@ -560,12 +560,25 @@ def test_unpublished_paper_authority_stays_unavailable_then_recovers_or_fails_cl
             ("shadow-main",)
         ]
 
-    roots[PAPER_ACCOUNTS_DATASET_ID].joinpath("current.json").write_bytes(b"{")
+    current_paper_pointer = roots[PAPER_ACCOUNTS_DATASET_ID] / "current.json"
+    current_paper_pointer.write_bytes(b"{")
     with pytest.raises(RuntimeError, match="paper_accounts reader failed"):
         step()
     assert ServingReader(tmp_path / "serving").current_manifest().generation_id == (
         recovered.source_generations["serving_generation"]
     )
+
+    current_paper_pointer.unlink()
+    restarted_step = serving_publisher_builder(snapshot_loader=None, clock=lambda: clock[0])(
+        _manifest(tmp_path, settings=settings)
+    )
+    with pytest.raises(RuntimeError, match="paper_accounts reader failed"):
+        restarted_step()
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        assert lease.manifest.generation_id == recovered.source_generations["serving_generation"]
+        assert lease.connection.execute("SELECT account_id FROM paper_accounts").fetchall() == [
+            ("shadow-main",)
+        ]
 
 
 def test_the_manifest_decides_which_sources_are_optional_not_the_default(
