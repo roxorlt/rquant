@@ -15,6 +15,8 @@ export type StatusInfo = Schemas["StatusInfo"];
 export type MonitorTimelineEnvelope = Schemas["Envelope_MonitorTimelineData_"];
 export type MonitorTimelineData = Schemas["MonitorTimelineData"];
 export type MonitorTimelineItem = MonitorTimelineData["items"][number];
+export type ResearchJobsData = Schemas["ResearchJobsData"];
+export type ResearchJobItem = Schemas["ResearchJobItem"];
 export type StockSearchData = Schemas["StockSearchData"];
 export type StockSearchRow = Schemas["StockSearchRow"];
 export type StockSummaryData = Schemas["StockSummaryData"];
@@ -54,6 +56,18 @@ export function useMonitorTimeline(
 ): ServingQueryResult<MonitorTimelineData> {
   return useServingQuery(["monitor", "timeline", cursor, refreshKey], async () => {
     const { data, response } = await apiClient().GET("/api/v1/monitor/timeline", {
+      params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
+    });
+    return unwrap(data, response);
+  });
+}
+
+export function useResearchJobs(
+  cursor: string | null,
+  refreshKey: number,
+): ServingQueryResult<ResearchJobsData> {
+  return useServingQuery(["tasks", "jobs", cursor, refreshKey], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/tasks/jobs", {
       params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
     });
     return unwrap(data, response);

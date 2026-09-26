@@ -72,6 +72,7 @@ from rquant.serving_contracts import (
 from rquant.serving_publisher import ServingPublisher
 from rquant.serving_read_models import (
     SERVING_TABLE_SPECS,
+    ServingLabJobRecord,
     ServingProjectionInput,
     ServingProjectionPayload,
     ServingReadModelInput,
@@ -978,6 +979,7 @@ def build_web_fixture(
     *,
     sequence: int = 0,
     event_projections: tuple[ServingProjectionPayload, ...] | None = None,
+    lab_jobs: tuple[ServingLabJobRecord, ...] = (),
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1008,6 +1010,7 @@ def build_web_fixture(
         deliveries=deliveries,
         paper_accounts=(_paper_account(built_at - timedelta(seconds=30)),),
         runtime_services=_runtime_services(built_at - timedelta(seconds=5)),
+        lab_jobs=lab_jobs,
         projections=projections,
     )
     publisher = ServingPublisher(

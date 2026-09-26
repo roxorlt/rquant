@@ -145,8 +145,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/tasks",
     title: "任务与调度",
     group: "运维",
-    ready: false,
-    summary: "定时任务和研究任务的运行情况，可以查看日志、立即运行。",
+    ready: true,
+    summary: "查看研究任务的进度与预计结束时间。",
   },
   {
     id: "health",
