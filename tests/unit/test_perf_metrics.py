@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -176,6 +176,16 @@ def test_round_trips_match_oldest_buy_first_across_two_lots() -> None:
 def test_round_trip_share_quantities_must_be_whole_for_a_shares() -> None:
     with pytest.raises(ValueError, match="whole shares"):
         build_round_trips([Fill(date(2026, 1, 2), "600000.SH", "银行", "buy", 0.5, 10.0, 0.0)])
+
+
+def test_round_trip_rejects_datetime_that_would_truncate_cross_day_holding() -> None:
+    with pytest.raises(ValueError, match="pure date"):
+        build_round_trips(
+            [
+                Fill(datetime(2026, 1, 2, 23, 59), "600000.SH", "银行", "buy", 1, 10.0, 0.0),
+                Fill(datetime(2026, 1, 3, 0, 1), "600000.SH", "银行", "sell", 1, 11.0, 0.0),
+            ]
+        )
 
 
 def test_distribution_covers_every_return_and_zero_breaks_streaks() -> None:

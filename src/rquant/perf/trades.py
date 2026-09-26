@@ -70,8 +70,8 @@ class _Lot:
 
 
 def _validate_fill(fill: Fill) -> None:
-    if not isinstance(fill.trade_date, date) or not fill.ts_code or not fill.industry:
-        raise ValueError("fill needs a date, symbol and industry")
+    if type(fill.trade_date) is not date or not fill.ts_code or not fill.industry:
+        raise ValueError("fill needs a pure date, symbol and industry")
     if fill.side not in ("buy", "sell"):
         raise ValueError("fill side must be buy or sell")
     if isinstance(fill.quantity, bool) or not isinstance(fill.quantity, int):
