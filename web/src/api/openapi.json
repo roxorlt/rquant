@@ -24,6 +24,55 @@
         "title": "ActionCount",
         "type": "object"
       },
+      "Assignment": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "value": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpr",
+                "call": "#/components/schemas/CallExpr",
+                "field": "#/components/schemas/FieldExpr",
+                "local": "#/components/schemas/LocalExpr",
+                "number": "#/components/schemas/NumberExpr",
+                "unary": "#/components/schemas/UnaryExpr"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NumberExpr"
+              },
+              {
+                "$ref": "#/components/schemas/FieldExpr"
+              },
+              {
+                "$ref": "#/components/schemas/LocalExpr"
+              },
+              {
+                "$ref": "#/components/schemas/UnaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/CallExpr"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "title": "Assignment",
+        "type": "object"
+      },
       "AttentionItem": {
         "properties": {
           "action": {
@@ -59,6 +108,110 @@
           "action"
         ],
         "title": "AttentionItem",
+        "type": "object"
+      },
+      "BinaryExpr": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "binary",
+            "default": "binary",
+            "title": "Kind",
+            "type": "string"
+          },
+          "left": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpr",
+                "call": "#/components/schemas/CallExpr",
+                "field": "#/components/schemas/FieldExpr",
+                "local": "#/components/schemas/LocalExpr",
+                "number": "#/components/schemas/NumberExpr",
+                "unary": "#/components/schemas/UnaryExpr"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NumberExpr"
+              },
+              {
+                "$ref": "#/components/schemas/FieldExpr"
+              },
+              {
+                "$ref": "#/components/schemas/LocalExpr"
+              },
+              {
+                "$ref": "#/components/schemas/UnaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/CallExpr"
+              }
+            ],
+            "title": "Left"
+          },
+          "op": {
+            "enum": [
+              "+",
+              "-",
+              "*",
+              "/",
+              ">",
+              ">=",
+              "<",
+              "<=",
+              "=",
+              "<>",
+              "AND",
+              "OR"
+            ],
+            "title": "Op",
+            "type": "string"
+          },
+          "right": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpr",
+                "call": "#/components/schemas/CallExpr",
+                "field": "#/components/schemas/FieldExpr",
+                "local": "#/components/schemas/LocalExpr",
+                "number": "#/components/schemas/NumberExpr",
+                "unary": "#/components/schemas/UnaryExpr"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NumberExpr"
+              },
+              {
+                "$ref": "#/components/schemas/FieldExpr"
+              },
+              {
+                "$ref": "#/components/schemas/LocalExpr"
+              },
+              {
+                "$ref": "#/components/schemas/UnaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/CallExpr"
+              }
+            ],
+            "title": "Right"
+          }
+        },
+        "required": [
+          "op",
+          "left",
+          "right"
+        ],
+        "title": "BinaryExpr",
         "type": "object"
       },
       "BoardRow": {
@@ -232,6 +385,64 @@
           "rows"
         ],
         "title": "BoardsData",
+        "type": "object"
+      },
+      "CallExpr": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "binary": "#/components/schemas/BinaryExpr",
+                  "call": "#/components/schemas/CallExpr",
+                  "field": "#/components/schemas/FieldExpr",
+                  "local": "#/components/schemas/LocalExpr",
+                  "number": "#/components/schemas/NumberExpr",
+                  "unary": "#/components/schemas/UnaryExpr"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/NumberExpr"
+                },
+                {
+                  "$ref": "#/components/schemas/FieldExpr"
+                },
+                {
+                  "$ref": "#/components/schemas/LocalExpr"
+                },
+                {
+                  "$ref": "#/components/schemas/UnaryExpr"
+                },
+                {
+                  "$ref": "#/components/schemas/BinaryExpr"
+                },
+                {
+                  "$ref": "#/components/schemas/CallExpr"
+                }
+              ]
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "kind": {
+            "const": "call",
+            "default": "call",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "args"
+        ],
+        "title": "CallExpr",
         "type": "object"
       },
       "CandidateGroup": {
@@ -1107,6 +1318,96 @@
         "title": "ErrorItem",
         "type": "object"
       },
+      "FieldExpr": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "field",
+            "default": "field",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "FieldExpr",
+        "type": "object"
+      },
+      "FormulaAst": {
+        "additionalProperties": false,
+        "properties": {
+          "assignments": {
+            "items": {
+              "$ref": "#/components/schemas/Assignment"
+            },
+            "title": "Assignments",
+            "type": "array"
+          },
+          "output": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpr",
+                "call": "#/components/schemas/CallExpr",
+                "field": "#/components/schemas/FieldExpr",
+                "local": "#/components/schemas/LocalExpr",
+                "number": "#/components/schemas/NumberExpr",
+                "unary": "#/components/schemas/UnaryExpr"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NumberExpr"
+              },
+              {
+                "$ref": "#/components/schemas/FieldExpr"
+              },
+              {
+                "$ref": "#/components/schemas/LocalExpr"
+              },
+              {
+                "$ref": "#/components/schemas/UnaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/CallExpr"
+              }
+            ],
+            "title": "Output"
+          },
+          "output_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Name"
+          },
+          "syntax_version": {
+            "const": "tdx-v1",
+            "default": "tdx-v1",
+            "title": "Syntax Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignments",
+          "output_name",
+          "output"
+        ],
+        "title": "FormulaAst",
+        "type": "object"
+      },
       "FreshnessItem": {
         "properties": {
           "key": {
@@ -1430,6 +1731,26 @@
           "marks"
         ],
         "title": "IntradayData",
+        "type": "object"
+      },
+      "LocalExpr": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "local",
+            "default": "local",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "LocalExpr",
         "type": "object"
       },
       "MarketInfo": {
@@ -1770,6 +2091,26 @@
         "title": "MinuteBar",
         "type": "object"
       },
+      "NumberExpr": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "number",
+            "default": "number",
+            "title": "Kind",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "number"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "NumberExpr",
+        "type": "object"
+      },
       "OverviewData": {
         "properties": {
           "attention": {
@@ -1962,6 +2303,37 @@
           "note"
         ],
         "title": "PaperSummary",
+        "type": "object"
+      },
+      "ParseIssue": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "syntax",
+              "type",
+              "range",
+              "future",
+              "limit",
+              "name"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "position": {
+            "$ref": "#/components/schemas/SourcePosition"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "position"
+        ],
+        "title": "ParseIssue",
         "type": "object"
       },
       "PipelineStage": {
@@ -3166,6 +3538,30 @@
         "title": "SignalsSummary",
         "type": "object"
       },
+      "SourcePosition": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "title": "Column",
+            "type": "integer"
+          },
+          "line": {
+            "title": "Line",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "line",
+          "column",
+          "offset"
+        ],
+        "title": "SourcePosition",
+        "type": "object"
+      },
       "StateCounts": {
         "properties": {
           "crit": {
@@ -3620,6 +4016,221 @@
           "name"
         ],
         "title": "TableItem",
+        "type": "object"
+      },
+      "TdxParseData": {
+        "additionalProperties": false,
+        "properties": {
+          "ast": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FormulaAst"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "capability": {
+            "const": "parse_only",
+            "default": "parse_only",
+            "title": "Capability",
+            "type": "string"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/ParseIssue"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "parsed",
+              "rejected"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "syntax_version": {
+            "const": "tdx-v1",
+            "default": "tdx-v1",
+            "title": "Syntax Version",
+            "type": "string"
+          },
+          "translation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TranslationPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unsupported": {
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedItem"
+            },
+            "title": "Unsupported",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "ast",
+          "translation",
+          "issues",
+          "unsupported"
+        ],
+        "title": "TdxParseData",
+        "type": "object"
+      },
+      "TdxParseRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "default": "",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "title": "TdxParseRequest",
+        "type": "object"
+      },
+      "TranslationPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "assignments": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Assignments",
+            "type": "array"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "functions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Functions",
+            "type": "array"
+          },
+          "requires_full_history": {
+            "title": "Requires Full History",
+            "type": "boolean"
+          },
+          "window_lookback_bars": {
+            "title": "Window Lookback Bars",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fields",
+          "functions",
+          "assignments",
+          "window_lookback_bars",
+          "requires_full_history"
+        ],
+        "title": "TranslationPlan",
+        "type": "object"
+      },
+      "UnaryExpr": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "unary",
+            "default": "unary",
+            "title": "Kind",
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "+",
+              "-",
+              "NOT"
+            ],
+            "title": "Op",
+            "type": "string"
+          },
+          "operand": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryExpr",
+                "call": "#/components/schemas/CallExpr",
+                "field": "#/components/schemas/FieldExpr",
+                "local": "#/components/schemas/LocalExpr",
+                "number": "#/components/schemas/NumberExpr",
+                "unary": "#/components/schemas/UnaryExpr"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NumberExpr"
+              },
+              {
+                "$ref": "#/components/schemas/FieldExpr"
+              },
+              {
+                "$ref": "#/components/schemas/LocalExpr"
+              },
+              {
+                "$ref": "#/components/schemas/UnaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/BinaryExpr"
+              },
+              {
+                "$ref": "#/components/schemas/CallExpr"
+              }
+            ],
+            "title": "Operand"
+          }
+        },
+        "required": [
+          "op",
+          "operand"
+        ],
+        "title": "UnaryExpr",
+        "type": "object"
+      },
+      "UnsupportedItem": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "function",
+              "field"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "position": {
+            "$ref": "#/components/schemas/SourcePosition"
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "position",
+          "message"
+        ],
+        "title": "UnsupportedItem",
         "type": "object"
       },
       "UserState": {
@@ -4194,6 +4805,47 @@
           }
         },
         "summary": "运行选股条件",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/parse": {
+      "post": {
+        "operationId": "parse_tdx_formula_api_v1_screen_tdx_parse_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TdxParseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TdxParseData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "检查通达信公式",
         "tags": [
           "screen"
         ]

@@ -242,6 +242,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/tdx/parse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 检查通达信公式 */
+        post: operations["parse_tdx_formula_api_v1_screen_tdx_parse_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stocks/search": {
         parameters: {
             query?: never;
@@ -289,6 +306,13 @@ export interface components {
             /** Label */
             label: string;
         };
+        /** Assignment */
+        Assignment: {
+            /** Name */
+            name: string;
+            /** Value */
+            value: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+        };
         /** AttentionItem */
         AttentionItem: {
             /** Action */
@@ -304,6 +328,23 @@ export interface components {
             title: string;
             /** To */
             to: string;
+        };
+        /** BinaryExpr */
+        BinaryExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "binary";
+            /** Left */
+            left: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "+" | "-" | "*" | "/" | ">" | ">=" | "<" | "<=" | "=" | "<>" | "AND" | "OR";
+            /** Right */
+            right: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
         };
         /** BoardRow */
         BoardRow: {
@@ -342,6 +383,18 @@ export interface components {
             system: string;
             /** Systems */
             systems: string[];
+        };
+        /** CallExpr */
+        CallExpr: {
+            /** Args */
+            args: (components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"])[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "call";
+            /** Name */
+            name: string;
         };
         /** CandidateGroup */
         CandidateGroup: {
@@ -629,6 +682,31 @@ export interface components {
             /** Summary */
             summary: string;
         };
+        /** FieldExpr */
+        FieldExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "field";
+            /** Name */
+            name: string;
+        };
+        /** FormulaAst */
+        FormulaAst: {
+            /** Assignments */
+            assignments: components["schemas"]["Assignment"][];
+            /** Output */
+            output: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+            /** Output Name */
+            output_name: string | null;
+            /**
+             * Syntax Version
+             * @default tdx-v1
+             * @constant
+             */
+            syntax_version: "tdx-v1";
+        };
         /** FreshnessItem */
         FreshnessItem: {
             /** Key */
@@ -729,6 +807,16 @@ export interface components {
             /** Ts Code */
             ts_code: string;
         };
+        /** LocalExpr */
+        LocalExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "local";
+            /** Name */
+            name: string;
+        };
         /** MarketInfo */
         MarketInfo: {
             /** Is Trading Day */
@@ -822,6 +910,16 @@ export interface components {
             /** Volume */
             volume: number | null;
         };
+        /** NumberExpr */
+        NumberExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "number";
+            /** Value */
+            value: number;
+        };
         /** OverviewData */
         OverviewData: {
             /** Attention */
@@ -876,6 +974,17 @@ export interface components {
             realized_pnl: number;
             /** Unrealized Pnl */
             unrealized_pnl: number;
+        };
+        /** ParseIssue */
+        ParseIssue: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "syntax" | "type" | "range" | "future" | "limit" | "name";
+            /** Message */
+            message: string;
+            position: components["schemas"]["SourcePosition"];
         };
         /** PipelineStage */
         PipelineStage: {
@@ -1235,6 +1344,15 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** SourcePosition */
+        SourcePosition: {
+            /** Column */
+            column: number;
+            /** Line */
+            line: number;
+            /** Offset */
+            offset: number;
+        };
         /** StateCounts */
         StateCounts: {
             /** Crit */
@@ -1376,6 +1494,81 @@ export interface components {
             key: string;
             /** Name */
             name: string;
+        };
+        /** TdxParseData */
+        TdxParseData: {
+            ast: components["schemas"]["FormulaAst"] | null;
+            /**
+             * Capability
+             * @default parse_only
+             * @constant
+             */
+            capability: "parse_only";
+            /** Issues */
+            issues: components["schemas"]["ParseIssue"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "parsed" | "rejected";
+            /**
+             * Syntax Version
+             * @default tdx-v1
+             * @constant
+             */
+            syntax_version: "tdx-v1";
+            translation: components["schemas"]["TranslationPlan"] | null;
+            /** Unsupported */
+            unsupported: components["schemas"]["UnsupportedItem"][];
+        };
+        /** TdxParseRequest */
+        TdxParseRequest: {
+            /**
+             * Source
+             * @default
+             */
+            source: string;
+        };
+        /** TranslationPlan */
+        TranslationPlan: {
+            /** Assignments */
+            assignments: string[];
+            /** Fields */
+            fields: string[];
+            /** Functions */
+            functions: string[];
+            /** Requires Full History */
+            requires_full_history: boolean;
+            /** Window Lookback Bars */
+            window_lookback_bars: number;
+        };
+        /** UnaryExpr */
+        UnaryExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "unary";
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "+" | "-" | "NOT";
+            /** Operand */
+            operand: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+        };
+        /** UnsupportedItem */
+        UnsupportedItem: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "function" | "field";
+            /** Message */
+            message: string;
+            /** Name */
+            name: string;
+            position: components["schemas"]["SourcePosition"];
         };
         /**
          * UserState
@@ -1766,6 +1959,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ScreenRunData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    parse_tdx_formula_api_v1_screen_tdx_parse_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TdxParseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TdxParseData"];
                 };
             };
             /** @description Validation Error */

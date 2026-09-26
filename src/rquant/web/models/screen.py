@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.screen.tdx.ast import ParseResult
+
 
 class ScreenOption(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -120,3 +122,13 @@ class ScreenRunData(BaseModel):
     steps: list[ScreenStep]
     rows: list[ScreenRow]
     next_cursor: str | None
+
+
+class TdxParseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = ""
+
+
+class TdxParseData(ParseResult):
+    capability: Literal["parse_only"] = "parse_only"
