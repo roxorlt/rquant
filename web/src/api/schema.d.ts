@@ -174,6 +174,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/stocks/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 搜索股票 */
+        get: operations["search_stocks_api_v1_stocks_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/stocks/{ts_code}/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 个股概览 */
+        get: operations["get_stock_summary_api_v1_stocks__ts_code__summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -405,6 +439,16 @@ export interface components {
         /** Envelope[PulseData] */
         Envelope_PulseData_: {
             data: components["schemas"]["PulseData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StockSearchData] */
+        Envelope_StockSearchData_: {
+            data: components["schemas"]["StockSearchData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StockSummaryData] */
+        Envelope_StockSummaryData_: {
+            data: components["schemas"]["StockSummaryData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[SurgeData] */
@@ -910,6 +954,37 @@ export interface components {
             reason: string;
             state: components["schemas"]["UserState"];
         };
+        /** StockSearchData */
+        StockSearchData: {
+            /** Available */
+            available: boolean;
+            /** Query */
+            query: string;
+            /** Rows */
+            rows: components["schemas"]["StockSearchRow"][];
+            /** Truncated */
+            truncated: boolean;
+        };
+        /** StockSearchRow */
+        StockSearchRow: {
+            /** Name */
+            name: string;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** StockSummaryData */
+        StockSummaryData: {
+            /** As Of */
+            as_of: string | null;
+            /** Name */
+            name: string | null;
+            /** Pools */
+            pools: string[];
+            /** Price */
+            price: number | null;
+            /** Ts Code */
+            ts_code: string;
+        };
         /** SurgeConfig */
         SurgeConfig: {
             /** Boards */
@@ -1280,6 +1355,68 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_SurgeSearchData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_stocks_api_v1_stocks_search_get: {
+        parameters: {
+            query: {
+                q: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StockSearchData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_stock_summary_api_v1_stocks__ts_code__summary_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ts_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StockSummaryData_"];
                 };
             };
             /** @description Validation Error */

@@ -5,8 +5,9 @@ import { formatTradeDate, shanghaiDate, weekdayOf } from "@/format/time";
 import { THEME_LABELS, useTheme } from "@/theme/ThemeProvider";
 import { Button, Tip } from "@/ui";
 import { GenerationBadge } from "./GenerationBadge";
-import { BrandMark, SearchIcon, SparkIcon, ThemeIcon } from "./icons";
+import { BrandMark, SparkIcon, ThemeIcon } from "./icons";
 import { APP_TITLE, HOME_PATH } from "./pages";
+import { StockSearch } from "./StockSearch";
 import { UserMenu } from "./UserMenu";
 
 export interface TopbarProps {
@@ -65,18 +66,7 @@ export function Topbar({ meta, metaReceivedAt, metaFailed }: TopbarProps) {
         <PhasePill meta={meta} />
         <GenerationBadge meta={meta} failed={metaFailed} receivedAt={metaReceivedAt} />
       </div>
-      {/* biome-ignore lint/a11y/useSemanticElements: <search> is newer than the Safari 15 build target. */}
-      <form className="search is-soon" role="search" onSubmit={(event) => event.preventDefault()}>
-        <Tip content="股票搜索即将上线" placement="bottom" className="search-tip">
-          <SearchIcon />
-          <input
-            type="search"
-            disabled
-            placeholder="代码 / 名称"
-            aria-label="搜索股票（即将上线）"
-          />
-        </Tip>
-      </form>
+      <StockSearch />
       <Button className="ai-btn" disabledReason="AI 助手即将上线">
         <SparkIcon />
         <span className="lbl">AI 助手</span>

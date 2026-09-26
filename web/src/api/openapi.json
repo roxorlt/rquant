@@ -750,6 +750,38 @@
         "title": "Envelope[PulseData]",
         "type": "object"
       },
+      "Envelope_StockSearchData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StockSearchData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StockSearchData]",
+        "type": "object"
+      },
+      "Envelope_StockSummaryData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StockSummaryData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StockSummaryData]",
+        "type": "object"
+      },
       "Envelope_SurgeData_": {
         "properties": {
           "data": {
@@ -2437,6 +2469,113 @@
         "title": "StatusInfo",
         "type": "object"
       },
+      "StockSearchData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/StockSearchRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query",
+          "available",
+          "rows",
+          "truncated"
+        ],
+        "title": "StockSearchData",
+        "type": "object"
+      },
+      "StockSearchRow": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts_code",
+          "name"
+        ],
+        "title": "StockSearchRow",
+        "type": "object"
+      },
+      "StockSummaryData": {
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts_code",
+          "name",
+          "price",
+          "as_of",
+          "pools"
+        ],
+        "title": "StockSummaryData",
+        "type": "object"
+      },
       "SurgeConfig": {
         "properties": {
           "boards": {
@@ -3174,6 +3313,93 @@
         "summary": "爆量记录（跨日搜索）",
         "tags": [
           "panorama"
+        ]
+      }
+    },
+    "/api/v1/stocks/search": {
+      "get": {
+        "operationId": "search_stocks_api_v1_stocks_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 32,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StockSearchData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "搜索股票",
+        "tags": [
+          "stocks"
+        ]
+      }
+    },
+    "/api/v1/stocks/{ts_code}/summary": {
+      "get": {
+        "operationId": "get_stock_summary_api_v1_stocks__ts_code__summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ts_code",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9A-Z]{6}\\.(SH|SZ|BJ)$",
+              "title": "Ts Code",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StockSummaryData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "个股概览",
+        "tags": [
+          "stocks"
         ]
       }
     }

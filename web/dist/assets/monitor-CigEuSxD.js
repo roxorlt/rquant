@@ -1,1 +1,0 @@
-import{n as e}from"./PageHeader-YKnkR1W_.js";import{t}from"./PlaceholderPage-BxAoXmd7.js";var n=e();function r(){return(0,n.jsx)(t,{id:`monitor`})}export{r as default};

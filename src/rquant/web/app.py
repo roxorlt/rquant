@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from rquant.web.routes import health, meta, overview, panorama
+from rquant.web.routes import health, meta, overview, panorama, stocks
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 
@@ -91,6 +91,7 @@ def create_app(
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
+    app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     return app
 
 

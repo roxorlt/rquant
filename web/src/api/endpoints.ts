@@ -12,6 +12,9 @@ export type SignalItem = Schemas["SignalItem"];
 export type CandidateItem = Schemas["CandidateItem"];
 export type HoldingItem = Schemas["HoldingItem"];
 export type StatusInfo = Schemas["StatusInfo"];
+export type StockSearchData = Schemas["StockSearchData"];
+export type StockSearchRow = Schemas["StockSearchRow"];
+export type StockSummaryData = Schemas["StockSummaryData"];
 
 function unwrap<T>(data: T | undefined, response: Response): T {
   if (data === undefined) {
@@ -36,6 +39,32 @@ export function useOverview(): ServingQueryResult<OverviewData> {
 
 export function useHealth(): ServingQueryResult<HealthData> {
   return useServingQuery(["health"], fetchHealth);
+}
+
+export function useStockSearch(query: string): ServingQueryResult<StockSearchData> {
+  return useServingQuery(
+    ["stocks", "search", query],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/stocks/search", {
+        params: { query: { q: query } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: query.length > 0 },
+  );
+}
+
+export function useStockSummary(tsCode: string | null): ServingQueryResult<StockSummaryData> {
+  return useServingQuery(
+    ["stocks", "summary", tsCode],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/stocks/{ts_code}/summary", {
+        params: { path: { ts_code: tsCode ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: tsCode !== null },
+  );
 }
 
 // ------------------------------------------------------------------ 市场全景

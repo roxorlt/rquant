@@ -124,11 +124,6 @@
   max-width: 100%;
   margin-block: 0;
 }
-.search .search-tip {
-  position: relative;
-  display: block;
-  width: 100%;
-}
 .search svg {
   position: absolute;
   left: 9px;
@@ -149,10 +144,112 @@
   background: var(--surface);
   border-color: var(--accent);
   outline: none;
+  box-shadow: 0 0 0 2px var(--accent-weak);
 }
-.search input:disabled {
-  cursor: not-allowed;
-  color: var(--faint);
+.stock-search-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 2;
+  width: max(100%, 300px);
+  max-width: calc(100vw - 24px);
+  max-height: min(360px, 65vh);
+  overflow-y: auto;
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow-pop);
+}
+.stock-search-option {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.stock-search-option:last-child {
+  border-bottom: 0;
+}
+.stock-search-option:hover,
+.stock-search-option[aria-selected="true"] {
+  background: var(--accent-weak);
+}
+.stock-search-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.stock-search-option .mono {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.stock-search-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.stock-search-state .skel-rows {
+  width: 100%;
+}
+.stock-search-hint {
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.stock-drawer-code {
+  margin-left: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.stock-drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+.stock-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.stock-summary > div {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+.stock-price {
+  color: var(--ink);
+  font-size: 26px;
+  line-height: 1.2;
+}
+.stock-pools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.stock-chart-title {
+  margin: 0 0 8px;
+  font-size: 14px;
 }
 .icon-btn {
   display: inline-grid;
@@ -376,10 +473,6 @@
     flex: 1 1 140px;
     margin-left: 0;
     width: auto;
-  }
-  /* A disabled search only takes room on a phone. */
-  .search.is-soon {
-    display: none;
   }
   .ai-btn .lbl,
   .theme-btn {

@@ -1,0 +1,1 @@
+import{n as e}from"./PageHeader-YKnkR1W_.js";import{t}from"./PlaceholderPage-BUDQY20x.js";var n=e();function r(){return(0,n.jsx)(t,{id:`screener`})}export{r as default};
