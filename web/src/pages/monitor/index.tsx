@@ -67,13 +67,13 @@ function TimelineEntry({
             {row.reasons.length ? (
               <p className="monitor-reasons">{row.reasons.join(" · ")}</p>
             ) : null}
-            {row.receipts.length ? (
-              <div className="monitor-event-foot">
-                <StatusBadge
-                  state={DELIVERY_TONE[row.delivery]}
-                  label={row.delivery_label}
-                  reason={row.delivery_note}
-                />
+            <div className="monitor-event-foot">
+              <StatusBadge
+                state={DELIVERY_TONE[row.delivery]}
+                label={row.delivery_label}
+                reason={row.delivery_note}
+              />
+              {row.receipts.length ? (
                 <ul className="monitor-receipts" aria-label="通知回执">
                   {row.receipts.map((receipt) => (
                     <li key={receipt.outbox_id}>
@@ -87,8 +87,8 @@ function TimelineEntry({
                     </li>
                   ))}
                 </ul>
-              </div>
-            ) : null}
+              ) : null}
+            </div>
           </>
         ) : row.kind === "monitor" ? (
           <p className="monitor-reasons">

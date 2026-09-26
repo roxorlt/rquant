@@ -324,7 +324,11 @@ def test_monitor_source_keeps_only_thirty_local_days_and_rejects_overflow(
         DuckDBSignalPageProjectionSource(database)(NOW)
 
 
-def test_missing_monitor_table_does_not_replace_verified_authority(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure", ("missing", "read_error"))
+def test_unreadable_monitor_source_publishes_partial_new_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+
     database = tmp_path / "rquant_ro.duckdb"
     _signal_projection_database(database)
     store = NotificationStateStore(tmp_path / "notification.sqlite3")
@@ -332,14 +336,23 @@ def test_missing_monitor_table_does_not_replace_verified_authority(tmp_path: Pat
         source=DuckDBSignalPageProjectionSource(database), store=store
     )
     first = producer.publish(NOW)
-    with duckdb.connect(str(database)) as connection:
-        connection.execute("DROP TABLE monitor_event")
+    if failure == "missing":
+        with duckdb.connect(str(database)) as connection:
+            connection.execute("DROP TABLE monitor_event")
+    else:
 
-    with pytest.raises(PageProjectionSourceIntegrityError, match="missing"):
-        producer.publish(NOW + timedelta(seconds=1))
-    retained = store.serving_snapshot(observed_at=NOW + timedelta(seconds=1), history_limit=1)
-    assert retained.projection_generation_id == first.generation_id
-    assert "monitor_event" in {item.table_name for item in retained.payload.projections}
+        def fail_read(*args: object, **kwargs: object) -> object:
+            raise duckdb.IOException("synthetic replica read failure")
+
+        monkeypatch.setattr(DuckDBSignalPageProjectionSource, "__call__", fail_read)
+    second = producer.publish(NOW + timedelta(seconds=1))
+    latest = store.serving_snapshot(observed_at=NOW + timedelta(seconds=1), history_limit=1)
+    assert second.written
+    assert latest.projection_generation_id != first.generation_id
+    assert "monitor_event" not in {item.table_name for item in latest.payload.projections}
+    assert "screen_bounds" in {item.table_name for item in latest.payload.projections}
+    historical = store.serving_snapshot(observed_at=NOW, history_limit=1)
+    assert "monitor_event" in {item.table_name for item in historical.payload.projections}
 
 
 @pytest.mark.parametrize(
@@ -456,6 +469,39 @@ def test_surge_source_rejects_file_replacement_during_read(
 
     monkeypatch.setattr(source_module.os, "open", rotate_after_open)
     with pytest.raises(PageProjectionSourceIntegrityError, match="rotated while read"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+
+
+def test_surge_source_rejects_same_inode_rewrite_with_restored_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    path = root / "events-2026-08-03.jsonl"
+    line = (
+        json.dumps(
+            SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52").model_dump(),
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    path.write_text(line, encoding="utf-8")
+    stamp = NOW.timestamp() - 1
+    os.utime(path, (stamp, stamp))
+    original = source_module._read_bound_optional_file
+
+    def rewrite_after_read(*args: object, **kwargs: object) -> object:
+        result = original(*args, **kwargs)
+        if result is not None:
+            path.write_text(line.replace("样本02", "样本03"), encoding="utf-8")
+            os.utime(path, (stamp, stamp))
+        return result
+
+    monkeypatch.setattr(source_module, "_read_bound_optional_file", rewrite_after_read)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="changed while read"):
         source_module._read_surge_event_projection(root, observed=NOW)
 
 

@@ -3,26 +3,160 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import duckdb
 
+from rquant import runtime_builder_signal
+from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
 from rquant.notification_state import NotificationStateStore
-from rquant.serving_contracts import ServingGenerationManifest
+from rquant.runtime_serving_authority import (
+    ServingSourceAuthorityPublisher,
+    ServingSourceAuthorityReader,
+)
+from rquant.runtime_serving_snapshot import (
+    LabJobsPayload,
+    PaperAccountsPayload,
+    PromotionsPayload,
+    ReferenceSlowPayload,
+    RuntimeHealthPayload,
+    ServingSnapshotAssembler,
+    SourcePayload,
+    SourceReadResult,
+)
+from rquant.serving_contracts import FreshnessStatus, ServingGenerationManifest
 from rquant.serving_page_projection_source import (
     DuckDBSignalPageProjectionSource,
     SignalPageProjectionProducer,
 )
+from rquant.serving_publisher import ServingPublisher
+from rquant.serving_read_models import (
+    SERVING_TABLE_SPECS,
+    ServingProjectionPayload,
+    build_serving_read_models,
+)
+from rquant.signal_bus import SignalBusStore
+from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_route_spool import (
+    ReadonlySignalRouteSpool,
+    SignalRouteSpool,
+    publish_signal_bus_prefix,
+)
+from rquant.signal_router_runtime import (
+    RouteSourceDescriptor,
+    RoutingDecision,
+    RunnerSignalBatch,
+    RunnerSignalRecord,
+    SignalRouteCursorStore,
+    SourceSnapshot,
+    route_runner_signals,
+)
 from rquant.surge_watch import SurgeConfirmed
-from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
+from tests.support.web_serving_fixture import (
+    FIXTURE_BUILT_AT,
+    FIXTURE_PRODUCER_COMMIT,
+    FIXTURE_SCHEMA_VERSION,
+    _runtime_services,
+    _stock_basic,
+    _trade_calendar,
+)
 
 
-def build_monitor_timeline_replay(root: Path) -> ServingGenerationManifest:
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _publish_replayed_signal(source_root: Path, store: NotificationStateStore) -> None:
+    event_time = datetime(2026, 9, 24, 1, 47, tzinfo=UTC)
+    available_at = event_time + timedelta(minutes=23)
+    signal = SignalEnvelope(
+        schema_version=1,
+        strategy_id="n_shape",
+        strategy_version="1",
+        parameter_fingerprint=_digest("monitor-replay-parameters"),
+        dataset_snapshot_id=_digest("monitor-replay-dataset"),
+        feature_snapshot_id=_digest("monitor-replay-features"),
+        event_time=event_time,
+        available_at=available_at,
+        candidate_id="600001.SH",
+        action=SignalAction.WATCH,
+        reason_codes=("sample_replay",),
+        evidence={},
+        expires_at=FIXTURE_BUILT_AT + timedelta(hours=1),
+        producer_commit=FIXTURE_PRODUCER_COMMIT,
+    )
+    descriptor = RouteSourceDescriptor(
+        source_id="strategy.n_shape.v1",
+        generation_id=_digest("monitor-replay-source"),
+        strategy_spec_fingerprint=_digest("monitor-replay-spec"),
+        first_sequence=1,
+        high_watermark=1,
+    )
+
+    class ReplaySource:
+        def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+            return RunnerSignalBatch(
+                snapshot=SourceSnapshot(descriptor=descriptor),
+                after_sequence=after_sequence,
+                limit=limit,
+                records=(RunnerSignalRecord(sequence=1, signal=signal),)
+                if after_sequence == 0
+                else (),
+            )
+
+    bus = SignalBusStore(source_root / "signal-bus.sqlite3")
+    policy = _digest("monitor-replay-policy")
+    route_runner_signals(
+        source_id=descriptor.source_id,
+        source=ReplaySource(),
+        bus=bus,
+        cursors=SignalRouteCursorStore(
+            source_root / "route-cursor.sqlite3", routing_policy_fingerprint=policy
+        ),
+        routed_at=available_at + timedelta(seconds=1),
+        target_resolver=lambda _signal: RoutingDecision.route(
+            routing_policy_fingerprint=policy,
+            targets=(DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER),),
+        ),
+        limit=1,
+    )
+    spool_root = source_root / "signal-spool"
+    publish_signal_bus_prefix(bus=bus, spool=SignalRouteSpool(spool_root), limit=1)
+    spool = ReadonlySignalRouteSpool(spool_root)
+    routed = spool.routed_after_global_sequence(after_sequence=0, through_sequence=1, limit=1)
+    store.replicate(
+        spool.source_descriptor(),
+        routed,
+        observed_at=available_at + timedelta(seconds=2),
+    )
+
+
+def _auxiliary_read(dataset_id: str, payload: SourcePayload) -> SourceReadResult:
+    observed = FIXTURE_BUILT_AT - timedelta(seconds=1)
+    return SourceReadResult(
+        dataset_id=dataset_id,
+        generation_id=_digest("monitor-replay:" + dataset_id),
+        sequence=1,
+        event_time=observed,
+        published_at=observed,
+        status=FreshnessStatus.FRESH,
+        payload=payload,
+    )
+
+
+def build_monitor_timeline_replay(
+    root: Path, *, source_failure: str | None = None
+) -> ServingGenerationManifest:
     """Exercise operational file readers and notification publication before Serving."""
+
+    if source_failure not in (None, "missing", "read_error"):
+        raise ValueError("unknown replay source failure")
 
     with TemporaryDirectory(prefix="rquant-monitor-replay-") as directory:
         source_root = Path(os.path.realpath(directory))
@@ -87,17 +221,105 @@ def build_monitor_timeline_replay(root: Path) -> ServingGenerationManifest:
         os.utime(surge_path, (source_stamp, source_stamp))
 
         store = NotificationStateStore(source_root / "notification.sqlite3")
-        SignalPageProjectionProducer(
+        _publish_replayed_signal(source_root, store)
+        page_producer = SignalPageProjectionProducer(
             source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
             store=store,
-        ).publish(FIXTURE_BUILT_AT)
-        published = store.serving_snapshot(observed_at=FIXTURE_BUILT_AT, history_limit=1)
-        events = tuple(
-            item
-            for item in published.payload.projections
-            if item.table_name in {"monitor_event", "surge_event"}
         )
-        return build_web_fixture(root, "panorama", event_projections=events)
+        page_producer.publish(FIXTURE_BUILT_AT)
+        authority_root = source_root / "signals-authority"
+        authority_clock = [FIXTURE_BUILT_AT]
+        publisher = ServingSourceAuthorityPublisher(
+            root=authority_root,
+            producer_commit=FIXTURE_PRODUCER_COMMIT,
+            dataset_id="signals",
+            payload_kind="signal_delivery",
+            clock=lambda: authority_clock[0],
+        )
+        reader = ServingSourceAuthorityReader(
+            root=authority_root,
+            expected_producer_commit=FIXTURE_PRODUCER_COMMIT,
+            expected_dataset_id="signals",
+            expected_payload_kind="signal_delivery",
+        )
+        reference_at = datetime(2026, 9, 24, 1, 25, tzinfo=UTC)
+        reference = ReferenceSlowPayload(
+            reference_generation_id=_digest("monitor-replay-reference"),
+            revision=1,
+            price_basis="raw_session",
+            adjustment_basis="tushare_adj_factor",
+            available_at=reference_at,
+            projections=(
+                ServingProjectionPayload(
+                    table_name="trade_calendar",
+                    available_at=reference_at,
+                    rows=tuple(_trade_calendar()),
+                ),
+                ServingProjectionPayload(
+                    table_name="stock_basic",
+                    available_at=reference_at,
+                    rows=tuple(_stock_basic()),
+                ),
+            ),
+        )
+        assembler = ServingSnapshotAssembler(
+            signal_reader=reader,
+            paper_accounts_reader=lambda _as_of: _auxiliary_read(
+                "paper_accounts", PaperAccountsPayload()
+            ),
+            runtime_health_reader=lambda _as_of: _auxiliary_read(
+                "runtime_health",
+                RuntimeHealthPayload(
+                    runtime_services=_runtime_services(FIXTURE_BUILT_AT - timedelta(seconds=5))
+                ),
+            ),
+            lab_jobs_reader=lambda _as_of: _auxiliary_read("lab_jobs", LabJobsPayload()),
+            promotions_reader=lambda _as_of: _auxiliary_read("promotions", PromotionsPayload()),
+            reference_slow_reader=lambda _as_of: _auxiliary_read(
+                "reference_slow_authority", reference
+            ),
+        )
+        serving = ServingPublisher(
+            root,
+            producer_commit=FIXTURE_PRODUCER_COMMIT,
+            schema_version=FIXTURE_SCHEMA_VERSION,
+            table_specs=SERVING_TABLE_SPECS,
+        )
+
+        def publish_generation(observed: datetime) -> ServingGenerationManifest:
+            runtime_builder_signal._publish_signal_authority(
+                store=store,
+                publisher=publisher,
+                reader=reader,
+                previous_reader=None,
+                observed_at=observed,
+                history_limit=100,
+            )
+            snapshot = assembler.assemble(observed)
+            return serving.publish(
+                build_serving_read_models(snapshot.read_model),
+                watermarks=snapshot.watermarks,
+                source_generations=snapshot.source_generations,
+                built_at=observed,
+            )
+
+        first = publish_generation(FIXTURE_BUILT_AT)
+        if source_failure is None:
+            return first
+        later = FIXTURE_BUILT_AT + timedelta(minutes=1)
+        authority_clock[0] = later
+        if source_failure == "missing":
+            with duckdb.connect(str(database)) as connection:
+                connection.execute("DROP TABLE monitor_event")
+            page_producer.publish(later)
+        else:
+            with patch.object(
+                DuckDBSignalPageProjectionSource,
+                "__call__",
+                side_effect=duckdb.IOException("synthetic replica read failure"),
+            ):
+                page_producer.publish(later)
+        return publish_generation(later)
 
 
 def main() -> None:

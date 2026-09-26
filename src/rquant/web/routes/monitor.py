@@ -49,7 +49,7 @@ _SURGE_VALID = (
 )
 _SIGNALS_SELECT = (
     "SELECT printf('%020d', global_sequence) AS sort_key, "
-    "available_at::TIMESTAMPTZ AS event_at, "
+    "event_time::TIMESTAMPTZ AS event_at, "
     "global_sequence, signal_id, strategy_id, strategy_version, candidate_id, action, "
     "available_at::TIMESTAMPTZ, expires_at::TIMESTAMPTZ, reason_codes_json FROM signals"
 )
@@ -285,7 +285,7 @@ def _page(
     has_surge = states.get("surge_event") is not None and states["surge_event"].available
     total = int(
         cursor.execute(
-            "SELECT count(*) FROM signals WHERE available_at::TIMESTAMPTZ BETWEEN ? AND ?",
+            "SELECT count(*) FROM signals WHERE event_time::TIMESTAMPTZ BETWEEN ? AND ?",
             (window_start, now),
         ).fetchone()[0]
     )

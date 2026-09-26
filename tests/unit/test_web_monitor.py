@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rquant.serving_read_models import ServingProjectionPayload
+from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
@@ -86,6 +87,28 @@ def test_timeline_ties_and_late_sequences_have_stable_order(
             }
         ],
     )
+    original_signal = fixture._signal
+
+    def signal_at_event_time(
+        *, strategy_id: str, candidate_id: str, action: SignalAction, available_at: datetime
+    ) -> SignalEnvelope:
+        signal = original_signal(
+            strategy_id=strategy_id,
+            candidate_id=candidate_id,
+            action=action,
+            available_at=available_at,
+        )
+        if signal.candidate_id != "600001.SH":
+            return signal
+        return type(signal).model_validate(
+            {
+                **signal.model_dump(mode="python"),
+                "event_time": signal.available_at,
+                "signal_id": None,
+            }
+        )
+
+    monkeypatch.setattr(fixture, "_signal", signal_at_event_time)
     root = tmp_path / "tie-serving"
     build_web_fixture(root, "baseline")
     with TestClient(_app(root)) as client:
@@ -291,6 +314,7 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
         "CREATE TABLE signals AS SELECT i::BIGINT AS global_sequence, "
         "'signal-' || i AS signal_id, 'n_shape' AS strategy_id, 'v1' AS strategy_version, "
         "'600001.SH' AS candidate_id, 'watch' AS action, "
+        "'2026-09-24 01:47:00+00'::TIMESTAMPTZ AS event_time, "
         "'2026-09-24 01:47:00+00'::TIMESTAMPTZ AS available_at, "
         "NULL::TIMESTAMPTZ AS expires_at, '[]' AS reason_codes_json "
         "FROM range(1, 502) t(i)"
@@ -356,12 +380,12 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
         nine_thirty = datetime(2026, 9, 24, 9, 30, tzinfo=shanghai)
         connection.executemany(
             "INSERT INTO signals VALUES "
-            "(?, ?, 'n_shape', 'v1', '600001.SH', 'watch', ?, NULL, '[]')",
+            "(?, ?, 'n_shape', 'v1', '600001.SH', 'watch', ?, ?, NULL, '[]')",
             [
-                (1, "late-1", ten),
-                (2, "late-2", nine_thirty),
-                (3, "late-3", ten),
-                (4, "late-4", nine_thirty),
+                (1, "late-1", ten, ten),
+                (2, "late-2", nine_thirty, nine_thirty),
+                (3, "late-3", ten, ten),
+                (4, "late-4", nine_thirty, nine_thirty),
             ],
         )
         seen_late: list[int] = []
@@ -378,11 +402,36 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
         connection.execute(
             "INSERT INTO signals VALUES "
             "(5, 'old-signal', 'n_shape', 'v1', '600001.SH', 'watch', "
-            "'2026-08-01 01:00:00+00'::TIMESTAMPTZ, NULL, '[]')"
+            "'2026-08-01 01:00:00+00'::TIMESTAMPTZ, "
+            "'2026-09-24 01:55:00+00'::TIMESTAMPTZ, NULL, '[]')"
         )
         recent = _page(borrowed, page_size=50, after=None, key=key, now=FIXTURE_BUILT_AT)
         assert recent.total == 4
         assert all(item.event_key != "signal:old-signal" for item in recent.items)
+        connection.execute(
+            "INSERT INTO signals VALUES "
+            "(6, 'delayed-signal', 'n_shape', 'v1', '600001.SH', 'watch', "
+            "'2026-09-24 01:40:00+00'::TIMESTAMPTZ, "
+            "'2026-09-24 02:20:00+00'::TIMESTAMPTZ, NULL, '[]')"
+        )
+        delayed = _page(borrowed, page_size=50, after=None, key=key, now=FIXTURE_BUILT_AT)
+        assert delayed.total == 5
+        assert [item.sequence for item in delayed.items] == [3, 1, 6, 4, 2]
+        assert delayed.items[2].event_key == "signal:delayed-signal"
+        assert delayed.items[2].at == datetime(2026, 9, 24, 1, 40, tzinfo=UTC)
+        local_window_start = datetime(2026, 8, 26, tzinfo=shanghai)
+        connection.executemany(
+            "INSERT INTO signals VALUES "
+            "(?, ?, 'n_shape', 'v1', '600001.SH', 'watch', ?, ?, NULL, '[]')",
+            [
+                (7, "window-edge", local_window_start, ten),
+                (8, "before-window", local_window_start - timedelta(seconds=1), ten),
+            ],
+        )
+        bounded = _page(borrowed, page_size=50, after=None, key=key, now=FIXTURE_BUILT_AT)
+        assert bounded.total == 6
+        assert {item.event_key for item in bounded.items} >= {"signal:window-edge"}
+        assert "signal:before-window" not in {item.event_key for item in bounded.items}
     finally:
         borrowed.cursor.close()
         connection.close()

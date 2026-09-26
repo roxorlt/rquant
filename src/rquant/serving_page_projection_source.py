@@ -2038,8 +2038,34 @@ class SignalPageProjectionProducer:
         """
 
         observed = normalize_aware_utc(observed_at)
-        snapshot = self.source(observed)
-        page_projections = snapshot.projections
+        try:
+            snapshot = self.source(observed)
+        except (PageProjectionSourceIntegrityError, OSError, duckdb.Error, ValueError) as error:
+            previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
+            if previous.projection_generation_id is None:
+                raise
+            logger.warning("盯盘事件来源暂不可用：{}", error)
+            page_projections = tuple(
+                item
+                for item in previous.payload.projections
+                if item.table_name not in _COMPANION_SIGNAL_TABLES
+                and item.table_name != "surge_event"
+            )
+            try:
+                surge = _read_surge_event_projection(self.source.surge_live_root, observed=observed)
+            except (PageProjectionSourceIntegrityError, OSError, ValueError) as surge_error:
+                logger.warning("爆量事件来源暂不可用：{}", surge_error)
+                surge = None
+            if surge is not None:
+                page_projections += (surge,)
+            page_available_at = max(item.available_at for item in page_projections)
+            page_generation_id = canonical_sha256(
+                {"source": "signal-page-projections-partial", "projections": page_projections}
+            )
+        else:
+            page_projections = snapshot.projections
+            page_available_at = snapshot.available_at
+            page_generation_id = snapshot.content_sha256
         if self.companion_projections is not None:
             injected_names = {item.table_name for item in self.companion_projections}
             page_projections = tuple(
@@ -2047,9 +2073,9 @@ class SignalPageProjectionProducer:
             )
         page_source = NotificationProjectionSourceReceipt.create(
             dataset_id="signal-page-projections",
-            generation_id=snapshot.content_sha256,
-            sequence=int(snapshot.available_at.timestamp() * 1_000_000),
-            event_time=snapshot.available_at,
+            generation_id=page_generation_id,
+            sequence=int(page_available_at.timestamp() * 1_000_000),
+            event_time=page_available_at,
             published_at=observed,
             projections=page_projections,
         )
@@ -2464,6 +2490,17 @@ def _read_surge_event_projection(
             if file is None:
                 continue
             raw, item = file
+            try:
+                current = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} rotated while read"
+                ) from error
+            if _copy_identity(current) != _copy_identity(item):
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} changed while read"
+                )
+            binding.verify()
             remaining -= len(raw)
             available = max(available, _source_file_time(item, observed=observed, name=name))
             if raw and not raw.endswith(b"\n"):

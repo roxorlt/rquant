@@ -16,7 +16,7 @@ describe("盯盘与告警", () => {
     expect(timeline).toHaveTextContent("12.34");
     expect(timeline).toHaveTextContent("+3.15%");
     expect(timeline.querySelectorAll('[aria-label="通知回执"]')).toHaveLength(1);
-    expect(timeline.lastElementChild).not.toHaveTextContent("暂无回执");
+    expect(timeline.lastElementChild).toHaveTextContent("暂无回执");
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
   });
 

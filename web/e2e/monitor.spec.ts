@@ -14,6 +14,13 @@ for (const width of [1440, 390]) {
       await expect(timeline).toBeVisible();
       const entries = timeline.locator(":scope > li");
       expect(await entries.count()).toBeGreaterThan(0);
+      if (process.env.RQ_E2E_REPLAY_ROOT) {
+        await expect(entries).toHaveCount(3);
+        await expect(entries.nth(0)).toContainText("上攻突破");
+        await expect(entries.nth(1)).toContainText("爆量");
+        await expect(entries.nth(2)).not.toContainText("暂无回执");
+        await expect(entries.nth(2).locator('[aria-label="通知回执"]')).toHaveCount(1);
+      }
       await expect(page.getByText("可向前翻看历史")).toHaveCount(0);
       await entries.first().locator(".monitor-event-time .tip-anchor").hover();
       await expect(page.getByRole("tooltip")).toContainText("2026-09-24");
