@@ -1,8 +1,8 @@
 """Bounded read-only alert timeline from one borrowed Serving generation.
 
-Signals carry new-runtime delivery receipts. Legacy trigger and surge events have no
-receipt evidence here. Notification history, acknowledgments, rule writes and channel
-tests remain separate later capabilities.
+Signals carry new-runtime delivery receipts. Legacy notifications are independent
+per-channel submission attempts. Acknowledgments, rule writes and channel tests remain
+separate later capabilities.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from rquant.web.envelope import Envelope
 from rquant.web.labels import ACTION_LABELS, CHANNEL_LABELS, DELIVERY_LABELS, strategy_label
 from rquant.web.market import MarketPhase, market_phase, shanghai_trade_date
 from rquant.web.models.monitor import (
+    MonitorNotification,
     MonitorReceipt,
     MonitorSignal,
     MonitorSurge,
@@ -64,6 +65,10 @@ _SURGE_SELECT = (
     "trade_date, confirmed_at, ts_code, name, price, pct_chg, status "
     f"FROM surge_event WHERE {_SURGE_VALID}"
 )
+_NOTIFICATION_SELECT = (
+    "SELECT record_key AS sort_key, sent_at AS event_at, "
+    "scene_label, channel_label, submitted FROM legacy_notification"
+)
 _RECEIPTS = (
     "SELECT outbox_id, signal_id, recipient_id, channel, status, attempt_count, "
     "updated_at, NULL AS last_error "
@@ -96,14 +101,14 @@ class _Cursor(BaseModel):
     kind: Literal["monitor_timeline_v1"]
     generation_id: str = Field(min_length=1, max_length=128)
     last_at: AwareUtcDatetime
-    last_rank: int = Field(ge=1, le=3)
+    last_rank: int = Field(ge=1, le=4)
     last_key: str = Field(min_length=1, max_length=64)
     page_size: int = Field(ge=1, le=50)
 
 
 @dataclass(frozen=True)
 class _Event:
-    kind: Literal["signal", "monitor", "surge"]
+    kind: Literal["signal", "monitor", "surge", "notification"]
     at: datetime
     rank: int
     sort_key: str
@@ -190,14 +195,14 @@ def _read_page(
     cursor: Any,
     *,
     select: str,
-    kind: Literal["signal", "monitor", "surge"],
+    kind: Literal["signal", "monitor", "surge", "notification"],
     rank: int,
     page_size: int,
     after: tuple[datetime, int, str] | None,
     window_start: datetime,
     now: datetime,
 ) -> list[_Event]:
-    # The three select statements are module constants. Only keyset values enter SQL as parameters.
+    # Select statements are module constants. Only keyset values enter SQL as parameters.
     statement = (
         f"WITH events AS ({select}) SELECT * FROM events WHERE event_at >= ? AND event_at <= ?"
     )
@@ -283,6 +288,14 @@ def _page(
     states = readers.table_states(cursor)
     has_monitor = states.get("monitor_event") is not None and states["monitor_event"].available
     has_surge = states.get("surge_event") is not None and states["surge_event"].available
+    has_notification = (
+        states.get("legacy_notification") is not None
+        and states["legacy_notification"].available
+    )
+    has_notification_status = (
+        states.get("legacy_notification_status") is not None
+        and states["legacy_notification_status"].available
+    )
     total = int(
         cursor.execute(
             "SELECT count(*) FROM signals WHERE event_time::TIMESTAMPTZ BETWEEN ? AND ?",
@@ -293,13 +306,14 @@ def _page(
         cursor,
         select=_SIGNALS_SELECT,
         kind="signal",
-        rank=3,
+        rank=4,
         page_size=page_size,
         after=after,
         window_start=window_start,
         now=now,
     )
     missing: list[str] = []
+    notification_note: str | None = None
     bad_times = 0
     if has_monitor:
         total += int(
@@ -313,7 +327,7 @@ def _page(
                 cursor,
                 select=_MONITOR_SELECT,
                 kind="monitor",
-                rank=2,
+                rank=3,
                 page_size=page_size,
                 after=after,
                 window_start=window_start,
@@ -341,7 +355,7 @@ def _page(
                 cursor,
                 select=_SURGE_SELECT,
                 kind="surge",
-                rank=1,
+                rank=2,
                 page_size=page_size,
                 after=after,
                 window_start=window_start,
@@ -350,6 +364,39 @@ def _page(
         )
     else:
         missing.append("爆量记录")
+    if has_notification_status:
+        status_row = cursor.execute(
+            "SELECT state, skipped FROM legacy_notification_status WHERE snapshot_key = 'current'"
+        ).fetchone()
+        if (
+            status_row is None
+            or status_row[0] not in {"complete", "partial"}
+            or not has_notification
+        ):
+            notification_note = "通知记录暂不可用，仅显示其他告警"
+        else:
+            if status_row[0] == "partial":
+                notification_note = f"{int(status_row[1])} 条通知记录无法识别，已略过"
+            total += int(
+                cursor.execute(
+                    "SELECT count(*) FROM legacy_notification WHERE sent_at BETWEEN ? AND ?",
+                    (window_start, now),
+                ).fetchone()[0]
+            )
+            events.extend(
+                _read_page(
+                    cursor,
+                    select=_NOTIFICATION_SELECT,
+                    kind="notification",
+                    rank=1,
+                    page_size=page_size,
+                    after=after,
+                    window_start=window_start,
+                    now=now,
+                )
+            )
+    else:
+        notification_note = "通知记录尚未接入，仅显示其他告警"
     events.sort(key=lambda event: (event.at, event.rank, event.sort_key), reverse=True)
     selected = events[:page_size]
     signals = [
@@ -376,6 +423,7 @@ def _page(
             else event.values[2]
         )
         for event in selected
+        if event.kind != "notification"
     ]
     names = readers.stock_names(cursor, states, codes)
     mode = _mode(cursor)
@@ -397,7 +445,7 @@ def _page(
                     status_label="已触发",
                 )
             )
-        else:
+        elif event.kind == "surge":
             _day, _confirmed_at, code, source_name, price, pct_chg, status = event.values
             items.append(
                 MonitorSurge(
@@ -409,6 +457,18 @@ def _page(
                     price=price,
                     pct_chg=pct_chg,
                     status_label=_SURGE_STATUS.get(str(status), "已确认"),
+                )
+            )
+        else:
+            scene_label, channel_label, submitted = event.values
+            items.append(
+                MonitorNotification(
+                    event_key=f"notification:{event.sort_key}",
+                    at=event.at,
+                    scene_label=str(scene_label),
+                    channel_label=str(channel_label),
+                    submitted=bool(submitted),
+                    submission_label="提交成功" if submitted else "提交失败",
                 )
             )
     next_cursor = (
@@ -430,6 +490,8 @@ def _page(
     source_notes = []
     if missing:
         source_notes.append(f"当前数据缺少{'、'.join(missing)}，仅显示已有记录")
+    if notification_note:
+        source_notes.append(notification_note)
     if bad_times:
         source_notes.append(f"{bad_times} 条爆量记录时间无效，未纳入时间线")
     return MonitorTimelineData(

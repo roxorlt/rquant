@@ -151,12 +151,22 @@ def _auxiliary_read(dataset_id: str, payload: SourcePayload) -> SourceReadResult
 
 
 def build_monitor_timeline_replay(
-    root: Path, *, source_failure: str | None = None
+    root: Path,
+    *,
+    source_failure: str | None = None,
+    with_notifications: bool = False,
+    notification_failure: str | None = None,
 ) -> ServingGenerationManifest:
     """Exercise operational file readers and notification publication before Serving."""
 
     if source_failure not in (None, "missing", "read_error"):
         raise ValueError("unknown replay source failure")
+    if notification_failure not in (None, "missing", "half_line"):
+        raise ValueError("unknown replay notification failure")
+    if notification_failure is not None and not with_notifications:
+        raise ValueError("notification failure requires an injected log")
+    if source_failure is not None and notification_failure is not None:
+        raise ValueError("only one replay source failure may be selected")
 
     with TemporaryDirectory(prefix="rquant-monitor-replay-") as directory:
         source_root = Path(os.path.realpath(directory))
@@ -216,14 +226,41 @@ def build_monitor_timeline_replay(
             + "\n",
             encoding="utf-8",
         )
+        notification_path = source_root / "logs" / "notification_log.jsonl"
+        if with_notifications:
+            notification_path.parent.mkdir()
+            notification_path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "sent_at": "2026-09-24T10:06:00.123456",
+                            "scene": "price_level",
+                            "channel": channel,
+                            "target": "SECRET-CANARY-target",
+                            "success": success,
+                            "error_msg": "SECRET-CANARY-error",
+                            "title": "SECRET-CANARY-title",
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+                    for channel, success in (("pushdeer", True), ("pushplus", False))
+                ),
+                encoding="utf-8",
+            )
         source_stamp = (FIXTURE_BUILT_AT - timedelta(seconds=10)).timestamp()
         os.utime(database, (source_stamp, source_stamp))
         os.utime(surge_path, (source_stamp, source_stamp))
+        if with_notifications:
+            os.utime(notification_path, (source_stamp, source_stamp))
 
         store = NotificationStateStore(source_root / "notification.sqlite3")
         _publish_replayed_signal(source_root, store)
         page_producer = SignalPageProjectionProducer(
-            source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
+            source=DuckDBSignalPageProjectionSource(
+                database,
+                surge_live_root=live_root,
+                notification_log_path=notification_path if with_notifications else None,
+            ),
             store=store,
         )
         page_producer.publish(FIXTURE_BUILT_AT)
@@ -304,11 +341,17 @@ def build_monitor_timeline_replay(
             )
 
         first = publish_generation(FIXTURE_BUILT_AT)
-        if source_failure is None:
+        if source_failure is None and notification_failure is None:
             return first
         later = FIXTURE_BUILT_AT + timedelta(minutes=1)
         authority_clock[0] = later
-        if source_failure == "missing":
+        if notification_failure == "missing":
+            notification_path.unlink()
+            page_producer.publish(later)
+        elif notification_failure == "half_line":
+            notification_path.write_text('{"sent_at":', encoding="utf-8")
+            page_producer.publish(later)
+        elif source_failure == "missing":
             with duckdb.connect(str(database)) as connection:
                 connection.execute("DROP TABLE monitor_event")
             page_producer.publish(later)
@@ -325,8 +368,11 @@ def build_monitor_timeline_replay(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--with-notifications", action="store_true")
     args = parser.parse_args()
-    manifest = build_monitor_timeline_replay(args.out)
+    manifest = build_monitor_timeline_replay(
+        args.out, with_notifications=args.with_notifications
+    )
     print(manifest.generation_id)
 
 

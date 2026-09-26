@@ -239,6 +239,108 @@ def test_no_serving_has_separate_source_state(tmp_path: Path) -> None:
         assert response.json()["data"]["items"] == []
 
 
+def test_legacy_notifications_are_independent_paged_submission_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support import web_serving_fixture as fixture
+
+    original = fixture._projections
+    secret = "SECRET-CANARY-not-for-web"
+
+    def with_notifications(scenario, *, built_at, generations):
+        current = original(scenario, built_at=built_at, generations=generations)
+        source_at = built_at - timedelta(seconds=30)
+        return (
+            *current,
+            fixture._projection(
+                "legacy_notification",
+                [
+                    {
+                        "record_key": "1" * 64,
+                        "sent_at": "2026-09-24T02:06:00Z",
+                        "scene_label": "价位提醒",
+                        "channel_label": "PushDeer",
+                        "submitted": True,
+                    },
+                    {
+                        "record_key": "2" * 64,
+                        "sent_at": "2026-09-24T02:06:00Z",
+                        "scene_label": "价位提醒",
+                        "channel_label": "PushPlus",
+                        "submitted": False,
+                    },
+                ],
+                owner="signals",
+                generations=generations,
+                available_at=source_at,
+            ),
+            fixture._projection(
+                "legacy_notification_status",
+                [{"snapshot_key": "current", "state": "partial", "skipped": 1}],
+                owner="signals",
+                generations=generations,
+                available_at=source_at,
+            ),
+        )
+
+    monkeypatch.setattr(fixture, "_projections", with_notifications)
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline")
+    with TestClient(_app(root)) as client:
+        seen = []
+        next_cursor = None
+        for _ in range(6):
+            response = client.get(
+                "/api/v1/monitor/timeline",
+                params={"page_size": 1, **({"cursor": next_cursor} if next_cursor else {})},
+            )
+            assert response.status_code == 200, response.text
+            data = response.json()["data"]
+            assert data["total"] == 6
+            assert "1 条通知记录无法识别" in data["source_note"]
+            assert secret not in response.text
+            seen.extend(data["items"])
+            next_cursor = data["next_cursor"]
+            if next_cursor is None:
+                break
+        notices = [row for row in seen if row["kind"] == "notification"]
+        assert len(notices) == 2
+        assert {row["channel_label"] for row in notices} == {"PushDeer", "PushPlus"}
+        assert {row["submission_label"] for row in notices} == {"提交成功", "提交失败"}
+        assert all("code" not in row and "receipts" not in row for row in notices)
+        assert all("送达" not in row["submission_label"] for row in notices)
+
+
+def test_unavailable_legacy_notification_source_is_named_without_old_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support import web_serving_fixture as fixture
+
+    original = fixture._projections
+
+    def with_failed_notification(scenario, *, built_at, generations):
+        return (
+            *original(scenario, built_at=built_at, generations=generations),
+            fixture._projection(
+                "legacy_notification_status",
+                [{"snapshot_key": "current", "state": "unavailable", "skipped": 0}],
+                owner="signals",
+                generations=generations,
+                available_at=built_at - timedelta(seconds=30),
+            ),
+        )
+
+    monkeypatch.setattr(fixture, "_projections", with_failed_notification)
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline")
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/monitor/timeline")
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert "通知记录暂不可用" in data["source_note"]
+        assert not any(row["kind"] == "notification" for row in data["items"])
+
+
 def test_empty_timeline_with_missing_legacy_sources_is_labeled_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -266,7 +368,7 @@ def test_empty_timeline_with_missing_legacy_sources_is_labeled_partial(
         assert "仅显示已有记录" in data["source_note"]
 
 
-def test_all_three_sources_can_publish_a_truly_empty_timeline(
+def test_three_event_sources_are_empty_while_notification_source_is_unconfigured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tests.support import web_serving_fixture as fixture
@@ -286,8 +388,8 @@ def test_all_three_sources_can_publish_a_truly_empty_timeline(
         assert response.status_code == 200, response.text
         data = response.json()["data"]
         assert data["source_state"] == "empty"
-        assert data["source_label"] == "最近 30 天没有告警"
-        assert data["source_note"] is None
+        assert data["source_label"] == "告警数据暂不完整"
+        assert "通知记录尚未接入" in data["source_note"]
         assert data["total"] == 0
 
 

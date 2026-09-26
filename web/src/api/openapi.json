@@ -1786,6 +1786,51 @@
         "title": "MinuteBar",
         "type": "object"
       },
+      "MonitorNotification": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "channel_label": {
+            "title": "Channel Label",
+            "type": "string"
+          },
+          "event_key": {
+            "title": "Event Key",
+            "type": "string"
+          },
+          "kind": {
+            "const": "notification",
+            "default": "notification",
+            "title": "Kind",
+            "type": "string"
+          },
+          "scene_label": {
+            "title": "Scene Label",
+            "type": "string"
+          },
+          "submission_label": {
+            "title": "Submission Label",
+            "type": "string"
+          },
+          "submitted": {
+            "title": "Submitted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "event_key",
+          "at",
+          "scene_label",
+          "channel_label",
+          "submitted",
+          "submission_label"
+        ],
+        "title": "MonitorNotification",
+        "type": "object"
+      },
       "MonitorReceipt": {
         "properties": {
           "attempt_count": {
@@ -2037,6 +2082,7 @@
               "discriminator": {
                 "mapping": {
                   "monitor": "#/components/schemas/MonitorTrigger",
+                  "notification": "#/components/schemas/MonitorNotification",
                   "signal": "#/components/schemas/MonitorSignal",
                   "surge": "#/components/schemas/MonitorSurge"
                 },
@@ -2051,6 +2097,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/MonitorSurge"
+                },
+                {
+                  "$ref": "#/components/schemas/MonitorNotification"
                 }
               ]
             },

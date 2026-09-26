@@ -75,8 +75,21 @@ class MonitorSurge(BaseModel):
     status_label: str
 
 
+class MonitorNotification(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["notification"] = "notification"
+    event_key: str
+    at: datetime
+    scene_label: str
+    channel_label: str
+    submitted: bool
+    submission_label: str
+
+
 MonitorTimelineItem = Annotated[
-    MonitorSignal | MonitorTrigger | MonitorSurge, Field(discriminator="kind")
+    MonitorSignal | MonitorTrigger | MonitorSurge | MonitorNotification,
+    Field(discriminator="kind"),
 ]
 
 

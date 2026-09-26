@@ -92,6 +92,8 @@ TABLE_LABELS: dict[str, str] = {
     "dc_board": "东财板块",
     "dc_board_member": "东财板块成分",
     "intraday_kline": "分时",
+    "legacy_notification": "通知提交记录",
+    "legacy_notification_status": "通知记录状态",
     "kpl_concept_member": "开盘啦题材成分",
     "market_liquidity": "流动性基准",
     "market_overview": "板块总表",

@@ -355,6 +355,59 @@ def test_unreadable_monitor_source_publishes_partial_new_authority(
     assert "monitor_event" in {item.table_name for item in historical.payload.projections}
 
 
+@pytest.mark.parametrize("failure", ("missing", "half_line"))
+def test_legacy_notification_failure_revokes_old_records_in_new_authority(
+    tmp_path: Path, failure: str
+) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    path = tmp_path / "logs" / "notification_log.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "sent_at": "2026-08-03T09:47:00",
+                "scene": "price_level",
+                "channel": "pushdeer",
+                "target": "SECRET-CANARY",
+                "success": True,
+                "error_msg": "SECRET-CANARY",
+                "title": "SECRET-CANARY",
+            }
+        ) + "\n",
+        encoding="utf-8",
+    )
+    os.utime(path, ((NOW - timedelta(seconds=2)).timestamp(),) * 2)
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, notification_log_path=path), store=store
+    )
+    first = producer.publish(NOW)
+    first_tables = {
+        item.table_name: item
+        for item in store.serving_snapshot(observed_at=NOW, history_limit=1).payload.projections
+    }
+    assert len(first_tables["legacy_notification"].rows) == 1
+    assert "SECRET-CANARY" not in repr(first_tables["legacy_notification"])
+
+    if failure == "missing":
+        path.unlink()
+    else:
+        path.write_text('{"sent_at":', encoding="utf-8")
+    second = producer.publish(NOW + timedelta(seconds=1))
+    latest = {
+        item.table_name: item
+        for item in store.serving_snapshot(
+            observed_at=NOW + timedelta(seconds=1), history_limit=1
+        ).payload.projections
+    }
+    assert second.written and second.generation_id != first.generation_id
+    assert "legacy_notification" not in latest
+    assert latest["legacy_notification_status"].rows[0]["state"] == "unavailable"
+    assert "monitor_event" in latest
+    assert "SECRET-CANARY" not in repr(latest)
+
+
 @pytest.mark.parametrize(
     ("record", "ending"),
     (

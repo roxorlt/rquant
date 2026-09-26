@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -73,7 +74,7 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.runtime_read_interrupt import READ_INTERRUPTS, interruptible_read
-from rquant.serving_read_models import ServingProjectionPayload
+from rquant.serving_read_models import ProjectionScalar, ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strict_json import StrictJsonError, strict_json_loads
 
@@ -93,9 +94,26 @@ _MAX_ALERT_FILE_BYTES = 512 * 1024
 _MAX_RUNTIME_CONFIG_BYTES = 16 * 1024
 _MAX_EVENT_ROWS = 10_000
 _MAX_SURGE_EVENT_BYTES = 8 * 1024 * 1024
+_MAX_LEGACY_NOTIFICATION_BYTES = 8 * 1024 * 1024
 _EVENT_WINDOW_DAYS = 30
 _SURGE_EVENT_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 _STOCK_CODE = re.compile(r"[0-9]{6}\.(?:SH|SZ|BJ)")
+_LEGACY_SCENE_LABELS = MappingProxyType(
+    {
+        "price_level": "价位提醒",
+        "pool2_exit": "二池退出",
+        "daily_summary": "每日汇总",
+        "error": "运行异常",
+        "heartbeat": "运行心跳",
+        "morning_pulse": "早盘脉搏",
+        "midday_report": "午间报告",
+        "surge_watch": "爆量提醒",
+        "pulse_alert": "脉搏异动",
+    }
+)
+_LEGACY_CHANNEL_LABELS = MappingProxyType(
+    {"pushdeer": "PushDeer", "pushplus": "PushPlus"}
+)
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
 _PAGE_CONTROL_PROTOCOL_MARKER = "safe-effect-journal-v2"
 _PAGE_CONTROL_PROTOCOL_VERSION = 2
@@ -221,6 +239,7 @@ def _read_bound_optional_file(
     name: str,
     *,
     max_bytes: int,
+    label: str = "surge live source",
 ) -> tuple[bytes, os.stat_result] | None:
     try:
         item = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
@@ -228,10 +247,10 @@ def _read_bound_optional_file(
         return None
     if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
         raise PageProjectionSourceIntegrityError(
-            f"surge live source {name} must be a regular non-symlink file"
+            f"{label} must be a regular non-symlink file"
         )
     if item.st_size > max_bytes:
-        raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds size bound")
+        raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     descriptor = os.open(
         name,
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
@@ -239,25 +258,25 @@ def _read_bound_optional_file(
     )
     try:
         opened = os.fstat(descriptor)
-        if _file_identity(opened) != _file_identity(item):
-            raise PageProjectionSourceIntegrityError(f"surge live source {name} rotated while open")
+        if _copy_identity(opened) != _copy_identity(item):
+            raise PageProjectionSourceIntegrityError(f"{label} rotated while read")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             raw = handle.read(max_bytes + 1)
         after = os.fstat(descriptor)
-        if _file_identity(after) != _file_identity(opened):
-            raise PageProjectionSourceIntegrityError(f"surge live source {name} changed while read")
+        if _copy_identity(after) != _copy_identity(opened):
+            raise PageProjectionSourceIntegrityError(f"{label} changed while read")
         try:
             named = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
         except FileNotFoundError as error:
             raise PageProjectionSourceIntegrityError(
-                f"surge live source {name} rotated while read"
+                f"{label} rotated while read"
             ) from error
-        if _file_identity(named) != _file_identity(opened):
-            raise PageProjectionSourceIntegrityError(f"surge live source {name} rotated while read")
+        if _copy_identity(named) != _copy_identity(opened):
+            raise PageProjectionSourceIntegrityError(f"{label} rotated while read")
     finally:
         os.close(descriptor)
     if len(raw) > max_bytes:
-        raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds size bound")
+        raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     binding.verify()
     return raw, opened
 
@@ -1000,6 +1019,7 @@ class DuckDBSignalPageProjectionSource:
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
         surge_live_root: Path | None = None,
+        notification_log_path: Path | None = None,
         control_root: Path | None = None,
         atomically_published: bool = False,
         read_profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
@@ -1021,6 +1041,9 @@ class DuckDBSignalPageProjectionSource:
         self.canvas_publication_keyring = canvas_publication_keyring
         self.surge_live_root = (
             None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
+        )
+        self.notification_log_path = (
+            None if notification_log_path is None else Path(os.path.abspath(notification_log_path))
         )
         if page_control_outbox is None:
             self.page_control_outbox = None
@@ -1124,6 +1147,9 @@ class DuckDBSignalPageProjectionSource:
         except (OSError, PageProjectionSourceIntegrityError, ValueError) as error:
             logger.warning("爆量事件来源暂不可用：{}", error)
             surge_event = None
+        legacy_notification, legacy_notification_status = self.legacy_notification_projections(
+            observed
+        )
         if canvas_definitions:
             available = max(
                 available,
@@ -1146,7 +1172,27 @@ class DuckDBSignalPageProjectionSource:
             surge_runtime_config=runtime_config,
             monitor_event=database.monitor_event,
             surge_event=surge_event,
+            legacy_notification=legacy_notification,
+            legacy_notification_status=legacy_notification_status,
         )
+
+    def legacy_notification_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload | None, ServingProjectionPayload | None]:
+        if self.notification_log_path is None:
+            return None, None
+        try:
+            result = _read_legacy_notification_projections(
+                self.notification_log_path, observed=observed
+            )
+        except (OSError, PageProjectionSourceIntegrityError, ValueError):
+            logger.warning("旧通知记录来源暂不可用")
+            result = None
+        if result is None:
+            return None, _legacy_notification_status(
+                state="unavailable", skipped=0, available_at=_EMPTY_PROJECTION_AVAILABLE_AT
+            )
+        return result
 
     def _read_database_projection(
         self,
@@ -2049,7 +2095,9 @@ class SignalPageProjectionProducer:
                 item
                 for item in previous.payload.projections
                 if item.table_name not in _COMPANION_SIGNAL_TABLES
-                and item.table_name != "surge_event"
+                and item.table_name not in {
+                    "surge_event", "legacy_notification", "legacy_notification_status"
+                }
             )
             try:
                 surge = _read_surge_event_projection(self.source.surge_live_root, observed=observed)
@@ -2058,6 +2106,12 @@ class SignalPageProjectionProducer:
                 surge = None
             if surge is not None:
                 page_projections += (surge,)
+            legacy_notification, legacy_status = self.source.legacy_notification_projections(
+                observed
+            )
+            page_projections += tuple(
+                item for item in (legacy_notification, legacy_status) if item is not None
+            )
             page_available_at = max(item.available_at for item in page_projections)
             page_generation_id = canonical_sha256(
                 {"source": "signal-page-projections-partial", "projections": page_projections}
@@ -2594,6 +2648,150 @@ def _read_surge_event_projection(
     )
 
 
+def _legacy_notification_status(
+    *, state: str, skipped: int, available_at: datetime
+) -> ServingProjectionPayload:
+    return ServingProjectionPayload(
+        table_name="legacy_notification_status",
+        available_at=available_at,
+        rows=({"snapshot_key": "current", "state": state, "skipped": skipped},),
+    )
+
+
+def _read_legacy_notification_projections(
+    path: Path | None, *, observed: datetime
+) -> tuple[ServingProjectionPayload, ServingProjectionPayload] | None:
+    """Extract only safe submission facts from one bounded, stable legacy JSONL file."""
+
+    if path is None:
+        return None
+    observed = normalize_aware_utc(observed)
+    try:
+        binding = _bind_readonly_directory(path.parent, label="legacy notification source")
+    except FileNotFoundError:
+        return None
+    try:
+        file = _read_bound_optional_file(
+            binding,
+            path.name,
+            max_bytes=_MAX_LEGACY_NOTIFICATION_BYTES,
+            label="legacy notification source",
+        )
+        if file is None:
+            return None
+        raw, item = file
+        if raw and not raw.endswith(b"\n"):
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source has an incomplete line"
+            )
+        try:
+            lines = raw.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source is not UTF-8"
+            ) from None
+        if len(lines) > _MAX_EVENT_ROWS:
+            raise PageProjectionSourceIntegrityError("legacy notification source exceeds row bound")
+        file_time = datetime.fromtimestamp(item.st_mtime_ns / 1_000_000_000, tz=UTC)
+        if file_time > observed:
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source has future file time"
+            )
+        local_start = observed.astimezone(_SHANGHAI).date() - timedelta(
+            days=_EVENT_WINDOW_DAYS - 1
+        )
+        window_start = datetime.combine(local_start, time.min, tzinfo=_SHANGHAI).astimezone(UTC)
+        rows: list[dict[str, ProjectionScalar]] = []
+        skipped = 0
+        for line_number, line in enumerate(lines, start=1):
+            try:
+                value = strict_json_loads(line)
+            except (StrictJsonError, ValueError):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source has invalid JSON"
+                ) from None
+            if not isinstance(value, dict):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source row is invalid"
+                )
+            sent_at_raw = value.get("sent_at")
+            if (
+                not isinstance(sent_at_raw, str)
+                or "T" not in sent_at_raw
+                or type(value.get("success")) is not bool
+            ):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source row is invalid"
+                )
+            try:
+                local_time = datetime.fromisoformat(sent_at_raw)
+            except ValueError:
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source time is invalid"
+                ) from None
+            if local_time.tzinfo is not None or local_time.utcoffset() is not None:
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source time is invalid"
+                )
+            event_at = local_time.replace(tzinfo=_SHANGHAI).astimezone(UTC)
+            if event_at > observed:
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source has future event"
+                )
+            scene = value.get("scene")
+            channel = value.get("channel")
+            scene_label = _LEGACY_SCENE_LABELS.get(scene) if isinstance(scene, str) else None
+            channel_label = (
+                _LEGACY_CHANNEL_LABELS.get(channel) if isinstance(channel, str) else None
+            )
+            if scene_label is None or channel_label is None:
+                skipped += 1
+                continue
+            if event_at < window_start:
+                continue
+            sent_at = event_at.isoformat()
+            identity = json.dumps(
+                (line_number, sent_at, scene, channel, value["success"]),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            rows.append(
+                {
+                    "record_key": hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                    "sent_at": sent_at,
+                    "scene_label": scene_label,
+                    "channel_label": channel_label,
+                    "submitted": value["success"],
+                }
+            )
+        try:
+            named = os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source rotated while read"
+            ) from None
+        if _copy_identity(named) != _copy_identity(item):
+            raise PageProjectionSourceIntegrityError(
+                "legacy notification source changed while read"
+            )
+        binding.verify()
+    finally:
+        binding.close()
+    available_at = max((file_time, *(datetime.fromisoformat(str(row["sent_at"])) for row in rows)))
+    try:
+        records = ServingProjectionPayload(
+            table_name="legacy_notification", available_at=available_at, rows=tuple(rows)
+        )
+        status = _legacy_notification_status(
+            state="partial" if skipped else "complete", skipped=skipped, available_at=available_at
+        )
+    except ValueError:
+        raise PageProjectionSourceIntegrityError(
+            "legacy notification source exceeds projection bound"
+        ) from None
+    return records, status
+
+
 def _pulse_as_of(trade_date: date, minute: str) -> datetime:
     try:
         parsed_time = time.fromisoformat(minute)
@@ -2832,6 +3030,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "surge_runtime_config",
             "monitor_event",
             "surge_event",
+            "legacy_notification",
+            "legacy_notification_status",
         }
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
@@ -2859,6 +3059,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
         monitor_event: ServingProjectionPayload | None = None,
         surge_event: ServingProjectionPayload | None = None,
+        legacy_notification: ServingProjectionPayload | None = None,
+        legacy_notification_status: ServingProjectionPayload | None = None,
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -2914,6 +3116,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         for table_name, projection in (
             ("monitor_event", monitor_event),
             ("surge_event", surge_event),
+            ("legacy_notification", legacy_notification),
+            ("legacy_notification_status", legacy_notification_status),
         ):
             if projection is not None:
                 if projection.table_name != table_name:

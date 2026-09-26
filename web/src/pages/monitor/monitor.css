@@ -62,6 +62,12 @@
   font-size: 12px;
 }
 
+.monitor-notification-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .monitor-receipts {
   list-style: none;
   padding: 0;

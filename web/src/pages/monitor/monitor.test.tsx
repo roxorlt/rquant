@@ -22,12 +22,13 @@ describe("盯盘与告警", () => {
       );
       const user = userEvent.setup();
       renderApp("/monitor");
-      const receiptKpi = await screen.findByText("本页回执");
+      const receiptKpi = await screen.findByText("信号回执");
       expect(
         within(receiptKpi.closest('[data-kpi="receipts"]') as HTMLElement).getByText(short),
       ).toBeInTheDocument();
       await user.hover(receiptKpi);
       expect(await screen.findByRole("tooltip")).toHaveTextContent(full);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent("旧通知记录另列");
       if (state === "no_receipts" || state === "truncated") {
         expect(screen.getByRole("status", { name: "" })).toHaveTextContent(full);
       }
@@ -47,6 +48,52 @@ describe("盯盘与告警", () => {
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
   });
 
+  it("shows old channel attempts independently without a stock or delivery claim", async () => {
+    const original = monitorEnvelope();
+    server.use(
+      http.get("*/api/v1/monitor/timeline", () =>
+        HttpResponse.json(
+          monitorEnvelope({
+            total: 6,
+            items: [
+              {
+                kind: "notification",
+                event_key: "notification:internal-1",
+                at: "2026-09-24T02:06:00Z",
+                scene_label: "价位提醒",
+                channel_label: "PushDeer",
+                submitted: true,
+                submission_label: "提交成功",
+              },
+              {
+                kind: "notification",
+                event_key: "notification:internal-2",
+                at: "2026-09-24T02:05:00Z",
+                scene_label: "价位提醒",
+                channel_label: "PushPlus",
+                submitted: false,
+                submission_label: "提交失败",
+              },
+              ...original.data.items,
+            ],
+          }),
+        ),
+      ),
+    );
+    renderApp("/monitor");
+    const timeline = await screen.findByRole("list", { name: "告警时间线" });
+    const entries = timeline.querySelectorAll(":scope > li");
+    expect(entries).toHaveLength(6);
+    expect(entries[0]).toHaveTextContent("价位提醒");
+    expect(entries[0]).toHaveTextContent("PushDeer");
+    expect(entries[0]).toHaveTextContent("提交成功");
+    expect(entries[0]?.querySelector(".monitor-stock")).toBeNull();
+    expect(entries[1]).toHaveTextContent("提交失败");
+    expect(timeline).not.toHaveTextContent("已送达");
+    expect(document.body.textContent).not.toContain("notification:internal-1");
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
   it("shows recent published signals, honest receipt states and a stock detail entry", async () => {
     const user = userEvent.setup();
     renderApp("/monitor");
@@ -63,7 +110,7 @@ describe("盯盘与告警", () => {
     await user.hover(times[3] as HTMLElement);
     expect(await screen.findByText("2026-09-23 09:47:00")).toBeInTheDocument();
     expect(screen.getByText("今天休市，显示历史告警")).toBeInTheDocument();
-    expect(screen.getByText("当前通知方式")).toBeInTheDocument();
+    expect(screen.getByText("新信号通知")).toBeInTheDocument();
     expect(screen.queryByText("已送达")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /确认|新建规则|发测试推送/ }),

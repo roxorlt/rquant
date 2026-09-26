@@ -268,6 +268,27 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=2 * 1024 * 1024,
             event_date_columns=("trade_date",),
         ),
+        "legacy_notification": _contract(
+            "signals",
+            (
+                ("record_key", "string"),
+                ("sent_at", "timestamp"),
+                ("scene_label", "string"),
+                ("channel_label", "string"),
+                ("submitted", "bool"),
+            ),
+            ("record_key",),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("sent_at",),
+        ),
+        "legacy_notification_status": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("state", "string"), ("skipped", "int")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=512,
+        ),
         "pulse_history": _contract(
             "signals",
             (

@@ -51,7 +51,7 @@ def test_legacy_event_files_reach_one_web_timeline_generation(
         assert response.status_code == 200, response.text
         data = response.json()["data"]
         assert data["total"] == 3
-        assert data["source_note"] is None
+        assert "通知记录尚未接入" in data["source_note"]
         assert [(row["kind"], row["at"]) for row in data["items"][:2]] == [
             ("monitor", "2026-09-24T02:05:00Z"),
             ("surge", "2026-09-24T01:52:00Z"),
@@ -86,3 +86,40 @@ def test_unreadable_monitor_source_stays_partial_after_new_serving_assembly(
         assert [item["kind"] for item in data["items"]] == ["surge", "signal"]
         assert "盯盘触发记录" in data["source_note"]
         assert "仅显示已有记录" in data["source_note"]
+
+
+@pytest.mark.parametrize("failure", (None, "missing", "half_line"))
+def test_real_shape_notification_log_reaches_serving_without_secrets_and_can_be_revoked(
+    tmp_path: Path, failure: str | None
+) -> None:
+    serving_root = tmp_path / "serving"
+    build_monitor_timeline_replay(
+        serving_root, with_notifications=True, notification_failure=failure
+    )
+    app = create_app(
+        WebSettings(serving_root=serving_root),
+        clock=lambda: FIXTURE_BUILT_AT + timedelta(minutes=1, seconds=30),
+        background=False,
+    )
+    with TestClient(app) as client:
+        response = client.get("/api/v1/monitor/timeline", params={"page_size": 20})
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        notifications = [row for row in data["items"] if row["kind"] == "notification"]
+        if failure is None:
+            assert data["total"] == 5
+            assert len(notifications) == 2
+            assert {row["submission_label"] for row in notifications} == {
+                "提交成功", "提交失败"
+            }
+            assert {row["channel_label"] for row in notifications} == {"PushDeer", "PushPlus"}
+            assert all("code" not in row and "receipts" not in row for row in notifications)
+            assert data["source_note"] is None
+        else:
+            assert data["total"] == 3
+            assert not notifications
+            assert "通知记录暂不可用" in data["source_note"]
+        assert "SECRET-CANARY" not in response.text
+    for path in serving_root.rglob("*"):
+        if path.is_file():
+            assert b"SECRET-CANARY" not in path.read_bytes()

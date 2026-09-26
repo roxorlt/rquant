@@ -844,6 +844,29 @@ export interface components {
             /** Volume */
             volume: number | null;
         };
+        /** MonitorNotification */
+        MonitorNotification: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Channel Label */
+            channel_label: string;
+            /** Event Key */
+            event_key: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "notification";
+            /** Scene Label */
+            scene_label: string;
+            /** Submission Label */
+            submission_label: string;
+            /** Submitted */
+            submitted: boolean;
+        };
         /** MonitorReceipt */
         MonitorReceipt: {
             /** Attempt Count */
@@ -940,7 +963,7 @@ export interface components {
         /** MonitorTimelineData */
         MonitorTimelineData: {
             /** Items */
-            items: (components["schemas"]["MonitorSignal"] | components["schemas"]["MonitorTrigger"] | components["schemas"]["MonitorSurge"])[];
+            items: (components["schemas"]["MonitorSignal"] | components["schemas"]["MonitorTrigger"] | components["schemas"]["MonitorSurge"] | components["schemas"]["MonitorNotification"])[];
             /** Market Note */
             market_note: string | null;
             /**

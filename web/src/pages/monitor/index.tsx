@@ -45,6 +45,27 @@ function TimelineEntry({
   row: MonitorTimelineItem;
   onStock: (code: string) => void;
 }) {
+  if (row.kind === "notification") {
+    return (
+      <li className="monitor-event monitor-notification">
+        <span className="monitor-event-time">
+          <RelativeTime at={row.at} />
+        </span>
+        <div className="monitor-event-body">
+          <div className="monitor-event-head">
+            <strong className="monitor-notification-title">通知记录</strong>
+            <span className="monitor-strategy">{row.scene_label}</span>
+            <span className="monitor-strategy">{row.channel_label}</span>
+            <StatusBadge
+              state={row.submitted ? "ok" : "crit"}
+              label={row.submission_label}
+              reason="仅表示通知接口提交结果，无法确认手机是否收到"
+            />
+          </div>
+        </div>
+      </li>
+    );
+  }
   return (
     <li className="monitor-event">
       <span className="monitor-event-time">
@@ -140,16 +161,16 @@ export default function MonitorPage() {
         },
         {
           key: "mode",
-          label: "当前通知方式",
+          label: "新信号通知",
           value: data.mode_label,
           tip: data.mode_note ?? "仅反映当前状态，历史回执不据此判定送达",
-          sub: data.mode === "shadow" ? "正式推送尚未开通" : undefined,
+          sub: data.mode === "shadow" ? "新信号仅记录" : undefined,
         },
         {
           key: "receipts",
-          label: "本页回执",
+          label: "信号回执",
           value: RECEIPT_KPI_VALUE[data.receipt_state],
-          tip: data.receipt_label,
+          tip: `${data.receipt_label}；旧通知记录另列，提交结果不代表手机送达`,
         },
       ]
     : [];

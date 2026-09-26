@@ -59,7 +59,10 @@ _REQUIRED_NOTIFICATION_PROJECTION_TABLES = frozenset(
     }
 )
 _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
-    {"pulse_history", "pulse_alert", "surge_runtime_config", "monitor_event", "surge_event"}
+    {
+        "pulse_history", "pulse_alert", "surge_runtime_config", "monitor_event",
+        "surge_event", "legacy_notification", "legacy_notification_status",
+    }
 )
 _NOTIFICATION_PROJECTION_TABLES = (
     _REQUIRED_NOTIFICATION_PROJECTION_TABLES | _OPTIONAL_NOTIFICATION_PROJECTION_TABLES
