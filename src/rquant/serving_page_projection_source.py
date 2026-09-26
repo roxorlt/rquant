@@ -2733,7 +2733,12 @@ def _read_legacy_notification_projections(
                 raise PageProjectionSourceIntegrityError(
                     "legacy notification source time is invalid"
                 )
-            event_at = local_time.replace(tzinfo=_SHANGHAI).astimezone(UTC)
+            try:
+                event_at = local_time.replace(tzinfo=_SHANGHAI).astimezone(UTC)
+            except (OverflowError, ValueError):
+                raise PageProjectionSourceIntegrityError(
+                    "legacy notification source time is invalid"
+                ) from None
             if event_at > observed:
                 raise PageProjectionSourceIntegrityError(
                     "legacy notification source has future event"

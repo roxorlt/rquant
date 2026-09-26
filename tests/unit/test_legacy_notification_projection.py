@@ -73,8 +73,9 @@ def test_reader_whitelists_fields_and_tracks_unknown_source_rows(tmp_path: Path)
         _line() + "{broken}\n",
         _line(sent_at="2026-09-25T09:47:00"),
         _line(sent_at="invalid"),
+        _line(sent_at="0001-01-01T00:00:00"),
     ],
-    ids=("half-line", "invalid-json", "future-time", "invalid-time"),
+    ids=("half-line", "invalid-json", "future-time", "invalid-time", "overflow-time"),
 )
 def test_incomplete_invalid_or_future_file_is_not_published(tmp_path: Path, content: str) -> None:
     path = tmp_path / "logs" / "notification_log.jsonl"

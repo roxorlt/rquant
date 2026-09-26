@@ -355,7 +355,7 @@ def test_unreadable_monitor_source_publishes_partial_new_authority(
     assert "monitor_event" in {item.table_name for item in historical.payload.projections}
 
 
-@pytest.mark.parametrize("failure", ("missing", "half_line"))
+@pytest.mark.parametrize("failure", ("missing", "half_line", "overflow_time"))
 def test_legacy_notification_failure_revokes_old_records_in_new_authority(
     tmp_path: Path, failure: str
 ) -> None:
@@ -392,8 +392,25 @@ def test_legacy_notification_failure_revokes_old_records_in_new_authority(
 
     if failure == "missing":
         path.unlink()
-    else:
+    elif failure == "half_line":
         path.write_text('{"sent_at":', encoding="utf-8")
+    else:
+        path.write_text(
+            json.dumps(
+                {
+                    "sent_at": "0001-01-01T00:00:00",
+                    "scene": "price_level",
+                    "channel": "pushdeer",
+                    "target": "SECRET-CANARY",
+                    "success": True,
+                    "error_msg": "SECRET-CANARY",
+                    "title": "SECRET-CANARY",
+                }
+            ) + "\n",
+            encoding="utf-8",
+        )
+        stamp = (NOW - timedelta(seconds=1)).timestamp()
+        os.utime(path, (stamp, stamp))
     second = producer.publish(NOW + timedelta(seconds=1))
     latest = {
         item.table_name: item
