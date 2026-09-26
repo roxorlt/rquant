@@ -3,18 +3,39 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import pandas as pd
 
 Rule = Callable[[pd.DataFrame], pd.Series]
+_DEPENDENCY_TAG = object()
 
 
-def _tag_lookback(fn: Rule, n: int) -> Rule:
+def _tag_lookback(
+    fn: Rule, n: int, columns: Iterable[str] | None = None
+) -> Rule:
     """给规则函数挂上 min_lookback 属性，方便 screen() 推断总 lookback。"""
     fn.min_lookback = n  # type: ignore[attr-defined]
+    if columns is not None:
+        fn.required_columns = frozenset(columns)  # type: ignore[attr-defined]
+        fn._dependency_tag = _DEPENDENCY_TAG  # type: ignore[attr-defined]
     return fn
+
+
+def required_rule_columns(rules: Sequence[Rule]) -> frozenset[str]:
+    """Collect factory-owned dependencies; untagged rules cannot use selective reads."""
+    columns: set[str] = set()
+    for rule in rules:
+        required = getattr(rule, "required_columns", None)
+        if (
+            getattr(rule, "_dependency_tag", None) is not _DEPENDENCY_TAG
+            or not isinstance(required, frozenset)
+            or any(not isinstance(column, str) for column in required)
+        ):
+            raise ValueError("screen rule dependency metadata is unavailable")
+        columns.update(required)
+    return frozenset(columns)
 
 
 @dataclass(frozen=True)
@@ -39,14 +60,14 @@ def not_st() -> Rule:
     """排除 ST / *ST / SST。"""
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df["is_st"].astype("boolean").eq(False).fillna(False)
-    return _tag_lookback(_rule, 0)
+    return _tag_lookback(_rule, 0, ("is_st",))
 
 
 def not_bj() -> Rule:
     """排除北交所（= board_in(['main','gem','star']) 的快捷方式）。"""
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df["is_bj"].astype("boolean").eq(False).fillna(False)
-    return _tag_lookback(_rule, 0)
+    return _tag_lookback(_rule, 0, ("is_bj",))
 
 
 def board_in(boards: list[str]) -> Rule:
@@ -54,7 +75,7 @@ def board_in(boards: list[str]) -> Rule:
     allowed = set(boards)
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df["board_type"].isin(allowed)
-    return _tag_lookback(_rule, 0)
+    return _tag_lookback(_rule, 0, ("board_type",))
 
 
 def _bool_state_rule(col_base: str, offset: int, negate: bool = False) -> Rule:
@@ -64,7 +85,7 @@ def _bool_state_rule(col_base: str, offset: int, negate: bool = False) -> Rule:
         return df[col].astype("boolean").eq(expected).fillna(False)
     # Canvas diagnostic 用：内部工厂闭包的 __qualname__ 没有意义，挂上 friendly name
     _rule.__rquant_name__ = f"{'not_' if negate else ''}{col_base.lower()}({offset})"  # type: ignore[attr-defined]
-    return _tag_lookback(_rule, offset)
+    return _tag_lookback(_rule, offset, (col,))
 
 
 def limit_up(offset: int = 0) -> Rule:
@@ -104,7 +125,7 @@ def circ_mv_lt(threshold_yi: float, offset: int = 0) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[col].fillna(float("inf")) < threshold_wan
 
-    return _tag_lookback(_rule, offset)
+    return _tag_lookback(_rule, offset, (col,))
 
 
 def has_lower_shadow(
@@ -119,11 +140,16 @@ def has_lower_shadow(
     - 振幅 = (HIGH[offset] - LOW[offset]) / LOW[offset]
     - 实体为 0（一字线/十字星）直接返回 False
     """
+    body_lower_col = f"BODY_LOWER[{offset}]"
+    body_upper_col = f"BODY_UPPER[{offset}]"
+    low_col = f"LOW[{offset}]"
+    high_col = f"HIGH[{offset}]"
+
     def _rule(df: pd.DataFrame) -> pd.Series:
-        body_lower = df[f"BODY_LOWER[{offset}]"]
-        body_upper = df[f"BODY_UPPER[{offset}]"]
-        low = df[f"LOW[{offset}]"]
-        high = df[f"HIGH[{offset}]"]
+        body_lower = df[body_lower_col]
+        body_upper = df[body_upper_col]
+        low = df[low_col]
+        high = df[high_col]
 
         lower_shadow = body_lower - low
         body = body_upper - body_lower
@@ -135,7 +161,9 @@ def has_lower_shadow(
 
         return has_body & ratio_ok & amp_ok
 
-    return _tag_lookback(_rule, offset)
+    return _tag_lookback(
+        _rule, offset, (body_lower_col, body_upper_col, low_col, high_col)
+    )
 
 
 def no_consec_ups_in_window(threshold: int = 3, window: int = 8) -> Rule:
@@ -156,7 +184,7 @@ def no_consec_ups_in_window(threshold: int = 3, window: int = 8) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[agg_name].lt(threshold).fillna(False)
 
-    fn = _tag_lookback(_rule, 0)
+    fn = _tag_lookback(_rule, 0, ())
     fn = _tag_aggregates(fn, [req])
     return fn
 
@@ -179,7 +207,7 @@ def no_limit_down_in_window(window: int = 30) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[agg_name].astype("boolean").eq(False).fillna(False)
 
-    fn = _tag_lookback(_rule, 0)
+    fn = _tag_lookback(_rule, 0, ())
     fn = _tag_aggregates(fn, [req])
     return fn
 
@@ -203,7 +231,7 @@ def has_prior_limit_up(window: int = 90, exclude_offset: int = 1) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[agg_name].ge(1).fillna(False)
 
-    fn = _tag_lookback(_rule, 0)
+    fn = _tag_lookback(_rule, 0, ())
     fn = _tag_aggregates(fn, [req])
     return fn
 
@@ -218,7 +246,7 @@ def consecutive_ups_gte(n: int, offset: int = 0) -> Rule:
     col = f"CONSECUTIVE_LIMIT_UPS[{offset}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
         return df[col].fillna(0).astype(int) >= n
-    return _tag_lookback(_rule, offset)
+    return _tag_lookback(_rule, offset, (col,))
 
 
 _LOOKBACK_RE = re.compile(r"\[(\d+)\]$")
@@ -238,29 +266,45 @@ def _resolve(df: pd.DataFrame, operand: str | float | int) -> pd.Series | float:
     return df[operand]
 
 
+def _operand_columns(*operands: str | float | int) -> tuple[str, ...]:
+    return tuple(operand for operand in operands if isinstance(operand, str))
+
+
 def gt(left: str | float, right: str | float) -> Rule:
     """left > right，操作数可以是字段名字符串或数字常数。"""
     def _rule(df: pd.DataFrame) -> pd.Series:
         return _resolve(df, left) > _resolve(df, right)
-    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+    return _tag_lookback(
+        _rule, max(_parse_lookback(left), _parse_lookback(right)),
+        _operand_columns(left, right),
+    )
 
 
 def lt(left: str | float, right: str | float) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return _resolve(df, left) < _resolve(df, right)
-    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+    return _tag_lookback(
+        _rule, max(_parse_lookback(left), _parse_lookback(right)),
+        _operand_columns(left, right),
+    )
 
 
 def gte(left: str | float, right: str | float) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return _resolve(df, left) >= _resolve(df, right)
-    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+    return _tag_lookback(
+        _rule, max(_parse_lookback(left), _parse_lookback(right)),
+        _operand_columns(left, right),
+    )
 
 
 def lte(left: str | float, right: str | float) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         return _resolve(df, left) <= _resolve(df, right)
-    return _tag_lookback(_rule, max(_parse_lookback(left), _parse_lookback(right)))
+    return _tag_lookback(
+        _rule, max(_parse_lookback(left), _parse_lookback(right)),
+        _operand_columns(left, right),
+    )
 
 
 def between(field: str, low: float, high: float) -> Rule:
@@ -268,57 +312,65 @@ def between(field: str, low: float, high: float) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         s = df[field]
         return (s >= low) & (s <= high)
-    return _tag_lookback(_rule, _parse_lookback(field))
+    return _tag_lookback(_rule, _parse_lookback(field), (field,))
 
 
 def cross_above(fast: str, slow: str, offset: int = 0) -> Rule:
     """fast 均线在 offset 日上穿 slow 均线。"""
+    f0_col, s0_col = f"{fast}[{offset}]", f"{slow}[{offset}]"
+    f1_col, s1_col = f"{fast}[{offset + 1}]", f"{slow}[{offset + 1}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
-        f0 = df[f"{fast}[{offset}]"]
-        s0 = df[f"{slow}[{offset}]"]
-        f1 = df[f"{fast}[{offset + 1}]"]
-        s1 = df[f"{slow}[{offset + 1}]"]
+        f0 = df[f0_col]
+        s0 = df[s0_col]
+        f1 = df[f1_col]
+        s1 = df[s1_col]
         return (f0 > s0) & (f1 <= s1)
-    return _tag_lookback(_rule, offset + 1)
+    return _tag_lookback(_rule, offset + 1, (f0_col, s0_col, f1_col, s1_col))
 
 
 def cross_below(fast: str, slow: str, offset: int = 0) -> Rule:
     """fast 均线在 offset 日下穿 slow 均线。"""
+    f0_col, s0_col = f"{fast}[{offset}]", f"{slow}[{offset}]"
+    f1_col, s1_col = f"{fast}[{offset + 1}]", f"{slow}[{offset + 1}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
-        f0 = df[f"{fast}[{offset}]"]
-        s0 = df[f"{slow}[{offset}]"]
-        f1 = df[f"{fast}[{offset + 1}]"]
-        s1 = df[f"{slow}[{offset + 1}]"]
+        f0 = df[f0_col]
+        s0 = df[s0_col]
+        f1 = df[f1_col]
+        s1 = df[s1_col]
         return (f0 < s0) & (f1 >= s1)
-    return _tag_lookback(_rule, offset + 1)
+    return _tag_lookback(_rule, offset + 1, (f0_col, s0_col, f1_col, s1_col))
 
 
 def above_ma(period: int, offset: int = 0) -> Rule:
     """CLOSE 在 offset 日高于 MA{period}。"""
+    close_col, ma_col = f"CLOSE[{offset}]", f"MA{period}[{offset}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return df[f"CLOSE[{offset}]"] > df[f"MA{period}[{offset}]"]
-    return _tag_lookback(_rule, offset)
+        return df[close_col] > df[ma_col]
+    return _tag_lookback(_rule, offset, (close_col, ma_col))
 
 
 def rsi_oversold(period: int = 14, threshold: float = 30.0, offset: int = 0) -> Rule:
     """RSI 低于阈值（默认 30）。"""
+    col = f"RSI{period}[{offset}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return df[f"RSI{period}[{offset}]"] < threshold
-    return _tag_lookback(_rule, offset)
+        return df[col] < threshold
+    return _tag_lookback(_rule, offset, (col,))
 
 
 def rsi_overbought(period: int = 14, threshold: float = 70.0, offset: int = 0) -> Rule:
     """RSI 高于阈值（默认 70）。"""
+    col = f"RSI{period}[{offset}]"
     def _rule(df: pd.DataFrame) -> pd.Series:
-        return df[f"RSI{period}[{offset}]"] > threshold
-    return _tag_lookback(_rule, offset)
+        return df[col] > threshold
+    return _tag_lookback(_rule, offset, (col,))
 
 
 def volume_ratio_gte(n: float, offset: int = 0, window: int = 5) -> Rule:
     """某日成交量 ≥ n × 前 {window} 日成交量均值。"""
+    today_col = f"VOL[{offset}]"
+    prev_cols = [f"VOL[{offset + i}]" for i in range(1, window + 1)]
     def _rule(df: pd.DataFrame) -> pd.Series:
-        today = df[f"VOL[{offset}]"]
-        prev_cols = [f"VOL[{offset + i}]" for i in range(1, window + 1)]
+        today = df[today_col]
         mean_prev = df[prev_cols].mean(axis=1, skipna=False)
         return today >= n * mean_prev
-    return _tag_lookback(_rule, offset + window)
+    return _tag_lookback(_rule, offset + window, (today_col, *prev_cols))

@@ -106,6 +106,29 @@ def test_verified_replica_returns_full_history_with_cursor_identity_and_time(
     assert _reader(primary, replica).available_dates().dates == [dates[0], dates[1], dates[2]]
 
 
+def test_verified_replica_reads_only_rule_base_and_requested_ranking_columns(
+    tmp_path: Path,
+) -> None:
+    primary, replica, dates = _world(tmp_path)
+    result = _reader(primary, replica).load(
+        dates[0], [gt("CLOSE[1]", 1)], include_columns=["CIRC_MV[0]"],
+    )
+    assert {"CLOSE[0]", "PCT_CHG[0]", "CLOSE[1]", "CIRC_MV[0]"}.issubset(
+        result.frame.columns
+    )
+    assert "OPEN[0]" not in result.frame.columns
+    assert "VOL[1]" not in result.frame.columns
+    assert pd.isna(result.frame.loc[0, "CIRC_MV[0]"])
+
+
+def test_verified_replica_rejects_unregistered_dependency(tmp_path: Path) -> None:
+    primary, replica, dates = _world(tmp_path)
+    with pytest.raises(ValueError, match="metadata"):
+        _reader(primary, replica).load(
+            dates[0], [lambda frame: frame["CLOSE[0]"] > 0]
+        )
+
+
 def test_maximum_volume_offset_and_long_aggregate_do_not_widen_to_500_days(
     tmp_path: Path,
 ) -> None:
@@ -120,6 +143,28 @@ def test_maximum_volume_offset_and_long_aggregate_do_not_widen_to_500_days(
     assert "count_limit_up_500d_ex1" in result.frame.columns
     assert "CLOSE[499]" not in result.frame.columns
     assert result.frame.loc[0, "trade_date"] == dates[0]
+
+
+def test_maximum_volume_and_500_day_aggregate_match_full_same_replica(
+    tmp_path: Path,
+) -> None:
+    from rquant.screen.loader import load_universe
+
+    primary, replica, dates = _world(tmp_path, days=500)
+    rules = [volume_ratio_gte(2, offset=30, window=60), has_prior_limit_up(window=500)]
+    result = _reader(primary, replica).load(dates[0], rules)
+    with DuckDBStore(replica, read_only=True) as store:
+        full = load_universe(
+            dates[0].isoformat(), lookback=90, store=store,
+            aggregate_requests=rules[1].aggregate_requests,
+        )
+    comparison = [
+        "ts_code", "CLOSE[0]", "PCT_CHG[0]", "VOL[30]", "VOL[90]",
+        "count_limit_up_500d_ex1",
+    ]
+    pd.testing.assert_frame_equal(result.frame[comparison], full[comparison])
+    for rule in rules:
+        pd.testing.assert_series_equal(rule(result.frame), rule(full), check_names=False)
 
 
 @pytest.mark.parametrize("alias", ["symlink", "hardlink"])

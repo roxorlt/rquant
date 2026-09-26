@@ -23,8 +23,8 @@ from rquant.replica_generation import (
     replica_generation_path,
 )
 from rquant.screen.core import _collect_aggregates, _infer_lookback
-from rquant.screen.loader import ScreeningCalendarError, load_universe
-from rquant.screen.rules import Rule
+from rquant.screen.loader import ScreeningCalendarError, _selected_sources, load_universe
+from rquant.screen.rules import Rule, required_rule_columns
 from rquant.storage.duckdb import DuckDBStore
 
 MAX_CONDITIONS = 26
@@ -34,7 +34,6 @@ MAX_AGGREGATE_WINDOW = 500
 MAX_WIDE_CELLS = 24_000_000
 MAX_AGGREGATE_FACTS = 8_000_000
 MAX_SIDECAR_BYTES = 16 * 1024
-_WIDE_FIELD_COUNT = 29
 
 
 class ScreenReplicaUnavailableError(RuntimeError):
@@ -242,12 +241,20 @@ class VerifiedReplicaScreenSource:
         rules: Sequence[Rule],
         *,
         decision_at: datetime | None = None,
+        include_columns: Sequence[str] | None = None,
     ) -> ScreenUniverseSnapshot:
         if type(trade_date) is not date:
             raise ValueError("screen trade date must be a date")
         if len(rules) > MAX_CONDITIONS:
             raise ScreenReplicaBudgetError("screen has too many conditions")
-        lookback = _infer_lookback(list(rules))
+        rule_columns = required_rule_columns(rules)
+        requested_columns = rule_columns | frozenset(include_columns or ())
+        _, wide_columns = _selected_sources(requested_columns, MAX_LOOKBACK)
+        required_offset = max(
+            (int(column.split("[")[1][:-1]) for column in wide_columns),
+            default=0,
+        )
+        lookback = max(_infer_lookback(list(rules)), required_offset)
         aggregates = _collect_aggregates(list(rules))
         if (
             lookback < 0
@@ -259,6 +266,7 @@ class VerifiedReplicaScreenSource:
 
         connection, descriptor, generation = self._open()
         try:
+            connection.execute("SET threads=1")
             row_count = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM daily_bar WHERE trade_date = ?", [trade_date]
@@ -269,7 +277,7 @@ class VerifiedReplicaScreenSource:
                 raise ScreenReplicaDataError("screening facts are unavailable")
             if (
                 row_count > MAX_STOCKS
-                or row_count * (lookback + 1) * _WIDE_FIELD_COUNT > MAX_WIDE_CELLS
+                or row_count * (len(wide_columns) + 5) > MAX_WIDE_CELLS
                 or row_count * sum(req.window for req in aggregates) > MAX_AGGREGATE_FACTS
             ):
                 raise ScreenReplicaBudgetError("screen data exceeds the allowed budget")
@@ -279,6 +287,7 @@ class VerifiedReplicaScreenSource:
                 store=cast(DuckDBStore, _StoreConnection(connection)),
                 aggregate_requests=aggregates,
                 decision_at=decision_at,
+                required_columns=requested_columns,
             )
             frame.insert(0, "trade_date", trade_date)
             self._finish(descriptor, generation)

@@ -269,6 +269,125 @@ def store(tmp_path) -> DuckDBStore:
 
 
 class TestLoadUniverse:
+    def test_selective_matches_each_registered_rule_on_one_store(
+        self, store: DuckDBStore
+    ) -> None:
+        from rquant.llm.registry import REGISTRY
+        from rquant.screen.core import _collect_aggregates, _infer_lookback
+        from rquant.screen.rules import required_rule_columns
+
+        args_by_name: dict[str, dict[str, object]] = {
+            "circ_mv_lt": {"threshold_yi": 100},
+            "board_in": {"boards": ["main", "gem"]},
+            "consecutive_ups_gte": {"n": 2, "offset": 1},
+            "has_lower_shadow": {"offset": 1},
+            "gt": {"left": "HIGH[0]", "right": "CLOSE[1]"},
+            "lt": {"left": "MA5[0]", "right": 20},
+            "gte": {"left": "CIRC_MV[0]", "right": 100},
+            "lte": {"left": "TURNOVER_RATE[0]", "right": 5},
+            "between": {"field": "PCT_CHG[0]", "low": -5, "high": 15},
+            "cross_above": {"fast": "MA5", "slow": "MA20"},
+            "cross_below": {"fast": "MA10", "slow": "MA60"},
+            "above_ma": {"period": 20},
+            "rsi_oversold": {"threshold": 30},
+            "rsi_overbought": {"threshold": 70},
+            "volume_ratio_gte": {"n": 2, "window": 2},
+            "no_consec_ups_in_window": {"window": 8},
+            "no_limit_down_in_window": {"window": 8},
+            "has_prior_limit_up": {"window": 8},
+        }
+        assert len(REGISTRY) == 26
+        for spec in REGISTRY:
+            args = spec.args_model.model_validate(args_by_name.get(spec.name, {})).model_dump()
+            rule = spec.fn(**args)
+            lookback = _infer_lookback([rule])
+            aggregates = _collect_aggregates([rule])
+            full = load_universe(
+                "2026-04-15", lookback=lookback, store=store,
+                aggregate_requests=aggregates,
+            )
+            selected = load_universe(
+                "2026-04-15", lookback=lookback, store=store,
+                aggregate_requests=aggregates,
+                required_columns=required_rule_columns([rule]),
+            )
+            pd.testing.assert_series_equal(
+                rule(selected), rule(full), check_names=False,
+                obj=spec.name,
+            )
+            for column in required_rule_columns([rule]):
+                pd.testing.assert_series_equal(
+                    selected[column], full[column], obj=f"{spec.name}: {column}"
+                )
+
+    def test_selective_history_matches_full_load_without_other_columns(
+        self, store: DuckDBStore
+    ) -> None:
+        requested = [
+            "CLOSE[0]", "PCT_CHG[0]", "VOL[2]", "BODY_LOWER[1]",
+            "MA20[0]", "CIRC_MV[1]", "IS_LIMIT_UP[1]",
+        ]
+        full = load_universe("2026-04-15", lookback=2, store=store)
+        selected = load_universe(
+            "2026-04-15", lookback=2, store=store,
+            required_columns=requested,
+        )
+
+        assert "HIGH[0]" not in selected.columns
+        assert "CLOSE[1]" not in selected.columns
+        assert set(requested).issubset(selected.columns)
+        comparison = ["ts_code", "name", "is_st", "is_bj", "board_type", *requested]
+        pd.testing.assert_frame_equal(
+            selected[comparison].sort_values("ts_code").reset_index(drop=True),
+            full[comparison].sort_values("ts_code").reset_index(drop=True),
+        )
+        missing = selected.loc[selected["ts_code"] == "000001.SZ", "CIRC_MV[1]"]
+        assert missing.isna().all()
+
+    def test_selective_path_rejects_unknown_or_out_of_range_fields(
+        self, store: DuckDBStore
+    ) -> None:
+        with pytest.raises(ValueError, match="unsupported"):
+            load_universe("2026-04-15", lookback=1, store=store,
+                          required_columns=["UNSAFE[0]"])
+        with pytest.raises(ValueError, match="offset"):
+            load_universe("2026-04-15", lookback=1, store=store,
+                          required_columns=["VOL[2]"])
+
+    def test_selective_missing_pit_status_does_not_match_negative_state_rule(
+        self, store: DuckDBStore
+    ) -> None:
+        from rquant.screen.rules import not_limit_up
+
+        store._conn.execute(
+            "DELETE FROM stock_status_daily WHERE ts_code = ? AND trade_date = ?",
+            ["300001.SZ", "2026-04-15"],
+        )
+        rule = not_limit_up()
+        selected = load_universe(
+            "2026-04-15", lookback=0, store=store,
+            required_columns=rule.required_columns,
+        )
+        unknown = selected.loc[selected["ts_code"] == "300001.SZ"]
+        assert pd.isna(unknown["IS_LIMIT_UP[0]"].iloc[0])
+        assert not bool(rule(unknown).iloc[0])
+
+    def test_selective_duplicate_source_row_fails_closed(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute("CREATE TABLE daily_basic_copy AS SELECT * FROM daily_basic")
+        store._conn.execute("DROP TABLE daily_basic")
+        store._conn.execute("ALTER TABLE daily_basic_copy RENAME TO daily_basic")
+        store._conn.execute(
+            "INSERT INTO daily_basic SELECT * FROM daily_basic "
+            "WHERE ts_code = '300001.SZ' AND trade_date = '2026-04-15'"
+        )
+        with pytest.raises(ValueError, match="duplicate"):
+            load_universe(
+                "2026-04-15", lookback=0, store=store,
+                required_columns=["CIRC_MV[0]"],
+            )
+
     def test_wide_frame_shape_and_columns(self, store: DuckDBStore) -> None:
         df = load_universe("2026-04-15", lookback=2, store=store)
 
@@ -568,6 +687,88 @@ class TestLoadUniverseBodyAndBasic:
 
 
 class TestLoadUniverseAggregates:
+    def test_selective_aggregate_column_survives_empty_source_table(
+        self, store: DuckDBStore
+    ) -> None:
+        store._conn.execute("DELETE FROM daily_state")
+        rule = no_limit_down_in_window(window=8)
+        selected = load_universe(
+            "2026-04-15", lookback=0, store=store,
+            aggregate_requests=rule.aggregate_requests, required_columns=[],
+        )
+        assert "has_limit_down_8d" in selected.columns
+        assert selected["has_limit_down_8d"].isna().all()
+        assert not rule(selected).any()
+
+    @pytest.mark.parametrize(
+        "source_col,agg_func",
+        [
+            ("consecutive_limit_ups", "max"),
+            ("is_limit_down", "any"),
+            ("is_limit_up", "count_nonzero"),
+        ],
+    )
+    @pytest.mark.parametrize("missing", ["source_row", "status_row", "source_value"])
+    def test_selective_aggregate_unknowns_match_full_load(
+        self, store: DuckDBStore, source_col: str, agg_func: str, missing: str
+    ) -> None:
+        if missing == "source_row":
+            store._conn.execute(
+                "DELETE FROM daily_state WHERE ts_code = '000001.SZ' "
+                "AND trade_date = '2026-04-09'"
+            )
+        elif missing == "status_row":
+            store._conn.execute(
+                "DELETE FROM stock_status_daily WHERE ts_code = '000001.SZ' "
+                "AND trade_date = '2026-04-09'"
+            )
+        else:
+            store._conn.execute(
+                f"UPDATE daily_state SET {source_col} = NULL "
+                "WHERE ts_code = '000001.SZ' AND trade_date = '2026-04-09'"
+            )
+        request = AggregateRequest(
+            name="test_aggregate", source_table="daily_state",
+            source_col=source_col, agg_func=agg_func, window=8,
+        )
+        full = load_universe(
+            "2026-04-15", lookback=0, store=store,
+            aggregate_requests=[request],
+        )
+        selected = load_universe(
+            "2026-04-15", lookback=0, store=store,
+            aggregate_requests=[request], required_columns=[],
+        )
+        actual = selected.set_index("ts_code")[request.name]
+        expected = full.set_index("ts_code")[request.name]
+        assert actual.index.tolist() == expected.index.tolist()
+        for code in actual.index:
+            if pd.isna(expected[code]):
+                assert pd.isna(actual[code])
+            else:
+                assert actual[code] == expected[code]
+
+    def test_selective_aggregate_batches_preserve_legacy_values(
+        self, store: DuckDBStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(screen_loader, "_AGGREGATE_STOCK_BATCH", 1)
+        request = AggregateRequest(
+            name="has_limit_down_8d", source_table="daily_state",
+            source_col="is_limit_down", agg_func="any", window=8,
+        )
+        full = load_universe(
+            "2026-04-15", lookback=0, store=store,
+            aggregate_requests=[request],
+        )
+        selected = load_universe(
+            "2026-04-15", lookback=0, store=store,
+            aggregate_requests=[request], required_columns=[],
+        )
+        pd.testing.assert_frame_equal(
+            selected[["ts_code", request.name]].sort_values("ts_code").reset_index(drop=True),
+            full[["ts_code", request.name]].sort_values("ts_code").reset_index(drop=True),
+        )
+
     def test_max_aggregate(self, store: DuckDBStore) -> None:
         """300001.SZ has consecutive_limit_ups: [1,2,0,0,0,...,0,1] over window.
         Max in 8-day window ending 4/15 should be 2."""
