@@ -1,8 +1,21 @@
 # 网页 `/app/`：目录、权限、发布与回滚
 
 云服务器 82.156.0.68（lighthouse 用户）上，新网页（React 前端 + 只读网页 API）在「第二关」之前不走受控部署器，
-用自己的目录和发布脚本 `scripts/web-release.sh`。第一次安装的逐条命令、每条的预期输出和回滚见 `DEPLOY.md`
-最上面的「待安装 · 网页 `/app/`」一条；本文说明结构和以后每次发布怎么做。
+用自己的目录和发布脚本 `scripts/web-release.sh`。从现有临时版切换的逐条命令、预期输出和回滚见 `DEPLOY.md`
+最上面的「待切换 · 网页 `/app/`」一条；本文说明结构和以后每次发布怎么做。
+
+2026-09-26 只读核对：服务器已有 `/home/lighthouse/rquant-web/app`，指向 CC 的临时版；临时 API 占用 `127.0.0.1:8768`，
+读取回放目录。正式 serving 根目前没有 `current.json`，按正式配置运行 `web-serve --self-check` 返回失败。
+切换前先用 `--target <tag> --prepare` 建好并自检发行版，不改现有页面或 API；只有正式 serving 根自检通过，才能停临时 API 并切换。
+
+## 切换边界与硬门槛
+
+这次从临时进程切到 systemd 属于高风险发布：保护对象是现有 `/app/`、`/preview/`、8506、登录保护和生产 serving 数据。
+信任边界是普通用户运行的发布脚本、root 管理的 systemd/sudoers/nginx，以及只读网页 API 读取的 serving 根。
+需要防住的失败是错 tag、正式数据代缺失、8768 端口冲突、服务启动失败和 nginx 读不到新静态文件。
+准备阶段不能改 `current`、`app` 或临时 API；正式切换时须先验证 tag 在 main、正式数据代可读、nginx 配置与候选版一致，
+再停临时 API；新 API 有数据代后才切 `app`。首次切换失败恢复临时 API 与旧 `app` 链接。
+本次不修生产 serving、不改 nginx、不停 Streamlit、不动数据库或密钥。任一硬门槛不满足就保留现状，记录证据。
 
 ## 目录
 
@@ -58,6 +71,8 @@ bash /home/lighthouse/rquant-web/current/scripts/web-release.sh --target "$TAG"
 切 `current` → 重启 API → 等 `/api/v1/meta` 应答 → 切 `app`。API 没起来就把 `current` 切回上一版并再重启一次，`app` 不动，
 退出码 1。同一个 tag 再跑一次什么都不改（「already current」）。
 
+`--target <tag> --prepare` 只做到给 nginx 权限，保留现有 `current`、`app` 和 API；正式发布同一 tag 时复用已准备的 worktree。
+
 ## 回滚
 
 ```bash
@@ -66,7 +81,7 @@ bash /home/lighthouse/rquant-web/current/scripts/web-release.sh --rollback
 bash /home/lighthouse/rquant-web/current/scripts/web-release.sh --status
 ```
 
-整体撤掉 `/app/`（包括第一次安装后没有上一版可回的情况）见 `DEPLOY.md` 那一条的「回滚」。
+首次切换失败时恢复临时版见 `DEPLOY.md` 顶部「回滚」；整体撤掉 `/app/` 是另一次决策。
 
 ## 「第二关」之后
 

@@ -14,6 +14,7 @@
 #     releases.jsonl        one line per release / rollback
 #
 #   bash scripts/web-release.sh --target v0.34.0 --dry-run   # show the plan, change nothing
+#   bash scripts/web-release.sh --target v0.34.0 --prepare   # build and check, keep active links
 #   bash scripts/web-release.sh --target v0.34.0             # publish (idempotent)
 #   bash scripts/web-release.sh --target v0.34.0 --no-restart  # before rquant-web.service exists
 #   bash scripts/web-release.sh --rollback                   # back to the previous release
@@ -24,7 +25,8 @@
 # only (ACL, chmod fallback) → switch `current` atomically → restart the API → wait for
 # /api/v1/meta → switch `app` atomically. If the API does not come back, `current` goes
 # back to the previous release and the API is restarted on it. Re-running a published
-# target changes nothing. Restarting rquant-web is not restricted to market hours: it is a
+# target changes nothing. --prepare stops after granting nginx access, so activation can
+# reuse the checked worktree without repeating uv sync. Restarting rquant-web is not restricted to market hours: it is a
 # new read-only service, not a Route A or legacy resident unit (CLAUDE.md 「不按交易时段排期」).
 #
 # Test seams (tests/unit/test_web_release_script.py): RQUANT_WEB_HOME, RQUANT_WEB_REPO_URL,
@@ -57,6 +59,7 @@ MODE=""
 TARGET=""
 DRY_RUN=0
 RESTART_API=1
+PREPARE=0
 
 usage() {
   sed -n '2,/^set -euo/p' "$0" | sed -e 's/^# \{0,1\}//' -e '/^set -euo/d' >&2
@@ -74,12 +77,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --target)
       [ $# -ge 2 ] || usage
+      [ -z "${MODE}" ] || usage
       MODE="release"
       TARGET="$2"
       shift 2
       ;;
-    --rollback) MODE="rollback"; shift ;;
-    --status) MODE="status"; shift ;;
+    --rollback) [ -z "${MODE}" ] || usage; MODE="rollback"; shift ;;
+    --status) [ -z "${MODE}" ] || usage; MODE="status"; shift ;;
+    --prepare) PREPARE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --no-restart) RESTART_API=0; shift ;;
     -h | --help) usage ;;
@@ -87,6 +92,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "${MODE}" ] || usage
+if [ "${PREPARE}" = "1" ] && { [ "${MODE}" != "release" ] || [ "${RESTART_API}" = "0" ]; }; then
+  usage
+fi
 
 if [ "$(id -u)" = "0" ]; then
   fail "run as lighthouse, not root (sudo is used for the one restart command only)"
@@ -161,7 +169,17 @@ api_healthy() {
   printf '%s' "${body}" | "$(python_bin)" -c '
 import json, sys
 body = json.load(sys.stdin)
-sys.exit(0 if isinstance(body.get("data"), dict) and "serving" in body else 1)
+serving = body.get("serving") if isinstance(body, dict) else None
+generation_id = serving.get("generation_id") if isinstance(serving, dict) else None
+state = serving.get("state") if isinstance(serving, dict) else None
+healthy = (
+    isinstance(body, dict)
+    and isinstance(body.get("data"), dict)
+    and isinstance(generation_id, str)
+    and bool(generation_id.strip())
+    and state in {"ready", "stale", "degraded"}
+)
+sys.exit(0 if healthy else 1)
 '
 }
 
@@ -297,11 +315,19 @@ if [ "${DRY_RUN}" = "1" ]; then
   [ -d "${REPO}" ] || plan "create the bare clone ${REPO}"
   plan "fetch main and tags into ${REPO}; refuse ${TARGET} unless it is on main"
   if [ "$(link_release current)" = "${TARGET}" ] && [ -f "${RELEASE}/.rquant-web-release" ]; then
-    plan "${TARGET} is already current: only re-check nginx access and the API"
+    if [ "${PREPARE}" = "1" ]; then
+      plan "${TARGET} is already current: only re-check nginx access; leave ${UNIT} unchanged"
+    else
+      plan "${TARGET} is already current: only re-check nginx access and the API"
+    fi
     exit 0
   fi
   plan "worktree ${RELEASE}; ${UV_BIN} sync --frozen --python 3.11 --no-dev; rquant web-serve --self-check"
   plan "grant ${NGINX_USER} traverse on the parents and read on ${RELEASE}/web/dist (setfacl, else chmod)"
+  if [ "${PREPARE}" = "1" ]; then
+    plan "leave current, app, previous and ${UNIT} unchanged; activation can reuse ${RELEASE}"
+    exit 0
+  fi
   was="$(link_release current)"
   plan "switch current -> releases/${TARGET} (now: ${was:-none})"
   if [ "${RESTART_API}" = "1" ]; then
@@ -333,7 +359,8 @@ if [ "${PREVIOUS}" = "${TARGET}" ] && [ -f "${RELEASE}/.rquant-web-release" ] &&
   [ "$(marker_commit "${RELEASE}")" != "${COMMIT}" ]; then
   fail "tag ${TARGET} now points at ${COMMIT:0:12}, not what is running; publish a new tag instead"
 fi
-if [ "${PREVIOUS}" = "${TARGET}" ] && [ "$(marker_commit "${RELEASE}")" = "${COMMIT}" ]; then
+if [ "${PREPARE}" = "0" ] && [ "${PREVIOUS}" = "${TARGET}" ] &&
+  [ "$(marker_commit "${RELEASE}")" = "${COMMIT}" ]; then
   say "${TARGET} is already current; re-checking nginx access and the API"
   grant_nginx "${RELEASE}"
   if [ "${RESTART_API}" = "1" ] && ! api_healthy; then
@@ -365,6 +392,10 @@ fi
 
 ACCESS=""
 grant_nginx "${RELEASE}"
+if [ "${PREPARE}" = "1" ]; then
+  say "prepared ${TARGET} (${COMMIT:0:12}); current, app and ${UNIT} unchanged; nginx access: ${ACCESS}"
+  exit 0
+fi
 
 say "switching current to ${TARGET}"
 switch_link current "releases/${TARGET}"

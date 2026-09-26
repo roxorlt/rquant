@@ -30,7 +30,20 @@ for bad in $FAKE_BAD; do
   [ "$release" = "$bad" ] && exit 7
 done
 [ -f "$FAKE_LOG/api-down" ] && exit 7
-echo '{"data": {"generation": null}, "serving": {"state": "ready"}}'
+if [ "$release" = "v0.34.1" ]; then
+  case "$FAKE_META_MODE" in
+    unavailable)
+      echo '{"data":{"generation":null},"serving":{"generation_id":null,"state":"unavailable"}}'
+      exit 0
+      ;;
+    missing_generation)
+      echo '{"data":{"generation":null},"serving":{"generation_id":null,"state":"ready"}}'
+      exit 0
+      ;;
+  esac
+fi
+printf '{"data":{},"serving":{"generation_id":"fake-generation","state":"%s"}}\n' \
+  "${FAKE_SERVING_STATE:-ready}"
 """,
     # The self-check runs under `env -i`, so a failing one is baked in at build time.
     "uv": """#!/bin/sh
@@ -143,6 +156,112 @@ def test_dry_run_prints_the_plan_and_creates_nothing(host: dict[str, object]) ->
     assert _log(host, "sudo.log") == []
 
 
+def test_prepare_builds_release_without_changing_active_links_or_api(
+    host: dict[str, object],
+) -> None:
+    home = Path(host["home"])  # type: ignore[arg-type]
+    origin = Path(host["origin"])  # type: ignore[arg-type]
+    assert _run(host, "--target", "v0.34.0").returncode == 0
+    before_current = _link(home, "current")
+    before_app = _link(home, "app")
+    before_sudo = _log(host, "sudo.log")
+    before_records = _releases(home)
+
+    prepared = _run(host, "--target", "v0.34.1", "--prepare")
+
+    assert prepared.returncode == 0, prepared.stderr
+    assert _link(home, "current") == before_current
+    assert _link(home, "app") == before_app
+    assert not (home / "previous").exists()
+    assert _log(host, "sudo.log") == before_sudo
+    assert _releases(home) == before_records
+    marker = home / "releases" / "v0.34.1" / ".rquant-web-release"
+    assert f"commit={_git(origin, 'rev-parse', 'v0.34.1^{commit}')}" in marker.read_text()
+    assert len(_log(host, "uv.log")) == 2
+    assert len(_log(host, "setfacl.log")) == 4
+
+
+def test_activation_reuses_prepared_release_without_installing_again(
+    host: dict[str, object],
+) -> None:
+    home = Path(host["home"])  # type: ignore[arg-type]
+    assert _run(host, "--target", "v0.34.0").returncode == 0
+    assert _run(host, "--target", "v0.34.1", "--prepare").returncode == 0
+    installs_after_prepare = _log(host, "uv.log")
+
+    activated = _run(host, "--target", "v0.34.1")
+
+    assert activated.returncode == 0, activated.stderr
+    assert _link(home, "current") == "releases/v0.34.1"
+    assert _link(home, "app") == "releases/v0.34.1/web/dist"
+    assert _link(home, "previous") == "releases/v0.34.0"
+    assert _log(host, "uv.log") == installs_after_prepare
+    assert len(_log(host, "sudo.log")) == 2
+    assert [record["target"] for record in _releases(home)] == ["v0.34.0", "v0.34.1"]
+
+
+def test_prepare_before_first_release_creates_no_active_links(host: dict[str, object]) -> None:
+    home = Path(host["home"])  # type: ignore[arg-type]
+
+    prepared = _run(host, "--prepare", "--target", "v0.34.0")
+
+    assert prepared.returncode == 0, prepared.stderr
+    assert (home / "releases" / "v0.34.0" / ".rquant-web-release").is_file()
+    assert not (home / "current").is_symlink()
+    assert not (home / "app").is_symlink()
+    assert not (home / "previous").is_symlink()
+    assert not (home / "releases.jsonl").exists()
+    assert _log(host, "sudo.log") == []
+
+
+def test_prepare_dry_run_only_plans_preparation(host: dict[str, object]) -> None:
+    result = _run(host, "--target", "v0.34.0", "--prepare", "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert "[dry-run] tag v0.34.0 exists" in result.stdout
+    assert "grant" in result.stdout
+    assert "switch current" not in result.stdout
+    assert "switch app" not in result.stdout
+    assert "restart rquant-web.service" not in result.stdout
+    assert not Path(host["home"]).exists()  # type: ignore[arg-type]
+
+
+def test_prepare_dry_run_for_current_release_does_not_plan_api_work(
+    host: dict[str, object],
+) -> None:
+    home = Path(host["home"])  # type: ignore[arg-type]
+    assert _run(host, "--target", "v0.34.0").returncode == 0
+
+    result = _run(host, "--target", "v0.34.0", "--prepare", "--dry-run")
+
+    assert result.returncode == 0, result.stderr
+    assert "already current" in result.stdout
+    assert "nginx access" in result.stdout
+    assert "API" not in result.stdout
+    assert "restart" not in result.stdout
+    assert _link(home, "current") == "releases/v0.34.0"
+    assert _log(host, "sudo.log") == ["-n /usr/bin/systemctl restart rquant-web.service"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        ("--prepare",),
+        ("--rollback", "--prepare"),
+        ("--status", "--prepare"),
+        ("--target", "v0.34.0", "--prepare", "--no-restart"),
+        ("--rollback", "--target", "v0.34.0", "--prepare"),
+    ),
+)
+def test_prepare_rejects_incompatible_options(
+    host: dict[str, object], args: tuple[str, ...]
+) -> None:
+    result = _run(host, *args)
+
+    assert result.returncode == 2
+    assert not Path(host["home"]).exists()  # type: ignore[arg-type]
+
+
 def test_a_release_switches_both_links_restarts_the_api_and_records_it(
     host: dict[str, object],
 ) -> None:
@@ -221,6 +340,35 @@ def test_a_release_whose_api_does_not_answer_is_rolled_back(host: dict[str, obje
     assert _link(home, "app") == "releases/v0.34.0/web/dist"
     assert _releases(home)[-1]["result"] == "rolled_back"
     assert len(_log(host, "sudo.log")) == 3
+
+
+@pytest.mark.parametrize("meta_mode", ("unavailable", "missing_generation"))
+def test_an_http_200_without_usable_serving_rolls_back_before_switching_app(
+    host: dict[str, object], meta_mode: str
+) -> None:
+    home = Path(host["home"])  # type: ignore[arg-type]
+    assert _run(host, "--target", "v0.34.0").returncode == 0
+
+    bad = _run(host, "--target", "v0.34.1", FAKE_META_MODE=meta_mode)
+
+    assert bad.returncode == 1
+    assert "rolled back to v0.34.0" in bad.stderr
+    assert _link(home, "current") == "releases/v0.34.0"
+    assert _link(home, "app") == "releases/v0.34.0/web/dist"
+    assert _releases(home)[-1]["result"] == "rolled_back"
+    assert len(_log(host, "sudo.log")) == 3
+
+
+@pytest.mark.parametrize("serving_state", ("ready", "stale", "degraded"))
+def test_a_release_with_a_generation_and_usable_serving_state_can_activate(
+    host: dict[str, object], serving_state: str
+) -> None:
+    home = Path(host["home"])  # type: ignore[arg-type]
+
+    result = _run(host, "--target", "v0.34.0", FAKE_SERVING_STATE=serving_state)
+
+    assert result.returncode == 0, result.stderr
+    assert _link(home, "app") == "releases/v0.34.0/web/dist"
 
 
 def test_a_failed_self_check_publishes_nothing(host: dict[str, object]) -> None:

@@ -6,6 +6,8 @@
 
 ### Added
 
+- **新前端 M1 市场全景与个股入口（2026-09-26）**：全景页接入涨跌脉搏、历史走势与异动提醒、三套板块榜及成分股、涨停复盘与跨日搜索；图表支持分时、五日、日 K 和爆量标记。顶栏加入全局股票搜索，个股抽屉展示最新价、所属板块与日 K。只读网页 API 增加全景及股票路由，接口类型由 OpenAPI 生成；合成数据浏览器用例覆盖全景、搜索和数据代切换。发布脚本增加预备发布步骤，以便从服务器现有的临时 `/app/` 平稳切换。
+
 - **新前端 M1 第一段：总览、系统健康和 `/app/` 装机套件（2026-09-25）**：
   - `GET /api/v1/overview`：显示的交易日按交易日历定（今天开盘后是今天，休市、周末、09:15 前是最近一个交易日）；
     返回今日链路（参考数据 → 竞价候选 → 盘中信号 → 模拟成交 → 通知推送）、候选（最近一次收盘选股 + 各策略当天候选）、
@@ -21,7 +23,7 @@
   - 装机套件：`deploy/nginx/rquant-backup.conf` 的 `/app/` 四个 location（`Host $host:$server_port`）、
     `deploy/systemd/rquant-web.service`（serving 面、384M / 640M、只读、无 `.env`）、`deploy/sudoers/rquant-web`（只允许重启这一个服务）、
     `scripts/web-release.sh`（精确 tag、原子切换、ACL 与 chmod 兜底、失败自动回滚、幂等、`--dry-run`），`docs/deploy/web-app.md`，
-    `DEPLOY.md`「待安装」一条。
+    `DEPLOY.md` 的 `/app/` 切换记录。
   - 浏览器测试：`scripts/serve_web_fixture.py` 固定 API 时钟；`RQ_E2E_REPLAY_ROOT` 指向回放副本时按真实数据验证
     （6 条信号、6 条推送、2 只持仓）。
 
