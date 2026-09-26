@@ -77,6 +77,50 @@
 .screen-actions .btn.primary {
   margin-left: auto;
 }
+.screen-rank-empty {
+  margin: 0;
+}
+.screen-rank-list {
+  display: grid;
+  gap: 8px;
+}
+.screen-rank-row {
+  display: grid;
+  grid-template-columns: 20px minmax(155px, 1.4fr) minmax(125px, 1fr) 100px auto;
+  align-items: end;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--sunken);
+}
+.screen-rank-row .screen-index {
+  align-self: center;
+}
+.screen-rank-row .btn {
+  margin-bottom: 2px;
+}
+.screen-rank-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+.screen-rank-summary {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.screen-rank-top {
+  width: 120px;
+}
+.screen-rank-error {
+  margin: 10px 0 0;
+  color: var(--crit-t);
+  font-size: 12px;
+}
 .screen-funnel {
   margin-block: 14px;
 }
@@ -163,6 +207,27 @@
   .screen-actions .btn.primary {
     grid-column: 1 / -1;
     margin-left: 0;
+  }
+  .screen-rank-row {
+    grid-template-columns: 20px minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+    padding: 9px;
+  }
+  .screen-rank-metric {
+    grid-column: 2 / -1;
+  }
+  .screen-rank-direction {
+    grid-column: 2;
+  }
+  .screen-rank-weight {
+    grid-column: 3;
+  }
+  .screen-rank-row .btn {
+    grid-column: 2 / -1;
+    justify-self: end;
+  }
+  .screen-rank-top {
+    width: 100%;
   }
   .screen-funnel li {
     grid-template-columns: minmax(90px, 140px) minmax(35px, 1fr) 42px;

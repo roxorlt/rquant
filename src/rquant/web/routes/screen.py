@@ -14,10 +14,13 @@ from pydantic import ValidationError
 
 from rquant.llm.compile import compile_screen_plan
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
+from rquant.screen.ranking import RankingCondition
 from rquant.serving_read_models import (
     PAGE_PROJECTION_CONTRACTS,
     NlScreenPageError,
+    NlScreenProjectionFeatureError,
     paginate_nl_screen_projection,
+    paginate_ranked_nl_screen_projection,
 )
 from rquant.web import readers
 from rquant.web.envelope import Envelope
@@ -28,7 +31,12 @@ from rquant.web.models.screen import (
     ScreenRunRequest,
     ScreenStep,
 )
-from rquant.web.screen_catalog import screen_blocks, validate_screen_choices
+from rquant.web.screen_catalog import (
+    RANKING_METRIC_LABELS,
+    available_ranking_metrics,
+    screen_blocks,
+    validate_screen_choices,
+)
 from rquant.web.security import current_user, require_csrf
 from rquant.web.serving import serving_meta
 
@@ -62,10 +70,18 @@ def get_blocks(
         )
         available = False
         dates: list[date] = []
+        ranking_metrics = []
         if borrowed is not None:
             state = readers.table_states(borrowed.cursor).get("nl_screen_universe")
             available = state is not None and state.available
             if available:
+                columns = {
+                    item[0]
+                    for item in borrowed.cursor.execute(
+                        "SELECT * FROM nl_screen_universe LIMIT 0"
+                    ).description
+                }
+                ranking_metrics = available_ranking_metrics(columns)
                 dates = [
                     row[0]
                     for row in borrowed.cursor.execute(
@@ -76,7 +92,12 @@ def get_blocks(
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     return Envelope[ScreenCatalogData](
-        data=ScreenCatalogData(blocks=screen_blocks(), dates=dates, available=available),
+        data=ScreenCatalogData(
+            blocks=screen_blocks(),
+            dates=dates,
+            available=available,
+            ranking_metrics=ranking_metrics,
+        ),
         serving=meta,
     )
 
@@ -112,6 +133,11 @@ def run_screen(
         validate_screen_choices(body.conditions)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="请从条件目录选择数据项或板块。") from error
+    if body.ranking is not None and any(
+        condition.metric not in RANKING_METRIC_LABELS
+        for condition in body.ranking.conditions
+    ):
+        raise HTTPException(status_code=422, detail="请从排名指标目录选择。")
     labels = {block.key: block.label for block in screen_blocks()}
     try:
         plan = ScreenPlan(
@@ -171,9 +197,21 @@ def run_screen(
                         raise HTTPException(status_code=409, detail="数据已更新，请重新筛选。")
                     data = _empty_run(body.trade_date, "no_date")
                 else:
+                    ranking = body.ranking
+                    if ranking is not None:
+                        missing_metrics = [
+                            condition.metric
+                            for condition in ranking.conditions
+                            if condition.metric not in universe.columns
+                        ]
+                        if missing_metrics:
+                            label = RANKING_METRIC_LABELS[missing_metrics[0]]
+                            raise HTTPException(
+                                status_code=422,
+                                detail=f"当前数据还没有「{label}」，请换一个排名指标。",
+                            )
                     try:
-                        page = paginate_nl_screen_projection(
-                            universe,
+                        page_args = dict(
                             generation_id=borrowed.manifest.generation_id,
                             trade_date=body.trade_date.isoformat(),
                             rules=compiled.rules,
@@ -183,15 +221,40 @@ def run_screen(
                             signing_key=web.cursor_key,
                             cursor=body.cursor,
                         )
+                        if ranking is None:
+                            page = paginate_nl_screen_projection(universe, **page_args)
+                        else:
+                            page = paginate_ranked_nl_screen_projection(
+                                universe,
+                                ranking=[
+                                    RankingCondition(
+                                        column=condition.metric,
+                                        ascending=condition.ascending,
+                                        weight=condition.weight,
+                                    )
+                                    for condition in ranking.conditions
+                                ],
+                                top_n=ranking.top_n,
+                                **page_args,
+                            )
                     except NlScreenPageError as error:
                         raise HTTPException(
                             status_code=409,
                             detail="数据已更新，请重新筛选。",
                         ) from error
-                    except ValueError as error:
+                    except NlScreenProjectionFeatureError as error:
                         raise HTTPException(
                             status_code=422,
                             detail="当前数据还不支持这个条件，请换一条或稍后重试。",
+                        ) from error
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "当前数据还不支持这个条件，请换一条或稍后重试。"
+                                if ranking is None
+                                else "当前数据还不支持这项排名，请换一个指标。"
+                            ),
                         ) from error
                     rows = [
                         ScreenRow(
@@ -199,6 +262,12 @@ def run_screen(
                             name=str(row["name"]) if pd.notna(row["name"]) else None,
                             close=_number(row["CLOSE[0]"]),
                             pct_chg=_number(row["PCT_CHG[0]"]),
+                            ranking_score=_number(row.get("ranking_score")),
+                            rank_position=(
+                                int(row["rank_position"])
+                                if "rank_position" in row
+                                else None
+                            ),
                         )
                         for row in page.rows.to_dict(orient="records")
                     ]
@@ -211,6 +280,11 @@ def run_screen(
                         status="ready",
                         base_count=len(universe),
                         total=steps[-1].count if steps else len(universe),
+                        ranked_count=(
+                            min(steps[-1].count if steps else len(universe), ranking.top_n)
+                            if ranking is not None
+                            else None
+                        ),
                         steps=steps,
                         rows=rows,
                         next_cursor=page.next_cursor,

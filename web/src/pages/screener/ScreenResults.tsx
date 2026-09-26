@@ -1,5 +1,5 @@
 import type { ScreenRow, ScreenRunData } from "@/api/screen";
-import { formatCount, formatPrice } from "@/format/number";
+import { formatCount, formatNumber, formatPrice } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, ChangeText, EmptyState, Panel, SkeletonRows } from "@/ui";
 import { StockCell } from "../shared/StockCell";
@@ -24,6 +24,23 @@ const COLUMNS: DataColumn<ScreenRow>[] = [
     header: "涨跌幅",
     value: (row) => row.pct_chg,
     cell: (row) => <ChangeText value={row.pct_chg} />,
+    numeric: true,
+  },
+];
+const RANKED_COLUMNS: DataColumn<ScreenRow>[] = [
+  {
+    id: "rank",
+    header: "名次",
+    value: (row) => row.rank_position ?? null,
+    cell: (row) => <span className="num">{formatCount(row.rank_position)}</span>,
+    numeric: true,
+  },
+  ...COLUMNS,
+  {
+    id: "score",
+    header: "排名分",
+    value: (row) => row.ranking_score ?? null,
+    cell: (row) => <strong className="num">{formatNumber(row.ranking_score, 1)}</strong>,
     numeric: true,
   },
 ];
@@ -56,7 +73,7 @@ function ResultBody({
   return (
     <DataTable
       rows={data.rows}
-      columns={COLUMNS}
+      columns={data.ranked_count == null ? COLUMNS : RANKED_COLUMNS}
       rowKey={(row) => row.ts_code}
       label="选股结果"
       onSelect={(row) => onStock(row.ts_code)}
@@ -120,7 +137,17 @@ export function ScreenResults({
             "结果"
           )
         }
-        sub={data?.status === "ready" ? `${data.trade_date} 收盘` : undefined}
+        sub={
+          data?.status === "ready" ? (
+            <>
+              {data.ranked_count == null ? null : (
+                <span>按排名分展示前 {formatCount(data.ranked_count)} 只</span>
+              )}
+              {data.ranked_count == null ? null : " · "}
+              {data.trade_date} 收盘
+            </>
+          ) : undefined
+        }
         flush
       >
         {stale ? (

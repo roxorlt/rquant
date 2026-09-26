@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from rquant.llm.registry import REGISTRY
 from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support import web_serving_fixture as fixture
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 
@@ -38,15 +39,19 @@ def _run(
     trade_date: str = "2026-09-24",
     page_size: int = 5,
     cursor: str | None = None,
+    ranking: dict | None = None,
 ):
+    payload = {
+        "trade_date": trade_date,
+        "conditions": conditions,
+        "page_size": page_size,
+        "cursor": cursor,
+    }
+    if ranking is not None:
+        payload["ranking"] = ranking
     return client.post(
         "/api/v1/screen/run",
-        json={
-            "trade_date": trade_date,
-            "conditions": conditions,
-            "page_size": page_size,
-            "cursor": cursor,
-        },
+        json=payload,
         headers={"X-Rquant-Csrf": "1"},
     )
 
@@ -66,6 +71,14 @@ def test_catalog_exposes_all_registered_rules_with_plain_chinese_labels(
     assert all(param["label"] for item in blocks for param in item["parameters"])
     assert body["data"]["dates"] == ["2026-09-24"]
     assert body["data"]["available"] is True
+    assert {item["value"] for item in body["data"]["ranking_metrics"]} == {
+        "PCT_CHG[0]",
+        "CIRC_MV[0]",
+    }
+    assert {item["label"] for item in body["data"]["ranking_metrics"]} == {
+        "今日涨跌幅",
+        "流通市值",
+    }
 
 
 def test_run_uses_registry_rules_with_cumulative_counts_and_bounded_pages(
@@ -122,6 +135,14 @@ def test_invalid_or_unavailable_rule_is_explained_without_technical_field_names(
     with _client(serving_root) as client:
         invalid = _run(client, conditions=[{"key": "circ_mv_lt", "args": {"threshold_yi": -1}}])
         unsupported = _run(client, conditions=[{"key": "first_limit_up", "args": {"offset": 1}}])
+        unsupported_with_ranking = _run(
+            client,
+            conditions=[{"key": "first_limit_up", "args": {"offset": 1}}],
+            ranking={
+                "conditions": [{"metric": "PCT_CHG[0]", "ascending": False, "weight": 100}],
+                "top_n": 20,
+            },
+        )
         unknown_field = _run(
             client,
             conditions=[{"key": "gt", "args": {"left": "name", "right": 1}}],
@@ -133,6 +154,8 @@ def test_invalid_or_unavailable_rule_is_explained_without_technical_field_names(
     assert "当前数据" in unsupported.json()["detail"]
     assert "[1]" not in unsupported.json()["detail"]
     assert "IS_FIRST_LIMIT_UP" not in unsupported.json()["detail"]
+    assert unsupported_with_ranking.status_code == 422
+    assert "这个条件" in unsupported_with_ranking.json()["detail"]
     assert unknown_field.status_code == 422
     assert "条件目录" in unknown_field.json()["detail"]
 
@@ -205,3 +228,140 @@ def test_missing_published_data_is_not_mistaken_for_zero_hits(tmp_path: Path) ->
     assert result.status_code == 200, result.text
     assert result.json()["data"]["status"] == "unavailable"
     assert result.json()["data"]["total"] is None
+
+
+def test_ranked_pages_keep_score_order_and_bind_plan_top_n_and_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline")
+    conditions = [{"key": "not_st", "args": {}}]
+    ranking = {
+        "conditions": [
+            {"metric": "PCT_CHG[0]", "ascending": False, "weight": 40},
+            {"metric": "CIRC_MV[0]", "ascending": False, "weight": 40},
+        ],
+        "top_n": 25,
+    }
+    with _client(root, age=timedelta(minutes=2)) as client:
+        first = _run(client, conditions=conditions, ranking=ranking)
+        assert first.status_code == 200, first.text
+        first_data = first.json()["data"]
+        assert (first_data["base_count"], first_data["total"], first_data["ranked_count"]) == (
+            30,
+            27,
+            25,
+        )
+        assert first_data["steps"] == [{"label": "排除 ST", "count": 27}]
+        assert [row["ts_code"] for row in first_data["rows"]] == [
+            "600029.SH", "600028.SH", "600027.SH", "600026.SH", "600025.SH"
+        ]
+        assert first_data["rows"][0]["ranking_score"] == pytest.approx(100)
+        assert [row["rank_position"] for row in first_data["rows"]] == list(range(1, 6))
+
+        changed_weight = _run(
+            client,
+            conditions=conditions,
+            ranking={
+                **ranking,
+                "conditions": [
+                    {"metric": "PCT_CHG[0]", "ascending": False, "weight": 60},
+                    ranking["conditions"][1],
+                ],
+            },
+            cursor=first_data["next_cursor"],
+        )
+        changed_top_n = _run(
+            client,
+            conditions=conditions,
+            ranking={**ranking, "top_n": 24},
+            cursor=first_data["next_cursor"],
+        )
+        assert changed_weight.status_code == 409
+        assert changed_top_n.status_code == 409
+
+        rows = first_data["rows"].copy()
+        cursor = first_data["next_cursor"]
+        while cursor is not None:
+            next_page = _run(client, conditions=conditions, ranking=ranking, cursor=cursor)
+            assert next_page.status_code == 200, next_page.text
+            data = next_page.json()["data"]
+            rows.extend(data["rows"])
+            cursor = data["next_cursor"]
+        assert len(rows) == len({row["ts_code"] for row in rows}) == 25
+        assert [row["rank_position"] for row in rows] == list(range(1, 26))
+        assert [row["ranking_score"] for row in rows] == sorted(
+            (row["ranking_score"] for row in rows), reverse=True
+        )
+
+        new_cursor = first_data["next_cursor"]
+        build_web_fixture(root, "baseline", sequence=1)
+        client.app.state.web.tracker.refresh()
+        expired = _run(client, conditions=conditions, ranking=ranking, cursor=new_cursor)
+        assert expired.status_code == 409
+
+
+def test_ranking_rejects_missing_or_unlisted_metrics_and_invalid_weights(
+    serving_root: Path,
+) -> None:
+    conditions = [{"key": "not_st", "args": {}}]
+    def rank(metric: str, weight: float = 100) -> dict:
+        return {
+            "conditions": [{"metric": metric, "ascending": False, "weight": weight}],
+            "top_n": 20,
+        }
+    with _client(serving_root) as client:
+        missing = _run(client, conditions=conditions, ranking=rank("RETURN_20D_PCT[0]"))
+        unknown = _run(client, conditions=conditions, ranking=rank("NOT_REGISTERED"))
+        zero = _run(client, conditions=conditions, ranking=rank("PCT_CHG[0]", 0))
+        negative = _run(client, conditions=conditions, ranking=rank("PCT_CHG[0]", -1))
+        too_many = _run(client, conditions=conditions, ranking={**rank("PCT_CHG[0]"), "top_n": 101})
+
+    assert missing.status_code == 422
+    assert "20 日涨幅" in missing.json()["detail"]
+    assert "RETURN_20D_PCT" not in missing.json()["detail"]
+    assert unknown.status_code == 422
+    assert "排名指标" in unknown.json()["detail"]
+    assert zero.status_code == 422
+    assert negative.status_code == 422
+    assert too_many.status_code == 422
+
+
+def test_published_optional_20_day_metric_appears_and_missing_values_rank_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "serving"
+    original = fixture._nl_screen_universe
+
+    def with_20_day_return() -> list[dict[str, object]]:
+        rows = original()
+        for index, row in enumerate(rows):
+            row["RETURN_20D_PCT[0]"] = None if index == 0 else float(index)
+        return rows
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fixture, "_nl_screen_universe", with_20_day_return)
+        build_web_fixture(root, "baseline")
+
+    with _client(root) as client:
+        catalog = client.get("/api/v1/screen/blocks")
+        ranked = _run(
+            client,
+            conditions=[{"key": "not_st", "args": {}}],
+            ranking={
+                "conditions": [
+                    {"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}
+                ],
+                "top_n": 30,
+            },
+            page_size=30,
+        )
+    assert "RETURN_20D_PCT[0]" in {
+        item["value"] for item in catalog.json()["data"]["ranking_metrics"]
+    }
+    assert ranked.status_code == 200, ranked.text
+    rows = ranked.json()["data"]["rows"]
+    assert rows[0]["ts_code"] == "600029.SH"
+    assert rows[-1]["ts_code"] == "600001.SH"
+    assert rows[-1]["ranking_score"] == 0

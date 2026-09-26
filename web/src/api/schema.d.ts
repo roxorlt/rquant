@@ -883,6 +883,8 @@ export interface components {
             blocks: components["schemas"]["ScreenBlock"][];
             /** Dates */
             dates: string[];
+            /** Ranking Metrics */
+            ranking_metrics: components["schemas"]["ScreenOption"][];
         };
         /** ScreenCondition */
         ScreenCondition: {
@@ -929,6 +931,22 @@ export interface components {
              */
             scale: number;
         };
+        /** ScreenRankingCondition */
+        ScreenRankingCondition: {
+            /** Ascending */
+            ascending: boolean;
+            /** Metric */
+            metric: string;
+            /** Weight */
+            weight: number;
+        };
+        /** ScreenRankingPlan */
+        ScreenRankingPlan: {
+            /** Conditions */
+            conditions: components["schemas"]["ScreenRankingCondition"][];
+            /** Top N */
+            top_n: number;
+        };
         /** ScreenRow */
         ScreenRow: {
             /** Close */
@@ -937,6 +955,10 @@ export interface components {
             name: string | null;
             /** Pct Chg */
             pct_chg: number | null;
+            /** Rank Position */
+            rank_position?: number | null;
+            /** Ranking Score */
+            ranking_score?: number | null;
             /** Ts Code */
             ts_code: string;
         };
@@ -946,6 +968,8 @@ export interface components {
             base_count: number | null;
             /** Next Cursor */
             next_cursor: string | null;
+            /** Ranked Count */
+            ranked_count?: number | null;
             /** Rows */
             rows: components["schemas"]["ScreenRow"][];
             /**
@@ -974,6 +998,7 @@ export interface components {
              * @default 20
              */
             page_size: number;
+            ranking?: components["schemas"]["ScreenRankingPlan"] | null;
             /**
              * Trade Date
              * Format: date

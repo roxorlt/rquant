@@ -4,6 +4,7 @@ import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 export type ScreenCatalogData = Schemas["ScreenCatalogData"];
 export type ScreenBlock = Schemas["ScreenBlock"];
 export type ScreenParameter = Schemas["ScreenParameter"];
+export type ScreenOption = Schemas["ScreenOption"];
 export type ScreenRunRequest = Schemas["ScreenRunRequest"];
 export type ScreenRunData = Schemas["ScreenRunData"];
 export type ScreenRow = Schemas["ScreenRow"];

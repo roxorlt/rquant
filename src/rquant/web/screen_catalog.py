@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 from pydantic_core import PydanticUndefined
@@ -75,6 +75,20 @@ _MA_OPTIONS = (
     ("MA20", "20 日均线"),
     ("MA60", "60 日均线"),
 )
+RANKING_METRIC_LABELS = {
+    "RETURN_20D_PCT[0]": "20 日涨幅",
+    "TURNOVER_RATE[0]": "换手率",
+    "CIRC_MV[0]": "流通市值",
+    "PCT_CHG[0]": "今日涨跌幅",
+}
+
+
+def available_ranking_metrics(columns: Collection[str]) -> list[ScreenOption]:
+    return [
+        ScreenOption(value=key, label=label)
+        for key, label in RANKING_METRIC_LABELS.items()
+        if key in columns
+    ]
 _INITIALS: dict[str, dict[str, Any]] = {
     "circ_mv_lt": {"threshold_yi": 100},
     "board_in": {"boards": ["main"]},

@@ -2165,12 +2165,20 @@
             },
             "title": "Dates",
             "type": "array"
+          },
+          "ranking_metrics": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenOption"
+            },
+            "title": "Ranking Metrics",
+            "type": "array"
           }
         },
         "required": [
           "blocks",
           "dates",
-          "available"
+          "available",
+          "ranking_metrics"
         ],
         "title": "ScreenCatalogData",
         "type": "object"
@@ -2318,6 +2326,60 @@
         "title": "ScreenParameter",
         "type": "object"
       },
+      "ScreenRankingCondition": {
+        "additionalProperties": false,
+        "properties": {
+          "ascending": {
+            "title": "Ascending",
+            "type": "boolean"
+          },
+          "metric": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Metric",
+            "type": "string"
+          },
+          "weight": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "metric",
+          "ascending",
+          "weight"
+        ],
+        "title": "ScreenRankingCondition",
+        "type": "object"
+      },
+      "ScreenRankingPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenRankingCondition"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "top_n": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top N",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conditions",
+          "top_n"
+        ],
+        "title": "ScreenRankingPlan",
+        "type": "object"
+      },
       "ScreenRow": {
         "properties": {
           "close": {
@@ -2352,6 +2414,28 @@
               }
             ],
             "title": "Pct Chg"
+          },
+          "rank_position": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rank Position"
+          },
+          "ranking_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ranking Score"
           },
           "ts_code": {
             "title": "Ts Code",
@@ -2390,6 +2474,17 @@
               }
             ],
             "title": "Next Cursor"
+          },
+          "ranked_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ranked Count"
           },
           "rows": {
             "items": {
@@ -2473,6 +2568,16 @@
             "minimum": 1.0,
             "title": "Page Size",
             "type": "integer"
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "trade_date": {
             "format": "date",

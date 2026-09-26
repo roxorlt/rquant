@@ -10,6 +10,7 @@ import {
 import { StockDrawer } from "@/app/StockDrawer";
 import { Button, EmptyState, PageHeader, PageSkeleton, Panel, Tip } from "@/ui";
 import { ParamControl, type ParameterValue } from "./ParamControl";
+import { type RankingDraft, RankingEditor } from "./RankingEditor";
 import { ScreenResults } from "./ScreenResults";
 import "./screener.css";
 
@@ -33,6 +34,9 @@ export default function ScreenerPage() {
   const [addKey, setAddKey] = useState("");
   const [initialized, setInitialized] = useState(false);
   const nextId = useRef(1);
+  const nextRankId = useRef(1);
+  const [rankDraft, setRankDraft] = useState<RankingDraft[]>([]);
+  const [topN, setTopN] = useState("20");
   const [result, setResult] = useState<ScreenRunData | null>(null);
   const [resultGeneration, setResultGeneration] = useState<string | null>(null);
   const [applied, setApplied] = useState<ScreenRunRequest | null>(null);
@@ -45,6 +49,7 @@ export default function ScreenerPage() {
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const blocks = catalog.data?.blocks ?? [];
   const dates = catalog.data?.dates ?? [];
+  const rankMetrics = catalog.data?.ranking_metrics ?? [];
 
   useEffect(() => {
     if (initialized || blocks.length === 0) return;
@@ -63,9 +68,30 @@ export default function ScreenerPage() {
   }, [dates, initialized, tradeDate]);
 
   const byKey = new Map(blocks.map((block) => [block.key, block]));
+  const rankWeights = rankDraft.map((row) =>
+    row.weight.trim() === "" ? Number.NaN : Number(row.weight),
+  );
+  const totalWeight = rankWeights.reduce((sum, weight) => sum + weight, 0);
+  const availableRankMetrics = new Set(rankMetrics.map((metric) => metric.value));
+  const rankingError =
+    rankDraft.length === 0
+      ? null
+      : rankDraft.some((row) => !availableRankMetrics.has(row.metric))
+        ? "所选排名指标暂不可用，请重新选择。"
+        : new Set(rankDraft.map((row) => row.metric)).size !== rankDraft.length
+          ? "同一排名指标只能添加一次。"
+          : rankWeights.some((weight) => !Number.isFinite(weight) || weight < 0 || weight > 100)
+            ? "权重请填 0 到 100。"
+            : totalWeight <= 0
+              ? "至少一项权重大于 0。"
+              : !Number.isInteger(Number(topN)) || Number(topN) < 1 || Number(topN) > 100
+                ? "前 N 只请填 1 到 100。"
+                : null;
   const snapshotKey = JSON.stringify({
     tradeDate,
     draft: draft.map(({ key, args }) => ({ key, args })),
+    ranking: rankDraft.map(({ metric, ascending, weight }) => ({ metric, ascending, weight })),
+    topN: rankDraft.length > 0 ? topN : null,
   });
   const stale =
     result !== null &&
@@ -77,7 +103,11 @@ export default function ScreenerPage() {
       ? "数据已更新，请重新筛选。旧结果仅供参考。"
       : "条件已改，请重新运行。旧结果仅供参考。";
   const canRun =
-    catalog.data?.available === true && dates.length > 0 && tradeDate !== null && draft.length > 0;
+    catalog.data?.available === true &&
+    dates.length > 0 &&
+    tradeDate !== null &&
+    draft.length > 0 &&
+    rankingError === null;
 
   function updateArg(id: number, key: string, value: ParameterValue) {
     setDraft((current) =>
@@ -93,6 +123,26 @@ export default function ScreenerPage() {
     const block = byKey.get(addKey);
     if (!block || draft.length >= 26) return;
     setDraft((current) => [...current, makeDraft(block, nextId.current++)]);
+  }
+
+  function addRanking() {
+    const firstUnused = rankMetrics.find(
+      (metric) => !rankDraft.some((row) => row.metric === metric.value),
+    );
+    if (!firstUnused) return;
+    setRankDraft((current) => [
+      ...current,
+      {
+        id: nextRankId.current++,
+        metric: firstUnused.value,
+        ascending: firstUnused.value === "CIRC_MV[0]",
+        weight: current.length === 0 ? "100" : "0",
+      },
+    ]);
+  }
+
+  function updateRanking(id: number, change: Partial<RankingDraft>) {
+    setRankDraft((current) => current.map((row) => (row.id === id ? { ...row, ...change } : row)));
   }
 
   async function run(body: ScreenRunRequest, key: string, nextIndex: number) {
@@ -131,6 +181,17 @@ export default function ScreenerPage() {
       conditions: draft.map(({ key, args }) => ({ key, args })),
       page_size: PAGE_SIZE,
       cursor: null,
+      ranking:
+        rankDraft.length > 0
+          ? {
+              conditions: rankDraft.map(({ metric, ascending, weight }) => ({
+                metric,
+                ascending,
+                weight: Number(weight),
+              })),
+              top_n: Number(topN),
+            }
+          : null,
     };
     void run(body, snapshotKey, 0);
   }
@@ -259,6 +320,17 @@ export default function ScreenerPage() {
               </Button>
             </div>
           </Panel>
+          <RankingEditor
+            metrics={rankMetrics}
+            rows={rankDraft}
+            topN={topN}
+            totalWeight={totalWeight}
+            error={rankingError}
+            onAdd={addRanking}
+            onUpdate={updateRanking}
+            onRemove={(id) => setRankDraft((current) => current.filter((row) => row.id !== id))}
+            onTopN={setTopN}
+          />
           <ScreenResults
             data={result}
             stale={stale}

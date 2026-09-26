@@ -35,6 +35,7 @@ from rquant.lab_jobs import LabJobSummary
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.runtime_service_control import RuntimeServiceHealth
+from rquant.screen.ranking import RankingCondition, rank_screen_results
 from rquant.serving_publisher import (
     DuckDBColumnType,
     ServingTableSpec,
@@ -57,6 +58,7 @@ _MAX_PROJECTION_CELL_BYTES = 64 * 1024
 _MAX_OWNER_PROJECTION_BYTES = 7 * 1024 * 1024
 _NL_SCREEN_CURSOR_TYPE = "nl_screen_page"
 _NL_SCREEN_ORDER_VERSION = "trade_date_ts_code_v1"
+_RANKED_NL_SCREEN_ORDER_VERSION = "rank_ts_code_v1"
 _NL_SCREEN_CURSOR_SIGNING_KEY_BYTES = 32
 _NL_SCREEN_CURSOR_SIGNATURE_BYTES = 32
 _NL_SCREEN_CURSOR_SIGNATURE_ENCODED_BYTES = 43
@@ -1383,13 +1385,17 @@ class NlScreenPageError(ValueError):
     """A cursor or bounded NL candidate read cannot safely continue."""
 
 
+class NlScreenProjectionFeatureError(ValueError):
+    """A registered screening rule needs a field absent from this generation."""
+
+
 class NlScreenCursor(RuntimeContractModel):
     cursor_type: Literal["nl_screen_page"]
     generation_id: GenerationId
     query_digest: GenerationId
     last_trade_date: date | None
     last_ts_code: StrictStr | None
-    order_version: Literal["trade_date_ts_code_v1"]
+    order_version: Literal["trade_date_ts_code_v1", "rank_ts_code_v1"]
 
     @model_validator(mode="after")
     def validate_last_key(self) -> Self:
@@ -1492,12 +1498,13 @@ def validate_nl_screen_cursor(
     *,
     generation_id: str,
     query_digest: str,
+    order_version: str = _NL_SCREEN_ORDER_VERSION,
 ) -> None:
     if cursor.generation_id != generation_id:
         raise NlScreenPageError("nl screen cursor requires rerun: generation changed")
     if cursor.query_digest != query_digest:
         raise NlScreenPageError("nl screen cursor requires rerun: query changed")
-    if cursor.order_version != _NL_SCREEN_ORDER_VERSION:
+    if cursor.order_version != order_version:
         raise NlScreenPageError("nl screen cursor requires rerun: ordering changed")
 
 
@@ -1507,6 +1514,7 @@ def _nl_screen_cursor(
     query_digest: str,
     last_trade_date: date | None,
     last_ts_code: str | None,
+    order_version: Literal["trade_date_ts_code_v1", "rank_ts_code_v1"] = _NL_SCREEN_ORDER_VERSION,
 ) -> NlScreenCursor:
     return NlScreenCursor(
         cursor_type=_NL_SCREEN_CURSOR_TYPE,
@@ -1514,7 +1522,7 @@ def _nl_screen_cursor(
         query_digest=query_digest,
         last_trade_date=last_trade_date,
         last_ts_code=last_ts_code,
-        order_version=_NL_SCREEN_ORDER_VERSION,
+        order_version=order_version,
     )
 
 
@@ -1534,7 +1542,9 @@ def screen_nl_projection(
     required_columns = ("trade_date", *base_columns, *include_columns)
     missing = tuple(column for column in required_columns if column not in universe.columns)
     if missing:
-        raise ValueError("nl serving projection is missing required columns: " + ", ".join(missing))
+        raise NlScreenProjectionFeatureError(
+            "nl serving projection is missing required columns: " + ", ".join(missing)
+        )
 
     normalized_dates = pd.to_datetime(universe["trade_date"], errors="coerce").dt.date
     requested_date = date.fromisoformat(trade_date)
@@ -1549,7 +1559,7 @@ def screen_nl_projection(
             rule_mask = rule(frame)
         except KeyError as error:
             missing_feature = str(error.args[0]) if error.args else "unknown"
-            raise ValueError(
+            raise NlScreenProjectionFeatureError(
                 f"nl serving projection is missing required feature {missing_feature}"
             ) from error
         if not isinstance(rule_mask, pd.Series) or not rule_mask.index.equals(frame.index):
@@ -1648,6 +1658,100 @@ def paginate_nl_screen_projection(
     )
 
 
+def paginate_ranked_nl_screen_projection(
+    universe: pd.DataFrame,
+    *,
+    generation_id: str,
+    trade_date: str,
+    rules: Sequence[Callable[[pd.DataFrame], pd.Series]],
+    rule_labels: Sequence[str],
+    normalized_plan: Mapping[str, object],
+    ranking: Sequence[RankingCondition],
+    top_n: int,
+    page_size: int,
+    signing_key: bytes,
+    cursor: str | None = None,
+) -> NlScreenPage:
+    """Screen once, rank all hits, then page the stable score order."""
+
+    if type(page_size) is not int or not 1 <= page_size <= 1_000:
+        raise ValueError("nl screen page_size must be an integer between 1 and 1000")
+    rank_columns = tuple(condition.column for condition in ranking)
+    rank_plan = {
+        **normalized_plan,
+        "ranking": {
+            "conditions": [
+                {
+                    "metric": condition.column,
+                    "ascending": condition.ascending,
+                    "weight": condition.weight,
+                }
+                for condition in ranking
+            ],
+            "top_n": top_n,
+        },
+    }
+    query_digest = nl_screen_query_digest(rank_plan, rank_columns)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, signing_key=signing_key)
+    if decoded is not None:
+        validate_nl_screen_cursor(
+            decoded,
+            generation_id=generation_id,
+            query_digest=query_digest,
+            order_version=_RANKED_NL_SCREEN_ORDER_VERSION,
+        )
+    start_cursor = encode_nl_screen_cursor(
+        decoded
+        if decoded is not None
+        else _nl_screen_cursor(
+            generation_id=generation_id,
+            query_digest=query_digest,
+            last_trade_date=None,
+            last_ts_code=None,
+            order_version=_RANKED_NL_SCREEN_ORDER_VERSION,
+        ),
+        signing_key=signing_key,
+    )
+    screened, diagnostics = screen_nl_projection(
+        universe,
+        trade_date=trade_date,
+        rules=rules,
+        rule_labels=rule_labels,
+        include_columns=rank_columns,
+    )
+    ranked = rank_screen_results(screened, ranking, top_n=top_n)
+    ranked["rank_position"] = range(1, len(ranked) + 1)
+    after = 0
+    if decoded is not None and decoded.last_trade_date is not None:
+        if decoded.last_trade_date != date.fromisoformat(trade_date):
+            raise NlScreenPageError("nl screen cursor requires rerun: date changed")
+        codes = ranked["ts_code"].tolist()
+        if decoded.last_ts_code not in codes:
+            raise NlScreenPageError("nl screen cursor requires rerun: snapshot key is missing")
+        after = codes.index(decoded.last_ts_code) + 1
+    rows = ranked.iloc[after : after + page_size].reset_index(drop=True)
+    next_cursor = None
+    if after + len(rows) < len(ranked):
+        next_cursor = encode_nl_screen_cursor(
+            _nl_screen_cursor(
+                generation_id=generation_id,
+                query_digest=query_digest,
+                last_trade_date=date.fromisoformat(trade_date),
+                last_ts_code=str(rows.iloc[-1]["ts_code"]),
+                order_version=_RANKED_NL_SCREEN_ORDER_VERSION,
+            ),
+            signing_key=signing_key,
+        )
+    return NlScreenPage(
+        rows=rows,
+        diagnostics=diagnostics,
+        start_cursor=start_cursor,
+        next_cursor=next_cursor,
+        generation_id=generation_id,
+        query_digest=query_digest,
+    )
+
+
 __all__ = [
     "SERVING_TABLE_SPECS",
     "PAGE_PROJECTION_CONTRACTS",
@@ -1657,6 +1761,7 @@ __all__ = [
     "NlScreenCursor",
     "NlScreenPage",
     "NlScreenPageError",
+    "NlScreenProjectionFeatureError",
     "ServingReadModelInput",
     "ServingLabJobRecord",
     "ServingSignalRecord",
@@ -1666,6 +1771,7 @@ __all__ = [
     "encode_nl_screen_cursor",
     "nl_screen_query_digest",
     "paginate_nl_screen_projection",
+    "paginate_ranked_nl_screen_projection",
     "screen_nl_projection",
     "serving_physical_table_specs_fingerprint",
 ]
