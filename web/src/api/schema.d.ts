@@ -276,6 +276,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/tdx/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 单股预览通达信公式 */
+        post: operations["preview_tdx_formula_api_v1_screen_tdx_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stocks/search": {
         parameters: {
             query?: never;
@@ -1759,6 +1776,45 @@ export interface components {
              */
             source: string;
         };
+        /** TdxPreviewData */
+        TdxPreviewData: {
+            /** Reason */
+            reason: string | null;
+            /**
+             * Source Updated At
+             * Format: date-time
+             */
+            source_updated_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "match" | "no_match" | "unknown";
+            /** Stock Code */
+            stock_code: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** TdxPreviewRequest */
+        TdxPreviewRequest: {
+            /**
+             * Source
+             * @default
+             */
+            source: string;
+            /** Source Identity */
+            source_identity: string;
+            /** Stock Code */
+            stock_code: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
         /** TranslationPlan */
         TranslationPlan: {
             /** Assignments */
@@ -2254,6 +2310,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TdxParseData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_tdx_formula_api_v1_screen_tdx_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TdxPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TdxPreviewData"];
                 };
             };
             /** @description Validation Error */

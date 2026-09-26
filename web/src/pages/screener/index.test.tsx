@@ -54,6 +54,7 @@ function catalog(available = true) {
               ]
             : [],
           source: available ? source : null,
+          source_kind: "replica",
         },
         serving,
       }),
@@ -76,6 +77,138 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it.each([
+    ["no_match", "不符合", null],
+    ["unknown", "暂无法判断", "历史日线不完整，暂无法判断。"],
+  ] as const)("公式单股预览如实展示 %s 结论", async (status, label, reason) => {
+    catalog();
+    server.use(
+      http.post("*/api/v1/screen/tdx/parse", () =>
+        HttpResponse.json({
+          syntax_version: "tdx-v1",
+          status: "parsed",
+          capability: "parse_only",
+          ast: null,
+          translation: null,
+          issues: [],
+          unsupported: [],
+        }),
+      ),
+      http.post("*/api/v1/screen/tdx/preview", () =>
+        HttpResponse.json({
+          stock_code: "600001.SH",
+          trade_date: "2026-09-24",
+          status,
+          reason,
+          source_updated_at: source.updated_at,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "导入公式" }));
+    const dialog = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.type(within(dialog).getByRole("textbox", { name: "通达信公式" }), "CLOSE>0");
+    await user.type(within(dialog).getByRole("textbox", { name: "股票代码" }), "600001.SH");
+    await user.click(within(dialog).getByRole("button", { name: "检查公式" }));
+    await within(dialog).findByText("公式可以预览这只股票。");
+    await user.click(within(dialog).getByRole("button", { name: "预览这只股票" }));
+    expect(await within(dialog).findByRole("status")).toHaveTextContent(label);
+    if (reason) expect(within(dialog).getByRole("status")).toHaveTextContent(reason);
+  });
+
+  it("先检查公式再预览单股，输入和来源变化使旧结论失效", async () => {
+    let identity = source.identity;
+    const previews: Schemas["TdxPreviewRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source: { ...source, identity },
+            source_kind: "replica",
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/tdx/parse", async ({ request }) => {
+        const body = (await request.json()) as Schemas["TdxParseRequest"];
+        if (body.source.includes("DYNAINFO")) {
+          return HttpResponse.json({
+            syntax_version: "tdx-v1",
+            status: "rejected",
+            capability: "parse_only",
+            ast: null,
+            translation: null,
+            issues: [],
+            unsupported: [{ message: "暂不支持函数「DYNAINFO」，请修改公式。" }],
+          });
+        }
+        return HttpResponse.json({
+          syntax_version: "tdx-v1",
+          status: "parsed",
+          capability: "parse_only",
+          ast: null,
+          translation: null,
+          issues: [],
+          unsupported: [],
+        });
+      }),
+      http.post("*/api/v1/screen/tdx/preview", async ({ request }) => {
+        previews.push((await request.json()) as Schemas["TdxPreviewRequest"]);
+        return HttpResponse.json({
+          stock_code: "600001.SH",
+          trade_date: "2026-09-24",
+          status: "match",
+          reason: null,
+          source_updated_at: "2026-09-24T07:30:00Z",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "导入公式" }));
+    const dialog = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.type(
+      within(dialog).getByRole("textbox", { name: "通达信公式" }),
+      "CLOSE>MA(CLOSE,2)",
+    );
+    await user.type(within(dialog).getByRole("textbox", { name: "股票代码" }), "600001.SH");
+    expect(within(dialog).getByRole("button", { name: "预览这只股票" })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "检查公式" }));
+    expect(await within(dialog).findByText("公式可以预览这只股票。")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "预览这只股票" }));
+    expect(await within(dialog).findByText("符合")).toBeInTheDocument();
+    expect(previews).toMatchObject([
+      { source_identity: source.identity, trade_date: "2026-09-24" },
+    ]);
+    expect(dialog.textContent).not.toContain(source.identity);
+    expect(findJargon(dialog.textContent ?? "")).toEqual([]);
+
+    await user.type(within(dialog).getByRole("textbox", { name: "通达信公式" }), " AND OPEN>0");
+    expect(within(dialog).getByRole("status")).toHaveTextContent("输入已改，请重新检查并预览");
+    await user.clear(within(dialog).getByRole("textbox", { name: "通达信公式" }));
+    await user.type(within(dialog).getByRole("textbox", { name: "通达信公式" }), "DYNAINFO(7)>0");
+    await user.click(within(dialog).getByRole("button", { name: "检查公式" }));
+    expect(await within(dialog).findByText(/暂不支持函数「DYNAINFO」/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "预览这只股票" })).toBeDisabled();
+
+    await user.clear(within(dialog).getByRole("textbox", { name: "通达信公式" }));
+    await user.type(within(dialog).getByRole("textbox", { name: "通达信公式" }), "CLOSE>0");
+    await user.click(within(dialog).getByRole("button", { name: "检查公式" }));
+    await user.click(within(dialog).getByRole("button", { name: "预览这只股票" }));
+    expect(await within(dialog).findByText("符合")).toBeInTheDocument();
+    identity = "b".repeat(64);
+    await user.click(within(dialog).getByRole("button", { name: "刷新选股数据" }));
+    expect(await within(dialog).findByRole("status")).toHaveTextContent(
+      "选股数据已更新，请重新预览",
+    );
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "公式预览" })).toBeNull());
+  });
   it("局部条件未知时在结果和逐条计数中明示未判定数量", async () => {
     catalog();
     server.use(

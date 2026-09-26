@@ -9,6 +9,7 @@ import {
 } from "@/api/screen";
 import { StockDrawer } from "@/app/StockDrawer";
 import { Button, EmptyState, PageHeader, PageSkeleton, Panel, RelativeTime, Tip } from "@/ui";
+import { FormulaPreviewDialog } from "./FormulaPreviewDialog";
 import { ParamControl, type ParameterValue } from "./ParamControl";
 import { type RankingDraft, RankingEditor } from "./RankingEditor";
 import { ScreenResults } from "./ScreenResults";
@@ -46,6 +47,7 @@ export default function ScreenerPage() {
   const [pageIndex, setPageIndex] = useState(0);
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
+  const [formulaOpen, setFormulaOpen] = useState(false);
   const blocks = catalog.data?.blocks ?? [];
   const dates = catalog.data?.dates ?? [];
   const rankMetrics = catalog.data?.ranking_metrics ?? [];
@@ -320,6 +322,7 @@ export default function ScreenerPage() {
               <Button onClick={addCondition} disabled={draft.length >= 26}>
                 添加条件
               </Button>
+              <Button onClick={() => setFormulaOpen(true)}>导入公式</Button>
               <Button
                 variant="primary"
                 onClick={runDraft}
@@ -355,6 +358,15 @@ export default function ScreenerPage() {
         </>
       )}
       <StockDrawer tsCode={selectedStock} onClose={() => setSelectedStock(null)} />
+      {formulaOpen ? (
+        <FormulaPreviewDialog
+          onClose={() => setFormulaOpen(false)}
+          onRefresh={() => void catalog.refetch()}
+          tradeDate={tradeDate}
+          source={catalog.data?.source ?? null}
+          sourceKind={catalog.data?.source_kind ?? null}
+        />
+      ) : null}
     </>
   );
 }

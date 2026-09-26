@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import duckdb
 import pandas as pd
@@ -25,6 +26,12 @@ from rquant.replica_generation import (
 from rquant.screen.core import _collect_aggregates, _infer_lookback
 from rquant.screen.loader import ScreeningCalendarError, _selected_sources, load_universe
 from rquant.screen.rules import Rule, required_rule_columns
+from rquant.screen.tdx.evaluate import (
+    MAX_BARS_PER_STOCK,
+    MAX_HISTORY_SPAN_DAYS,
+    HistoricalBar,
+    StockHistory,
+)
 from rquant.storage.duckdb import DuckDBStore
 
 MAX_CONDITIONS = 26
@@ -48,6 +55,14 @@ class ScreenReplicaBudgetError(RuntimeError):
     """A legal looking request still exceeds the bounded screening budget."""
 
 
+class ScreenReplicaChangedError(ScreenReplicaUnavailableError):
+    """The requested replica generation is no longer current."""
+
+
+class ScreenReplicaDateError(ScreenReplicaDataError):
+    """The selected date is not an open day in the bound replica calendar."""
+
+
 @dataclass(frozen=True, slots=True)
 class ScreenUniverseSnapshot:
     frame: pd.DataFrame
@@ -58,6 +73,17 @@ class ScreenUniverseSnapshot:
 @dataclass(frozen=True, slots=True)
 class ScreenDatesSnapshot:
     dates: list[date]
+    identity: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaHistorySnapshot:
+    stock: StockHistory | None
+    unknown_reason: Literal[
+        "missing_date", "missing_listing", "missing_calendar", "missing_history",
+        "invalid_value",
+    ] | None
     identity: str
     updated_at: datetime
 
@@ -228,6 +254,113 @@ class VerifiedReplicaScreenSource:
             )
         except duckdb.Error as error:
             raise ScreenReplicaDataError("screening dates are unavailable") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
+
+    def formula_history(
+        self,
+        trade_date: date,
+        stock_code: str,
+        *,
+        expected_identity: str,
+        lookback: int,
+        full_history: bool,
+    ) -> FormulaHistorySnapshot:
+        if type(trade_date) is not date or not 0 <= lookback <= 500:
+            raise ScreenReplicaBudgetError("formula history exceeds the allowed range")
+        connection, descriptor, generation = self._open()
+
+        def unknown(reason: Literal[
+            "missing_date", "missing_listing", "missing_calendar", "missing_history",
+            "invalid_value",
+        ]) -> FormulaHistorySnapshot:
+            self._finish(descriptor, generation)
+            return FormulaHistorySnapshot(
+                stock=None, unknown_reason=reason,
+                identity=generation.identity, updated_at=generation.updated_at,
+            )
+
+        try:
+            if generation.identity != expected_identity:
+                raise ScreenReplicaChangedError("screening replica changed")
+            connection.execute("SET threads=1")
+            calendar_day = connection.execute(
+                "SELECT is_open FROM trade_calendar "
+                "WHERE exchange = 'SSE' AND cal_date = ?", [trade_date]
+            ).fetchone()
+            if calendar_day is None or calendar_day[0] is not True:
+                self._finish(descriptor, generation)
+                raise ScreenReplicaDateError("screen date is not an open SSE day")
+            listing_row = connection.execute(
+                "SELECT list_date FROM stock_basic WHERE ts_code = ?", [stock_code]
+            ).fetchone()
+            listing = listing_row[0] if listing_row is not None else None
+            if full_history and listing is None:
+                return unknown("missing_listing")
+            if listing is not None and listing > trade_date:
+                return unknown("missing_date")
+            max_rows = MAX_BARS_PER_STOCK + 1 if full_history else lookback + 1
+            where_listing = " AND trade_date >= ?" if full_history else ""
+            parameters: list[object] = [stock_code, trade_date]
+            if full_history:
+                parameters.append(listing)
+            parameters.append(max_rows)
+            rows = connection.execute(
+                "SELECT trade_date, open, high, low, close, vol, amount "
+                "FROM daily_bar WHERE ts_code = ? AND trade_date <= ?"
+                + where_listing + " ORDER BY trade_date DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+            if full_history and len(rows) > MAX_BARS_PER_STOCK:
+                raise ScreenReplicaBudgetError("formula history exceeds the allowed range")
+            if not rows or rows[0][0] != trade_date:
+                return unknown("missing_date")
+            rows.reverse()
+            if not full_history and len(rows) < max_rows and listing is None:
+                return unknown("missing_listing")
+            start = listing if full_history or len(rows) < max_rows else rows[0][0]
+            if start is None or (trade_date - start).days > MAX_HISTORY_SPAN_DAYS:
+                raise ScreenReplicaBudgetError("formula history exceeds the allowed range")
+            calendar = connection.execute(
+                "SELECT cal_date, is_open FROM trade_calendar "
+                "WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ? "
+                "ORDER BY cal_date LIMIT ?",
+                [start, trade_date, MAX_HISTORY_SPAN_DAYS + 2],
+            ).fetchall()
+            if (
+                len(calendar) != (trade_date - start).days + 1
+                or any(row[0] != start + timedelta(days=index)
+                       for index, row in enumerate(calendar))
+            ):
+                return unknown("missing_calendar")
+            expected_open = {day for day, is_open in calendar if is_open}
+            if expected_open != {row[0] for row in rows}:
+                return unknown("missing_history")
+            if any(
+                value is not None and not math.isfinite(value)
+                for row in rows for value in row[1:]
+            ):
+                return unknown("invalid_value")
+            stock = StockHistory(
+                stock_code=stock_code,
+                complete_from_listing=full_history,
+                bars=tuple(HistoricalBar(
+                    trade_date=row[0], open=row[1], high=row[2], low=row[3],
+                    close=row[4], vol=row[5], amount=row[6],
+                ) for row in rows),
+            )
+            self._finish(descriptor, generation)
+            return FormulaHistorySnapshot(
+                stock=stock, unknown_reason=None,
+                identity=generation.identity, updated_at=generation.updated_at,
+            )
+        except duckdb.Error as error:
+            raise ScreenReplicaDataError("screening formula facts are unavailable") from error
+        except ScreenReplicaUnavailableError as error:
+            if isinstance(error, ScreenReplicaChangedError):
+                raise
+            raise ScreenReplicaChangedError("screening replica changed") from error
         finally:
             connection.close()
             os.close(descriptor)

@@ -116,6 +116,11 @@ def create_app(
     async def request_validation_error(
         request: Request, error: RequestValidationError,
     ) -> Response:
+        if request.url.path == "/api/v1/screen/tdx/preview":
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "预览输入有误，请检查股票、日期和公式。"},
+            )
         if request.url.path == "/api/v1/screen/tdx/parse":
             return JSONResponse(
                 status_code=422,

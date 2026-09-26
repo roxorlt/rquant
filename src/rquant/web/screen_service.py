@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import ValidationError
@@ -14,11 +15,19 @@ from rquant.screen.core import _collect_aggregates
 from rquant.screen.ranking import RankingCondition
 from rquant.screen.replica_source import (
     ScreenReplicaBudgetError,
+    ScreenReplicaChangedError,
     ScreenReplicaDataError,
+    ScreenReplicaDateError,
     ScreenReplicaUnavailableError,
     VerifiedReplicaScreenSource,
 )
 from rquant.screen.rules import Rule, required_rule_columns
+from rquant.screen.tdx import parse_formula
+from rquant.screen.tdx.evaluate import (
+    EvaluationRejectedError,
+    FormulaEvaluationInput,
+    evaluate_formula,
+)
 from rquant.serving_read_models import (
     PAGE_PROJECTION_CONTRACTS,
     NlScreenPageError,
@@ -34,6 +43,8 @@ from rquant.web.models.screen import (
     ScreenRunRequest,
     ScreenSourceInfo,
     ScreenStep,
+    TdxPreviewData,
+    TdxPreviewRequest,
 )
 from rquant.web.screen_catalog import (
     RANKING_METRIC_LABELS,
@@ -44,6 +55,21 @@ from rquant.web.screen_catalog import (
 from rquant.web.serving import BorrowedGeneration
 
 _REPLICA_RANK_COLUMNS = frozenset({"TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]"})
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_PREVIEW_UNKNOWN = {
+    "missing_date": "这只股票在所选日期缺少日线，暂无法判断。",
+    "missing_listing": "缺少上市日期，暂无法核对完整历史。",
+    "missing_calendar": "交易日历不完整，暂无法判断。",
+    "missing_history": "历史日线不完整，暂无法判断。",
+    "invalid_value": "行情字段无效，暂无法判断。",
+    "insufficient_history": "历史天数不足，暂无法判断。",
+    "incomplete_history": "历史覆盖不足，暂无法判断。",
+    "missing_value": "行情字段缺失，暂无法判断。",
+    "division_by_zero": "公式遇到除零，暂无法判断。",
+    "non_finite": "公式结果超出数值范围，暂无法判断。",
+    "numeric_underflow": "公式结果过小，暂无法判断。",
+    "never_true": "此前没有满足条件的记录，暂无法判断。",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +134,62 @@ class ScreenApplicationService:
     ) -> None:
         self.cursor_key = cursor_key
         self.replica = replica
+
+    def preview(
+        self, body: TdxPreviewRequest, *, decision_at: datetime,
+    ) -> TdxPreviewData:
+        if self.replica is None:
+            raise ScreenApplicationError(503, "选股数据暂不可用，请稍后重试。")
+        parsed = parse_formula(body.source)
+        if parsed.status != "parsed" or parsed.translation is None:
+            raise ScreenApplicationError(422, "公式尚未通过检查，请修改后重试。")
+        if decision_at.astimezone(_SHANGHAI) < datetime.combine(
+            body.trade_date, time(17), _SHANGHAI,
+        ):
+            raise ScreenApplicationError(422, "这一天的日线尚未收盘，请换日期。")
+        try:
+            snapshot = self.replica.formula_history(
+                body.trade_date,
+                body.stock_code,
+                expected_identity=body.source_identity,
+                lookback=parsed.translation.window_lookback_bars,
+                full_history=parsed.translation.requires_full_history,
+            )
+        except ScreenReplicaChangedError as error:
+            raise ScreenApplicationError(409, "选股数据已更新，请刷新后重试。") from error
+        except ScreenReplicaDateError as error:
+            raise ScreenApplicationError(422, "请选择已开市的交易日。") from error
+        except (ScreenReplicaUnavailableError, ScreenReplicaDataError) as error:
+            raise ScreenApplicationError(503, "选股数据暂不可用，请稍后重试。") from error
+        except ScreenReplicaBudgetError as error:
+            raise ScreenApplicationError(
+                422, "这只股票的历史超出单次预览范围，请换股票。",
+            ) from error
+
+        status = "unknown"
+        reason = _PREVIEW_UNKNOWN[snapshot.unknown_reason] if snapshot.unknown_reason else None
+        if snapshot.stock is not None:
+            try:
+                evaluated = evaluate_formula(FormulaEvaluationInput(
+                    formula=body.source,
+                    decision_date=body.trade_date,
+                    decision_at=decision_at,
+                    stocks=(snapshot.stock,),
+                ))
+            except EvaluationRejectedError as error:
+                raise ScreenApplicationError(
+                    422, "公式或历史超出单次预览范围，请缩短后重试。",
+                ) from error
+            decision = evaluated.decisions[0]
+            status = decision.status
+            reason = _PREVIEW_UNKNOWN[decision.reason] if decision.reason else None
+        return TdxPreviewData(
+            stock_code=body.stock_code,
+            trade_date=body.trade_date,
+            status=status,
+            reason=reason,
+            source_updated_at=snapshot.updated_at,
+        )
 
     def catalog(self, borrowed: BorrowedGeneration | None) -> ScreenCatalogData:
         blocks = screen_blocks()
