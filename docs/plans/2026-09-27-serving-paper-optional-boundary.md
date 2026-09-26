@@ -6,11 +6,11 @@
 
 ## 失败路径与不变量
 
-1. 模拟账户权威根目录或 `current.json` 尚不存在，或已发布版本在本次 `as_of` 尚不可见：权威 reader 明确抛出 `ServingSourceAuthorityUnavailableError`。正式 profile 将 `paper_accounts` 列为可选来源；assembler 发布空账户表与状态为 `UNAVAILABLE` 的水位，原因来自固定的分类错误。相同缺失原因在不同轮次产生相同来源 generation ID 与 epoch 水位，不因观察时钟反复发布。
+1. 模拟账户权威根目录尚不存在，或 `current.json` 尚不存在且无任何不可变发布痕迹，或已发布版本在本次 `as_of` 尚不可见：权威 reader 明确抛出 `ServingSourceAuthorityUnavailableError`。正式 profile 将 `paper_accounts` 列为可选来源；assembler 发布空账户表与状态为 `UNAVAILABLE` 的水位，原因来自固定的分类错误。相同缺失原因在不同轮次产生相同来源 generation ID 与 epoch 水位，不因观察时钟反复发布。
 2. 权威恢复并通过指针、文档及内容身份验证：读取真实账户及其原有水位。空表不能伪造账户，恢复也不能继续沿用缺失的 generation ID。
-3. 已出现的指针/文档若格式、身份、内容、所有权、路径安全或历史链有问题，reader 抛出 `ServingSourceAuthorityIntegrityError`；assembler 必须拒绝整个轮次。未知读取异常也拒绝，不能当成“暂时缺失”。
+3. 已出现的指针/文档若格式、身份、内容、所有权、路径安全或历史链有问题，reader 抛出 `ServingSourceAuthorityIntegrityError`；assembler 必须拒绝整个轮次。已有不可变发布痕迹而 `current.json` 消失，包括 reader 新进程启动后，也属于完整性失败；读取过程中消失亦然。历史扫描上限无法证实最合适的 `as_of` 版本时属于完整性失败，不能发布空账户。未知读取异常也拒绝，不能当成“暂时缺失”。
 4. `signals`、`runtime_health` 与 `reference_slow_authority` 仍是必需来源；任一失败，整轮拒绝。已有 `lab_jobs`、`promotions` 可选行为仅接受明确的权威不可用分类；损坏不能降级。
 
 ## 排除与验收
 
-不更改生产已部署 profile、数据库、服务配置、切流或模拟交易服务；不补造模拟账户。验收使用本地合成权威：正式 profile 与 authority stage 配置一致；缺失时可生成真实其它来源加空模拟账户；跨轮身份稳定；恢复后读真实账户；损坏的已发布权威和必需来源失败均阻断。聚焦测试与 Ruff 通过后只提交候选，交由独立审查。
+不更改生产已部署 profile、数据库、服务配置、切流或模拟交易服务；不补造模拟账户。若整个权威根目录及其所有不可变痕迹同时消失，单个来源 reader 无本地证据可区分从未发布；本轮仅修复保留权威根目录时的指针丢失。验收使用本地合成权威：正式 profile 与 authority stage 配置一致；首次缺失时可生成真实其它来源加空模拟账户；跨轮身份稳定；恢复后读真实账户；损坏、已发布后指针丢失、历史扫描上限和必需来源失败均阻断。聚焦测试与 Ruff 通过后只提交候选，交由独立审查。
