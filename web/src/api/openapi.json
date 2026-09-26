@@ -1197,6 +1197,22 @@
         "title": "Envelope[PulseData]",
         "type": "object"
       },
+      "Envelope_ResearchJobsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ResearchJobsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ResearchJobsData]",
+        "type": "object"
+      },
       "Envelope_ScreenCatalogData_": {
         "properties": {
           "data": {
@@ -1747,6 +1763,56 @@
           "marks"
         ],
         "title": "IntradayData",
+        "type": "object"
+      },
+      "JobCounts": {
+        "properties": {
+          "cancelled": {
+            "minimum": 0.0,
+            "title": "Cancelled",
+            "type": "integer"
+          },
+          "checkpointed": {
+            "minimum": 0.0,
+            "title": "Checkpointed",
+            "type": "integer"
+          },
+          "failed": {
+            "minimum": 0.0,
+            "title": "Failed",
+            "type": "integer"
+          },
+          "other": {
+            "minimum": 0.0,
+            "title": "Other",
+            "type": "integer"
+          },
+          "queued": {
+            "minimum": 0.0,
+            "title": "Queued",
+            "type": "integer"
+          },
+          "running": {
+            "minimum": 0.0,
+            "title": "Running",
+            "type": "integer"
+          },
+          "succeeded": {
+            "minimum": 0.0,
+            "title": "Succeeded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "queued",
+          "running",
+          "checkpointed",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "other"
+        ],
+        "title": "JobCounts",
         "type": "object"
       },
       "LocalExpr": {
@@ -3225,6 +3291,207 @@
           "up_ratio_pct"
         ],
         "title": "PulsePoint",
+        "type": "object"
+      },
+      "ResearchJobItem": {
+        "properties": {
+          "eta_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta At"
+          },
+          "eta_high": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta High"
+          },
+          "eta_label": {
+            "title": "Eta Label",
+            "type": "string"
+          },
+          "eta_low": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta Low"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "job_type_label": {
+            "title": "Job Type Label",
+            "type": "string"
+          },
+          "progress_fraction": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Progress Fraction",
+            "type": "number"
+          },
+          "resource_label": {
+            "title": "Resource Label",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusInfo"
+          },
+          "strategy_name": {
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "terminal_shards": {
+            "minimum": 0.0,
+            "title": "Terminal Shards",
+            "type": "integer"
+          },
+          "total_shards": {
+            "minimum": 0.0,
+            "title": "Total Shards",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "strategy_name",
+          "job_type_label",
+          "resource_label",
+          "status",
+          "progress_fraction",
+          "terminal_shards",
+          "total_shards",
+          "eta_at",
+          "eta_low",
+          "eta_high",
+          "eta_label",
+          "updated_at"
+        ],
+        "title": "ResearchJobItem",
+        "type": "object"
+      },
+      "ResearchJobsData": {
+        "properties": {
+          "counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ResearchJobItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "page_size": {
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "empty",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_label",
+          "source_note",
+          "source_updated_at",
+          "total",
+          "counts",
+          "page_size",
+          "items",
+          "next_cursor"
+        ],
+        "title": "ResearchJobsData",
         "type": "object"
       },
       "ScreenBlock": {
@@ -5590,6 +5857,68 @@
         "summary": "个股概览",
         "tags": [
           "stocks"
+        ]
+      }
+    },
+    "/api/v1/tasks/jobs": {
+      "get": {
+        "operationId": "get_jobs_api_v1_tasks_jobs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ResearchJobsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "研究任务队列",
+        "tags": [
+          "tasks"
         ]
       }
     }

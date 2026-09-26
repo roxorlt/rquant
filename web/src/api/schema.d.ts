@@ -310,6 +310,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研究任务队列 */
+        get: operations["get_jobs_api_v1_tasks_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -661,6 +678,11 @@ export interface components {
             data: components["schemas"]["PulseData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[ResearchJobsData] */
+        Envelope_ResearchJobsData_: {
+            data: components["schemas"]["ResearchJobsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ScreenCatalogData] */
         Envelope_ScreenCatalogData_: {
             data: components["schemas"]["ScreenCatalogData"];
@@ -828,6 +850,23 @@ export interface components {
             name: string | null;
             /** Ts Code */
             ts_code: string;
+        };
+        /** JobCounts */
+        JobCounts: {
+            /** Cancelled */
+            cancelled: number;
+            /** Checkpointed */
+            checkpointed: number;
+            /** Failed */
+            failed: number;
+            /** Other */
+            other: number;
+            /** Queued */
+            queued: number;
+            /** Running */
+            running: number;
+            /** Succeeded */
+            succeeded: number;
         };
         /** LocalExpr */
         LocalExpr: {
@@ -1282,6 +1321,60 @@ export interface components {
             t: string;
             /** Up Ratio Pct */
             up_ratio_pct: number | null;
+        };
+        /** ResearchJobItem */
+        ResearchJobItem: {
+            /** Eta At */
+            eta_at: string | null;
+            /** Eta High */
+            eta_high: string | null;
+            /** Eta Label */
+            eta_label: string;
+            /** Eta Low */
+            eta_low: string | null;
+            /** Job Id */
+            job_id: string;
+            /** Job Type Label */
+            job_type_label: string;
+            /** Progress Fraction */
+            progress_fraction: number;
+            /** Resource Label */
+            resource_label: string;
+            status: components["schemas"]["StatusInfo"];
+            /** Strategy Name */
+            strategy_name: string;
+            /** Terminal Shards */
+            terminal_shards: number;
+            /** Total Shards */
+            total_shards: number;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** ResearchJobsData */
+        ResearchJobsData: {
+            counts: components["schemas"]["JobCounts"] | null;
+            /** Items */
+            items: components["schemas"]["ResearchJobItem"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Page Size */
+            page_size: number;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+            /** Total */
+            total: number | null;
         };
         /** ScreenBlock */
         ScreenBlock: {
@@ -2316,6 +2409,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StockSummaryData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_jobs_api_v1_tasks_jobs_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ResearchJobsData_"];
                 };
             };
             /** @description Validation Error */

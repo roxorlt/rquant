@@ -153,6 +153,50 @@ export function monitorEnvelope(
   };
 }
 
+export function tasksEnvelope(
+  overrides: Partial<Schemas["ResearchJobsData"]> = {},
+): Schemas["Envelope_ResearchJobsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: {
+      source_state: "ready",
+      source_label: "研究任务",
+      source_note: null,
+      source_updated_at: "2026-09-24T07:30:40Z",
+      total: 2,
+      counts: {
+        queued: 1,
+        running: 1,
+        checkpointed: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        other: 0,
+      },
+      page_size: 1,
+      next_cursor: "fixture-next",
+      items: [
+        {
+          job_id: "00000000-0000-0000-0000-000000000001",
+          strategy_name: "动量参数搜索",
+          job_type_label: "参数搜索",
+          resource_label: "标准",
+          status: { state: "ok", label: "运行中", reason: "任务正在运行" },
+          progress_fraction: 0.25,
+          terminal_shards: 1,
+          total_shards: 4,
+          eta_at: "2026-09-24T07:35:00Z",
+          eta_low: "2026-09-24T07:33:00Z",
+          eta_high: "2026-09-24T07:37:00Z",
+          eta_label: "预计结束",
+          updated_at: "2026-09-24T07:30:00Z",
+        },
+      ],
+      ...overrides,
+    },
+  };
+}
+
 /** A synthetic /api/v1/overview envelope shaped like the 2026-09-24 replay. */
 export function overviewEnvelope(
   overrides: Partial<OverviewEnvelope["data"]> = {},

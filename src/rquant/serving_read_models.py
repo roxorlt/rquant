@@ -1201,7 +1201,7 @@ def build_serving_read_models(
                 "phase": record.summary.progress.phase,
                 "terminal_shards": record.summary.progress.terminal_shards,
                 "total_shards": record.summary.progress.total_shards,
-                "eta_status": record.eta.status.value if record.eta is not None else None,
+                "eta_status": record.eta.status if record.eta is not None else None,
                 "eta_finish_low": (
                     record.eta.finish_at.low
                     if record.eta is not None and record.eta.finish_at is not None

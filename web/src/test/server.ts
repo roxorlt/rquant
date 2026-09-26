@@ -1,6 +1,12 @@
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
-import { healthEnvelope, metaEnvelope, monitorEnvelope, overviewEnvelope } from "./fixtures";
+import {
+  healthEnvelope,
+  metaEnvelope,
+  monitorEnvelope,
+  overviewEnvelope,
+  tasksEnvelope,
+} from "./fixtures";
 
 export const metaHandler = (envelope = metaEnvelope()) =>
   http.get("*/api/v1/meta", () => HttpResponse.json(envelope));
@@ -14,10 +20,14 @@ export const healthHandler = (envelope = healthEnvelope()) =>
 export const monitorHandler = (envelope = monitorEnvelope()) =>
   http.get("*/api/v1/monitor/timeline", () => HttpResponse.json(envelope));
 
+export const tasksHandler = (envelope = tasksEnvelope()) =>
+  http.get("*/api/v1/tasks/jobs", () => HttpResponse.json(envelope));
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
   overviewHandler(),
   healthHandler(),
   monitorHandler(),
+  tasksHandler(),
 );

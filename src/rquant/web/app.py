@@ -24,7 +24,17 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
-from rquant.web.routes import catalog, health, meta, monitor, overview, panorama, screen, stocks
+from rquant.web.routes import (
+    catalog,
+    health,
+    meta,
+    monitor,
+    overview,
+    panorama,
+    screen,
+    stocks,
+    tasks,
+)
 from rquant.web.screen_service import ScreenApplicationService
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
@@ -114,7 +124,8 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(
-        request: Request, error: RequestValidationError,
+        request: Request,
+        error: RequestValidationError,
     ) -> Response:
         if request.url.path == "/api/v1/screen/tdx/parse":
             return JSONResponse(
@@ -126,6 +137,7 @@ def create_app(
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
+    app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
