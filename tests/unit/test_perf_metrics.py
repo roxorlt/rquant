@@ -51,6 +51,9 @@ def test_summary_matches_frozen_independently_calculated_reference() -> None:
     actual = performance_summary(_returns(fixture["daily_returns"]))
     for field, expected in fixture["summary"].items():
         assert getattr(actual, field) == pytest.approx(expected)
+    for reference in fixture["library_references"].values():
+        for field, expected in reference.items():
+            assert getattr(actual, field) == pytest.approx(expected)
 
 
 def test_summary_undefined_ratios_and_no_trades_are_none() -> None:

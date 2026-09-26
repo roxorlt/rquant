@@ -1,5 +1,5 @@
 {
-  "provenance": "Independently calculated arithmetic reference for C7.1, frozen before implementation; quantstats/pyfolio parity is pending because neither package is present offline.",
+  "provenance": "Four daily returns were checked offline against quantstats 0.0.82 and pyfolio 0.9.2 (empyrical 0.5.5); neither library is a project dependency. The remaining summary fields are independent arithmetic references.",
   "daily_returns": [0.1, -0.1, 0.2, -0.05],
   "summary": {
     "observations": 4,
@@ -13,5 +13,25 @@
     "max_drawdown_duration": 1,
     "win_rate": 0.5,
     "payoff_ratio": 2.0
+  },
+  "library_references": {
+    "quantstats_0.0.82": {
+      "annualized_return": 2040.8455777682977,
+      "annualized_volatility": 2.18574929943944,
+      "sharpe": 4.323460152737353,
+      "sortino": 10.648943609579309,
+      "calmar": 20408.455777682982,
+      "max_drawdown": -0.09999999999999998,
+      "win_rate": 0.5,
+      "payoff_ratio": 2.0
+    },
+    "pyfolio_0.9.2_empyrical_0.5.5": {
+      "annualized_return": 2040.8455777682977,
+      "annualized_volatility": 2.18574929943944,
+      "sharpe": 4.323460152737353,
+      "sortino": 10.648943609579309,
+      "calmar": 20408.45577768298,
+      "max_drawdown": -0.09999999999999999
+    }
   }
 }
