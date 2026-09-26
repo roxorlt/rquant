@@ -938,6 +938,22 @@
         "title": "Envelope[MetaData]",
         "type": "object"
       },
+      "Envelope_MonitorSignalsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MonitorSignalsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MonitorSignalsData]",
+        "type": "object"
+      },
       "Envelope_OverviewData_": {
         "properties": {
           "data": {
@@ -1768,6 +1784,279 @@
           "direction"
         ],
         "title": "MinuteBar",
+        "type": "object"
+      },
+      "MonitorReceipt": {
+        "properties": {
+          "attempt_count": {
+            "title": "Attempt Count",
+            "type": "integer"
+          },
+          "channel": {
+            "title": "Channel",
+            "type": "string"
+          },
+          "channel_label": {
+            "title": "Channel Label",
+            "type": "string"
+          },
+          "outbox_id": {
+            "title": "Outbox Id",
+            "type": "string"
+          },
+          "recipient_id": {
+            "title": "Recipient Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outbox_id",
+          "recipient_id",
+          "channel",
+          "channel_label",
+          "status",
+          "status_label",
+          "updated_at",
+          "attempt_count"
+        ],
+        "title": "MonitorReceipt",
+        "type": "object"
+      },
+      "MonitorSignal": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "action_label": {
+            "title": "Action Label",
+            "type": "string"
+          },
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "delivery": {
+            "enum": [
+              "delivered",
+              "recorded",
+              "unconfirmed",
+              "sending",
+              "failed",
+              "expired",
+              "none"
+            ],
+            "title": "Delivery",
+            "type": "string"
+          },
+          "delivery_label": {
+            "title": "Delivery Label",
+            "type": "string"
+          },
+          "delivery_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Note"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/MonitorReceipt"
+            },
+            "title": "Receipts",
+            "type": "array"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "signal_id": {
+            "title": "Signal Id",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "strategy_name": {
+            "title": "Strategy Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "signal_id",
+          "sequence",
+          "at",
+          "code",
+          "name",
+          "strategy_id",
+          "strategy_name",
+          "action",
+          "action_label",
+          "reasons",
+          "delivery",
+          "delivery_label",
+          "delivery_note",
+          "receipts"
+        ],
+        "title": "MonitorSignal",
+        "type": "object"
+      },
+      "MonitorSignalsData": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MonitorSignal"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "market_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Market Note"
+          },
+          "mode": {
+            "enum": [
+              "live",
+              "shadow",
+              "unknown"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "mode_label": {
+            "title": "Mode Label",
+            "type": "string"
+          },
+          "mode_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode Note"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "receipt_label": {
+            "title": "Receipt Label",
+            "type": "string"
+          },
+          "receipt_state": {
+            "enum": [
+              "not_published",
+              "no_receipts",
+              "has_receipts",
+              "truncated"
+            ],
+            "title": "Receipt State",
+            "type": "string"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          },
+          "source_state": {
+            "enum": [
+              "unavailable",
+              "not_published",
+              "empty",
+              "ready"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_label",
+          "receipt_state",
+          "receipt_label",
+          "total",
+          "page_size",
+          "items",
+          "next_cursor",
+          "mode",
+          "mode_label",
+          "mode_note",
+          "market_note"
+        ],
+        "title": "MonitorSignalsData",
         "type": "object"
       },
       "OverviewData": {
@@ -3783,6 +4072,68 @@
         "summary": "数据代、数据集水位与市场阶段",
         "tags": [
           "meta"
+        ]
+      }
+    },
+    "/api/v1/monitor/signals": {
+      "get": {
+        "operationId": "get_signals_api_v1_monitor_signals_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MonitorSignalsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "最近信号与通知回执",
+        "tags": [
+          "monitor"
         ]
       }
     },

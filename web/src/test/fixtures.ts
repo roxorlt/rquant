@@ -1,4 +1,4 @@
-import type { MetaEnvelope } from "@/api/client";
+import type { MetaEnvelope, Schemas } from "@/api/client";
 import type { HealthEnvelope, OverviewEnvelope } from "@/api/endpoints";
 
 /** A synthetic /api/v1/meta envelope (shape from the generated schema). */
@@ -58,6 +58,73 @@ const SERVING = {
   message: null,
   detail: "serving generation verified",
 } as const;
+
+export function monitorEnvelope(
+  overrides: Partial<Schemas["MonitorSignalsData"]> = {},
+): Schemas["Envelope_MonitorSignalsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: {
+      source_state: "ready",
+      source_label: "最近信号",
+      receipt_state: "has_receipts",
+      receipt_label: "通知回执已更新",
+      total: 2,
+      page_size: 20,
+      mode: "shadow",
+      mode_label: "仅记录",
+      mode_note: "正式推送开通前只记录不发送",
+      market_note: "今天休市，显示历史信号",
+      next_cursor: "fixture-next",
+      items: [
+        {
+          signal_id: "signal-internal-2",
+          sequence: 2,
+          at: "2026-09-24T05:05:14Z",
+          code: "002238.SZ",
+          name: "天威视讯",
+          strategy_id: "auction_gap",
+          strategy_name: "竞价跳空",
+          action: "b_intent",
+          action_label: "买入意向",
+          reasons: ["竞价跳空确认"],
+          delivery: "unconfirmed",
+          delivery_label: "送达未确认",
+          delivery_note: "回执没有保存当时的推送方式，无法确认是否到达手机",
+          receipts: [
+            {
+              outbox_id: "outbox-internal",
+              recipient_id: "admin",
+              channel: "pushdeer",
+              channel_label: "PushDeer",
+              status: "succeeded",
+              status_label: "送达未确认",
+              updated_at: "2026-09-24T05:05:20Z",
+              attempt_count: 1,
+            },
+          ],
+        },
+        {
+          signal_id: "signal-internal-1",
+          sequence: 1,
+          at: "2026-09-23T01:47:00Z",
+          code: "600001.SH",
+          name: "样本01",
+          strategy_id: "n_shape",
+          strategy_name: "N 字",
+          action: "watch",
+          action_label: "观察",
+          reasons: [],
+          delivery: "none",
+          delivery_label: "暂无回执",
+          delivery_note: null,
+          receipts: [],
+        },
+      ],
+      ...overrides,
+    },
+  };
+}
 
 /** A synthetic /api/v1/overview envelope shaped like the 2026-09-24 replay. */
 export function overviewEnvelope(

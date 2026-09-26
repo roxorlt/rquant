@@ -8,7 +8,6 @@ source is not published is left out rather than shown as zero.
 
 from __future__ import annotations
 
-import json
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from datetime import date, datetime
@@ -32,7 +31,6 @@ from rquant.web.models.overview import (
     CandidateItem,
     CandidatesSummary,
     DeliveriesSummary,
-    DeliveryState,
     FreshnessSummary,
     HoldingItem,
     OverviewData,
@@ -52,6 +50,12 @@ from rquant.web.routes.health import (
 )
 from rquant.web.security import current_user
 from rquant.web.serving import serving_meta
+from rquant.web.signal_display import (
+    DELIVERY_STATE_LABELS,
+    SENDING,
+    delivery_state,
+    signal_reasons,
+)
 from rquant.web.status import (
     PAPER_VALUATION_NOTE,
     PAPER_VALUATION_REASON,
@@ -74,13 +78,6 @@ _STAGE_LABELS: dict[StageState, str] = {
     "paused": "午休暂停",
     "late": "未生效",
 }
-#: Signal reason codes worth showing, in plain words; the rest are internal.
-_REASON_LABELS = {
-    "auction_gap_observer": "竞价跳空观察",
-    "auction_gap_confirmed": "竞价跳空确认",
-    "vwap_supported": "均价线支撑",
-}
-_SENDING = {"pending", "leased", "retry"}
 
 
 def _float(value: Decimal | float | int) -> float:
@@ -94,37 +91,6 @@ def _on(day: date | None, at: datetime) -> bool:
 # ------------------------------------------------------------------ signals & deliveries
 
 
-_FINISHED: dict[str, DeliveryState] = {
-    "live": "delivered",
-    "shadow": "recorded",
-    "unknown": "unconfirmed",
-}
-
-
-def _delivery_state(rows: Sequence[DeliveryRow], mode: DeliveryMode) -> DeliveryState:
-    statuses = {row.status for row in rows}
-    if not statuses:
-        return "none"
-    if "dead_letter" in statuses:
-        return "failed"
-    if statuses & _SENDING:
-        return "sending"
-    if "succeeded" in statuses:
-        return _FINISHED[mode.mode]
-    return "expired"
-
-
-_DELIVERY_STATE_LABELS: dict[DeliveryState, str] = {
-    "delivered": "已送达",
-    "recorded": "仅记录",
-    "unconfirmed": "未确认",
-    "sending": "发送中",
-    "failed": "失败",
-    "expired": "已过期",
-    "none": "未推送",
-}
-
-
 def _delivery_mode(context: GenerationContext) -> DeliveryMode:
     return delivery_mode(
         [
@@ -133,18 +99,6 @@ def _delivery_mode(context: GenerationContext) -> DeliveryMode:
             if split_service_id(row.service_id)[0] == "notifier"
         ]
     )
-
-
-def _reasons(signal: SignalRow) -> list[str]:
-    try:
-        codes = json.loads(signal.reason_codes_json)
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(codes, list):
-        return []
-    return [
-        _REASON_LABELS[code] for code in codes if isinstance(code, str) and code in _REASON_LABELS
-    ]
 
 
 def _signals(
@@ -160,7 +114,7 @@ def _signals(
     actions = Counter(row.action for row in signals)
     items = []
     for row in ordered[:_MAX_SIGNAL_ITEMS]:
-        state = _delivery_state(by_signal.get(row.signal_id, ()), mode)
+        state = delivery_state(by_signal.get(row.signal_id, ()), mode)
         items.append(
             SignalItem(
                 signal_id=row.signal_id,
@@ -173,8 +127,8 @@ def _signals(
                 action=row.action,
                 action_label=ACTION_LABELS.get(row.action, "其他"),
                 delivery=state,
-                delivery_label=_DELIVERY_STATE_LABELS[state],
-                reasons=_reasons(row),
+                delivery_label=DELIVERY_STATE_LABELS[state],
+                reasons=signal_reasons(row),
             )
         )
     return SignalsSummary(
@@ -192,7 +146,7 @@ def _deliveries(deliveries: Sequence[DeliveryRow], mode: DeliveryMode) -> Delive
     return DeliveriesSummary(
         total=len(deliveries),
         delivered=statuses["succeeded"],
-        sending=sum(statuses[name] for name in _SENDING),
+        sending=sum(statuses[name] for name in SENDING),
         failed=statuses["dead_letter"],
         expired=statuses["expired"],
         mode=mode.mode,  # type: ignore[arg-type]

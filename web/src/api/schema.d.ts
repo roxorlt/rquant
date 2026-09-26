@@ -72,6 +72,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitor/signals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 最近信号与通知回执 */
+        get: operations["get_signals_api_v1_monitor_signals_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overview": {
         parameters: {
             query?: never;
@@ -576,6 +593,11 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[MonitorSignalsData] */
+        Envelope_MonitorSignalsData_: {
+            data: components["schemas"]["MonitorSignalsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
@@ -821,6 +843,101 @@ export interface components {
             t: string;
             /** Volume */
             volume: number | null;
+        };
+        /** MonitorReceipt */
+        MonitorReceipt: {
+            /** Attempt Count */
+            attempt_count: number;
+            /** Channel */
+            channel: string;
+            /** Channel Label */
+            channel_label: string;
+            /** Outbox Id */
+            outbox_id: string;
+            /** Recipient Id */
+            recipient_id: string;
+            /** Status */
+            status: string;
+            /** Status Label */
+            status_label: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** MonitorSignal */
+        MonitorSignal: {
+            /** Action */
+            action: string;
+            /** Action Label */
+            action_label: string;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /**
+             * Delivery
+             * @enum {string}
+             */
+            delivery: "delivered" | "recorded" | "unconfirmed" | "sending" | "failed" | "expired" | "none";
+            /** Delivery Label */
+            delivery_label: string;
+            /** Delivery Note */
+            delivery_note: string | null;
+            /** Name */
+            name: string | null;
+            /** Reasons */
+            reasons: string[];
+            /** Receipts */
+            receipts: components["schemas"]["MonitorReceipt"][];
+            /** Sequence */
+            sequence: number;
+            /** Signal Id */
+            signal_id: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Strategy Name */
+            strategy_name: string;
+        };
+        /** MonitorSignalsData */
+        MonitorSignalsData: {
+            /** Items */
+            items: components["schemas"]["MonitorSignal"][];
+            /** Market Note */
+            market_note: string | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "live" | "shadow" | "unknown";
+            /** Mode Label */
+            mode_label: string;
+            /** Mode Note */
+            mode_note: string | null;
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Page Size */
+            page_size: number;
+            /** Receipt Label */
+            receipt_label: string;
+            /**
+             * Receipt State
+             * @enum {string}
+             */
+            receipt_state: "not_published" | "no_receipts" | "has_receipts" | "truncated";
+            /** Source Label */
+            source_label: string;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "unavailable" | "not_published" | "empty" | "ready";
+            /** Total */
+            total: number | null;
         };
         /** OverviewData */
         OverviewData: {
@@ -1491,6 +1608,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MetaData_"];
+                };
+            };
+        };
+    };
+    get_signals_api_v1_monitor_signals_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MonitorSignalsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

@@ -12,6 +12,9 @@ export type SignalItem = Schemas["SignalItem"];
 export type CandidateItem = Schemas["CandidateItem"];
 export type HoldingItem = Schemas["HoldingItem"];
 export type StatusInfo = Schemas["StatusInfo"];
+export type MonitorSignalsEnvelope = Schemas["Envelope_MonitorSignalsData_"];
+export type MonitorSignalsData = Schemas["MonitorSignalsData"];
+export type MonitorSignal = Schemas["MonitorSignal"];
 export type StockSearchData = Schemas["StockSearchData"];
 export type StockSearchRow = Schemas["StockSearchRow"];
 export type StockSummaryData = Schemas["StockSummaryData"];
@@ -43,6 +46,18 @@ export function useOverview(): ServingQueryResult<OverviewData> {
 
 export function useHealth(): ServingQueryResult<HealthData> {
   return useServingQuery(["health"], fetchHealth);
+}
+
+export function useMonitorSignals(
+  cursor: string | null,
+  refreshKey: number,
+): ServingQueryResult<MonitorSignalsData> {
+  return useServingQuery(["monitor", "signals", cursor, refreshKey], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/monitor/signals", {
+      params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
+    });
+    return unwrap(data, response);
+  });
 }
 
 export function useCatalog(): ServingQueryResult<CatalogList> {

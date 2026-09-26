@@ -127,8 +127,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/monitor",
     title: "盯盘与告警",
     group: "跟踪与告警",
-    ready: false,
-    summary: "盯盘名单、告警时间线和推送通道。",
+    ready: true,
+    summary: "查看最近信号和通知回执。",
     phoneTab: "盯盘",
   },
   {
