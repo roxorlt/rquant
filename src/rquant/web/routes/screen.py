@@ -15,6 +15,8 @@ from pydantic import ValidationError
 from rquant.llm.compile import compile_screen_plan
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
 from rquant.screen.ranking import RankingCondition
+from rquant.screen.tdx import parse_formula
+from rquant.screen.tdx.tokens import MAX_SOURCE_BYTES
 from rquant.serving_read_models import (
     PAGE_PROJECTION_CONTRACTS,
     NlScreenPageError,
@@ -30,6 +32,8 @@ from rquant.web.models.screen import (
     ScreenRunData,
     ScreenRunRequest,
     ScreenStep,
+    TdxParseData,
+    TdxParseRequest,
 )
 from rquant.web.screen_catalog import (
     RANKING_METRIC_LABELS,
@@ -42,6 +46,23 @@ from rquant.web.serving import serving_meta
 
 router = APIRouter(prefix="/screen")
 _MAX_REQUEST_BYTES = 8_192
+
+
+@router.post("/tdx/parse", response_model=TdxParseData, summary="检查通达信公式")
+def parse_tdx_formula(
+    body: TdxParseRequest,
+    _viewer: Annotated[str | None, Depends(current_user)],
+    _same_site: Annotated[None, Depends(require_csrf)],
+) -> TdxParseData:
+    if len(body.source) > MAX_SOURCE_BYTES:
+        raise HTTPException(status_code=413, detail="公式太长，请删减后重试。")
+    try:
+        source_bytes = body.source.encode("utf-8")
+    except UnicodeEncodeError:
+        return TdxParseData.model_validate(parse_formula(body.source).model_dump())
+    if len(source_bytes) > MAX_SOURCE_BYTES:
+        raise HTTPException(status_code=413, detail="公式太长，请删减后重试。")
+    return TdxParseData.model_validate(parse_formula(body.source).model_dump())
 
 
 @contextmanager

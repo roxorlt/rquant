@@ -56,6 +56,89 @@ def _run(
     )
 
 
+def _parse(client: TestClient, source: str):
+    return client.post(
+        "/api/v1/screen/tdx/parse",
+        json={"source": source},
+        headers={"X-Rquant-Csrf": "1"},
+    )
+
+
+def test_tdx_parse_is_only_a_syntax_check_and_needs_no_serving_data(tmp_path: Path) -> None:
+    with _client(tmp_path / "absent") as client:
+        response = _parse(client, "XG:CROSS(CLOSE,MA(CLOSE,5));")
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["status"] == "parsed"
+    assert data["capability"] == "parse_only"
+    assert data["ast"]["output_name"] == "XG"
+    assert data["translation"]["fields"] == ["CLOSE"]
+    assert "saved" not in data and "runnable" not in data
+
+
+def test_tdx_parse_reports_unsupported_and_positioned_errors(tmp_path: Path) -> None:
+    with _client(tmp_path / "absent") as client:
+        unsupported = _parse(client, "MACD(CLOSE,12,26)>DYNAINFO(7)")
+        invalid = _parse(client, "REF(CLOSE,-1)>0")
+        oversized = _parse(client, "中" * 1400)
+        empty = _parse(client, "   ")
+        invalid_unicode = client.post(
+            "/api/v1/screen/tdx/parse",
+            content=b'{"source":"CLOSE>\\ud800"}',
+            headers={"Content-Type": "application/json", "X-Rquant-Csrf": "1"},
+        )
+        without_csrf = client.post(
+            "/api/v1/screen/tdx/parse", json={"source": "CLOSE>0"}
+        )
+
+    assert unsupported.status_code == 200
+    assert [item["name"] for item in unsupported.json()["unsupported"]] == [
+        "MACD", "DYNAINFO"
+    ]
+    assert invalid.status_code == 200
+    assert invalid.json()["issues"][0]["position"] == {"line": 1, "column": 11, "offset": 10}
+    assert oversized.status_code == 413
+    assert "太长" in oversized.json()["detail"]
+    assert empty.status_code == 200
+    assert "粘贴" in empty.json()["issues"][0]["message"]
+    assert invalid_unicode.status_code == 200
+    assert invalid_unicode.json()["issues"][0]["code"] == "syntax"
+    assert without_csrf.status_code == 403
+
+
+def test_tdx_parse_rejects_bad_json_fields_in_short_chinese_without_echo(tmp_path: Path) -> None:
+    with _client(tmp_path / "absent") as client:
+        wrong_type = client.post(
+            "/api/v1/screen/tdx/parse",
+            json={"source": 123},
+            headers={"X-Rquant-Csrf": "1"},
+        )
+        extra_field = client.post(
+            "/api/v1/screen/tdx/parse",
+            json={"source": "CLOSE>0", "comment": "SECRET_MARKER"},
+            headers={"X-Rquant-Csrf": "1"},
+        )
+
+    for response in (wrong_type, extra_field):
+        assert response.status_code == 422
+        assert response.json() == {"detail": "公式输入有误，请只填写文本公式。"}
+        assert "input" not in response.text
+        assert "SECRET_MARKER" not in response.text
+
+
+@pytest.mark.parametrize("source", [".7.>0", ".５>0"])
+def test_tdx_parse_malformed_number_stays_a_positioned_client_error(
+    tmp_path: Path, source: str,
+) -> None:
+    with _client(tmp_path / "absent") as client:
+        response = _parse(client, source)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert response.json()["issues"][0]["code"] == "syntax"
+
+
 def test_catalog_exposes_all_registered_rules_with_plain_chinese_labels(
     serving_root: Path,
 ) -> None:

@@ -18,6 +18,8 @@ from typing import Any
 
 import anyio.to_thread
 from fastapi import FastAPI, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
@@ -96,6 +98,17 @@ def create_app(
     @app.exception_handler(Exception)
     async def unexpected_error(_request: Request, _error: Exception) -> JSONResponse:
         return JSONResponse(status_code=500, content={"detail": "网页 API 内部错误"})
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        request: Request, error: RequestValidationError,
+    ) -> Response:
+        if request.url.path == "/api/v1/screen/tdx/parse":
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "公式输入有误，请只填写文本公式。"},
+            )
+        return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
