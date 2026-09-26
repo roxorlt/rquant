@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { ApiError } from "@/api/client";
-import { type MonitorSignal, useMonitorSignals } from "@/api/endpoints";
+import { type MonitorTimelineItem, useMonitorTimeline } from "@/api/endpoints";
 import { StockDrawer } from "@/app/StockDrawer";
-import { formatCount } from "@/format/number";
+import { formatCount, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import {
   Button,
+  ChangeText,
   EmptyState,
   type Kpi,
   KpiStrip,
@@ -30,7 +31,13 @@ const DELIVERY_TONE = {
   none: "idle",
 } as const;
 
-function SignalEntry({ row, onStock }: { row: MonitorSignal; onStock: (code: string) => void }) {
+function TimelineEntry({
+  row,
+  onStock,
+}: {
+  row: MonitorTimelineItem;
+  onStock: (code: string) => void;
+}) {
   return (
     <li className="monitor-event">
       <span className="monitor-event-time">
@@ -46,32 +53,56 @@ function SignalEntry({ row, onStock }: { row: MonitorSignal; onStock: (code: str
           >
             <StockCell code={row.code} name={row.name} />
           </button>
-          <span className="monitor-strategy">{row.strategy_name}</span>
-          <Pill kind={row.action === "b_intent" ? "acc" : "idle"}>{row.action_label}</Pill>
+          <span className="monitor-strategy">
+            {row.kind === "signal" ? row.strategy_name : row.event_label}
+          </span>
+          {row.kind === "signal" ? (
+            <Pill kind={row.action === "b_intent" ? "acc" : "idle"}>{row.action_label}</Pill>
+          ) : (
+            <Pill kind={row.kind === "monitor" ? "acc" : "idle"}>{row.status_label}</Pill>
+          )}
         </div>
-        {row.reasons.length ? <p className="monitor-reasons">{row.reasons.join(" · ")}</p> : null}
-        <div className="monitor-event-foot">
-          <StatusBadge
-            state={DELIVERY_TONE[row.delivery]}
-            label={row.delivery_label}
-            reason={row.delivery_note}
-          />
-          {row.receipts.length ? (
-            <ul className="monitor-receipts" aria-label="通知回执">
-              {row.receipts.map((receipt) => (
-                <li key={receipt.outbox_id}>
-                  <Tip
-                    content={`回执 ${receipt.outbox_id} · ${formatShanghaiDateTime(receipt.updated_at)}`}
-                  >
-                    <span>
-                      {receipt.channel_label} · {receipt.status_label}
-                    </span>
-                  </Tip>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
+        {row.kind === "signal" ? (
+          <>
+            {row.reasons.length ? (
+              <p className="monitor-reasons">{row.reasons.join(" · ")}</p>
+            ) : null}
+            {row.receipts.length ? (
+              <div className="monitor-event-foot">
+                <StatusBadge
+                  state={DELIVERY_TONE[row.delivery]}
+                  label={row.delivery_label}
+                  reason={row.delivery_note}
+                />
+                <ul className="monitor-receipts" aria-label="通知回执">
+                  {row.receipts.map((receipt) => (
+                    <li key={receipt.outbox_id}>
+                      <Tip
+                        content={`回执 ${receipt.outbox_id} · ${formatShanghaiDateTime(receipt.updated_at)}`}
+                      >
+                        <span>
+                          {receipt.channel_label} · {receipt.status_label}
+                        </span>
+                      </Tip>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </>
+        ) : row.kind === "monitor" ? (
+          <p className="monitor-reasons">
+            触发价 <span className="num">{formatPrice(row.price)}</span>
+            <span className="monitor-detail-separator">·</span>参考价{" "}
+            <span className="num">{formatPrice(row.level_price)}</span>
+          </p>
+        ) : (
+          <p className="monitor-reasons">
+            价格 <span className="num">{formatPrice(row.price)}</span>
+            <span className="monitor-detail-separator">·</span>涨幅{" "}
+            <ChangeText value={row.pct_chg} />
+          </p>
+        )}
       </div>
     </li>
   );
@@ -82,7 +113,7 @@ export default function MonitorPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const pageIndex = cursors.length - 1;
-  const result = useMonitorSignals(cursors[pageIndex] ?? null, refreshKey);
+  const result = useMonitorTimeline(cursors[pageIndex] ?? null, refreshKey);
   const data = result.data;
   const changed = result.error instanceof ApiError && result.error.status === 409;
 
@@ -94,8 +125,8 @@ export default function MonitorPage() {
   const metrics: Kpi[] = data
     ? [
         {
-          key: "signals",
-          label: "已发布信号",
+          key: "events",
+          label: "时间线记录",
           value: formatCount(data.total),
           unit: data.total === null ? undefined : "条",
           sub: data.source_state === "ready" && data.next_cursor ? "可向前翻看历史" : undefined,
@@ -120,7 +151,7 @@ export default function MonitorPage() {
       <PageHeader
         eyebrow="跟踪与告警"
         title="盯盘与告警"
-        note={data?.market_note ?? "查看最近发布的信号与通知回执"}
+        note={data?.market_note ?? "查看盯盘触发、爆量和通知回执"}
         actions={
           <Button size="sm" variant="ghost" onClick={refresh} disabled={result.isFetching}>
             刷新
@@ -128,11 +159,11 @@ export default function MonitorPage() {
         }
       />
       {result.isLoading ? (
-        <PageSkeleton label="最近信号加载中" />
+        <PageSkeleton label="告警时间线加载中" />
       ) : result.error ? (
-        <Panel title="最近信号">
+        <Panel title="告警时间线">
           <EmptyState
-            title={changed ? "数据已更新，请从第一页重新查看。" : "最近信号暂时无法加载"}
+            title={changed ? "数据已更新，请从第一页重新查看。" : "告警时间线暂时无法加载"}
             hint={
               <Button size="sm" onClick={changed ? refresh : result.refetch}>
                 {changed ? "返回最新" : "重试"}
@@ -143,29 +174,35 @@ export default function MonitorPage() {
       ) : data ? (
         <div className="monitor-content">
           <KpiStrip items={metrics} label="信号与通知概况" compact />
-          <Panel title="最近信号" sub={`按时间倒序 · 每页最多 ${data.page_size} 条`}>
+          <Panel title="告警时间线" sub={`最近 30 天 · 按时间倒序 · 每页最多 ${data.page_size} 条`}>
+            {data.source_note ? (
+              <p className="monitor-notice" role="status">
+                {data.source_note}
+              </p>
+            ) : null}
             {data.source_state !== "ready" ? (
               <EmptyState
                 title={data.source_label}
                 hint={
-                  data.source_state === "empty"
-                    ? "盘中出现新信号后会自动显示，也可稍后刷新。"
+                  data.source_state === "empty" && !data.source_note
+                    ? "盘中出现新记录后会显示，也可稍后刷新。"
                     : "请稍后刷新，或查看系统健康。"
                 }
               />
             ) : (
               <>
-                {data.receipt_state === "no_receipts" || data.receipt_state === "truncated" ? (
+                {data.items.some((item) => item.kind === "signal") &&
+                (data.receipt_state === "no_receipts" || data.receipt_state === "truncated") ? (
                   <p className="monitor-notice" role="status">
                     {data.receipt_label}
                   </p>
                 ) : null}
-                <ul className="monitor-timeline" aria-label="最近信号">
+                <ul className="monitor-timeline" aria-label="告警时间线">
                   {data.items.map((row) => (
-                    <SignalEntry key={row.signal_id} row={row} onStock={setSelectedStock} />
+                    <TimelineEntry key={row.event_key} row={row} onStock={setSelectedStock} />
                   ))}
                 </ul>
-                <nav className="monitor-pages" aria-label="信号翻页">
+                <nav className="monitor-pages" aria-label="时间线翻页">
                   <span className="hint">第 {pageIndex + 1} 页</span>
                   <Button
                     size="sm"

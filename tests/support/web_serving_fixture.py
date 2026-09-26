@@ -731,6 +731,41 @@ def _surge_events() -> list[dict[str, object]]:
     ]
 
 
+def _sample_surge_event() -> dict[str, object]:
+    return {
+        "trade_date": FIXTURE_TRADE_DATE.isoformat(),
+        "confirmed_at": "09:52",
+        "ts_code": "600004.SH",
+        "name": "样本04",
+        "theme": "工业",
+        "price": 11.25,
+        "pct_chg": 3.15,
+        "cum_amount": 1.2e8,
+        "rel_cum": 2.8,
+        "room_to_limit_pct": 6.85,
+        "status": "confirmed",
+    }
+
+
+def _timeline_surge_events(scenario: str) -> list[dict[str, object]]:
+    return _surge_events() if scenario == "panorama" else [_sample_surge_event()]
+
+
+def _monitor_events() -> list[dict[str, object]]:
+    return [
+        {
+            "trade_date": FIXTURE_TRADE_DATE.isoformat(),
+            "trigger_time": _utc_iso(_cst(FIXTURE_TRADE_DATE, 10, 5)),
+            "ts_code": "600005.SH",
+            "level": "attack_break_high",
+            "trigger_price": 12.34,
+            "level_price": 12.0,
+            "trigger_type": "attack",
+            "pool": "pool2",
+        }
+    ]
+
+
 def _pulse_history() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for row in _fake_pulse_history().itertuples(index=False):
@@ -812,6 +847,8 @@ def _projections(
         reference("trade_calendar", _trade_calendar()),
         reference("stock_basic", _stock_basic()),
         reference("nl_screen_universe", _nl_screen_universe()),
+        signal_owned("monitor_event", _monitor_events()),
+        signal_owned("surge_event", _timeline_surge_events(scenario)),
     ]
     if scenario != "degraded":
         projections.append(
@@ -847,7 +884,6 @@ def _projections(
                 reference("market_liquidity", _market_liquidity()),
                 reference("daily_bar", _daily_bars()),
                 signal_owned("intraday_kline", _intraday_bars()),
-                signal_owned("surge_event", _surge_events()),
                 signal_owned("pulse_history", _pulse_history()),
                 signal_owned("pulse_alert", _pulse_alerts()),
                 signal_owned("surge_runtime_config", _surge_runtime_config(as_of)),
@@ -941,6 +977,7 @@ def build_web_fixture(
     scenario: str,
     *,
     sequence: int = 0,
+    event_projections: tuple[ServingProjectionPayload, ...] | None = None,
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -951,6 +988,19 @@ def build_web_fixture(
     built_at = fixture_built_at(sequence)
     generations = _generation_ids(scenario, sequence)
     signals, routes, deliveries = _signal_bundle(built_at)
+    projections = _projections(scenario, built_at=built_at, generations=generations)
+    if event_projections is not None:
+        if {item.table_name for item in event_projections} != {"monitor_event", "surge_event"}:
+            raise ValueError("event replay must supply both event projections")
+        replacements = {
+            item.table_name: ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="signals",
+                owner_generation_id=generations["signals"],
+            )
+            for item in event_projections
+        }
+        projections = tuple(replacements.get(item.table_name, item) for item in projections)
     source = ServingReadModelInput(
         observed_at=built_at,
         signals=signals,
@@ -958,7 +1008,7 @@ def build_web_fixture(
         deliveries=deliveries,
         paper_accounts=(_paper_account(built_at - timedelta(seconds=30)),),
         runtime_services=_runtime_services(built_at - timedelta(seconds=5)),
-        projections=_projections(scenario, built_at=built_at, generations=generations),
+        projections=projections,
     )
     publisher = ServingPublisher(
         root,

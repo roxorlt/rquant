@@ -72,6 +72,10 @@
   margin-right: 10px;
 }
 
+.monitor-detail-separator {
+  margin: 0 7px;
+}
+
 .monitor-notice {
   padding: 8px 10px;
   border-radius: 6px;

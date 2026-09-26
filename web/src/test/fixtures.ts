@@ -60,24 +60,27 @@ const SERVING = {
 } as const;
 
 export function monitorEnvelope(
-  overrides: Partial<Schemas["MonitorSignalsData"]> = {},
-): Schemas["Envelope_MonitorSignalsData_"] {
+  overrides: Partial<Schemas["MonitorTimelineData"]> = {},
+): Schemas["Envelope_MonitorTimelineData_"] {
   return {
     serving: { ...SERVING },
     data: {
       source_state: "ready",
-      source_label: "最近信号",
+      source_label: "告警时间线",
+      source_note: null,
       receipt_state: "has_receipts",
       receipt_label: "通知回执已更新",
-      total: 2,
+      total: 4,
       page_size: 20,
       mode: "shadow",
       mode_label: "仅记录",
       mode_note: "正式推送开通前只记录不发送",
-      market_note: "今天休市，显示历史信号",
+      market_note: "今天休市，显示历史告警",
       next_cursor: "fixture-next",
       items: [
         {
+          kind: "signal",
+          event_key: "signal:signal-internal-2",
           signal_id: "signal-internal-2",
           sequence: 2,
           at: "2026-09-24T05:05:14Z",
@@ -105,6 +108,30 @@ export function monitorEnvelope(
           ],
         },
         {
+          kind: "monitor",
+          event_key: "monitor:fixture-1",
+          at: "2026-09-24T02:05:00Z",
+          code: "600005.SH",
+          name: "样本05",
+          event_label: "上攻突破",
+          price: 12.34,
+          level_price: 12,
+          status_label: "已触发",
+        },
+        {
+          kind: "surge",
+          event_key: "surge:fixture-1",
+          at: "2026-09-24T01:52:00Z",
+          code: "600004.SH",
+          name: "样本04",
+          event_label: "爆量",
+          price: 11.25,
+          pct_chg: 3.15,
+          status_label: "已确认",
+        },
+        {
+          kind: "signal",
+          event_key: "signal:signal-internal-1",
           signal_id: "signal-internal-1",
           sequence: 1,
           at: "2026-09-23T01:47:00Z",

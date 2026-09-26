@@ -1111,6 +1111,10 @@ def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
             INSERT INTO minute_bar VALUES
               ('600000.SH', '2026-07-31 09:30:00', '1min', 10, 10, 10, 10,
                100, 1000, 'tushare', '2026-07-31 09:31:00');
+            CREATE TABLE monitor_event (
+                trade_date DATE, trigger_time TIMESTAMP, ts_code VARCHAR, level VARCHAR,
+                trigger_price DOUBLE, level_price DOUBLE, trigger_type VARCHAR, pool VARCHAR
+            );
             """
         )
     finally:
@@ -1188,6 +1192,10 @@ def _page_projection_replica(tmp_path: Path, *, synced_at: datetime) -> Path:
             INSERT INTO minute_bar VALUES
               ('600000.SH', '2026-07-31 09:30:00', '1min', 10, 10, 10, 10,
                100, 1000, 'tushare', '2026-07-31 09:31:00');
+            CREATE TABLE monitor_event (
+                trade_date DATE, trigger_time TIMESTAMP, ts_code VARCHAR, level VARCHAR,
+                trigger_price DOUBLE, level_price DOUBLE, trigger_type VARCHAR, pool VARCHAR
+            );
             """
         )
         connection.execute("CHECKPOINT")
@@ -1250,9 +1258,7 @@ def test_the_notifier_begins_each_iteration_s_replica_accounting(
         begun.append(1)
         original(self)
 
-    monkeypatch.setattr(
-        DuckDBSignalPageProjectionSource, "begin_replica_iteration", counted
-    )
+    monkeypatch.setattr(DuckDBSignalPageProjectionSource, "begin_replica_iteration", counted)
     step = notifier_builder(
         provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
         clock=lambda: NOW,
@@ -1415,8 +1421,7 @@ def two_notifier_generations(tmp_path: Path, sealed_bundle_installs: None) -> Pa
             root,
             producer_commit=commit,
             manifests=tuple(
-                manifest.model_copy(update={"producer_commit": commit})
-                for manifest in manifests
+                manifest.model_copy(update={"producer_commit": commit}) for manifest in manifests
             ),
             capability_env=capabilities,
         )
@@ -2202,9 +2207,7 @@ def test_the_notifier_never_writes_into_the_page_control_root(tmp_path: Path) ->
             serving_authority_root=str(notifications / "serving-authority"),
             page_projection_database_path=str(replica),
             page_projection_canvas_catalog_root=str(catalog),
-            page_projection_canvas_receipt_root=str(
-                catalog.parent / "canvas-publication-receipts"
-            ),
+            page_projection_canvas_receipt_root=str(catalog.parent / "canvas-publication-receipts"),
             page_projection_page_control_outbox_path=str(outbox.path),
             page_projection_canvas_active_key_id=authority.keyring.active_key_id,
             page_projection_canvas_active_public_key_pem=public_key,
@@ -2245,9 +2248,9 @@ class _GrowingSource:
             ),
             after_sequence=after_sequence,
             limit=limit,
-            records=tuple(
-                record for record in self.records if record.sequence > after_sequence
-            )[:limit],
+            records=tuple(record for record in self.records if record.sequence > after_sequence)[
+                :limit
+            ],
         )
 
 
@@ -2382,9 +2385,9 @@ class _RacingSource:
             ),
             after_sequence=after_sequence,
             limit=limit,
-            records=tuple(
-                record for record in self.records if record.sequence > after_sequence
-            )[:limit],
+            records=tuple(record for record in self.records if record.sequence > after_sequence)[
+                :limit
+            ],
         )
 
 
@@ -2417,9 +2420,12 @@ def test_a_source_that_grows_while_being_routed_still_reports_the_move(
     assert first.watermark_advanced is True
     assert raced.watermark_advanced is True
     assert raced.processed_count == 1
-    assert SignalBusStore(
-        tmp_path / "signal-bus.sqlite3"
-    ).route_cursor("n-shape-v1").observed_high_watermark == 3
+    assert (
+        SignalBusStore(tmp_path / "signal-bus.sqlite3")
+        .route_cursor("n-shape-v1")
+        .observed_high_watermark
+        == 3
+    )
 
 
 def test_a_second_source_that_grows_alone_still_reports_the_move(tmp_path: Path) -> None:

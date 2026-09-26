@@ -47,8 +47,6 @@ _REQUIRED_NOTIFICATION_PROJECTION_TABLES = frozenset(
     {
         "screen_result",
         "pool2_watch",
-        "monitor_event",
-        "surge_event",
         "market_snapshot",
         "market_overview",
         "intraday_kline",
@@ -61,7 +59,7 @@ _REQUIRED_NOTIFICATION_PROJECTION_TABLES = frozenset(
     }
 )
 _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
-    {"pulse_history", "pulse_alert", "surge_runtime_config"}
+    {"pulse_history", "pulse_alert", "surge_runtime_config", "monitor_event", "surge_event"}
 )
 _NOTIFICATION_PROJECTION_TABLES = (
     _REQUIRED_NOTIFICATION_PROJECTION_TABLES | _OPTIONAL_NOTIFICATION_PROJECTION_TABLES

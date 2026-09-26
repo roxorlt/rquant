@@ -938,10 +938,10 @@
         "title": "Envelope[MetaData]",
         "type": "object"
       },
-      "Envelope_MonitorSignalsData_": {
+      "Envelope_MonitorTimelineData_": {
         "properties": {
           "data": {
-            "$ref": "#/components/schemas/MonitorSignalsData"
+            "$ref": "#/components/schemas/MonitorTimelineData"
           },
           "serving": {
             "$ref": "#/components/schemas/ServingMeta"
@@ -951,7 +951,7 @@
           "data",
           "serving"
         ],
-        "title": "Envelope[MonitorSignalsData]",
+        "title": "Envelope[MonitorTimelineData]",
         "type": "object"
       },
       "Envelope_OverviewData_": {
@@ -1882,6 +1882,16 @@
             ],
             "title": "Delivery Note"
           },
+          "event_key": {
+            "title": "Event Key",
+            "type": "string"
+          },
+          "kind": {
+            "const": "signal",
+            "default": "signal",
+            "title": "Kind",
+            "type": "string"
+          },
           "name": {
             "anyOf": [
               {
@@ -1925,6 +1935,7 @@
           }
         },
         "required": [
+          "event_key",
           "signal_id",
           "sequence",
           "at",
@@ -1943,11 +1954,105 @@
         "title": "MonitorSignal",
         "type": "object"
       },
-      "MonitorSignalsData": {
+      "MonitorSurge": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "event_key": {
+            "title": "Event Key",
+            "type": "string"
+          },
+          "event_label": {
+            "title": "Event Label",
+            "type": "string"
+          },
+          "kind": {
+            "const": "surge",
+            "default": "surge",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_key",
+          "at",
+          "code",
+          "name",
+          "event_label",
+          "price",
+          "pct_chg",
+          "status_label"
+        ],
+        "title": "MonitorSurge",
+        "type": "object"
+      },
+      "MonitorTimelineData": {
         "properties": {
           "items": {
             "items": {
-              "$ref": "#/components/schemas/MonitorSignal"
+              "discriminator": {
+                "mapping": {
+                  "monitor": "#/components/schemas/MonitorTrigger",
+                  "signal": "#/components/schemas/MonitorSignal",
+                  "surge": "#/components/schemas/MonitorSurge"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/MonitorSignal"
+                },
+                {
+                  "$ref": "#/components/schemas/MonitorTrigger"
+                },
+                {
+                  "$ref": "#/components/schemas/MonitorSurge"
+                }
+              ]
             },
             "title": "Items",
             "type": "array"
@@ -2020,6 +2125,17 @@
             "title": "Source Label",
             "type": "string"
           },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
           "source_state": {
             "enum": [
               "unavailable",
@@ -2045,6 +2161,7 @@
         "required": [
           "source_state",
           "source_label",
+          "source_note",
           "receipt_state",
           "receipt_label",
           "total",
@@ -2056,7 +2173,83 @@
           "mode_note",
           "market_note"
         ],
-        "title": "MonitorSignalsData",
+        "title": "MonitorTimelineData",
+        "type": "object"
+      },
+      "MonitorTrigger": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "event_key": {
+            "title": "Event Key",
+            "type": "string"
+          },
+          "event_label": {
+            "title": "Event Label",
+            "type": "string"
+          },
+          "kind": {
+            "const": "monitor",
+            "default": "monitor",
+            "title": "Kind",
+            "type": "string"
+          },
+          "level_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level Price"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_key",
+          "at",
+          "code",
+          "name",
+          "event_label",
+          "price",
+          "level_price",
+          "status_label"
+        ],
+        "title": "MonitorTrigger",
         "type": "object"
       },
       "OverviewData": {
@@ -4075,9 +4268,9 @@
         ]
       }
     },
-    "/api/v1/monitor/signals": {
+    "/api/v1/monitor/timeline": {
       "get": {
-        "operationId": "get_signals_api_v1_monitor_signals_get",
+        "operationId": "get_timeline_api_v1_monitor_timeline_get",
         "parameters": [
           {
             "in": "query",
@@ -4114,7 +4307,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope_MonitorSignalsData_"
+                  "$ref": "#/components/schemas/Envelope_MonitorTimelineData_"
                 }
               }
             },
@@ -4131,7 +4324,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "最近信号与通知回执",
+        "summary": "告警时间线",
         "tags": [
           "monitor"
         ]

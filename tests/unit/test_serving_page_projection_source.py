@@ -243,8 +243,251 @@ def _signal_projection_database(path: Path) -> None:
                1000, 11000, 'future-source', '2026-08-03 17:00:01')
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE monitor_event (
+                trade_date DATE NOT NULL, ts_code VARCHAR NOT NULL, level VARCHAR NOT NULL,
+                trigger_price DOUBLE, level_price DOUBLE, trigger_time TIMESTAMP NOT NULL,
+                trigger_type VARCHAR, pool VARCHAR
+            )
+            """
+        )
     finally:
         connection.close()
+
+
+def test_real_monitor_and_surge_formats_reach_notification_authority(tmp_path: Path) -> None:
+    from rquant.surge_watch import SurgeConfirmed
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO monitor_event VALUES "
+            "('2026-08-03', '600001.SH', 'attack_break_high', 12.34, 12.00, "
+            "'2026-08-03 10:05:00', 'attack', 'pool2')"
+        )
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    source_path = live_root / "events-2026-08-03.jsonl"
+    source_path.write_text(
+        json.dumps(
+            SurgeConfirmed(
+                ts_code="600002.SH",
+                name="样本02",
+                confirmed_at="09:52",
+                price=11.25,
+                pct_chg=3.15,
+                status="confirmed",
+            ).model_dump(),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(source_path, (stamp, stamp))
+
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
+        store=store,
+    )
+    producer.publish(NOW)
+    published = {
+        item.table_name: item
+        for item in store.serving_snapshot(observed_at=NOW, history_limit=1).payload.projections
+    }
+    assert published["monitor_event"].rows[0]["trigger_time"] == "2026-08-03T02:05:00+00:00"
+    assert published["surge_event"].rows[0]["confirmed_at"] == "09:52"
+
+
+def test_monitor_source_keeps_only_thirty_local_days_and_rejects_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO monitor_event VALUES "
+            "('2026-07-04', '600001.SH', 'old', 1, 1, '2026-07-04 09:40:00', NULL, NULL), "
+            "('2026-07-05', '600001.SH', 'edge', 2, 2, '2026-07-05 09:41:00', NULL, NULL), "
+            "('2026-08-03', '600001.SH', 'future', 3, 3, '2026-08-03 16:01:00', NULL, NULL)"
+        )
+    source = DuckDBSignalPageProjectionSource(database)
+    rows = {item.table_name: item for item in source(NOW).projections}["monitor_event"].rows
+    assert [row["level"] for row in rows] == ["edge"]
+    monkeypatch.setattr(source_module, "_MAX_EVENT_ROWS", 0)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="row bound"):
+        DuckDBSignalPageProjectionSource(database)(NOW)
+
+
+def test_missing_monitor_table_does_not_replace_verified_authority(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database), store=store
+    )
+    first = producer.publish(NOW)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("DROP TABLE monitor_event")
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="missing"):
+        producer.publish(NOW + timedelta(seconds=1))
+    retained = store.serving_snapshot(observed_at=NOW + timedelta(seconds=1), history_limit=1)
+    assert retained.projection_generation_id == first.generation_id
+    assert "monitor_event" in {item.table_name for item in retained.payload.projections}
+
+
+@pytest.mark.parametrize(
+    ("record", "ending"),
+    (
+        ({"confirmed_at": "25:90"}, "\n"),
+        ({"ts_code": "broken"}, "\n"),
+        ({}, ""),
+    ),
+)
+def test_bad_surge_file_is_unpublished_without_reusing_old_rows(
+    tmp_path: Path, record: dict[str, object], ending: str
+) -> None:
+    from rquant.surge_watch import SurgeConfirmed
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    path = live_root / "events-2026-08-03.jsonl"
+    normal = SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52")
+    path.write_text(json.dumps(normal.model_dump(), ensure_ascii=False) + "\n", encoding="utf-8")
+    os.utime(path, (NOW.timestamp() - 2, NOW.timestamp() - 2))
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
+        store=store,
+    )
+    producer.publish(NOW)
+    assert "surge_event" in {
+        item.table_name
+        for item in store.serving_snapshot(observed_at=NOW, history_limit=1).payload.projections
+    }
+
+    path.write_text(
+        json.dumps({**normal.model_dump(), **record}, ensure_ascii=False) + ending,
+        encoding="utf-8",
+    )
+    os.utime(path, (NOW.timestamp() - 1, NOW.timestamp() - 1))
+    producer.publish(NOW + timedelta(seconds=1))
+    latest = {
+        item.table_name
+        for item in store.serving_snapshot(
+            observed_at=NOW + timedelta(seconds=1), history_limit=1
+        ).payload.projections
+    }
+    assert "monitor_event" in latest
+    assert "surge_event" not in latest
+
+
+def test_surge_source_rejects_symlink_and_byte_budget_but_accepts_absent_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    empty = source_module._read_surge_event_projection(root, observed=NOW)
+    assert empty is not None and empty.rows == ()
+    (root / "unrelated.txt").write_text("pulse", encoding="utf-8")
+    assert source_module._read_surge_event_projection(root, observed=NOW) == empty
+    assert source_module._read_surge_event_projection(tmp_path / "missing", observed=NOW) is None
+
+    target = tmp_path / "outside.jsonl"
+    target.write_text(
+        json.dumps(
+            SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52").model_dump()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    link = root / "events-2026-08-03.jsonl"
+    link.symlink_to(target)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="non-symlink"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+    link.unlink()
+    link.write_bytes(target.read_bytes())
+    os.utime(link, (NOW.timestamp() - 1, NOW.timestamp() - 1))
+    monkeypatch.setattr(source_module, "_MAX_SURGE_EVENT_BYTES", 32)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="size bound"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+
+
+def test_surge_source_rejects_file_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    name = "events-2026-08-03.jsonl"
+    first = root / name
+    replacement = root / "replacement.jsonl"
+    line = (
+        json.dumps(
+            SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52").model_dump()
+        )
+        + "\n"
+    )
+    first.write_text(line, encoding="utf-8")
+    replacement.write_text(line, encoding="utf-8")
+    stamp = NOW.timestamp() - 1
+    os.utime(first, (stamp, stamp))
+    os.utime(replacement, (stamp, stamp))
+    original_open = source_module.os.open
+
+    def rotate_after_open(path: str | os.PathLike[str], *args: object, **kwargs: object) -> int:
+        descriptor = original_open(path, *args, **kwargs)
+        if path == name:
+            os.replace(replacement, first)
+        return descriptor
+
+    monkeypatch.setattr(source_module.os, "open", rotate_after_open)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="rotated while read"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+
+
+def test_surge_duplicates_have_stable_selection_and_quality_log(tmp_path: Path) -> None:
+    from loguru import logger
+
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    path = root / "events-2026-08-03.jsonl"
+    first = SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52", price=11.0)
+    second = first.model_copy(update={"price": 12.0})
+    messages: list[str] = []
+    handler = logger.add(lambda message: messages.append(message.record["message"]))
+    try:
+        rows = []
+        for records in ((first, second), (second, first)):
+            path.write_text(
+                "".join(json.dumps(item.model_dump()) + "\n" for item in records),
+                encoding="utf-8",
+            )
+            os.utime(path, (NOW.timestamp() - 1, NOW.timestamp() - 1))
+            projection = source_module._read_surge_event_projection(root, observed=NOW)
+            assert projection is not None
+            rows.append(projection.rows)
+    finally:
+        logger.remove(handler)
+    assert rows[0] == rows[1]
+    assert len(rows[0]) == 1
+    assert sum("重复记录" in message for message in messages) == 2
 
 
 def test_duckdb_signal_source_builds_bounded_pit_page_projections(tmp_path: Path) -> None:
@@ -1909,7 +2152,6 @@ def test_the_pinned_generation_is_the_one_the_reader_opened(tmp_path: Path) -> N
         os.replace(replacement, outbox.path)
 
 
-
 def test_the_duckdb_reader_pins_through_a_descriptor_where_the_engine_takes_one(
     tmp_path: Path,
 ) -> None:
@@ -2336,7 +2578,6 @@ def test_a_source_whose_only_changed_stamp_is_ctime_is_still_refused(
     )
     assert after.st_ctime_ns != before.st_ctime_ns
     assert not any(control.iterdir())
-
 
 
 def _count_database_opens(monkeypatch: pytest.MonkeyPatch) -> list[int]:

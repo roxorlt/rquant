@@ -11,6 +11,7 @@ import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
+from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
@@ -31,27 +32,157 @@ def _app(root: Path):
     )
 
 
-def test_recent_signals_page_has_real_receipts_and_signed_next_cursor(serving_root: Path) -> None:
+def test_timeline_interleaves_three_sources_across_pages(serving_root: Path) -> None:
     with TestClient(_app(serving_root)) as client:
-        first = client.get("/api/v1/monitor/signals", params={"page_size": 1})
+        seen: list[tuple[str, str]] = []
+        cursor = None
+        while True:
+            response = client.get(
+                "/api/v1/monitor/timeline",
+                params={"page_size": 1, **({"cursor": cursor} if cursor else {})},
+            )
+            assert response.status_code == 200, response.text
+            data = response.json()["data"]
+            assert data["total"] == 4
+            assert len(data["items"]) == 1
+            item = data["items"][0]
+            seen.append((item["kind"], item["at"]))
+            cursor = data["next_cursor"]
+            if cursor is None:
+                break
+        assert [kind for kind, _ in seen] == ["monitor", "surge", "signal", "signal"]
+        assert [at for _, at in seen] == sorted((at for _, at in seen), reverse=True)
+
+
+def test_timeline_ties_and_late_sequences_have_stable_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support import web_serving_fixture as fixture
+
+    same_time = "09:47"
+    monkeypatch.setattr(
+        fixture,
+        "_monitor_events",
+        lambda: [
+            {
+                "trade_date": "2026-09-24",
+                "trigger_time": "2026-09-24T01:47:00Z",
+                "ts_code": "600004.SH",
+                "level": "attack_break_high",
+                "trigger_price": 12.34,
+                "level_price": 12.0,
+                "trigger_type": "attack",
+                "pool": "pool2",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        fixture,
+        "_timeline_surge_events",
+        lambda _scenario: [
+            {
+                **fixture._sample_surge_event(),
+                "confirmed_at": same_time,
+            }
+        ],
+    )
+    root = tmp_path / "tie-serving"
+    build_web_fixture(root, "baseline")
+    with TestClient(_app(root)) as client:
+        keys: list[str] = []
+        cursor = None
+        while True:
+            response = client.get(
+                "/api/v1/monitor/timeline",
+                params={"page_size": 1, **({"cursor": cursor} if cursor else {})},
+            )
+            assert response.status_code == 200, response.text
+            data = response.json()["data"]
+            keys.extend(item["event_key"] for item in data["items"])
+            cursor = data["next_cursor"]
+            if cursor is None:
+                break
+        assert len(keys) == len(set(keys)) == 4
+        assert [key.split(":", 1)[0] for key in keys] == ["signal", "monitor", "surge", "signal"]
+
+
+def test_bad_surge_time_is_visible_as_partial_data_without_leaking_raw_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support import web_serving_fixture as fixture
+
+    monkeypatch.setattr(
+        fixture,
+        "_timeline_surge_events",
+        lambda _scenario: [{**fixture._sample_surge_event(), "confirmed_at": "25:90"}],
+    )
+    root = tmp_path / "bad-time-serving"
+    build_web_fixture(root, "baseline")
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/monitor/timeline")
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert data["total"] == 3
+        assert "1 条爆量记录时间无效" in data["source_note"]
+        assert "25:90" not in response.text
+
+
+def test_timeline_cursor_is_bound_to_generation_page_size_and_full_sort_key(
+    serving_root: Path,
+) -> None:
+    app = _app(serving_root)
+    with TestClient(app) as client:
+        first = client.get("/api/v1/monitor/timeline", params={"page_size": 1})
+        assert first.status_code == 200, first.text
+        cursor = first.json()["data"]["next_cursor"]
+        assert cursor
+        assert (
+            client.get(
+                "/api/v1/monitor/timeline", params={"page_size": 2, "cursor": cursor}
+            ).status_code
+            == 409
+        )
+        changed = f"{cursor[:-1]}{'a' if cursor[-1] != 'a' else 'b'}"
+        assert (
+            client.get(
+                "/api/v1/monitor/timeline", params={"page_size": 1, "cursor": changed}
+            ).status_code
+            == 409
+        )
+        build_web_fixture(serving_root, "baseline", sequence=1)
+        app.state.web.tracker.refresh()
+        assert (
+            client.get(
+                "/api/v1/monitor/timeline", params={"page_size": 1, "cursor": cursor}
+            ).status_code
+            == 409
+        )
+
+
+def test_timeline_keeps_real_receipts_on_signal_rows_only(serving_root: Path) -> None:
+    with TestClient(_app(serving_root)) as client:
+        first = client.get("/api/v1/monitor/timeline", params={"page_size": 3})
         assert first.status_code == 200, first.text
         data = first.json()["data"]
         assert data["source_state"] == "ready"
         assert data["receipt_state"] == "has_receipts"
-        assert data["total"] == 2
+        assert data["total"] == 4
         assert data["mode"] == "shadow"
-        assert len(data["items"]) == 1
-        assert data["items"][0]["sequence"] == 1
-        assert data["items"][0]["strategy_name"] == "N 字"
-        assert data["items"][0]["action_label"] == "买入意向"
-        assert data["items"][0]["delivery_label"] == "送达未确认"
-        assert data["items"][0]["receipts"][0]["status_label"] == "送达未确认"
-        assert "当时" in data["items"][0]["delivery_note"]
+        assert [item["kind"] for item in data["items"]] == ["monitor", "surge", "signal"]
+        assert "receipts" not in data["items"][0]
+        assert "receipts" not in data["items"][1]
+        signal = data["items"][2]
+        assert signal["sequence"] == 1
+        assert signal["strategy_name"] == "N 字"
+        assert signal["action_label"] == "买入意向"
+        assert signal["delivery_label"] == "送达未确认"
+        assert signal["receipts"][0]["status_label"] == "送达未确认"
+        assert "当时" in signal["delivery_note"]
         assert data["next_cursor"]
 
         second = client.get(
-            "/api/v1/monitor/signals",
-            params={"page_size": 1, "cursor": data["next_cursor"]},
+            "/api/v1/monitor/timeline",
+            params={"page_size": 3, "cursor": data["next_cursor"]},
         )
         assert second.status_code == 200, second.text
         older = second.json()["data"]
@@ -61,31 +192,80 @@ def test_recent_signals_page_has_real_receipts_and_signed_next_cursor(serving_ro
         assert older["next_cursor"] is None
 
 
-def test_cursor_rejects_generation_change_and_tampering(serving_root: Path) -> None:
-    app = _app(serving_root)
-    with TestClient(app) as client:
-        first = client.get("/api/v1/monitor/signals", params={"page_size": 1})
-        cursor = first.json()["data"]["next_cursor"]
-        assert cursor
-        altered = f"{cursor[:-1]}{'a' if cursor[-1] != 'a' else 'b'}"
-        tampered = client.get("/api/v1/monitor/signals", params={"cursor": altered, "page_size": 1})
-        assert tampered.status_code == 409
-        resized = client.get("/api/v1/monitor/signals", params={"cursor": cursor, "page_size": 2})
-        assert resized.status_code == 409
-        build_web_fixture(serving_root, "baseline", sequence=1)
-        app.state.web.tracker.refresh()
-        changed = client.get("/api/v1/monitor/signals", params={"cursor": cursor, "page_size": 1})
-        assert changed.status_code == 409
-        assert "数据已更新" in changed.json()["detail"]
+def test_surge_near_limit_status_does_not_claim_the_stock_hit_limit(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(root, "panorama")
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/monitor/timeline", params={"page_size": 50})
+        assert response.status_code == 200, response.text
+        labels = [
+            item["status_label"]
+            for item in response.json()["data"]["items"]
+            if item["kind"] == "surge"
+        ]
+        assert "临近涨停" in labels
+        assert "已涨停" not in labels
 
 
 def test_no_serving_has_separate_source_state(tmp_path: Path) -> None:
     with TestClient(_app(tmp_path / "missing")) as client:
-        response = client.get("/api/v1/monitor/signals")
+        response = client.get("/api/v1/monitor/timeline")
         assert response.status_code == 200
         assert response.json()["data"]["source_state"] == "unavailable"
         assert response.json()["data"]["total"] is None
         assert response.json()["data"]["items"] == []
+
+
+def test_empty_timeline_with_missing_legacy_sources_is_labeled_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support import web_serving_fixture as fixture
+
+    original = fixture._projections
+    monkeypatch.setattr(fixture, "_signal_bundle", lambda _built_at: ((), (), ()))
+    monkeypatch.setattr(
+        fixture,
+        "_projections",
+        lambda scenario, *, built_at, generations: tuple(
+            item
+            for item in original(scenario, built_at=built_at, generations=generations)
+            if item.table_name not in {"monitor_event", "surge_event"}
+        ),
+    )
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline")
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/monitor/timeline")
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert data["source_state"] == "empty"
+        assert data["source_label"] == "告警数据暂不完整"
+        assert "仅显示已有记录" in data["source_note"]
+
+
+def test_all_three_sources_can_publish_a_truly_empty_timeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support import web_serving_fixture as fixture
+
+    monkeypatch.setattr(fixture, "_signal_bundle", lambda _built_at: ((), (), ()))
+    root = tmp_path / "serving"
+    build_web_fixture(
+        root,
+        "baseline",
+        event_projections=tuple(
+            ServingProjectionPayload(table_name=name, available_at=FIXTURE_BUILT_AT, rows=())
+            for name in ("monitor_event", "surge_event")
+        ),
+    )
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/monitor/timeline")
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert data["source_state"] == "empty"
+        assert data["source_label"] == "最近 30 天没有告警"
+        assert data["source_note"] is None
+        assert data["total"] == 0
 
 
 def test_unpublished_signal_source_is_distinct_from_an_empty_page(
@@ -95,7 +275,7 @@ def test_unpublished_signal_source_is_distinct_from_an_empty_page(
 
     monkeypatch.setattr(monitor, "_source_published", lambda _borrowed: False)
     with TestClient(_app(serving_root)) as client:
-        response = client.get("/api/v1/monitor/signals")
+        response = client.get("/api/v1/monitor/timeline")
         assert response.status_code == 200
         data = response.json()["data"]
         assert data["source_state"] == "not_published"
@@ -143,7 +323,7 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
             if page.next_cursor is None:
                 break
             decoded = _decode_cursor(page.next_cursor, key)
-            after = (decoded.last_available_at, decoded.last_sequence)
+            after = (decoded.last_at, decoded.last_rank, decoded.last_key)
         assert len(seen) == 501
         assert seen == list(range(501, 0, -1))
 
@@ -169,7 +349,7 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
         empty = _page(borrowed, page_size=20, after=None, key=key, now=FIXTURE_BUILT_AT)
         assert empty.source_state == "empty"
         assert empty.total == 0
-        assert empty.receipt_label == "尚无通知回执"
+        assert empty.receipt_label == "本页没有新运行时通知回执"
 
         shanghai = ZoneInfo("Asia/Shanghai")
         ten = datetime(2026, 9, 24, 10, tzinfo=shanghai)
@@ -192,9 +372,17 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
             if page.next_cursor is None:
                 break
             decoded = _decode_cursor(page.next_cursor, key)
-            assert decoded.last_available_at.astimezone(UTC) == page.items[-1].at
-            after = (decoded.last_available_at, decoded.last_sequence)
+            assert decoded.last_at.astimezone(UTC) == page.items[-1].at
+            after = (decoded.last_at, decoded.last_rank, decoded.last_key)
         assert seen_late == [3, 1, 4, 2]
+        connection.execute(
+            "INSERT INTO signals VALUES "
+            "(5, 'old-signal', 'n_shape', 'v1', '600001.SH', 'watch', "
+            "'2026-08-01 01:00:00+00'::TIMESTAMPTZ, NULL, '[]')"
+        )
+        recent = _page(borrowed, page_size=50, after=None, key=key, now=FIXTURE_BUILT_AT)
+        assert recent.total == 4
+        assert all(item.event_key != "signal:old-signal" for item in recent.items)
     finally:
         borrowed.cursor.close()
         connection.close()

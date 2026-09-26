@@ -3,14 +3,14 @@ import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
 for (const width of [1440, 390]) {
-  test.describe(`最近信号 ${width}px`, () => {
+  test.describe(`告警时间线 ${width}px`, () => {
     test.use({ viewport: { width, height: 844 } });
 
     test("shows published records and opens a stock from the keyboard", async ({ page }) => {
       const watcher = watch(page);
       await page.goto("./#/monitor");
       await expect(page.getByRole("heading", { level: 1, name: "盯盘与告警" })).toBeVisible();
-      const timeline = page.getByRole("list", { name: "最近信号" });
+      const timeline = page.getByRole("list", { name: "告警时间线" });
       await expect(timeline).toBeVisible();
       const entries = timeline.locator(":scope > li");
       expect(await entries.count()).toBeGreaterThan(0);
@@ -21,6 +21,10 @@ for (const width of [1440, 390]) {
       await expect(page.getByRole("button", { name: "确认" })).toHaveCount(0);
       await expectNoHorizontalOverflow(page, "monitor");
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      await test.info().attach(`monitor-${width}px`, {
+        body: await page.screenshot({ fullPage: true }),
+        contentType: "image/png",
+      });
 
       const stock = entries.first().getByRole("button", { name: /查看.+详情/ });
       await stock.focus();

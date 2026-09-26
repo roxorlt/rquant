@@ -5,12 +5,13 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import sqlite3
 import stat
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import mkdtemp
 from types import MappingProxyType
@@ -19,6 +20,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import duckdb
+from loguru import logger
 from pydantic import (
     ConfigDict,
     Field,
@@ -73,6 +75,7 @@ from rquant.runtime_contracts import (
 from rquant.runtime_read_interrupt import READ_INTERRUPTS, interruptible_read
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strict_json import StrictJsonError, strict_json_loads
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -88,6 +91,11 @@ _MAX_PULSE_ROWS = 512
 _MAX_PULSE_FILE_BYTES = 256 * 1024
 _MAX_ALERT_FILE_BYTES = 512 * 1024
 _MAX_RUNTIME_CONFIG_BYTES = 16 * 1024
+_MAX_EVENT_ROWS = 10_000
+_MAX_SURGE_EVENT_BYTES = 8 * 1024 * 1024
+_EVENT_WINDOW_DAYS = 30
+_SURGE_EVENT_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
+_STOCK_CODE = re.compile(r"[0-9]{6}\.(?:SH|SZ|BJ)")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
 _PAGE_CONTROL_PROTOCOL_MARKER = "safe-effect-journal-v2"
 _PAGE_CONTROL_PROTOCOL_VERSION = 2
@@ -238,6 +246,14 @@ def _read_bound_optional_file(
         after = os.fstat(descriptor)
         if _file_identity(after) != _file_identity(opened):
             raise PageProjectionSourceIntegrityError(f"surge live source {name} changed while read")
+        try:
+            named = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise PageProjectionSourceIntegrityError(
+                f"surge live source {name} rotated while read"
+            ) from error
+        if _file_identity(named) != _file_identity(opened):
+            raise PageProjectionSourceIntegrityError(f"surge live source {name} rotated while read")
     finally:
         os.close(descriptor)
     if len(raw) > max_bytes:
@@ -968,6 +984,7 @@ class _DatabaseProjection:
     latest_trade_date: date | None
     canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
     canvas_hits: tuple[CanvasHitProjectionRow, ...]
+    monitor_event: ServingProjectionPayload
     available_at: datetime
 
 
@@ -1102,6 +1119,11 @@ class DuckDBSignalPageProjectionSource:
             self.surge_live_root,
             observed=observed,
         )
+        try:
+            surge_event = _read_surge_event_projection(self.surge_live_root, observed=observed)
+        except (OSError, PageProjectionSourceIntegrityError, ValueError) as error:
+            logger.warning("爆量事件来源暂不可用：{}", error)
+            surge_event = None
         if canvas_definitions:
             available = max(
                 available,
@@ -1122,6 +1144,8 @@ class DuckDBSignalPageProjectionSource:
             pulse_history=pulse_history,
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
+            monitor_event=database.monitor_event,
+            surge_event=surge_event,
         )
 
     def _read_database_projection(
@@ -1267,15 +1291,79 @@ class DuckDBSignalPageProjectionSource:
                 """,
                 (cutoff.date(), cutoff, cutoff, cutoff),
             ).fetchone()
+            window_start = cutoff.date() - timedelta(days=_EVENT_WINDOW_DAYS - 1)
+            monitor_rows = connection.execute(
+                """
+                SELECT trade_date, trigger_time, ts_code, level, trigger_price,
+                       level_price, trigger_type, pool
+                FROM monitor_event
+                WHERE trade_date BETWEEN ? AND ?
+                  AND trigger_time >= ? AND trigger_time <= ?
+                ORDER BY trade_date DESC, trigger_time DESC, ts_code, level
+                LIMIT ?
+                """,
+                (
+                    window_start,
+                    cutoff.date(),
+                    datetime.combine(window_start, time.min),
+                    cutoff,
+                    _MAX_EVENT_ROWS + 1,
+                ),
+            ).fetchall()
         if available_row is None or available_row[0] is None:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
+        database_available = _database_timestamp(available_row[0])
+        if len(monitor_rows) > _MAX_EVENT_ROWS:
+            raise PageProjectionSourceIntegrityError("monitor events exceed the row bound")
+        published_monitor: list[dict[str, object]] = []
+        monitor_available = database_available
+        for (
+            trade_day,
+            trigger_at,
+            code,
+            level,
+            price,
+            level_price,
+            trigger_type,
+            pool,
+        ) in monitor_rows:
+            if not isinstance(trigger_at, datetime) or trigger_at.tzinfo is not None:
+                raise PageProjectionSourceIntegrityError(
+                    "monitor event time must be local naive time"
+                )
+            if trade_day != trigger_at.date():
+                raise PageProjectionSourceIntegrityError(
+                    "monitor event trade date differs from time"
+                )
+            at = _database_timestamp(trigger_at)
+            if at > observed:
+                raise PageProjectionSourceIntegrityError("monitor events contain future evidence")
+            monitor_available = max(monitor_available, at)
+            published_monitor.append(
+                {
+                    "trade_date": trade_day.isoformat(),
+                    "trigger_time": at.isoformat(),
+                    "ts_code": str(code),
+                    "level": str(level),
+                    "trigger_price": price,
+                    "level_price": level_price,
+                    "trigger_type": trigger_type,
+                    "pool": pool,
+                }
+            )
+        monitor_projection = ServingProjectionPayload(
+            table_name="monitor_event",
+            available_at=monitor_available,
+            rows=tuple(published_monitor),
+        )
         return _DatabaseProjection(
             screen_bounds=screen_bounds,
             minute_coverage=minute_coverage,
             latest_trade_date=latest_date,
             canvas_diagnostics=diagnostics,
             canvas_hits=hits,
-            available_at=_database_timestamp(available_row[0]),
+            monitor_event=monitor_projection,
+            available_at=database_available,
         )
 
     def _canvas_definitions(
@@ -1669,12 +1757,13 @@ class DuckDBSignalPageProjectionSource:
         rows = connection.execute(
             """
             SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'main' AND table_name IN ('screen_result', 'minute_bar')
+            WHERE table_schema = 'main'
+              AND table_name IN ('screen_result', 'minute_bar', 'monitor_event')
             """
         ).fetchall()
-        if {str(row[0]) for row in rows} != {"screen_result", "minute_bar"}:
+        if {str(row[0]) for row in rows} != {"screen_result", "minute_bar", "monitor_event"}:
             raise PageProjectionSourceIntegrityError(
-                "projection database is missing screen_result or minute_bar"
+                "projection database is missing screen_result, minute_bar or monitor_event"
             )
 
     @staticmethod
@@ -1950,13 +2039,19 @@ class SignalPageProjectionProducer:
 
         observed = normalize_aware_utc(observed_at)
         snapshot = self.source(observed)
+        page_projections = snapshot.projections
+        if self.companion_projections is not None:
+            injected_names = {item.table_name for item in self.companion_projections}
+            page_projections = tuple(
+                item for item in page_projections if item.table_name not in injected_names
+            )
         page_source = NotificationProjectionSourceReceipt.create(
             dataset_id="signal-page-projections",
             generation_id=snapshot.content_sha256,
             sequence=int(snapshot.available_at.timestamp() * 1_000_000),
             event_time=snapshot.available_at,
             published_at=observed,
-            projections=snapshot.projections,
+            projections=page_projections,
         )
         if self.companion_projections is None:
             previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
@@ -1970,7 +2065,9 @@ class SignalPageProjectionProducer:
                     available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
                     rows=(),
                 )
-                for table_name in sorted(_COMPANION_SIGNAL_TABLES)
+                for table_name in sorted(
+                    _COMPANION_SIGNAL_TABLES - {"monitor_event", "surge_event"}
+                )
             )
         else:
             companion_projections = self.companion_projections
@@ -2339,6 +2436,127 @@ def _parse_jsonl_objects(raw: bytes, *, name: str) -> tuple[dict[str, object], .
     return tuple(rows)
 
 
+def _read_surge_event_projection(
+    root: Path | None, *, observed: datetime
+) -> ServingProjectionPayload | None:
+    """Read the writer's complete daily JSONL files for a bounded 30-day window."""
+
+    if root is None:
+        return None
+    try:
+        binding = _bind_readonly_directory(root, label="surge event source")
+    except FileNotFoundError:
+        return None
+    from rquant.runtime_shadow_sources import LegacySurgeEvent
+
+    local_day = observed.astimezone(_SHANGHAI).date()
+    first_day = local_day - timedelta(days=_EVENT_WINDOW_DAYS - 1)
+    remaining = _MAX_SURGE_EVENT_BYTES
+    seen = 0
+    duplicates = 0
+    selected: dict[tuple[str, str, str], dict[str, object]] = {}
+    available = _EMPTY_PROJECTION_AVAILABLE_AT
+    try:
+        for offset in range(_EVENT_WINDOW_DAYS):
+            day = first_day + timedelta(days=offset)
+            name = f"events-{day.isoformat()}.jsonl"
+            file = _read_bound_optional_file(binding, name, max_bytes=remaining)
+            if file is None:
+                continue
+            raw, item = file
+            remaining -= len(raw)
+            available = max(available, _source_file_time(item, observed=observed, name=name))
+            if raw and not raw.endswith(b"\n"):
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} has an incomplete line"
+                )
+            try:
+                lines = raw.decode("utf-8").splitlines()
+            except UnicodeDecodeError as error:
+                raise PageProjectionSourceIntegrityError(
+                    f"surge event source {name} is not UTF-8"
+                ) from error
+            for line_number, line in enumerate(lines, start=1):
+                seen += 1
+                if seen > _MAX_EVENT_ROWS:
+                    raise PageProjectionSourceIntegrityError("surge events exceed the row bound")
+                if not line:
+                    raise PageProjectionSourceIntegrityError(
+                        f"surge event source {name} has an empty line"
+                    )
+                try:
+                    value = strict_json_loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError("event record must be an object")
+                    required = {
+                        "ts_code",
+                        "name",
+                        "theme",
+                        "confirmed_at",
+                        "price",
+                        "pct_chg",
+                        "cum_amount",
+                        "rel_cum",
+                        "room_to_limit_pct",
+                        "status",
+                    }
+                    if not required.issubset(value):
+                        raise ValueError("event fields are incomplete")
+                    if set(value) - (set(LegacySurgeEvent.model_fields) | {"push_count_5d"}):
+                        raise ValueError("event fields are unknown")
+                    event = LegacySurgeEvent.model_validate(
+                        {
+                            field: value[field]
+                            for field in LegacySurgeEvent.model_fields
+                            if field in value
+                        }
+                    )
+                    if (
+                        _STOCK_CODE.fullmatch(event.ts_code) is None
+                        or _SURGE_EVENT_TIME.fullmatch(event.confirmed_at) is None
+                    ):
+                        raise ValueError("event code or time is invalid")
+                    event_at = datetime.combine(
+                        day, time.fromisoformat(event.confirmed_at), tzinfo=_SHANGHAI
+                    ).astimezone(UTC)
+                    if event_at > observed:
+                        raise ValueError("event is from the future")
+                    row: dict[str, object] = {
+                        "trade_date": day.isoformat(),
+                        "confirmed_at": event.confirmed_at,
+                        "ts_code": event.ts_code,
+                        "name": event.name,
+                        "theme": event.theme,
+                        "price": event.price,
+                        "pct_chg": event.pct_chg,
+                        "cum_amount": event.cum_amount,
+                        "rel_cum": event.rel_cum,
+                        "room_to_limit_pct": event.room_to_limit_pct,
+                        "status": event.status,
+                    }
+                except (StrictJsonError, ValueError) as error:
+                    raise PageProjectionSourceIntegrityError(
+                        f"surge event source {name} line {line_number} is invalid"
+                    ) from error
+                key = (day.isoformat(), event.confirmed_at, event.ts_code)
+                old = selected.get(key)
+                if old is not None:
+                    duplicates += 1
+                    if canonical_sha256(row) <= canonical_sha256(old):
+                        continue
+                selected[key] = row
+        binding.verify()
+    finally:
+        binding.close()
+    if duplicates:
+        logger.warning("爆量事件有 {} 条重复记录，已按内容稳定去重", duplicates)
+    return ServingProjectionPayload(
+        table_name="surge_event",
+        available_at=available,
+        rows=tuple(selected[key] for key in sorted(selected)),
+    )
+
+
 def _pulse_as_of(trade_date: date, minute: str) -> datetime:
     try:
         parsed_time = time.fromisoformat(minute)
@@ -2571,7 +2789,13 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_hit",
             "canvas_definition",
         }
-        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config"}
+        optional_names = {
+            "pulse_history",
+            "pulse_alert",
+            "surge_runtime_config",
+            "monitor_event",
+            "surge_event",
+        }
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
@@ -2596,6 +2820,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         pulse_history: PulseHistoryProjectionSource | None = None,
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
+        monitor_event: ServingProjectionPayload | None = None,
+        surge_event: ServingProjectionPayload | None = None,
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -2648,6 +2874,14 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                     rows=(_surge_runtime_config_row(surge_runtime_config.row),),
                 )
             )
+        for table_name, projection in (
+            ("monitor_event", monitor_event),
+            ("surge_event", surge_event),
+        ):
+            if projection is not None:
+                if projection.table_name != table_name:
+                    raise ValueError("signal event projection has the wrong table")
+                optional.append(projection)
         projections = tuple(sorted((*projections, *optional), key=lambda item: item.table_name))
         snapshot_available = max(item.available_at for item in projections)
         identity = {"available_at": snapshot_available, "projections": projections}

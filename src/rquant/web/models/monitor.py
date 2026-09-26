@@ -1,11 +1,11 @@
-"""Recent published signals and notification receipts."""
+"""One read-only timeline of published alerts and notification receipts."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.web.models.overview import DeliveryMode, DeliveryState
 
@@ -29,6 +29,8 @@ class MonitorReceipt(BaseModel):
 class MonitorSignal(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    kind: Literal["signal"] = "signal"
+    event_key: str
     signal_id: str
     sequence: int
     at: datetime
@@ -45,16 +47,50 @@ class MonitorSignal(BaseModel):
     receipts: list[MonitorReceipt]
 
 
-class MonitorSignalsData(BaseModel):
+class MonitorTrigger(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["monitor"] = "monitor"
+    event_key: str
+    at: datetime
+    code: str
+    name: str | None
+    event_label: str
+    price: float | None
+    level_price: float | None
+    status_label: str
+
+
+class MonitorSurge(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["surge"] = "surge"
+    event_key: str
+    at: datetime
+    code: str
+    name: str | None
+    event_label: str
+    price: float | None
+    pct_chg: float | None
+    status_label: str
+
+
+MonitorTimelineItem = Annotated[
+    MonitorSignal | MonitorTrigger | MonitorSurge, Field(discriminator="kind")
+]
+
+
+class MonitorTimelineData(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     source_state: SignalSourceState
     source_label: str
+    source_note: str | None
     receipt_state: ReceiptSourceState
     receipt_label: str
     total: int | None
     page_size: int
-    items: list[MonitorSignal]
+    items: list[MonitorTimelineItem]
     next_cursor: str | None
     mode: DeliveryMode
     mode_label: str

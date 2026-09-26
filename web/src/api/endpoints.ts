@@ -12,9 +12,9 @@ export type SignalItem = Schemas["SignalItem"];
 export type CandidateItem = Schemas["CandidateItem"];
 export type HoldingItem = Schemas["HoldingItem"];
 export type StatusInfo = Schemas["StatusInfo"];
-export type MonitorSignalsEnvelope = Schemas["Envelope_MonitorSignalsData_"];
-export type MonitorSignalsData = Schemas["MonitorSignalsData"];
-export type MonitorSignal = Schemas["MonitorSignal"];
+export type MonitorTimelineEnvelope = Schemas["Envelope_MonitorTimelineData_"];
+export type MonitorTimelineData = Schemas["MonitorTimelineData"];
+export type MonitorTimelineItem = MonitorTimelineData["items"][number];
 export type StockSearchData = Schemas["StockSearchData"];
 export type StockSearchRow = Schemas["StockSearchRow"];
 export type StockSummaryData = Schemas["StockSummaryData"];
@@ -48,12 +48,12 @@ export function useHealth(): ServingQueryResult<HealthData> {
   return useServingQuery(["health"], fetchHealth);
 }
 
-export function useMonitorSignals(
+export function useMonitorTimeline(
   cursor: string | null,
   refreshKey: number,
-): ServingQueryResult<MonitorSignalsData> {
-  return useServingQuery(["monitor", "signals", cursor, refreshKey], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/monitor/signals", {
+): ServingQueryResult<MonitorTimelineData> {
+  return useServingQuery(["monitor", "timeline", cursor, refreshKey], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/monitor/timeline", {
       params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
     });
     return unwrap(data, response);

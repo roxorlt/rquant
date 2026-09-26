@@ -72,15 +72,15 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/monitor/signals": {
+    "/api/v1/monitor/timeline": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** 最近信号与通知回执 */
-        get: operations["get_signals_api_v1_monitor_signals_get"];
+        /** 告警时间线 */
+        get: operations["get_timeline_api_v1_monitor_timeline_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -593,9 +593,9 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
-        /** Envelope[MonitorSignalsData] */
-        Envelope_MonitorSignalsData_: {
-            data: components["schemas"]["MonitorSignalsData"];
+        /** Envelope[MonitorTimelineData] */
+        Envelope_MonitorTimelineData_: {
+            data: components["schemas"]["MonitorTimelineData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[OverviewData] */
@@ -888,6 +888,13 @@ export interface components {
             delivery_label: string;
             /** Delivery Note */
             delivery_note: string | null;
+            /** Event Key */
+            event_key: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "signal";
             /** Name */
             name: string | null;
             /** Reasons */
@@ -903,10 +910,37 @@ export interface components {
             /** Strategy Name */
             strategy_name: string;
         };
-        /** MonitorSignalsData */
-        MonitorSignalsData: {
+        /** MonitorSurge */
+        MonitorSurge: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /** Event Key */
+            event_key: string;
+            /** Event Label */
+            event_label: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "surge";
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+            /** Price */
+            price: number | null;
+            /** Status Label */
+            status_label: string;
+        };
+        /** MonitorTimelineData */
+        MonitorTimelineData: {
             /** Items */
-            items: components["schemas"]["MonitorSignal"][];
+            items: (components["schemas"]["MonitorSignal"] | components["schemas"]["MonitorTrigger"] | components["schemas"]["MonitorSurge"])[];
             /** Market Note */
             market_note: string | null;
             /**
@@ -931,6 +965,8 @@ export interface components {
             receipt_state: "not_published" | "no_receipts" | "has_receipts" | "truncated";
             /** Source Label */
             source_label: string;
+            /** Source Note */
+            source_note: string | null;
             /**
              * Source State
              * @enum {string}
@@ -938,6 +974,33 @@ export interface components {
             source_state: "unavailable" | "not_published" | "empty" | "ready";
             /** Total */
             total: number | null;
+        };
+        /** MonitorTrigger */
+        MonitorTrigger: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /** Event Key */
+            event_key: string;
+            /** Event Label */
+            event_label: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "monitor";
+            /** Level Price */
+            level_price: number | null;
+            /** Name */
+            name: string | null;
+            /** Price */
+            price: number | null;
+            /** Status Label */
+            status_label: string;
         };
         /** OverviewData */
         OverviewData: {
@@ -1612,7 +1675,7 @@ export interface operations {
             };
         };
     };
-    get_signals_api_v1_monitor_signals_get: {
+    get_timeline_api_v1_monitor_timeline_get: {
         parameters: {
             query?: {
                 page_size?: number;
@@ -1630,7 +1693,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Envelope_MonitorSignalsData_"];
+                    "application/json": components["schemas"]["Envelope_MonitorTimelineData_"];
                 };
             };
             /** @description Validation Error */
