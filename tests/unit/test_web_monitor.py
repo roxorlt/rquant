@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
@@ -40,11 +41,12 @@ def test_recent_signals_page_has_real_receipts_and_signed_next_cursor(serving_ro
         assert data["total"] == 2
         assert data["mode"] == "shadow"
         assert len(data["items"]) == 1
-        assert data["items"][0]["sequence"] == 2
-        assert data["items"][0]["strategy_name"] == "竞价跳空"
-        assert data["items"][0]["action_label"] == "观察"
-        assert data["items"][0]["delivery_label"] == "发送中"
-        assert data["items"][0]["receipts"][0]["status_label"] == "待发送"
+        assert data["items"][0]["sequence"] == 1
+        assert data["items"][0]["strategy_name"] == "N 字"
+        assert data["items"][0]["action_label"] == "买入意向"
+        assert data["items"][0]["delivery_label"] == "送达未确认"
+        assert data["items"][0]["receipts"][0]["status_label"] == "送达未确认"
+        assert "当时" in data["items"][0]["delivery_note"]
         assert data["next_cursor"]
 
         second = client.get(
@@ -53,10 +55,9 @@ def test_recent_signals_page_has_real_receipts_and_signed_next_cursor(serving_ro
         )
         assert second.status_code == 200, second.text
         older = second.json()["data"]
-        assert [item["sequence"] for item in older["items"]] == [1]
-        assert older["items"][0]["delivery_label"] == "送达未确认"
-        assert older["items"][0]["receipts"][0]["status_label"] == "送达未确认"
-        assert "当时" in older["items"][0]["delivery_note"]
+        assert [item["sequence"] for item in older["items"]] == [2]
+        assert older["items"][0]["delivery_label"] == "发送中"
+        assert older["items"][0]["receipts"][0]["status_label"] == "待发送"
         assert older["next_cursor"] is None
 
 
@@ -141,7 +142,8 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
             assert all(item.delivery_label == "暂无回执" for item in page.items)
             if page.next_cursor is None:
                 break
-            after = _decode_cursor(page.next_cursor, key).last_sequence
+            decoded = _decode_cursor(page.next_cursor, key)
+            after = (decoded.last_available_at, decoded.last_sequence)
         assert len(seen) == 501
         assert seen == list(range(501, 0, -1))
 
@@ -168,6 +170,31 @@ def test_page_reads_beyond_the_overview_500_row_limit_and_names_missing_receipts
         assert empty.source_state == "empty"
         assert empty.total == 0
         assert empty.receipt_label == "尚无通知回执"
+
+        shanghai = ZoneInfo("Asia/Shanghai")
+        ten = datetime(2026, 9, 24, 10, tzinfo=shanghai)
+        nine_thirty = datetime(2026, 9, 24, 9, 30, tzinfo=shanghai)
+        connection.executemany(
+            "INSERT INTO signals VALUES "
+            "(?, ?, 'n_shape', 'v1', '600001.SH', 'watch', ?, NULL, '[]')",
+            [
+                (1, "late-1", ten),
+                (2, "late-2", nine_thirty),
+                (3, "late-3", ten),
+                (4, "late-4", nine_thirty),
+            ],
+        )
+        seen_late: list[int] = []
+        after = None
+        while True:
+            page = _page(borrowed, page_size=2, after=after, key=key, now=FIXTURE_BUILT_AT)
+            seen_late.extend(item.sequence for item in page.items)
+            if page.next_cursor is None:
+                break
+            decoded = _decode_cursor(page.next_cursor, key)
+            assert decoded.last_available_at.astimezone(UTC) == page.items[-1].at
+            after = (decoded.last_available_at, decoded.last_sequence)
+        assert seen_late == [3, 1, 4, 2]
     finally:
         borrowed.cursor.close()
         connection.close()

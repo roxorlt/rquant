@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
+from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus
 from rquant.web import readers
 from rquant.web.calendar import calendar_day
@@ -34,12 +35,13 @@ router = APIRouter(prefix="/monitor")
 _SIGNALS_FIRST = (
     "SELECT global_sequence, signal_id, strategy_id, strategy_version, candidate_id, "
     "action, available_at, expires_at, reason_codes_json FROM signals "
-    "ORDER BY global_sequence DESC LIMIT ?"
+    "ORDER BY available_at DESC, global_sequence DESC LIMIT ?"
 )
 _SIGNALS_AFTER = (
     "SELECT global_sequence, signal_id, strategy_id, strategy_version, candidate_id, "
     "action, available_at, expires_at, reason_codes_json FROM signals "
-    "WHERE global_sequence < ? ORDER BY global_sequence DESC LIMIT ?"
+    "WHERE available_at < ? OR (available_at = ? AND global_sequence < ?) "
+    "ORDER BY available_at DESC, global_sequence DESC LIMIT ?"
 )
 _RECEIPTS = (
     "SELECT outbox_id, signal_id, recipient_id, channel, status, attempt_count, "
@@ -59,8 +61,9 @@ _UNKNOWN_MODE = DeliveryMode("unknown", "未确认", _HISTORICAL_RECEIPT_NOTE)
 class _Cursor(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    kind: Literal["monitor_signals_v1"]
+    kind: Literal["monitor_signals_v2"]
     generation_id: str = Field(min_length=1, max_length=128)
+    last_available_at: AwareUtcDatetime
     last_sequence: int = Field(ge=1)
     page_size: int = Field(ge=1, le=50)
 
@@ -139,13 +142,18 @@ def _empty_data(
 
 
 def _page(
-    borrowed: BorrowedGeneration, *, page_size: int, after: int | None, key: bytes, now: datetime
+    borrowed: BorrowedGeneration,
+    *,
+    page_size: int,
+    after: tuple[datetime, int] | None,
+    key: bytes,
+    now: datetime,
 ) -> MonitorSignalsData:
     cursor = borrowed.cursor
     total = int(cursor.execute("SELECT count(*) FROM signals").fetchone()[0])
     raw = cursor.execute(
         _SIGNALS_FIRST if after is None else _SIGNALS_AFTER,
-        (page_size + 1,) if after is None else (after, page_size + 1),
+        (page_size + 1,) if after is None else (after[0], after[0], after[1], page_size + 1),
     ).fetchall()
     rows = [
         SignalRow.model_validate(dict(zip(SignalRow.model_fields, item, strict=True)))
@@ -215,8 +223,9 @@ def _page(
     next_cursor = (
         _encode_cursor(
             _Cursor(
-                kind="monitor_signals_v1",
+                kind="monitor_signals_v2",
                 generation_id=borrowed.manifest.generation_id,
+                last_available_at=rows[-1].available_at,
                 last_sequence=rows[-1].global_sequence,
                 page_size=page_size,
             ),
@@ -279,7 +288,9 @@ def get_signals(
             data = _page(
                 borrowed,
                 page_size=page_size,
-                after=decoded.last_sequence if decoded is not None else None,
+                after=(decoded.last_available_at, decoded.last_sequence)
+                if decoded is not None
+                else None,
                 key=web.cursor_key,
                 now=now,
             )

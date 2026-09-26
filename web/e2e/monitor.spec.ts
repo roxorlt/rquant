@@ -14,6 +14,7 @@ for (const width of [1440, 390]) {
       await expect(timeline).toBeVisible();
       const entries = timeline.locator(":scope > li");
       expect(await entries.count()).toBeGreaterThan(0);
+      await expect(page.getByText("可向前翻看历史")).toHaveCount(0);
       await entries.first().locator(".monitor-event-time .tip-anchor").hover();
       await expect(page.getByRole("tooltip")).toContainText("2026-09-24");
       await expect(page.getByRole("button", { name: "新建规则" })).toHaveCount(0);

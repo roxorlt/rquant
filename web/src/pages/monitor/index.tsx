@@ -98,7 +98,7 @@ export default function MonitorPage() {
           label: "已发布信号",
           value: formatCount(data.total),
           unit: data.total === null ? undefined : "条",
-          sub: "可向前翻看历史",
+          sub: data.source_state === "ready" && data.next_cursor ? "可向前翻看历史" : undefined,
         },
         {
           key: "mode",

@@ -48,9 +48,11 @@ describe("盯盘与告警", () => {
     const user = userEvent.setup();
     renderApp("/monitor");
     await screen.findByRole("list", { name: "最近信号" });
+    expect(screen.getByText("可向前翻看历史")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "下一页" }));
     expect(await screen.findByText("第 2 页")).toBeInTheDocument();
     expect(screen.getByRole("list", { name: "最近信号" })).not.toHaveTextContent("天威视讯");
+    expect(screen.queryByText("可向前翻看历史")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "上一页" }));
     expect(await screen.findByText("第 1 页")).toBeInTheDocument();
     expect(screen.getByRole("list", { name: "最近信号" })).toHaveTextContent("天威视讯");
@@ -93,6 +95,7 @@ describe("盯盘与告警", () => {
     );
     const view = renderApp("/monitor");
     expect(await screen.findByText("暂时读不到页面数据")).toBeInTheDocument();
+    expect(screen.queryByText("可向前翻看历史")).not.toBeInTheDocument();
     view.unmount();
 
     server.use(
@@ -116,6 +119,7 @@ describe("盯盘与告警", () => {
     );
     renderApp("/monitor");
     expect(await screen.findByText("还没有信号")).toBeInTheDocument();
+    expect(screen.queryByText("可向前翻看历史")).not.toBeInTheDocument();
   });
 
   it("offers a clean restart when the published generation changes during paging", async () => {
