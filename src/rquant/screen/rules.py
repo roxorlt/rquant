@@ -319,6 +319,6 @@ def volume_ratio_gte(n: float, offset: int = 0, window: int = 5) -> Rule:
     def _rule(df: pd.DataFrame) -> pd.Series:
         today = df[f"VOL[{offset}]"]
         prev_cols = [f"VOL[{offset + i}]" for i in range(1, window + 1)]
-        mean_prev = df[prev_cols].mean(axis=1)
+        mean_prev = df[prev_cols].mean(axis=1, skipna=False)
         return today >= n * mean_prev
     return _tag_lookback(_rule, offset + window)

@@ -500,12 +500,18 @@ def load_universe(
         # - 数值规则（circ_mv_lt 内部 .fillna(inf)）拿 NaN 得 False（该股不入选）
         # - bool 状态规则只接受显式 True/False，NaN 会 fail closed
         max_offset = len(dates) - 1
+        missing_columns: list[str] = []
         for cmap in (PRICE_COLS_MAP, IND_COLS_MAP, BASIC_COLS_MAP, STATE_COLS_MAP):
             for dst in cmap.values():
                 for off in range(max_offset + 1):
                     col = f"{dst}[{off}]"
                     if col not in out.columns:
-                        out[col] = float("nan")
+                        missing_columns.append(col)
+        if missing_columns:
+            out = pd.concat(
+                [out, pd.DataFrame(float("nan"), index=out.index, columns=missing_columns)],
+                axis=1,
+            )
 
         # 聚合列：根据 AggregateRequest 动态生成 SQL
         if aggregate_requests:
