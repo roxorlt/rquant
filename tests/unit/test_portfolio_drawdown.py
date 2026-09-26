@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -135,6 +136,38 @@ def test_timezone_offsets_compare_by_instant_not_wall_clock() -> None:
         evaluate_drawdown(Decimal("90"), same_instant, rule, first.state)
     later = evaluate_drawdown(Decimal("90"), later_instant, rule, first.state)
     assert later.state.last_at == later_instant
+
+
+def test_dst_fold_rejects_actual_time_reversal_despite_later_wall_clock() -> None:
+    ny = ZoneInfo("America/New_York")
+    later_instant = datetime(2026, 11, 1, 1, 15, tzinfo=ny, fold=1)
+    earlier_instant = datetime(2026, 11, 1, 1, 30, tzinfo=ny, fold=0)
+    rule = block_rule()
+    first = evaluate_drawdown(Decimal("100"), later_instant, rule)
+
+    with pytest.raises(DrawdownInputError, match="时间"):
+        evaluate_drawdown(Decimal("90"), earlier_instant, rule, first.state)
+    with pytest.raises(ValidationError, match="峰值时间"):
+        DrawdownState(
+            rule=rule,
+            peak_nav=Decimal("100"),
+            peak_at=later_instant,
+            last_nav=Decimal("90"),
+            last_at=earlier_instant,
+            active=False,
+        )
+
+
+def test_dst_fold_accepts_actual_forward_time_despite_earlier_wall_clock() -> None:
+    ny = ZoneInfo("America/New_York")
+    earlier_instant = datetime(2026, 11, 1, 1, 30, tzinfo=ny, fold=0)
+    later_instant = datetime(2026, 11, 1, 1, 15, tzinfo=ny, fold=1)
+    rule = block_rule()
+    first = evaluate_drawdown(Decimal("100"), earlier_instant, rule)
+
+    next_step = evaluate_drawdown(Decimal("90"), later_instant, rule, first.state)
+    assert next_step.drawdown == Decimal("0.10")
+    assert next_step.state.last_at == later_instant
 
 
 @pytest.mark.parametrize(

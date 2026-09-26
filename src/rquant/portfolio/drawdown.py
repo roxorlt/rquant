@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal, localcontext
 from fractions import Fraction
 from typing import Literal, Self
@@ -20,6 +20,10 @@ def _require_aware_time(value: datetime) -> datetime:
     if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError("观测时间必须带时区")
     return value
+
+
+def _utc_instant(value: datetime) -> datetime:
+    return _require_aware_time(value).astimezone(UTC)
 
 
 class DrawdownRule(BaseModel):
@@ -60,9 +64,11 @@ class DrawdownState(BaseModel):
     def validate_peak(self) -> Self:
         if self.peak_nav < self.last_nav:
             raise ValueError("峰值净值不能低于末次净值")
-        if self.peak_at > self.last_at:
+        peak_instant = _utc_instant(self.peak_at)
+        last_instant = _utc_instant(self.last_at)
+        if peak_instant > last_instant:
             raise ValueError("峰值时间不能晚于末次观测时间")
-        if self.peak_at == self.last_at and self.peak_nav != self.last_nav:
+        if peak_instant == last_instant and self.peak_nav != self.last_nav:
             raise ValueError("峰值与末次观测同刻时净值必须一致")
         drawdown = (Fraction(self.peak_nav) - Fraction(self.last_nav)) / Fraction(self.peak_nav)
         if self.active and drawdown <= Fraction(self.rule.release_drawdown):
@@ -115,7 +121,7 @@ def evaluate_drawdown(
             raise DrawdownInputError("前态必须使用已校验模型")
         if previous.rule != rule:
             raise DrawdownInputError("回撤规则变化须从历史重算或开启新序列")
-        if observed_at <= previous.last_at:
+        if _utc_instant(observed_at) <= _utc_instant(previous.last_at):
             raise DrawdownInputError("观测时间必须严格晚于前次观测")
 
     if previous is None or nav > previous.peak_nav:
