@@ -1,0 +1,61 @@
+# rQuant web API behind nginx /app/api/ (read-only; plan v2 §2.4, docs/deploy/web-app.md).
+# Install: sudo install -m 0644 -o root -g root <release>/deploy/systemd/rquant-web.service /etc/systemd/system/
+# Cloud gate before install: systemd-analyze verify <release>/deploy/systemd/rquant-web.service
+# The code comes from /home/lighthouse/rquant-web/current, switched by scripts/web-release.sh,
+# never from the production checkout. No .env: the API reads RQUANT_SERVING_ROOT only.
+[Unit]
+Description=rQuant web API (read-only, /app/api/ behind nginx)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+Slice=rquant-serving.slice
+WorkingDirectory=/home/lighthouse/rquant-web/current
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1 PYTHONDONTWRITEBYTECODE=1
+Environment=RQUANT_SERVING_ROOT=/home/lighthouse/rquant/data/runtime/serving
+Environment=RQUANT_WEB_BIND=127.0.0.1:8768
+ExecStart=/home/lighthouse/rquant-web/current/.venv/bin/rquant web-serve --bind 127.0.0.1:8768
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=20s
+
+MemoryAccounting=true
+MemoryHigh=384M
+MemoryMax=640M
+TasksMax=64
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadOnlyPaths=/home/lighthouse/rquant/data/runtime/serving
+# No secrets and no databases: the API reads Serving generations only.
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials -/home/lighthouse/rquant/data/rquant.duckdb -/home/lighthouse/rquant/data/rquant.duckdb.wal -/home/lighthouse/rquant/data/rquant_ro.duckdb -/home/lighthouse/rquant/data/rquant_ro.duckdb.wal -/home/lighthouse/rquant/backup
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

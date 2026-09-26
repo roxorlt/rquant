@@ -1,0 +1,93 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": false
+  },
+  "files": {
+    "includes": [
+      "**",
+      "!dist",
+      "!node_modules",
+      "!playwright-report",
+      "!test-results",
+      "!public",
+      "!src/api/openapi.json",
+      "!src/api/schema.d.ts"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "suspicious": {
+        "noExplicitAny": "error"
+      },
+      "correctness": {
+        "useExhaustiveDependencies": "error",
+        "useHookAtTopLevel": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["src/pages/**", "src/app/**", "src/reports/**"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "antd": "Pages and the shell import components from src/ui/, not antd directly.",
+                  "echarts": "Use the EChart wrapper in src/charts/.",
+                  "lightweight-charts": "Use the PriceChart wrapper in src/charts/.",
+                  "@tanstack/react-table": "Use the DataTable in src/table/.",
+                  "@xyflow/react": "Use the FlowGraph wrapper in src/charts/.",
+                  "@dagrejs/dagre": "Use layoutFlow in src/charts/.",
+                  "openapi-fetch": "Use the API client in src/api/.",
+                  "@tanstack/react-query": "Use the hooks in src/api/ (useServingQuery, useMeta).",
+                  "@tanstack/react-virtual": "Use the DataTable in src/table/."
+                },
+                "patterns": [
+                  {
+                    "group": ["antd/*", "echarts/*", "lightweight-charts/*", "@xyflow/react/*"],
+                    "message": "Pages and the shell go through src/ui/, src/charts/ and src/api/."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/styles/**"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "noImportantStyles": "off"
+          },
+          "style": {
+            "noDescendingSpecificity": "off"
+          }
+        }
+      }
+    }
+  ],
+  "css": {
+    "linter": {
+      "enabled": true
+    }
+  }
+}

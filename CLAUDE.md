@@ -2,9 +2,17 @@
 
 ## 项目定位
 
-rQuant 是一个**个人自用**的 A 股量化选股与盯盘平台：
-- 只做「条件筛选 + 实时监控 + 告警通知」
-- **明确暂时不做**：实盘下单、高频策略、Tick 级微观结构、Level2
+rQuant 是一个**个人自用**的 A 股**投研平台（不含下单）**：
+- 数据、选股、因子、策略、回测、实验、模拟盘、盯盘告警、调度、运维
+- **明确不做**：实盘下单、高频策略、Tick 级微观结构、Level2
+- 2026-09-25 owner 决定：范围从「条件筛选 + 实时监控 + 告警通知」扩为投研平台（新前端计划 v2），新网页入口 `/app/`
+
+## 前端交付方向（2026-09-26 owner 确认）
+
+- 线上旧 Streamlit 页面资源负担高，页面体验也不是 owner 期望的目标；不再给旧 Streamlit 页面开发新功能、打磨界面或扩容。过渡期仅做维持现有服务所必需的故障与安全修复。
+- 新网页采用 `web/` 中的 React + TypeScript + Vite，以 CC 可点击原型的完整交互体验为最终目标；页面按 `web/CLAUDE.md` 的界面与文案原则实现，不能把内部实现细节直接摆给用户。
+- 每完成一项原型功能，先接通真实能力并验证功能、数据与体验，再迁移对应入口和使用场景；逐项停用被替代的 Streamlit 单元，直到原型全部功能和按钮可用。差距表中的所有「部分」「缺」都须补齐，M4、M12 虽标「已有」但列出的未完部分也须完成；M11 实盘交易仍排除。
+- 代码完成不等于线上已切换或旧服务可停。生产切流、停服及相关基础设施变更依本文件的生产规则单独取得明确授权。决策与验收细节见 `docs/plans/2026-09-26-react-platform-decision.md`。
 
 ## 开发环境
 
@@ -24,8 +32,15 @@ uv run pytest -q                         # 全量测试（约 13.4k 用例，本
 uv run pytest tests/unit/test_xxx.py -q  # 改哪块测哪块（秒级）
 uv run ruff check <改动的文件>            # lint 只查改动文件——全库存量约 980 个历史告警，全量跑会误判为本次改动引入
 uv run rquant --help                     # CLI 入口（serve / run-daily / monitor / notify-test 等 40+ 子命令）
-uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard
+uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard（逐步停用）
+pnpm -C web install --frozen-lockfile    # 前端依赖（Node 22.22.2 + pnpm 10，版本见 web/.nvmrc 与 package.json）
+pnpm -C web check                        # Biome + tsc + Vitest
+pnpm -C web build                        # 编译到 web/dist（要提交）；pnpm -C web verify:dist 核对提交的是最新编译结果
+pnpm -C web e2e                          # Playwright：合成数据代 + 网页 API + /app/ 静态服务
+uv run rquant web-serve --bind 127.0.0.1:8768      # 只读网页 API（读 RQUANT_SERVING_ROOT，不读 .env）
 ```
+
+前端的目录约定和代理规则见 `web/CLAUDE.md`。
 
 ## 技术栈约束
 
@@ -38,7 +53,7 @@ uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard
 | 指标 | pandas-ta | TA-Lib（Mac 装麻烦） |
 | 调度 | APScheduler | Celery / Airflow（个人项目用不上） |
 | 日志 | loguru | 标准 logging（手动配置烦） |
-| UI | Streamlit | React/Vue 从零写（先别开分支） |
+| UI | React + TypeScript + Vite（`web/`，入口 `/app/`）；Streamlit 页面逐步停用（2026-09-25 owner 决定） | Vue、新的 Streamlit 页面 |
 | 通知 | PushDeer（参考 30-projects/xueqiuFollow/src/notifier.py），现阶段只推 admin（刘彤） | cc2im（受限于微信 token 限制）、企业微信 webhook、新搭通知系统 |
 
 ## 代码风格
@@ -88,9 +103,9 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
 本身只读不写主库，但同一时刻只能一个写者）按 systemd timer 约定串行，watchdog 和 timer
 错开。新增 Streamlit / FastAPI / 临时脚本时，code review 必查这一条。
 
-## MVP 路径（必须按顺序）
+## 历史 MVP 路径（非当前实施计划）
 
-不要并行推进多个阶段。按周迭代：
+以下是项目早期按周迭代的历史记录，不能用于指导当前前端交付与 Streamlit 投入。当前实施方向以上述「前端交付方向」和新前端计划 v2 为准。
 
 1. Week 1：数据接入 + DuckDB 存储 → **能跑再下一步**
 2. Week 2：指标计算
@@ -113,6 +128,18 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
   - 跨小时分钟范围 `09:30..11:30/2` 整段被 `Invalid argument` 拒收
   - minute 字段 `*/N` 通配步进**不接受**，但 `0/N` 显式起点接受
   - 已知能 work 的 2min 步进语法：`OnCalendar=Mon..Fri *-*-* 9..14:0/2`
+
+## 不按交易时段排期（owner 硬性要求）
+
+owner 多次纠正（2026-09-24「别等17点了」、「盘中能做的都改在盘中」，2026-09-25「再说一次不要等开盘」）：
+**不要把现在能做的事推迟到「开盘后 / 收盘后 / 17 点后 / 下一个交易日」。**
+
+- **默认立即执行**：装机、加 nginx 路径、新服务上线、预览、回放验证、研究任务、合并发版，休市日、周末、夜间都照常做。
+- **验证不等交易日**：链路逻辑用 `scripts/route_a_day_replay.py`（以及多日回放）在历史数据上验证；交易日实盘只做一次最终确认，
+  不作为下一步工作的前提。
+- **只有两类操作避开交易时段 09:15–15:10**：① 重启路线 A 常驻 unit 或旧系统常驻服务（受控部署器本身会在交易时段自动延期）；
+  ② 会和盘中写者抢锁、或长时间占满一核以上的重操作（写生产主库、大批量回补、整日回放）——盘中要先看主机负载再决定，不是一律不做。
+- **确实要等时，写清楚等的是哪个具体条件**（例如「等 09:52 检查点通过」「等 CI 全绿」），不要笼统写「等收盘」「等周一」。
 
 ## 版本控制与部署
 
@@ -227,7 +254,8 @@ chore: init pyproject.toml with uv
 用户已授权 Codex 代管日常 PR merge、tag 和腾讯云代码部署。自动化必须走固定安全链路，
 不是任意生产权限：
 
-1. PR 仅在 mergeable 且 Python 3.11/3.12 CI 全绿后 squash merge；随后创建 annotated
+1. PR 仅在 mergeable 且 Python 3.11/3.12 CI（改到前端时还有 `web.yml`）全绿后用「Create a merge commit」
+   合并（main 上都是两父合并提交，R07 证据要求第一父等于冻结基线，不用 squash）；随后创建 annotated
    SemVer tag，tag 必须指向合并后的 `origin/main` commit。
 2. 腾讯云日常发布只允许通过
    `bash scripts/deploy-production.sh --target <exact-tag-or-full-sha>`；禁止盲拉 main。
@@ -252,10 +280,10 @@ chore: init pyproject.toml with uv
 
 ## 边界守则（重要）
 
-当讨论到新功能时，先问：**这个需求是否属于「条件筛选 + 监控 + 告警」这个核心范围？**
+当讨论到新功能时，先问：**这个需求是否属于「投研平台（不含下单）」这个范围？**
 
 - 属于 → 可以做
-- 不属于（如：下单、高频、Tick 分析、策略自动优化）→ 提醒用户这超出了项目边界，是否要扩张
+- 不属于（如：实盘下单、高频、Tick 级分析、Level2）→ 提醒用户这超出了项目边界，是否要扩张
 
 这是个人项目最容易阵亡的原因——功能无限扩张。
 

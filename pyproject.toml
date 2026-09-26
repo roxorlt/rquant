@@ -25,6 +25,8 @@ dependencies = [
     "streamlit-flow-component>=1.6.1",
     "pysocks>=1.7.1",
     "pytz>=2026.2",
+    "fastapi>=0.141.1,<0.142",
+    "uvicorn>=0.46.0,<0.47",
 ]
 
 [build-system]

@@ -8672,6 +8672,13 @@ def main() -> int:
 
         return stage_main(sys.argv[2:])
 
+    # The web API reads only the Serving root and never `.env` (its unit hides the file), so
+    # `web-serve` / `web-openapi` are handed to `rquant.web.cli` the same way.
+    if sys.argv[1:2] in (["web-serve"], ["web-openapi"]):
+        from rquant.web.cli import main as web_main
+
+        return web_main(sys.argv[1:])
+
     # BLK-8: the route A production commands share that bootstrap worktree, so they are
     # dispatched the same way. Only the first positional decides — the argument parsing itself
     # is the ordinary one, it just happens before the configuration is constructed.

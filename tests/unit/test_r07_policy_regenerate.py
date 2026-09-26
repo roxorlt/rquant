@@ -48,6 +48,13 @@ def _head() -> str:
         # it at all (#175). Both are pinned here so the pair cannot drift apart again.
         ("AGENTS.md", "architecture"),
         ("CLAUDE.md", "architecture"),
+        # The React front end (2026-09-25 owner decision) is one reviewed directory rule,
+        # like deploy/ or docs/: its sources, its committed build output and its lockfile
+        # are all architecture, so a front-end pull request can be frozen at all (#175 is
+        # the precedent: an unclassified path made policy generation refuse the diff).
+        ("web/src/main.tsx", "architecture"),
+        ("web/dist/index.html", "architecture"),
+        ("web/pnpm-lock.yaml", "architecture"),
     ),
 )
 def test_diff_category_rules_are_frozen(path: str, category: str) -> None:
@@ -63,6 +70,12 @@ def test_unknown_top_level_paths_require_review_instead_of_a_silent_category() -
     # architecture: an unlisted root file still has to be categorized by a reviewer.
     with pytest.raises(ValueError, match="unclassified"):
         regenerate.diff_category("CONTRIBUTING.md")
+    # The web rule is the directory, not a prefix: a sibling top-level entry that merely
+    # starts with "web" still needs its own reviewed rule.
+    with pytest.raises(ValueError, match="unclassified"):
+        regenerate.diff_category("webapp/index.html")
+    with pytest.raises(ValueError, match="unclassified"):
+        regenerate.diff_category("web")
 
 
 def test_check_mode_passes_on_the_checked_in_policy() -> None:

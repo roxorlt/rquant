@@ -6,6 +6,53 @@
 
 ### Added
 
+- **新前端 M1 市场全景与个股入口（2026-09-26）**：全景页接入涨跌脉搏、历史走势与异动提醒、三套板块榜及成分股、涨停复盘与跨日搜索；图表支持分时、五日、日 K 和爆量标记。顶栏加入全局股票搜索，个股抽屉展示最新价、所属板块与日 K。只读网页 API 增加全景及股票路由，接口类型由 OpenAPI 生成；合成数据浏览器用例覆盖全景、搜索和数据代切换。发布脚本增加预备发布步骤，以便从服务器现有的临时 `/app/` 平稳切换。
+
+- **新前端 M1 第一段：总览、系统健康和 `/app/` 装机套件（2026-09-25）**：
+  - `GET /api/v1/overview`：显示的交易日按交易日历定（今天开盘后是今天，休市、周末、09:15 前是最近一个交易日）；
+    返回今日链路（参考数据 → 竞价候选 → 盘中信号 → 模拟成交 → 通知推送）、候选（最近一次收盘选股 + 各策略当天候选）、
+    信号及推送状态、模拟账户与持仓、服务计数、数据按时情况和「需要关注」清单。
+  - `GET /api/v1/health`：运行服务用中文名和五种状态（正常 / 注意 / 异常 / 未运行 / 等待开盘或已收盘；盘中服务在交易时段外
+    没有心跳是预期状态，不标红），数据新鲜度（日线、分钟线、选股结果、交易日历余量、各数据集水位），页面数据（数据代年龄、
+    还没有数据来源的模块）和最近错误。技术 id 单独成字段，只进 tooltip 和详情抽屉。
+  - 全部复用已有读取函数（`runtime_console_data` 新增 `read_runtime_console_sections()`，一次请求一个游标），不新增 serving 投影。
+  - 前端两页按原型实现（`DataTable`、缺失值一律「—」），外框按 owner 的界面与文案要求改：数据标记改成「数据 3 分钟前更新」、
+    版本号和各数据集状态放 tooltip；顶栏的休市与下一交易日取自交易日历；未完成的页面只显示「即将上线」；手机底部常用页面栏；
+    新组件 `Tip`、`StatusBadge`、`RelativeTime`、`EmptyState`、骨架屏。规则写进 `web/CLAUDE.md`「界面与文案原则」，
+    `src/test/jargon.ts` 在 Vitest 和 Playwright 里检查正文不出现内部词。
+  - 装机套件：`deploy/nginx/rquant-backup.conf` 的 `/app/` 四个 location（`Host $host:$server_port`）、
+    `deploy/systemd/rquant-web.service`（serving 面、384M / 640M、只读、无 `.env`）、`deploy/sudoers/rquant-web`（只允许重启这一个服务）、
+    `scripts/web-release.sh`（精确 tag、原子切换、ACL 与 chmod 兜底、失败自动回滚、幂等、`--dry-run`），`docs/deploy/web-app.md`，
+    `DEPLOY.md` 的 `/app/` 切换记录。
+  - 浏览器测试：`scripts/serve_web_fixture.py` 固定 API 时钟；`RQ_E2E_REPLAY_ROOT` 指向回放副本时按真实数据验证
+    （6 条信号、6 条推送、2 只持仓）。
+
+- **新前端 M0：`web/` 网页外框、只读网页 API、合成数据代与 `web.yml`（2026-09-25 owner 决定用
+  React + TypeScript + Vite，入口 `/app/`）**：只改仓库，不碰服务器，nginx `/app/` 块在 M1 装机时再加。
+  - `web/`：Vite 8 + React 19.3 + TypeScript 5.9（严格模式），antd 6（`zh_CN`，只经 `src/ui/` 封装）、
+    TanStack Query / Table 8.21 / Virtual、openapi-fetch、lightweight-charts 5、ECharts 6（按需注册）、React Flow + dagre、
+    React Router 8（hash 路由）。外框按原型：顶栏（交易日、市场阶段、数据代标记、搜索与 AI 占位、主题、「我的」菜单）、
+    可收起的左侧导航（6 组 13 页）、手机底部导航抽屉、浅色 / 深色 / 跟随系统、红涨绿跌、IBM Plex Mono 数字字体（自带拉丁子集）。
+    13 个页面是占位页（M1 的总览、系统健康、市场全景写「M1 开发中」）；调研报告与差距总览按 owner 决定不进导航，
+    放在「我的 → 报告」（差距总览是可筛选的 `gap-status.json`，随发布列车更新）。编译结果 `web/dist/` 提交进仓库，
+    `pnpm -C web verify:dist` 重新编译并核对，首屏 gzip 约 245 KB（上限 550 KB）。Vitest 59 个用例，Playwright 在
+    1440 与 390 两种宽度逐页检查无报错、无横向溢出，并测新数据代 20 秒内到达页面。
+  - `src/rquant/web/`：FastAPI 只读网页 API（`rquant web-serve`，只允许回环地址，默认 `127.0.0.1:8768`；
+    `rquant web-openapi` 输出 OpenAPI 快照 `web/src/api/openapi.json`）。`GET /api/v1/meta` 返回数据代、数据集水位、
+    投影可用状态和市场阶段，外壳 `{data, serving}` 的四种状态与 Streamlit 页面一致；`GenerationTracker` 跟随新数据代，
+    校验失败的新一代不会顶替正在用的一代（标 `degraded`），进行中的请求用完旧租约才关闭。不读 `rquant.config` /
+    `.env`、不引用 `rquant.storage`、不直连 DuckDB（导入隔离测试钉住）；两个命令在 `rquant.cli.main` 里先于配置构造分派。
+    新依赖只有 `fastapi` 与 `annotated-doc`（另把已在锁里的 `uvicorn` 写成直接依赖）。
+  - `tests/support/web_serving_fixture.py` 与 `scripts/build_web_fixture.py`：经生产路径
+    （`ServingReadModelInput` → `build_serving_read_models` → `ServingPublisher`）发布合成数据代，场景
+    `baseline` / `panorama` / `degraded`，`--publish-next` 发第二代；数据全部编造。
+  - `.github/workflows/web.yml`：单个 Linux 任务，按路径触发：Biome、tsc、Vitest、`verify:dist`、OpenAPI 与 TS 类型比对、
+    Playwright 冒烟。`ci.yml` 未改。
+  - R07：`diff_category` 把 `web/` 登记为 architecture 目录（仿 #175），测试钉住 `web/src/main.tsx`、`web/dist/index.html`、
+    `web/pnpm-lock.yaml`，并确认 `webapp/` 之类的兄弟目录仍然报「未分类」。根 `.gitignore` 加 `!web/dist/` 与前端缓存目录。
+  - `CLAUDE.md` / `AGENTS.md`：项目定位改为「投研平台（不含下单）」，UI 一行改为 React（Streamlit 逐步停用），
+    合并方式写明「Create a merge commit」，加前端命令；新增 `web/CLAUDE.md` / `web/AGENTS.md` / `web/README.md`。
+
 - **路线 A 单日回放工具 `scripts/route_a_day_replay.py`（包 AH）**：在一个 0700 的沙箱里，用真实的 role 入口
   （`runtime_service_main.run` + wrapper 自己派生的 argv 与环境）把一个录下的交易日从 09:15 走到收盘：参考批次与
   竞价批次按原样重新封签，分钟线来自副本里当天的 `minute_bar`（缺的代码可用 `--tushare` 补），时钟由回放推进，
@@ -134,6 +181,13 @@
   bootstrap worktree。
 
 ### Changed
+
+- **数据状态横幅只看数据代本身**：`serving_meta()` 只在没有数据代、数据代过期、或更新的一代没通过校验时报状态；
+  数据集水位不再参与（生产上 `runtime_health` 一直是 degraded、`lab_jobs` 一直 unavailable，按水位判会让每页都挂横幅）。
+  外壳新增 `age_seconds` 和给横幅用的一句话 `message`。
+- **合成数据代用 2026 年上交所真实交易日历**（原来按工作日算，把 09-25 中秋算成交易日），服务 id 和策略 id 改成生产格式，
+  并带上最近一次收盘选股；`/api/v1/meta` 增加 `previous_trading_day`、`next_trading_day`。
+- 写接口的同源检查改为比较 Origin 与 Host 的主机和端口（nginx 现在转发端口）。
 
 - deploy(nginx): `deploy/nginx/rquant-backup.conf` 加 `location /preview/`（新版看板预览，路线 A，读
   `RQUANT_SERVING_ROOT` 指向的 serving 代，只读），反代 Streamlit `127.0.0.1:8509`（lighthouse 进程，非 systemd），
