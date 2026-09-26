@@ -83,6 +83,28 @@ def test_fewer_missing_positive_weight_metrics_break_equal_score_ties() -> None:
     assert result["ts_code"].tolist() == ["000002.SZ", "000001.SZ", "000003.SZ"]
 
 
+def test_complete_stock_precedes_higher_scoring_stock_with_missing_metric() -> None:
+    frame = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000002.SZ"],
+            "momentum": [100.0, 10.0],
+            "valuation": [np.nan, 5.0],
+        }
+    )
+
+    result = rank_screen_results(
+        frame,
+        [
+            RankingCondition("momentum", ascending=False, weight=9),
+            RankingCondition("valuation", ascending=False, weight=1),
+        ],
+        top_n=1,
+    )
+
+    assert result["ts_code"].tolist() == ["000002.SZ"]
+    assert result["ranking_score"].tolist() == pytest.approx([55])
+
+
 def test_weights_are_proportional_and_zero_weight_does_not_affect_ties() -> None:
     frame = pd.DataFrame(
         {

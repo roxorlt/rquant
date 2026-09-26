@@ -25,7 +25,7 @@ def rank_screen_results(
     *,
     top_n: int,
 ) -> pd.DataFrame:
-    """Weight average percentiles of finite values (worst 1/n, best 1); missing gets 0."""
+    """Weight finite-value percentiles (worst 1/n, best 1); rank fewer missing metrics first."""
     if isinstance(top_n, bool) or not isinstance(top_n, Integral) or top_n < 1:
         raise ValueError("top_n must be a positive integer")
     if not frame.columns.is_unique:
@@ -90,7 +90,7 @@ def rank_screen_results(
 
     order = sorted(
         range(len(frame)),
-        key=lambda position: (-scores[position], missing_counts[position], codes.iloc[position]),
+        key=lambda position: (missing_counts[position], -scores[position], codes.iloc[position]),
     )[:top_n]
     result = frame.iloc[order].copy().reset_index(drop=True)
     result["ranking_score"] = scores[order]
