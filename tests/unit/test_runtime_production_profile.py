@@ -1415,6 +1415,11 @@ def test_production_profile_binds_three_strategy_authorities_end_to_end(
     serving = ServingRuntimeSettings.model_validate(
         dict(by_kind[RuntimeServiceKind.SERVING_PUBLISHER][0].settings)
     )
+    assert serving.optional_source_datasets == (
+        "lab_jobs",
+        "paper_accounts",
+        "promotions",
+    )
     assert {source.dataset_id for source in serving.source_authorities} == {
         "signals",
         "paper_accounts",

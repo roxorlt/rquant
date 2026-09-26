@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ServingReferenceSlowEvidence,
@@ -479,14 +481,114 @@ def test_serving_publishes_while_the_research_authorities_have_never_published(
     assert absent[LAB_JOBS_DATASET_ID] != absent[PROMOTIONS_DATASET_ID]
 
 
+@pytest.mark.parametrize("root_exists", [False, True])
+def test_unpublished_paper_authority_stays_unavailable_then_recovers_or_fails_closed(
+    tmp_path: Path,
+    root_exists: bool,
+) -> None:
+    settings, roots = _authority_settings(
+        tmp_path,
+        unpublished=frozenset({PAPER_ACCOUNTS_DATASET_ID}),
+    )
+    settings["optional_source_datasets"] = [
+        LAB_JOBS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+    ]
+    if root_exists:
+        roots[PAPER_ACCOUNTS_DATASET_ID].mkdir(parents=True)
+    unavailable_reason = (
+        "current pointer is unavailable" if root_exists else "current authority is unavailable"
+    )
+    clock = [NOW]
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: clock[0])(
+        _manifest(tmp_path, settings=settings)
+    )
+
+    first = step()
+    assert first.generation_published is True
+    assert first.degraded_reasons == (
+        "serving:paper_accounts:unavailable:ServingSourceAuthorityUnavailableError: "
+        f"{unavailable_reason}",
+    )
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        paper_watermark = next(
+            item
+            for item in lease.manifest.watermarks
+            if item.dataset_id == PAPER_ACCOUNTS_DATASET_ID
+        )
+        assert paper_watermark.status is FreshnessStatus.UNAVAILABLE
+        assert lease.connection.execute("SELECT COUNT(*) FROM paper_accounts").fetchone() == (0,)
+        first_generation = lease.manifest.generation_id
+
+    clock[0] += timedelta(seconds=30)
+    unchanged = step()
+    assert unchanged.generation_published is False
+    assert unchanged.source_generations[PAPER_ACCOUNTS_DATASET_ID] == (
+        first.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+
+    account = PaperAccountSnapshot(
+        account_id="shadow-main",
+        as_of_time=NOW,
+        cash=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        frozen_cash=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        nav=Decimal("100000"),
+    )
+    ServingSourceAuthorityPublisher(
+        root=roots[PAPER_ACCOUNTS_DATASET_ID],
+        producer_commit=COMMIT,
+        dataset_id=PAPER_ACCOUNTS_DATASET_ID,
+        payload_kind="paper_accounts",
+        clock=lambda: clock[0],
+    ).publish(
+        _authority_result(
+            PAPER_ACCOUNTS_DATASET_ID,
+            PaperAccountsPayload(paper_accounts=(account,)),
+            published_at=NOW + timedelta(seconds=1),
+        )
+    )
+    recovered = step()
+    assert recovered.generation_published is True
+    assert recovered.degraded_reasons == ()
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        assert lease.manifest.generation_id != first_generation
+        assert lease.connection.execute("SELECT account_id FROM paper_accounts").fetchall() == [
+            ("shadow-main",)
+        ]
+
+    current_paper_pointer = roots[PAPER_ACCOUNTS_DATASET_ID] / "current.json"
+    current_paper_pointer.write_bytes(b"{")
+    with pytest.raises(RuntimeError, match="paper_accounts reader failed"):
+        step()
+    assert ServingReader(tmp_path / "serving").current_manifest().generation_id == (
+        recovered.source_generations["serving_generation"]
+    )
+
+    current_paper_pointer.unlink()
+    restarted_step = serving_publisher_builder(snapshot_loader=None, clock=lambda: clock[0])(
+        _manifest(tmp_path, settings=settings)
+    )
+    with pytest.raises(RuntimeError, match="paper_accounts reader failed"):
+        restarted_step()
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        assert lease.manifest.generation_id == recovered.source_generations["serving_generation"]
+        assert lease.connection.execute("SELECT account_id FROM paper_accounts").fetchall() == [
+            ("shadow-main",)
+        ]
+
+
 def test_the_manifest_decides_which_sources_are_optional_not_the_default(
     tmp_path: Path,
 ) -> None:
     """A profile that shortens the list back to `[]` really tightens the rule.
 
-    The builder's default and what `runtime_production_profile` writes into the manifest
-    are the same two datasets today, so every other case here cannot tell the two paths
-    apart: wiring `:313` back to the constant leaves all of them green. That matters
+    The builder's legacy default names two research datasets while the current profile
+    explicitly adds paper accounts. This case still guards manifest authority: wiring
+    the builder directly to its default would hide a profile change. That matters
     because writing the list into the manifest is the whole reason the profile spells it
     out -- the day the research plane publishes, shortening it to `[]` is meant to be a
     profile change with its own fingerprint, and it has to actually bite.
@@ -519,9 +621,14 @@ def test_a_source_outside_the_optional_set_stops_the_whole_round(
     tmp_path: Path,
     dataset_id: str,
 ) -> None:
-    """The negative half of #283, at the builder: only the two research sources degrade."""
+    """The new optional paper source does not weaken the three required owner reads."""
 
     settings, _roots = _authority_settings(tmp_path, unpublished=frozenset({dataset_id}))
+    settings["optional_source_datasets"] = [
+        LAB_JOBS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+    ]
     step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
         _manifest(tmp_path, settings=settings)
     )

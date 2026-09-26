@@ -2712,6 +2712,11 @@ def test_blk3_derived_settings_agree_with_the_production_profile_field_by_field(
     monkeypatch.setattr(stage_module, "PRODUCTION_RUNTIME_ROOT", inputs.runtime_root)
     _trusted_keyring(monkeypatch, tmp_path / "keyring")
     derived = stage_module.bootstrap_settings(inputs.producer_commit)
+    assert derived["serving.publisher.v1"]["optional_source_datasets"] == [
+        "lab_jobs",
+        "paper_accounts",
+        "promotions",
+    ]
     published = {
         manifest.service_id: json.loads(manifest.model_dump_json())["settings"]
         for manifest in profile.manifests
