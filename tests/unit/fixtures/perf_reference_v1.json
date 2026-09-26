@@ -1,0 +1,17 @@
+{
+  "provenance": "Independently calculated arithmetic reference for C7.1, frozen before implementation; quantstats/pyfolio parity is pending because neither package is present offline.",
+  "daily_returns": [0.1, -0.1, 0.2, -0.05],
+  "summary": {
+    "observations": 4,
+    "total_return": 0.1286,
+    "annualized_return": 2040.8455777682977,
+    "annualized_volatility": 2.18574929943944,
+    "sharpe": 4.323460152737353,
+    "sortino": 10.648943609579309,
+    "calmar": 20408.455777682975,
+    "max_drawdown": -0.1,
+    "max_drawdown_duration": 1,
+    "win_rate": 0.5,
+    "payoff_ratio": 2.0
+  }
+}
