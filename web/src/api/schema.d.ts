@@ -1309,6 +1309,11 @@ export interface components {
             /** Ranking Metrics */
             ranking_metrics: components["schemas"]["ScreenOption"][];
             source: components["schemas"]["ScreenSourceInfo"] | null;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
         };
         /** ScreenCondition */
         ScreenCondition: {

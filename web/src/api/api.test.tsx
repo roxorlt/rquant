@@ -49,7 +49,14 @@ describe("useServingQuery", () => {
       http.get("*/api/v1/screen/blocks", () => {
         catalogReads += 1;
         return HttpResponse.json({
-          data: { blocks: [], dates: [], available: false, ranking_metrics: [], source: null },
+          data: {
+            blocks: [],
+            dates: [],
+            available: false,
+            ranking_metrics: [],
+            source: null,
+            source_kind: "replica",
+          },
           serving: metaEnvelope().serving,
         });
       }),
@@ -73,6 +80,91 @@ describe("useServingQuery", () => {
     );
     expect(catalogReads).toBe(1);
     result.current.catalog.refetch();
+    await waitFor(() => expect(catalogReads).toBe(2));
+  });
+
+  it("默认 Serving 选股目录随代际更新，并让旧结果的来源可判过期", async () => {
+    const client = testQueryClient();
+    let generationId = "a".repeat(64);
+    let catalogReads = 0;
+    server.use(
+      http.get("*/api/v1/meta", () => HttpResponse.json(metaEnvelope({ generationId }))),
+      http.get("*/api/v1/screen/blocks", () => {
+        catalogReads += 1;
+        return HttpResponse.json({
+          data: {
+            blocks: [],
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source: { identity: generationId, updated_at: "2026-09-24T07:31:00Z" },
+            source_kind: "serving",
+          },
+          serving: metaEnvelope({ generationId }).serving,
+        });
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => ({ meta: useMeta(), catalog: useScreenCatalog() }), {
+      wrapper,
+    });
+    await waitFor(() => expect(catalogReads).toBe(1));
+    const oldResultIdentity = result.current.catalog.data?.source?.identity;
+    expect(oldResultIdentity).toBe(generationId);
+
+    generationId = "b".repeat(64);
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: META_QUERY_KEY });
+    });
+    await waitFor(() =>
+      expect(result.current.meta.data?.data.generation?.generation_id).toBe(generationId),
+    );
+    await waitFor(() => expect(catalogReads).toBe(2));
+    expect(result.current.catalog.data?.source?.identity).toBe(generationId);
+    expect(result.current.catalog.data?.source?.identity).not.toBe(oldResultIdentity);
+    result.current.catalog.refetch();
+    await waitFor(() => expect(catalogReads).toBe(3));
+  });
+
+  it("初载不可用且来源为空的 Serving 选股目录仍随代际重取", async () => {
+    const client = testQueryClient();
+    let generationId = "a".repeat(64);
+    let catalogReads = 0;
+    server.use(
+      http.get("*/api/v1/meta", () => HttpResponse.json(metaEnvelope({ generationId }))),
+      http.get("*/api/v1/screen/blocks", () => {
+        catalogReads += 1;
+        return HttpResponse.json({
+          data: {
+            blocks: [],
+            dates: [],
+            available: false,
+            ranking_metrics: [],
+            source: null,
+            source_kind: "serving",
+          },
+          serving: metaEnvelope({ generationId }).serving,
+        });
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => ({ meta: useMeta(), catalog: useScreenCatalog() }), {
+      wrapper,
+    });
+    await waitFor(() => expect(catalogReads).toBe(1));
+    expect(result.current.catalog.data?.source).toBeNull();
+
+    generationId = "b".repeat(64);
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: META_QUERY_KEY });
+    });
+    await waitFor(() =>
+      expect(result.current.meta.data?.data.generation?.generation_id).toBe(generationId),
+    );
     await waitFor(() => expect(catalogReads).toBe(2));
   });
 });

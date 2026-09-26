@@ -1,6 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import { ApiError, apiClient, type MetaEnvelope } from "./client";
+import type { ScreenCatalogData } from "./screen";
+import type { ServingEnvelope } from "./useServingQuery";
 
 export const META_QUERY_KEY = ["meta"] as const;
 export const META_POLL_MS = 15_000;
@@ -14,8 +16,8 @@ export async function fetchMeta(): Promise<MetaEnvelope> {
 }
 
 /**
- * Polls /api/v1/meta every 15 s. When the Serving generation changes, every
- * other query is invalidated, so the page on screen refetches its data.
+ * Polls /api/v1/meta every 15 s. A Serving generation change invalidates
+ * Serving-backed queries; the independent screen replica stays on manual refresh.
  */
 export function useMeta() {
   const queryClient = useQueryClient();
@@ -35,9 +37,14 @@ export function useMeta() {
     }
     if (previous.current !== null && previous.current !== generationId) {
       void queryClient.invalidateQueries({
-        predicate: (entry) =>
-          entry.queryKey[0] !== META_QUERY_KEY[0] &&
-          !(entry.queryKey[0] === "screen" && entry.queryKey[1] === "blocks"),
+        predicate: (entry) => {
+          if (entry.queryKey[0] === META_QUERY_KEY[0]) return false;
+          if (entry.queryKey[0] === "screen" && entry.queryKey[1] === "blocks") {
+            const catalog = entry.state.data as ServingEnvelope<ScreenCatalogData> | undefined;
+            return catalog?.data.source_kind !== "replica";
+          }
+          return true;
+        },
       });
     }
     previous.current = generationId;

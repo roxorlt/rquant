@@ -116,9 +116,11 @@ class ScreenApplicationService:
                 snapshot = self.replica.available_dates()
             except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
                 return ScreenCatalogData(
-                    blocks=blocks, dates=[], available=False, ranking_metrics=[], source=None,
+                    source_kind="replica", blocks=blocks, dates=[], available=False,
+                    ranking_metrics=[], source=None,
                 )
             return ScreenCatalogData(
+                source_kind="replica",
                 blocks=blocks,
                 dates=snapshot.dates,
                 available=bool(snapshot.dates),
@@ -155,6 +157,7 @@ class ScreenApplicationService:
                     updated_at=borrowed.manifest.built_at,
                 )
         return ScreenCatalogData(
+            source_kind="serving",
             blocks=blocks,
             dates=dates,
             available=available,

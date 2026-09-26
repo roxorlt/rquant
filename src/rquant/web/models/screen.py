@@ -53,6 +53,7 @@ class ScreenSourceInfo(BaseModel):
 class ScreenCatalogData(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    source_kind: Literal["serving", "replica"]
     blocks: list[ScreenBlock]
     dates: list[date]
     available: bool

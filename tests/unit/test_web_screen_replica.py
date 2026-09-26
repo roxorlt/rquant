@@ -138,6 +138,7 @@ def test_replica_catalog_and_pages_work_without_serving_and_bind_source_identity
 
     assert catalog.status_code == first.status_code == second.status_code == 200
     assert catalog.json()["serving"]["generation_id"] is None
+    assert catalog.json()["data"]["source_kind"] == "replica"
     assert catalog.json()["data"]["available"] is True
     assert catalog.json()["data"]["dates"][0] == latest.isoformat()
     identity = catalog.json()["data"]["source"]["identity"]
@@ -167,6 +168,7 @@ def test_configured_broken_replica_never_falls_back_to_available_serving(
 
     assert catalog.status_code == 200
     assert catalog.json()["data"]["available"] is False
+    assert catalog.json()["data"]["source_kind"] == "replica"
     assert catalog.json()["data"]["source"] is None
     assert result.status_code == 503
     assert result.json() == {"detail": "选股数据暂不可用，请稍后重试。"}

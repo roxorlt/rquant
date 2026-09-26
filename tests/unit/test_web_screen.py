@@ -147,6 +147,7 @@ def test_catalog_exposes_all_registered_rules_with_plain_chinese_labels(
 
     assert response.status_code == 200, response.text
     body = response.json()
+    assert body["data"]["source_kind"] == "serving"
     blocks = body["data"]["blocks"]
     assert {item["key"] for item in blocks} == {item.name for item in REGISTRY}
     assert len(blocks) == 26
@@ -307,6 +308,7 @@ def test_missing_published_data_is_not_mistaken_for_zero_hits(tmp_path: Path) ->
         result = _run(client, conditions=[{"key": "not_st", "args": {}}])
 
     assert catalog.json()["data"]["available"] is False
+    assert catalog.json()["data"]["source_kind"] == "serving"
     assert catalog.json()["data"]["dates"] == []
     assert result.status_code == 200, result.text
     assert result.json()["data"]["status"] == "unavailable"

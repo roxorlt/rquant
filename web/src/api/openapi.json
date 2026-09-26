@@ -3305,9 +3305,18 @@
                 "type": "null"
               }
             ]
+          },
+          "source_kind": {
+            "enum": [
+              "serving",
+              "replica"
+            ],
+            "title": "Source Kind",
+            "type": "string"
           }
         },
         "required": [
+          "source_kind",
           "blocks",
           "dates",
           "available",
