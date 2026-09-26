@@ -964,11 +964,9 @@ def bootstrap_settings(commit: str) -> dict[str, dict[str, object]]:
                     "root": str(reference_spool / "serving-authority"),
                 },
             ],
-            #: named here rather than left to the field's default, for the same reason the
-            #: production profile names it (#283): which sources may degrade is a manifest
-            #: decision. The two research-plane publishers have never cut a generation on
-            #: the host, and before this the whole round refused over their absence.
-            "optional_source_datasets": ["lab_jobs", "promotions"],
+            #: Match the production profile: first installation may have no research or
+            #: paper account authority yet. Integrity failures remain fatal.
+            "optional_source_datasets": ["lab_jobs", "paper_accounts", "promotions"],
         },
     }
     for strategy in strategies:

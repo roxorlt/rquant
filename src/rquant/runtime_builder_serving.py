@@ -79,9 +79,10 @@ class ServingRuntimeSettings(RuntimeContractModel):
     serving_root: Path
     schema_version: StrictInt = Field(ge=1)
     source_authorities: tuple[ServingSourceAuthoritySettings, ...] = ()
-    #: A manifest written before #283 does not carry this key, and the default is what
-    #: this release decided, so such a manifest gets the same behaviour without being
-    #: rewritten. The reverse does not hold: `RuntimeContractModel` forbids extra keys, so
+    #: Older manifests without this key retain the research-only optional set. The
+    #: production profile explicitly adds paper_accounts; the default must not silently
+    #: widen already published manifests. The reverse does not hold:
+    #: `RuntimeContractModel` forbids extra keys, so
     #: a runtime generation staged by this code and left published while the code rolls
     #: back to one that has no such field is refused at build. Roll the runtime generation
     #: back together with the code.
@@ -315,10 +316,8 @@ def serving_publisher_builder(
                 lab_jobs_reader=readers["lab_jobs"],
                 promotions_reader=readers["promotions"],
                 reference_slow_reader=readers[_REFERENCE_SLOW_AUTHORITY_DATASET_ID],
-                #: #283: the research plane has never published a generation on the host,
-                #: and a fail-closed read of it stopped serving from cutting any
-                #: generation at all. These two degrade to an empty payload and an
-                #: `unavailable` watermark; the other four still refuse the round.
+                #: The manifest names sources allowed to be absent. The assembler only
+                #: degrades classified unavailability; integrity failures still refuse.
                 optional_datasets=frozenset(settings.optional_source_datasets),
             )
             resolved_snapshot_loader = assembler.assemble

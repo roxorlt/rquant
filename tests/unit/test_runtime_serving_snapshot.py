@@ -12,6 +12,10 @@ from rquant.runtime_service_control import (
     RuntimeServicePlane,
     RuntimeServiceStatus,
 )
+from rquant.runtime_serving_authority import (
+    ServingSourceAuthorityIntegrityError,
+    ServingSourceAuthorityUnavailableError,
+)
 from rquant.runtime_serving_snapshot import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
     LAB_JOBS_DATASET_ID,
@@ -326,9 +330,12 @@ def test_page_projection_is_bound_to_the_verified_owner_generation() -> None:
     assert projection.owner_generation_id == "7" * 64
 
 
-def _failing_reader(message: str):
+def _failing_reader(
+    message: str,
+    error_type: type[Exception] = OSError,
+):
     def reader(_as_of: datetime) -> SourceReadResult:
-        raise OSError(message)
+        raise error_type(message)
 
     return reader
 
@@ -374,13 +381,19 @@ def test_an_absent_research_source_degrades_to_an_empty_payload(
     """#283: the research plane has published nothing, and serving still cuts a generation."""
 
     assembler = _assembler()
-    object.__setattr__(assembler, attribute, _failing_reader("research authority is unavailable"))
+    object.__setattr__(
+        assembler,
+        attribute,
+        _failing_reader("current authority is unavailable", ServingSourceAuthorityUnavailableError),
+    )
 
     snapshot = assembler.assemble(NOW)
     watermark = next(item for item in snapshot.watermarks if item.dataset_id == dataset_id)
 
     assert watermark.status is FreshnessStatus.UNAVAILABLE
-    assert watermark.reason == "OSError: research authority is unavailable"
+    assert watermark.reason == (
+        "ServingSourceAuthorityUnavailableError: current authority is unavailable"
+    )
     assert snapshot.source_generations[dataset_id] == watermark.generation_id
     assert snapshot.read_model.lab_jobs == ()
     assert snapshot.read_model.promotions == ()
@@ -403,7 +416,7 @@ def test_an_absent_source_puts_no_clock_in_the_generation_it_contributes() -> No
     object.__setattr__(
         assembler,
         "lab_jobs_reader",
-        _failing_reader("research authority is unavailable"),
+        _failing_reader("current authority is unavailable", ServingSourceAuthorityUnavailableError),
     )
 
     first = assembler.assemble(NOW)
@@ -424,9 +437,40 @@ def test_an_absent_source_puts_no_clock_in_the_generation_it_contributes() -> No
     #: and it is still an identity, not a constant: a different refusal is a different
     #: source, which is what makes the publisher rebuild when the reason really changes
     other = _assembler()
-    object.__setattr__(other, "lab_jobs_reader", _failing_reader("authority is corrupt"))
+    object.__setattr__(
+        other,
+        "lab_jobs_reader",
+        _failing_reader("authority is not yet available", ServingSourceAuthorityUnavailableError),
+    )
     other_generation = other.assemble(NOW).source_generations[LAB_JOBS_DATASET_ID]
     assert other_generation != absent_generation
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "attribute"),
+    [
+        (PAPER_ACCOUNTS_DATASET_ID, "paper_accounts_reader"),
+        (LAB_JOBS_DATASET_ID, "lab_jobs_reader"),
+        (PROMOTIONS_DATASET_ID, "promotions_reader"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [ServingSourceAuthorityIntegrityError, OSError])
+def test_optional_source_integrity_or_unknown_failure_refuses_generation(
+    dataset_id: str,
+    attribute: str,
+    error_type: type[Exception],
+) -> None:
+    assembler = _assembler(
+        optional_datasets=DEFAULT_OPTIONAL_SOURCE_DATASETS | {PAPER_ACCOUNTS_DATASET_ID}
+    )
+    object.__setattr__(
+        assembler,
+        attribute,
+        _failing_reader("published authority is unsafe", error_type),
+    )
+
+    with pytest.raises(RuntimeError, match=f"{dataset_id} reader failed"):
+        assembler.assemble(NOW)
 
 
 def test_reference_slow_can_never_be_made_optional() -> None:

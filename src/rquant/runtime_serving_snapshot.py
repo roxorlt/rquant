@@ -536,9 +536,15 @@ class ServingSnapshotAssembler:
         try:
             result = reader(as_of)
         except Exception as error:
-            if dataset_id not in self.optional_datasets:
-                raise RuntimeError(f"{dataset_id} reader failed: {_error_text(error)}") from error
-            if payload_type is ReferenceSlowPayload:
+            # The authority reader imports this module for SourceReadResult, so keep the
+            # classified exception import local to the failure path.
+            from rquant.runtime_serving_authority import ServingSourceAuthorityUnavailableError
+
+            if (
+                dataset_id not in self.optional_datasets
+                or payload_type is ReferenceSlowPayload
+                or not isinstance(error, ServingSourceAuthorityUnavailableError)
+            ):
                 raise RuntimeError(f"{dataset_id} reader failed: {_error_text(error)}") from error
             reason = _error_text(error)
             return SourceReadResult(

@@ -2047,14 +2047,10 @@ def build_production_runtime_profile(
                         "root": str(root / "live" / "reference-slow" / "serving-authority"),
                     },
                 ],
-                #: The research plane publishes neither of these on the host yet, and
-                #: while serving read all six fail-closed that absence cost the whole
-                #: round -- not one generation was cut (#283). Written out rather than
-                #: left to the builder's default so the manifest says which sources this
-                #: profile lets serving degrade on, and so shortening the list back to
-                #: `[]` the day the research plane runs is a profile change with its own
-                #: fingerprint.
-                "optional_source_datasets": ["lab_jobs", "promotions"],
+                #: On a fresh host these sources may not yet have published. Only the
+                #: authority reader's classified unavailability degrades; invalid
+                #: published evidence still stops the entire serving round.
+                "optional_source_datasets": ["lab_jobs", "paper_accounts", "promotions"],
             },
         )
     )
