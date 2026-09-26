@@ -265,9 +265,7 @@ def test_with_the_descriptor_refused_the_budget_decides_copy_or_in_place(
     ) as read_in_place:
         assert read_in_place.opened_through == "in_place"
         assert not list(Path(tempfile.gettempdir()).glob("rquant-reference-source-*"))
-        assert (
-            read_in_place.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
-        )
+        assert read_in_place.connection.execute("SELECT count(*) FROM daily_bar").fetchone()[0] == 2
 
 
 def test_a_generation_over_the_copy_budget_is_read_in_place_and_copied_nowhere(
@@ -776,6 +774,180 @@ def test_capture_includes_bounded_reference_page_projections_from_same_database_
     assert nl_row["RSI14[0]"] == 55.0
     assert nl_row["CIRC_MV[0]"] == 1000.0
     assert nl_row["IS_LIMIT_UP[0]"] is False
+
+
+def _twenty_day_projection_database(
+    tmp_path: Path,
+) -> tuple[Path, MarketCalendarAuthority, tuple[date, ...]]:
+    database = _database(tmp_path)
+    open_dates = tuple(item.date() for item in pd.bdate_range(end=PRIOR_DATE, periods=21))
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("ALTER TABLE daily_bar ADD COLUMN pct_chg DOUBLE")
+        connection.execute("UPDATE daily_bar SET pct_chg = 0.0")
+        connection.execute("UPDATE adj_factor SET adj_factor = 2.0 WHERE ts_code = '600000.SH'")
+        connection.executemany(
+            "INSERT INTO daily_bar (ts_code, trade_date, close, pct_chg) VALUES (?, ?, ?, ?)",
+            [
+                (code, trade_date, close, 0.0)
+                for trade_date in open_dates[:-1]
+                for code, close in (("300001.SZ", 16.0), ("600000.SH", 20.0))
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO adj_factor VALUES (?, ?, ?)",
+            [
+                (code, trade_date, 1.0)
+                for trade_date in open_dates[:-1]
+                for code in ("300001.SZ", "600000.SH")
+            ],
+        )
+        connection.execute("CREATE TABLE stock_basic(ts_code VARCHAR, name VARCHAR)")
+        connection.executemany(
+            "INSERT INTO stock_basic VALUES (?, ?)",
+            (("300001.SZ", "成长样本"), ("600000.SH", "普通样本")),
+        )
+        connection.execute(
+            """
+            CREATE TABLE daily_state(
+                ts_code VARCHAR, trade_date DATE, is_st BOOLEAN, is_bj BOOLEAN,
+                board_type VARCHAR
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO daily_state VALUES (?, ?, ?, ?, ?)",
+            [
+                ("300001.SZ", PRIOR_DATE, False, False, "gem"),
+                ("600000.SH", PRIOR_DATE, False, False, "main"),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close, pct_chg) "
+            "VALUES ('600000.SH', ?, 1000.0, 999.0)",
+            [TARGET_DATE],
+        )
+        connection.execute("INSERT INTO adj_factor VALUES ('600000.SH', ?, 100.0)", [TARGET_DATE])
+    database.chmod(0o600)
+    calendar = MarketCalendarAuthority.create(
+        schema_version=1,
+        exchange="SSE",
+        producer_commit=COMMIT,
+        coverage_start=open_dates[0],
+        coverage_end=date(2026, 8, 3),
+        open_dates=(*open_dates, TARGET_DATE, date(2026, 8, 3)),
+        generated_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    return database, calendar, open_dates
+
+
+def _twenty_day_rows(
+    database: Path,
+    calendar: MarketCalendarAuthority,
+) -> tuple[dict[str, object], ...]:
+    snapshot = capture_reference_slow_source_snapshot(
+        database_path=database,
+        adapter=_Adapter(),
+        calendar=calendar,
+        target_trade_date=TARGET_DATE,
+        captured_at=OBSERVED_AT,
+        completion_clock=lambda: OBSERVED_AT,
+        producer_commit=COMMIT,
+    )
+    return tuple(
+        dict(row)
+        for projection in snapshot.projections
+        if projection.table_name == "nl_screen_universe"
+        for row in projection.rows
+    )
+
+
+def test_twenty_day_return_uses_21_open_sessions_and_adjusted_closes_without_lookahead(
+    tmp_path: Path,
+) -> None:
+    database, calendar, _open_dates = _twenty_day_projection_database(tmp_path)
+
+    rows = _twenty_day_rows(database, calendar)
+
+    assert [row["ts_code"] for row in rows] == ["300001.SZ", "600000.SH"]
+    assert [row["CLOSE[0]"] for row in rows] == [20.0, 10.0]
+    assert [row["PCT_CHG[0]"] for row in rows] == [0.0, 0.0]
+    assert rows[0]["RETURN_20D_PCT[0]"] == pytest.approx(25.0)
+    assert rows[1]["RETURN_20D_PCT[0]"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "missing_evidence",
+    (
+        "base_bar",
+        "middle_bar",
+        "base_factor",
+        "middle_factor",
+        "zero_factor",
+        "zero_close",
+        "calendar",
+    ),
+)
+def test_twenty_day_return_is_null_when_a_session_or_factor_is_missing(
+    tmp_path: Path,
+    missing_evidence: str,
+) -> None:
+    database, calendar, open_dates = _twenty_day_projection_database(tmp_path)
+    if missing_evidence == "calendar":
+        calendar = _calendar()
+    else:
+        with duckdb.connect(str(database)) as connection:
+            if missing_evidence in {"base_bar", "middle_bar"}:
+                trade_date = open_dates[0] if missing_evidence == "base_bar" else open_dates[10]
+                connection.execute(
+                    "DELETE FROM daily_bar WHERE ts_code = '600000.SH' AND trade_date = ?",
+                    [trade_date],
+                )
+            elif missing_evidence in {"base_factor", "middle_factor"}:
+                trade_date = open_dates[0] if missing_evidence == "base_factor" else open_dates[10]
+                connection.execute(
+                    "DELETE FROM adj_factor WHERE ts_code = '600000.SH' AND trade_date = ?",
+                    [trade_date],
+                )
+            elif missing_evidence == "zero_factor":
+                connection.execute(
+                    "UPDATE adj_factor SET adj_factor = 0 WHERE ts_code = '600000.SH' "
+                    "AND trade_date = ?",
+                    [open_dates[10]],
+                )
+            elif missing_evidence == "zero_close":
+                connection.execute(
+                    "UPDATE daily_bar SET close = 0 WHERE ts_code = '600000.SH' AND trade_date = ?",
+                    [open_dates[10]],
+                )
+        database.chmod(0o600)
+
+    rows = _twenty_day_rows(database, calendar)
+
+    assert [row["ts_code"] for row in rows] == ["300001.SZ", "600000.SH"]
+    assert rows[1]["RETURN_20D_PCT[0]"] is None
+    if missing_evidence != "calendar":
+        assert rows[0]["RETURN_20D_PCT[0]"] == pytest.approx(25.0)
+
+
+def test_twenty_day_return_does_not_add_a_stock_without_a_current_bar(
+    tmp_path: Path,
+) -> None:
+    database, calendar, _open_dates = _twenty_day_projection_database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "DELETE FROM daily_bar WHERE ts_code = '600000.SH' AND trade_date = ?",
+            [PRIOR_DATE],
+        )
+    database.chmod(0o600)
+
+    _daily, projections = reference_slow_source_module._query_database_reference_evidence(
+        database,
+        prior_trade_date=PRIOR_DATE,
+        projection_as_of_date=TARGET_DATE,
+        calendar_open_dates=calendar.open_dates,
+    )
+
+    assert [row["ts_code"] for row in projections["nl_screen_universe"]] == ["300001.SZ"]
 
 
 class _DelistingAdapter(_Adapter):

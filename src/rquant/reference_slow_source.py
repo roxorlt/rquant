@@ -625,11 +625,27 @@ _ReferenceEvidence = tuple[
 ]
 
 
+def _twenty_day_open_sessions(
+    trade_date: date,
+    calendar_open_dates: tuple[date, ...] | None,
+) -> tuple[date, ...]:
+    if calendar_open_dates is None:
+        return ()
+    known = tuple(item for item in calendar_open_dates if item <= trade_date)
+    if len(known) < 21 or known[-1] != trade_date:
+        return ()
+    sessions = known[-21:]
+    if any(left >= right for left, right in zip(sessions, sessions[1:], strict=False)):
+        return ()
+    return sessions
+
+
 def _load_database_reference_evidence(
     database_path: Path,
     *,
     prior_trade_date: date,
     projection_as_of_date: date | None = None,
+    calendar_open_dates: tuple[date, ...] | None = None,
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_deadline: float = float("inf"),
     monotonic_clock: Callable[[], float] = monotonic,
@@ -655,6 +671,7 @@ def _load_database_reference_evidence(
             database_path,
             prior_trade_date=prior_trade_date,
             projection_as_of_date=projection_as_of_date,
+            calendar_open_dates=calendar_open_dates,
             limits=limits,
             monotonic_deadline=monotonic_deadline,
             monotonic_clock=monotonic_clock,
@@ -664,11 +681,17 @@ def _load_database_reference_evidence(
             database_path,
             prior_trade_date=prior_trade_date,
             projection_as_of_date=projection_as_of_date,
+            calendar_open_dates=calendar_open_dates,
             limits=limits,
             monotonic_deadline=monotonic_deadline,
             monotonic_clock=monotonic_clock,
         ),
-        key=("reference-slow-evidence", prior_trade_date, projection_as_of_date),
+        key=(
+            "reference-slow-evidence",
+            prior_trade_date,
+            projection_as_of_date,
+            _twenty_day_open_sessions(prior_trade_date, calendar_open_dates),
+        ),
     ).value
 
 
@@ -677,6 +700,7 @@ def _query_database_reference_evidence(
     *,
     prior_trade_date: date,
     projection_as_of_date: date | None = None,
+    calendar_open_dates: tuple[date, ...] | None = None,
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_deadline: float = float("inf"),
     monotonic_clock: Callable[[], float] = monotonic,
@@ -685,6 +709,7 @@ def _query_database_reference_evidence(
 
     limits = ReferenceSlowSourceLimits.model_validate(limits)
     projection_date = projection_as_of_date or prior_trade_date
+    return_window = _twenty_day_open_sessions(prior_trade_date, calendar_open_dates)
     normalized: list[tuple[str, float, float]] = []
     response_bytes = 0
     projections: dict[str, tuple[dict[str, str | int | float | bool | None], ...]] = {}
@@ -710,9 +735,7 @@ def _query_database_reference_evidence(
             )
             while True:
                 if monotonic_clock() > monotonic_deadline:
-                    raise ReferenceSlowSourceError(
-                        "reference source read deadline expired"
-                    )
+                    raise ReferenceSlowSourceError("reference source read deadline expired")
                 rows = cursor.fetchmany(limits.query_chunk_rows)
                 if not rows:
                     break
@@ -1013,6 +1036,56 @@ def _query_database_reference_evidence(
                         f'basic_daily.{column} AS "{alias}[0]"'
                         for column, alias in basic_aliases.items()
                     )
+                return_parameters: list[object] = []
+                if return_window:
+                    joins += """
+                    LEFT JOIN (
+                        SELECT history.ts_code,
+                               COUNT(*) AS observed_sessions,
+                               COUNT(*) FILTER (
+                                   WHERE history.close > 0
+                                     AND isfinite(history.close)
+                                     AND adjustment.adj_factor > 0
+                                     AND isfinite(adjustment.adj_factor)
+                               ) AS valid_sessions,
+                               MAX(CASE WHEN history.trade_date = ? THEN
+                                   history.close * adjustment.adj_factor END
+                               ) AS adjusted_start,
+                               MAX(CASE WHEN history.trade_date = ? THEN
+                                   history.close * adjustment.adj_factor END
+                               ) AS adjusted_end
+                        FROM daily_bar AS history
+                        JOIN (SELECT UNNEST(?::DATE[]) AS trade_date) AS open_day
+                          ON open_day.trade_date = history.trade_date
+                        LEFT JOIN adj_factor AS adjustment
+                          ON adjustment.ts_code = history.ts_code
+                         AND adjustment.trade_date = history.trade_date
+                        GROUP BY history.ts_code
+                    ) AS return_history ON return_history.ts_code = daily.ts_code
+                    """
+                    projection_columns.append(
+                        """
+                        CASE WHEN return_history.observed_sessions = 21
+                                  AND return_history.valid_sessions = 21
+                                  AND return_history.adjusted_start > 0
+                                  AND isfinite(return_history.adjusted_start)
+                                  AND isfinite(return_history.adjusted_end)
+                                  AND isfinite(
+                                      (return_history.adjusted_end /
+                                       return_history.adjusted_start - 1) * 100
+                                  )
+                             THEN (return_history.adjusted_end /
+                                   return_history.adjusted_start - 1) * 100
+                             ELSE NULL END AS "RETURN_20D_PCT[0]"
+                        """
+                    )
+                    return_parameters = [
+                        return_window[0],
+                        return_window[-1],
+                        list(return_window),
+                    ]
+                else:
+                    projection_columns.append('CAST(NULL AS DOUBLE) AS "RETURN_20D_PCT[0]"')
                 bounded_projection(
                     "nl_screen_universe",
                     f"""
@@ -1021,7 +1094,7 @@ def _query_database_reference_evidence(
                     WHERE daily.trade_date = ?
                     ORDER BY daily.trade_date, daily.ts_code
                     """,
-                    [prior_trade_date],
+                    [*return_parameters, prior_trade_date],
                     source_table="daily_state",
                 )
         except duckdb.Error as exc:
@@ -1316,6 +1389,7 @@ def capture_reference_slow_source_snapshot(
         _normalized_absolute_path(database_path),
         prior_trade_date=prior_trade_date,
         projection_as_of_date=target_trade_date,
+        calendar_open_dates=calendar.open_dates,
         limits=limits,
         monotonic_deadline=read_deadline,
         monotonic_clock=monotonic_clock,
