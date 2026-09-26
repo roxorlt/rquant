@@ -21,6 +21,18 @@ for (const width of [1440, 390]) {
         await expect(entries.nth(2)).not.toContainText("暂无回执");
         await expect(entries.nth(2).locator('[aria-label="通知回执"]')).toHaveCount(1);
       }
+      if (width === 390) {
+        const receiptTextOverhang = await page
+          .locator('[data-kpi="receipts"] .val')
+          .evaluate((value) => {
+            const fullText = document.createRange();
+            fullText.selectNodeContents(value);
+            const cell = value.closest(".kpi");
+            if (!cell) throw new Error("Receipt KPI cell is missing");
+            return fullText.getBoundingClientRect().right - cell.getBoundingClientRect().right;
+          });
+        expect(receiptTextOverhang).toBeLessThanOrEqual(0);
+      }
       await expect(page.getByText("可向前翻看历史")).toHaveCount(0);
       await entries.first().locator(".monitor-event-time .tip-anchor").hover();
       await expect(page.getByRole("tooltip")).toContainText("2026-09-24");

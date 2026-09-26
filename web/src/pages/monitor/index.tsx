@@ -31,6 +31,13 @@ const DELIVERY_TONE = {
   none: "idle",
 } as const;
 
+const RECEIPT_KPI_VALUE = {
+  not_published: "未就绪",
+  no_receipts: "暂无",
+  has_receipts: "有回执",
+  truncated: "仅部分",
+} as const;
+
 function TimelineEntry({
   row,
   onStock,
@@ -141,7 +148,8 @@ export default function MonitorPage() {
         {
           key: "receipts",
           label: "本页回执",
-          value: data.receipt_label,
+          value: RECEIPT_KPI_VALUE[data.receipt_state],
+          tip: data.receipt_label,
         },
       ]
     : [];

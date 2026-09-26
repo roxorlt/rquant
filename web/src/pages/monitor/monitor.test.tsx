@@ -7,6 +7,33 @@ import { renderApp } from "@/test/render";
 import { monitorHandler, server } from "@/test/server";
 
 describe("盯盘与告警", () => {
+  it.each([
+    ["has_receipts", "有回执", "通知回执已更新"],
+    ["truncated", "仅部分", "回执较多，仅显示部分，状态未确认"],
+    ["no_receipts", "暂无", "这些信号还没有通知回执"],
+    ["not_published", "未就绪", "通知来源尚未发布"],
+  ] as const)(
+    "keeps %s receipt detail available without a long KPI value",
+    async (state, short, full) => {
+      server.use(
+        http.get("*/api/v1/monitor/timeline", () =>
+          HttpResponse.json(monitorEnvelope({ receipt_state: state, receipt_label: full })),
+        ),
+      );
+      const user = userEvent.setup();
+      renderApp("/monitor");
+      const receiptKpi = await screen.findByText("本页回执");
+      expect(
+        within(receiptKpi.closest('[data-kpi="receipts"]') as HTMLElement).getByText(short),
+      ).toBeInTheDocument();
+      await user.hover(receiptKpi);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(full);
+      if (state === "no_receipts" || state === "truncated") {
+        expect(screen.getByRole("status", { name: "" })).toHaveTextContent(full);
+      }
+    },
+  );
+
   it("shows trigger and surge records beside signals without claiming delivery", async () => {
     renderApp("/monitor");
     const timeline = await screen.findByRole("list", { name: "告警时间线" });
