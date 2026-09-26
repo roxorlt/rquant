@@ -252,9 +252,7 @@ def _budget_and_validate(request: FormulaEvaluationInput, ast: FormulaAst) -> No
             for field in ("open", "high", "low", "close", "vol", "amount"):
                 value = getattr(bar, field)
                 if value is not None and (
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(value)
+                    type(value) is not float or not math.isfinite(value)
                 ):
                     raise EvaluationRejectedError("shape", "行情数值格式不正确。")
             input_bytes += len(bar.model_dump_json())
@@ -386,7 +384,18 @@ class _StockEvaluator:
                 elif prior is None:
                     prior = _known(float(current[0]))
                 elif prior[0] is not None:
-                    prior = _known(alpha * float(current[0]) + (1 - alpha) * float(prior[0]))
+                    current_value = float(current[0])
+                    prior_value = float(prior[0])
+                    current_term = alpha * current_value
+                    prior_weight = 1 - alpha
+                    prior_term = prior_weight * prior_value
+                    if (
+                        (current_value != 0 and current_term == 0)
+                        or (prior_value != 0 and prior_weight != 0 and prior_term == 0)
+                    ):
+                        prior = _unknown("numeric_underflow")
+                    else:
+                        prior = _known(current_term + prior_term)
                 result.append(prior)
             return result
         result = []
@@ -417,7 +426,12 @@ class _StockEvaluator:
             values = [float(atom[0]) for atom in selected]
             try:
                 if name == "MA":
-                    result.append(_known(math.fsum(values) / window))
+                    total = math.fsum(values)
+                    mean = total / window
+                    if total != 0 and mean == 0:
+                        result.append(_unknown("numeric_underflow"))
+                    else:
+                        result.append(_known(mean))
                 elif name == "SUM":
                     result.append(_known(math.fsum(values)))
                 elif name == "COUNT":
@@ -462,14 +476,11 @@ def evaluate_formula(request: FormulaEvaluationInput) -> FormulaEvaluationResult
         required_from: date | None = None
         if target_index is None:
             reason = "missing_date"
-        elif target_index < parsed.translation.window_lookback_bars:
-            reason = "insufficient_history"
-        else:
-            if parsed.translation.requires_full_history:
-                required_from = stock.bars[0].trade_date if stock.complete_from_listing else None
-            else:
-                earliest_index = target_index - parsed.translation.window_lookback_bars
-                required_from = stock.bars[earliest_index].trade_date
+        elif parsed.translation.requires_full_history:
+            required_from = stock.bars[0].trade_date if stock.complete_from_listing else None
+        elif target_index >= parsed.translation.window_lookback_bars:
+            earliest_index = target_index - parsed.translation.window_lookback_bars
+            required_from = stock.bars[earliest_index].trade_date
         if reason is not None:
             decisions.append(StockDecision(
                 stock_code=stock.stock_code, status="unknown", reason=reason,

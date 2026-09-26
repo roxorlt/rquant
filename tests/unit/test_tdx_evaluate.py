@@ -149,6 +149,27 @@ def test_known_boolean_branch_can_resolve_incomplete_recursive_history() -> None
     assert _run("NOT(EMA(CLOSE,3)>0)", incomplete).decisions[0].status == "unknown"
 
 
+@pytest.mark.parametrize(
+    ("formula", "expected"),
+    [
+        ("OPEN=0 AND REF(CLOSE,4)>0", "no_match"),
+        ("OPEN=1 OR REF(CLOSE,4)>0", "match"),
+        ("IF(OPEN=1,1,REF(CLOSE,4))=1", "match"),
+    ],
+)
+def test_short_history_keeps_known_boolean_branch(formula: str, expected: str) -> None:
+    stock = _stock(closes=(1, 2))
+    result = _run(formula, stock, decision_date=DATES[1])
+    assert result.decisions[0].status == expected
+
+
+@pytest.mark.parametrize("formula", ["EMA(CLOSE,3)=1", "SMA(CLOSE,3,1)=1"])
+def test_complete_listing_history_seeds_recursive_average_on_first_bar(formula: str) -> None:
+    stock = _stock(closes=(1,))
+    result = _run(formula, stock, decision_date=DATES[0])
+    assert result.decisions[0].status == "match"
+
+
 def test_unknown_stays_unknown_under_not_and_comparison_but_kleene_logic_is_sound() -> None:
     missing = _stock(closes=(1, 2, 3, 4, None))
     assert _run("NOT(CLOSE>0)", missing).decisions[0].reason == "missing_value"
@@ -180,6 +201,23 @@ def test_nonzero_arithmetic_underflow_does_not_fake_a_zero() -> None:
     assert result.decisions[0].reason == "numeric_underflow"
 
 
+@pytest.mark.parametrize(
+    "formula",
+    ["MA(CLOSE,2)=0", "SMA(CLOSE,2,1)=0", "EMA(CLOSE,4)=0"],
+)
+def test_average_underflow_does_not_fake_a_zero(formula: str) -> None:
+    stock = StockHistory(
+        stock_code="000001.SZ", complete_from_listing=True,
+        bars=[
+            HistoricalBar(trade_date=DATES[0], close=0),
+            HistoricalBar(trade_date=DATES[1], close=5e-324),
+        ],
+    )
+    result = _run(formula, stock, decision_date=DATES[1])
+    assert result.decisions[0].status == "unknown"
+    assert result.decisions[0].reason == "numeric_underflow"
+
+
 def test_rejected_text_cannot_smuggle_ast_or_unsafe_expressions() -> None:
     for formula in ["REF(CLOSE,-1)>0", "CLOSE.__class__>0", "CLOSE/0>0"]:
         with pytest.raises(EvaluationRejectedError) as error:
@@ -200,6 +238,17 @@ def test_shape_date_and_non_finite_inputs_are_rejected() -> None:
         _run("CLOSE>0", future)
     with pytest.raises(EvaluationRejectedError, match="重复"):
         _run("CLOSE>0", _stock(), _stock())
+
+
+def test_model_copy_cannot_smuggle_huge_integer_past_numeric_validation() -> None:
+    bar = HistoricalBar(trade_date=DATES[-1], close=1)
+    forged = bar.model_copy(update={"close": 10**1000})
+    stock = StockHistory(
+        stock_code="000001.SZ", complete_from_listing=True, bars=[forged],
+    )
+    with pytest.raises(EvaluationRejectedError) as error:
+        _run("CLOSE>0", stock)
+    assert error.value.code == "shape"
 
 
 def test_validated_input_cannot_mutate_rows_between_checks_and_evaluation() -> None:
