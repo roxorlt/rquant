@@ -1,7 +1,7 @@
 # web/ 前端开发约定（代理必读）
 
-rQuant 投研平台的网页（React 19 + TypeScript + Vite，入口 `/app/`）。本文件和 `web/CLAUDE.md` 内容相同，改一个就同步另一个。
-仓库级规则（分支、提交、合并、部署）见根目录 `CLAUDE.md`；计划与排期见新前端计划 v2。
+rQuant 投研平台的网页（React 19 + TypeScript + Vite，入口 `/app/`）。本文件是 Codex 的 `web/` 规则；`web/CLAUDE.md` 由 Claude Code 独立维护，不要求同步。
+仓库级规则（分支、提交、合并、部署）见根目录 `AGENTS.md`；计划与排期见新前端计划 v2。
 
 ## 七条规则
 
@@ -13,7 +13,7 @@ rQuant 投研平台的网页（React 19 + TypeScript + Vite，入口 `/app/`）�
 3. **页面只引用自己的封装**：`@/ui`、`@/table/DataTable`、`@/charts/*`、`@/api/*`、`@/format/*`。页面、外框和报告不直接引用 antd、echarts、
    lightweight-charts、TanStack、React Flow、dagre、openapi-fetch（`biome.json` 的 `noRestrictedImports` 会报错）。
 4. **TypeScript 严格模式**（含 `noUncheckedIndexedAccess`），不写 `any`；依赖在 `pnpm-lock.yaml` 里精确锁定，升级单独开 PR。
-5. **库版本比训练资料新**（React 19.3、React Router 8、Vite 8、antd 6、ECharts 6、lightweight-charts 5、TanStack Table 8.21、Vitest 5）：写代码前先用 context7 查当前文档。
+5. **库版本比训练资料新**（React 19.3、React Router 8、Vite 8、antd 6、ECharts 6、lightweight-charts 5、TanStack Table 8.21、Vitest 5）：使用不熟悉或版本敏感的 API 时，查项目锁定版本的类型定义或官方文档；需要时再用 context7。
 6. **禁用目录名**：`lib/`、`build/`、`env/`、`var/`、`parts/`、`data/`、`logs/`、`tmp/`、`temp/`、`secrets/`、`downloads/`，以及 `web/dist` 以外任何 `dist/`。
    根 `.gitignore` 会悄悄忽略它们；`pnpm -C web verify:dist` 发现被忽略的文件会失败。数据中心页因此叫 `pages/datacenter/`。
 7. **设计变量只有一份**：`src/styles/tokens.css`（原型 `:root` 变量）；图表（`src/charts/tokens.ts`）和 antd（`src/ui/theme.ts`）运行时读取它。
@@ -59,12 +59,11 @@ owner 原话：「UI UX 需要按使用人体验极致的角度做精细设计�
 | `e2e/` | Playwright：合成 serving 数据代（或 `RQ_E2E_REPLAY_ROOT` 指向的回放副本）+ 固定时钟的网页 API（`scripts/serve_web_fixture.py`）+ 模仿 nginx 的 `/app/` 静态服务 |
 | `scripts/` | `verify-dist.mjs`（重新编译并核对提交的 `dist/`）、`check-size.mjs`（首屏体积上限） |
 
-## 改完前端要做的事
+## 前端验证
 
-1. `pnpm -C web check`（Biome、tsc、Vitest）。
-2. `pnpm -C web build`，把 `web/dist/` 一起提交；`pnpm -C web verify:dist` 必须通过（CI 在 Linux 上重新编译并比对）。
-3. `pnpm -C web e2e`（需要仓库的 Python 环境：`uv sync --python 3.11`）。
-4. 改了网页 API：重新生成 `openapi.json` 和 `schema.d.ts`，并跑 `uv run pytest tests/unit/test_web_*.py -q`。
+- 开发中运行直接受影响的 Biome、TypeScript、Vitest 或 Playwright 检查；修复后只重跑被该修复影响的检查。仅修改规则文档不需要构建或 E2E。
+- 最终候选版本或准备合并时，运行一次 `pnpm -C web check`、`pnpm -C web build`、`pnpm -C web verify:dist` 和 `pnpm -C web e2e`（E2E 需要仓库的 Python 环境：`uv sync --python 3.11`）。提交前端代码时连同最新 `web/dist/` 一起提交；CI 门禁保持有效。
+- 改了网页 API 时，重新生成 `openapi.json` 和 `schema.d.ts`，并运行相关的 `tests/unit/test_web_*.py`；只有修改影响全组测试时才运行整组。
 
 ## 生产约束
 

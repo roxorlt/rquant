@@ -52,8 +52,8 @@ uv run rquant web-serve --bind 127.0.0.1:8768      # 只读网页 API（读 RQUA
 ## 模型与子任务边界
 
 - **OpenAI-only**：未经用户在当前对话明确授权，Codex 及其子任务不得调用 Claude、Gemini 或任何其他第三方模型、代理或 CLI。不得把登录、配额或安全提示当作改走其他模型的理由。
-- **子任务最小权限**：每个子任务开头明确说明这是用户自有仓库内的授权可靠性开发；默认只访问指定 worktree，离线 TDD，不访问网络、`.env`、真实凭据或生产环境。安全相关检查应采用防御性、可审计的表述和标准 API，不尝试规避平台安全控制。
-- **职责分离**：5.6Sol 只做任务规划、子任务委派、审查与验收；具体编码、测试和修复由已获授权的 OpenAI 子任务承担。
+- **子任务最小权限**：每个子任务开头明确说明这是用户自有仓库内的授权可靠性开发；默认只访问指定 worktree，离线做与改动相关的验证，不访问网络、`.env`、真实凭据或生产环境。安全相关检查应采用防御性、可审计的表述和标准 API，不尝试规避平台安全控制。
+- **任务执行**：按全局 `AGENTS.md` 的任务分级决定是否委派和独立审查；不按模型名称强制拆分角色。小改动可由当前代理直接实现并验证。
 
 ## DuckDB 并发约束（强制）
 
@@ -95,19 +95,9 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
 本身只读不写主库，但同一时刻只能一个写者）按 systemd timer 约定串行，watchdog 和 timer
 错开。新增 Streamlit / FastAPI / 临时脚本时，code review 必查这一条。
 
-## MVP 路径（必须按顺序）
+## 当前迭代依据
 
-不要并行推进多个阶段。按周迭代：
-
-1. Week 1：数据接入 + DuckDB 存储 → **能跑再下一步**
-2. Week 2：指标计算
-3. Week 3a：派生字段层（daily_state）
-4. Week 3b：筛选规则（Python 函数积木，命名对齐通达信/MyTT 风格）
-5. Week 4：调度（APScheduler）+ 筛选结果落库
-6. Week 5：盘中监控（Ashare 轮询）
-7. Week 6：通知（PushDeer）
-8. Week 7：Streamlit UI + 自然语言输入（LLM → 积木调用）
-9. Week 8：通达信选股公式支持（解析器 → MyTT/积木）
+早期 Week 1–8 MVP 路径是历史规划，不作为当前任务的顺序门禁。网页工作以 2026-09-25 确认的新前端计划 v2 和本文件的 React 技术栈为准；只处理当前里程碑及直接受影响的依赖，不因旧周计划延后或扩张任务。
 
 ## 验证规范
 
@@ -143,15 +133,7 @@ owner 多次纠正（2026-09-24「别等17点了」、「盘中能做的都改�
 
 ### 分支命名规范
 
-```
-feat/weekN-xxx       # MVP 周迭代，如 feat/week1-data-ingestion
-feat/xxx             # MVP 后的新功能，如 feat/multi-factor-scoring
-fix/xxx              # bug 修复
-refactor/xxx         # 重构
-docs/xxx             # 文档
-chore/xxx            # 配置/工具链
-deploy/xxx           # 部署脚本/配置
-```
+Codex 新建分支统一按全局 `AGENTS.md` 使用 `cdx/{会话主题}-{简短目的}`。既有的 `feat/`、`fix/`、`docs/` 等分支名属于历史记录，不作为新建分支的模板。
 
 ### Commit 规范（Conventional Commits）
 
