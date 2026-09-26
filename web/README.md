@@ -1,7 +1,9 @@
 # rQuant 网页前端（web/）
 
-React 19 + TypeScript + Vite 的单页应用，生产入口 `http://82.156.0.68:8081/app/`（nginx 发送 `web/dist`，`/app/api/` 转到只读网页 API）。
+React 19 + TypeScript + Vite 的单页应用，目标生产入口为 `http://82.156.0.68:8081/app/`（nginx 发送 `web/dist`，`/app/api/` 转到只读网页 API）；正式切流与旧服务停用仍须验收和授权。
 开发约定见 `web/CLAUDE.md`。
+
+这套网页以 CC 可点击原型的完整功能和精细交互为目标。旧 Streamlit 页面资源负担高且体验不符合目标；新功能与界面改进只投向 `/app/`，旧页面仅做过渡期必要维护。每项能力在新网页接通并验证后，再迁移入口、逐项停用对应旧服务；最终还须补齐差距表的「部分」「缺」和 M4、M12 未完项，M11 实盘交易排除。生产切流与停服须按项目规则单独授权。见 [交付决策](../docs/plans/2026-09-26-react-platform-decision.md)。
 
 ## 准备
 
