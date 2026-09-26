@@ -950,6 +950,50 @@ def test_twenty_day_return_does_not_add_a_stock_without_a_current_bar(
     assert [row["ts_code"] for row in projections["nl_screen_universe"]] == ["300001.SZ"]
 
 
+@pytest.mark.parametrize(
+    ("table_name", "column_name", "valid_today"),
+    (("daily_bar", "close", 10.0), ("adj_factor", "adj_factor", 2.0)),
+)
+def test_twenty_day_return_keeps_current_evidence_fail_closed_but_historical_invalid_null(
+    tmp_path: Path,
+    table_name: str,
+    column_name: str,
+    valid_today: float,
+) -> None:
+    database, calendar, open_dates = _twenty_day_projection_database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            f"UPDATE {table_name} SET {column_name} = 0 "
+            "WHERE ts_code = '600000.SH' AND trade_date = ?",
+            [PRIOR_DATE],
+        )
+    database.chmod(0o600)
+
+    with pytest.raises(
+        ReferenceSlowSourceError, match="prior daily evidence contains an invalid row"
+    ):
+        _twenty_day_rows(database, calendar)
+
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            f"UPDATE {table_name} SET {column_name} = ? "
+            "WHERE ts_code = '600000.SH' AND trade_date = ?",
+            [valid_today, PRIOR_DATE],
+        )
+        connection.execute(
+            f"UPDATE {table_name} SET {column_name} = 0 "
+            "WHERE ts_code = '600000.SH' AND trade_date = ?",
+            [open_dates[10]],
+        )
+    database.chmod(0o600)
+
+    rows = _twenty_day_rows(database, calendar)
+
+    assert [row["ts_code"] for row in rows] == ["300001.SZ", "600000.SH"]
+    assert rows[0]["RETURN_20D_PCT[0]"] == pytest.approx(25.0)
+    assert rows[1]["RETURN_20D_PCT[0]"] is None
+
+
 class _DelistingAdapter(_Adapter):
     def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
         self.calls.append(f"stock_basic:{list_status}")
