@@ -29,13 +29,13 @@ export function useMeta() {
     staleTime: 0,
   });
   const generationId = query.data?.data.generation?.generation_id ?? null;
-  const previous = useRef<string | null>(null);
+  const hasMeta = query.data !== undefined;
+  // undefined means no /meta response yet; null means Serving reported no generation.
+  const previous = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
-    if (generationId === null) {
-      return;
-    }
-    if (previous.current !== null && previous.current !== generationId) {
+    if (!hasMeta) return;
+    if (previous.current !== undefined && previous.current !== generationId) {
       void queryClient.invalidateQueries({
         predicate: (entry) => {
           if (entry.queryKey[0] === META_QUERY_KEY[0]) return false;
@@ -48,7 +48,7 @@ export function useMeta() {
       });
     }
     previous.current = generationId;
-  }, [generationId, queryClient]);
+  }, [generationId, hasMeta, queryClient]);
 
   return query;
 }

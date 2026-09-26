@@ -167,4 +167,64 @@ describe("useServingQuery", () => {
     );
     await waitFor(() => expect(catalogReads).toBe(2));
   });
+
+  it.each([
+    { sourceKind: "serving", expectedReads: 2 },
+    { sourceKind: "replica", expectedReads: 1 },
+  ])(
+    "/meta 首次从无代到 A 时按 $sourceKind 来源刷新目录",
+    async ({ sourceKind, expectedReads }) => {
+      const client = testQueryClient();
+      const firstGeneration = "a".repeat(64);
+      let generationId: string | null = null;
+      let catalogReads = 0;
+      server.use(
+        http.get("*/api/v1/meta", () => {
+          const envelope = metaEnvelope({ generationId: generationId ?? firstGeneration });
+          if (generationId === null) {
+            envelope.data.generation = null;
+            envelope.serving.generation_id = null;
+            envelope.serving.state = "unavailable";
+          }
+          return HttpResponse.json(envelope);
+        }),
+        http.get("*/api/v1/screen/blocks", () => {
+          catalogReads += 1;
+          const available = sourceKind === "serving" && generationId !== null;
+          return HttpResponse.json({
+            data: {
+              blocks: [],
+              dates: available ? ["2026-09-24"] : [],
+              available,
+              ranking_metrics: [],
+              source: available
+                ? { identity: generationId, updated_at: "2026-09-24T07:31:00Z" }
+                : null,
+              source_kind: sourceKind,
+            },
+            serving: metaEnvelope().serving,
+          });
+        }),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const { result } = renderHook(() => ({ meta: useMeta(), catalog: useScreenCatalog() }), {
+        wrapper,
+      });
+      await waitFor(() => expect(result.current.meta.data?.data.generation).toBeNull());
+      await waitFor(() => expect(catalogReads).toBe(1));
+      expect(result.current.catalog.data?.source).toBeNull();
+
+      generationId = firstGeneration;
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: META_QUERY_KEY });
+      });
+      await waitFor(() =>
+        expect(result.current.meta.data?.data.generation?.generation_id).toBe(firstGeneration),
+      );
+      await waitFor(() => expect(catalogReads).toBe(expectedReads));
+      expect(result.current.catalog.data?.available).toBe(sourceKind === "serving");
+    },
+  );
 });

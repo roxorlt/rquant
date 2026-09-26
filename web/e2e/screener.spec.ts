@@ -190,3 +190,46 @@ test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选",
   await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
   expect(watcher.problems).toEqual([]);
 });
+
+test("首次 Serving 数据代到来后，无需手动刷新即可运行选股", async ({ page }) => {
+  const watcher = watch(page);
+  let generationId: string | null = null;
+  let catalogReads = 0;
+  await page.route("**/api/v1/meta", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_MetaData_"];
+    if (generationId === null) {
+      body.data.generation = null;
+      body.serving.generation_id = null;
+      body.serving.state = "unavailable";
+    } else {
+      if (body.data.generation) body.data.generation.generation_id = generationId;
+      body.serving.generation_id = generationId;
+    }
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    catalogReads += 1;
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    if (generationId === null) {
+      body.data.available = false;
+      body.data.dates = [];
+      body.data.source = null;
+    } else {
+      body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
+    }
+    await route.fulfill({ response, json: body });
+  });
+
+  await page.clock.install();
+  await page.goto("./#/screener");
+  await expect(page.getByText("选股数据暂不可用")).toBeVisible();
+  await expect(page.getByRole("button", { name: "运行筛选" })).toBeDisabled();
+  expect(catalogReads).toBe(1);
+  generationId = "a".repeat(64);
+  await page.clock.fastForward(31_000);
+  await expect.poll(() => catalogReads).toBe(2);
+  await expect(page.getByRole("button", { name: "运行筛选" })).toBeEnabled();
+  expect(watcher.problems).toEqual([]);
+});
