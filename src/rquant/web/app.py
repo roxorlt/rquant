@@ -23,7 +23,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
+from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.routes import catalog, health, meta, monitor, overview, panorama, screen, stocks
+from rquant.web.screen_service import ScreenApplicationService
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 
@@ -44,6 +46,7 @@ class WebContext:
     clock: Callable[[], datetime]
     cursor_key: bytes
     screen_gate: threading.BoundedSemaphore
+    screen_service: ScreenApplicationService
 
 
 def create_app(
@@ -79,12 +82,22 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    cursor_key = secrets.token_bytes(32)
+    screen_replica = (
+        VerifiedReplicaScreenSource(
+            primary_path=settings.screen_primary_path,
+            replica_path=settings.screen_replica_path,
+        )
+        if settings.screen_primary_path is not None and settings.screen_replica_path is not None
+        else None
+    )
     app.state.web = WebContext(
         settings=settings,
         tracker=generation_tracker,
         clock=clock,
-        cursor_key=secrets.token_bytes(32),
+        cursor_key=cursor_key,
         screen_gate=threading.BoundedSemaphore(1),
+        screen_service=ScreenApplicationService(cursor_key=cursor_key, replica=screen_replica),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 

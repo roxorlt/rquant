@@ -3295,13 +3295,24 @@
             },
             "title": "Ranking Metrics",
             "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "blocks",
           "dates",
           "available",
-          "ranking_metrics"
+          "ranking_metrics",
+          "source"
         ],
         "title": "ScreenCatalogData",
         "type": "object"
@@ -3616,6 +3627,16 @@
             "title": "Rows",
             "type": "array"
           },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "enum": [
               "ready",
@@ -3656,7 +3677,8 @@
           "total",
           "steps",
           "rows",
-          "next_cursor"
+          "next_cursor",
+          "source"
         ],
         "title": "ScreenRunData",
         "type": "object"
@@ -3713,6 +3735,25 @@
           "conditions"
         ],
         "title": "ScreenRunRequest",
+        "type": "object"
+      },
+      "ScreenSourceInfo": {
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity",
+          "updated_at"
+        ],
+        "title": "ScreenSourceInfo",
         "type": "object"
       },
       "ScreenStep": {

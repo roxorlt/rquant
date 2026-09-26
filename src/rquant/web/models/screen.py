@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -43,6 +43,13 @@ class ScreenBlock(BaseModel):
     parameters: list[ScreenParameter]
 
 
+class ScreenSourceInfo(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    identity: str
+    updated_at: datetime
+
+
 class ScreenCatalogData(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -50,6 +57,7 @@ class ScreenCatalogData(BaseModel):
     dates: list[date]
     available: bool
     ranking_metrics: list[ScreenOption]
+    source: ScreenSourceInfo | None
 
 
 class ScreenCondition(BaseModel):
@@ -122,6 +130,7 @@ class ScreenRunData(BaseModel):
     steps: list[ScreenStep]
     rows: list[ScreenRow]
     next_cursor: str | None
+    source: ScreenSourceInfo | None
 
 
 class TdxParseRequest(BaseModel):

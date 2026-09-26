@@ -191,6 +191,51 @@ def test_main_database_alias_is_never_opened(
     assert opened == []
 
 
+def test_primary_path_is_never_statted_or_resolved_by_web_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, replica, dates = _world(tmp_path)
+    original_stat = Path.stat
+    original_lstat = Path.lstat
+    original_resolve = Path.resolve
+
+    def no_primary_stat(path: Path, *args, **kwargs):
+        if path == primary:
+            raise PermissionError("primary is hidden from the web service")
+        return original_stat(path, *args, **kwargs)
+
+    def no_primary_lstat(path: Path, *args, **kwargs):
+        if path == primary:
+            raise PermissionError("primary is hidden from the web service")
+        return original_lstat(path, *args, **kwargs)
+
+    def no_primary_resolve(path: Path, *args, **kwargs):
+        if path == primary:
+            raise PermissionError("primary is hidden from the web service")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", no_primary_stat)
+    monkeypatch.setattr(Path, "lstat", no_primary_lstat)
+    monkeypatch.setattr(Path, "resolve", no_primary_resolve)
+    source = _reader(primary, replica)
+    assert source.available_dates().dates[0] == dates[0]
+    assert source.load(dates[0], [not_limit_up()]).frame["ts_code"].tolist() == ["600001.SH"]
+
+
+def test_matching_sidecar_cannot_authorize_a_primary_hardlink(tmp_path: Path) -> None:
+    primary, replica, dates = _world(tmp_path)
+    replica.unlink()
+    os.link(primary, replica)
+    write_replica_generation_metadata(
+        primary_path=primary,
+        replica_path=replica,
+        output_path=replica_generation_path(replica),
+        source_before=capture_database_watermark(primary),
+    )
+    with pytest.raises(_source_module().ScreenReplicaUnavailableError):
+        _reader(primary, replica).load(dates[0], [])
+
+
 def test_replica_directory_alias_is_not_a_configured_canonical_source(
     tmp_path: Path,
 ) -> None:

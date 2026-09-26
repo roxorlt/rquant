@@ -14,13 +14,15 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rquant.serving_paths import serving_root_from_env
 
 BIND_ENV_VAR = "RQUANT_WEB_BIND"
 PAGE_CONTROL_URL_ENV_VAR = "RQUANT_PAGE_CONTROL_URL"
 STALE_AFTER_ENV_VAR = "RQUANT_WEB_STALE_AFTER_SECONDS"
+SCREEN_PRIMARY_ENV_VAR = "RQUANT_WEB_SCREEN_PRIMARY_PATH"
+SCREEN_REPLICA_ENV_VAR = "RQUANT_WEB_SCREEN_REPLICA_PATH"
 
 DEFAULT_BIND = "127.0.0.1:8768"
 DEFAULT_PAGE_CONTROL_URL = "http://127.0.0.1:8767/v1/commands"
@@ -65,6 +67,14 @@ class WebSettings(BaseModel):
     background_check_seconds: float = Field(default=5.0, gt=0)
     #: Request handler threads (DuckDB cursors in flight at once).
     worker_threads: int = Field(default=4, ge=1, le=32)
+    screen_primary_path: Path | None = None
+    screen_replica_path: Path | None = None
+
+    @model_validator(mode="after")
+    def validate_screen_source(self) -> Self:
+        if (self.screen_primary_path is None) != (self.screen_replica_path is None):
+            raise ValueError("screen primary and replica paths must be configured together")
+        return self
 
     @field_validator("bind")
     @classmethod
@@ -97,4 +107,10 @@ class WebSettings(BaseModel):
         stale_after = source.get(STALE_AFTER_ENV_VAR, "").strip()
         if stale_after:
             values["stale_after_seconds"] = float(stale_after)
+        primary = source.get(SCREEN_PRIMARY_ENV_VAR, "").strip()
+        replica = source.get(SCREEN_REPLICA_ENV_VAR, "").strip()
+        if primary:
+            values["screen_primary_path"] = Path(primary)
+        if replica:
+            values["screen_replica_path"] = Path(replica)
         return cls.model_validate(values)

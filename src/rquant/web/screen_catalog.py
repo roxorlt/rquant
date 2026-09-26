@@ -75,6 +75,8 @@ _MA_OPTIONS = (
     ("MA20", "20 日均线"),
     ("MA60", "60 日均线"),
 )
+_MA_PERIOD_OPTIONS = tuple((value[2:], label) for value, label in _MA_OPTIONS)
+_RSI_PERIOD_OPTIONS = (("6", "6 日 RSI"), ("14", "14 日 RSI"))
 RANKING_METRIC_LABELS = {
     "RETURN_20D_PCT[0]": "20 日涨幅",
     "TURNOVER_RATE[0]": "换手率",
@@ -149,7 +151,11 @@ def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
     elif key == "exclude_offset":
         label, kind = "排除前几日", "integer"
     elif key == "period":
-        label, kind = "指标周期", "integer"
+        label, kind, options = (
+            "指标周期",
+            "choice",
+            _options(_MA_PERIOD_OPTIONS if spec.name == "above_ma" else _RSI_PERIOD_OPTIONS),
+        )
     elif key == "n":
         label, kind = ("放量倍数" if spec.name == "volume_ratio_gte" else "连板下限"), "number"
     elif key == "low":
@@ -161,6 +167,8 @@ def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
     initial = _INITIALS.get(spec.name, {}).get(key)
     if initial is None and field.default is not PydanticUndefined:
         initial = field.default
+    if key == "period" and initial is not None:
+        initial = str(initial)
     return ScreenParameter(
         key=key,
         label=label,
@@ -205,7 +213,11 @@ def validate_screen_choices(conditions: Sequence[ScreenCondition]) -> None:
             value = condition.args[parameter.key]
             choices = {option.value for option in parameter.options}
             if parameter.input in {"choice", "field"}:
-                valid = type(value) is str and value in choices
+                valid = (
+                    type(value) in {str, int} and str(value) in choices
+                    if parameter.key == "period"
+                    else type(value) is str and value in choices
+                )
             elif parameter.input == "operand":
                 valid = type(value) in {int, float} or (type(value) is str and value in choices)
             elif parameter.input == "multi_choice":
@@ -215,4 +227,6 @@ def validate_screen_choices(conditions: Sequence[ScreenCondition]) -> None:
             else:
                 continue
             if not valid:
+                if parameter.key == "period":
+                    raise ValueError("screen indicator period is not yet available")
                 raise ValueError("screen form choice is not listed in the catalog")
