@@ -47,7 +47,7 @@ export function useHealth(): ServingQueryResult<HealthData> {
 
 export function useCatalog(): ServingQueryResult<CatalogList> {
   return useServingQuery(["catalog", "datasets"], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/catalog/datasets");
+    const { data, response } = await apiClient().GET("/api/v1/data/catalog");
     return unwrap(data, response);
   });
 }
@@ -56,8 +56,8 @@ export function useCatalogDataset(datasetId: string | null): ServingQueryResult<
   return useServingQuery(
     ["catalog", "dataset", datasetId],
     async () => {
-      const { data, response } = await apiClient().GET("/api/v1/catalog/datasets/{dataset_id}", {
-        params: { path: { dataset_id: datasetId ?? "" } },
+      const { data, response } = await apiClient().GET("/api/v1/data/catalog/{dataset}", {
+        params: { path: { dataset: datasetId ?? "" } },
       });
       return unwrap(data, response);
     },

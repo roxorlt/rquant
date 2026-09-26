@@ -4,7 +4,7 @@
  */
 
 export interface paths {
-    "/api/v1/catalog/datasets": {
+    "/api/v1/data/catalog": {
         parameters: {
             query?: never;
             header?: never;
@@ -12,7 +12,7 @@ export interface paths {
             cookie?: never;
         };
         /** 数据目录 */
-        get: operations["list_datasets_api_v1_catalog_datasets_get"];
+        get: operations["list_datasets_api_v1_data_catalog_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -21,7 +21,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/catalog/datasets/{dataset_id}": {
+    "/api/v1/data/catalog/{dataset}": {
         parameters: {
             query?: never;
             header?: never;
@@ -29,7 +29,7 @@ export interface paths {
             cookie?: never;
         };
         /** 数据集字段说明 */
-        get: operations["get_dataset_api_v1_catalog_datasets__dataset_id__get"];
+        get: operations["get_dataset_api_v1_data_catalog__dataset__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1404,7 +1404,7 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
-    list_datasets_api_v1_catalog_datasets_get: {
+    list_datasets_api_v1_data_catalog_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -1424,12 +1424,12 @@ export interface operations {
             };
         };
     };
-    get_dataset_api_v1_catalog_datasets__dataset_id__get: {
+    get_dataset_api_v1_data_catalog__dataset__get: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                dataset_id: string;
+                dataset: string;
             };
             cookie?: never;
         };

@@ -73,7 +73,7 @@ const descriptions: CatalogList = {
 
 function catalogHandlers(list: CatalogList = descriptions) {
   server.use(
-    http.get("*/api/v1/catalog/datasets", () =>
+    http.get("*/api/v1/data/catalog", () =>
       HttpResponse.json({
         data: list,
         serving: {
@@ -86,7 +86,7 @@ function catalogHandlers(list: CatalogList = descriptions) {
         },
       }),
     ),
-    http.get("*/api/v1/catalog/datasets/:id", ({ params }) =>
+    http.get("*/api/v1/data/catalog/:id", ({ params }) =>
       HttpResponse.json({
         data:
           params.id === "daily_bar"
@@ -152,7 +152,7 @@ describe("数据中心目录", () => {
     empty.unmount();
 
     server.use(
-      http.get("*/api/v1/catalog/datasets", () =>
+      http.get("*/api/v1/data/catalog", () =>
         HttpResponse.json({ detail: "数据目录暂时不可用" }, { status: 503 }),
       ),
     );

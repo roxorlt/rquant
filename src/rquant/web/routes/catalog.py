@@ -12,7 +12,7 @@ from rquant.data_catalog.models import CatalogDataset, CatalogDocument, CatalogL
 from rquant.web.envelope import Envelope, ServingMeta, ServingState
 from rquant.web.security import current_user
 
-router = APIRouter(prefix="/catalog")
+router = APIRouter(prefix="/data")
 CATALOG_FILE = Path(__file__).resolve().parents[2] / "data_catalog/catalog-v1.json"
 
 
@@ -46,7 +46,7 @@ def _envelope(
     return Envelope[CatalogDataset](data=data, serving=meta)
 
 
-@router.get("/datasets", response_model=Envelope[CatalogList], summary="数据目录")
+@router.get("/catalog", response_model=Envelope[CatalogList], summary="数据目录")
 def list_datasets(
     _viewer: Annotated[str | None, Depends(current_user)],
 ) -> Envelope[CatalogList]:
@@ -65,14 +65,14 @@ def list_datasets(
 
 
 @router.get(
-    "/datasets/{dataset_id}",
+    "/catalog/{dataset}",
     response_model=Envelope[CatalogDataset],
     summary="数据集字段说明",
 )
 def get_dataset(
-    _viewer: Annotated[str | None, Depends(current_user)], dataset_id: str
+    _viewer: Annotated[str | None, Depends(current_user)], dataset: str
 ) -> Envelope[CatalogDataset]:
-    dataset = next((item for item in _catalog().datasets if item.dataset_id == dataset_id), None)
-    if dataset is None:
+    found = next((item for item in _catalog().datasets if item.dataset_id == dataset), None)
+    if found is None:
         raise HTTPException(status_code=404, detail="找不到这个数据集")
-    return _envelope(dataset)
+    return _envelope(found)

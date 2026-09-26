@@ -3681,9 +3681,9 @@
   },
   "openapi": "3.1.0",
   "paths": {
-    "/api/v1/catalog/datasets": {
+    "/api/v1/data/catalog": {
       "get": {
-        "operationId": "list_datasets_api_v1_catalog_datasets_get",
+        "operationId": "list_datasets_api_v1_data_catalog_get",
         "responses": {
           "200": {
             "content": {
@@ -3702,16 +3702,16 @@
         ]
       }
     },
-    "/api/v1/catalog/datasets/{dataset_id}": {
+    "/api/v1/data/catalog/{dataset}": {
       "get": {
-        "operationId": "get_dataset_api_v1_catalog_datasets__dataset_id__get",
+        "operationId": "get_dataset_api_v1_data_catalog__dataset__get",
         "parameters": [
           {
             "in": "path",
-            "name": "dataset_id",
+            "name": "dataset",
             "required": true,
             "schema": {
-              "title": "Dataset Id",
+              "title": "Dataset",
               "type": "string"
             }
           }

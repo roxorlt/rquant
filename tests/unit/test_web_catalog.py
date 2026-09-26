@@ -14,8 +14,8 @@ from rquant.web.settings import WebSettings
 def test_list_and_detail_work_without_a_serving_generation(tmp_path: Path) -> None:
     app = create_app(WebSettings(serving_root=tmp_path / "missing"), background=False)
     with TestClient(app) as client:
-        listed = client.get("/api/v1/catalog/datasets")
-        detailed = client.get("/api/v1/catalog/datasets/daily_bar")
+        listed = client.get("/api/v1/data/catalog")
+        detailed = client.get("/api/v1/data/catalog/daily_bar")
 
     assert listed.status_code == 200
     assert len(listed.json()["data"]["datasets"]) == 23
@@ -42,11 +42,20 @@ def test_unknown_id_and_unreadable_artifact_have_clear_responses(
 ) -> None:
     app = create_app(WebSettings(serving_root=tmp_path / "missing"), background=False)
     with TestClient(app) as client:
-        missing = client.get("/api/v1/catalog/datasets/no_such_dataset")
+        missing = client.get("/api/v1/data/catalog/no_such_dataset")
         assert missing.status_code == 404
         assert missing.json()["detail"] == "找不到这个数据集"
 
         monkeypatch.setattr("rquant.web.routes.catalog.CATALOG_FILE", tmp_path / "missing.json")
-        unavailable = client.get("/api/v1/catalog/datasets")
+        unavailable = client.get("/api/v1/data/catalog")
         assert unavailable.status_code == 503
         assert unavailable.json()["detail"] == "数据目录暂时不可用"
+
+
+def test_catalog_uses_the_v2_paths_without_a_legacy_alias(tmp_path: Path) -> None:
+    app = create_app(WebSettings(serving_root=tmp_path / "missing"), background=False)
+    paths = app.openapi()["paths"]
+    assert "/api/v1/data/catalog" in paths
+    assert "/api/v1/data/catalog/{dataset}" in paths
+    assert "/api/v1/catalog/datasets" not in paths
+    assert "/api/v1/catalog/datasets/{dataset_id}" not in paths
