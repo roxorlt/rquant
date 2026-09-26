@@ -18,7 +18,7 @@ from rquant.screen.replica_source import (
     ScreenReplicaUnavailableError,
     VerifiedReplicaScreenSource,
 )
-from rquant.screen.rules import required_rule_columns
+from rquant.screen.rules import Rule, required_rule_columns
 from rquant.serving_read_models import (
     PAGE_PROJECTION_CONTRACTS,
     NlScreenPageError,
@@ -67,6 +67,36 @@ def _empty_run(trade_date: date, status: str) -> ScreenRunData:
 
 def _number(value: object) -> float | None:
     return None if value is None or bool(pd.isna(value)) else float(value)
+
+
+def _known_rule(rule: Rule, dependencies: tuple[str, ...]) -> Rule:
+    def apply(frame: pd.DataFrame) -> pd.Series:
+        present = frame.loc[:, dependencies].notna().all(axis=1)
+        return rule(frame).astype("boolean").fillna(False) & present
+
+    return apply
+
+
+def _replica_rule_state(
+    universe: pd.DataFrame, rules: list[Rule],
+) -> tuple[list[Rule], list[int]]:
+    confirmed = pd.Series(True, index=universe.index, dtype="boolean")
+    possible = confirmed.copy()
+    safe_rules: list[Rule] = []
+    unknown_counts: list[int] = []
+    for rule in rules:
+        dependencies = tuple(sorted(
+            required_rule_columns([rule]) | {
+                request.name for request in _collect_aggregates([rule])
+            }
+        ))
+        present = universe.loc[:, dependencies].notna().all(axis=1)
+        passed = rule(universe).astype("boolean").fillna(False) & present
+        confirmed &= passed
+        possible &= passed | ~present
+        unknown_counts.append(int((possible & ~confirmed).sum()))
+        safe_rules.append(_known_rule(rule, dependencies))
+    return safe_rules, unknown_counts
 
 
 class ScreenApplicationService:
@@ -174,6 +204,8 @@ class ScreenApplicationService:
 
         ranking = body.ranking
         rank_columns = [condition.metric for condition in ranking.conditions] if ranking else []
+        page_rules = compiled.rules
+        unknown_counts = [0] * len(compiled.rules)
         if self.replica is not None:
             unsupported_metric = next(
                 (metric for metric in rank_columns if metric not in _REPLICA_RANK_COLUMNS),
@@ -222,6 +254,7 @@ class ScreenApplicationService:
                 raise ScreenApplicationError(
                     503, "所选日期的数据不完整，请换日期或稍后重试。",
                 )
+            page_rules, unknown_counts = _replica_rule_state(universe, compiled.rules)
             source = ScreenSourceInfo(
                 identity=snapshot.identity, updated_at=snapshot.updated_at,
             )
@@ -267,7 +300,7 @@ class ScreenApplicationService:
             page_args = dict(
                 generation_id=source.identity,
                 trade_date=body.trade_date.isoformat(),
-                rules=compiled.rules,
+                rules=page_rules,
                 rule_labels=rule_labels,
                 normalized_plan=compiled.normalized_plan,
                 page_size=body.page_size,
@@ -314,13 +347,17 @@ class ScreenApplicationService:
             )
             for row in page.rows.to_dict(orient="records")
         ]
-        steps = [ScreenStep(label=label, count=count) for label, count in page.diagnostics]
+        steps = [
+            ScreenStep(label=label, count=count, unknown_count=unknown)
+            for (label, count), unknown in zip(page.diagnostics, unknown_counts, strict=True)
+        ]
         total = steps[-1].count if steps else len(universe)
         return ScreenRunData(
             trade_date=body.trade_date,
             status="ready",
             base_count=len(universe),
             total=total,
+            unknown_count=steps[-1].unknown_count if steps else 0,
             ranked_count=min(total, ranking.top_n) if ranking is not None else None,
             steps=steps,
             rows=rows,

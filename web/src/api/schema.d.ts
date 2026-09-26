@@ -1411,6 +1411,11 @@ export interface components {
              * Format: date
              */
             trade_date: string;
+            /**
+             * Unknown Count
+             * @default 0
+             */
+            unknown_count: number;
         };
         /** ScreenRunRequest */
         ScreenRunRequest: {
@@ -1446,6 +1451,11 @@ export interface components {
             count: number;
             /** Label */
             label: string;
+            /**
+             * Unknown Count
+             * @default 0
+             */
+            unknown_count: number;
         };
         /** ServiceItem */
         ServiceItem: {

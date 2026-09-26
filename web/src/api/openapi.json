@@ -3668,6 +3668,12 @@
             "format": "date",
             "title": "Trade Date",
             "type": "string"
+          },
+          "unknown_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
           }
         },
         "required": [
@@ -3765,6 +3771,12 @@
           "label": {
             "title": "Label",
             "type": "string"
+          },
+          "unknown_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
           }
         },
         "required": [

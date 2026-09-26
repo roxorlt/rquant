@@ -335,7 +335,9 @@ def test_ranked_pages_keep_score_order_and_bind_plan_top_n_and_generation(
             27,
             25,
         )
-        assert first_data["steps"] == [{"label": "排除 ST", "count": 27}]
+        assert first_data["steps"] == [
+            {"label": "排除 ST", "count": 27, "unknown_count": 0}
+        ]
         assert [row["ts_code"] for row in first_data["rows"]] == [
             "600029.SH", "600028.SH", "600027.SH", "600026.SH", "600025.SH"
         ]

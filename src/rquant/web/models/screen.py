@@ -106,6 +106,7 @@ class ScreenStep(BaseModel):
 
     label: str
     count: int
+    unknown_count: int = Field(default=0, ge=0)
 
 
 class ScreenRow(BaseModel):
@@ -126,6 +127,7 @@ class ScreenRunData(BaseModel):
     status: Literal["ready", "unavailable", "no_date"]
     base_count: int | None
     total: int | None
+    unknown_count: int = Field(default=0, ge=0)
     ranked_count: int | None = None
     steps: list[ScreenStep]
     rows: list[ScreenRow]

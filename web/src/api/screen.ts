@@ -19,7 +19,7 @@ export function useScreenCatalog(): ServingQueryResult<ScreenCatalogData> {
       }
       return data;
     },
-    { refetchInterval: 15_000 },
+    { staleTime: Infinity },
   );
 }
 

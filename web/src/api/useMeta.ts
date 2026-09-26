@@ -35,7 +35,9 @@ export function useMeta() {
     }
     if (previous.current !== null && previous.current !== generationId) {
       void queryClient.invalidateQueries({
-        predicate: (entry) => entry.queryKey[0] !== META_QUERY_KEY[0],
+        predicate: (entry) =>
+          entry.queryKey[0] !== META_QUERY_KEY[0] &&
+          !(entry.queryKey[0] === "screen" && entry.queryKey[1] === "blocks"),
       });
     }
     previous.current = generationId;

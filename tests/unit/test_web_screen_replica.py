@@ -149,7 +149,9 @@ def test_replica_catalog_and_pages_work_without_serving_and_bind_source_identity
         "600001.SH", "600002.SH",
     ]
     assert [row["ts_code"] for row in second.json()["data"]["rows"]] == ["600003.SH"]
-    assert first.json()["data"]["steps"] == [{"label": "排除 ST", "count": 3}]
+    assert first.json()["data"]["steps"] == [
+        {"label": "排除 ST", "count": 3, "unknown_count": 0}
+    ]
 
 
 def test_configured_broken_replica_never_falls_back_to_available_serving(
@@ -216,6 +218,67 @@ def test_missing_indicator_facts_are_unavailable_instead_of_zero_hits(tmp_path: 
         result = _run(client, conditions=[{"key": "above_ma", "args": {"period": 20}}])
     assert result.status_code == 503
     assert result.json() == {"detail": "所选日期的数据不完整，请换日期或稍后重试。"}
+
+
+def test_one_missing_indicator_fact_is_explicitly_unknown_in_each_screen_step(
+    tmp_path: Path,
+) -> None:
+    primary, replica, latest = _replica_world(tmp_path)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "DELETE FROM daily_indicator WHERE ts_code = '600001.SH' AND trade_date = ?",
+            [latest],
+        )
+        store._conn.execute(
+            "UPDATE daily_indicator SET ma20 = 100 "
+            "WHERE ts_code != '600001.SH' AND trade_date = ?",
+            [latest],
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        response = _run(client, conditions=[
+            {"key": "not_st", "args": {}},
+            {"key": "above_ma", "args": {"period": 20}},
+        ])
+        resolved = _run(client, conditions=[
+            {"key": "not_st", "args": {}},
+            {"key": "above_ma", "args": {"period": 20}},
+            {"key": "circ_mv_lt", "args": {"threshold_yi": 1}},
+        ])
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert (data["base_count"], data["total"], data["unknown_count"]) == (3, 0, 1)
+    assert data["steps"] == [
+        {"label": "排除 ST", "count": 3, "unknown_count": 0},
+        {"label": "收盘价高于均线", "count": 0, "unknown_count": 1},
+    ]
+    assert resolved.status_code == 200
+    assert resolved.json()["data"]["unknown_count"] == 0
+    assert resolved.json()["data"]["steps"][-1] == {
+        "label": "流通市值低于", "count": 0, "unknown_count": 0,
+    }
+
+
+def test_legitimate_short_indicator_history_remains_explicitly_unknown(
+    tmp_path: Path,
+) -> None:
+    primary, replica, latest = _replica_world(tmp_path)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "UPDATE daily_indicator SET ma20 = NULL "
+            "WHERE ts_code = '600001.SH' AND trade_date = ?",
+            [latest],
+        )
+        store._conn.execute(
+            "UPDATE daily_indicator SET ma20 = 100 "
+            "WHERE ts_code != '600001.SH' AND trade_date = ?",
+            [latest],
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        response = _run(client, conditions=[{"key": "above_ma", "args": {"period": 20}}])
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["unknown_count"] == 1
 
 
 def test_missing_aggregate_facts_are_unavailable_instead_of_zero_hits(tmp_path: Path) -> None:
@@ -294,7 +357,9 @@ def test_all_26_catalog_conditions_execute_against_the_same_formal_replica_schem
             data = response.json()["data"]
             assert data["status"] == "ready", block["key"]
             assert data["source"]["identity"] == identity
-            assert data["steps"] == [{"label": block["label"], "count": data["total"]}]
+            assert data["steps"] == [
+                {"label": block["label"], "count": data["total"], "unknown_count": 0}
+            ]
 
 
 def test_replica_ranking_keeps_order_across_pages(tmp_path: Path) -> None:

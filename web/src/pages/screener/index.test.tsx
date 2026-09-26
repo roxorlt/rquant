@@ -76,6 +76,34 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("局部条件未知时在结果和逐条计数中明示未判定数量", async () => {
+    catalog();
+    server.use(
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 3,
+            total: 0,
+            unknown_count: 1,
+            steps: [{ label: "排除 ST", count: 0, unknown_count: 1 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText(/未判定 1 只/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "逐条命中" })).toHaveTextContent("未知 1 只");
+    expect(screen.queryByText("没有命中股票")).not.toBeInTheDocument();
+  });
+
   it("添加并编辑中文条件，运行后展示逐条命中、分页和个股详情", async () => {
     catalog();
     stockDrawer();

@@ -67,6 +67,9 @@ function ResultBody({
   if (data.status === "no_date") {
     return <EmptyState title="所选日期没有选股数据" hint="换一个数据日期后重试。" />;
   }
+  if (data.total === 0 && (data.unknown_count ?? 0) > 0) {
+    return <EmptyState title="暂无确定命中" hint="有股票数据不足，换日期核对或调整条件后重试。" />;
+  }
   if (data.total === 0) {
     return <EmptyState title="没有命中股票" hint="查看逐条命中，放宽让数量变为 0 的条件。" />;
   }
@@ -108,20 +111,27 @@ export function ScreenResults({
         <h2>逐条命中</h2>
         {data?.status === "ready" && data.base_count !== null ? (
           <ol>
-            {[{ label: "全部股票", count: data.base_count }, ...data.steps].map((step, index) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: the ordered funnel has no stateful children.
-              <li key={`${index}-${step.label}`}>
-                <span>{step.label}</span>
-                <div className="screen-funnel-track" aria-hidden="true">
-                  <span
-                    style={{
-                      width: `${Math.max(2, (step.count / Math.max(data.base_count ?? 1, 1)) * 100)}%`,
-                    }}
-                  />
-                </div>
-                <strong className="num">{formatCount(step.count)}</strong>
-              </li>
-            ))}
+            {[{ label: "全部股票", count: data.base_count, unknown_count: 0 }, ...data.steps].map(
+              (step, index) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: the ordered funnel has no stateful children.
+                <li key={`${index}-${step.label}`}>
+                  <span>{step.label}</span>
+                  <div className="screen-funnel-track" aria-hidden="true">
+                    <span
+                      style={{
+                        width: `${Math.max(2, (step.count / Math.max(data.base_count ?? 1, 1)) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                  <span className="screen-step-count">
+                    <strong className="num">{formatCount(step.count)}</strong>
+                    {(step.unknown_count ?? 0) > 0 ? (
+                      <small>未知 {formatCount(step.unknown_count)} 只</small>
+                    ) : null}
+                  </span>
+                </li>
+              ),
+            )}
           </ol>
         ) : (
           <p className="hint">运行后查看每条条件留下多少只。</p>
@@ -131,7 +141,13 @@ export function ScreenResults({
         title={
           data?.status === "ready" ? (
             <>
-              结果 · <span>命中 {formatCount(data.total)} 只</span>
+              结果 ·{" "}
+              <span>
+                {(data.unknown_count ?? 0) > 0 ? "已确认命中" : "命中"} {formatCount(data.total)} 只
+              </span>
+              {(data.unknown_count ?? 0) > 0 ? (
+                <span> · 未判定 {formatCount(data.unknown_count)} 只</span>
+              ) : null}
             </>
           ) : (
             "结果"
@@ -158,6 +174,11 @@ export function ScreenResults({
         {error ? (
           <p className="screen-notice error" role="alert">
             {error}
+          </p>
+        ) : null}
+        {data?.status === "ready" && (data.unknown_count ?? 0) > 0 ? (
+          <p className="screen-notice">
+            有股票因条件数据缺失或历史不足未判定；结果仅包含已确认命中的股票。
           </p>
         ) : null}
         <ResultBody data={data} running={running} onStock={onStock} />
