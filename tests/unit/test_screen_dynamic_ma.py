@@ -22,7 +22,7 @@ from rquant.screen.replica_source import (
     ScreenReplicaUnavailableError,
     VerifiedReplicaScreenSource,
 )
-from rquant.screen.rules import above_ma, gt
+from rquant.screen.rules import above_ma, cross_above, gt
 from rquant.storage.duckdb import DuckDBStore
 
 _CODE = "600001.SH"
@@ -131,6 +131,14 @@ def test_period_250_and_offset_30_use_only_their_bounded_history(tmp_path: Path)
         _expected(prices, factors, 250, 30)
     )
     assert "CLOSE[279]" not in frame.columns
+
+
+def test_cross_at_offset_30_reads_its_prior_ma_within_281_days(tmp_path: Path) -> None:
+    source, _, _, dates, prices, factors = _world(tmp_path, days=281)
+    frame = source.load(dates[0], [cross_above("MA2", "MA250", offset=30)]).frame
+    assert frame.loc[0, "MA250[31]"] == pytest.approx(
+        _expected(prices, factors, 250, 31)
+    )
 
 
 def test_new_listing_missing_bar_or_factor_is_unknown_per_stock(tmp_path: Path) -> None:

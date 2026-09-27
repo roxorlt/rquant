@@ -77,6 +77,7 @@ export function ParamControl({
           <input
             className="inp num"
             type="number"
+            inputMode="decimal"
             step="any"
             aria-label={`${parameter.label}数值`}
             value={value}
@@ -114,6 +115,8 @@ export function ParamControl({
       <input
         className="inp num"
         type="number"
+        inputMode={parameter.input === "integer" ? "numeric" : "decimal"}
+        aria-label={parameter.label}
         step={parameter.input === "integer" ? 1 : "any"}
         min={parameter.minimum == null ? undefined : parameter.minimum * scale}
         max={parameter.maximum == null ? undefined : parameter.maximum * scale}

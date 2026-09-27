@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Sequence
 from typing import Any
 
@@ -77,6 +78,9 @@ _MA_OPTIONS = (
 )
 _MA_PERIOD_OPTIONS = tuple((value[2:], label) for value, label in _MA_OPTIONS)
 _RSI_PERIOD_OPTIONS = (("6", "6 日 RSI"), ("14", "14 日 RSI"))
+_MA_PERIOD_TEXT = re.compile(r"[1-9][0-9]*\Z")
+_MA_NAME_TEXT = re.compile(r"MA([1-9][0-9]*)\Z")
+_DYNAMIC_MA_RULES = frozenset({"above_ma", "cross_above", "cross_below"})
 RANKING_METRIC_LABELS = {
     "RETURN_20D_PCT[0]": "20 日涨幅",
     "TURNOVER_RATE[0]": "换手率",
@@ -113,7 +117,7 @@ def _options(rows: tuple[tuple[str, str], ...]) -> list[ScreenOption]:
     return [ScreenOption(value=key, label=label) for key, label in rows]
 
 
-def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
+def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter:
     field = spec.args_model.model_fields[key]
     prop = spec.args_model.model_json_schema()["properties"][key]
     options: list[ScreenOption] = []
@@ -122,11 +126,15 @@ def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
     if key == "boards":
         label, kind, options = "板块", "multi_choice", _options(_BOARD_OPTIONS)
     elif key in {"fast", "slow"}:
-        label, kind, options = (
-            "快线" if key == "fast" else "慢线",
-            "choice",
-            _options(_MA_OPTIONS),
-        )
+        if dynamic_ma:
+            label, kind = ("快线（日）" if key == "fast" else "慢线（日）"), "integer"
+            hint = "可填 2–250 个交易日"
+        else:
+            label, kind, options = (
+                "快线" if key == "fast" else "慢线",
+                "choice",
+                _options(_MA_OPTIONS),
+            )
     elif key == "field":
         label, kind, options = "比较项", "field", _options(_FIELDS)
     elif key in {"left", "right"}:
@@ -134,7 +142,11 @@ def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
         hint = "可选数据项，也可输入固定数字"
     elif key == "offset":
         label, kind = "相对日期", "integer"
-        hint = "0 为所选交易日，1 为前一交易日"
+        hint = (
+            "0 为所选交易日，最多往前 30 个交易日"
+            if dynamic_ma and spec.name in _DYNAMIC_MA_RULES
+            else "0 为所选交易日，1 为前一交易日"
+        )
     elif key == "threshold_yi":
         label, kind = "市值上限（亿元）", "number"
     elif key == "min_ratio":
@@ -151,11 +163,15 @@ def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
     elif key == "exclude_offset":
         label, kind = "排除前几日", "integer"
     elif key == "period":
-        label, kind, options = (
-            "指标周期",
-            "choice",
-            _options(_MA_PERIOD_OPTIONS if spec.name == "above_ma" else _RSI_PERIOD_OPTIONS),
-        )
+        if dynamic_ma and spec.name == "above_ma":
+            label, kind = "均线周期（日）", "integer"
+            hint = "可填 2–250 个交易日"
+        else:
+            label, kind, options = (
+                "指标周期",
+                "choice",
+                _options(_MA_PERIOD_OPTIONS if spec.name == "above_ma" else _RSI_PERIOD_OPTIONS),
+            )
     elif key == "n":
         label, kind = ("放量倍数" if spec.name == "volume_ratio_gte" else "连板下限"), "number"
     elif key == "low":
@@ -167,23 +183,29 @@ def _parameter(spec: RuleSpec, key: str) -> ScreenParameter:
     initial = _INITIALS.get(spec.name, {}).get(key)
     if initial is None and field.default is not PydanticUndefined:
         initial = field.default
-    if key == "period" and initial is not None:
+    if dynamic_ma and key in {"fast", "slow"}:
+        initial = int(initial[2:])
+    if key == "period" and initial is not None and not (dynamic_ma and spec.name == "above_ma"):
         initial = str(initial)
+    minimum = prop.get("minimum", prop.get("exclusiveMinimum"))
+    maximum = prop.get("maximum", prop.get("exclusiveMaximum"))
+    if dynamic_ma and (key in {"fast", "slow"} or (spec.name == "above_ma" and key == "period")):
+        minimum, maximum = 2, 250
     return ScreenParameter(
         key=key,
         label=label,
         input=kind,
         initial=initial,
         required=field.is_required(),
-        minimum=prop.get("minimum", prop.get("exclusiveMinimum")),
-        maximum=prop.get("maximum", prop.get("exclusiveMaximum")),
+        minimum=minimum,
+        maximum=maximum,
         scale=scale,
         options=options,
         hint=hint,
     )
 
 
-def screen_blocks() -> list[ScreenBlock]:
+def screen_blocks(*, dynamic_ma: bool = False) -> list[ScreenBlock]:
     if set(_RULE_COPY) != {spec.name for spec in REGISTRY}:
         raise ValueError("screen rule catalog labels are out of sync with registry")
     return [
@@ -193,17 +215,39 @@ def screen_blocks() -> list[ScreenBlock]:
             hint=_RULE_COPY[spec.name][1],
             category=spec.category,
             category_label=_CATEGORIES[spec.category],
-            parameters=[_parameter(spec, name) for name in spec.args_model.model_fields],
+            parameters=[
+                _parameter(spec, name, dynamic_ma=dynamic_ma)
+                for name in spec.args_model.model_fields
+            ],
         )
         for spec in REGISTRY
     ]
 
 
-def validate_screen_choices(conditions: Sequence[ScreenCondition]) -> None:
-    """Accept only the numeric data items and choices this UI offers."""
+def _dynamic_period(value: object, *, named: bool) -> int:
+    if type(value) is int:
+        period = value
+    elif type(value) is str:
+        pattern = _MA_NAME_TEXT if named else _MA_PERIOD_TEXT
+        match = pattern.fullmatch(value)
+        period = int(match.group(1) if named else value) if match else 0
+    else:
+        period = 0
+    if not 2 <= period <= 250:
+        raise ValueError("screen indicator period is not yet available")
+    return period
 
-    blocks = {block.key: block for block in screen_blocks()}
+
+def validate_screen_choices(
+    conditions: Sequence[ScreenCondition], *, dynamic_ma: bool = False,
+) -> list[dict[str, Any]]:
+    """Accept only offered choices and normalize replica MA periods for the registry."""
+
+    blocks = {block.key: block for block in screen_blocks(dynamic_ma=dynamic_ma)}
+    normalized: list[dict[str, Any]] = []
     for condition in conditions:
+        args = dict(condition.args)
+        normalized.append(args)
         block = blocks.get(condition.key)
         if block is None:
             continue  # The registry compiler reports the unknown rule.
@@ -211,6 +255,13 @@ def validate_screen_choices(conditions: Sequence[ScreenCondition]) -> None:
             if parameter.key not in condition.args:
                 continue
             value = condition.args[parameter.key]
+            if dynamic_ma and condition.key in _DYNAMIC_MA_RULES:
+                if parameter.key in {"fast", "slow"}:
+                    args[parameter.key] = f"MA{_dynamic_period(value, named=True)}"
+                    continue
+                if condition.key == "above_ma" and parameter.key == "period":
+                    args[parameter.key] = _dynamic_period(value, named=False)
+                    continue
             choices = {option.value for option in parameter.options}
             if parameter.input in {"choice", "field"}:
                 valid = (
@@ -230,3 +281,4 @@ def validate_screen_choices(conditions: Sequence[ScreenCondition]) -> None:
                 if parameter.key == "period":
                     raise ValueError("screen indicator period is not yet available")
                 raise ValueError("screen form choice is not listed in the catalog")
+    return normalized

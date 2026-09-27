@@ -341,6 +341,140 @@ describe("选股器", () => {
     expect(await screen.findByText("样本21")).toBeInTheDocument();
   });
 
+  it("副本均线可用数字键盘填写周期，范围可查并按数值提交", async () => {
+    const dynamicBlocks: Schemas["ScreenBlock"][] = [
+      blocks[0] as Schemas["ScreenBlock"],
+      {
+        key: "above_ma",
+        label: "收盘价高于均线",
+        hint: "收盘价高于指定周期的均线",
+        category: "indicator",
+        category_label: "指标",
+        parameters: [
+          {
+            key: "period",
+            label: "均线周期（日）",
+            input: "integer",
+            initial: 20,
+            required: true,
+            minimum: 2,
+            maximum: 250,
+            scale: 1,
+            hint: "可填 2–250 个交易日",
+          },
+          {
+            key: "offset",
+            label: "相对日期",
+            input: "integer",
+            initial: 0,
+            required: false,
+            minimum: 0,
+            maximum: 30,
+            scale: 1,
+            hint: "0 为所选交易日，最多往前 30 个交易日",
+          },
+        ],
+      },
+      {
+        key: "cross_above",
+        label: "均线上穿",
+        hint: "短期均线由下向上穿过长期均线",
+        category: "indicator",
+        category_label: "指标",
+        parameters: [
+          ...(["fast", "slow"] as const).map((key) => ({
+            key,
+            label: key === "fast" ? "快线（日）" : "慢线（日）",
+            input: "integer" as const,
+            initial: key === "fast" ? 5 : 20,
+            required: true,
+            minimum: 2,
+            maximum: 250,
+            scale: 1,
+            hint: "可填 2–250 个交易日",
+          })),
+          {
+            key: "offset",
+            label: "相对日期",
+            input: "integer",
+            initial: 0,
+            required: false,
+            minimum: 0,
+            maximum: 30,
+            scale: 1,
+          },
+        ],
+      },
+    ];
+    const requests: Schemas["ScreenRunRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: dynamicBlocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        requests.push(body);
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 3,
+            total: 0,
+            steps: [],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "条件目录" }), "above_ma");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    const period = screen.getByRole("spinbutton", { name: "均线周期（日）" });
+    expect(period).toHaveAttribute("min", "2");
+    expect(period).toHaveAttribute("max", "250");
+    expect(period).toHaveAttribute("inputmode", "numeric");
+    await user.hover(
+      screen.getByRole("img", { name: "均线周期（日）说明" }).parentElement as HTMLElement,
+    );
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("2–250");
+    await user.clear(period);
+    await user.type(period, "7");
+    await user.selectOptions(screen.getByRole("combobox", { name: "条件目录" }), "cross_above");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    const fast = screen.getByRole("spinbutton", { name: "快线（日）" });
+    const slow = screen.getByRole("spinbutton", { name: "慢线（日）" });
+    expect(fast).toHaveAttribute("inputmode", "numeric");
+    await user.clear(fast);
+    await user.type(fast, "2");
+    await user.clear(slow);
+    await user.type(slow, "3");
+    const offsets = screen.getAllByRole("spinbutton", { name: "相对日期" });
+    await user.clear(offsets[1] as HTMLElement);
+    await user.type(offsets[1] as HTMLElement, "30");
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]?.conditions).toMatchObject([
+      { key: "not_st", args: {} },
+      { key: "above_ma", args: { period: 7, offset: 0 } },
+      { key: "cross_above", args: { fast: 2, slow: 3, offset: 30 } },
+    ]);
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
   it("条件修改后标明旧结果；无数据或不支持的条件不显示伪结果", async () => {
     catalog();
     let unsupported = false;

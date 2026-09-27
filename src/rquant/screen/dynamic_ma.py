@@ -32,7 +32,7 @@ def requested_dynamic_ma(columns: Collection[str]) -> dict[str, tuple[int, int]]
         period, offset = (int(value) for value in match.groups())
         if period in FIXED_MA_PERIODS:
             continue
-        if period < 2 or period > 250 or offset > 30:
+        if period < 2 or period > 250 or offset > 31:
             raise ValueError(f"unsupported dynamic MA dependency: {column}")
         selected[column] = (period, offset)
     return selected
