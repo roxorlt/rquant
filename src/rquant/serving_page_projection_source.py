@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -66,7 +67,7 @@ from rquant.page_control import (
 )
 from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
 from rquant.pool_membership import PoolDayEvidence, PoolMemberClose, compute_pool_membership
-from rquant.pool_result_receipt import ScreenRunReceipt, member_set_digest
+from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
     ReplicaRead,
@@ -126,6 +127,7 @@ _RUN_RECEIPT_COLUMNS = (
     "completed_at",
     "result_version",
 )
+_RUN_PRICE_RECEIPT_COLUMNS = ("contract", "price_digest")
 _MAX_RESEARCH_GATES = 512
 _MAX_AUDIT_FINDING_LIST_BYTES = 32 * 1024
 _MAX_PULSE_ROWS = 512
@@ -1199,6 +1201,7 @@ class _ReadonlyPageControlAuditReader:
 class _VerifiedRunReceipts:
     latest: tuple[ScreenRunReceipt, ...]
     lineage: tuple[ScreenRunReceipt, ...]
+    price_digest_verified: frozenset[str]
     newest_candidate_day: date | None
     newest_candidate_at: datetime | None
     exact_parent_steps: tuple[tuple[str, int], ...]
@@ -1263,11 +1266,18 @@ def _read_verified_run_receipts(
     }
     if not set(_RUN_RECEIPT_COLUMNS).issubset(columns):
         raise PageProjectionSourceIntegrityError("screen run receipt table is incomplete")
+    price_columns = set(_RUN_PRICE_RECEIPT_COLUMNS)
+    if columns & price_columns and not price_columns <= columns:
+        raise PageProjectionSourceIntegrityError("screen run price receipt columns are incomplete")
+    receipt_columns = (
+        _RUN_RECEIPT_COLUMNS + _RUN_PRICE_RECEIPT_COLUMNS
+        if price_columns <= columns
+        else _RUN_RECEIPT_COLUMNS
+    )
+    receipt_select = ", ".join(receipt_columns)
     candidate_rows = connection.execute(
-        """
-        SELECT trade_date, preset_name, definition_version, parent_trade_date,
-               parent_result_version, hit_count, member_digest, lineage_complete,
-               completed_at, result_version
+        f"""
+        SELECT {receipt_select}
         FROM screen_run_receipt
         WHERE trade_date BETWEEN ? AND ? AND completed_at <= ?
         ORDER BY trade_date DESC, preset_name
@@ -1292,6 +1302,7 @@ def _read_verified_run_receipts(
     newest = max((row[0] for row in candidates), default=None)
     newest_at = max((_database_timestamp(row[8]) for row in candidate_rows), default=None)
     verified: dict[tuple[date, str], ScreenRunReceipt | None] = {}
+    price_digest_verified: set[str] = set()
     member_total = 0
 
     def verify(raw: tuple[object, ...]) -> ScreenRunReceipt | None:
@@ -1303,16 +1314,14 @@ def _read_verified_run_receipts(
             raise PageProjectionSourceIntegrityError("screen run receipt lineage exceeds bound")
         verified[key] = None
         try:
-            receipt = ScreenRunReceipt.model_validate(
-                dict(zip(_RUN_RECEIPT_COLUMNS, raw, strict=True))
-            )
+            receipt = ScreenRunReceipt.model_validate(dict(zip(receipt_columns, raw, strict=True)))
         except ValueError:
             return None
         if receipt.trade_date > cutoff.date() or receipt.completed_at > observed:
             return None
         member_rows = connection.execute(
             """
-            SELECT ts_code FROM screen_result
+            SELECT ts_code, close FROM screen_result
             WHERE trade_date = ? AND preset_name = ? AND created_at <= ?
             ORDER BY ts_code LIMIT ?
             """,
@@ -1335,10 +1344,8 @@ def _read_verified_run_receipts(
             if receipt.parent_trade_date >= receipt.trade_date:
                 return None
             parent_rows = connection.execute(
-                """
-                SELECT trade_date, preset_name, definition_version, parent_trade_date,
-                       parent_result_version, hit_count, member_digest, lineage_complete,
-                       completed_at, result_version
+                f"""
+                SELECT {receipt_select}
                 FROM screen_run_receipt
                 WHERE trade_date = ? AND result_version = ? AND completed_at <= ?
                 LIMIT 2
@@ -1354,6 +1361,13 @@ def _read_verified_run_receipts(
                 or parent.lineage_complete != receipt.lineage_complete
             ):
                 return None
+        if (
+            receipt.contract == "screen-run-receipt/v2"
+            and receipt.price_digest
+            == member_price_digest([(str(code), close) for code, close in member_rows])
+        ):
+            assert receipt.result_version is not None
+            price_digest_verified.add(receipt.result_version)
         verified[key] = receipt
         return receipt
 
@@ -1399,6 +1413,7 @@ def _read_verified_run_receipts(
     return _VerifiedRunReceipts(
         latest=latest,
         lineage=lineage,
+        price_digest_verified=frozenset(price_digest_verified),
         newest_candidate_day=newest,
         newest_candidate_at=newest_at,
         exact_parent_steps=tuple(exact_parent_steps),
@@ -1462,6 +1477,8 @@ def _receipt_projection(
             "preset_name": item.preset_name,
             "definition_version": item.definition_version,
             "result_version": item.result_version,
+            "contract": item.contract,
+            "price_digest_verified": item.result_version in receipts.price_digest_verified,
             "parent_trade_date": (
                 None if item.parent_trade_date is None else item.parent_trade_date.isoformat()
             ),
@@ -1559,9 +1576,15 @@ def _read_membership_source(
         str(row[0])
         for row in connection.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' "
-            "AND table_name = 'trade_calendar'"
+            "AND table_name IN ('trade_calendar', 'daily_bar')"
         ).fetchall()
     }
+    daily_columns = (
+        {str(row[1]) for row in connection.execute("PRAGMA table_info('daily_bar')").fetchall()}
+        if "daily_bar" in tables
+        else set()
+    )
+    daily_has_close = {"trade_date", "ts_code", "close"} <= daily_columns
     start = min(
         (day for day, _pool in receipts.membership_candidate_keys if day <= target_date),
         default=target_date,
@@ -1574,10 +1597,17 @@ def _read_membership_source(
     days: list[PoolDayEvidence] = []
     member_total = 0
     for receipt in receipts.membership_daily:
+        daily_close_select = (
+            "db.close AS daily_close FROM screen_result AS sr "
+            "LEFT JOIN daily_bar AS db ON db.trade_date = sr.trade_date "
+            "AND db.ts_code = sr.ts_code"
+            if daily_has_close
+            else "NULL::DOUBLE AS daily_close FROM screen_result AS sr"
+        )
         member_rows = connection.execute(
-            "SELECT ts_code FROM screen_result "
-            "WHERE trade_date = ? AND preset_name = ? AND created_at <= ? "
-            "ORDER BY ts_code LIMIT ?",
+            "SELECT sr.ts_code, sr.close, " + daily_close_select + " "
+            "WHERE sr.trade_date = ? AND sr.preset_name = ? AND sr.created_at <= ? "
+            "ORDER BY sr.ts_code LIMIT ?",
             (
                 receipt.trade_date,
                 receipt.preset_name,
@@ -1596,7 +1626,23 @@ def _read_membership_source(
                 days=(),
                 candidate_keys=receipts.membership_candidate_keys,
             )
-        members = tuple(PoolMemberClose(ts_code=str(code)) for (code,) in member_rows)
+        prices_match_receipt = receipt.result_version in receipts.price_digest_verified
+        members = tuple(
+            PoolMemberClose(
+                ts_code=str(code),
+                close=(
+                    close
+                    if prices_match_receipt
+                    and close is not None
+                    and daily_close is not None
+                    and math.isfinite(close)
+                    and close > 0
+                    and close == daily_close
+                    else None
+                ),
+            )
+            for code, close, daily_close in member_rows
+        )
         days.append(
             PoolDayEvidence(trade_date=receipt.trade_date, receipt=receipt, members=members)
         )
