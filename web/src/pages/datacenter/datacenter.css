@@ -187,6 +187,95 @@
 .dc-audit-issues .tbl-wrap {
   max-width: 100%;
 }
+.dc-report {
+  min-width: 0;
+}
+.dc-report-intro {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 14px 16px;
+}
+.dc-report-dates {
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.8;
+}
+.dc-report-states {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.dc-report .kpis {
+  margin: 0 16px;
+}
+.dc-report-caveat {
+  margin: 12px 16px 0;
+  padding: 9px 12px;
+  border-left: 3px solid var(--warn);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.dc-report-section {
+  min-width: 0;
+  margin-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+.dc-report-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 13px 16px 9px;
+}
+.dc-report-section-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.dc-report-chart {
+  padding: 0 8px;
+  box-sizing: border-box;
+}
+.dc-report-rule-name,
+.dc-report-reasons,
+.dc-report-issue-name {
+  display: grid;
+  gap: 2px;
+}
+.dc-report-rule-name small,
+.dc-report-issue-name small,
+.dc-report-reasons span,
+.dc-report-muted {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+.dc-report-mobile-progress,
+.dc-report-mobile-code {
+  display: none;
+}
+.dc-report-progress {
+  white-space: nowrap;
+  border-bottom: 1px dotted var(--faint);
+}
+.dc-report-partial {
+  color: var(--warn-t);
+  font-size: 12px;
+}
+.dc-history {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+}
+.dc-history > .panel {
+  width: 100%;
+  min-width: 0;
+}
 @media (max-width: 760px) {
   .dc-layout {
     display: block;
@@ -220,5 +309,42 @@
   }
   .dc-audit-controls .seg {
     max-width: 100%;
+  }
+  .dc-report .kpis.compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .dc-report .kpis.compact .kpi:last-child {
+    grid-column: auto;
+  }
+  .dc-report-intro,
+  .dc-report-section-head {
+    padding-inline: 12px;
+  }
+  .dc-report .kpis {
+    margin-inline: 12px;
+  }
+  .dc-report-caveat {
+    margin-inline: 12px;
+  }
+  .dc-report-mobile-progress,
+  .dc-report-mobile-code {
+    display: block;
+  }
+  .dc-report-rule-table .tbl,
+  .dc-report-issue-table .tbl {
+    table-layout: fixed;
+  }
+  .dc-report-rule-table .tbl td.wrap,
+  .dc-report-issue-table .tbl td.wrap {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .dc-report-rule-table .tbl th:first-child,
+  .dc-report-rule-table .tbl td:first-child {
+    width: 43%;
+  }
+  .dc-report-issue-table .tbl th:first-child,
+  .dc-report-issue-table .tbl td:first-child {
+    width: 112px;
   }
 }

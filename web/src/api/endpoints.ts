@@ -124,6 +124,24 @@ export function useDataAuditHealth(): ServingQueryResult<DataAuditHealthData> {
   });
 }
 
+export function useDataAuditReport(generation: string | null | undefined) {
+  return useServingQuery(
+    ["data", "audit", "report", generation],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/data/report");
+      return unwrap(data, response);
+    },
+    { enabled: generation !== undefined },
+  );
+}
+
+// openapi-fetch's Readable response omits null-only fields from the generated model.
+// Derive the page shape from the typed client response so it stays in sync with OpenAPI.
+export type DataAuditReportData = NonNullable<ReturnType<typeof useDataAuditReport>["data"]>;
+export type AuditReportMonth = DataAuditReportData["months"][number];
+export type AuditReportRule = DataAuditReportData["rules"][number];
+export type AuditReportIssue = DataAuditReportData["issues"][number];
+
 export function useDataAuditIssues(
   datasetId: string,
   generation: string | null,
