@@ -810,3 +810,202 @@
     width: 112px;
   }
 }
+.dc-financial {
+  min-width: 0;
+  margin-top: 18px;
+  overflow: hidden;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.dc-fin-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 24px 18px;
+  border-bottom: 1px solid var(--rule);
+}
+.dc-fin-eyebrow {
+  margin: 0 0 5px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+.dc-fin-heading h2 {
+  margin: 0;
+  font-family: var(--font-head);
+  font-size: 23px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+.dc-fin-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 16px;
+  padding: 26px 24px 24px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--surface-2);
+}
+.dc-fin-decision,
+.dc-fin-records {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.dc-fin-label {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-fin-decision strong {
+  color: var(--ink);
+  font-size: clamp(19px, 2.5vw, 28px);
+  font-weight: 550;
+  line-height: 1.1;
+}
+.dc-fin-records strong {
+  font-size: clamp(29px, 3.5vw, 38px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.035em;
+}
+.dc-fin-count-unit {
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-fin-wait {
+  align-self: center;
+  padding: 4px 8px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 100px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.dc-fin-provenance {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 11px;
+}
+.dc-fin-provenance .tip-anchor,
+.dc-fin-field-head .tip-anchor,
+.dc-fin-field-counts .tip-anchor {
+  border-bottom: 1px dotted var(--faint);
+}
+.dc-fin-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  background: var(--rule);
+  list-style: none;
+}
+.dc-fin-field {
+  min-width: 0;
+  padding: 20px 22px;
+  background: var(--surface);
+}
+.dc-fin-field-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+}
+.dc-fin-field-head strong {
+  font-weight: 600;
+}
+.dc-fin-unit {
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.dc-fin-field-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 16px 0 0;
+}
+.dc-fin-field-counts > div + div {
+  padding-left: 15px;
+  border-left: 1px solid var(--rule);
+}
+.dc-fin-field-counts dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+.dc-fin-field-counts dd {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 21px;
+  font-weight: 550;
+  line-height: 1.1;
+}
+.dc-fin-field-counts > div + div dd {
+  color: var(--muted);
+}
+.dc-fin-empty {
+  min-height: 220px;
+  padding: 26px 24px;
+}
+.dc-fin-empty-date {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-fin-empty .dc-fin-wait {
+  display: inline-flex;
+  margin-bottom: 12px;
+}
+.dc-fin-empty-source {
+  margin: 24px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+@media (max-width: 900px) {
+  .dc-fin-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 480px) {
+  .dc-fin-heading {
+    padding: 16px;
+  }
+  .dc-fin-summary {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 20px 16px;
+  }
+  .dc-fin-decision strong {
+    font-size: 17px;
+  }
+  .dc-fin-records strong {
+    font-size: 27px;
+  }
+  .dc-fin-wait {
+    font-size: 10px;
+  }
+  .dc-fin-provenance {
+    padding-inline: 16px;
+  }
+  .dc-fin-field {
+    padding: 15px 13px;
+  }
+  .dc-fin-field-counts > div + div {
+    padding-left: 8px;
+  }
+  .dc-fin-field-counts dd {
+    font-size: 18px;
+  }
+}

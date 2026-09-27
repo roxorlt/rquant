@@ -25,6 +25,7 @@ import { AuditPanel } from "./AuditPanel";
 import { BackfillPlanPanel } from "./BackfillPlanPanel";
 import { BackfillPlanCommandSession } from "./backfillPlanCommandSession";
 import { DailyReportPanel } from "./DailyReportPanel";
+import { FinancialPanel } from "./FinancialPanel";
 import "./datacenter.css";
 
 const FIELD_COLUMNS: DataColumn<CatalogField>[] = [
@@ -380,7 +381,7 @@ export default function DataCenterPage() {
     commandSession.snapshot,
     commandSession.snapshot,
   );
-  const [view, setView] = useState<"catalog" | "plans">(() =>
+  const [view, setView] = useState<"catalog" | "financial" | "plans">(() =>
     commandSession.snapshot().journal ? "plans" : "catalog",
   );
   const [requestOpen, setRequestOpen] = useState(false);
@@ -418,6 +419,7 @@ export default function DataCenterPage() {
           label="数据中心内容"
           options={[
             { value: "catalog", label: "数据目录" },
+            { value: "financial", label: "财务" },
             { value: "plans", label: "回补计划" },
           ]}
           value={view}
@@ -426,6 +428,8 @@ export default function DataCenterPage() {
       </div>
       {view === "catalog" ? (
         <CatalogView />
+      ) : view === "financial" ? (
+        <FinancialPanel />
       ) : (
         <BackfillPlanPanel
           commandSession={commandSession}
