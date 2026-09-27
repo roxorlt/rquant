@@ -43,8 +43,6 @@ def _projections(tmp_path: Path, *, count: int = 1) -> tuple[ServingProjectionPa
         plans = []
     return project_backfill_plans(
         plans,
-        total_count=count,
-        has_older_plans=False,
         available_at=FIXTURE_BUILT_AT - timedelta(minutes=1),
     )
 
