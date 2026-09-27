@@ -385,7 +385,7 @@ def test_v10_creates_dataset_snapshot_binding_only_through_migration() -> None:
 def test_v11_creates_screen_run_receipt_only_through_migration() -> None:
     from rquant.storage.schema import ALL_DDL, SCREEN_RUN_RECEIPT_DDL
 
-    assert [migration.version for migration in MIGRATIONS] == list(range(1, 12))
+    assert [migration.version for migration in MIGRATIONS[:11]] == list(range(1, 12))
     assert MIGRATIONS[10].statements == (SCREEN_RUN_RECEIPT_DDL,)
     assert SCREEN_RUN_RECEIPT_DDL in ALL_DDL
 
@@ -395,7 +395,7 @@ def test_v11_creates_screen_run_receipt_only_through_migration() -> None:
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_name = 'screen_run_receipt'"
     ).fetchone() == (0,)
-    initialize_schema(conn)
+    initialize_schema(conn, migrations=MIGRATIONS[:11])
     columns = conn.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = 'screen_run_receipt' ORDER BY ordinal_position"

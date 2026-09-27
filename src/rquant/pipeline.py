@@ -12,7 +12,7 @@ from loguru import logger
 from pydantic import Field
 
 from rquant.builtin_presets import builtin_definition_version
-from rquant.pool_result_receipt import ScreenRunReceipt, member_set_digest
+from rquant.pool_result_receipt import ScreenRunReceipt, ScreenRunReceiptDraft, member_set_digest
 from rquant.presets import PRESET_SCREENS, ScreenPreset, load_user_presets
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.runtime_contracts import RuntimeContractModel
@@ -355,7 +355,7 @@ def run_daily_screen_stage(
                         f"在 {lookback} 无命中，跳过"
                     )
                     empty = _to_screen_result_df(pd.DataFrame(), trade_date, name)
-                    receipt = ScreenRunReceipt(
+                    receipt = ScreenRunReceiptDraft(
                         trade_date=date.fromisoformat(trade_date),
                         preset_name=name,
                         definition_version=_definition_version(preset),
@@ -394,7 +394,7 @@ def run_daily_screen_stage(
                     removed = sr_df.loc[hit_mask, "ts_code"].tolist()
                     sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
                     logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
-            receipt = ScreenRunReceipt(
+            receipt = ScreenRunReceiptDraft(
                 trade_date=date.fromisoformat(trade_date),
                 preset_name=name,
                 definition_version=_definition_version(preset),

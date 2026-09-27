@@ -189,6 +189,12 @@ CREATE TABLE IF NOT EXISTS screen_run_receipt (
 );
 """
 
+SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS: tuple[str, ...] = (
+    "ALTER TABLE screen_run_receipt ADD COLUMN IF NOT EXISTS "
+    "contract VARCHAR DEFAULT 'screen-run-receipt/v1';",
+    "ALTER TABLE screen_run_receipt ADD COLUMN IF NOT EXISTS price_digest VARCHAR;",
+)
+
 POOL2_WATCH_DDL = """
 CREATE TABLE IF NOT EXISTS pool2_watch (
     ts_code       VARCHAR   PRIMARY KEY,
@@ -1134,6 +1140,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     STOCK_SUSPEND_COVERAGE_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
     SCREEN_RUN_RECEIPT_DDL,
+    *SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

@@ -1227,6 +1227,12 @@ def _sync_table(
                 mode="error",
                 detail=f"screen_run_receipt missing columns: {sorted(required - set(cols))}",
             )
+        if ("contract" in cols) != ("price_digest" in cols):
+            return TableSyncResult(
+                table=table,
+                mode="error",
+                detail="screen_run_receipt has incomplete price proof columns",
+            )
     if not cols:
         return TableSyncResult(table=table, mode="skipped", detail="无共同列")
     if mode in ("merge", "restore") and any(pk not in cols for pk in pk_cols):
