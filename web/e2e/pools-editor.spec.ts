@@ -89,6 +89,7 @@ for (const viewport of [
                 scale: 1,
                 options: [],
                 hint: null,
+                custom_ma: false,
               },
             ],
           },

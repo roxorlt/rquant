@@ -253,6 +253,12 @@ def test_serving_catalog_keeps_fixed_ma_choices_and_rejects_dynamic_periods(
         dynamic_cross = _run(client, conditions=[
             {"key": "cross_above", "args": {"fast": 7, "slow": 20}},
         ])
+        dynamic_compare = _run(client, conditions=[
+            {"key": "gt", "args": {"left": "MA7[0]", "right": 9}},
+        ])
+        dynamic_between = _run(client, conditions=[
+            {"key": "between", "args": {"field": "MA7[0]", "low": 0, "high": 10}},
+        ])
 
     blocks = {block["key"]: block for block in catalog["blocks"]}
     above = next(item for item in blocks["above_ma"]["parameters"] if item["key"] == "period")
@@ -260,7 +266,14 @@ def test_serving_catalog_keeps_fixed_ma_choices_and_rejects_dynamic_periods(
     assert above["input"] == fast["input"] == "choice"
     assert {option["value"] for option in above["options"]} == {"5", "10", "20", "60"}
     assert {option["value"] for option in fast["options"]} == {"MA5", "MA10", "MA20", "MA60"}
+    assert next(item for item in blocks["gt"]["parameters"] if item["key"] == "left")[
+        "custom_ma"
+    ] is False
+    assert next(item for item in blocks["between"]["parameters"] if item["key"] == "field")[
+        "custom_ma"
+    ] is False
     assert dynamic.status_code == dynamic_cross.status_code == 422
+    assert dynamic_compare.status_code == dynamic_between.status_code == 422
 
 
 def test_next_page_requires_a_rerun_after_generation_changes(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ import {
   RelativeTime,
   Tip,
 } from "@/ui";
+import { CustomMaParamControl } from "./CustomMaParamControl";
 import { FormulaPreviewDialog } from "./FormulaPreviewDialog";
 import { type RankingDraft, RankingEditor } from "./RankingEditor";
 import { ScreenResults } from "./ScreenResults";
@@ -287,14 +288,23 @@ export default function ScreenerPage() {
                     </div>
                     {block.parameters.length > 0 ? (
                       <div className="screen-params">
-                        {block.parameters.map((parameter) => (
-                          <ParamControl
-                            key={parameter.key}
-                            parameter={parameter}
-                            value={condition.args[parameter.key] ?? null}
-                            onChange={(value) => updateArg(condition.id, parameter.key, value)}
-                          />
-                        ))}
+                        {block.parameters.map((parameter) =>
+                          parameter.custom_ma ? (
+                            <CustomMaParamControl
+                              key={parameter.key}
+                              parameter={parameter}
+                              value={condition.args[parameter.key] ?? null}
+                              onChange={(value) => updateArg(condition.id, parameter.key, value)}
+                            />
+                          ) : (
+                            <ParamControl
+                              key={parameter.key}
+                              parameter={parameter}
+                              value={condition.args[parameter.key] ?? null}
+                              onChange={(value) => updateArg(condition.id, parameter.key, value)}
+                            />
+                          ),
+                        )}
                       </div>
                     ) : null}
                   </div>

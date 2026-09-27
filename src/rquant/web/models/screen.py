@@ -30,6 +30,7 @@ class ScreenParameter(BaseModel):
     scale: float = 1
     options: list[ScreenOption] = Field(default_factory=list)
     hint: str | None = None
+    custom_ma: bool = False
 
 
 class ScreenBlock(BaseModel):

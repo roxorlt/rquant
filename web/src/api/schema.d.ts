@@ -2918,6 +2918,11 @@ export interface components {
         };
         /** ScreenParameter */
         ScreenParameter: {
+            /**
+             * Custom Ma
+             * @default false
+             */
+            custom_ma: boolean;
             /** Hint */
             hint?: string | null;
             /** Initial */

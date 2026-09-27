@@ -40,6 +40,7 @@ const catalog: Schemas["ScreenCatalogData"] = {
           scale: 1,
           options: [],
           hint: null,
+          custom_ma: false,
         },
         {
           key: "window",
@@ -52,6 +53,7 @@ const catalog: Schemas["ScreenCatalogData"] = {
           scale: 1,
           options: [],
           hint: null,
+          custom_ma: false,
         },
       ],
     },
@@ -383,6 +385,7 @@ const parameter = (
   scale: 1,
   options,
   hint: "",
+  custom_ma: false,
 });
 const block = (
   key: string,
