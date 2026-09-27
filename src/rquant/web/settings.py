@@ -25,6 +25,7 @@ SCREEN_PRIMARY_ENV_VAR = "RQUANT_WEB_SCREEN_PRIMARY_PATH"
 SCREEN_REPLICA_ENV_VAR = "RQUANT_WEB_SCREEN_REPLICA_PATH"
 SCREEN_HISTORY_ENV_VAR = "RQUANT_WEB_SCREEN_HISTORY_ROOT"
 CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
+ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 
 DEFAULT_BIND = "127.0.0.1:8768"
 DEFAULT_PAGE_CONTROL_URL = "http://127.0.0.1:8767/v1/commands"
@@ -73,6 +74,7 @@ class WebSettings(BaseModel):
     screen_replica_path: Path | None = None
     screen_history_root: Path | None = None
     catalog_samples_file: Path | None = None
+    ack_admission_socket_path: Path | None = None
 
     @model_validator(mode="after")
     def validate_screen_source(self) -> Self:
@@ -91,6 +93,13 @@ class WebSettings(BaseModel):
     def validate_page_control_url(cls, value: str) -> str:
         if value != DEFAULT_PAGE_CONTROL_URL:
             raise ValueError("page control URL must be the fixed IPv4 loopback endpoint")
+        return value
+
+    @field_validator("ack_admission_socket_path")
+    @classmethod
+    def validate_ack_admission_socket_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("ack admission socket path must be absolute")
         return value
 
     @property
@@ -130,4 +139,7 @@ class WebSettings(BaseModel):
         samples = source.get(CATALOG_SAMPLES_ENV_VAR, "").strip()
         if samples:
             values["catalog_samples_file"] = Path(samples)
+        admission_socket = source.get(ACK_ADMISSION_SOCKET_ENV_VAR, "").strip()
+        if admission_socket:
+            values["ack_admission_socket_path"] = Path(admission_socket)
         return cls.model_validate(values)

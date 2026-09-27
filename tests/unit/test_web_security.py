@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 import pytest
@@ -41,6 +42,16 @@ def test_settings_come_from_the_environment_only() -> None:
     assert str(WebSettings.from_env({}).serving_root) == "data/runtime/serving"
     with pytest.raises(ValueError):
         WebSettings.from_env({"RQUANT_WEB_BIND": "0.0.0.0:8768"})
+
+
+def test_ack_admission_socket_is_explicit_and_absolute(tmp_path: Path) -> None:
+    socket_path = tmp_path / "private" / "ack.sock"
+    assert WebSettings.from_env({}).ack_admission_socket_path is None
+    assert WebSettings.from_env(
+        {"RQUANT_WEB_ACK_ADMISSION_SOCKET": str(socket_path)}
+    ).ack_admission_socket_path == socket_path
+    with pytest.raises(ValueError):
+        WebSettings.from_env({"RQUANT_WEB_ACK_ADMISSION_SOCKET": "private/ack.sock"})
 
 
 def _app() -> FastAPI:

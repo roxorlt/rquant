@@ -20,8 +20,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rquant.alert_ack import stable_alert_id, stable_signal_alert_id
+from rquant.alert_ack_admission import (
+    AckAdmissionClient,
+    AckAdmissionRejectedError,
+    AckAdmissionUnavailableError,
+)
 from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
-from rquant.page_control import AckAlert, PageControlStatus
+from rquant.page_control import AckAlert, PageControlReceipt, PageControlStatus
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus
 from rquant.web import readers
@@ -677,45 +682,69 @@ async def acknowledge_alert(
     except AckLookupInvalidResponseError as error:
         raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。") from error
     if original is not None:
-        if original.status is PageControlStatus.SUCCEEDED:
-            result = original.result
-            confirmation_id = result.get("confirmation_id") if isinstance(result, dict) else None
-            if not isinstance(confirmation_id, str) or not 1 <= len(confirmation_id) <= 128:
-                raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。")
-            return AckCommandReceipt(
-                command_id=body.command_id,
-                status="succeeded",
-                confirmation_id=confirmation_id,
-                message="已受理，正在同步",
-            )
-        return AckCommandReceipt(
-            command_id=body.command_id,
-            status=original.status.value,
-            message={
-                "pending": "已受理，等待处理",
-                "processing": "正在处理",
-                "failed": "确认未完成，请检查后重试。",
-                "ambiguous": "状态待确认，请使用原请求重试。",
-            }[original.status.value],
-        )
-    # The fixed PageControl endpoint currently refuses new acknowledgment commands.
-    # Until a separately reviewed authenticated admission contract exists, do not write.
+        if (
+            original.status in {PageControlStatus.PENDING, PageControlStatus.PROCESSING}
+            and web.ack_admission is not None
+        ):
+            resumed = await _submit_ack_admission(web.ack_admission, command)
+            return _ack_response(command, resumed)
+        return _ack_response(command, original)
     with web.tracker.borrow() as borrowed:
+        now = web.clock()
         meta = serving_meta(
             borrowed,
-            now=web.clock(),
+            now=now,
             stale_after=web.settings.stale_after,
             failure=web.tracker.failure,
         )
         if borrowed is None or meta.generation_id != body.generation_id:
             raise HTTPException(status_code=409, detail="数据已更新，请刷新告警时间线。")
         alerts = read_alert_ack(
-            borrowed, meta=meta, now=web.clock(), stale_after=web.settings.stale_after
+            borrowed, meta=meta, now=now, stale_after=web.settings.stale_after
         )
         if alerts.summary.state != "ready" or not any(
-            item.alert_id == body.alert_id
-            and alerts.status_for(item.source, item.alert_id).eligible
+            item.alert_id == body.alert_id and alerts.is_eligible(item.source, item.alert_id)
             for item in alerts.events.values()
         ):
             raise HTTPException(status_code=409, detail="确认状态暂不可用，请稍后重试。")
-    raise HTTPException(status_code=503, detail="确认服务尚未就绪，请稍后重试。")
+    if web.ack_admission is None:
+        raise HTTPException(status_code=503, detail="确认服务尚未就绪，请稍后重试。")
+    receipt = await _submit_ack_admission(web.ack_admission, command)
+    return _ack_response(command, receipt)
+
+
+async def _submit_ack_admission(
+    admission: AckAdmissionClient, command: AckAlert
+) -> PageControlReceipt:
+    try:
+        return await anyio.to_thread.run_sync(admission.submit, command)
+    except AckAdmissionRejectedError as error:
+        raise HTTPException(status_code=409, detail="告警状态已变化，请刷新后重试。") from error
+    except AckAdmissionUnavailableError as error:
+        raise HTTPException(status_code=503, detail="连接暂不可用，请使用原请求重试。") from error
+
+
+def _ack_response(command: AckAlert, receipt: PageControlReceipt) -> AckCommandReceipt:
+    if receipt.command_id != command.command_id:
+        raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。")
+    if receipt.status is PageControlStatus.SUCCEEDED:
+        result = receipt.result
+        confirmation_id = result.get("confirmation_id") if isinstance(result, dict) else None
+        if not isinstance(confirmation_id, str) or not 1 <= len(confirmation_id) <= 128:
+            raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。")
+        return AckCommandReceipt(
+            command_id=command.command_id,
+            status="succeeded",
+            confirmation_id=confirmation_id,
+            message="已受理，正在同步",
+        )
+    return AckCommandReceipt(
+        command_id=command.command_id,
+        status=receipt.status.value,
+        message={
+            "pending": "已受理，等待处理",
+            "processing": "正在处理",
+            "failed": "确认未完成，请检查后重试。",
+            "ambiguous": "状态待确认，请使用原请求重试。",
+        }[receipt.status.value],
+    )

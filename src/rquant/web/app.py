@@ -1,4 +1,4 @@
-"""``create_app()``: the read-only FastAPI application behind ``/app/api/``.
+"""``create_app()``: the FastAPI application behind ``/app/api/``.
 
 nginx serves the static front end itself and proxies ``/app/api/`` here with the prefix
 stripped, so this app only knows ``/api/v1/...``. No static files, no CORS, no docs pages
@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
+from rquant.alert_ack_admission import AckAdmissionClient
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
@@ -67,6 +68,7 @@ class WebContext:
     screen_service: ScreenApplicationService
     pool_commands: PoolCommandGateway
     ack_lookup: AckLookupGateway
+    ack_admission: AckAdmissionClient | None
 
 
 def create_app(
@@ -77,6 +79,7 @@ def create_app(
     background: bool = True,
     pool_command_transport: PoolCommandTransport | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
+    ack_admission_client: AckAdmissionClient | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -118,6 +121,13 @@ def create_app(
         if settings.screen_history_root is not None
         else None
     )
+    configured_ack_admission = None
+    if settings.ack_admission_socket_path is not None:
+        configured_ack_admission = (
+            ack_admission_client
+            if ack_admission_client is not None
+            else AckAdmissionClient(settings.ack_admission_socket_path)
+        )
     app.state.web = WebContext(
         settings=settings,
         tracker=generation_tracker,
@@ -137,6 +147,7 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=ack_lookup_transport,
         ),
+        ack_admission=configured_ack_admission,
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
