@@ -146,6 +146,42 @@ def test_running_task_has_progress_without_a_report(tmp_path: Path) -> None:
     assert "audit_report_overview" not in rows
 
 
+@pytest.mark.parametrize("status", ["queued", "running", "failed"])
+def test_latest_task_with_corrupt_request_cannot_publish_ready_progress(
+    tmp_path: Path, status: str
+) -> None:
+    store, primary, replica, research, _ = _fixture(tmp_path)
+    queued = store.submit(_request(primary, replica, key="audit-command-0001"))
+    if status == "running":
+        assert store._claim() is not None
+    elif status == "failed":
+        replacement = _database(tmp_path / "replacement.duckdb")
+        os.replace(replacement, replica)
+        result = DataAuditReportJobWorker(store).run_one()
+        assert result is not None and result.status == "failed"
+    with sqlite3.connect(store.state_path) as connection:
+        connection.execute(
+            "UPDATE data_audit_report_job SET request_json = ? WHERE task_id = ?",
+            ("broken-json", queued.task_id),
+        )
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="audit report job state"):
+        _rows(_source(research, store.state_path, store.report_directory))
+
+
+def test_latest_task_request_hash_mismatch_cannot_publish_ready_progress(tmp_path: Path) -> None:
+    store, primary, replica, research, _ = _fixture(tmp_path)
+    queued = store.submit(_request(primary, replica, key="audit-command-0001"))
+    with sqlite3.connect(store.state_path) as connection:
+        connection.execute(
+            "UPDATE data_audit_report_job SET request_sha256 = ? WHERE task_id = ?",
+            ("0" * 64, queued.task_id),
+        )
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="request hash"):
+        _rows(_source(research, store.state_path, store.report_directory))
+
+
 def test_latest_failure_keeps_verified_older_report_and_separate_times(tmp_path: Path) -> None:
     store, primary, replica, research, clock = _fixture(tmp_path)
     store.submit(_request(primary, replica, key="audit-command-0001"))

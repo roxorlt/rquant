@@ -278,6 +278,8 @@ def _read_snapshot(
     ).fetchone()
     successful_row = _read_latest_success_row(connection)
     latest = None if latest_row is None else _receipt(latest_row)
+    if latest_row is not None:
+        _request(latest_row)
     successful = None
     if successful_row is not None:
         receipt = _receipt(successful_row)
