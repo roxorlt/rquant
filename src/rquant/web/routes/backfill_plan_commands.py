@@ -85,9 +85,7 @@ async def submit_backfill_plan_command(
             status_code=409, detail="命令内容与已有记录不一致，请保留原请求。"
         ) from error
     except BackfillPlanCommandUnavailableError as error:
-        raise HTTPException(
-            status_code=503, detail="连接暂不可用，状态待确认，请使用原请求重试。"
-        ) from error
+        raise HTTPException(status_code=503, detail="提交状态待确认，请使用原请求重试。") from error
     except BackfillPlanCommandInvalidReceiptError as error:
         raise HTTPException(
             status_code=502, detail="回执无法核对，状态待确认，请使用原请求重试。"

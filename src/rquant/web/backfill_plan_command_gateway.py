@@ -58,8 +58,8 @@ class BackfillPlanCommandGateway:
         except BackfillPlanCommandConflictError:
             raise
         except ValueError as error:
-            raise BackfillPlanCommandConflictError(
-                "command conflicts with existing record"
+            raise BackfillPlanCommandUnavailableError(
+                "PageControl returned an unclassified failure"
             ) from error
         except (OSError, TimeoutError, http.client.HTTPException) as error:
             raise BackfillPlanCommandUnavailableError("PageControl is unavailable") from error
@@ -84,9 +84,9 @@ class BackfillPlanCommandGateway:
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
             )
             response = connection.getresponse()
-            if response.status in {400, 409}:
-                raise BackfillPlanCommandConflictError("PageControl rejected the command")
             if response.status != 200:
+                # PageControl currently returns 400 for both conflicts and runtime
+                # errors; no HTTP error status here proves whether the effect ran.
                 raise BackfillPlanCommandUnavailableError("PageControl did not return success")
             if response.getheader("Content-Type", "").split(";", 1)[0].strip().lower() != (
                 "application/json"

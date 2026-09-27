@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from rquant.page_control import SubmitBackfillPlan, parse_page_control_command
 from rquant.web.app import create_app
 from rquant.web.backfill_plan_command_gateway import (
+    BackfillPlanCommandConflictError,
     BackfillPlanCommandGateway,
     BackfillPlanCommandUnavailableError,
 )
@@ -208,20 +209,70 @@ def test_connection_loss_keeps_original_command_retryable(tmp_path: Path) -> Non
 
 def test_page_control_conflict_and_unavailable_are_distinct(tmp_path: Path) -> None:
     def conflict(_payload: dict[str, object]) -> dict[str, object]:
-        raise ValueError("different actor for existing command")
+        raise BackfillPlanCommandConflictError("different actor for existing command")
 
     def unavailable(_payload: dict[str, object]) -> dict[str, object]:
         raise OSError("connection refused")
+
+    def unclassified(_payload: dict[str, object]) -> dict[str, object]:
+        raise ValueError("database failed after command effect")
 
     with TestClient(_app(tmp_path / "conflict", conflict)) as client:
         rejected = client.post(PATH, json=_body(), headers=HEADERS)
     with TestClient(_app(tmp_path / "unavailable", unavailable)) as client:
         offline = client.post(PATH, json=_body(), headers=HEADERS)
+    with TestClient(_app(tmp_path / "unclassified", unclassified)) as client:
+        unknown = client.post(PATH, json=_body(), headers=HEADERS)
 
     assert rejected.status_code == 409
     assert offline.status_code == 503
+    assert unknown.status_code == 503
     assert "different actor" not in rejected.text
     assert "connection refused" not in offline.text
+    assert "database failed" not in unknown.text
+    assert "原请求重试" in unknown.json()["detail"]
+
+
+@pytest.mark.parametrize("upstream_status", [400, 409])
+def test_unclassified_page_control_http_error_preserves_original_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, upstream_status: int
+) -> None:
+    submitted: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status = upstream_status
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int, *, timeout: float) -> None:
+            assert (host, port, timeout) == ("127.0.0.1", 8767, 1.0)
+
+        def request(self, method: str, path: str, *, body: bytes, headers: dict[str, str]) -> None:
+            assert (method, path, headers["Content-Type"]) == (
+                "POST",
+                "/v1/commands",
+                "application/json",
+            )
+            submitted.append(json.loads(body))
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "rquant.web.backfill_plan_command_gateway.http.client.HTTPConnection", FakeConnection
+    )
+    with TestClient(_app(tmp_path / "serving")) as client:
+        first = client.post(PATH, json=_body(), headers=HEADERS)
+        retried = client.post(PATH, json=_body(), headers=HEADERS)
+
+    assert first.status_code == retried.status_code == 503
+    assert first.json() == retried.json()
+    assert "状态待确认" in first.json()["detail"]
+    assert "原请求重试" in first.json()["detail"]
+    assert "冲突" not in first.text
+    assert submitted == [submitted[0], submitted[0]]
 
 
 def test_fixed_loopback_transport_never_follows_redirect(
