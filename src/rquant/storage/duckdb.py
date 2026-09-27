@@ -30,7 +30,12 @@ from rquant.data_metadata import (
     normalize_utc_datetime,
     utc_now,
 )
-from rquant.pool_result_receipt import ScreenRunReceipt, member_set_digest
+from rquant.pool_result_receipt import (
+    ScreenRunReceipt,
+    ScreenRunReceiptDraft,
+    member_price_digest,
+    member_set_digest,
+)
 from rquant.price_adjustment import resolve_price_factor_basis
 from rquant.security_status import (
     INTENTIONAL_STATUS_EXCLUSION_REASONS,
@@ -2570,12 +2575,19 @@ class DuckDBStore:
         trade_date: str,
         preset_name: str,
         df: pd.DataFrame,
-        receipt: ScreenRunReceipt,
+        receipt: ScreenRunReceipt | ScreenRunReceiptDraft,
         *,
         manage_transaction: bool = True,
     ) -> int:
         """Commit the exact member set and its proof together, including zero rows."""
-        receipt = ScreenRunReceipt.model_validate(receipt)
+        if isinstance(receipt, ScreenRunReceiptDraft):
+            receipt = ScreenRunReceiptDraft.model_validate(receipt)
+        else:
+            receipt = ScreenRunReceipt.model_validate(receipt)
+            if receipt.contract == "screen-run-receipt/v2":
+                raise ValueError(
+                    "v2 price receipt requires an unsealed draft and persisted readback"
+                )
         codes = [] if df.empty else df["ts_code"].tolist()
         if (
             receipt.trade_date.isoformat() != trade_date
@@ -2590,7 +2602,30 @@ class DuckDBStore:
                 self._conn.execute("BEGIN")
                 started = True
             self.replace_screen_result(trade_date, preset_name, df)
-            self._upsert_screen_run_receipt(receipt)
+            if isinstance(receipt, ScreenRunReceiptDraft):
+                persisted = self._conn.execute(
+                    """
+                    SELECT ts_code, close FROM screen_result
+                    WHERE trade_date = ? AND preset_name = ?
+                    ORDER BY ts_code
+                    """,
+                    [trade_date, preset_name],
+                ).fetchall()
+                persisted_codes = [code for code, _ in persisted]
+                if (
+                    receipt.hit_count != len(persisted_codes)
+                    or receipt.member_digest != member_set_digest(persisted_codes)
+                ):
+                    raise ValueError("persisted screen members differ from receipt draft")
+                sealed = ScreenRunReceipt.model_validate(
+                    {
+                        **receipt.model_dump(mode="python"),
+                        "price_digest": member_price_digest(persisted),
+                    }
+                )
+            else:
+                sealed = receipt
+            self._upsert_screen_run_receipt(sealed)
             if started:
                 self._conn.execute("COMMIT")
                 started = False
@@ -2606,8 +2641,8 @@ class DuckDBStore:
             INSERT INTO screen_run_receipt (
                 trade_date, preset_name, definition_version, parent_trade_date,
                 parent_result_version, hit_count, member_digest, lineage_complete,
-                completed_at, result_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                completed_at, result_version, contract, price_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (trade_date, preset_name) DO UPDATE SET
                 definition_version = excluded.definition_version,
                 parent_trade_date = excluded.parent_trade_date,
@@ -2616,7 +2651,9 @@ class DuckDBStore:
                 member_digest = excluded.member_digest,
                 lineage_complete = excluded.lineage_complete,
                 completed_at = excluded.completed_at,
-                result_version = excluded.result_version
+                result_version = excluded.result_version,
+                contract = excluded.contract,
+                price_digest = excluded.price_digest
             """,
             [
                 receipt.trade_date,
@@ -2629,17 +2666,27 @@ class DuckDBStore:
                 receipt.lineage_complete,
                 receipt.completed_at,
                 receipt.result_version,
+                receipt.contract,
+                receipt.price_digest,
             ],
         )
 
     def query_screen_run_receipt(
         self, trade_date: str, preset_name: str
     ) -> ScreenRunReceipt | None:
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('screen_run_receipt')").fetchall()
+        }
+        price_columns = {"contract", "price_digest"}
+        if columns & price_columns and not price_columns <= columns:
+            raise ValueError("screen run receipt has incomplete price proof columns")
+        extra_select = ", contract, price_digest" if price_columns <= columns else ""
         row = self._conn.execute(
-            """
+            f"""
             SELECT trade_date, preset_name, definition_version, parent_trade_date,
                    parent_result_version, hit_count, member_digest, lineage_complete,
-                   completed_at, result_version
+                   completed_at, result_version{extra_select}
             FROM screen_run_receipt
             WHERE trade_date = ? AND preset_name = ?
             """,
@@ -2652,6 +2699,8 @@ class DuckDBStore:
             "parent_result_version", "hit_count", "member_digest", "lineage_complete",
             "completed_at", "result_version",
         )
+        if price_columns <= columns:
+            fields += ("contract", "price_digest")
         return ScreenRunReceipt.model_validate(dict(zip(fields, row, strict=True)))
 
     def query_screen_result(
