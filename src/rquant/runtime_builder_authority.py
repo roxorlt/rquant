@@ -99,12 +99,17 @@ class LabJobsPublisherSettings(RuntimeContractModel):
     lab_jobs_path: Path
     research_metadata_path: Path | None = None
     audit_report_path: Path | None = None
+    backfill_plan_directory: Path | None = None
     authority_root: Path
     max_jobs: StrictInt = Field(default=100, gt=0, le=100)
     eta_completed_limit: StrictInt = Field(default=256, ge=3, le=256)
 
     @field_validator(
-        "lab_jobs_path", "research_metadata_path", "audit_report_path", "authority_root"
+        "lab_jobs_path",
+        "research_metadata_path",
+        "audit_report_path",
+        "backfill_plan_directory",
+        "authority_root",
     )
     @classmethod
     def require_absolute_path(cls, value: Path | None) -> Path | None:
@@ -115,9 +120,11 @@ class LabJobsPublisherSettings(RuntimeContractModel):
         return value
 
     @model_validator(mode="after")
-    def require_report_reader(self) -> LabJobsPublisherSettings:
+    def require_page_reader(self) -> LabJobsPublisherSettings:
         if self.audit_report_path is not None and self.research_metadata_path is None:
             raise ValueError("audit_report_path requires research_metadata_path")
+        if self.backfill_plan_directory is not None and self.research_metadata_path is None:
+            raise ValueError("backfill_plan_directory requires research_metadata_path")
         return self
 
 
@@ -334,6 +341,7 @@ def lab_jobs_publisher_builder(
                 page_source = DuckDBLabPageProjectionSource(
                     settings.research_metadata_path,
                     audit_report_path=settings.audit_report_path,
+                    backfill_plan_directory=settings.backfill_plan_directory,
                 )
 
                 def page_projection_reader(
