@@ -46,12 +46,43 @@ def test_settings_come_from_the_environment_only() -> None:
 
 def test_ack_admission_socket_is_explicit_and_absolute(tmp_path: Path) -> None:
     socket_path = tmp_path / "private" / "ack.sock"
+    ingress_path = tmp_path / "ingress" / "web.sock"
     assert WebSettings.from_env({}).ack_admission_socket_path is None
     assert WebSettings.from_env(
-        {"RQUANT_WEB_ACK_ADMISSION_SOCKET": str(socket_path)}
+        {
+            "RQUANT_WEB_ACK_ADMISSION_SOCKET": str(socket_path),
+            "RQUANT_WEB_INGRESS_SOCKET": str(ingress_path),
+        }
     ).ack_admission_socket_path == socket_path
     with pytest.raises(ValueError):
-        WebSettings.from_env({"RQUANT_WEB_ACK_ADMISSION_SOCKET": "private/ack.sock"})
+        WebSettings.from_env(
+            {
+                "RQUANT_WEB_ACK_ADMISSION_SOCKET": "private/ack.sock",
+                "RQUANT_WEB_INGRESS_SOCKET": str(ingress_path),
+            }
+        )
+
+
+def test_ack_admission_requires_a_private_web_ingress(tmp_path: Path) -> None:
+    ack_socket = tmp_path / "ack" / "ack.sock"
+    ingress_socket = tmp_path / "ingress" / "web.sock"
+    with pytest.raises(ValueError, match="private Web ingress"):
+        WebSettings(serving_root=tmp_path, ack_admission_socket_path=ack_socket)
+    configured = WebSettings.from_env(
+        {
+            "RQUANT_WEB_ACK_ADMISSION_SOCKET": str(ack_socket),
+            "RQUANT_WEB_INGRESS_SOCKET": str(ingress_socket),
+        }
+    )
+    assert configured.ingress_socket_path == ingress_socket
+    with pytest.raises(ValueError, match="private Web ingress"):
+        WebSettings.from_env(
+            {
+                "RQUANT_WEB_ACK_ADMISSION_SOCKET": str(ack_socket),
+                "RQUANT_WEB_INGRESS_SOCKET": str(ingress_socket),
+                "RQUANT_WEB_BIND": "127.0.0.1:8768",
+            }
+        )
 
 
 def _app() -> FastAPI:

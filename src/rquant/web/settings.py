@@ -1,8 +1,8 @@
 """Web API settings, read from the process environment only.
 
 ``rquant.config`` is deliberately not used: constructing it reads ``.env``, and the web
-process must not see the secrets file at all (its systemd unit hides it). Everything the
-API needs is the Serving root, a loopback bind address and a few freshness budgets.
+process must not see the secrets file at all (its systemd unit hides it). The default
+listener is loopback TCP; acknowledgment admission requires a separate private Web UDS.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ SCREEN_REPLICA_ENV_VAR = "RQUANT_WEB_SCREEN_REPLICA_PATH"
 SCREEN_HISTORY_ENV_VAR = "RQUANT_WEB_SCREEN_HISTORY_ROOT"
 CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
+INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 
 DEFAULT_BIND = "127.0.0.1:8768"
 DEFAULT_PAGE_CONTROL_URL = "http://127.0.0.1:8767/v1/commands"
@@ -75,11 +76,19 @@ class WebSettings(BaseModel):
     screen_history_root: Path | None = None
     catalog_samples_file: Path | None = None
     ack_admission_socket_path: Path | None = None
+    ingress_socket_path: Path | None = None
 
     @model_validator(mode="after")
-    def validate_screen_source(self) -> Self:
+    def validate_sources_and_ingress(self) -> Self:
         if (self.screen_primary_path is None) != (self.screen_replica_path is None):
             raise ValueError("screen primary and replica paths must be configured together")
+        if self.ingress_socket_path is not None and self.bind != DEFAULT_BIND:
+            raise ValueError("private Web ingress cannot also configure a TCP bind")
+        if self.ack_admission_socket_path is not None:
+            if self.ingress_socket_path is None:
+                raise ValueError("ack admission requires private Web ingress")
+            if self.ingress_socket_path.parent == self.ack_admission_socket_path.parent:
+                raise ValueError("private Web ingress and ack admission need separate directories")
         return self
 
     @field_validator("bind")
@@ -100,6 +109,13 @@ class WebSettings(BaseModel):
     def validate_ack_admission_socket_path(cls, value: Path | None) -> Path | None:
         if value is not None and not value.is_absolute():
             raise ValueError("ack admission socket path must be absolute")
+        return value
+
+    @field_validator("ingress_socket_path")
+    @classmethod
+    def validate_ingress_socket_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("private Web ingress socket path must be absolute")
         return value
 
     @property
@@ -142,4 +158,9 @@ class WebSettings(BaseModel):
         admission_socket = source.get(ACK_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if admission_socket:
             values["ack_admission_socket_path"] = Path(admission_socket)
+        ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
+        if ingress_socket:
+            if bind is not None or source.get(BIND_ENV_VAR, "").strip():
+                raise ValueError("private Web ingress cannot also configure a TCP bind")
+            values["ingress_socket_path"] = Path(ingress_socket)
         return cls.model_validate(values)

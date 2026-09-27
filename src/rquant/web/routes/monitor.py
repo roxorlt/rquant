@@ -12,7 +12,7 @@ from base64 import b64decode, urlsafe_b64encode
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
 import anyio.to_thread
@@ -20,11 +20,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rquant.alert_ack import stable_alert_id, stable_signal_alert_id
-from rquant.alert_ack_admission import (
-    AckAdmissionClient,
-    AckAdmissionRejectedError,
-    AckAdmissionUnavailableError,
-)
 from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
 from rquant.page_control import AckAlert, PageControlReceipt, PageControlStatus
 from rquant.runtime_contracts import AwareUtcDatetime
@@ -32,6 +27,7 @@ from rquant.serving_contracts import FreshnessStatus
 from rquant.web import readers
 from rquant.web.alert_ack_gateway import (
     AckLookupConflictError,
+    AckLookupGateway,
     AckLookupInvalidResponseError,
     AckLookupUnavailableError,
 )
@@ -59,6 +55,9 @@ from rquant.web.security import current_user, require_csrf
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.signal_display import DELIVERY_STATE_LABELS, delivery_state, signal_reasons
 from rquant.web.status import DeliveryMode, delivery_mode
+
+if TYPE_CHECKING:
+    from rquant.alert_ack_admission import AckAdmissionClient
 
 router = APIRouter(prefix="/monitor")
 
@@ -671,23 +670,22 @@ async def acknowledge_alert(
         raise HTTPException(status_code=413, detail="请求内容过长，请重试。")
     web = request.app.state.web
     command = AckAlert.model_validate({**body.model_dump(mode="python"), "actor_id": viewer})
-    try:
-        original = await anyio.to_thread.run_sync(web.ack_lookup.lookup, command)
-    except AckLookupConflictError as error:
-        raise HTTPException(
-            status_code=409, detail="命令内容与已有记录不一致，请保留原请求。"
-        ) from error
-    except AckLookupUnavailableError as error:
-        raise HTTPException(status_code=503, detail="连接暂不可用，请使用原请求重试。") from error
-    except AckLookupInvalidResponseError as error:
-        raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。") from error
+    original = await _lookup_ack_command(web.ack_lookup, command)
     if original is not None:
         if (
             original.status in {PageControlStatus.PENDING, PageControlStatus.PROCESSING}
             and web.ack_admission is not None
         ):
-            resumed = await _submit_ack_admission(web.ack_admission, command)
-            return _ack_response(command, resumed)
+            try:
+                resumed = await _submit_ack_admission(web.ack_admission, command)
+                return _ack_response(command, resumed)
+            except HTTPException as admission_error:
+                durable = await _lookup_ack_command(web.ack_lookup, command)
+                if durable is None:
+                    raise HTTPException(
+                        status_code=502, detail="回执无法核对，请使用原请求重试。"
+                    ) from admission_error
+                return _ack_response(command, durable)
         return _ack_response(command, original)
     with web.tracker.borrow() as borrowed:
         now = web.clock()
@@ -713,9 +711,26 @@ async def acknowledge_alert(
     return _ack_response(command, receipt)
 
 
+async def _lookup_ack_command(
+    gateway: AckLookupGateway, command: AckAlert
+) -> PageControlReceipt | None:
+    try:
+        return await anyio.to_thread.run_sync(gateway.lookup, command)
+    except AckLookupConflictError as error:
+        raise HTTPException(
+            status_code=409, detail="命令内容与已有记录不一致，请保留原请求。"
+        ) from error
+    except AckLookupUnavailableError as error:
+        raise HTTPException(status_code=503, detail="连接暂不可用，请使用原请求重试。") from error
+    except AckLookupInvalidResponseError as error:
+        raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。") from error
+
+
 async def _submit_ack_admission(
     admission: AckAdmissionClient, command: AckAlert
 ) -> PageControlReceipt:
+    from rquant.alert_ack_admission import AckAdmissionRejectedError, AckAdmissionUnavailableError
+
     try:
         return await anyio.to_thread.run_sync(admission.submit, command)
     except AckAdmissionRejectedError as error:

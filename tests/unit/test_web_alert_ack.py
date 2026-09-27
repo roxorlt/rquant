@@ -64,6 +64,9 @@ def _app(root: Path, *, lookup=None, admission=None):
             ack_admission_socket_path=(root.parent / "private" / "ack.sock")
             if admission is not None
             else None,
+            ingress_socket_path=(root.parent / "web-private" / "web.sock")
+            if admission is not None
+            else None,
         ),
         clock=lambda: NOW,
         background=False,
@@ -603,16 +606,17 @@ def test_pending_original_resumes_over_private_admission_without_serving(tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected_status"),
-    [
-        (AckAdmissionRejectedError("private path"), 409),
-        (AckAdmissionUnavailableError("private path"), 503),
-    ],
+    "failure",
+    [AckAdmissionRejectedError("private path"), AckAdmissionUnavailableError("private path")],
 )
-def test_pending_original_admission_failure_does_not_claim_result(
-    tmp_path: Path, failure: Exception, expected_status: int
+def test_pending_original_admission_failure_returns_durable_pending(
+    tmp_path: Path, failure: Exception
 ) -> None:
+    lookups = 0
+
     def lookup(payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
         return {
             "found": True,
             "receipt": _receipt(str(payload["command_id"]), "pending").model_dump(mode="json"),
@@ -624,8 +628,88 @@ def test_pending_original_admission_failure_does_not_claim_result(
 
     with TestClient(_app(tmp_path / "no-serving", lookup=lookup, admission=Admission())) as client:
         response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
-    assert response.status_code == expected_status
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"
+    assert response.json()["confirmation_id"] is None
+    assert lookups == 2
     assert "private path" not in response.text
+
+
+def test_pending_original_rechecks_durable_receipt_after_private_response_loss(
+    tmp_path: Path,
+) -> None:
+    lookups = 0
+
+    def lookup(payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
+        receipt = _receipt(
+            str(payload["command_id"]),
+            "pending" if lookups == 1 else "succeeded",
+            confirmation_id="ack-first" if lookups == 2 else None,
+        )
+        return {"found": True, "receipt": receipt.model_dump(mode="json")}
+
+    class Admission:
+        def submit(self, _command: AckAlert) -> PageControlReceipt:
+            raise AckAdmissionUnavailableError("response lost")
+
+    with TestClient(_app(tmp_path / "no-serving", lookup=lookup, admission=Admission())) as client:
+        response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["status"] == "succeeded"
+    assert response.json()["confirmation_id"] == "ack-first"
+    assert lookups == 2
+
+
+def test_pending_original_needs_second_lookup_if_private_admission_fails(tmp_path: Path) -> None:
+    lookups = 0
+
+    def lookup(payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 2:
+            raise OSError("private database path")
+        return {
+            "found": True,
+            "receipt": _receipt(str(payload["command_id"]), "pending").model_dump(mode="json"),
+        }
+
+    class Admission:
+        def submit(self, _command: AckAlert) -> PageControlReceipt:
+            raise AckAdmissionUnavailableError("response lost")
+
+    with TestClient(_app(tmp_path / "no-serving", lookup=lookup, admission=Admission())) as client:
+        response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
+    assert response.status_code == 503
+    assert lookups == 2
+    assert "private database path" not in response.text
+
+
+def test_pending_original_rechecks_if_private_receipt_lacks_confirmation_id(
+    tmp_path: Path,
+) -> None:
+    lookups = 0
+
+    def lookup(payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
+        receipt = _receipt(
+            str(payload["command_id"]),
+            "pending" if lookups == 1 else "succeeded",
+            confirmation_id="ack-first" if lookups == 2 else None,
+        )
+        return {"found": True, "receipt": receipt.model_dump(mode="json")}
+
+    class Admission:
+        def submit(self, command: AckAlert) -> PageControlReceipt:
+            return _receipt(command.command_id, "succeeded")
+
+    with TestClient(_app(tmp_path / "no-serving", lookup=lookup, admission=Admission())) as client:
+        response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["confirmation_id"] == "ack-first"
+    assert lookups == 2
 
 
 def test_new_ack_rejects_old_generation_before_private_admission(tmp_path: Path) -> None:
@@ -809,7 +893,11 @@ def test_web_ack_uses_real_private_socket_and_recovers_same_receipt(tmp_path: Pa
         worker.start()
         try:
             app = create_app(
-                WebSettings(serving_root=root, ack_admission_socket_path=socket_path),
+                WebSettings(
+                    serving_root=root,
+                    ack_admission_socket_path=socket_path,
+                    ingress_socket_path=tmp_path / "web-private" / "web.sock",
+                ),
                 clock=lambda: NOW,
                 background=False,
                 ack_lookup_transport=lookup,

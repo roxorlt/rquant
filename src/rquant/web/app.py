@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio.to_thread
 from fastapi import FastAPI, Request, Response
@@ -23,7 +23,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from rquant.alert_ack_admission import AckAdmissionClient
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
@@ -47,6 +46,9 @@ from rquant.web.routes import (
 from rquant.web.screen_service import ScreenApplicationService
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
+
+if TYPE_CHECKING:
+    from rquant.alert_ack_admission import AckAdmissionClient
 
 API_TITLE = "rQuant Web API"
 #: Version of the HTTP contract, bumped by hand; not the package version, so that a
@@ -123,6 +125,8 @@ def create_app(
     )
     configured_ack_admission = None
     if settings.ack_admission_socket_path is not None:
+        from rquant.alert_ack_admission import AckAdmissionClient
+
         configured_ack_admission = (
             ack_admission_client
             if ack_admission_client is not None
