@@ -18,8 +18,10 @@ Scenarios:
   ``minute_coverage``, the latest daily screen (``canvas_hit``,
   ``canvas_latest_trade_date``, ``screen_bounds``), ``trade_calendar`` and
   ``stock_basic``; every watermark fresh.
-* ``panorama``: ``baseline`` plus every table the market panorama reads and a second,
-  cash-only paper account for account-switching browser tests.
+* ``panorama``: ``baseline`` plus market panorama tables, a second paper account,
+  and published minute replay rows for browser tests.
+* ``platform_empty``: published but empty minute replay tables.
+* ``platform_summary_only``: replay summaries published without trades.
 * ``degraded``: ``baseline`` with degraded / unavailable watermarks and two page
   projections left unpublished.
 
@@ -88,7 +90,14 @@ from rquant.signal_bus import RouteReceiptDisposition, SignalRouteReceipt
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.storage.duckdb import DuckDBStore
 
-SCENARIOS = ("baseline", "panorama", "degraded")
+SCENARIOS = (
+    "baseline",
+    "panorama",
+    "platform_empty",
+    "platform_summary_only",
+    "degraded",
+)
+_PANORAMA_SCENARIOS = frozenset(("panorama", "platform_empty", "platform_summary_only"))
 FIXTURE_PRODUCER_COMMIT = "0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b"
 #: Schema version the production publisher writes (manifest ``schema_version`` 3).
 FIXTURE_SCHEMA_VERSION = 3
@@ -399,6 +408,102 @@ def _projection(
         owner_dataset_id=owner,
         owner_generation_id=generations[owner],
     )
+
+
+def _backtest_summary(built_at: datetime) -> list[dict[str, object]]:
+    common: dict[str, object] = {
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-31",
+        "max_hold_days": 3,
+        "candidates": 100,
+        "trigger_rate_pct": 22.0,
+        "mean_ret_pct": 2.0,
+        "median_ret_pct": 2.0,
+        "win_rate_pct": 100.0,
+        "best_ret_pct": 2.0,
+        "worst_ret_pct": 2.0,
+        "gap_stop_rate_pct": 0.0,
+    }
+    return [
+        {
+            **common,
+            "run_id": "run-earlier",
+            "computed_at": _utc_iso(built_at - timedelta(minutes=11)),
+            "entry_mode": "first_break",
+            "profile_variant": "baseline",
+            "trades": 22,
+        },
+        {
+            **common,
+            "run_id": "run-earlier",
+            "computed_at": _utc_iso(built_at - timedelta(minutes=10)),
+            "entry_mode": "break_retest",
+            "profile_variant": "vp_90",
+            "trades": 1,
+            "trigger_rate_pct": 1.0,
+            "mean_ret_pct": -2.0,
+            "median_ret_pct": -2.0,
+            "win_rate_pct": 0.0,
+            "best_ret_pct": -2.0,
+        },
+        {
+            **common,
+            "run_id": "run-later",
+            "computed_at": _utc_iso(built_at - timedelta(minutes=5)),
+            "entry_mode": "first_break",
+            "profile_variant": "baseline",
+            "trades": 0,
+            "trigger_rate_pct": 0.0,
+            "mean_ret_pct": None,
+            "median_ret_pct": None,
+            "win_rate_pct": None,
+            "best_ret_pct": None,
+            "worst_ret_pct": None,
+        },
+    ]
+
+
+def _backtest_trades() -> list[dict[str, object]]:
+    common: dict[str, object] = {
+        "run_id": "run-earlier",
+        "profile_variant": "baseline",
+        "entry_mode": "first_break",
+        "ts_code": "600001.SH",
+        "name": "样本01",
+        "entry_price_raw": 10.0,
+        "entry_price": 10.1,
+        "stop_loss_basis": 9.8,
+        "take_profit_basis": 10.5,
+        "volume_profile_lookbacks": "[]",
+        "volume_profile_rr": None,
+        "exit_price": 10.3,
+    }
+    trades = [
+        {
+            **common,
+            "trade_id": f"trade-{day}",
+            "signal_date": f"2026-07-{day:02d}",
+            "entry_time": f"2026-07-{day:02d}T01:31:00Z",
+            "exit_time": f"2026-07-{day:02d}T06:31:00Z",
+            "exit_reason": "time_3d" if day == 29 else "take_profit_trailing",
+            "ret_pct": 2.0,
+        }
+        for day in range(8, 30)
+    ]
+    trades.append(
+        {
+            **common,
+            "trade_id": "trade-3",
+            "signal_date": "2026-07-31",
+            "entry_mode": "break_retest",
+            "profile_variant": "vp_90",
+            "entry_time": "2026-07-31T01:31:00Z",
+            "exit_time": "2026-07-31T06:31:00Z",
+            "exit_reason": "stop_loss",
+            "ret_pct": -2.0,
+        },
+    )
+    return trades
 
 
 def _dashboard_summary(built_at: datetime) -> list[dict[str, object]]:
@@ -769,7 +874,9 @@ def _sample_surge_event() -> dict[str, object]:
 
 
 def _timeline_surge_events(scenario: str) -> list[dict[str, object]]:
-    return _surge_events() if scenario == "panorama" else [_sample_surge_event()]
+    if scenario in _PANORAMA_SCENARIOS:
+        return _surge_events()
+    return [_sample_surge_event()]
 
 
 def _monitor_events() -> list[dict[str, object]]:
@@ -892,7 +999,7 @@ def _projections(
                 signal_owned("screen_bounds", _screen_bounds()),
             )
         )
-    if scenario == "panorama":
+    if scenario in _PANORAMA_SCENARIOS:
         as_of = _cst(FIXTURE_TRADE_DATE, 15, 0, 3).astimezone(UTC)
         board_rows, member_rows = _dc_boards()
         projections.extend(
@@ -945,6 +1052,26 @@ def _projections(
                 ),
             )
         )
+    if scenario in _PANORAMA_SCENARIOS:
+        projections.append(
+            _projection(
+                "strategy_summary",
+                [] if scenario == "platform_empty" else _backtest_summary(built_at),
+                owner="lab_jobs",
+                generations=generations,
+                available_at=built_at - timedelta(seconds=10),
+            )
+        )
+        if scenario != "platform_summary_only":
+            projections.append(
+                _projection(
+                    "strategy_trade",
+                    [] if scenario == "platform_empty" else _backtest_trades(),
+                    owner="lab_jobs",
+                    generations=generations,
+                    available_at=built_at - timedelta(seconds=10),
+                )
+            )
     return tuple(sorted(projections, key=lambda item: item.table_name))
 
 
@@ -1143,7 +1270,7 @@ def build_web_fixture(
         }
         projections = tuple(replacements.get(item.table_name, item) for item in projections)
     default_paper_accounts = (_paper_account(built_at - timedelta(seconds=30)),)
-    if scenario == "panorama":
+    if scenario in _PANORAMA_SCENARIOS:
         default_paper_accounts += (_cash_only_account(built_at - timedelta(minutes=1)),)
     source = ServingReadModelInput(
         observed_at=built_at,

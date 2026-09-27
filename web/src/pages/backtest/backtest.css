@@ -1,0 +1,138 @@
+.bt-selector {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.bt-selector-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  min-width: 0;
+}
+.bt-selector-main label {
+  font-size: 12px;
+  color: var(--muted);
+}
+.bt-selector-main select {
+  min-width: 0;
+  width: min(480px, 100%);
+  max-width: 100%;
+}
+.bt-selector-info,
+.bt-context {
+  color: var(--muted);
+  font-size: 12px;
+}
+.bt-selector-pages,
+.bt-pages {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bt-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  padding: 0 2px;
+}
+.bt-context b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.bt-context-tip {
+  color: var(--accent-t);
+  cursor: help;
+}
+.bt-stock {
+  color: var(--accent-t);
+  font-weight: 500;
+}
+.bt-pages {
+  justify-content: flex-end;
+  padding: 10px 14px;
+  border-top: 1px solid var(--rule);
+}
+.bt-pages .hint {
+  margin-right: auto;
+}
+.bt-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-height: 100px;
+  color: var(--crit-t);
+  font-size: 13px;
+}
+.bt-empty-actions {
+  display: flex;
+  justify-content: center;
+  padding-bottom: 16px;
+}
+.bt-trade-detail {
+  display: grid;
+  gap: 22px;
+}
+.bt-trade-return {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 14px 16px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 13px;
+}
+.bt-trade-return .num {
+  font-size: 20px;
+  font-weight: 600;
+}
+.bt-trade-detail dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 12px;
+  margin: 0;
+}
+.bt-trade-detail dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.bt-trade-detail dd {
+  margin: 4px 0 0;
+  color: var(--ink-2);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .bt-kpis .kpis.compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .bt-selector-main {
+    width: 100%;
+  }
+  .bt-selector-main label {
+    width: 100%;
+  }
+  .bt-selector-main select {
+    width: 100%;
+  }
+  .bt-selector-pages {
+    margin-left: auto;
+  }
+  .bt-context {
+    gap: 4px 14px;
+  }
+  .bt-pages {
+    flex-wrap: wrap;
+  }
+  .bt-pages .hint {
+    width: 100%;
+  }
+}

@@ -39,6 +39,7 @@ from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransp
 from rquant.web.routes import (
     backfill_plan_commands,
     backfill_plans,
+    backtests,
     catalog,
     data_audit,
     data_audit_report,
@@ -255,6 +256,7 @@ def create_app(
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])
+    app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"])
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])

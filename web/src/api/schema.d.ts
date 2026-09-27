@@ -4,6 +4,40 @@
  */
 
 export interface paths {
+    "/api/v1/backtests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 最近分钟回放 */
+        get: operations["list_backtests_api_v1_backtests_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 分钟回放详情 */
+        get: operations["get_backtest_api_v1_backtests__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/audit-report/calendar": {
         parameters: {
             query?: never;
@@ -1358,6 +1392,126 @@ export interface components {
             /** Total */
             total?: number | null;
         };
+        /** BacktestDetailData */
+        BacktestDetailData: {
+            /** Groups */
+            groups: components["schemas"]["BacktestGroup"][];
+            /** Next Offset */
+            next_offset: number | null;
+            run: components["schemas"]["BacktestRun"] | null;
+            /** Summary Available */
+            summary_available: boolean;
+            /** Total Trades */
+            total_trades: number;
+            /** Trades */
+            trades: components["schemas"]["BacktestTrade"][];
+            /** Trades Available */
+            trades_available: boolean;
+        };
+        /** BacktestGroup */
+        BacktestGroup: {
+            /** Best Ret Pct */
+            best_ret_pct: number | null;
+            /** Candidates */
+            candidates: number;
+            /** Entry Mode */
+            entry_mode: string;
+            /** Entry Mode Label */
+            entry_mode_label: string;
+            /** Gap Stop Rate Pct */
+            gap_stop_rate_pct: number | null;
+            /** Mean Ret Pct */
+            mean_ret_pct: number | null;
+            /** Median Ret Pct */
+            median_ret_pct: number | null;
+            /** Profile Variant */
+            profile_variant: string;
+            /** Profile Variant Label */
+            profile_variant_label: string;
+            /** Trades */
+            trades: number;
+            /** Trigger Rate Pct */
+            trigger_rate_pct: number | null;
+            /** Win Rate Pct */
+            win_rate_pct: number | null;
+            /** Worst Ret Pct */
+            worst_ret_pct: number | null;
+        };
+        /** BacktestListData */
+        BacktestListData: {
+            /** Available */
+            available: boolean;
+            /** Next Offset */
+            next_offset: number | null;
+            /** Runs */
+            runs: components["schemas"]["BacktestRun"][];
+            /** Total */
+            total: number;
+        };
+        /** BacktestRun */
+        BacktestRun: {
+            /** Candidates */
+            candidates: number;
+            /**
+             * Computed At
+             * Format: date-time
+             */
+            computed_at: string;
+            /** Configurations */
+            configurations: number;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Max Hold Days */
+            max_hold_days: number;
+            /** Run Id */
+            run_id: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Trades */
+            trades: number;
+        };
+        /** BacktestTrade */
+        BacktestTrade: {
+            /** Entry Mode */
+            entry_mode: string;
+            /** Entry Mode Label */
+            entry_mode_label: string;
+            /** Entry Price */
+            entry_price: number | null;
+            /** Entry Time */
+            entry_time: string | null;
+            /** Exit Price */
+            exit_price: number | null;
+            /** Exit Reason */
+            exit_reason: string | null;
+            /** Exit Reason Label */
+            exit_reason_label: string;
+            /** Exit Time */
+            exit_time: string | null;
+            /** Name */
+            name: string | null;
+            /** Profile Variant */
+            profile_variant: string;
+            /** Profile Variant Label */
+            profile_variant_label: string;
+            /** Ret Pct */
+            ret_pct: number | null;
+            /**
+             * Signal Date
+             * Format: date
+             */
+            signal_date: string;
+            /** Trade Id */
+            trade_id: string;
+            /** Ts Code */
+            ts_code: string;
+        };
         /** BinaryExpr */
         BinaryExpr: {
             /**
@@ -1794,6 +1948,16 @@ export interface components {
         /** Envelope[BackfillPlansData] */
         Envelope_BackfillPlansData_: {
             data: components["schemas"]["BackfillPlansData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BacktestDetailData] */
+        Envelope_BacktestDetailData_: {
+            data: components["schemas"]["BacktestDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BacktestListData] */
+        Envelope_BacktestListData_: {
+            data: components["schemas"]["BacktestListData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[BoardsData] */
@@ -3487,6 +3651,76 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_backtests_api_v1_backtests_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BacktestListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_backtest_api_v1_backtests__run_id__get: {
+        parameters: {
+            query: {
+                generation_id: string;
+                limit?: number;
+                offset?: number;
+                entry_mode?: string | null;
+                profile_variant?: string | null;
+            };
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BacktestDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get: {
         parameters: {
             query?: {

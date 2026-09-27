@@ -2076,6 +2076,414 @@
         "title": "BackfillPlansData",
         "type": "object"
       },
+      "BacktestDetailData": {
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/BacktestGroup"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BacktestRun"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "summary_available": {
+            "title": "Summary Available",
+            "type": "boolean"
+          },
+          "total_trades": {
+            "title": "Total Trades",
+            "type": "integer"
+          },
+          "trades": {
+            "items": {
+              "$ref": "#/components/schemas/BacktestTrade"
+            },
+            "title": "Trades",
+            "type": "array"
+          },
+          "trades_available": {
+            "title": "Trades Available",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "summary_available",
+          "trades_available",
+          "run",
+          "groups",
+          "trades",
+          "total_trades",
+          "next_offset"
+        ],
+        "title": "BacktestDetailData",
+        "type": "object"
+      },
+      "BacktestGroup": {
+        "properties": {
+          "best_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Best Ret Pct"
+          },
+          "candidates": {
+            "title": "Candidates",
+            "type": "integer"
+          },
+          "entry_mode": {
+            "title": "Entry Mode",
+            "type": "string"
+          },
+          "entry_mode_label": {
+            "title": "Entry Mode Label",
+            "type": "string"
+          },
+          "gap_stop_rate_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gap Stop Rate Pct"
+          },
+          "mean_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Ret Pct"
+          },
+          "median_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Ret Pct"
+          },
+          "profile_variant": {
+            "title": "Profile Variant",
+            "type": "string"
+          },
+          "profile_variant_label": {
+            "title": "Profile Variant Label",
+            "type": "string"
+          },
+          "trades": {
+            "title": "Trades",
+            "type": "integer"
+          },
+          "trigger_rate_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Rate Pct"
+          },
+          "win_rate_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win Rate Pct"
+          },
+          "worst_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worst Ret Pct"
+          }
+        },
+        "required": [
+          "entry_mode",
+          "entry_mode_label",
+          "profile_variant",
+          "profile_variant_label",
+          "candidates",
+          "trades",
+          "trigger_rate_pct",
+          "mean_ret_pct",
+          "median_ret_pct",
+          "win_rate_pct",
+          "best_ret_pct",
+          "worst_ret_pct",
+          "gap_stop_rate_pct"
+        ],
+        "title": "BacktestGroup",
+        "type": "object"
+      },
+      "BacktestListData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/BacktestRun"
+            },
+            "title": "Runs",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "available",
+          "runs",
+          "total",
+          "next_offset"
+        ],
+        "title": "BacktestListData",
+        "type": "object"
+      },
+      "BacktestRun": {
+        "properties": {
+          "candidates": {
+            "title": "Candidates",
+            "type": "integer"
+          },
+          "computed_at": {
+            "format": "date-time",
+            "title": "Computed At",
+            "type": "string"
+          },
+          "configurations": {
+            "title": "Configurations",
+            "type": "integer"
+          },
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "max_hold_days": {
+            "title": "Max Hold Days",
+            "type": "integer"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "trades": {
+            "title": "Trades",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id",
+          "computed_at",
+          "start_date",
+          "end_date",
+          "max_hold_days",
+          "candidates",
+          "trades",
+          "configurations"
+        ],
+        "title": "BacktestRun",
+        "type": "object"
+      },
+      "BacktestTrade": {
+        "properties": {
+          "entry_mode": {
+            "title": "Entry Mode",
+            "type": "string"
+          },
+          "entry_mode_label": {
+            "title": "Entry Mode Label",
+            "type": "string"
+          },
+          "entry_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Price"
+          },
+          "entry_time": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Time"
+          },
+          "exit_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Price"
+          },
+          "exit_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Reason"
+          },
+          "exit_reason_label": {
+            "title": "Exit Reason Label",
+            "type": "string"
+          },
+          "exit_time": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Time"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "profile_variant": {
+            "title": "Profile Variant",
+            "type": "string"
+          },
+          "profile_variant_label": {
+            "title": "Profile Variant Label",
+            "type": "string"
+          },
+          "ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ret Pct"
+          },
+          "signal_date": {
+            "format": "date",
+            "title": "Signal Date",
+            "type": "string"
+          },
+          "trade_id": {
+            "title": "Trade Id",
+            "type": "string"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_id",
+          "entry_mode",
+          "entry_mode_label",
+          "profile_variant",
+          "profile_variant_label",
+          "signal_date",
+          "ts_code",
+          "name",
+          "entry_time",
+          "entry_price",
+          "exit_time",
+          "exit_price",
+          "exit_reason",
+          "exit_reason_label",
+          "ret_pct"
+        ],
+        "title": "BacktestTrade",
+        "type": "object"
+      },
       "BinaryExpr": {
         "additionalProperties": false,
         "properties": {
@@ -3524,6 +3932,38 @@
           "serving"
         ],
         "title": "Envelope[BackfillPlansData]",
+        "type": "object"
+      },
+      "Envelope_BacktestDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BacktestDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BacktestDetailData]",
+        "type": "object"
+      },
+      "Envelope_BacktestListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BacktestListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BacktestListData]",
         "type": "object"
       },
       "Envelope_BoardsData_": {
@@ -8886,6 +9326,192 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/backtests": {
+      "get": {
+        "operationId": "list_backtests_api_v1_backtests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 2000,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BacktestListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "最近分钟回放",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/{run_id}": {
+      "get": {
+        "operationId": "get_backtest_api_v1_backtests__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Generation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 10000,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "entry_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Entry Mode"
+            }
+          },
+          {
+            "in": "query",
+            "name": "profile_variant",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Profile Variant"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BacktestDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "分钟回放详情",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
     "/api/v1/data/audit-report/calendar": {
       "get": {
         "operationId": "get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get",
