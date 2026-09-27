@@ -1,5 +1,5 @@
 import type { ScreenParameter } from "@/api/screen";
-import { Tip } from "@/ui";
+import { Tip } from "./Tip";
 
 export type ParameterValue = string | number | string[] | null;
 

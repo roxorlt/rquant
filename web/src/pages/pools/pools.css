@@ -7,6 +7,206 @@
   gap: 12px;
   margin-bottom: 14px;
 }
+.pools-add-button {
+  margin-left: auto;
+}
+.pools-detail-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.pools-editor-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-size: 12px;
+}
+.pools-editor-evidence > span {
+  border: 1px solid var(--rule);
+  border-radius: 100px;
+  padding: 4px 9px;
+  color: var(--ink-2);
+  background: var(--surface);
+}
+.pool-editor {
+  min-width: 0;
+  display: grid;
+  gap: 20px;
+  padding-bottom: 16px;
+}
+.pool-editor-lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.pool-editor-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.pool-editor-fields .field:first-child,
+.pool-editor-fields .field:nth-child(2) {
+  grid-column: 1 / -1;
+}
+.pool-editor-fields .field,
+.pool-editor-add .field {
+  min-width: 0;
+}
+.pool-editor-fields .lbl small {
+  color: var(--muted);
+  font-weight: 400;
+}
+.pool-editor-fields .inp,
+.pool-editor-add .inp {
+  width: 100%;
+  min-width: 0;
+}
+.pool-editor-section {
+  display: grid;
+  gap: 11px;
+  min-width: 0;
+  border-top: 1px solid var(--rule);
+  padding-top: 16px;
+}
+.pool-editor-section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.pool-editor-section-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+}
+.pool-editor-section-head > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.pool-editor-rule {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--sunken);
+}
+.pool-editor-rule-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pool-editor-rule-head strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.pool-editor-rule-head .btn {
+  margin-left: auto;
+}
+.pool-editor-rule-index {
+  color: var(--accent-t);
+  font-size: 11px;
+}
+.pool-editor-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.pool-editor-params .screen-param {
+  flex: 1 1 150px;
+  min-width: 0;
+}
+.pool-editor-params .screen-help {
+  margin-left: 4px;
+  color: var(--muted);
+}
+.pool-editor-params .screen-multi {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.pool-editor-params .screen-multi legend {
+  color: var(--muted);
+  font-size: 12px;
+}
+.pool-editor-add {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+.pool-editor-add .field {
+  flex: 1;
+}
+.pool-editor-add .btn {
+  flex: none;
+}
+.pool-editor-preview {
+  display: grid;
+  gap: 7px;
+  padding: 13px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-weak);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.pool-editor-preview > strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+.pool-editor-preview ol {
+  display: grid;
+  gap: 6px;
+  padding-left: 20px;
+  margin: 4px 0 0;
+}
+.pool-editor-preview li span {
+  display: block;
+  color: var(--muted);
+}
+.pool-editor-status {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 13px;
+}
+.pool-editor-status strong {
+  font-weight: 600;
+}
+.pool-editor-status p {
+  margin: 0;
+  color: var(--muted);
+}
+.pool-editor-status .btn {
+  justify-self: start;
+}
+.pool-editor-error {
+  margin: 0;
+  color: var(--warn-t);
+  font-size: 12px;
+}
+.pool-editor-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+@media (max-width: 540px) {
+  .pool-editor-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pool-editor-fields .field {
+    grid-column: 1 / -1;
+  }
+  .pool-editor-footer .btn {
+    flex: 1;
+  }
+}
 .pools-canvas-picker {
   display: flex;
   align-items: center;
@@ -330,6 +530,10 @@
   .pools-toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .pools-add-button {
+    width: 100%;
+    margin-left: 0;
   }
   .pools-canvas-picker,
   .pools-canvas-picker select {

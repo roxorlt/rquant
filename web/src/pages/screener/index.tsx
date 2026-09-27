@@ -8,9 +8,18 @@ import {
   useScreenCatalog,
 } from "@/api/screen";
 import { StockDrawer } from "@/app/StockDrawer";
-import { Button, EmptyState, PageHeader, PageSkeleton, Panel, RelativeTime, Tip } from "@/ui";
+import {
+  Button,
+  EmptyState,
+  PageHeader,
+  PageSkeleton,
+  Panel,
+  ParamControl,
+  type ParameterValue,
+  RelativeTime,
+  Tip,
+} from "@/ui";
 import { FormulaPreviewDialog } from "./FormulaPreviewDialog";
-import { ParamControl, type ParameterValue } from "./ParamControl";
 import { type RankingDraft, RankingEditor } from "./RankingEditor";
 import { ScreenResults } from "./ScreenResults";
 import "./screener.css";

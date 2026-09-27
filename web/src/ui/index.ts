@@ -14,6 +14,7 @@ export { type Kpi, KpiStrip } from "./KpiStrip";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 export { PagePlaceholder, type PagePlaceholderProps } from "./PagePlaceholder";
 export { Panel, type PanelProps } from "./Panel";
+export { ParamControl, type ParameterValue } from "./ParamControl";
 export { Pill, type PillKind } from "./Pill";
 export { Popover, type PopoverProps } from "./Popover";
 export { RelativeTime, useNow } from "./RelativeTime";
