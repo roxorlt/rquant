@@ -8832,6 +8832,10 @@ def main() -> int:
         return handler(args)
 
     try:
+        if args.command == "run-daily":
+            from rquant.unit_log_emitter import run_with_lifecycle
+
+            return run_with_lifecycle(lambda: handler(args))
         return handler(args)
     except Exception as e:
         logger.exception(f"=== {args.command} 异常 ===")

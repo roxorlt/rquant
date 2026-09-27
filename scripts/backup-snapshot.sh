@@ -27,10 +27,35 @@ TMP_DB="${BACKUP_DIR}/.latest.duckdb.${$}"
 TMP_GZ="${TMP_DB}.gz"
 TMP_JSON="${BACKUP_DIR}/.latest.json.${$}"
 
-mkdir -p "${BACKUP_DIR}" "$(dirname -- "${LOG}")"
-
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG}"; }
 cleanup() { rm -f "${TMP_DB}" "${TMP_DB}.wal" "${TMP_GZ}" "${TMP_JSON}"; }
+LIFECYCLE_START_SECONDS=$SECONDS
+LIFECYCLE_CLEANUP_DONE=0
+lifecycle_emit() {
+    "${VENV_PY}" -m rquant.unit_log_emitter "$@" </dev/null >/dev/null 2>&1 || :
+}
+lifecycle_finish() {
+    local status=$1
+    local elapsed_ms=$(( (SECONDS - LIFECYCLE_START_SECONDS) * 1000 ))
+    trap - EXIT
+    if (( ! LIFECYCLE_CLEANUP_DONE )); then
+        cleanup || :
+    fi
+    if (( elapsed_ms > 604800000 )); then
+        elapsed_ms=604800000
+    fi
+    if (( status == 0 )); then
+        lifecycle_emit run_succeeded "${elapsed_ms}" "${status}"
+    else
+        lifecycle_emit run_failed "${elapsed_ms}" "${status}"
+    fi
+    exit "${status}"
+}
+trap 'lifecycle_finish "$?"' EXIT
+lifecycle_emit run_started
+
+mkdir -p "${BACKUP_DIR}" "$(dirname -- "${LOG}")"
+
 # 被信号打断时先删私有代际再写日志：备份跑在 rquant-workload-arbiter 下，arbiter 在转发
 # SIGTERM 后 5s 就 SIGKILL 整个子进程组（--preempt-grace-seconds 默认 5.0），清理预算只有
 # 那 5 秒。EXIT trap 在 bash 收到 SIGTERM 时其实也会跑（Linux bash 5.2 实测），但那依赖
@@ -38,8 +63,9 @@ cleanup() { rm -f "${TMP_DB}" "${TMP_DB}.wal" "${TMP_GZ}" "${TMP_JSON}"; }
 on_signal() {
     local name=$1
     local number=$2
-    trap - EXIT INT TERM HUP ERR
+    trap - INT TERM HUP ERR
     cleanup
+    LIFECYCLE_CLEANUP_DONE=1
     log "ABORT: SIG${name} received; removed this run's private generation"
     exit $(( 128 + number ))
 }
@@ -124,7 +150,6 @@ generation_mtime() {
     echo "${latest}"
 }
 
-trap cleanup EXIT
 trap 'on_signal INT 2' INT
 trap 'on_signal TERM 15' TERM
 trap 'on_signal HUP 1' HUP
