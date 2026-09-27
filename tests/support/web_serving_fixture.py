@@ -1006,6 +1006,7 @@ def build_web_fixture(
     paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
     lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
     audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
+    backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
     audit: bool = False,
     signal_projections: tuple[ServingProjectionPayload, ...] = (),
 ) -> ServingGenerationManifest:
@@ -1114,7 +1115,7 @@ def build_web_fixture(
             owner_dataset_id="lab_jobs",
             owner_generation_id=generations["lab_jobs"],
         )
-        for item in audit_report_projections
+        for item in (*audit_report_projections, *backfill_plan_projections)
     )
     if event_projections is not None:
         if {item.table_name for item in event_projections} != {"monitor_event", "surge_event"}:
