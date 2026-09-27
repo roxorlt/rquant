@@ -225,6 +225,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/paper/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 模拟账户与持仓 */
+        get: operations["get_accounts_api_v1_paper_accounts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/blocks": {
         parameters: {
             query?: never;
@@ -705,6 +722,11 @@ export interface components {
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PaperAccountsData] */
+        Envelope_PaperAccountsData_: {
+            data: components["schemas"]["PaperAccountsData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[PulseData] */
@@ -1228,6 +1250,63 @@ export interface components {
             tables_total: number;
             /** Unpublished */
             unpublished: components["schemas"]["TableItem"][];
+        };
+        /** PaperAccountItem */
+        PaperAccountItem: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Cash */
+            cash: number;
+            /** Holdings */
+            holdings: components["schemas"]["PaperHoldingItem"][];
+            /** Market Value */
+            market_value: number;
+            /** Nav */
+            nav: number;
+            /** Unrealized Pnl */
+            unrealized_pnl: number;
+        };
+        /** PaperAccountsData */
+        PaperAccountsData: {
+            /** Accounts */
+            accounts: components["schemas"]["PaperAccountItem"][];
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+            /** Valuation Note */
+            valuation_note: string | null;
+        };
+        /** PaperHoldingItem */
+        PaperHoldingItem: {
+            /** Available Quantity */
+            available_quantity: number;
+            /** Average Cost */
+            average_cost: number;
+            /** Code */
+            code: string;
+            /** Market Price */
+            market_price: number;
+            /** Market Value */
+            market_value: number;
+            /** Name */
+            name: string | null;
+            /** Quantity */
+            quantity: number;
+            /** Unrealized Pct */
+            unrealized_pct: number | null;
+            /** Unrealized Pnl */
+            unrealized_pnl: number;
         };
         /** PaperSummary */
         PaperSummary: {
@@ -2351,6 +2430,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_accounts_api_v1_paper_accounts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperAccountsData_"];
                 };
             };
         };

@@ -5,6 +5,7 @@ import {
   metaEnvelope,
   monitorEnvelope,
   overviewEnvelope,
+  paperEnvelope,
   tasksEnvelope,
 } from "./fixtures";
 
@@ -23,6 +24,9 @@ export const monitorHandler = (envelope = monitorEnvelope()) =>
 export const tasksHandler = (envelope = tasksEnvelope()) =>
   http.get("*/api/v1/tasks/jobs", () => HttpResponse.json(envelope));
 
+export const paperHandler = (envelope = paperEnvelope()) =>
+  http.get("*/api/v1/paper/accounts", () => HttpResponse.json(envelope));
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
@@ -30,4 +34,5 @@ export const server = setupServer(
   healthHandler(),
   monitorHandler(),
   tasksHandler(),
+  paperHandler(),
 );
