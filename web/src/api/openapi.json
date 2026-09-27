@@ -353,6 +353,526 @@
         "title": "AuditAttempt",
         "type": "object"
       },
+      "AuditReportIssue": {
+        "additionalProperties": false,
+        "properties": {
+          "field_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field Label"
+          },
+          "field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field Name"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "null_rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Null Rows"
+          },
+          "number": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Number",
+            "type": "integer"
+          },
+          "observed_rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Rows"
+          },
+          "observed_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Value"
+          },
+          "reference_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Value"
+          },
+          "rule_id": {
+            "enum": [
+              "daily_bar.close_above_limit",
+              "daily_bar.close_below_limit",
+              "daily_bar.zero_volume_unsuspended",
+              "daily_bar.field_null_ratio"
+            ],
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "ts_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Code"
+          }
+        },
+        "required": [
+          "number",
+          "trade_date",
+          "rule_id",
+          "name",
+          "ts_code",
+          "field_name",
+          "field_label",
+          "observed_value",
+          "reference_value",
+          "null_rows",
+          "observed_rows"
+        ],
+        "title": "AuditReportIssue",
+        "type": "object"
+      },
+      "AuditReportMonth": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Ratio"
+          },
+          "covered_open_days": {
+            "minimum": 0.0,
+            "title": "Covered Open Days",
+            "type": "integer"
+          },
+          "expected_open_days": {
+            "minimum": 0.0,
+            "title": "Expected Open Days",
+            "type": "integer"
+          },
+          "month": {
+            "format": "date",
+            "title": "Month",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "measured",
+              "no_expected_sessions"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "month",
+          "expected_open_days",
+          "covered_open_days",
+          "coverage_ratio",
+          "status",
+          "status_label"
+        ],
+        "title": "AuditReportMonth",
+        "type": "object"
+      },
+      "AuditReportOverview": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_start": {
+            "format": "date",
+            "title": "Audit Start",
+            "type": "string"
+          },
+          "closed_day_count": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Closed Day Count",
+            "type": "integer"
+          },
+          "collection_completed_through": {
+            "title": "Collection Completed Through",
+            "type": "null"
+          },
+          "collection_label": {
+            "title": "Collection Label",
+            "type": "string"
+          },
+          "collection_status": {
+            "const": "collection_unconfirmed",
+            "title": "Collection Status",
+            "type": "string"
+          },
+          "coverage_conclusion": {
+            "const": "unconfirmed",
+            "title": "Coverage Conclusion",
+            "type": "string"
+          },
+          "coverage_label": {
+            "title": "Coverage Label",
+            "type": "string"
+          },
+          "covered_open_days": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Covered Open Days",
+            "type": "integer"
+          },
+          "current": {
+            "const": false,
+            "title": "Current",
+            "type": "boolean"
+          },
+          "expected_open_days": {
+            "maximum": 3660.0,
+            "minimum": 1.0,
+            "title": "Expected Open Days",
+            "type": "integer"
+          },
+          "gap_count": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Gap Count",
+            "type": "integer"
+          },
+          "indexed_issue_count": {
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Indexed Issue Count",
+            "type": "integer"
+          },
+          "longest_gap_open_days": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Longest Gap Open Days",
+            "type": "integer"
+          },
+          "missing_open_days": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Missing Open Days",
+            "type": "integer"
+          },
+          "monthly_count": {
+            "maximum": 122.0,
+            "minimum": 1.0,
+            "title": "Monthly Count",
+            "type": "integer"
+          },
+          "observed_through": {
+            "format": "date",
+            "title": "Observed Through",
+            "type": "string"
+          },
+          "omitted_issue_count": {
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Omitted Issue Count",
+            "type": "integer"
+          },
+          "quality_conclusion": {
+            "enum": [
+              "not_fully_assessed",
+              "issues_observed",
+              "no_issues_observed"
+            ],
+            "title": "Quality Conclusion",
+            "type": "string"
+          },
+          "quality_issue_count": {
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Quality Issue Count",
+            "type": "integer"
+          },
+          "quality_label": {
+            "title": "Quality Label",
+            "type": "string"
+          },
+          "replica_generation_id": {
+            "title": "Replica Generation Id",
+            "type": "null"
+          },
+          "report_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Report Hash",
+            "type": "string"
+          },
+          "rule_count": {
+            "maximum": 11.0,
+            "minimum": 3.0,
+            "title": "Rule Count",
+            "type": "integer"
+          },
+          "rule_version": {
+            "const": "daily-bar-quality-v1",
+            "title": "Rule Version",
+            "type": "string"
+          },
+          "run_status": {
+            "const": "completed",
+            "title": "Run Status",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_mode": {
+            "const": "production_unverified",
+            "title": "Source Mode",
+            "type": "string"
+          },
+          "source_namespace": {
+            "const": "production",
+            "title": "Source Namespace",
+            "type": "string"
+          },
+          "unassessed_rule_days": {
+            "maximum": 40260.0,
+            "minimum": 0.0,
+            "title": "Unassessed Rule Days",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "report_hash",
+          "schema_version",
+          "rule_version",
+          "run_status",
+          "collection_status",
+          "collection_completed_through",
+          "coverage_conclusion",
+          "quality_conclusion",
+          "current",
+          "source_mode",
+          "source_namespace",
+          "replica_generation_id",
+          "audit_start",
+          "observed_through",
+          "expected_open_days",
+          "covered_open_days",
+          "missing_open_days",
+          "gap_count",
+          "longest_gap_open_days",
+          "closed_day_count",
+          "monthly_count",
+          "rule_count",
+          "quality_issue_count",
+          "indexed_issue_count",
+          "omitted_issue_count",
+          "unassessed_rule_days",
+          "collection_label",
+          "coverage_label",
+          "quality_label"
+        ],
+        "title": "AuditReportOverview",
+        "type": "object"
+      },
+      "AuditReportRule": {
+        "additionalProperties": false,
+        "properties": {
+          "assessed_days": {
+            "minimum": 0.0,
+            "title": "Assessed Days",
+            "type": "integer"
+          },
+          "assessment_complete": {
+            "title": "Assessment Complete",
+            "type": "boolean"
+          },
+          "checked_days": {
+            "minimum": 0.0,
+            "title": "Checked Days",
+            "type": "integer"
+          },
+          "expected_days": {
+            "minimum": 1.0,
+            "title": "Expected Days",
+            "type": "integer"
+          },
+          "field_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field Label"
+          },
+          "field_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field Name"
+          },
+          "first_assessed_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Assessed Date"
+          },
+          "issue_count": {
+            "minimum": 0.0,
+            "title": "Issue Count",
+            "type": "integer"
+          },
+          "last_assessed_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Assessed Date"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "rule_id": {
+            "enum": [
+              "daily_bar.close_limit",
+              "daily_bar.zero_volume",
+              "daily_bar.field_null_ratio"
+            ],
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "unassessed_days": {
+            "minimum": 0.0,
+            "title": "Unassessed Days",
+            "type": "integer"
+          },
+          "unassessed_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportUnassessedReason"
+            },
+            "title": "Unassessed Reasons",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rule_id",
+          "name",
+          "field_name",
+          "field_label",
+          "expected_days",
+          "checked_days",
+          "assessed_days",
+          "unassessed_days",
+          "first_assessed_date",
+          "last_assessed_date",
+          "assessment_complete",
+          "unassessed_reasons",
+          "issue_count"
+        ],
+        "title": "AuditReportRule",
+        "type": "object"
+      },
+      "AuditReportUnassessedReason": {
+        "additionalProperties": false,
+        "properties": {
+          "days": {
+            "maximum": 3660.0,
+            "minimum": 1.0,
+            "title": "Days",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "no_daily_bar",
+              "close_missing",
+              "limits_unavailable",
+              "volume_missing",
+              "suspension_unknown",
+              "no_observations"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "name",
+          "days"
+        ],
+        "title": "AuditReportUnassessedReason",
+        "type": "object"
+      },
       "AuditSuccess": {
         "additionalProperties": false,
         "properties": {
@@ -1495,6 +2015,60 @@
         "title": "DataAuditIssuesData",
         "type": "object"
       },
+      "DataAuditReportData": {
+        "additionalProperties": false,
+        "properties": {
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportIssue"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "months": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportMonth"
+            },
+            "title": "Months",
+            "type": "array"
+          },
+          "overview": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditReportOverview"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportRule"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_state",
+          "overview",
+          "months",
+          "rules",
+          "issues"
+        ],
+        "title": "DataAuditReportData",
+        "type": "object"
+      },
       "DatasetWatermarkInfo": {
         "properties": {
           "dataset_id": {
@@ -1837,6 +2411,22 @@
           "serving"
         ],
         "title": "Envelope[DataAuditIssuesData]",
+        "type": "object"
+      },
+      "Envelope_DataAuditReportData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DataAuditReportData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[DataAuditReportData]",
         "type": "object"
       },
       "Envelope_HealthData_": {
@@ -7223,6 +7813,57 @@
           }
         },
         "summary": "数据审计问题",
+        "tags": [
+          "data-audit"
+        ]
+      }
+    },
+    "/api/v1/data/report": {
+      "get": {
+        "operationId": "get_data_audit_report_api_v1_data_report_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DataAuditReportData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "日线数据审计报告",
         "tags": [
           "data-audit"
         ]

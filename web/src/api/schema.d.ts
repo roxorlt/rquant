@@ -72,6 +72,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 日线数据审计报告 */
+        get: operations["get_data_audit_report_api_v1_data_report_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -602,6 +619,196 @@ export interface components {
              */
             status: "running" | "completed" | "failed";
         };
+        /** AuditReportIssue */
+        AuditReportIssue: {
+            /** Field Label */
+            field_label: string | null;
+            /** Field Name */
+            field_name: string | null;
+            /** Name */
+            name: string;
+            /** Null Rows */
+            null_rows: number | null;
+            /** Number */
+            number: number;
+            /** Observed Rows */
+            observed_rows: number | null;
+            /** Observed Value */
+            observed_value: string | null;
+            /** Reference Value */
+            reference_value: string | null;
+            /**
+             * Rule Id
+             * @enum {string}
+             */
+            rule_id: "daily_bar.close_above_limit" | "daily_bar.close_below_limit" | "daily_bar.zero_volume_unsuspended" | "daily_bar.field_null_ratio";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Ts Code */
+            ts_code: string | null;
+        };
+        /** AuditReportMonth */
+        AuditReportMonth: {
+            /** Coverage Ratio */
+            coverage_ratio: number | null;
+            /** Covered Open Days */
+            covered_open_days: number;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "measured" | "no_expected_sessions";
+            /** Status Label */
+            status_label: string;
+        };
+        /** AuditReportOverview */
+        AuditReportOverview: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Closed Day Count */
+            closed_day_count: number;
+            /** Collection Completed Through */
+            collection_completed_through: null;
+            /** Collection Label */
+            collection_label: string;
+            /**
+             * Collection Status
+             * @constant
+             */
+            collection_status: "collection_unconfirmed";
+            /**
+             * Coverage Conclusion
+             * @constant
+             */
+            coverage_conclusion: "unconfirmed";
+            /** Coverage Label */
+            coverage_label: string;
+            /** Covered Open Days */
+            covered_open_days: number;
+            /**
+             * Current
+             * @constant
+             */
+            current: false;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /** Gap Count */
+            gap_count: number;
+            /** Indexed Issue Count */
+            indexed_issue_count: number;
+            /** Longest Gap Open Days */
+            longest_gap_open_days: number;
+            /** Missing Open Days */
+            missing_open_days: number;
+            /** Monthly Count */
+            monthly_count: number;
+            /**
+             * Observed Through
+             * Format: date
+             */
+            observed_through: string;
+            /** Omitted Issue Count */
+            omitted_issue_count: number;
+            /**
+             * Quality Conclusion
+             * @enum {string}
+             */
+            quality_conclusion: "not_fully_assessed" | "issues_observed" | "no_issues_observed";
+            /** Quality Issue Count */
+            quality_issue_count: number;
+            /** Quality Label */
+            quality_label: string;
+            /** Replica Generation Id */
+            replica_generation_id: null;
+            /** Report Hash */
+            report_hash: string;
+            /** Rule Count */
+            rule_count: number;
+            /**
+             * Rule Version
+             * @constant
+             */
+            rule_version: "daily-bar-quality-v1";
+            /**
+             * Run Status
+             * @constant
+             */
+            run_status: "completed";
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "production_unverified";
+            /**
+             * Source Namespace
+             * @constant
+             */
+            source_namespace: "production";
+            /** Unassessed Rule Days */
+            unassessed_rule_days: number;
+        };
+        /** AuditReportRule */
+        AuditReportRule: {
+            /** Assessed Days */
+            assessed_days: number;
+            /** Assessment Complete */
+            assessment_complete: boolean;
+            /** Checked Days */
+            checked_days: number;
+            /** Expected Days */
+            expected_days: number;
+            /** Field Label */
+            field_label: string | null;
+            /** Field Name */
+            field_name: string | null;
+            /** First Assessed Date */
+            first_assessed_date: string | null;
+            /** Issue Count */
+            issue_count: number;
+            /** Last Assessed Date */
+            last_assessed_date: string | null;
+            /** Name */
+            name: string;
+            /**
+             * Rule Id
+             * @enum {string}
+             */
+            rule_id: "daily_bar.close_limit" | "daily_bar.zero_volume" | "daily_bar.field_null_ratio";
+            /** Unassessed Days */
+            unassessed_days: number;
+            /** Unassessed Reasons */
+            unassessed_reasons: components["schemas"]["AuditReportUnassessedReason"][];
+        };
+        /** AuditReportUnassessedReason */
+        AuditReportUnassessedReason: {
+            /** Days */
+            days: number;
+            /** Name */
+            name: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "no_daily_bar" | "close_missing" | "limits_unavailable" | "volume_missing" | "suspension_unknown" | "no_observations";
+        };
         /** AuditSuccess */
         AuditSuccess: {
             /**
@@ -944,6 +1151,21 @@ export interface components {
             /** Total Count */
             total_count: number;
         };
+        /** DataAuditReportData */
+        DataAuditReportData: {
+            /** Issues */
+            issues: components["schemas"]["AuditReportIssue"][];
+            /** Months */
+            months: components["schemas"]["AuditReportMonth"][];
+            overview: components["schemas"]["AuditReportOverview"] | null;
+            /** Rules */
+            rules: components["schemas"]["AuditReportRule"][];
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "not_published" | "unavailable";
+        };
         /** DatasetWatermarkInfo */
         DatasetWatermarkInfo: {
             /** Dataset Id */
@@ -1064,6 +1286,11 @@ export interface components {
         /** Envelope[DataAuditIssuesData] */
         Envelope_DataAuditIssuesData_: {
             data: components["schemas"]["DataAuditIssuesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataAuditReportData] */
+        Envelope_DataAuditReportData_: {
+            data: components["schemas"]["DataAuditReportData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[HealthData] */
@@ -2807,6 +3034,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_DataAuditIssuesData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_data_audit_report_api_v1_data_report_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataAuditReportData_"];
                 };
             };
             /** @description Validation Error */

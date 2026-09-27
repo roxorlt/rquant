@@ -1005,6 +1005,7 @@ def build_web_fixture(
     lab_jobs: tuple[ServingLabJobRecord, ...] = (),
     paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
     lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
+    audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
     audit: bool = False,
     signal_projections: tuple[ServingProjectionPayload, ...] = (),
 ) -> ServingGenerationManifest:
@@ -1107,6 +1108,14 @@ def build_web_fixture(
             )
             for item in lab_page_projections
         )
+    projections += tuple(
+        ServingProjectionInput.bind(
+            item,
+            owner_dataset_id="lab_jobs",
+            owner_generation_id=generations["lab_jobs"],
+        )
+        for item in audit_report_projections
+    )
     if event_projections is not None:
         if {item.table_name for item in event_projections} != {"monitor_event", "surge_event"}:
             raise ValueError("event replay must supply both event projections")
