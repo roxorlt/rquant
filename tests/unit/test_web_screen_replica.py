@@ -298,7 +298,7 @@ def test_missing_aggregate_facts_are_unavailable_instead_of_zero_hits(tmp_path: 
     assert result.json() == {"detail": "所选日期的数据不完整，请换日期或稍后重试。"}
 
 
-def test_replica_catalog_offers_bounded_ma_periods_but_keeps_rsi_and_fields_fixed(
+def test_replica_catalog_offers_bounded_ma_periods_and_custom_compare_fields(
     tmp_path: Path,
 ) -> None:
     primary, replica, _ = _replica_world(tmp_path)
@@ -327,6 +327,13 @@ def test_replica_catalog_offers_bounded_ma_periods_but_keeps_rsi_and_fields_fixe
         assert (params["offset"]["minimum"], params["offset"]["maximum"]) == (0, 30)
     assert rsi_period["input"] == "choice"
     assert {item["value"] for item in rsi_period["options"]} == {"6", "14"}
+    for rule_name in ("gt", "lt", "gte", "lte"):
+        for parameter in blocks[rule_name]["parameters"]:
+            assert parameter["custom_ma"] is True
+            assert parameter["input"] == "operand"
+    assert next(p for p in blocks["between"]["parameters"] if p["key"] == "field")[
+        "custom_ma"
+    ] is True
     assert {item["value"] for item in next(
         p for p in blocks["gt"]["parameters"] if p["key"] == "left"
     )["options"]} >= {"CLOSE[0]", "MA5[0]"}
@@ -336,6 +343,101 @@ def test_replica_catalog_offers_bounded_ma_periods_but_keeps_rsi_and_fields_fixe
     assert "RETURN_20D_PCT[0]" not in {item["value"] for item in catalog["ranking_metrics"]}
     assert legacy_period.status_code == 200, legacy_period.text
     assert missing_metric.status_code == 422
+
+
+@pytest.mark.parametrize("condition", [
+    {"key": "gt", "args": {"left": "MA7[2]", "right": 9}},
+    {"key": "lt", "args": {"left": 9, "right": "MA7[2]"}},
+    {"key": "gte", "args": {"left": "MA7[2]", "right": 10}},
+    {"key": "lte", "args": {"left": "MA7[2]", "right": 12}},
+    {"key": "between", "args": {"field": "MA2[30]", "low": 10, "high": 11}},
+])
+def test_replica_compare_and_between_use_custom_ma_from_verified_replica(
+    tmp_path: Path, condition: dict,
+) -> None:
+    primary, replica, _ = _replica_world(tmp_path, days=34)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar"
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        result = _run(client, conditions=[condition])
+    assert result.status_code == 200, result.text
+    assert result.json()["data"]["source"]["identity"]
+    assert result.json()["data"]["unknown_count"] == 0
+
+
+def test_custom_ma_maximum_period_and_offset_are_accepted_before_history_check(
+    tmp_path: Path,
+) -> None:
+    primary, replica, _ = _replica_world(tmp_path)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        result = _run(client, conditions=[
+            {"key": "between", "args": {"field": "MA250[30]", "low": 0, "high": 10}},
+        ])
+    assert result.status_code == 503
+    assert result.json()["detail"] == "所选日期的数据不完整，请换日期或稍后重试。"
+
+
+def test_custom_ma_cursor_rejects_a_rotated_replica(tmp_path: Path) -> None:
+    primary, replica, _ = _replica_world(tmp_path)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar"
+        )
+    _publish(primary, replica)
+    condition = [{"key": "gt", "args": {"left": "MA2[0]", "right": 9}}]
+    with _client(tmp_path / "absent", primary, replica) as client:
+        first = _run(client, conditions=condition, page_size=1)
+        assert first.status_code == 200, first.text
+        cursor = first.json()["data"]["next_cursor"]
+        assert cursor
+        replacement = tmp_path / "replacement.duckdb"
+        shutil.copy2(replica, replacement)
+        replacement.replace(replica)
+        write_replica_generation_metadata(
+            primary_path=primary, replica_path=replica,
+            output_path=replica_generation_path(replica),
+            source_before=capture_database_watermark(primary),
+        )
+        stale = _run(client, conditions=condition, cursor=cursor, page_size=1)
+    assert stale.status_code == 409
+    assert stale.json() == {"detail": "选股数据已更新，请重新筛选。"}
+
+
+def test_custom_ma_operand_missing_price_and_adjustment_remain_unknown(
+    tmp_path: Path,
+) -> None:
+    primary, replica, latest = _replica_world(tmp_path, days=34)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar"
+        )
+        store._conn.execute(
+            "DELETE FROM daily_bar WHERE ts_code = '600002.SH' AND trade_date = ?",
+            [latest - timedelta(days=5)],
+        )
+        store._conn.execute(
+            "DELETE FROM adj_factor WHERE ts_code = '600003.SH' AND trade_date = ?",
+            [latest - timedelta(days=5)],
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        compare = _run(client, conditions=[
+            {"key": "gt", "args": {"left": "MA7[2]", "right": 9}},
+        ])
+        interval = _run(client, conditions=[
+            {"key": "between", "args": {"field": "MA7[2]", "low": 9, "high": 11}},
+        ])
+    for result in (compare, interval):
+        assert result.status_code == 200, result.text
+        assert result.json()["data"]["total"] == 1
+        assert result.json()["data"]["unknown_count"] == 2
+        assert [row["ts_code"] for row in result.json()["data"]["rows"]] == ["600001.SH"]
 
 
 def test_dynamic_ma_screen_runs_with_offsets_and_keeps_missing_stock_history_unknown(
@@ -406,7 +508,18 @@ def test_dynamic_ma_screen_runs_with_offsets_and_keeps_missing_stock_history_unk
     {"key": "cross_above", "args": {"fast": [], "slow": 20}},
     {"key": "cross_above", "args": {"fast": 2, "slow": 20, "offset": 31}},
     {"key": "rsi_oversold", "args": {"period": 7, "threshold": 30}},
-    {"key": "gt", "args": {"left": "MA7[0]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA1[0]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA251[0]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA07[0]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA7[00]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA7[31]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA999999999999999999999[0]", "right": "CLOSE[0]"}},
+    {"key": "gt", "args": {"left": "MA7[0];DROP", "right": "CLOSE[0]"}},
+    {"key": "lt", "args": {"left": "CLOSE[0]", "right": "RSI7[0]"}},
+    {"key": "gte", "args": {"left": "CLOSE[1]", "right": 9}},
+    {"key": "lte", "args": {"left": True, "right": "MA7[0]"}},
+    {"key": "between", "args": {"field": "MA7", "low": 0, "high": 10}},
+    {"key": "between", "args": {"field": "MA7[31]", "low": 0, "high": 10}},
 ])
 def test_replica_rejects_unlisted_or_malformed_indicator_requests(
     tmp_path: Path, condition: dict,

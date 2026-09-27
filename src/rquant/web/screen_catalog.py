@@ -80,7 +80,9 @@ _MA_PERIOD_OPTIONS = tuple((value[2:], label) for value, label in _MA_OPTIONS)
 _RSI_PERIOD_OPTIONS = (("6", "6 日 RSI"), ("14", "14 日 RSI"))
 _MA_PERIOD_TEXT = re.compile(r"[1-9][0-9]*\Z")
 _MA_NAME_TEXT = re.compile(r"MA([1-9][0-9]*)\Z")
+_MA_FIELD_TEXT = re.compile(r"MA([1-9][0-9]{0,2})\[(0|[1-9][0-9]?)\]\Z")
 _DYNAMIC_MA_RULES = frozenset({"above_ma", "cross_above", "cross_below"})
+_COMPARE_RULES = frozenset({"gt", "lt", "gte", "lte"})
 RANKING_METRIC_LABELS = {
     "RETURN_20D_PCT[0]": "20 日涨幅",
     "TURNOVER_RATE[0]": "换手率",
@@ -123,6 +125,10 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
     options: list[ScreenOption] = []
     scale = 1
     hint: str | None = None
+    custom_ma = dynamic_ma and (
+        (spec.name in _COMPARE_RULES and key in {"left", "right"})
+        or (spec.name == "between" and key == "field")
+    )
     if key == "boards":
         label, kind, options = "板块", "multi_choice", _options(_BOARD_OPTIONS)
     elif key in {"fast", "slow"}:
@@ -137,9 +143,14 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
             )
     elif key == "field":
         label, kind, options = "比较项", "field", _options(_FIELDS)
+        if custom_ma:
+            hint = "也可自定义均线：周期 2–250 日，相对日期 0–30 日"
     elif key in {"left", "right"}:
         label, kind, options = ("左侧" if key == "left" else "右侧"), "operand", _options(_FIELDS)
-        hint = "可选数据项，也可输入固定数字"
+        hint = (
+            "可选数据项、固定数字或自定义均线；均线周期 2–250 日，相对日期 0–30 日"
+            if custom_ma else "可选数据项，也可输入固定数字"
+        )
     elif key == "offset":
         label, kind = "相对日期", "integer"
         hint = (
@@ -202,6 +213,7 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
         scale=scale,
         options=options,
         hint=hint,
+        custom_ma=custom_ma,
     )
 
 
@@ -238,6 +250,13 @@ def _dynamic_period(value: object, *, named: bool) -> int:
     return period
 
 
+def _valid_custom_ma_field(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    match = _MA_FIELD_TEXT.fullmatch(value)
+    return match is not None and 2 <= int(match.group(1)) <= 250 and int(match.group(2)) <= 30
+
+
 def validate_screen_choices(
     conditions: Sequence[ScreenCondition], *, dynamic_ma: bool = False,
 ) -> list[dict[str, Any]]:
@@ -269,8 +288,12 @@ def validate_screen_choices(
                     if parameter.key == "period"
                     else type(value) is str and value in choices
                 )
+                if parameter.custom_ma:
+                    valid = valid or _valid_custom_ma_field(value)
             elif parameter.input == "operand":
                 valid = type(value) in {int, float} or (type(value) is str and value in choices)
+                if parameter.custom_ma:
+                    valid = valid or _valid_custom_ma_field(value)
             elif parameter.input == "multi_choice":
                 valid = type(value) is list and all(
                     type(item) is str and item in choices for item in value
@@ -280,5 +303,7 @@ def validate_screen_choices(
             if not valid:
                 if parameter.key == "period":
                     raise ValueError("screen indicator period is not yet available")
+                if parameter.custom_ma:
+                    raise ValueError("screen custom MA field is not available")
                 raise ValueError("screen form choice is not listed in the catalog")
     return normalized

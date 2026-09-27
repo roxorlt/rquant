@@ -286,6 +286,8 @@ class ScreenApplicationService:
                     if self.replica is not None
                     else "当前仅支持已列出的均线和 RSI 周期，请调整条件。"
                 )
+            elif "custom MA field" in str(error):
+                detail = "请从目录选择数据项；均线周期填 2 到 250 日，相对日期填 0 到 30 日。"
             else:
                 detail = "请从条件目录选择数据项或板块。"
             raise ScreenApplicationError(422, detail) from error

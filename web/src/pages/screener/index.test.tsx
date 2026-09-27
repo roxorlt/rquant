@@ -34,6 +34,7 @@ const blocks: Schemas["ScreenBlock"][] = [
         minimum: 0,
         maximum: 10000,
         scale: 1,
+        custom_ma: false,
       },
     ],
   },
@@ -361,6 +362,7 @@ describe("选股器", () => {
             maximum: 250,
             scale: 1,
             hint: "可填 2–250 个交易日",
+            custom_ma: false,
           },
           {
             key: "offset",
@@ -372,6 +374,7 @@ describe("选股器", () => {
             maximum: 30,
             scale: 1,
             hint: "0 为所选交易日，最多往前 30 个交易日",
+            custom_ma: false,
           },
         ],
       },
@@ -392,6 +395,7 @@ describe("选股器", () => {
             maximum: 250,
             scale: 1,
             hint: "可填 2–250 个交易日",
+            custom_ma: false,
           })),
           {
             key: "offset",
@@ -402,6 +406,7 @@ describe("选股器", () => {
             minimum: 0,
             maximum: 30,
             scale: 1,
+            custom_ma: false,
           },
         ],
       },
@@ -472,6 +477,144 @@ describe("选股器", () => {
       { key: "above_ma", args: { period: 7, offset: 0 } },
       { key: "cross_above", args: { fast: 2, slow: 3, offset: 30 } },
     ]);
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("副本比较和区间条件可选择自定义均线，且固定数字仍可填写", async () => {
+    const fields = [
+      { value: "CLOSE[0]", label: "收盘价" },
+      { value: "MA5[0]", label: "5 日均线" },
+    ];
+    const customBlocks: Schemas["ScreenBlock"][] = [
+      blocks[0] as Schemas["ScreenBlock"],
+      {
+        key: "gt",
+        label: "大于",
+        hint: "比较两项数据",
+        category: "compare",
+        category_label: "数值比较",
+        parameters: (["left", "right"] as const).map((key) => ({
+          key,
+          label: key === "left" ? "左侧" : "右侧",
+          input: "operand" as const,
+          initial: key === "left" ? "CLOSE[0]" : "MA5[0]",
+          required: true,
+          scale: 1,
+          options: fields,
+          custom_ma: true,
+          hint: "均线周期 2–250 日，相对日期 0–30 日",
+        })),
+      },
+      {
+        key: "between",
+        label: "落在区间",
+        hint: "指定数据位于上下限之间",
+        category: "compare",
+        category_label: "数值比较",
+        parameters: [
+          {
+            key: "field",
+            label: "比较项",
+            input: "field",
+            initial: "CLOSE[0]",
+            required: true,
+            scale: 1,
+            options: fields,
+            custom_ma: true,
+            hint: "均线周期 2–250 日，相对日期 0–30 日",
+          },
+          ...(["low", "high"] as const).map((key) => ({
+            key,
+            label: key === "low" ? "下限" : "上限",
+            input: "number" as const,
+            initial: key === "low" ? 0 : 20,
+            required: true,
+            scale: 1,
+            custom_ma: false,
+          })),
+        ],
+      },
+    ];
+    const requests: Schemas["ScreenRunRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: customBlocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        requests.push(body);
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 3,
+            total: 0,
+            steps: [],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "条件目录" }), "gt");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "左侧" }), "__custom_ma__");
+    const leftPeriod = screen.getByRole("spinbutton", { name: "左侧均线周期（日）" });
+    const leftOffset = screen.getByRole("spinbutton", { name: "左侧相对日期" });
+    expect(leftPeriod).toHaveAttribute("min", "2");
+    expect(leftPeriod).toHaveAttribute("max", "250");
+    expect(leftPeriod).toHaveAttribute("inputmode", "numeric");
+    expect(leftOffset).toHaveAttribute("min", "0");
+    expect(leftOffset).toHaveAttribute("max", "30");
+    await user.tab();
+    expect(leftPeriod).toHaveFocus();
+    await user.clear(leftPeriod);
+    await user.type(leftPeriod, "7");
+    await user.clear(leftOffset);
+    await user.type(leftOffset, "2");
+    await user.selectOptions(screen.getByRole("combobox", { name: "右侧" }), "__number__");
+    await user.clear(screen.getByRole("spinbutton", { name: "右侧数值" }));
+    await user.type(screen.getByRole("spinbutton", { name: "右侧数值" }), "10.5");
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]?.conditions[1]).toEqual({
+      key: "gt",
+      args: { left: "MA7[2]", right: 10.5 },
+    });
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "右侧" }), "__custom_ma__");
+    await user.clear(screen.getByRole("spinbutton", { name: "右侧均线周期（日）" }));
+    await user.type(screen.getByRole("spinbutton", { name: "右侧均线周期（日）" }), "3");
+    await user.clear(screen.getByRole("spinbutton", { name: "右侧相对日期" }));
+    await user.type(screen.getByRole("spinbutton", { name: "右侧相对日期" }), "1");
+    await user.selectOptions(screen.getByRole("combobox", { name: "条件目录" }), "between");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "比较项" }), "__custom_ma__");
+    await user.clear(screen.getByRole("spinbutton", { name: "比较项均线周期（日）" }));
+    await user.type(screen.getByRole("spinbutton", { name: "比较项均线周期（日）" }), "2");
+    await user.clear(screen.getByRole("spinbutton", { name: "比较项相对日期" }));
+    await user.type(screen.getByRole("spinbutton", { name: "比较项相对日期" }), "30");
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await waitFor(() => expect(requests).toHaveLength(2));
+    expect(requests[1]?.conditions.slice(1)).toEqual([
+      { key: "gt", args: { left: "MA7[2]", right: "MA3[1]" } },
+      { key: "between", args: { field: "MA2[30]", low: 0, high: 20 } },
+    ]);
+    expect(document.body).not.toHaveTextContent(/MA(?:7\[2\]|3\[1\]|2\[30\])/);
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
   });
 

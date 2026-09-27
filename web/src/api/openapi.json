@@ -7193,6 +7193,11 @@
       },
       "ScreenParameter": {
         "properties": {
+          "custom_ma": {
+            "default": false,
+            "title": "Custom Ma",
+            "type": "boolean"
+          },
           "hint": {
             "anyOf": [
               {

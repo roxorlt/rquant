@@ -49,6 +49,18 @@
 .screen-param {
   width: min(180px, 100%);
 }
+.screen-ma-param {
+  width: min(238px, 100%);
+}
+.screen-ma-values {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.screen-ma-values .inp {
+  width: 100%;
+  min-width: 0;
+}
 .screen-help {
   margin-left: 5px;
   color: var(--muted);
