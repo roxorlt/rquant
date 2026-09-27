@@ -10,6 +10,7 @@ from rquant.factor.evaluate import (
     GroupReturn,
     evaluate_factor,
 )
+from rquant.factor.summary import FactorICSummary, ICSeriesSummary, summarize_factor_ic
 
 __all__ = [
     "CorrelationResult",
@@ -17,7 +18,10 @@ __all__ = [
     "FactorEvaluation",
     "FactorEvaluationInput",
     "FactorSample",
+    "FactorICSummary",
     "GroupReturn",
     "GroupingResult",
+    "ICSeriesSummary",
     "evaluate_factor",
+    "summarize_factor_ic",
 ]
