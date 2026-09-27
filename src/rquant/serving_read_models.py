@@ -297,7 +297,7 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=2 * 1024 * 1024,
             event_time_columns=("confirmed_at",),
         ),
-        "signal_coverage_receipt": _contract(
+        "signal_observed_prefix": _contract(
             "signals",
             (
                 ("source_generation_id", "string"),

@@ -515,11 +515,11 @@ def _signal_source_result(
         f"history_limit_truncated:{snapshot.omitted_signal_count}" if snapshot.truncated else None
     )
     projections = snapshot.payload.projections
-    if snapshot.signal_coverage_receipt is not None:
-        receipt = snapshot.signal_coverage_receipt
+    if snapshot.signal_observed_prefix is not None:
+        receipt = snapshot.signal_observed_prefix
         projections += (
             ServingProjectionPayload(
-                table_name="signal_coverage_receipt",
+                table_name="signal_observed_prefix",
                 available_at=receipt.source_inspected_at,
                 rows=(receipt.model_dump(mode="json"),),
             ),

@@ -1,4 +1,4 @@
-"""A bounded, positive proof for the notifier-owned signal source."""
+"""Bounded evidence for the notifier's observed signal spool prefix."""
 
 from __future__ import annotations
 
@@ -31,8 +31,13 @@ def signal_window_digest(records: Iterable[ServingSignalRecord]) -> str:
     )
 
 
-class SignalSourceCoverageReceipt(RuntimeContractModel):
-    """One inspected spool prefix verified against one notifier SQLite read transaction."""
+class SignalObservedPrefixReceipt(RuntimeContractModel):
+    """One inspected notifier spool prefix, with no upstream completeness claim.
+
+    The generation and high watermark describe the spool descriptor. The window
+    only filters rows in that observed prefix; it does not prove zero events before
+    spool creation or that the spool caught up with the signal bus.
+    """
 
     source_generation_id: Sha256
     first_global_sequence: StrictInt = Field(ge=1)
@@ -46,9 +51,9 @@ class SignalSourceCoverageReceipt(RuntimeContractModel):
     prefix_rows_sha256: Sha256
 
     @model_validator(mode="after")
-    def validate_positive_proof(self) -> Self:
+    def validate_observed_prefix(self) -> Self:
         if self.first_global_sequence != 1:
-            raise ValueError("signal coverage starts after the source beginning")
+            raise ValueError("observed signal prefix starts after the spool beginning")
         if self.prefix_row_count != self.source_high_watermark:
             raise ValueError("signal prefix count differs from high watermark")
         if self.window_row_count > self.prefix_row_count:
@@ -60,8 +65,8 @@ class SignalSourceCoverageReceipt(RuntimeContractModel):
             activated_at=datetime(1970, 1, 1, tzinfo=UTC),
         )
         if self.window_start != expected_start:
-            raise ValueError("signal coverage window start is invalid")
+            raise ValueError("observed signal window start is invalid")
         return self
 
 
-__all__ = ["SignalSourceCoverageReceipt", "signal_window_digest"]
+__all__ = ["SignalObservedPrefixReceipt", "signal_window_digest"]

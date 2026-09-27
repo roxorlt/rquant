@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Literal, Self
 from pydantic import Field, field_serializer, field_validator, model_validator
 
 from rquant.alert_ack import alert_event_at, alert_window_start
-from rquant.alert_signal_coverage import SignalSourceCoverageReceipt, signal_window_digest
 from rquant.delivery_contracts import (
     DeliveryChannel,
     DeliveryTarget,
@@ -41,6 +40,7 @@ from rquant.signal_bus import (
     require_legacy_signal_write,
 )
 from rquant.signal_contracts import SignalEnvelopeFamily
+from rquant.signal_observed_prefix import SignalObservedPrefixReceipt, signal_window_digest
 
 if TYPE_CHECKING:
     from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
@@ -431,7 +431,7 @@ class NotificationServingSnapshot:
     payload: SignalDeliveryReadPayload
     projection_generation_id: str | None = None
     projection_source_receipts: Mapping[str, str] = dataclass_field(default_factory=dict)
-    signal_coverage_receipt: SignalSourceCoverageReceipt | None = None
+    signal_observed_prefix: SignalObservedPrefixReceipt | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -970,15 +970,15 @@ class NotificationStateStore(SignalBusStore):
             replicated_count=replicated_count,
         )
 
-    def _signal_coverage_from_transaction(
+    def _observed_signal_prefix_from_transaction(
         self,
         connection: sqlite3.Connection,
         *,
         observed_at: datetime,
         selected: tuple[ServingSignalRecord, ...],
         truncated: bool,
-    ) -> SignalSourceCoverageReceipt | None:
-        """Verify a complete source prefix and its window inside the serving read transaction."""
+    ) -> SignalObservedPrefixReceipt | None:
+        """Verify the observed spool prefix inside the serving read transaction."""
         if truncated:
             return None
         observation = connection.execute(
@@ -1081,7 +1081,7 @@ class NotificationStateStore(SignalBusStore):
             or signal_window_digest(selected_window) != digest
         ):
             return None
-        return SignalSourceCoverageReceipt(
+        return SignalObservedPrefixReceipt(
             source_generation_id=str(observation["source_generation_id"]),
             first_global_sequence=1,
             source_high_watermark=high,
@@ -1284,7 +1284,7 @@ class NotificationStateStore(SignalBusStore):
                     )
                 deliveries = tuple(self._outbox_from_row(row) for row in delivery_rows)
             omitted = visible_signal_count - len(selected)
-            coverage_receipt = self._signal_coverage_from_transaction(
+            observed_prefix = self._observed_signal_prefix_from_transaction(
                 connection,
                 observed_at=observed,
                 selected=signal_records,
@@ -1324,7 +1324,7 @@ class NotificationStateStore(SignalBusStore):
             projection_source_receipts=(
                 {} if projection_snapshot is None else projection_snapshot.source_receipts
             ),
-            signal_coverage_receipt=coverage_receipt,
+            signal_observed_prefix=observed_prefix,
         )
 
     def apply_recipient_alias_migrations(
