@@ -9,7 +9,7 @@ import os
 import re
 import sqlite3
 import stat
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -31,6 +31,7 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.builtin_presets import BUILTIN_PRESET_SCREENS
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
     CanvasPublicationKeyring,
@@ -60,8 +61,10 @@ from rquant.page_control import (
     CanvasCurrentHead,
     PageControlOutbox,
     PageControlStatus,
+    parse_page_control_command,
     read_canvas_current_head,
 )
+from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
     ReplicaRead,
@@ -94,6 +97,12 @@ _MAX_CANVAS_HITS = 20_000
 _MAX_CANVAS_DEFINITIONS = 512
 _MAX_CANVAS_DEFINITION_BYTES = 64 * 1024
 _MAX_CANVAS_CATALOG_BYTES = 2 * 1024 * 1024
+_MAX_POOL_DEFINITIONS = 512
+_MAX_POOL_DEFINITION_BYTES = 64 * 1024
+_MAX_POOL_CATALOG_BYTES = 2 * 1024 * 1024
+_MAX_POOL_MUTATIONS = 8_192
+_MAX_POOL_AUDIT_BYTES = 8 * 1024 * 1024
+_MAX_POOL_AUDIT_CELL_CHARS = 128 * 1024
 _MAX_RESEARCH_GATES = 512
 _MAX_AUDIT_FINDING_LIST_BYTES = 32 * 1024
 _MAX_PULSE_ROWS = 512
@@ -281,6 +290,69 @@ def _read_bound_optional_file(
         raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     binding.verify()
     return raw, opened
+
+
+def _pool_definition_projection(
+    root: Path,
+    audit: _ReadonlyPageControlAuditReader,
+) -> ServingProjectionPayload:
+    """Read every managed pool through pinned paths in one PageControl audit snapshot."""
+    root = Path(os.path.abspath(root))
+    mutations = audit.pool_mutations()
+    files: dict[str, Mapping[str, object] | None] = {}
+    try:
+        binding = _bind_readonly_directory(root, label="user pool catalog")
+    except FileNotFoundError:
+        binding = None
+    if binding is not None:
+        try:
+            names = sorted(os.listdir(binding.descriptor))
+            definition_names = [name for name in names if name.endswith(".json")]
+            if len(definition_names) + len(BUILTIN_PRESET_SCREENS) > _MAX_POOL_DEFINITIONS:
+                raise PageProjectionSourceIntegrityError("user pools exceed row bound")
+            total_bytes = 0
+            identities: dict[str, os.stat_result] = {}
+            for name in definition_names:
+                base_name = name.removesuffix(".json")
+                if not re.fullmatch(r"[\w\u4e00-\u9fff-]+", base_name):
+                    raise PageProjectionSourceIntegrityError("user pool filename is invalid")
+                found = _read_bound_optional_file(
+                    binding,
+                    name,
+                    max_bytes=_MAX_POOL_DEFINITION_BYTES,
+                    label="user pool definition",
+                )
+                if found is None:
+                    raise PageProjectionSourceIntegrityError("user pool rotated while read")
+                raw_bytes, identity = found
+                identities[name] = identity
+                total_bytes += len(raw_bytes)
+                if total_bytes > _MAX_POOL_CATALOG_BYTES:
+                    raise PageProjectionSourceIntegrityError("user pool catalog exceeds byte bound")
+                try:
+                    value = strict_json_loads(raw_bytes)
+                except (UnicodeDecodeError, StrictJsonError, ValueError):
+                    value = None
+                files[base_name] = value if isinstance(value, dict) else None
+            if sorted(os.listdir(binding.descriptor)) != names:
+                raise PageProjectionSourceIntegrityError("user pool catalog rotated while read")
+            for name, before in identities.items():
+                after = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+                if _copy_identity(after) != _copy_identity(before):
+                    raise PageProjectionSourceIntegrityError(
+                        "user pool definition changed while read"
+                    )
+            binding.verify()
+        finally:
+            binding.close()
+    rows = build_pool_definition_rows(files, mutations, root_path=str(root))
+    # A client request time is not a server publication time. Verified command and
+    # file versions live in the rows, whose content hash changes only with facts.
+    return ServingProjectionPayload(
+        table_name="pool_definition",
+        available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
+        rows=rows,
+    )
 
 
 def _local_naive(value: datetime) -> datetime:
@@ -943,6 +1015,110 @@ class _ReadonlyPageControlAuditReader:
                 latest[canvas_name] = audit
         return MappingProxyType(latest)
 
+    def pool_mutations(self) -> Mapping[str, PoolMutation]:
+        """Newest successful mutation per pool, from this pinned audit generation."""
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.command_id, c.command_kind, c.command_hash,
+                       CASE WHEN length(c.payload_json) <= ?
+                            THEN c.payload_json ELSE NULL END AS payload_json,
+                       c.status,
+                       CASE WHEN length(c.result_json) <= ?
+                            THEN c.result_json ELSE NULL END AS result_json,
+                       e.command_id AS effect_command_id,
+                       e.command_hash AS effect_command_hash,
+                       e.effect_kind, e.status AS effect_status,
+                       CASE WHEN length(e.result_json) <= ?
+                            THEN e.result_json ELSE NULL END AS effect_result_json
+                FROM page_control_command AS c
+                LEFT JOIN page_control_effect AS e USING (command_id)
+                WHERE c.status = ?
+                  AND c.command_kind IN (?, ?, ?, ?, ?)
+                ORDER BY c.rowid DESC
+                LIMIT ?
+                """,
+                (
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    PageControlStatus.SUCCEEDED.value,
+                    "save_user_pool",
+                    "save_user_pool_v2",
+                    "save_nl_preset",
+                    "fork_builtin_pool",
+                    "delete_user_pool",
+                    _MAX_POOL_MUTATIONS + 1,
+                ),
+            )
+            return self._pool_mutations_from_rows(rows)
+
+    @classmethod
+    def _pool_mutations_from_rows(cls, rows: Iterable[sqlite3.Row]) -> Mapping[str, PoolMutation]:
+        latest: dict[str, PoolMutation] = {}
+        audit_bytes = 0
+        for position, row in enumerate(rows):
+            if position >= _MAX_POOL_MUTATIONS:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit exceeds event bound"
+                )
+            if any(
+                row[field] is None
+                for field in ("payload_json", "result_json", "effect_result_json")
+            ):
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit exceeds cell bound or lacks result"
+                )
+            audit_bytes += sum(
+                len(value.encode("utf-8"))
+                for value in (
+                    row["payload_json"],
+                    row["result_json"],
+                    row["effect_result_json"],
+                )
+                if isinstance(value, str)
+            )
+            if audit_bytes > _MAX_POOL_AUDIT_BYTES:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit exceeds byte bound"
+                )
+            audit = cls._audit_row(row)
+            try:
+                command = parse_page_control_command(dict(audit.payload))
+                receipt = strict_json_loads(row["result_json"])
+                effect = strict_json_loads(row["effect_result_json"])
+            except (TypeError, ValueError, StrictJsonError) as exc:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool audit is malformed"
+                ) from exc
+            if (
+                command.kind != audit.command_kind
+                or canonical_sha256(command.model_dump(mode="json")) != audit.command_hash
+                or not isinstance(receipt, dict)
+                or receipt != effect
+            ):
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl pool effect result mismatches command"
+                )
+            base_name = (
+                command.target_base_name
+                if command.kind == "fork_builtin_pool"
+                else command.name
+                if command.kind == "save_nl_preset"
+                else command.base_name
+            )
+            if base_name not in latest:
+                latest[base_name] = PoolMutation(
+                    command_id=audit.command_id,
+                    command_kind=audit.command_kind,
+                    command_hash=audit.command_hash,
+                    payload=audit.payload,
+                    result=receipt,
+                )
+            if len(latest) > _MAX_POOL_DEFINITIONS:
+                raise PageProjectionSourceIntegrityError("PageControl pools exceed row bound")
+        return MappingProxyType(latest)
+
     @staticmethod
     def _canvas_name_for_audit(audit: _ReadonlyPageControlAudit) -> str | None:
         field_name = (
@@ -962,7 +1138,7 @@ class _ReadonlyPageControlAuditReader:
     @staticmethod
     def _audit_row(row: sqlite3.Row) -> _ReadonlyPageControlAudit:
         try:
-            payload = json.loads(row["payload_json"])
+            payload = strict_json_loads(row["payload_json"])
             status = PageControlStatus(row["status"])
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise PageProjectionSourceIntegrityError("PageControl audit row is malformed") from exc
@@ -1020,6 +1196,7 @@ class DuckDBSignalPageProjectionSource:
         canvas_receipt_root: Path | None = None,
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
+        user_presets_root: Path | None = None,
         surge_live_root: Path | None = None,
         notification_log_path: Path | None = None,
         control_root: Path | None = None,
@@ -1041,6 +1218,9 @@ class DuckDBSignalPageProjectionSource:
             None if canvas_receipt_root is None else Path(os.path.abspath(canvas_receipt_root))
         )
         self.canvas_publication_keyring = canvas_publication_keyring
+        self.user_presets_root = (
+            None if user_presets_root is None else Path(os.path.abspath(user_presets_root))
+        )
         self.surge_live_root = (
             None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
         )
@@ -1060,6 +1240,10 @@ class DuckDBSignalPageProjectionSource:
         if self.canvas_catalog_root is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
                 "configured canvas catalog requires readonly PageControl audit authority"
+            )
+        if self.user_presets_root is not None and self.page_control_outbox is None:
+            raise PageProjectionSourceIntegrityError(
+                "configured user pools require readonly PageControl audit authority"
             )
         if self.canvas_catalog_root is not None and (
             self.canvas_receipt_root is None or self.canvas_publication_keyring is None
@@ -1140,6 +1324,14 @@ class DuckDBSignalPageProjectionSource:
         hits = database.canvas_hits
         available = database.available_at
         canvas_definitions = self._canvas_definitions(observed=observed)
+        pool_definition = (
+            None
+            if self.user_presets_root is None
+            else _pool_definition_projection(
+                self.user_presets_root,
+                self.page_control_outbox,
+            )
+        )
         pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
             self.surge_live_root,
             observed=observed,
@@ -1169,6 +1361,7 @@ class DuckDBSignalPageProjectionSource:
             ),
             canvas_hits=hits,
             canvas_definitions=canvas_definitions,
+            pool_definition=pool_definition,
             pulse_history=pulse_history,
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
@@ -2195,7 +2388,12 @@ class SignalPageProjectionProducer:
                 for item in previous.payload.projections
                 if item.table_name not in _COMPANION_SIGNAL_TABLES
                 and item.table_name
-                not in {"surge_event", "legacy_notification", "legacy_notification_status"}
+                not in {
+                    "surge_event",
+                    "legacy_notification",
+                    "legacy_notification_status",
+                    "pool_definition",
+                }
             )
             try:
                 surge = _read_surge_event_projection(self.source.surge_live_root, observed=observed)
@@ -3126,6 +3324,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_definition",
         }
         optional_names = {
+            "pool_definition",
             "pulse_history",
             "pulse_alert",
             "surge_runtime_config",
@@ -3155,6 +3354,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         canvas_latest_trade_date: CanvasLatestTradeDateProjectionRow | None = None,
         canvas_hits: tuple[CanvasHitProjectionRow, ...] = (),
         canvas_definitions: tuple[CanvasDefinitionProjectionRow, ...] = (),
+        pool_definition: ServingProjectionPayload | None = None,
         pulse_history: PulseHistoryProjectionSource | None = None,
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
@@ -3215,6 +3415,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                 )
             )
         for table_name, projection in (
+            ("pool_definition", pool_definition),
             ("monitor_event", monitor_event),
             ("surge_event", surge_event),
             ("legacy_notification", legacy_notification),
