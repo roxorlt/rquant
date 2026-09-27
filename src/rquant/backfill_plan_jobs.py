@@ -32,8 +32,12 @@ from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_JOBS = 4096
+_MAX_EVENTS_PER_JOB = 64
 _PLAN_PREFIX = "daily-bar-backfill-plan-v1-"
 _JobStatus = Literal["queued", "running", "succeeded", "failed"]
+_EventType = Literal[
+    "queued", "started", "resumed", "source_check", "succeeded", "failed", "retried"
+]
 _ErrorCode = Literal[
     "snapshot_changed", "invalid_evidence", "artifact_invalid", "internal_error"
 ]
@@ -100,6 +104,23 @@ class BackfillPlanJobReceipt(_JobModel):
         return self
 
 
+class BackfillPlanJobEvent(_JobModel):
+    """A bounded status transition, safe for a user-facing progress projection."""
+
+    event_id: int = Field(gt=0, strict=True)
+    task_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    event_type: _EventType
+    attempts: int = Field(ge=0, strict=True)
+    occurred_at: datetime
+    error_code: _ErrorCode | None = None
+
+    @model_validator(mode="after")
+    def validate_error(self) -> BackfillPlanJobEvent:
+        if (self.event_type == "failed") != (self.error_code is not None):
+            raise ValueError("only failed events may carry an error code")
+        return self
+
+
 class BackfillPlanArtifactUnavailableError(RuntimeError):
     """A persisted success cannot currently be verified against its sealed artifact."""
 
@@ -108,6 +129,7 @@ class BackfillPlanArtifactUnavailableError(RuntimeError):
 class _Claim:
     task_id: str
     token: str
+    attempts: int
     request: BackfillPlanJobRequest
     snapshot_sha256: str | None
 
@@ -183,6 +205,29 @@ class BackfillPlanJobStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backfill_plan_job_event (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN (
+                        'queued','started','resumed','source_check','succeeded','failed','retried'
+                    )),
+                    attempts INTEGER NOT NULL CHECK(attempts >= 0),
+                    occurred_at TEXT NOT NULL,
+                    error_code TEXT CHECK(error_code IN (
+                        'snapshot_changed','invalid_evidence','artifact_invalid','internal_error'
+                    )),
+                    CHECK((event_type = 'failed') = (error_code IS NOT NULL))
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS backfill_plan_job_event_task_order
+                ON backfill_plan_job_event(task_id, event_id)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.state_path, timeout=5, isolation_level=None)
@@ -203,6 +248,35 @@ class BackfillPlanJobStore:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _record_event(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        event_type: _EventType,
+        attempts: int,
+        occurred_at: str,
+        error_code: _ErrorCode | None = None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO backfill_plan_job_event (
+                task_id, event_type, attempts, occurred_at, error_code
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (task_id, event_type, attempts, occurred_at, error_code),
+        )
+        connection.execute(
+            """
+            DELETE FROM backfill_plan_job_event
+            WHERE task_id = ? AND event_id NOT IN (
+                SELECT event_id FROM backfill_plan_job_event
+                WHERE task_id = ? ORDER BY event_id DESC LIMIT ?
+            )
+            """,
+            (task_id, task_id, _MAX_EVENTS_PER_JOB),
+        )
 
     def submit(self, request: BackfillPlanJobRequest) -> BackfillPlanJobReceipt:
         request = BackfillPlanJobRequest.model_validate(request)
@@ -237,6 +311,13 @@ class BackfillPlanJobStore:
                     """,
                     (task_id, request.idempotency_key, payload, digest, now, now),
                 )
+                self._record_event(
+                    connection,
+                    task_id=task_id,
+                    event_type="queued",
+                    attempts=0,
+                    occurred_at=now,
+                )
         return self.status(task_id)
 
     def status(self, task_id: str) -> BackfillPlanJobReceipt:
@@ -257,6 +338,31 @@ class BackfillPlanJobStore:
             assert receipt.plan_hash is not None
             self._verify_artifact(receipt.plan_hash, request, row["snapshot_sha256"])
         return receipt
+
+    def list_events(self, task_id: str, *, limit: int = 20) -> tuple[BackfillPlanJobEvent, ...]:
+        if type(limit) is not int or limit < 1 or limit > _MAX_EVENTS_PER_JOB:
+            raise ValueError(f"event limit must be between 1 and {_MAX_EVENTS_PER_JOB}")
+        self.status(task_id)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, task_id, event_type, attempts, occurred_at, error_code
+                FROM backfill_plan_job_event
+                WHERE task_id = ? ORDER BY event_id DESC LIMIT ?
+                """,
+                (task_id, limit),
+            ).fetchall()
+        return tuple(
+            BackfillPlanJobEvent(
+                event_id=row["event_id"],
+                task_id=row["task_id"],
+                event_type=row["event_type"],
+                attempts=row["attempts"],
+                occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                error_code=row["error_code"],
+            )
+            for row in reversed(rows)
+        )
 
     def lookup_by_key(
         self, idempotency_key: str
@@ -289,16 +395,27 @@ class BackfillPlanJobStore:
 
     def retry_failed(self, task_id: str) -> BackfillPlanJobReceipt:
         with self._transaction() as connection:
+            now = _utc(self.clock).isoformat()
             changed = connection.execute(
                 """
                 UPDATE backfill_plan_job
                 SET status = 'queued', error_code = NULL, updated_at = ?
                 WHERE task_id = ? AND status = 'failed'
                 """,
-                (_utc(self.clock).isoformat(), task_id),
+                (now, task_id),
             ).rowcount
             if changed != 1:
                 raise ValueError("only a failed backfill plan task can be retried")
+            attempts = connection.execute(
+                "SELECT attempts FROM backfill_plan_job WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            self._record_event(
+                connection,
+                task_id=task_id,
+                event_type="retried",
+                attempts=attempts,
+                occurred_at=now,
+            )
         return self.status(task_id)
 
     @staticmethod
@@ -358,9 +475,17 @@ class BackfillPlanJobStore:
                     row["task_id"],
                 ),
             )
+            self._record_event(
+                connection,
+                task_id=row["task_id"],
+                event_type="resumed" if row["status"] == "running" else "started",
+                attempts=row["attempts"] + 1,
+                occurred_at=now.isoformat(),
+            )
             return _Claim(
                 task_id=row["task_id"],
                 token=token,
+                attempts=row["attempts"] + 1,
                 request=BackfillPlanJobRequest.model_validate_json(row["request_json"]),
                 snapshot_sha256=row["snapshot_sha256"],
             )
@@ -384,6 +509,13 @@ class BackfillPlanJobStore:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("backfill plan task lease or source identity was lost")
+            self._record_event(
+                connection,
+                task_id=claim.task_id,
+                event_type="source_check",
+                attempts=claim.attempts,
+                occurred_at=now,
+            )
 
     def _renew(self, claim: _Claim) -> bool:
         now = _utc(self.clock)
@@ -424,6 +556,13 @@ class BackfillPlanJobStore:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("backfill plan task lease was lost")
+            self._record_event(
+                connection,
+                task_id=claim.task_id,
+                event_type="succeeded",
+                attempts=claim.attempts,
+                occurred_at=now,
+            )
         return self.status(claim.task_id)
 
     def _finish_failure(self, claim: _Claim, error_code: _ErrorCode) -> BackfillPlanJobReceipt:
@@ -441,6 +580,14 @@ class BackfillPlanJobStore:
             ).rowcount
             if changed != 1:
                 raise RuntimeError("backfill plan task lease was lost")
+            self._record_event(
+                connection,
+                task_id=claim.task_id,
+                event_type="failed",
+                attempts=claim.attempts,
+                occurred_at=now,
+                error_code=error_code,
+            )
         return self.status(claim.task_id)
 
 
