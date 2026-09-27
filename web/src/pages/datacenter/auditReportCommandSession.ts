@@ -9,6 +9,9 @@ export interface AuditReportDateEvidence {
   market: Market | null | undefined;
   /** Include only SSE open dates verified by a Web result from the same data generation. */
   verifiedOpenDates?: readonly string[];
+  /** The same verified result's latest closed SSE date. */
+  verifiedClosedThrough?: string;
+  verifiedEarliestSelectable?: string;
 }
 
 export interface AuditReportJournal {
@@ -96,9 +99,20 @@ export function validateAuditReportRange(
 ): string | null {
   const invalid = validateRangeDays(start, end);
   if (invalid) return invalid;
-  const latest = latestClosedAuditDate(evidence?.market);
+  const latest = evidence?.verifiedClosedThrough ?? latestClosedAuditDate(evidence?.market);
   if (latest === null) return "交易日历暂不可用，请稍后重试。";
+  if (dateMillis(latest) === null) return "交易日历暂不可用，请稍后重试。";
+  if (
+    evidence?.verifiedEarliestSelectable !== undefined &&
+    start < evidence.verifiedEarliestSelectable
+  )
+    return "开始日期须在可核对范围内。";
   if (end > latest) return "结束日期须为已收盘交易日。";
+  if (evidence?.verifiedClosedThrough !== undefined) {
+    if (!evidence.verifiedOpenDates?.includes(end))
+      return "该日期尚未核实为交易日，请选最近已收盘交易日。";
+    return null;
+  }
   if (
     !provenClosedAuditDates(evidence?.market).includes(end) &&
     !evidence?.verifiedOpenDates?.includes(end)
