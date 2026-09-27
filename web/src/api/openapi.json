@@ -1450,35 +1450,167 @@
       "BackfillPlanProgress": {
         "additionalProperties": false,
         "properties": {
+          "attempts": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempts"
+          },
           "availability": {
-            "const": "unavailable",
+            "enum": [
+              "unavailable",
+              "empty",
+              "ready"
+            ],
             "title": "Availability",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "event_history": {
+            "default": "unavailable",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Event History",
             "type": "string"
           },
           "logs": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/BackfillPlanProgressLog"
             },
-            "maxItems": 100,
+            "maxItems": 20,
             "title": "Logs",
             "type": "array"
           },
           "message": {
-            "const": "任务进度尚未提供",
-            "default": "任务进度尚未提供",
+            "maxLength": 64,
             "title": "Message",
             "type": "string"
           },
+          "plan_hash": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Hash"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
           "task_id": {
-            "title": "Task Id",
-            "type": "null"
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
           }
         },
         "required": [
           "availability",
-          "task_id"
+          "message"
         ],
         "title": "BackfillPlanProgress",
+        "type": "object"
+      },
+      "BackfillPlanProgressLog": {
+        "additionalProperties": false,
+        "properties": {
+          "attempts": {
+            "minimum": 0.0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "event_id": {
+            "exclusiveMinimum": 0.0,
+            "title": "Event Id",
+            "type": "integer"
+          },
+          "event_type": {
+            "enum": [
+              "queued",
+              "started",
+              "resumed",
+              "source_check",
+              "succeeded",
+              "failed",
+              "retried"
+            ],
+            "title": "Event Type",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 64,
+            "title": "Message",
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "event_type",
+          "attempts",
+          "occurred_at",
+          "message"
+        ],
+        "title": "BackfillPlanProgressLog",
         "type": "object"
       },
       "BackfillPlanSource": {

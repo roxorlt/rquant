@@ -1136,21 +1136,52 @@ export interface components {
         };
         /** BackfillPlanProgress */
         BackfillPlanProgress: {
+            /** Attempts */
+            attempts?: number | null;
             /**
              * Availability
-             * @constant
+             * @enum {string}
              */
-            availability: "unavailable";
-            /** Logs */
-            logs?: string[];
+            availability: "unavailable" | "empty" | "ready";
+            /** Created At */
+            created_at?: string | null;
             /**
-             * Message
-             * @default 任务进度尚未提供
-             * @constant
+             * Event History
+             * @default unavailable
+             * @enum {string}
              */
-            message: "任务进度尚未提供";
+            event_history: "available" | "unavailable";
+            /** Logs */
+            logs?: components["schemas"]["BackfillPlanProgressLog"][];
+            /** Message */
+            message: string;
+            /** Plan Hash */
+            plan_hash?: string | null;
+            /** Status */
+            status?: ("queued" | "running" | "succeeded" | "failed") | null;
             /** Task Id */
-            task_id: null;
+            task_id?: string | null;
+            /** Updated At */
+            updated_at?: string | null;
+        };
+        /** BackfillPlanProgressLog */
+        BackfillPlanProgressLog: {
+            /** Attempts */
+            attempts: number;
+            /** Event Id */
+            event_id: number;
+            /**
+             * Event Type
+             * @enum {string}
+             */
+            event_type: "queued" | "started" | "resumed" | "source_check" | "succeeded" | "failed" | "retried";
+            /** Message */
+            message: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
         };
         /** BackfillPlanSource */
         BackfillPlanSource: {

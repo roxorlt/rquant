@@ -117,6 +117,7 @@ function planHandlers(options: { changedOnNext?: boolean; detailMissing?: boolea
             next_cursor: null,
             progress: {
               availability: "unavailable",
+              event_history: "unavailable",
               task_id: null,
               message: "任务进度尚未提供",
               logs: [],
@@ -130,6 +131,7 @@ function planHandlers(options: { changedOnNext?: boolean; detailMissing?: boolea
             next_cursor: secondHash,
             progress: {
               availability: "unavailable",
+              event_history: "unavailable",
               task_id: null,
               message: "任务进度尚未提供",
               logs: [],
@@ -149,6 +151,7 @@ function planHandlers(options: { changedOnNext?: boolean; detailMissing?: boolea
         plan: detail(hash, hash === olderHash ? 2 : hash === secondHash ? 1 : 0),
         progress: {
           availability: "unavailable",
+          event_history: "unavailable",
           task_id: null,
           message: "任务进度尚未提供",
           logs: [],
