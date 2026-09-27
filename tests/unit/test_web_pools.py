@@ -8,8 +8,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from rquant.pool_definition_projection import build_pool_definition_rows
+from rquant.screen.loader import BASIC_COLS_MAP, IND_COLS_MAP, PRICE_COLS_MAP, STATE_COLS_MAP
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.app import create_app
+from rquant.web.pool_rule_view import _FIELDS
+from rquant.web.screen_catalog import screen_blocks
 from rquant.web.settings import WebSettings
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
@@ -35,6 +39,36 @@ def _canvas_row(name: str, pool_refs: list[str]) -> dict:
         "source_identity_hash": "b" * 64,
         "record_hash": "c" * 64,
         "version_hash": "d" * 64,
+    }
+
+
+def _rule_row(
+    name: str,
+    *,
+    display_name: str | None = None,
+    state: str = "available",
+    reason: str | None = None,
+    rules: list[dict] | None = None,
+    depends_on: str | None = None,
+    delay_mode: str = "none",
+    delay_days: int = 0,
+) -> dict:
+    return {
+        "pool_name": name,
+        "display_name": display_name or name.removeprefix("user/"),
+        "description": "收盘后观察",
+        "source_kind": "user",
+        "state": state,
+        "reason": reason,
+        "version": "v" * 64 if state == "available" else None,
+        "command_id": "private-command",
+        "command_hash": "h" * 64,
+        "depends_on": depends_on,
+        "delay_mode": delay_mode,
+        "delay_days": delay_days,
+        "rules_json": json.dumps(rules if rules is not None else [], ensure_ascii=False),
+        "include_columns_json": "[]",
+        "can_edit": state == "available",
     }
 
 
@@ -297,6 +331,30 @@ def test_single_named_diagnostic_keeps_its_published_label(tmp_path: Path) -> No
     assert pool["steps"] == [{"step_index": 1, "label": "均线过滤", "count": 3}]
 
 
+def test_technical_diagnostic_label_does_not_reach_page_copy(tmp_path: Path) -> None:
+    root = tmp_path / "technical-step"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection(
+                "canvas_diagnostic",
+                [
+                    {
+                        "trade_date": "2026-09-23",
+                        "preset_name": "n-shape-pool1",
+                        "step_index": 1,
+                        "rule_label": "gt(CLOSE[0])",
+                        "remaining_count": 3,
+                    }
+                ],
+            ),
+        ),
+    )
+    pool = next(item for item in _get(root)["data"]["pools"] if item["key"] == "n-shape-pool1")
+    assert pool["steps"] == [{"step_index": 1, "label": "筛选步骤 1", "count": 3}]
+
+
 def test_user_pool_names_and_unknown_keys_remain_distinguishable(tmp_path: Path) -> None:
     root = tmp_path / "names"
     keys = ["user/突破新高", "user/回踩均线", "unknown-alpha", "unknown-beta"]
@@ -382,3 +440,260 @@ def test_later_canvas_keeps_a_published_pool_at_global_limit(tmp_path: Path) -> 
     assert later_key in pools
     assert pools[later_key]["state"] == "current"
     assert pools[later_key]["member_count"] == 1
+
+
+def test_published_rules_include_real_conditions_and_keep_results_separate(tmp_path: Path) -> None:
+    root = tmp_path / "rules"
+    rows = list(build_pool_definition_rows({}, {}, root_path="/synthetic"))
+    rows.append(
+        _rule_row(
+            "user/观察池",
+            rules=[
+                {"name": "board_in", "args": {"boards": ["main", "gem"]}},
+                {"name": "has_lower_shadow", "args": {"min_amplitude": 0.02}},
+            ],
+            depends_on="n-shape-pool1",
+            delay_mode="exact",
+            delay_days=2,
+        )
+    )
+    build_web_fixture(root, "baseline", signal_projections=(_projection("pool_definition", rows),))
+
+    body = _get(root)
+    data = body["data"]
+    assert data["rules_available"] is True
+    pools = {pool["key"]: pool for pool in data["pools"]}
+    assert pools["n-shape-pool1"]["member_count"] == 3
+    assert pools["n-shape-pool2"]["definition"]["depends_on"] == "n-shape-pool1"
+    assert pools["n-shape-pool2"]["definition"]["delay_label"] == "使用父池前 2 个交易日内的成员"
+    custom = pools["user/观察池"]
+    assert custom["state"] == "unpublished"
+    assert custom["definition"]["state"] == "available"
+    assert custom["definition"]["source_label"] == "自建规则"
+    assert custom["definition"]["depends_on"] == "n-shape-pool1"
+    assert custom["definition"]["delay_label"] == "使用父池恰好前 2 个交易日的成员"
+    assert custom["definition"]["rules"][0] == {
+        "label": "所属板块",
+        "parameters": [{"label": "板块", "value": "沪深主板、创业板"}],
+    }
+    assert {
+        item["label"]: item["value"] for item in custom["definition"]["rules"][1]["parameters"]
+    } == {
+        "下影线倍数": "1.5",
+        "最小振幅": "2%",
+        "相对日期": "所选交易日",
+    }
+    size_rule = next(
+        item
+        for item in pools["n-shape-pool1"]["definition"]["rules"]
+        if item["label"] == "流通市值低于"
+    )
+    assert size_rule["parameters"][0] == {"label": "市值上限", "value": "150 亿元"}
+    assert "private-command" not in json.dumps(data, ensure_ascii=False)
+    assert "command_hash" not in json.dumps(data, ensure_ascii=False)
+
+
+def test_rule_source_and_result_source_are_independent(tmp_path: Path) -> None:
+    members = _get(_published_baseline(tmp_path / "members"))["data"]
+    assert members["rules_available"] is False
+    assert members["pools"][0]["member_count"] is not None
+
+    root = tmp_path / "rules-only"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection(
+                "pool_definition", list(build_pool_definition_rows({}, {}, root_path="/synthetic"))
+            ),
+            _projection("canvas_latest_trade_date", []),
+            _projection("canvas_hit", []),
+            _projection("screen_bounds", []),
+        ),
+    )
+    data = _get(root)["data"]
+    assert data["state"] == "no_data"
+    assert data["rules_available"] is True
+    assert data["latest_trade_date"] is None
+    assert {pool["key"] for pool in data["pools"]} == {"n-shape-pool1", "n-shape-pool2"}
+    assert all(pool["definition"]["state"] == "available" for pool in data["pools"])
+    assert all(pool["member_count"] is None for pool in data["pools"])
+
+
+def _published_baseline(root: Path) -> Path:
+    build_web_fixture(root, "baseline")
+    return root
+
+
+def test_invalid_and_oversized_rule_rows_never_look_published(tmp_path: Path) -> None:
+    damaged = _rule_row("user/损坏池")
+    damaged["rules_json"] = "{"
+    rows = [
+        _rule_row("user/旧文件", state="migration_required", reason="no_audit"),
+        _rule_row("user/损坏文件", state="unavailable", reason="invalid_content"),
+        _rule_row("user/缺父池", state="unavailable", reason="parent_missing"),
+        _rule_row("user/已删除", state="deleted"),
+        damaged,
+        _rule_row("user/未知积木", rules=[{"name": "not_registered", "args": {}}]),
+        _rule_row("user/过多规则", rules=[{"name": "not_st", "args": {}}] * 65),
+    ]
+    root = tmp_path / "invalid"
+    build_web_fixture(root, "baseline", signal_projections=(_projection("pool_definition", rows),))
+    pools = {
+        pool["key"]: pool["definition"]
+        for pool in _get(root)["data"]["pools"]
+        if pool["definition"] is not None
+    }
+
+    assert pools["user/旧文件"]["state"] == "migration_required"
+    assert pools["user/旧文件"]["reason_label"] == "旧规则尚未完成迁移"
+    assert pools["user/损坏文件"]["reason_label"] == "规则文件内容损坏"
+    assert pools["user/缺父池"]["reason_label"] == "父池不存在"
+    assert pools["user/已删除"]["state"] == "deleted"
+    assert pools["user/损坏池"]["reason_label"] == "规则内容损坏"
+    assert pools["user/未知积木"]["reason_label"] == "规则内容无法识别"
+    assert pools["user/过多规则"]["state"] == "limit_exceeded"
+    assert all(item["depends_on"] is None and item["rules"] == [] for item in pools.values())
+
+
+def test_every_executable_wide_field_is_readable(tmp_path: Path) -> None:
+    fields = set().union(
+        PRICE_COLS_MAP.values(),
+        IND_COLS_MAP.values(),
+        STATE_COLS_MAP.values(),
+        BASIC_COLS_MAP.values(),
+    )
+    assert set(_FIELDS) == fields
+    calls = [
+        {"name": "gt", "args": {"left": f"{field}[1]", "right": 1}} for field in sorted(fields)
+    ]
+    root = tmp_path / "all-fields"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("pool_definition", [_rule_row("user/全部字段", rules=calls)]),
+        ),
+    )
+    definition = next(
+        item["definition"] for item in _get(root)["data"]["pools"] if item["key"] == "user/全部字段"
+    )
+    assert definition["state"] == "available"
+    assert len(definition["rules"]) == len(fields)
+    names = {
+        field: item["parameters"][0]["value"]
+        for field, item in zip(sorted(fields), definition["rules"], strict=True)
+    }
+    assert names["AMOUNT"] == "前 1 个交易日成交额"
+    assert names["PRE_CLOSE"] == "前 1 个交易日前收盘价"
+    assert names["TOTAL_MV"] == "前 1 个交易日总市值"
+    assert names["MACD_HIST"] == "前 1 个交易日 MACD 柱"
+    assert names["KDJ_J"] == "前 1 个交易日 KDJ J 值"
+
+
+def test_rule_number_copy_preserves_small_thresholds_and_common_format(tmp_path: Path) -> None:
+    values = [1e-9, 12345.6789012345, 1000000.0, -0.0025, 0.0]
+    calls = [{"name": "gt", "args": {"left": "CLOSE[0]", "right": value}} for value in values]
+    root = tmp_path / "numeric-thresholds"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("pool_definition", [_rule_row("user/精度池", rules=calls)]),
+        ),
+    )
+    definition = next(
+        item["definition"] for item in _get(root)["data"]["pools"] if item["key"] == "user/精度池"
+    )
+    assert definition["state"] == "available"
+    assert [item["parameters"][1]["value"] for item in definition["rules"]] == [
+        "0.000000001",
+        "12,345.6789012345",
+        "1,000,000",
+        "-0.0025",
+        "0",
+    ]
+
+
+def test_every_registered_rule_and_default_parameter_has_readable_copy(tmp_path: Path) -> None:
+    calls = [
+        {
+            "name": block.key,
+            "args": {
+                parameter.key: parameter.initial
+                for parameter in block.parameters
+                if parameter.initial is not None
+            },
+        }
+        for block in screen_blocks()
+    ]
+    root = tmp_path / "all-blocks"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("pool_definition", [_rule_row("user/全部条件", rules=calls)]),
+        ),
+    )
+    pool = next(item for item in _get(root)["data"]["pools"] if item["key"] == "user/全部条件")
+    assert pool["definition"]["state"] == "available"
+    rendered = pool["definition"]["rules"]
+    assert len(rendered) == len(screen_blocks())
+    assert all(
+        item["label"] and all(param["value"] for param in item["parameters"]) for item in rendered
+    )
+    assert all("name" not in item and "args" not in item for item in rendered)
+
+
+def test_rule_only_pool_list_is_bounded_and_marks_truncation(tmp_path: Path) -> None:
+    root = tmp_path / "many-rules"
+    rows = [_rule_row(f"user/规则{index:02d}") for index in range(70)]
+    build_web_fixture(root, "baseline", signal_projections=(_projection("pool_definition", rows),))
+    data = _get(root)["data"]
+    assert len(data["pools"]) == 64
+    assert data["pools_truncated"] is True
+
+
+def test_rules_and_members_switch_together_between_generations(tmp_path: Path) -> None:
+    root = tmp_path / "switch-rules"
+    first_rule = _rule_row("user/观察池", rules=[{"name": "not_st", "args": {}}])
+    build_web_fixture(
+        root, "baseline", signal_projections=(_projection("pool_definition", [first_rule]),)
+    )
+    app = create_app(
+        WebSettings(serving_root=root, stale_after_seconds=600),
+        clock=lambda: FIXTURE_BUILT_AT + timedelta(minutes=1, seconds=30),
+        background=False,
+    )
+    with TestClient(app) as client:
+        first = client.get("/api/v1/pools")
+        second_rule = _rule_row("user/观察池", rules=[{"name": "not_bj", "args": {}}])
+        build_web_fixture(
+            root,
+            "baseline",
+            sequence=1,
+            signal_projections=(
+                _projection("pool_definition", [second_rule]),
+                _projection(
+                    "canvas_hit",
+                    [
+                        {
+                            "trade_date": "2026-09-23",
+                            "preset_name": "n-shape-pool1",
+                            "ts_code": "600001.SH",
+                            "row_json": "{}",
+                        }
+                    ],
+                ),
+            ),
+        )
+        app.state.web.tracker.refresh()
+        second = client.get("/api/v1/pools")
+
+    assert first.headers["x-rquant-generation"] != second.headers["x-rquant-generation"]
+    before = {pool["key"]: pool for pool in first.json()["data"]["pools"]}
+    after = {pool["key"]: pool for pool in second.json()["data"]["pools"]}
+    assert before["user/观察池"]["definition"]["rules"][0]["label"] == "排除 ST"
+    assert after["user/观察池"]["definition"]["rules"][0]["label"] == "排除北交所"
+    assert before["n-shape-pool1"]["member_count"] == 3
+    assert after["n-shape-pool1"]["member_count"] == 1

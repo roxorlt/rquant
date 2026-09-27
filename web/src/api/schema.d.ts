@@ -1514,6 +1514,30 @@ export interface components {
             /** Window */
             window: string;
         };
+        /** PoolDefinitionView */
+        PoolDefinitionView: {
+            /** Delay Label */
+            delay_label: string | null;
+            /** Depends On */
+            depends_on: string | null;
+            /** Description */
+            description: string | null;
+            /** Name */
+            name: string;
+            /** Reason Label */
+            reason_label: string | null;
+            /** Rules */
+            rules: components["schemas"]["PoolRuleItem"][];
+            /** Source Label */
+            source_label: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "available" | "migration_required" | "unavailable" | "deleted" | "limit_exceeded";
+            /** Status Label */
+            status_label: string;
+        };
         /** PoolMember */
         PoolMember: {
             /** Close */
@@ -1524,6 +1548,20 @@ export interface components {
             name: string | null;
             /** Pct Chg */
             pct_chg: number | null;
+        };
+        /** PoolRuleItem */
+        PoolRuleItem: {
+            /** Label */
+            label: string;
+            /** Parameters */
+            parameters: components["schemas"]["PoolRuleParameter"][];
+        };
+        /** PoolRuleParameter */
+        PoolRuleParameter: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
         };
         /** PoolStep */
         PoolStep: {
@@ -1549,6 +1587,11 @@ export interface components {
             /** Pools Truncated */
             pools_truncated: boolean;
             /**
+             * Rules Available
+             * @default false
+             */
+            rules_available: boolean;
+            /**
              * State
              * @enum {string}
              */
@@ -1569,6 +1612,7 @@ export interface components {
         };
         /** PublishedPool */
         PublishedPool: {
+            definition?: components["schemas"]["PoolDefinitionView"] | null;
             /** Key */
             key: string;
             /** Member Count */

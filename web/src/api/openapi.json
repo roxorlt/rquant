@@ -3452,6 +3452,97 @@
         "title": "PipelineStage",
         "type": "object"
       },
+      "PoolDefinitionView": {
+        "properties": {
+          "delay_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delay Label"
+          },
+          "depends_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depends On"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason Label"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/PoolRuleItem"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "available",
+              "migration_required",
+              "unavailable",
+              "deleted",
+              "limit_exceeded"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "status_label",
+          "reason_label",
+          "source_label",
+          "description",
+          "depends_on",
+          "delay_label",
+          "rules"
+        ],
+        "title": "PoolDefinitionView",
+        "type": "object"
+      },
       "PoolMember": {
         "properties": {
           "close": {
@@ -3499,6 +3590,45 @@
           "pct_chg"
         ],
         "title": "PoolMember",
+        "type": "object"
+      },
+      "PoolRuleItem": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "parameters": {
+            "items": {
+              "$ref": "#/components/schemas/PoolRuleParameter"
+            },
+            "title": "Parameters",
+            "type": "array"
+          }
+        },
+        "required": [
+          "label",
+          "parameters"
+        ],
+        "title": "PoolRuleItem",
+        "type": "object"
+      },
+      "PoolRuleParameter": {
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "PoolRuleParameter",
         "type": "object"
       },
       "PoolStep": {
@@ -3562,6 +3692,11 @@
           },
           "pools_truncated": {
             "title": "Pools Truncated",
+            "type": "boolean"
+          },
+          "rules_available": {
+            "default": false,
+            "title": "Rules Available",
             "type": "boolean"
           },
           "state": {
@@ -3643,6 +3778,16 @@
       },
       "PublishedPool": {
         "properties": {
+          "definition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PoolDefinitionView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "key": {
             "title": "Key",
             "type": "string"

@@ -12,6 +12,7 @@ const base: Schemas["PoolsData"] = {
   state: "ready",
   latest_trade_date: "2026-09-23",
   definitions_available: true,
+  rules_available: false,
   canvases: [
     {
       name: "观察画布",
@@ -46,6 +47,33 @@ const base: Schemas["PoolsData"] = {
     },
   ],
   pools_truncated: false,
+};
+
+const firstRule: Schemas["PoolDefinitionView"] = {
+  name: "N 形态一池",
+  state: "available",
+  status_label: "已发布",
+  reason_label: null,
+  source_label: "内置规则",
+  description: "昨首板与安全过滤",
+  depends_on: null,
+  delay_label: null,
+  rules: [{ label: "排除 ST", parameters: [] }],
+};
+const secondRule: Schemas["PoolDefinitionView"] = {
+  ...firstRule,
+  name: "N 形态二池",
+  depends_on: "n-shape-pool1",
+  delay_label: "使用父池前 2 个交易日内的成员",
+  rules: [
+    {
+      label: "明显下影线",
+      parameters: [
+        { label: "最小振幅（%）", value: "2%" },
+        { label: "相对日期", value: "所选交易日" },
+      ],
+    },
+  ],
 };
 
 function respond(data: Schemas["PoolsData"] = base) {
@@ -161,4 +189,97 @@ it("explains when no pools have been published", async () => {
   respond({ ...base, state: "no_data", latest_trade_date: null, canvases: [], pools: [] });
   renderApp("/pools");
   expect(await screen.findByText("还没有已发布的池子")).toBeInTheDocument();
+});
+
+it("draws published dependencies through condition nodes and opens rules by keyboard", async () => {
+  const first = base.pools[0];
+  const canvas = base.canvases[0];
+  if (!first || !canvas) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    rules_available: true,
+    canvases: [{ ...canvas, pool_keys: ["n-shape-pool1", "n-shape-pool2"] }],
+    pools: [
+      { ...first, name: "N 形态一池", definition: firstRule },
+      {
+        ...first,
+        key: "n-shape-pool2",
+        name: "N 形态二池",
+        member_count: 2,
+        definition: secondRule,
+      },
+    ],
+  });
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  const graph = await screen.findByRole("group", { name: "已发布规则与池子" });
+  expect(graph.querySelectorAll(".react-flow__node")).toHaveLength(4);
+  const condition = graph.querySelector<HTMLElement>('[data-id="condition:n-shape-pool2"]');
+  expect(condition).toBeTruthy();
+  act(() => condition?.focus());
+  await user.keyboard("{Enter}");
+  expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent("明显下影线");
+  expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent("最小振幅（%）2%");
+  expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent("N 形态一池");
+  expect(screen.getByRole("region", { name: "上次选股结果" })).toHaveTextContent("2 只");
+  expect(screen.getByRole("button", { name: "查看 N 形态二池条件" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(container.querySelector("main")?.textContent).not.toContain("n-shape-pool");
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("keeps published rules visible when the member source is unavailable", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    state: "unavailable",
+    latest_trade_date: null,
+    rules_available: true,
+    pools: [
+      {
+        ...first,
+        name: "N 形态一池",
+        state: "unavailable",
+        trade_date: null,
+        member_count: null,
+        members: [],
+        definition: firstRule,
+      },
+    ],
+  });
+  renderApp("/pools");
+  expect(await screen.findByRole("region", { name: "规则详情" })).toHaveTextContent("排除 ST");
+  expect(screen.getByRole("region", { name: "上次选股结果" })).toHaveTextContent("结果暂不可用");
+  expect(screen.queryByText("样本01")).not.toBeInTheDocument();
+});
+
+it("does not invent a parent line when the parent is hidden by the list limit", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    rules_available: true,
+    pools_truncated: true,
+    canvases: [],
+    pools: [
+      {
+        ...first,
+        key: "user/观察池",
+        name: "观察池",
+        definition: { ...secondRule, name: "观察池", depends_on: "user/未展示" },
+      },
+    ],
+  });
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  const graph = await screen.findByRole("group", { name: "已发布规则与池子" });
+  expect(graph.querySelectorAll(".react-flow__node")).toHaveLength(2);
+  await user.click(screen.getByRole("button", { name: "查看 观察池条件" }));
+  expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent(
+    "父池未显示，列表已达上限",
+  );
+  expect(container.querySelector("main")?.textContent).not.toContain("user/未展示");
 });
