@@ -266,6 +266,7 @@ class NotifierSettings(RuntimeContractModel):
     page_projection_database_path: Path | None = None
     page_projection_surge_live_root: Path | None = None
     page_projection_canvas_catalog_root: Path | None = None
+    page_projection_user_presets_root: Path | None = None
     page_projection_canvas_receipt_root: Path | None = None
     page_projection_page_control_outbox_path: Path | None = None
     page_projection_canvas_active_key_id: str | None = Field(
@@ -320,6 +321,7 @@ class NotifierSettings(RuntimeContractModel):
         "page_projection_database_path",
         "page_projection_surge_live_root",
         "page_projection_canvas_catalog_root",
+        "page_projection_user_presets_root",
         "page_projection_canvas_receipt_root",
         "page_projection_page_control_outbox_path",
         "serving_authority_root",
@@ -348,20 +350,31 @@ class NotifierSettings(RuntimeContractModel):
             and self.page_projection_database_path is None
         ):
             raise ValueError("canvas catalog projection requires a page projection database")
+        if self.page_projection_user_presets_root is not None and (
+            self.page_projection_database_path is None
+            or self.page_projection_page_control_outbox_path is None
+        ):
+            raise ValueError("pool projection requires a database and PageControl audit")
         canvas_authority = (
             self.page_projection_canvas_receipt_root,
-            self.page_projection_page_control_outbox_path,
             self.page_projection_canvas_active_key_id,
             self.page_projection_canvas_active_public_key_pem,
         )
-        if self.page_projection_canvas_catalog_root is not None and any(
-            value is None for value in canvas_authority
+        if self.page_projection_canvas_catalog_root is not None and (
+            any(value is None for value in canvas_authority)
+            or self.page_projection_page_control_outbox_path is None
         ):
             raise ValueError("canvas catalog projection requires its full public authority")
         if self.page_projection_canvas_catalog_root is None and any(
             value is not None for value in canvas_authority
         ):
             raise ValueError("canvas projection authority requires a catalog root")
+        if (
+            self.page_projection_page_control_outbox_path is not None
+            and self.page_projection_canvas_catalog_root is None
+            and self.page_projection_user_presets_root is None
+        ):
+            raise ValueError("PageControl audit requires a canvas or pool projection")
         if (
             self.page_projection_canvas_active_key_id
             in self.page_projection_canvas_previous_public_key_pems
@@ -1074,6 +1087,7 @@ def notifier_builder(
                         clock=clock,
                         surge_live_root=settings.page_projection_surge_live_root,
                         canvas_catalog_root=settings.page_projection_canvas_catalog_root,
+                        user_presets_root=settings.page_projection_user_presets_root,
                         canvas_receipt_root=settings.page_projection_canvas_receipt_root,
                         canvas_publication_keyring=canvas_keyring,
                         #: #241: the outbox belongs to the page-control service and its

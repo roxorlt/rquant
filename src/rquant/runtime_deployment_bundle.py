@@ -1361,6 +1361,19 @@ def _validate_manifest_authority(
             }
             if not required_public_authority <= set(manifest.settings):
                 raise ValueError("canvas projection manifest lacks public key authority")
+        if "page_projection_user_presets_root" in manifest.settings:
+            expected_user_presets = runtime_root / "serving" / "page-control" / "user_presets"
+            if Path(str(manifest.settings["page_projection_user_presets_root"])) != (
+                expected_user_presets
+            ):
+                raise ValueError(
+                    "page_projection_user_presets_root must equal "
+                    "the PageControl user_presets catalog"
+                )
+            if Path(str(manifest.settings.get("page_projection_page_control_outbox_path", ""))) != (
+                runtime_root / "control" / "page-control.sqlite3"
+            ):
+                raise ValueError("pool projection must use the PageControl audit authority")
     if manifest.service_kind is RuntimeServiceKind.PAPER_BROKER:
         paper_root = runtime_root / "live" / "paper-brokers" / instance
         expected_paper_paths = {
