@@ -25,6 +25,8 @@
 | `monitor_event` | `trade_date`、`trigger_time`、`ts_code`、`level`、`trigger_price`、`level_price`、`trigger_type`、`pool`；仅主键三元组不够。 |
 | `surge_event` | `trade_date`、`confirmed_at`、`ts_code`、`name`、`theme`、`price`、`pct_chg`、`cum_amount`、`rel_cum`、`room_to_limit_pct`、`status`。 |
 
+现有 Serving `signals` 小表未发布信封的全部身份字段，读端不能仅凭小表重算 `signal_id`。当前信任链是：发布器先通过 `ServingReadModelInput` 对完整 `SignalEnvelope` 做哈希验证，再生成受内容摘要保护的不可变数据代；网页与 PageControl 在该代中核对 `signal_id`、原始行集合和来源代。以后若信号改由其他路径写入，必须补等价的完整信封验证/来源证明；没有正面证明时该来源不完整，不能开放确认或精确计数。
+
 哈希域为 `rquant-alert/v1` 加来源类型与有序字段。日期用 ISO 日期；时刻先按源约定解释（盯盘时刻在发布前按上海时间转 UTC，爆量日期加 `HH:mm` 按上海时间解释），再规范为 UTC 微秒；字符串按原已发布值作 NFC 规范化，不从页面文案逆推；浮点只接受有限 IEEE 754 值，以 `float.hex()` 表示并把负零归零；空值有独立标记。重复身份、非法时间或非有限数值令该来源不完整。新增或移除身份字段须升版本，不重解释历史确认。
 
 ### 重试、崩溃与来源完整性
