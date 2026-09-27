@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from enum import StrEnum
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 
 class CatalogModel(BaseModel):
@@ -50,3 +52,38 @@ class CatalogSummary(CatalogModel):
 class CatalogList(CatalogModel):
     version: int
     datasets: list[CatalogSummary]
+
+
+class SampleState(StrEnum):
+    AVAILABLE = "available"
+    EMPTY = "empty"
+    MISSING = "missing"
+    UNSUPPORTED = "unsupported"
+    UNPUBLISHED = "unpublished"
+    STALE = "stale"
+    ERROR = "error"
+
+
+SampleValue = str | int | float | bool | None
+
+
+class CatalogSample(CatalogModel):
+    state: SampleState
+    rows: list[dict[str, SampleValue]] = Field(max_length=20)
+
+    @model_validator(mode="after")
+    def validate_rows(self) -> CatalogSample:
+        if (self.state is SampleState.AVAILABLE) != bool(self.rows):
+            raise ValueError("available samples require rows; other states require none")
+        return self
+
+
+class CatalogSamplesDocument(CatalogModel):
+    version: int = Field(default=1, ge=1, le=1)
+    built_at: AwareDatetime
+    datasets: dict[str, CatalogSample]
+
+
+class CatalogDatasetDetail(CatalogDataset):
+    sample_fields: list[CatalogField]
+    sample: CatalogSample

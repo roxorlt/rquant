@@ -818,7 +818,7 @@
         "title": "CandidatesSummary",
         "type": "object"
       },
-      "CatalogDataset": {
+      "CatalogDatasetDetail": {
         "additionalProperties": false,
         "properties": {
           "category": {
@@ -851,10 +851,20 @@
             "title": "Purpose",
             "type": "string"
           },
+          "sample": {
+            "$ref": "#/components/schemas/CatalogSample"
+          },
           "sample_available": {
             "default": false,
             "title": "Sample Available",
             "type": "boolean"
+          },
+          "sample_fields": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogField"
+            },
+            "title": "Sample Fields",
+            "type": "array"
           },
           "schema_available": {
             "title": "Schema Available",
@@ -891,9 +901,11 @@
           "visibility_note",
           "primary_key",
           "schema_available",
-          "fields"
+          "fields",
+          "sample_fields",
+          "sample"
         ],
-        "title": "CatalogDataset",
+        "title": "CatalogDatasetDetail",
         "type": "object"
       },
       "CatalogField": {
@@ -962,6 +974,47 @@
           "datasets"
         ],
         "title": "CatalogList",
+        "type": "object"
+      },
+      "CatalogSample": {
+        "additionalProperties": false,
+        "properties": {
+          "rows": {
+            "items": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            "maxItems": 20,
+            "title": "Rows",
+            "type": "array"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SampleState"
+          }
+        },
+        "required": [
+          "state",
+          "rows"
+        ],
+        "title": "CatalogSample",
         "type": "object"
       },
       "CatalogSummary": {
@@ -1504,10 +1557,10 @@
         "title": "Envelope[BoardsData]",
         "type": "object"
       },
-      "Envelope_CatalogDataset_": {
+      "Envelope_CatalogDatasetDetail_": {
         "properties": {
           "data": {
-            "$ref": "#/components/schemas/CatalogDataset"
+            "$ref": "#/components/schemas/CatalogDatasetDetail"
           },
           "serving": {
             "$ref": "#/components/schemas/ServingMeta"
@@ -1517,7 +1570,7 @@
           "data",
           "serving"
         ],
-        "title": "Envelope[CatalogDataset]",
+        "title": "Envelope[CatalogDatasetDetail]",
         "type": "object"
       },
       "Envelope_CatalogList_": {
@@ -4826,6 +4879,19 @@
         "title": "ResearchJobsData",
         "type": "object"
       },
+      "SampleState": {
+        "enum": [
+          "available",
+          "empty",
+          "missing",
+          "unsupported",
+          "unpublished",
+          "stale",
+          "error"
+        ],
+        "title": "SampleState",
+        "type": "string"
+      },
       "SavePoolCommand": {
         "additionalProperties": false,
         "properties": {
@@ -6766,7 +6832,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope_CatalogDataset_"
+                  "$ref": "#/components/schemas/Envelope_CatalogDatasetDetail_"
                 }
               }
             },

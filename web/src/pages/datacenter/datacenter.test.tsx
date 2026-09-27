@@ -7,7 +7,7 @@ import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
 
 type CatalogList = Schemas["CatalogList"];
-type CatalogDataset = Schemas["CatalogDataset"];
+type CatalogDataset = Schemas["CatalogDatasetDetail"];
 
 const daily: CatalogDataset = {
   dataset_id: "daily_bar",
@@ -21,6 +21,8 @@ const daily: CatalogDataset = {
   primary_key: ["ts_code", "trade_date"],
   schema_available: true,
   sample_available: false,
+  sample: { state: "unpublished", rows: [] },
+  sample_fields: [],
   fields: [
     {
       key: "ts_code",
@@ -205,6 +207,95 @@ describe("数据中心目录", () => {
     );
     renderApp("/datacenter");
     expect(await screen.findByText("暂时读不到数据目录")).toBeInTheDocument();
+  });
+
+  it("renders only approved sample fields and never prints hostile metadata", async () => {
+    catalogHandlers();
+    const hostile = {
+      ...daily,
+      sample_available: true,
+      fields: [
+        ...daily.fields,
+        {
+          key: "conflict_reason",
+          name: "冲突原因",
+          description: "核对来源",
+          data_type: "VARCHAR",
+          unit: null,
+          is_primary_key: false,
+        },
+      ],
+      sample_fields: daily.fields,
+      sample: {
+        state: "available",
+        rows: [
+          {
+            ts_code: "000001.SZ",
+            pct_chg: 3.14,
+            source_file: "/private/secrets/a.json",
+            conflict_reason: "notifier.admin.shadow.v1",
+            snapshot_hash: "a".repeat(64),
+          },
+        ],
+      },
+    };
+    server.use(
+      http.get("*/api/v1/data/catalog/daily_bar", () =>
+        HttpResponse.json({
+          data: hostile,
+          serving: {
+            generation_id: null,
+            built_at: null,
+            age_seconds: null,
+            state: "ready",
+            message: null,
+            detail: "static",
+          },
+        }),
+      ),
+    );
+    renderApp("/datacenter");
+    const table = await screen.findByRole("table", { name: "样例数据" });
+    expect(within(table).getByText("000001.SZ")).toBeInTheDocument();
+    expect(within(table).getByText("3.14")).toBeInTheDocument();
+    expect(within(table).queryAllByText("a".repeat(64))).toHaveLength(0);
+    const body = document.querySelector("main")?.textContent ?? "";
+    for (const secret of [
+      "/private/secrets/a.json",
+      "notifier.admin.shadow.v1",
+      "conflict_reason",
+      "source_file",
+      "a".repeat(64),
+    ]) {
+      expect(body).not.toContain(secret);
+    }
+    expect(findJargon(body)).toEqual([]);
+  });
+
+  it.each([
+    ["empty", "这份数据暂时没有记录"],
+    ["missing", "这份数据尚未接入样例"],
+    ["stale", "样例数据需要更新"],
+    ["error", "暂时读不到样例数据"],
+  ] as const)("shows the %s sample empty state", async (state, copy) => {
+    catalogHandlers();
+    server.use(
+      http.get("*/api/v1/data/catalog/daily_bar", () =>
+        HttpResponse.json({
+          data: { ...daily, sample: { state, rows: [] } },
+          serving: {
+            generation_id: null,
+            built_at: null,
+            age_seconds: null,
+            state: "ready",
+            message: null,
+            detail: "static",
+          },
+        }),
+      ),
+    );
+    renderApp("/datacenter");
+    expect(await screen.findByText(copy)).toBeInTheDocument();
   });
 });
 

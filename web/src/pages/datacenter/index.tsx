@@ -26,10 +26,9 @@ const FIELD_COLUMNS: DataColumn<CatalogField>[] = [
     header: "字段",
     value: (field) => field.name,
     cell: (field) => (
-      <Tip content={field.description}>
+      <Tip content={`${field.description} · ${field.key}`}>
         <span className="dc-field-name">
           <span>{field.name}</span>
-          <span className="mono dc-field-key">{field.key}</span>
         </span>
       </Tip>
     ),
@@ -50,6 +49,51 @@ const FIELD_COLUMNS: DataColumn<CatalogField>[] = [
     secondary: true,
   },
 ];
+
+type SampleRow = CatalogDataset["sample"]["rows"][number];
+
+function sampleText(field: CatalogField, value: SampleRow[string] | undefined): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "number") {
+    if (field.unit === "%" || field.key === "close" || field.key === "price") {
+      return value.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    return value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+  }
+  return value;
+}
+
+function sampleColumns(fields: CatalogField[]): DataColumn<SampleRow>[] {
+  return fields.map((field) => ({
+    id: field.key,
+    header: field.name,
+    value: (row) => {
+      const value = row[field.key];
+      return typeof value === "boolean" ? (value ? "是" : "否") : (value ?? null);
+    },
+    numeric: ["DOUBLE", "FLOAT", "INTEGER", "BIGINT", "SMALLINT"].includes(field.data_type),
+    cell: (row) => {
+      const display = sampleText(field, row[field.key]);
+      return display.length > 22 ? (
+        <Tip content={display}>
+          <span className="dc-sample-truncated">{display.slice(0, 22)}…</span>
+        </Tip>
+      ) : (
+        display
+      );
+    },
+  }));
+}
+
+const SAMPLE_EMPTY_COPY: Record<Exclude<CatalogDataset["sample"]["state"], "available">, string> = {
+  unpublished: "样例数据尚未发布",
+  empty: "这份数据暂时没有记录",
+  missing: "这份数据尚未接入样例",
+  unsupported: "这份数据暂时没有可展示的字段",
+  stale: "样例数据需要更新",
+  error: "暂时读不到样例数据",
+};
 
 function DatasetList({
   datasets,
@@ -114,7 +158,15 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
           </div>
           <div>
             <dt>主键</dt>
-            <dd className="mono dc-key-list">{dataset.primary_key.join(" · ")}</dd>
+            <dd>
+              <Tip content={dataset.primary_key.join(" · ")}>
+                <span>
+                  {dataset.primary_key
+                    .map((key) => dataset.fields.find((field) => field.key === key)?.name ?? "字段")
+                    .join(" · ")}
+                </span>
+              </Tip>
+            </dd>
           </div>
         </dl>
       </Panel>
@@ -145,8 +197,31 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
           <EmptyState title="字段结构待发布" hint="这份数据尚无可核对的字段结构" />
         )}
       </Panel>
-      <Panel title="样例数据">
-        <EmptyState title="样例数据尚未发布" />
+      <Panel
+        title="样例数据"
+        sub={
+          dataset.sample.state === "available" ? `最近 ${dataset.sample.rows.length} 条` : undefined
+        }
+        flush={dataset.sample.state === "available"}
+      >
+        {dataset.sample.state === "available" && dataset.sample_fields.length ? (
+          <div className="dc-sample-table">
+            <DataTable
+              label="样例数据"
+              rows={dataset.sample.rows.slice(0, 20)}
+              columns={sampleColumns(dataset.sample_fields)}
+              rowKey={(row) => String(dataset.sample.rows.indexOf(row))}
+            />
+          </div>
+        ) : (
+          <EmptyState
+            title={
+              SAMPLE_EMPTY_COPY[
+                dataset.sample.state === "available" ? "error" : dataset.sample.state
+              ]
+            }
+          />
+        )}
       </Panel>
       <AuditPanel datasetId={dataset.dataset_id} />
     </div>

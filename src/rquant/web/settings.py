@@ -24,6 +24,7 @@ STALE_AFTER_ENV_VAR = "RQUANT_WEB_STALE_AFTER_SECONDS"
 SCREEN_PRIMARY_ENV_VAR = "RQUANT_WEB_SCREEN_PRIMARY_PATH"
 SCREEN_REPLICA_ENV_VAR = "RQUANT_WEB_SCREEN_REPLICA_PATH"
 SCREEN_HISTORY_ENV_VAR = "RQUANT_WEB_SCREEN_HISTORY_ROOT"
+CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
 
 DEFAULT_BIND = "127.0.0.1:8768"
 DEFAULT_PAGE_CONTROL_URL = "http://127.0.0.1:8767/v1/commands"
@@ -71,6 +72,7 @@ class WebSettings(BaseModel):
     screen_primary_path: Path | None = None
     screen_replica_path: Path | None = None
     screen_history_root: Path | None = None
+    catalog_samples_file: Path | None = None
 
     @model_validator(mode="after")
     def validate_screen_source(self) -> Self:
@@ -125,4 +127,7 @@ class WebSettings(BaseModel):
         history = source.get(SCREEN_HISTORY_ENV_VAR, "").strip()
         if history:
             values["screen_history_root"] = Path(history)
+        samples = source.get(CATALOG_SAMPLES_ENV_VAR, "").strip()
+        if samples:
+            values["catalog_samples_file"] = Path(samples)
         return cls.model_validate(values)
