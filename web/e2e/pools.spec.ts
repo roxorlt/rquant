@@ -119,5 +119,76 @@ for (const viewport of [
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
       expect(watcher.problems).toEqual([]);
     });
+
+    test("shows an entry day and marks only the matching generation's daily candle", async ({
+      page,
+    }) => {
+      const watcher = watch(page);
+      let entryCode: string | null = null;
+      let dailyGeneration: string | null = null;
+      await page.route("**/api/v1/pools", async (route) => {
+        const upstream = await route.fetch();
+        const body = (await upstream.json()) as Schemas["Envelope_PoolsData_"];
+        const pool = body.data.pools.find((item) => item.key === "n-shape-pool1");
+        const member = pool?.members[0];
+        if (!pool || !member) throw new Error("synthetic pool member is missing");
+        entryCode = member.code;
+        member.entry_trade_date = "2026-09-22";
+        member.entry_close = null;
+        pool.result = {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: pool.member_count,
+        };
+        await route.fulfill({ response: upstream, body: JSON.stringify(body) });
+      });
+      await page.route("**/api/v1/panorama/stocks/*/daily", async (route) => {
+        const upstream = await route.fetch();
+        const body = (await upstream.json()) as Schemas["Envelope_DailyData_"];
+        if (entryCode !== null) body.data.ts_code = entryCode;
+        body.data.bars = [
+          {
+            date: "2026-09-22",
+            open: 10,
+            high: 11,
+            low: 9.8,
+            close: 10.5,
+            volume: 1000,
+            ma5: null,
+            ma10: null,
+            ma20: null,
+            provisional: false,
+          },
+        ];
+        if (dailyGeneration !== null) body.serving.generation_id = dailyGeneration;
+        await route.fulfill({ response: upstream, body: JSON.stringify(body) });
+      });
+      await page.goto("./#/pools");
+      const table = page.getByRole("table", { name: "池子成员" });
+      await expect(table.getByRole("columnheader", { name: "入池日", exact: true })).toBeVisible();
+      const row = table.locator("tbody tr").first();
+      await expect(row).toContainText("2026-09-22");
+      await expect(row).toContainText("—");
+      await row.focus();
+      await row.press("Enter");
+      const drawer = page.getByRole("dialog");
+      await expect(drawer.getByText("入池 · 2026-09-22")).toBeVisible();
+      await expect(drawer.getByRole("img", { name: /日 K/ })).toBeVisible();
+      await expect(drawer).toBeInViewport({ ratio: 0.98 });
+      await page.screenshot({
+        path: join(tmpdir(), `rquant-pool-entry-${viewport.name}.png`),
+      });
+      await expectNoHorizontalOverflow(page, "pool entry");
+      dailyGeneration = "another-generation";
+      await page.reload();
+      const nextRow = page.getByRole("table", { name: "池子成员" }).locator("tbody tr").first();
+      await nextRow.focus();
+      await nextRow.press("Enter");
+      await expect(page.getByRole("dialog").getByRole("img", { name: /日 K/ })).toBeVisible();
+      await expect(page.getByText("入池 · 2026-09-22")).toHaveCount(0);
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      expect(watcher.problems).toEqual([]);
+    });
   });
 }

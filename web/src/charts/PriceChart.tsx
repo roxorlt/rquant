@@ -56,8 +56,19 @@ export interface SessionMark {
   label: string;
 }
 
+export interface DailyMark {
+  time: string;
+  label: string;
+}
+
 export type PriceChartProps =
-  | { mode: "daily"; bars: readonly DailyBar[]; label: string; className?: string }
+  | {
+      mode: "daily";
+      bars: readonly DailyBar[];
+      marks?: readonly DailyMark[];
+      label: string;
+      className?: string;
+    }
   | {
       mode: "intraday" | "five-day";
       bars: readonly SessionBar[];
@@ -371,14 +382,26 @@ export function PriceChart(props: PriceChartProps) {
       const provisional = props.bars.filter((bar) => bar.provisional);
       if (series) {
         markersRef.current ??= createSeriesMarkers(series as ISeriesApi<"Candlestick", Time>, []);
+        const barDates = new Set(props.bars.map((bar) => bar.time));
         markersRef.current.setMarkers(
-          provisional.map((bar) => ({
-            time: bar.time as Time,
-            position: "aboveBar" as const,
-            color: colors.muted,
-            shape: "circle" as const,
-            text: "盘中",
-          })),
+          [
+            ...provisional.map((bar) => ({
+              time: bar.time as Time,
+              position: "aboveBar" as const,
+              color: colors.muted,
+              shape: "circle" as const,
+              text: "盘中",
+            })),
+            ...(props.marks ?? [])
+              .filter((mark) => barDates.has(mark.time))
+              .map((mark) => ({
+                time: mark.time as Time,
+                position: "belowBar" as const,
+                color: colors.accent,
+                shape: "arrowUp" as const,
+                text: mark.label,
+              })),
+          ].sort((left, right) => String(left.time).localeCompare(String(right.time))),
         );
       }
       chart.applyOptions({ timeScale: { tickMarkFormatter: undefined } });
