@@ -82,6 +82,33 @@ def test_false_caller_digest_is_rejected_before_artifact_publication(tmp_path: P
     assert not directory.exists() or not list(directory.iterdir())
 
 
+def test_worker_can_derive_digest_from_the_fixed_source(tmp_path: Path) -> None:
+    from rquant.backfill_plan_artifact import (
+        capture_backfill_snapshot_identity,
+        create_and_publish_daily_bar_backfill_plan,
+        load_daily_bar_backfill_plan,
+    )
+
+    snapshot = _snapshot(tmp_path)
+    identity = capture_backfill_snapshot_identity(snapshot)
+    destination = create_and_publish_daily_bar_backfill_plan(
+        snapshot_path=snapshot,
+        expected_file_sha256=None,
+        expected_file_identity=identity,
+        snapshot_label="fixed-replica",
+        evidence_code_revision="revision-1",
+        audit_start=START,
+        completed_through=END,
+        observed_at=OBSERVED,
+        assumptions=_assumptions(),
+        directory=tmp_path / "plans",
+    )
+
+    assert load_daily_bar_backfill_plan(destination).source.claimed_file_sha256 == hashlib.sha256(
+        snapshot.read_bytes()
+    ).hexdigest()
+
+
 def test_replaced_snapshot_during_evidence_read_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
