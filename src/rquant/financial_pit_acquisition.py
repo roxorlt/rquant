@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -9,8 +10,9 @@ import os
 import re
 import sqlite3
 import stat
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -40,6 +42,12 @@ _REQUIRED_COLUMNS = {
     "express": frozenset({"ts_code", "ann_date", "end_date"}),
     "dividend": frozenset({"ts_code", "ann_date", "end_date", "div_proc"}),
 }
+_MANIFEST_NAME = "manifest.sqlite3"
+_IDENTITY_NAME = "archive.identity.json"
+_ANCHOR_NAME = "manifest.anchor.jsonl"
+_MAX_SNAPSHOT_BYTES = 64_000_000
+_MAX_ANCHOR_BYTES = 16_000_000
+_MAX_ANCHOR_LINE_BYTES = 1024
 
 
 def _json_bytes(value: object) -> bytes:
@@ -133,6 +141,7 @@ class AcquisitionLimits(_Model):
     max_rows_per_response: int = Field(default=5000, gt=0, le=10000)
     max_batch_bytes: int = Field(default=8_000_000, gt=0, le=32_000_000)
     max_field_chars: int = Field(default=8192, gt=0, le=65_536)
+    max_columns: int = Field(default=256, gt=0, le=1024)
 
 
 class FinancialRawRow(_Model):
@@ -176,6 +185,28 @@ class FinancialObservedVersion(_Model):
     row: FinancialRawRow
     first_observed_at: datetime
     first_response_status: FinancialStatus
+
+
+class _AnchorRecord(_Model):
+    archive_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    generation: int = Field(ge=0)
+    snapshot_sha256: str = Field(pattern=_SHA256_PATTERN)
+    high_water: str | None
+    batch_count: int = Field(ge=0)
+    previous_record_sha256: str | None = Field(pattern=_SHA256_PATTERN)
+
+
+@dataclass
+class _ArchiveState:
+    root_fd: int
+    identity_fd: int
+    snapshot_fd: int
+    anchor_fd: int
+    connection: sqlite3.Connection
+    archive_id: str
+    snapshot_sha256: str
+    anchor: _AnchorRecord
+    anchor_record_sha256: str
 
 
 def _validate_query_for_day(query: FinancialQuery, run_day: date) -> None:
@@ -237,6 +268,8 @@ def _normalized_rows(
     if official_cap is not None and len(response) > official_cap:
         raise ValueError("supplier response exceeds documented interface limit")
     columns = list(response.columns)
+    if len(columns) > limits.max_columns:
+        raise ValueError("supplier response exceeds local column limit")
     if any(not isinstance(column, str) for column in columns) or len(set(columns)) != len(columns):
         raise ValueError("supplier response columns must be unique strings")
     if any(len(column) > limits.max_field_chars for column in columns):
@@ -245,11 +278,16 @@ def _normalized_rows(
         raise ValueError("supplier response lacks required columns")
 
     rows: list[FinancialRawRow] = []
-    for source_row in response.to_dict(orient="records"):
+    value_bytes_seen = 0
+    for source_values in response.itertuples(index=False, name=None):
         values = {
             name: _normalize_scalar(value, limits.max_field_chars)
-            for name, value in source_row.items()
+            for name, value in zip(columns, source_values, strict=True)
         }
+        value_bytes = _json_bytes(values)
+        value_bytes_seen += len(value_bytes)
+        if value_bytes_seen > limits.max_batch_bytes:
+            raise ValueError("supplier response exceeds local batch byte limit")
         if values["ts_code"] != query.ts_code:
             raise ValueError("supplier row belongs to a different security")
         parsed_dates = {
@@ -284,7 +322,7 @@ def _normalized_rows(
             FinancialRawRow(
                 values=values,
                 pit_usable=pit_usable,
-                content_sha256=_sha256(_json_bytes(values)),
+                content_sha256=_sha256(value_bytes),
             )
         )
 
@@ -325,109 +363,389 @@ def _open_child_directory(parent_fd: int, name: str, *, create: bool = False) ->
         with suppress(FileExistsError):
             os.mkdir(name, 0o700, dir_fd=parent_fd)
     try:
-        return os.open(
+        descriptor = os.open(
             name,
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=parent_fd,
         )
+        opened = os.fstat(descriptor)
+        if opened.st_uid != os.getuid() or opened.st_mode & 0o022:
+            os.close(descriptor)
+            raise ValueError(f"archive child has unsafe permissions: {name}")
+        return descriptor
     except OSError as exc:
         raise ValueError(f"archive child is not a safe directory: {name}") from exc
 
 
+def _write_all(descriptor: int, data: bytes) -> None:
+    written = 0
+    while written < len(data):
+        count = os.write(descriptor, data[written:])
+        if count <= 0:
+            raise OSError("archive write made no progress")
+        written += count
+
+
+def _safe_regular_stat(root_fd: int, name: str, descriptor: int) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or opened.st_mode & 0o022
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        or not stat.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+    ):
+        raise ValueError(f"archive {name} is not a safe single-link regular file")
+    return opened
+
+
+def _open_regular(
+    root_fd: int, name: str, *, max_bytes: int, writable: bool = False
+) -> tuple[int, bytes]:
+    flags = (os.O_RDWR | os.O_APPEND if writable else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=root_fd)
+    except OSError as exc:
+        raise ValueError(f"archive {name} cannot be safely opened") from exc
+    try:
+        opened = _safe_regular_stat(root_fd, name, descriptor)
+        if opened.st_size > max_bytes:
+            raise ValueError(f"archive {name} exceeds its byte limit")
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(descriptor, min(1_048_576, max_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) != opened.st_size or len(data) > max_bytes:
+            raise ValueError(f"archive {name} changed during read")
+        after = os.fstat(descriptor)
+        if (opened.st_size, opened.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError(f"archive {name} changed during read")
+        return descriptor, bytes(data)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _create_regular(root_fd: int, name: str, data: bytes) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=root_fd,
+    )
+    try:
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _anchor_line(record: _AnchorRecord) -> bytes:
+    line = _json_bytes(record.model_dump(mode="json")) + b"\n"
+    if len(line) > _MAX_ANCHOR_LINE_BYTES:
+        raise ValueError("anchor record exceeds its byte limit")
+    return line
+
+
+def _parse_anchor(data: bytes) -> tuple[_AnchorRecord, str, int]:
+    if not data or len(data) > _MAX_ANCHOR_BYTES:
+        raise ValueError("archive anchor is missing or exceeds its byte limit")
+    complete_size = data.rfind(b"\n") + 1
+    if complete_size == 0 or len(data) - complete_size > _MAX_ANCHOR_LINE_BYTES:
+        raise ValueError("archive anchor has no complete bounded record")
+    previous: _AnchorRecord | None = None
+    previous_digest: str | None = None
+    for line in data[:complete_size].splitlines(keepends=True):
+        if len(line) > _MAX_ANCHOR_LINE_BYTES:
+            raise ValueError("anchor record exceeds its byte limit")
+        try:
+            record = _AnchorRecord.model_validate_json(line[:-1], strict=True)
+        except Exception as exc:
+            raise ValueError("archive anchor has an invalid record") from exc
+        if _anchor_line(record) != line:
+            raise ValueError("archive anchor record is not canonical")
+        if previous is None:
+            if (
+                record.generation != 0
+                or record.high_water is not None
+                or record.batch_count != 0
+                or record.previous_record_sha256 is not None
+            ):
+                raise ValueError("archive anchor has an invalid genesis")
+        elif (
+            record.archive_id != previous.archive_id
+            or record.generation != previous.generation + 1
+            or record.previous_record_sha256 != previous_digest
+            or record.batch_count != previous.batch_count + 1
+            or record.high_water is None
+            or (previous.high_water is not None and record.high_water <= previous.high_water)
+        ):
+            raise ValueError("archive anchor chain or high-water is invalid")
+        if record.high_water is not None:
+            try:
+                at = datetime.fromisoformat(record.high_water)
+            except ValueError as exc:
+                raise ValueError("archive anchor high-water is invalid") from exc
+            if (
+                at.tzinfo is None
+                or at.utcoffset() != timedelta(0)
+                or record.high_water != at.isoformat(timespec="microseconds")
+            ):
+                raise ValueError("archive anchor high-water is not canonical UTC")
+        previous, previous_digest = record, _sha256(line[:-1])
+    assert previous is not None and previous_digest is not None
+    return previous, previous_digest, complete_size
+
+
 class FinancialArchive:
-    """SQLite committed manifest plus no-clobber files under one fixed root."""
+    """Immutable batches and a locked, anchored SQLite state snapshot."""
 
     def __init__(self, root: Path, *, limits: AcquisitionLimits | None = None) -> None:
         self.root = Path(root)
         self.limits = limits or AcquisitionLimits()
         root_existed = self.root.exists() or self.root.is_symlink()
         root_fd = _open_directory(self.root, create_last=True)
-        try:
-            batches_fd = _open_child_directory(root_fd, "batches", create=True)
-            os.close(batches_fd)
-            self._ensure_database_file(root_fd, create=not root_existed)
-        finally:
-            os.close(root_fd)
-        self._initialize_database()
-
-    @property
-    def _database_path(self) -> Path:
-        return self.root / "manifest.sqlite3"
-
-    @staticmethod
-    def _ensure_database_file(root_fd: int, *, create: bool = False) -> None:
-        name = "manifest.sqlite3"
-        if create:
-            try:
-                descriptor = os.open(
-                    name,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=root_fd,
-                )
-            except FileExistsError:
-                descriptor = -1
-            if descriptor >= 0:
-                os.close(descriptor)
-                os.fsync(root_fd)
-        try:
-            observed = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        except FileNotFoundError as exc:
-            raise ValueError("archive manifest is missing") from exc
-        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-            raise ValueError("archive manifest is not a single-link regular file")
+        os.close(root_fd)
+        self._initialize_database(create=not root_existed)
 
     def _connect(self) -> sqlite3.Connection:
-        root_fd = _open_directory(self.root)
-        try:
-            self._ensure_database_file(root_fd)
-        finally:
-            os.close(root_fd)
-        connection = sqlite3.connect(self._database_path, isolation_level=None, timeout=5)
+        connection = sqlite3.connect(":memory:", isolation_level=None)
         connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA busy_timeout = 5000")
-            connection.execute("PRAGMA synchronous = FULL")
-            connection.execute("PRAGMA foreign_keys = ON")
-            root_fd = _open_directory(self.root)
-            try:
-                self._ensure_database_file(root_fd)
-            finally:
-                os.close(root_fd)
-        except BaseException:
-            connection.close()
-            raise
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
-    def _initialize_database(self) -> None:
-        connection = self._connect()
+    @contextmanager
+    def _locked_root(self) -> Iterator[int]:
+        root_fd = _open_directory(self.root)
         try:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS batch_manifest (
-                    request_id TEXT PRIMARY KEY,
-                    query_json TEXT NOT NULL,
-                    observed_at TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL,
-                    row_count INTEGER NOT NULL,
-                    relative_path TEXT NOT NULL UNIQUE,
-                    file_sha256 TEXT NOT NULL,
-                    byte_count INTEGER NOT NULL
-                )"""
-            )
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS clock_high_water (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    observed_at TEXT NOT NULL
-                )"""
-            )
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
+            opened = os.fstat(root_fd)
+            if opened.st_uid != os.getuid() or opened.st_mode & 0o022:
+                raise ValueError("archive root has unsafe owner or permissions")
+            fcntl.flock(root_fd, fcntl.LOCK_EX)
+            self._check_root(root_fd)
+            yield root_fd
         finally:
-            connection.close()
+            os.close(root_fd)
+
+    def _check_root(self, root_fd: int) -> None:
+        opened = os.fstat(root_fd)
+        named = os.stat(self.root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or opened.st_uid != os.getuid()
+            or opened.st_mode & 0o022
+        ):
+            raise ValueError("archive root path changed or has unsafe permissions")
+
+    def _reject_sqlite_sidecars(self, root_fd: int) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                os.stat(_MANIFEST_NAME + suffix, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise ValueError("unsafe SQLite sidecar exists in archive")
+
+    def _initialize_database(self, *, create: bool = False) -> None:
+        if not create:
+            with self._state():
+                return
+        with self._locked_root() as root_fd:
+            batches_fd = _open_child_directory(root_fd, "batches", create=True)
+            os.close(batches_fd)
+            archive_id = uuid4().hex
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """CREATE TABLE batch_manifest (
+                        request_id TEXT PRIMARY KEY,
+                        query_json TEXT NOT NULL,
+                        observed_at TEXT NOT NULL UNIQUE,
+                        status TEXT NOT NULL,
+                        row_count INTEGER NOT NULL,
+                        relative_path TEXT NOT NULL UNIQUE,
+                        file_sha256 TEXT NOT NULL,
+                        byte_count INTEGER NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    """CREATE TABLE clock_high_water (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        observed_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute(
+                    """CREATE TABLE archive_meta (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        archive_id TEXT NOT NULL,
+                        schema_version INTEGER NOT NULL,
+                        generation INTEGER NOT NULL,
+                        previous_snapshot_sha256 TEXT
+                    )"""
+                )
+                connection.execute(
+                    """INSERT INTO archive_meta
+                       (singleton, archive_id, schema_version, generation, previous_snapshot_sha256)
+                       VALUES (1, ?, 1, 0, NULL)""",
+                    (archive_id,),
+                )
+                connection.commit()
+                snapshot = connection.serialize()
+            finally:
+                connection.close()
+            identity = _json_bytes({"archive_id": archive_id, "schema_version": 1}) + b"\n"
+            anchor = _AnchorRecord(
+                archive_id=archive_id,
+                generation=0,
+                snapshot_sha256=_sha256(snapshot),
+                high_water=None,
+                batch_count=0,
+                previous_record_sha256=None,
+            )
+            _create_regular(root_fd, _IDENTITY_NAME, identity)
+            _create_regular(root_fd, _MANIFEST_NAME, snapshot)
+            _create_regular(root_fd, _ANCHOR_NAME, _anchor_line(anchor))
+            os.fsync(root_fd)
+
+    def _manifest_metadata(
+        self, connection: sqlite3.Connection, archive_id: str
+    ) -> tuple[int, str | None, int, str | None]:
+        try:
+            meta = connection.execute("SELECT * FROM archive_meta WHERE singleton = 1").fetchone()
+            high = connection.execute(
+                "SELECT observed_at FROM clock_high_water WHERE singleton = 1"
+            ).fetchone()
+            count, newest = connection.execute(
+                "SELECT COUNT(*), MAX(observed_at) FROM batch_manifest"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise ValueError("archive manifest schema is invalid") from exc
+        if meta is None or meta["archive_id"] != archive_id or meta["schema_version"] != 1:
+            raise ValueError("archive manifest identity or schema is invalid")
+        high_water = None if high is None else high["observed_at"]
+        if high_water != newest or (count == 0) != (high_water is None):
+            raise ValueError("manifest and clock high-water disagree")
+        if high_water is not None:
+            try:
+                parsed = datetime.fromisoformat(high_water)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("manifest high-water is invalid") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+                raise ValueError("manifest high-water must be UTC")
+        return meta["generation"], high_water, count, meta["previous_snapshot_sha256"]
+
+    @contextmanager
+    def _state(self) -> Iterator[_ArchiveState]:
+        with self._locked_root() as root_fd:
+            identity_fd = snapshot_fd = anchor_fd = -1
+            connection: sqlite3.Connection | None = None
+            try:
+                self._reject_sqlite_sidecars(root_fd)
+                batches_fd = _open_child_directory(root_fd, "batches")
+                os.close(batches_fd)
+                identity_fd, identity_bytes = _open_regular(root_fd, _IDENTITY_NAME, max_bytes=256)
+                try:
+                    identity = json.loads(identity_bytes)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("archive identity is invalid") from exc
+                if (
+                    not isinstance(identity, dict)
+                    or set(identity) != {"archive_id", "schema_version"}
+                    or not isinstance(identity["archive_id"], str)
+                    or re.fullmatch(r"[0-9a-f]{32}", identity["archive_id"]) is None
+                    or identity["schema_version"] != 1
+                    or identity_bytes != _json_bytes(identity) + b"\n"
+                ):
+                    raise ValueError("archive identity is invalid")
+                snapshot_fd, snapshot = _open_regular(
+                    root_fd, _MANIFEST_NAME, max_bytes=_MAX_SNAPSHOT_BYTES
+                )
+                anchor_fd, anchor_bytes = _open_regular(
+                    root_fd, _ANCHOR_NAME, max_bytes=_MAX_ANCHOR_BYTES, writable=True
+                )
+                anchor, anchor_digest, complete_size = _parse_anchor(anchor_bytes)
+                if complete_size < len(anchor_bytes):
+                    os.ftruncate(anchor_fd, complete_size)
+                    os.fsync(anchor_fd)
+                if anchor.archive_id != identity["archive_id"]:
+                    raise ValueError("archive anchor identity is invalid")
+                connection = self._connect()
+                try:
+                    connection.deserialize(snapshot)
+                except (sqlite3.DatabaseError, MemoryError, ValueError) as exc:
+                    raise ValueError("archive snapshot is corrupt") from exc
+                generation, high_water, count, previous_snapshot = self._manifest_metadata(
+                    connection, identity["archive_id"]
+                )
+                snapshot_digest = _sha256(snapshot)
+                if snapshot_digest == anchor.snapshot_sha256:
+                    if (
+                        generation != anchor.generation
+                        or high_water != anchor.high_water
+                        or count != anchor.batch_count
+                    ):
+                        raise ValueError("archive snapshot and anchor disagree")
+                    os.fsync(anchor_fd)
+                elif (
+                    generation == anchor.generation + 1
+                    and previous_snapshot == anchor.snapshot_sha256
+                    and count == anchor.batch_count + 1
+                    and high_water is not None
+                    and (anchor.high_water is None or high_water > anchor.high_water)
+                ):
+                    newest = connection.execute(
+                        "SELECT * FROM batch_manifest ORDER BY observed_at DESC LIMIT 1"
+                    ).fetchone()
+                    if newest is None:
+                        raise ValueError("archive recovery lacks its new batch")
+                    self._load_batch(self._receipt_from_row(newest), root_fd=root_fd)
+                    recovered = _AnchorRecord(
+                        archive_id=identity["archive_id"],
+                        generation=generation,
+                        snapshot_sha256=snapshot_digest,
+                        high_water=high_water,
+                        batch_count=count,
+                        previous_record_sha256=anchor_digest,
+                    )
+                    self._check_root(root_fd)
+                    _safe_regular_stat(root_fd, _IDENTITY_NAME, identity_fd)
+                    _safe_regular_stat(root_fd, _MANIFEST_NAME, snapshot_fd)
+                    _safe_regular_stat(root_fd, _ANCHOR_NAME, anchor_fd)
+                    os.fsync(root_fd)
+                    self._append_anchor(anchor_fd, recovered)
+                    anchor, anchor_digest = recovered, _sha256(_anchor_line(recovered)[:-1])
+                else:
+                    raise ValueError("archive snapshot rollback or anchor mismatch")
+                yield _ArchiveState(
+                    root_fd=root_fd,
+                    identity_fd=identity_fd,
+                    snapshot_fd=snapshot_fd,
+                    anchor_fd=anchor_fd,
+                    connection=connection,
+                    archive_id=identity["archive_id"],
+                    snapshot_sha256=snapshot_digest,
+                    anchor=anchor,
+                    anchor_record_sha256=anchor_digest,
+                )
+            finally:
+                if connection is not None:
+                    connection.close()
+                for descriptor in (identity_fd, snapshot_fd, anchor_fd):
+                    if descriptor >= 0:
+                        os.close(descriptor)
+
+    def _append_anchor(self, anchor_fd: int, record: _AnchorRecord) -> None:
+        line = _anchor_line(record)
+        if os.fstat(anchor_fd).st_size + len(line) > _MAX_ANCHOR_BYTES:
+            raise ValueError("archive anchor is full")
+        _write_all(anchor_fd, line)
+        os.fsync(anchor_fd)
 
     def _receipt_from_row(self, row: sqlite3.Row) -> FinancialReceipt:
         receipt = FinancialReceipt(
@@ -449,55 +767,41 @@ class FinancialArchive:
         return receipt
 
     def _read_receipt(self, request_id: UUID) -> FinancialReceipt | None:
-        connection = self._connect()
-        try:
-            row = connection.execute(
+        with self._state() as state:
+            row = state.connection.execute(
                 "SELECT * FROM batch_manifest WHERE request_id = ?", (str(request_id),)
             ).fetchone()
             return None if row is None else self._receipt_from_row(row)
-        finally:
-            connection.close()
 
     def receipt(self, request_id: UUID) -> FinancialReceipt:
-        receipt = self._read_receipt(request_id)
-        if receipt is None:
-            raise KeyError(request_id)
-        self._load_batch(receipt)
-        return receipt
+        with self._state() as state:
+            row = state.connection.execute(
+                "SELECT * FROM batch_manifest WHERE request_id = ?", (str(request_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(request_id)
+            receipt = self._receipt_from_row(row)
+            self._load_batch(receipt, root_fd=state.root_fd)
+            return receipt
 
     def read_batch(self, request_id: UUID) -> FinancialBatch:
-        receipt = self._read_receipt(request_id)
-        if receipt is None:
-            raise KeyError(request_id)
-        return self._load_batch(receipt)
+        with self._state() as state:
+            row = state.connection.execute(
+                "SELECT * FROM batch_manifest WHERE request_id = ?", (str(request_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(request_id)
+            return self._load_batch(self._receipt_from_row(row), root_fd=state.root_fd)
 
     def list_committed(self) -> tuple[FinancialBatch, ...]:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN")
-            rows = connection.execute(
+        with self._state() as state:
+            rows = state.connection.execute(
                 "SELECT * FROM batch_manifest ORDER BY observed_at"
             ).fetchall()
-            high_water = connection.execute(
-                "SELECT observed_at FROM clock_high_water WHERE singleton = 1"
-            ).fetchone()
             receipts = tuple(self._receipt_from_row(row) for row in rows)
-            if (not receipts) != (high_water is None):
-                raise ValueError("manifest and clock high-water disagree")
-            if receipts and high_water["observed_at"] != receipts[-1].observed_at.isoformat(
-                timespec="microseconds"
-            ):
-                raise ValueError("manifest and clock high-water disagree")
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-        return tuple(self._load_batch(receipt) for receipt in receipts)
+            return tuple(self._load_batch(receipt, root_fd=state.root_fd) for receipt in receipts)
 
-    def _load_batch(self, receipt: FinancialReceipt) -> FinancialBatch:
-        root_fd = _open_directory(self.root)
+    def _load_batch(self, receipt: FinancialReceipt, *, root_fd: int) -> FinancialBatch:
         try:
             batches_fd = _open_child_directory(root_fd, "batches")
             try:
@@ -529,8 +833,6 @@ class FinancialArchive:
                 os.close(batches_fd)
         except OSError as exc:
             raise ValueError("committed batch cannot be safely opened") from exc
-        finally:
-            os.close(root_fd)
         if len(data) != receipt.byte_count or _sha256(data) != receipt.file_sha256:
             raise ValueError("committed batch length or digest mismatch")
         try:
@@ -551,43 +853,59 @@ class FinancialArchive:
                 raise ValueError("committed row digest mismatch")
         return batch
 
-    def _publish_file(self, request_id: UUID, data: bytes) -> None:
-        root_fd = _open_directory(self.root)
+    def _publish_file(self, root_fd: int, request_id: UUID, data: bytes) -> None:
+        batches_fd = _open_child_directory(root_fd, "batches")
         try:
-            batches_fd = _open_child_directory(root_fd, "batches")
+            temporary = f".tmp-{uuid4().hex}"
+            target = f"{request_id}.json"
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=batches_fd,
+            )
             try:
-                temporary = f".tmp-{uuid4().hex}"
-                target = f"{request_id}.json"
-                descriptor = os.open(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=batches_fd,
-                )
+                _write_all(descriptor, data)
+                os.fsync(descriptor)
                 try:
-                    written = 0
-                    while written < len(data):
-                        written += os.write(descriptor, data[written:])
-                    os.fsync(descriptor)
-                    try:
-                        os.link(
-                            temporary,
-                            target,
-                            src_dir_fd=batches_fd,
-                            dst_dir_fd=batches_fd,
-                            follow_symlinks=False,
-                        )
-                    except FileExistsError as exc:
-                        raise ValueError("batch target already exists; refusing overwrite") from exc
-                    os.fsync(batches_fd)
-                finally:
-                    os.close(descriptor)
-                    os.unlink(temporary, dir_fd=batches_fd)
-                    os.fsync(batches_fd)
+                    os.link(
+                        temporary,
+                        target,
+                        src_dir_fd=batches_fd,
+                        dst_dir_fd=batches_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise ValueError("batch target already exists; refusing overwrite") from exc
+                os.fsync(batches_fd)
             finally:
-                os.close(batches_fd)
+                os.close(descriptor)
+                os.unlink(temporary, dir_fd=batches_fd)
+                os.fsync(batches_fd)
         finally:
-            os.close(root_fd)
+            os.close(batches_fd)
+
+    def _publish_snapshot(self, state: _ArchiveState, snapshot: bytes) -> None:
+        if len(snapshot) > _MAX_SNAPSHOT_BYTES:
+            raise ValueError("archive snapshot exceeds its byte limit")
+        temporary = f".manifest-{uuid4().hex}.tmp"
+        try:
+            _create_regular(state.root_fd, temporary, snapshot)
+            self._check_root(state.root_fd)
+            _safe_regular_stat(state.root_fd, _IDENTITY_NAME, state.identity_fd)
+            _safe_regular_stat(state.root_fd, _ANCHOR_NAME, state.anchor_fd)
+            _safe_regular_stat(state.root_fd, _MANIFEST_NAME, state.snapshot_fd)
+            self._reject_sqlite_sidecars(state.root_fd)
+            os.replace(
+                temporary,
+                _MANIFEST_NAME,
+                src_dir_fd=state.root_fd,
+                dst_dir_fd=state.root_fd,
+            )
+            os.fsync(state.root_fd)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=state.root_fd)
 
     def _append(
         self,
@@ -597,87 +915,113 @@ class FinancialArchive:
         *,
         clock: Callable[[], datetime],
     ) -> FinancialReceipt:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
-                "SELECT observed_at FROM clock_high_water WHERE singleton = 1"
-            ).fetchone()
-            newest = connection.execute(
-                "SELECT MAX(observed_at) AS observed_at FROM batch_manifest"
-            ).fetchone()["observed_at"]
-            if (previous is None and newest is not None) or (
-                previous is not None and previous["observed_at"] != newest
-            ):
-                raise ValueError("manifest and clock high-water disagree")
-            existing_row = connection.execute(
-                "SELECT * FROM batch_manifest WHERE request_id = ?", (str(query.request_id),)
-            ).fetchone()
-            if existing_row is not None:
-                existing = self._receipt_from_row(existing_row)
-                if existing.query != query:
-                    raise ValueError("request ID was already committed for another query")
-                self._load_batch(existing)
+        with self._state() as state:
+            connection = state.connection
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                previous = connection.execute(
+                    "SELECT observed_at FROM clock_high_water WHERE singleton = 1"
+                ).fetchone()
+                newest = connection.execute(
+                    "SELECT MAX(observed_at) AS observed_at FROM batch_manifest"
+                ).fetchone()["observed_at"]
+                if (previous is None and newest is not None) or (
+                    previous is not None and previous["observed_at"] != newest
+                ):
+                    raise ValueError("manifest and clock high-water disagree")
+                existing_row = connection.execute(
+                    "SELECT * FROM batch_manifest WHERE request_id = ?", (str(query.request_id),)
+                ).fetchone()
+                if existing_row is not None:
+                    existing = self._receipt_from_row(existing_row)
+                    if existing.query != query:
+                        raise ValueError("request ID was already committed for another query")
+                    self._load_batch(existing, root_fd=state.root_fd)
+                    connection.commit()
+                    return existing
+                observed_at = _utc(clock())
+                if previous is not None and observed_at <= datetime.fromisoformat(
+                    previous["observed_at"]
+                ):
+                    raise ValueError(
+                        "observation clock did not advance beyond committed high-water"
+                    )
+                observation_day = observed_at.astimezone(_SHANGHAI).date()
+                if query.api in _ANNOUNCEMENT_WINDOW_APIS and query.end_date > observation_day:
+                    raise ValueError("announcement query ended after observation day")
+                if query.api == "dividend" and query.ann_date > observation_day:
+                    raise ValueError("dividend query is after observation day")
+                batch = FinancialBatch(
+                    query=query,
+                    observed_at=observed_at,
+                    status=status,
+                    row_count=len(rows),
+                    rows=rows,
+                )
+                data = _json_bytes(batch.model_dump(mode="json"))
+                if len(data) > self.limits.max_batch_bytes:
+                    raise ValueError("batch exceeds local byte limit")
+                receipt = FinancialReceipt(
+                    query=query,
+                    observed_at=observed_at,
+                    status=status,
+                    row_count=len(rows),
+                    relative_path=f"batches/{query.request_id}.json",
+                    file_sha256=_sha256(data),
+                    byte_count=len(data),
+                )
+                self._publish_file(state.root_fd, query.request_id, data)
+                connection.execute(
+                    """INSERT INTO batch_manifest
+                       (request_id, query_json, observed_at, status, row_count,
+                        relative_path, file_sha256, byte_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(query.request_id),
+                        _json_bytes(query.model_dump(mode="json")).decode("utf-8"),
+                        observed_at.isoformat(timespec="microseconds"),
+                        status,
+                        len(rows),
+                        receipt.relative_path,
+                        receipt.file_sha256,
+                        receipt.byte_count,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO clock_high_water(singleton, observed_at) VALUES (1, ?)
+                       ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at""",
+                    (observed_at.isoformat(timespec="microseconds"),),
+                )
+                connection.execute(
+                    """UPDATE archive_meta
+                       SET generation = generation + 1, previous_snapshot_sha256 = ?
+                       WHERE singleton = 1""",
+                    (state.snapshot_sha256,),
+                )
                 connection.commit()
-                return existing
-            observed_at = _utc(clock())
-            if previous is not None and observed_at <= datetime.fromisoformat(
-                previous["observed_at"]
-            ):
-                raise ValueError("observation clock did not advance beyond committed high-water")
-            observation_day = observed_at.astimezone(_SHANGHAI).date()
-            if query.api in _ANNOUNCEMENT_WINDOW_APIS and query.end_date > observation_day:
-                raise ValueError("announcement query ended after observation day")
-            if query.api == "dividend" and query.ann_date > observation_day:
-                raise ValueError("dividend query is after observation day")
-            batch = FinancialBatch(
-                query=query,
-                observed_at=observed_at,
-                status=status,
-                row_count=len(rows),
-                rows=rows,
-            )
-            data = _json_bytes(batch.model_dump(mode="json"))
-            if len(data) > self.limits.max_batch_bytes:
-                raise ValueError("batch exceeds local byte limit")
-            receipt = FinancialReceipt(
-                query=query,
-                observed_at=observed_at,
-                status=status,
-                row_count=len(rows),
-                relative_path=f"batches/{query.request_id}.json",
-                file_sha256=_sha256(data),
-                byte_count=len(data),
-            )
-            self._publish_file(query.request_id, data)
-            connection.execute(
-                """INSERT INTO batch_manifest
-                   (request_id, query_json, observed_at, status, row_count,
-                    relative_path, file_sha256, byte_count)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    str(query.request_id),
-                    _json_bytes(query.model_dump(mode="json")).decode("utf-8"),
-                    observed_at.isoformat(timespec="microseconds"),
-                    status,
-                    len(rows),
-                    receipt.relative_path,
-                    receipt.file_sha256,
-                    receipt.byte_count,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO clock_high_water(singleton, observed_at) VALUES (1, ?)
-                   ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at""",
-                (observed_at.isoformat(timespec="microseconds"),),
-            )
-            connection.commit()
-            return receipt
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+                snapshot = connection.serialize()
+                record = _AnchorRecord(
+                    archive_id=state.archive_id,
+                    generation=state.anchor.generation + 1,
+                    snapshot_sha256=_sha256(snapshot),
+                    high_water=observed_at.isoformat(timespec="microseconds"),
+                    batch_count=state.anchor.batch_count + 1,
+                    previous_record_sha256=state.anchor_record_sha256,
+                )
+                if (
+                    os.fstat(state.anchor_fd).st_size + len(_anchor_line(record))
+                    > _MAX_ANCHOR_BYTES
+                ):
+                    raise ValueError("archive anchor is full")
+                self._publish_snapshot(state, snapshot)
+                self._check_root(state.root_fd)
+                _safe_regular_stat(state.root_fd, _IDENTITY_NAME, state.identity_fd)
+                _safe_regular_stat(state.root_fd, _ANCHOR_NAME, state.anchor_fd)
+                self._append_anchor(state.anchor_fd, record)
+                return receipt
+            except BaseException:
+                connection.rollback()
+                raise
 
 
 def acquire_financial_batches(
@@ -708,7 +1052,7 @@ def acquire_financial_batches(
         if existing is not None:
             if existing.query != query:
                 raise ValueError("request ID was already committed for another query")
-            archive._load_batch(existing)
+            archive.read_batch(query.request_id)
             receipts.append(existing)
             continue
         method = getattr(client, query.api)
@@ -718,6 +1062,16 @@ def acquire_financial_batches(
         status: FinancialStatus = (
             "empty" if not rows else "possibly_truncated" if cap == len(rows) else "observed"
         )
+        largest_clock_text = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+        preflight = FinancialBatch(
+            query=query,
+            observed_at=largest_clock_text,
+            status=status,
+            row_count=len(rows),
+            rows=rows,
+        )
+        if len(_json_bytes(preflight.model_dump(mode="json"))) > archive.limits.max_batch_bytes:
+            raise ValueError("supplier response exceeds local batch byte limit")
         receipts.append(archive._append(query, rows, status, clock=clock))
     return tuple(receipts)
 

@@ -6,6 +6,8 @@ import json
 import multiprocessing
 import os
 import sqlite3
+import stat
+import threading
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -428,8 +430,8 @@ def test_interruption_after_file_publish_leaves_only_an_uncommitted_orphan(
     query = _query()
     publish = archive._publish_file
 
-    def interrupt(request_id: UUID, data: bytes) -> None:
-        publish(request_id, data)
+    def interrupt(root_fd: int, request_id: UUID, data: bytes) -> None:
+        publish(root_fd, request_id, data)
         raise RuntimeError("process failed before SQLite commit")
 
     monkeypatch.setattr(archive, "_publish_file", interrupt)
@@ -512,10 +514,10 @@ def test_read_rejects_symlink_even_when_target_bytes_match_manifest(tmp_path: Pa
 
 def test_manifest_symlink_is_rejected_before_sqlite_open(tmp_path: Path) -> None:
     root = tmp_path / "archive"
-    root.mkdir()
-    (root / "batches").mkdir()
+    FinancialArchive(root)
     outside = tmp_path / "outside.sqlite3"
     outside.write_text("unchanged")
+    (root / "manifest.sqlite3").unlink()
     (root / "manifest.sqlite3").symlink_to(outside)
     with pytest.raises(ValueError, match="manifest"):
         FinancialArchive(root)
@@ -692,47 +694,47 @@ def test_missing_high_water_cannot_be_rebuilt_behind_committed_batches(tmp_path:
     _acquire(root, _query(), pd.DataFrame([_row()]))
     with sqlite3.connect(root / "manifest.sqlite3") as connection:
         connection.execute("DELETE FROM clock_high_water")
-    archive = FinancialArchive(root)
     with pytest.raises(ValueError, match="high-water"):
-        acquire_financial_batches(
-            FakeTushare(pd.DataFrame([_row(value=120.0)])),
-            archive,
-            (_query(),),
-            run_day=date(2026, 9, 28),
-            clock=_clock(datetime(2026, 9, 28, 11, tzinfo=UTC)),
-        )
+        FinancialArchive(root)
     assert len(list((root / "batches").glob("*.json"))) == 1
 
 
-def test_manifest_listing_reads_rows_and_clock_from_one_sqlite_snapshot(
+def test_manifest_listing_blocks_concurrent_writer_until_snapshot_read_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "archive"
     _acquire(root, _query(), pd.DataFrame([_row()]))
     reader = FinancialArchive(root)
-    real_connect = reader._connect
+    real_load = reader._load_batch
     later_query = _query()
-    invoked: list[bool] = []
+    started = threading.Event()
+    finished = threading.Event()
+    children: list[threading.Thread] = []
 
-    def connect_with_interleaving() -> sqlite3.Connection:
-        connection = real_connect()
+    def write_later() -> None:
+        started.set()
+        _acquire(
+            root,
+            later_query,
+            pd.DataFrame([_row(value=120.0)]),
+            at=datetime(2026, 9, 28, 13, tzinfo=UTC),
+        )
+        finished.set()
 
-        def before_select(sql: str) -> None:
-            if sql.startswith("SELECT observed_at FROM clock_high_water") and not invoked:
-                invoked.append(True)
-                _acquire(
-                    root,
-                    later_query,
-                    pd.DataFrame([_row(value=120.0)]),
-                    at=datetime(2026, 9, 28, 13, tzinfo=UTC),
-                )
+    def load_with_interleaving(*args: object, **kwargs: object) -> object:
+        child = threading.Thread(target=write_later)
+        children.append(child)
+        child.start()
+        assert started.wait(2)
+        assert not finished.is_set()
+        return real_load(*args, **kwargs)
 
-        connection.set_trace_callback(before_select)
-        return connection
-
-    monkeypatch.setattr(reader, "_connect", connect_with_interleaving)
+    monkeypatch.setattr(reader, "_load_batch", load_with_interleaving)
     snapshot = reader.list_committed()
-    assert invoked == [True]
+    for child in children:
+        child.join(5)
+        assert not child.is_alive()
+    assert finished.is_set()
     assert len(snapshot) == 1
     assert len(FinancialArchive(root).list_committed()) == 2
 
@@ -747,5 +749,305 @@ def test_manifest_request_id_must_match_sealed_query_identity(tmp_path: Path) ->
             "UPDATE batch_manifest SET request_id = ? WHERE request_id = ?",
             (str(wrong_id), str(original.request_id)),
         )
-    with pytest.raises(ValueError, match="request identity"):
+    with pytest.raises(ValueError, match="request identity|snapshot"):
         FinancialArchive(root).read_batch(wrong_id)
+
+
+def test_replaced_empty_regular_manifest_cannot_reset_committed_history(tmp_path: Path) -> None:
+    root = tmp_path / "archive"
+    _acquire(root, _query(), pd.DataFrame([_row()]))
+    manifest = root / "manifest.sqlite3"
+    manifest.unlink()
+    manifest.write_bytes(b"")
+
+    with pytest.raises(ValueError, match="manifest|snapshot|identity"):
+        FinancialArchive(root)
+
+
+def test_replaced_valid_empty_manifest_from_other_archive_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "archive"
+    _acquire(root, _query(), pd.DataFrame([_row()]))
+    other = tmp_path / "other"
+    FinancialArchive(other)
+    (root / "manifest.sqlite3").write_bytes((other / "manifest.sqlite3").read_bytes())
+
+    with pytest.raises(ValueError, match="identity|manifest|snapshot"):
+        FinancialArchive(root)
+
+
+def test_manifest_symlink_swap_only_during_sqlite_connect_cannot_write_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rquant.financial_pit_acquisition as acquisition
+
+    root = tmp_path / "archive"
+    archive = FinancialArchive(root)
+    manifest = root / "manifest.sqlite3"
+    outside = tmp_path / "outside.sqlite3"
+    outside.write_bytes(b"")
+    real_connect = sqlite3.connect
+    swaps: list[str] = []
+
+    def swap_during_connect(
+        database: object, *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        saved = root / "saved-manifest.sqlite3"
+        manifest.rename(saved)
+        manifest.symlink_to(outside)
+        swaps.append(str(database))
+        try:
+            return real_connect(database, *args, **kwargs)
+        finally:
+            manifest.unlink()
+            saved.rename(manifest)
+
+    monkeypatch.setattr(acquisition.sqlite3, "connect", swap_during_connect)
+    archive._initialize_database()
+
+    assert swaps
+    assert outside.read_bytes() == b""
+
+
+def test_hardlinked_sqlite_shm_sidecar_cannot_write_outside(tmp_path: Path) -> None:
+    root = tmp_path / "archive"
+    _acquire(root, _query(), pd.DataFrame([_row()]))
+    outside = tmp_path / "outside-shm"
+    outside.write_bytes(b"X" * 32768)
+    os.link(outside, root / "manifest.sqlite3-shm")
+
+    with pytest.raises(ValueError, match="sidecar|shm|unsafe"):
+        FinancialArchive(root)
+    assert outside.read_bytes() == b"X" * 32768
+
+
+def test_wide_supplier_response_is_rejected_before_observation_clock(tmp_path: Path) -> None:
+    row = _row()
+    row.update({f"extra_{index}": "x" for index in range(300)})
+    ticks: list[int] = []
+
+    def clock() -> datetime:
+        ticks.append(1)
+        return datetime(2026, 9, 28, 12, tzinfo=UTC)
+
+    archive = FinancialArchive(tmp_path / "archive")
+    with pytest.raises(ValueError, match="column|field|response"):
+        acquire_financial_batches(
+            FakeTushare(pd.DataFrame([row])),
+            archive,
+            (_query(),),
+            run_day=date(2026, 9, 28),
+            clock=clock,
+        )
+    assert ticks == []
+    assert archive.list_committed() == ()
+
+
+def test_serialized_response_over_byte_cap_is_rejected_before_observation_clock(
+    tmp_path: Path,
+) -> None:
+    ticks: list[int] = []
+
+    def clock() -> datetime:
+        ticks.append(1)
+        return datetime(2026, 9, 28, 12, tzinfo=UTC)
+
+    archive = FinancialArchive(tmp_path / "archive", limits=AcquisitionLimits(max_batch_bytes=100))
+    with pytest.raises(ValueError, match="byte limit"):
+        acquire_financial_batches(
+            FakeTushare(pd.DataFrame([_row()])),
+            archive,
+            (_query(),),
+            run_day=date(2026, 9, 28),
+            clock=clock,
+        )
+    assert ticks == []
+    assert archive.list_committed() == ()
+
+
+def test_old_valid_snapshot_from_same_archive_cannot_roll_back_history(tmp_path: Path) -> None:
+    root = tmp_path / "archive"
+    _acquire(root, _query(), pd.DataFrame([_row()]))
+    old_snapshot = (root / "manifest.sqlite3").read_bytes()
+    _acquire(
+        root,
+        _query(),
+        pd.DataFrame([_row(value=120.0)]),
+        at=datetime(2026, 9, 28, 13, tzinfo=UTC),
+    )
+    (root / "manifest.sqlite3").write_bytes(old_snapshot)
+
+    with pytest.raises(ValueError, match="snapshot|anchor|rollback"):
+        FinancialArchive(root)
+
+
+def test_directory_fsync_error_after_snapshot_replace_recovers_same_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rquant.financial_pit_acquisition as acquisition
+
+    root = tmp_path / "archive"
+    FinancialArchive(root)
+    query = _query()
+    root_inode = root.stat().st_ino
+    real_fsync = os.fsync
+    failed = False
+
+    def uncertain_fsync(descriptor: int) -> None:
+        nonlocal failed
+        info = os.fstat(descriptor)
+        if not failed and stat.S_ISDIR(info.st_mode) and info.st_ino == root_inode:
+            failed = True
+            raise OSError("snapshot directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(acquisition.os, "fsync", uncertain_fsync)
+    with pytest.raises(OSError, match="directory fsync"):
+        _acquire(root, query, pd.DataFrame([_row()]))
+    assert failed
+    monkeypatch.setattr(acquisition.os, "fsync", real_fsync)
+    retry_client = FakeTushare(PermissionError("retry must not fetch"))
+    recovered = FinancialArchive(root)
+    receipt = acquire_financial_batches(
+        retry_client,
+        recovered,
+        (query,),
+        run_day=date(2026, 9, 28),
+        clock=_clock(datetime(2026, 9, 28, 11, tzinfo=UTC)),
+    )[0]
+    assert receipt.observed_at == datetime(2026, 9, 28, 12, tzinfo=UTC)
+    assert retry_client.calls == []
+    assert len(recovered.list_committed()) == 1
+
+
+def test_anchor_fsync_error_recovers_one_complete_snapshot_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rquant.financial_pit_acquisition as acquisition
+
+    root = tmp_path / "archive"
+    FinancialArchive(root)
+    anchor = root / "manifest.anchor.jsonl"
+    anchor_inode = anchor.stat().st_ino
+    initial_size = anchor.stat().st_size
+    query = _query()
+    real_fsync = os.fsync
+    failed = False
+
+    def uncertain_fsync(descriptor: int) -> None:
+        nonlocal failed
+        info = os.fstat(descriptor)
+        if not failed and info.st_ino == anchor_inode and info.st_size > initial_size:
+            failed = True
+            raise OSError("anchor fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(acquisition.os, "fsync", uncertain_fsync)
+    with pytest.raises(OSError, match="anchor fsync"):
+        _acquire(root, query, pd.DataFrame([_row()]))
+    assert failed
+    monkeypatch.setattr(acquisition.os, "fsync", real_fsync)
+    retry_client = FakeTushare(PermissionError("retry must not fetch"))
+    recovered = FinancialArchive(root)
+    assert len(recovered.list_committed()) == 1
+    receipt = acquire_financial_batches(
+        retry_client,
+        recovered,
+        (query,),
+        run_day=date(2026, 9, 28),
+        clock=_clock(datetime(2026, 9, 28, 11, tzinfo=UTC)),
+    )[0]
+    assert receipt.observed_at == datetime(2026, 9, 28, 12, tzinfo=UTC)
+    assert retry_client.calls == []
+
+
+def test_partial_anchor_tail_is_trimmed_before_reading_committed_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "archive"
+    query = _query()
+    _acquire(root, query, pd.DataFrame([_row()]))
+    anchor = root / "manifest.anchor.jsonl"
+    with anchor.open("ab") as stream:
+        stream.write(b'{"generation":2')
+
+    reopened = FinancialArchive(root)
+    assert reopened.read_batch(query.request_id).row_count == 1
+    assert anchor.read_bytes().endswith(b"\n")
+
+
+@pytest.mark.parametrize("name", ["manifest.sqlite3", "manifest.anchor.jsonl"])
+def test_replacing_pinned_state_file_before_snapshot_commit_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    root = tmp_path / "archive"
+    archive = FinancialArchive(root)
+    query = _query()
+    publish = archive._publish_file
+
+    def replace_after_batch(root_fd: int, request_id: UUID, data: bytes) -> None:
+        publish(root_fd, request_id, data)
+        target = root / name
+        saved = root / f"saved-{name}"
+        target.rename(saved)
+        target.write_bytes(saved.read_bytes())
+
+    monkeypatch.setattr(archive, "_publish_file", replace_after_batch)
+    with pytest.raises(ValueError, match="manifest|anchor"):
+        acquire_financial_batches(
+            FakeTushare(pd.DataFrame([_row()])),
+            archive,
+            (query,),
+            run_day=date(2026, 9, 28),
+            clock=_clock(datetime(2026, 9, 28, 12, tzinfo=UTC)),
+        )
+    assert FinancialArchive(root).list_committed() == ()
+
+
+def test_torn_anchor_append_after_snapshot_commit_is_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "archive"
+    archive = FinancialArchive(root)
+    query = _query()
+
+    def torn_append(descriptor: int, record: object) -> None:
+        os.write(descriptor, b'{"generation":')
+        raise OSError("anchor append interrupted")
+
+    monkeypatch.setattr(archive, "_append_anchor", torn_append)
+    with pytest.raises(OSError, match="anchor append"):
+        acquire_financial_batches(
+            FakeTushare(pd.DataFrame([_row()])),
+            archive,
+            (query,),
+            run_day=date(2026, 9, 28),
+            clock=_clock(datetime(2026, 9, 28, 12, tzinfo=UTC)),
+        )
+    assert (root / "manifest.anchor.jsonl").read_bytes().endswith(b'{"generation":')
+
+    recovered = FinancialArchive(root)
+    assert recovered.read_batch(query.request_id).row_count == 1
+    assert (root / "manifest.anchor.jsonl").read_bytes().endswith(b"\n")
+
+
+def test_snapshot_ahead_of_anchor_requires_intact_new_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "archive"
+    archive = FinancialArchive(root)
+    query = _query()
+
+    def interrupted_anchor(descriptor: int, record: object) -> None:
+        raise OSError("anchor not published")
+
+    monkeypatch.setattr(archive, "_append_anchor", interrupted_anchor)
+    with pytest.raises(OSError, match="anchor not published"):
+        acquire_financial_batches(
+            FakeTushare(pd.DataFrame([_row()])),
+            archive,
+            (query,),
+            run_day=date(2026, 9, 28),
+            clock=_clock(datetime(2026, 9, 28, 12, tzinfo=UTC)),
+        )
+    (root / "batches" / f"{query.request_id}.json").unlink()
+
+    with pytest.raises(ValueError, match="committed batch"):
+        FinancialArchive(root)
