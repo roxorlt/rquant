@@ -194,7 +194,7 @@ def _parse_rows(
     *,
     unit: str,
     boot: str,
-    since: datetime,
+    since: datetime | None,
     level: str | None,
     max_rows: int,
 ) -> list[tuple[str, JournalEntry]]:
@@ -230,7 +230,7 @@ def _parse_rows(
         if micros is None or priority is None:
             raise ValueError
         at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=micros)
-        if at < since or (previous_at is not None and at > previous_at):
+        if (since is not None and at < since) or (previous_at is not None and at > previous_at):
             raise ValueError
         if level is not None and priority > _PRIORITY[level]:
             raise ValueError
@@ -369,7 +369,7 @@ class JournalLogReader:
                 "--output=json",
                 "--reverse",
                 f"--boot={boot}",
-                f"--since={since_utc.isoformat()}",
+                *((f"--since={since_utc.isoformat()}",) if prior is None else ()),
                 *((f"--priority={level}",) if level is not None else ()),
                 f"--lines={limit}",
                 *((f"--cursor={prior['journal']}",) if prior is not None else ()),
@@ -383,7 +383,7 @@ class JournalLogReader:
                     payload,
                     unit=unit,
                     boot=boot,
-                    since=since_utc,
+                    since=since_utc if prior is None else None,
                     level=level,
                     max_rows=limit,
                 )
@@ -408,6 +408,7 @@ class JournalLogReader:
                 if not rows or rows[0][0] != prior["journal"]:
                     raise JournalCursorError
                 rows = rows[1:]
+                rows = [row for row in rows if row[1].at >= since_utc]
             visible = rows[:page_size]
             has_more = len(rows) > page_size
             next_cursor = (

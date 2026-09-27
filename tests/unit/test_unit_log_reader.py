@@ -223,8 +223,12 @@ def test_same_microsecond_cursor_paging_is_stable_and_bound(
     third = reader.read(unit=DAILY, since=SINCE, page_size=2, cursor=second.next_cursor)
     assert [len(page.entries) for page in (first, second, third)] == [2, 2, 1]
     assert first.next_cursor and second.next_cursor and third.next_cursor is None
+    assert f"--since={SINCE.isoformat()}" in observed[0]
+    assert not any(arg.startswith("--cursor=") for arg in observed[0])
     assert "--cursor=s=1" in observed[1]
     assert "--cursor=s=3" in observed[2]
+    assert not any(arg.startswith("--since=") for arg in observed[1])
+    assert not any(arg.startswith("--since=") for arg in observed[2])
     with pytest.raises(JournalCursorError):
         reader.read(unit=BACKUP, since=SINCE, page_size=2, cursor=first.next_cursor)
     with pytest.raises(JournalCursorError):
@@ -236,6 +240,39 @@ def test_same_microsecond_cursor_paging_is_stable_and_bound(
     with pytest.raises(JournalCursorError):
         reader.read(unit=DAILY, since=SINCE, page_size=2, cursor=first.next_cursor[:-1] + "x")
     assert len(observed) == 3
+
+
+def test_cursor_page_stops_at_signed_since_without_treating_older_rows_as_damage(
+    signed_manifest: tuple[Path, bytes],
+) -> None:
+    since_us = int(SINCE.timestamp() * 1_000_000)
+    rows = (
+        _row("s=latest"),
+        _row("s=boundary-before", timestamp=since_us + 1),
+        _row("s=boundary", timestamp=since_us),
+        _row("s=older", timestamp=since_us - 1),
+        _row("s=oldest", timestamp=since_us - 2),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: tuple[str, ...], _timeout: float, _max_bytes: int) -> bytes:
+        calls.append(argv)
+        has_since = any(arg.startswith("--since=") for arg in argv)
+        has_cursor = any(arg.startswith("--cursor=") for arg in argv)
+        if has_since and has_cursor:
+            raise ValueError("journalctl rejects --since with --cursor")
+        if has_cursor:
+            return _json_lines(*rows[1:])
+        return _json_lines(*rows[:3])
+
+    reader = _reader(signed_manifest, runner)
+    first = reader.read(unit=DAILY, since=SINCE, page_size=2)
+    assert first.next_cursor is not None
+    second = reader.read(unit=DAILY, since=SINCE, page_size=2, cursor=first.next_cursor)
+    assert len(second.entries) == 1
+    assert second.entries[0].at == SINCE
+    assert second.next_cursor is None
+    assert len(calls) == 2
 
 
 def test_rotation_and_boot_change_invalidate_cursor(signed_manifest: tuple[Path, bytes]) -> None:
