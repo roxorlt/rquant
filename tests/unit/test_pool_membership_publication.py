@@ -60,7 +60,7 @@ def _three_day_history(path: Path, *, calendar_gap: date | None = None) -> str:
     return entered.result_version
 
 
-def test_same_replica_history_publishes_only_proven_entry_close(tmp_path: Path) -> None:
+def test_same_replica_history_publishes_entry_date_without_unbound_close(tmp_path: Path) -> None:
     path = tmp_path / "rquant_ro.duckdb"
     entered_version = _three_day_history(path)
 
@@ -73,9 +73,9 @@ def test_same_replica_history_publishes_only_proven_entry_close(tmp_path: Path) 
     assert member["trade_date"] == TODAY.isoformat()
     assert member["ts_code"] == "600000.SH"
     assert member["entry_trade_date"] == OLD_DAY.isoformat()
-    assert member["entry_close"] == 10.6
+    assert member["entry_close"] is None
     assert member["entry_result_version"] == entered_version
-    assert member["unknown_reason"] is None
+    assert member["unknown_reason"] == "entry_price_missing"
     assert "gain_pct" not in member
 
 
@@ -126,7 +126,7 @@ def test_complete_calendar_gap_revokes_entry_but_not_base_members(tmp_path: Path
 
 
 @pytest.mark.parametrize("corruption", ["missing", "changed"])
-def test_missing_or_changed_authoritative_daily_close_suppresses_entry_price(
+def test_missing_or_changed_daily_close_cannot_authenticate_entry_price(
     tmp_path: Path, corruption: str
 ) -> None:
     path = tmp_path / "rquant_ro.duckdb"
@@ -141,7 +141,32 @@ def test_missing_or_changed_authoritative_daily_close_suppresses_entry_price(
     rows = [row for row in _projection(path)["pool_membership"].rows if row["pool_name"] == _POOL]
     member = next(row for row in rows if row["row_kind"] == "member")
 
-    assert member["entry_trade_date"] is None
+    assert member["entry_trade_date"] == OLD_DAY.isoformat()
+    assert member["entry_close"] is None
+    assert member["unknown_reason"] == "entry_price_missing"
+
+
+def test_dual_close_rewrite_after_receipt_cannot_prove_entry_price(tmp_path: Path) -> None:
+    path = tmp_path / "rquant_ro.duckdb"
+    entry_version = _three_day_history(path)
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            "UPDATE screen_result SET close = 19.9, created_at = TIMESTAMP '2026-08-03 15:30:00' "
+            "WHERE trade_date = ? AND preset_name = ?",
+            (OLD_DAY, _POOL),
+        )
+        connection.execute(
+            "UPDATE daily_bar SET close = 19.9 WHERE trade_date = ? AND ts_code = ?",
+            (OLD_DAY, "600000.SH"),
+        )
+    _seal_database_before_cutoff(path)
+
+    rows = [row for row in _projection(path)["pool_membership"].rows if row["pool_name"] == _POOL]
+    member = next(row for row in rows if row["row_kind"] == "member")
+
+    assert rows[0]["status"] == "verified"
+    assert member["entry_trade_date"] == OLD_DAY.isoformat()
+    assert member["entry_result_version"] == entry_version
     assert member["entry_close"] is None
     assert member["unknown_reason"] == "entry_price_missing"
 

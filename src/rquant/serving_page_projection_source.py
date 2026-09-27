@@ -5,7 +5,6 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
-import math
 import os
 import re
 import sqlite3
@@ -1535,7 +1534,6 @@ def _read_membership_source(
     target_date: date | None,
     cutoff: datetime,
     observed: datetime,
-    generation_sealed_before_cutoff: bool,
 ) -> _MembershipSource:
     if receipts is None or target_date is None:
         return _MembershipSource(
@@ -1561,7 +1559,7 @@ def _read_membership_source(
         str(row[0])
         for row in connection.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' "
-            "AND table_name IN ('trade_calendar', 'daily_bar')"
+            "AND table_name = 'trade_calendar'"
         ).fetchall()
     }
     start = min(
@@ -1573,31 +1571,13 @@ def _read_membership_source(
         if "trade_calendar" in tables
         else ((), False)
     )
-    daily_columns = (
-        {str(row[1]) for row in connection.execute("PRAGMA table_info('daily_bar')").fetchall()}
-        if "daily_bar" in tables
-        else set()
-    )
-    price_authority = generation_sealed_before_cutoff and {
-        "trade_date",
-        "ts_code",
-        "close",
-    }.issubset(daily_columns)
     days: list[PoolDayEvidence] = []
     member_total = 0
     for receipt in receipts.membership_daily:
         member_rows = connection.execute(
-            (
-                "SELECT sr.ts_code, sr.close, db.close FROM screen_result AS sr "
-                "LEFT JOIN daily_bar AS db ON db.trade_date = sr.trade_date "
-                "AND db.ts_code = sr.ts_code "
-                "WHERE sr.trade_date = ? AND sr.preset_name = ? AND sr.created_at <= ? "
-                "ORDER BY sr.ts_code LIMIT ?"
-                if price_authority
-                else "SELECT ts_code, close, NULL FROM screen_result "
-                "WHERE trade_date = ? AND preset_name = ? AND created_at <= ? "
-                "ORDER BY ts_code LIMIT ?"
-            ),
+            "SELECT ts_code FROM screen_result "
+            "WHERE trade_date = ? AND preset_name = ? AND created_at <= ? "
+            "ORDER BY ts_code LIMIT ?",
             (
                 receipt.trade_date,
                 receipt.preset_name,
@@ -1616,24 +1596,7 @@ def _read_membership_source(
                 days=(),
                 candidate_keys=receipts.membership_candidate_keys,
             )
-        members = tuple(
-            PoolMemberClose(
-                ts_code=str(code),
-                close=(
-                    float(screen_close)
-                    if price_authority
-                    and screen_close is not None
-                    and bar_close is not None
-                    and math.isfinite(float(screen_close))
-                    and math.isfinite(float(bar_close))
-                    and math.isclose(
-                        float(screen_close), float(bar_close), rel_tol=1e-9, abs_tol=1e-8
-                    )
-                    else None
-                ),
-            )
-            for code, screen_close, bar_close in member_rows
-        )
+        members = tuple(PoolMemberClose(ts_code=str(code)) for (code,) in member_rows)
         days.append(
             PoolDayEvidence(trade_date=receipt.trade_date, receipt=receipt, members=members)
         )
@@ -2127,7 +2090,6 @@ class DuckDBSignalPageProjectionSource:
                 target_date=membership_target_date,
                 cutoff=cutoff,
                 observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
-                generation_sealed_before_cutoff=sealed_before_cutoff,
             )
             diagnostics: tuple[CanvasDiagnosticProjectionRow, ...] = ()
             hits: tuple[CanvasHitProjectionRow, ...] = ()
