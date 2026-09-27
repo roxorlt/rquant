@@ -17,6 +17,9 @@ class PoolMember(BaseModel):
     pct_chg: float | None
     entry_trade_date: date | None
     entry_close: float | None
+    gain_pct: float | None
+    gain_through_date: date | None
+    entry_line_price: float | None
 
 
 class PoolStep(BaseModel):
@@ -75,6 +78,8 @@ class PublishedPool(BaseModel):
     state: Literal["current", "older", "no_data", "unpublished", "unavailable"]
     trade_date: date | None
     member_count: int | None
+    gain_verified_count: int
+    gain_sample_avg_pct: float | None
     steps: list[PoolStep]
     steps_truncated: bool
     members: list[PoolMember]

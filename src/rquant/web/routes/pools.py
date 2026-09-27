@@ -39,6 +39,7 @@ _MAX_STEPS = 32
 _MAX_RULE_ROWS = 512
 _MAX_RECEIPTS = 512
 _MAX_MEMBERSHIP_ROWS = 4_608
+_MAX_RETURN_ROWS = 4_096
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,17 @@ class _MembershipRow:
 class _EntryEvidence:
     trade_date: date | None = None
     close: float | None = None
+
+
+@dataclass(frozen=True)
+class _ReturnRow:
+    trade_date: date
+    result_version: str
+    code: str
+    entry_trade_date: date
+    entry_result_version: str
+    gain_pct: float | None
+    entry_line_price: float | None
 
 
 def _available(tables: dict[str, readers.TableState], name: str) -> bool:
@@ -208,6 +220,33 @@ def _membership_rows(
     return by_pool
 
 
+def _return_rows(cursor: Any, tables: dict[str, readers.TableState]) -> dict[str, list[_ReturnRow]]:
+    if not _available(tables, "pool_member_return"):
+        return {}
+    rows = cursor.execute(
+        "SELECT pool_name, trade_date, result_version, ts_code, entry_trade_date, "
+        "entry_result_version, gain_pct, entry_line_price FROM pool_member_return "
+        "ORDER BY pool_name, ts_code LIMIT ?",
+        (_MAX_RETURN_ROWS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_RETURN_ROWS:
+        return {}
+    by_pool: dict[str, list[_ReturnRow]] = defaultdict(list)
+    for name, day, version, code, entry_day, entry_version, gain, line in rows:
+        by_pool[str(name)].append(
+            _ReturnRow(
+                trade_date=day,
+                result_version=str(version),
+                code=str(code),
+                entry_trade_date=entry_day,
+                entry_result_version=str(entry_version),
+                gain_pct=readers._number(gain),
+                entry_line_price=readers._number(line),
+            )
+        )
+    return by_pool
+
+
 def _entry_evidence(row: _MembershipRow, *, result_date: date) -> _EntryEvidence:
     if (
         row.entry_trade_date is None
@@ -276,6 +315,55 @@ def _member_entries(
     ):
         return {}
     return {row.code: _entry_evidence(row, result_date=receipt.trade_date) for row in members}
+
+
+def _member_returns(
+    *,
+    rows: list[_ReturnRow] | None,
+    receipt: _RunReceipt | None,
+    membership: list[_MembershipRow] | None,
+    entries: dict[str, _EntryEvidence],
+    member_codes: set[str],
+    member_count: int,
+) -> dict[str, _ReturnRow]:
+    if (
+        not rows
+        or receipt is None
+        or receipt.result_version is None
+        or membership is None
+        or len(entries) != member_count
+        or len(member_codes) != member_count
+    ):
+        return {}
+    members = {row.code: row for row in membership if row.row_kind == "member"}
+    if len(members) != member_count:
+        return {}
+    verified: dict[str, _ReturnRow] = {}
+    for row in rows:
+        entry = entries.get(row.code)
+        member = members.get(row.code)
+        if (
+            row.code in verified
+            or row.code not in member_codes
+            or row.trade_date != receipt.trade_date
+            or row.result_version != receipt.result_version
+            or entry is None
+            or entry.trade_date is None
+            or entry.close is None
+            or member is None
+            or member.entry_result_version is None
+            or row.entry_trade_date != entry.trade_date
+            or row.entry_result_version != member.entry_result_version
+            or row.gain_pct is None
+            or not math.isfinite(row.gain_pct)
+            or (
+                row.entry_line_price is not None
+                and (not math.isfinite(row.entry_line_price) or row.entry_line_price != entry.close)
+            )
+        ):
+            return {}
+        verified[row.code] = row
+    return verified
 
 
 def _result_view(
@@ -383,6 +471,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
     rule_definitions, rule_versions = _rule_definitions(cursor, tables)
     receipts = _run_receipts(cursor, tables)
     memberships = _membership_rows(cursor, tables)
+    returns = _return_rows(cursor, tables)
     results_available = all(
         _available(tables, name) for name in ("canvas_latest_trade_date", "canvas_hit")
     )
@@ -425,6 +514,9 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                     pct_chg=readers._number(payload.get("pct_chg")),
                     entry_trade_date=None,
                     entry_close=None,
+                    gain_pct=None,
+                    gain_through_date=None,
+                    entry_line_price=None,
                 )
             )
 
@@ -544,11 +636,37 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             member_codes=hit_codes[key],
             member_count=counts[key],
         )
+        member_returns = _member_returns(
+            rows=returns.get(key),
+            receipt=receipt,
+            membership=memberships.get(key),
+            entries=entries,
+            member_codes=hit_codes[key],
+            member_count=counts[key],
+        )
+        gains = [row.gain_pct for row in member_returns.values() if row.gain_pct is not None]
+        try:
+            sample_avg = math.fsum(gains) / len(gains) if gains else None
+        except OverflowError:
+            sample_avg = None
+        if sample_avg is not None and not math.isfinite(sample_avg):
+            sample_avg = None
+        if gains and sample_avg is None:
+            member_returns = {}
         visible_members = [
             member.model_copy(
                 update={
                     "entry_trade_date": entries[member.code].trade_date,
                     "entry_close": entries[member.code].close,
+                    "gain_pct": member_returns[member.code].gain_pct
+                    if member.code in member_returns
+                    else None,
+                    "gain_through_date": member_returns[member.code].trade_date
+                    if member.code in member_returns
+                    else None,
+                    "entry_line_price": member_returns[member.code].entry_line_price
+                    if member.code in member_returns
+                    else None,
                 }
             )
             if member.code in entries
@@ -565,6 +683,8 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                 state=state,
                 trade_date=trade_date,
                 member_count=member_count,
+                gain_verified_count=len(member_returns),
+                gain_sample_avg_pct=sample_avg if member_returns else None,
                 steps=pool_steps if state == "current" else [],
                 steps_truncated=state == "current" and step_counts[key] > _MAX_STEPS,
                 members=visible_members if state == "current" else [],

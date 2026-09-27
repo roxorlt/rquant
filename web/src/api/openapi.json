@@ -3571,6 +3571,17 @@
             ],
             "title": "Entry Close"
           },
+          "entry_line_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Line Price"
+          },
           "entry_trade_date": {
             "anyOf": [
               {
@@ -3582,6 +3593,29 @@
               }
             ],
             "title": "Entry Trade Date"
+          },
+          "gain_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gain Pct"
+          },
+          "gain_through_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gain Through Date"
           },
           "name": {
             "anyOf": [
@@ -3612,7 +3646,10 @@
           "close",
           "pct_chg",
           "entry_trade_date",
-          "entry_close"
+          "entry_close",
+          "gain_pct",
+          "gain_through_date",
+          "entry_line_price"
         ],
         "title": "PoolMember",
         "type": "object"
@@ -3875,6 +3912,21 @@
               }
             ]
           },
+          "gain_sample_avg_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gain Sample Avg Pct"
+          },
+          "gain_verified_count": {
+            "title": "Gain Verified Count",
+            "type": "integer"
+          },
           "key": {
             "title": "Key",
             "type": "string"
@@ -3949,6 +4001,8 @@
           "state",
           "trade_date",
           "member_count",
+          "gain_verified_count",
+          "gain_sample_avg_pct",
           "steps",
           "steps_truncated",
           "members",

@@ -1546,8 +1546,14 @@ export interface components {
             code: string;
             /** Entry Close */
             entry_close: number | null;
+            /** Entry Line Price */
+            entry_line_price: number | null;
             /** Entry Trade Date */
             entry_trade_date: string | null;
+            /** Gain Pct */
+            gain_pct: number | null;
+            /** Gain Through Date */
+            gain_through_date: string | null;
             /** Name */
             name: string | null;
             /** Pct Chg */
@@ -1633,6 +1639,10 @@ export interface components {
         /** PublishedPool */
         PublishedPool: {
             definition?: components["schemas"]["PoolDefinitionView"] | null;
+            /** Gain Sample Avg Pct */
+            gain_sample_avg_pct: number | null;
+            /** Gain Verified Count */
+            gain_verified_count: number;
             /** Key */
             key: string;
             /** Member Count */

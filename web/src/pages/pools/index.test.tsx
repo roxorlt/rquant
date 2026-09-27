@@ -11,10 +11,19 @@ vi.mock("@/charts/PriceChart", () => ({
   PriceChart: ({
     label,
     marks,
+    referenceLine,
   }: {
     label: string;
     marks?: readonly { time: string; label: string }[];
-  }) => <div role="img" aria-label={label} data-marks={JSON.stringify(marks ?? [])} />,
+    referenceLine?: { price: number; label: string };
+  }) => (
+    <div
+      role="img"
+      aria-label={label}
+      data-marks={JSON.stringify(marks ?? [])}
+      data-reference={JSON.stringify(referenceLine ?? null)}
+    />
+  ),
 }));
 
 const serving = metaEnvelope().serving;
@@ -39,6 +48,8 @@ const base: Schemas["PoolsData"] = {
       state: "current",
       trade_date: "2026-09-23",
       member_count: 121,
+      gain_verified_count: 0,
+      gain_sample_avg_pct: null,
       steps: [{ step_index: 0, label: "最终命中", count: 121 }],
       steps_truncated: false,
       members: [
@@ -49,6 +60,9 @@ const base: Schemas["PoolsData"] = {
           pct_chg: 1.2,
           entry_trade_date: null,
           entry_close: null,
+          gain_pct: null,
+          gain_through_date: null,
+          entry_line_price: null,
         },
       ],
       members_truncated: true,
@@ -65,6 +79,8 @@ const base: Schemas["PoolsData"] = {
       state: "unpublished",
       trade_date: null,
       member_count: null,
+      gain_verified_count: 0,
+      gain_sample_avg_pct: null,
       steps: [],
       steps_truncated: false,
       members: [],
@@ -227,6 +243,131 @@ it.each([
   expect(within(drawer).queryByText("入池 · 2026-09-22") !== null).toBe(marked);
   expect(findJargon(container.textContent ?? "")).toEqual([]);
 });
+
+it.each([
+  {
+    name: "same factor",
+    line: 10.25,
+    provisional: false,
+    differentGeneration: false,
+    expectedLine: true,
+  },
+  {
+    name: "factor changed",
+    line: null,
+    provisional: false,
+    differentGeneration: false,
+    expectedLine: false,
+  },
+  {
+    name: "current bar is provisional",
+    line: 10.25,
+    provisional: true,
+    differentGeneration: false,
+    expectedLine: false,
+  },
+  {
+    name: "another generation",
+    line: 10.25,
+    provisional: false,
+    differentGeneration: true,
+    expectedLine: false,
+  },
+])(
+  "shows verified return and safe entry line for $name",
+  async ({ line, provisional, differentGeneration, expectedLine }) => {
+    const first = base.pools[0];
+    const member = first?.members[0];
+    if (!first || !member) throw new Error("pool fixture is incomplete");
+    respond({
+      ...base,
+      pools: [
+        {
+          ...first,
+          member_count: 1,
+          gain_verified_count: 1,
+          gain_sample_avg_pct: 12.5,
+          members: [
+            {
+              ...member,
+              entry_trade_date: "2026-09-22",
+              entry_close: 10.25,
+              gain_pct: 12.5,
+              gain_through_date: "2026-09-23",
+              entry_line_price: line,
+            },
+          ],
+          result: {
+            state: "current_rules",
+            status_label: "结果已按当前规则更新",
+            trade_date: "2026-09-23",
+            hit_count: 1,
+          },
+        },
+      ],
+    });
+    server.use(
+      http.get("*/api/v1/stocks/600001.SH/summary", () =>
+        HttpResponse.json({
+          data: { ts_code: "600001.SH", name: "样本01", price: 11, as_of: null, pools: [] },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/panorama/stocks/600001.SH/daily", () =>
+        HttpResponse.json({
+          data: {
+            ts_code: "600001.SH",
+            name: "样本01",
+            bars: [
+              {
+                date: "2026-09-22",
+                open: 10,
+                high: 11,
+                low: 9.8,
+                close: 10.25,
+                volume: 1000,
+                ma5: null,
+                ma10: null,
+                ma20: null,
+                provisional: false,
+              },
+              {
+                date: "2026-09-23",
+                open: 10.3,
+                high: 11,
+                low: 10,
+                close: 11,
+                volume: 1000,
+                ma5: null,
+                ma10: null,
+                ma20: null,
+                provisional,
+              },
+            ],
+          },
+          serving: differentGeneration
+            ? { ...serving, generation_id: "another-generation" }
+            : serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { container } = renderApp("/pools");
+    const table = await screen.findByRole("table", { name: "池子成员" });
+    expect(within(table).getByRole("columnheader", { name: "入池后复权涨幅" })).toBeInTheDocument();
+    expect(within(table).getByRole("row", { name: /样本01/ })).toHaveTextContent("12.50%");
+    expect(screen.getByText("已核验样本平均")).toBeInTheDocument();
+    await user.click(within(table).getByRole("row", { name: /样本01/ }));
+    const drawer = await screen.findByRole("dialog");
+    const chart = await within(drawer).findByRole("img", { name: "样本01 日 K" });
+    expect(chart).toHaveAttribute(
+      "data-reference",
+      JSON.stringify(expectedLine ? { price: 10.25, label: "入池日收盘价" } : null),
+    );
+    if (line === null) expect(within(drawer).getByText("价格口径不同")).toBeInTheDocument();
+    expect(findJargon(container.textContent ?? "")).toEqual([]);
+  },
+);
 
 it("shows independent published-rule and verified-result states in graph, list, and detail", async () => {
   const first = base.pools[0];

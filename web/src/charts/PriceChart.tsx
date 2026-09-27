@@ -7,6 +7,7 @@ import {
   type DeepPartial,
   HistogramSeries,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
   LineSeries,
@@ -66,6 +67,7 @@ export type PriceChartProps =
       mode: "daily";
       bars: readonly DailyBar[];
       marks?: readonly DailyMark[];
+      referenceLine?: { price: number; label: string };
       label: string;
       className?: string;
     }
@@ -258,6 +260,7 @@ export function PriceChart(props: PriceChartProps) {
   const maRefs = useRef<ISeriesApi<"Line">[]>([]);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const entryLineRef = useRef<IPriceLine | null>(null);
   const readoutAt = useRef<(time: number | string | null) => ChartReadout | null>(() => null);
   const markTimesRef = useRef<{ time: number; label: string }[]>([]);
   const [readout, setReadout] = useState<ChartReadout | null>(null);
@@ -353,6 +356,7 @@ export function PriceChart(props: PriceChartProps) {
       maRefs.current = [];
       volumeRef.current = null;
       markersRef.current = null;
+      entryLineRef.current = null;
     };
   }, [mode]);
 
@@ -369,9 +373,23 @@ export function PriceChart(props: PriceChartProps) {
       setMarkLines([]);
       const series = priceRef.current as ISeriesApi<"Candlestick"> | null;
       series?.applyOptions(candleSeriesColors(colors));
+      if (entryLineRef.current && series) {
+        series.removePriceLine(entryLineRef.current);
+        entryLineRef.current = null;
+      }
       series?.setData(
         props.bars.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
       );
+      if (series && props.referenceLine && Number.isFinite(props.referenceLine.price)) {
+        entryLineRef.current = series.createPriceLine({
+          price: props.referenceLine.price,
+          color: colors.accent,
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: props.referenceLine.label,
+        });
+      }
       const maKeys = ["ma5", "ma10", "ma20"] as const;
       const maColors = [colors.series[1], colors.series[0], colors.series[2]];
       maRefs.current.forEach((line, index) => {
