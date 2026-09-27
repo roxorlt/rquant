@@ -99,6 +99,33 @@ def test_changed_digest_withholds_read_link(tmp_path: Path) -> None:
     assert ReadonlySignalRouteSpool(spool.paths.root).bus_prefix_link() is None
 
 
+def test_same_reader_rechecks_record_file_after_it_was_damaged(tmp_path: Path) -> None:
+    bus, spool = _routed_source(tmp_path)
+    publish_signal_bus_prefix(bus=bus, spool=spool, limit=10)
+    linked = spool.publish_bus_prefix_link(bus=bus, observed_at=datetime.now(UTC))
+    assert linked is not None
+    reader = ReadonlySignalRouteSpool(spool.paths.root)
+    assert reader.bus_prefix_link() == linked
+
+    (spool.paths.records / "00000000000000000001.json").write_text("{}")
+
+    assert reader.bus_prefix_link() is None
+
+
+@pytest.mark.parametrize("column", ("target_manifest_hash", "decision_fingerprint"))
+def test_changed_bus_route_ledger_withholds_new_link(tmp_path: Path, column: str) -> None:
+    bus, spool = _routed_source(tmp_path)
+    publish_signal_bus_prefix(bus=bus, spool=spool, limit=10)
+    with sqlite3.connect(bus.path) as connection:
+        connection.execute(
+            f"UPDATE signal_route_receipt SET {column} = ? WHERE source_sequence = 1",
+            ("0" * 64,),
+        )
+
+    assert spool.publish_bus_prefix_link(bus=bus, observed_at=datetime.now(UTC)) is None
+    assert ReadonlySignalRouteSpool(spool.paths.root).bus_prefix_link() is None
+
+
 def test_advanced_spool_pointer_withholds_stale_link(tmp_path: Path) -> None:
     bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
     first = _signal("1")

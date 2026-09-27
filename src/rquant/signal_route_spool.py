@@ -25,13 +25,20 @@ from pydantic import (
     model_validator,
 )
 
-from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
+from rquant.runtime_contracts import (
+    AwareUtcDatetime,
+    RuntimeContractModel,
+    canonical_sha256,
+    normalize_aware_utc,
+)
 from rquant.signal_bus import (
     LegacySignalWriteActivationError,
+    SignalBusIntegrityError,
     SignalBusObservedPrefixReceipt,
     SignalBusRoutedRecord,
     SignalBusSignalRecord,
     SignalBusSourceDescriptor,
+    SignalBusSourceSequenceError,
     SignalBusStore,
     SignalRouteReceipt,
     require_legacy_signal_write,
@@ -308,12 +315,17 @@ class SignalBusSpoolPrefixReceipt(RuntimeContractModel):
 
     bus_prefix: SignalBusObservedPrefixReceipt
     spool_last_record_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    routed_rows_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_head(self) -> Self:
         if (self.bus_prefix.source_high_watermark == 0) != (self.spool_last_record_hash is None):
             raise ValueError("empty bus prefix and spool head disagree")
         return self
+
+
+def _routed_prefix_digest(records: tuple[SignalBusRoutedRecord, ...]) -> str:
+    return canonical_sha256({"contract": "signal-bus-routed-prefix/v1", "records": records})
 
 
 class _SignalRouteSpoolPaths:
@@ -1002,6 +1014,17 @@ class SignalRouteSpool:
         bus_prefix = bus.observed_prefix_receipt(observed_at=observed_at)
         if bus_prefix is None:
             return None
+        try:
+            bus_source = bus.source_descriptor()
+            bus_routed = bus.routed_signals_after_global_sequence(
+                after_sequence=0,
+                through_sequence=bus_prefix.source_high_watermark,
+                limit=max(1, bus_prefix.source_high_watermark),
+            )
+        except (SignalBusIntegrityError, SignalBusSourceSequenceError, TypeError, ValueError):
+            return None
+        if not bus_prefix.matches_routed_prefix(bus_source, bus_routed):
+            return None
         root_descriptor = _open_root_directory(self.paths.root)
         try:
             records_descriptor = _open_records_directory(root_descriptor)
@@ -1011,11 +1034,15 @@ class SignalRouteSpool:
                         root_descriptor, records_descriptor
                     )
                     routed = tuple(entry.record for entry in entries)
-                    if not bus_prefix.matches_routed_prefix(pointer.source, routed):
+                    if (
+                        not bus_prefix.matches_routed_prefix(pointer.source, routed)
+                        or routed != bus_routed
+                    ):
                         return None
                     link = SignalBusSpoolPrefixReceipt(
                         bus_prefix=bus_prefix,
                         spool_last_record_hash=pointer.last_record_hash,
+                        routed_rows_sha256=_routed_prefix_digest(bus_routed),
                     )
                     payload = _canonical_bytes(link)
                     if _file_exists_at(root_descriptor, "bus-prefix-link.json"):
@@ -1108,14 +1135,17 @@ class ReadonlySignalRouteSpool:
             return self._refresh_locked().source
 
     def bus_prefix_link(self) -> SignalBusSpoolPrefixReceipt | None:
-        """Serve only a link that still matches this verified spool prefix."""
+        """Recheck disk records; a cached reader cannot attest to later file damage."""
         with self._lock:
-            pointer = self._refresh_locked()
             root_descriptor = _open_root_directory(self.paths.root)
             try:
-                if not _file_exists_at(root_descriptor, "bus-prefix-link.json"):
-                    return None
+                records_descriptor = _open_records_directory(root_descriptor)
                 try:
+                    identity, pointer, entries = _load_verified_snapshot(
+                        root_descriptor, records_descriptor
+                    )
+                    if not _file_exists_at(root_descriptor, "bus-prefix-link.json"):
+                        return None
                     payload = _read_file_at(
                         root_descriptor,
                         "bus-prefix-link.json",
@@ -1123,14 +1153,23 @@ class ReadonlySignalRouteSpool:
                         max_bytes=_MAX_METADATA_BYTES,
                     )
                     link = _parse_bus_prefix_link(payload)
+                    current_identity, current_pointer = _load_spool_metadata(
+                        root_descriptor, records_descriptor
+                    )
+                    if current_identity != identity or current_pointer != pointer:
+                        return None
                 except (FileNotFoundError, SignalRouteSpoolIntegrityError):
                     return None
+                finally:
+                    os.close(records_descriptor)
             finally:
                 os.close(root_descriptor)
             if link.spool_last_record_hash != pointer.last_record_hash:
                 return None
-            routed = tuple(entry.record for entry in self._verified_entries)
-            if not link.bus_prefix.matches_routed_prefix(pointer.source, routed):
+            routed = tuple(entry.record for entry in entries)
+            if not link.bus_prefix.matches_routed_prefix(
+                pointer.source, routed
+            ) or link.routed_rows_sha256 != _routed_prefix_digest(routed):
                 return None
             return link
 
