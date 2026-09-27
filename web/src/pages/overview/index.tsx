@@ -31,6 +31,7 @@ import { unacknowledgedKpi } from "../shared/AlertAcknowledgment";
 import { StockCell } from "../shared/StockCell";
 import { Attention } from "./Attention";
 import { Pipeline } from "./Pipeline";
+import "./overview.css";
 
 const ACTION_KIND: Record<string, PillKind> = {
   b_intent: "acc",
@@ -422,7 +423,9 @@ export default function OverviewPage() {
     <>
       <PageHeader eyebrow="概览" title="总览" note={sessionNote(data)} actions={refresh} />
       {data.pipeline.length ? <Pipeline stages={data.pipeline} /> : null}
-      <KpiStrip label="今日关键数字" items={kpis(data)} />
+      <div className="overview-kpis">
+        <KpiStrip label="今日关键数字" items={kpis(data)} />
+      </div>
       <div className="g2">
         <Panel title="最新信号" sub={`${formatCount(data.signals.total)} 条`} flush>
           <DataTable

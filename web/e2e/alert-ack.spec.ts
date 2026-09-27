@@ -98,6 +98,26 @@ for (const width of [1440, 390]) {
       const overviewCard = page.locator('[data-kpi="unacknowledged"]');
       await expect(overviewCard.locator(".val")).toContainText("12条");
       await expect(overviewCard.locator(".sub")).toContainText("截至");
+      if (width === 390) {
+        const strip = page.getByRole("region", { name: "今日关键数字" });
+        const cards = strip.locator(".kpi");
+        await expect(cards).toHaveCount(7);
+        const first = await cards.first().boundingBox();
+        const last = await cards.last().boundingBox();
+        const bounds = await strip.boundingBox();
+        if (!first || !last || !bounds) throw new Error("总览关键数字未显示");
+        expect(last.x).toBe(first.x);
+        expect(last.y).toBeGreaterThan(first.y);
+        expect(last.width).toBeGreaterThan(first.width * 1.9);
+        expect(Math.abs(last.x + last.width - (bounds.x + bounds.width - 1))).toBeLessThan(2);
+        const captureDir = process.env.RQ_E2E_CAPTURE_DIR;
+        if (captureDir) {
+          await page.screenshot({
+            fullPage: true,
+            path: `${captureDir}/alert-ack-overview-390.png`,
+          });
+        }
+      }
       await overviewCard.locator(".sub .tip-anchor").focus();
       await expect(
         page.getByRole("tooltip").filter({ hasText: "2026-09-24 13:10:00" }),
