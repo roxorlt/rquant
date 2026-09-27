@@ -30,7 +30,7 @@ export const paperHandler = (envelope = paperEnvelope()) =>
 export const poolEditorHandler = () =>
   http.get("*/api/v1/pools/editor", () =>
     HttpResponse.json({
-      data: { state: "unavailable", pools: [], canvases: [] },
+      data: { state: "unavailable", pools: [], copy_sources: [], canvases: [] },
       serving: metaEnvelope().serving,
     }),
   );

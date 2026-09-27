@@ -4,6 +4,7 @@ import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 export type PoolEditorData = Schemas["PoolEditorData"];
 export type EditablePool = Schemas["EditablePool"];
 export type EditableCanvas = Schemas["EditableCanvas"];
+export type BuiltinPoolCopySource = Schemas["BuiltinPoolCopySource"];
 export type EditorCommand = Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"];
 export type EditorReceipt = Schemas["PoolEditorReceipt"];
 

@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PublishedPool } from "@/api/endpoints";
-import type { EditableCanvas, EditablePool } from "@/api/poolEditor";
+import type { BuiltinPoolCopySource, EditableCanvas, EditablePool } from "@/api/poolEditor";
 import { type ScreenBlock, useScreenCatalog } from "@/api/screen";
 import { Button, ParamControl, type ParameterValue, SideDrawer, Tip } from "@/ui";
 import type { EditorSessionSnapshot, PoolEditorSession, SaveInput } from "./editorSession";
 
 type RuleDraft = { id: number; key: string; args: Record<string, ParameterValue> };
-type Mode = { kind: "create"; parentKey: string | null } | { kind: "edit"; pool: EditablePool };
+type Mode =
+  | { kind: "create"; parentKey: string | null }
+  | { kind: "edit"; pool: EditablePool }
+  | { kind: "copy"; source: BuiltinPoolCopySource };
 
-function initialRules(pool: EditablePool | null): RuleDraft[] {
+function initialRules(pool: Pick<EditablePool, "rule_calls"> | null): RuleDraft[] {
   return (
     pool?.rule_calls.map((rule, index) => ({
       id: index + 1,
@@ -104,25 +107,30 @@ export function PoolEditorForm({
   onClose: () => void;
 }) {
   const editing = mode.kind === "edit" ? mode.pool : null;
+  const copying = mode.kind === "copy" ? mode.source : null;
   const catalog = useScreenCatalog();
-  const [name, setName] = useState(editing?.display_name ?? "");
-  const [description, setDescription] = useState(editing?.description ?? "");
-  const [parent, setParent] = useState(
-    editing
-      ? (editing.depends_on ?? "")
-      : mode.kind === "create"
-        ? (mode.parentKey ?? publishedPools[0]?.key ?? "")
-        : "",
+  const [name, setName] = useState(
+    editing?.display_name ??
+      (copying
+        ? `${copying.display_name.replace(/[^\w\u4e00-\u9fff-]/gu, "").slice(0, 78)}副本`
+        : ""),
   );
-  const [delay, setDelay] = useState(editing?.delay_days ?? 1);
+  const [description, setDescription] = useState(
+    editing?.description ?? copying?.description ?? "",
+  );
+  const [parent, setParent] = useState(
+    editing?.depends_on ??
+      copying?.depends_on ??
+      (mode.kind === "create" ? (mode.parentKey ?? publishedPools[0]?.key ?? "") : ""),
+  );
+  const [delay, setDelay] = useState(editing?.delay_days ?? copying?.delay_days ?? 1);
   const [canvas, setCanvas] = useState(
     currentCanvas && canvases.some((item) => item.name === currentCanvas) ? currentCanvas : "",
   );
   const [chosenBlock, setChosenBlock] = useState("");
-  const [rules, setRules] = useState<RuleDraft[]>(() => initialRules(editing));
+  const [rules, setRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
   const [preview, setPreview] = useState(false);
   const previewRef = useRef<HTMLElement>(null);
-  const statusRef = useRef<HTMLDivElement>(null);
   const blocks = catalog.data?.blocks ?? [];
   const blockMap = useMemo(() => new Map(blocks.map((block) => [block.key, block])), [blocks]);
   const parentPool = publishedPools.find((pool) => pool.key === parent);
@@ -176,7 +184,7 @@ export function PoolEditorForm({
         delay >= 1 &&
         delay <= 252 &&
         Number.isInteger(delay)
-      : editing !== null) &&
+      : editing !== null || copying !== null) &&
     rulesValid &&
     snapshot.storageAvailable &&
     !snapshot.busy &&
@@ -215,7 +223,7 @@ export function PoolEditorForm({
       depends_on: parent || null,
       delay_days: parent ? delay : 0,
       rule_calls: rules.map((rule) => ({ name: rule.key, args: rule.args })),
-      include_columns: editing?.include_columns ?? [],
+      include_columns: editing?.include_columns ?? copying?.include_columns ?? [],
       expected_version: editing?.version ?? null,
     };
     await session.startSave(input, attachTo);
@@ -228,40 +236,72 @@ export function PoolEditorForm({
     }
   }, [preview]);
 
-  useEffect(() => {
-    if (statusLabel && !snapshot.busy && typeof statusRef.current?.scrollIntoView === "function") {
-      statusRef.current.scrollIntoView({ block: "end" });
-    }
-  }, [snapshot.busy, statusLabel]);
-
   return (
     <SideDrawer
       open
       onClose={onClose}
       wide
-      title={editing ? "编辑规则" : "添加条件节点"}
+      title={editing ? "编辑规则" : copying ? "复制为自建池" : "添加条件节点"}
       footer={
         <div className="pool-editor-footer">
-          <Button onClick={onClose}>返回画布</Button>
-          <Button
-            variant="primary"
-            disabledReason={
-              !canSubmit
-                ? "请先补齐有效条件，并等待同一批数据。"
-                : !preview
-                  ? "先查看变更预览。"
-                  : undefined
-            }
-            onClick={() => void submit()}
-          >
-            {attachTo ? "保存并加入画布" : "保存规则"}
-          </Button>
+          {sameTarget && statusLabel ? (
+            <div className="pool-editor-status" role="status">
+              {snapshot.journal?.saveStatus === "succeeded" &&
+              !statusLabel.startsWith("池子已保存") ? (
+                <span>池子已保存</span>
+              ) : null}
+              <strong>{statusLabel}</strong>
+              {snapshot.message ? <p>{snapshot.message}</p> : null}
+              {snapshot.journal?.attachStatus === "failed" ? (
+                <Button size="sm" onClick={() => void session.retryAttachment()}>
+                  重试加入画布
+                </Button>
+              ) : null}
+              {snapshot.journal &&
+              (["pending", "processing", "ambiguous", "unknown"].includes(
+                snapshot.journal.saveStatus,
+              ) ||
+                (snapshot.journal.saveStatus === "succeeded" &&
+                  ["pending", "processing", "ambiguous", "unknown"].includes(
+                    snapshot.journal.attachStatus,
+                  ))) ? (
+                <Button size="sm" disabled={snapshot.busy} onClick={() => void session.advance()}>
+                  继续核对
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+          {!snapshot.storageAvailable ? (
+            <p role="alert" className="pool-editor-error">
+              {snapshot.message ?? "浏览器存储不可用，无法安全提交。"}
+            </p>
+          ) : null}
+          <div className="pool-editor-footer-actions">
+            <Button onClick={onClose}>返回画布</Button>
+            <Button
+              variant="primary"
+              disabledReason={
+                !canSubmit
+                  ? "请先补齐有效条件，并等待同一批数据。"
+                  : !preview
+                    ? "先查看变更预览。"
+                    : undefined
+              }
+              onClick={() => void submit()}
+            >
+              {attachTo ? "保存并加入画布" : "保存规则"}
+            </Button>
+          </div>
         </div>
       }
     >
       <div className="pool-editor">
         <p className="pool-editor-lead">
-          {editing ? "调整这只自建池的筛选条件。" : "从父池筛选，保存后加入所选画布。"}
+          {editing
+            ? "调整这只自建池的筛选条件。"
+            : copying
+              ? "复制已核验的条件，保存前可调整。"
+              : "从父池筛选，保存后加入所选画布。"}
         </p>
         <div className="pool-editor-fields">
           <label className="field">
@@ -300,7 +340,7 @@ export function PoolEditorForm({
                 setPreview(false);
               }}
             >
-              {editing ? <option value="">独立筛选</option> : null}
+              {editing || copying ? <option value="">独立筛选</option> : null}
               {publishedPools
                 .filter((pool) => pool.key !== editing?.key)
                 .map((pool) => (
@@ -450,6 +490,7 @@ export function PoolEditorForm({
           {preview && rulesValid ? (
             <div className="pool-editor-preview">
               <strong>{name.trim()}</strong>
+              {copying ? <span>来自「{copying.display_name}」</span> : null}
               <span>
                 {parent ? `从 ${parentPool?.name} 筛选 · 延后 ${delay} 个交易日` : "独立筛选"}
               </span>
@@ -479,34 +520,6 @@ export function PoolEditorForm({
             <p className="pools-note">填写后预览将保存的规则。</p>
           )}
         </section>
-        {sameTarget && statusLabel ? (
-          <div ref={statusRef} className="pool-editor-status" role="status">
-            <strong>{statusLabel}</strong>
-            {snapshot.message ? <p>{snapshot.message}</p> : null}
-            {snapshot.journal?.attachStatus === "failed" ? (
-              <Button size="sm" onClick={() => void session.retryAttachment()}>
-                重试加入画布
-              </Button>
-            ) : null}
-            {snapshot.journal &&
-            (["pending", "processing", "ambiguous", "unknown"].includes(
-              snapshot.journal.saveStatus,
-            ) ||
-              (snapshot.journal.saveStatus === "succeeded" &&
-                ["pending", "processing", "ambiguous", "unknown"].includes(
-                  snapshot.journal.attachStatus,
-                ))) ? (
-              <Button size="sm" disabled={snapshot.busy} onClick={() => void session.advance()}>
-                继续核对
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
-        {!snapshot.storageAvailable ? (
-          <p role="alert" className="pool-editor-error">
-            {snapshot.message ?? "浏览器存储不可用，无法安全提交。"}
-          </p>
-        ) : null}
       </div>
     </SideDrawer>
   );

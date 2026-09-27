@@ -334,7 +334,10 @@ export default function PoolsPage() {
   );
   const autoRetry = useRef({ commandId: "", attempts: 0 });
   const [editorMode, setEditorMode] = useState<
-    { kind: "create"; parentKey: string | null } | { kind: "edit"; key: string } | null
+    | { kind: "create"; parentKey: string | null }
+    | { kind: "edit"; key: string }
+    | { kind: "copy"; key: string }
+    | null
   >(null);
   const [canvasName, setCanvasName] = useState<string | null>(null);
   const [selectionId, setSelectionId] = useState<string | null>(null);
@@ -407,16 +410,29 @@ export default function PoolsPage() {
   const selectedKind =
     selectionId?.startsWith("condition:") && selected?.key === selectedKey ? "condition" : "pool";
   const selectedEditable = editorQuery.data?.pools.find((item) => item.key === selected?.key);
+  const selectedCopySource = editorQuery.data?.copy_sources.find(
+    (item) => item.key === selected?.key,
+  );
   const activeEditable =
     editorMode?.kind === "edit"
       ? editorQuery.data?.pools.find((item) => item.key === editorMode.key)
+      : null;
+  const activeCopySource =
+    editorMode?.kind === "copy"
+      ? editorQuery.data?.copy_sources.find(
+          (item) =>
+            item.key === editorMode.key && item.copyable && item.delay_mode !== "legacy_window",
+        )
       : null;
   const activeMode =
     editorMode?.kind === "create"
       ? editorMode
       : activeEditable
         ? { kind: "edit" as const, pool: activeEditable }
-        : null;
+        : activeCopySource
+          ? { kind: "copy" as const, source: activeCopySource }
+          : null;
+  const editorDrawerOpen = activeMode !== null && editorReady;
   const stockPool = data?.pools.find((pool) => pool.key === stockSelection?.poolKey);
   const stockMember = stockPool?.members.find((member) => member.code === stockSelection?.code);
   const entryMark =
@@ -540,7 +556,7 @@ export default function PoolsPage() {
               {editorNotice}
             </p>
           ) : null}
-          {editorSnapshot.journal?.saveStatus === "succeeded" ? (
+          {!editorDrawerOpen && editorSnapshot.journal?.saveStatus === "succeeded" ? (
             <div className="pools-editor-evidence" role="status">
               <span>池子已保存</span>
               {editorSnapshot.journal.canvasName ? (
@@ -560,7 +576,8 @@ export default function PoolsPage() {
                 </Button>
               ) : null}
             </div>
-          ) : editorSnapshot.journal &&
+          ) : !editorDrawerOpen &&
+            editorSnapshot.journal &&
             ["ambiguous", "unknown"].includes(editorSnapshot.journal.saveStatus) ? (
             <div className="pools-editor-evidence" role="status">
               <span>保存状态待确认</span>
@@ -661,7 +678,18 @@ export default function PoolsPage() {
                             编辑规则
                           </Button>
                         ) : (
-                          <Button size="sm" disabledReason="内置规则的复制资料尚未发布。">
+                          <Button
+                            size="sm"
+                            disabledReason={
+                              editorReady &&
+                              selectedCopySource?.copyable &&
+                              selectedCopySource.delay_mode !== "legacy_window"
+                                ? undefined
+                                : (selectedCopySource?.copy_block_reason ??
+                                  "这只内置池的复制资料暂不可用。")
+                            }
+                            onClick={() => setEditorMode({ kind: "copy", key: selected.key })}
+                          >
                             复制为自建池
                           </Button>
                         )}
@@ -718,12 +746,14 @@ export default function PoolsPage() {
         entryMark={entryMark}
         onClose={() => setStockSelection(null)}
       />
-      {activeMode && editorReady ? (
+      {editorDrawerOpen && activeMode ? (
         <PoolEditorForm
           key={
             activeMode.kind === "edit"
               ? `edit:${activeMode.pool.key}`
-              : `create:${activeMode.parentKey ?? ""}`
+              : activeMode.kind === "copy"
+                ? `copy:${activeMode.source.key}`
+                : `create:${activeMode.parentKey ?? ""}`
           }
           mode={activeMode}
           publishedPools={data?.pools ?? []}

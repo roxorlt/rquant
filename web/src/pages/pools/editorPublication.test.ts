@@ -34,6 +34,7 @@ const journal: EditorJournal = {
 };
 const editor: Schemas["PoolEditorData"] = {
   state: "ready",
+  copy_sources: [],
   pools: [
     {
       key: "user/放量确认",

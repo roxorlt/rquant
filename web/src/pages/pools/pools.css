@@ -169,9 +169,11 @@
   color: var(--muted);
 }
 .pool-editor-status {
-  display: grid;
-  gap: 8px;
-  padding: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 10px;
+  padding: 8px 10px;
   border-radius: 8px;
   background: var(--surface-2);
   font-size: 13px;
@@ -181,10 +183,11 @@
 }
 .pool-editor-status p {
   margin: 0;
+  flex-basis: 100%;
   color: var(--muted);
 }
 .pool-editor-status .btn {
-  justify-self: start;
+  margin-left: auto;
 }
 .pool-editor-error {
   margin: 0;
@@ -192,6 +195,10 @@
   font-size: 12px;
 }
 .pool-editor-footer {
+  display: grid;
+  gap: 8px;
+}
+.pool-editor-footer-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -203,7 +210,7 @@
   .pool-editor-fields .field {
     grid-column: 1 / -1;
   }
-  .pool-editor-footer .btn {
+  .pool-editor-footer-actions .btn {
     flex: 1;
   }
 }

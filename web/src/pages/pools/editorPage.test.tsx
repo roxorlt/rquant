@@ -79,7 +79,7 @@ const published: Schemas["PoolsData"] = {
   pools: [
     {
       key: "n-shape-pool1",
-      name: "首板池",
+      name: "N 形态一池",
       state: "current",
       trade_date: "2026-09-23",
       member_count: 0,
@@ -90,7 +90,7 @@ const published: Schemas["PoolsData"] = {
       members: [],
       members_truncated: false,
       definition: {
-        name: "首板池",
+        name: "N 形态一池",
         state: "available",
         status_label: "已发布",
         reason_label: null,
@@ -141,6 +141,7 @@ const published: Schemas["PoolsData"] = {
 };
 const editor: Schemas["PoolEditorData"] = {
   state: "ready",
+  copy_sources: [],
   pools: [
     {
       key: "user/自建观察",
@@ -221,13 +222,13 @@ it("creates a child condition, previews the exact parent and rules, saves, then 
   );
   await user.click(within(dialog).getByRole("button", { name: "添加条件" }));
   await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
-  expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent("首板池");
+  expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent("N 形态一池");
   expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent("成交量放大");
   expect(screen.queryByText("池子已保存")).not.toBeInTheDocument();
   expect(screen.queryByText("已加入当前画布")).not.toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "保存并加入画布" }));
   expect(await within(dialog).findByText("已加入当前画布")).toBeInTheDocument();
-  expect(screen.getByText("池子已保存")).toBeInTheDocument();
+  expect(within(dialog).getByText("池子已保存")).toBeInTheDocument();
   expect(commands).toHaveLength(2);
   expect(commands[0]).toMatchObject({
     base_name: "放量确认",
@@ -275,8 +276,105 @@ it("edits only the verified custom version and does not offer direct builtin edi
     rule_calls: [{ name: "volume_ratio_gte", args: { n: 3, window: 5 } }],
   });
   await user.click(within(dialog).getByRole("button", { name: "返回画布" }));
-  await user.click(screen.getByRole("button", { name: "查看 首板池条件" }));
+  await user.click(screen.getByRole("button", { name: "查看 N 形态一池条件" }));
   expect(screen.getByRole("button", { name: "复制为自建池" })).toBeDisabled();
+});
+
+const copySource: Schemas["BuiltinPoolCopySource"] = {
+  key: "n-shape-pool1",
+  display_name: "N 形态一池",
+  description: "",
+  version: "e".repeat(64),
+  depends_on: null,
+  delay_mode: "none",
+  delay_days: 0,
+  rule_calls: [{ name: "not_st", args: {} }],
+  include_columns: [],
+  copyable: true,
+  copy_block_reason: null,
+};
+
+it("copies verified builtin rules as a new custom pool without guessing its delay", async () => {
+  respond({ editor: { ...editor, copy_sources: [copySource] } });
+  const commands: Array<Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"]> = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as
+        | Schemas["SavePoolCommand"]
+        | Schemas["AttachPoolCommand"];
+      commands.push(body);
+      return HttpResponse.json(
+        body.kind === "save_user_pool_v2"
+          ? {
+              command_id: body.command_id,
+              status: "succeeded",
+              message: "池子已保存",
+              pool_version: NEXT_VERSION,
+            }
+          : {
+              command_id: body.command_id,
+              status: "succeeded",
+              message: "池子已加入当前画布",
+              pool_version: NEXT_VERSION,
+              canvas_name: "观察画布",
+            },
+      );
+    }),
+  );
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 N 形态一池条件" }));
+  await user.click(screen.getByRole("button", { name: "复制为自建池" }));
+  const dialog = screen.getByRole("dialog", { name: "复制为自建池" });
+  expect(within(dialog).getByRole("textbox", { name: "池子名称" })).toHaveValue("N形态一池副本");
+  expect(within(dialog).getByRole("combobox", { name: "父池" })).toHaveValue("");
+  expect(within(dialog).getByRole("spinbutton", { name: "延后交易日" })).toHaveValue(0);
+  expect(within(dialog).getByRole("region", { name: "筛选条件" })).toHaveTextContent("排除 ST");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent(
+    "来自「N 形态一池」",
+  );
+  await user.click(within(dialog).getByRole("button", { name: "保存并加入画布" }));
+  expect(await within(dialog).findByText("已加入当前画布")).toBeInTheDocument();
+  expect(commands[0]).toMatchObject({
+    kind: "save_user_pool_v2",
+    base_name: "N形态一池副本",
+    depends_on: null,
+    delay_days: 0,
+    rule_calls: copySource.rule_calls,
+    include_columns: [],
+    expected_version: null,
+  });
+  expect(commands[1]).toMatchObject({
+    kind: "add_pool_to_canvas",
+    expected_pool_version: NEXT_VERSION,
+  });
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("explains why an old windowed builtin cannot be copied", async () => {
+  respond({
+    editor: {
+      ...editor,
+      copy_sources: [
+        {
+          ...copySource,
+          delay_mode: "legacy_window",
+          copyable: false,
+          copy_block_reason: "旧版时间窗口与精确延后日不同，暂不能无损复制。",
+        },
+      ],
+    },
+  });
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 N 形态一池条件" }));
+  const copy = screen.getByRole("button", { name: "复制为自建池" });
+  expect(copy).toBeDisabled();
+  expect(copy).toHaveAttribute(
+    "aria-description",
+    "旧版时间窗口与精确延后日不同，暂不能无损复制。",
+  );
 });
 
 it("keeps an existing independent pool independent when editing its conditions", async () => {

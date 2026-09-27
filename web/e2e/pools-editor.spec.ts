@@ -38,6 +38,21 @@ for (const viewport of [
         body.data = {
           state: "ready",
           pools: [],
+          copy_sources: [
+            {
+              key: "n-shape-pool1",
+              display_name: "N 形态一池",
+              description: "",
+              version: "d".repeat(64),
+              depends_on: null,
+              delay_mode: "none",
+              delay_days: 0,
+              rule_calls: [{ name: "volume_ratio_gte", args: { n: 2 } }],
+              include_columns: [],
+              copyable: true,
+              copy_block_reason: null,
+            },
+          ],
           canvases: [
             {
               name: "研究画布",
@@ -122,15 +137,44 @@ for (const viewport of [
         path: join(tmpdir(), `rquant-pool-editor-${viewport.name}-draft.png`),
       });
       await drawer.getByRole("button", { name: "保存并加入画布" }).click();
-      await expect(drawer).toContainText("已加入当前画布");
-      await expect(page.locator(".pools-editor-evidence")).toContainText("池子已保存");
+      await expect(drawer.getByText("池子已保存", { exact: true })).toBeVisible();
+      await expect(drawer.getByText("已加入当前画布")).toBeVisible();
+      await expect(page.locator(".pools-editor-evidence")).toHaveCount(0);
       expect(posted).toBe(2);
       await expectNoHorizontalOverflow(page, `pool editor ${viewport.name}`);
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      expect(findJargon(await drawer.innerText())).toEqual([]);
       await page.screenshot({ path: join(tmpdir(), `rquant-pool-editor-${viewport.name}.png`) });
       await drawer.getByRole("button", { name: "返回画布" }).click();
       await expect(drawer).toBeHidden();
       await expect(add).toBeVisible();
+
+      const condition = page.getByRole("button", { name: "查看 N 形态一池条件" });
+      await condition.focus();
+      await condition.press("Enter");
+      const copy = page.getByRole("button", { name: "复制为自建池" });
+      await expect(copy).toBeEnabled();
+      await copy.click();
+      const copyDrawer = page.getByRole("dialog", { name: "复制为自建池" });
+      await expect(page.locator(".pools-editor-evidence")).toHaveCount(0);
+      await expect(copyDrawer).not.toContainText("池子已保存");
+      await expect(copyDrawer.getByRole("textbox", { name: "池子名称" })).toHaveValue(
+        "N形态一池副本",
+      );
+      await expect(copyDrawer.getByRole("combobox", { name: "父池" })).toHaveValue("");
+      await copyDrawer.getByRole("button", { name: "预览变更" }).click();
+      await expect(copyDrawer.getByRole("region", { name: "变更预览" })).toContainText(
+        "来自「N 形态一池」",
+      );
+      await copyDrawer.getByRole("button", { name: "保存并加入画布" }).click();
+      await expect(copyDrawer.getByText("池子已保存", { exact: true })).toBeVisible();
+      await expect(copyDrawer.getByText("已加入当前画布")).toBeVisible();
+      expect(posted).toBe(4);
+      await expectNoHorizontalOverflow(page, `builtin copy ${viewport.name}`);
+      expect(findJargon(await copyDrawer.innerText())).toEqual([]);
+      await page.screenshot({
+        path: join(tmpdir(), `rquant-pool-editor-${viewport.name}-copy.png`),
+      });
       expect(watcher.problems).toEqual([]);
     });
   });
