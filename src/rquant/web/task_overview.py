@@ -94,24 +94,30 @@ def _mark(borrowed: BorrowedGeneration, dataset_id: str) -> ServingDatasetWaterm
     )
 
 
-def _unavailable_scheduled(note: str) -> ScheduledTasksData:
+def _unavailable_scheduled(
+    note: str, *, sampled_at: datetime | None, remaining_seconds: float | None
+) -> ScheduledTasksData:
     return ScheduledTasksData(
         source_state="unavailable",
         source_label="定时任务暂不可用",
         source_note=note,
-        source_updated_at=None,
-        expires_at=None,
+        source_updated_at=sampled_at,
+        expires_at=None if sampled_at is None else sampled_at + _OPS_TTL,
+        remaining_seconds=remaining_seconds,
         items=[],
     )
 
 
-def _unavailable_resources(note: str) -> ResourcesData:
+def _unavailable_resources(
+    note: str, *, sampled_at: datetime | None, remaining_seconds: float | None
+) -> ResourcesData:
     return ResourcesData(
         source_state="unavailable",
         source_label="资源状态暂不可用",
         source_note=note,
-        source_updated_at=None,
-        expires_at=None,
+        source_updated_at=sampled_at,
+        expires_at=None if sampled_at is None else sampled_at + _OPS_TTL,
+        remaining_seconds=remaining_seconds,
         host_memory_total_bytes=None,
         host_memory_available_bytes=None,
         rquant_memory_current_bytes=None,
@@ -122,10 +128,16 @@ def _unavailable_resources(note: str) -> ResourcesData:
     )
 
 
-def unavailable_ops(note: str = "还没有可信的任务状态，等待状态采集更新。") -> tuple[
-    ScheduledTasksData, ResourcesData
-]:
-    return _unavailable_scheduled(note), _unavailable_resources(note)
+def unavailable_ops(
+    note: str = "还没有可信的任务状态，等待状态采集更新。",
+    *,
+    sampled_at: datetime | None = None,
+    remaining_seconds: float | None = None,
+) -> tuple[ScheduledTasksData, ResourcesData]:
+    return (
+        _unavailable_scheduled(note, sampled_at=sampled_at, remaining_seconds=remaining_seconds),
+        _unavailable_resources(note, sampled_at=sampled_at, remaining_seconds=remaining_seconds),
+    )
 
 
 def unavailable_services(
@@ -247,17 +259,23 @@ def ops_sections(
     if mark.event_time > now:
         return unavailable_ops("任务状态时间暂时无法核实，等待下一次更新。")
     if now - mark.event_time >= _OPS_TTL:
-        return unavailable_ops("任务状态已过期，等待下一次更新。")
+        return unavailable_ops(
+            "任务状态已过期，等待下一次更新。",
+            sampled_at=mark.event_time,
+            remaining_seconds=0,
+        )
     sample = _ops_sample(borrowed, mark)
     if sample is None:
         return unavailable_ops("任务状态暂时无法核实，等待下一次更新。")
     phase = market_phase(now, None if day is None else day.is_trading_day)
+    remaining_seconds = (sample.sampled_at + _OPS_TTL - now).total_seconds()
     scheduled = ScheduledTasksData(
         source_state="ready",
         source_label="定时任务",
         source_note=None,
         source_updated_at=sample.sampled_at,
         expires_at=sample.sampled_at + _OPS_TTL,
+        remaining_seconds=remaining_seconds,
         items=[
             ScheduledTaskItem(
                 name=item.label,
@@ -291,6 +309,7 @@ def ops_sections(
         source_note=None,
         source_updated_at=sample.sampled_at,
         expires_at=sample.sampled_at + _OPS_TTL,
+        remaining_seconds=remaining_seconds,
         host_memory_total_bytes=sample.host_memory_total_bytes,
         host_memory_available_bytes=sample.host_memory_available_bytes,
         rquant_memory_current_bytes=parent.memory_current_bytes,

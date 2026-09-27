@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.web.models.common import StatusInfo
@@ -59,6 +59,13 @@ class ResearchJobsData(BaseModel):
 OverviewSourceState = Literal["ready", "unavailable"]
 
 
+def _validate_remaining(state: OverviewSourceState, remaining: float | None) -> None:
+    if state == "ready" and (remaining is None or remaining <= 0):
+        raise ValueError("ready ops source requires a positive remaining budget")
+    if state == "unavailable" and remaining not in (None, 0):
+        raise ValueError("unavailable ops source cannot retain a positive budget")
+
+
 class ScheduledTaskItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -80,7 +87,13 @@ class ScheduledTasksData(BaseModel):
     source_note: str | None
     source_updated_at: AwareUtcDatetime | None
     expires_at: AwareUtcDatetime | None
+    remaining_seconds: float | None = Field(ge=0, le=120, allow_inf_nan=False)
     items: list[ScheduledTaskItem] = Field(max_length=32)
+
+    @model_validator(mode="after")
+    def validate_remaining(self) -> Self:
+        _validate_remaining(self.source_state, self.remaining_seconds)
+        return self
 
 
 class RuntimeServiceItem(BaseModel):
@@ -120,6 +133,7 @@ class ResourcesData(BaseModel):
     source_note: str | None
     source_updated_at: AwareUtcDatetime | None
     expires_at: AwareUtcDatetime | None
+    remaining_seconds: float | None = Field(ge=0, le=120, allow_inf_nan=False)
     host_memory_total_bytes: int | None = Field(ge=0)
     host_memory_available_bytes: int | None = Field(ge=0)
     rquant_memory_current_bytes: int | None = Field(ge=0)
@@ -127,6 +141,11 @@ class ResourcesData(BaseModel):
     groups: list[ResourceGroupItem] = Field(max_length=4)
     cpu_usage_percent: float | None = Field(ge=0, le=100, allow_inf_nan=False)
     cpu_note: str
+
+    @model_validator(mode="after")
+    def validate_remaining(self) -> Self:
+        _validate_remaining(self.source_state, self.remaining_seconds)
+        return self
 
 
 class TaskOverviewData(BaseModel):

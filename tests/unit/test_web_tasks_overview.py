@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from rquant.lab_jobs import JobStatus
 from rquant.ops_status import (
@@ -25,6 +26,7 @@ from rquant.runtime_service_control import (
 from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_read_models import ServingProjectionInput
 from rquant.web.app import create_app
+from rquant.web.models.tasks import ResourcesData, ScheduledTasksData
 from rquant.web.settings import WebSettings
 from tests.support import web_serving_fixture as fixture
 from tests.unit.test_web_tasks import _job
@@ -259,11 +261,15 @@ def test_overview_expires_at_full_120_seconds_even_when_serving_is_current(
         data = response.json()["data"]
         assert data["scheduled"]["source_state"] == expected
         assert data["resources"]["source_state"] == expected
+        assert data["scheduled"]["remaining_seconds"] == data["resources"]["remaining_seconds"]
         if expected == "unavailable":
+            assert data["scheduled"]["remaining_seconds"] == 0
+            assert data["scheduled"]["expires_at"] is not None
             assert data["scheduled"]["items"] == []
             assert data["resources"]["rquant_memory_current_bytes"] is None
             assert data["resources"]["groups"] == []
         else:
+            assert data["scheduled"]["remaining_seconds"] == pytest.approx(0.001)
             assert data["scheduled"]["expires_at"] is not None
 
 
@@ -277,11 +283,55 @@ def test_overview_missing_sources_do_not_promote_untrusted_rows(
     assert response.status_code == 200, response.text
     data = response.json()["data"]
     assert data["scheduled"]["source_state"] == "unavailable"
+    assert data["scheduled"]["remaining_seconds"] is None
+    assert data["scheduled"]["expires_at"] is None
     assert data["scheduled"]["items"] == []
     assert data["services"]["source_state"] == "unavailable"
     assert data["services"]["items"] == []
     assert data["resources"]["source_state"] == "unavailable"
+    assert data["resources"]["remaining_seconds"] is None
+    assert data["resources"]["expires_at"] is None
     assert data["research"]["source_state"] == "empty"
+
+
+def test_remaining_seconds_models_reject_false_ready_and_unbounded_values() -> None:
+    scheduled = {
+        "source_state": "ready",
+        "source_label": "定时任务",
+        "source_note": None,
+        "source_updated_at": fixture.FIXTURE_BUILT_AT,
+        "expires_at": fixture.FIXTURE_BUILT_AT + timedelta(seconds=120),
+        "items": [],
+    }
+    for invalid in (None, 0, -0.001, 120.001, float("nan")):
+        with pytest.raises(ValidationError):
+            ScheduledTasksData.model_validate({**scheduled, "remaining_seconds": invalid})
+    assert ScheduledTasksData.model_validate(
+        {**scheduled, "remaining_seconds": 120}
+    ).remaining_seconds == 120
+    with pytest.raises(ValidationError):
+        ScheduledTasksData.model_validate(
+            {**scheduled, "source_state": "unavailable", "remaining_seconds": 1}
+        )
+    resource = {
+        "source_state": "ready",
+        "source_label": "资源使用",
+        "source_note": None,
+        "source_updated_at": fixture.FIXTURE_BUILT_AT,
+        "expires_at": fixture.FIXTURE_BUILT_AT + timedelta(seconds=120),
+        "host_memory_total_bytes": None,
+        "host_memory_available_bytes": None,
+        "rquant_memory_current_bytes": None,
+        "rquant_memory_peak_bytes": None,
+        "groups": [],
+        "cpu_usage_percent": None,
+        "cpu_note": "暂无可信 CPU 数据",
+    }
+    with pytest.raises(ValidationError):
+        ResourcesData.model_validate({**resource, "remaining_seconds": None})
+    assert ResourcesData.model_validate(
+        {**resource, "source_state": "unavailable", "remaining_seconds": 0}
+    ).remaining_seconds == 0
 
 
 def test_legacy_generation_without_ops_watermark_keeps_both_ops_sections_unavailable(
