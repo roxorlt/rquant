@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import shutil
+import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -353,12 +354,19 @@ def test_in_place_rewrite_before_request_cannot_reuse_the_sidecar(
     tmp_path: Path,
 ) -> None:
     primary, replica, dates = _world(tmp_path)
-    before = replica.stat()
-    with replica.open("r+b") as handle:
-        first = handle.read(1)
-        handle.seek(0)
-        handle.write(first)
-    os.utime(replica, ns=(before.st_atime_ns, before.st_mtime_ns))
+    sidecar_ctime = replica_generation_path(replica).stat().st_ctime_ns
+    deadline = time.monotonic() + 3
+    while True:
+        before = replica.stat()
+        with replica.open("r+b") as handle:
+            first = handle.read(1)
+            handle.seek(0)
+            handle.write(first)
+        os.utime(replica, ns=(before.st_atime_ns, before.st_mtime_ns))
+        if replica.stat().st_ctime_ns > sidecar_ctime:
+            break
+        assert time.monotonic() < deadline, "test filesystem did not advance replica ctime"
+        time.sleep(0.02)
 
     with pytest.raises(_source_module().ScreenReplicaUnavailableError):
         _reader(primary, replica).load(dates[0], [])
