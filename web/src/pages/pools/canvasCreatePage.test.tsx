@@ -57,6 +57,7 @@ function respondEmpty(viewer: string | null = "tester") {
         serving,
       }),
     ),
+    http.get("*/api/v1/screen/blocks", () => HttpResponse.json({ data: { blocks: [] }, serving })),
   );
 }
 
@@ -91,6 +92,28 @@ it("creates a blank canvas from the keyboard, waits for matching publication, th
           copy_sources: [],
           canvases: published ? [{ ...editableCanvas, command_id: sent?.command_id ?? "" }] : [],
         } satisfies Schemas["PoolEditorData"],
+        serving: metaEnvelope({ generationId: published ? "g2" : "g1" }).serving,
+      }),
+    ),
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          source_kind: "serving",
+          blocks: [
+            {
+              key: "not_st",
+              label: "排除 ST",
+              hint: "排除风险股票",
+              category: "filter",
+              category_label: "股票范围",
+              parameters: [],
+            },
+          ],
+          dates: [],
+          available: false,
+          ranking_metrics: [],
+          source: null,
+        } satisfies Schemas["ScreenCatalogData"],
         serving: metaEnvelope({ generationId: published ? "g2" : "g1" }).serving,
       }),
     ),
@@ -130,11 +153,8 @@ it("creates a blank canvas from the keyboard, waits for matching publication, th
   await user.click(within(available).getByRole("button", { name: "打开画布" }));
   expect(await screen.findByRole("combobox", { name: "选择画布" })).toHaveValue("晨盘观察");
   expect(screen.getByText("这张画布还是空的")).toBeInTheDocument();
-  expect(screen.getByText("先发布一只池子，再来添加条件节点。")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "添加条件节点" })).toHaveAttribute(
-    "aria-description",
-    "还没有可作为来源的池子，先发布一只池子。",
-  );
+  expect(screen.getByText("创建首只池子后，这里会显示条件和结果。")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole("button", { name: "创建首只池子" })).toBeEnabled());
   expect(findJargon(second.container.textContent ?? "")).toEqual([]);
 });
 

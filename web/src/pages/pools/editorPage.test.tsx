@@ -6,7 +6,7 @@ import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
-import { POOL_EDITOR_JOURNAL_KEY } from "./editorSession";
+import { type EditorJournal, POOL_EDITOR_JOURNAL_KEY } from "./editorSession";
 
 const serving = metaEnvelope().serving;
 const VERSION = "a".repeat(64);
@@ -230,7 +230,7 @@ it("creates a child condition, previews the exact parent and rules, saves, then 
   expect(screen.queryByText("池子已保存")).not.toBeInTheDocument();
   expect(screen.queryByText("已加入当前画布")).not.toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "保存并加入画布" }));
-  expect(await within(dialog).findByText("已加入当前画布")).toBeInTheDocument();
+  expect(await within(dialog).findByText("加入请求已完成，等待画布更新")).toBeInTheDocument();
   expect(within(dialog).getByText("池子已保存")).toBeInTheDocument();
   expect(commands).toHaveLength(2);
   expect(commands[0]).toMatchObject({
@@ -245,6 +245,75 @@ it("creates a child condition, previews the exact parent and rules, saves, then 
     expected_pool_version: NEXT_VERSION,
   });
   expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("keeps a published attachment tied to its actual canvas after switching the visible canvas", async () => {
+  const otherCanvas = {
+    name: "备用画布",
+    description: "",
+    pool_keys: [],
+    refs_truncated: false,
+  };
+  respond({
+    editor: {
+      ...editor,
+      canvases: [
+        ...editor.canvases,
+        {
+          name: otherCanvas.name,
+          description: "",
+          version: "d".repeat(64),
+          command_id: "canvas-other",
+          record_hash: "e".repeat(64),
+          pool_refs: [],
+        },
+      ],
+    },
+  });
+  server.use(
+    http.get("*/api/v1/pools", () =>
+      HttpResponse.json({
+        data: { ...published, canvases: [...published.canvases, otherCanvas] },
+        serving,
+      }),
+    ),
+  );
+  const journal: EditorJournal = {
+    schema: 1,
+    save: {
+      kind: "save_user_pool_v2",
+      command_id: "save-first",
+      requested_at: "2026-09-27T07:00:00Z",
+      base_name: "自建观察",
+      display_name: "自建观察",
+      description: "",
+      depends_on: "n-shape-pool1",
+      delay_days: 1,
+      rule_calls: [{ name: "not_st", args: {} }],
+      include_columns: [],
+      expected_version: null,
+    },
+    canvasName: "观察画布",
+    saveVersion: VERSION,
+    saveStatus: "succeeded",
+    attach: {
+      kind: "add_pool_to_canvas",
+      command_id: "attach-first",
+      requested_at: "2026-09-27T07:00:01Z",
+      canvas_name: "观察画布",
+      pool_name: "user/自建观察",
+      expected_pool_version: VERSION,
+    },
+    attachStatus: "succeeded",
+  };
+  window.sessionStorage.setItem(POOL_EDITOR_JOURNAL_KEY, JSON.stringify(journal));
+  const user = userEvent.setup();
+  renderApp("/pools");
+  expect(await screen.findByText("已加入「观察画布」")).toBeInTheDocument();
+  await user.selectOptions(screen.getByRole("combobox", { name: "选择画布" }), "备用画布");
+  expect(screen.getByText("这张画布还是空的")).toBeInTheDocument();
+  expect(screen.getByText("已加入「观察画布」")).toBeInTheDocument();
+  expect(screen.queryByText("已加入当前画布")).not.toBeInTheDocument();
 });
 
 it("edits only the verified custom version and does not offer direct builtin editing", async () => {
@@ -528,7 +597,7 @@ it("copies verified builtin rules as a new custom pool without guessing its dela
     "来自「N 形态一池」",
   );
   await user.click(within(dialog).getByRole("button", { name: "保存并加入画布" }));
-  expect(await within(dialog).findByText("已加入当前画布")).toBeInTheDocument();
+  expect(await within(dialog).findByText("加入请求已完成，等待画布更新")).toBeInTheDocument();
   expect(commands[0]).toMatchObject({
     kind: "save_user_pool_v2",
     base_name: "N形态一池副本",
@@ -671,7 +740,7 @@ it("shows an attachment resume action after reload and keeps its original reques
   renderApp("/pools");
   await user.click(await screen.findByRole("button", { name: "继续核对画布" }));
   await waitFor(() => expect(seen).toEqual([attach, attach]));
-  expect(await screen.findByText("已加入当前画布")).toBeInTheDocument();
+  expect(await screen.findByText("加入请求已完成，等待画布更新")).toBeInTheDocument();
 });
 
 it("retains a draft through a data-generation change and requires a fresh preview", async () => {

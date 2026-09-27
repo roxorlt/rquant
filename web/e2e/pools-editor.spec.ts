@@ -141,7 +141,7 @@ for (const viewport of [
       });
       await drawer.getByRole("button", { name: "保存并加入画布" }).click();
       await expect(drawer.getByText("池子已保存", { exact: true })).toBeVisible();
-      await expect(drawer.getByText("已加入当前画布")).toBeVisible();
+      await expect(drawer.getByText("加入请求已完成，等待画布更新")).toBeVisible();
       await expect(page.locator(".pools-editor-evidence")).toHaveCount(0);
       expect(posted).toBe(2);
       await expectNoHorizontalOverflow(page, `pool editor ${viewport.name}`);
@@ -171,7 +171,7 @@ for (const viewport of [
       );
       await copyDrawer.getByRole("button", { name: "保存并加入画布" }).click();
       await expect(copyDrawer.getByText("池子已保存", { exact: true })).toBeVisible();
-      await expect(copyDrawer.getByText("已加入当前画布")).toBeVisible();
+      await expect(copyDrawer.getByText("加入请求已完成，等待画布更新")).toBeVisible();
       expect(posted).toBe(4);
       await expectNoHorizontalOverflow(page, `builtin copy ${viewport.name}`);
       expect(findJargon(await copyDrawer.innerText())).toEqual([]);

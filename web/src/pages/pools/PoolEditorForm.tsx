@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PublishedPool } from "@/api/endpoints";
 import type { BuiltinPoolCopySource, EditableCanvas, EditablePool } from "@/api/poolEditor";
-import { type ScreenBlock, type ScreenOption, useScreenCatalog } from "@/api/screen";
+import {
+  catalogUsableForGeneration,
+  type ScreenBlock,
+  type ScreenOption,
+  useScreenCatalog,
+} from "@/api/screen";
 import { Button, ParamControl, type ParameterValue, SideDrawer, Tip } from "@/ui";
+import type { PublicationStage } from "./editorPublication";
 import type { EditorSessionSnapshot, PoolEditorSession, SaveInput } from "./editorSession";
 
 type RuleDraft = { id: number; key: string; args: Record<string, ParameterValue> };
@@ -112,7 +118,10 @@ function parameterText(
   return String(value * (parameter.scale || 1));
 }
 
-function requestLabel(snapshot: EditorSessionSnapshot): string | null {
+function requestLabel(
+  snapshot: EditorSessionSnapshot,
+  publication: PublicationStage,
+): string | null {
   const journal = snapshot.journal;
   if (!journal) return null;
   if (journal.saveStatus === "failed")
@@ -124,8 +133,10 @@ function requestLabel(snapshot: EditorSessionSnapshot): string | null {
   if (journal.attachStatus === "failed") return "池子已保存，画布挂接失败";
   if (journal.attachStatus === "ambiguous" || journal.attachStatus === "unknown")
     return "池子已保存，画布状态待确认";
-  if (journal.attachStatus !== "succeeded") return "池子已保存，正在加入当前画布";
-  return "已加入当前画布";
+  if (journal.attachStatus !== "succeeded") return `池子已保存，正在加入「${journal.canvasName}」`;
+  return publication === "published" || publication === "result"
+    ? `已加入「${journal.canvasName}」`
+    : "加入请求已完成，等待画布更新";
 }
 
 export function PoolEditorForm({
@@ -138,6 +149,7 @@ export function PoolEditorForm({
   attachmentVersion,
   session,
   snapshot,
+  publicationStage,
   onClose,
   onRestart,
 }: {
@@ -150,11 +162,13 @@ export function PoolEditorForm({
   attachmentVersion: string | null;
   session: PoolEditorSession;
   snapshot: EditorSessionSnapshot;
+  publicationStage: PublicationStage;
   onClose: () => void;
   onRestart: () => void;
 }) {
   const editing = mode.kind === "edit" ? mode.pool : null;
   const copying = mode.kind === "copy" ? mode.source : null;
+  const firstPoolMode = mode.kind === "create" && mode.parentKey === null;
   const catalog = useScreenCatalog();
   const [name, setName] = useState(
     editing?.display_name ??
@@ -166,9 +180,9 @@ export function PoolEditorForm({
     editing?.description ?? copying?.description ?? "",
   );
   const [parent, setParent] = useState(
-    editing?.depends_on ??
-      copying?.depends_on ??
-      (mode.kind === "create" ? (mode.parentKey ?? publishedPools[0]?.key ?? "") : ""),
+    mode.kind === "create"
+      ? (mode.parentKey ?? "")
+      : (editing?.depends_on ?? copying?.depends_on ?? ""),
   );
   const [delay, setDelay] = useState(editing?.delay_days ?? copying?.delay_days ?? 1);
   const [canvas, setCanvas] = useState(
@@ -234,7 +248,7 @@ export function PoolEditorForm({
     });
   const canSubmit =
     !!generationId &&
-    catalog.serving?.generation_id === generationId &&
+    catalogUsableForGeneration(catalog.data, catalog.serving?.generation_id, generationId) &&
     nameValid &&
     description.length <= 1024 &&
     (parent
@@ -243,7 +257,9 @@ export function PoolEditorForm({
         delay >= 1 &&
         delay <= 252 &&
         Number.isInteger(delay)
-      : editing !== null || copying !== null) &&
+      : editing !== null ||
+        copying !== null ||
+        (firstPoolMode && targetCanvas?.pool_refs.length === 0 && attachTo !== null)) &&
     rulesValid &&
     snapshot.storageAvailable &&
     !snapshot.busy &&
@@ -288,7 +304,7 @@ export function PoolEditorForm({
     };
     await session.startSave(input, attachTo);
   };
-  const statusLabel = requestLabel(snapshot);
+  const statusLabel = requestLabel(snapshot, publicationStage);
   const restart = () => {
     if (!canRestart) return;
     if (sameTarget && previous?.saveConflict && !session.discardFailedSave()) return;
@@ -316,7 +332,15 @@ export function PoolEditorForm({
       open
       onClose={onClose}
       wide
-      title={editing ? "编辑规则" : copying ? "复制为自建池" : "添加条件节点"}
+      title={
+        editing
+          ? "编辑规则"
+          : copying
+            ? "复制为自建池"
+            : firstPoolMode
+              ? "创建首只池子"
+              : "添加条件节点"
+      }
       footer={
         <div className="pool-editor-footer">
           {sameTarget && statusLabel ? (
@@ -430,7 +454,9 @@ export function PoolEditorForm({
             ? "调整这只自建池的筛选条件。"
             : copying
               ? "复制已核验的条件，保存前可调整。"
-              : "从父池筛选，保存后加入所选画布。"}
+              : firstPoolMode
+                ? "选好条件，预览后加入当前画布。"
+                : "从父池筛选，保存后加入所选画布。"}
         </p>
         <div className="pool-editor-fields">
           <label className="field">
@@ -460,7 +486,7 @@ export function PoolEditorForm({
             />
           </label>
           <label className="field">
-            <span className="lbl">父池</span>
+            <span className="lbl">{firstPoolMode ? "筛选来源" : "父池"}</span>
             <select
               className="inp"
               value={parent}
@@ -469,9 +495,9 @@ export function PoolEditorForm({
                 setPreview(false);
               }}
             >
-              {editing || copying ? <option value="">独立筛选</option> : null}
+              {editing || copying || firstPoolMode ? <option value="">独立筛选</option> : null}
               {publishedPools
-                .filter((pool) => pool.key !== editing?.key)
+                .filter((pool) => !firstPoolMode && pool.key !== editing?.key)
                 .map((pool) => (
                   <option key={pool.key} value={pool.key}>
                     {pool.name}
@@ -505,7 +531,7 @@ export function PoolEditorForm({
                 setPreview(false);
               }}
             >
-              <option value="">仅保存池子</option>
+              {!firstPoolMode ? <option value="">仅保存池子</option> : null}
               {canvases.map((item) => (
                 <option key={item.name} value={item.name}>
                   {item.name}
