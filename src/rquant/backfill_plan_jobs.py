@@ -223,7 +223,20 @@ class BackfillPlanJobStore:
                         "event_history_complete INTEGER NOT NULL DEFAULT 1 "
                         "CHECK(event_history_complete IN (0,1))"
                     )
-                    if not event_table_existed:
+                    # An empty table created by the old opener has no AUTOINCREMENT high-water mark.
+                    event_table_never_used = (
+                        event_table_existed
+                        and connection.execute(
+                            "SELECT 1 FROM backfill_plan_job_event LIMIT 1"
+                        ).fetchone()
+                        is None
+                        and connection.execute(
+                            "SELECT 1 FROM sqlite_sequence "
+                            "WHERE name='backfill_plan_job_event' AND seq > 0"
+                        ).fetchone()
+                        is None
+                    )
+                    if not event_table_existed or event_table_never_used:
                         connection.execute("UPDATE backfill_plan_job SET event_history_complete=0")
                 elif (
                     not event_table_existed

@@ -362,6 +362,77 @@ def test_legacy_success_without_events_still_requires_same_generation_plan(
         source(OBSERVED)
 
 
+def test_intermediate_old_store_with_empty_event_table_keeps_legacy_status(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    snapshot = _snapshot(tmp_path)
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    old = store.submit(_request(snapshot))
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DROP TABLE backfill_plan_job_event")
+        connection.execute("ALTER TABLE backfill_plan_job DROP COLUMN event_history_complete")
+        connection.execute(
+            """
+            CREATE TABLE backfill_plan_job_event (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                error_code TEXT
+            )
+            """
+        )
+        assert connection.execute("SELECT COUNT(*) FROM backfill_plan_job_event").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='backfill_plan_job_event'"
+            ).fetchone()
+            is None
+        )
+
+    reopened = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    source = _source(tmp_path, directory, state_path)
+    old_projection = _rows(source)
+    assert old_projection["backfill_plan_job"][0]["task_id"] == old.task_id
+    assert old_projection["backfill_plan_job"][0]["event_history"] == "unavailable"
+    assert old_projection["backfill_plan_event"] == ()
+
+    new = reopened.submit(_request(snapshot, key="request-00000002"))
+    new_projection = _rows(source)
+    assert new_projection["backfill_plan_job"][0]["task_id"] == new.task_id
+    assert new_projection["backfill_plan_job"][0]["event_history"] == "available"
+    assert [row["event_type"] for row in new_projection["backfill_plan_event"]] == ["queued"]
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DELETE FROM backfill_plan_job_event WHERE task_id=?", (new.task_id,))
+    with pytest.raises(PageProjectionSourceIntegrityError, match="latest event"):
+        source(OBSERVED)
+
+
+def test_used_pre_marker_event_table_with_removed_events_is_not_legacy(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    task = store.submit(_request(_snapshot(tmp_path)))
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("ALTER TABLE backfill_plan_job DROP COLUMN event_history_complete")
+        connection.execute("DELETE FROM backfill_plan_job_event WHERE task_id=?", (task.task_id,))
+        assert (
+            connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='backfill_plan_job_event'"
+            ).fetchone()[0]
+            > 0
+        )
+    BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="latest event"):
+        _source(tmp_path, directory, state_path)(OBSERVED)
+
+
 def test_new_task_missing_its_events_refuses_generation(tmp_path: Path) -> None:
     directory = tmp_path / "plans"
     state_path = tmp_path / "job-state.sqlite"
