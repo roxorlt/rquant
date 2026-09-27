@@ -7,7 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -219,6 +219,22 @@ def test_tampered_v2_content_is_unavailable_not_effective(tmp_path: Path) -> Non
     assert row["rules_json"] is None
 
 
+def test_invalid_saved_json_is_distinct_from_missing_file(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    assert service.submit(_v2("save-v2")).status is PageControlStatus.SUCCEEDED
+    path = tmp_path / "data" / "user_presets" / "breakout.json"
+
+    path.write_text("{broken", encoding="utf-8")
+    broken = _rows(tmp_path)["user/breakout"]
+    assert broken["state"] == "unavailable"
+    assert broken["reason"] == "invalid_content"
+
+    path.unlink()
+    missing = _rows(tmp_path)["user/breakout"]
+    assert missing["state"] == "unavailable"
+    assert missing["reason"] == "file_missing"
+
+
 def test_delete_tombstone_cannot_publish_leftover_file(tmp_path: Path) -> None:
     service = _service(tmp_path)
     assert service.submit(_v2("save-v2")).status is PageControlStatus.SUCCEEDED
@@ -336,6 +352,32 @@ def test_pool_projection_joins_same_signal_generation(tmp_path: Path) -> None:
     row = next(item for item in projection.rows if item["pool_name"] == "user/breakout")
     assert row["state"] == "available"
     assert projection.available_at == snapshot.available_at
+
+
+def test_unchanged_pool_projection_does_not_publish_new_generation(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    assert service.submit(_v2("save-v2")).status is PageControlStatus.SUCCEEDED
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(
+            database,
+            user_presets_root=tmp_path / "data" / "user_presets",
+            page_control_outbox=tmp_path / "control.sqlite3",
+        ),
+        store=NotificationStateStore(tmp_path / "notification.sqlite3"),
+    )
+
+    first = producer.publish(NOW)
+    second = producer.publish(NOW + timedelta(seconds=2))
+    assert first.written is True
+    assert second.written is False
+    assert second.generation_id == first.generation_id
+
+    (tmp_path / "data" / "user_presets" / "breakout.json").write_text("{broken", encoding="utf-8")
+    changed = producer.publish(NOW + timedelta(seconds=4))
+    assert changed.written is True
+    assert changed.generation_id != first.generation_id
 
 
 def test_old_signal_generation_without_optional_pool_projection_still_valid(

@@ -161,7 +161,12 @@ def _user_row(
             )
         return _empty_row(pool_name, state="deleted", reason=None, mutation=mutation)
     if raw is None:
-        return _empty_row(pool_name, state="unavailable", reason="file_missing", mutation=mutation)
+        return _empty_row(
+            pool_name,
+            state="unavailable",
+            reason="invalid_content" if file_present else "file_missing",
+            mutation=mutation,
+        )
 
     expected = _expected_fields(mutation)
     if expected is None:

@@ -348,9 +348,20 @@ def _pool_definition_projection(
         finally:
             binding.close()
     rows = build_pool_definition_rows(files, mutations, root_path=str(root))
+    # Successful, hash-checked commands supply a stable source timestamp. File and
+    # builtin changes are represented by the rows' content hash, not by the poll time.
+    available_at = max(
+        (
+            normalize_aware_utc(datetime.fromisoformat(str(item.payload["requested_at"])))
+            for item in mutations.values()
+        ),
+        default=_EMPTY_PROJECTION_AVAILABLE_AT,
+    )
+    if available_at > normalize_aware_utc(observed):
+        raise PageProjectionSourceIntegrityError("user pool audit is newer than observation")
     return ServingProjectionPayload(
         table_name="pool_definition",
-        available_at=normalize_aware_utc(observed),
+        available_at=available_at,
         rows=rows,
     )
 
