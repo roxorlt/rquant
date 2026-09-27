@@ -63,16 +63,16 @@ class PoolMembershipMember(RuntimeContractModel):
 
     @model_validator(mode="after")
     def require_complete_entry_evidence(self) -> Self:
-        present = (
-            self.entry_trade_date is not None,
-            self.entry_close is not None,
-            self.entry_result_version is not None,
-        )
-        if any(present) != all(present):
+        has_day = self.entry_trade_date is not None
+        has_version = self.entry_result_version is not None
+        has_close = self.entry_close is not None
+        if has_day != has_version or (has_close and not has_day):
             raise ValueError("entry evidence must be complete or have an unknown reason")
-        if all(present) and self.unknown_reason is not None:
+        if has_close and self.unknown_reason is not None:
             raise ValueError("entry evidence must be complete or have an unknown reason")
-        if not any(present) and self.unknown_reason is None:
+        if has_day and not has_close and self.unknown_reason != "entry_price_missing":
+            raise ValueError("entry evidence must be complete or have an unknown reason")
+        if not has_day and self.unknown_reason is None:
             raise ValueError("entry evidence must be complete or have an unknown reason")
         return self
 
@@ -221,7 +221,12 @@ def compute_pool_membership(
                     entries[code] = (
                         _Entry(trade_date, member.close, selected.receipt.result_version, None)
                         if _valid_price(member.close)
-                        else _Entry(None, None, None, "entry_price_missing")
+                        else _Entry(
+                            trade_date,
+                            None,
+                            selected.receipt.result_version,
+                            "entry_price_missing",
+                        )
                     )
                 else:
                     entries[code] = _Entry(None, None, None, previous_status or "window_truncated")

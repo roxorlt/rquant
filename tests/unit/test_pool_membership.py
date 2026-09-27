@@ -195,7 +195,8 @@ def test_missing_or_invalid_entry_close_does_not_fabricate_entry(
     )
 
     member = result.members[0]
-    assert member.entry_trade_date is None
+    assert member.entry_trade_date == _TUESDAY
+    assert member.entry_result_version == result.result_version
     assert member.entry_close is None
     assert member.unknown_reason == "entry_price_missing"
 
@@ -311,13 +312,26 @@ def test_receipt_for_a_different_pool_is_rejected() -> None:
         _compute((_TUESDAY,), wrong)
 
 
-def test_output_cannot_claim_entry_without_its_day_close_and_result_proof() -> None:
+def test_output_can_keep_proven_day_when_price_evidence_is_missing() -> None:
+    member = PoolMembershipMember(
+        ts_code="A",
+        entry_trade_date=_TUESDAY,
+        entry_result_version="c" * 64,
+        unknown_reason="entry_price_missing",
+    )
+    assert member.entry_trade_date == _TUESDAY
+    assert member.entry_close is None
+
+
+def test_output_cannot_claim_entry_without_result_proof_or_price_reason() -> None:
     with pytest.raises(ValueError, match="entry evidence"):
         PoolMembershipMember(
             ts_code="A",
             entry_trade_date=_TUESDAY,
-            entry_result_version="c" * 64,
+            unknown_reason="entry_price_missing",
         )
+    with pytest.raises(ValueError, match="entry evidence"):
+        PoolMembershipMember(ts_code="A", entry_trade_date=_TUESDAY, entry_result_version="c" * 64)
     with pytest.raises(ValueError, match="entry evidence"):
         PoolMembershipMember(
             ts_code="A",
