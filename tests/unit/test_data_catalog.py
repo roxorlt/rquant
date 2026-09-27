@@ -8,10 +8,10 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from rquant.data_catalog.build import build_catalog, schema_from_connection
+from rquant.data_catalog.build import CATALOG_CONTRACTS, build_catalog, schema_from_connection
 from rquant.data_catalog.descriptions import DATASETS, FIELDS, DatasetCopy, FieldCopy
 from rquant.data_catalog.models import CatalogDocument
-from rquant.data_contracts import DATASET_CONTRACTS
+from rquant.data_contracts import CONTRACTS_BY_ID, DATASET_CONTRACTS
 from rquant.storage.migrations import initialize_schema
 
 
@@ -83,8 +83,9 @@ def test_all_real_contracts_are_described_and_snapshot_matches(tmp_path: Path) -
     with duckdb.connect(":memory:") as connection:
         initialize_schema(connection)
         schemas = schema_from_connection(connection)
-    result = build_catalog(DATASET_CONTRACTS, schemas, DATASETS, FIELDS)
-    assert len(result.datasets) == len(DATASET_CONTRACTS)
+    result = build_catalog(CATALOG_CONTRACTS, schemas, DATASETS, FIELDS)
+    assert len(result.datasets) == len(DATASET_CONTRACTS) + 1
+    assert "limit_up_pool_daily" not in CONTRACTS_BY_ID
     assert all(item.name and item.purpose and item.fields for item in result.datasets)
     assert all(
         field.name and field.description for item in result.datasets for field in item.fields

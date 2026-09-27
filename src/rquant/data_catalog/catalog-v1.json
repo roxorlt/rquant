@@ -2502,6 +2502,171 @@
           "is_primary_key": false
         }
       ]
+    },
+    {
+      "dataset_id": "limit_up_pool_daily",
+      "table_name": "limit_up_pool_daily",
+      "name": "东方财富涨停池",
+      "purpose": "查看每日涨停股票、封单和开板情况",
+      "category": "行情",
+      "sources": [
+        "东方财富"
+      ],
+      "update_note": "有事件时更新",
+      "visibility_note": "下一交易日可见",
+      "primary_key": [
+        "ts_code",
+        "trade_date",
+        "source"
+      ],
+      "schema_available": true,
+      "sample_available": false,
+      "fields": [
+        {
+          "key": "ts_code",
+          "name": "证券或板块代码",
+          "description": "该记录对应的股票、指数或板块代码",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "trade_date",
+          "name": "交易日期",
+          "description": "该记录所属的交易日",
+          "data_type": "DATE",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "name",
+          "name": "名称",
+          "description": "数据源给出的股票或板块名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "pct_chg",
+          "name": "涨跌幅",
+          "description": "相对前收盘价的涨跌百分比",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "close",
+          "name": "收盘价",
+          "description": "该交易日或时段结束时的价格",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "amount",
+          "name": "成交额",
+          "description": "该时段的成交金额；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "circ_mv",
+          "name": "流通市值",
+          "description": "流通股市值；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "total_mv",
+          "name": "总市值",
+          "description": "全部股份的市值；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "turnover_rate",
+          "name": "换手率",
+          "description": "成交股份占流通股份的比例",
+          "data_type": "DOUBLE",
+          "unit": "%",
+          "is_primary_key": false
+        },
+        {
+          "key": "seal_amount",
+          "name": "封板资金",
+          "description": "涨停封板资金；单位沿用数据源口径",
+          "data_type": "DOUBLE",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "first_seal_time",
+          "name": "首次封板时间",
+          "description": "该交易日首次封板的时间",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "last_seal_time",
+          "name": "最后封板时间",
+          "description": "该交易日最后一次封板的时间",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "break_count",
+          "name": "开板次数",
+          "description": "该交易日涨停开板的次数",
+          "data_type": "INTEGER",
+          "unit": "次",
+          "is_primary_key": false
+        },
+        {
+          "key": "limit_up_stat",
+          "name": "涨停统计",
+          "description": "数据源给出的涨停统计文本",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "consecutive_boards",
+          "name": "连板数",
+          "description": "截至该交易日的连续涨停交易日数",
+          "data_type": "INTEGER",
+          "unit": "天",
+          "is_primary_key": false
+        },
+        {
+          "key": "industry",
+          "name": "行业",
+          "description": "数据源给出的行业名称",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": false
+        },
+        {
+          "key": "source",
+          "name": "数据来源",
+          "description": "这条记录实际采用的数据源",
+          "data_type": "VARCHAR",
+          "unit": null,
+          "is_primary_key": true
+        },
+        {
+          "key": "created_at",
+          "name": "记录创建时间",
+          "description": "本地写入该记录的时间",
+          "data_type": "TIMESTAMP",
+          "unit": null,
+          "is_primary_key": false
+        }
+      ]
     }
   ]
 }

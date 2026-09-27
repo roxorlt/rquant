@@ -10,17 +10,49 @@ import duckdb
 
 from rquant.data_catalog.descriptions import DatasetCopy, FieldCopy
 from rquant.data_catalog.models import CatalogDataset, CatalogDocument, CatalogField
-from rquant.data_contracts import DATASET_CONTRACTS, DatasetContract, VisibilityRule
+from rquant.data_contracts import (
+    DATASET_CONTRACTS,
+    DatasetContract,
+    FreshnessRule,
+    PriceBasis,
+    VisibilityRule,
+)
 from rquant.storage.migrations import initialize_schema
 
 SCHEMA = Mapping[str, tuple[tuple[str, str], ...]]
 
 SOURCE_NAMES = {
+    "eastmoney": "东方财富",
     "tushare": "Tushare Pro",
     "tushare_rt": "Tushare 实时行情",
     "tushare_rt_daily": "Tushare 实时日线",
     "minute_0930_fallback": "09:30 分钟行情兜底",
 }
+
+# This table is shown in the web directory because an existing audit rule reports
+# findings against it. Keep its catalog description out of the runtime freshness
+# registry: its Eastmoney source only provides the current day, and a missing day
+# cannot be backfilled from that source.
+CATALOG_CONTRACTS: tuple[DatasetContract, ...] = (
+    *DATASET_CONTRACTS,
+    DatasetContract(
+        dataset_id="limit_up_pool_daily",
+        table_name="limit_up_pool_daily",
+        sources=("eastmoney",),
+        physical_primary_key=("ts_code", "trade_date", "source"),
+        logical_key=("ts_code", "trade_date"),
+        event_date_column="trade_date",
+        ingested_at_column="created_at",
+        price_basis=PriceBasis.RAW,
+        visibility=VisibilityRule.PANEL_CLOSE_NEXT_SESSION,
+        freshness=FreshnessRule(
+            watermark_column="trade_date",
+            event_driven=True,
+            required_on_open_day=False,
+        ),
+        historized=True,
+    ),
+)
 
 
 def schema_from_connection(
@@ -140,7 +172,7 @@ def write_current_catalog(destination: Path) -> CatalogDocument:
     """Generate without opening any existing DuckDB file or touching production state."""
     from rquant.data_catalog.descriptions import DATASETS, FIELDS
 
-    contract_ids = {contract.dataset_id for contract in DATASET_CONTRACTS}
+    contract_ids = {contract.dataset_id for contract in CATALOG_CONTRACTS}
     if set(DATASETS) != contract_ids:
         missing = sorted(contract_ids - set(DATASETS))
         obsolete = sorted(set(DATASETS) - contract_ids)
@@ -150,7 +182,7 @@ def write_current_catalog(destination: Path) -> CatalogDocument:
     with duckdb.connect(":memory:") as connection:
         initialize_schema(connection)
         schemas = schema_from_connection(connection)
-    document = build_catalog(DATASET_CONTRACTS, schemas, DATASETS, FIELDS)
+    document = build_catalog(CATALOG_CONTRACTS, schemas, DATASETS, FIELDS)
     destination.write_text(
         json.dumps(document.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

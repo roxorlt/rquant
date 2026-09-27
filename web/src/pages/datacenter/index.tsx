@@ -17,6 +17,7 @@ import {
   Segmented,
   Tip,
 } from "@/ui";
+import { AuditPanel } from "./AuditPanel";
 import "./datacenter.css";
 
 const FIELD_COLUMNS: DataColumn<CatalogField>[] = [
@@ -147,6 +148,7 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
       <Panel title="样例数据">
         <EmptyState title="样例数据尚未发布" />
       </Panel>
+      <AuditPanel datasetId={dataset.dataset_id} />
     </div>
   );
 }

@@ -10,7 +10,7 @@ for (const viewport of [
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await page.goto("./#/datacenter");
     await expect(page.getByRole("heading", { level: 1, name: "数据中心" })).toBeVisible();
-    await expect(page.getByRole("list", { name: "数据集" }).getByRole("button")).toHaveCount(23);
+    await expect(page.getByRole("list", { name: "数据集" }).getByRole("button")).toHaveCount(24);
     await expectNoHorizontalOverflow(page, "data directory");
 
     const daily = page.getByRole("button", { name: /股票日线/ });

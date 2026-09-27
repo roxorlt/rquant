@@ -27,6 +27,9 @@ export type CatalogList = Schemas["CatalogList"];
 export type CatalogDataset = Schemas["CatalogDataset"];
 export type CatalogSummary = Schemas["CatalogSummary"];
 export type CatalogField = Schemas["CatalogField"];
+export type DataAuditHealthData = Schemas["DataAuditHealthData"];
+export type DataAuditIssuesData = Schemas["DataAuditIssuesData"];
+export type DataAuditIssueItem = Schemas["DataAuditIssueItem"];
 
 function unwrap<T>(data: T | undefined, response: Response): T {
   if (data === undefined) {
@@ -101,6 +104,29 @@ export function useCatalogDataset(datasetId: string | null): ServingQueryResult<
       return unwrap(data, response);
     },
     { enabled: datasetId !== null },
+  );
+}
+
+export function useDataAuditHealth(): ServingQueryResult<DataAuditHealthData> {
+  return useServingQuery(["data", "audit", "health"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/data/health");
+    return unwrap(data, response);
+  });
+}
+
+export function useDataAuditIssues(
+  datasetId: string,
+  generation: string | null,
+): ServingQueryResult<DataAuditIssuesData> {
+  return useServingQuery(
+    ["data", "audit", "issues", datasetId, generation],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/data/issues", {
+        params: { query: { dataset: datasetId, generation } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: generation !== null },
   );
 }
 

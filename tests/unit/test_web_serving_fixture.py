@@ -70,6 +70,39 @@ def test_panorama_publishes_every_panorama_projection(tmp_path: Path) -> None:
     assert [row[0] for row in systems] == ["东财概念", "东财行业", "开盘啦题材"]
 
 
+def test_audit_fixture_projects_synthetic_research_metadata_through_serving(tmp_path: Path) -> None:
+    root = tmp_path / "audit"
+    manifest = build_web_fixture(root, "panorama", audit=True)
+
+    assert manifest.row_counts["data_audit_status"] == 1
+    assert manifest.row_counts["data_audit_issue"] == 2
+    with ServingReader(root).acquire_generation() as lease:
+        status = lease.connection.execute(
+            "SELECT latest_status, finding_count FROM data_audit_status"
+        ).fetchone()
+        issues = lease.connection.execute(
+            "SELECT dataset_id, rule_id FROM data_audit_issue ORDER BY dataset_id"
+        ).fetchall()
+    assert status == ("failed", 2)
+    assert issues == [
+        ("limit_up_pool_daily", "limit-up-pool-calendar-coverage"),
+        ("minute_bar", "minute-without-daily"),
+    ]
+
+
+def test_cli_can_publish_an_audit_generation_for_browser_checks(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    assert fixture_cli.main(["--out", str(root), "--scenario", "panorama"]) == 0
+    assert (
+        fixture_cli.main(
+            ["--out", str(root), "--scenario", "panorama", "--publish-next", "--audit"]
+        )
+        == 0
+    )
+    with ServingReader(root).acquire_generation() as lease:
+        assert lease.manifest.row_counts["data_audit_issue"] == 2
+
+
 def test_degraded_marks_watermarks_and_leaves_projections_unpublished(tmp_path: Path) -> None:
     root = tmp_path / "degraded"
     manifest = build_web_fixture(root, "degraded")

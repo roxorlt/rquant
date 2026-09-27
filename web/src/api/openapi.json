@@ -110,6 +110,94 @@
         "title": "AttentionItem",
         "type": "object"
       },
+      "AuditAttempt": {
+        "additionalProperties": false,
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "running",
+              "completed",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "label",
+          "observed_at",
+          "completed_at"
+        ],
+        "title": "AuditAttempt",
+        "type": "object"
+      },
+      "AuditSuccess": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of_date": {
+            "format": "date",
+            "title": "As Of Date",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "finding_count": {
+            "minimum": 0.0,
+            "title": "Finding Count",
+            "type": "integer"
+          },
+          "p0_count": {
+            "minimum": 0.0,
+            "title": "P0 Count",
+            "type": "integer"
+          },
+          "range_end": {
+            "format": "date",
+            "title": "Range End",
+            "type": "string"
+          },
+          "range_start": {
+            "format": "date",
+            "title": "Range Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "as_of_date",
+          "range_start",
+          "range_end",
+          "completed_at",
+          "finding_count",
+          "p0_count"
+        ],
+        "title": "AuditSuccess",
+        "type": "object"
+      },
       "BinaryExpr": {
         "additionalProperties": false,
         "properties": {
@@ -899,6 +987,130 @@
         "title": "DailyData",
         "type": "object"
       },
+      "DataAuditHealthData": {
+        "additionalProperties": false,
+        "properties": {
+          "latest_attempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditAttempt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latest_success": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditSuccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_state",
+          "latest_attempt",
+          "latest_success"
+        ],
+        "title": "DataAuditHealthData",
+        "type": "object"
+      },
+      "DataAuditIssueItem": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "number": {
+            "minimum": 1.0,
+            "title": "Number",
+            "type": "integer"
+          },
+          "severity": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "待处理",
+              "已处理"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "name",
+          "severity",
+          "status"
+        ],
+        "title": "DataAuditIssueItem",
+        "type": "object"
+      },
+      "DataAuditIssuesData": {
+        "additionalProperties": false,
+        "properties": {
+          "dataset_name": {
+            "title": "Dataset Name",
+            "type": "string"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/DataAuditIssueItem"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "partial": {
+            "title": "Partial",
+            "type": "boolean"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "total_count": {
+            "minimum": 0.0,
+            "title": "Total Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_state",
+          "dataset_name",
+          "total_count",
+          "partial",
+          "issues"
+        ],
+        "title": "DataAuditIssuesData",
+        "type": "object"
+      },
       "DatasetWatermarkInfo": {
         "properties": {
           "dataset_id": {
@@ -1083,6 +1295,38 @@
           "serving"
         ],
         "title": "Envelope[DailyData]",
+        "type": "object"
+      },
+      "Envelope_DataAuditHealthData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DataAuditHealthData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[DataAuditHealthData]",
+        "type": "object"
+      },
+      "Envelope_DataAuditIssuesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DataAuditIssuesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[DataAuditIssuesData]",
         "type": "object"
       },
       "Envelope_HealthData_": {
@@ -5526,6 +5770,89 @@
         "summary": "数据集字段说明",
         "tags": [
           "catalog"
+        ]
+      }
+    },
+    "/api/v1/data/health": {
+      "get": {
+        "operationId": "get_data_health_api_v1_data_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DataAuditHealthData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "数据审计状态",
+        "tags": [
+          "data-audit"
+        ]
+      }
+    },
+    "/api/v1/data/issues": {
+      "get": {
+        "operationId": "get_data_issues_api_v1_data_issues_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dataset",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Dataset",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DataAuditIssuesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "数据审计问题",
+        "tags": [
+          "data-audit"
         ]
       }
     },
