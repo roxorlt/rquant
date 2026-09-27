@@ -256,6 +256,28 @@ def test_duplicate_daily_code_and_nonfinite_value_fail_closed(tmp_path: Path) ->
         _audit(path)
 
 
+@pytest.mark.parametrize("bad_open", [float("nan"), float("inf")])
+def test_selected_null_field_nonfinite_value_fails_closed(tmp_path: Path, bad_open: float) -> None:
+    path = _database(tmp_path / "nonfinite-open.duckdb", ((CODE, 10.0, 100.0),))
+    with duckdb.connect(str(path)) as connection:
+        connection.execute("UPDATE daily_bar SET open = ? WHERE ts_code = ?", (bad_open, CODE))
+
+    with (
+        duckdb.connect(str(path), read_only=True) as connection,
+        pytest.raises(ValueError, match="non-finite|invalid"),
+    ):
+        evidence.audit_daily_bar_quality_from_connection(
+            connection,
+            snapshot_id="verified-generation-1",
+            completed_trade_date=DAY,
+            null_fields=(
+                evidence.DailyBarNullFieldSpec(
+                    field_name="open", max_null_numerator=0, max_null_denominator=1
+                ),
+            ),
+        )
+
+
 def test_requires_open_sse_day_read_only_connection_and_explicit_fields(tmp_path: Path) -> None:
     path = _database(tmp_path / "wrong-connection.duckdb", ((CODE, 10.0, 100.0),))
     with duckdb.connect(str(path)) as connection, pytest.raises(ValueError, match="read-only"):

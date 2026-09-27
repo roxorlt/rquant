@@ -1,5 +1,6 @@
 """Read bounded daily-bar coverage evidence from one fixed DuckDB replica connection."""
 
+import math
 from datetime import date, datetime, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -315,24 +316,35 @@ def audit_daily_bar_quality_from_connection(
         except ValueError as exc:
             raise ValueError("daily_bar contains invalid or non-finite price or volume") from exc
 
-    fields = tuple(
-        FieldNullCount(
-            field_name=field.field_name,
-            observed_rows=len(bar_rows),
-            null_rows=sum(
-                row[_DAILY_QUALITY_COLUMNS.index(field.field_name)] is None for row in bar_rows
-            ),
-            max_null_numerator=field.max_null_numerator,
-            max_null_denominator=field.max_null_denominator,
+    fields: list[FieldNullCount] = []
+    for field in null_fields:
+        column = _DAILY_QUALITY_COLUMNS.index(field.field_name)
+        null_rows = 0
+        for bar in bar_rows:
+            value = bar[column]
+            if value is None:
+                null_rows += 1
+            elif (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"daily_bar.{field.field_name} contains a non-finite value")
+        fields.append(
+            FieldNullCount(
+                field_name=field.field_name,
+                observed_rows=len(bar_rows),
+                null_rows=null_rows,
+                max_null_numerator=field.max_null_numerator,
+                max_null_denominator=field.max_null_denominator,
+            )
         )
-        for field in null_fields
-    )
     return audit_daily_bar_quality(
         DailyBarQualityRequest(
             snapshot_id=snapshot_id,
             dataset_id="daily_bar",
             trade_date=completed_trade_date,
             rows=tuple(quality_rows),
-            fields=fields,
+            fields=tuple(fields),
         )
     )
