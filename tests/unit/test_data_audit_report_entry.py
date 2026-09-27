@@ -105,6 +105,27 @@ def test_entry_rejects_unsealed_wal_without_publishing(tmp_path: Path) -> None:
     assert not directory.exists() or not list(directory.iterdir())
 
 
+def test_entry_rejects_shm_appearing_during_read_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import data_audit_report as artifact
+
+    primary, replica = _sources(tmp_path)
+    directory = tmp_path / "reports"
+    original_build = artifact.build_data_audit_report
+
+    def add_sidecar_after_read(*args: object, **kwargs: object) -> object:
+        result = original_build(*args, **kwargs)
+        Path(f"{replica}.shm").write_bytes(b"unsealed")
+        return result
+
+    monkeypatch.setattr(artifact, "build_data_audit_report", add_sidecar_after_read)
+
+    with pytest.raises(ValueError, match="replica|sidecar|SHM"):
+        _publish(primary, replica, directory)
+    assert not directory.exists() or not list(directory.iterdir())
+
+
 def test_entry_rejects_replica_replacement_during_read_and_keeps_old_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

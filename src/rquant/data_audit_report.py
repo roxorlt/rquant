@@ -626,6 +626,8 @@ def _require_fixed_replica(primary_path: Path, replica_path: Path, opened: os.st
         raise DataAuditReplicaChangedError("read-only replica changed during audit")
     if os.path.lexists(f"{replica_path}.wal"):
         raise DataAuditReplicaChangedError("read-only replica has an unsealed DuckDB WAL")
+    if os.path.lexists(f"{replica_path}.shm"):
+        raise DataAuditReplicaChangedError("read-only replica has an unsealed SHM sidecar")
 
 
 def capture_data_audit_replica_identity(

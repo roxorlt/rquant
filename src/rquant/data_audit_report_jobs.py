@@ -410,6 +410,25 @@ class DataAuditReportJobStore:
             raise KeyError(task_id)
         return self._status_row(row)
 
+    def admission_by_key(
+        self, idempotency_key: str
+    ) -> tuple[DataAuditReportJobRequest, str] | None:
+        """Read the durable task binding independently of report artifact health."""
+        if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", idempotency_key) is None:
+            raise ValueError("invalid audit report idempotency key")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT task_id, request_json FROM data_audit_report_job WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        request = DataAuditReportJobRequest.model_validate_json(row["request_json"])
+        task_id = row["task_id"]
+        if _TASK_ID.fullmatch(task_id) is None:
+            raise ValueError("stored audit report task id is invalid")
+        return request, task_id
+
     def lookup_by_key(
         self, idempotency_key: str
     ) -> tuple[DataAuditReportJobRequest, DataAuditReportJobReceipt] | None:
