@@ -566,6 +566,54 @@ def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
     assert observed_basic == {**basic_row, "valuation_observed": True}
 
 
+@pytest.mark.parametrize("field", ("pe_ttm", "pb", "dv_ttm"))
+@pytest.mark.parametrize("invalid", (float("inf"), -float("inf"), float("nan")))
+def test_daily_basic_source_rejects_nonfinite_valuation_before_signing(
+    monkeypatch: pytest.MonkeyPatch, field: str, invalid: float
+) -> None:
+    snapshot = _snapshot()
+    basic_row = snapshot["daily_basic"][0]
+    assert isinstance(basic_row, dict)
+    basic_row.update(pe_ttm=None, pb=1.25, dv_ttm=2.5)
+    basic_row[field] = invalid
+
+    class FakeAdapter:
+        def __init__(self, *, token: str, backup_token: str) -> None:
+            assert token == "not-a-real-token"
+            assert backup_token == ""
+
+        def daily_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["daily_bar"])
+
+        def daily_basic_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["daily_basic"])
+
+        def adj_factor_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["adj_factor"])
+
+        def index_daily_major_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["index_daily"])
+
+        def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
+            return pd.DataFrame(
+                ({"ts_code": "600000.SH", "name": "浦发银行", "list_status": list_status},)
+            )
+
+        def stock_st_raw(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(columns=("ts_code",))
+
+        def suspend_d_raw(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(columns=("ts_code", "trade_date", "suspend_type", "suspend_timing"))
+
+    monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", FakeAdapter)
+    fetch = runtime_builder_daily._tushare_daily_close_fetcher(
+        {"TUSHARE_TOKEN_MAIN": "not-a-real-token"}
+    )
+
+    with pytest.raises(ValueError, match=f"daily-close daily_basic {field} is nonfinite"):
+        fetch(DailyCloseSourceRequest(source="tushare.daily_close", trade_date=TRADE_DATE))
+
+
 def _records(gateway: DailyCloseGateway):
     return gateway.spool.list_after(LiveChannel.DAILY_CLOSE, sequence=-1)
 

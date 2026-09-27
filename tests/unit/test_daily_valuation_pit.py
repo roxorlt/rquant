@@ -36,8 +36,13 @@ def _db() -> duckdb.DuckDBPyConnection:
         conn.execute(
             "INSERT INTO trade_calendar "
             "(exchange, cal_date, is_open, pretrade_date, source, updated_at) "
-            "VALUES ('SSE', ?, ?, NULL, 'test', ?)",
-            [day, day in {FRIDAY, MONDAY}, datetime(2026, 9, 25, tzinfo=UTC)],
+            "VALUES ('SSE', ?, ?, ?, 'tushare', ?)",
+            [
+                day,
+                day in {FRIDAY, MONDAY},
+                date(2026, 9, 24) if day == FRIDAY else FRIDAY,
+                datetime(2026, 9, 25, tzinfo=UTC),
+            ],
         )
     return conn
 
@@ -190,6 +195,44 @@ def test_incomplete_calendar_or_closed_decision_date_fails_closed() -> None:
         assert _select(conn, date(2026, 9, 26)).reason == "decision_not_open"
 
 
+@pytest.mark.parametrize("day", [FRIDAY, date(2026, 9, 26), MONDAY])
+def test_untrusted_calendar_source_cannot_select_valuation(day: date) -> None:
+    with _db() as conn:
+        _record_daily_valuation_batch_in_transaction(
+            conn, _batch(1, datetime(2026, 9, 25, 8, tzinfo=UTC))
+        )
+        assert _select(conn).status == "selected"
+        conn.execute(
+            "UPDATE trade_calendar SET source = 'test' WHERE exchange = 'SSE' AND cal_date = ?",
+            [day],
+        )
+        assert _select(conn).reason == "incomplete_calendar"
+
+
+@pytest.mark.parametrize(
+    ("day", "pretrade_date"),
+    [
+        (FRIDAY, None),
+        (date(2026, 9, 26), None),
+        (MONDAY, date(2026, 9, 24)),
+    ],
+)
+def test_broken_calendar_pretrade_chain_cannot_select_valuation(
+    day: date, pretrade_date: date | None
+) -> None:
+    with _db() as conn:
+        _record_daily_valuation_batch_in_transaction(
+            conn, _batch(1, datetime(2026, 9, 25, 8, tzinfo=UTC))
+        )
+        assert _select(conn).status == "selected"
+        conn.execute(
+            "UPDATE trade_calendar SET pretrade_date = ? "
+            "WHERE exchange = 'SSE' AND cal_date = ?",
+            [pretrade_date, day],
+        )
+        assert _select(conn).reason == "incomplete_calendar"
+
+
 def test_long_holiday_uses_exact_prior_open_date() -> None:
     with _db() as conn:
         conn.execute("UPDATE trade_calendar SET is_open = FALSE WHERE cal_date = ?", [MONDAY])
@@ -198,8 +241,8 @@ def test_long_holiday_uses_exact_prior_open_date() -> None:
             conn.execute(
                 "INSERT INTO trade_calendar "
                 "(exchange, cal_date, is_open, pretrade_date, source, updated_at) "
-                "VALUES ('SSE', ?, ?, NULL, 'test', ?)",
-                [day, day == date(2026, 10, 9), datetime(2026, 9, 25, tzinfo=UTC)],
+                "VALUES ('SSE', ?, ?, ?, 'tushare', ?)",
+                [day, day == date(2026, 10, 9), FRIDAY, datetime(2026, 9, 25, tzinfo=UTC)],
             )
         _record_daily_valuation_batch_in_transaction(
             conn, _batch(1, datetime(2026, 9, 25, 8, tzinfo=UTC))

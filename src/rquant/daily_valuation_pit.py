@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
@@ -207,12 +207,25 @@ def query_daily_valuation_pit(
     if previous is None:
         return _unknown("no_previous_session")
     expected_days = (decision_day - previous).days + 1
-    actual_days = conn.execute(
-        "SELECT COUNT(*) FROM trade_calendar WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?",
+    calendar_rows = conn.execute(
+        "SELECT cal_date, is_open, pretrade_date, source FROM trade_calendar "
+        "WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
         [previous, decision_day],
-    ).fetchone()[0]
-    if actual_days != expected_days:
+    ).fetchall()
+    if len(calendar_rows) != expected_days:
         return _unknown("incomplete_calendar")
+    prior_open = calendar_rows[0][2]
+    if prior_open is None or prior_open >= previous:
+        return _unknown("incomplete_calendar")
+    for offset, (cal_date, is_open, pretrade_date, source) in enumerate(calendar_rows):
+        if (
+            cal_date != previous + timedelta(days=offset)
+            or source != "tushare"
+            or pretrade_date != prior_open
+        ):
+            return _unknown("incomplete_calendar")
+        if is_open:
+            prior_open = cal_date
     as_of_local = datetime.combine(decision_day, time(17, 0), tzinfo=_SHANGHAI)
     next_open_at = datetime.combine(decision_day, time(9, 30), tzinfo=_SHANGHAI)
     if as_of_local < next_open_at:

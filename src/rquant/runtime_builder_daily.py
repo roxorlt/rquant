@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, time
+from numbers import Real
 from pathlib import Path
 from typing import Literal, Protocol
 from zoneinfo import ZoneInfo
@@ -106,10 +107,19 @@ def _rows(frame: pd.DataFrame, *, fields: tuple[str, ...], label: str) -> list[d
     missing = set(fields) - set(frame.columns)
     if missing:
         raise ValueError(f"daily-close {label} response lacks fields: {sorted(missing)}")
-    return [
-        {field: _scalar(record[field]) for field in fields}
-        for record in frame.loc[:, list(fields)].to_dict(orient="records")
-    ]
+    rows: list[dict[str, object]] = []
+    for record in frame.loc[:, list(fields)].to_dict(orient="records"):
+        row: dict[str, object] = {}
+        for field in fields:
+            value = record[field]
+            if label == "daily_basic" and field in {"pe_ttm", "pb", "dv_ttm"}:
+                if isinstance(value, Real) and not math.isfinite(value):
+                    raise ValueError(f"daily-close daily_basic {field} is nonfinite")
+                if value is pd.NA:
+                    value = None
+            row[field] = _scalar(value)
+        rows.append(row)
+    return rows
 
 
 def _tushare_daily_close_fetcher(
