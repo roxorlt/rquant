@@ -7,6 +7,7 @@ import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
+import { AUDIT_REPORT_JOURNAL_KEY } from "./auditReportCommandSession";
 
 vi.mock("@/charts/EChart", () => ({
   EChart: ({ label }: { label: string }) => <div role="img" aria-label={label} />,
@@ -81,6 +82,17 @@ const descriptions: CatalogList = {
 
 function catalogHandlers(list: CatalogList = descriptions) {
   server.use(
+    http.get("*/api/v1/data/audit-report/calendar", () =>
+      HttpResponse.json({
+        data: {
+          availability: "unavailable",
+          earliest_selectable_date: null,
+          latest_closed_date: null,
+          open_dates: [],
+        },
+        serving: metaEnvelope().serving,
+      }),
+    ),
     http.get("*/api/v1/data/report", () =>
       HttpResponse.json({
         data: { source_state: "not_published", overview: null, months: [], rules: [], issues: [] },
@@ -488,6 +500,306 @@ function reportHandler(data: Schemas["DataAuditReportData"] = report) {
     ),
   );
 }
+
+function calendarHandler(
+  data: Schemas["AuditReportCalendarData"] = {
+    availability: "ready",
+    earliest_selectable_date: "2024-09-02",
+    latest_closed_date: "2026-09-23",
+    open_dates: ["2024-09-02", "2026-09-18", "2026-09-22", "2026-09-23"],
+  },
+  generationId?: string,
+) {
+  server.use(
+    http.get("*/api/v1/data/audit-report/calendar", () =>
+      HttpResponse.json({ data, serving: metaEnvelope({ generationId }).serving }),
+    ),
+  );
+}
+
+describe("运行日线审计", () => {
+  it("uses the verified calendar, confirms the read-only range, and persists one original request", async () => {
+    const user = userEvent.setup();
+    const requests: Schemas["AuditReportCommandRequest"][] = [];
+    catalogHandlers();
+    calendarHandler();
+    server.use(
+      http.post("*/api/v1/data/audit-report/commands", async ({ request }) => {
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        const body = (await request.json()) as Schemas["AuditReportCommandRequest"];
+        requests.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          task_id: "a".repeat(32),
+          status: "queued",
+          message: "queued",
+        });
+      }),
+    );
+    renderApp("/datacenter");
+    await screen.findByRole("button", { name: /运行数据审计/ });
+    const panel = screen.getByRole("region", { name: "日线质量报告" });
+    await waitFor(() => expect(within(panel).getByLabelText("结束日期")).toHaveValue("2026-09-23"));
+    await user.click(within(panel).getByRole("button", { name: "运行数据审计" }));
+    expect(screen.getByText(/不会执行回补或写入日线/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认排队" }));
+    expect(await within(panel).findByText("本次请求已排队")).toBeInTheDocument();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.observed_through).toBe("2026-09-23");
+    expect(JSON.parse(localStorage.getItem(AUDIT_REPORT_JOURNAL_KEY) ?? "{}").body).toEqual(
+      requests[0],
+    );
+    expect(findJargon(document.querySelector("main")?.textContent ?? "")).toEqual([]);
+  });
+
+  it("refuses a date absent from the verified trading calendar", async () => {
+    const user = userEvent.setup();
+    catalogHandlers();
+    calendarHandler();
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    const end = await within(panel).findByLabelText("结束日期");
+    await user.clear(end);
+    await user.type(end, "2026-09-19");
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeDisabled();
+    expect(within(panel).getByText(/尚未核实为交易日/)).toBeInTheDocument();
+  });
+
+  it("disables submission when the calendar belongs to a different data generation", async () => {
+    catalogHandlers();
+    calendarHandler(undefined, "b".repeat(64));
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByRole("button", { name: "运行数据审计" })).toBeDisabled();
+    expect(within(panel).getByText(/交易日历暂不可用/)).toBeInTheDocument();
+  });
+
+  it("marks a report as this run only after matching published task and report evidence", async () => {
+    const taskId = "a".repeat(32);
+    localStorage.setItem(
+      AUDIT_REPORT_JOURNAL_KEY,
+      JSON.stringify({
+        schema: 1,
+        body: {
+          command_id: "web-original",
+          requested_at: "2026-09-24T07:00:00Z",
+          audit_start: "2024-09-02",
+          observed_through: "2026-09-23",
+        },
+        status: "queued",
+        taskId,
+      }),
+    );
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      ...report,
+      progress: {
+        availability: "ready",
+        latest_task_id: taskId,
+        latest_status: "succeeded",
+        successful_task_id: taskId,
+        successful_report_hash: report.overview?.report_hash ?? null,
+        successful_created_at: "2026-09-24T07:00:00Z",
+        successful_updated_at: "2026-09-24T07:05:00Z",
+        events: [
+          { event_type: "succeeded", label: "检查完成", occurred_at: "2026-09-24T07:05:00Z" },
+        ],
+      },
+    });
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("本次报告已发布")).toBeInTheDocument();
+    expect(within(panel).getByRole("heading", { name: "本次报告" })).toBeInTheDocument();
+  });
+
+  it("keeps a published result tied to its request after a newer task fails", async () => {
+    const taskId = "a".repeat(32);
+    localStorage.setItem(
+      AUDIT_REPORT_JOURNAL_KEY,
+      JSON.stringify({
+        schema: 1,
+        body: {
+          command_id: "web-original",
+          requested_at: "2026-09-24T07:00:00Z",
+          audit_start: "2024-09-02",
+          observed_through: "2026-09-23",
+        },
+        status: "queued",
+        taskId,
+      }),
+    );
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      ...report,
+      progress: {
+        availability: "ready",
+        latest_task_id: "b".repeat(32),
+        latest_status: "failed",
+        successful_task_id: taskId,
+        successful_report_hash: report.overview?.report_hash ?? null,
+        successful_updated_at: "2026-09-24T07:05:00Z",
+        events: [
+          { event_type: "failed", label: "检查未完成", occurred_at: "2026-09-24T07:07:00Z" },
+        ],
+      },
+    });
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("本次报告已发布")).toBeInTheDocument();
+    expect(within(panel).getByRole("heading", { name: "本次报告" })).toBeInTheDocument();
+    expect(within(panel).getByText("最近任务未完成")).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeEnabled();
+  });
+
+  it("shows a real empty task state while the report is unpublished", async () => {
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      source_state: "not_published",
+      overview: null,
+      months: [],
+      rules: [],
+      issues: [],
+      progress: { availability: "empty", events: [] },
+    });
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("还没有审计任务，选择日期后运行。")).toBeInTheDocument();
+    expect(within(panel).queryByText(/近期任务暂不可查看/)).not.toBeInTheDocument();
+  });
+
+  it("blocks stale meta data after a failed refresh", async () => {
+    catalogHandlers();
+    calendarHandler();
+    reportHandler();
+    const { queryClient } = renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    await waitFor(() =>
+      expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeEnabled(),
+    );
+    server.use(
+      http.get("*/api/v1/meta", () =>
+        HttpResponse.json({ detail: "unavailable" }, { status: 503 }),
+      ),
+    );
+    await queryClient.invalidateQueries({ queryKey: ["meta"] });
+    await waitFor(() => expect(queryClient.getQueryState(["meta"])?.error).toBeTruthy());
+    expect(queryClient.getQueryState(["meta"])?.data).toBeDefined();
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeDisabled();
+    expect(within(panel).queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+
+  it("withdraws a cached success and blocks submission after report refresh conflicts", async () => {
+    const taskId = "a".repeat(32);
+    localStorage.setItem(
+      AUDIT_REPORT_JOURNAL_KEY,
+      JSON.stringify({
+        schema: 1,
+        body: {
+          command_id: "web-original",
+          requested_at: "2026-09-24T07:00:00Z",
+          audit_start: "2024-09-02",
+          observed_through: "2026-09-23",
+        },
+        status: "queued",
+        taskId,
+      }),
+    );
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      ...report,
+      progress: {
+        availability: "ready",
+        latest_task_id: taskId,
+        latest_status: "succeeded",
+        successful_task_id: taskId,
+        successful_report_hash: report.overview?.report_hash ?? null,
+        events: [],
+      },
+    });
+    const { queryClient } = renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("本次报告已发布")).toBeInTheDocument();
+    server.use(
+      http.get("*/api/v1/data/report", () =>
+        HttpResponse.json({ detail: "changed" }, { status: 409 }),
+      ),
+    );
+    await queryClient.invalidateQueries({ queryKey: ["data", "audit", "report"] });
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState(["data", "audit", "report", metaEnvelope().serving.generation_id])
+          ?.error,
+      ).toBeTruthy(),
+    );
+    expect(
+      queryClient.getQueryState(["data", "audit", "report", metaEnvelope().serving.generation_id])
+        ?.data,
+    ).toBeDefined();
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeDisabled();
+    expect(within(panel).queryByText("本次报告已发布")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps an unknown original request for manual retry and retains the previous report after failure", async () => {
+    const user = userEvent.setup();
+    const original = {
+      command_id: "web-original",
+      requested_at: "2026-09-24T07:00:00Z",
+      audit_start: "2024-09-02",
+      observed_through: "2026-09-23",
+    };
+    localStorage.setItem(
+      AUDIT_REPORT_JOURNAL_KEY,
+      JSON.stringify({ schema: 1, body: original, status: "unknown", taskId: null }),
+    );
+    const requests: Schemas["AuditReportCommandRequest"][] = [];
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      ...report,
+      progress: {
+        availability: "ready",
+        latest_task_id: "b".repeat(32),
+        latest_status: "failed",
+        latest_status_label: "失败",
+        latest_hint: "核对未完成，请稍后重试。",
+        latest_created_at: "2026-09-24T06:00:00Z",
+        latest_updated_at: "2026-09-24T06:01:00Z",
+        successful_task_id: "c".repeat(32),
+        successful_report_hash: report.overview?.report_hash ?? null,
+        successful_created_at: "2026-09-23T06:00:00Z",
+        successful_updated_at: "2026-09-23T06:01:00Z",
+        events: [{ event_type: "failed", label: "核对失败", occurred_at: "2026-09-24T06:01:00Z" }],
+      },
+    });
+    server.use(
+      http.post("*/api/v1/data/audit-report/commands", async ({ request }) => {
+        const body = (await request.json()) as Schemas["AuditReportCommandRequest"];
+        requests.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          task_id: null,
+          status: "pending",
+          message: "pending",
+        });
+      }),
+    );
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("本次提交状态待确认")).toBeInTheDocument();
+    expect(within(panel).getByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
+    expect(within(panel).getByText("最近任务未完成")).toBeInTheDocument();
+    expect(requests).toHaveLength(0);
+    await user.click(within(panel).getByRole("button", { name: "继续核对" }));
+    await waitFor(() => expect(requests).toEqual([original]));
+    expect(await within(panel).findByText("本次提交状态待确认")).toBeInTheDocument();
+    expect(within(panel).getByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
+  });
+});
 
 describe("日线质量报告", () => {
   it("shows measured coverage, per-rule assessed range and the bounded issue list", async () => {

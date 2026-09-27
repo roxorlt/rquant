@@ -161,6 +161,23 @@ export function useDataAuditReport(generation: string | null | undefined) {
   );
 }
 
+export function useAuditReportCalendar(generation: string | null | undefined) {
+  return useServingQuery(
+    ["data", "audit", "calendar", generation],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/data/audit-report/calendar", {
+        params: { query: { generation: generation ?? undefined } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: generation !== undefined },
+  );
+}
+
+export type AuditReportCalendarData = NonNullable<
+  ReturnType<typeof useAuditReportCalendar>["data"]
+>;
+
 // openapi-fetch's Readable response omits null-only fields from the generated model.
 // Derive the page shape from the typed client response so it stays in sync with OpenAPI.
 export type DataAuditReportData = NonNullable<ReturnType<typeof useDataAuditReport>["data"]>;

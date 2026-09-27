@@ -1,9 +1,12 @@
+import { type ReactNode, useEffect, useState, useSyncExternalStore } from "react";
+import { submitAuditReportCommand } from "@/api/auditReportCommand";
 import { ApiError } from "@/api/client";
 import {
   type AuditReportIssue,
   type AuditReportMonth,
   type AuditReportRule,
   type DataAuditReportData,
+  useAuditReportCalendar,
   useDataAuditReport,
 } from "@/api/endpoints";
 import { useMeta } from "@/api/useMeta";
@@ -13,7 +16,18 @@ import { baseOption } from "@/charts/options";
 import type { ChartColors } from "@/charts/tokens";
 import { formatCount, formatPercent } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
-import { EmptyState, type Kpi, KpiStrip, PageSkeleton, Panel, StatusBadge, Tip } from "@/ui";
+import {
+  EmptyState,
+  type Kpi,
+  KpiStrip,
+  PageSkeleton,
+  Panel,
+  RelativeTime,
+  StatusBadge,
+  Tip,
+} from "@/ui";
+import { AuditReportRun } from "./AuditReportRun";
+import { AuditReportCommandSession } from "./auditReportCommandSession";
 
 type Overview = NonNullable<DataAuditReportData["overview"]>;
 
@@ -353,59 +367,135 @@ export function DailyReportPanel() {
   const meta = useMeta();
   const expectedGeneration = meta.data?.serving.generation_id;
   const report = useDataAuditReport(expectedGeneration);
-
-  if (meta.isLoading || report.isLoading) {
-    return (
-      <Panel title="日线质量报告" label="日线质量报告">
-        <PageSkeleton label="日线质量报告加载中" />
-      </Panel>
-    );
-  }
-  if (meta.error) {
-    return (
-      <Panel title="日线质量报告" label="日线质量报告">
-        <EmptyState title="暂时无法确认当前数据" hint="稍后刷新页面再试" />
-      </Panel>
-    );
-  }
-  if (report.error) {
-    return (
-      <Panel title="日线质量报告" label="日线质量报告">
-        <EmptyState
-          title={
-            report.error instanceof ApiError && report.error.status === 409
-              ? "日线质量报告已更新，请刷新"
-              : "日线质量报告暂时不可用"
+  const calendar = useAuditReportCalendar(expectedGeneration);
+  const [commandSession] = useState(
+    () =>
+      new AuditReportCommandSession(
+        (() => {
+          try {
+            return window.localStorage;
+          } catch {
+            return {
+              getItem: () => {
+                throw new Error("storage unavailable");
+              },
+            } as unknown as Storage;
           }
-          hint="稍后刷新页面再试"
-        />
-      </Panel>
+        })(),
+        submitAuditReportCommand,
+        () =>
+          `web-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) => item.toString(16).padStart(2, "0")).join("")}`,
+        () => new Date().toISOString(),
+      ),
+  );
+  const command = useSyncExternalStore(
+    commandSession.subscribe,
+    commandSession.snapshot,
+    commandSession.snapshot,
+  );
+  const readBlock = meta.error
+    ? "暂时无法确认当前数据，请刷新后重试。"
+    : report.error
+      ? "审计进度暂不可读取，请刷新后重试。"
+      : report.isLoading
+        ? "正在读取近期任务。"
+        : null;
+  const sameReport =
+    !meta.error &&
+    !report.error &&
+    expectedGeneration !== null &&
+    expectedGeneration !== undefined &&
+    report.serving?.generation_id === expectedGeneration;
+  const sameCalendar =
+    readBlock === null &&
+    expectedGeneration !== null &&
+    expectedGeneration !== undefined &&
+    meta.data?.data.generation?.generation_id === expectedGeneration &&
+    calendar.serving?.generation_id === expectedGeneration &&
+    calendar.data?.availability === "ready";
+  const progress = sameReport ? (report.data?.progress ?? null) : null;
+  const overview =
+    sameReport && report.data?.source_state === "ready" ? report.data.overview : null;
+  const ownPublished = Boolean(
+    command.journal?.taskId &&
+      progress?.successful_task_id === command.journal.taskId &&
+      progress.successful_report_hash === overview?.report_hash,
+  );
+  const ownFailed = Boolean(
+    command.journal?.taskId &&
+      progress?.latest_task_id === command.journal.taskId &&
+      progress.latest_status === "failed",
+  );
+
+  useEffect(() => {
+    if (
+      !(command.journal?.status === "queued" && !ownPublished && !ownFailed) &&
+      !["queued", "running"].includes(progress?.latest_status ?? "")
+    )
+      return;
+    const timer = window.setInterval(() => report.refetch(), 10_000);
+    return () => window.clearInterval(timer);
+  }, [command.journal?.status, ownPublished, ownFailed, progress?.latest_status, report.refetch]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => calendar.refetch(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [calendar.refetch]);
+
+  let result: ReactNode;
+  if (meta.isLoading || report.isLoading) {
+    result = <PageSkeleton label="日线质量报告加载中" />;
+  } else if (meta.error) {
+    result = <EmptyState title="暂时无法确认当前数据" hint="稍后刷新页面再试" />;
+  } else if (report.error) {
+    result = (
+      <EmptyState
+        title={
+          report.error instanceof ApiError && report.error.status === 409
+            ? "日线质量报告已更新，请刷新"
+            : "日线质量报告暂时不可用"
+        }
+        hint="稍后刷新页面再试"
+      />
     );
-  }
-  if (report.serving?.generation_id !== expectedGeneration) {
-    return (
-      <Panel title="日线质量报告" label="日线质量报告">
-        <EmptyState title="日线质量报告已更新，请刷新" hint="稍后刷新页面再试" />
-      </Panel>
-    );
-  }
-  if (report.data?.source_state === "not_published") {
-    return (
-      <Panel title="日线质量报告" label="日线质量报告">
-        <EmptyState title="日线质量报告尚未发布" hint="发布后会显示覆盖与质量记录" />
-      </Panel>
-    );
-  }
-  if (report.data?.source_state !== "ready" || report.data.overview === null) {
-    return (
-      <Panel title="日线质量报告" label="日线质量报告">
-        <EmptyState title="日线质量报告暂时不可用" hint="稍后刷新页面再试" />
-      </Panel>
-    );
+  } else if (!sameReport) {
+    result = <EmptyState title="日线质量报告已更新，请刷新" hint="稍后刷新页面再试" />;
+  } else if (report.data?.source_state === "not_published") {
+    result = <EmptyState title="日线质量报告尚未发布" hint="发布后会显示覆盖与质量记录" />;
+  } else if (report.data?.source_state !== "ready" || report.data.overview === null) {
+    result = <EmptyState title="日线质量报告暂时不可用" hint="稍后刷新页面再试" />;
+  } else {
+    result = <ReportContent data={report.data} overview={report.data.overview} />;
   }
   return (
     <Panel title="日线质量报告" label="日线质量报告" flush>
-      <ReportContent data={report.data} overview={report.data.overview} />
+      <AuditReportRun
+        calendar={calendar.data}
+        calendarReady={sameCalendar && !calendar.error}
+        market={meta.data?.data.market}
+        viewer={meta.data?.data.viewer}
+        overview={overview}
+        progress={progress}
+        ownPublished={ownPublished}
+        readBlock={readBlock}
+        commandSession={commandSession}
+        command={command}
+        onRefresh={() => {
+          report.refetch();
+          calendar.refetch();
+        }}
+      />
+      <section className="dc-report-result" aria-label="审计报告结果">
+        <div className="dc-report-result-head">
+          <h3>{ownPublished ? "本次报告" : "上次报告"}</h3>
+          {overview && progress?.successful_report_hash === overview.report_hash ? (
+            <span>
+              <RelativeTime at={progress.successful_updated_at} suffix="完成" />
+            </span>
+          ) : null}
+        </div>
+        {result}
+      </section>
     </Panel>
   );
 }
