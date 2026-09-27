@@ -12,6 +12,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from ctypes import CDLL, byref, c_uint, get_errno
 from datetime import UTC, datetime, timedelta
@@ -50,15 +51,24 @@ class AckAdmission:
         self.reader_factory = reader_factory
         self.before_final_pointer_check = before_final_pointer_check
         self.after_final_pointer_check = after_final_pointer_check
+        self._admission_lock = threading.Lock()
 
     def admit(self, command: AckAlert) -> PageControlReceipt:
+        # The private listener is threaded. A stale rejection must wait for any
+        # earlier admission of this exact command to finish its durable enqueue.
+        with self._admission_lock:
+            return self._admit_locked(command)
+
+    def _admit_locked(self, command: AckAlert) -> PageControlReceipt:
         original = self.service.lookup_ack_command(command)
         if original is not None:
             return self.service.submit(command)
         reader = self.reader_factory(self.serving_root)
         with reader.acquire_generation() as lease:
-            if lease.pointer is None or lease.manifest.generation_id != command.generation_id:
-                raise ValueError("Serving generation changed")
+            if lease.pointer is None:
+                raise ValueError("Serving generation is unavailable")
+            if lease.manifest.generation_id != command.generation_id:
+                raise AckAdmissionStaleGenerationError("Serving generation changed")
             now = self.clock()
             if now.tzinfo is None or now.utcoffset() is None:
                 raise ValueError("admission clock must be timezone-aware")
@@ -92,11 +102,12 @@ class AckAdmission:
                 self.before_final_pointer_check()
             # This is the final Serving observation and the admission decision point.
             current = reader.current_pointer()
-            if (
-                current.generation_id != command.generation_id
-                or current.manifest_sha256 != lease.pointer.manifest_sha256
-            ):
-                raise ValueError("Serving generation changed before admission")
+            if current.generation_id != command.generation_id:
+                raise AckAdmissionStaleGenerationError(
+                    "Serving generation changed before admission"
+                )
+            if current.manifest_sha256 != lease.pointer.manifest_sha256:
+                raise ValueError("Serving manifest changed before admission")
             if self.after_final_pointer_check is not None:
                 self.after_final_pointer_check()
             return self.service._submit_verified_ack(command)
@@ -271,6 +282,9 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 receipt = self.server.admission.admit(command)
+            except AckAdmissionStaleGenerationError:
+                self._json(409, {"error": "stale_generation"})
+                return
             except ValueError:
                 self._json(409, {"error": "acknowledgment is not eligible or conflicts"})
                 return
@@ -333,6 +347,10 @@ class AckAdmissionRejectedError(ValueError):
     """The current published generation does not admit this new command."""
 
 
+class AckAdmissionStaleGenerationError(AckAdmissionRejectedError):
+    """The original command was absent and its generation failed admission."""
+
+
 class _UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, socket_path: Path, *, timeout_seconds: float) -> None:
         super().__init__("localhost", timeout=timeout_seconds)
@@ -364,6 +382,12 @@ class AckAdmissionClient:
             response = connection.getresponse()
             body = response.read(_MAX_BODY_BYTES + 1)
             if response.status == 409:
+                try:
+                    rejection = json.loads(body) if len(body) <= _MAX_BODY_BYTES else None
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    rejection = None
+                if rejection == {"error": "stale_generation"}:
+                    raise AckAdmissionStaleGenerationError("Serving generation changed")
                 raise AckAdmissionRejectedError("acknowledgment is not eligible or conflicts")
             if response.status != 200:
                 raise AckAdmissionUnavailableError(f"ack admission returned HTTP {response.status}")

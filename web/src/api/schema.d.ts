@@ -586,6 +586,13 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AckCommandConflict */
+        AckCommandConflict: {
+            /** Code */
+            code?: "stale_generation_no_effect" | null;
+            /** Detail */
+            detail: string;
+        };
         /** AckCommandReceipt */
         AckCommandReceipt: {
             /** Command Id */
@@ -3832,6 +3839,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AckCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckCommandConflict"];
                 };
             };
             /** @description Validation Error */

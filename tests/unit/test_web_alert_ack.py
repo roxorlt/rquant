@@ -19,10 +19,11 @@ from rquant.alert_ack import (
 from rquant.alert_ack_admission import (
     AckAdmission,
     AckAdmissionRejectedError,
+    AckAdmissionStaleGenerationError,
     AckAdmissionUnavailableError,
     build_ack_admission_server,
 )
-from rquant.page_control import AckAlert, AlertAcknowledgment, PageControlReceipt
+from rquant.page_control import AckAlert, AlertAcknowledgment, PageControlReceipt, PageControlStatus
 from rquant.page_control_service import build_page_control_service
 from rquant.runtime_contracts import canonical_sha256
 from rquant.serving_alert_projection import AlertAckAuthoritySnapshot
@@ -487,7 +488,7 @@ def test_new_ack_stays_closed_after_explicit_lookup_miss(tmp_path: Path) -> None
         )
     assert response.status_code == 409
     assert "暂不可用" in response.json()["detail"]
-    assert len(observed) == 1
+    assert len(observed) == 2
 
 
 @pytest.mark.parametrize(
@@ -749,19 +750,140 @@ def test_pending_original_rechecks_if_private_receipt_lacks_confirmation_id(
     assert lookups == 2
 
 
-def test_new_ack_rejects_old_generation_before_private_admission(tmp_path: Path) -> None:
+def test_old_generation_requires_private_no_effect_proof(tmp_path: Path) -> None:
     root = tmp_path / "serving"
     build_web_fixture(root, "baseline", signal_projections=_complete_alert_projections())
+    lookups = 0
+
+    def lookup(_payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
+        return {"found": False}
 
     class Admission:
         def submit(self, _command: AckAlert) -> PageControlReceipt:
-            pytest.fail("stale generation reached private admission")
+            raise AckAdmissionStaleGenerationError("old generation")
 
-    app = _app(root, lookup=lambda _payload: {"found": False}, admission=Admission())
+    app = _app(root, lookup=lookup, admission=Admission())
     with TestClient(app) as client:
         response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
     assert response.status_code == 409
+    assert response.json()["code"] == "stale_generation_no_effect"
     assert "刷新" in response.json()["detail"]
+    assert lookups == 3
+
+
+def test_old_generation_no_effect_requires_successful_final_lookup(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline", signal_projections=_complete_alert_projections())
+    lookups = 0
+
+    def lookup(_payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 3:
+            raise OSError("lookup unavailable")
+        return {"found": False}
+
+    class Admission:
+        def submit(self, _command: AckAlert) -> PageControlReceipt:
+            raise AckAdmissionStaleGenerationError("old generation")
+
+    with TestClient(_app(root, lookup=lookup, admission=Admission())) as client:
+        response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
+    assert response.status_code == 503
+    assert "stale_generation_no_effect" not in response.text
+
+
+def test_stale_web_check_recovers_command_enqueued_after_first_lookup(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline", signal_projections=_complete_alert_projections())
+    lookups = 0
+
+    def lookup(payload: dict[str, object]) -> dict[str, object]:
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            return {"found": False}
+        return {
+            "found": True,
+            "receipt": _receipt(str(payload["command_id"]), "pending").model_dump(mode="json"),
+        }
+
+    with TestClient(_app(root, lookup=lookup)) as client:
+        response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"
+    assert lookups == 2
+
+
+def test_enqueue_then_settle_value_error_returns_durable_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "serving"
+    manifest = build_web_fixture(root, "baseline", signal_projections=_complete_alert_projections())
+    service = build_page_control_service(
+        outbox_path=tmp_path / "control" / "page-control.sqlite3",
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+        allowed_lab_export_roots=(tmp_path / "exports",),
+        load_default_lab_backend=False,
+        clock=lambda: NOW,
+    )
+    service.outbox.activate_alert_ack(FIXTURE_BUILT_AT - timedelta(days=1))
+
+    def fail_after_enqueue(_command: object, receipt: PageControlReceipt) -> PageControlReceipt:
+        assert receipt.status is PageControlStatus.PENDING
+        raise ValueError("settle failed after durable enqueue")
+
+    monkeypatch.setattr(service, "_settle", fail_after_enqueue)
+
+    def lookup(payload: dict[str, object]) -> dict[str, object]:
+        original = service.lookup_ack_command(AckAlert.model_validate(payload))
+        return (
+            {"found": False}
+            if original is None
+            else {"found": True, "receipt": original.model_dump(mode="json")}
+        )
+
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        server = build_ack_admission_server(
+            AckAdmission(service, root, clock=lambda: NOW), socket_path=socket_path
+        )
+        assert server is not None
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            app = create_app(
+                WebSettings(
+                    serving_root=root,
+                    ack_admission_socket_path=socket_path,
+                    ingress_socket_path=tmp_path / "web-private" / "web.sock",
+                ),
+                clock=lambda: NOW,
+                background=False,
+                ack_lookup_transport=lookup,
+            )
+            body = {
+                **_body(),
+                "generation_id": manifest.generation_id,
+                "alert_id": stable_alert_id("monitor_event", _monitor_events()[0]),
+            }
+            with TestClient(app) as client:
+                response = client.post("/api/v1/monitor/ack", json=body, headers=HEADERS)
+            assert response.status_code == 200
+            assert response.json()["status"] == "pending"
+            assert (
+                service.lookup_ack_command(
+                    AckAlert.model_validate({**body, "actor_id": "researcher"})
+                )
+                is not None
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
 
 
 def test_new_ack_rejects_incomplete_source_before_private_admission(tmp_path: Path) -> None:
@@ -895,7 +1017,8 @@ def test_lost_private_response_recovers_original_id_on_exact_retry(tmp_path: Pat
     with TestClient(_app(root, lookup=lookup, admission=Admission())) as client:
         first = client.post("/api/v1/monitor/ack", json=body, headers=HEADERS)
         retry = client.post("/api/v1/monitor/ack", json=body, headers=HEADERS)
-    assert first.status_code == 503
+    assert first.status_code == 200
+    assert first.json()["confirmation_id"] == "ack-first"
     assert retry.status_code == 200
     assert retry.json()["confirmation_id"] == "ack-first"
     assert len(submitted) == 1
@@ -951,6 +1074,62 @@ def test_web_ack_uses_real_private_socket_and_recovers_same_receipt(tmp_path: Pa
             assert first.json() == retry.json()
             assert first.json()["status"] == "succeeded"
             assert first.json()["confirmation_id"] == "ack-original"
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
+
+def test_old_generation_real_private_socket_proves_no_effect(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline", signal_projections=_complete_alert_projections())
+    service = build_page_control_service(
+        outbox_path=tmp_path / "control" / "page-control.sqlite3",
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+        allowed_lab_export_roots=(tmp_path / "exports",),
+        load_default_lab_backend=False,
+        clock=lambda: NOW,
+    )
+    service.outbox.activate_alert_ack(FIXTURE_BUILT_AT - timedelta(days=1))
+
+    def lookup(payload: dict[str, object]) -> dict[str, object]:
+        original = service.lookup_ack_command(AckAlert.model_validate(payload))
+        return (
+            {"found": False}
+            if original is None
+            else {"found": True, "receipt": original.model_dump(mode="json")}
+        )
+
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        server = build_ack_admission_server(
+            AckAdmission(service, root, clock=lambda: NOW), socket_path=socket_path
+        )
+        assert server is not None
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            app = create_app(
+                WebSettings(
+                    serving_root=root,
+                    ack_admission_socket_path=socket_path,
+                    ingress_socket_path=tmp_path / "web-private" / "web.sock",
+                ),
+                clock=lambda: NOW,
+                background=False,
+                ack_lookup_transport=lookup,
+            )
+            with TestClient(app) as client:
+                response = client.post("/api/v1/monitor/ack", json=_body(), headers=HEADERS)
+            assert response.status_code == 409
+            assert response.json()["code"] == "stale_generation_no_effect"
+            assert (
+                service.lookup_ack_command(
+                    AckAlert.model_validate({**_body(), "actor_id": "researcher"})
+                )
+                is None
+            )
         finally:
             server.shutdown()
             server.server_close()

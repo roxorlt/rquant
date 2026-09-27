@@ -19,14 +19,16 @@ function countCard(): HTMLElement {
   return document.querySelector('[data-kpi="unacknowledged"]') as HTMLElement;
 }
 
-describe("告警确认只读展示", () => {
+describe("告警确认状态展示", () => {
   it("shows every event state and keeps notification submissions separate", async () => {
     const original = monitorEnvelope();
     const states: Schemas["AlertAcknowledgmentView"][] = [
-      { state: "unconfirmed", eligible: true, label: "待确认" },
+      { state: "unconfirmed", eligible: true, alert_id: "1".repeat(64), label: "待确认" },
       {
         state: "confirmed",
         eligible: false,
+        alert_id: "2".repeat(64),
+        confirmation_id: "confirmed-first",
         label: "已确认",
         confirmed_at: "2026-09-24T05:06:00Z",
       },
@@ -79,7 +81,7 @@ describe("告警确认只读展示", () => {
         screen.getAllByRole("tooltip").some((tip) => tip.textContent?.includes("启用前的告警")),
       ).toBe(true),
     );
-    expect(screen.queryByRole("button", { name: /^确认$/ })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^确认$/ })).toHaveLength(1);
   });
 
   it("uses the same published count and cutoff on timeline and overview", async () => {

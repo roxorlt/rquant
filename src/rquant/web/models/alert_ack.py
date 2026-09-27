@@ -29,3 +29,10 @@ class AckCommandReceipt(BaseModel):
     status: Literal["pending", "processing", "succeeded", "failed", "ambiguous"]
     confirmation_id: str | None = None
     message: str
+
+
+class AckCommandConflict(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    detail: str
+    code: Literal["stale_generation_no_effect"] | None = None

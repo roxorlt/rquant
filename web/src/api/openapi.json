@@ -1,6 +1,32 @@
 {
   "components": {
     "schemas": {
+      "AckCommandConflict": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "const": "stale_generation_no_effect",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "AckCommandConflict",
+        "type": "object"
+      },
       "AckCommandReceipt": {
         "properties": {
           "command_id": {
@@ -9391,6 +9417,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AckCommandConflict"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {

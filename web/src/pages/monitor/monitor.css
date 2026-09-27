@@ -42,6 +42,17 @@
   gap: 7px 10px;
 }
 
+.monitor-ack {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.monitor-ack .btn {
+  min-height: 32px;
+}
+
 .monitor-stock {
   border: 0;
   padding: 0;

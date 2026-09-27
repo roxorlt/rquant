@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { submitAlertAckCommand } from "@/api/alertAckCommand";
 import { ApiError } from "@/api/client";
 import { type MonitorTimelineItem, useMonitorTimeline } from "@/api/endpoints";
-import { useCurrentGeneration } from "@/api/useMeta";
+import { useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
@@ -21,7 +22,10 @@ import {
 } from "@/ui";
 import { AlertAcknowledgment, unacknowledgedKpi } from "../shared/AlertAcknowledgment";
 import { StockCell } from "../shared/StockCell";
+import { type AckCommandSnapshot, AlertAckCommandSession } from "./alertAckCommandSession";
 import "./monitor.css";
+
+const ALERT_ID = /^[0-9a-f]{64}$/;
 
 const DELIVERY_TONE = {
   delivered: "ok",
@@ -43,9 +47,19 @@ const RECEIPT_KPI_VALUE = {
 function TimelineEntry({
   row,
   onStock,
+  commandSession,
+  command,
+  canConfirm,
+  canResume,
+  generationId,
 }: {
   row: MonitorTimelineItem;
   onStock: (code: string) => void;
+  commandSession: AlertAckCommandSession;
+  command: AckCommandSnapshot;
+  canConfirm: boolean;
+  canResume: boolean;
+  generationId: string | null | undefined;
 }) {
   if (row.kind === "notification") {
     return (
@@ -91,7 +105,14 @@ function TimelineEntry({
           ) : (
             <Pill kind={row.kind === "monitor" ? "acc" : "idle"}>{row.status_label}</Pill>
           )}
-          <AlertAcknowledgment acknowledgment={row.acknowledgment} />
+          <AckAction
+            acknowledgment={row.acknowledgment}
+            commandSession={commandSession}
+            command={command}
+            canConfirm={canConfirm}
+            canResume={canResume}
+            generationId={generationId}
+          />
         </div>
         {row.kind === "signal" ? (
           <>
@@ -139,17 +160,186 @@ function TimelineEntry({
   );
 }
 
+type Acknowledgment = Exclude<MonitorTimelineItem, { kind: "notification" }>["acknowledgment"];
+
+function AckAction({
+  acknowledgment,
+  commandSession,
+  command,
+  canConfirm,
+  canResume,
+  generationId,
+}: {
+  acknowledgment: Acknowledgment;
+  commandSession: AlertAckCommandSession;
+  command: AckCommandSnapshot;
+  canConfirm: boolean;
+  canResume: boolean;
+  generationId: string | null | undefined;
+}) {
+  const alertId = acknowledgment?.alert_id;
+  const validId = typeof alertId === "string" && ALERT_ID.test(alertId);
+  const entry = validId ? command.entries[alertId] : undefined;
+  const busy = validId && command.busyAlerts.includes(alertId);
+  const verifiedConfirmation =
+    validId &&
+    acknowledgment?.state === "confirmed" &&
+    acknowledgment.eligible === false &&
+    typeof acknowledgment.confirmation_id === "string" &&
+    acknowledgment.confirmation_id.length > 0;
+  const confirmed =
+    verifiedConfirmation &&
+    (entry?.status !== "succeeded" ||
+      (generationId !== entry.body.generation_id &&
+        acknowledgment?.confirmation_id === entry.confirmationId));
+  const eligible =
+    canConfirm &&
+    validId &&
+    acknowledgment?.state === "unconfirmed" &&
+    acknowledgment.eligible === true;
+
+  if (confirmed) return <AlertAcknowledgment acknowledgment={acknowledgment} />;
+  if (entry?.status === "succeeded") {
+    return (
+      <StatusBadge
+        state="waiting"
+        label="已受理，正在同步"
+        reason="确认已保存。页面数据更新后将显示最终状态。"
+      />
+    );
+  }
+  if (entry && entry.status !== "failed") {
+    return (
+      <span className="monitor-ack">
+        <StatusBadge
+          state="waiting"
+          label={busy ? "正在核对" : "状态待核对"}
+          reason="本次请求已有记录，请用原请求继续核对。"
+        />
+        {command.storageAvailable ? (
+          <Button
+            size="sm"
+            disabled={busy || !canResume}
+            disabledReason={!canResume ? "请登录后继续核对本次请求。" : undefined}
+            onClick={() => {
+              if (alertId) void commandSession.advance(alertId);
+            }}
+          >
+            继续核对
+          </Button>
+        ) : null}
+      </span>
+    );
+  }
+  if (entry?.status === "failed") {
+    const stale = entry.failureKind === "stale_generation";
+    return (
+      <span className="monitor-ack">
+        <StatusBadge
+          state="warn"
+          label={stale ? "数据已更新" : "确认未完成"}
+          reason={
+            stale ? "旧数据上的请求未受理，刷新后可重新确认。" : "上次请求已结束，告警仍需确认。"
+          }
+        />
+        {eligible && (!stale || generationId !== entry.body.generation_id) ? (
+          <Button
+            size="sm"
+            onClick={() => {
+              if (generationId && alertId) void commandSession.start(generationId, alertId);
+            }}
+          >
+            重新确认
+          </Button>
+        ) : null}
+      </span>
+    );
+  }
+  return (
+    <span className="monitor-ack">
+      <AlertAcknowledgment
+        acknowledgment={
+          verifiedConfirmation
+            ? acknowledgment
+            : acknowledgment?.state === "confirmed"
+              ? undefined
+              : acknowledgment
+        }
+      />
+      {eligible && command.storageAvailable ? (
+        <Button
+          size="sm"
+          onClick={() => {
+            if (generationId && alertId) void commandSession.start(generationId, alertId);
+          }}
+        >
+          确认
+        </Button>
+      ) : null}
+    </span>
+  );
+}
+
 export default function MonitorPage() {
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const pageIndex = cursors.length - 1;
   const result = useMonitorTimeline(cursors[pageIndex] ?? null, refreshKey);
-  const currentGeneration = useCurrentGeneration();
+  const meta = useCurrentMeta();
+  useEffect(() => {
+    void meta.refetch();
+  }, [meta.refetch]);
+  const currentGeneration = meta.data?.data.generation?.generation_id;
+  const viewer =
+    meta.isFetchedAfterMount && !meta.isError ? (meta.data?.data.viewer ?? null) : null;
+  const commandSession = useMemo(
+    () =>
+      new AlertAckCommandSession(
+        (() => {
+          try {
+            return window.localStorage;
+          } catch {
+            return null;
+          }
+        })(),
+        viewer,
+        submitAlertAckCommand,
+        () =>
+          `web-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) => item.toString(16).padStart(2, "0")).join("")}`,
+        () => new Date().toISOString(),
+      ),
+    [viewer],
+  );
+  const command = useSyncExternalStore(
+    commandSession.subscribe,
+    commandSession.snapshot,
+    commandSession.snapshot,
+  );
+  useEffect(() => {
+    if (viewer && !meta.isError) void commandSession.resumePending();
+  }, [commandSession, viewer, meta.isError]);
   const oldGeneration =
     currentGeneration !== undefined && result.serving?.generation_id !== currentGeneration;
   const data = oldGeneration || result.error ? undefined : result.data;
   const changed = result.error instanceof ApiError && result.error.status === 409;
+  const pageFresh =
+    meta.isFetchedAfterMount &&
+    !meta.isError &&
+    meta.data?.serving.state === "ready" &&
+    result.serving?.state === "ready" &&
+    currentGeneration !== undefined &&
+    currentGeneration !== null &&
+    currentGeneration === result.serving.generation_id;
+  const canConfirm =
+    pageFresh &&
+    !!viewer &&
+    command.storageAvailable &&
+    data?.source_state === "ready" &&
+    data.unacknowledged?.state === "ready" &&
+    data.unacknowledged.count !== null &&
+    data.unacknowledged.count_as_of !== null;
+  const canResume = !!viewer && !meta.isError && command.storageAvailable;
 
   function refresh() {
     setCursors([null]);
@@ -165,7 +355,7 @@ export default function MonitorPage() {
           unit: data.total === null ? undefined : "条",
           sub: data.source_state === "ready" && data.next_cursor ? "可向前翻看历史" : undefined,
         },
-        unacknowledgedKpi(data.unacknowledged),
+        unacknowledgedKpi(pageFresh ? data.unacknowledged : undefined),
         {
           key: "mode",
           label: "新信号通知",
@@ -216,6 +406,25 @@ export default function MonitorPage() {
                 {data.source_note}
               </p>
             ) : null}
+            {meta.data &&
+            !viewer &&
+            data.items.some(
+              (item) => item.kind !== "notification" && item.acknowledgment?.eligible,
+            ) ? (
+              <p className="monitor-notice" role="status">
+                请先登录，才能确认告警。
+              </p>
+            ) : null}
+            {command.message ? (
+              <p className="monitor-notice" role="status">
+                {command.message}
+              </p>
+            ) : null}
+            {!command.storageAvailable && viewer ? (
+              <p className="monitor-notice" role="status">
+                浏览器记录不可用，暂时无法安全确认。
+              </p>
+            ) : null}
             {data.source_state !== "ready" ? (
               <EmptyState
                 title={data.source_label}
@@ -235,7 +444,16 @@ export default function MonitorPage() {
                 ) : null}
                 <ul className="monitor-timeline" aria-label="告警时间线">
                   {data.items.map((row) => (
-                    <TimelineEntry key={row.event_key} row={row} onStock={setSelectedStock} />
+                    <TimelineEntry
+                      key={row.event_key}
+                      row={row}
+                      onStock={setSelectedStock}
+                      commandSession={commandSession}
+                      command={command}
+                      canConfirm={canConfirm}
+                      canResume={canResume}
+                      generationId={result.serving?.generation_id}
+                    />
                   ))}
                 </ul>
                 <nav className="monitor-pages" aria-label="时间线翻页">
