@@ -1,8 +1,7 @@
 """Bounded read-only alert timeline from one borrowed Serving generation.
 
 Signals carry new-runtime delivery receipts. Legacy notifications are independent
-per-channel submission attempts. Acknowledgments, rule writes and channel tests remain
-separate later capabilities.
+per-channel submission attempts. Acknowledgments use the same borrowed Serving generation.
 """
 
 from __future__ import annotations
@@ -16,17 +15,32 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
+import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from rquant.alert_ack import stable_alert_id, stable_signal_alert_id
 from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
+from rquant.page_control import AckAlert, PageControlStatus
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus
 from rquant.web import readers
+from rquant.web.alert_ack_gateway import (
+    AckLookupConflictError,
+    AckLookupInvalidResponseError,
+    AckLookupUnavailableError,
+)
+from rquant.web.alert_ack_read import AlertReadModel, read_alert_ack
 from rquant.web.calendar import calendar_day
 from rquant.web.envelope import Envelope
 from rquant.web.labels import ACTION_LABELS, CHANNEL_LABELS, DELIVERY_LABELS, strategy_label
 from rquant.web.market import MarketPhase, market_phase, shanghai_trade_date
+from rquant.web.models.alert_ack import (
+    AckCommandReceipt,
+    AckCommandRequest,
+    AlertAcknowledgmentView,
+    UnacknowledgedSummary,
+)
 from rquant.web.models.monitor import (
     MonitorNotification,
     MonitorReceipt,
@@ -36,7 +50,7 @@ from rquant.web.models.monitor import (
     MonitorTimelineItem,
     MonitorTrigger,
 )
-from rquant.web.security import current_user
+from rquant.web.security import current_user, require_csrf
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.signal_display import DELIVERY_STATE_LABELS, delivery_state, signal_reasons
 from rquant.web.status import DeliveryMode, delivery_mode
@@ -56,13 +70,15 @@ _SIGNALS_SELECT = (
 )
 _MONITOR_SELECT = (
     "SELECT sha256(to_json([trade_date::VARCHAR, ts_code, level])) AS sort_key, "
-    "trigger_time AS event_at, trade_date, ts_code, level, trigger_price, level_price "
+    "trigger_time AS event_at, trade_date, ts_code, level, trigger_price, level_price, "
+    "trigger_type, pool "
     "FROM monitor_event"
 )
 _SURGE_SELECT = (
     "SELECT sha256(to_json([trade_date::VARCHAR, confirmed_at, ts_code])) AS sort_key, "
     f"{_SURGE_TIME} AT TIME ZONE 'Asia/Shanghai' AS event_at, "
-    "trade_date, confirmed_at, ts_code, name, price, pct_chg, status "
+    "trade_date, confirmed_at, ts_code, name, price, pct_chg, status, theme, "
+    "cum_amount, rel_cum, room_to_limit_pct "
     f"FROM surge_event WHERE {_SURGE_VALID}"
 )
 _NOTIFICATION_SELECT = (
@@ -93,6 +109,32 @@ _TRIGGER_LABELS = {
 }
 _SURGE_STATUS = {"confirmed": "已确认", "unbuyable": "临近涨停"}
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+MAX_ACK_REQUEST_BYTES = 4096
+
+
+def _unverified_ack() -> AlertAcknowledgmentView:
+    return AlertAcknowledgmentView(
+        state="unavailable",
+        eligible=False,
+        label="确认状态暂不可用",
+        note="这条告警尚未核对。",
+    )
+
+
+def _event_ack(
+    alerts: AlertReadModel,
+    source: Literal["signal", "monitor_event", "surge_event"],
+    facts: object,
+) -> AlertAcknowledgmentView:
+    try:
+        alert_id = (
+            stable_signal_alert_id(facts)
+            if source == "signal" and isinstance(facts, str)
+            else stable_alert_id(source, facts)
+        )
+    except (TypeError, ValueError):
+        return _unverified_ack()
+    return alerts.status_for(source, alert_id)
 
 
 class _Cursor(BaseModel):
@@ -226,6 +268,7 @@ def _signal_item(
     names: dict[str, str],
     by_signal: dict[str, list[DeliveryRow]],
     truncated: bool,
+    alerts: AlertReadModel,
 ) -> MonitorSignal:
     row = SignalRow.model_validate(dict(zip(SignalRow.model_fields, event.values, strict=True)))
     related = by_signal[row.signal_id]
@@ -271,6 +314,7 @@ def _signal_item(
             )
             for receipt in related
         ],
+        acknowledgment=_event_ack(alerts, "signal", row.signal_id),
     )
 
 
@@ -281,7 +325,10 @@ def _page(
     after: tuple[datetime, int, str] | None,
     key: bytes,
     now: datetime,
+    alerts: AlertReadModel | None = None,
 ) -> MonitorTimelineData:
+    if alerts is None:
+        alerts = AlertReadModel(UnacknowledgedSummary(), None, {}, {})
     cursor = borrowed.cursor
     local_start = shanghai_trade_date(now) - timedelta(days=29)
     window_start = datetime.combine(local_start, time.min, tzinfo=_SHANGHAI).astimezone(UTC)
@@ -289,8 +336,7 @@ def _page(
     has_monitor = states.get("monitor_event") is not None and states["monitor_event"].available
     has_surge = states.get("surge_event") is not None and states["surge_event"].available
     has_notification = (
-        states.get("legacy_notification") is not None
-        and states["legacy_notification"].available
+        states.get("legacy_notification") is not None and states["legacy_notification"].available
     )
     has_notification_status = (
         states.get("legacy_notification_status") is not None
@@ -430,9 +476,27 @@ def _page(
     items: list[MonitorTimelineItem] = []
     for event in selected:
         if event.kind == "signal":
-            items.append(_signal_item(event, names=names, by_signal=by_signal, truncated=truncated))
+            items.append(
+                _signal_item(
+                    event,
+                    names=names,
+                    by_signal=by_signal,
+                    truncated=truncated,
+                    alerts=alerts,
+                )
+            )
         elif event.kind == "monitor":
-            _day, code, level, price, level_price = event.values
+            day, code, level, price, level_price, trigger_type, pool = event.values
+            facts = {
+                "trade_date": day,
+                "trigger_time": event.at,
+                "ts_code": code,
+                "level": level,
+                "trigger_price": price,
+                "level_price": level_price,
+                "trigger_type": trigger_type,
+                "pool": pool,
+            }
             items.append(
                 MonitorTrigger(
                     event_key=f"monitor:{event.sort_key}",
@@ -443,10 +507,36 @@ def _page(
                     price=price,
                     level_price=level_price,
                     status_label="已触发",
+                    acknowledgment=_event_ack(alerts, "monitor_event", facts),
                 )
             )
         elif event.kind == "surge":
-            _day, _confirmed_at, code, source_name, price, pct_chg, status = event.values
+            (
+                day,
+                confirmed_at,
+                code,
+                source_name,
+                price,
+                pct_chg,
+                status,
+                theme,
+                cum_amount,
+                rel_cum,
+                room_to_limit_pct,
+            ) = event.values
+            facts = {
+                "trade_date": day,
+                "confirmed_at": confirmed_at,
+                "ts_code": code,
+                "name": source_name,
+                "theme": theme,
+                "price": price,
+                "pct_chg": pct_chg,
+                "cum_amount": cum_amount,
+                "rel_cum": rel_cum,
+                "room_to_limit_pct": room_to_limit_pct,
+                "status": status,
+            }
             items.append(
                 MonitorSurge(
                     event_key=f"surge:{event.sort_key}",
@@ -457,6 +547,7 @@ def _page(
                     price=price,
                     pct_chg=pct_chg,
                     status_label=_SURGE_STATUS.get(str(status), "已确认"),
+                    acknowledgment=_event_ack(alerts, "surge_event", facts),
                 )
             )
         else:
@@ -514,6 +605,7 @@ def _page(
         mode_label=mode.label,
         mode_note=mode.note,
         market_note=_market_note(cursor, now),
+        unacknowledged=alerts.summary,
     )
 
 
@@ -531,6 +623,7 @@ def get_timeline(
         meta = serving_meta(
             borrowed, now=now, stale_after=web.settings.stale_after, failure=web.tracker.failure
         )
+        alerts = read_alert_ack(borrowed, meta=meta, now=now, stale_after=web.settings.stale_after)
         if meta.generation_id is not None:
             response.headers["X-Rquant-Generation"] = meta.generation_id
         decoded = _decode_cursor(cursor, web.cursor_key) if cursor is not None else None
@@ -555,5 +648,74 @@ def get_timeline(
                 else None,
                 key=web.cursor_key,
                 now=now,
+                alerts=alerts,
             )
     return Envelope[MonitorTimelineData](data=data, serving=meta)
+
+
+@router.post("/ack", response_model=AckCommandReceipt, summary="确认一条告警")
+async def acknowledge_alert(
+    request: Request,
+    body: AckCommandRequest,
+    viewer: Annotated[str | None, Depends(current_user)],
+    _same_site: Annotated[None, Depends(require_csrf)],
+) -> AckCommandReceipt:
+    if viewer is None:
+        raise HTTPException(status_code=401, detail="请先登录。")
+    if len(await request.body()) > MAX_ACK_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="请求内容过长，请重试。")
+    web = request.app.state.web
+    command = AckAlert.model_validate({**body.model_dump(mode="python"), "actor_id": viewer})
+    try:
+        original = await anyio.to_thread.run_sync(web.ack_lookup.lookup, command)
+    except AckLookupConflictError as error:
+        raise HTTPException(
+            status_code=409, detail="命令内容与已有记录不一致，请保留原请求。"
+        ) from error
+    except AckLookupUnavailableError as error:
+        raise HTTPException(status_code=503, detail="连接暂不可用，请使用原请求重试。") from error
+    except AckLookupInvalidResponseError as error:
+        raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。") from error
+    if original is not None:
+        if original.status is PageControlStatus.SUCCEEDED:
+            result = original.result
+            confirmation_id = result.get("confirmation_id") if isinstance(result, dict) else None
+            if not isinstance(confirmation_id, str) or not 1 <= len(confirmation_id) <= 128:
+                raise HTTPException(status_code=502, detail="回执无法核对，请使用原请求重试。")
+            return AckCommandReceipt(
+                command_id=body.command_id,
+                status="succeeded",
+                confirmation_id=confirmation_id,
+                message="已受理，正在同步",
+            )
+        return AckCommandReceipt(
+            command_id=body.command_id,
+            status=original.status.value,
+            message={
+                "pending": "已受理，等待处理",
+                "processing": "正在处理",
+                "failed": "确认未完成，请检查后重试。",
+                "ambiguous": "状态待确认，请使用原请求重试。",
+            }[original.status.value],
+        )
+    # The fixed PageControl endpoint currently refuses new acknowledgment commands.
+    # Until a separately reviewed authenticated admission contract exists, do not write.
+    with web.tracker.borrow() as borrowed:
+        meta = serving_meta(
+            borrowed,
+            now=web.clock(),
+            stale_after=web.settings.stale_after,
+            failure=web.tracker.failure,
+        )
+        if borrowed is None or meta.generation_id != body.generation_id:
+            raise HTTPException(status_code=409, detail="数据已更新，请刷新告警时间线。")
+        alerts = read_alert_ack(
+            borrowed, meta=meta, now=web.clock(), stale_after=web.settings.stale_after
+        )
+        if alerts.summary.state != "ready" or not any(
+            item.alert_id == body.alert_id
+            and alerts.status_for(item.source, item.alert_id).eligible
+            for item in alerts.events.values()
+        ):
+            raise HTTPException(status_code=409, detail="确认状态暂不可用，请稍后重试。")
+    raise HTTPException(status_code=503, detail="确认服务尚未就绪，请稍后重试。")

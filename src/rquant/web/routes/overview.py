@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Request, Response
 
 from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
 from rquant.web import readers
+from rquant.web.alert_ack_read import read_alert_ack
 from rquant.web.calendar import session_date
 from rquant.web.envelope import Envelope, ServingMeta, ServingState
 from rquant.web.labels import ACTION_LABELS, PRESET_LABELS, split_service_id, strategy_label
@@ -634,6 +635,13 @@ def get_overview(
             data = empty_overview(now, meta)
         else:
             data = build_overview(generation_context(borrowed, now), meta)
+        data = data.model_copy(
+            update={
+                "unacknowledged": read_alert_ack(
+                    borrowed, meta=meta, now=now, stale_after=web.settings.stale_after
+                ).summary
+            }
+        )
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     return Envelope[OverviewData](data=data, serving=meta)
