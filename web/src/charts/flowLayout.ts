@@ -25,7 +25,7 @@ export interface FlowPosition {
 }
 
 /**
- * Automatic layout for the pool canvas (node = pool, edge = depends_on).
+ * Automatic layout for pool and condition nodes with published dependency edges.
  * Positions are computed, never stored, so nothing about the layout has to be
  * written back to the server. Returns top-left corners, as React Flow expects.
  */

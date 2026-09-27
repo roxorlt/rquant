@@ -61,6 +61,7 @@ from rquant.panorama_data import (
     _session_minute_stamps,
 )
 from rquant.paper_contracts import PaperAccountSnapshot, PaperHolding
+from rquant.pool_definition_projection import build_pool_definition_rows
 from rquant.runtime_service_control import (
     RuntimeServiceHealth,
     RuntimeServiceHeartbeatProjection,
@@ -895,6 +896,10 @@ def _projections(
         board_rows, member_rows = _dc_boards()
         projections.extend(
             (
+                signal_owned(
+                    "pool_definition",
+                    build_pool_definition_rows({}, {}, root_path="/synthetic"),
+                ),
                 signal_owned("market_snapshot", _market_snapshot(as_of)),
                 signal_owned("market_overview", _market_overview(as_of)),
                 reference("dc_board", board_rows),

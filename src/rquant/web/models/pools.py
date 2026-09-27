@@ -25,6 +25,34 @@ class PoolStep(BaseModel):
     count: int
 
 
+class PoolRuleParameter(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    value: str
+
+
+class PoolRuleItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    parameters: list[PoolRuleParameter]
+
+
+class PoolDefinitionView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    state: Literal["available", "migration_required", "unavailable", "deleted", "limit_exceeded"]
+    status_label: str
+    reason_label: str | None
+    source_label: str
+    description: str | None
+    depends_on: str | None
+    delay_label: str | None
+    rules: list[PoolRuleItem]
+
+
 class PublishedPool(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -37,6 +65,7 @@ class PublishedPool(BaseModel):
     steps_truncated: bool
     members: list[PoolMember]
     members_truncated: bool
+    definition: PoolDefinitionView | None = None
 
 
 class SavedCanvas(BaseModel):
@@ -54,6 +83,7 @@ class PoolsData(BaseModel):
     state: Literal["ready", "no_data", "unavailable"]
     latest_trade_date: date | None
     definitions_available: bool
+    rules_available: bool = False
     canvases: list[SavedCanvas]
     canvases_truncated: bool
     pools: list[PublishedPool]
