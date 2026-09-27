@@ -9,11 +9,13 @@ import re
 import secrets
 import stat
 import tempfile
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from typing import BinaryIO
 
 import duckdb
+from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.backfill_plan_core import (
     BackfillEstimateAssumptions,
@@ -23,6 +25,41 @@ from rquant.backfill_plan_core import (
 
 MAX_BACKFILL_PLAN_BYTES = 8_000_000
 _PLAN_PREFIX = "daily-bar-backfill-plan-v1-"
+
+
+class BackfillSnapshotFileIdentity(BaseModel):
+    """Fast file identity, not proof of production generation or complete collection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    device: int = Field(ge=0, strict=True)
+    inode: int = Field(ge=0, strict=True)
+    size: int = Field(gt=0, strict=True)
+    mtime_ns: int = Field(gt=0, strict=True)
+    ctime_ns: int = Field(gt=0, strict=True)
+
+
+def _snapshot_identity(observed: os.stat_result) -> BackfillSnapshotFileIdentity:
+    return BackfillSnapshotFileIdentity(
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        size=observed.st_size,
+        mtime_ns=observed.st_mtime_ns,
+        ctime_ns=observed.st_ctime_ns,
+    )
+
+
+def capture_backfill_snapshot_identity(path: Path) -> BackfillSnapshotFileIdentity:
+    """Bind an explicit fixed file in O(1), without opening DuckDB or reading bytes."""
+    if not path.is_absolute():
+        raise ValueError("snapshot path must be absolute")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("snapshot must be a regular file")
+        _require_same_snapshot(path, opened)
+        return _snapshot_identity(opened)
 
 
 def _canonical_bytes(plan: DailyBarBackfillPlan) -> bytes:
@@ -60,7 +97,8 @@ def _require_same_snapshot(path: Path, opened: os.stat_result) -> None:
         raise ValueError("snapshot path changed during read") from exc
     if not stat.S_ISREG(current.st_mode) or _file_identity(current) != _file_identity(opened):
         raise ValueError("snapshot file identity changed during read")
-    if Path(f"{path}.wal").exists():
+    wal_path = Path(f"{path}.wal")
+    if wal_path.exists() or wal_path.is_symlink():
         raise ValueError("snapshot has an unsealed DuckDB WAL")
 
 
@@ -189,7 +227,7 @@ def _publish_plan(plan: DailyBarBackfillPlan, directory: Path) -> Path:
 def create_and_publish_daily_bar_backfill_plan(
     *,
     snapshot_path: Path,
-    expected_file_sha256: str,
+    expected_file_sha256: str | None = None,
     snapshot_label: str,
     evidence_code_revision: str,
     audit_start: date,
@@ -197,6 +235,8 @@ def create_and_publish_daily_bar_backfill_plan(
     observed_at: datetime,
     assumptions: BackfillEstimateAssumptions,
     directory: Path,
+    expected_file_identity: BackfillSnapshotFileIdentity | None = None,
+    on_source_sha256: Callable[[str], None] | None = None,
 ) -> Path:
     """Measure a fixed file, take one read-only view, then atomically publish.
 
@@ -205,7 +245,9 @@ def create_and_publish_daily_bar_backfill_plan(
     """
     if not snapshot_path.is_absolute() or not directory.is_absolute():
         raise ValueError("snapshot and plan directory must be explicit absolute paths")
-    if re.fullmatch(r"[0-9a-f]{64}", expected_file_sha256) is None:
+    if expected_file_sha256 is not None and re.fullmatch(
+        r"[0-9a-f]{64}", expected_file_sha256
+    ) is None:
         raise ValueError("expected snapshot SHA256 must be lowercase hexadecimal")
 
     descriptor = os.open(snapshot_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -213,11 +255,17 @@ def create_and_publish_daily_bar_backfill_plan(
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("snapshot must be a regular file")
+        if expected_file_identity is not None and _snapshot_identity(
+            opened
+        ) != BackfillSnapshotFileIdentity.model_validate(expected_file_identity):
+            raise ValueError("snapshot file identity changed before evidence read")
         _require_same_snapshot(snapshot_path, opened)
         observed_sha256 = _file_sha256(handle)
-        if observed_sha256 != expected_file_sha256:
+        if expected_file_sha256 is not None and observed_sha256 != expected_file_sha256:
             raise ValueError("snapshot SHA256 digest disagrees with supplied identity")
         _require_same_snapshot(snapshot_path, opened)
+        if on_source_sha256 is not None:
+            on_source_sha256(observed_sha256)
         directory.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=".backfill-source-", dir=directory.parent
