@@ -19,19 +19,56 @@ from rquant.serving_page_projection_source import (
     SignalPageProjectionProducer,
 )
 from rquant.serving_read_models import ServingProjectionPayload
-from rquant.storage.schema import SCREEN_RUN_RECEIPT_DDL
+from rquant.storage.schema import DAILY_BAR_DDL, SCREEN_RUN_RECEIPT_DDL, TRADE_CALENDAR_DDL
 from tests.unit.test_pool_definition_publication import _service, _v2
 from tests.unit.test_serving_page_projection_source import _signal_projection_database
 
 NOW = datetime(2026, 8, 3, 8, 0, tzinfo=UTC)
 OLD_DAY = date(2026, 7, 31)
 TODAY = date(2026, 8, 3)
+TWO_DAYS_BEFORE = date(2026, 7, 30)
 
 
 def _database(path: Path) -> None:
     _signal_projection_database(path)
     with duckdb.connect(str(path)) as connection:
         connection.execute(SCREEN_RUN_RECEIPT_DDL)
+
+
+def _seal_database_before_cutoff(path: Path) -> None:
+    stamp = (NOW - timedelta(minutes=1)).timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+def _trading_evidence(
+    path: Path,
+    *,
+    calendar_gap: date | None = None,
+    include_target_bar: bool = True,
+    calendar_updated_at: datetime = datetime(2026, 7, 29, tzinfo=UTC),
+) -> None:
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(TRADE_CALENDAR_DDL)
+        connection.execute(DAILY_BAR_DDL)
+        connection.executemany(
+            "INSERT INTO trade_calendar VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("SSE", day, is_open, pretrade, "fixture", calendar_updated_at)
+                for day, is_open, pretrade in (
+                    (TWO_DAYS_BEFORE, True, date(2026, 7, 29)),
+                    (OLD_DAY, True, TWO_DAYS_BEFORE),
+                    (date(2026, 8, 1), False, OLD_DAY),
+                    (date(2026, 8, 2), False, OLD_DAY),
+                    (TODAY, True, OLD_DAY),
+                )
+                if day != calendar_gap
+            ],
+        )
+        if include_target_bar:
+            connection.executemany(
+                "INSERT INTO daily_bar (ts_code, trade_date) VALUES ('600000.SH', ?)",
+                [(TWO_DAYS_BEFORE,), (OLD_DAY,)],
+            )
 
 
 def _insert_receipt(
@@ -44,6 +81,7 @@ def _insert_receipt(
     parent_day: date | None = None,
     parent_version: str | None = None,
     completed_at: datetime | None = None,
+    lineage_complete: bool = True,
 ) -> ScreenRunReceipt:
     receipt = ScreenRunReceipt(
         trade_date=day,
@@ -53,7 +91,7 @@ def _insert_receipt(
         parent_result_version=parent_version,
         hit_count=len(members),
         member_digest=member_set_digest(list(members)),
-        lineage_complete=True,
+        lineage_complete=lineage_complete,
         completed_at=completed_at or datetime(2026, 8, 3, 7, 10, tzinfo=UTC),
     )
     with duckdb.connect(str(path)) as connection:
@@ -148,6 +186,106 @@ def test_child_with_missing_parent_version_does_not_publish_false_zero(
     assert projections["canvas_hit"].rows == ()
 
 
+@pytest.mark.parametrize(
+    ("parent_day", "calendar_state", "expected_current"),
+    [
+        (OLD_DAY, "complete", False),
+        (TWO_DAYS_BEFORE, "complete", True),
+        (TWO_DAYS_BEFORE, "missing_calendar", False),
+        (TWO_DAYS_BEFORE, "calendar_gap", False),
+        (TWO_DAYS_BEFORE, "missing_target_calendar", False),
+        (TWO_DAYS_BEFORE, "missing_target_bar", False),
+        (TWO_DAYS_BEFORE, "future_calendar", False),
+        (TWO_DAYS_BEFORE, "unsealed_generation", False),
+    ],
+    ids=(
+        "wrong-t1",
+        "exact-t2",
+        "missing-calendar",
+        "missing-calendar-day",
+        "missing-target-calendar",
+        "missing-bar",
+        "future-calendar",
+        "unsealed-generation",
+    ),
+)
+def test_exact_t2_current_definition_requires_complete_calendar_and_target_data(
+    tmp_path: Path,
+    parent_day: date,
+    calendar_state: str,
+    expected_current: bool,
+) -> None:
+    service = _service(tmp_path)
+    saved = service.submit(_v2("save-v2"))
+    assert saved.status is PageControlStatus.SUCCEEDED
+    assert isinstance(saved.result, dict)
+    path = tmp_path / "rquant_ro.duckdb"
+    _database(path)
+    if calendar_state != "missing_calendar":
+        _trading_evidence(
+            path,
+            calendar_gap=(
+                date(2026, 8, 1)
+                if calendar_state == "calendar_gap"
+                else TWO_DAYS_BEFORE
+                if calendar_state == "missing_target_calendar"
+                else None
+            ),
+            include_target_bar=calendar_state != "missing_target_bar",
+            calendar_updated_at=(
+                NOW + timedelta(minutes=1)
+                if calendar_state == "future_calendar"
+                else datetime(2026, 7, 29, tzinfo=UTC)
+            ),
+        )
+    parent = _insert_receipt(
+        path,
+        day=parent_day,
+        members=("600000.SH",) if parent_day == OLD_DAY else (),
+    )
+    _insert_receipt(
+        path,
+        day=TODAY,
+        pool="user/breakout",
+        version=str(saved.result["version"]),
+        parent_day=parent_day,
+        parent_version=parent.result_version,
+    )
+    if calendar_state != "unsealed_generation":
+        _seal_database_before_cutoff(path)
+    source = DuckDBSignalPageProjectionSource(
+        path,
+        user_presets_root=tmp_path / "data" / "user_presets",
+        page_control_outbox=tmp_path / "control.sqlite3",
+    )
+
+    projections = {item.table_name: item for item in source(NOW).projections}
+    child = next(
+        row
+        for row in projections["screen_run_receipt"].rows
+        if row["preset_name"] == "user/breakout"
+    )
+    assert child["current_definition"] is expected_current
+
+
+def test_legacy_window_receipt_remains_readable_without_exact_calendar(tmp_path: Path) -> None:
+    path = tmp_path / "rquant_ro.duckdb"
+    _database(path)
+    _insert_receipt(
+        path,
+        day=TODAY,
+        pool="n-shape-pool2",
+        lineage_complete=False,
+    )
+
+    projections = _projections(path)
+
+    row = projections["screen_run_receipt"].rows[0]
+    assert row["preset_name"] == "n-shape-pool2"
+    assert row["lineage_complete"] is False
+    assert row["current_definition"] is False
+
+
 def test_exact_child_requires_current_parent_members_and_rule_versions(tmp_path: Path) -> None:
     service = _service(tmp_path)
     saved = service.submit(_v2("save-v2", requested_at=datetime(2026, 8, 3, 6, 0, tzinfo=UTC)))
@@ -155,15 +293,21 @@ def test_exact_child_requires_current_parent_members_and_rule_versions(tmp_path:
     assert isinstance(saved.result, dict)
     path = tmp_path / "rquant_ro.duckdb"
     _database(path)
-    parent = _insert_receipt(path, day=OLD_DAY, members=("600000.SH",))
+    _trading_evidence(path)
+    with duckdb.connect(str(path)) as connection:
+        connection.execute(
+            "UPDATE screen_result SET trade_date = '2026-07-30' WHERE trade_date = '2026-07-31'"
+        )
+    parent = _insert_receipt(path, day=TWO_DAYS_BEFORE, members=("600000.SH",))
     _insert_receipt(
         path,
         day=TODAY,
         pool="user/breakout",
         version=str(saved.result["version"]),
-        parent_day=OLD_DAY,
+        parent_day=TWO_DAYS_BEFORE,
         parent_version=parent.result_version,
     )
+    _seal_database_before_cutoff(path)
     source = DuckDBSignalPageProjectionSource(
         path,
         user_presets_root=tmp_path / "data" / "user_presets",
@@ -196,7 +340,7 @@ def test_exact_child_requires_current_parent_members_and_rule_versions(tmp_path:
 
     with duckdb.connect(str(path)) as connection:
         connection.execute(
-            "UPDATE screen_result SET ts_code = '600001.SH' WHERE trade_date = '2026-07-31'"
+            "UPDATE screen_result SET ts_code = '600001.SH' WHERE trade_date = '2026-07-30'"
         )
     third = _projections(path)
     assert all(row["preset_name"] != "user/breakout" for row in third["screen_run_receipt"].rows)

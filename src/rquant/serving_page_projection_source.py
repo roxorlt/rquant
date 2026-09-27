@@ -110,6 +110,7 @@ _MAX_RUN_LINEAGE_NODES = 512
 _MAX_RUN_MEMBERS_PER_POOL = 20_000
 _MAX_RUN_TOTAL_MEMBERS = 100_000
 _RUN_RECEIPT_LOOKBACK_DAYS = 30
+_MAX_EXACT_PARENT_CALENDAR_SPAN_DAYS = 730
 _RUN_RECEIPT_COLUMNS = (
     "trade_date",
     "preset_name",
@@ -1196,6 +1197,45 @@ class _VerifiedRunReceipts:
     latest: tuple[ScreenRunReceipt, ...]
     lineage: tuple[ScreenRunReceipt, ...]
     newest_candidate_day: date | None
+    exact_parent_steps: tuple[tuple[str, int], ...]
+
+
+def _exact_parent_steps(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    receipt: ScreenRunReceipt,
+    observed: datetime,
+) -> int | None:
+    parent_day = receipt.parent_trade_date
+    if parent_day is None:
+        return None
+    span = (receipt.trade_date - parent_day).days
+    if span <= 0 or span > _MAX_EXACT_PARENT_CALENDAR_SPAN_DAYS:
+        return None
+    calendar = connection.execute(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT cal_date),
+               COUNT(*) FILTER (WHERE cal_date IN (?, ?) AND is_open),
+               COUNT(*) FILTER (WHERE cal_date > ? AND is_open),
+               COUNT(*) FILTER (WHERE updated_at <= ?)
+        FROM trade_calendar
+        WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?
+        """,
+        (parent_day, receipt.trade_date, parent_day, observed, parent_day, receipt.trade_date),
+    ).fetchone()
+    assert calendar is not None
+    expected_rows = span + 1
+    if (
+        calendar[0] != expected_rows
+        or calendar[1] != expected_rows
+        or calendar[2] != 2
+        or calendar[4] != expected_rows
+    ):
+        return None
+    target_bar = connection.execute(
+        "SELECT 1 FROM daily_bar WHERE trade_date = ? LIMIT 1", (parent_day,)
+    ).fetchone()
+    return int(calendar[3]) if target_bar is not None else None
 
 
 def _read_verified_run_receipts(
@@ -1203,6 +1243,7 @@ def _read_verified_run_receipts(
     *,
     cutoff: datetime,
     observed: datetime,
+    generation_sealed_before_cutoff: bool,
 ) -> _VerifiedRunReceipts | None:
     present = connection.execute(
         "SELECT 1 FROM information_schema.tables "
@@ -1310,10 +1351,33 @@ def _read_verified_run_receipts(
         return receipt
 
     latest = tuple(item for raw in candidates if (item := verify(raw)) is not None)
+    lineage = tuple(item for item in verified.values() if item is not None)
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main' AND table_name IN ('trade_calendar', 'daily_bar')"
+        ).fetchall()
+    }
+    exact_parent_steps: list[tuple[str, int]] = []
+    # daily_bar has no row timestamp, so its target-day presence proves a PIT fact
+    # only after the immutable replica generation was already sealed.
+    if generation_sealed_before_cutoff and tables == {"trade_calendar", "daily_bar"}:
+        step_cache: dict[tuple[date, date], int | None] = {}
+        for item in lineage:
+            if item.parent_trade_date is None:
+                continue
+            key = (item.parent_trade_date, item.trade_date)
+            if key not in step_cache:
+                step_cache[key] = _exact_parent_steps(connection, receipt=item, observed=observed)
+            steps = step_cache[key]
+            if steps is not None and item.result_version is not None:
+                exact_parent_steps.append((item.result_version, steps))
     return _VerifiedRunReceipts(
         latest=latest,
-        lineage=tuple(item for item in verified.values() if item is not None),
+        lineage=lineage,
         newest_candidate_day=newest,
+        exact_parent_steps=tuple(exact_parent_steps),
     )
 
 
@@ -1323,6 +1387,7 @@ def _receipt_projection(
 ) -> ServingProjectionPayload:
     by_name = {str(row["pool_name"]): row for row in definitions.rows}
     by_version = {item.result_version: item for item in receipts.lineage}
+    exact_parent_steps = dict(receipts.exact_parent_steps)
     current_cache: dict[str, bool] = {}
 
     def current(receipt: ScreenRunReceipt) -> bool:
@@ -1347,6 +1412,7 @@ def _receipt_projection(
                     and parent is not None
                     and parent.preset_name == parent_name
                     and parent.trade_date == receipt.parent_trade_date
+                    and exact_parent_steps.get(receipt.result_version) == row["delay_days"]
                     and current(parent)
                 )
         current_cache[receipt.result_version] = matches
@@ -1684,6 +1750,7 @@ class DuckDBSignalPageProjectionSource:
                 connection,
                 cutoff=cutoff,
                 observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
+                generation_sealed_before_cutoff=sealed_before_cutoff,
             )
             if run_receipts is not None:
                 trusted_date = max((item.trade_date for item in run_receipts.latest), default=None)
