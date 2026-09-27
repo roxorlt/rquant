@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -179,3 +179,32 @@ def test_missing_factor_remains_unknown_in_screen_diagnostics(tmp_path: Path) ->
     assert data["total"] == 2
     assert data["unknown_count"] == 1
     assert data["steps"][0]["unknown_count"] == 1
+
+
+def test_catalog_keeps_custom_rsi_unavailable_for_unclosed_replica_date(tmp_path: Path) -> None:
+    primary, replica, today = _replica_world(tmp_path, days=70)
+    tomorrow = today + timedelta(days=1)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO trade_calendar (exchange, cal_date, is_open, source, updated_at) "
+            "VALUES ('SSE', ?, TRUE, 'fixture', ?)",
+            [tomorrow, datetime.now(UTC)],
+        )
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) "
+            "SELECT ts_code, ?, close FROM daily_bar WHERE trade_date=?",
+            [tomorrow, today],
+        )
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar"
+        )
+    _publish(primary, replica)
+    publish_dynamic_rsi_projection(
+        VerifiedReplicaScreenSource(primary_path=primary, replica_path=replica),
+        tmp_path / "rsi",
+        as_of=datetime(2026, 4, 15, 9, tzinfo=UTC),
+    )
+    with _client(tmp_path, primary, replica) as client:
+        assert _catalog(client)["dates"][0] == tomorrow.isoformat()
+        assert _period(_catalog(client))["input"] == "choice"

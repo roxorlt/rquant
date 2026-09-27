@@ -152,11 +152,12 @@ class ScreenApplicationService:
         self.history = history
         self.rsi = rsi
 
-    def _rsi_ready(self, source_identity: str) -> bool:
+    def _rsi_ready(self, source_identity: str, dates: list[date]) -> bool:
         if self.rsi is None:
             return False
         try:
-            return bool(self.rsi.catalog(source_identity).dates)
+            projected_dates = self.rsi.catalog(source_identity).dates
+            return bool(dates) and set(dates).issubset(projected_dates)
         except DynamicRsiProjectionUnavailableError:
             return False
 
@@ -254,7 +255,7 @@ class ScreenApplicationService:
                     ranking_metrics=[],
                     source=None,
                 )
-            rsi_ready = self._rsi_ready(snapshot.identity)
+            rsi_ready = self._rsi_ready(snapshot.identity, snapshot.dates)
             try:
                 current = self.replica.available_dates()
             except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
@@ -318,7 +319,9 @@ class ScreenApplicationService:
         rsi_ready = False
         if self.replica is not None and self.rsi is not None:
             with suppress(ScreenReplicaUnavailableError, ScreenReplicaDataError):
-                rsi_ready = self._rsi_ready(self.replica.generation_identity())
+                rsi_ready = self._rsi_ready(
+                    self.replica.generation_identity(), [body.trade_date]
+                )
         try:
             normalized_args = validate_screen_choices(
                 body.conditions,

@@ -22,6 +22,7 @@ from rquant.screen.dynamic_rsi import (
     DynamicRsiProjectionUnavailableError,
     VerifiedDynamicRsiProjection,
     publish_dynamic_rsi_projection,
+    requested_dynamic_rsi,
 )
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.storage.duckdb import DuckDBStore
@@ -190,3 +191,45 @@ def test_missing_row_and_request_budget_fail_closed(tmp_path: Path) -> None:
         )
     with pytest.raises(DynamicRsiProjectionUnavailableError):
         projection.values(identity, latest, ["600001.SH"], {"RSI7[0]": (7, 0)})
+
+
+def test_legacy_rsi_offsets_keep_the_persisted_path() -> None:
+    assert requested_dynamic_rsi(frozenset({"RSI6[31]", "RSI14[90]"})) == {}
+    with pytest.raises(ValueError, match="dynamic RSI"):
+        requested_dynamic_rsi(frozenset({"RSI7[31]"}))
+
+
+def test_projection_excludes_future_and_not_yet_closed_days(tmp_path: Path) -> None:
+    primary, replica, today = _replica_world(tmp_path)
+    tomorrow = today + timedelta(days=1)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO trade_calendar (exchange, cal_date, is_open, source, updated_at) "
+            "VALUES ('SSE', ?, TRUE, 'fixture', ?)",
+            [tomorrow, datetime.now(UTC)],
+        )
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES "
+            "('600001.SH', ?, 11), ('600002.SH', ?, 12), ('600003.SH', ?, 13)",
+            [tomorrow] * 3,
+        )
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar"
+        )
+    _publish(primary, replica)
+    source = VerifiedReplicaScreenSource(primary_path=primary, replica_path=replica)
+    root = tmp_path / "rsi"
+
+    before_close = publish_dynamic_rsi_projection(
+        source, root, as_of=datetime(2026, 4, 15, 8, 59, tzinfo=UTC)
+    )
+    assert before_close.dates[0] == today - timedelta(days=1)
+    assert today not in before_close.dates
+    assert tomorrow not in before_close.dates
+
+    after_close = publish_dynamic_rsi_projection(
+        source, root, as_of=datetime(2026, 4, 15, 9, 0, tzinfo=UTC)
+    )
+    assert after_close.dates[0] == today
+    assert tomorrow not in after_close.dates

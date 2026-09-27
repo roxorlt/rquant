@@ -12,9 +12,10 @@ import stat
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,8 +34,10 @@ MAX_SOURCE_BARS = 100_000_000
 MAX_STOCK_BARS = 50_000
 MAX_QUERY_CELLS = 1_000_000
 _FIELD = re.compile(r"RSI([1-9][0-9]?)\[(0|[1-9][0-9]?)\]\Z")
+_PERSISTED_FIELD = re.compile(r"RSI(?:6|14)\[(0|[1-9][0-9]*)\]\Z")
 _FILE = re.compile(r"[0-9a-f]{32}\.sqlite\Z")
 _PERIODS = range(MIN_PERIOD, MAX_PERIOD + 1)
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class DynamicRsiProjectionUnavailableError(RuntimeError):
@@ -80,6 +83,8 @@ def requested_dynamic_rsi(columns: set[str] | frozenset[str]) -> dict[str, tuple
     selected: dict[str, tuple[int, int]] = {}
     for column in columns:
         if not isinstance(column, str) or not column.startswith("RSI"):
+            continue
+        if _PERSISTED_FIELD.fullmatch(column):
             continue
         match = _FIELD.fullmatch(column)
         if match is None:
@@ -226,7 +231,13 @@ class VerifiedDynamicRsiProjection:
         if len(ts_codes) * (len(columns) + 5) > MAX_QUERY_CELLS:
             raise DynamicRsiProjectionBudgetError("RSI wide budget exceeded")
         for column, parts in columns.items():
-            if requested_dynamic_rsi(frozenset({column})).get(column) != parts:
+            match = _FIELD.fullmatch(column)
+            if (
+                match is None
+                or parts != (int(match.group(1)), int(match.group(2)))
+                or not MIN_PERIOD <= parts[0] <= MAX_PERIOD
+                or parts[1] > MAX_OFFSET
+            ):
                 raise ValueError("unsupported dynamic RSI dependency")
         generation = self._verify()
         dates = generation.manifest.dates
@@ -303,8 +314,17 @@ class _PinnedConnection:
 def publish_dynamic_rsi_projection(
     source: VerifiedReplicaScreenSource,
     root: Path,
+    *,
+    as_of: datetime | None = None,
 ) -> DynamicRsiCatalog:
     """Build from one pinned replica; replace the pointer only after complete validation."""
+    build_time = as_of if as_of is not None else datetime.now(UTC)
+    if build_time.tzinfo is None or build_time.utcoffset() is None:
+        raise ValueError("RSI build time must have a timezone")
+    shanghai_time = build_time.astimezone(_SHANGHAI)
+    closed_through = shanghai_time.date()
+    if shanghai_time.hour < 17:
+        closed_through -= timedelta(days=1)
     root = Path(root)
     if not root.is_absolute() or root != Path(os.path.abspath(root)):
         raise ValueError("RSI root must be absolute and canonical")
@@ -316,7 +336,10 @@ def publish_dynamic_rsi_projection(
     pointer_tmp = root / f".current-{uuid.uuid4().hex}.tmp"
     duck, descriptor, replica = source._open()
     try:
-        max_row = duck.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()
+        max_row = duck.execute(
+            "SELECT MAX(trade_date) FROM daily_bar WHERE trade_date <= ?",
+            [closed_through],
+        ).fetchone()
         if max_row is None or max_row[0] is None:
             raise DynamicRsiProjectionUnavailableError("RSI source has no daily bars")
         latest = max_row[0]
@@ -349,7 +372,8 @@ def publish_dynamic_rsi_projection(
                 "SELECT daily.ts_code, daily.trade_date, daily.close, adj.adj_factor "
                 "FROM daily_bar AS daily LEFT JOIN adj_factor AS adj "
                 "ON adj.ts_code=daily.ts_code AND adj.trade_date=daily.trade_date "
-                "ORDER BY daily.ts_code, daily.trade_date"
+                "WHERE daily.trade_date <= ? ORDER BY daily.ts_code, daily.trade_date",
+                [closed_through],
             )
             code: str | None = None
             history: list[tuple[date, float | None]] = []
