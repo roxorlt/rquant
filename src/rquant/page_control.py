@@ -88,6 +88,17 @@ class SaveCanvas(PageControlCommand):
         return _validated_name(value, label="canvas name")
 
 
+class CreateCanvas(PageControlCommand):
+    kind: Literal["create_canvas"] = "create_canvas"
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=1_024)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _validated_name(value, label="canvas name")
+
+
 class DeleteCanvas(PageControlCommand):
     kind: Literal["delete_canvas"] = "delete_canvas"
     name: str
@@ -264,6 +275,7 @@ class LabPageControlBackend(Protocol):
 
 PageControlCommandValue = Annotated[
     SaveCanvas
+    | CreateCanvas
     | DeleteCanvas
     | SetCanvasPoolRefs
     | AddPoolToCanvas
@@ -1105,12 +1117,13 @@ class PageControlOutbox:
                 SELECT command_kind, command_hash, payload_json
                 FROM page_control_command
                 WHERE status = ?
-                  AND command_kind IN (?, ?, ?, ?, ?, ?)
+                  AND command_kind IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY rowid DESC
                 """,
                 (
                     PageControlStatus.SUCCEEDED.value,
                     "save_canvas",
+                    "create_canvas",
                     "delete_canvas",
                     "set_canvas_pool_refs",
                     "add_pool_to_canvas",
@@ -1124,7 +1137,7 @@ class PageControlOutbox:
                 raise ValueError("PageControl canvas mutation authority is malformed")
             affected_canvas = (
                 command.name
-                if isinstance(command, (SaveCanvas, DeleteCanvas, SetCanvasPoolRefs))
+                if isinstance(command, (SaveCanvas, CreateCanvas, DeleteCanvas, SetCanvasPoolRefs))
                 else command.canvas_name
             )
             if affected_canvas == canvas_name:
@@ -1482,6 +1495,19 @@ class PageControlConsumer:
         return binding.descriptor
 
     def _has_committed_local_mutation(self, command: PageControlCommandValue) -> bool:
+        if isinstance(command, CreateCanvas):
+            try:
+                record, _publication = self._read_verified_canvas_catalog(
+                    command.name, require_current_head=False
+                )
+            except Exception:
+                return False
+            return (
+                record.command_id == command.command_id
+                and record.description == command.description
+                and not record.pool_refs
+                and record.source == "page_control"
+            )
         if isinstance(command, SaveUserPoolV2):
             try:
                 return self._recover_user_pool_v2_result(command) is not None
@@ -1518,6 +1544,8 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if isinstance(command, CreateCanvas):
+            return self._create_canvas(command)
         if isinstance(command, SaveCanvas):
             return self._save_canvas(command)
         if isinstance(command, DeleteCanvas):
@@ -1592,7 +1620,7 @@ class PageControlConsumer:
         self,
         command: PageControlCommandValue,
     ) -> tuple[_LocalEffectFenceTarget, ...]:
-        if isinstance(command, SaveCanvas):
+        if isinstance(command, (SaveCanvas, CreateCanvas)):
             return self._canvas_publication_fence_targets(command.name)
         if isinstance(command, SetCanvasPoolRefs):
             return self._canvas_publication_fence_targets(command.name)
@@ -1796,6 +1824,8 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, CreateCanvas):
+            return self._recover_create_canvas_result(command)
         if isinstance(command, SaveCanvas):
             return self._recover_canvas_result(self._canvas_path(command.name), command)
         if isinstance(command, SetCanvasPoolRefs):
@@ -1927,6 +1957,66 @@ class PageControlConsumer:
             publication_receipt_id=publication.receipt_id,
         )
         return self._canvas_publication_result(path, publication)
+
+    def _create_canvas(self, command: CreateCanvas) -> JsonValue:
+        if command.name == "__default__":
+            raise ValueError("default canvas is virtual and cannot be persisted")
+        path = self._canvas_path(command.name)
+        current = self._current_canvas_head(command.name)
+        watermark = self._current_canvas_watermark(command.name)
+        self._assert_canvas_watermark_matches_head(current, watermark)
+        self._assert_canvas_head_matches_latest_authority(command.name, current)
+        if current is not None or self._managed_json_exists(path):
+            raise FileExistsError("canvas name is already occupied")
+        save = SaveCanvas(
+            command_id=command.command_id,
+            requested_at=command.requested_at,
+            name=command.name,
+            description=command.description,
+            pool_refs=(),
+            source="page_control",
+        )
+        return self._created_canvas_result(
+            command, self._save_canvas(save, identity_command=command)
+        )
+
+    def _recover_create_canvas_result(self, command: CreateCanvas) -> JsonValue | None:
+        path = self._canvas_path(command.name)
+        if not self._managed_json_exists(path):
+            return None
+        record, publication = self._read_verified_canvas_catalog(
+            command.name, require_current_head=False
+        )
+        if record.command_id != command.command_id:
+            return None
+        if (
+            record.description != command.description
+            or record.pool_refs
+            or record.source != "page_control"
+        ):
+            raise ValueError("created canvas differs from the original command")
+        current = self._current_canvas_head(command.name)
+        watermark = self._current_canvas_watermark(command.name)
+        if current is None and watermark is not None:
+            raise ValueError("canvas immutable watermark exists without its current head")
+        if current is not None and (
+            current.receipt.claims.command.command_id != command.command_id
+            or current.authority_command_kind != command.kind
+            or current.authority_command_hash != _command_hash(command)
+            or current.publication_receipt_id != publication.receipt_id
+            or current.sequence != 1
+            or current.previous_head_receipt_id is not None
+        ):
+            raise ValueError("created canvas conflicts with current head authority")
+        if current is not None and watermark is None:
+            self._publish_canvas_watermark(current)
+        recovered = self._recover_canvas_result(path, command)
+        return None if recovered is None else self._created_canvas_result(command, recovered)
+
+    @staticmethod
+    def _created_canvas_result(command: CreateCanvas, result: JsonValue) -> dict[str, JsonValue]:
+        assert isinstance(result, dict)
+        return {**result, "canvas_name": command.name}
 
     def _save_user_pool(
         self,
@@ -3288,6 +3378,7 @@ def parse_page_control_command(payload: object) -> PageControlCommandValue:
 __all__ = [
     "AddPoolToCanvas",
     "AppendNlQueryLog",
+    "CreateCanvas",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
     "DeleteCanvas",
     "DeleteUserPool",

@@ -499,6 +499,190 @@ def test_page_control_save_canvas_fails_closed_without_publication_signer(
     assert not (data_dir / "canvases" / "breakout.json").exists()
 
 
+@pytest.mark.parametrize("prior", ["active", "deleted"])
+def test_create_canvas_rejects_occupied_name_without_replacing_authority(
+    tmp_path: Path, prior: str
+) -> None:
+    outbox = PageControlOutbox(tmp_path / "control.sqlite3")
+    service = _service_for(outbox=outbox, tmp_path=tmp_path)
+    assert (
+        service.submit(
+            SaveCanvas(
+                command_id="existing-canvas",
+                requested_at=NOW,
+                name="breakout",
+                description="original",
+                pool_refs=("n-shape-pool1",),
+            )
+        ).status
+        is PageControlStatus.SUCCEEDED
+    )
+    if prior == "deleted":
+        assert (
+            service.submit(
+                DeleteCanvas(
+                    command_id="delete-existing",
+                    requested_at=NOW + timedelta(seconds=1),
+                    name="breakout",
+                )
+            ).status
+            is PageControlStatus.SUCCEEDED
+        )
+    path = tmp_path / "data" / "canvases" / "breakout.json"
+    original = path.read_bytes() if path.exists() else None
+    head = service.consumer._current_canvas_head("breakout")
+    assert head is not None
+
+    receipt = service.submit(
+        page_control.CreateCanvas(
+            command_id="create-conflict",
+            requested_at=NOW + timedelta(seconds=2),
+            name="breakout",
+            description="replacement",
+        )
+    )
+
+    assert receipt.status is PageControlStatus.FAILED
+    assert (path.read_bytes() if path.exists() else None) == original
+    current = service.consumer._current_canvas_head("breakout")
+    assert current is not None
+    assert current.receipt.receipt_id == head.receipt.receipt_id
+
+
+def test_create_canvas_two_adjacent_commands_leave_only_first_effect(tmp_path: Path) -> None:
+    service = _service_for(
+        outbox=PageControlOutbox(tmp_path / "control.sqlite3"), tmp_path=tmp_path
+    )
+    first = page_control.CreateCanvas(
+        command_id="create-first", requested_at=NOW, name="breakout", description="first"
+    )
+    second = page_control.CreateCanvas(
+        command_id="create-second",
+        requested_at=NOW + timedelta(seconds=1),
+        name="breakout",
+        description="second",
+    )
+
+    first_receipt = service.submit(first)
+    path = tmp_path / "data" / "canvases" / "breakout.json"
+    original = path.read_bytes()
+    second_receipt = service.submit(second)
+    retry_receipt = service.submit(first)
+    with pytest.raises(ValueError, match="command_id"):
+        service.submit(first.model_copy(update={"description": "changed"}))
+
+    assert first_receipt.status is PageControlStatus.SUCCEEDED
+    assert second_receipt.status is PageControlStatus.FAILED
+    assert retry_receipt.result == first_receipt.result
+    assert path.read_bytes() == original
+    record = json.loads(original)
+    assert record["description"] == "first"
+    assert record["pool_refs"] == []
+
+
+def test_create_canvas_recovers_same_command_after_catalog_write_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox_path = tmp_path / "control.sqlite3"
+    service = _service_for(outbox=PageControlOutbox(outbox_path), tmp_path=tmp_path)
+    original_atomic_json = page_control.PageControlConsumer._atomic_json
+    writes: list[Path] = []
+    crashed = False
+
+    def crash_after_write(path: Path, payload: object, *, command_id: str) -> None:
+        nonlocal crashed
+        writes.append(path)
+        original_atomic_json(path, payload, command_id=command_id)
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt("crash after create catalog write")
+
+    monkeypatch.setattr(
+        page_control.PageControlConsumer, "_atomic_json", staticmethod(crash_after_write)
+    )
+    command = page_control.CreateCanvas(
+        command_id="create-after-write", requested_at=NOW, name="breakout", description="created"
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        service.submit(command)
+    recovered = _service_for(
+        outbox=PageControlOutbox(outbox_path),
+        tmp_path=tmp_path,
+        now=NOW + timedelta(seconds=2),
+    ).submit(command)
+
+    assert recovered.status is PageControlStatus.SUCCEEDED
+    assert len(writes) == 1
+    assert writes[0] == tmp_path / "data" / "canvases" / "breakout.json"
+    assert isinstance(recovered.result, dict)
+    assert len(str(recovered.result["publication_receipt_id"])) == 64
+    head = service.consumer._current_canvas_head("breakout")
+    assert head is not None
+    assert head.authority_command_kind == "create_canvas"
+
+
+def test_create_canvas_recovers_head_before_watermark_without_second_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox_path = tmp_path / "control.sqlite3"
+    service = _service_for(outbox=PageControlOutbox(outbox_path), tmp_path=tmp_path)
+    original_watermark = page_control.PageControlConsumer._publish_canvas_watermark
+    crashed = False
+
+    def crash_before_watermark(consumer: PageControlConsumer, head: object) -> None:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt("crash after current head")
+        original_watermark(consumer, head)
+
+    monkeypatch.setattr(
+        page_control.PageControlConsumer,
+        "_publish_canvas_watermark",
+        crash_before_watermark,
+    )
+    command = page_control.CreateCanvas(
+        command_id="create-after-head", requested_at=NOW, name="breakout"
+    )
+    with pytest.raises(KeyboardInterrupt):
+        service.submit(command)
+    path = tmp_path / "data" / "canvases" / "breakout.json"
+    original_record = path.read_bytes()
+    first_head = service.consumer._current_canvas_head("breakout")
+    assert first_head is not None
+
+    recovered_service = _service_for(
+        outbox=PageControlOutbox(outbox_path), tmp_path=tmp_path, now=NOW + timedelta(seconds=2)
+    )
+    recovered = recovered_service.submit(command)
+
+    assert recovered.status is PageControlStatus.SUCCEEDED
+    assert path.read_bytes() == original_record
+    assert len(list((tmp_path / "data" / "canvas-publication-receipts").glob("*.json"))) == 1
+    current_head = recovered_service.consumer._current_canvas_head("breakout")
+    watermark = recovered_service.consumer._current_canvas_watermark("breakout")
+    assert current_head is not None and watermark is not None
+    assert current_head.receipt.receipt_id == first_head.receipt.receipt_id
+    assert watermark.receipt.receipt_id == first_head.receipt.receipt_id
+
+
+def test_create_canvas_rejects_corrupt_catalog_without_overwriting(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "canvases" / "breakout.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"{broken")
+    service = _service_for(
+        outbox=PageControlOutbox(tmp_path / "control.sqlite3"), tmp_path=tmp_path
+    )
+
+    receipt = service.submit(
+        page_control.CreateCanvas(command_id="create-on-corrupt", requested_at=NOW, name="breakout")
+    )
+
+    assert receipt.status is PageControlStatus.FAILED
+    assert path.read_bytes() == b"{broken"
+
+
 @pytest.mark.parametrize("operation", ["save", "set_refs", "fork"])
 def test_canvas_updates_reject_tampered_current_signed_catalog(
     tmp_path: Path,

@@ -1021,12 +1021,13 @@ class _ReadonlyPageControlAuditReader:
                 FROM page_control_command AS c
                 LEFT JOIN page_control_effect AS e USING (command_id)
                 WHERE c.status = ?
-                  AND c.command_kind IN (?, ?, ?, ?, ?, ?)
+                  AND c.command_kind IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY c.rowid
                 """,
                 (
                     PageControlStatus.SUCCEEDED.value,
                     "save_canvas",
+                    "create_canvas",
                     "delete_canvas",
                     "set_canvas_pool_refs",
                     "add_pool_to_canvas",
@@ -1150,7 +1151,8 @@ class _ReadonlyPageControlAuditReader:
     def _canvas_name_for_audit(audit: _ReadonlyPageControlAudit) -> str | None:
         field_name = (
             "name"
-            if audit.command_kind in {"save_canvas", "delete_canvas", "set_canvas_pool_refs"}
+            if audit.command_kind
+            in {"save_canvas", "create_canvas", "delete_canvas", "set_canvas_pool_refs"}
             else "canvas_name"
         )
         value = audit.payload.get(field_name)

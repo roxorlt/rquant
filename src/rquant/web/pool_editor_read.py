@@ -201,7 +201,7 @@ def _copy_source(row: tuple[object, ...]) -> BuiltinPoolCopySource | None:
 
 
 def _canvas(row: tuple[object, ...]) -> EditableCanvas | None:
-    name, description, refs_json, version = row
+    name, description, refs_json, version, command_id, record_hash = row
     refs = _json_list(refs_json, limit=_MAX_CANVAS_REFS)
     if (
         not isinstance(name, str)
@@ -209,17 +209,33 @@ def _canvas(row: tuple[object, ...]) -> EditableCanvas | None:
         or not isinstance(description, str)
         or len(description) > 1_024
         or not _sha(version)
+        or not isinstance(command_id, str)
+        or not 1 <= len(command_id) <= 128
+        or not _sha(record_hash)
         or refs is None
         or any(not isinstance(item, str) or not item for item in refs)
         or len(set(refs)) != len(refs)
     ):
         return None
-    return EditableCanvas(name=name, description=description, version=version, pool_refs=refs)
+    return EditableCanvas(
+        name=name,
+        description=description,
+        version=version,
+        pool_refs=refs,
+        command_id=command_id,
+        record_hash=record_hash,
+    )
 
 
 def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
     unavailable = PoolEditorSnapshot(
-        data=PoolEditorData(state="unavailable", pools=[], copy_sources=[], canvases=[]),
+        data=PoolEditorData(
+            state="unavailable",
+            pools=[],
+            copy_sources=[],
+            canvases=[],
+            canvas_create_available=False,
+        ),
         present_user_names=frozenset(),
         builtin_names=frozenset(),
     )
@@ -242,17 +258,24 @@ def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
     copy_sources = [item for row in pool_rows if (item := _copy_source(row)) is not None]
     canvases: list[EditableCanvas] = []
     canvas_table = tables.get("canvas_definition")
-    if canvas_table is not None and canvas_table.available:
+    canvas_create_available = canvas_table is not None and canvas_table.available
+    if canvas_create_available:
         canvas_rows = cursor.execute(
-            "SELECT name, description, pool_refs_json, version_hash "
+            "SELECT name, description, pool_refs_json, version_hash, command_id, record_hash "
             "FROM canvas_definition ORDER BY name LIMIT ?",
             (_MAX_CANVASES + 1,),
         ).fetchall()
         if len(canvas_rows) <= _MAX_CANVASES:
             canvases = [item for row in canvas_rows if (item := _canvas(row)) is not None]
+        else:
+            canvas_create_available = False
     return PoolEditorSnapshot(
         data=PoolEditorData(
-            state="ready", pools=pools, copy_sources=copy_sources, canvases=canvases
+            state="ready",
+            pools=pools,
+            copy_sources=copy_sources,
+            canvases=canvases,
+            canvas_create_available=canvas_create_available,
         ),
         present_user_names=frozenset(
             key for key, *_ in pool_rows if isinstance(key, str) and key.startswith("user/")
