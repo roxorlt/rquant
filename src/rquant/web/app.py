@@ -26,8 +26,13 @@ from fastapi.responses import JSONResponse
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
+from rquant.web.backfill_plan_command_gateway import (
+    BackfillPlanCommandGateway,
+    BackfillPlanCommandTransport,
+)
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.routes import (
+    backfill_plan_commands,
     backfill_plans,
     catalog,
     data_audit,
@@ -55,6 +60,11 @@ API_TITLE = "rQuant Web API"
 #: Version of the HTTP contract, bumped by hand; not the package version, so that a
 #: release that does not touch the API leaves the OpenAPI snapshot unchanged.
 API_VERSION = "1"
+_WRITE_BODY_LIMITS = {
+    "/api/v1/pools/editor/commands": pool_editor.MAX_REQUEST_BYTES,
+    "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
+    "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
+}
 
 
 def _utc_now() -> datetime:
@@ -72,6 +82,7 @@ class WebContext:
     pool_commands: PoolCommandGateway
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
+    backfill_plan_commands: BackfillPlanCommandGateway
 
 
 def create_app(
@@ -83,6 +94,7 @@ def create_app(
     pool_command_transport: PoolCommandTransport | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
+    backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -153,15 +165,16 @@ def create_app(
             transport=ack_lookup_transport,
         ),
         ack_admission=configured_ack_admission,
+        backfill_plan_commands=BackfillPlanCommandGateway(
+            endpoint=settings.page_control_url,
+            transport=backfill_plan_command_transport,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Response:
-        if request.method == "POST" and request.url.path in {
-            "/api/v1/pools/editor/commands",
-            "/api/v1/monitor/ack",
-        }:
+        if request.method == "POST" and request.url.path in _WRITE_BODY_LIMITS:
             content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
                 return JSONResponse(
@@ -173,12 +186,7 @@ def create_app(
             total = 0
             async for part in request.stream():
                 total += len(part)
-                limit = (
-                    monitor.MAX_ACK_REQUEST_BYTES
-                    if request.url.path == "/api/v1/monitor/ack"
-                    else pool_editor.MAX_REQUEST_BYTES
-                )
-                if total > limit:
+                if total > _WRITE_BODY_LIMITS[request.url.path]:
                     return JSONResponse(
                         status_code=413,
                         content={"detail": "请求内容过长，请删减后重试。"},
@@ -214,6 +222,8 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": "编辑内容有误，请检查后重试。"})
         if request.url.path == "/api/v1/monitor/ack":
             return JSONResponse(status_code=422, content={"detail": "确认请求有误，请刷新后重试。"})
+        if request.url.path == "/api/v1/data/backfill-plans/commands":
+            return JSONResponse(status_code=422, content={"detail": "计划日期有误，请检查后重试。"})
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
@@ -231,6 +241,7 @@ def create_app(
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(data_audit_report.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(backfill_plans.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(backfill_plan_commands.router, prefix="/api/v1", tags=["data-audit"])
     return app
 
 
