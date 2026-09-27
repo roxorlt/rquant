@@ -729,7 +729,7 @@ it("retains a draft through a data-generation change and requires a fresh previe
   expect(within(dialog).getByRole("button", { name: "保存并加入画布" })).toBeEnabled();
 });
 
-it("recovers a conflicted attachment only with a newer verified pool version", async () => {
+it("never attaches a different V2 rule set after the saved V1 attachment conflicts", async () => {
   let currentVersion = VERSION;
   respond();
   server.use(
@@ -737,7 +737,17 @@ it("recovers a conflicted attachment only with a newer verified pool version", a
       HttpResponse.json({
         data: {
           ...editor,
-          pools: editor.pools.map((pool) => ({ ...pool, version: currentVersion })),
+          pools: editor.pools.map((pool) =>
+            currentVersion === VERSION
+              ? pool
+              : {
+                  ...pool,
+                  version: currentVersion,
+                  depends_on: null,
+                  delay_days: 0,
+                  rule_calls: [{ name: "volume_ratio_gte", args: { n: 7, window: 5 } }],
+                },
+          ),
         },
         serving,
       }),
@@ -791,23 +801,22 @@ it("recovers a conflicted attachment only with a newer verified pool version", a
   );
   const user = userEvent.setup();
   const { queryClient } = renderApp("/pools");
-  const retry = await screen.findByRole("button", { name: "按最新规则加入画布" });
+  const retry = await screen.findByRole("button", { name: "按本次保存规则重试" });
+  expect(screen.getByText("画布挂接失败")).toBeInTheDocument();
   expect(retry).toBeDisabled();
   currentVersion = NEXT_VERSION;
   await act(async () => {
     await queryClient.invalidateQueries({ queryKey: ["pools", "editor"] });
   });
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "按最新规则加入画布" })).toBeEnabled(),
-  );
-  await user.click(screen.getByRole("button", { name: "按最新规则加入画布" }));
-  expect(seen).toHaveLength(1);
-  expect(seen[0]?.expected_pool_version).toBe(NEXT_VERSION);
-  expect(seen[0]?.command_id).not.toBe("attach-old");
-  expect(await screen.findByText("已加入当前画布")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "按本次保存规则重试" })).toBeDisabled();
+  expect(seen).toHaveLength(0);
+  await user.click(screen.getByRole("button", { name: "结束本次挂接" }));
+  expect(seen).toHaveLength(0);
+  expect(screen.queryByText("已加入当前画布")).not.toBeInTheDocument();
+  expect(document.querySelector(".pools-editor-evidence")).toHaveTextContent("等待新规则选股");
 });
 
-it("keeps a failed edit draft and rebases only after the user checks a newer version", async () => {
+it("keeps a failed V1 draft until explicitly reopening actual V2 rules and parent", async () => {
   let currentVersion = VERSION;
   respond();
   server.use(
@@ -815,7 +824,17 @@ it("keeps a failed edit draft and rebases only after the user checks a newer ver
       HttpResponse.json({
         data: {
           ...editor,
-          pools: editor.pools.map((pool) => ({ ...pool, version: currentVersion })),
+          pools: editor.pools.map((pool) =>
+            currentVersion === VERSION
+              ? pool
+              : {
+                  ...pool,
+                  version: currentVersion,
+                  depends_on: null,
+                  delay_days: 0,
+                  rule_calls: [{ name: "volume_ratio_gte", args: { n: 7, window: 5 } }],
+                },
+          ),
         },
         serving,
       }),
@@ -856,14 +875,77 @@ it("keeps a failed edit draft and rebases only after the user checks a newer ver
   await act(async () => {
     await queryClient.invalidateQueries({ queryKey: ["pools", "editor"] });
   });
-  const rebase = await within(dialog).findByRole("button", { name: "按最新版本继续" });
-  await waitFor(() => expect(rebase).toBeEnabled());
-  await user.click(rebase);
-  expect(within(dialog).queryByRole("button", { name: "按最新版本继续" })).not.toBeInTheDocument();
+  const restart = await within(dialog).findByRole("button", { name: "重新打开最新规则" });
+  await waitFor(() => expect(restart).toBeEnabled());
   expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(4);
   expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeDisabled();
-  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
-  expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeEnabled();
-  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  expect(commands).toHaveLength(1);
+  await user.click(restart);
+  const latest = screen.getByRole("dialog", { name: "编辑规则" });
+  expect(within(latest).getByRole("combobox", { name: "父池" })).toHaveValue("");
+  expect(within(latest).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(7);
+  expect(commands).toHaveLength(1);
+  await user.clear(within(latest).getByRole("spinbutton", { name: "放量倍数" }));
+  await user.type(within(latest).getByRole("spinbutton", { name: "放量倍数" }), "8");
+  await user.click(within(latest).getByRole("button", { name: "预览变更" }));
+  await user.click(within(latest).getByRole("button", { name: "保存规则" }));
   expect(commands[1]?.expected_version).toBe(NEXT_VERSION);
+  expect(commands[1]?.depends_on).toBeNull();
+  expect(commands[1]?.rule_calls).toEqual([
+    { name: "volume_ratio_gte", args: { n: 8, window: 5 } },
+  ]);
+});
+
+it("offers a safe exit after reloading a failed save, then opens the real V2 definition", async () => {
+  const original = editor.pools[0];
+  if (!original) throw new Error("missing custom pool");
+  respond({
+    editor: {
+      ...editor,
+      pools: [
+        {
+          ...original,
+          version: NEXT_VERSION,
+          depends_on: null,
+          delay_days: 0,
+          rule_calls: [{ name: "volume_ratio_gte", args: { n: 7, window: 5 } }],
+        },
+      ],
+    },
+  });
+  window.sessionStorage.setItem(
+    POOL_EDITOR_JOURNAL_KEY,
+    JSON.stringify({
+      schema: 1,
+      save: {
+        kind: "save_user_pool_v2",
+        command_id: "save-before-reload",
+        requested_at: "2026-09-27T07:00:00Z",
+        base_name: "自建观察",
+        display_name: "自建观察",
+        description: "",
+        depends_on: "n-shape-pool1",
+        delay_days: 1,
+        rule_calls: [{ name: "volume_ratio_gte", args: { n: 4, window: 5 } }],
+        include_columns: [],
+        expected_version: VERSION,
+      },
+      canvasName: null,
+      saveVersion: null,
+      saveStatus: "failed",
+      saveConflict: true,
+      attach: null,
+      attachStatus: "idle",
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  expect(await screen.findByText("上次保存未完成")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "结束本次编辑" }));
+  expect(window.sessionStorage.getItem(POOL_EDITOR_JOURNAL_KEY)).toBeNull();
+  await user.click(screen.getByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const latest = screen.getByRole("dialog", { name: "编辑规则" });
+  expect(within(latest).getByRole("combobox", { name: "父池" })).toHaveValue("");
+  expect(within(latest).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(7);
 });

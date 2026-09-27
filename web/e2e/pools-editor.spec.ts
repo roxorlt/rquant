@@ -177,5 +177,52 @@ for (const viewport of [
       });
       expect(watcher.problems).toEqual([]);
     });
+
+    test("offers a keyboard exit for a saved conflict after reload", async ({ page }) => {
+      const watcher = watch(page);
+      let posted = 0;
+      await page.addInitScript(() => {
+        sessionStorage.setItem(
+          "rquant.pool-editor-command.v1",
+          JSON.stringify({
+            schema: 1,
+            save: {
+              kind: "save_user_pool_v2",
+              command_id: "save-before-reload",
+              requested_at: "2026-09-27T07:00:00Z",
+              base_name: "自建观察",
+              display_name: "自建观察",
+              description: "",
+              depends_on: "n-shape-pool1",
+              delay_days: 1,
+              rule_calls: [{ name: "not_st", args: {} }],
+              include_columns: [],
+              expected_version: "a".repeat(64),
+            },
+            canvasName: null,
+            saveVersion: null,
+            saveStatus: "failed",
+            saveConflict: true,
+            attach: null,
+            attachStatus: "idle",
+          }),
+        );
+      });
+      await page.route("**/api/v1/pools/editor/commands", async (route) => {
+        posted += 1;
+        await route.abort();
+      });
+      await page.goto("./#/pools");
+      const banner = page.locator(".pools-editor-evidence");
+      await expect(banner).toContainText("上次保存未完成");
+      const end = banner.getByRole("button", { name: "结束本次编辑" });
+      await end.focus();
+      await end.press("Enter");
+      await expect(banner).toHaveCount(0);
+      expect(posted).toBe(0);
+      await expectNoHorizontalOverflow(page, `conflict exit ${viewport.name}`);
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      expect(watcher.problems).toEqual([]);
+    });
   });
 }

@@ -111,13 +111,24 @@ it("requires one generation, target version, canvas membership, and current-rule
         attach: { ...journal.attach, expected_pool_version: newerVersion },
         attachStatus: "succeeded",
       },
-      { ...editor, pools: [{ ...editorPool, version: newerVersion }] },
+      {
+        ...editor,
+        pools: [
+          {
+            ...editorPool,
+            version: newerVersion,
+            depends_on: null,
+            delay_days: 0,
+            rule_calls: [{ name: "not_st", args: {} }],
+          },
+        ],
+      },
       pools,
       GENERATION,
       GENERATION,
       GENERATION,
     ),
-  ).toBe("result");
+  ).toBe("saved");
   expect(publicationStage(journal, editor, pools, GENERATION, "b".repeat(64), GENERATION)).toBe(
     "attached",
   );

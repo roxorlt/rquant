@@ -85,6 +85,12 @@ function isJournal(value: unknown): value is EditorJournal {
   );
 }
 
+function reconcileVersion(journal: EditorJournal): EditorJournal {
+  return journal.attach && journal.attach.expected_pool_version !== journal.saveVersion
+    ? { ...journal, attachStatus: "failed", attachConflict: true }
+    : journal;
+}
+
 /** One browser tab's durable two-command workflow. Every POST reads its already stored body. */
 export class PoolEditorSession {
   private current: EditorSessionSnapshot;
@@ -104,7 +110,7 @@ export class PoolEditorSession {
       const saved = storage.getItem(POOL_EDITOR_JOURNAL_KEY);
       if (saved !== null) {
         const parsed: unknown = JSON.parse(saved);
-        if (isJournal(parsed)) journal = parsed;
+        if (isJournal(parsed)) journal = reconcileVersion(parsed);
         else throw new Error("invalid journal");
       }
       const archived = storage.getItem(POOL_EDITOR_DEFERRED_KEY);
@@ -112,7 +118,9 @@ export class PoolEditorSession {
         const parsed: unknown = JSON.parse(archived);
         if (!Array.isArray(parsed) || parsed.length > 20 || !parsed.every(isJournal))
           throw new Error("invalid deferred requests");
-        deferred = parsed.filter((item) => item.attach?.command_id !== journal?.attach?.command_id);
+        deferred = parsed
+          .map(reconcileVersion)
+          .filter((item) => item.attach?.command_id !== journal?.attach?.command_id);
       }
     } catch {
       storageAvailable = false;
@@ -190,6 +198,10 @@ export class PoolEditorSession {
       return;
     }
     const previous = this.current.journal;
+    if (previous?.saveConflict && previous.save.base_name === input.base_name) {
+      this.emit({ message: "请结束冲突编辑，再从最新规则重新打开。" });
+      return;
+    }
     if (previous && !["failed", "succeeded"].includes(previous.saveStatus)) {
       this.emit({ message: "请先确认上一次保存请求。" });
       return;
@@ -224,7 +236,7 @@ export class PoolEditorSession {
     }
   }
 
-  async retryAttachment(verifiedVersion?: string): Promise<void> {
+  async retryAttachment(verifiedVersion: string | null): Promise<void> {
     const journal = this.current.journal;
     if (
       this.current.busy ||
@@ -235,21 +247,23 @@ export class PoolEditorSession {
       journal.attachStatus !== "failed"
     )
       return;
-    const version = verifiedVersion ?? journal.saveVersion;
-    if (
-      !VERSION.test(version) ||
-      (journal.attachConflict && version === journal.attach?.expected_pool_version)
-    ) {
-      this.emit({ message: "请先核对已发布的新规则版本，或结束本次挂接。" });
+    if (journal.attachConflict || verifiedVersion !== journal.saveVersion) {
+      this.emit({ message: "本次保存的规则已变化，请结束此次挂接。" });
       return;
     }
     try {
-      const attach = this.attachBody(journal.save, journal.canvasName, version);
+      const attach = this.attachBody(journal.save, journal.canvasName, journal.saveVersion);
       if (this.persist({ ...journal, attach, attachStatus: "pending", attachConflict: false }))
         await this.advance();
     } catch {
       this.emit({ message: "暂时无法生成画布请求，请重试。" });
     }
+  }
+
+  discardFailedSave(): boolean {
+    if (this.current.busy || this.current.journal?.saveStatus !== "failed") return false;
+    this.clear();
+    return this.current.storageAvailable && this.current.journal === null;
   }
 
   discardFailedAttachment(): void {
@@ -302,6 +316,14 @@ export class PoolEditorSession {
       !["pending", "processing", "ambiguous", "unknown"].includes(journal.attachStatus)
     )
       return;
+    if (body.expected_pool_version !== journal.saveVersion) {
+      this.persistDeferred(
+        this.current.deferred.map((item) =>
+          item.attach?.command_id === commandId ? reconcileVersion(item) : item,
+        ),
+      );
+      return;
+    }
     this.emit({ busy: true });
     try {
       const receipt = await this.post(body);
@@ -357,6 +379,10 @@ export class PoolEditorSession {
     if (status === "failed" || status === "succeeded" || status === "idle") return;
     const body = savePhase ? journal.save : journal.attach;
     if (body === null) return;
+    if (body.kind === "add_pool_to_canvas" && body.expected_pool_version !== journal.saveVersion) {
+      this.persist(reconcileVersion(journal));
+      return;
+    }
     this.emit({ busy: true });
     let nextAttachment = false;
     try {

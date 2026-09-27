@@ -115,12 +115,13 @@ function parameterText(
 function requestLabel(snapshot: EditorSessionSnapshot): string | null {
   const journal = snapshot.journal;
   if (!journal) return null;
-  if (journal.saveStatus === "failed") return "保存失败，请检查后重试";
+  if (journal.saveStatus === "failed")
+    return journal.saveConflict ? "保存未完成，规则已更新" : "保存失败，请检查后重试";
   if (journal.saveStatus === "ambiguous" || journal.saveStatus === "unknown")
     return "保存状态待确认";
   if (journal.saveStatus !== "succeeded") return "正在核对保存结果";
   if (journal.canvasName === null) return "池子已保存";
-  if (journal.attachStatus === "failed") return "池子已保存，尚未加入当前画布";
+  if (journal.attachStatus === "failed") return "池子已保存，画布挂接失败";
   if (journal.attachStatus === "ambiguous" || journal.attachStatus === "unknown")
     return "池子已保存，画布状态待确认";
   if (journal.attachStatus !== "succeeded") return "池子已保存，正在加入当前画布";
@@ -138,6 +139,7 @@ export function PoolEditorForm({
   session,
   snapshot,
   onClose,
+  onRestart,
 }: {
   mode: Mode;
   publishedPools: PublishedPool[];
@@ -149,6 +151,7 @@ export function PoolEditorForm({
   session: PoolEditorSession;
   snapshot: EditorSessionSnapshot;
   onClose: () => void;
+  onRestart: () => void;
 }) {
   const editing = mode.kind === "edit" ? mode.pool : null;
   const copying = mode.kind === "copy" ? mode.source : null;
@@ -176,9 +179,6 @@ export function PoolEditorForm({
   const [originalRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
   const [preview, setPreview] = useState(false);
   const previewGeneration = useRef(generationId);
-  const [acknowledgedVersion, setAcknowledgedVersion] = useState(
-    editing?.version ?? copying?.version ?? null,
-  );
   const previewRef = useRef<HTMLElement>(null);
   const blocks = catalog.data?.blocks ?? [];
   const blockMap = useMemo(() => new Map(blocks.map((block) => [block.key, block])), [blocks]);
@@ -209,7 +209,11 @@ export function PoolEditorForm({
       });
   const versionNeedsReview =
     (editing !== null || copying !== null) &&
-    (verifiedVersion === null || verifiedVersion !== acknowledgedVersion);
+    (verifiedVersion === null || verifiedVersion !== (editing?.version ?? copying?.version));
+  const canRestart =
+    !!generationId &&
+    !!verifiedVersion &&
+    verifiedVersion !== (editing?.version ?? copying?.version);
   const nameValid =
     /^[\w\u4e00-\u9fff-]{1,80}$/u.test(baseName) &&
     name.trim().length >= 1 &&
@@ -244,12 +248,7 @@ export function PoolEditorForm({
     snapshot.storageAvailable &&
     !snapshot.busy &&
     !versionNeedsReview &&
-    !(
-      sameTarget &&
-      previous?.saveConflict &&
-      editing !== null &&
-      verifiedVersion === previous.save.expected_version
-    ) &&
+    !(sameTarget && previous?.saveConflict) &&
     !(sameTarget && previous?.saveStatus === "succeeded" && unchanged) &&
     !(
       snapshot.journal &&
@@ -285,11 +284,19 @@ export function PoolEditorForm({
       delay_days: parent ? delay : 0,
       rule_calls: rules.map((rule) => ({ name: rule.key, args: rule.args })),
       include_columns: editing?.include_columns ?? copying?.include_columns ?? [],
-      expected_version: editing ? acknowledgedVersion : null,
+      expected_version: editing?.version ?? null,
     };
     await session.startSave(input, attachTo);
   };
   const statusLabel = requestLabel(snapshot);
+  const restart = () => {
+    if (!canRestart) return;
+    if (sameTarget && previous?.saveConflict && !session.discardFailedSave()) return;
+    onRestart();
+  };
+  const endConflict = () => {
+    if (sameTarget && previous?.saveConflict && session.discardFailedSave()) onClose();
+  };
 
   useEffect(() => {
     if (preview && typeof previewRef.current?.scrollIntoView === "function") {
@@ -320,6 +327,7 @@ export function PoolEditorForm({
               ) : null}
               <strong>{statusLabel}</strong>
               {snapshot.message ? <p>{snapshot.message}</p> : null}
+              {snapshot.journal?.attachConflict ? <p>当前规则已变化，请结束本次挂接。</p> : null}
               {snapshot.journal?.attachStatus === "failed" ? (
                 <>
                   <Button
@@ -327,14 +335,14 @@ export function PoolEditorForm({
                     disabledReason={
                       !generationId ||
                       !attachmentVersion ||
-                      (snapshot.journal.attachConflict &&
-                        attachmentVersion === snapshot.journal.attach?.expected_pool_version)
-                        ? "等待最新规则发布后重试，或结束本次挂接。"
+                      snapshot.journal.attachConflict ||
+                      attachmentVersion !== snapshot.journal.saveVersion
+                        ? "本次保存的规则已变化，请结束此次挂接。"
                         : undefined
                     }
-                    onClick={() => void session.retryAttachment(attachmentVersion ?? undefined)}
+                    onClick={() => void session.retryAttachment(attachmentVersion)}
                   >
-                    按最新规则加入画布
+                    按本次保存规则重试
                   </Button>
                   <Button size="sm" onClick={() => session.discardFailedAttachment()}>
                     结束本次挂接
@@ -395,16 +403,25 @@ export function PoolEditorForm({
         ) : null}
         {versionNeedsReview ? (
           <div className="pool-editor-review" role="status">
-            <p>规则版本已变化。请核对草稿后按最新版本继续。</p>
+            <p>当前草稿仍在；重新打开会以最新规则重填。</p>
             <Button
               size="sm"
-              disabledReason={!generationId || !verifiedVersion ? "等待最新规则可用。" : undefined}
-              onClick={() => {
-                setAcknowledgedVersion(verifiedVersion);
-                setPreview(false);
-              }}
+              disabledReason={!canRestart ? "等待最新规则可用。" : undefined}
+              onClick={restart}
             >
-              按最新版本继续
+              重新打开最新规则
+            </Button>
+            {sameTarget && previous?.saveConflict ? (
+              <Button size="sm" onClick={endConflict}>
+                结束本次编辑
+              </Button>
+            ) : null}
+          </div>
+        ) : sameTarget && previous?.saveConflict ? (
+          <div className="pool-editor-review" role="status">
+            <p>保存未完成。草稿已保留，请刷新规则后重新打开。</p>
+            <Button size="sm" onClick={endConflict}>
+              结束本次编辑
             </Button>
           </div>
         ) : null}

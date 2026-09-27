@@ -13,6 +13,8 @@ export function publicationStage(
   newestGeneration: string | null | undefined,
 ): PublicationStage {
   if (journal?.saveStatus !== "succeeded" || journal.saveVersion === null) return "pending";
+  if (journal.attach && journal.attach.expected_pool_version !== journal.saveVersion)
+    return "saved";
   if (journal.canvasName !== null && journal.attachStatus !== "succeeded") return "saved";
   const accepted: PublicationStage = journal.canvasName === null ? "saved" : "attached";
   if (
@@ -27,14 +29,10 @@ export function publicationStage(
     return accepted;
 
   const key = `user/${journal.save.base_name}`;
-  const targetVersion =
-    journal.attachStatus === "succeeded"
-      ? (journal.attach?.expected_pool_version ?? journal.saveVersion)
-      : journal.saveVersion;
   const publishedEditorPool = editor.pools.find((pool) => pool.key === key);
   const publishedPool = pools.pools.find((pool) => pool.key === key);
   if (
-    publishedEditorPool?.version !== targetVersion ||
+    publishedEditorPool?.version !== journal.saveVersion ||
     publishedPool?.definition?.state !== "available"
   )
     return accepted;

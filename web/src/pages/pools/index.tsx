@@ -512,7 +512,9 @@ export default function PoolsPage() {
             <span>
               {editorSnapshot.journal.attachStatus === "succeeded"
                 ? "已加入当前画布"
-                : "尚未加入当前画布"}
+                : editorSnapshot.journal.attachStatus === "failed"
+                  ? "画布挂接失败"
+                  : "尚未加入当前画布"}
             </span>
           ) : null}
           <span>{stage === "published" || stage === "result" ? "规则已发布" : "等待规则发布"}</span>
@@ -523,22 +525,18 @@ export default function PoolsPage() {
                 size="sm"
                 disabledReason={
                   !editorReady ||
-                  !editorQuery.data?.pools.some(
-                    (item) =>
-                      item.key === savedKey &&
-                      (!editorSnapshot.journal?.attachConflict ||
-                        item.version !== editorSnapshot.journal.attach?.expected_pool_version),
-                  )
-                    ? "等待最新规则发布后重试，或结束本次挂接。"
+                  editorSnapshot.journal.attachConflict ||
+                  attachmentVersion !== editorSnapshot.journal.saveVersion
+                    ? "本次保存的规则已变化，请结束此次挂接。"
                     : undefined
                 }
                 onClick={() =>
                   void editorSession.retryAttachment(
-                    editorQuery.data?.pools.find((item) => item.key === savedKey)?.version,
+                    editorQuery.data?.pools.find((item) => item.key === savedKey)?.version ?? null,
                   )
                 }
               >
-                按最新规则加入画布
+                按本次保存规则重试
               </Button>
               <Button size="sm" onClick={() => editorSession.discardFailedAttachment()}>
                 结束本次挂接
@@ -573,6 +571,13 @@ export default function PoolsPage() {
           <span>保存状态待确认</span>
           <Button size="sm" onClick={() => void editorSession.advance()}>
             继续核对
+          </Button>
+        </div>
+      ) : !editorDrawerOpen && editorSnapshot.journal?.saveStatus === "failed" ? (
+        <div className="pools-editor-evidence" role="status">
+          <span>{editorSnapshot.journal.saveConflict ? "上次保存未完成" : "上次保存失败"}</span>
+          <Button size="sm" onClick={() => editorSession.discardFailedSave()}>
+            结束本次编辑
           </Button>
         </div>
       ) : null}
@@ -833,9 +838,9 @@ export default function PoolsPage() {
         <PoolEditorForm
           key={
             activeMode.kind === "edit"
-              ? `edit:${activeMode.pool.key}`
+              ? `edit:${activeMode.pool.key}:${activeMode.pool.version}`
               : activeMode.kind === "copy"
-                ? `copy:${activeMode.source.key}`
+                ? `copy:${activeMode.source.key}:${activeMode.source.version}`
                 : `create:${activeMode.parentKey ?? ""}`
           }
           mode={activeMode}
@@ -848,6 +853,20 @@ export default function PoolsPage() {
           session={editorSession}
           snapshot={editorSnapshot}
           onClose={() => setEditorMode(null)}
+          onRestart={() => {
+            if (!editorReady) return;
+            if (activeMode.kind === "edit") {
+              const latest = editorQuery.data?.pools.find(
+                (item) => item.key === activeMode.pool.key,
+              );
+              if (latest) setEditorMode({ kind: "edit", pool: latest });
+            } else if (activeMode.kind === "copy") {
+              const latest = editorQuery.data?.copy_sources.find(
+                (item) => item.key === activeMode.source.key && item.copyable,
+              );
+              if (latest) setEditorMode({ kind: "copy", source: latest });
+            }
+          }}
         />
       ) : null}
     </>

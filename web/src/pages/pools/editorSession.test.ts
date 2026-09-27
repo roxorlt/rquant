@@ -138,7 +138,9 @@ it("keeps ambiguous save identity and retries only attachment with a new ID afte
   await session.startSave(saveInput, "观察画布");
   expect(session.snapshot().journal?.attachStatus).toBe("failed");
   expect(session.snapshot().journal?.saveVersion).toBe(VERSION);
-  await session.retryAttachment();
+  await session.retryAttachment(null);
+  expect(seen).toHaveLength(2);
+  await session.retryAttachment(VERSION);
   expect(seen.map((body) => body.command_id)).toEqual(["save-1", "attach-1", "attach-2"]);
   expect(seen[2]).toMatchObject({ expected_pool_version: VERSION });
   expect(session.snapshot().journal?.attachStatus).toBe("succeeded");
@@ -201,7 +203,7 @@ it("keeps an unresolved attachment resumable after reload and frees other saves 
   expect(seen.at(-1)).toEqual(originalAttach);
 });
 
-it("uses a newly verified version for a fresh attachment after conflict, or ends failed attachment", async () => {
+it("never substitutes a newer rule version for the saved attachment after conflict", async () => {
   const seen: Command[] = [];
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
     seen.push(body);
@@ -227,8 +229,8 @@ it("uses a newly verified version for a fresh attachment after conflict, or ends
   await session.retryAttachment(VERSION);
   expect(seen).toHaveLength(2);
   await session.retryAttachment(NEW_VERSION);
-  expect(seen[2]).toMatchObject({ expected_pool_version: NEW_VERSION });
-  expect(session.snapshot().journal?.attachStatus).toBe("succeeded");
+  expect(seen).toHaveLength(2);
+  expect(session.snapshot().journal?.attachStatus).toBe("failed");
 
   const failed = makeSession(async (body) =>
     body.kind === "save_user_pool_v2"
@@ -246,4 +248,51 @@ it("uses a newly verified version for a fresh attachment after conflict, or ends
   expect(failed.snapshot().journal?.canvasName).toBeNull();
   await failed.startSave({ ...saveInput, base_name: "后续池", display_name: "后续池" }, null);
   expect(failed.snapshot().journal?.save.base_name).toBe("后续池");
+});
+
+it("keeps the original V1 command after a lost response and reload even when V2 has changed", async () => {
+  const seen: Command[] = [];
+  const post = vi.fn(async (body: Command): Promise<Receipt> => {
+    seen.push(body);
+    if (seen.length === 1) throw new ApiError(503, "连接暂不可用");
+    throw new ApiError(409, "规则已更新");
+  });
+  const first = makeSession(post);
+  await first.startSave(saveInput, null);
+  expect(first.snapshot().journal?.saveStatus).toBe("unknown");
+  const restored = makeSession(post);
+  await restored.advance();
+  expect(seen[1]).toEqual(seen[0]);
+  expect(restored.snapshot().journal?.saveStatus).toBe("failed");
+  expect(restored.snapshot().journal?.saveConflict).toBe(true);
+});
+
+it("does not treat a legacy mismatched saved attachment as V1 success after reload", () => {
+  window.sessionStorage.setItem(
+    POOL_EDITOR_JOURNAL_KEY,
+    JSON.stringify({
+      schema: 1,
+      save: {
+        ...saveInput,
+        kind: "save_user_pool_v2",
+        command_id: "save-1",
+        requested_at: "2026-09-27T07:00:00.000Z",
+      },
+      canvasName: "观察画布",
+      saveVersion: VERSION,
+      saveStatus: "succeeded",
+      attach: {
+        kind: "add_pool_to_canvas",
+        command_id: "attach-1",
+        requested_at: "2026-09-27T07:01:00.000Z",
+        canvas_name: "观察画布",
+        pool_name: "user/放量确认",
+        expected_pool_version: NEW_VERSION,
+      },
+      attachStatus: "succeeded",
+    }),
+  );
+  const session = makeSession(vi.fn());
+  expect(session.snapshot().journal?.attachStatus).toBe("failed");
+  expect(session.snapshot().journal?.attachConflict).toBe(true);
 });
