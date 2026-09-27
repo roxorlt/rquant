@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -157,11 +158,16 @@ def test_the_trade_calendar_is_the_2026_sse_schedule_not_a_weekday_rule(tmp_path
     build_web_fixture(root, "baseline")
     with ServingReader(root).acquire_generation() as lease:
         rows = lease.connection.execute(
-            "SELECT trade_date FROM trade_calendar WHERE exchange = 'SSE' AND is_open "
+            "SELECT trade_date, is_open FROM trade_calendar WHERE exchange = 'SSE' "
             "ORDER BY trade_date"
         ).fetchall()
-    open_days = {row[0] for row in rows}
+    open_days = {day for day, is_open in rows if is_open}
 
+    assert len(rows) == 365
+    assert rows[0] == (date(2026, 1, 1), False)
+    assert (date(2026, 9, 25), False) in rows
+    assert (date(2026, 9, 27), False) in rows
+    assert (date(2026, 9, 28), True) in rows
     assert len(open_days) == 242
     assert min(open_days).isoformat() == "2026-01-05"
     assert max(open_days).isoformat() == "2026-12-31"

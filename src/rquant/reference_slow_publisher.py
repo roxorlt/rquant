@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import Field, StringConstraints, field_serializer, field_validator, model_validator
 
+from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.live_contracts import ConsumerCursor
 from rquant.reference_data_registry import (
     ReferenceDataset,
@@ -31,7 +32,7 @@ from rquant.runtime_contracts import (
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.security_status import normalize_name
 from rquant.serving_contracts import FreshnessStatus
-from rquant.serving_read_models import ServingProjectionPayload
+from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionPayload
 from rquant.state.derive import (
     _classify_board,
     _historical_limit_pct,
@@ -228,6 +229,8 @@ class ReferenceSlowSourceSnapshot(RuntimeContractModel):
         suspended_codes: tuple[str, ...] = (),
         projections: tuple[ServingProjectionPayload, ...] | None = None,
         trade_calendar_open_dates: tuple[date, ...] = (),
+        trade_calendar_coverage_start: date | None = None,
+        trade_calendar_coverage_end: date | None = None,
     ) -> ReferenceSlowSourceSnapshot:
         normalized_captured_at = normalize_aware_utc(captured_at)
         prepared_projections = projections or _default_reference_projections(
@@ -236,6 +239,8 @@ class ReferenceSlowSourceSnapshot(RuntimeContractModel):
             daily_facts=daily_facts,
             security_facts=security_facts,
             trade_calendar_open_dates=trade_calendar_open_dates,
+            trade_calendar_coverage_start=trade_calendar_coverage_start,
+            trade_calendar_coverage_end=trade_calendar_coverage_end,
         )
         identity = {
             "schema_version": 1,
@@ -270,6 +275,8 @@ def _default_reference_projections(
     daily_facts: tuple[ReferenceDailyFact, ...],
     security_facts: tuple[ReferenceSecurityFact, ...],
     trade_calendar_open_dates: tuple[date, ...] = (),
+    trade_calendar_coverage_start: date | None = None,
+    trade_calendar_coverage_end: date | None = None,
 ) -> tuple[ServingProjectionPayload, ...]:
     available = normalize_aware_utc(captured_at)
     daily_by_code = {fact.ts_code: fact for fact in daily_facts}
@@ -331,13 +338,11 @@ def _default_reference_projections(
         "kpl_concept_member": (),
         "market_liquidity": (),
         "daily_bar": tuple(daily_rows),
-        "trade_calendar": tuple(
-            {
-                "trade_date": trade_date.isoformat(),
-                "exchange": "SSE",
-                "is_open": True,
-            }
-            for trade_date in (trade_calendar_open_dates or (target_trade_date,))
+        "trade_calendar": _daily_calendar_projection_rows(
+            target_trade_date=target_trade_date,
+            open_dates=trade_calendar_open_dates,
+            coverage_start=trade_calendar_coverage_start,
+            coverage_end=trade_calendar_coverage_end,
         ),
         "nl_screen_universe": tuple(universe_rows),
     }
@@ -349,6 +354,37 @@ def _default_reference_projections(
         )
         for table_name in sorted(rows_by_table)
     )
+
+
+def _daily_calendar_projection_rows(
+    *,
+    target_trade_date: date,
+    open_dates: tuple[date, ...],
+    coverage_start: date | None,
+    coverage_end: date | None,
+) -> tuple[dict[str, object], ...]:
+    if (coverage_start is None) != (coverage_end is None):
+        raise ReferenceSlowPublicationError("calendar coverage bounds must be paired")
+    if coverage_start is not None and not open_dates:
+        raise ReferenceSlowPublicationError("covered calendar needs authoritative open dates")
+    known_open = open_dates or (target_trade_date,)
+    first = coverage_start or known_open[0]
+    last = coverage_end or known_open[-1]
+    if (
+        first > last
+        or target_trade_date not in known_open
+        or any(day < first or day > last for day in known_open)
+        or any(left >= right for left, right in zip(known_open, known_open[1:], strict=False))
+    ):
+        raise ReferenceSlowPublicationError("calendar coverage and open dates disagree")
+    max_days = min(MAX_AUDIT_DAYS, PAGE_PROJECTION_CONTRACTS["trade_calendar"].max_rows)
+    first = max(first, last - timedelta(days=max_days - 1))
+    open_set = frozenset(known_open)
+    rows: list[dict[str, object]] = []
+    for index in range((last - first).days + 1):
+        day = first + timedelta(days=index)
+        rows.append({"trade_date": day.isoformat(), "exchange": "SSE", "is_open": day in open_set})
+    return tuple(rows)
 
 
 def _reference_generation_revision(
