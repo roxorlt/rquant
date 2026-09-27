@@ -23,7 +23,8 @@ LIFECYCLE_MESSAGE_ID = "4d46a7d8b26c4e0ea93d681a62f1ad70"
 LIFECYCLE_MESSAGE = "rquant.lifecycle"
 
 _BOOT_PATH = "/proc/sys/kernel/random/boot_id"
-_BOOT_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+_PROC_BOOT_ID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+_BOOT_ID = re.compile(r"^[0-9a-f]{32}$")
 _JOURNAL_CURSOR = re.compile(r"^[\x21-\x7e]{1,1024}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PRIORITY = {
@@ -48,7 +49,10 @@ _JOURNAL_FIELDS = frozenset(
         "__CURSOR",
         "__REALTIME_TIMESTAMP",
         "__MONOTONIC_TIMESTAMP",
+        "__SEQNUM",
+        "__SEQNUM_ID",
         "_BOOT_ID",
+        "_RUNTIME_SCOPE",
         "_SYSTEMD_UNIT",
         "_SYSTEMD_INVOCATION_ID",
         "_PID",
@@ -152,9 +156,9 @@ def _boot_id(payload: bytes) -> str:
     if len(payload) > 128:
         raise ValueError
     boot = payload.decode("ascii").strip()
-    if _BOOT_ID.fullmatch(boot) is None:
+    if _PROC_BOOT_ID.fullmatch(boot) is None:
         raise ValueError
-    return boot
+    return boot.replace("-", "")
 
 
 def _bounded_number(value: object, *, maximum: int) -> int | None:

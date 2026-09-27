@@ -28,6 +28,7 @@ from rquant.unit_log_reader import (
 NOW = datetime(2026, 9, 28, 4, 0, tzinfo=UTC)
 SINCE = NOW - timedelta(days=1)
 BOOT = "12345678-1234-1234-1234-123456789abc"
+JOURNAL_BOOT = BOOT.replace("-", "")
 DAILY = "rquant-daily.service"
 BACKUP = "rquant-backup.service"
 
@@ -101,7 +102,7 @@ def _row(
     *,
     timestamp: int = 1_790_566_800_000_000,
     unit: str = DAILY,
-    boot: str = BOOT,
+    boot: str = JOURNAL_BOOT,
     priority: str = "6",
     event: str = "run_started",
     message: str = LIFECYCLE_MESSAGE,
@@ -148,6 +149,55 @@ def _reader(
     )
 
 
+def test_linux_boot_uuid_is_compacted_for_journal_and_page_cursor(
+    signed_manifest: tuple[Path, bytes],
+) -> None:
+    compact_boot = BOOT.replace("-", "")
+    records = (
+        _row("s=first", boot=compact_boot),
+        _row("s=last", boot=compact_boot),
+    )
+    argv_calls: list[tuple[str, ...]] = []
+
+    def runner(argv: tuple[str, ...], _timeout: float, _max_bytes: int) -> bytes:
+        argv_calls.append(argv)
+        return _json_lines(*records)
+
+    reader = _reader(signed_manifest, runner)
+    first = reader.read(unit=DAILY, since=SINCE, page_size=1)
+    assert len(first.entries) == 1 and first.next_cursor is not None
+    second = reader.read(unit=DAILY, since=SINCE, page_size=1, cursor=first.next_cursor)
+    assert len(second.entries) == 1 and second.next_cursor is None
+    assert all(f"--boot={compact_boot}" in argv for argv in argv_calls)
+
+    token_body = first.next_cursor.split(".")[0]
+    decoded = json.loads(base64.urlsafe_b64decode(token_body + "=" * (-len(token_body) % 4)))
+    assert decoded["boot"] == compact_boot
+    old_format_cursor = reader._encode_cursor(decoded | {"boot": BOOT})
+    with pytest.raises(JournalCursorError, match="日志已更新"):
+        reader.read(unit=DAILY, since=SINCE, page_size=1, cursor=old_format_cursor)
+
+    with pytest.raises(JournalUnavailableError):
+        _reader(
+            signed_manifest,
+            runner,
+            boot_reader=lambda: (compact_boot + "\n").encode(),
+        ).read(unit=DAILY, since=SINCE)
+
+
+def test_linux_standard_journal_metadata_keeps_registered_event_visible(
+    signed_manifest: tuple[Path, bytes],
+) -> None:
+    row = _row(
+        "s=metadata",
+        _RUNTIME_SCOPE="system",
+        __SEQNUM="319",
+        __SEQNUM_ID="a" * 32,
+    )
+    page = _reader(signed_manifest, lambda *_args: _json_lines(row)).read(unit=DAILY, since=SINCE)
+    assert [item.text for item in page.entries] == ["任务已开始"]
+
+
 def test_exact_signed_service_and_fixed_command_projection(
     signed_manifest: tuple[Path, bytes],
 ) -> None:
@@ -176,7 +226,7 @@ def test_exact_signed_service_and_fixed_command_projection(
     argv, timeout, max_bytes = calls[0]
     assert argv[0] == "/usr/bin/journalctl"
     assert "--no-pager" in argv and "--output=json" in argv and "--reverse" in argv
-    assert f"--boot={BOOT}" in argv
+    assert f"--boot={JOURNAL_BOOT}" in argv
     assert f"--since={SINCE.isoformat()}" in argv
     assert "--priority=info" in argv
     assert "--lines=22" in argv
@@ -316,7 +366,8 @@ def test_expired_time_window_invalidates_existing_cursor(
     "bad_output",
     [
         _json_lines(_row("s=x", unit=BACKUP)),
-        _json_lines(_row("s=x", boot="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+        _json_lines(_row("s=x", boot="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+        _json_lines(_row("s=x", boot=BOOT)),
         _json_lines(_row("s=x", priority="8")),
         _json_lines(_row("s=x", timestamp=1)),
         b'{"__CURSOR":"x","__CURSOR":"y"}\n',
