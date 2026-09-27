@@ -2987,6 +2987,15 @@ class PageControlService:
                 raise ValueError("ack_alert requires verified Serving eligibility")
         else:
             receipt = self.outbox.enqueue(command)
+        return self._settle(command, receipt)
+
+    def _submit_verified_ack(self, command: AckAlert) -> PageControlReceipt:
+        """Called only after the local Serving admission checks succeed."""
+        return self._settle(command, self.outbox.enqueue_verified_ack(command))
+
+    def _settle(
+        self, command: PageControlCommandValue, receipt: PageControlReceipt
+    ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
