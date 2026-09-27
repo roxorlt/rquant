@@ -1424,7 +1424,18 @@ class PageControlConsumer:
             now=self.clock(),
         ):
             if isinstance(claim.command, AckAlert):
-                self._assert_command_time(claim.command)
+                try:
+                    self._assert_command_time(claim.command)
+                except ValueError as exc:
+                    receipts.append(
+                        self.outbox.complete(
+                            claim.command.command_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                            owner_id=claim.owner_id,
+                            claim_token=claim.claim_token,
+                        )
+                    )
+                    continue
                 receipts.append(self.outbox.complete_ack(claim))
                 continue
             try:

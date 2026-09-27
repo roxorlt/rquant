@@ -17,6 +17,14 @@ AlertSource = Literal["signal", "monitor_event", "surge_event"]
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _STOCK_CODE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 _REQUIRED_TEXT = frozenset({"ts_code", "level", "name", "theme", "status"})
+_MONITOR_LEVELS = frozenset(
+    {
+        "attack_open_strength",
+        "attack_break_high",
+        "attack_strong_carry",
+        "attack_near_limit",
+    }
+)
 _MONITOR_FIELDS = (
     "trade_date",
     "trigger_time",
@@ -76,11 +84,17 @@ def _monitor_time(value: object, trade_date: date) -> str:
             value = datetime.fromisoformat(value)
         except ValueError as exc:
             raise ValueError("invalid monitor trigger_time") from exc
-    if not isinstance(value, datetime) or value.tzinfo is not None:
+    if not isinstance(value, datetime):
         raise ValueError("invalid monitor trigger_time")
-    if value.date() != trade_date:
+    if value.tzinfo is None:
+        local = value.replace(tzinfo=_SHANGHAI)
+    elif value.utcoffset() is None:
+        raise ValueError("invalid monitor trigger_time")
+    else:
+        local = value.astimezone(_SHANGHAI)
+    if local.date() != trade_date:
         raise ValueError("monitor trigger_time and trade_date disagree")
-    return _utc_microsecond(value.replace(tzinfo=_SHANGHAI))
+    return _utc_microsecond(local)
 
 
 def _surge_time(value: object, trade_date: date) -> str:
@@ -118,7 +132,7 @@ def _field(name: str, value: object) -> object:
         raise ValueError(f"{name} must be a string or null")
     if name == "ts_code" and _STOCK_CODE.fullmatch(value) is None:
         raise ValueError("invalid ts_code")
-    if name == "level" and value not in {"attack_strong_carry", "attack_break_high"}:
+    if name == "level" and value not in _MONITOR_LEVELS:
         raise ValueError("invalid monitor level")
     if name == "status" and value not in {"confirmed", "unbuyable"}:
         raise ValueError("invalid surge status")

@@ -172,6 +172,72 @@ def test_ack_window_uses_thirty_shanghai_calendar_days_and_activation() -> None:
     ) == datetime(2026, 9, 25, tzinfo=UTC)
 
 
+def test_monitor_writer_rows_and_serving_utc_rows_share_all_four_level_identities() -> None:
+    from rquant.monitor import RealtimeQuote, WatchItem, check_attack_signals
+
+    item = WatchItem(
+        ts_code="002415.SZ",
+        pool="pool2",
+        limit_up_date=date(2026, 9, 24),
+        body_upper=13.20,
+        body_lower=11.80,
+        body=1.40,
+        level_40=12.36,
+        level_30=12.22,
+        level_20=12.08,
+        stop_strong=11.80,
+        stop_weak=11.52,
+        reference_date=date(2026, 9, 25),
+        t_high=13.00,
+        t_close=12.50,
+        limit_up_price_next=13.75,
+    )
+    quote = RealtimeQuote(
+        ts_code=item.ts_code,
+        price=13.58,
+        low=12.60,
+        open=12.88,
+        high=13.60,
+    )
+    events = check_attack_signals(item, quote)
+    assert {event["level"] for event in events} == {
+        "attack_open_strength",
+        "attack_break_high",
+        "attack_strong_carry",
+        "attack_near_limit",
+    }
+    writer_at = datetime(2026, 9, 25, 10, 3, 4, 123456)
+    published_at = "2026-09-25T02:03:04.123456+00:00"
+    for event in events:
+        writer_row = {
+            "trade_date": date(2026, 9, 25),
+            "trigger_time": writer_at,
+            "ts_code": item.ts_code,
+            "pool": item.pool,
+            **event,
+        }
+        serving_row = {
+            **writer_row,
+            "trade_date": "2026-09-25",
+            "trigger_time": published_at,
+        }
+        assert stable_alert_id("monitor_event", writer_row) == stable_alert_id(
+            "monitor_event", serving_row
+        )
+
+
+def test_monitor_local_naive_and_published_utc_timestamp_have_one_identity() -> None:
+    writer_row = _monitor()
+    published_row = {
+        **writer_row,
+        "trade_date": "2026-09-27",
+        "trigger_time": "2026-09-27T02:03:04.123456+00:00",
+    }
+    assert stable_alert_id("monitor_event", writer_row) == stable_alert_id(
+        "monitor_event", published_row
+    )
+
+
 def test_new_ack_is_fail_closed_until_serving_eligibility_is_verified(tmp_path: Path) -> None:
     outbox = PageControlOutbox(tmp_path / "control.sqlite3")
     outbox.activate_alert_ack(NOW - timedelta(days=1))
@@ -362,6 +428,26 @@ def test_loopback_lookup_is_readonly_and_conflicts_without_leaking_receipt(tmp_p
     )
     assert status == 409
     assert "receipt" not in body
+
+
+def test_bad_future_ack_does_not_turn_successful_http_receipt_into_error(tmp_path: Path) -> None:
+    outbox = PageControlOutbox(tmp_path / "control.sqlite3")
+    outbox.activate_alert_ack(NOW - timedelta(days=1))
+    good = _command("good-ack")
+    bad = _command("bad-ack", requested_at=NOW + timedelta(minutes=6)).model_copy(
+        update={"alert_id": "c" * 64}
+    )
+    outbox.enqueue_verified_ack(good)
+    outbox.enqueue_verified_ack(bad)
+    service = PageControlService(outbox=outbox, consumer=_consumer(outbox, tmp_path))
+    status, body = _http_post(service, "/v1/commands", good.model_dump(mode="json"))
+    assert status == 200
+    assert body["status"] == "succeeded"
+    assert body["result"]["confirmation_id"] == good.command_id
+    assert outbox.receipt(good.command_id).status is PageControlStatus.SUCCEEDED
+    assert outbox.acknowledgment(good.alert_id).confirmation_id == good.command_id
+    assert outbox.receipt(bad.command_id).status is PageControlStatus.FAILED
+    assert outbox.acknowledgment(bad.alert_id) is None
 
 
 def test_page_client_lookup_distinguishes_absence_receipt_and_unavailability() -> None:
