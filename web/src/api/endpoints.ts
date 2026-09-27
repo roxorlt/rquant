@@ -30,6 +30,8 @@ export type CatalogField = Schemas["CatalogField"];
 export type DataAuditHealthData = Schemas["DataAuditHealthData"];
 export type DataAuditIssuesData = Schemas["DataAuditIssuesData"];
 export type DataAuditIssueItem = Schemas["DataAuditIssueItem"];
+export type BackfillPlanItem = Schemas["BackfillPlanItem"];
+export type BackfillPlanDetail = Schemas["BackfillPlanDetail"];
 export type PoolsData = Schemas["PoolsData"];
 export type PublishedPool = Schemas["PublishedPool"];
 export type PoolMember = Schemas["PoolMember"];
@@ -122,6 +124,30 @@ export function useDataAuditHealth(): ServingQueryResult<DataAuditHealthData> {
     const { data, response } = await apiClient().GET("/api/v1/data/health");
     return unwrap(data, response);
   });
+}
+
+export function useBackfillPlans(cursor: string | null, generation: string | null) {
+  return useServingQuery(["data", "backfill-plans", cursor, generation], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/data/backfill-plans", {
+      params: {
+        query: { page_size: 20, cursor: cursor ?? undefined, generation: generation ?? undefined },
+      },
+    });
+    return unwrap(data, response);
+  });
+}
+
+export function useBackfillPlanDetail(planHash: string | null, generation: string | null) {
+  return useServingQuery(
+    ["data", "backfill-plan", planHash, generation],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/data/backfill-plans/{plan_hash}", {
+        params: { path: { plan_hash: planHash ?? "" }, query: { generation } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: planHash !== null && generation !== null },
+  );
 }
 
 export function useDataAuditReport(generation: string | null | undefined) {

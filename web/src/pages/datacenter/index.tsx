@@ -20,6 +20,7 @@ import {
   Tip,
 } from "@/ui";
 import { AuditPanel } from "./AuditPanel";
+import { BackfillPlanPanel } from "./BackfillPlanPanel";
 import { DailyReportPanel } from "./DailyReportPanel";
 import "./datacenter.css";
 
@@ -250,7 +251,7 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
   );
 }
 
-export default function DataCenterPage() {
+function CatalogView() {
   const catalog = useCatalog();
   const [category, setCategory] = useState("全部");
   const [query, setQuery] = useState("");
@@ -282,18 +283,14 @@ export default function DataCenterPage() {
 
   if (!catalog.data) {
     return (
-      <div className="data-center">
-        <PageHeader eyebrow="数据" title="数据中心" />
-        <Panel>
-          <EmptyState title="暂时读不到数据目录" hint="稍后刷新页面再试" />
-        </Panel>
-      </div>
+      <Panel>
+        <EmptyState title="暂时读不到数据目录" hint="稍后刷新页面再试" />
+      </Panel>
     );
   }
 
   return (
-    <div className={`data-center${mobileDetail ? " dc-show-detail" : ""}`}>
-      <PageHeader eyebrow="数据" title="数据中心" note={`${datasets.length} 份数据`} />
+    <div className={mobileDetail ? "dc-show-detail" : ""}>
       <div className="dc-layout">
         <section className="dc-index" aria-label="数据目录">
           <div className="dc-index-head">
@@ -349,6 +346,27 @@ export default function DataCenterPage() {
           )}
         </section>
       </div>
+    </div>
+  );
+}
+
+export default function DataCenterPage() {
+  const [view, setView] = useState<"catalog" | "plans">("catalog");
+  return (
+    <div className="data-center">
+      <PageHeader eyebrow="数据" title="数据中心" />
+      <div className="dc-view-switch">
+        <Segmented
+          label="数据中心内容"
+          options={[
+            { value: "catalog", label: "数据目录" },
+            { value: "plans", label: "回补计划" },
+          ]}
+          value={view}
+          onChange={setView}
+        />
+      </div>
+      {view === "catalog" ? <CatalogView /> : <BackfillPlanPanel />}
     </div>
   );
 }
