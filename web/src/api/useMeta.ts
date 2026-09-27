@@ -21,6 +21,11 @@ export function useCurrentGeneration(): string | null | undefined {
   return query.data?.data.generation?.generation_id;
 }
 
+/** Observe the shell's authenticated viewer and current data state without another request. */
+export function useCurrentMeta() {
+  return useQuery({ queryKey: META_QUERY_KEY, queryFn: fetchMeta, enabled: false });
+}
+
 /**
  * Polls /api/v1/meta every 15 s. A Serving generation change invalidates
  * Serving-backed queries; the independent screen replica stays on manual refresh.

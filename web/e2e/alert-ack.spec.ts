@@ -23,6 +23,8 @@ async function useSyntheticApi(
     {
       state: "confirmed",
       eligible: false,
+      alert_id: "2".repeat(64),
+      confirmation_id: "confirmed-first",
       label: "已确认",
       confirmed_at: "2026-09-24T05:06:00Z",
     },
@@ -150,6 +152,107 @@ for (const width of [1440, 390]) {
       await expect(overviewCard.locator(".val")).toHaveText("—");
       await expect(overviewCard.locator(".sub")).toHaveText("数量未知");
       await expectNoHorizontalOverflow(page, "overview unknown count");
+      expect(watcher.problems).toEqual([]);
+    });
+  });
+}
+
+for (const width of [1440, 390]) {
+  test.describe(`告警确认操作 ${width}px`, () => {
+    test.use({ viewport: { width, height: 844 }, hasTouch: width === 390 });
+
+    test("keeps the count until a matching new version confirms the event", async ({ page }) => {
+      const watcher = watch(page);
+      await page.clock.setFixedTime(new Date("2026-09-24T05:12:00Z"));
+      const alertId = "a".repeat(64);
+      const first = monitorEnvelope();
+      const active = monitorEnvelope({
+        unacknowledged: { ...READY, count: 3 },
+        items: first.data.items.map((item, index) => ({
+          ...item,
+          acknowledgment:
+            index === 0
+              ? {
+                  state: "unconfirmed" as const,
+                  eligible: true,
+                  alert_id: alertId,
+                  label: "待确认",
+                }
+              : { state: "historical" as const, eligible: false, label: "历史告警" },
+        })),
+      });
+      const nextGeneration = "c".repeat(64);
+      const originalGeneration = active.serving.generation_id;
+      if (!originalGeneration) throw new Error("synthetic data version is missing");
+      let generation = originalGeneration;
+      let confirmed = false;
+      const requests: Schemas["AckCommandRequest"][] = [];
+      await page.route("**/api/v1/meta", (route) =>
+        route.fulfill({ json: metaEnvelope({ generationId: generation }) }),
+      );
+      await page.route(/\/api\/v1\/monitor\/timeline(?:\?|$)/, (route) =>
+        route.fulfill({
+          json: confirmed
+            ? {
+                ...active,
+                serving: { ...active.serving, generation_id: nextGeneration },
+                data: {
+                  ...active.data,
+                  unacknowledged: { ...READY, count: 2 },
+                  items: active.data.items.map((item, index) =>
+                    index === 0
+                      ? {
+                          ...item,
+                          acknowledgment: {
+                            state: "confirmed" as const,
+                            eligible: false,
+                            alert_id: alertId,
+                            confirmation_id: "first-confirmation",
+                            label: "已确认",
+                          },
+                        }
+                      : item,
+                  ),
+                },
+              }
+            : active,
+        }),
+      );
+      await page.route("**/api/v1/monitor/ack", async (route) => {
+        const request = route.request();
+        expect(request.headers()["x-rquant-csrf"]).toBe("1");
+        const body = request.postDataJSON() as Schemas["AckCommandRequest"];
+        requests.push(body);
+        await route.fulfill({
+          json: {
+            command_id: body.command_id,
+            status: "succeeded",
+            confirmation_id: "first-confirmation",
+            message: "已受理，正在同步",
+          },
+        });
+      });
+      await page.goto("./#/monitor");
+      const timeline = page.getByRole("list", { name: "告警时间线" });
+      await expect(timeline).toBeVisible();
+      const button = timeline.getByRole("button", { name: /^确认$/ });
+      if (width === 390) await button.tap();
+      else {
+        await button.focus();
+        await page.keyboard.press("Enter");
+      }
+      await expect(timeline.locator(":scope > li").first()).toContainText("已受理，正在同步");
+      await expect(page.locator('[data-kpi="unacknowledged"] .val')).toContainText("3条");
+      expect(requests).toHaveLength(1);
+      await expectNoHorizontalOverflow(page, "alert acknowledgment command");
+
+      generation = nextGeneration;
+      confirmed = true;
+      await page.reload();
+      await expect(timeline.locator(":scope > li").first()).toContainText("已确认");
+      await expect(page.locator('[data-kpi="unacknowledged"] .val')).toContainText("2条");
+      expect(requests).toHaveLength(1);
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
       expect(watcher.problems).toEqual([]);
     });
   });
