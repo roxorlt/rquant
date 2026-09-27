@@ -20,6 +20,7 @@ from rquant.ops_status import load_signed_ops_manifest
 from rquant.unit_log_reader import JournalPage
 from rquant.unit_log_service import UnitLogServiceError
 from rquant.web.security import current_user
+from rquant.web.service_log_access_audit import ServiceLogAccessRecord
 
 router = APIRouter(prefix="/tasks")
 
@@ -170,6 +171,7 @@ def get_service_logs(
         or not settings.log_admin_users
         or settings.unit_log_socket_path is None
         or web.unit_log_client is None
+        or web.unit_log_access_audit is None
         or not settings.unit_log_verified_units
     ):
         raise HTTPException(status_code=503, detail="运行日志尚未开放。")
@@ -179,10 +181,19 @@ def get_service_logs(
         raise HTTPException(status_code=403, detail="当前账号不能查看运行日志。")
     if unit not in settings.unit_log_verified_units:
         raise HTTPException(status_code=403, detail="当前服务的运行日志尚未开放。")
-    query = _parse_query(request, now=web.clock())
+    now = web.clock()
+    query = _parse_query(request, now=now)
     with _admitted(web.unit_log_gate):
         if not _installed_unit(request, unit):
             raise HTTPException(status_code=403, detail="当前服务的运行日志尚未开放。")
+        try:
+            recorded = web.unit_log_access_audit.record(
+                ServiceLogAccessRecord(operator=viewer, unit=unit, at=now)
+            )
+            if recorded is not None:
+                raise ValueError("access audit did not acknowledge the record")
+        except Exception:
+            raise HTTPException(status_code=503, detail=_UNAVAILABLE) from None
         try:
             page = web.unit_log_client.read(
                 unit=unit,

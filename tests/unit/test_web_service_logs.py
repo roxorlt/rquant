@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from rquant.unit_log_reader import JournalEntry, JournalPage
 from rquant.unit_log_service import UnitLogServiceError
 from rquant.web.app import create_app
+from rquant.web.service_log_access_audit import ServiceLogAccessRecord
 from rquant.web.settings import WebSettings
 from tests.unit.test_ops_status import _manifest, _signed
 
@@ -42,6 +43,17 @@ class FakeClient:
         )
 
 
+class FakeAudit:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.records: list[ServiceLogAccessRecord] = []
+        self.error = error
+
+    def record(self, event: ServiceLogAccessRecord) -> None:
+        self.records.append(event)
+        if self.error is not None:
+            raise self.error
+
+
 def _configured(tmp_path: Path, *, accepted: frozenset[str] = frozenset({UNIT})) -> WebSettings:
     signed, public = _signed(
         _manifest().model_copy(update={"host_name": socket.gethostname()}), tmp_path
@@ -66,11 +78,13 @@ def _configured(tmp_path: Path, *, accepted: frozenset[str] = frozenset({UNIT}))
 
 def test_admin_reads_only_a_typed_bounded_service_page(tmp_path: Path) -> None:
     fake = FakeClient()
+    audit = FakeAudit()
     app = create_app(
         _configured(tmp_path),
         clock=lambda: NOW,
         background=False,
         unit_log_client=fake,
+        unit_log_access_audit=audit,
     )
     with TestClient(app) as client:
         response = client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()})
@@ -91,6 +105,55 @@ def test_admin_reads_only_a_typed_bounded_service_page(tmp_path: Path) -> None:
     assert fake.calls == [
         {"unit": UNIT, "since": SINCE, "level": None, "page_size": 100, "cursor": None}
     ]
+    assert [record.model_dump(mode="json") for record in audit.records] == [
+        {
+            "operator": "liutong",
+            "unit": UNIT,
+            "result_class": "admitted",
+            "at": NOW.isoformat().replace("+00:00", "Z"),
+        }
+    ]
+
+
+def test_verified_unit_stays_closed_without_access_audit(tmp_path: Path) -> None:
+    fake = FakeClient()
+    app = create_app(
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+    )
+    with TestClient(app) as client:
+        response = client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()})
+    assert response.status_code == 503
+    assert fake.calls == []
+
+
+def test_audit_write_failure_refuses_journal_read_and_hides_error(tmp_path: Path) -> None:
+    fake = FakeClient()
+    audit = FakeAudit(error=RuntimeError("Bearer secret in audit backend"))
+    app = create_app(
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=audit,
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            URL,
+            headers=ADMIN,
+            params={"since": SINCE.isoformat(), "cursor": "secret.cursor"},
+        )
+    assert response.status_code == 503
+    assert "Bearer" not in response.text
+    assert "secret.cursor" not in response.text
+    assert fake.calls == []
+    assert len(audit.records) == 1
+    assert set(audit.records[0].model_dump()) == {"operator", "unit", "result_class", "at"}
+    serialized = audit.records[0].model_dump_json()
+    assert "secret.cursor" not in serialized
+    assert "Bearer" not in serialized
 
 
 def test_default_and_unaccepted_service_logs_are_unavailable(tmp_path: Path) -> None:
@@ -105,6 +168,7 @@ def test_default_and_unaccepted_service_logs_are_unavailable(tmp_path: Path) -> 
         clock=lambda: NOW,
         background=False,
         unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
     )
     with TestClient(app) as client:
         response = client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()})
@@ -120,7 +184,11 @@ def test_spoofed_header_needs_private_ingress_and_exact_admin(tmp_path: Path) ->
     assert forged.status_code == 503
 
     app = create_app(
-        _configured(tmp_path), clock=lambda: NOW, background=False, unit_log_client=fake
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
     )
     with TestClient(app) as client:
         missing = client.get(URL, params={"since": SINCE.isoformat()})
@@ -141,7 +209,13 @@ def test_spoofed_header_needs_private_ingress_and_exact_admin(tmp_path: Path) ->
 def test_only_exact_accepted_and_signed_service_can_reach_client(tmp_path: Path) -> None:
     fake = FakeClient()
     settings = _configured(tmp_path)
-    app = create_app(settings, clock=lambda: NOW, background=False, unit_log_client=fake)
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
+    )
     with TestClient(app) as client:
         for unit in ("rquant-monitor.service", "ssh.service", "rquant-daily.service;id"):
             denied = client.get(
@@ -176,7 +250,11 @@ def test_only_exact_accepted_and_signed_service_can_reach_client(tmp_path: Path)
 def test_invalid_or_extra_log_filters_do_not_reach_client(tmp_path: Path, params: object) -> None:
     fake = FakeClient()
     app = create_app(
-        _configured(tmp_path), clock=lambda: NOW, background=False, unit_log_client=fake
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
     )
     with TestClient(app) as client:
         response = client.get(URL, headers=ADMIN, params=params)
@@ -189,7 +267,11 @@ def test_invalid_or_extra_log_filters_do_not_reach_client(tmp_path: Path, params
 def test_valid_filters_keep_exact_timezone_and_page_binding(tmp_path: Path) -> None:
     fake = FakeClient()
     app = create_app(
-        _configured(tmp_path), clock=lambda: NOW, background=False, unit_log_client=fake
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
     )
     with TestClient(app) as client:
         response = client.get(
@@ -230,7 +312,11 @@ def test_transport_failures_are_closed_and_do_not_expose_source_data(
     fake = FakeClient()
     fake.error = error
     app = create_app(
-        _configured(tmp_path), clock=lambda: NOW, background=False, unit_log_client=fake
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
     )
     with TestClient(app) as client:
         response = client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()})
@@ -306,7 +392,13 @@ def test_untrusted_or_oversized_public_key_file_never_reaches_transport(tmp_path
     assert settings.unit_log_public_key_path is not None
     public_path = settings.unit_log_public_key_path
     public_path.write_bytes(b"x" * 8193)
-    app = create_app(settings, clock=lambda: NOW, background=False, unit_log_client=fake)
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
+    )
     with TestClient(app) as client:
         oversized = client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()})
         public_path.unlink()
@@ -341,7 +433,11 @@ def test_inflight_log_read_rejects_second_request_without_blocking_health(tmp_pa
 
     fake = BlockingClient()
     app = create_app(
-        _configured(tmp_path), clock=lambda: NOW, background=False, unit_log_client=fake
+        _configured(tmp_path),
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
     )
     with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(client.get, URL, headers=ADMIN, params={"since": SINCE.isoformat()})

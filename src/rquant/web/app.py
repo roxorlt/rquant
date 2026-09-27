@@ -61,6 +61,7 @@ from rquant.web.routes import (
     tasks,
 )
 from rquant.web.screen_service import ScreenApplicationService
+from rquant.web.service_log_access_audit import ServiceLogAccessAudit
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 
@@ -95,6 +96,7 @@ class WebContext:
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
     unit_log_client: UnitLogClient | None
+    unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
     backfill_plan_commands: BackfillPlanCommandGateway
     audit_report_commands: AuditReportCommandGateway
@@ -110,6 +112,7 @@ def create_app(
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
+    unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
     audit_report_command_transport: AuditReportCommandTransport | None = None,
 ) -> FastAPI:
@@ -202,6 +205,7 @@ def create_app(
         ),
         ack_admission=configured_ack_admission,
         unit_log_client=configured_unit_log,
+        unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
         backfill_plan_commands=BackfillPlanCommandGateway(
             endpoint=settings.page_control_url,
