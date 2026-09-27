@@ -30,6 +30,9 @@ export type CatalogField = Schemas["CatalogField"];
 export type DataAuditHealthData = Schemas["DataAuditHealthData"];
 export type DataAuditIssuesData = Schemas["DataAuditIssuesData"];
 export type DataAuditIssueItem = Schemas["DataAuditIssueItem"];
+export type PoolsData = Schemas["PoolsData"];
+export type PublishedPool = Schemas["PublishedPool"];
+export type PoolMember = Schemas["PoolMember"];
 
 function unwrap<T>(data: T | undefined, response: Response): T {
   if (data === undefined) {
@@ -54,6 +57,13 @@ export function useOverview(): ServingQueryResult<OverviewData> {
 
 export function useHealth(): ServingQueryResult<HealthData> {
   return useServingQuery(["health"], fetchHealth);
+}
+
+export function usePools(): ServingQueryResult<PoolsData> {
+  return useServingQuery(["pools"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/pools");
+    return unwrap(data, response);
+  });
 }
 
 export function useMonitorTimeline(

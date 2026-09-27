@@ -1441,6 +1441,22 @@
         "title": "Envelope[PaperAccountsData]",
         "type": "object"
       },
+      "Envelope_PoolsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PoolsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PoolsData]",
+        "type": "object"
+      },
       "Envelope_PulseData_": {
         "properties": {
           "data": {
@@ -3436,6 +3452,140 @@
         "title": "PipelineStage",
         "type": "object"
       },
+      "PoolMember": {
+        "properties": {
+          "close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Close"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "close",
+          "pct_chg"
+        ],
+        "title": "PoolMember",
+        "type": "object"
+      },
+      "PoolStep": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "step_index": {
+            "title": "Step Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "step_index",
+          "label",
+          "count"
+        ],
+        "title": "PoolStep",
+        "type": "object"
+      },
+      "PoolsData": {
+        "properties": {
+          "canvases": {
+            "items": {
+              "$ref": "#/components/schemas/SavedCanvas"
+            },
+            "title": "Canvases",
+            "type": "array"
+          },
+          "canvases_truncated": {
+            "title": "Canvases Truncated",
+            "type": "boolean"
+          },
+          "definitions_available": {
+            "title": "Definitions Available",
+            "type": "boolean"
+          },
+          "latest_trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Trade Date"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/PublishedPool"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "pools_truncated": {
+            "title": "Pools Truncated",
+            "type": "boolean"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "no_data",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "latest_trade_date",
+          "definitions_available",
+          "canvases",
+          "canvases_truncated",
+          "pools",
+          "pools_truncated"
+        ],
+        "title": "PoolsData",
+        "type": "object"
+      },
       "ProjectionInfo": {
         "properties": {
           "available": {
@@ -3489,6 +3639,87 @@
           "available_at"
         ],
         "title": "ProjectionInfo",
+        "type": "object"
+      },
+      "PublishedPool": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "member_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member Count"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/PoolMember"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "members_truncated": {
+            "title": "Members Truncated",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "current",
+              "older",
+              "no_data",
+              "unpublished",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PoolStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "steps_truncated": {
+            "title": "Steps Truncated",
+            "type": "boolean"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "key",
+          "name",
+          "state",
+          "trade_date",
+          "member_count",
+          "steps",
+          "steps_truncated",
+          "members",
+          "members_truncated"
+        ],
+        "title": "PublishedPool",
         "type": "object"
       },
       "PulseAlert": {
@@ -3938,6 +4169,37 @@
           "next_cursor"
         ],
         "title": "ResearchJobsData",
+        "type": "object"
+      },
+      "SavedCanvas": {
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "pool_keys": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pool Keys",
+            "type": "array"
+          },
+          "refs_truncated": {
+            "title": "Refs Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "pool_keys",
+          "refs_truncated"
+        ],
+        "title": "SavedCanvas",
         "type": "object"
       },
       "ScreenBlock": {
@@ -6329,6 +6591,27 @@
         "summary": "模拟账户与持仓",
         "tags": [
           "paper"
+        ]
+      }
+    },
+    "/api/v1/pools": {
+      "get": {
+        "operationId": "get_pools_api_v1_pools_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PoolsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "已发布池子画布",
+        "tags": [
+          "pools"
         ]
       }
     },

@@ -276,6 +276,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/pools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 已发布池子画布 */
+        get: operations["get_pools_api_v1_pools_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/blocks": {
         parameters: {
             query?: never;
@@ -858,6 +875,11 @@ export interface components {
         /** Envelope[PaperAccountsData] */
         Envelope_PaperAccountsData_: {
             data: components["schemas"]["PaperAccountsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PoolsData] */
+        Envelope_PoolsData_: {
+            data: components["schemas"]["PoolsData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[PulseData] */
@@ -1492,6 +1514,46 @@ export interface components {
             /** Window */
             window: string;
         };
+        /** PoolMember */
+        PoolMember: {
+            /** Close */
+            close: number | null;
+            /** Code */
+            code: string;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+        };
+        /** PoolStep */
+        PoolStep: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /** Step Index */
+            step_index: number;
+        };
+        /** PoolsData */
+        PoolsData: {
+            /** Canvases */
+            canvases: components["schemas"]["SavedCanvas"][];
+            /** Canvases Truncated */
+            canvases_truncated: boolean;
+            /** Definitions Available */
+            definitions_available: boolean;
+            /** Latest Trade Date */
+            latest_trade_date: string | null;
+            /** Pools */
+            pools: components["schemas"]["PublishedPool"][];
+            /** Pools Truncated */
+            pools_truncated: boolean;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "no_data" | "unavailable";
+        };
         /** ProjectionInfo */
         ProjectionInfo: {
             /** Available */
@@ -1504,6 +1566,30 @@ export interface components {
             reason: string | null;
             /** Table Name */
             table_name: string;
+        };
+        /** PublishedPool */
+        PublishedPool: {
+            /** Key */
+            key: string;
+            /** Member Count */
+            member_count: number | null;
+            /** Members */
+            members: components["schemas"]["PoolMember"][];
+            /** Members Truncated */
+            members_truncated: boolean;
+            /** Name */
+            name: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "current" | "older" | "no_data" | "unpublished" | "unavailable";
+            /** Steps */
+            steps: components["schemas"]["PoolStep"][];
+            /** Steps Truncated */
+            steps_truncated: boolean;
+            /** Trade Date */
+            trade_date: string | null;
         };
         /** PulseAlert */
         PulseAlert: {
@@ -1619,6 +1705,17 @@ export interface components {
             source_updated_at: string | null;
             /** Total */
             total: number | null;
+        };
+        /** SavedCanvas */
+        SavedCanvas: {
+            /** Description */
+            description: string;
+            /** Name */
+            name: string;
+            /** Pool Keys */
+            pool_keys: string[];
+            /** Refs Truncated */
+            refs_truncated: boolean;
         };
         /** ScreenBlock */
         ScreenBlock: {
@@ -2633,6 +2730,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_PaperAccountsData_"];
+                };
+            };
+        };
+    };
+    get_pools_api_v1_pools_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PoolsData_"];
                 };
             };
         };

@@ -34,6 +34,7 @@ from rquant.web.routes import (
     overview,
     panorama,
     paper,
+    pools,
     screen,
     stocks,
     tasks,
@@ -153,6 +154,7 @@ def create_app(
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
+    app.include_router(pools.router, prefix="/api/v1", tags=["pools"])
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])
