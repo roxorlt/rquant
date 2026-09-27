@@ -31,6 +31,7 @@ from rquant.reference_slow_publisher import (
     ReferenceDailyFact,
     ReferenceSecurityFact,
     ReferenceSlowSourceSnapshot,
+    _daily_calendar_projection_rows,
 )
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256, normalize_aware_utc
 from rquant.runtime_market_session import MarketCalendarAuthority
@@ -270,6 +271,8 @@ def assemble_reference_slow_source_snapshot(
         security_facts=publisher_security,
         suspended_codes=tuple(sorted(suspended_codes)),
         trade_calendar_open_dates=calendar.open_dates,
+        trade_calendar_coverage_start=calendar.coverage_start,
+        trade_calendar_coverage_end=calendar.coverage_end,
     )
 
 
@@ -646,6 +649,7 @@ def _load_database_reference_evidence(
     prior_trade_date: date,
     projection_as_of_date: date | None = None,
     calendar_open_dates: tuple[date, ...] | None = None,
+    calendar_authority: MarketCalendarAuthority | None = None,
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_deadline: float = float("inf"),
     monotonic_clock: Callable[[], float] = monotonic,
@@ -672,6 +676,7 @@ def _load_database_reference_evidence(
             prior_trade_date=prior_trade_date,
             projection_as_of_date=projection_as_of_date,
             calendar_open_dates=calendar_open_dates,
+            calendar_authority=calendar_authority,
             limits=limits,
             monotonic_deadline=monotonic_deadline,
             monotonic_clock=monotonic_clock,
@@ -682,6 +687,7 @@ def _load_database_reference_evidence(
             prior_trade_date=prior_trade_date,
             projection_as_of_date=projection_as_of_date,
             calendar_open_dates=calendar_open_dates,
+            calendar_authority=calendar_authority,
             limits=limits,
             monotonic_deadline=monotonic_deadline,
             monotonic_clock=monotonic_clock,
@@ -691,6 +697,7 @@ def _load_database_reference_evidence(
             prior_trade_date,
             projection_as_of_date,
             _twenty_day_open_sessions(prior_trade_date, calendar_open_dates),
+            None if calendar_authority is None else calendar_authority.content_sha256,
         ),
     ).value
 
@@ -701,6 +708,7 @@ def _query_database_reference_evidence(
     prior_trade_date: date,
     projection_as_of_date: date | None = None,
     calendar_open_dates: tuple[date, ...] | None = None,
+    calendar_authority: MarketCalendarAuthority | None = None,
     limits: ReferenceSlowSourceLimits = _DEFAULT_LIMITS,
     monotonic_deadline: float = float("inf"),
     monotonic_clock: Callable[[], float] = monotonic,
@@ -774,6 +782,16 @@ def _query_database_reference_evidence(
             table_columns: dict[str, set[str]] = {}
             for table_name, column_name in column_rows:
                 table_columns.setdefault(str(table_name), set()).add(str(column_name))
+            if calendar_authority is not None and "trade_calendar" in tables:
+                _verify_database_calendar(
+                    connection,
+                    calendar=calendar_authority,
+                    target_trade_date=projection_date,
+                    columns=table_columns.get("trade_calendar", set()),
+                    limits=limits,
+                    deadline=monotonic_deadline,
+                    clock=monotonic_clock,
+                )
 
             def bounded_projection(
                 table_name: str,
@@ -1114,6 +1132,48 @@ def _query_database_reference_evidence(
     return result, projections
 
 
+def _verify_database_calendar(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    calendar: MarketCalendarAuthority,
+    target_trade_date: date,
+    columns: set[str],
+    limits: ReferenceSlowSourceLimits,
+    deadline: float,
+    clock: Callable[[], float],
+) -> None:
+    if not {"exchange", "cal_date", "is_open", "updated_at"} <= columns:
+        raise ReferenceSlowSourceError("fixed database calendar lacks required columns")
+    expected = _daily_calendar_projection_rows(
+        target_trade_date=target_trade_date,
+        open_dates=calendar.open_dates,
+        coverage_start=calendar.coverage_start,
+        coverage_end=calendar.coverage_end,
+    )
+    if len(expected) > limits.max_response_rows or clock() > deadline:
+        raise ReferenceSlowSourceError("fixed database calendar exceeds read budget")
+    start = date.fromisoformat(str(expected[0]["trade_date"]))
+    end = date.fromisoformat(str(expected[-1]["trade_date"]))
+    rows = connection.execute(
+        "SELECT cal_date, is_open, updated_at FROM trade_calendar "
+        "WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ? "
+        "ORDER BY cal_date LIMIT ?",
+        (start, end, len(expected) + 1),
+    ).fetchall()
+    if len(rows) != len(expected) or clock() > deadline:
+        raise ReferenceSlowSourceError("fixed database calendar has incomplete coverage")
+    if any(
+        type(day) is not date
+        or type(is_open) is not bool
+        or type(updated_at) is not datetime
+        or updated_at.tzinfo is None
+        or day.isoformat() != item["trade_date"]
+        or is_open is not item["is_open"]
+        for (day, is_open, updated_at), item in zip(rows, expected, strict=True)
+    ):
+        raise ReferenceSlowSourceError("fixed database calendar disagrees with authority")
+
+
 def _load_prior_daily(
     database_path: Path,
     *,
@@ -1390,6 +1450,7 @@ def capture_reference_slow_source_snapshot(
         prior_trade_date=prior_trade_date,
         projection_as_of_date=target_trade_date,
         calendar_open_dates=calendar.open_dates,
+        calendar_authority=calendar,
         limits=limits,
         monotonic_deadline=read_deadline,
         monotonic_clock=monotonic_clock,

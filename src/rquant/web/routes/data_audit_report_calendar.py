@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from bisect import bisect_left
 from datetime import date, datetime, timedelta
 from typing import Annotated, Literal
 
@@ -11,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
-from rquant.web.calendar import CalendarDay, last_closed_trading_day
+from rquant.web.calendar import calendar_day_from_rows, calendar_rows, last_closed_trading_day
 from rquant.web.envelope import Envelope
 from rquant.web.market import market_phase, shanghai_trade_date
 from rquant.web.security import current_user
@@ -86,34 +85,18 @@ def _snapshot(borrowed: BorrowedGeneration | None, *, now: datetime) -> AuditRep
     expected = _published_count(borrowed)
     if expected is None:
         return _unavailable()
-    rows = borrowed.cursor.execute(
-        "SELECT trade_date, is_open FROM trade_calendar WHERE exchange = 'SSE' "
-        "ORDER BY trade_date LIMIT ?",
-        (_CONTRACT.max_rows + 1,),
-    ).fetchall()
-    dates = [row[0] for row in rows]
-    if (
-        len(rows) != expected
-        or any(type(day) is not date or flag is not True for day, flag in rows)
-        or any(previous >= following for previous, following in zip(dates, dates[1:], strict=False))
-    ):
-        raise ValueError("calendar rows are invalid")
+    rows = calendar_rows(borrowed.cursor)
+    if rows is None or len(rows) != expected:
+        raise ValueError("calendar rows disagree with manifest")
     today = shanghai_trade_date(now)
-    if not dates[0] <= today <= dates[-1]:
+    if not rows[0][0] <= today <= rows[-1][0]:
         return _unavailable()
-    index = bisect_left(dates, today)
-    is_open = index < len(dates) and dates[index] == today
-    day = CalendarDay(
-        trade_date=today,
-        is_trading_day=is_open,
-        previous_trading_day=dates[index - 1] if index else None,
-        next_trading_day=dates[index + int(is_open)] if index + int(is_open) < len(dates) else None,
-    )
-    latest = last_closed_trading_day(day, market_phase(now, is_open))
+    day = calendar_day_from_rows(rows, today)
+    latest = last_closed_trading_day(day, market_phase(now, day.is_trading_day))
     if latest is None:
         return _unavailable()
     earliest_bound = today - timedelta(days=MAX_AUDIT_DAYS - 1)
-    selectable = [value for value in dates if earliest_bound <= value <= latest]
+    selectable = [value for value, is_open in rows if is_open and earliest_bound <= value <= latest]
     if not selectable:
         return _unavailable()
     return AuditReportCalendarData(

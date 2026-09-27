@@ -10,11 +10,12 @@ import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
+from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.app import create_app
 from rquant.web.routes.data_audit_report_calendar import _snapshot
 from rquant.web.serving import BorrowedGeneration
 from rquant.web.settings import WebSettings
-from tests.support.web_serving_fixture import build_web_fixture
+from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, _trade_calendar, build_web_fixture
 
 
 def _clock(day: int, hour: int, minute: int = 0) -> datetime:
@@ -113,6 +114,46 @@ def test_calendar_pinned_generation_rejects_changed_generation(tmp_path: Path) -
     assert latest.json()["serving"]["generation_id"] == newer.generation_id
 
 
+def test_signed_generation_with_missing_open_monday_never_calls_it_a_holiday(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "serving"
+    calendar = ServingProjectionPayload(
+        table_name="trade_calendar",
+        available_at=FIXTURE_BUILT_AT,
+        rows=tuple(row for row in _trade_calendar() if row["trade_date"] != "2026-09-28"),
+    )
+    build_web_fixture(root, "baseline", calendar_projection=calendar)
+    app = create_app(WebSettings(serving_root=root), clock=lambda: _clock(28, 15), background=False)
+
+    with TestClient(app) as client:
+        report = client.get("/api/v1/data/audit-report/calendar")
+        market = client.get("/api/v1/meta").json()["data"]["market"]
+
+    assert report.status_code == 503
+    assert market["is_trading_day"] is None
+    assert market["phase"] == "unknown"
+
+
+def test_old_open_only_generation_cannot_claim_a_holiday(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    legacy = ServingProjectionPayload(
+        table_name="trade_calendar",
+        available_at=FIXTURE_BUILT_AT,
+        rows=tuple(row for row in _trade_calendar() if row["is_open"]),
+    )
+    build_web_fixture(root, "baseline", calendar_projection=legacy)
+    app = create_app(WebSettings(serving_root=root), clock=lambda: _clock(25, 10), background=False)
+
+    with TestClient(app) as client:
+        report = client.get("/api/v1/data/audit-report/calendar")
+        market = client.get("/api/v1/meta").json()["data"]["market"]
+
+    assert report.status_code == 503
+    assert market["is_trading_day"] is None
+    assert market["phase"] == "unknown"
+
+
 def _borrowed_calendar(
     connection: duckdb.DuckDBPyConnection,
     *,
@@ -186,8 +227,11 @@ def test_corrupt_calendar_never_offers_dates(damage: str) -> None:
 
 
 def test_calendar_limits_choices_to_one_valid_audit_range() -> None:
-    start = date(2014, 1, 6)
-    rows = [(start + timedelta(days=7 * index), True, "SSE") for index in range(680)]
+    start = date(2015, 1, 1)
+    rows = []
+    for index in range((date(2026, 12, 31) - start).days + 1):
+        day = start + timedelta(days=index)
+        rows.append((day, day.weekday() < 5, "SSE"))
     today = date(2026, 9, 28)
     with duckdb.connect(":memory:") as connection:
         borrowed = _borrowed_calendar(connection, rows=rows)
