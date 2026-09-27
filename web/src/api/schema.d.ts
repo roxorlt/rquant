@@ -667,6 +667,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/services/{unit}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 服务运行日志 */
+        get: operations["get_service_logs_api_v1_tasks_services__unit__logs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2350,6 +2367,39 @@ export interface components {
             running: number;
             /** Succeeded */
             succeeded: number;
+        };
+        /** JournalEntry */
+        JournalEntry: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "紧急" | "警报" | "严重" | "错误" | "警告" | "注意" | "信息" | "调试";
+            /**
+             * Text
+             * @enum {string}
+             */
+            text: "任务已开始" | "任务已完成" | "任务未完成" | "该条内容暂不可显示";
+        };
+        /** JournalPage */
+        JournalPage: {
+            /** Entries */
+            entries: components["schemas"]["JournalEntry"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /**
+             * Scope
+             * @default 本机本次开机以来的服务日志（含手动运行）
+             * @constant
+             */
+            scope: "本机本次开机以来的服务日志（含手动运行）";
+            /** Service Label */
+            service_label: string;
         };
         JsonValue: unknown;
         /** LocalExpr */
@@ -5043,6 +5093,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_TaskOverviewData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_service_logs_api_v1_tasks_services__unit__logs_get: {
+        parameters: {
+            query: {
+                since: string;
+                level?: "emerg" | "alert" | "crit" | "err" | "warning" | "notice" | "info" | "debug";
+                page_size?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JournalPage"];
                 };
             };
             /** @description Validation Error */

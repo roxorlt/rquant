@@ -5064,6 +5064,89 @@
         "title": "JobCounts",
         "type": "object"
       },
+      "JournalEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "level": {
+            "enum": [
+              "紧急",
+              "警报",
+              "严重",
+              "错误",
+              "警告",
+              "注意",
+              "信息",
+              "调试"
+            ],
+            "title": "Level",
+            "type": "string"
+          },
+          "text": {
+            "enum": [
+              "任务已开始",
+              "任务已完成",
+              "任务未完成",
+              "该条内容暂不可显示"
+            ],
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "level",
+          "text"
+        ],
+        "title": "JournalEntry",
+        "type": "object"
+      },
+      "JournalPage": {
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/JournalEntry"
+            },
+            "maxItems": 498,
+            "title": "Entries",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "scope": {
+            "const": "本机本次开机以来的服务日志（含手动运行）",
+            "default": "本机本次开机以来的服务日志（含手动运行）",
+            "title": "Scope",
+            "type": "string"
+          },
+          "service_label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Service Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_label",
+          "entries"
+        ],
+        "title": "JournalPage",
+        "type": "object"
+      },
       "JsonValue": {},
       "LocalExpr": {
         "additionalProperties": false,
@@ -11894,6 +11977,96 @@
           }
         },
         "summary": "任务与运行状态",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/services/{unit}/logs": {
+      "get": {
+        "operationId": "get_service_logs_api_v1_tasks_services__unit__logs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "unit",
+            "required": true,
+            "schema": {
+              "title": "Unit",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "enum": [
+                "emerg",
+                "alert",
+                "crit",
+                "err",
+                "warning",
+                "notice",
+                "info",
+                "debug"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 498,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "服务运行日志",
         "tags": [
           "tasks"
         ]
