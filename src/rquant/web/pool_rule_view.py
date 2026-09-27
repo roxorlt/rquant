@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
 import re
+from decimal import Decimal
 from functools import lru_cache
 from typing import Any
 
@@ -19,6 +19,7 @@ _REASONS = {
     "no_audit": "旧规则尚未完成迁移",
     "delete_conflict": "删除记录与规则文件不一致",
     "file_missing": "规则文件缺失",
+    "invalid_content": "规则文件内容损坏",
     "command_invalid": "规则发布记录无效",
     "content_mismatch": "规则文件与发布记录不一致",
     "name_mismatch": "规则名称与文件不一致",
@@ -35,10 +36,25 @@ _FIELDS = {
     "HIGH": "最高价",
     "LOW": "最低价",
     "CLOSE": "收盘价",
+    "PRE_CLOSE": "前收盘价",
     "PCT_CHG": "涨跌幅",
     "VOL": "成交量",
+    "AMOUNT": "成交额",
     "CIRC_MV": "流通市值",
+    "TOTAL_MV": "总市值",
     "TURNOVER_RATE": "换手率",
+    "MA5": "5 日均线",
+    "MA10": "10 日均线",
+    "MA20": "20 日均线",
+    "MA60": "60 日均线",
+    "RSI6": "6 日 RSI",
+    "RSI14": "14 日 RSI",
+    "MACD": "MACD 值",
+    "MACD_SIGNAL": "MACD 信号线",
+    "MACD_HIST": "MACD 柱",
+    "KDJ_K": "KDJ K 值",
+    "KDJ_D": "KDJ D 值",
+    "KDJ_J": "KDJ J 值",
     "BODY_UPPER": "实体上沿",
     "BODY_LOWER": "实体下沿",
     "IS_LIMIT_UP": "涨停状态",
@@ -47,7 +63,7 @@ _FIELDS = {
     "IS_YIZIBAN": "一字板状态",
     "CONSECUTIVE_LIMIT_UPS": "连板数",
 }
-_FIELD_PATTERN = re.compile(r"([A-Z][A-Z0-9_]*)(?:\[(\d+)\])?\Z")
+_FIELD_PATTERN = re.compile(r"([A-Z][A-Z0-9_]*)(?:\[(0|[1-9][0-9]*)\])?\Z")
 
 
 @lru_cache(maxsize=1)
@@ -58,11 +74,13 @@ def _blocks() -> dict[str, ScreenBlock]:
 def _number(value: object) -> str | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(float(value)):
+    number = Decimal(str(value))
+    if not number.is_finite():
         return None
-    if isinstance(value, int):
-        return f"{value:,}"
-    return f"{value:,.8f}".rstrip("0").rstrip(".")
+    rendered = f"{number:,f}"
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return "0" if rendered == "-0" else rendered
 
 
 def _day(offset: int) -> str:
@@ -78,13 +96,12 @@ def _field(value: str) -> str | None:
         return None
     base, offset = matched.groups()
     label = _FIELDS.get(base)
-    if label is None and re.fullmatch(r"MA\d+", base):
-        label = f"{base[2:]} 日均线"
-    if label is None and re.fullmatch(r"RSI\d+", base):
-        label = f"{base[3:]} 日 RSI"
     if label is None:
         return None
-    return label if offset is None else f"{_day(int(offset))}{label}"
+    if offset is None:
+        return label
+    separator = " " if label[0].isascii() else ""
+    return f"{_day(int(offset))}{separator}{label}"
 
 
 def _value(rule_name: str, parameter: ScreenParameter, raw: object) -> str | None:

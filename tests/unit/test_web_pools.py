@@ -9,8 +9,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from rquant.pool_definition_projection import build_pool_definition_rows
+from rquant.screen.loader import BASIC_COLS_MAP, IND_COLS_MAP, PRICE_COLS_MAP, STATE_COLS_MAP
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.app import create_app
+from rquant.web.pool_rule_view import _FIELDS
 from rquant.web.screen_catalog import screen_blocks
 from rquant.web.settings import WebSettings
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
@@ -528,6 +530,7 @@ def test_invalid_and_oversized_rule_rows_never_look_published(tmp_path: Path) ->
     damaged["rules_json"] = "{"
     rows = [
         _rule_row("user/旧文件", state="migration_required", reason="no_audit"),
+        _rule_row("user/损坏文件", state="unavailable", reason="invalid_content"),
         _rule_row("user/缺父池", state="unavailable", reason="parent_missing"),
         _rule_row("user/已删除", state="deleted"),
         damaged,
@@ -544,12 +547,72 @@ def test_invalid_and_oversized_rule_rows_never_look_published(tmp_path: Path) ->
 
     assert pools["user/旧文件"]["state"] == "migration_required"
     assert pools["user/旧文件"]["reason_label"] == "旧规则尚未完成迁移"
+    assert pools["user/损坏文件"]["reason_label"] == "规则文件内容损坏"
     assert pools["user/缺父池"]["reason_label"] == "父池不存在"
     assert pools["user/已删除"]["state"] == "deleted"
     assert pools["user/损坏池"]["reason_label"] == "规则内容损坏"
     assert pools["user/未知积木"]["reason_label"] == "规则内容无法识别"
     assert pools["user/过多规则"]["state"] == "limit_exceeded"
     assert all(item["depends_on"] is None and item["rules"] == [] for item in pools.values())
+
+
+def test_every_executable_wide_field_is_readable(tmp_path: Path) -> None:
+    fields = set().union(
+        PRICE_COLS_MAP.values(),
+        IND_COLS_MAP.values(),
+        STATE_COLS_MAP.values(),
+        BASIC_COLS_MAP.values(),
+    )
+    assert set(_FIELDS) == fields
+    calls = [
+        {"name": "gt", "args": {"left": f"{field}[1]", "right": 1}} for field in sorted(fields)
+    ]
+    root = tmp_path / "all-fields"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("pool_definition", [_rule_row("user/全部字段", rules=calls)]),
+        ),
+    )
+    definition = next(
+        item["definition"] for item in _get(root)["data"]["pools"] if item["key"] == "user/全部字段"
+    )
+    assert definition["state"] == "available"
+    assert len(definition["rules"]) == len(fields)
+    names = {
+        field: item["parameters"][0]["value"]
+        for field, item in zip(sorted(fields), definition["rules"], strict=True)
+    }
+    assert names["AMOUNT"] == "前 1 个交易日成交额"
+    assert names["PRE_CLOSE"] == "前 1 个交易日前收盘价"
+    assert names["TOTAL_MV"] == "前 1 个交易日总市值"
+    assert names["MACD_HIST"] == "前 1 个交易日 MACD 柱"
+    assert names["KDJ_J"] == "前 1 个交易日 KDJ J 值"
+
+
+def test_rule_number_copy_preserves_small_thresholds_and_common_format(tmp_path: Path) -> None:
+    values = [1e-9, 12345.6789012345, 1000000.0, -0.0025, 0.0]
+    calls = [{"name": "gt", "args": {"left": "CLOSE[0]", "right": value}} for value in values]
+    root = tmp_path / "numeric-thresholds"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("pool_definition", [_rule_row("user/精度池", rules=calls)]),
+        ),
+    )
+    definition = next(
+        item["definition"] for item in _get(root)["data"]["pools"] if item["key"] == "user/精度池"
+    )
+    assert definition["state"] == "available"
+    assert [item["parameters"][1]["value"] for item in definition["rules"]] == [
+        "0.000000001",
+        "12,345.6789012345",
+        "1,000,000",
+        "-0.0025",
+        "0",
+    ]
 
 
 def test_every_registered_rule_and_default_parameter_has_readable_copy(tmp_path: Path) -> None:
