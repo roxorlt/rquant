@@ -7,11 +7,13 @@ export function ParamControl({
   parameter,
   value,
   extraOption,
+  numberUnit,
   onChange,
 }: {
   parameter: ScreenParameter;
   value: ParameterValue;
   extraOption?: ScreenOption | null;
+  numberUnit?: string | null;
   onChange: (value: ParameterValue) => void;
 }) {
   const options = extraOption
@@ -20,6 +22,7 @@ export function ParamControl({
   const label = (
     <span className="lbl">
       {parameter.label}
+      {numberUnit ? `（${numberUnit}）` : ""}
       {parameter.hint ? (
         <Tip content={parameter.hint}>
           <span className="screen-help" role="img" aria-label={`${parameter.label}说明`}>
@@ -74,17 +77,24 @@ export function ParamControl({
           <option value="__number__">固定数字</option>
         </select>
         {numeric ? (
-          <input
-            className="inp num"
-            type="number"
-            inputMode="decimal"
-            step="any"
-            aria-label={`${parameter.label}数值`}
-            value={value}
-            onChange={(event) =>
-              onChange(event.target.value === "" ? "" : Number(event.target.value))
-            }
-          />
+          <div className="screen-number">
+            <input
+              className="inp num"
+              type="number"
+              inputMode="decimal"
+              step="any"
+              aria-label={`${parameter.label}数值${numberUnit ? `（${numberUnit}）` : ""}`}
+              value={value}
+              onChange={(event) =>
+                onChange(event.target.value === "" ? "" : Number(event.target.value))
+              }
+            />
+            {numberUnit ? (
+              <span className="screen-unit" aria-hidden="true">
+                {numberUnit}
+              </span>
+            ) : null}
+          </div>
         ) : null}
       </div>
     );
@@ -116,7 +126,7 @@ export function ParamControl({
         className="inp num"
         type="number"
         inputMode={parameter.input === "integer" ? "numeric" : "decimal"}
-        aria-label={parameter.label}
+        aria-label={`${parameter.label}${numberUnit ? `（${numberUnit}）` : ""}`}
         step={parameter.input === "integer" ? 1 : "any"}
         min={parameter.minimum == null ? undefined : parameter.minimum * scale}
         max={parameter.maximum == null ? undefined : parameter.maximum * scale}

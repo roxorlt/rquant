@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import {
   fetchScreenRun,
+  isFundamentalScreenField,
   type ScreenBlock,
   type ScreenRunData,
   type ScreenRunRequest,
@@ -27,6 +28,30 @@ import "./screener.css";
 
 type Draft = { id: number; key: string; args: Record<string, ParameterValue> };
 const PAGE_SIZE = 20;
+function fieldUnit(block: ScreenBlock, value: ParameterValue): string | null {
+  if (!isFundamentalScreenField(value)) return null;
+  const option = block.parameters
+    .flatMap((parameter) => parameter.options ?? [])
+    .find((item) => item.value === value);
+  return /（(%|倍)）$/.exec(option?.label ?? "")?.[1] ?? null;
+}
+
+function conditionNumberUnit(block: ScreenBlock, condition: Draft, key: string): string | null {
+  if (condition.key === "between" && (key === "low" || key === "high")) {
+    return fieldUnit(block, condition.args.field ?? null);
+  }
+  if (["gt", "lt", "gte", "lte"].includes(condition.key)) {
+    if (key === "left") return fieldUnit(block, condition.args.right ?? null);
+    if (key === "right") return fieldUnit(block, condition.args.left ?? null);
+  }
+  return null;
+}
+
+function usesFundamental(conditions: ScreenRunRequest["conditions"]): boolean {
+  return conditions.some((condition) =>
+    Object.values(condition.args ?? {}).some((value) => isFundamentalScreenField(value)),
+  );
+}
 
 function makeDraft(block: ScreenBlock, id: number): Draft {
   return {
@@ -46,6 +71,8 @@ export default function ScreenerPage() {
   const [initialized, setInitialized] = useState(false);
   const nextId = useRef(1);
   const nextRankId = useRef(1);
+  const lastSourceIdentity = useRef<string | null | undefined>(undefined);
+  const sourceEpoch = useRef(0);
   const [rankDraft, setRankDraft] = useState<RankingDraft[]>([]);
   const [topN, setTopN] = useState("20");
   const [result, setResult] = useState<ScreenRunData | null>(null);
@@ -68,6 +95,39 @@ export default function ScreenerPage() {
         (parameter) => parameter.key === "period" && parameter.input === "integer",
       ),
   );
+
+  useEffect(() => {
+    const activeCatalog = catalog.data;
+    if (!activeCatalog) return;
+    const identity = activeCatalog.source?.identity ?? null;
+    if (lastSourceIdentity.current === undefined) {
+      lastSourceIdentity.current = identity;
+      return;
+    }
+    if (lastSourceIdentity.current === identity) return;
+    lastSourceIdentity.current = identity;
+    sourceEpoch.current += 1;
+    setResult(null);
+    setApplied(null);
+    setAppliedKey(null);
+    setCursors([null]);
+    setPageIndex(0);
+    setForceStale(true);
+    setError(null);
+    setDraft((current) =>
+      current.filter((condition) => {
+        const block = activeCatalog.blocks.find((item) => item.key === condition.key);
+        if (!block) return false;
+        return !Object.entries(condition.args).some(
+          ([key, value]) =>
+            isFundamentalScreenField(value) &&
+            !block.parameters
+              .find((parameter) => parameter.key === key)
+              ?.options?.some((option) => option.value === value),
+        );
+      }),
+    );
+  }, [catalog.data]);
 
   useEffect(() => {
     if (initialized || blocks.length === 0) return;
@@ -141,19 +201,22 @@ export default function ScreenerPage() {
     topN: rankDraft.length > 0 ? topN : null,
   });
   const stale =
-    result !== null &&
-    (forceStale ||
-      snapshotKey !== appliedKey ||
-      (result.source?.identity ?? null) !== (catalog.data?.source?.identity ?? null));
+    forceStale ||
+    (result !== null &&
+      (snapshotKey !== appliedKey ||
+        (result.source?.identity ?? null) !== (catalog.data?.source?.identity ?? null)));
   const staleText =
-    forceStale || (result !== null && result.source?.identity !== catalog.data?.source?.identity)
-      ? "选股数据已更新，请重新筛选。旧结果仅供参考。"
-      : "条件已改，请重新运行。旧结果仅供参考。";
+    result === null
+      ? "选股数据已更新，请重新筛选。"
+      : forceStale || result.source?.identity !== catalog.data?.source?.identity
+        ? "选股数据已更新，请重新筛选。旧结果仅供参考。"
+        : "条件已改，请重新运行。旧结果仅供参考。";
   const canRun =
     catalog.data?.available === true &&
     dates.length > 0 &&
     tradeDate !== null &&
     draft.length > 0 &&
+    (catalog.data?.source_kind !== "replica" || catalog.data.source !== null) &&
     rankingError === null;
 
   function updateArg(id: number, key: string, value: ParameterValue) {
@@ -196,8 +259,15 @@ export default function ScreenerPage() {
     if (running) return;
     setRunning(true);
     setError(null);
+    const startedAtEpoch = sourceEpoch.current;
     try {
       const envelope = await fetchScreenRun(body);
+      if (
+        startedAtEpoch !== sourceEpoch.current ||
+        (body.source_identity && envelope.data.source?.identity !== body.source_identity)
+      ) {
+        throw new ApiError(409, "选股数据已更新，请重新筛选。");
+      }
       setResult(envelope.data);
       setForceStale(false);
       if (nextIndex === 0) {
@@ -215,7 +285,13 @@ export default function ScreenerPage() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "筛选暂时无法完成，请稍后重试。");
       if (caught instanceof ApiError && (caught.status === 409 || caught.status === 503)) {
-        setForceStale(true);
+        setResult(null);
+        setApplied(null);
+        setAppliedKey(null);
+        setCursors([null]);
+        setPageIndex(0);
+        setForceStale(caught.status === 409);
+        if (caught.status === 409) catalog.refetch();
       }
     } finally {
       setRunning(false);
@@ -229,6 +305,8 @@ export default function ScreenerPage() {
       conditions: draft.map(({ key, args }) => ({ key, args })),
       page_size: PAGE_SIZE,
       cursor: null,
+      source_identity:
+        catalog.data?.source_kind === "replica" ? (catalog.data.source?.identity ?? null) : null,
       ranking:
         rankDraft.length > 0
           ? {
@@ -335,6 +413,7 @@ export default function ScreenerPage() {
                               value={condition.args[parameter.key] ?? null}
                               onChange={(value) => updateArg(condition.id, parameter.key, value)}
                               allowRsi={customRsiReady}
+                              numberUnit={conditionNumberUnit(block, condition, parameter.key)}
                             />
                           ) : (
                             <ParamControl
@@ -342,6 +421,7 @@ export default function ScreenerPage() {
                               parameter={parameter}
                               value={condition.args[parameter.key] ?? null}
                               onChange={(value) => updateArg(condition.id, parameter.key, value)}
+                              numberUnit={conditionNumberUnit(block, condition, parameter.key)}
                             />
                           ),
                         )}
@@ -413,6 +493,7 @@ export default function ScreenerPage() {
             onStock={setSelectedStock}
             onPrevious={() => runPage(pageIndex - 1, cursors[pageIndex - 1] ?? null)}
             onNext={() => runPage(pageIndex + 1, result?.next_cursor ?? null)}
+            usesFundamental={applied !== null && usesFundamental(applied.conditions)}
           />
         </>
       )}

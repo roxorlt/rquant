@@ -15,6 +15,19 @@ export type TdxPreviewRequest = Schemas["TdxPreviewRequest"];
 export type TdxPreviewData = Schemas["TdxPreviewData"];
 export type TdxPreviewSourceData = Schemas["TdxPreviewSourceData"];
 
+const FUNDAMENTAL_SCREEN_FIELDS = new Set([
+  "PE_TTM[0]",
+  "PB[0]",
+  "DV_TTM[0]",
+  "ROE[0]",
+  "OR_YOY[0]",
+  "NETPROFIT_YOY[0]",
+]);
+
+export function isFundamentalScreenField(value: unknown): boolean {
+  return typeof value === "string" && FUNDAMENTAL_SCREEN_FIELDS.has(value);
+}
+
 /** Replica catalogs have their own source lifetime; Serving catalogs follow the page generation. */
 export function catalogUsableForGeneration(
   catalog: ScreenCatalogData | undefined,

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import ValidationError
 
 from rquant.llm.registry import REGISTRY_BY_NAME
+from rquant.screen.loader import FUNDAMENTAL_COLS_MAP
 from rquant.web.envelope import Envelope
 from rquant.web.models.pool_editor import (
     AttachPoolCommand,
@@ -32,6 +33,7 @@ from rquant.web.serving import serving_meta
 router = APIRouter(prefix="/pools/editor")
 MAX_REQUEST_BYTES = 32_768
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_UNPUBLISHED_POOL_COLUMNS = frozenset(f"{name}[0]" for name in FUNDAMENTAL_COLS_MAP.values())
 
 
 @router.get("", response_model=Envelope[PoolEditorData], summary="可编辑池子与画布")
@@ -71,6 +73,11 @@ def _authorize(snapshot: PoolEditorSnapshot, body: PoolEditorCommand) -> None:
     if body.base_name in snapshot.builtin_names and key not in snapshot.present_user_names:
         raise HTTPException(status_code=409, detail="内置池需先复制为自建池。")
     for rule in body.rule_calls:
+        if any(
+            type(value) is str and value in _UNPUBLISHED_POOL_COLUMNS
+            for value in rule.args.values()
+        ):
+            raise HTTPException(status_code=422, detail="这个数据项在池子中暂不可用。")
         spec = REGISTRY_BY_NAME.get(rule.name)
         if spec is None or not set(rule.args) <= set(spec.args_model.model_fields):
             raise HTTPException(status_code=422, detail="选股条件有误，请检查后重试。")
@@ -78,6 +85,8 @@ def _authorize(snapshot: PoolEditorSnapshot, body: PoolEditorCommand) -> None:
             spec.args_model.model_validate(rule.args)
         except (TypeError, ValueError, ValidationError) as error:
             raise HTTPException(status_code=422, detail="选股条件有误，请检查后重试。") from error
+    if any(column in _UNPUBLISHED_POOL_COLUMNS for column in body.include_columns):
+        raise HTTPException(status_code=422, detail="这个数据项在池子中暂不可用。")
     if any(not 1 <= len(column) <= 64 for column in body.include_columns):
         raise HTTPException(status_code=422, detail="选股字段有误，请检查后重试。")
 

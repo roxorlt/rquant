@@ -8011,6 +8011,18 @@
               }
             ]
           },
+          "source_identity": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Identity"
+          },
           "trade_date": {
             "format": "date",
             "title": "Trade Date",

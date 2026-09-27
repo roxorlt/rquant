@@ -100,6 +100,7 @@ class ScreenRunRequest(BaseModel):
     conditions: list[ScreenCondition] = Field(min_length=1, max_length=26)
     page_size: int = Field(default=20, ge=1, le=100)
     cursor: str | None = Field(default=None, max_length=1024)
+    source_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     ranking: ScreenRankingPlan | None = None
 
 

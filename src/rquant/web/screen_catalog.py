@@ -69,6 +69,14 @@ _FIELDS = (
     ("MA60[0]", "60 日均线"),
     ("RSI14[0]", "14 日 RSI"),
 )
+_FUNDAMENTAL_FIELDS = {
+    "pe_ttm": ("PE_TTM[0]", "市盈率（倍）"),
+    "pb": ("PB[0]", "市净率（倍）"),
+    "dv_ttm": ("DV_TTM[0]", "股息率（%）"),
+    "roe": ("ROE[0]", "净资产收益率（%）"),
+    "or_yoy": ("OR_YOY[0]", "营收同比（%）"),
+    "netprofit_yoy": ("NETPROFIT_YOY[0]", "归母净利同比（%）"),
+}
 _BOARD_OPTIONS = (("main", "沪深主板"), ("gem", "创业板"), ("star", "科创板"), ("bj", "北交所"))
 _MA_OPTIONS = (
     ("MA5", "5 日均线"),
@@ -122,7 +130,14 @@ def _options(rows: tuple[tuple[str, str], ...]) -> list[ScreenOption]:
     return [ScreenOption(value=key, label=label) for key, label in rows]
 
 
-def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool, dynamic_rsi: bool) -> ScreenParameter:
+def _parameter(
+    spec: RuleSpec,
+    key: str,
+    *,
+    dynamic_ma: bool,
+    dynamic_rsi: bool,
+    fundamental_fields: Collection[str],
+) -> ScreenParameter:
     field = spec.args_model.model_fields[key]
     prop = spec.args_model.model_json_schema()["properties"][key]
     options: list[ScreenOption] = []
@@ -135,6 +150,10 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool, dynamic_rsi: bool)
     custom_rsi = dynamic_rsi and (
         (spec.name in _COMPARE_RULES and key in {"left", "right"})
         or (spec.name == "between" and key == "field")
+    )
+    fields = (
+        *_FIELDS,
+        *(_FUNDAMENTAL_FIELDS[name] for name in _FUNDAMENTAL_FIELDS if name in fundamental_fields),
     )
     if key == "boards":
         label, kind, options = "板块", "multi_choice", _options(_BOARD_OPTIONS)
@@ -149,13 +168,13 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool, dynamic_rsi: bool)
                 _options(_MA_OPTIONS),
             )
     elif key == "field":
-        label, kind, options = "比较项", "field", _options(_FIELDS)
+        label, kind, options = "比较项", "field", _options(fields)
         if custom_rsi:
             hint = "可自定义均线或 RSI；相对日期 0–30 日"
         elif custom_ma:
             hint = "可自定义均线；相对日期 0–30 日"
     elif key in {"left", "right"}:
-        label, kind, options = ("左侧" if key == "left" else "右侧"), "operand", _options(_FIELDS)
+        label, kind, options = ("左侧" if key == "left" else "右侧"), "operand", _options(fields)
         hint = (
             "可选数据项、固定数字或自定义均线与 RSI；相对日期 0–30 日"
             if custom_rsi
@@ -242,7 +261,12 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool, dynamic_rsi: bool)
     )
 
 
-def screen_blocks(*, dynamic_ma: bool = False, dynamic_rsi: bool = False) -> list[ScreenBlock]:
+def screen_blocks(
+    *,
+    dynamic_ma: bool = False,
+    dynamic_rsi: bool = False,
+    fundamental_fields: Collection[str] = (),
+) -> list[ScreenBlock]:
     if set(_RULE_COPY) != {spec.name for spec in REGISTRY}:
         raise ValueError("screen rule catalog labels are out of sync with registry")
     return [
@@ -253,7 +277,13 @@ def screen_blocks(*, dynamic_ma: bool = False, dynamic_rsi: bool = False) -> lis
             category=spec.category,
             category_label=_CATEGORIES[spec.category],
             parameters=[
-                _parameter(spec, name, dynamic_ma=dynamic_ma, dynamic_rsi=dynamic_rsi)
+                _parameter(
+                    spec,
+                    name,
+                    dynamic_ma=dynamic_ma,
+                    dynamic_rsi=dynamic_rsi,
+                    fundamental_fields=fundamental_fields,
+                )
                 for name in spec.args_model.model_fields
             ],
         )
@@ -294,6 +324,7 @@ def validate_screen_choices(
     *,
     dynamic_ma: bool = False,
     dynamic_rsi: bool = False,
+    fundamental_fields: Collection[str] = (),
 ) -> list[dict[str, Any]]:
     """Accept only offered choices and normalize replica MA periods for the registry."""
 
@@ -302,6 +333,7 @@ def validate_screen_choices(
         for block in screen_blocks(
             dynamic_ma=dynamic_ma,
             dynamic_rsi=dynamic_rsi,
+            fundamental_fields=fundamental_fields,
         )
     }
     normalized: list[dict[str, Any]] = []
