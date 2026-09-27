@@ -471,8 +471,9 @@ def test_missing_replica_revokes_previous_receipt_authority(tmp_path: Path) -> N
     producer.publish(NOW)
     path.unlink()
 
-    producer.publish(NOW)
+    later = NOW + timedelta(seconds=1)
+    producer.publish(later)
 
-    latest = store.serving_snapshot(observed_at=NOW, history_limit=1)
+    latest = store.serving_snapshot(observed_at=later, history_limit=1)
     assert "screen_run_receipt" not in {item.table_name for item in latest.payload.projections}
     assert "pool_membership" not in {item.table_name for item in latest.payload.projections}
