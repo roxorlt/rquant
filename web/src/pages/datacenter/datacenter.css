@@ -123,9 +123,20 @@
   white-space: normal;
   min-width: 105px;
 }
-.dc-field-key {
-  color: var(--muted);
-  font-size: 11px;
+.dc-sample-table {
+  min-width: 0;
+  max-width: 100%;
+}
+.dc-sample-table .tbl {
+  min-width: max-content;
+}
+.dc-sample-truncated {
+  display: inline-block;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
 }
 .dc-field-type {
   font-size: 11px;

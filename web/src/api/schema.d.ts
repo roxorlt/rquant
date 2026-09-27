@@ -701,8 +701,8 @@ export interface components {
             /** Total */
             total: number;
         };
-        /** CatalogDataset */
-        CatalogDataset: {
+        /** CatalogDatasetDetail */
+        CatalogDatasetDetail: {
             /** Category */
             category: string;
             /** Dataset Id */
@@ -715,11 +715,14 @@ export interface components {
             primary_key: string[];
             /** Purpose */
             purpose: string;
+            sample: components["schemas"]["CatalogSample"];
             /**
              * Sample Available
              * @default false
              */
             sample_available: boolean;
+            /** Sample Fields */
+            sample_fields: components["schemas"]["CatalogField"][];
             /** Schema Available */
             schema_available: boolean;
             /** Sources */
@@ -752,6 +755,14 @@ export interface components {
             datasets: components["schemas"]["CatalogSummary"][];
             /** Version */
             version: number;
+        };
+        /** CatalogSample */
+        CatalogSample: {
+            /** Rows */
+            rows: {
+                [key: string]: string | number | boolean | null;
+            }[];
+            state: components["schemas"]["SampleState"];
         };
         /** CatalogSummary */
         CatalogSummary: {
@@ -965,9 +976,9 @@ export interface components {
             data: components["schemas"]["BoardsData"];
             serving: components["schemas"]["ServingMeta"];
         };
-        /** Envelope[CatalogDataset] */
-        Envelope_CatalogDataset_: {
-            data: components["schemas"]["CatalogDataset"];
+        /** Envelope[CatalogDatasetDetail] */
+        Envelope_CatalogDatasetDetail_: {
+            data: components["schemas"]["CatalogDatasetDetail"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[CatalogList] */
@@ -1969,6 +1980,11 @@ export interface components {
             /** Total */
             total: number | null;
         };
+        /**
+         * SampleState
+         * @enum {string}
+         */
+        SampleState: "available" | "empty" | "missing" | "unsupported" | "unpublished" | "stale" | "error";
         /** SavePoolCommand */
         SavePoolCommand: {
             /** Base Name */
@@ -2645,7 +2661,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Envelope_CatalogDataset_"];
+                    "application/json": components["schemas"]["Envelope_CatalogDatasetDetail_"];
                 };
             };
             /** @description Validation Error */
