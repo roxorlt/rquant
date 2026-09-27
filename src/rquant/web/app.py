@@ -29,6 +29,7 @@ from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransp
 from rquant.web.routes import (
     catalog,
     data_audit,
+    data_audit_report,
     health,
     meta,
     monitor,
@@ -195,6 +196,7 @@ def create_app(
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(data_audit_report.router, prefix="/api/v1", tags=["data-audit"])
     return app
 
 
