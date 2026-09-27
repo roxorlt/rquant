@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Collection
 from datetime import date, datetime, time
@@ -11,6 +12,14 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from rquant.fundamental_daily import (
+    FinancialSource,
+    FundamentalDailyQuery,
+    FundamentalDailyVersion,
+    ValuationSource,
+    _load_fields,
+    _version_identity,
+)
 from rquant.screen.dynamic_ma import (
     derive_requested_ma,
     dynamic_ma_day_count,
@@ -72,6 +81,15 @@ BASIC_COLS_MAP = {
     "turnover_rate": "TURNOVER_RATE",
 }
 
+FUNDAMENTAL_COLS_MAP = {
+    "pe_ttm": "PE_TTM",
+    "pb": "PB",
+    "dv_ttm": "DV_TTM",
+    "roe": "ROE",
+    "or_yoy": "OR_YOY",
+    "netprofit_yoy": "NETPROFIT_YOY",
+}
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_SCREEN_TIME = time(17, 0)
 CALENDAR_EXCHANGE = "SSE"
@@ -96,6 +114,7 @@ _WIDE_SOURCES = {
         ("daily_indicator", IND_COLS_MAP),
         ("daily_state", STATE_COLS_MAP),
         ("daily_basic", BASIC_COLS_MAP),
+        ("fundamental_daily_version", FUNDAMENTAL_COLS_MAP),
     )
     for source, name in mapping.items()
 }
@@ -437,6 +456,8 @@ def _selected_sources(
         offset = int(match.group(2))
         if offset > lookback:
             raise ValueError(f"screen dependency offset exceeds lookback: {column}")
+        if match.group(1) in FUNDAMENTAL_COLS_MAP.values() and offset != 0:
+            raise ValueError(f"fundamental screen dependency offset must be zero: {column}")
         wide_columns.add(column)
     for column in sorted(wide_columns):
         if column in dynamic_ma or column in dynamic_rsi:
@@ -446,6 +467,107 @@ def _selected_sources(
         table, source = _WIDE_SOURCES[match.group(1)]
         selected.setdefault(table, {}).setdefault(source, set()).add(int(match.group(2)))
     return selected, frozenset(wide_columns)
+
+
+def _load_fundamental_wide(
+    store: DuckDBStore,
+    *,
+    trade_date: str,
+    ts_codes: list[str],
+    sources: Collection[str],
+    decision_at: datetime | None,
+) -> pd.DataFrame:
+    """Project exact head receipts in one bounded query, without re-deriving PIT."""
+    expected_decision = _resolve_decision_at(trade_date, None)
+    if _resolve_decision_at(trade_date, decision_at) != expected_decision:
+        raise ScreeningFactError("fundamental screen requires the fixed T17 decision")
+    code_slots = ",".join("?" for _ in ts_codes)
+    rows = store._conn.execute(
+        f"""
+        SELECT h.ts_code, h.trade_date, h.version_id, h.revision,
+               v.version_id, v.ts_code, v.trade_date, v.revision, v.decision_at,
+               v.target_report_period, v.target_period_reason,
+               CASE WHEN length(v.financial_source_json) <= 4096
+                    THEN v.financial_source_json END,
+               CASE WHEN length(v.valuation_source_json) <= 4096
+                    THEN v.valuation_source_json END,
+               CASE WHEN length(v.fields_json) <= 16384 THEN v.fields_json END,
+               v.pe_ttm, v.pb, v.dv_ttm, v.roe, v.or_yoy, v.netprofit_yoy
+        FROM fundamental_daily_head AS h
+        LEFT JOIN fundamental_daily_version AS v
+          ON v.version_id = h.version_id
+         AND v.ts_code = h.ts_code AND v.trade_date = h.trade_date
+        WHERE h.trade_date = ? AND h.ts_code IN ({code_slots})
+        ORDER BY h.ts_code
+        """,
+        [trade_date, *ts_codes],
+    ).fetchall()
+    expected_date = _parse_trade_date(trade_date)
+    seen: set[str] = set()
+    projected: list[dict[str, object]] = []
+    for row in rows:
+        if row[0] in seen or row[4] is None or any(item is None for item in row[11:14]):
+            raise ScreeningFactError("fundamental daily head is ambiguous or incomplete")
+        seen.add(row[0])
+        try:
+            version = FundamentalDailyVersion.model_validate(
+                {
+                    "version_id": row[4],
+                    "ts_code": row[5],
+                    "trade_date": row[6],
+                    "revision": row[7],
+                    "decision_at": row[8],
+                    "target_report_period": row[9],
+                    "target_period_reason": row[10],
+                    "financial_source": FinancialSource.model_validate_json(row[11]),
+                    "valuation_source": ValuationSource.model_validate_json(row[12]),
+                    "fields": _load_fields(row[13]),
+                }
+            )
+            identity = _version_identity(
+                FundamentalDailyQuery(ts_code=version.ts_code, trade_date=version.trade_date),
+                version.decision_at,
+                version.target_report_period,
+                version.target_period_reason,
+                version.financial_source,
+                version.valuation_source,
+                version.fields,
+            )
+            expected_values = tuple(
+                float(version.fields[name].value)
+                if version.fields[name].value is not None
+                else None
+                for name in FUNDAMENTAL_COLS_MAP
+            )
+        except (AttributeError, OverflowError, TypeError, ValueError) as error:
+            raise ScreeningFactError("fundamental daily version is invalid") from error
+        if any(value is not None and not math.isfinite(value) for value in expected_values):
+            raise ScreeningFactError("fundamental daily value is not representable")
+        if (
+            row[1] != expected_date
+            or row[2] != version.version_id
+            or row[3] != version.revision
+            or version.decision_at != expected_decision
+            or identity != version.version_id
+            or row[14:] != expected_values
+        ):
+            raise ScreeningFactError("fundamental daily version receipt mismatch")
+        projected.append(
+            {
+                "ts_code": version.ts_code,
+                **{
+                    f"{FUNDAMENTAL_COLS_MAP[name]}[0]": (
+                        float(version.fields[name].value)
+                        if version.fields[name].value is not None
+                        else float("nan")
+                    )
+                    for name in sources
+                },
+            }
+        )
+    return pd.DataFrame(
+        projected, columns=["ts_code", *(f"{FUNDAMENTAL_COLS_MAP[name]}[0]" for name in sources)]
+    )
 
 
 def _load_selected_wide(
@@ -530,6 +652,8 @@ def _load_universe_selective(
     required_columns: Collection[str],
 ) -> pd.DataFrame:
     selected, wide_columns = _selected_sources(required_columns, lookback)
+    if "fundamental_daily_version" in selected:
+        raise ScreeningFactError("fundamental screen requires a verified replica")
     dynamic_ma = requested_dynamic_ma(required_columns)
     resolved_decision_at = _resolve_decision_at(trade_date, decision_at)
     needed_days = dynamic_ma_day_count(dynamic_ma)

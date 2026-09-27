@@ -36,8 +36,10 @@ from rquant.screen.dynamic_rsi import (
     requested_dynamic_rsi,
 )
 from rquant.screen.loader import (
+    FUNDAMENTAL_COLS_MAP,
     ScreeningCalendarError,
     ScreeningFactError,
+    _load_fundamental_wide,
     _selected_sources,
     load_universe,
 )
@@ -270,6 +272,7 @@ class VerifiedReplicaScreenSource:
         rules: Sequence[Rule],
         *,
         decision_at: datetime | None = None,
+        expected_identity: str | None = None,
         include_columns: Sequence[str] | None = None,
         rsi_projection: VerifiedDynamicRsiProjection | None = None,
     ) -> ScreenUniverseSnapshot:
@@ -286,7 +289,13 @@ class VerifiedReplicaScreenSource:
             if parts[0] not in (6, 14)
         }
         dynamic_days = dynamic_ma_day_count(dynamic_ma)
-        _, wide_columns = _selected_sources(requested_columns, MAX_LOOKBACK)
+        selected_sources, wide_columns = _selected_sources(requested_columns, MAX_LOOKBACK)
+        fundamental_fields = selected_sources.get("fundamental_daily_version", {})
+        if fundamental_fields and expected_identity is None:
+            raise ScreenReplicaChangedError("fundamental screening requires a bound replica")
+        ordinary_columns = requested_columns - {
+            f"{FUNDAMENTAL_COLS_MAP[name]}[0]" for name in fundamental_fields
+        }
         required_offset = max(
             (int(column.split("[")[1][:-1]) for column in wide_columns),
             default=0,
@@ -303,6 +312,8 @@ class VerifiedReplicaScreenSource:
 
         connection, descriptor, generation = self._open()
         try:
+            if expected_identity is not None and generation.identity != expected_identity:
+                raise ScreenReplicaChangedError("screening replica generation changed")
             connection.execute("SET threads=1")
             row_count = int(
                 connection.execute(
@@ -329,8 +340,17 @@ class VerifiedReplicaScreenSource:
                 store=cast("DuckDBStore", _StoreConnection(connection)),
                 aggregate_requests=aggregates,
                 decision_at=decision_at,
-                required_columns=requested_columns,
+                required_columns=ordinary_columns,
             )
+            if fundamental_fields:
+                fundamental = _load_fundamental_wide(
+                    cast("DuckDBStore", _StoreConnection(connection)),
+                    trade_date=trade_date.isoformat(),
+                    ts_codes=frame["ts_code"].tolist(),
+                    sources=fundamental_fields,
+                    decision_at=decision_at,
+                )
+                frame = frame.merge(fundamental, on="ts_code", how="left", validate="one_to_one")
             if dynamic_rsi:
                 if rsi_projection is None:
                     raise ScreenReplicaDataError("screening RSI projection is unavailable")
