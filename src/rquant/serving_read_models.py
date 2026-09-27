@@ -28,6 +28,7 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.data_audit_contracts import MAX_INDEXED_ISSUES
 from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
 from rquant.lab_eta import LabEtaEstimate
@@ -777,7 +778,7 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
                 ("observed_rows", "int"),
             ),
             ("report_hash", "issue_index"),
-            max_rows=256,
+            max_rows=MAX_INDEXED_ISSUES,
             max_bytes=256 * 1024,
             event_date_columns=("trade_date",),
         ),
