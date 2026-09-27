@@ -75,6 +75,8 @@ def notifier_projection_replica(route: RouteAWorld) -> Path:
 
     import duckdb
 
+    from rquant.storage.schema import MONITOR_EVENT_DDL
+
     notifier = manifests_of(route, RuntimeServiceKind.NOTIFIER)[0]
     database = Path(str(notifier.settings["page_projection_database_path"]))
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +100,7 @@ def notifier_projection_replica(route: RouteAWorld) -> Path:
                100, 1000, 'tushare', '2026-08-03 09:31:00');
             """
         )
+        connection.execute(MONITOR_EVENT_DDL)
         connection.execute("CHECKPOINT")
     database.chmod(0o600)
     return database
