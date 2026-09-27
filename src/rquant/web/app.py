@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
+from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.routes import (
     catalog,
     data_audit,
@@ -34,6 +35,7 @@ from rquant.web.routes import (
     overview,
     panorama,
     paper,
+    pool_editor,
     pools,
     screen,
     stocks,
@@ -61,6 +63,7 @@ class WebContext:
     cursor_key: bytes
     screen_gate: threading.BoundedSemaphore
     screen_service: ScreenApplicationService
+    pool_commands: PoolCommandGateway
 
 
 def create_app(
@@ -69,6 +72,7 @@ def create_app(
     tracker: GenerationTracker | None = None,
     clock: Callable[[], datetime] = _utc_now,
     background: bool = True,
+    pool_command_transport: PoolCommandTransport | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -121,11 +125,35 @@ def create_app(
             replica=screen_replica,
             history=screen_history,
         ),
+        pool_commands=PoolCommandGateway(
+            endpoint=settings.page_control_url,
+            transport=pool_command_transport,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Response:
+        if request.method == "POST" and request.url.path == "/api/v1/pools/editor/commands":
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return JSONResponse(
+                    status_code=415,
+                    content={"detail": "写接口只接受 application/json"},
+                    headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+                )
+            parts: list[bytes] = []
+            total = 0
+            async for part in request.stream():
+                total += len(part)
+                if total > pool_editor.MAX_REQUEST_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "条件内容过长，请删减后重试。"},
+                        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+                    )
+                parts.append(part)
+            request._body = b"".join(parts)
         response: Response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Cache-Control", "no-store")
@@ -150,11 +178,14 @@ def create_app(
                 status_code=422,
                 content={"detail": "公式输入有误，请只填写文本公式。"},
             )
+        if request.url.path == "/api/v1/pools/editor/commands":
+            return JSONResponse(status_code=422, content={"detail": "编辑内容有误，请检查后重试。"})
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(pools.router, prefix="/api/v1", tags=["pools"])
+    app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"])
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])

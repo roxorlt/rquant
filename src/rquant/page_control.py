@@ -109,6 +109,26 @@ class SetCanvasPoolRefs(PageControlCommand):
         return _validated_name(value, label="canvas name")
 
 
+class AddPoolToCanvas(PageControlCommand):
+    kind: Literal["add_pool_to_canvas"] = "add_pool_to_canvas"
+    canvas_name: str
+    pool_name: str
+    expected_pool_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("canvas_name")
+    @classmethod
+    def validate_canvas_name(cls, value: str) -> str:
+        return _validated_name(value, label="canvas name")
+
+    @field_validator("pool_name")
+    @classmethod
+    def validate_pool_name(cls, value: str) -> str:
+        if not value.startswith("user/"):
+            raise ValueError("only user pools may be added by this command")
+        _validated_name(value.removeprefix("user/"), label="pool name")
+        return value
+
+
 class SaveUserPool(PageControlCommand):
     kind: Literal["save_user_pool"] = "save_user_pool"
     base_name: str
@@ -246,6 +266,7 @@ PageControlCommandValue = Annotated[
     SaveCanvas
     | DeleteCanvas
     | SetCanvasPoolRefs
+    | AddPoolToCanvas
     | SaveUserPool
     | SaveUserPoolV2
     | DeleteUserPool
@@ -1084,7 +1105,7 @@ class PageControlOutbox:
                 SELECT command_kind, command_hash, payload_json
                 FROM page_control_command
                 WHERE status = ?
-                  AND command_kind IN (?, ?, ?, ?, ?)
+                  AND command_kind IN (?, ?, ?, ?, ?, ?)
                 ORDER BY rowid DESC
                 """,
                 (
@@ -1092,6 +1113,7 @@ class PageControlOutbox:
                     "save_canvas",
                     "delete_canvas",
                     "set_canvas_pool_refs",
+                    "add_pool_to_canvas",
                     "save_user_pool",
                     "fork_builtin_pool",
                 ),
@@ -1511,6 +1533,8 @@ class PageControlConsumer:
                 source="canvas_edit",
             )
             return self._save_canvas(save, identity_command=command)
+        if isinstance(command, AddPoolToCanvas):
+            return self._add_verified_pool_to_canvas(command)
         if isinstance(command, SaveUserPool):
             result = self._save_user_pool(command)
             if command.canvas_name is not None and command.canvas_name != "__default__":
@@ -1572,6 +1596,15 @@ class PageControlConsumer:
             return self._canvas_publication_fence_targets(command.name)
         if isinstance(command, SetCanvasPoolRefs):
             return self._canvas_publication_fence_targets(command.name)
+        if isinstance(command, AddPoolToCanvas):
+            return (
+                _LocalEffectFenceTarget(
+                    role="user_pool_directory",
+                    path=self._user_pool_path(command.pool_name.removeprefix("user/")).parent,
+                    create=False,
+                ),
+                *self._canvas_publication_fence_targets(command.canvas_name),
+            )
         if isinstance(command, SaveUserPool):
             targets = [
                 _LocalEffectFenceTarget(
@@ -1767,6 +1800,9 @@ class PageControlConsumer:
             return self._recover_canvas_result(self._canvas_path(command.name), command)
         if isinstance(command, SetCanvasPoolRefs):
             return self._recover_canvas_result(self._canvas_path(command.name), command)
+        if isinstance(command, AddPoolToCanvas):
+            recovered = self._recover_canvas_result(self._canvas_path(command.canvas_name), command)
+            return None if recovered is None else self._attach_result(command, recovered)
         if isinstance(command, SaveUserPool):
             result = self._recover_user_pool_result(command, identity_command=command)
             if result is None:
@@ -2043,6 +2079,36 @@ class PageControlConsumer:
             source="canvas_edit",
         )
         return self._save_canvas(save, identity_command=identity_command)
+
+    def _add_verified_pool_to_canvas(self, command: AddPoolToCanvas) -> JsonValue:
+        base_name = command.pool_name.removeprefix("user/")
+        path = self._user_pool_path(base_name)
+        if not self._managed_json_exists(path):
+            raise ValueError("pool definition is unavailable")
+        current = self._read_json(path)
+        if (
+            current.get("schema_version") != 2
+            or current.get("name") != base_name
+            or current.get("source") != "page_control_v2"
+            or canonical_sha256(current) != command.expected_pool_version
+        ):
+            raise ValueError("pool version conflict: definition changed since save")
+        result = self._add_pool_to_canvas(
+            command.canvas_name,
+            command.pool_name,
+            identity_command=command,
+        )
+        return self._attach_result(command, result)
+
+    @staticmethod
+    def _attach_result(command: AddPoolToCanvas, result: JsonValue) -> dict[str, JsonValue]:
+        assert isinstance(result, dict)
+        return {
+            **result,
+            "canvas_name": command.canvas_name,
+            "pool_name": command.pool_name,
+            "pool_version": command.expected_pool_version,
+        }
 
     def _recover_canvas_result(
         self,
@@ -3220,6 +3286,7 @@ def parse_page_control_command(payload: object) -> PageControlCommandValue:
 
 
 __all__ = [
+    "AddPoolToCanvas",
     "AppendNlQueryLog",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
     "DeleteCanvas",
