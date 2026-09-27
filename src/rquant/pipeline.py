@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 from loguru import logger
 from pydantic import Field
 
-from rquant.presets import PRESET_SCREENS, ScreenPreset
+from rquant.presets import PRESET_SCREENS, ScreenPreset, load_user_presets
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.screen.core import screen
@@ -33,6 +34,10 @@ class DailyPoolPipelineResult(RuntimeContractModel):
     errors: tuple[str, ...] = ()
 
 
+class ParentMarketDataGapError(LookupError):
+    """A trusted parent trading day has no daily market rows."""
+
+
 def _get_prev_trading_date(store: DuckDBStore, trade_date: str, n: int = 1) -> str | None:
     """trade_date 前第 n 个交易日（n=1 = 前一天）。"""
     row = store._conn.execute(
@@ -48,6 +53,25 @@ def _get_prev_trading_date(store: DuckDBStore, trade_date: str, n: int = 1) -> s
         [trade_date, n - 1],
     ).fetchone()
     return row[0] if row else None
+
+
+def _get_exact_delayed_trading_date(
+    store: DuckDBStore, trade_date: str, delay_days: int
+) -> str:
+    anchor = date.fromisoformat(trade_date)
+    if not store.is_trading_day("SSE", anchor):
+        raise ValueError(f"v2 screen date is not an open trading day: {trade_date}")
+    for _ in range(delay_days):
+        anchor = store.previous_trading_day(anchor)
+    available = store._conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM daily_bar WHERE trade_date = ?)",
+        [anchor],
+    ).fetchone()[0]
+    if not available:
+        raise ParentMarketDataGapError(
+            f"daily_bar missing for exact parent trading day {anchor.isoformat()}"
+        )
+    return anchor.isoformat()
 
 
 def _to_screen_result_df(
@@ -101,12 +125,26 @@ def _resolve_execution_order(
     presets: dict[str, ScreenPreset],
     names: list[str] | None = None,
 ) -> list[str]:
-    """按依赖拓扑排序：无 depends_on 的先跑。"""
-    selected = {n: presets[n] for n in names if n in presets} if names else presets
-
-    no_dep = [n for n, p in selected.items() if p.depends_on is None]
-    has_dep = [n for n, p in selected.items() if p.depends_on is not None]
-    return no_dep + has_dep
+    """按依赖拓扑排序，等价节点保持注册表声明顺序。"""
+    selected = {n: presets[n] for n in names if n in presets} if names is not None else presets
+    state: dict[str, int] = {}
+    ordered: list[str] = []
+    for name in selected:
+        chain: list[str] = []
+        current = name
+        while current in selected and state.get(current) != 2:
+            if state.get(current) == 1:
+                raise ValueError("pool dependency cycle")
+            state[current] = 1
+            chain.append(current)
+            parent = selected[current].depends_on
+            if parent is None:
+                break
+            current = parent
+        for item in reversed(chain):
+            state[item] = 2
+            ordered.append(item)
+    return ordered
 
 
 def _compute_levels(body_upper: float, body_lower: float) -> dict[str, float]:
@@ -183,6 +221,7 @@ def run_daily_screen_stage(
     *,
     preset_names: list[str] | None = None,
     store: DuckDBStore,
+    preset_directory: Path | None = None,
 ) -> DailyScreenPipelineResult:
     """Run only screen materialization. Notification is deliberately out of band."""
     count = store._conn.execute(
@@ -192,7 +231,20 @@ def run_daily_screen_stage(
         logger.warning(f"{trade_date} 无 daily_bar 数据，跳过")
         return DailyScreenPipelineResult(preset_hits={}, errors=())
 
-    order = _resolve_execution_order(PRESET_SCREENS, preset_names)
+    from rquant.config import settings
+
+    directory = (
+        Path(settings.data_dir) / "user_presets"
+        if preset_directory is None
+        else preset_directory
+    )
+    presets = {
+        name: preset
+        for name, preset in PRESET_SCREENS.items()
+        if not name.startswith("user/")
+    }
+    presets.update(load_user_presets(directory))
+    order = _resolve_execution_order(presets, preset_names)
     summary: dict[str, int] = {}
     errors: list[str] = []
     blacklist = load_active_blacklist(store)
@@ -201,25 +253,47 @@ def run_daily_screen_stage(
 
     for name in order:
         try:
-            preset = PRESET_SCREENS[name]
+            preset = presets[name]
             ts_whitelist: list[str] | None = None
             if preset.depends_on:
                 ts_whitelist = []
                 parent_dates = []
-                for offset in range(1, preset.offset_days + 1):
-                    parent_date = _get_prev_trading_date(store, trade_date, offset)
+                # v2 延后只取 T-N；旧 offset_days 保持 T-1..T-N 回看窗口。
+                if preset.delay_days is not None:
+                    candidate_dates = (
+                        _get_exact_delayed_trading_date(
+                            store, trade_date, preset.delay_days
+                        ),
+                    )
+                else:
+                    candidate_dates = tuple(
+                        _get_prev_trading_date(store, trade_date, offset)
+                        for offset in range(1, preset.offset_days + 1)
+                    )
+                for parent_date in candidate_dates:
                     if parent_date is None:
                         continue
                     parent_df = store.query_screen_result(parent_date, preset.depends_on)
                     if not parent_df.empty:
                         ts_whitelist.extend(parent_df["ts_code"].tolist())
                         parent_dates.append(parent_date)
-                ts_whitelist = list(set(ts_whitelist))
+                ts_whitelist = sorted(set(ts_whitelist))
                 if not ts_whitelist:
+                    lookback = (
+                        f"T-{preset.delay_days}"
+                        if preset.delay_days is not None
+                        else f"T-1~T-{preset.offset_days}"
+                    )
                     logger.info(
                         f"{name}: 父预设 {preset.depends_on} "
-                        f"在 T-1~T-{preset.offset_days} 无命中，跳过"
+                        f"在 {lookback} 无命中，跳过"
                     )
+                    if preset.delay_days is not None:
+                        store.replace_screen_result(
+                            trade_date,
+                            name,
+                            _to_screen_result_df(pd.DataFrame(), trade_date, name),
+                        )
                     summary[name] = 0
                     continue
                 logger.info(f"{name}: 从 {parent_dates} 合并 {len(ts_whitelist)} 只白名单")
@@ -238,7 +312,10 @@ def run_daily_screen_stage(
                     removed = sr_df.loc[hit_mask, "ts_code"].tolist()
                     sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
                     logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
-            store.upsert_screen_result(sr_df)
+            if preset.delay_days is not None:
+                store.replace_screen_result(trade_date, name, sr_df)
+            else:
+                store.upsert_screen_result(sr_df)
             summary[name] = len(sr_df)
             logger.info(f"  {name}: {len(sr_df)} 命中")
         except Exception as exc:

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json as _json
 from dataclasses import dataclass, field
+from pathlib import Path as _Path
 
+from loguru import logger as _logger
+
+from rquant.config import settings as _settings
 from rquant.llm.schemas import RuleCall
 from rquant.screen.rules import (
     Rule,
@@ -38,18 +43,14 @@ class ScreenPreset:
     depends_on: str | None = None
     offset_days: int = 0
     rule_calls: list[RuleCall] = field(default_factory=list)
-
-
-import json as _json
-from pathlib import Path as _Path
-
-from loguru import logger as _logger
+    display_name: str | None = None
+    delay_days: int | None = None
 
 
 def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
     """从 directory 下的 *.json 加载用户保存的 preset。
 
-    JSON 结构：
+    旧 JSON 结构：
         {
           "name": "<base_name>",
           "description": "<NL query>",
@@ -58,6 +59,7 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
           "created_at": "...",
           "source": "nl_input"
         }
+    v2 增加 display_name、depends_on 与精确 delay_days；旧 offset_days 是回看窗口。
 
     解析失败的文件跳过（记 warning），不影响其他 preset。
 
@@ -75,7 +77,35 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
         try:
             data = _json.loads(path.read_text(encoding="utf-8"))
             base_name = data["name"]
+            if base_name != path.stem:
+                raise ValueError("pool name does not match definition filename")
             full_name = f"user/{base_name}"
+
+            depends_on = data.get("depends_on")
+            if depends_on is not None and (not isinstance(depends_on, str) or not depends_on):
+                raise ValueError("parent pool name must be nonempty")
+            delay_days: int | None = None
+            offset_days = 0
+            if "delay_days" in data:
+                delay_days = data["delay_days"]
+                if type(delay_days) is not int:
+                    raise ValueError("delay_days must be an integer")
+                if depends_on is None and delay_days != 0:
+                    raise ValueError("delay_days must be 0 without a parent pool")
+                if depends_on is not None and not 1 <= delay_days <= 252:
+                    raise ValueError("delay_days must be 1..252 with a parent pool")
+            else:
+                offset_days = data.get("offset_days", 0)
+                if type(offset_days) is not int or offset_days < 0:
+                    raise ValueError("offset_days must be a nonnegative integer")
+                if depends_on is None and offset_days != 0:
+                    raise ValueError("offset_days must be 0 without a parent pool")
+                if depends_on is not None and offset_days == 0:
+                    raise ValueError("offset_days must be positive with a parent pool")
+
+            display_name = data.get("display_name", base_name)
+            if not isinstance(display_name, str) or not display_name.strip():
+                raise ValueError("display_name must be nonempty")
 
             # 把 rules（flat list）包成单 stage，复用 dispatch.build_rules 校验
             rule_calls = [
@@ -94,15 +124,37 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
                 rules=rules,
                 rule_calls=rule_calls,
                 include_columns=data.get("include_columns", []),
+                depends_on=depends_on,
+                offset_days=offset_days,
+                delay_days=delay_days,
+                display_name=display_name,
             )
         except Exception as e:
             _logger.warning(f"加载 user preset 失败 {path.name}: {e}")
             continue
 
+    builtins = set(BUILTIN_PRESET_SCREENS)
+
+    def has_valid_ancestry(name: str) -> bool:
+        visited: set[str] = set()
+        while name not in builtins:
+            preset = result.get(name)
+            if preset is None or name in visited:
+                return False
+            visited.add(name)
+            if preset.depends_on is None:
+                return True
+            name = preset.depends_on
+        return True
+
+    for name in tuple(result):
+        if not has_valid_ancestry(name):
+            _logger.warning(f"加载 user preset 失败 {name}: parent missing or dependency cycle")
+            del result[name]
     return result
 
 
-PRESET_SCREENS: dict[str, ScreenPreset] = {
+BUILTIN_PRESET_SCREENS: dict[str, ScreenPreset] = {
     "n-shape-pool1": ScreenPreset(
         name="n-shape-pool1",
         description="N形态-Pool1：昨首板+安全过滤+下影线",
@@ -128,7 +180,10 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
             RuleCall(name="not_yiziban", args={"offset": 1}),
             RuleCall(name="gt", args={"left": "HIGH[0]", "right": "CLOSE[1]"}),
             RuleCall(name="circ_mv_lt", args={"threshold_yi": 150}),
-            RuleCall(name="has_lower_shadow", args={"min_ratio": 0.5, "min_amplitude": 0.02, "offset": 0}),
+            RuleCall(
+                name="has_lower_shadow",
+                args={"min_ratio": 0.5, "min_amplitude": 0.02, "offset": 0},
+            ),
             RuleCall(name="no_consec_ups_in_window", args={"threshold": 3, "window": 8}),
             RuleCall(name="no_limit_down_in_window", args={"window": 30}),
             RuleCall(name="has_prior_limit_up", args={"window": 120, "exclude_offset": 1}),
@@ -153,7 +208,10 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
         rule_calls=[
             RuleCall(name="lt", args={"left": "BODY_UPPER[0]", "right": "BODY_UPPER[1]"}),
             RuleCall(name="lt", args={"left": "BODY_LOWER[0]", "right": "BODY_LOWER[1]"}),
-            RuleCall(name="has_lower_shadow", args={"min_ratio": 0.5, "min_amplitude": 0.02, "offset": 0}),
+            RuleCall(
+                name="has_lower_shadow",
+                args={"min_ratio": 0.5, "min_amplitude": 0.02, "offset": 0},
+            ),
         ],
         include_columns=[
             "BODY_UPPER[0]",
@@ -164,8 +222,9 @@ PRESET_SCREENS: dict[str, ScreenPreset] = {
     ),
 }
 
-from rquant.config import settings as _settings
-
 # 启动时自动 merge user_presets 目录下所有 JSON
 _user_presets_dir = _Path(_settings.data_dir) / "user_presets"
-PRESET_SCREENS.update(load_user_presets(_user_presets_dir))
+PRESET_SCREENS: dict[str, ScreenPreset] = {
+    **BUILTIN_PRESET_SCREENS,
+    **load_user_presets(_user_presets_dir),
+}

@@ -129,6 +129,23 @@ class SaveUserPool(PageControlCommand):
         return None if value is None else _validated_name(value, label="canvas name")
 
 
+class SaveUserPoolV2(PageControlCommand):
+    kind: Literal["save_user_pool_v2"] = "save_user_pool_v2"
+    base_name: str
+    display_name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+    rule_calls: tuple[RuleCall, ...] = ()
+    include_columns: tuple[str, ...] = ()
+    depends_on: str | None = None
+    delay_days: int = 0
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("base_name")
+    @classmethod
+    def validate_base_name(cls, value: str) -> str:
+        return _validated_name(value, label="user pool name")
+
+
 class DeleteUserPool(PageControlCommand):
     kind: Literal["delete_user_pool"] = "delete_user_pool"
     base_name: str
@@ -230,6 +247,7 @@ PageControlCommandValue = Annotated[
     | DeleteCanvas
     | SetCanvasPoolRefs
     | SaveUserPool
+    | SaveUserPoolV2
     | DeleteUserPool
     | ForkBuiltinPool
     | SaveNlPreset
@@ -1442,6 +1460,11 @@ class PageControlConsumer:
         return binding.descriptor
 
     def _has_committed_local_mutation(self, command: PageControlCommandValue) -> bool:
+        if isinstance(command, SaveUserPoolV2):
+            try:
+                return self._recover_user_pool_v2_result(command) is not None
+            except Exception:
+                return False
         if not isinstance(command, DeleteCanvas):
             return False
         try:
@@ -1500,6 +1523,8 @@ class PageControlConsumer:
                     result = dict(result)
                     result["canvas_result"] = canvas_result
             return result
+        if isinstance(command, SaveUserPoolV2):
+            return self._save_user_pool_v2(command)
         if isinstance(command, DeleteUserPool):
             return {"deleted": self._delete(self._user_pool_path(command.base_name))}
         if isinstance(command, ForkBuiltinPool):
@@ -1557,6 +1582,13 @@ class PageControlConsumer:
             if command.canvas_name is not None and command.canvas_name != "__default__":
                 targets.extend(self._canvas_publication_fence_targets(command.canvas_name))
             return tuple(targets)
+        if isinstance(command, SaveUserPoolV2):
+            return (
+                _LocalEffectFenceTarget(
+                    role="user_pool_directory",
+                    path=self._user_pool_path(command.base_name).parent,
+                ),
+            )
         if isinstance(command, SaveNlPreset):
             return (
                 _LocalEffectFenceTarget(
@@ -1751,6 +1783,8 @@ class PageControlConsumer:
                     result = dict(result)
                     result["canvas_result"] = canvas_result
             return result
+        if isinstance(command, SaveUserPoolV2):
+            return self._recover_user_pool_v2_result(command)
         if isinstance(command, SaveNlPreset):
             save = SaveUserPool(
                 command_id=command.command_id,
@@ -1866,6 +1900,8 @@ class PageControlConsumer:
     ) -> JsonValue:
         identity = command if identity_command is None else identity_command
         path = self._user_pool_path(command.base_name)
+        if self._managed_json_exists(path) and self._read_json(path).get("schema_version") == 2:
+            raise ValueError("v2 pool definition requires save_user_pool_v2")
         payload = {
             "name": command.base_name,
             "description": command.description,
@@ -1878,6 +1914,64 @@ class PageControlConsumer:
         }
         self._atomic_json(path, payload, command_id=identity.command_id)
         return {"path": str(path)}
+
+    def _save_user_pool_v2(self, command: SaveUserPoolV2) -> JsonValue:
+        from rquant.llm.dispatch import build_rules
+        from rquant.llm.schemas import ScreenPlan, Stage
+        from rquant.presets import BUILTIN_PRESET_SCREENS, load_user_presets
+
+        path = self._user_pool_path(command.base_name)
+        current = self._read_json(path) if self._managed_json_exists(path) else None
+        current_version = None if current is None else canonical_sha256(current)
+        if command.expected_version != current_version:
+            raise ValueError("pool version conflict: definition changed since it was read")
+        if not command.display_name.strip():
+            raise ValueError("pool display name is required")
+        if command.depends_on is None:
+            if command.delay_days != 0:
+                raise ValueError("delay_days must be 0 without a parent pool")
+        elif not 1 <= command.delay_days <= 252:
+            raise ValueError("delay_days must be 1..252 with a parent pool")
+
+        build_rules(
+            ScreenPlan(
+                trade_date="1900-01-01",
+                stages=[Stage(label="saved", rules=list(command.rule_calls))],
+                include_columns=list(command.include_columns),
+            )
+        )
+        candidate_name = f"user/{command.base_name}"
+        if command.depends_on == candidate_name:
+            raise ValueError("pool cannot depend on itself")
+        available = dict(BUILTIN_PRESET_SCREENS)
+        available.update(load_user_presets(path.parent))
+        parent_name = command.depends_on
+        visited = {candidate_name}
+        while parent_name is not None:
+            if parent_name in visited:
+                raise ValueError("pool dependency cycle")
+            visited.add(parent_name)
+            parent = available.get(parent_name)
+            if parent is None:
+                raise ValueError(f"parent pool does not exist or is invalid: {parent_name}")
+            parent_name = parent.depends_on
+
+        payload = {
+            "schema_version": 2,
+            "name": command.base_name,
+            "display_name": command.display_name.strip(),
+            "description": command.description,
+            "rules": [rule.model_dump(mode="json") for rule in command.rule_calls],
+            "include_columns": list(command.include_columns),
+            "depends_on": command.depends_on,
+            "delay_days": command.delay_days,
+            "updated_at": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
+            "source": "page_control_v2",
+            "command_id": command.command_id,
+            "command_hash": _command_hash(command),
+        }
+        self._atomic_json(path, payload, command_id=command.command_id)
+        return {"path": str(path), "version": canonical_sha256(payload)}
 
     def _fork_builtin(self, command: ForkBuiltinPool) -> JsonValue:
         save = self._fork_builtin_save_command(command)
@@ -1992,6 +2086,17 @@ class PageControlConsumer:
         if raw.get("command_hash") != _command_hash(identity_command):
             return None
         return {"path": str(path)}
+
+    def _recover_user_pool_v2_result(self, command: SaveUserPoolV2) -> JsonValue | None:
+        path = self._user_pool_path(command.base_name)
+        if not self._managed_json_exists(path):
+            return None
+        raw = self._read_json(path)
+        if raw.get("command_id") != command.command_id:
+            return None
+        if raw.get("command_hash") != _command_hash(command):
+            return None
+        return {"path": str(path), "version": canonical_sha256(raw)}
 
     def _recover_canvas_pool_link(
         self,
@@ -3137,6 +3242,7 @@ __all__ = [
     "SaveCanvas",
     "SaveNlPreset",
     "SaveUserPool",
+    "SaveUserPoolV2",
     "SetCanvasPoolRefs",
     "SubmitLabCommand",
 ]

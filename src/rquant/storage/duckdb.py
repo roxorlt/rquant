@@ -2526,6 +2526,44 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert screen_result: {count} 行")
         return count
 
+    def replace_screen_result(
+        self, trade_date: str, preset_name: str, df: pd.DataFrame
+    ) -> int:
+        """Atomically replace one preset/date snapshot, including an empty result."""
+        if not df.empty and (
+            not (df["trade_date"] == trade_date).all()
+            or not (df["preset_name"] == preset_name).all()
+        ):
+            raise ValueError("screen result replacement contains another preset or date")
+        self._conn.register("screen_result_replace_tmp", df)
+        try:
+            self._conn.execute(
+                """
+                MERGE INTO screen_result AS target
+                USING screen_result_replace_tmp AS source
+                  ON target.trade_date = source.trade_date
+                 AND target.preset_name = source.preset_name
+                 AND target.ts_code = source.ts_code
+                WHEN MATCHED THEN UPDATE SET
+                    name = source.name,
+                    close = source.close,
+                    pct_chg = source.pct_chg,
+                    extra = source.extra
+                WHEN NOT MATCHED THEN INSERT
+                    (trade_date, preset_name, ts_code, name, close, pct_chg, extra)
+                    VALUES (source.trade_date, source.preset_name, source.ts_code,
+                            source.name, source.close, source.pct_chg, source.extra)
+                WHEN NOT MATCHED BY SOURCE
+                 AND target.trade_date = ? AND target.preset_name = ?
+                THEN DELETE
+                """,
+                [trade_date, preset_name],
+            )
+        finally:
+            self._conn.unregister("screen_result_replace_tmp")
+        logger.info(f"DuckDB replace screen_result {preset_name} {trade_date}: {len(df)} 行")
+        return len(df)
+
     def query_screen_result(
         self, trade_date: str, preset_name: str
     ) -> pd.DataFrame:
