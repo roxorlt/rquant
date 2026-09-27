@@ -114,6 +114,10 @@ function assessedRange(rule: AuditReportRule): string {
   return `已评估日期：${rule.first_assessed_date} 至 ${rule.last_assessed_date}`;
 }
 
+function assessmentDetail(rule: AuditReportRule): string {
+  return `已检查 ${formatCount(rule.checked_days)} 天 · ${assessedRange(rule)}`;
+}
+
 const RULE_COLUMNS: DataColumn<AuditReportRule>[] = [
   {
     id: "name",
@@ -123,9 +127,13 @@ const RULE_COLUMNS: DataColumn<AuditReportRule>[] = [
       <span className="dc-report-rule-name">
         {row.name}
         {row.field_label ? <small>{row.field_label}</small> : null}
-        <small className="dc-report-mobile-progress">
-          已评估 {formatCount(row.assessed_days)} / {formatCount(row.expected_days)} 天
-        </small>
+        <span className="dc-report-mobile-progress">
+          <Tip content={assessmentDetail(row)}>
+            <small className="dc-report-progress">
+              已评估 {formatCount(row.assessed_days)} / {formatCount(row.expected_days)} 天
+            </small>
+          </Tip>
+        </span>
       </span>
     ),
     wrap: true,
@@ -135,7 +143,7 @@ const RULE_COLUMNS: DataColumn<AuditReportRule>[] = [
     header: "已评估 / 应有",
     value: (row) => row.assessed_days,
     cell: (row) => (
-      <Tip content={`已检查 ${formatCount(row.checked_days)} 天 · ${assessedRange(row)}`}>
+      <Tip content={assessmentDetail(row)}>
         <span className="num dc-report-progress">
           {formatCount(row.assessed_days)} / {formatCount(row.expected_days)}
         </span>

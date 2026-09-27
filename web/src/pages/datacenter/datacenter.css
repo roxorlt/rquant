@@ -259,6 +259,9 @@
 .dc-report-mobile-code {
   display: none;
 }
+.dc-report-mobile-progress .tip-anchor {
+  min-height: 32px;
+}
 .dc-report-progress {
   white-space: nowrap;
   border-bottom: 1px dotted var(--faint);

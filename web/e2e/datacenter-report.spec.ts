@@ -180,3 +180,29 @@ for (const width of [1440, 390]) {
     expect(observer.problems).toEqual([]);
   });
 }
+
+test.describe("390px touch report", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("tapping a rule shows its assessed date range", async ({ page }) => {
+    const metaResponse = await page.request.get("./api/v1/meta");
+    expect(metaResponse.ok()).toBe(true);
+    const meta: Schemas["Envelope_MetaData_"] = await metaResponse.json();
+    await page.route("**/api/v1/meta*", async (route) => {
+      await route.fulfill({ json: meta });
+    });
+    await page.route("**/api/v1/data/report*", async (route) => {
+      await route.fulfill({ json: { data: report, serving: meta.serving } });
+    });
+    await page.goto("./#/datacenter");
+    await page.getByRole("button", { name: /股票日线/ }).click();
+
+    const rule = page
+      .getByRole("table", { name: "质量规则" })
+      .getByRole("row", { name: /零成交量/ });
+    const mobileProgress = rule.getByText("已评估 64 / 66 天");
+    await expect(mobileProgress).toBeVisible();
+    await mobileProgress.tap();
+    await expect(page.getByRole("tooltip")).toContainText("已评估日期：2026-07-01 至 2026-09-30");
+  });
+});
