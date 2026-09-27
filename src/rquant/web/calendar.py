@@ -1,20 +1,17 @@
-"""Trading-day questions answered from the Serving ``trade_calendar`` projection.
-
-The projection lists open SSE dates only; a date inside its coverage that is not listed is
-closed (weekends and exchange holidays such as 2026-09-25 中秋). Nothing here guesses from
-the weekday: when the projection is unpublished or does not cover a date, the answer is
-``None`` and the page says it does not know.
-"""
+"""Trading-day questions answered only from a complete daily SSE Serving projection."""
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
+from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
 from rquant.web.market import MarketPhase
 
 CALENDAR_EXCHANGE = "SSE"
+_MAX_ROWS = PAGE_PROJECTION_CONTRACTS["trade_calendar"].max_rows
 
 
 @dataclass(frozen=True)
@@ -26,35 +23,68 @@ class CalendarDay:
     next_trading_day: date | None
 
 
-def calendar_available(cursor: Any) -> bool:
+def calendar_rows(cursor: Any) -> tuple[tuple[date, bool], ...] | None:
+    """Return explicit daily facts, or refuse a legacy/incomplete projection."""
+
     row = cursor.execute(
-        "SELECT available FROM projection_status WHERE table_name = 'trade_calendar'"
+        "SELECT available, row_count FROM projection_status WHERE table_name = 'trade_calendar'"
     ).fetchone()
-    return bool(row is not None and row[0])
+    if row is None or row[0] is False:
+        return None
+    expected = row[1]
+    if row[0] is not True or type(expected) is not int or not 1 <= expected <= _MAX_ROWS:
+        raise ValueError("calendar projection status is invalid")
+    rows = cursor.execute(
+        "SELECT trade_date, exchange, is_open FROM trade_calendar "
+        "ORDER BY trade_date, exchange LIMIT ?",
+        (_MAX_ROWS + 1,),
+    ).fetchall()
+    if len(rows) != expected or any(
+        type(day) is not date or exchange != CALENDAR_EXCHANGE or type(open_flag) is not bool
+        for day, exchange, open_flag in rows
+    ):
+        raise ValueError("calendar projection rows are invalid")
+    first = rows[0][0]
+    if not any(open_flag is False for _, _, open_flag in rows) or any(
+        day != first + timedelta(days=index) for index, (day, _, _) in enumerate(rows)
+    ):
+        raise ValueError("calendar projection is not a complete daily schedule")
+    return tuple((day, open_flag) for day, _, open_flag in rows)
+
+
+def calendar_available(cursor: Any) -> bool:
+    try:
+        return calendar_rows(cursor) is not None
+    except ValueError:
+        return False
 
 
 def calendar_day(cursor: Any, trade_date: date) -> CalendarDay:
     """Whether ``trade_date`` is open, and the open days either side of it."""
 
+    try:
+        rows = calendar_rows(cursor)
+    except ValueError:
+        return CalendarDay(trade_date, None, None, None)
+    if rows is None:
+        return CalendarDay(trade_date, None, None, None)
+    return calendar_day_from_rows(rows, trade_date)
+
+
+def calendar_day_from_rows(rows: tuple[tuple[date, bool], ...], trade_date: date) -> CalendarDay:
+    """Answer one date from an already validated daily projection."""
+
     unknown = CalendarDay(trade_date, None, None, None)
-    if not calendar_available(cursor):
+    dates = [day for day, _ in rows]
+    if not dates[0] <= trade_date <= dates[-1]:
         return unknown
-    row = cursor.execute(
-        "SELECT min(trade_date), max(trade_date), "
-        "coalesce(bool_or(trade_date = ? AND is_open), false), "
-        "max(trade_date) FILTER (WHERE is_open AND trade_date < ?), "
-        "min(trade_date) FILTER (WHERE is_open AND trade_date > ?) "
-        "FROM trade_calendar WHERE exchange = ?",
-        (trade_date, trade_date, trade_date, CALENDAR_EXCHANGE),
-    ).fetchone()
-    if row is None or row[0] is None or row[1] is None:
-        return unknown
-    first, last, is_open, previous, following = row
-    if not first <= trade_date <= last:
-        return unknown
+    index = bisect_left(dates, trade_date)
+    is_open = rows[index][1]
+    previous = next((day for day, open_flag in reversed(rows[:index]) if open_flag), None)
+    following = next((day for day, open_flag in rows[index + 1 :] if open_flag), None)
     return CalendarDay(
         trade_date=trade_date,
-        is_trading_day=bool(is_open),
+        is_trading_day=is_open,
         previous_trading_day=previous,
         next_trading_day=following,
     )
@@ -90,6 +120,8 @@ __all__ = [
     "CalendarDay",
     "calendar_available",
     "calendar_day",
+    "calendar_day_from_rows",
+    "calendar_rows",
     "last_closed_trading_day",
     "session_date",
 ]

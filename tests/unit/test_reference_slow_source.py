@@ -16,6 +16,7 @@ import pytest
 import rquant.readside_replica_gate as readside_replica_gate
 import rquant.reference_slow_source as reference_slow_source_module
 from rquant.readside_replica_gate import ReplicaReadGate
+from rquant.reference_slow_publisher import ReferenceSlowSourceSnapshot
 from rquant.reference_slow_source import (
     ReferenceAdjustmentSourceFact,
     ReferenceDailySourceFact,
@@ -596,6 +597,67 @@ def test_captures_exact_pre_market_sources_into_one_sealed_snapshot(tmp_path: Pa
     assert snapshot.daily_facts[0].prior_adj_factor == 1.0
     assert snapshot.daily_facts[0].adj_factor == 2.0
     assert snapshot.security_facts[1].is_st is True
+    calendar_rows = next(
+        projection.rows
+        for projection in snapshot.projections
+        if projection.table_name == "trade_calendar"
+    )
+    assert [(row["trade_date"], row["is_open"]) for row in calendar_rows] == [
+        ("2026-07-29", True),
+        ("2026-07-30", True),
+        ("2026-07-31", True),
+        ("2026-08-01", False),
+        ("2026-08-02", False),
+        ("2026-08-03", True),
+    ]
+
+
+@pytest.mark.parametrize("damage", ("none", "wrong_flag", "missing_day"))
+def test_capture_checks_fixed_database_calendar_against_authority(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "CREATE TABLE trade_calendar (exchange VARCHAR, cal_date DATE, "
+            "is_open BOOLEAN, updated_at TIMESTAMPTZ)"
+        )
+        connection.executemany(
+            "INSERT INTO trade_calendar VALUES ('SSE', ?, ?, ?)",
+            [
+                (
+                    date(2026, 7, 29) + timedelta(days=index),
+                    index not in {3, 4},
+                    datetime(2026, 7, 28, tzinfo=UTC),
+                )
+                for index in range(6)
+            ],
+        )
+        if damage == "wrong_flag":
+            connection.execute(
+                "UPDATE trade_calendar SET is_open = FALSE WHERE cal_date = '2026-07-31'"
+            )
+        if damage == "missing_day":
+            connection.execute("DELETE FROM trade_calendar WHERE cal_date = '2026-07-31'")
+    database.chmod(0o600)
+
+    def capture() -> ReferenceSlowSourceSnapshot:
+        return capture_reference_slow_source_snapshot(
+            database_path=database,
+            adapter=_Adapter(),
+            calendar=_calendar(),
+            target_trade_date=TARGET_DATE,
+            captured_at=OBSERVED_AT,
+            completion_clock=lambda: OBSERVED_AT,
+            producer_commit=COMMIT,
+        )
+
+    if damage == "none":
+        assert capture().target_trade_date == TARGET_DATE
+    else:
+        with pytest.raises(ReferenceSlowSourceError, match="calendar"):
+            capture()
 
 
 def test_capture_includes_bounded_reference_page_projections_from_same_database_snapshot(

@@ -41,6 +41,7 @@ from rquant.web.routes import (
     catalog,
     data_audit,
     data_audit_report,
+    data_audit_report_calendar,
     data_audit_report_commands,
     health,
     meta,
@@ -254,6 +255,7 @@ def create_app(
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(data_audit_report.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(data_audit_report_calendar.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(data_audit_report_commands.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(backfill_plans.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(backfill_plan_commands.router, prefix="/api/v1", tags=["data-audit"])

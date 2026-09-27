@@ -5,7 +5,7 @@ board members from ``rquant.panorama_data``'s test-only fixtures. No real market
 The one real thing is the trade calendar: the published 2026 SSE schedule (weekdays minus
 the exchange holidays, e.g. 2026-09-25 中秋 is closed and the next open day is 09-28),
 because the top bar and the overview read it and a weekday rule would call a holiday a
-trading day. Like the production calendar it lists open dates only and ends 2026-12-31.
+trading day. It explicitly marks each natural day through 2026-12-31.
 
 Generations go through the production path — ``ServingReadModelInput`` validation,
 ``build_serving_read_models`` and a ``ServingPublisher`` over ``SERVING_TABLE_SPECS`` — so
@@ -132,7 +132,7 @@ def _cst(day: date, hour: int, minute: int, second: int = 0) -> datetime:
 
 
 #: Weekday closures of the 2026 SSE calendar (the exchange's published holiday schedule;
-#: the same dates the production ``trade_calendar`` projection leaves out).
+#: the same dates the production ``trade_calendar`` projection marks closed).
 SSE_2026_WEEKDAY_CLOSURES = frozenset(
     date.fromisoformat(day)
     for day in (
@@ -458,11 +458,12 @@ def _minute_coverage() -> list[dict[str, object]]:
 
 
 def _trade_calendar() -> list[dict[str, object]]:
-    # Open dates only, like the production projection.
-    return [
-        {"trade_date": day.isoformat(), "exchange": "SSE", "is_open": True}
-        for day in _trading_days(CALENDAR_START, CALENDAR_END)
-    ]
+    open_days = frozenset(_trading_days(CALENDAR_START, CALENDAR_END))
+    rows: list[dict[str, object]] = []
+    for offset in range((CALENDAR_END - CALENDAR_START).days + 1):
+        day = CALENDAR_START + timedelta(days=offset)
+        rows.append({"trade_date": day.isoformat(), "exchange": "SSE", "is_open": day in open_days})
+    return rows
 
 
 #: The latest daily screen: selected after the 2026-09-23 close for the 09-24 session.
@@ -1009,6 +1010,7 @@ def build_web_fixture(
     backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
     audit: bool = False,
     signal_projections: tuple[ServingProjectionPayload, ...] = (),
+    calendar_projection: ServingProjectionPayload | None = None,
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1079,6 +1081,17 @@ def build_web_fixture(
                 )
             lab_page_projections = DuckDBLabPageProjectionSource(research)(built_at).projections
     projections = _projections(scenario, built_at=built_at, generations=generations)
+    if calendar_projection is not None:
+        if calendar_projection.table_name != "trade_calendar":
+            raise ValueError("calendar fixture override must be trade_calendar")
+        replacement = ServingProjectionInput.bind(
+            calendar_projection,
+            owner_dataset_id="reference_slow_authority",
+            owner_generation_id=generations["reference_slow_authority"],
+        )
+        projections = tuple(
+            replacement if item.table_name == "trade_calendar" else item for item in projections
+        )
     if signal_projections:
         replacements = {
             item.table_name: ServingProjectionInput.bind(
