@@ -214,18 +214,17 @@ class ScreenApplicationService:
         )
 
     def catalog(self, borrowed: BorrowedGeneration | None) -> ScreenCatalogData:
-        blocks = screen_blocks()
         if self.replica is not None:
             try:
                 snapshot = self.replica.available_dates()
             except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
                 return ScreenCatalogData(
-                    source_kind="replica", blocks=blocks, dates=[], available=False,
+                    source_kind="replica", blocks=screen_blocks(), dates=[], available=False,
                     ranking_metrics=[], source=None,
                 )
             return ScreenCatalogData(
                 source_kind="replica",
-                blocks=blocks,
+                blocks=screen_blocks(dynamic_ma=True),
                 dates=snapshot.dates,
                 available=bool(snapshot.dates),
                 ranking_metrics=available_ranking_metrics(_REPLICA_RANK_COLUMNS),
@@ -262,7 +261,7 @@ class ScreenApplicationService:
                 )
         return ScreenCatalogData(
             source_kind="serving",
-            blocks=blocks,
+            blocks=screen_blocks(),
             dates=dates,
             available=available,
             ranking_metrics=ranking_metrics,
@@ -277,13 +276,18 @@ class ScreenApplicationService:
         serving_unavailable: bool,
     ) -> ScreenRunData:
         try:
-            validate_screen_choices(body.conditions)
-        except ValueError as error:
-            detail = (
-                "当前仅支持已列出的均线和 RSI 周期，请调整条件。"
-                if "indicator period" in str(error)
-                else "请从条件目录选择数据项或板块。"
+            normalized_args = validate_screen_choices(
+                body.conditions, dynamic_ma=self.replica is not None,
             )
+        except ValueError as error:
+            if "indicator period" in str(error):
+                detail = (
+                    "均线周期请填 2 到 250 日；RSI 请从目录选择。"
+                    if self.replica is not None
+                    else "当前仅支持已列出的均线和 RSI 周期，请调整条件。"
+                )
+            else:
+                detail = "请从条件目录选择数据项或板块。"
             raise ScreenApplicationError(422, detail) from error
         if body.ranking is not None and any(
             condition.metric not in RANKING_METRIC_LABELS
@@ -296,8 +300,8 @@ class ScreenApplicationService:
             plan = ScreenPlan(
                 trade_date=body.trade_date.isoformat(),
                 stages=[Stage(label="条件", rules=[
-                    RuleCall(name=condition.key, args=condition.args)
-                    for condition in body.conditions
+                    RuleCall(name=condition.key, args=args)
+                    for condition, args in zip(body.conditions, normalized_args, strict=True)
                 ])],
             )
             compiled = compile_screen_plan(plan)

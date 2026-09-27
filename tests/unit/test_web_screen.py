@@ -244,6 +244,25 @@ def test_invalid_or_unavailable_rule_is_explained_without_technical_field_names(
     assert "条件目录" in unknown_field.json()["detail"]
 
 
+def test_serving_catalog_keeps_fixed_ma_choices_and_rejects_dynamic_periods(
+    serving_root: Path,
+) -> None:
+    with _client(serving_root) as client:
+        catalog = client.get("/api/v1/screen/blocks").json()["data"]
+        dynamic = _run(client, conditions=[{"key": "above_ma", "args": {"period": 7}}])
+        dynamic_cross = _run(client, conditions=[
+            {"key": "cross_above", "args": {"fast": 7, "slow": 20}},
+        ])
+
+    blocks = {block["key"]: block for block in catalog["blocks"]}
+    above = next(item for item in blocks["above_ma"]["parameters"] if item["key"] == "period")
+    fast = next(item for item in blocks["cross_above"]["parameters"] if item["key"] == "fast")
+    assert above["input"] == fast["input"] == "choice"
+    assert {option["value"] for option in above["options"]} == {"5", "10", "20", "60"}
+    assert {option["value"] for option in fast["options"]} == {"MA5", "MA10", "MA20", "MA60"}
+    assert dynamic.status_code == dynamic_cross.status_code == 422
+
+
 def test_next_page_requires_a_rerun_after_generation_changes(tmp_path: Path) -> None:
     root = tmp_path / "serving"
     build_web_fixture(root, "baseline")

@@ -298,14 +298,13 @@ def test_missing_aggregate_facts_are_unavailable_instead_of_zero_hits(tmp_path: 
     assert result.json() == {"detail": "所选日期的数据不完整，请换日期或稍后重试。"}
 
 
-def test_catalog_and_api_offer_only_persisted_indicator_periods_and_metrics(
+def test_replica_catalog_offers_bounded_ma_periods_but_keeps_rsi_and_fields_fixed(
     tmp_path: Path,
 ) -> None:
     primary, replica, _ = _replica_world(tmp_path)
     with _client(tmp_path / "absent", primary, replica) as client:
         catalog = client.get("/api/v1/screen/blocks").json()["data"]
-        unsupported = _run(client, conditions=[{"key": "above_ma", "args": {"period": 7}}])
-        supported = _run(client, conditions=[{"key": "above_ma", "args": {"period": "20"}}])
+        legacy_period = _run(client, conditions=[{"key": "above_ma", "args": {"period": "20"}}])
         missing_metric = _run(client, ranking={
             "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
             "top_n": 10,
@@ -314,14 +313,109 @@ def test_catalog_and_api_offer_only_persisted_indicator_periods_and_metrics(
     blocks = {block["key"]: block for block in catalog["blocks"]}
     above_period = next(p for p in blocks["above_ma"]["parameters"] if p["key"] == "period")
     rsi_period = next(p for p in blocks["rsi_oversold"]["parameters"] if p["key"] == "period")
-    assert above_period["input"] == rsi_period["input"] == "choice"
-    assert {item["value"] for item in above_period["options"]} == {"5", "10", "20", "60"}
+    assert above_period["input"] == "integer"
+    assert above_period["minimum"] == 2
+    assert above_period["maximum"] == 250
+    assert above_period["initial"] == 20
+    assert above_period["options"] == []
+    for rule_name in ("cross_above", "cross_below"):
+        params = {item["key"]: item for item in blocks[rule_name]["parameters"]}
+        for key, initial in (("fast", 5), ("slow", 20)):
+            assert params[key]["input"] == "integer"
+            assert params[key]["initial"] == initial
+            assert (params[key]["minimum"], params[key]["maximum"]) == (2, 250)
+        assert (params["offset"]["minimum"], params["offset"]["maximum"]) == (0, 30)
+    assert rsi_period["input"] == "choice"
     assert {item["value"] for item in rsi_period["options"]} == {"6", "14"}
+    assert {item["value"] for item in next(
+        p for p in blocks["gt"]["parameters"] if p["key"] == "left"
+    )["options"]} >= {"CLOSE[0]", "MA5[0]"}
+    assert "MA7[0]" not in {item["value"] for item in next(
+        p for p in blocks["gt"]["parameters"] if p["key"] == "left"
+    )["options"]}
     assert "RETURN_20D_PCT[0]" not in {item["value"] for item in catalog["ranking_metrics"]}
-    assert unsupported.status_code == 422
-    assert "当前仅支持" in unsupported.json()["detail"]
-    assert supported.status_code == 200, supported.text
+    assert legacy_period.status_code == 200, legacy_period.text
     assert missing_metric.status_code == 422
+
+
+def test_dynamic_ma_screen_runs_with_offsets_and_keeps_missing_stock_history_unknown(
+    tmp_path: Path,
+) -> None:
+    primary, replica, latest = _replica_world(tmp_path, days=34)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar"
+        )
+        store._conn.execute(
+            "UPDATE daily_bar SET close = 20 WHERE ts_code = '600001.SH' AND trade_date IN (?, ?)",
+            [latest - timedelta(days=2), latest - timedelta(days=30)],
+        )
+        store._conn.execute(
+            "UPDATE daily_bar SET close = 1 WHERE ts_code = '600002.SH' AND trade_date = ?",
+            [latest - timedelta(days=30)],
+        )
+        store._conn.execute(
+            "DELETE FROM adj_factor WHERE ts_code = '600003.SH' AND trade_date = ?",
+            [latest - timedelta(days=5)],
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        above = _run(client, conditions=[
+            {"key": "above_ma", "args": {"period": 7, "offset": 2}},
+        ])
+        up = _run(client, conditions=[
+            {"key": "cross_above", "args": {"fast": 2, "slow": 3, "offset": 30}},
+        ])
+        down = _run(client, conditions=[
+            {"key": "cross_below", "args": {"fast": 2, "slow": 3, "offset": 30}},
+        ])
+        legacy_up = _run(client, conditions=[
+            {"key": "cross_above", "args": {"fast": "MA2", "slow": "MA3", "offset": 30}},
+        ])
+
+    for response, code in ((above, "600001.SH"), (up, "600001.SH"), (down, "600002.SH")):
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["total"] == 1
+        assert [row["ts_code"] for row in response.json()["data"]["rows"]] == [code]
+    assert above.json()["data"]["unknown_count"] == 1
+    assert legacy_up.status_code == 200, legacy_up.text
+    assert legacy_up.json()["data"]["rows"] == up.json()["data"]["rows"]
+
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "DELETE FROM adj_factor WHERE trade_date = ?", [latest - timedelta(days=5)],
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        unavailable = _run(client, conditions=[
+            {"key": "above_ma", "args": {"period": 7, "offset": 2}},
+        ])
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"] == "所选日期的数据不完整，请换日期或稍后重试。"
+
+
+@pytest.mark.parametrize("condition", [
+    {"key": "above_ma", "args": {"period": 1}},
+    {"key": "above_ma", "args": {"period": 251}},
+    {"key": "above_ma", "args": {"period": 7.5}},
+    {"key": "above_ma", "args": {"period": True}},
+    {"key": "above_ma", "args": {"period": "07"}},
+    {"key": "cross_above", "args": {"fast": "MA251", "slow": 20}},
+    {"key": "cross_below", "args": {"fast": "MA7[0]", "slow": 20}},
+    {"key": "cross_above", "args": {"fast": [], "slow": 20}},
+    {"key": "cross_above", "args": {"fast": 2, "slow": 20, "offset": 31}},
+    {"key": "rsi_oversold", "args": {"period": 7, "threshold": 30}},
+    {"key": "gt", "args": {"left": "MA7[0]", "right": "CLOSE[0]"}},
+])
+def test_replica_rejects_unlisted_or_malformed_indicator_requests(
+    tmp_path: Path, condition: dict,
+) -> None:
+    primary, replica, _ = _replica_world(tmp_path)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        result = _run(client, conditions=[condition])
+    assert result.status_code == 422
+    assert "Traceback" not in result.text
 
 
 def test_bad_sidecar_source_identity_is_unavailable(tmp_path: Path) -> None:
