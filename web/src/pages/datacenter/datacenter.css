@@ -1,6 +1,203 @@
 .data-center {
   min-width: 0;
 }
+.dc-view-switch {
+  margin-top: 14px;
+}
+.dc-plan-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 286px) minmax(0, 1fr);
+  min-width: 0;
+}
+.dc-plan-list {
+  min-width: 0;
+  border-right: 1px solid var(--rule);
+}
+.dc-plan-list > ul {
+  list-style: none;
+  max-height: min(650px, 72vh);
+  overflow-y: auto;
+}
+.dc-plan-item {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  padding: 14px;
+  border: 0;
+  border-bottom: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.dc-plan-item:hover,
+.dc-plan-item[aria-current="true"] {
+  background: var(--accent-weak);
+}
+.dc-plan-item[aria-current="true"] {
+  box-shadow: inset 3px 0 var(--accent);
+}
+.dc-plan-item-top,
+.dc-plan-item-foot,
+.dc-plan-month-head,
+.dc-plan-section-head,
+.dc-plan-detail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.dc-plan-item-top strong {
+  font-size: 13px;
+}
+.dc-plan-item-top > span {
+  color: var(--accent-t);
+  font-size: 11px;
+}
+.dc-plan-item-range,
+.dc-plan-item-foot,
+.dc-plan-kicker,
+.dc-plan-muted {
+  color: var(--muted);
+  font-size: 11px;
+}
+.dc-plan-item-range {
+  overflow-wrap: anywhere;
+}
+.dc-plan-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px;
+}
+.dc-plan-pager > span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dc-plan-preview {
+  min-width: 0;
+  padding: 18px;
+}
+.dc-plan-older {
+  margin-bottom: 12px;
+  color: var(--warn-t);
+  font-size: 12px;
+}
+.dc-plan-detail {
+  min-width: 0;
+}
+.dc-plan-detail h3,
+.dc-plan-month h4 {
+  margin: 0;
+}
+.dc-plan-detail-head h3 {
+  font-size: 17px;
+}
+.dc-plan-kicker {
+  margin-bottom: 3px;
+}
+.dc-plan-tech,
+.dc-plan-cost .num,
+.dc-plan-scope span {
+  border-bottom: 1px dotted var(--faint);
+  cursor: help;
+}
+.dc-plan-tech {
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-plan-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 20px;
+  margin: 18px 0;
+}
+.dc-plan-facts > div {
+  min-width: 0;
+}
+.dc-plan-facts dt,
+.dc-plan-checks,
+.dc-plan-scope,
+.dc-plan-cost,
+.dc-plan-month-head {
+  font-size: 12px;
+}
+.dc-plan-facts dt,
+.dc-plan-scope,
+.dc-plan-month-head span {
+  color: var(--muted);
+}
+.dc-plan-facts dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+}
+.dc-plan-checks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 12px;
+  border-left: 3px solid var(--warn);
+  background: var(--surface-2);
+}
+.dc-plan-checks > span:first-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.dc-plan-scope {
+  margin-top: 10px;
+}
+.dc-plan-cost {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 14px;
+}
+.dc-plan-section {
+  min-width: 0;
+  margin-top: 20px;
+  border-top: 1px solid var(--rule);
+  padding-top: 14px;
+}
+.dc-plan-section-head {
+  margin-bottom: 12px;
+}
+.dc-plan-section-head h3 {
+  font-size: 13px;
+}
+.dc-plan-section-head > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-plan-month + .dc-plan-month {
+  margin-top: 16px;
+}
+.dc-plan-month-head {
+  margin-bottom: 8px;
+}
+.dc-plan-month-head h4 {
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.dc-plan-dates {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 6px;
+  list-style: none;
+}
+.dc-plan-dates li {
+  padding: 7px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-size: 11px;
+  text-align: center;
+}
 .dc-layout {
   display: grid;
   grid-template-columns: minmax(250px, 305px) minmax(0, 1fr);
@@ -289,6 +486,25 @@
   min-width: 0;
 }
 @media (max-width: 760px) {
+  .dc-plan-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .dc-plan-list {
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .dc-plan-list > ul {
+    max-height: 230px;
+  }
+  .dc-plan-preview {
+    padding: 14px;
+  }
+  .dc-plan-facts {
+    gap: 10px 12px;
+  }
+  .dc-plan-facts > div:first-child {
+    grid-column: 1 / -1;
+  }
   .dc-layout {
     display: block;
   }
