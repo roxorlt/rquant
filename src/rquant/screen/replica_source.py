@@ -48,6 +48,14 @@ class ScreenReplicaBudgetError(RuntimeError):
     """A legal looking request still exceeds the bounded screening budget."""
 
 
+class ScreenReplicaChangedError(ScreenReplicaUnavailableError):
+    """The requested replica generation is no longer current."""
+
+
+class ScreenReplicaDateError(ScreenReplicaDataError):
+    """The selected date is not an open day in the bound replica calendar."""
+
+
 @dataclass(frozen=True, slots=True)
 class ScreenUniverseSnapshot:
     frame: pd.DataFrame

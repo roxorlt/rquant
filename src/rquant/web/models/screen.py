@@ -144,3 +144,30 @@ class TdxParseRequest(BaseModel):
 
 class TdxParseData(ParseResult):
     capability: Literal["parse_only"] = "parse_only"
+
+
+class TdxPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = ""
+    stock_code: str = Field(pattern=r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
+    trade_date: date
+    source_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class TdxPreviewData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stock_code: str
+    trade_date: date
+    status: Literal["match", "no_match", "unknown"]
+    reason: str | None
+    source_updated_at: datetime
+
+
+class TdxPreviewSourceData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    available: bool
+    dates: list[date]
+    source: ScreenSourceInfo | None

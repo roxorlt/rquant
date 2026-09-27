@@ -4958,6 +4958,118 @@
         "title": "TdxParseRequest",
         "type": "object"
       },
+      "TdxPreviewData": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "source_updated_at": {
+            "format": "date-time",
+            "title": "Source Updated At",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "match",
+              "no_match",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stock_code": {
+            "title": "Stock Code",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stock_code",
+          "trade_date",
+          "status",
+          "reason",
+          "source_updated_at"
+        ],
+        "title": "TdxPreviewData",
+        "type": "object"
+      },
+      "TdxPreviewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "default": "",
+            "title": "Source",
+            "type": "string"
+          },
+          "source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "stock_code": {
+            "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+            "title": "Stock Code",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stock_code",
+          "trade_date",
+          "source_identity"
+        ],
+        "title": "TdxPreviewRequest",
+        "type": "object"
+      },
+      "TdxPreviewSourceData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Dates",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "available",
+          "dates",
+          "source"
+        ],
+        "title": "TdxPreviewSourceData",
+        "type": "object"
+      },
       "TranslationPlan": {
         "additionalProperties": false,
         "properties": {
@@ -5768,6 +5880,68 @@
           }
         },
         "summary": "检查通达信公式",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/preview": {
+      "post": {
+        "operationId": "preview_tdx_formula_api_v1_screen_tdx_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TdxPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TdxPreviewData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "单股预览通达信公式",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/preview/source": {
+      "get": {
+        "operationId": "get_tdx_preview_source_api_v1_screen_tdx_preview_source_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TdxPreviewSourceData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "公式预览数据",
         "tags": [
           "screen"
         ]

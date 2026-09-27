@@ -3,6 +3,92 @@ import type { Schemas } from "../src/api/client.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
+test("单股公式预览先检查再判断，来源换代后桌面与手机要求重跑", async ({ page }, testInfo) => {
+  const watcher = watch(page);
+  let identity = "a".repeat(64);
+  await page.route("**/api/v1/screen/tdx/preview/source", async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        available: true,
+        dates: ["2026-09-24"],
+        source: { identity, updated_at: "2026-09-24T07:31:00Z" },
+      },
+    });
+  });
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    body.data.source_kind = "replica";
+    body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/tdx/parse", async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        syntax_version: "tdx-v1",
+        status: "parsed",
+        capability: "parse_only",
+        ast: null,
+        translation: null,
+        issues: [],
+        unsupported: [],
+      },
+    });
+  });
+  await page.route("**/api/v1/screen/tdx/preview", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["TdxPreviewRequest"];
+    expect(request.source_identity).toBe(identity);
+    expect(request.stock_code).toBe("600001.SH");
+    await route.fulfill({
+      status: 200,
+      json: {
+        stock_code: request.stock_code,
+        trade_date: request.trade_date,
+        status: "match",
+        reason: null,
+        source_updated_at: "2026-09-24T07:31:00Z",
+      },
+    });
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "导入公式" }).click();
+  const dialog = page.getByRole("dialog", { name: "公式预览" });
+  await dialog.getByRole("textbox", { name: "通达信公式" }).fill("CLOSE>MA(CLOSE,2)");
+  await dialog.getByRole("textbox", { name: "股票代码" }).fill("600001.SH");
+  await expect(dialog.getByRole("button", { name: "预览这只股票" })).toBeDisabled();
+  await dialog.getByRole("button", { name: "检查公式" }).click();
+  await expect(dialog.getByText("公式可以预览这只股票。")).toBeVisible();
+  await dialog.getByRole("button", { name: "预览这只股票" }).click();
+  await expect(dialog.getByRole("status")).toContainText("符合");
+  expect(await dialog.innerText()).not.toContain(identity);
+  expect(findJargon(await dialog.innerText())).toEqual([]);
+  await expectNoHorizontalOverflow(page, "formula preview desktop");
+  await page.screenshot({ path: testInfo.outputPath("formula-preview-desktop.png") });
+
+  await dialog.getByRole("button", { name: "关闭" }).click();
+  await expect(dialog).toBeHidden();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "导入公式" }).click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("textbox", { name: "通达信公式" }).fill("CLOSE>MA(CLOSE,2)");
+  await dialog.getByRole("textbox", { name: "股票代码" }).fill("600001.SH");
+  await dialog.getByRole("button", { name: "检查公式" }).click();
+  await dialog.getByRole("button", { name: "预览这只股票" }).click();
+  await expect(dialog.getByRole("status")).toContainText("符合");
+  await expectNoHorizontalOverflow(page, "formula preview phone");
+  await page.screenshot({ path: testInfo.outputPath("formula-preview-phone.png") });
+  identity = "b".repeat(64);
+  await dialog.getByRole("button", { name: "刷新公式预览数据" }).click();
+  await expect(dialog.getByRole("status")).toContainText("公式预览数据已更新，请重新预览");
+  await dialog.getByRole("button", { name: "预览这只股票" }).click();
+  await expect(dialog.getByRole("status")).toContainText("符合");
+  expect(watcher.problems).toEqual([]);
+});
+
 test("中文条件筛选、翻页和个股详情在桌面与手机宽度可用", async ({ page }) => {
   const watcher = watch(page);
   await page.setViewportSize({ width: 1440, height: 900 });

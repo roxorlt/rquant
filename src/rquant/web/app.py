@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
+from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.routes import (
     catalog,
@@ -101,13 +102,19 @@ def create_app(
         if settings.screen_primary_path is not None and settings.screen_replica_path is not None
         else None
     )
+    screen_history = (
+        VerifiedFormulaHistoryProjection(settings.screen_history_root)
+        if settings.screen_history_root is not None else None
+    )
     app.state.web = WebContext(
         settings=settings,
         tracker=generation_tracker,
         clock=clock,
         cursor_key=cursor_key,
         screen_gate=threading.BoundedSemaphore(1),
-        screen_service=ScreenApplicationService(cursor_key=cursor_key, replica=screen_replica),
+        screen_service=ScreenApplicationService(
+            cursor_key=cursor_key, replica=screen_replica, history=screen_history,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -127,6 +134,11 @@ def create_app(
         request: Request,
         error: RequestValidationError,
     ) -> Response:
+        if request.url.path == "/api/v1/screen/tdx/preview":
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "预览输入有误，请检查股票、日期和公式。"},
+            )
         if request.url.path == "/api/v1/screen/tdx/parse":
             return JSONResponse(
                 status_code=422,

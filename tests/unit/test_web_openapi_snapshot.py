@@ -28,6 +28,10 @@ def test_every_api_path_is_versioned_and_screen_parse_is_read_only_post() -> Non
         assert path.startswith("/api/v1/")
         assert set(operations) == (
             {"post"}
-            if path in {"/api/v1/screen/run", "/api/v1/screen/tdx/parse"}
+            if path in {
+                "/api/v1/screen/run",
+                "/api/v1/screen/tdx/parse",
+                "/api/v1/screen/tdx/preview",
+            }
             else {"get"}
         )

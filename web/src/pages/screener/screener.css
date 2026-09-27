@@ -87,6 +87,64 @@
 .screen-actions .btn.primary {
   margin-left: auto;
 }
+.tdx-preview {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  font-size: 13px;
+}
+.tdx-preview-source-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.tdx-preview-source {
+  height: 160px;
+  padding: 9px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  line-height: 1.55;
+}
+.tdx-preview-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.tdx-preview-date {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  color: var(--ink-2);
+}
+.tdx-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.tdx-preview-result {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--sunken);
+  padding: 12px;
+  color: var(--ink-2);
+}
+.tdx-preview-result strong {
+  font-weight: 600;
+}
+.tdx-preview-result.ok strong {
+  color: var(--ok-t);
+}
+.tdx-preview-result.warn strong {
+  color: var(--warn-t);
+}
+.tdx-preview-result small {
+  color: var(--muted);
+}
 .screen-rank-empty {
   margin: 0;
 }
@@ -224,6 +282,9 @@
   .screen-actions .btn.primary {
     grid-column: 1 / -1;
     margin-left: 0;
+  }
+  .tdx-preview-actions > * {
+    flex: 1 1 150px;
   }
   .screen-rank-row {
     grid-template-columns: 20px minmax(0, 1fr) minmax(0, 1fr);
