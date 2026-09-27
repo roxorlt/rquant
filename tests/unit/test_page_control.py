@@ -652,6 +652,13 @@ def test_create_canvas_recovers_head_before_watermark_without_second_publication
     first_head = service.consumer._current_canvas_head("breakout")
     assert first_head is not None
 
+    rival = _service_for(outbox=PageControlOutbox(outbox_path), tmp_path=tmp_path).submit(
+        page_control.CreateCanvas(command_id="create-rival", requested_at=NOW, name="breakout")
+    )
+    assert rival.status is PageControlStatus.FAILED
+    assert "canvas name is already occupied" in (rival.error or "")
+    assert path.read_bytes() == original_record
+
     recovered_service = _service_for(
         outbox=PageControlOutbox(outbox_path), tmp_path=tmp_path, now=NOW + timedelta(seconds=2)
     )

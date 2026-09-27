@@ -267,6 +267,8 @@ def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
         ).fetchall()
         if len(canvas_rows) <= _MAX_CANVASES:
             canvases = [item for row in canvas_rows if (item := _canvas(row)) is not None]
+            if len(canvases) != len(canvas_rows):
+                canvas_create_available = False
         else:
             canvas_create_available = False
     return PoolEditorSnapshot(

@@ -405,10 +405,17 @@ def test_editor_hides_noneditable_or_corrupt_rows_and_old_generation_cannot_writ
         data = client.get("/api/v1/pools/editor").json()["data"]
         assert data["pools"] == []
         assert data["canvases"] == []
+        assert data["canvas_create_available"] is False
         denied = client.post(
             "/api/v1/pools/editor/commands", json=_save_body("update"), headers=HEADERS
         )
+        create_denied = client.post(
+            "/api/v1/pools/editor/commands",
+            json=_create_body("create-on-corrupt"),
+            headers=HEADERS,
+        )
     assert denied.status_code == 409
+    assert create_denied.status_code == 409
 
     old_root = tmp_path / "old"
     build_web_fixture(old_root, "baseline")

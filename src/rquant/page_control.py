@@ -1963,11 +1963,11 @@ class PageControlConsumer:
             raise ValueError("default canvas is virtual and cannot be persisted")
         path = self._canvas_path(command.name)
         current = self._current_canvas_head(command.name)
+        if current is not None or self._managed_json_exists(path):
+            raise FileExistsError("canvas name is already occupied")
         watermark = self._current_canvas_watermark(command.name)
         self._assert_canvas_watermark_matches_head(current, watermark)
         self._assert_canvas_head_matches_latest_authority(command.name, current)
-        if current is not None or self._managed_json_exists(path):
-            raise FileExistsError("canvas name is already occupied")
         save = SaveCanvas(
             command_id=command.command_id,
             requested_at=command.requested_at,
