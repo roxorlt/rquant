@@ -40,7 +40,8 @@ from rquant.backfill_plan_core import DailyBarBackfillPlan
 from rquant.backfill_plan_projection import (
     BACKFILL_PLAN_PROJECTION_TABLES,
     MAX_DISCOVERABLE_BACKFILL_PLANS,
-    MAX_INDEXED_BACKFILL_PLANS,
+    MAX_PREVIEW_BACKFILL_PLANS,
+    decode_backfill_plan_archive_row,
     project_backfill_plans,
 )
 from rquant.builtin_presets import BUILTIN_PRESET_SCREENS
@@ -342,7 +343,7 @@ def _read_bound_optional_file(
 
 _BACKFILL_PLAN_NAME = re.compile(r"daily-bar-backfill-plan-v1-([0-9a-f]{64})\.json\Z")
 _BACKFILL_TEMP_NAME = re.compile(r"\.backfill-plan-[0-9a-f]{32}\Z")
-MAX_BACKFILL_INDEX_READ_BYTES = 64 * 1024 * 1024
+MAX_BACKFILL_CATALOG_READ_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -3212,23 +3213,13 @@ class DuckDBLabPageProjectionSource:
             raise ValueError("backfill plan directory must be absolute")
         self.backfill_plan_directory = backfill_plan_directory
 
-    def backfill_plan_index_page(
-        self,
-        observed_at: datetime,
-        *,
-        cursor_hash: str | None = None,
-        limit: int | None = None,
+    def _backfill_plan_projections(
+        self, observed_at: datetime
     ) -> tuple[ServingProjectionPayload, ...]:
-        """Read one bounded catalogue page; the hash cursor discovers older plans."""
+        """Seal every discoverable plan in this source generation or refuse it."""
         directory = self.backfill_plan_directory
         if directory is None:
             return ()
-        if limit is None:
-            limit = MAX_INDEXED_BACKFILL_PLANS
-        if not 1 <= limit <= MAX_INDEXED_BACKFILL_PLANS:
-            raise ValueError("backfill plan page limit is out of range")
-        if cursor_hash is not None and re.fullmatch(r"[0-9a-f]{64}", cursor_hash) is None:
-            raise ValueError("backfill plan cursor hash is invalid")
         observed = normalize_aware_utc(observed_at)
         try:
             binding = _bind_readonly_directory(directory, label="backfill plan directory")
@@ -3236,12 +3227,8 @@ class DuckDBLabPageProjectionSource:
             try:
                 os.stat(directory, follow_symlinks=False)
             except FileNotFoundError:
-                if cursor_hash is not None:
-                    raise ValueError("backfill plan cursor is unavailable") from None
                 return project_backfill_plans(
                     (),
-                    total_count=0,
-                    has_older_plans=False,
                     available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
                 )
             raise PageProjectionSourceIntegrityError(
@@ -3249,33 +3236,14 @@ class DuckDBLabPageProjectionSource:
             ) from None
         try:
             entries = _list_bound_backfill_plan_entries(binding)
-            cursor_position = -1
-            if cursor_hash is not None:
-                cursor_position = next(
-                    (
-                        index
-                        for index, entry in enumerate(entries)
-                        if entry.plan_hash == cursor_hash
-                    ),
-                    -1,
-                )
-                if cursor_position < 0:
-                    raise ValueError("backfill plan cursor is unavailable")
-            selected_entries = []
-            selected_bytes = 0
-            for entry in entries[cursor_position + 1 : cursor_position + 1 + limit]:
-                size = entry.identity[2]
-                if selected_entries and selected_bytes + size > MAX_BACKFILL_INDEX_READ_BYTES:
-                    break
-                selected_entries.append(entry)
-                selected_bytes += size
-            selected = tuple(selected_entries)
+            if sum(entry.identity[2] for entry in entries) > MAX_BACKFILL_CATALOG_READ_BYTES:
+                raise ValueError("backfill plan complete catalogue exceeds read bound")
             directory_stat = os.fstat(binding.descriptor)
             if os.name != "posix" or directory_stat.st_ctime_ns <= 0:
                 raise ValueError("backfill plan directory publication time is unavailable")
             available_ns = max(
                 directory_stat.st_ctime_ns,
-                *(entry.published_ns for entry in selected),
+                *(entry.published_ns for entry in entries),
             )
             if available_ns > int(observed.timestamp() * 1_000_000_000):
                 raise ValueError("backfill plan is not yet available")
@@ -3284,71 +3252,13 @@ class DuckDBLabPageProjectionSource:
                     _read_bound_backfill_plan(binding, entry),
                     datetime.fromtimestamp(entry.published_ns / 1_000_000_000, tz=UTC),
                 )
-                for entry in selected
+                for entry in entries
             )
             _verify_bound_backfill_catalogue(binding, entries)
             return project_backfill_plans(
                 indexed,
-                total_count=len(entries),
-                has_older_plans=cursor_position + 1 + len(selected) < len(entries),
                 available_at=datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC),
             )
-        except (OSError, ValueError) as exc:
-            raise PageProjectionSourceIntegrityError(f"backfill plan invalid: {exc}") from exc
-        finally:
-            binding.close()
-
-    def backfill_plan_by_hash(
-        self, plan_hash: str, *, observed_at: datetime
-    ) -> DailyBarBackfillPlan | None:
-        """Reopen any indexed or older sealed plan by its exact content hash."""
-        directory = self.backfill_plan_directory
-        if directory is None:
-            return None
-        if re.fullmatch(r"[0-9a-f]{64}", plan_hash) is None:
-            raise ValueError("backfill plan hash is invalid")
-        observed = normalize_aware_utc(observed_at)
-        try:
-            binding = _bind_readonly_directory(directory, label="backfill plan directory")
-        except FileNotFoundError:
-            try:
-                os.stat(directory, follow_symlinks=False)
-            except FileNotFoundError:
-                return None
-            raise PageProjectionSourceIntegrityError(
-                "backfill plan directory appeared while read"
-            ) from None
-        try:
-            name = f"daily-bar-backfill-plan-v1-{plan_hash}.json"
-            found = _read_bound_optional_file(
-                binding,
-                name,
-                max_bytes=MAX_BACKFILL_PLAN_BYTES,
-                label="backfill plan",
-            )
-            if found is None:
-                binding.verify()
-                try:
-                    os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
-                except FileNotFoundError:
-                    return None
-                raise PageProjectionSourceIntegrityError(
-                    "backfill plan appeared while read"
-                ) from None
-            directory_stat = os.fstat(binding.descriptor)
-            available_ns = max(
-                found[1].st_mtime_ns,
-                found[1].st_ctime_ns,
-                directory_stat.st_ctime_ns,
-            )
-            if available_ns > int(observed.timestamp() * 1_000_000_000):
-                raise ValueError("backfill plan is not yet available")
-            plan = parse_daily_bar_backfill_plan_bytes(found[0], filename=name)
-            binding.verify()
-            named = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
-            if _copy_identity(named) != _copy_identity(found[1]):
-                raise PageProjectionSourceIntegrityError("backfill plan rotated while read")
-            return plan
         except (OSError, ValueError) as exc:
             raise PageProjectionSourceIntegrityError(f"backfill plan invalid: {exc}") from exc
         finally:
@@ -3532,7 +3442,7 @@ class DuckDBLabPageProjectionSource:
             audit_status=audit_status,
             audit_issues=audit_issues,
             audit_report_projections=self._report_projections(observed),
-            backfill_plan_projections=self.backfill_plan_index_page(observed),
+            backfill_plan_projections=self._backfill_plan_projections(observed),
         )
 
     @staticmethod
@@ -4810,16 +4720,22 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             catalog = catalog_rows[0]
             index = projections["backfill_plan_index"].rows
             preview = projections["backfill_plan_preview"].rows
+            archive = projections["backfill_plan_archive"].rows
             if (
                 catalog["catalog_key"] != "current"
-                or catalog["total_plan_count"] < len(index)
+                or catalog["total_plan_count"] != len(index)
                 or catalog["indexed_plan_count"] != len(index)
                 or catalog["preview_plan_count"] != len(preview)
+                or catalog["has_older_plans"] is not False
                 or catalog["oldest_indexed_hash"]
                 != (index[-1]["plan_hash"] if index else None)
                 or [row["rank"] for row in index] != list(range(len(index)))
+                or len(preview) != min(MAX_PREVIEW_BACKFILL_PLANS, len(index))
                 or {row["plan_hash"] for row in preview}
                 != {row["plan_hash"] for row in index[: len(preview)]}
+                or len(archive) != len(index)
+                or {row["plan_hash"] for row in archive}
+                != {row["plan_hash"] for row in index}
             ):
                 raise ValueError("backfill plan catalog rows disagree")
             if any(
@@ -4832,6 +4748,23 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             ):
                 raise ValueError("backfill plan cannot become verified or executable")
             try:
+                index_by_hash = {row["plan_hash"]: row for row in index}
+                for row in archive:
+                    detail = decode_backfill_plan_archive_row(dict(row))
+                    summary = index_by_hash[detail.plan_hash]
+                    if (
+                        detail.audit_start.isoformat() != summary["audit_start"]
+                        or detail.completed_through.isoformat() != summary["completed_through"]
+                        or detail.cutoff_observed_at.isoformat()
+                        != summary["cutoff_observed_at"]
+                        or detail.published_at.isoformat() != summary["published_at"]
+                        or len(detail.missing_dates) != summary["missing_day_count"]
+                        or str(detail.estimate.estimated_seconds)
+                        != summary["estimated_seconds"]
+                        or detail.source.mode != summary["source_mode"]
+                        or detail.source.snapshot_label != summary["snapshot_label"]
+                    ):
+                        raise ValueError("backfill plan archive and index disagree")
                 for row in preview:
                     source = json.loads(str(row["source_json"]))
                     estimate = json.loads(str(row["estimate_json"]))

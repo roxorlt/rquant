@@ -10,14 +10,16 @@ from pathlib import Path
 import pytest
 
 from rquant.backfill_plan_artifact import load_daily_bar_backfill_plan
-from rquant.backfill_plan_core import DailyBarBackfillPlan
 from rquant.runtime_builder_authority import LabJobsPublisherSettings
+from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_page_projection_source import (
     DuckDBLabPageProjectionSource,
     LabPageProjectionSnapshot,
     PageProjectionSourceIntegrityError,
 )
+from rquant.serving_publisher import ServingPublisher, ServingReader
 from rquant.serving_read_models import (
+    SERVING_TABLE_SPECS,
     ServingProjectionInput,
     ServingProjectionPayload,
     ServingReadModelInput,
@@ -25,6 +27,7 @@ from rquant.serving_read_models import (
 )
 from rquant.storage.duckdb import DuckDBStore
 from tests.unit.test_backfill_plan_artifact import _publish, _snapshot
+from tests.unit.test_backfill_plan_core import _rehash
 from tests.unit.test_data_audit_report_serving import _production_report_file
 
 OBSERVED = datetime(2026, 10, 1, 12, tzinfo=UTC)
@@ -32,6 +35,7 @@ TABLES = {
     "backfill_plan_catalog",
     "backfill_plan_index",
     "backfill_plan_preview",
+    "backfill_plan_archive",
     "backfill_plan_progress",
 }
 
@@ -68,6 +72,7 @@ def test_multiple_plans_publish_complete_preview_and_separate_unknown_progress(
     assert catalog["indexed_plan_count"] == 2
     assert catalog["preview_plan_count"] == 2
     assert catalog["has_older_plans"] is False
+    assert len(rows["backfill_plan_archive"]) == 2
     index = rows["backfill_plan_index"]
     assert [row["rank"] for row in index] == [0, 1]
     assert {row["plan_hash"] for row in index} == {
@@ -120,6 +125,7 @@ def test_absent_configuration_and_empty_directory_are_distinct(tmp_path: Path) -
     assert configured.keys() >= TABLES
     assert configured["backfill_plan_index"] == ()
     assert configured["backfill_plan_preview"] == ()
+    assert configured["backfill_plan_archive"] == ()
     assert configured["backfill_plan_catalog"][0]["total_plan_count"] == 0
     assert configured["backfill_plan_progress"][0]["availability"] == "unavailable"
 
@@ -272,6 +278,22 @@ def test_snapshot_contract_cannot_promote_plan_or_invent_progress(tmp_path: Path
                 for item in projections
             ),
         )
+    archive = by_name["backfill_plan_archive"]
+    damaged = ServingProjectionPayload(
+        table_name=archive.table_name,
+        available_at=archive.available_at,
+        rows=(
+            {**dict(archive.rows[0]), "detail_sha256": "0" * 64},
+        ),
+    )
+    with pytest.raises(ValueError, match="archive|hash|detail"):
+        LabPageProjectionSnapshot.create(
+            available_at=OBSERVED,
+            backfill_plan_projections=tuple(
+                damaged if item.table_name == archive.table_name else item
+                for item in projections
+            ),
+        )
 
 
 def test_old_plan_can_be_reopened_by_content_hash_after_preview_window(
@@ -296,19 +318,116 @@ def test_old_plan_can_be_reopened_by_content_hash_after_preview_window(
     assert old_plan.content_sha256 not in {
         row["plan_hash"] for row in rows["backfill_plan_preview"]
     }
-    recovered = source.backfill_plan_by_hash(old_plan.content_sha256, observed_at=OBSERVED)
-    assert isinstance(recovered, DailyBarBackfillPlan)
-    assert recovered == old_plan
+    from rquant.backfill_plan_projection import read_backfill_plan_detail_from_serving
+
+    projected = source(OBSERVED)
+    tables = build_serving_read_models(
+        ServingReadModelInput(
+            observed_at=OBSERVED,
+            projections=tuple(
+                ServingProjectionInput.bind(
+                    item, owner_dataset_id="lab_jobs", owner_generation_id="a" * 64
+                )
+                for item in projected.projections
+            ),
+        )
+    )
+    root = tmp_path / "serving"
+    ServingPublisher(root, producer_commit="b" * 40, table_specs=SERVING_TABLE_SPECS).publish(
+        tables,
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="lab_jobs",
+                generation_id="a" * 64,
+                event_time=OBSERVED,
+                published_at=OBSERVED,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"lab_jobs": "a" * 64},
+        built_at=OBSERVED,
+    )
+    for path in paths:
+        path.unlink()
+    with ServingReader(root).acquire_generation() as lease:
+        recovered = read_backfill_plan_detail_from_serving(
+            lease.connection, old_plan.content_sha256
+        )
+        assert read_backfill_plan_detail_from_serving(lease.connection, "f" * 64) is None
+    assert recovered is not None
+    assert recovered.plan_hash == old_plan.content_sha256
+    assert recovered.missing_dates == old_plan.missing_dates
+    assert recovered.monthly == old_plan.monthly
+    assert recovered.estimate == old_plan.estimate
+    assert recovered.source == old_plan.source
 
 
-def test_index_window_pages_older_plans_without_hiding_newest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from rquant import backfill_plan_projection as projection
-    from rquant import serving_page_projection_source as page_source
+def test_more_than_256_plans_have_no_unreachable_catalogued_tail(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    template = _publish(_snapshot(tmp_path), directory)
+    body = json.loads(template.read_text())
+    template.unlink()
+    first_hash = ""
+    for index in range(257):
+        candidate = json.loads(json.dumps(body))
+        candidate["evidence"]["code_revision"] = f"revision-{index:03}"
+        sealed = _rehash(candidate)
+        if index == 0:
+            first_hash = str(sealed["content_sha256"])
+        name = f"daily-bar-backfill-plan-v1-{sealed['content_sha256']}.json"
+        (directory / name).write_text(
+            json.dumps(sealed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
 
-    monkeypatch.setattr(projection, "MAX_INDEXED_BACKFILL_PLANS", 2)
-    monkeypatch.setattr(page_source, "MAX_INDEXED_BACKFILL_PLANS", 2)
+    source = _source(tmp_path, directory)
+    snapshot = source(OBSERVED)
+    rows = {item.table_name: item.rows for item in snapshot.projections}
+    assert rows["backfill_plan_catalog"][0]["total_plan_count"] == 257
+    assert rows["backfill_plan_catalog"][0]["has_older_plans"] is False
+    assert len(rows["backfill_plan_index"]) == 257
+    assert len(rows["backfill_plan_archive"]) == 257
+    assert first_hash in {row["plan_hash"] for row in rows["backfill_plan_archive"]}
+    tables = build_serving_read_models(
+        ServingReadModelInput(
+            observed_at=OBSERVED,
+            projections=tuple(
+                ServingProjectionInput.bind(
+                    item, owner_dataset_id="lab_jobs", owner_generation_id="a" * 64
+                )
+                for item in snapshot.projections
+            ),
+        )
+    )
+    assert len(tables["backfill_plan_index"]) == 257
+    assert len(tables["backfill_plan_archive"]) == 257
+    root = tmp_path / "serving"
+    ServingPublisher(root, producer_commit="b" * 40, table_specs=SERVING_TABLE_SPECS).publish(
+        tables,
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="lab_jobs",
+                generation_id="a" * 64,
+                event_time=OBSERVED,
+                published_at=OBSERVED,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"lab_jobs": "a" * 64},
+        built_at=OBSERVED,
+    )
+    for path in directory.iterdir():
+        path.unlink()
+    with ServingReader(root).acquire_generation() as lease:
+        from rquant.backfill_plan_projection import read_backfill_plan_detail_from_serving
+
+        old = read_backfill_plan_detail_from_serving(lease.connection, first_hash)
+    assert old is not None
+    assert old.plan_hash == first_hash
+
+
+def test_more_than_preview_window_has_every_plan_in_same_generation(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path)
     directory = tmp_path / "plans"
     paths = [
@@ -321,18 +440,15 @@ def test_index_window_pages_older_plans_without_hiding_newest(
     first = _rows(source)
     catalog = first["backfill_plan_catalog"][0]
     assert catalog["total_plan_count"] == 3
-    assert catalog["indexed_plan_count"] == 2
-    assert catalog["has_older_plans"] is True
+    assert catalog["indexed_plan_count"] == 3
+    assert catalog["has_older_plans"] is False
     assert first["backfill_plan_index"][0]["plan_hash"] == newest.content_sha256
-    second_page = {
-        item.table_name: item.rows
-        for item in source.backfill_plan_index_page(
-            OBSERVED, cursor_hash=catalog["oldest_indexed_hash"], limit=2
-        )
+    assert {row["plan_hash"] for row in first["backfill_plan_archive"]} == {
+        row["plan_hash"] for row in first["backfill_plan_index"]
     }
-    assert second_page["backfill_plan_index"][0]["plan_hash"] == oldest.content_sha256
-    assert second_page["backfill_plan_catalog"][0]["has_older_plans"] is False
-    assert source.backfill_plan_by_hash(oldest.content_sha256, observed_at=OBSERVED) == oldest
+    assert oldest.content_sha256 in {
+        row["plan_hash"] for row in first["backfill_plan_archive"]
+    }
 
 
 def test_directory_capacity_is_explicit_and_not_silently_truncated(
@@ -351,38 +467,36 @@ def test_directory_capacity_is_explicit_and_not_silently_truncated(
         source(OBSERVED)
 
 
-def test_read_byte_budget_keeps_latest_plan_and_exposes_older_page(
+def test_read_byte_budget_refuses_partial_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from rquant import serving_page_projection_source as page_source
 
     database = _snapshot(tmp_path)
     directory = tmp_path / "plans"
-    first = _publish(database, directory, evidence_code_revision="rev-a")
+    _publish(database, directory, evidence_code_revision="rev-a")
     second = _publish(database, directory, evidence_code_revision="rev-b")
-    monkeypatch.setattr(page_source, "MAX_BACKFILL_INDEX_READ_BYTES", second.stat().st_size)
+    monkeypatch.setattr(page_source, "MAX_BACKFILL_CATALOG_READ_BYTES", second.stat().st_size)
     source = _source(tmp_path, directory)
 
-    first_page = _rows(source)
-    catalog = first_page["backfill_plan_catalog"][0]
-    assert catalog["total_plan_count"] == 2
-    assert catalog["indexed_plan_count"] == 1
-    assert catalog["has_older_plans"] is True
-    assert first_page["backfill_plan_index"][0]["plan_hash"] == (
-        load_daily_bar_backfill_plan(second).content_sha256
-    )
-    older = {
-        item.table_name: item.rows
-        for item in source.backfill_plan_index_page(
-            OBSERVED, cursor_hash=catalog["oldest_indexed_hash"]
-        )
-    }
-    assert older["backfill_plan_index"][0]["plan_hash"] == (
-        load_daily_bar_backfill_plan(first).content_sha256
-    )
+    with pytest.raises(PageProjectionSourceIntegrityError, match="bound"):
+        source(OBSERVED)
 
 
-def test_old_plan_tampering_is_rejected_when_reopened_by_hash(tmp_path: Path) -> None:
+def test_archive_byte_budget_refuses_partial_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import backfill_plan_projection as projection
+
+    directory = tmp_path / "plans"
+    _publish(_snapshot(tmp_path), directory)
+    monkeypatch.setattr(projection, "MAX_BACKFILL_ARCHIVE_BYTES", 1)
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="archive|bound"):
+        _source(tmp_path, directory)(OBSERVED)
+
+
+def test_old_plan_tampering_refuses_a_partial_new_generation(tmp_path: Path) -> None:
     from rquant.backfill_plan_projection import MAX_PREVIEW_BACKFILL_PLANS
 
     snapshot = _snapshot(tmp_path)
@@ -391,14 +505,13 @@ def test_old_plan_tampering_is_rejected_when_reopened_by_hash(tmp_path: Path) ->
         _publish(snapshot, directory, evidence_code_revision=f"rev-{index:02}")
         for index in range(MAX_PREVIEW_BACKFILL_PLANS + 1)
     ]
-    old = load_daily_bar_backfill_plan(paths[0])
     source = _source(tmp_path, directory)
-    assert source.backfill_plan_by_hash(old.content_sha256, observed_at=OBSERVED) == old
+    assert len(_rows(source)["backfill_plan_archive"]) == len(paths)
     paths[0].chmod(0o600)
     paths[0].write_bytes(paths[0].read_bytes().replace(b"unverified", b"verified", 1))
 
     with pytest.raises(PageProjectionSourceIntegrityError, match="invalid|digest|canonical"):
-        source.backfill_plan_by_hash(old.content_sha256, observed_at=OBSERVED)
+        source(OBSERVED)
 
 
 def test_backdated_file_time_cannot_publish_plan_into_past(tmp_path: Path) -> None:
@@ -407,23 +520,3 @@ def test_backdated_file_time_cannot_publish_plan_into_past(tmp_path: Path) -> No
     assert path.stat().st_ctime > datetime(2026, 9, 20, tzinfo=UTC).timestamp()
     with pytest.raises(PageProjectionSourceIntegrityError, match="available|time|past"):
         _source(tmp_path, path.parent)(datetime(2026, 9, 20, tzinfo=UTC))
-
-
-def test_missing_hash_during_directory_rotation_is_not_a_stable_absence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from rquant import serving_page_projection_source as page_source
-
-    directory = tmp_path / "plans"
-    directory.mkdir()
-    source = _source(tmp_path, directory)
-    original_read = page_source._read_bound_optional_file
-
-    def rotate_after_missing(*args: object, **kwargs: object) -> None:
-        assert original_read(*args, **kwargs) is None
-        os.replace(directory, tmp_path / "old-plans")
-        directory.mkdir()
-
-    monkeypatch.setattr(page_source, "_read_bound_optional_file", rotate_after_missing)
-    with pytest.raises(PageProjectionSourceIntegrityError, match="rotated|changed"):
-        source.backfill_plan_by_hash("0" * 64, observed_at=OBSERVED)
