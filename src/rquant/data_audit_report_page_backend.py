@@ -78,6 +78,21 @@ class DataAuditReportPageBackend:
             report_directory=directory,
             clock=self.clock,
         )
+        created_state = state.stat(follow_symlinks=False)
+        if not stat.S_ISREG(created_state.st_mode) or state.is_symlink():
+            raise ValueError("audit task state must remain a regular file")
+        self._state_inode = (created_state.st_dev, created_state.st_ino)
+
+    def _require_state_inode(self) -> tuple[int, int]:
+        observed = self.config.state_path.stat(follow_symlinks=False)
+        inode = (observed.st_dev, observed.st_ino)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or self.config.state_path.is_symlink()
+            or inode != self._state_inode
+        ):
+            raise ValueError("audit task state changed after backend initialization")
+        return inode
 
     @staticmethod
     def idempotency_key(command: SubmitDataAuditReport) -> str:
@@ -91,6 +106,7 @@ class DataAuditReportPageBackend:
 
     def recover(self, command: SubmitDataAuditReport) -> dict[str, str] | None:
         command = SubmitDataAuditReport.model_validate(command)
+        self._require_state_inode()
         existing = self.store.admission_by_key(self.idempotency_key(command))
         if existing is None:
             return None
@@ -117,9 +133,12 @@ class DataAuditReportPageBackend:
         if command.observed_through > closed_through:
             raise ValueError("audit end date must be after Shanghai market close")
         try:
+            state_inode = self._require_state_inode()
             primary = self.config.primary_path.stat(follow_symlinks=False)
             if not stat.S_ISREG(primary.st_mode) or self.config.primary_path.is_symlink():
                 raise ValueError("trusted primary is unavailable")
+            if (primary.st_dev, primary.st_ino) == state_inode:
+                raise ValueError("trusted primary aliases audit task state")
             if any(
                 os.path.lexists(f"{self.config.replica_path}{suffix}")
                 for suffix in (".wal", ".shm")
@@ -128,6 +147,9 @@ class DataAuditReportPageBackend:
             identity = capture_data_audit_replica_identity(
                 self.config.primary_path, self.config.replica_path
             )
+            if (identity.device, identity.inode) == state_inode:
+                raise ValueError("trusted read-only replica aliases audit task state")
+            self._require_state_inode()
         except (OSError, ValueError) as exc:
             raise ValueError("trusted read-only replica is unavailable") from exc
         request = DataAuditReportJobRequest(

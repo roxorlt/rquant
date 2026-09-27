@@ -257,6 +257,18 @@ def test_replica_symlink_fifo_sidecar_and_primary_alias_fail_closed(tmp_path: Pa
     assert backend.store.latest() is None
 
 
+def test_replaced_replica_cannot_alias_initialized_audit_task_state(tmp_path: Path) -> None:
+    primary, replica = _sources(tmp_path)
+    backend = _backend(tmp_path, primary, replica)
+    replica.unlink()
+    os.link(backend.config.state_path, replica)
+
+    receipt = _service(tmp_path, backend).submit(_command("audit-state-alias-0001"))
+
+    assert receipt.status is PageControlStatus.FAILED
+    assert backend.store.latest() is None
+
+
 def test_trusted_paths_reject_alias_symlink_fifo_and_noncanonical(tmp_path: Path) -> None:
     primary, replica = _sources(tmp_path)
     state = tmp_path / "audit-jobs.sqlite"

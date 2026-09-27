@@ -168,6 +168,20 @@ def test_rotated_replica_fails_and_does_not_replace_previous_success(tmp_path: P
     assert all(str(primary) not in str(event) for event in store.list_events(queued.task_id))
 
 
+def test_replica_shm_created_after_queue_prevents_worker_success(tmp_path: Path) -> None:
+    primary, replica = _sources(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(primary, replica))
+    Path(f"{replica}.shm").write_bytes(b"unsealed")
+
+    failed = DataAuditReportJobWorker(store).run_one()
+
+    assert failed is not None and failed.task_id == queued.task_id
+    assert failed.status == "failed" and failed.error_code == "replica_changed"
+    assert not (tmp_path / "reports").exists()
+
+
 def test_crash_after_publish_recovers_from_persisted_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
