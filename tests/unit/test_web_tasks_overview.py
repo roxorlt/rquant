@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,8 +27,10 @@ from rquant.runtime_service_control import (
 from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_read_models import ServingProjectionInput
 from rquant.web.app import create_app
+from rquant.web.market import MarketPhase
 from rquant.web.models.tasks import ResourcesData, ScheduledTasksData
 from rquant.web.settings import WebSettings
+from rquant.web.task_overview import _timer_status
 from tests.support import web_serving_fixture as fixture
 from tests.unit.test_web_tasks import _job
 
@@ -64,6 +67,7 @@ def _sample(at: datetime) -> OpsSnapshot:
                 timer_unit_file_state="disabled" if stem == "backup" else "enabled",
                 timer_active_state="inactive" if stem == "monitor" else "active",
                 timer_sub_state="waiting",
+                service_load_state="loaded",
                 last_trigger_at=at - timedelta(hours=1),
                 next_at=(
                     at + timedelta(seconds=10)
@@ -99,6 +103,7 @@ def _publish(
     built_at: datetime | None = None,
     health_rows: int | None = None,
     long_job_name: bool = False,
+    ops_sample_transform: Callable[[OpsSnapshot], OpsSnapshot] | None = None,
 ) -> datetime:
     if built_at is not None:
         monkeypatch.setattr(
@@ -128,6 +133,8 @@ def _publish(
         if not ops_available:
             return result
         sample = _sample(at - timedelta(seconds=40))
+        if ops_sample_transform is not None:
+            sample = ops_sample_transform(sample)
         ops_projections = ops_status_projections(sample)
         if ops_partial:
             ops_projections = tuple(
@@ -189,6 +196,36 @@ def _app(root: Path, now: datetime):
     return create_app(WebSettings(serving_root=root), clock=lambda: now, background=False)
 
 
+@pytest.mark.parametrize("service_load_state", (None, "not-found"))
+def test_active_timer_without_its_installed_service_is_not_healthy(
+    service_load_state: str | None,
+) -> None:
+    now = fixture.FIXTURE_BUILT_AT
+    timer = next(
+        item for item in _sample(now).units if item.timer == "rquant-monitor-watchdog.timer"
+    ).model_copy(update={"service_load_state": service_load_state})
+
+    status = _timer_status(timer, MarketPhase.CONTINUOUS, now)
+
+    assert status.state == "crit"
+    assert status.label == "异常"
+
+
+@pytest.mark.parametrize("phase", (MarketPhase.NON_TRADING_DAY, MarketPhase.PRE_OPEN))
+def test_failed_market_timer_remains_an_alarm_outside_market_hours(
+    phase: MarketPhase,
+) -> None:
+    now = fixture.FIXTURE_BUILT_AT
+    timer = next(
+        item for item in _sample(now).units if item.timer == "rquant-monitor.timer"
+    ).model_copy(update={"timer_active_state": "failed"})
+
+    status = _timer_status(timer, phase, now)
+
+    assert status.state == "crit"
+    assert status.label == "异常"
+
+
 def test_overview_uses_one_borrow_and_keeps_results_unknown_without_receipts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -247,6 +284,39 @@ def test_overview_uses_one_borrow_and_keeps_results_unknown_without_receipts(
     assert len(data["research"]["items"]) == 1
     assert data["research"]["next_cursor"]
     assert response.headers["X-Rquant-Generation"] == response.json()["serving"]["generation_id"]
+
+
+def test_missing_or_inactive_slice_does_not_report_stale_memory_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def change_resources(sample: OpsSnapshot) -> OpsSnapshot:
+        return sample.model_copy(
+            update={
+                "resources": tuple(
+                    item.model_copy(update={"load_state": "not-found"})
+                    if item.slice_name == "rquant.slice"
+                    else item.model_copy(update={"active_state": "inactive"})
+                    if item.slice_name == "rquant-live.slice"
+                    else item
+                    for item in sample.resources
+                )
+            }
+        )
+
+    root = tmp_path / "serving"
+    at = _publish(root, monkeypatch, ops_sample_transform=change_resources)
+    with TestClient(_app(root, at + timedelta(seconds=30))) as client:
+        response = client.get("/api/v1/tasks/overview")
+
+    assert response.status_code == 200, response.text
+    resources = response.json()["data"]["resources"]
+    assert resources["source_state"] == "ready"
+    assert resources["rquant_memory_current_bytes"] is None
+    assert resources["rquant_memory_peak_bytes"] is None
+    assert resources["groups"][0]["memory_current_bytes"] is None
+    assert resources["groups"][0]["memory_peak_bytes"] is None
+    assert resources["groups"][1]["memory_current_bytes"] == 700
+    assert resources["groups"][1]["memory_peak_bytes"] == 900
 
 
 def test_overview_expires_at_full_120_seconds_even_when_serving_is_current(
