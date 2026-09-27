@@ -29,6 +29,7 @@ class VisibilityRule(StrEnum):
     MINUTE_AS_OF = "minute_as_of"
     AUCTION_0925 = "auction_0925"
     PANEL_CLOSE_NEXT_SESSION = "panel_close_next_session"
+    FINANCIAL_PIT = "financial_pit"
     UNKNOWN = "unknown"
 
 
@@ -136,6 +137,9 @@ class DatasetContract(ContractModel):
         }:
             if self.event_date_column is None:
                 raise ValueError(f"{self.visibility.name} visibility requires an event date column")
+        elif self.visibility is VisibilityRule.FINANCIAL_PIT:
+            if self.event_date_column is not None or self.event_time_column is not None:
+                raise ValueError("FINANCIAL_PIT requires the dedicated fact selector")
         else:
             if self.event_date_column is not None or self.event_time_column is not None:
                 raise ValueError("UNKNOWN visibility is reserved for undated current snapshots")
@@ -205,6 +209,9 @@ def is_visible(
     source: str | None = None,
 ) -> bool:
     """Evaluate one event using conservative Asia/Shanghai PIT visibility."""
+
+    if contract.visibility is VisibilityRule.FINANCIAL_PIT:
+        raise ValueError("financial PIT requires query_financial_pit")
 
     local_as_of = _require_aware_as_of(as_of_time)
 
@@ -642,6 +649,22 @@ DATASET_CONTRACTS: tuple[DatasetContract, ...] = (
         earliest_date=None,
         allowed_missing_reasons=(),
         backfill_dataset_id="moneyflow_mkt_dc",
+    ),
+    DatasetContract(
+        dataset_id="financial_observation",
+        table_name="financial_observation",
+        sources=("tushare",),
+        physical_primary_key=("archive_id", "request_id", "row_index"),
+        logical_key=("archive_id", "request_id", "row_index"),
+        ingested_at_column="observed_at",
+        price_basis=PriceBasis.NOT_APPLICABLE,
+        visibility=VisibilityRule.FINANCIAL_PIT,
+        freshness=FreshnessRule(
+            watermark_column="observed_at",
+            event_driven=True,
+            required_on_open_day=False,
+        ),
+        historized=True,
     ),
 )
 

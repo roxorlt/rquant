@@ -84,12 +84,14 @@ def test_all_real_contracts_are_described_and_snapshot_matches(tmp_path: Path) -
         initialize_schema(connection)
         schemas = schema_from_connection(connection)
     result = build_catalog(CATALOG_CONTRACTS, schemas, DATASETS, FIELDS)
-    assert len(result.datasets) == len(DATASET_CONTRACTS) + 1
+    assert len(result.datasets) == len(DATASET_CONTRACTS)
+    assert "financial_observation" not in {item.dataset_id for item in result.datasets}
     assert "limit_up_pool_daily" not in CONTRACTS_BY_ID
     assert all(item.name and item.purpose and item.fields for item in result.datasets)
     assert all(
         field.name and field.description for item in result.datasets for field in item.fields
     )
     artifact = Path(__file__).resolve().parents[2] / "src/rquant/data_catalog/catalog-v1.json"
+    assert "archive_id" not in artifact.read_text(encoding="utf-8")
     assert CatalogDocument.model_validate_json(artifact.read_text(encoding="utf-8")) == result
     assert json.loads(artifact.read_text(encoding="utf-8"))["version"] == 1

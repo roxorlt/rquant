@@ -199,6 +199,27 @@ def test_revision_selection_preserves_older_version_until_new_one_is_observed() 
     assert historical.content_sha256 != revised_now.content_sha256
 
 
+def test_later_blocker_masks_old_value_until_a_visible_recovery() -> None:
+    old = _fact()
+    blocker = _fact(
+        value=None,
+        first_observed_at=datetime(2026, 9, 29, 10, tzinfo=SHANGHAI),
+    )
+    recovery = _fact(
+        value=Decimal("120"),
+        ann_date=date(2026, 9, 29),
+        first_observed_at=datetime(2026, 9, 29, 11, tzinfo=SHANGHAI),
+    )
+
+    assert _select((old, blocker), datetime(2026, 9, 29, 9, 59, tzinfo=SHANGHAI)).fact == old
+    masked = _select((old, blocker, recovery), datetime(2026, 9, 29, 12, tzinfo=SHANGHAI))
+    assert masked.status == "unknown"
+    assert masked.reason == "missing_value"
+    restored = _select((old, blocker, recovery), datetime(2026, 9, 30, 9, 30, tzinfo=SHANGHAI))
+    assert restored.status == "selected"
+    assert restored.fact == recovery
+
+
 def test_future_observation_does_not_require_future_calendar_to_select_old_version() -> None:
     old = _fact()
     future = _fact(

@@ -48,6 +48,7 @@ _ANCHOR_NAME = "manifest.anchor.jsonl"
 _MAX_SNAPSHOT_BYTES = 64_000_000
 _MAX_ANCHOR_BYTES = 16_000_000
 _MAX_ANCHOR_LINE_BYTES = 1024
+_MAX_COMMITTED_PAGE = 32
 
 
 def _json_bytes(value: object) -> bytes:
@@ -187,6 +188,20 @@ class FinancialObservedVersion(_Model):
     first_response_status: FinancialStatus
 
 
+class FinancialCommittedEntry(_Model):
+    receipt: FinancialReceipt
+    batch: FinancialBatch
+
+
+class FinancialCommittedPage(_Model):
+    archive_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    high_water: datetime | None
+    anchor_generation: int = Field(ge=0)
+    anchor_record_sha256: str = Field(pattern=_SHA256_PATTERN)
+    entries: tuple[FinancialCommittedEntry, ...]
+    has_more: bool
+
+
 class _AnchorRecord(_Model):
     archive_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     generation: int = Field(ge=0)
@@ -207,6 +222,7 @@ class _ArchiveState:
     snapshot_sha256: str
     anchor: _AnchorRecord
     anchor_record_sha256: str
+    anchor_bytes: bytes
 
 
 def _validate_query_for_day(query: FinancialQuery, run_day: date) -> None:
@@ -673,6 +689,7 @@ class FinancialArchive:
                 if complete_size < len(anchor_bytes):
                     os.ftruncate(anchor_fd, complete_size)
                     os.fsync(anchor_fd)
+                    anchor_bytes = anchor_bytes[:complete_size]
                 if anchor.archive_id != identity["archive_id"]:
                     raise ValueError("archive anchor identity is invalid")
                 connection = self._connect()
@@ -720,6 +737,7 @@ class FinancialArchive:
                     os.fsync(root_fd)
                     self._append_anchor(anchor_fd, recovered)
                     anchor, anchor_digest = recovered, _sha256(_anchor_line(recovered)[:-1])
+                    anchor_bytes += _anchor_line(recovered)
                 else:
                     raise ValueError("archive snapshot rollback or anchor mismatch")
                 yield _ArchiveState(
@@ -732,6 +750,7 @@ class FinancialArchive:
                     snapshot_sha256=snapshot_digest,
                     anchor=anchor,
                     anchor_record_sha256=anchor_digest,
+                    anchor_bytes=anchor_bytes,
                 )
             finally:
                 if connection is not None:
@@ -812,6 +831,64 @@ class FinancialArchive:
             ).fetchall()
             receipts = tuple(self._receipt_from_row(row) for row in rows)
             return tuple(self._load_batch(receipt, root_fd=state.root_fd) for receipt in receipts)
+
+    def committed_page(
+        self,
+        *,
+        after: datetime | None = None,
+        limit: int = _MAX_COMMITTED_PAGE,
+        accepted_anchor_generation: int | None = None,
+        accepted_anchor_sha256: str | None = None,
+    ) -> FinancialCommittedPage:
+        """Read a bounded committed page and prove an accepted anchor is still a prefix."""
+
+        if type(limit) is not int or not 1 <= limit <= _MAX_COMMITTED_PAGE:
+            raise ValueError("committed page limit is outside its fixed bound")
+        if (accepted_anchor_generation is None) != (accepted_anchor_sha256 is None):
+            raise ValueError("anchor generation and digest must be supplied together")
+        if after is not None:
+            after = _utc(after)
+        with self._state() as state:
+            if accepted_anchor_generation is not None:
+                if (
+                    type(accepted_anchor_generation) is not int
+                    or accepted_anchor_generation < 0
+                    or accepted_anchor_generation > state.anchor.generation
+                    or not isinstance(accepted_anchor_sha256, str)
+                    or re.fullmatch(_SHA256_PATTERN, accepted_anchor_sha256) is None
+                ):
+                    raise ValueError("accepted anchor is invalid")
+                prefix = state.anchor_bytes.splitlines()[accepted_anchor_generation]
+                if _sha256(prefix) != accepted_anchor_sha256:
+                    raise ValueError("accepted anchor is not a prefix of this archive")
+            high_water = (
+                datetime.fromisoformat(state.anchor.high_water)
+                if state.anchor.high_water is not None
+                else None
+            )
+            if after is not None and (high_water is None or after > high_water):
+                raise ValueError("committed page cursor is ahead of archive high-water")
+            after_text = after.isoformat(timespec="microseconds") if after is not None else None
+            rows = state.connection.execute(
+                "SELECT * FROM batch_manifest WHERE (? IS NULL OR observed_at > ?) "
+                "ORDER BY observed_at LIMIT ?",
+                (after_text, after_text, limit + 1),
+            ).fetchall()
+            entries = tuple(
+                FinancialCommittedEntry(
+                    receipt=receipt,
+                    batch=self._load_batch(receipt, root_fd=state.root_fd),
+                )
+                for receipt in (self._receipt_from_row(row) for row in rows[:limit])
+            )
+            return FinancialCommittedPage(
+                archive_id=state.archive_id,
+                high_water=high_water,
+                anchor_generation=state.anchor.generation,
+                anchor_record_sha256=state.anchor_record_sha256,
+                entries=entries,
+                has_more=len(rows) > limit,
+            )
 
     def _load_batch(self, receipt: FinancialReceipt, *, root_fd: int) -> FinancialBatch:
         try:
