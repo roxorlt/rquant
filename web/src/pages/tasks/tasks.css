@@ -10,6 +10,23 @@
   min-width: 0;
 }
 
+.tasks-name-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tasks-name-head .tip-anchor {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.tasks-progress-link {
+  flex: 0 0 auto;
+  margin: -3px -6px -3px auto;
+}
+
 .tasks-name {
   color: var(--ink);
   font-size: 13px;
@@ -114,6 +131,122 @@
 
 .tasks-pages .hint {
   margin-right: auto;
+}
+
+.tasks-event-title {
+  display: grid;
+  gap: 2px;
+  line-height: 1.35;
+}
+
+.tasks-event-title span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.tasks-event-body {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+}
+
+.tasks-event-updated,
+.tasks-event-limit {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tasks-event-updated {
+  color: var(--muted);
+}
+
+.tasks-event-updated time,
+.tasks-event-list time {
+  font-variant-numeric: tabular-nums;
+}
+
+.tasks-event-limit {
+  padding: 9px 12px;
+  border-radius: 6px;
+  background: var(--warn-weak);
+  color: var(--warn-t);
+}
+
+.tasks-event-list {
+  list-style: none;
+  display: grid;
+  margin: 0 0 0 6px;
+  padding: 0;
+}
+
+.tasks-event-list li {
+  position: relative;
+  display: grid;
+  gap: 5px;
+  padding: 0 0 18px 20px;
+  border-left: 1px solid var(--rule-strong);
+  min-width: 0;
+}
+
+.tasks-event-list li:last-child {
+  padding-bottom: 0;
+  border-color: transparent;
+}
+
+.tasks-event-list li::before {
+  position: absolute;
+  top: 4px;
+  left: -4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  content: "";
+}
+
+.tasks-event-list time {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tasks-event-entry {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tasks-event-entry strong {
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.tasks-event-entry span {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--sunken);
+  color: var(--ink-2);
+  font-size: 11px;
+}
+
+.tasks-event-message {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+}
+
+.tasks-event-message > p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 13px;
 }
 
 @media (max-width: 760px) {

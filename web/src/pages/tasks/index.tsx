@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import { type ResearchJobItem, type ResearchJobsData, useTaskOverview } from "@/api/endpoints";
+import { useCurrentGeneration } from "@/api/useMeta";
 import { formatCount, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime, formatShanghaiTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
@@ -17,6 +18,7 @@ import {
   Tip,
 } from "@/ui";
 import { OverviewSections } from "./OverviewSections";
+import { type SelectedTask, TaskProgressDrawer } from "./TaskProgressDrawer";
 import "./tasks.css";
 
 function metrics(data: ResearchJobsData): Kpi[] {
@@ -59,12 +61,31 @@ function Eta({ row }: { row: ResearchJobItem }) {
   );
 }
 
-function TaskName({ row }: { row: ResearchJobItem }) {
+function TaskName({
+  row,
+  onProgress,
+}: {
+  row: ResearchJobItem;
+  onProgress?: (row: ResearchJobItem, trigger: HTMLButtonElement) => void;
+}) {
   return (
     <div className="tasks-name-cell">
-      <Tip content={`任务编号 ${row.job_id}`}>
-        <strong className="tasks-name">{row.strategy_name}</strong>
-      </Tip>
+      <div className="tasks-name-head">
+        <Tip content={`任务编号 ${row.job_id}`}>
+          <strong className="tasks-name">{row.strategy_name}</strong>
+        </Tip>
+        {onProgress ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="tasks-progress-link"
+            aria-label={`查看${row.strategy_name}的进展`}
+            onClick={(event) => onProgress(row, event.currentTarget)}
+          >
+            进展
+          </Button>
+        ) : null}
+      </div>
       <span className="tasks-meta">
         {row.job_type_label} · {row.resource_label}
       </span>
@@ -142,11 +163,33 @@ export default function TasksPage() {
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [, setClockPulse] = useState(0);
+  const [selected, setSelected] = useState<SelectedTask | null>(null);
+  const [progressNotice, setProgressNotice] = useState<string | null>(null);
+  const returnFocus = useRef<HTMLButtonElement | null>(null);
   const pageIndex = cursors.length - 1;
   const result = useTaskOverview(cursors[pageIndex] ?? null, refreshKey);
+  const currentGeneration = useCurrentGeneration();
   const snapshot = result.data;
   const data = snapshot?.overview;
+  const generationId = result.serving?.generation_id ?? null;
+  const outdated = currentGeneration !== undefined && currentGeneration !== generationId;
   const changed = result.error instanceof ApiError && result.error.status === 409;
+  const canViewProgress =
+    !outdated &&
+    result.error === null &&
+    generationId !== null &&
+    data?.can_view_research_logs === true &&
+    data.research.source_state === "ready" &&
+    data.research.items.length > 0;
+  const staleSelection =
+    selected !== null &&
+    (selected.generationId !== generationId ||
+      outdated ||
+      result.error !== null ||
+      data?.can_view_research_logs !== true ||
+      data.research.source_state !== "ready" ||
+      !data.research.items.some((row) => row.job_id === selected.jobId));
+  const activeSelection = staleSelection ? null : selected;
   const now = performance.now();
   const scheduledDeadline = snapshot?.scheduledDeadline ?? null;
   const resourcesDeadline = snapshot?.resourcesDeadline ?? null;
@@ -158,6 +201,52 @@ export default function TasksPage() {
     data?.resources.source_state === "ready" &&
     resourcesDeadline !== null &&
     resourcesDeadline > now;
+
+  const openProgress = useCallback(
+    (row: ResearchJobItem, trigger: HTMLButtonElement) => {
+      if (!canViewProgress || generationId === null) return;
+      returnFocus.current = trigger;
+      setProgressNotice(null);
+      setSelected({ jobId: row.job_id, name: row.strategy_name, generationId });
+    },
+    [canViewProgress, generationId],
+  );
+  const columns = useMemo(
+    () =>
+      canViewProgress
+        ? COLUMNS.map((column) =>
+            column.id === "task"
+              ? {
+                  ...column,
+                  cell: (row: ResearchJobItem) => <TaskName row={row} onProgress={openProgress} />,
+                }
+              : column,
+          )
+        : COLUMNS,
+    [canViewProgress, openProgress],
+  );
+  const closeProgress = useCallback(() => setSelected(null), []);
+  const invalidateProgress = useCallback(() => {
+    setSelected(null);
+    setProgressNotice("数据已更新，请重新打开任务进展。");
+  }, []);
+
+  useEffect(() => {
+    if (!staleSelection) return;
+    setSelected(null);
+    setProgressNotice(
+      selected?.generationId !== generationId || outdated || changed
+        ? "数据已更新，请重新打开任务进展。"
+        : "当前无法查看任务进展。",
+    );
+  }, [staleSelection, selected, generationId, outdated, changed]);
+
+  useEffect(() => {
+    if (selected !== null || !returnFocus.current?.isConnected) return;
+    const trigger = returnFocus.current;
+    const frame = window.requestAnimationFrame(() => trigger.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [selected]);
 
   useEffect(() => {
     if (!changed || pageIndex === 0) return;
@@ -215,7 +304,12 @@ export default function TasksPage() {
           </Button>
         }
       />
-      {result.isLoading || (changed && pageIndex > 0) ? (
+      {progressNotice ? (
+        <p className="tasks-notice tasks-progress-notice" role="status">
+          {progressNotice}
+        </p>
+      ) : null}
+      {result.isLoading || (outdated && !result.error) || (changed && pageIndex > 0) ? (
         <PageSkeleton label="任务总览加载中" />
       ) : result.error ? (
         <Panel title="任务总览">
@@ -263,7 +357,7 @@ export default function TasksPage() {
               <>
                 <DataTable
                   rows={data.research.items}
-                  columns={COLUMNS}
+                  columns={columns}
                   rowKey={(row) => row.job_id}
                   label="研究任务队列"
                   emptyText="本页没有更多任务，请返回上一页。"
@@ -296,6 +390,11 @@ export default function TasksPage() {
           </Panel>
         </div>
       ) : null}
+      <TaskProgressDrawer
+        selected={activeSelection}
+        onClose={closeProgress}
+        onInvalidated={invalidateProgress}
+      />
     </>
   );
 }

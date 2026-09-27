@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef } from "react";
 import { ApiError, apiClient, type Schemas } from "./client";
 import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
@@ -18,6 +18,7 @@ export type MonitorTimelineData = Schemas["MonitorTimelineData"];
 export type MonitorTimelineItem = MonitorTimelineData["items"][number];
 export type ResearchJobsData = Schemas["ResearchJobsData"];
 export type ResearchJobItem = Schemas["ResearchJobItem"];
+export type ResearchTaskEventsData = Schemas["ResearchTaskEventsData"];
 export type TaskOverviewData = Schemas["TaskOverviewData"];
 export type ScheduledTaskItem = Schemas["ScheduledTaskItem"];
 export type RuntimeServiceItem = Schemas["RuntimeServiceItem"];
@@ -99,6 +100,27 @@ export function useResearchJobs(
       params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
     });
     return unwrap(data, response);
+  });
+}
+
+/** Private task progress is keyed to the exact overview generation and opens on demand. */
+export function useResearchTaskEvents(jobId: string | null, generationId: string | null) {
+  return useQuery({
+    queryKey: ["tasks", "research-events", jobId, generationId],
+    enabled: jobId !== null && generationId !== null,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    queryFn: async (): Promise<ResearchTaskEventsData> => {
+      const { data, response } = await apiClient().GET("/api/v1/tasks/jobs/{job_id}/events", {
+        params: {
+          path: { job_id: jobId ?? "" },
+          query: { generation_id: generationId },
+        },
+      });
+      return unwrap(data, response);
+    },
   });
 }
 
