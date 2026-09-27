@@ -4427,6 +4427,121 @@
         "title": "FieldExpr",
         "type": "object"
       },
+      "FinancialFieldCount": {
+        "properties": {
+          "key": {
+            "enum": [
+              "pe_ttm",
+              "pb",
+              "dv_ttm",
+              "roe",
+              "or_yoy",
+              "netprofit_yoy"
+            ],
+            "title": "Key",
+            "type": "string"
+          },
+          "known_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Known Count"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FinancialReasonCount"
+            },
+            "maxItems": 4,
+            "title": "Reasons",
+            "type": "array"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          },
+          "unknown_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unknown Count"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "unit",
+          "known_count",
+          "unknown_count",
+          "reasons"
+        ],
+        "title": "FinancialFieldCount",
+        "type": "object"
+      },
+      "FinancialReasonCount": {
+        "properties": {
+          "count": {
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "enum": [
+              "尚无来源记录",
+              "披露尚未可见",
+              "字段缺值",
+              "来源证据不足",
+              "日历待核验",
+              "候选数量超限",
+              "数值不可用",
+              "其他原因"
+            ],
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "count"
+        ],
+        "title": "FinancialReasonCount",
+        "type": "object"
+      },
+      "FinancialSummarySource": {
+        "properties": {
+          "identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Identity",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity",
+          "updated_at"
+        ],
+        "title": "FinancialSummarySource",
+        "type": "object"
+      },
       "FormulaAst": {
         "additionalProperties": false,
         "properties": {
@@ -4591,6 +4706,83 @@
           "caveats"
         ],
         "title": "FreshnessSummary",
+        "type": "object"
+      },
+      "FundamentalSummaryData": {
+        "properties": {
+          "coverage_note": {
+            "const": "全市场覆盖尚未核验",
+            "title": "Coverage Note",
+            "type": "string"
+          },
+          "decision_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Date"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/FinancialFieldCount"
+            },
+            "maxItems": 6,
+            "minItems": 6,
+            "title": "Fields",
+            "type": "array"
+          },
+          "record_count": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Count"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinancialSummarySource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "not_configured",
+              "calendar_unavailable",
+              "no_records"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "waiting_for_today": {
+            "title": "Waiting For Today",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "decision_date",
+          "waiting_for_today",
+          "source",
+          "record_count",
+          "fields",
+          "coverage_note"
+        ],
+        "title": "FundamentalSummaryData",
         "type": "object"
       },
       "GenerationInfo": {
@@ -10350,6 +10542,56 @@
         "summary": "数据集字段说明",
         "tags": [
           "catalog"
+        ]
+      }
+    },
+    "/api/v1/data/fundamentals/summary": {
+      "get": {
+        "operationId": "get_fundamental_summary_api_v1_data_fundamentals_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "expected_identity",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Identity"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FundamentalSummaryData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "财务数据概况",
+        "tags": [
+          "data-center"
         ]
       }
     },

@@ -157,6 +157,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data/fundamentals/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 财务数据概况 */
+        get: operations["get_fundamental_summary_api_v1_data_fundamentals_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/health": {
         parameters: {
             query?: never;
@@ -2125,6 +2142,44 @@ export interface components {
             /** Name */
             name: string;
         };
+        /** FinancialFieldCount */
+        FinancialFieldCount: {
+            /**
+             * Key
+             * @enum {string}
+             */
+            key: "pe_ttm" | "pb" | "dv_ttm" | "roe" | "or_yoy" | "netprofit_yoy";
+            /** Known Count */
+            known_count: number | null;
+            /** Label */
+            label: string;
+            /** Reasons */
+            reasons: components["schemas"]["FinancialReasonCount"][];
+            /** Unit */
+            unit: string;
+            /** Unknown Count */
+            unknown_count: number | null;
+        };
+        /** FinancialReasonCount */
+        FinancialReasonCount: {
+            /** Count */
+            count: number;
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "尚无来源记录" | "披露尚未可见" | "字段缺值" | "来源证据不足" | "日历待核验" | "候选数量超限" | "数值不可用" | "其他原因";
+        };
+        /** FinancialSummarySource */
+        FinancialSummarySource: {
+            /** Identity */
+            identity: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
         /** FormulaAst */
         FormulaAst: {
             /** Assignments */
@@ -2169,6 +2224,28 @@ export interface components {
             no_source: number;
             /** On Time */
             on_time: number;
+        };
+        /** FundamentalSummaryData */
+        FundamentalSummaryData: {
+            /**
+             * Coverage Note
+             * @constant
+             */
+            coverage_note: "全市场覆盖尚未核验";
+            /** Decision Date */
+            decision_date: string | null;
+            /** Fields */
+            fields: components["schemas"]["FinancialFieldCount"][];
+            /** Record Count */
+            record_count: number | null;
+            source: components["schemas"]["FinancialSummarySource"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "not_configured" | "calendar_unavailable" | "no_records";
+            /** Waiting For Today */
+            waiting_for_today: boolean;
         };
         /** GenerationInfo */
         GenerationInfo: {
@@ -4062,6 +4139,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_CatalogDatasetDetail_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_fundamental_summary_api_v1_data_fundamentals_summary_get: {
+        parameters: {
+            query?: {
+                expected_identity?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FundamentalSummaryData"];
                 };
             };
             /** @description Validation Error */
