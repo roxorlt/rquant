@@ -418,15 +418,18 @@ def test_field_a_b_a_is_a_new_version_and_late_first_seen_is_not_backfilled(tmp_
             assert query_financial_pit(other, _pit_query()).status == "unknown"
 
 
-def test_unkeyed_and_missing_announcement_observations_block_until_recovery(
-    tmp_path: Path,
+@pytest.mark.parametrize("missing_key_column", ["report_type", "end_date"])
+def test_unkeyed_observation_persists_after_keyed_recovery(
+    tmp_path: Path, missing_key_column: str,
 ) -> None:
     archive = FinancialArchive(tmp_path / "archive")
     _observe(archive, datetime(2026, 9, 24, 8, tzinfo=UTC), [_row(revenue=100)])
+    unkeyed = _row(revenue=110)
+    unkeyed[missing_key_column] = None
     _observe(
         archive,
         datetime(2026, 9, 29, 1, tzinfo=UTC),
-        [_row(report_type=None, revenue=110)],
+        [unkeyed],
     )
     _observe(
         archive,
@@ -438,6 +441,9 @@ def test_unkeyed_and_missing_announcement_observations_block_until_recovery(
         initialize_schema(conn)
         _calendar(conn)
         import_financial_archive(conn, archive, page_size=1)
+        historical = query_financial_pit(
+            conn, _pit_query(as_of=datetime(2026, 9, 29, 8, 59, tzinfo=SHANGHAI))
+        )
         before = query_financial_pit(
             conn, _pit_query(as_of=datetime(2026, 9, 29, 10, tzinfo=SHANGHAI))
         )
@@ -447,7 +453,28 @@ def test_unkeyed_and_missing_announcement_observations_block_until_recovery(
         recovered = query_financial_pit(
             conn, _pit_query(as_of=datetime(2026, 9, 29, 12, tzinfo=SHANGHAI))
         )
+        assert historical.fact.value == 100
         assert before.reason == "unkeyed_observation"
+        assert masked.reason == "unkeyed_observation"
+        assert recovered.status == "unknown"
+        assert recovered.reason == "unkeyed_observation"
+
+
+def test_keyed_missing_announcement_is_cleared_by_later_complete_version(tmp_path: Path) -> None:
+    archive = FinancialArchive(tmp_path / "archive")
+    _observe(archive, datetime(2026, 9, 24, 8, tzinfo=UTC), [_row(revenue=100)])
+    _observe(archive, datetime(2026, 9, 29, 2, tzinfo=UTC), [_row(ann_date=None)])
+    _observe(archive, datetime(2026, 9, 29, 3, tzinfo=UTC), [_row(revenue=120)])
+    with duckdb.connect(":memory:") as conn:
+        initialize_schema(conn)
+        _calendar(conn)
+        import_financial_archive(conn, archive, page_size=1)
+        masked = query_financial_pit(
+            conn, _pit_query(as_of=datetime(2026, 9, 29, 11, tzinfo=SHANGHAI))
+        )
+        recovered = query_financial_pit(
+            conn, _pit_query(as_of=datetime(2026, 9, 29, 12, tzinfo=SHANGHAI))
+        )
         assert masked.reason == "missing_announcement_date"
         assert recovered.fact.value == 120
 

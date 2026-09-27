@@ -185,6 +185,9 @@ def select_financial_fact(
             return _unknown("missing_observation_time")
         if as_of_utc <= observed_utc:
             continue
+        # A keyed revision cannot resolve an observation with no report identity.
+        if fact.block_reason == "unkeyed_observation":
+            return _unknown("unkeyed_observation")
         block_reason = (
             fact.block_reason
             or ("missing_announcement_date" if fact.ann_date is None else None)
