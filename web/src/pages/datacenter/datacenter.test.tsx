@@ -1,10 +1,16 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
+import { vi } from "vitest";
 import type { Schemas } from "@/api/client";
+import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
+
+vi.mock("@/charts/EChart", () => ({
+  EChart: ({ label }: { label: string }) => <div role="img" aria-label={label} />,
+}));
 
 type CatalogList = Schemas["CatalogList"];
 type CatalogDataset = Schemas["CatalogDatasetDetail"];
@@ -75,6 +81,12 @@ const descriptions: CatalogList = {
 
 function catalogHandlers(list: CatalogList = descriptions) {
   server.use(
+    http.get("*/api/v1/data/report", () =>
+      HttpResponse.json({
+        data: { source_state: "not_published", overview: null, months: [], rules: [], issues: [] },
+        serving: metaEnvelope().serving,
+      }),
+    ),
     http.get("*/api/v1/data/health", () =>
       HttpResponse.json({
         data: { source_state: "not_published", latest_attempt: null, latest_success: null },
@@ -351,8 +363,291 @@ describe("数据中心目录", () => {
   });
 });
 
+const report: Schemas["DataAuditReportData"] = {
+  source_state: "ready",
+  overview: {
+    report_hash: "f".repeat(64),
+    schema_version: 1,
+    rule_version: "daily-bar-quality-v1",
+    run_status: "completed",
+    collection_status: "collection_unconfirmed",
+    collection_completed_through: null,
+    collection_label: "采集未确认",
+    coverage_conclusion: "unconfirmed",
+    coverage_label: "覆盖情况待确认",
+    quality_conclusion: "issues_observed",
+    quality_label: "发现问题",
+    current: false,
+    source_mode: "production_unverified",
+    source_namespace: "production",
+    replica_generation_id: null,
+    audit_start: "2026-08-01",
+    observed_through: "2026-09-30",
+    expected_open_days: 42,
+    covered_open_days: 40,
+    missing_open_days: 2,
+    gap_count: 1,
+    longest_gap_open_days: 2,
+    closed_day_count: 19,
+    monthly_count: 2,
+    rule_count: 3,
+    quality_issue_count: 1,
+    indexed_issue_count: 1,
+    omitted_issue_count: 0,
+    unassessed_rule_days: 46,
+  },
+  months: [
+    {
+      month: "2026-08-01",
+      expected_open_days: 21,
+      covered_open_days: 21,
+      coverage_ratio: 1,
+      status: "measured",
+      status_label: "已统计",
+    },
+    {
+      month: "2026-09-01",
+      expected_open_days: 21,
+      covered_open_days: 19,
+      coverage_ratio: 19 / 21,
+      status: "measured",
+      status_label: "已统计",
+    },
+  ],
+  rules: [
+    {
+      rule_id: "daily_bar.close_limit",
+      name: "收盘价上下限",
+      field_name: null,
+      field_label: null,
+      expected_days: 42,
+      checked_days: 40,
+      assessed_days: 0,
+      unassessed_days: 42,
+      first_assessed_date: null,
+      last_assessed_date: null,
+      assessment_complete: false,
+      unassessed_reasons: [
+        { reason: "no_daily_bar", name: "缺少日线", days: 2 },
+        { reason: "limits_unavailable", name: "涨跌停价未确认", days: 40 },
+      ],
+      issue_count: 0,
+    },
+    {
+      rule_id: "daily_bar.zero_volume",
+      name: "零成交量",
+      field_name: null,
+      field_label: null,
+      expected_days: 42,
+      checked_days: 40,
+      assessed_days: 40,
+      unassessed_days: 2,
+      first_assessed_date: "2026-08-03",
+      last_assessed_date: "2026-09-30",
+      assessment_complete: false,
+      unassessed_reasons: [{ reason: "no_daily_bar", name: "缺少日线", days: 2 }],
+      issue_count: 1,
+    },
+    {
+      rule_id: "daily_bar.field_null_ratio",
+      name: "字段空值比例",
+      field_name: "close",
+      field_label: "收盘价",
+      expected_days: 42,
+      checked_days: 40,
+      assessed_days: 40,
+      unassessed_days: 2,
+      first_assessed_date: "2026-08-03",
+      last_assessed_date: "2026-09-30",
+      assessment_complete: false,
+      unassessed_reasons: [{ reason: "no_daily_bar", name: "缺少日线", days: 2 }],
+      issue_count: 0,
+    },
+  ],
+  issues: [
+    {
+      number: 1,
+      trade_date: "2026-09-03",
+      rule_id: "daily_bar.zero_volume_unsuspended",
+      name: "未停牌但零成交量",
+      ts_code: "000001.SZ",
+      field_name: null,
+      field_label: null,
+      observed_value: "0",
+      reference_value: null,
+      null_rows: null,
+      observed_rows: null,
+    },
+  ],
+};
+
+function reportHandler(data: Schemas["DataAuditReportData"] = report) {
+  server.use(
+    http.get("*/api/v1/data/report", () =>
+      HttpResponse.json({ data, serving: metaEnvelope().serving }),
+    ),
+  );
+}
+
+describe("日线质量报告", () => {
+  it("shows measured coverage, per-rule assessed range and the bounded issue list", async () => {
+    catalogHandlers();
+    reportHandler();
+    renderApp("/datacenter");
+    await screen.findByText("采集未确认");
+    const panel = screen.getByRole("region", { name: "日线质量报告" });
+    expect(screen.queryByRole("heading", { name: "数据审计" })).not.toBeInTheDocument();
+    expect(within(panel).getByText("采集未确认")).toBeInTheDocument();
+    expect(within(panel).getByText("覆盖情况待确认")).toBeInTheDocument();
+    expect(within(panel).getByText(/尚未完整检查/)).toBeInTheDocument();
+    const summary = within(panel).getByRole("region", { name: "日线报告摘要" });
+    expect(within(summary).getByText("42")).toBeInTheDocument();
+    expect(within(summary).getByText("40")).toBeInTheDocument();
+    expect(within(summary).getByText("2")).toBeInTheDocument();
+    expect(within(panel).getByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
+    expect(within(panel).getByRole("table", { name: "月度覆盖" })).toHaveTextContent("2026-09");
+    const rules = within(panel).getByRole("table", { name: "质量规则" });
+    expect(rules).toHaveTextContent("收盘价上下限");
+    expect(rules).toHaveTextContent("0 / 42");
+    expect(rules).toHaveTextContent("涨跌停价未确认 40 天");
+    const issues = within(panel).getByRole("table", { name: "日线质量问题" });
+    expect(issues).toHaveTextContent("未停牌但零成交量");
+    expect(within(panel).queryByText(/仅列出/)).not.toBeInTheDocument();
+    expect(findJargon(document.querySelector("main")?.textContent ?? "")).toEqual([]);
+    expect(document.querySelector("main")?.textContent).not.toContain("f".repeat(64));
+  });
+
+  it("shows the total issue count when the visible index stops at 256", async () => {
+    catalogHandlers();
+    const overview = report.overview;
+    if (overview === null) throw new Error("报告测试数据缺少摘要");
+    const issue = report.issues[0];
+    if (issue === undefined) throw new Error("报告测试数据缺少问题");
+    reportHandler({
+      ...report,
+      overview: {
+        ...overview,
+        quality_issue_count: 301,
+        indexed_issue_count: 256,
+        omitted_issue_count: 45,
+      },
+      rules: report.rules.map((rule) =>
+        rule.rule_id === "daily_bar.zero_volume" ? { ...rule, issue_count: 301 } : rule,
+      ),
+      issues: Array.from({ length: 256 }, (_, index) => ({ ...issue, number: index + 1 })),
+    });
+    renderApp("/datacenter");
+    expect(await screen.findByText("仅列出 256 / 301 条")).toBeInTheDocument();
+    const panel = screen.getByRole("region", { name: "日线质量报告" });
+    expect(within(panel).getByRole("table", { name: "日线质量问题" })).toBeInTheDocument();
+    expect(within(panel).getByRole("region", { name: "日线报告摘要" })).toHaveTextContent("301");
+  });
+
+  it("keeps missing and unassessed days visible even when no issue was observed", async () => {
+    catalogHandlers();
+    const overview = report.overview;
+    if (overview === null) throw new Error("报告测试数据缺少摘要");
+    reportHandler({
+      ...report,
+      overview: {
+        ...overview,
+        quality_conclusion: "not_fully_assessed",
+        quality_label: "尚未完整检查",
+        quality_issue_count: 0,
+        indexed_issue_count: 0,
+        omitted_issue_count: 0,
+      },
+      rules: report.rules.map((item) => ({ ...item, issue_count: 0 })),
+      issues: [],
+    });
+    renderApp("/datacenter");
+    await screen.findByText("尚未完整检查");
+    const panel = screen.getByRole("region", { name: "日线质量报告" });
+    expect(within(panel).getByText("尚未完整检查")).toBeInTheDocument();
+    expect(within(panel).getByText(/仍有 46 个规则日未评估/)).toBeInTheDocument();
+    expect(within(panel).queryByText("正常")).not.toBeInTheDocument();
+    expect(within(panel).getByText("本次记录没有质量问题；未评估日期仍需检查")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["not_published", "日线质量报告尚未发布"],
+    ["unavailable", "日线质量报告暂时不可用"],
+  ] as const)("shows %s without a fabricated zero", async (state, title) => {
+    catalogHandlers();
+    reportHandler({ source_state: state, overview: null, months: [], rules: [], issues: [] });
+    renderApp("/datacenter");
+    expect(await screen.findByText(title)).toBeInTheDocument();
+    expect(screen.queryByRole("table", { name: "月度覆盖" })).not.toBeInTheDocument();
+  });
+
+  it.each([503, 409])("withdraws the report after HTTP %s", async (status) => {
+    catalogHandlers();
+    server.use(
+      http.get("*/api/v1/data/report", () => HttpResponse.json({ detail: "internal" }, { status })),
+    );
+    renderApp("/datacenter");
+    expect(
+      await screen.findByText(
+        status === 409 ? "日线质量报告已更新，请刷新" : "日线质量报告暂时不可用",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+
+  it("withdraws a newer report envelope until the page observes that data generation", async () => {
+    catalogHandlers();
+    reportHandler();
+    const { queryClient } = renderApp("/datacenter");
+    expect(await screen.findByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
+    server.use(
+      http.get("*/api/v1/data/report", () =>
+        HttpResponse.json({
+          data: report,
+          serving: metaEnvelope({ generationId: "b".repeat(64) }).serving,
+        }),
+      ),
+    );
+    await queryClient.invalidateQueries({ queryKey: ["data", "audit", "report"] });
+    expect(await screen.findByText("日线质量报告已更新，请刷新")).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+
+  it("only requests the report on daily_bar and clears the old report after a generation swap", async () => {
+    const user = userEvent.setup();
+    catalogHandlers();
+    reportHandler();
+    const { queryClient } = renderApp("/datacenter");
+    expect(await screen.findByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /复权因子/ }));
+    expect(screen.queryByRole("region", { name: "日线质量报告" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /股票日线/ }));
+    expect(await screen.findByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
+    server.use(
+      http.get("*/api/v1/meta", () =>
+        HttpResponse.json(metaEnvelope({ generationId: "b".repeat(64) })),
+      ),
+      http.get("*/api/v1/data/report", () =>
+        HttpResponse.json({
+          data: {
+            source_state: "not_published",
+            overview: null,
+            months: [],
+            rules: [],
+            issues: [],
+          },
+          serving: metaEnvelope({ generationId: "b".repeat(64) }).serving,
+        }),
+      ),
+    );
+    await queryClient.invalidateQueries({ queryKey: ["meta"] });
+    expect(await screen.findByText("日线质量报告尚未发布")).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+});
+
 describe("数据中心审计", () => {
   it("marks completed audits with findings as attention, not healthy", async () => {
+    const user = userEvent.setup();
     catalogHandlers();
     auditHandlers(
       {
@@ -375,6 +670,7 @@ describe("数据中心审计", () => {
       [{ number: 1, name: "分钟线缺少日线", severity: "P1", status: "待处理" }],
     );
     renderApp("/datacenter");
+    await user.click(await screen.findByRole("button", { name: "查看历史审计记录" }));
     expect(await screen.findByText("发现问题")).toBeInTheDocument();
     expect(screen.getByText("发现问题").closest(".status")).toHaveAttribute("data-state", "warn");
   });
@@ -403,6 +699,7 @@ describe("数据中心审计", () => {
       [{ number: 1, name: "分钟线缺少日线", severity: "P1", status: "待处理" }],
     );
     renderApp("/datacenter");
+    await user.click(await screen.findByRole("button", { name: "查看历史审计记录" }));
     expect(await screen.findByText("审计失败")).toBeInTheDocument();
     expect(screen.getByText(/上次完成/)).toBeInTheDocument();
     expect(await screen.findByRole("table", { name: "审计问题" })).toHaveTextContent(
@@ -416,9 +713,11 @@ describe("数据中心审计", () => {
   });
 
   it("tells apart no audit, running, and unavailable source", async () => {
+    const user = userEvent.setup();
     catalogHandlers();
     auditHandlers({ source_state: "ready", latest_attempt: null, latest_success: null });
     const empty = renderApp("/datacenter");
+    await user.click(await screen.findByRole("button", { name: "查看历史审计记录" }));
     expect(await screen.findByText("尚未审计")).toBeInTheDocument();
     empty.unmount();
 
@@ -433,11 +732,13 @@ describe("数据中心审计", () => {
       latest_success: null,
     });
     const running = renderApp("/datacenter");
+    await user.click(await screen.findByRole("button", { name: "查看历史审计记录" }));
     expect(await screen.findByText("审计中")).toBeInTheDocument();
     running.unmount();
 
     auditHandlers({ source_state: "unavailable", latest_attempt: null, latest_success: null });
     renderApp("/datacenter");
+    await user.click(await screen.findByRole("button", { name: "查看历史审计记录" }));
     expect(await screen.findByText("审计结果暂时不可用")).toBeInTheDocument();
   });
 });

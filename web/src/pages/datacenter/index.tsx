@@ -20,6 +20,7 @@ import {
   Tip,
 } from "@/ui";
 import { AuditPanel } from "./AuditPanel";
+import { DailyReportPanel } from "./DailyReportPanel";
 import "./datacenter.css";
 
 const FIELD_COLUMNS: DataColumn<CatalogField>[] = [
@@ -133,6 +134,7 @@ function DatasetList({
 
 function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
   const [query, setQuery] = useState("");
+  const [showHistoricalAudit, setShowHistoricalAudit] = useState(false);
   const needle = query.trim().toLocaleLowerCase();
   const fields = useMemo(
     () =>
@@ -175,6 +177,7 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
           </div>
         </dl>
       </Panel>
+      {dataset.dataset_id === "daily_bar" ? <DailyReportPanel /> : null}
       <Panel
         title="字段字典"
         sub={dataset.schema_available ? `${dataset.fields.length} 个字段` : undefined}
@@ -228,7 +231,21 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
           />
         )}
       </Panel>
-      <AuditPanel datasetId={dataset.dataset_id} />
+      {dataset.dataset_id === "daily_bar" ? (
+        <div className="dc-history">
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-expanded={showHistoricalAudit}
+            onClick={() => setShowHistoricalAudit((value) => !value)}
+          >
+            {showHistoricalAudit ? "收起历史审计记录" : "查看历史审计记录"}
+          </Button>
+          {showHistoricalAudit ? <AuditPanel datasetId={dataset.dataset_id} /> : null}
+        </div>
+      ) : (
+        <AuditPanel datasetId={dataset.dataset_id} />
+      )}
     </div>
   );
 }
