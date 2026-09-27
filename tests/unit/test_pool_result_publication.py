@@ -475,3 +475,4 @@ def test_missing_replica_revokes_previous_receipt_authority(tmp_path: Path) -> N
 
     latest = store.serving_snapshot(observed_at=NOW, history_limit=1)
     assert "screen_run_receipt" not in {item.table_name for item in latest.payload.projections}
+    assert "pool_membership" not in {item.table_name for item in latest.payload.projections}
