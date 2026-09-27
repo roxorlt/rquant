@@ -916,6 +916,201 @@
         "title": "AuditReportRule",
         "type": "object"
       },
+      "AuditReportTaskEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "event_type": {
+            "enum": [
+              "queued",
+              "started",
+              "resumed",
+              "source_check",
+              "succeeded",
+              "failed"
+            ],
+            "title": "Event Type",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_type",
+          "occurred_at",
+          "label"
+        ],
+        "title": "AuditReportTaskEvent",
+        "type": "object"
+      },
+      "AuditReportTaskProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "ready"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportTaskEvent"
+            },
+            "maxItems": 20,
+            "title": "Events",
+            "type": "array"
+          },
+          "latest_attempts": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Attempts"
+          },
+          "latest_created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Created At"
+          },
+          "latest_hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Hint"
+          },
+          "latest_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Status"
+          },
+          "latest_status_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Status Label"
+          },
+          "latest_task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Task Id"
+          },
+          "latest_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Updated At"
+          },
+          "successful_created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successful Created At"
+          },
+          "successful_report_hash": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successful Report Hash"
+          },
+          "successful_task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successful Task Id"
+          },
+          "successful_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successful Updated At"
+          }
+        },
+        "required": [
+          "availability"
+        ],
+        "title": "AuditReportTaskProgress",
+        "type": "object"
+      },
       "AuditReportUnassessedReason": {
         "additionalProperties": false,
         "properties": {
@@ -2924,6 +3119,9 @@
                 "type": "null"
               }
             ]
+          },
+          "progress": {
+            "$ref": "#/components/schemas/AuditReportTaskProgress"
           },
           "rules": {
             "items": {

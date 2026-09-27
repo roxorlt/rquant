@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -190,9 +190,34 @@ class AuditReportIssue(_ReportModel):
     observed_rows: int | None
 
 
+class AuditReportTaskEvent(_ReportModel):
+    event_type: Literal["queued", "started", "resumed", "source_check", "succeeded", "failed"]
+    occurred_at: datetime
+    label: str
+
+
+class AuditReportTaskProgress(_ReportModel):
+    availability: Literal["unavailable", "empty", "ready"]
+    latest_task_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    latest_status: Literal["queued", "running", "succeeded", "failed"] | None = None
+    latest_status_label: str | None = None
+    latest_attempts: int | None = Field(default=None, ge=0)
+    latest_created_at: datetime | None = None
+    latest_updated_at: datetime | None = None
+    latest_hint: str | None = None
+    successful_task_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    successful_report_hash: ReportHash | None = None
+    successful_created_at: datetime | None = None
+    successful_updated_at: datetime | None = None
+    events: list[AuditReportTaskEvent] = Field(default_factory=list, max_length=20)
+
+
 class DataAuditReportData(_ReportModel):
     source_state: Literal["ready", "not_published", "unavailable"]
     overview: AuditReportOverview | None
     months: list[AuditReportMonth]
     rules: list[AuditReportRule]
     issues: list[AuditReportIssue]
+    progress: AuditReportTaskProgress = Field(
+        default_factory=lambda: AuditReportTaskProgress(availability="unavailable")
+    )
