@@ -224,6 +224,7 @@ it("retries the original request after an uncertain response and reload", async 
 
 it.each([
   [403, "当前账号无权确认"],
+  [409, "告警状态已变化"],
   [503, "确认状态待核对"],
 ] as const)("keeps the original request after HTTP %s", async (status, message) => {
   const sent: Schemas["AckCommandRequest"][] = [];
@@ -260,7 +261,10 @@ it("ends a directly rejected old-version request and starts a new command only o
       const body = (await request.json()) as Schemas["AckCommandRequest"];
       posts.push(body);
       return body.generation_id === monitorEnvelope().serving.generation_id
-        ? HttpResponse.json({ detail: "数据已更新，请刷新告警时间线。" }, { status: 409 })
+        ? HttpResponse.json(
+            { detail: "数据已更新，请刷新告警时间线。", code: "stale_generation_no_effect" },
+            { status: 409 },
+          )
         : HttpResponse.json({
             command_id: body.command_id,
             status: "succeeded",

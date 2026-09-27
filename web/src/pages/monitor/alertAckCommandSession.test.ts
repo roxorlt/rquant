@@ -1,3 +1,4 @@
+import { AckNoEffectError } from "@/api/alertAckCommand";
 import { ApiError, type Schemas } from "@/api/client";
 import { ACK_JOURNAL_KEY, AlertAckCommandSession } from "./alertAckCommandSession";
 
@@ -165,9 +166,9 @@ it("rejects a malformed saved journal instead of overwriting an uncertain comman
   expect(post).not.toHaveBeenCalled();
 });
 
-it("turns only a direct first-request 409 into a terminal stale command", async () => {
+it("turns only a proved no-effect first request into a terminal stale command", async () => {
   const post = vi.fn(async () => {
-    throw new ApiError(409, "数据已更新");
+    throw new AckNoEffectError();
   });
   const current = session(post);
   await current.start(GENERATION, ALERT);
@@ -193,6 +194,46 @@ it("does not turn a later 409 into failure after an uncertain first effect", asy
   await current.advance(ALERT);
   expect(current.snapshot().entries[ALERT]?.status).toBe("unknown");
   expect(post.mock.calls[1]?.[0]).toEqual(post.mock.calls[0]?.[0]);
+});
+
+it("keeps an ordinary first 409 uncertain and retries only the saved command", async () => {
+  const post = vi.fn(async (_body: Command) => {
+    throw new ApiError(409, "准入冲突但效果待核对");
+  });
+  const current = session(post);
+  await current.start(GENERATION, ALERT);
+  expect(current.snapshot().entries[ALERT]?.status).toBe("unknown");
+  await current.advance(ALERT);
+  expect(post.mock.calls[1]?.[0]).toEqual(post.mock.calls[0]?.[0]);
+});
+
+it("does not let another tab's late uncertain reply replace a proved no-effect result", async () => {
+  let rejectStale!: () => void;
+  let rejectUnknown!: () => void;
+  const firstPost = vi.fn(
+    (_body: Command) =>
+      new Promise<Receipt>((_resolve, reject) => {
+        rejectStale = () => reject(new AckNoEffectError());
+      }),
+  );
+  const secondPost = vi.fn(
+    (_body: Command) =>
+      new Promise<Receipt>((_resolve, reject) => {
+        rejectUnknown = () => reject(new ApiError(503, "连接断开"));
+      }),
+  );
+  const first = session(firstPost);
+  const firstRequest = first.start(GENERATION, ALERT);
+  const second = session(secondPost);
+  const secondRequest = second.advance(ALERT);
+  rejectStale();
+  await firstRequest;
+  rejectUnknown();
+  await secondRequest;
+  expect(session(secondPost).snapshot().entries[ALERT]).toMatchObject({
+    status: "failed",
+    failureKind: "stale_generation",
+  });
 });
 
 it("keeps different tabs' commands in independent records and adopts an existing alert request", async () => {

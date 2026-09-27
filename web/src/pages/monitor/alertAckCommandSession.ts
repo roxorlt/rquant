@@ -1,3 +1,4 @@
+import { AckNoEffectError } from "@/api/alertAckCommand";
 import { ApiError, type Schemas } from "@/api/client";
 
 type Command = Schemas["AckCommandRequest"];
@@ -197,7 +198,11 @@ export class AlertAckCommandSession {
           throw new Error("invalid existing request");
         if (JSON.stringify(parsed.body) !== JSON.stringify(entry.body))
           throw new Error("command identity collision");
-        if (parsed.status === "succeeded" && entry.status !== "succeeded") {
+        if (
+          (parsed.status === "succeeded" ||
+            (parsed.status === "failed" && parsed.failureKind === "stale_generation")) &&
+          entry.status !== "succeeded"
+        ) {
           this.refreshFromStorage(true);
           return false;
         }
@@ -300,16 +305,16 @@ export class AlertAckCommandSession {
           }
         } catch (error) {
           const firstRejected =
-            error instanceof ApiError &&
-            error.status === 409 &&
+            error instanceof AckNoEffectError &&
             firstCommandId === entry.body.command_id &&
             entry.status === "pending";
-          this.persist({
+          const saved = this.persist({
             ...entry,
             status: firstRejected ? "failed" : "unknown",
             confirmationId: null,
             failureKind: firstRejected ? "stale_generation" : null,
           });
+          if (!saved && this.current.entries[alertId]?.failureKind === "stale_generation") continue;
           this.emit({
             message: firstRejected
               ? "数据已更新，请刷新后重新确认。"

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rquant.alert_ack import stable_alert_id, stable_signal_alert_id
@@ -37,6 +38,7 @@ from rquant.web.envelope import Envelope
 from rquant.web.labels import ACTION_LABELS, CHANNEL_LABELS, DELIVERY_LABELS, strategy_label
 from rquant.web.market import MarketPhase, market_phase, shanghai_trade_date
 from rquant.web.models.alert_ack import (
+    AckCommandConflict,
     AckCommandReceipt,
     AckCommandRequest,
     AlertAcknowledgmentView,
@@ -657,13 +659,20 @@ def get_timeline(
     return Envelope[MonitorTimelineData](data=data, serving=meta)
 
 
-@router.post("/ack", response_model=AckCommandReceipt, summary="确认一条告警")
+@router.post(
+    "/ack",
+    response_model=AckCommandReceipt,
+    responses={409: {"model": AckCommandConflict}},
+    summary="确认一条告警",
+)
 async def acknowledge_alert(
     request: Request,
     body: AckCommandRequest,
     viewer: Annotated[str | None, Depends(current_user)],
     _same_site: Annotated[None, Depends(require_csrf)],
-) -> AckCommandReceipt:
+) -> AckCommandReceipt | JSONResponse:
+    from rquant.alert_ack_admission import AckAdmissionStaleGenerationError
+
     if viewer is None:
         raise HTTPException(status_code=401, detail="请先登录。")
     if len(await request.body()) > MAX_ACK_REQUEST_BYTES:
@@ -679,7 +688,7 @@ async def acknowledge_alert(
             try:
                 resumed = await _submit_ack_admission(web.ack_admission, command)
                 return _ack_response(command, resumed)
-            except HTTPException as admission_error:
+            except (HTTPException, AckAdmissionStaleGenerationError) as admission_error:
                 durable = await _lookup_ack_command(web.ack_lookup, command)
                 if durable is None:
                     raise HTTPException(
@@ -687,6 +696,8 @@ async def acknowledge_alert(
                     ) from admission_error
                 return _ack_response(command, durable)
         return _ack_response(command, original)
+    rejection: HTTPException | None = None
+    web_stale = False
     with web.tracker.borrow() as borrowed:
         now = web.clock()
         meta = serving_meta(
@@ -695,19 +706,44 @@ async def acknowledge_alert(
             stale_after=web.settings.stale_after,
             failure=web.tracker.failure,
         )
-        if borrowed is None or meta.generation_id != body.generation_id:
-            raise HTTPException(status_code=409, detail="数据已更新，请刷新告警时间线。")
-        alerts = read_alert_ack(
-            borrowed, meta=meta, now=now, stale_after=web.settings.stale_after
-        )
-        if alerts.summary.state != "ready" or not any(
-            item.alert_id == body.alert_id and alerts.is_eligible(item.source, item.alert_id)
-            for item in alerts.events.values()
-        ):
-            raise HTTPException(status_code=409, detail="确认状态暂不可用，请稍后重试。")
+        if borrowed is None:
+            rejection = HTTPException(status_code=409, detail="数据已更新，请刷新告警时间线。")
+        elif meta.generation_id == body.generation_id:
+            alerts = read_alert_ack(
+                borrowed, meta=meta, now=now, stale_after=web.settings.stale_after
+            )
+            if alerts.summary.state != "ready" or not any(
+                item.alert_id == body.alert_id and alerts.is_eligible(item.source, item.alert_id)
+                for item in alerts.events.values()
+            ):
+                rejection = HTTPException(status_code=409, detail="确认状态暂不可用，请稍后重试。")
+        else:
+            web_stale = True
+        # For an old generation, only the serialized PageControl admission can
+        # distinguish an absent command from another tab still enqueuing it.
+    if rejection is not None:
+        durable = await _lookup_ack_command(web.ack_lookup, command)
+        if durable is not None:
+            return _ack_response(command, durable)
+        raise rejection
+    if web_stale:
+        durable = await _lookup_ack_command(web.ack_lookup, command)
+        if durable is not None:
+            return _ack_response(command, durable)
     if web.ack_admission is None:
         raise HTTPException(status_code=503, detail="确认服务尚未就绪，请稍后重试。")
-    receipt = await _submit_ack_admission(web.ack_admission, command)
+    try:
+        receipt = await _submit_ack_admission(web.ack_admission, command)
+    except (HTTPException, AckAdmissionStaleGenerationError) as admission_error:
+        durable = await _lookup_ack_command(web.ack_lookup, command)
+        if durable is not None:
+            return _ack_response(command, durable)
+        if isinstance(admission_error, AckAdmissionStaleGenerationError):
+            conflict = AckCommandConflict(
+                detail="数据已更新，请刷新告警时间线。", code="stale_generation_no_effect"
+            )
+            return JSONResponse(status_code=409, content=conflict.model_dump(exclude_none=True))
+        raise admission_error
     return _ack_response(command, receipt)
 
 
@@ -729,10 +765,16 @@ async def _lookup_ack_command(
 async def _submit_ack_admission(
     admission: AckAdmissionClient, command: AckAlert
 ) -> PageControlReceipt:
-    from rquant.alert_ack_admission import AckAdmissionRejectedError, AckAdmissionUnavailableError
+    from rquant.alert_ack_admission import (
+        AckAdmissionRejectedError,
+        AckAdmissionStaleGenerationError,
+        AckAdmissionUnavailableError,
+    )
 
     try:
         return await anyio.to_thread.run_sync(admission.submit, command)
+    except AckAdmissionStaleGenerationError:
+        raise
     except AckAdmissionRejectedError as error:
         raise HTTPException(status_code=409, detail="告警状态已变化，请刷新后重试。") from error
     except AckAdmissionUnavailableError as error:

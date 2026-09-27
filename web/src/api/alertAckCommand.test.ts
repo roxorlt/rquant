@@ -1,6 +1,6 @@
 import { HttpResponse, http } from "msw";
 import { server } from "@/test/server";
-import { submitAlertAckCommand } from "./alertAckCommand";
+import { AckNoEffectError, submitAlertAckCommand } from "./alertAckCommand";
 import type { ApiError, Schemas } from "./client";
 
 const body: Schemas["AckCommandRequest"] = {
@@ -43,6 +43,15 @@ it("preserves rejection status and treats a lost connection as uncertain", async
     name: "ApiError",
     status: 409,
   } satisfies Partial<ApiError>);
+  server.use(
+    http.post("*/api/v1/monitor/ack", () =>
+      HttpResponse.json(
+        { detail: "数据已更新", code: "stale_generation_no_effect" },
+        { status: 409 },
+      ),
+    ),
+  );
+  await expect(submitAlertAckCommand(body)).rejects.toBeInstanceOf(AckNoEffectError);
   server.use(http.post("*/api/v1/monitor/ack", () => Response.error()));
   await expect(submitAlertAckCommand(body)).rejects.toMatchObject({
     name: "ApiError",

@@ -7,6 +7,8 @@ import json
 import os
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -317,6 +319,34 @@ def test_pointer_change_before_decision_rejects_but_after_decision_allows(tmp_pa
     assert admission2.admit(command2).status is PageControlStatus.SUCCEEDED
     assert ServingReader(root2).current_pointer().generation_id != command2.generation_id
     assert admission2.admit(command2).status is PageControlStatus.SUCCEEDED
+
+
+def test_concurrent_same_command_waits_for_first_durable_enqueue(tmp_path: Path) -> None:
+    root, service, command = _setup(tmp_path)
+    decided = threading.Event()
+    release = threading.Event()
+
+    def hold_after_decision() -> None:
+        decided.set()
+        if not release.wait(3):
+            raise TimeoutError("first admission did not resume")
+
+    admission = AckAdmission(
+        service, root, clock=lambda: NOW, after_final_pointer_check=hold_after_decision
+    )
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(admission.admit, command)
+        assert decided.wait(2)
+        build_web_fixture(root, "baseline", sequence=1, signal_projections=_alert_projections())
+        second = workers.submit(admission.admit, command)
+        try:
+            with pytest.raises(FutureTimeoutError):
+                second.result(timeout=0.15)
+        finally:
+            release.set()
+        assert first.result(timeout=3).status is PageControlStatus.SUCCEEDED
+        assert second.result(timeout=3) == first.result(timeout=3)
+        assert service.lookup_ack_command(command) == first.result(timeout=3)
 
 
 def test_crash_after_decision_before_enqueue_has_no_receipt_and_retry_rechecks(

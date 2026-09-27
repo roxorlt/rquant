@@ -297,7 +297,13 @@ test("旧数据的确认持续被拒后，刷新到新数据才生成新请求",
     requests.push(body);
     await route.fulfill(
       body.generation_id === oldGeneration
-        ? { status: 409, json: { detail: "数据已更新，请刷新告警时间线。" } }
+        ? {
+            status: 409,
+            json: {
+              detail: "数据已更新，请刷新告警时间线。",
+              code: "stale_generation_no_effect",
+            },
+          }
         : {
             json: {
               command_id: body.command_id,
