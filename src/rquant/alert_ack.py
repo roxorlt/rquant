@@ -186,6 +186,26 @@ def unique_alert_ids(
     return identifiers
 
 
+def alert_event_at(
+    source: AlertSource,
+    event: Mapping[str, object] | SignalEnvelopeFamily,
+) -> datetime:
+    """Interpret the trigger instant using the same source clock rules as its identity."""
+    if source == "signal":
+        payload = (
+            event.model_dump(mode="json") if isinstance(event, SignalEnvelopeFamily) else event
+        )
+        return parse_signal_envelope(payload).event_time.astimezone(UTC)
+    if not isinstance(event, Mapping):
+        raise ValueError("alert event must be a mapping")
+    trade_date = _trade_date(event.get("trade_date"))
+    if source == "monitor_event":
+        return datetime.fromisoformat(_monitor_time(event.get("trigger_time"), trade_date))
+    if source == "surge_event":
+        return datetime.fromisoformat(_surge_time(event.get("confirmed_at"), trade_date))
+    raise ValueError(f"source {source!r} is not confirmable")
+
+
 def alert_window_start(*, count_as_of: datetime, activated_at: datetime) -> datetime:
     if count_as_of.tzinfo is None or activated_at.tzinfo is None:
         raise ValueError("alert window timestamps must be timezone-aware")

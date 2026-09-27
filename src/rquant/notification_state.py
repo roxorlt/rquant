@@ -65,6 +65,8 @@ _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
         "surge_runtime_config",
         "monitor_event",
         "surge_event",
+        "alert_ack_state",
+        "alert_ack",
         "legacy_notification",
         "legacy_notification_status",
         "pool_definition",

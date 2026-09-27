@@ -33,6 +33,7 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.runtime_service_control import RuntimeServiceHealth
+from rquant.serving_alert_projection import build_alert_read_projections
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_read_models import (
     ServingLabJobRecord,
@@ -451,7 +452,7 @@ class ServingSnapshotAssembler:
             )
         )
 
-        read_model = ServingReadModelInput(
+        base_read_model = ServingReadModelInput(
             observed_at=observed_at,
             signals=tuple(sorted(signal_payload.signals, key=lambda item: item.global_sequence)),
             routes=tuple(
@@ -477,6 +478,29 @@ class ServingSnapshotAssembler:
                 )
             ),
             projections=bound_projections,
+        )
+        if {item.table_name for item in bound_projections} & {
+            "alert_event",
+            "alert_source_coverage",
+            "alert_overview",
+        }:
+            raise ValueError("derived alert projections cannot be supplied by an owner")
+        alert_projections = tuple(
+            ServingProjectionInput.bind(
+                projection,
+                owner_dataset_id=SIGNALS_DATASET_ID,
+                owner_generation_id=by_dataset[SIGNALS_DATASET_ID].generation_id,
+            )
+            for projection in build_alert_read_projections(
+                base_read_model,
+                signal_generation_id=by_dataset[SIGNALS_DATASET_ID].generation_id,
+            )
+        )
+        read_model = ServingReadModelInput(
+            **base_read_model.model_dump(mode="python", exclude={"projections"}),
+            projections=tuple(
+                sorted((*bound_projections, *alert_projections), key=lambda p: p.table_name)
+            ),
         )
         ordered_reads = tuple(sorted(reads, key=lambda item: item.dataset_id))
         reference_watermarks = (
