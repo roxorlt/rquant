@@ -82,13 +82,19 @@ def _app(
     root: Path,
     *,
     user_rows: list[dict[str, object]] | None = None,
+    builtin_rows: list[dict[str, object]] | None = None,
     canvas_rows: list[dict[str, object]] | None = None,
     transport=None,
 ):
     projections = (
         _projection(
             "pool_definition",
-            list(build_pool_definition_rows({}, {}, root_path="/synthetic")) + (user_rows or []),
+            (
+                list(build_pool_definition_rows({}, {}, root_path="/synthetic"))
+                if builtin_rows is None
+                else builtin_rows
+            )
+            + (user_rows or []),
         ),
         _projection("canvas_definition", [_canvas_row()] if canvas_rows is None else canvas_rows),
     )
@@ -169,6 +175,91 @@ def test_editor_reads_registered_user_rules_and_verified_canvas_from_one_generat
         {"name": "观察", "description": "日终观察", "version": "b" * 64, "pool_refs": []}
     ]
     assert response.json()["serving"]["generation_id"] is not None
+
+
+def test_editor_exposes_bounded_builtin_copy_sources_with_original_semantics(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path / "serving")
+    with TestClient(app) as client:
+        response = client.get("/api/v1/pools/editor")
+    assert response.status_code == 200
+    sources = {source["key"]: source for source in response.json()["data"]["copy_sources"]}
+    assert set(sources) == {"n-shape-pool1", "n-shape-pool2"}
+    first = sources["n-shape-pool1"]
+    assert first["display_name"] == "N 形态一池"
+    assert first["description"] == "昨首板、安全过滤与下影线"
+    assert len(first["version"]) == 64
+    assert first["depends_on"] is None
+    assert first["delay_mode"] == "none"
+    assert first["delay_days"] == 0
+    assert first["copyable"] is True
+    assert first["copy_block_reason"] is None
+    assert {"name": "circ_mv_lt", "args": {"threshold_yi": 150}} in first["rule_calls"]
+    assert "CIRC_MV[0]" in first["include_columns"]
+
+    second = sources["n-shape-pool2"]
+    assert second["depends_on"] == "n-shape-pool1"
+    assert second["delay_mode"] == "legacy_window"
+    assert second["delay_days"] == 2
+    assert second["copyable"] is False
+    assert second["copy_block_reason"] == "旧版时间窗口与精确延后日不同，暂不能无损复制。"
+    assert {"name": "lt", "args": {"left": "BODY_UPPER[0]", "right": "BODY_UPPER[1]"}} in second[
+        "rule_calls"
+    ]
+
+
+def test_editor_copy_source_uses_published_rules_and_hides_invalid_registered_args(
+    tmp_path: Path,
+) -> None:
+    rows = list(build_pool_definition_rows({}, {}, root_path="/synthetic"))
+    changed = next(row for row in rows if row["pool_name"] == "n-shape-pool1")
+    changed["version"] = "c" * 64
+    changed["rules_json"] = json.dumps([{"name": "circ_mv_lt", "args": {"threshold_yi": 42}}])
+    app = _app(tmp_path / "published", builtin_rows=rows)
+    with TestClient(app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+    first = next(source for source in data["copy_sources"] if source["key"] == "n-shape-pool1")
+    assert first["version"] == "c" * 64
+    assert first["rule_calls"] == [{"name": "circ_mv_lt", "args": {"threshold_yi": 42}}]
+
+    changed["rules_json"] = json.dumps([{"name": "circ_mv_lt", "args": {"unknown": 42}}])
+    invalid_app = _app(tmp_path / "invalid", builtin_rows=rows)
+    with TestClient(invalid_app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+    assert [source["key"] for source in data["copy_sources"]] == ["n-shape-pool2"]
+
+
+def test_editor_empty_builtin_rules_cannot_be_copied_or_saved_directly(tmp_path: Path) -> None:
+    rows = list(build_pool_definition_rows({}, {}, root_path="/synthetic"))
+    first = next(row for row in rows if row["pool_name"] == "n-shape-pool1")
+    first["rules_json"] = "[]"
+    app = _app(
+        tmp_path / "serving",
+        builtin_rows=rows,
+        transport=lambda _body: pytest.fail("builtin must not reach PageControl"),
+    )
+    with TestClient(app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+        denied = client.post(
+            "/api/v1/pools/editor/commands",
+            json={**_save_body("builtin-direct"), "base_name": "n-shape-pool1"},
+            headers=HEADERS,
+        )
+    source = next(source for source in data["copy_sources"] if source["key"] == "n-shape-pool1")
+    assert source["copyable"] is False
+    assert source["copy_block_reason"] == "没有可复制的选股条件。"
+    assert denied.status_code == 409
+
+
+def test_old_generation_has_no_copy_sources(tmp_path: Path) -> None:
+    root = tmp_path / "old"
+    build_web_fixture(root, "baseline")
+    app = create_app(WebSettings(serving_root=root), clock=lambda: NOW, background=False)
+    with TestClient(app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+    assert data["state"] == "unavailable"
+    assert data["copy_sources"] == []
 
 
 @pytest.mark.parametrize("count", [65, 256])

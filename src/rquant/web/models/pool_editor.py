@@ -33,6 +33,22 @@ class EditablePool(BaseModel):
     include_columns: list[str]
 
 
+class BuiltinPoolCopySource(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    display_name: str
+    description: str
+    version: str
+    depends_on: str | None
+    delay_mode: Literal["none", "exact", "legacy_window"]
+    delay_days: int
+    rule_calls: list[EditorRuleCall]
+    include_columns: list[str]
+    copyable: bool
+    copy_block_reason: str | None
+
+
 class EditableCanvas(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -47,6 +63,7 @@ class PoolEditorData(BaseModel):
 
     state: Literal["ready", "unavailable"]
     pools: list[EditablePool]
+    copy_sources: list[BuiltinPoolCopySource]
     canvases: list[EditableCanvas]
 
 

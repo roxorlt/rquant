@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from rquant.llm.registry import REGISTRY_BY_NAME
 from rquant.web import readers
 from rquant.web.models.pool_editor import (
+    BuiltinPoolCopySource,
     EditableCanvas,
     EditablePool,
     EditorRuleCall,
@@ -47,6 +48,35 @@ def _json_list(value: object, *, limit: int) -> list[Any] | None:
     except ValueError:
         return None
     return decoded if isinstance(decoded, list) and len(decoded) <= limit else None
+
+
+def _rules(value: object) -> list[EditorRuleCall] | None:
+    raw_rules = _json_list(value, limit=_MAX_RULES)
+    if raw_rules is None:
+        return None
+    rules: list[EditorRuleCall] = []
+    for item in raw_rules:
+        if not isinstance(item, dict) or set(item) != {"name", "args"}:
+            return None
+        try:
+            rule = EditorRuleCall.model_validate(item)
+            spec = REGISTRY_BY_NAME[rule.name]
+            if not set(rule.args) <= set(spec.args_model.model_fields):
+                return None
+            spec.args_model.model_validate(rule.args)
+        except (KeyError, TypeError, ValueError, ValidationError):
+            return None
+        rules.append(rule)
+    return rules
+
+
+def _columns(value: object) -> list[str] | None:
+    columns = _json_list(value, limit=_MAX_COLUMNS)
+    if columns is None or any(
+        not isinstance(item, str) or not 1 <= len(item) <= 64 for item in columns
+    ):
+        return None
+    return columns
 
 
 def _pool(row: tuple[object, ...]) -> EditablePool | None:
@@ -87,22 +117,9 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
         or not 1 <= delay_days <= 252
     ):
         return None
-    raw_rules = _json_list(rules_json, limit=_MAX_RULES)
-    raw_columns = _json_list(columns_json, limit=_MAX_COLUMNS)
-    if raw_rules is None or raw_columns is None:
-        return None
-    rules: list[EditorRuleCall] = []
-    for item in raw_rules:
-        if not isinstance(item, dict) or set(item) != {"name", "args"}:
-            return None
-        try:
-            rule = EditorRuleCall.model_validate(item)
-            spec = REGISTRY_BY_NAME[rule.name]
-            spec.args_model.model_validate(rule.args)
-        except (KeyError, TypeError, ValueError, ValidationError):
-            return None
-        rules.append(rule)
-    if any(not isinstance(item, str) or not 1 <= len(item) <= 64 for item in raw_columns):
+    rules = _rules(rules_json)
+    columns = _columns(columns_json)
+    if rules is None or columns is None:
         return None
     return EditablePool(
         key=key,
@@ -112,7 +129,74 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
         depends_on=depends_on,
         delay_days=delay_days,
         rule_calls=rules,
-        include_columns=raw_columns,
+        include_columns=columns,
+    )
+
+
+def _copy_source(row: tuple[object, ...]) -> BuiltinPoolCopySource | None:
+    (
+        key,
+        display_name,
+        description,
+        source_kind,
+        state,
+        version,
+        depends_on,
+        delay_mode,
+        delay_days,
+        rules_json,
+        columns_json,
+        can_edit,
+    ) = row
+    if (
+        source_kind != "builtin"
+        or state != "available"
+        or can_edit is not False
+        or not isinstance(key, str)
+        or not 1 <= len(key) <= 100
+        or key.startswith("user/")
+        or not _sha(version)
+        or not isinstance(display_name, str)
+        or not 1 <= len(display_name) <= 80
+        or not isinstance(description, str)
+        or len(description) > 1_024
+        or type(delay_days) is not int
+        or not 0 <= delay_days <= 10_000
+    ):
+        return None
+    if depends_on is None:
+        if delay_mode != "none" or delay_days != 0:
+            return None
+    elif (
+        not isinstance(depends_on, str)
+        or not 1 <= len(depends_on) <= 100
+        or delay_mode not in {"exact", "legacy_window"}
+        or delay_days < 1
+    ):
+        return None
+    rules = _rules(rules_json)
+    columns = _columns(columns_json)
+    if rules is None or columns is None:
+        return None
+    block_reason = None
+    if delay_mode == "legacy_window":
+        block_reason = "旧版时间窗口与精确延后日不同，暂不能无损复制。"
+    elif delay_days > 252:
+        block_reason = "延后天数超出可保存范围，暂不能复制。"
+    elif not rules:
+        block_reason = "没有可复制的选股条件。"
+    return BuiltinPoolCopySource(
+        key=key,
+        display_name=display_name,
+        description=description,
+        version=version,
+        depends_on=depends_on,
+        delay_mode=delay_mode,
+        delay_days=delay_days,
+        rule_calls=rules,
+        include_columns=columns,
+        copyable=block_reason is None,
+        copy_block_reason=block_reason,
     )
 
 
@@ -135,7 +219,7 @@ def _canvas(row: tuple[object, ...]) -> EditableCanvas | None:
 
 def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
     unavailable = PoolEditorSnapshot(
-        data=PoolEditorData(state="unavailable", pools=[], canvases=[]),
+        data=PoolEditorData(state="unavailable", pools=[], copy_sources=[], canvases=[]),
         present_user_names=frozenset(),
         builtin_names=frozenset(),
     )
@@ -155,6 +239,7 @@ def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
     if len(pool_rows) > _MAX_POOLS:
         return unavailable
     pools = [item for row in pool_rows if (item := _pool(row)) is not None]
+    copy_sources = [item for row in pool_rows if (item := _copy_source(row)) is not None]
     canvases: list[EditableCanvas] = []
     canvas_table = tables.get("canvas_definition")
     if canvas_table is not None and canvas_table.available:
@@ -166,7 +251,9 @@ def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
         if len(canvas_rows) <= _MAX_CANVASES:
             canvases = [item for row in canvas_rows if (item := _canvas(row)) is not None]
     return PoolEditorSnapshot(
-        data=PoolEditorData(state="ready", pools=pools, canvases=canvases),
+        data=PoolEditorData(
+            state="ready", pools=pools, copy_sources=copy_sources, canvases=canvases
+        ),
         present_user_names=frozenset(
             key for key, *_ in pool_rows if isinstance(key, str) and key.startswith("user/")
         ),
