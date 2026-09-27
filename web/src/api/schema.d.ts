@@ -21,6 +21,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data/backfill-plans/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 生成历史日线回补计划 */
+        post: operations["submit_backfill_plan_command_api_v1_data_backfill_plans_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/backfill-plans/{plan_hash}": {
         parameters: {
             query?: never;
@@ -914,6 +931,40 @@ export interface components {
              * @constant
              */
             trade_cal: 0;
+        };
+        /** BackfillPlanCommandReceipt */
+        BackfillPlanCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "pending" | "processing" | "failed" | "ambiguous";
+            /** Task Id */
+            task_id?: string | null;
+        };
+        /** BackfillPlanCommandRequest */
+        BackfillPlanCommandRequest: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Completed Through
+             * Format: date
+             */
+            completed_through: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** BackfillPlanDetail */
         BackfillPlanDetail: {
@@ -3278,6 +3329,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_BackfillPlansData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_backfill_plan_command_api_v1_data_backfill_plans_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackfillPlanCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackfillPlanCommandReceipt"];
                 };
             };
             /** @description Validation Error */

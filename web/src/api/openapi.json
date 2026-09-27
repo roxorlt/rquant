@@ -1034,6 +1034,83 @@
         "title": "BackfillLogicalOperations",
         "type": "object"
       },
+      "BackfillPlanCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "pending",
+              "processing",
+              "failed",
+              "ambiguous"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "BackfillPlanCommandReceipt",
+        "type": "object"
+      },
+      "BackfillPlanCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_start": {
+            "format": "date",
+            "title": "Audit Start",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "completed_through": {
+            "format": "date",
+            "title": "Completed Through",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "audit_start",
+          "completed_through"
+        ],
+        "title": "BackfillPlanCommandRequest",
+        "type": "object"
+      },
       "BackfillPlanDetail": {
         "additionalProperties": false,
         "properties": {
@@ -8376,6 +8453,47 @@
           }
         },
         "summary": "历史日线回补计划",
+        "tags": [
+          "data-audit"
+        ]
+      }
+    },
+    "/api/v1/data/backfill-plans/commands": {
+      "post": {
+        "operationId": "submit_backfill_plan_command_api_v1_data_backfill_plans_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackfillPlanCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillPlanCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "生成历史日线回补计划",
         "tags": [
           "data-audit"
         ]
