@@ -68,6 +68,7 @@ _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
         "legacy_notification",
         "legacy_notification_status",
         "pool_definition",
+        "screen_run_receipt",
     }
 )
 _NOTIFICATION_PROJECTION_TABLES = (
