@@ -66,6 +66,9 @@ async function installPlans(page: Page) {
   const metaResponse = await page.request.get("./api/v1/meta");
   expect(metaResponse.ok()).toBe(true);
   const meta: Schemas["Envelope_MetaData_"] = await metaResponse.json();
+  await page.route("**/api/v1/meta", (route) =>
+    route.fulfill({ json: { ...meta, data: { ...meta.data, viewer: "tester" } } }),
+  );
   await page.route("**/api/v1/data/backfill-plans?*", (route) =>
     route.fulfill({
       json: {
@@ -77,6 +80,7 @@ async function installPlans(page: Page) {
           next_cursor: null,
           progress: {
             availability: "unavailable",
+            event_history: "unavailable",
             task_id: null,
             message: "任务进度尚未提供",
             logs: [],
@@ -94,6 +98,7 @@ async function installPlans(page: Page) {
           plan: detail,
           progress: {
             availability: "unavailable",
+            event_history: "unavailable",
             task_id: null,
             message: "任务进度尚未提供",
             logs: [],
@@ -111,7 +116,7 @@ for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     await installPlans(page);
     await page.goto("./#/datacenter");
-    const switcher = page.getByRole("button", { name: "回补计划" });
+    const switcher = page.getByRole("button", { name: "回补计划", exact: true });
     await switcher.focus();
     await page.keyboard.press("Enter");
     const preview = page.getByRole("region", { name: "计划详情" });
@@ -120,9 +125,12 @@ for (const width of [1440, 390]) {
     await expect(preview.getByText("2024-10-08")).toBeVisible();
     await expect(preview.getByText("预计 46 分钟")).toBeVisible();
     await expect(preview.getByText("配额待确认")).toBeVisible();
-    await expect(preview.getByText("暂无进度信息")).toBeVisible();
+    await expect(
+      page.getByRole("region", { name: "任务进度" }).getByText("任务进度暂不可用"),
+    ).toBeVisible();
     expect(await page.locator("main").innerText()).not.toContain(planHash);
-    await expect(page.getByRole("button", { name: /生成回补计划|执行回补/ })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "生成回补计划" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "执行回补" })).toHaveCount(0);
     await expectNoHorizontalOverflow(page, "backfill plan");
     await page
       .locator(".dc-plan-layout")
@@ -135,18 +143,93 @@ for (const width of [1440, 390]) {
   });
 }
 
+test("keyboard confirmation queues a read-only plan and survives reload", async ({ page }) => {
+  await installPlans(page);
+  let posted: Schemas["BackfillPlanCommandRequest"] | null = null;
+  let calls = 0;
+  await page.route("**/api/v1/data/backfill-plans/commands", async (route) => {
+    calls += 1;
+    expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+    posted = route.request().postDataJSON() as Schemas["BackfillPlanCommandRequest"];
+    await route.fulfill({
+      json: {
+        command_id: posted.command_id,
+        status: "queued",
+        task_id: "e".repeat(32),
+        message: "已排队",
+      },
+    });
+  });
+  await page.goto("./#/datacenter");
+  const generate = page.getByRole("button", { name: "生成回补计划" });
+  await expect(generate).toBeEnabled();
+  await generate.focus();
+  await page.keyboard.press("Enter");
+  const form = page.getByRole("region", { name: "生成回补计划" });
+  await expect(form.getByLabel("开始日期")).toHaveValue("2024-09-01");
+  await form.screenshot({ path: "/private/tmp/rquant-backfill-command-desktop.png" });
+  await form.getByRole("button", { name: "核对并生成" }).click();
+  const dialog = page.getByRole("dialog", { name: "生成回补计划" });
+  await expect(dialog).toContainText("只读核对");
+  await dialog.getByRole("button", { name: "确认排队" }).click();
+  await expect(page.getByText("本次请求已排队，等待生成")).toBeVisible();
+  expect(posted).toMatchObject({ audit_start: "2024-09-01", completed_through: "2025-04-30" });
+  expect(Object.keys(posted ?? {}).sort()).toEqual([
+    "audit_start",
+    "command_id",
+    "completed_through",
+    "requested_at",
+  ]);
+  await page.reload();
+  await expect(page.getByText("本次请求已排队，等待生成")).toBeVisible();
+  expect(calls).toBe(1);
+});
+
 test.describe("390px touch backfill plan", () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 
   test("tap reveals estimate context", async ({ page }) => {
     await installPlans(page);
     await page.goto("./#/datacenter");
-    await page.getByRole("button", { name: "回补计划" }).tap();
+    await page.getByRole("button", { name: "回补计划", exact: true }).tap();
     const estimate = page.getByText("预计 46 分钟");
     await expect(estimate).toBeVisible();
     await estimate.locator("..").tap();
     await expect(page.getByRole("tooltip")).toContainText("名称变更窗口 2");
     await expect(page.getByRole("tooltip")).toContainText("共 14 次逻辑操作");
     await expectNoHorizontalOverflow(page, "touch backfill plan");
+  });
+
+  test("tap can open and confirm the plan request", async ({ page }) => {
+    await installPlans(page);
+    await page.route("**/api/v1/data/backfill-plans/commands", async (route) => {
+      const body = route.request().postDataJSON() as Schemas["BackfillPlanCommandRequest"];
+      await route.fulfill({
+        json: {
+          command_id: body.command_id,
+          status: "queued",
+          task_id: "e".repeat(32),
+          message: "已排队",
+        },
+      });
+    });
+    await page.goto("./#/datacenter");
+    const generate = page.getByRole("button", { name: "生成回补计划" });
+    await expect(generate).toBeEnabled();
+    await generate.tap();
+    await expectNoHorizontalOverflow(page, "touch plan form");
+    await page
+      .getByRole("region", { name: "生成回补计划" })
+      .screenshot({ path: "/private/tmp/rquant-backfill-command-390.png" });
+    await page
+      .getByRole("region", { name: "生成回补计划" })
+      .getByRole("button", { name: "核对并生成" })
+      .tap();
+    await page
+      .getByRole("dialog", { name: "生成回补计划" })
+      .getByRole("button", { name: "确认排队" })
+      .tap();
+    await expect(page.getByText("本次请求已排队，等待生成")).toBeVisible();
+    await expectNoHorizontalOverflow(page, "touch plan command");
   });
 });

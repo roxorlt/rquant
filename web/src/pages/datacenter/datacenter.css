@@ -4,6 +4,103 @@
 .dc-view-switch {
   margin-top: 14px;
 }
+.dc-plan-stack {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  margin-top: 18px;
+}
+.dc-plan-command-form,
+.dc-plan-command-status {
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px 16px;
+}
+.dc-plan-command-form-head,
+.dc-plan-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+.dc-plan-command-form-head h2 {
+  margin: 0;
+  font-size: 14px;
+}
+.dc-plan-date-fields {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  margin-top: 12px;
+}
+.dc-plan-date-fields .field {
+  min-width: 160px;
+}
+.dc-plan-date-fields .inp {
+  width: 100%;
+}
+.dc-plan-form-error {
+  margin-top: 8px;
+  color: var(--crit-t);
+  font-size: 12px;
+}
+.dc-plan-form-tip {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--muted);
+  border-bottom: 1px dotted var(--faint);
+  font-size: 12px;
+}
+.dc-plan-command-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  border-left: 3px solid var(--accent);
+  font-size: 12px;
+}
+.dc-plan-command-status strong {
+  font-size: 13px;
+}
+.dc-plan-command-status > span {
+  color: var(--muted);
+}
+.dc-plan-progress-head {
+  justify-content: flex-start;
+  font-size: 12px;
+}
+.dc-plan-progress-head strong {
+  font-size: 13px;
+}
+.dc-plan-progress-head .rel-time,
+.dc-plan-progress-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-plan-progress-note {
+  margin-top: 8px;
+}
+.dc-plan-progress-logs {
+  display: grid;
+  gap: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-top: 8px;
+  padding: 0;
+  list-style: none;
+}
+.dc-plan-progress-logs li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--rule);
+  font-size: 12px;
+}
 .dc-plan-layout {
   display: grid;
   grid-template-columns: minmax(230px, 286px) minmax(0, 1fr);
@@ -477,6 +574,20 @@
   min-width: 0;
 }
 @media (max-width: 760px) {
+  .dc-plan-command-form,
+  .dc-plan-command-status {
+    padding: 12px;
+  }
+  .dc-plan-date-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .dc-plan-date-fields .field {
+    min-width: 0;
+  }
+  .dc-plan-date-fields > .btn {
+    grid-column: 1 / -1;
+  }
   .dc-plan-layout {
     grid-template-columns: minmax(0, 1fr);
   }

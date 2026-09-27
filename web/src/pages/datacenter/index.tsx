@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
+import { submitBackfillPlanCommand } from "@/api/backfillPlanCommand";
 import {
   type CatalogDataset,
   type CatalogField,
@@ -6,6 +7,7 @@ import {
   useCatalog,
   useCatalogDataset,
 } from "@/api/endpoints";
+import { useMeta } from "@/api/useMeta";
 import { formatNumber, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
@@ -21,6 +23,7 @@ import {
 } from "@/ui";
 import { AuditPanel } from "./AuditPanel";
 import { BackfillPlanPanel } from "./BackfillPlanPanel";
+import { BackfillPlanCommandSession } from "./backfillPlanCommandSession";
 import { DailyReportPanel } from "./DailyReportPanel";
 import "./datacenter.css";
 
@@ -351,10 +354,65 @@ function CatalogView() {
 }
 
 export default function DataCenterPage() {
-  const [view, setView] = useState<"catalog" | "plans">("catalog");
+  const meta = useMeta();
+  const [commandSession] = useState(
+    () =>
+      new BackfillPlanCommandSession(
+        (() => {
+          try {
+            return window.sessionStorage;
+          } catch {
+            return {
+              getItem: () => {
+                throw new Error("storage unavailable");
+              },
+            } as unknown as Storage;
+          }
+        })(),
+        submitBackfillPlanCommand,
+        () =>
+          `web-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) => item.toString(16).padStart(2, "0")).join("")}`,
+        () => new Date().toISOString(),
+      ),
+  );
+  const command = useSyncExternalStore(
+    commandSession.subscribe,
+    commandSession.snapshot,
+    commandSession.snapshot,
+  );
+  const [view, setView] = useState<"catalog" | "plans">(() =>
+    commandSession.snapshot().journal ? "plans" : "catalog",
+  );
+  const [requestOpen, setRequestOpen] = useState(false);
+  const pending =
+    command.journal !== null && !["queued", "failed"].includes(command.journal.status);
+  const disabledReason = !meta.data
+    ? "正在加载用户信息。"
+    : !meta.data.data.viewer
+      ? "请先登录，才能生成回补计划。"
+      : !command.storageAvailable
+        ? "浏览器存储不可用，无法安全提交。"
+        : pending
+          ? "请先核对上一次请求。"
+          : undefined;
   return (
     <div className="data-center">
-      <PageHeader eyebrow="数据" title="数据中心" />
+      <PageHeader
+        eyebrow="数据"
+        title="数据中心"
+        actions={
+          <Button
+            variant="primary"
+            disabledReason={disabledReason}
+            onClick={() => {
+              setView("plans");
+              setRequestOpen(true);
+            }}
+          >
+            生成回补计划
+          </Button>
+        }
+      />
       <div className="dc-view-switch">
         <Segmented
           label="数据中心内容"
@@ -366,7 +424,17 @@ export default function DataCenterPage() {
           onChange={setView}
         />
       </div>
-      {view === "catalog" ? <CatalogView /> : <BackfillPlanPanel />}
+      {view === "catalog" ? (
+        <CatalogView />
+      ) : (
+        <BackfillPlanPanel
+          commandSession={commandSession}
+          command={command}
+          canSubmit={!!meta.data?.data.viewer}
+          requestOpen={requestOpen}
+          onCloseRequest={() => setRequestOpen(false)}
+        />
+      )}
     </div>
   );
 }
