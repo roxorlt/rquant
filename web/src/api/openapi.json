@@ -526,6 +526,94 @@
         "title": "BoardsData",
         "type": "object"
       },
+      "BuiltinPoolCopySource": {
+        "properties": {
+          "copy_block_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Copy Block Reason"
+          },
+          "copyable": {
+            "title": "Copyable",
+            "type": "boolean"
+          },
+          "delay_days": {
+            "title": "Delay Days",
+            "type": "integer"
+          },
+          "delay_mode": {
+            "enum": [
+              "none",
+              "exact",
+              "legacy_window"
+            ],
+            "title": "Delay Mode",
+            "type": "string"
+          },
+          "depends_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depends On"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "include_columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Include Columns",
+            "type": "array"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "rule_calls": {
+            "items": {
+              "$ref": "#/components/schemas/EditorRuleCall"
+            },
+            "title": "Rule Calls",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "display_name",
+          "description",
+          "version",
+          "depends_on",
+          "delay_mode",
+          "delay_days",
+          "rule_calls",
+          "include_columns",
+          "copyable",
+          "copy_block_reason"
+        ],
+        "title": "BuiltinPoolCopySource",
+        "type": "object"
+      },
       "CallExpr": {
         "additionalProperties": false,
         "properties": {
@@ -3736,6 +3824,13 @@
             "title": "Canvases",
             "type": "array"
           },
+          "copy_sources": {
+            "items": {
+              "$ref": "#/components/schemas/BuiltinPoolCopySource"
+            },
+            "title": "Copy Sources",
+            "type": "array"
+          },
           "pools": {
             "items": {
               "$ref": "#/components/schemas/EditablePool"
@@ -3755,6 +3850,7 @@
         "required": [
           "state",
           "pools",
+          "copy_sources",
           "canvases"
         ],
         "title": "PoolEditorData",
