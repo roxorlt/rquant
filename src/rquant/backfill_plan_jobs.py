@@ -261,7 +261,17 @@ class BackfillPlanJobStore:
     def lookup_by_key(
         self, idempotency_key: str
     ) -> tuple[BackfillPlanJobRequest, BackfillPlanJobReceipt] | None:
-        """Let a trusted caller resume the original request before binding new inputs."""
+        """Look up the original request and its integrity-checked current status."""
+        admission = self.admission_by_key(idempotency_key)
+        if admission is None:
+            return None
+        request, task_id = admission
+        return request, self.status(task_id)
+
+    def admission_by_key(
+        self, idempotency_key: str
+    ) -> tuple[BackfillPlanJobRequest, str] | None:
+        """Read the durable task binding without treating plan generation as admission."""
         if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", idempotency_key) is None:
             raise ValueError("invalid backfill plan idempotency key")
         connection = self._connect()
@@ -275,7 +285,7 @@ class BackfillPlanJobStore:
         if row is None:
             return None
         request = BackfillPlanJobRequest.model_validate_json(row["request_json"])
-        return request, self.status(row["task_id"])
+        return request, row["task_id"]
 
     def retry_failed(self, task_id: str) -> BackfillPlanJobReceipt:
         with self._transaction() as connection:
