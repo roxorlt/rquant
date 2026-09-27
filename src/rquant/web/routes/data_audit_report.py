@@ -10,7 +10,7 @@ from typing import Annotated, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
-from rquant.data_audit_report_projection import REPORT_PROJECTION_TABLES
+from rquant.data_audit_contracts import REPORT_PROJECTION_TABLES
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
 from rquant.web.envelope import Envelope
 from rquant.web.models.data_audit_report import (

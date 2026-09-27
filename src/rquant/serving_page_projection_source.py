@@ -45,6 +45,7 @@ from rquant.canvas_publication_receipt import (
     canvas_publication_receipt_id,
     canvas_source_identity_hash,
 )
+from rquant.data_audit_contracts import REPORT_PROJECTION_TABLES
 from rquant.data_audit_projection import (
     MAX_AUDIT_ISSUES as _MAX_AUDIT_ISSUES,
 )
@@ -53,10 +54,7 @@ from rquant.data_audit_projection import (
     DataAuditStatusProjectionRow,
 )
 from rquant.data_audit_report import MAX_REPORT_BYTES, parse_data_audit_report_bytes
-from rquant.data_audit_report_projection import (
-    REPORT_PROJECTION_TABLES,
-    project_data_audit_report,
-)
+from rquant.data_audit_report_projection import project_data_audit_report
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
     NotificationProjectionPublication,

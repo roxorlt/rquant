@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.data_audit_coverage import (
     CalendarDay,
     CalendarEvidence,
@@ -31,7 +32,6 @@ from rquant.suspension import (
     _snapshot_hash,
 )
 
-MAX_AUDIT_DAYS = 3660
 MAX_DAILY_QUALITY_ROWS = 10_000
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DAILY_QUALITY_COLUMNS = (
