@@ -28,6 +28,7 @@ from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.routes import (
+    backfill_plans,
     catalog,
     data_audit,
     data_audit_report,
@@ -214,6 +215,7 @@ def create_app(
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(data_audit_report.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(backfill_plans.router, prefix="/api/v1", tags=["data-audit"])
     return app
 
 

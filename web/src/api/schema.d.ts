@@ -4,6 +4,40 @@
  */
 
 export interface paths {
+    "/api/v1/data/backfill-plans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 历史日线回补计划 */
+        get: operations["get_backfill_plans_api_v1_data_backfill_plans_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/backfill-plans/{plan_hash}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 历史日线回补计划详情 */
+        get: operations["get_backfill_plan_detail_api_v1_data_backfill_plans__plan_hash__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/catalog": {
         parameters: {
             query?: never;
@@ -836,6 +870,276 @@ export interface components {
              */
             range_start: string;
         };
+        /** BackfillEstimateAssumptions */
+        BackfillEstimateAssumptions: {
+            /** Adapter Seconds Per Operation */
+            adapter_seconds_per_operation: string;
+            /** Market Throttle Seconds Per Operation */
+            market_throttle_seconds_per_operation: string;
+            /** Retry Allowance Seconds Per Operation */
+            retry_allowance_seconds_per_operation: string;
+            /**
+             * Status Namechange Start
+             * Format: date
+             */
+            status_namechange_start: string;
+            /**
+             * Status Source As Of
+             * Format: date
+             */
+            status_source_as_of: string;
+            /** Status Throttle Seconds Per Operation */
+            status_throttle_seconds_per_operation: string;
+            /** Status Window Years */
+            status_window_years: number;
+        };
+        /** BackfillLogicalOperations */
+        BackfillLogicalOperations: {
+            /** Adj Factor */
+            adj_factor: number;
+            /** Daily */
+            daily: number;
+            /** Daily Basic */
+            daily_basic: number;
+            /** Namechange Context Batches */
+            namechange_context_batches: number;
+            /** Namechange Windows */
+            namechange_windows: number;
+            /** Stock St Upper Bound */
+            stock_st_upper_bound: number;
+            /** Total */
+            total: number;
+            /**
+             * Trade Cal
+             * @constant
+             */
+            trade_cal: 0;
+        };
+        /** BackfillPlanDetail */
+        BackfillPlanDetail: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /**
+             * Collection Complete Verified
+             * @constant
+             */
+            collection_complete_verified: false;
+            /**
+             * Completed Through
+             * Format: date
+             */
+            completed_through: string;
+            /**
+             * Coverage Scope
+             * @constant
+             */
+            coverage_scope: "whole_day_presence_only";
+            /**
+             * Cutoff Observed At
+             * Format: date-time
+             */
+            cutoff_observed_at: string;
+            estimate: components["schemas"]["BackfillPlanEstimate"];
+            /** Estimated Seconds */
+            estimated_seconds: string;
+            /**
+             * Executable
+             * @constant
+             */
+            executable: false;
+            /** Gap Count */
+            gap_count: number;
+            /**
+             * Identity Verified
+             * @constant
+             */
+            identity_verified: false;
+            /** Missing Dates */
+            missing_dates: string[];
+            /** Missing Day Count */
+            missing_day_count: number;
+            /** Monthly */
+            monthly: components["schemas"]["BackfillPlanMonth"][];
+            /** Plan Hash */
+            plan_hash: string;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /**
+             * Quota Status
+             * @constant
+             */
+            quota_status: "unverified";
+            /** Snapshot Label */
+            snapshot_label: string;
+            source: components["schemas"]["BackfillPlanSource"];
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "production_unverified";
+        };
+        /** BackfillPlanDetailData */
+        BackfillPlanDetailData: {
+            plan?: components["schemas"]["BackfillPlanDetail"] | null;
+            progress?: components["schemas"]["BackfillPlanProgress"] | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+        };
+        /** BackfillPlanEstimate */
+        BackfillPlanEstimate: {
+            /**
+             * Actual Http Calls Known
+             * @constant
+             */
+            actual_http_calls_known: false;
+            assumptions: components["schemas"]["BackfillEstimateAssumptions"];
+            /** Estimated Seconds */
+            estimated_seconds: string;
+            logical_operations: components["schemas"]["BackfillLogicalOperations"];
+            /**
+             * Quota Status
+             * @constant
+             */
+            quota_status: "unverified";
+        };
+        /** BackfillPlanItem */
+        BackfillPlanItem: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /**
+             * Collection Complete Verified
+             * @constant
+             */
+            collection_complete_verified: false;
+            /**
+             * Completed Through
+             * Format: date
+             */
+            completed_through: string;
+            /**
+             * Cutoff Observed At
+             * Format: date-time
+             */
+            cutoff_observed_at: string;
+            /** Estimated Seconds */
+            estimated_seconds: string;
+            /**
+             * Executable
+             * @constant
+             */
+            executable: false;
+            /**
+             * Identity Verified
+             * @constant
+             */
+            identity_verified: false;
+            /** Missing Day Count */
+            missing_day_count: number;
+            /** Plan Hash */
+            plan_hash: string;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /**
+             * Quota Status
+             * @constant
+             */
+            quota_status: "unverified";
+            /** Rank */
+            rank: number;
+            /** Snapshot Label */
+            snapshot_label: string;
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "production_unverified";
+        };
+        /** BackfillPlanMonth */
+        BackfillPlanMonth: {
+            /** Covered Open Days */
+            covered_open_days: number;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /** Missing Open Days */
+            missing_open_days: number;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+        };
+        /** BackfillPlanProgress */
+        BackfillPlanProgress: {
+            /**
+             * Availability
+             * @constant
+             */
+            availability: "unavailable";
+            /** Logs */
+            logs?: string[];
+            /**
+             * Message
+             * @default 任务进度尚未提供
+             * @constant
+             */
+            message: "任务进度尚未提供";
+            /** Task Id */
+            task_id: null;
+        };
+        /** BackfillPlanSource */
+        BackfillPlanSource: {
+            /** Claimed File Sha256 */
+            claimed_file_sha256: string;
+            /**
+             * Collection Complete Verified
+             * @constant
+             */
+            collection_complete_verified: false;
+            /**
+             * Identity Verified
+             * @constant
+             */
+            identity_verified: false;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "production_unverified";
+            /** Snapshot Label */
+            snapshot_label: string;
+        };
+        /** BackfillPlansData */
+        BackfillPlansData: {
+            /** Items */
+            items: components["schemas"]["BackfillPlanItem"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /** Page Size */
+            page_size: number;
+            progress?: components["schemas"]["BackfillPlanProgress"] | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Total */
+            total?: number | null;
+        };
         /** BinaryExpr */
         BinaryExpr: {
             /**
@@ -1257,6 +1561,16 @@ export interface components {
             };
             /** Name */
             name: string;
+        };
+        /** Envelope[BackfillPlanDetailData] */
+        Envelope_BackfillPlanDetailData_: {
+            data: components["schemas"]["BackfillPlanDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BackfillPlansData] */
+        Envelope_BackfillPlansData_: {
+            data: components["schemas"]["BackfillPlansData"];
+            serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[BoardsData] */
         Envelope_BoardsData_: {
@@ -2944,6 +3258,72 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_backfill_plans_api_v1_data_backfill_plans_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                generation?: string | null;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BackfillPlansData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_backfill_plan_detail_api_v1_data_backfill_plans__plan_hash__get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path: {
+                plan_hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BackfillPlanDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_datasets_api_v1_data_catalog_get: {
         parameters: {
             query?: never;

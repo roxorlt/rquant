@@ -918,6 +918,603 @@
         "title": "AuditSuccess",
         "type": "object"
       },
+      "BackfillEstimateAssumptions": {
+        "additionalProperties": false,
+        "properties": {
+          "adapter_seconds_per_operation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Adapter Seconds Per Operation",
+            "type": "string"
+          },
+          "market_throttle_seconds_per_operation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Market Throttle Seconds Per Operation",
+            "type": "string"
+          },
+          "retry_allowance_seconds_per_operation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Retry Allowance Seconds Per Operation",
+            "type": "string"
+          },
+          "status_namechange_start": {
+            "format": "date",
+            "title": "Status Namechange Start",
+            "type": "string"
+          },
+          "status_source_as_of": {
+            "format": "date",
+            "title": "Status Source As Of",
+            "type": "string"
+          },
+          "status_throttle_seconds_per_operation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Status Throttle Seconds Per Operation",
+            "type": "string"
+          },
+          "status_window_years": {
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Status Window Years",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status_namechange_start",
+          "status_source_as_of",
+          "status_window_years",
+          "adapter_seconds_per_operation",
+          "market_throttle_seconds_per_operation",
+          "status_throttle_seconds_per_operation",
+          "retry_allowance_seconds_per_operation"
+        ],
+        "title": "BackfillEstimateAssumptions",
+        "type": "object"
+      },
+      "BackfillLogicalOperations": {
+        "additionalProperties": false,
+        "properties": {
+          "adj_factor": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Adj Factor",
+            "type": "integer"
+          },
+          "daily": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Daily",
+            "type": "integer"
+          },
+          "daily_basic": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Daily Basic",
+            "type": "integer"
+          },
+          "namechange_context_batches": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Namechange Context Batches",
+            "type": "integer"
+          },
+          "namechange_windows": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Namechange Windows",
+            "type": "integer"
+          },
+          "stock_st_upper_bound": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Stock St Upper Bound",
+            "type": "integer"
+          },
+          "total": {
+            "maximum": 20000.0,
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "trade_cal": {
+            "const": 0,
+            "title": "Trade Cal",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "daily",
+          "daily_basic",
+          "adj_factor",
+          "namechange_context_batches",
+          "namechange_windows",
+          "stock_st_upper_bound",
+          "trade_cal",
+          "total"
+        ],
+        "title": "BackfillLogicalOperations",
+        "type": "object"
+      },
+      "BackfillPlanDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_start": {
+            "format": "date",
+            "title": "Audit Start",
+            "type": "string"
+          },
+          "collection_complete_verified": {
+            "const": false,
+            "title": "Collection Complete Verified",
+            "type": "boolean"
+          },
+          "completed_through": {
+            "format": "date",
+            "title": "Completed Through",
+            "type": "string"
+          },
+          "coverage_scope": {
+            "const": "whole_day_presence_only",
+            "title": "Coverage Scope",
+            "type": "string"
+          },
+          "cutoff_observed_at": {
+            "format": "date-time",
+            "title": "Cutoff Observed At",
+            "type": "string"
+          },
+          "estimate": {
+            "$ref": "#/components/schemas/BackfillPlanEstimate"
+          },
+          "estimated_seconds": {
+            "pattern": "^\\d+(?:\\.\\d+)?$",
+            "title": "Estimated Seconds",
+            "type": "string"
+          },
+          "executable": {
+            "const": false,
+            "title": "Executable",
+            "type": "boolean"
+          },
+          "gap_count": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Gap Count",
+            "type": "integer"
+          },
+          "identity_verified": {
+            "const": false,
+            "title": "Identity Verified",
+            "type": "boolean"
+          },
+          "missing_dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "maxItems": 3660,
+            "title": "Missing Dates",
+            "type": "array"
+          },
+          "missing_day_count": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Missing Day Count",
+            "type": "integer"
+          },
+          "monthly": {
+            "items": {
+              "$ref": "#/components/schemas/BackfillPlanMonth"
+            },
+            "maxItems": 122,
+            "title": "Monthly",
+            "type": "array"
+          },
+          "plan_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Plan Hash",
+            "type": "string"
+          },
+          "published_at": {
+            "format": "date-time",
+            "title": "Published At",
+            "type": "string"
+          },
+          "quota_status": {
+            "const": "unverified",
+            "title": "Quota Status",
+            "type": "string"
+          },
+          "snapshot_label": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Snapshot Label",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/BackfillPlanSource"
+          },
+          "source_mode": {
+            "const": "production_unverified",
+            "title": "Source Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_hash",
+          "published_at",
+          "audit_start",
+          "completed_through",
+          "cutoff_observed_at",
+          "missing_day_count",
+          "estimated_seconds",
+          "source_mode",
+          "snapshot_label",
+          "identity_verified",
+          "collection_complete_verified",
+          "quota_status",
+          "executable",
+          "missing_dates",
+          "monthly",
+          "estimate",
+          "source",
+          "gap_count",
+          "coverage_scope"
+        ],
+        "title": "BackfillPlanDetail",
+        "type": "object"
+      },
+      "BackfillPlanDetailData": {
+        "additionalProperties": false,
+        "properties": {
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BackfillPlanDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BackfillPlanProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "empty",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_state"
+        ],
+        "title": "BackfillPlanDetailData",
+        "type": "object"
+      },
+      "BackfillPlanEstimate": {
+        "additionalProperties": false,
+        "properties": {
+          "actual_http_calls_known": {
+            "const": false,
+            "title": "Actual Http Calls Known",
+            "type": "boolean"
+          },
+          "assumptions": {
+            "$ref": "#/components/schemas/BackfillEstimateAssumptions"
+          },
+          "estimated_seconds": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Estimated Seconds",
+            "type": "string"
+          },
+          "logical_operations": {
+            "$ref": "#/components/schemas/BackfillLogicalOperations"
+          },
+          "quota_status": {
+            "const": "unverified",
+            "title": "Quota Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "logical_operations",
+          "assumptions",
+          "estimated_seconds",
+          "quota_status",
+          "actual_http_calls_known"
+        ],
+        "title": "BackfillPlanEstimate",
+        "type": "object"
+      },
+      "BackfillPlanItem": {
+        "additionalProperties": false,
+        "properties": {
+          "audit_start": {
+            "format": "date",
+            "title": "Audit Start",
+            "type": "string"
+          },
+          "collection_complete_verified": {
+            "const": false,
+            "title": "Collection Complete Verified",
+            "type": "boolean"
+          },
+          "completed_through": {
+            "format": "date",
+            "title": "Completed Through",
+            "type": "string"
+          },
+          "cutoff_observed_at": {
+            "format": "date-time",
+            "title": "Cutoff Observed At",
+            "type": "string"
+          },
+          "estimated_seconds": {
+            "pattern": "^\\d+(?:\\.\\d+)?$",
+            "title": "Estimated Seconds",
+            "type": "string"
+          },
+          "executable": {
+            "const": false,
+            "title": "Executable",
+            "type": "boolean"
+          },
+          "identity_verified": {
+            "const": false,
+            "title": "Identity Verified",
+            "type": "boolean"
+          },
+          "missing_day_count": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Missing Day Count",
+            "type": "integer"
+          },
+          "plan_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Plan Hash",
+            "type": "string"
+          },
+          "published_at": {
+            "format": "date-time",
+            "title": "Published At",
+            "type": "string"
+          },
+          "quota_status": {
+            "const": "unverified",
+            "title": "Quota Status",
+            "type": "string"
+          },
+          "rank": {
+            "maximum": 4095.0,
+            "minimum": 0.0,
+            "title": "Rank",
+            "type": "integer"
+          },
+          "snapshot_label": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Snapshot Label",
+            "type": "string"
+          },
+          "source_mode": {
+            "const": "production_unverified",
+            "title": "Source Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rank",
+          "plan_hash",
+          "published_at",
+          "audit_start",
+          "completed_through",
+          "cutoff_observed_at",
+          "missing_day_count",
+          "estimated_seconds",
+          "source_mode",
+          "snapshot_label",
+          "identity_verified",
+          "collection_complete_verified",
+          "quota_status",
+          "executable"
+        ],
+        "title": "BackfillPlanItem",
+        "type": "object"
+      },
+      "BackfillPlanMonth": {
+        "additionalProperties": false,
+        "properties": {
+          "covered_open_days": {
+            "maximum": 31.0,
+            "minimum": 0.0,
+            "title": "Covered Open Days",
+            "type": "integer"
+          },
+          "expected_open_days": {
+            "maximum": 31.0,
+            "minimum": 0.0,
+            "title": "Expected Open Days",
+            "type": "integer"
+          },
+          "missing_open_days": {
+            "maximum": 31.0,
+            "minimum": 0.0,
+            "title": "Missing Open Days",
+            "type": "integer"
+          },
+          "month": {
+            "format": "date",
+            "title": "Month",
+            "type": "string"
+          }
+        },
+        "required": [
+          "month",
+          "expected_open_days",
+          "covered_open_days",
+          "missing_open_days"
+        ],
+        "title": "BackfillPlanMonth",
+        "type": "object"
+      },
+      "BackfillPlanProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "const": "unavailable",
+            "title": "Availability",
+            "type": "string"
+          },
+          "logs": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Logs",
+            "type": "array"
+          },
+          "message": {
+            "const": "任务进度尚未提供",
+            "default": "任务进度尚未提供",
+            "title": "Message",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "null"
+          }
+        },
+        "required": [
+          "availability",
+          "task_id"
+        ],
+        "title": "BackfillPlanProgress",
+        "type": "object"
+      },
+      "BackfillPlanSource": {
+        "additionalProperties": false,
+        "properties": {
+          "claimed_file_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Claimed File Sha256",
+            "type": "string"
+          },
+          "collection_complete_verified": {
+            "const": false,
+            "title": "Collection Complete Verified",
+            "type": "boolean"
+          },
+          "identity_verified": {
+            "const": false,
+            "title": "Identity Verified",
+            "type": "boolean"
+          },
+          "mode": {
+            "const": "production_unverified",
+            "title": "Mode",
+            "type": "string"
+          },
+          "snapshot_label": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Snapshot Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "snapshot_label",
+          "claimed_file_sha256",
+          "identity_verified",
+          "collection_complete_verified"
+        ],
+        "title": "BackfillPlanSource",
+        "type": "object"
+      },
+      "BackfillPlansData": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BackfillPlanItem"
+            },
+            "maxItems": 50,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "page_size": {
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BackfillPlanProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "empty",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          }
+        },
+        "required": [
+          "source_state",
+          "page_size",
+          "items"
+        ],
+        "title": "BackfillPlansData",
+        "type": "object"
+      },
       "BinaryExpr": {
         "additionalProperties": false,
         "properties": {
@@ -2315,6 +2912,38 @@
           "args"
         ],
         "title": "EditorRuleCall",
+        "type": "object"
+      },
+      "Envelope_BackfillPlanDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BackfillPlanDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BackfillPlanDetailData]",
+        "type": "object"
+      },
+      "Envelope_BackfillPlansData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BackfillPlansData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BackfillPlansData]",
         "type": "object"
       },
       "Envelope_BoardsData_": {
@@ -7672,6 +8301,147 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/data/backfill-plans": {
+      "get": {
+        "operationId": "get_backfill_plans_api_v1_data_backfill_plans_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BackfillPlansData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "历史日线回补计划",
+        "tags": [
+          "data-audit"
+        ]
+      }
+    },
+    "/api/v1/data/backfill-plans/{plan_hash}": {
+      "get": {
+        "operationId": "get_backfill_plan_detail_api_v1_data_backfill_plans__plan_hash__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "plan_hash",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Plan Hash",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BackfillPlanDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "历史日线回补计划详情",
+        "tags": [
+          "data-audit"
+        ]
+      }
+    },
     "/api/v1/data/catalog": {
       "get": {
         "operationId": "list_datasets_api_v1_data_catalog_get",
