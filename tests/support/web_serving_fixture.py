@@ -40,11 +40,13 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+from rquant.data_metadata import DataAuditRun, DataAuditRunFinalization, DataQualityIssue
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxRecord, OutboxStatus
 from rquant.panorama_data import (
     _FAKE_CODES,
@@ -70,6 +72,7 @@ from rquant.serving_contracts import (
     ServingDatasetWatermark,
     ServingGenerationManifest,
 )
+from rquant.serving_page_projection_source import DuckDBLabPageProjectionSource
 from rquant.serving_publisher import ServingPublisher
 from rquant.serving_read_models import (
     SERVING_TABLE_SPECS,
@@ -82,6 +85,7 @@ from rquant.serving_read_models import (
 )
 from rquant.signal_bus import RouteReceiptDisposition, SignalRouteReceipt
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.storage.duckdb import DuckDBStore
 
 SCENARIOS = ("baseline", "panorama", "degraded")
 FIXTURE_PRODUCER_COMMIT = "0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b"
@@ -995,6 +999,8 @@ def build_web_fixture(
     event_projections: tuple[ServingProjectionPayload, ...] | None = None,
     lab_jobs: tuple[ServingLabJobRecord, ...] = (),
     paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
+    lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
+    audit: bool = False,
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1005,7 +1011,81 @@ def build_web_fixture(
     built_at = fixture_built_at(sequence)
     generations = _generation_ids(scenario, sequence)
     signals, routes, deliveries = _signal_bundle(built_at)
+    if audit:
+        if lab_page_projections is not None:
+            raise ValueError("audit fixture cannot also accept Lab projections")
+        with TemporaryDirectory(prefix="rquant-web-audit-") as directory:
+            research = Path(directory) / "research.duckdb"
+            observed_at = built_at - timedelta(minutes=10)
+            issue = DataQualityIssue.detected(
+                rule_id="minute-without-daily",
+                dataset_id="minute_bar",
+                severity="P1",
+                scope_key="synthetic/secret/2026-09-24",
+                message="Synthetic /private/path must stay hidden",
+                evidence={"path": "/private/path"},
+                observed_at=observed_at,
+            )
+            limit_up_issue = DataQualityIssue.detected(
+                rule_id="limit-up-pool-calendar-coverage",
+                dataset_id="limit_up_pool_daily",
+                severity="P2",
+                scope_key="synthetic/limit-up/2026-09-23",
+                message="Synthetic calendar gap /private/path",
+                evidence={"path": "/private/path"},
+                observed_at=observed_at,
+            )
+            with DuckDBStore(research) as store:
+                store.record_data_quality_issue(issue)
+                store.record_data_quality_issue(limit_up_issue)
+                completed = store.begin_data_audit_run(
+                    DataAuditRun.create(
+                        as_of_date=date(2026, 9, 23),
+                        range_start=date(2026, 9, 1),
+                        range_end=date(2026, 9, 23),
+                        rule_set_version="stage1-v3",
+                        observed_at=observed_at,
+                    )
+                )
+                store.finalize_data_audit_run(
+                    completed.audit_run_id,
+                    DataAuditRunFinalization(
+                        finding_issue_ids=(issue.issue_id, limit_up_issue.issue_id),
+                        p0_count=0,
+                        completed_at=observed_at + timedelta(minutes=1),
+                    ),
+                )
+                failed = store.begin_data_audit_run(
+                    DataAuditRun.create(
+                        as_of_date=date(2026, 9, 24),
+                        range_start=date(2026, 9, 1),
+                        range_end=date(2026, 9, 24),
+                        rule_set_version="stage1-v3",
+                        observed_at=observed_at + timedelta(minutes=2),
+                    )
+                )
+                store.fail_data_audit_run(
+                    failed.audit_run_id,
+                    error_message="Synthetic secret failure /private/path",
+                    completed_at=observed_at + timedelta(minutes=3),
+                )
+            lab_page_projections = DuckDBLabPageProjectionSource(research)(built_at).projections
     projections = _projections(scenario, built_at=built_at, generations=generations)
+    if lab_page_projections is not None:
+        if {item.table_name for item in lab_page_projections} != {
+            "data_audit_issue",
+            "data_audit_status",
+            "research_gate_metadata",
+        }:
+            raise ValueError("lab audit fixture projections are incomplete")
+        projections += tuple(
+            ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="lab_jobs",
+                owner_generation_id=generations["lab_jobs"],
+            )
+            for item in lab_page_projections
+        )
     if event_projections is not None:
         if {item.table_name for item in event_projections} != {"monitor_event", "surge_event"}:
             raise ValueError("event replay must supply both event projections")

@@ -138,6 +138,44 @@
 .dc-detail .panel-b > .empty-state {
   padding: 28px 12px;
 }
+.dc-audit-help {
+  color: var(--muted);
+  font-size: 12px;
+  cursor: help;
+}
+.dc-audit-summary,
+.dc-audit-success,
+.dc-audit-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.dc-audit-summary {
+  margin-bottom: 12px;
+}
+.dc-audit-time,
+.dc-audit-success > span:first-child {
+  color: var(--muted);
+  font-size: 12px;
+}
+.dc-audit-success {
+  padding-block: 10px 14px;
+  border-top: 1px solid var(--rule);
+  font-size: 12px;
+}
+.dc-audit-success strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.dc-audit-controls {
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.dc-audit-issues .tbl-wrap {
+  max-width: 100%;
+}
 @media (max-width: 760px) {
   .dc-layout {
     display: block;
@@ -168,5 +206,8 @@
   .dc-detail .tbl th,
   .dc-detail .tbl td {
     padding-inline: 8px;
+  }
+  .dc-audit-controls .seg {
+    max-width: 100%;
   }
 }

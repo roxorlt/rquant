@@ -43,6 +43,13 @@ from rquant.canvas_publication_receipt import (
     canvas_publication_receipt_id,
     canvas_source_identity_hash,
 )
+from rquant.data_audit_projection import (
+    MAX_AUDIT_ISSUES as _MAX_AUDIT_ISSUES,
+)
+from rquant.data_audit_projection import (
+    DataAuditIssueProjectionRow,
+    DataAuditStatusProjectionRow,
+)
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
     NotificationProjectionPublication,
@@ -88,6 +95,7 @@ _MAX_CANVAS_DEFINITIONS = 512
 _MAX_CANVAS_DEFINITION_BYTES = 64 * 1024
 _MAX_CANVAS_CATALOG_BYTES = 2 * 1024 * 1024
 _MAX_RESEARCH_GATES = 512
+_MAX_AUDIT_FINDING_LIST_BYTES = 32 * 1024
 _MAX_PULSE_ROWS = 512
 _MAX_PULSE_FILE_BYTES = 256 * 1024
 _MAX_ALERT_FILE_BYTES = 512 * 1024
@@ -111,9 +119,7 @@ _LEGACY_SCENE_LABELS = MappingProxyType(
         "pulse_alert": "脉搏异动",
     }
 )
-_LEGACY_CHANNEL_LABELS = MappingProxyType(
-    {"pushdeer": "PushDeer", "pushplus": "PushPlus"}
-)
+_LEGACY_CHANNEL_LABELS = MappingProxyType({"pushdeer": "PushDeer", "pushplus": "PushPlus"})
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
 _PAGE_CONTROL_PROTOCOL_MARKER = "safe-effect-journal-v2"
 _PAGE_CONTROL_PROTOCOL_VERSION = 2
@@ -246,9 +252,7 @@ def _read_bound_optional_file(
     except FileNotFoundError:
         return None
     if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
-        raise PageProjectionSourceIntegrityError(
-            f"{label} must be a regular non-symlink file"
-        )
+        raise PageProjectionSourceIntegrityError(f"{label} must be a regular non-symlink file")
     if item.st_size > max_bytes:
         raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     descriptor = os.open(
@@ -268,9 +272,7 @@ def _read_bound_optional_file(
         try:
             named = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
         except FileNotFoundError as error:
-            raise PageProjectionSourceIntegrityError(
-                f"{label} rotated while read"
-            ) from error
+            raise PageProjectionSourceIntegrityError(f"{label} rotated while read") from error
         if _copy_identity(named) != _copy_identity(opened):
             raise PageProjectionSourceIntegrityError(f"{label} rotated while read")
     finally:
@@ -1935,6 +1937,7 @@ class DuckDBLabPageProjectionSource:
         stable = _StableReadonlyDuckDB(self.database_path, control_root=self.control_root)
         with stable as connection:
             self._require_tables(connection)
+            audit_status, audit_issues = self._audit_results(connection, observed=observed)
             candidates = connection.execute(
                 """
                 SELECT snapshot.snapshot_id, snapshot.strategy_name, snapshot.code_commit,
@@ -2025,13 +2028,109 @@ class DuckDBLabPageProjectionSource:
                             metadata_ready=research_gate_metadata_ready(decision),
                         )
                     )
-        available_at = (
-            _EMPTY_PROJECTION_AVAILABLE_AT if not rows else max(row.completed_at for row in rows)
+        available_at = max(
+            (
+                _EMPTY_PROJECTION_AVAILABLE_AT,
+                *(row.completed_at for row in rows),
+                *(
+                    time
+                    for time in (
+                        audit_status.latest_observed_at,
+                        audit_status.latest_completed_at,
+                        audit_status.successful_completed_at,
+                    )
+                    if time is not None
+                ),
+            )
         )
         return LabPageProjectionSnapshot.create(
             available_at=available_at,
             rows=tuple(rows),
+            audit_status=audit_status,
+            audit_issues=audit_issues,
         )
+
+    @staticmethod
+    def _audit_results(
+        connection: duckdb.DuckDBPyConnection, *, observed: datetime
+    ) -> tuple[DataAuditStatusProjectionRow, tuple[DataAuditIssueProjectionRow, ...]]:
+        latest = connection.execute(
+            """
+            SELECT audit_run_id, status, observed_at, completed_at
+            FROM data_audit_run
+            WHERE observed_at <= ? AND (status = 'running' OR completed_at <= ?)
+            ORDER BY observed_at DESC, audit_run_id DESC LIMIT 1
+            """,
+            (observed, observed),
+        ).fetchone()
+        successful = connection.execute(
+            """
+            SELECT audit_run_id, as_of_date, range_start, range_end,
+                   observed_at, completed_at, p0_count,
+                   json_array_length(finding_issue_ids),
+                   json_type(finding_issue_ids),
+                   octet_length(encode(CAST(finding_issue_ids AS VARCHAR)))
+            FROM data_audit_run
+            WHERE status = 'completed' AND observed_at <= ? AND completed_at <= ?
+            ORDER BY observed_at DESC, audit_run_id DESC LIMIT 1
+            """,
+            (observed, observed),
+        ).fetchone()
+        issues: tuple[DataAuditIssueProjectionRow, ...] = ()
+        if successful is not None:
+            if successful[8] != "ARRAY" or int(successful[9]) > _MAX_AUDIT_FINDING_LIST_BYTES:
+                raise PageProjectionSourceIntegrityError("audit finding list is malformed or large")
+            expected = int(successful[7])
+            if expected > _MAX_AUDIT_ISSUES:
+                raise PageProjectionSourceIntegrityError("audit issue limit exceeded")
+            rows = connection.execute(
+                """
+                SELECT json_extract_string(finding.value, '$') AS finding_id,
+                       issue.issue_id, issue.dataset_id, issue.rule_id,
+                       issue.severity, issue.status
+                FROM data_audit_run AS audit,
+                     json_each(audit.finding_issue_ids) AS finding
+                LEFT JOIN data_quality_issue AS issue
+                  ON issue.issue_id = json_extract_string(finding.value, '$')
+                WHERE audit.audit_run_id = ?
+                ORDER BY finding_id LIMIT ?
+                """,
+                (str(successful[0]), _MAX_AUDIT_ISSUES + 1),
+            ).fetchall()
+            if len(rows) != expected or any(row[1] is None for row in rows):
+                raise PageProjectionSourceIntegrityError("audit issue is missing")
+            if len({str(row[0]) for row in rows}) != expected:
+                raise PageProjectionSourceIntegrityError("audit issue ids are duplicated")
+            issues = tuple(
+                DataAuditIssueProjectionRow(
+                    audit_run_id=str(successful[0]),
+                    issue_id=str(issue_id),
+                    dataset_id=str(dataset_id),
+                    rule_id=str(rule_id),
+                    severity=str(severity),
+                    status=str(status),
+                )
+                for _finding_id, issue_id, dataset_id, rule_id, severity, status in rows
+            )
+            # Issue severity can change after this completed run; p0_count is its
+            # historical result, while issue rows show the current classification.
+        status = DataAuditStatusProjectionRow(
+            latest_status="never_run" if latest is None else str(latest[1]),
+            latest_observed_at=None if latest is None else _database_timestamp(latest[2]),
+            latest_completed_at=(
+                None if latest is None or latest[3] is None else _database_timestamp(latest[3])
+            ),
+            successful_audit_id=None if successful is None else str(successful[0]),
+            successful_as_of_date=None if successful is None else successful[1],
+            successful_range_start=None if successful is None else successful[2],
+            successful_range_end=None if successful is None else successful[3],
+            successful_completed_at=(
+                None if successful is None else _database_timestamp(successful[5])
+            ),
+            finding_count=0 if successful is None else int(successful[7]),
+            p0_count=0 if successful is None else int(successful[6]),
+        )
+        return status, issues
 
     @staticmethod
     def _require_tables(connection: duckdb.DuckDBPyConnection) -> None:
@@ -2095,9 +2194,8 @@ class SignalPageProjectionProducer:
                 item
                 for item in previous.payload.projections
                 if item.table_name not in _COMPANION_SIGNAL_TABLES
-                and item.table_name not in {
-                    "surge_event", "legacy_notification", "legacy_notification_status"
-                }
+                and item.table_name
+                not in {"surge_event", "legacy_notification", "legacy_notification_status"}
             )
             try:
                 surge = _read_surge_event_projection(self.source.surge_live_root, observed=observed)
@@ -2697,9 +2795,7 @@ def _read_legacy_notification_projections(
             raise PageProjectionSourceIntegrityError(
                 "legacy notification source has future file time"
             )
-        local_start = observed.astimezone(_SHANGHAI).date() - timedelta(
-            days=_EVENT_WINDOW_DAYS - 1
-        )
+        local_start = observed.astimezone(_SHANGHAI).date() - timedelta(days=_EVENT_WINDOW_DAYS - 1)
         window_start = datetime.combine(local_start, time.min, tzinfo=_SHANGHAI).astimezone(UTC)
         rows: list[dict[str, ProjectionScalar]] = []
         skipped = 0
@@ -3141,8 +3237,18 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
-        if tuple(item.table_name for item in self.projections) != ("research_gate_metadata",):
+        if tuple(item.table_name for item in self.projections) != (
+            "data_audit_issue",
+            "data_audit_status",
+            "research_gate_metadata",
+        ):
             raise ValueError("lab page projection snapshot is incomplete")
+        status = self.projections[1].rows
+        issues = self.projections[0].rows
+        if len(status) != 1 or len(issues) != status[0]["finding_count"]:
+            raise ValueError("lab audit projection row count differs")
+        if any(item["audit_run_id"] != status[0]["successful_audit_id"] for item in issues):
+            raise ValueError("lab audit projection mixes audit runs")
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("lab page projection snapshot hash mismatch")
@@ -3154,14 +3260,31 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         *,
         available_at: datetime,
         rows: tuple[ResearchGateProjectionRow, ...] = (),
+        audit_status: DataAuditStatusProjectionRow | None = None,
+        audit_issues: tuple[DataAuditIssueProjectionRow, ...] = (),
     ) -> LabPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
-        projection = ServingProjectionPayload(
-            table_name="research_gate_metadata",
-            available_at=available,
-            rows=tuple(_research_gate_row(row) for row in rows),
+        status = audit_status or DataAuditStatusProjectionRow(
+            latest_status="never_run", finding_count=0, p0_count=0
         )
-        identity = {"available_at": available, "projections": (projection,)}
+        projections = (
+            ServingProjectionPayload(
+                table_name="data_audit_issue",
+                available_at=available,
+                rows=tuple(item.model_dump(mode="json") for item in audit_issues),
+            ),
+            ServingProjectionPayload(
+                table_name="data_audit_status",
+                available_at=available,
+                rows=({"status_key": "current", **status.model_dump(mode="json")},),
+            ),
+            ServingProjectionPayload(
+                table_name="research_gate_metadata",
+                available_at=available,
+                rows=tuple(_research_gate_row(row) for row in rows),
+            ),
+        )
+        identity = {"available_at": available, "projections": projections}
         return cls(**identity, content_sha256=canonical_sha256(identity))
 
 

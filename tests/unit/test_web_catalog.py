@@ -18,7 +18,7 @@ def test_list_and_detail_work_without_a_serving_generation(tmp_path: Path) -> No
         detailed = client.get("/api/v1/data/catalog/daily_bar")
 
     assert listed.status_code == 200
-    assert len(listed.json()["data"]["datasets"]) == 23
+    assert len(listed.json()["data"]["datasets"]) == 24
     assert "fields" not in listed.json()["data"]["datasets"][0]
     assert listed.json()["serving"]["state"] == "ready"
     assert detailed.status_code == 200
@@ -33,6 +33,31 @@ def test_list_and_detail_work_without_a_serving_generation(tmp_path: Path) -> No
         "data_type": "DOUBLE",
         "unit": "%",
         "is_primary_key": False,
+    }
+
+
+def test_limit_up_pool_is_selectable_with_its_real_schema(tmp_path: Path) -> None:
+    app = create_app(WebSettings(serving_root=tmp_path / "missing"), background=False)
+    with TestClient(app) as client:
+        listed = client.get("/api/v1/data/catalog")
+        detailed = client.get("/api/v1/data/catalog/limit_up_pool_daily")
+
+    assert "limit_up_pool_daily" in {
+        item["dataset_id"] for item in listed.json()["data"]["datasets"]
+    }
+    assert detailed.status_code == 200
+    record = detailed.json()["data"]
+    assert record["name"] == "东方财富涨停池"
+    assert record["sources"] == ["东方财富"]
+    assert record["update_note"] == "有事件时更新"
+    assert record["primary_key"] == ["ts_code", "trade_date", "source"]
+    assert record["schema_available"] is True
+    assert {field["key"] for field in record["fields"]} >= {
+        "ts_code",
+        "trade_date",
+        "source",
+        "seal_amount",
+        "break_count",
     }
 
 

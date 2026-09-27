@@ -27,12 +27,13 @@ from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProje
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.routes import (
     catalog,
+    data_audit,
     health,
     meta,
     monitor,
     overview,
-    paper,
     panorama,
+    paper,
     screen,
     stocks,
     tasks,
@@ -105,7 +106,8 @@ def create_app(
     )
     screen_history = (
         VerifiedFormulaHistoryProjection(settings.screen_history_root)
-        if settings.screen_history_root is not None else None
+        if settings.screen_history_root is not None
+        else None
     )
     app.state.web = WebContext(
         settings=settings,
@@ -114,7 +116,9 @@ def create_app(
         cursor_key=cursor_key,
         screen_gate=threading.BoundedSemaphore(1),
         screen_service=ScreenApplicationService(
-            cursor_key=cursor_key, replica=screen_replica, history=screen_history,
+            cursor_key=cursor_key,
+            replica=screen_replica,
+            history=screen_history,
         ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -157,6 +161,7 @@ def create_app(
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
+    app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
     return app
 
 

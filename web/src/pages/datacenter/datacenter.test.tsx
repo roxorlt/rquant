@@ -73,6 +73,19 @@ const descriptions: CatalogList = {
 
 function catalogHandlers(list: CatalogList = descriptions) {
   server.use(
+    http.get("*/api/v1/data/health", () =>
+      HttpResponse.json({
+        data: { source_state: "not_published", latest_attempt: null, latest_success: null },
+        serving: {
+          generation_id: null,
+          built_at: null,
+          age_seconds: null,
+          state: "unavailable",
+          message: null,
+          detail: "no audit fixture",
+        },
+      }),
+    ),
     http.get("*/api/v1/data/catalog", () =>
       HttpResponse.json({
         data: list,
@@ -108,6 +121,40 @@ function catalogHandlers(list: CatalogList = descriptions) {
         },
       }),
     ),
+  );
+}
+
+function auditHandlers(
+  health: Schemas["DataAuditHealthData"],
+  issueItems: Schemas["DataAuditIssueItem"][] = [],
+) {
+  const serving = {
+    generation_id: "generation-a",
+    built_at: "2026-09-24T07:31:00Z",
+    age_seconds: 20,
+    state: "ready",
+    message: null,
+    detail: "",
+  };
+  server.use(
+    http.get("*/api/v1/data/health", () => HttpResponse.json({ data: health, serving })),
+    http.get("*/api/v1/data/issues", ({ request }) => {
+      const query = new URL(request.url).searchParams;
+      if (query.get("generation") !== serving.generation_id) {
+        return HttpResponse.json({ detail: "审计数据已更新" }, { status: 409 });
+      }
+      const selected = query.get("dataset") === "daily_bar" ? issueItems : [];
+      return HttpResponse.json({
+        data: {
+          source_state: "ready",
+          dataset_name: query.get("dataset") === "daily_bar" ? "股票日线" : "复权因子",
+          total_count: selected.length,
+          partial: false,
+          issues: selected,
+        },
+        serving,
+      });
+    }),
   );
 }
 
@@ -158,5 +205,96 @@ describe("数据中心目录", () => {
     );
     renderApp("/datacenter");
     expect(await screen.findByText("暂时读不到数据目录")).toBeInTheDocument();
+  });
+});
+
+describe("数据中心审计", () => {
+  it("marks completed audits with findings as attention, not healthy", async () => {
+    catalogHandlers();
+    auditHandlers(
+      {
+        source_state: "ready",
+        latest_attempt: {
+          status: "completed",
+          label: "已完成",
+          observed_at: "2026-09-24T07:20:00Z",
+          completed_at: "2026-09-24T07:21:00Z",
+        },
+        latest_success: {
+          as_of_date: "2026-09-23",
+          range_start: "2026-09-01",
+          range_end: "2026-09-23",
+          completed_at: "2026-09-24T07:21:00Z",
+          finding_count: 1,
+          p0_count: 0,
+        },
+      },
+      [{ number: 1, name: "分钟线缺少日线", severity: "P1", status: "待处理" }],
+    );
+    renderApp("/datacenter");
+    expect(await screen.findByText("发现问题")).toBeInTheDocument();
+    expect(screen.getByText("发现问题").closest(".status")).toHaveAttribute("data-state", "warn");
+  });
+
+  it("keeps a failed attempt and the last successful issue list separate", async () => {
+    const user = userEvent.setup();
+    catalogHandlers();
+    auditHandlers(
+      {
+        source_state: "ready",
+        latest_attempt: {
+          status: "failed",
+          label: "审计失败",
+          observed_at: "2026-09-24T07:20:00Z",
+          completed_at: "2026-09-24T07:21:00Z",
+        },
+        latest_success: {
+          as_of_date: "2026-09-23",
+          range_start: "2026-09-01",
+          range_end: "2026-09-23",
+          completed_at: "2026-09-24T07:10:00Z",
+          finding_count: 1,
+          p0_count: 0,
+        },
+      },
+      [{ number: 1, name: "分钟线缺少日线", severity: "P1", status: "待处理" }],
+    );
+    renderApp("/datacenter");
+    expect(await screen.findByText("审计失败")).toBeInTheDocument();
+    expect(screen.getByText(/上次完成/)).toBeInTheDocument();
+    expect(await screen.findByRole("table", { name: "审计问题" })).toHaveTextContent(
+      "分钟线缺少日线",
+    );
+    expect(screen.getByText("全部 1 条")).toBeInTheDocument();
+    expect(findJargon(document.querySelector("main")?.textContent ?? "")).toEqual([]);
+    await user.click(screen.getByRole("button", { name: /复权因子/ }));
+    expect(await screen.findByText("这份数据没有审计问题")).toBeInTheDocument();
+    expect(screen.queryByText("分钟线缺少日线")).not.toBeInTheDocument();
+  });
+
+  it("tells apart no audit, running, and unavailable source", async () => {
+    catalogHandlers();
+    auditHandlers({ source_state: "ready", latest_attempt: null, latest_success: null });
+    const empty = renderApp("/datacenter");
+    expect(await screen.findByText("尚未审计")).toBeInTheDocument();
+    empty.unmount();
+
+    auditHandlers({
+      source_state: "ready",
+      latest_attempt: {
+        status: "running",
+        label: "审计中",
+        observed_at: "2026-09-24T07:20:00Z",
+        completed_at: null,
+      },
+      latest_success: null,
+    });
+    const running = renderApp("/datacenter");
+    expect(await screen.findByText("审计中")).toBeInTheDocument();
+    running.unmount();
+
+    auditHandlers({ source_state: "unavailable", latest_attempt: null, latest_success: null });
+    renderApp("/datacenter");
+    expect(await screen.findByText("审计结果暂时不可用")).toBeInTheDocument();
   });
 });

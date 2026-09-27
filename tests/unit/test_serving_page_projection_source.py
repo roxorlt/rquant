@@ -374,7 +374,8 @@ def test_legacy_notification_failure_revokes_old_records_in_new_authority(
                 "error_msg": "SECRET-CANARY",
                 "title": "SECRET-CANARY",
             }
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     os.utime(path, ((NOW - timedelta(seconds=2)).timestamp(),) * 2)
@@ -406,7 +407,8 @@ def test_legacy_notification_failure_revokes_old_records_in_new_authority(
                     "error_msg": "SECRET-CANARY",
                     "title": "SECRET-CANARY",
                 }
-            ) + "\n",
+            )
+            + "\n",
             encoding="utf-8",
         )
         stamp = (NOW - timedelta(seconds=1)).timestamp()
@@ -2003,9 +2005,11 @@ def test_duckdb_lab_source_publishes_explicit_empty_gate_projection(tmp_path: Pa
 
     snapshot = DuckDBLabPageProjectionSource(database)(NOW)
 
-    assert len(snapshot.projections) == 1
-    assert snapshot.projections[0].table_name == "research_gate_metadata"
-    assert snapshot.projections[0].rows == ()
+    projections = {item.table_name: item for item in snapshot.projections}
+    assert set(projections) == {"research_gate_metadata", "data_audit_status", "data_audit_issue"}
+    assert projections["research_gate_metadata"].rows == ()
+    assert projections["data_audit_status"].rows[0]["latest_status"] == "never_run"
+    assert projections["data_audit_issue"].rows == ()
 
 
 def test_duckdb_lab_source_reuses_bound_generation_for_research_gate_store(
@@ -2040,7 +2044,9 @@ def test_duckdb_lab_source_reuses_bound_generation_for_research_gate_store(
 
     snapshot = DuckDBLabPageProjectionSource(database)(NOW)
 
-    assert snapshot.projections[0].rows == ()
+    assert {item.table_name: item for item in snapshot.projections}[
+        "research_gate_metadata"
+    ].rows == ()
     assert attacker_swaps >= 2
 
 
@@ -2137,7 +2143,7 @@ def test_lab_page_projection_serializes_research_gate_metadata() -> None:
         ),
     )
 
-    projection = snapshot.projections[0]
+    projection = {item.table_name: item for item in snapshot.projections}["research_gate_metadata"]
     assert projection.table_name == "research_gate_metadata"
     assert projection.rows[0]["coverage_ratios_json"] == '{"minute":0.9}'
     assert '"sample_warning"' in str(projection.rows[0]["failures_json"])

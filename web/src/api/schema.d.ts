@@ -38,6 +38,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据审计状态 */
+        get: operations["get_data_health_api_v1_data_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/issues": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据审计问题 */
+        get: operations["get_data_issues_api_v1_data_issues_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -414,6 +448,50 @@ export interface components {
             /** To */
             to: string;
         };
+        /** AuditAttempt */
+        AuditAttempt: {
+            /** Completed At */
+            completed_at: string | null;
+            /** Label */
+            label: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "completed" | "failed";
+        };
+        /** AuditSuccess */
+        AuditSuccess: {
+            /**
+             * As Of Date
+             * Format: date
+             */
+            as_of_date: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /** Finding Count */
+            finding_count: number;
+            /** P0 Count */
+            p0_count: number;
+            /**
+             * Range End
+             * Format: date
+             */
+            range_end: string;
+            /**
+             * Range Start
+             * Format: date
+             */
+            range_start: string;
+        };
         /** BinaryExpr */
         BinaryExpr: {
             /**
@@ -625,6 +703,49 @@ export interface components {
             /** Ts Code */
             ts_code: string;
         };
+        /** DataAuditHealthData */
+        DataAuditHealthData: {
+            latest_attempt: components["schemas"]["AuditAttempt"] | null;
+            latest_success: components["schemas"]["AuditSuccess"] | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "not_published" | "unavailable";
+        };
+        /** DataAuditIssueItem */
+        DataAuditIssueItem: {
+            /** Name */
+            name: string;
+            /** Number */
+            number: number;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "P0" | "P1" | "P2" | "P3";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "待处理" | "已处理";
+        };
+        /** DataAuditIssuesData */
+        DataAuditIssuesData: {
+            /** Dataset Name */
+            dataset_name: string;
+            /** Issues */
+            issues: components["schemas"]["DataAuditIssueItem"][];
+            /** Partial */
+            partial: boolean;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "not_published" | "unavailable";
+            /** Total Count */
+            total_count: number;
+        };
         /** DatasetWatermarkInfo */
         DatasetWatermarkInfo: {
             /** Dataset Id */
@@ -692,6 +813,16 @@ export interface components {
         /** Envelope[DailyData] */
         Envelope_DailyData_: {
             data: components["schemas"]["DailyData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataAuditHealthData] */
+        Envelope_DataAuditHealthData_: {
+            data: components["schemas"]["DataAuditHealthData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataAuditIssuesData] */
+        Envelope_DataAuditIssuesData_: {
+            data: components["schemas"]["DataAuditIssuesData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[HealthData] */
@@ -2118,6 +2249,58 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_CatalogDataset_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_data_health_api_v1_data_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataAuditHealthData_"];
+                };
+            };
+        };
+    };
+    get_data_issues_api_v1_data_issues_get: {
+        parameters: {
+            query: {
+                dataset: string;
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataAuditIssuesData_"];
                 };
             };
             /** @description Validation Error */
