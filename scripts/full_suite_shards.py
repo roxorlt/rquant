@@ -30,7 +30,9 @@ MAX_NODEID_BYTES = 1_100_000
 MAX_JSONL_LINE_BYTES = 2 * MAX_NODEID_BYTES + 96
 MAX_INDEX_BYTES = 64 * 1024
 MAX_SHARD_MANIFEST_BYTES = 2 * 1024 * 1024
-MAX_MANIFEST_TOTAL_BYTES = 4 * 1024 * 1024
+# The previous 4 MiB aggregate bound was exhausted by the selected test set;
+# keep a finite limit while allowing its deterministic manifest to grow.
+MAX_MANIFEST_TOTAL_BYTES = 5 * 1024 * 1024
 MAX_COLLECTION_BYTES = MAX_MANIFEST_TOTAL_BYTES
 CI_DUMMY_TUSHARE_TOKEN = "0" * 32
 
