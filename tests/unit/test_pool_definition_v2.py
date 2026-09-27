@@ -461,6 +461,18 @@ def test_daily_screen_uses_exact_prior_trading_day_and_reloads_saved_definition(
                 }
             )
         )
+        with patch(
+            "rquant.pipeline.screen",
+            return_value=pd.DataFrame(
+                {"ts_code": ["TWO"], "name": ["two"],
+                 "CLOSE[0]": [1.0], "PCT_CHG[0]": [0.0]}
+            ),
+        ):
+            parent_run = run_daily_screen_stage(
+                "2026-07-31", preset_names=["user/parent"], store=store,
+                preset_directory=data_dir,
+            )
+        assert parent_run.preset_hits == {"user/parent": 1}
         observed: list[tuple[str, list[str] | None]] = []
 
         def screen_stub(**kwargs: object) -> pd.DataFrame:
@@ -522,6 +534,7 @@ def test_v2_same_day_rerun_to_zero_atomically_replaces_old_members(tmp_path: Pat
                 preset_names=["user/breakout"],
                 store=store,
                 preset_directory=tmp_path / "data" / "user_presets",
+                transaction_open=True,
             )
             store._conn.execute("COMMIT")
         assert first.preset_hits == {"user/breakout": 1}
@@ -632,6 +645,15 @@ def test_v2_exact_parent_day_with_market_data_and_zero_hits_is_empty_not_error(
             "('X', '2026-08-03', 1,1,1,1,1,0,0,0,0),"
             "('X', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
         )
+        with patch(
+            "rquant.pipeline.screen",
+            return_value=pd.DataFrame(columns=["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]),
+        ):
+            parent = run_daily_screen_stage(
+                "2026-08-03", preset_names=["n-shape-pool1"], store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+        assert parent.preset_hits == {"n-shape-pool1": 0}
         with patch("rquant.pipeline.screen") as screened:
             result = run_daily_screen_stage(
                 "2026-08-04",
@@ -656,9 +678,10 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
         _command("save-c", base_name="c", depends_on="user/b", delay_days=1)
     ).status is PageControlStatus.SUCCEEDED
     with DuckDBStore(tmp_path / "chain.duckdb") as store:
-        _seed_calendar(store, date(2026, 7, 31), date(2026, 8, 4))
+        _seed_calendar(store, date(2026, 7, 30), date(2026, 8, 4))
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
+            "('X', '2026-07-30', 1,1,1,1,1,0,0,0,0),"
             "('X', '2026-07-31', 1,1,1,1,1,0,0,0,0),"
             "('X', '2026-08-03', 1,1,1,1,1,0,0,0,0),"
             "('X', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
@@ -676,6 +699,31 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
                 }
             )
         )
+        with patch(
+            "rquant.pipeline.screen",
+            return_value=pd.DataFrame(
+                {"ts_code": ["FROM_A"], "name": ["a"],
+                 "CLOSE[0]": [1.0], "PCT_CHG[0]": [0.0]}
+            ),
+        ):
+            for day in ("2026-07-30", "2026-07-31"):
+                first = run_daily_screen_stage(
+                    day, preset_names=["user/a"], store=store,
+                    preset_directory=tmp_path / "data" / "user_presets",
+                )
+                assert first.preset_hits == {"user/a": 1}
+        with patch(
+            "rquant.pipeline.screen",
+            return_value=pd.DataFrame(
+                {"ts_code": ["FROM_B"], "name": ["b"],
+                 "CLOSE[0]": [1.0], "PCT_CHG[0]": [0.0]}
+            ),
+        ):
+            middle = run_daily_screen_stage(
+                "2026-08-03", preset_names=["user/b"], store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+        assert middle.preset_hits == {"user/b": 1}
         observed: list[list[str] | None] = []
 
         def screen_stub(**kwargs: object) -> pd.DataFrame:

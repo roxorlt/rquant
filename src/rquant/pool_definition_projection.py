@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from rquant.builtin_presets import BUILTIN_PRESET_SCREENS
+from rquant.builtin_presets import BUILTIN_PRESET_SCREENS, builtin_definition_version
 from rquant.llm.registry import REGISTRY_BY_NAME
 from rquant.runtime_contracts import canonical_sha256
 
@@ -55,14 +55,6 @@ def _builtins() -> dict[str, dict[str, object]]:
     rows: dict[str, dict[str, object]] = {}
     for name, preset in BUILTIN_PRESET_SCREENS.items():
         rules = [item.model_dump(mode="json") for item in preset.rule_calls]
-        identity = {
-            "name": name,
-            "description": preset.description,
-            "depends_on": preset.depends_on,
-            "offset_days": preset.offset_days,
-            "rules": rules,
-            "include_columns": preset.include_columns,
-        }
         rows[name] = {
             "pool_name": name,
             "display_name": preset.display_name or name,
@@ -70,7 +62,7 @@ def _builtins() -> dict[str, dict[str, object]]:
             "source_kind": "builtin",
             "state": "available",
             "reason": None,
-            "version": canonical_sha256({"contract": "builtin-pool/v1", **identity}),
+            "version": builtin_definition_version(preset),
             "command_id": None,
             "command_hash": None,
             "depends_on": preset.depends_on,

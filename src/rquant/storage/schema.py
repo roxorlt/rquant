@@ -172,6 +172,23 @@ CREATE TABLE IF NOT EXISTS screen_result (
 );
 """
 
+SCREEN_RUN_RECEIPT_DDL = """
+CREATE TABLE IF NOT EXISTS screen_run_receipt (
+    trade_date             DATE        NOT NULL,
+    preset_name            VARCHAR     NOT NULL,
+    definition_version     VARCHAR     NOT NULL,
+    parent_trade_date      DATE,
+    parent_result_version  VARCHAR,
+    hit_count              INTEGER     NOT NULL CHECK (hit_count >= 0),
+    member_digest          VARCHAR     NOT NULL,
+    lineage_complete       BOOLEAN     NOT NULL,
+    completed_at           TIMESTAMPTZ NOT NULL,
+    result_version         VARCHAR     NOT NULL,
+    PRIMARY KEY (trade_date, preset_name),
+    CHECK ((parent_trade_date IS NULL) = (parent_result_version IS NULL))
+);
+"""
+
 POOL2_WATCH_DDL = """
 CREATE TABLE IF NOT EXISTS pool2_watch (
     ts_code       VARCHAR   PRIMARY KEY,
@@ -1116,6 +1133,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     STOCK_SUSPEND_EVENT_DDL,
     STOCK_SUSPEND_COVERAGE_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
+    SCREEN_RUN_RECEIPT_DDL,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

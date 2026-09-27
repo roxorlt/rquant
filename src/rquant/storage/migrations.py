@@ -28,6 +28,7 @@ from rquant.storage.schema import (
     PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+    SCREEN_RUN_RECEIPT_DDL,
     STOCK_STATUS_DAILY_V4_DDL,
     STOCK_STATUS_NAME_OPTIONAL_MIGRATION_DDLS,
     STOCK_SUSPEND_COVERAGE_DDL,
@@ -159,6 +160,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=10,
         name="immutable dataset snapshot execution binding",
         statements=(DATASET_SNAPSHOT_BINDING_DDL,),
+    ),
+    Migration(
+        version=11,
+        name="screen run result lineage",
+        statements=(SCREEN_RUN_RECEIPT_DDL,),
     ),
 )
 
