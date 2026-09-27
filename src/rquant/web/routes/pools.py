@@ -147,6 +147,7 @@ def _result_view(
     definition: PoolDefinitionView | None,
     definition_version: str | None,
     latest: date | None,
+    latest_pool_result_date: date | None,
     today: date,
     member_state: str,
     member_count: int,
@@ -168,10 +169,15 @@ def _result_view(
     unverified = PoolResultView(
         state="unverified",
         status_label="结果版本待确认",
-        trade_date=receipt.trade_date,
+        trade_date=receipt.trade_date if receipt.trade_date == latest_pool_result_date else None,
         hit_count=None,
     )
-    if latest is None or receipt.trade_date > latest or not receipt.lineage_complete:
+    if (
+        latest is None
+        or receipt.trade_date > latest
+        or (latest_pool_result_date is not None and receipt.trade_date < latest_pool_result_date)
+        or not receipt.lineage_complete
+    ):
         return unverified
     if member_state == "current" and receipt.trade_date != latest:
         return unverified
@@ -329,6 +335,11 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                 )
             ]
         receipt = receipts.get(key)
+        latest_pool_result_date = bounds.get(key)
+        if receipt is not None:
+            latest_pool_result_date = max(
+                latest_pool_result_date or receipt.trade_date, receipt.trade_date
+            )
         verified_zero = (
             receipt is not None
             and receipt.lineage_complete
@@ -355,15 +366,13 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             trade_date = latest
             member_count = 0
         elif (
-            (
-                (bounds.get(key) is not None and bounds[key] < latest)
-                or (receipt is not None and receipt.trade_date < latest)
-            )
+            latest_pool_result_date is not None
+            and latest_pool_result_date < latest
             and counts[key] == 0
             and step_counts[key] == 0
         ):
             state = "older"
-            trade_date = receipt.trade_date if receipt is not None else bounds[key]
+            trade_date = latest_pool_result_date
             member_count = None
         elif counts[key] > 0 or (pool_steps and pool_steps[-1].count == 0):
             state = "current"
@@ -393,6 +402,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                     definition=rule_definitions.get(key),
                     definition_version=rule_versions.get(key),
                     latest=latest,
+                    latest_pool_result_date=latest_pool_result_date,
                     today=today,
                     member_state=state,
                     member_count=counts[key],

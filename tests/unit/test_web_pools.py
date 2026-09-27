@@ -321,6 +321,27 @@ def test_other_pool_today_does_not_relabel_this_pools_older_receipt(tmp_path: Pa
     assert pools["user/今日池"]["result"]["state"] == "current_rules"
 
 
+def test_newer_pool_result_without_receipt_does_not_confirm_an_older_run(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/今日池"), _rule_row("user/未确认池")],
+        hits=[("user/今日池", "600001.SH")],
+        receipts=[
+            _receipt_row("user/今日池", day="2026-09-24"),
+            _receipt_row("user/未确认池", day="2026-09-22", count=2),
+        ],
+        bounds={"user/今日池": "2026-09-24", "user/未确认池": "2026-09-23"},
+        latest="2026-09-24",
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/未确认池")
+    assert pool["state"] == "older"
+    assert pool["trade_date"] == "2026-09-23"
+    assert pool["result"]["state"] == "unverified"
+    assert pool["result"]["status_label"] == "结果版本待确认"
+    assert pool["result"]["trade_date"] is None
+    assert pool["result"]["hit_count"] is None
+
+
 def test_legacy_members_stay_visible_without_a_receipt(tmp_path: Path) -> None:
     data = _receipt_response(
         tmp_path,
