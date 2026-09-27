@@ -18,6 +18,7 @@ import { CanvasCreateSession } from "./canvasCreateSession";
 import { canvasPublicationStage } from "./canvasPublication";
 import { publicationStage } from "./editorPublication";
 import { PoolEditorSession } from "./editorSession";
+import { FirstPoolAction } from "./FirstPoolAction";
 import { PoolEditorForm } from "./PoolEditorForm";
 import "./pools.css";
 
@@ -606,7 +607,9 @@ export default function PoolsPage() {
           {editorSnapshot.journal.canvasName ? (
             <span>
               {editorSnapshot.journal.attachStatus === "succeeded"
-                ? "已加入当前画布"
+                ? stage === "published" || stage === "result"
+                  ? "已加入当前画布"
+                  : "加入请求已完成，等待画布更新"
                 : editorSnapshot.journal.attachStatus === "failed"
                   ? "画布挂接失败"
                   : "尚未加入当前画布"}
@@ -682,7 +685,18 @@ export default function PoolsPage() {
             <span>
               {item.save.display_name} ·{" "}
               {item.attachStatus === "succeeded"
-                ? "已加入画布"
+                ? ["published", "result"].includes(
+                    publicationStage(
+                      item,
+                      editorQuery.data,
+                      data,
+                      editorQuery.serving?.generation_id,
+                      visibleGeneration,
+                      newest,
+                    ),
+                  )
+                  ? "已加入画布"
+                  : "加入请求已完成，等待画布更新"
                 : item.attachStatus === "failed"
                   ? "画布挂接失败"
                   : "画布状态待确认"}
@@ -711,7 +725,11 @@ export default function PoolsPage() {
         <PageSkeleton />
       ) : query.error || changing ? (
         <EmptyState title="池子数据正在更新" hint="稍后刷新页面再查看。" />
-      ) : data && (data.state === "ready" || data.pools.length > 0 || editorReady) ? (
+      ) : data &&
+        (data.state === "ready" ||
+          data.pools.length > 0 ||
+          (data.state !== "unavailable" && data.canvases.length > 0) ||
+          editorReady) ? (
         <div className="pools-page">
           <div className="pools-toolbar">
             {data.canvases.length > 0 ? (
@@ -752,26 +770,35 @@ export default function PoolsPage() {
             >
               新建画布
             </Button>
-            <Button
-              className="pools-add-button"
-              variant="primary"
-              size="sm"
-              disabledReason={
-                !data.pools.length
-                  ? "还没有可作为来源的池子，先发布一只池子。"
-                  : editorReady
-                    ? undefined
-                    : `${editorNotice}，暂时无法添加条件。`
-              }
-              onClick={() =>
-                setEditorMode({
-                  kind: "create",
-                  parentKey: selected?.key ?? data.pools[0]?.key ?? null,
-                })
-              }
-            >
-              添加条件节点
-            </Button>
+            {data.pools.length === 0 ? (
+              <FirstPoolAction
+                canvas={canvas}
+                editor={editorQuery.data}
+                editorReady={editorReady}
+                editorNotice={editorNotice}
+                generationId={visibleGeneration}
+                viewer={meta.data?.data.viewer}
+                definitionsAvailable={data.definitions_available}
+                poolsTruncated={data.pools_truncated}
+                storageAvailable={editorSnapshot.storageAvailable}
+                onCreate={() => setEditorMode({ kind: "create", parentKey: null })}
+              />
+            ) : (
+              <Button
+                className="pools-add-button"
+                variant="primary"
+                size="sm"
+                disabledReason={editorReady ? undefined : `${editorNotice}，暂时无法添加条件。`}
+                onClick={() =>
+                  setEditorMode({
+                    kind: "create",
+                    parentKey: selected?.key ?? data.pools[0]?.key ?? null,
+                  })
+                }
+              >
+                添加条件节点
+              </Button>
+            )}
           </div>
           {!editorReady && !editorQuery.isLoading ? (
             <p className="pools-note" role="status">
@@ -792,7 +819,7 @@ export default function PoolsPage() {
               hint={
                 data.pools.length
                   ? "添加条件节点后，池子会显示在这里。"
-                  : "先发布一只池子，再来添加条件节点。"
+                  : "创建首只池子后，这里会显示条件和结果。"
               }
             />
           ) : !canvas && data.pools.length === 0 ? (
@@ -999,6 +1026,7 @@ export default function PoolsPage() {
           attachmentVersion={attachmentVersion}
           session={editorSession}
           snapshot={editorSnapshot}
+          publicationStage={stage}
           onClose={() => setEditorMode(null)}
           onRestart={() => {
             if (!editorReady) return;
