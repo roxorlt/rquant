@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pandas as pd
 
 from rquant.screen.loader import load_universe
 from rquant.screen.rules import AggregateRequest, Rule
-from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 BASE_COLUMNS = ["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]
 
