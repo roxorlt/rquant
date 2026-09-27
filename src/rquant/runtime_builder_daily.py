@@ -113,8 +113,12 @@ def _rows(frame: pd.DataFrame, *, fields: tuple[str, ...], label: str) -> list[d
         for field in fields:
             value = record[field]
             if label == "daily_basic" and field in {"pe_ttm", "pb", "dv_ttm"}:
-                if isinstance(value, Real) and not math.isfinite(value):
-                    raise ValueError(f"daily-close daily_basic {field} is nonfinite")
+                if isinstance(value, Real):
+                    if math.isinf(value):
+                        raise ValueError(f"daily-close daily_basic {field} is nonfinite")
+                    # Tushare's DataFrame collapses mixed JSON null/float rows to NaN.
+                    if math.isnan(value):
+                        value = None
                 if value is pd.NA:
                     value = None
             row[field] = _scalar(value)

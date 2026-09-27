@@ -513,13 +513,16 @@ def test_gateway_rejects_a_seven_call_receipt_with_repeated_interface(tmp_path: 
     assert quota.list_attempts()[0].outcome is SourceQuotaAttemptOutcome.FAILURE
 
 
-def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("missing_pe", (None, float("nan")))
+def test_default_daily_fetcher_preserves_mixed_missing_pe_and_usage_receipt(
+    monkeypatch: pytest.MonkeyPatch, missing_pe: float | None
 ) -> None:
     snapshot = _snapshot()
     basic_row = snapshot["daily_basic"][0]
     assert isinstance(basic_row, dict)
-    basic_row.update(pe_ttm=None, pb=1.25, dv_ttm=2.5)
+    basic_row.update(pe_ttm=10.0, pb=1.25, dv_ttm=2.5)
+    missing_row = {**basic_row, "ts_code": "000001.SZ", "pe_ttm": missing_pe}
+    snapshot["daily_basic"] = (basic_row, missing_row)
 
     class FakeAdapter:
         def __init__(self, *, token: str, backup_token: str) -> None:
@@ -562,13 +565,15 @@ def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
     assert isinstance(result, DailyCloseFetchResult)
     assert result.actual_call_count == 7
     assert result.interface_calls == DAILY_CLOSE_SOURCE_INTERFACES
-    observed_basic = result.payload["daily_basic"][0]
-    assert observed_basic == {**basic_row, "valuation_observed": True}
+    observed_basic = result.payload["daily_basic"]
+    assert observed_basic[0] == {**basic_row, "valuation_observed": True}
+    assert observed_basic[1] == {**missing_row, "pe_ttm": None, "valuation_observed": True}
+    assert DailyBasicFact.model_validate(observed_basic[1]).pe_ttm is None
 
 
 @pytest.mark.parametrize("field", ("pe_ttm", "pb", "dv_ttm"))
-@pytest.mark.parametrize("invalid", (float("inf"), -float("inf"), float("nan")))
-def test_daily_basic_source_rejects_nonfinite_valuation_before_signing(
+@pytest.mark.parametrize("invalid", (float("inf"), -float("inf")))
+def test_daily_basic_source_rejects_infinite_valuation_before_signing(
     monkeypatch: pytest.MonkeyPatch, field: str, invalid: float
 ) -> None:
     snapshot = _snapshot()
