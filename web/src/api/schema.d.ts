@@ -619,6 +619,34 @@ export interface components {
             /** Systems */
             systems: string[];
         };
+        /** BuiltinPoolCopySource */
+        BuiltinPoolCopySource: {
+            /** Copy Block Reason */
+            copy_block_reason: string | null;
+            /** Copyable */
+            copyable: boolean;
+            /** Delay Days */
+            delay_days: number;
+            /**
+             * Delay Mode
+             * @enum {string}
+             */
+            delay_mode: "none" | "exact" | "legacy_window";
+            /** Depends On */
+            depends_on: string | null;
+            /** Description */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Include Columns */
+            include_columns: string[];
+            /** Key */
+            key: string;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+            /** Version */
+            version: string;
+        };
         /** CallExpr */
         CallExpr: {
             /** Args */
@@ -1642,6 +1670,8 @@ export interface components {
         PoolEditorData: {
             /** Canvases */
             canvases: components["schemas"]["EditableCanvas"][];
+            /** Copy Sources */
+            copy_sources: components["schemas"]["BuiltinPoolCopySource"][];
             /** Pools */
             pools: components["schemas"]["EditablePool"][];
             /**
