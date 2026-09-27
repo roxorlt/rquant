@@ -220,7 +220,7 @@ def test_ops_owner_accepts_one_fresh_sample_then_expires_at_120_seconds() -> Non
     assembler = _assembler()
     object.__setattr__(assembler, "ops_status_reader", lambda _as_of: result)
 
-    fresh = assembler.assemble(NOW + timedelta(seconds=120))
+    fresh = assembler.assemble(NOW + timedelta(seconds=119, milliseconds=999))
     assert next(
         item for item in fresh.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
     ).status is FreshnessStatus.FRESH
@@ -231,7 +231,7 @@ def test_ops_owner_accepts_one_fresh_sample_then_expires_at_120_seconds() -> Non
     }
     assert names == {"ops_host_status", "ops_unit_status", "ops_resource_status"}
 
-    expired = assembler.assemble(NOW + timedelta(seconds=121))
+    expired = assembler.assemble(NOW + timedelta(seconds=120))
     assert next(
         item for item in expired.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
     ).status is FreshnessStatus.UNAVAILABLE

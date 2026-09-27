@@ -629,9 +629,9 @@ class ServingSnapshotAssembler:
                         )
                     if sample.sampled_at > as_of:
                         raise ServingSourceAuthorityIntegrityError("ops sample is in the future")
-                    if (as_of - sample.sampled_at).total_seconds() > 120:
+                    if (as_of - sample.sampled_at).total_seconds() >= 120:
                         raise ServingSourceAuthorityUnavailableError(
-                            "ops sample is older than 120 seconds"
+                            "ops sample is at least 120 seconds old"
                         )
                     self._last_ops_security_reason = None
         except Exception as error:
