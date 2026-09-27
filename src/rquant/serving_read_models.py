@@ -693,6 +693,27 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=512,
             max_bytes=2 * 1024 * 1024,
         ),
+        "screen_run_receipt": _contract(
+            "signals",
+            (
+                ("trade_date", "date"),
+                ("preset_name", "string"),
+                ("definition_version", "string"),
+                ("result_version", "string"),
+                ("parent_trade_date", "date"),
+                ("parent_result_version", "string"),
+                ("hit_count", "int"),
+                ("member_digest", "string"),
+                ("lineage_complete", "bool"),
+                ("current_definition", "bool"),
+                ("completed_at", "timestamp"),
+            ),
+            ("preset_name",),
+            max_rows=512,
+            max_bytes=256 * 1024,
+            event_date_columns=("trade_date", "parent_trade_date"),
+            event_time_columns=("completed_at",),
+        ),
         "nl_screen_universe": _contract(
             "reference_slow_authority",
             (

@@ -65,6 +65,7 @@ from rquant.page_control import (
     read_canvas_current_head,
 )
 from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
+from rquant.pool_result_receipt import ScreenRunReceipt, member_set_digest
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
     ReplicaRead,
@@ -103,6 +104,25 @@ _MAX_POOL_CATALOG_BYTES = 2 * 1024 * 1024
 _MAX_POOL_MUTATIONS = 8_192
 _MAX_POOL_AUDIT_BYTES = 8 * 1024 * 1024
 _MAX_POOL_AUDIT_CELL_CHARS = 128 * 1024
+_MAX_RUN_RECEIPTS = 512
+_MAX_RUN_RECEIPT_SOURCE_ROWS = 16_384
+_MAX_RUN_LINEAGE_NODES = 512
+_MAX_RUN_MEMBERS_PER_POOL = 20_000
+_MAX_RUN_TOTAL_MEMBERS = 100_000
+_RUN_RECEIPT_LOOKBACK_DAYS = 30
+_MAX_EXACT_PARENT_CALENDAR_SPAN_DAYS = 730
+_RUN_RECEIPT_COLUMNS = (
+    "trade_date",
+    "preset_name",
+    "definition_version",
+    "parent_trade_date",
+    "parent_result_version",
+    "hit_count",
+    "member_digest",
+    "lineage_complete",
+    "completed_at",
+    "result_version",
+)
 _MAX_RESEARCH_GATES = 512
 _MAX_AUDIT_FINDING_LIST_BYTES = 32 * 1024
 _MAX_PULSE_ROWS = 512
@@ -1173,6 +1193,258 @@ class _ReadonlyPageControlAuditReader:
 
 
 @dataclass(frozen=True, slots=True)
+class _VerifiedRunReceipts:
+    latest: tuple[ScreenRunReceipt, ...]
+    lineage: tuple[ScreenRunReceipt, ...]
+    newest_candidate_day: date | None
+    exact_parent_steps: tuple[tuple[str, int], ...]
+
+
+def _exact_parent_steps(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    receipt: ScreenRunReceipt,
+    observed: datetime,
+) -> int | None:
+    parent_day = receipt.parent_trade_date
+    if parent_day is None:
+        return None
+    span = (receipt.trade_date - parent_day).days
+    if span <= 0 or span > _MAX_EXACT_PARENT_CALENDAR_SPAN_DAYS:
+        return None
+    calendar = connection.execute(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT cal_date),
+               COUNT(*) FILTER (WHERE cal_date IN (?, ?) AND is_open),
+               COUNT(*) FILTER (WHERE cal_date > ? AND is_open),
+               COUNT(*) FILTER (WHERE updated_at <= ?)
+        FROM trade_calendar
+        WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?
+        """,
+        (parent_day, receipt.trade_date, parent_day, observed, parent_day, receipt.trade_date),
+    ).fetchone()
+    assert calendar is not None
+    expected_rows = span + 1
+    if (
+        calendar[0] != expected_rows
+        or calendar[1] != expected_rows
+        or calendar[2] != 2
+        or calendar[4] != expected_rows
+    ):
+        return None
+    target_bar = connection.execute(
+        "SELECT 1 FROM daily_bar WHERE trade_date = ? LIMIT 1", (parent_day,)
+    ).fetchone()
+    return int(calendar[3]) if target_bar is not None else None
+
+
+def _read_verified_run_receipts(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    cutoff: datetime,
+    observed: datetime,
+    generation_sealed_before_cutoff: bool,
+) -> _VerifiedRunReceipts | None:
+    present = connection.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'main' AND table_name = 'screen_run_receipt'"
+    ).fetchone()
+    if present is None:
+        return None
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info('screen_run_receipt')").fetchall()
+    }
+    if not set(_RUN_RECEIPT_COLUMNS).issubset(columns):
+        raise PageProjectionSourceIntegrityError("screen run receipt table is incomplete")
+    candidate_rows = connection.execute(
+        """
+        SELECT trade_date, preset_name, definition_version, parent_trade_date,
+               parent_result_version, hit_count, member_digest, lineage_complete,
+               completed_at, result_version
+        FROM screen_run_receipt
+        WHERE trade_date BETWEEN ? AND ? AND completed_at <= ?
+        ORDER BY trade_date DESC, preset_name
+        LIMIT ?
+        """,
+        (
+            cutoff.date() - timedelta(days=_RUN_RECEIPT_LOOKBACK_DAYS),
+            cutoff.date(),
+            observed,
+            _MAX_RUN_RECEIPT_SOURCE_ROWS + 1,
+        ),
+    ).fetchall()
+    if len(candidate_rows) > _MAX_RUN_RECEIPT_SOURCE_ROWS:
+        raise PageProjectionSourceIntegrityError("screen run receipt source exceeds bound")
+    latest_by_pool: dict[str, tuple[object, ...]] = {}
+    for raw in candidate_rows:
+        latest_by_pool.setdefault(str(raw[1]), raw)
+    if len(latest_by_pool) > _MAX_RUN_RECEIPTS:
+        raise PageProjectionSourceIntegrityError("screen run receipt exceeds row bound")
+
+    candidates = tuple(latest_by_pool[name] for name in sorted(latest_by_pool))
+    newest = max((row[0] for row in candidates), default=None)
+    verified: dict[tuple[date, str], ScreenRunReceipt | None] = {}
+    member_total = 0
+
+    def verify(raw: tuple[object, ...]) -> ScreenRunReceipt | None:
+        nonlocal member_total
+        key = (raw[0], raw[1])
+        if key in verified:
+            return verified[key]
+        if len(verified) >= _MAX_RUN_LINEAGE_NODES:
+            raise PageProjectionSourceIntegrityError("screen run receipt lineage exceeds bound")
+        verified[key] = None
+        try:
+            receipt = ScreenRunReceipt.model_validate(
+                dict(zip(_RUN_RECEIPT_COLUMNS, raw, strict=True))
+            )
+        except ValueError:
+            return None
+        if receipt.trade_date > cutoff.date() or receipt.completed_at > observed:
+            return None
+        member_rows = connection.execute(
+            """
+            SELECT ts_code FROM screen_result
+            WHERE trade_date = ? AND preset_name = ? AND created_at <= ?
+            ORDER BY ts_code LIMIT ?
+            """,
+            (receipt.trade_date, receipt.preset_name, cutoff, _MAX_RUN_MEMBERS_PER_POOL + 1),
+        ).fetchall()
+        member_total += len(member_rows)
+        if len(member_rows) > _MAX_RUN_MEMBERS_PER_POOL or member_total > _MAX_RUN_TOTAL_MEMBERS:
+            raise PageProjectionSourceIntegrityError("screen run receipt members exceed bound")
+        codes = [str(row[0]) for row in member_rows]
+        try:
+            matches = (
+                len(codes) == receipt.hit_count
+                and member_set_digest(codes) == receipt.member_digest
+            )
+        except ValueError:
+            return None
+        if not matches:
+            return None
+        if receipt.parent_trade_date is not None:
+            if receipt.parent_trade_date >= receipt.trade_date:
+                return None
+            parent_rows = connection.execute(
+                """
+                SELECT trade_date, preset_name, definition_version, parent_trade_date,
+                       parent_result_version, hit_count, member_digest, lineage_complete,
+                       completed_at, result_version
+                FROM screen_run_receipt
+                WHERE trade_date = ? AND result_version = ? AND completed_at <= ?
+                LIMIT 2
+                """,
+                (receipt.parent_trade_date, receipt.parent_result_version, observed),
+            ).fetchall()
+            if len(parent_rows) != 1:
+                return None
+            parent = verify(parent_rows[0])
+            if (
+                parent is None
+                or parent.completed_at > receipt.completed_at
+                or parent.lineage_complete != receipt.lineage_complete
+            ):
+                return None
+        verified[key] = receipt
+        return receipt
+
+    latest = tuple(item for raw in candidates if (item := verify(raw)) is not None)
+    lineage = tuple(item for item in verified.values() if item is not None)
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main' AND table_name IN ('trade_calendar', 'daily_bar')"
+        ).fetchall()
+    }
+    exact_parent_steps: list[tuple[str, int]] = []
+    # daily_bar has no row timestamp, so its target-day presence proves a PIT fact
+    # only after the immutable replica generation was already sealed.
+    if generation_sealed_before_cutoff and tables == {"trade_calendar", "daily_bar"}:
+        step_cache: dict[tuple[date, date], int | None] = {}
+        for item in lineage:
+            if item.parent_trade_date is None:
+                continue
+            key = (item.parent_trade_date, item.trade_date)
+            if key not in step_cache:
+                step_cache[key] = _exact_parent_steps(connection, receipt=item, observed=observed)
+            steps = step_cache[key]
+            if steps is not None and item.result_version is not None:
+                exact_parent_steps.append((item.result_version, steps))
+    return _VerifiedRunReceipts(
+        latest=latest,
+        lineage=lineage,
+        newest_candidate_day=newest,
+        exact_parent_steps=tuple(exact_parent_steps),
+    )
+
+
+def _receipt_projection(
+    receipts: _VerifiedRunReceipts,
+    definitions: ServingProjectionPayload,
+) -> ServingProjectionPayload:
+    by_name = {str(row["pool_name"]): row for row in definitions.rows}
+    by_version = {item.result_version: item for item in receipts.lineage}
+    exact_parent_steps = dict(receipts.exact_parent_steps)
+    current_cache: dict[str, bool] = {}
+
+    def current(receipt: ScreenRunReceipt) -> bool:
+        assert receipt.result_version is not None
+        if receipt.result_version in current_cache:
+            return current_cache[receipt.result_version]
+        row = by_name.get(receipt.preset_name)
+        matches = bool(
+            row is not None
+            and row["state"] == "available"
+            and row["version"] == receipt.definition_version
+            and receipt.lineage_complete
+        )
+        if matches and row is not None:
+            parent_name = row["depends_on"]
+            if parent_name is None:
+                matches = receipt.parent_result_version is None
+            else:
+                parent = by_version.get(receipt.parent_result_version)
+                matches = bool(
+                    row["delay_mode"] == "exact"
+                    and parent is not None
+                    and parent.preset_name == parent_name
+                    and parent.trade_date == receipt.parent_trade_date
+                    and exact_parent_steps.get(receipt.result_version) == row["delay_days"]
+                    and current(parent)
+                )
+        current_cache[receipt.result_version] = matches
+        return matches
+
+    rows = tuple(
+        {
+            "trade_date": item.trade_date.isoformat(),
+            "preset_name": item.preset_name,
+            "definition_version": item.definition_version,
+            "result_version": item.result_version,
+            "parent_trade_date": (
+                None if item.parent_trade_date is None else item.parent_trade_date.isoformat()
+            ),
+            "parent_result_version": item.parent_result_version,
+            "hit_count": item.hit_count,
+            "member_digest": item.member_digest,
+            "lineage_complete": item.lineage_complete,
+            "current_definition": current(item),
+            "completed_at": item.completed_at.isoformat(),
+        }
+        for item in receipts.latest
+    )
+    available = max(
+        (item.completed_at for item in receipts.latest), default=_EMPTY_PROJECTION_AVAILABLE_AT
+    )
+    return ServingProjectionPayload(
+        table_name="screen_run_receipt", available_at=available, rows=rows
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _DatabaseProjection:
     """Everything one page projection takes out of the replica, in one open (#256)."""
 
@@ -1181,6 +1453,7 @@ class _DatabaseProjection:
     latest_trade_date: date | None
     canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
     canvas_hits: tuple[CanvasHitProjectionRow, ...]
+    run_receipts: _VerifiedRunReceipts | None
     monitor_event: ServingProjectionPayload
     available_at: datetime
 
@@ -1325,12 +1598,25 @@ class DuckDBSignalPageProjectionSource:
         available = database.available_at
         canvas_definitions = self._canvas_definitions(observed=observed)
         pool_definition = (
-            None
-            if self.user_presets_root is None
-            else _pool_definition_projection(
+            _pool_definition_projection(
                 self.user_presets_root,
                 self.page_control_outbox,
             )
+            if self.user_presets_root is not None
+            else (
+                ServingProjectionPayload(
+                    table_name="pool_definition",
+                    available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
+                    rows=build_pool_definition_rows({}, {}, root_path=""),
+                )
+                if database.run_receipts is not None
+                else None
+            )
+        )
+        run_receipt_projection = (
+            _receipt_projection(database.run_receipts, pool_definition)
+            if database.run_receipts is not None and pool_definition is not None
+            else None
         )
         pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
             self.surge_live_root,
@@ -1362,6 +1648,7 @@ class DuckDBSignalPageProjectionSource:
             canvas_hits=hits,
             canvas_definitions=canvas_definitions,
             pool_definition=pool_definition,
+            screen_run_receipt=run_receipt_projection,
             pulse_history=pulse_history,
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
@@ -1459,6 +1746,21 @@ class DuckDBSignalPageProjectionSource:
                 (cutoff.date(), cutoff),
             ).fetchone()
             latest_date = None if latest_row is None else latest_row[0]
+            run_receipts = _read_verified_run_receipts(
+                connection,
+                cutoff=cutoff,
+                observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
+                generation_sealed_before_cutoff=sealed_before_cutoff,
+            )
+            if run_receipts is not None:
+                trusted_date = max((item.trade_date for item in run_receipts.latest), default=None)
+                if trusted_date is not None:
+                    latest_date = max(latest_date, trusted_date) if latest_date else trusted_date
+                if run_receipts.newest_candidate_day is not None and (
+                    latest_date is None or run_receipts.newest_candidate_day > latest_date
+                ):
+                    # A newer, invalid run cannot make yesterday's members look current.
+                    latest_date = None
             diagnostics: tuple[CanvasDiagnosticProjectionRow, ...] = ()
             hits: tuple[CanvasHitProjectionRow, ...] = ()
             if latest_date is not None:
@@ -1551,9 +1853,24 @@ class DuckDBSignalPageProjectionSource:
                     _MAX_EVENT_ROWS + 1,
                 ),
             ).fetchall()
-        if available_row is None or available_row[0] is None:
+        receipt_available = (
+            max(
+                (item.completed_at for item in run_receipts.latest),
+                default=None,
+            )
+            if run_receipts is not None
+            else None
+        )
+        if (available_row is None or available_row[0] is None) and receipt_available is None:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
-        database_available = _database_timestamp(available_row[0])
+        database_available = max(
+            (
+                _database_timestamp(available_row[0])
+                if available_row is not None and available_row[0] is not None
+                else _EMPTY_PROJECTION_AVAILABLE_AT
+            ),
+            receipt_available or _EMPTY_PROJECTION_AVAILABLE_AT,
+        )
         if len(monitor_rows) > _MAX_EVENT_ROWS:
             raise PageProjectionSourceIntegrityError("monitor events exceed the row bound")
         published_monitor: list[dict[str, object]] = []
@@ -1603,6 +1920,7 @@ class DuckDBSignalPageProjectionSource:
             latest_trade_date=latest_date,
             canvas_diagnostics=diagnostics,
             canvas_hits=hits,
+            run_receipts=run_receipts,
             monitor_event=monitor_projection,
             available_at=database_available,
         )
@@ -2393,6 +2711,7 @@ class SignalPageProjectionProducer:
                     "legacy_notification",
                     "legacy_notification_status",
                     "pool_definition",
+                    "screen_run_receipt",
                 }
             )
             try:
@@ -3325,6 +3644,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         }
         optional_names = {
             "pool_definition",
+            "screen_run_receipt",
             "pulse_history",
             "pulse_alert",
             "surge_runtime_config",
@@ -3355,6 +3675,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         canvas_hits: tuple[CanvasHitProjectionRow, ...] = (),
         canvas_definitions: tuple[CanvasDefinitionProjectionRow, ...] = (),
         pool_definition: ServingProjectionPayload | None = None,
+        screen_run_receipt: ServingProjectionPayload | None = None,
         pulse_history: PulseHistoryProjectionSource | None = None,
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
@@ -3416,6 +3737,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             )
         for table_name, projection in (
             ("pool_definition", pool_definition),
+            ("screen_run_receipt", screen_run_receipt),
             ("monitor_event", monitor_event),
             ("surge_event", surge_event),
             ("legacy_notification", legacy_notification),
