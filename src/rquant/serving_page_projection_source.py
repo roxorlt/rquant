@@ -32,6 +32,18 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.backfill_plan_artifact import (
+    MAX_BACKFILL_PLAN_BYTES,
+    parse_daily_bar_backfill_plan_bytes,
+)
+from rquant.backfill_plan_core import DailyBarBackfillPlan
+from rquant.backfill_plan_projection import (
+    BACKFILL_PLAN_PROJECTION_TABLES,
+    MAX_DISCOVERABLE_BACKFILL_PLANS,
+    MAX_PREVIEW_BACKFILL_PLANS,
+    decode_backfill_plan_archive_row,
+    project_backfill_plans,
+)
 from rquant.builtin_presets import BUILTIN_PRESET_SCREENS
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
@@ -325,6 +337,87 @@ def _read_bound_optional_file(
         raise PageProjectionSourceIntegrityError(f"{label} exceeds size bound")
     binding.verify()
     return raw, opened
+
+
+_BACKFILL_PLAN_NAME = re.compile(r"daily-bar-backfill-plan-v1-([0-9a-f]{64})\.json\Z")
+_BACKFILL_TEMP_NAME = re.compile(r"\.backfill-plan-[0-9a-f]{32}\Z")
+MAX_BACKFILL_CATALOG_READ_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _BackfillPlanDirectoryEntry:
+    name: str
+    identity: tuple[int, int, int, int, int]
+    published_ns: int
+
+    @property
+    def plan_hash(self) -> str:
+        match = _BACKFILL_PLAN_NAME.fullmatch(self.name)
+        if match is None:
+            raise PageProjectionSourceIntegrityError("backfill plan filename is invalid")
+        return match.group(1)
+
+
+def _list_bound_backfill_plan_entries(
+    binding: _BoundReadonlyDirectory,
+) -> tuple[_BackfillPlanDirectoryEntry, ...]:
+    """List a bounded immutable catalogue without reading large old plans."""
+    names = []
+    for name in os.listdir(binding.descriptor):
+        if _BACKFILL_TEMP_NAME.fullmatch(name):
+            continue
+        if _BACKFILL_PLAN_NAME.fullmatch(name) is None:
+            raise PageProjectionSourceIntegrityError("backfill plan filename is unexpected")
+        names.append(name)
+    if len(names) > MAX_DISCOVERABLE_BACKFILL_PLANS:
+        raise PageProjectionSourceIntegrityError("backfill plan directory exceeds its bound")
+    entries = []
+    for name in names:
+        if _BACKFILL_PLAN_NAME.fullmatch(name) is None:
+            raise PageProjectionSourceIntegrityError("backfill plan filename is invalid")
+        observed = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode) or not (
+            0 < observed.st_size <= MAX_BACKFILL_PLAN_BYTES
+        ):
+            raise PageProjectionSourceIntegrityError("backfill plan must be a bounded regular file")
+        if os.name != "posix" or any(
+            value <= 0 for value in (observed.st_mtime_ns, observed.st_ctime_ns)
+        ):
+            raise PageProjectionSourceIntegrityError(
+                "backfill plan publication time is unavailable"
+            )
+        entries.append(
+            _BackfillPlanDirectoryEntry(
+                name=name,
+                identity=_copy_identity(observed),
+                published_ns=max(observed.st_mtime_ns, observed.st_ctime_ns),
+            )
+        )
+    binding.verify()
+    return tuple(sorted(entries, key=lambda item: (-item.published_ns, item.plan_hash)))
+
+
+def _read_bound_backfill_plan(
+    binding: _BoundReadonlyDirectory, entry: _BackfillPlanDirectoryEntry
+) -> DailyBarBackfillPlan:
+    found = _read_bound_optional_file(
+        binding,
+        entry.name,
+        max_bytes=MAX_BACKFILL_PLAN_BYTES,
+        label="backfill plan",
+    )
+    if found is None or _copy_identity(found[1]) != entry.identity:
+        raise PageProjectionSourceIntegrityError("backfill plan rotated while read")
+    return parse_daily_bar_backfill_plan_bytes(found[0], filename=entry.name)
+
+
+def _verify_bound_backfill_catalogue(
+    binding: _BoundReadonlyDirectory,
+    entries: tuple[_BackfillPlanDirectoryEntry, ...],
+) -> None:
+    binding.verify()
+    if _list_bound_backfill_plan_entries(binding) != entries:
+        raise PageProjectionSourceIntegrityError("backfill plan directory changed while read")
 
 
 def _pool_definition_projection(
@@ -3106,6 +3199,7 @@ class DuckDBLabPageProjectionSource:
         *,
         control_root: Path | None = None,
         audit_report_path: Path | None = None,
+        backfill_plan_directory: Path | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
@@ -3113,6 +3207,60 @@ class DuckDBLabPageProjectionSource:
         if audit_report_path is not None and not audit_report_path.is_absolute():
             raise ValueError("audit report path must be absolute")
         self.audit_report_path = audit_report_path
+        if backfill_plan_directory is not None and not backfill_plan_directory.is_absolute():
+            raise ValueError("backfill plan directory must be absolute")
+        self.backfill_plan_directory = backfill_plan_directory
+
+    def _backfill_plan_projections(
+        self, observed_at: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        """Seal every discoverable plan in this source generation or refuse it."""
+        directory = self.backfill_plan_directory
+        if directory is None:
+            return ()
+        observed = normalize_aware_utc(observed_at)
+        try:
+            binding = _bind_readonly_directory(directory, label="backfill plan directory")
+        except FileNotFoundError:
+            try:
+                os.stat(directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return project_backfill_plans(
+                    (),
+                    available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
+                )
+            raise PageProjectionSourceIntegrityError(
+                "backfill plan directory appeared while read"
+            ) from None
+        try:
+            entries = _list_bound_backfill_plan_entries(binding)
+            if sum(entry.identity[2] for entry in entries) > MAX_BACKFILL_CATALOG_READ_BYTES:
+                raise ValueError("backfill plan complete catalogue exceeds read bound")
+            directory_stat = os.fstat(binding.descriptor)
+            if os.name != "posix" or directory_stat.st_ctime_ns <= 0:
+                raise ValueError("backfill plan directory publication time is unavailable")
+            available_ns = max(
+                directory_stat.st_ctime_ns,
+                *(entry.published_ns for entry in entries),
+            )
+            if available_ns > int(observed.timestamp() * 1_000_000_000):
+                raise ValueError("backfill plan is not yet available")
+            indexed = tuple(
+                (
+                    _read_bound_backfill_plan(binding, entry),
+                    datetime.fromtimestamp(entry.published_ns / 1_000_000_000, tz=UTC),
+                )
+                for entry in entries
+            )
+            _verify_bound_backfill_catalogue(binding, entries)
+            return project_backfill_plans(
+                indexed,
+                available_at=datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC),
+            )
+        except (OSError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(f"backfill plan invalid: {exc}") from exc
+        finally:
+            binding.close()
 
     def _report_projections(self, observed: datetime) -> tuple[ServingProjectionPayload, ...]:
         path = self.audit_report_path
@@ -3292,6 +3440,7 @@ class DuckDBLabPageProjectionSource:
             audit_status=audit_status,
             audit_issues=audit_issues,
             audit_report_projections=self._report_projections(observed),
+            backfill_plan_projections=self._backfill_plan_projections(observed),
         )
 
     @staticmethod
@@ -4513,7 +4662,13 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         names = {item.table_name for item in self.projections}
         required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
         if (
-            names not in (required, required | REPORT_PROJECTION_TABLES)
+            names
+            not in (
+                required,
+                required | REPORT_PROJECTION_TABLES,
+                required | BACKFILL_PLAN_PROJECTION_TABLES,
+                required | REPORT_PROJECTION_TABLES | BACKFILL_PLAN_PROJECTION_TABLES,
+            )
             or len(names) != len(self.projections)
             or tuple(item.table_name for item in self.projections) != tuple(sorted(names))
         ):
@@ -4553,6 +4708,73 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                 != summary["quality_issue_count"]
             ):
                 raise ValueError("audit report projection row counts disagree")
+        if names >= BACKFILL_PLAN_PROJECTION_TABLES:
+            catalog_rows = projections["backfill_plan_catalog"].rows
+            progress_rows = projections["backfill_plan_progress"].rows
+            if len(catalog_rows) != 1 or progress_rows != (
+                {"status_key": "current", "availability": "unavailable", "task_id": None},
+            ):
+                raise ValueError("backfill plan progress must remain unavailable")
+            catalog = catalog_rows[0]
+            index = projections["backfill_plan_index"].rows
+            preview = projections["backfill_plan_preview"].rows
+            archive = projections["backfill_plan_archive"].rows
+            if (
+                catalog["catalog_key"] != "current"
+                or catalog["total_plan_count"] != len(index)
+                or catalog["indexed_plan_count"] != len(index)
+                or catalog["preview_plan_count"] != len(preview)
+                or catalog["has_older_plans"] is not False
+                or catalog["oldest_indexed_hash"]
+                != (index[-1]["plan_hash"] if index else None)
+                or [row["rank"] for row in index] != list(range(len(index)))
+                or len(preview) != min(MAX_PREVIEW_BACKFILL_PLANS, len(index))
+                or {row["plan_hash"] for row in preview}
+                != {row["plan_hash"] for row in index[: len(preview)]}
+                or len(archive) != len(index)
+                or {row["plan_hash"] for row in archive}
+                != {row["plan_hash"] for row in index}
+            ):
+                raise ValueError("backfill plan catalog rows disagree")
+            if any(
+                row["source_mode"] != "production_unverified"
+                or row["identity_verified"] is not False
+                or row["collection_complete_verified"] is not False
+                or row["quota_status"] != "unverified"
+                or row["executable"] is not False
+                for row in index
+            ):
+                raise ValueError("backfill plan cannot become verified or executable")
+            try:
+                index_by_hash = {row["plan_hash"]: row for row in index}
+                for row in archive:
+                    detail = decode_backfill_plan_archive_row(dict(row))
+                    summary = index_by_hash[detail.plan_hash]
+                    if (
+                        detail.audit_start.isoformat() != summary["audit_start"]
+                        or detail.completed_through.isoformat() != summary["completed_through"]
+                        or detail.cutoff_observed_at.isoformat()
+                        != summary["cutoff_observed_at"]
+                        or detail.published_at.isoformat() != summary["published_at"]
+                        or len(detail.missing_dates) != summary["missing_day_count"]
+                        or str(detail.estimate.estimated_seconds)
+                        != summary["estimated_seconds"]
+                        or detail.source.mode != summary["source_mode"]
+                        or detail.source.snapshot_label != summary["snapshot_label"]
+                    ):
+                        raise ValueError("backfill plan archive and index disagree")
+                for row in preview:
+                    source = json.loads(str(row["source_json"]))
+                    estimate = json.loads(str(row["estimate_json"]))
+                    if (
+                        source["mode"] != "production_unverified"
+                        or source["identity_verified"] is not False
+                        or source["collection_complete_verified"] is not False
+                        or estimate["quota_status"] != "unverified"
+                    ):
+                        raise ValueError("backfill plan preview cannot promote trust")
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("backfill plan preview is invalid") from exc
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("lab page projection snapshot hash mismatch")
@@ -4567,6 +4789,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         audit_status: DataAuditStatusProjectionRow | None = None,
         audit_issues: tuple[DataAuditIssueProjectionRow, ...] = (),
         audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
+        backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         status = audit_status or DataAuditStatusProjectionRow(
@@ -4594,8 +4817,17 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             and {item.table_name for item in audit_report_projections} != REPORT_PROJECTION_TABLES
         ):
             raise ValueError("audit report projections must be complete")
+        if (
+            backfill_plan_projections
+            and {item.table_name for item in backfill_plan_projections}
+            != BACKFILL_PLAN_PROJECTION_TABLES
+        ):
+            raise ValueError("backfill plan projections must be complete")
         projections = tuple(
-            sorted((*projections, *audit_report_projections), key=lambda item: item.table_name)
+            sorted(
+                (*projections, *audit_report_projections, *backfill_plan_projections),
+                key=lambda item: item.table_name,
+            )
         )
         identity = {
             "available_at": max(item.available_at for item in projections),
