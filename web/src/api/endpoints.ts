@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { useRef } from "react";
 import { ApiError, apiClient, type Schemas } from "./client";
 import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
@@ -17,6 +18,15 @@ export type MonitorTimelineData = Schemas["MonitorTimelineData"];
 export type MonitorTimelineItem = MonitorTimelineData["items"][number];
 export type ResearchJobsData = Schemas["ResearchJobsData"];
 export type ResearchJobItem = Schemas["ResearchJobItem"];
+export type TaskOverviewData = Schemas["TaskOverviewData"];
+export type ScheduledTaskItem = Schemas["ScheduledTaskItem"];
+export type RuntimeServiceItem = Schemas["RuntimeServiceItem"];
+export type ResourceGroupItem = Schemas["ResourceGroupItem"];
+export type TimedTaskOverview = {
+  overview: TaskOverviewData;
+  scheduledDeadline: number | null;
+  resourcesDeadline: number | null;
+};
 export type PaperAccountsData = Schemas["PaperAccountsData"];
 export type PaperAccountItem = Schemas["PaperAccountItem"];
 export type PaperHoldingItem = Schemas["PaperHoldingItem"];
@@ -89,6 +99,67 @@ export function useResearchJobs(
       params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
     });
     return unwrap(data, response);
+  });
+}
+
+export function deadlineFromRemaining(
+  state: "ready" | "unavailable",
+  remainingSeconds: number | null,
+  startedAt: number,
+  receivedAt: number,
+): number | null {
+  if (state !== "ready" || remainingSeconds === null || !Number.isFinite(remainingSeconds)) {
+    return null;
+  }
+  const elapsed = Math.max(0, receivedAt - startedAt);
+  return receivedAt + Math.max(0, remainingSeconds * 1000 - elapsed);
+}
+
+export function pinnedTaskDeadline(
+  previous: { key: string; deadline: number } | null,
+  key: string,
+  deadline: number,
+): number {
+  return previous?.key === key ? Math.min(previous.deadline, deadline) : deadline;
+}
+
+export function useTaskOverview(
+  cursor: string | null,
+  refreshKey: number,
+): ServingQueryResult<TimedTaskOverview> {
+  const budgets = useRef<
+    Record<"scheduled" | "resources", { key: string; deadline: number } | null>
+  >({ scheduled: null, resources: null });
+  return useServingQuery(["tasks", "overview", cursor, refreshKey], async () => {
+    const startedAt = performance.now();
+    const { data, response } = await apiClient().GET("/api/v1/tasks/overview", {
+      params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
+    });
+    const envelope = unwrap(data, response);
+    const receivedAt = performance.now();
+    const pin = (section: "scheduled" | "resources"): number | null => {
+      const source = envelope.data[section];
+      const deadline = deadlineFromRemaining(
+        source.source_state,
+        source.remaining_seconds,
+        startedAt,
+        receivedAt,
+      );
+      if (deadline === null) return null;
+      const key = `${envelope.serving.generation_id}:${source.source_updated_at}:${source.expires_at}`;
+      const previous = budgets.current[section];
+      const pinned = pinnedTaskDeadline(previous, key, deadline);
+      budgets.current[section] = { key, deadline: pinned };
+      return pinned;
+    };
+    return {
+      data: {
+        overview: envelope.data,
+        scheduledDeadline: pin("scheduled"),
+        resourcesDeadline: pin("resources"),
+      },
+      serving: envelope.serving,
+    };
   });
 }
 
