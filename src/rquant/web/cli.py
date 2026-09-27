@@ -8,6 +8,7 @@ the web process runs without ``.env`` (its unit hides the file), like
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import sys
 from collections.abc import Sequence
@@ -19,7 +20,7 @@ WEB_COMMANDS = frozenset({"web-serve", "web-openapi"})
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rquant")
     commands = parser.add_subparsers(dest="command", required=True)
-    serve = commands.add_parser("web-serve", help="启动只读网页 API（/app/api/ 背后的进程）")
+    serve = commands.add_parser("web-serve", help="启动网页 API（/app/api/ 背后的进程）")
     serve.add_argument("--bind", help="host:port，只允许回环地址（默认 127.0.0.1:8768）")
     serve.add_argument(
         "--self-check",
@@ -68,14 +69,22 @@ def main(argv: Sequence[str]) -> int:
 
     import uvicorn
 
-    uvicorn.run(
-        create_app(settings),
-        host=settings.bind_host,
-        port=settings.bind_port,
+    app = create_app(settings)
+    options = dict(
         workers=1,
         proxy_headers=False,
         server_header=False,
         access_log=False,
         log_level="info",
     )
+    if settings.ingress_socket_path is None:
+        uvicorn.run(app, host=settings.bind_host, port=settings.bind_port, **options)
+    else:
+        from rquant.web.ingress import private_web_ingress_socket
+
+        nginx_group_gid = grp.getgrnam("www").gr_gid
+        with private_web_ingress_socket(
+            settings.ingress_socket_path, nginx_group_gid=nginx_group_gid
+        ) as listener:
+            uvicorn.run(app, fd=listener.fileno(), **options)
     return 0

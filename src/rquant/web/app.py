@@ -1,4 +1,4 @@
-"""``create_app()``: the read-only FastAPI application behind ``/app/api/``.
+"""``create_app()``: the FastAPI application behind ``/app/api/``.
 
 nginx serves the static front end itself and proxies ``/app/api/`` here with the prefix
 stripped, so this app only knows ``/api/v1/...``. No static files, no CORS, no docs pages
@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio.to_thread
 from fastapi import FastAPI, Request, Response
@@ -47,6 +47,9 @@ from rquant.web.screen_service import ScreenApplicationService
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 
+if TYPE_CHECKING:
+    from rquant.alert_ack_admission import AckAdmissionClient
+
 API_TITLE = "rQuant Web API"
 #: Version of the HTTP contract, bumped by hand; not the package version, so that a
 #: release that does not touch the API leaves the OpenAPI snapshot unchanged.
@@ -67,6 +70,7 @@ class WebContext:
     screen_service: ScreenApplicationService
     pool_commands: PoolCommandGateway
     ack_lookup: AckLookupGateway
+    ack_admission: AckAdmissionClient | None
 
 
 def create_app(
@@ -77,6 +81,7 @@ def create_app(
     background: bool = True,
     pool_command_transport: PoolCommandTransport | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
+    ack_admission_client: AckAdmissionClient | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -118,6 +123,15 @@ def create_app(
         if settings.screen_history_root is not None
         else None
     )
+    configured_ack_admission = None
+    if settings.ack_admission_socket_path is not None:
+        from rquant.alert_ack_admission import AckAdmissionClient
+
+        configured_ack_admission = (
+            ack_admission_client
+            if ack_admission_client is not None
+            else AckAdmissionClient(settings.ack_admission_socket_path)
+        )
     app.state.web = WebContext(
         settings=settings,
         tracker=generation_tracker,
@@ -137,6 +151,7 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=ack_lookup_transport,
         ),
+        ack_admission=configured_ack_admission,
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
