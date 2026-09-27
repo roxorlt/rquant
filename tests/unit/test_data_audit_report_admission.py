@@ -159,6 +159,72 @@ def test_crash_after_queue_recovers_old_task_before_rotated_replica(
     assert recovered.result == {"outcome": "task_queued", "task_id": old_task_id}
 
 
+def test_uncertain_queue_effect_keeps_original_command_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, replica = _sources(tmp_path)
+    backend = _backend(tmp_path, primary, replica)
+    command = _command("audit-uncertain-queue-0001")
+    real_submit = backend.submit
+    real_recover = backend.recover
+    recover_calls = 0
+
+    def recover_after_one_failure(value: SubmitDataAuditReport) -> dict[str, str] | None:
+        nonlocal recover_calls
+        recover_calls += 1
+        if recover_calls == 1:
+            raise RuntimeError("temporary task-state read failure")
+        return real_recover(value)
+
+    def lose_receipt_after_queue(value: SubmitDataAuditReport) -> object:
+        real_submit(value)
+        monkeypatch.setattr(backend, "recover", recover_after_one_failure)
+        raise RuntimeError("receipt lost after durable queue")
+
+    monkeypatch.setattr(backend, "submit", lose_receipt_after_queue)
+    first = _service(tmp_path, backend).submit(command)
+    admitted = backend.store.lookup_by_key(backend.idempotency_key(command))
+    assert admitted is not None
+    task_id = admitted[1].task_id
+    assert first.status is PageControlStatus.PENDING
+    assert first.result is None
+    assert first.error is None
+
+    recovered = _service(tmp_path, backend, now=NOW + timedelta(seconds=2)).submit(command)
+    assert recovered.status is PageControlStatus.SUCCEEDED
+    assert recovered.result == {"outcome": "task_queued", "task_id": task_id}
+    assert recover_calls == 2
+    assert backend.store.lookup_by_key(backend.idempotency_key(command))[1].task_id == task_id
+
+
+def test_started_queue_effect_remains_recoverable_when_backend_is_temporarily_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary, replica = _sources(tmp_path)
+    backend = _backend(tmp_path, primary, replica)
+    command = _command("audit-backend-missing-after-queue-0001")
+    real_submit = backend.submit
+
+    def stop_after_queue(value: SubmitDataAuditReport) -> object:
+        real_submit(value)
+        raise KeyboardInterrupt("after durable queue")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "submit", stop_after_queue)
+        with pytest.raises(KeyboardInterrupt, match="after durable queue"):
+            _service(tmp_path, backend).submit(command)
+
+    admitted = backend.store.lookup_by_key(backend.idempotency_key(command))
+    assert admitted is not None
+    task_id = admitted[1].task_id
+    without_backend = _service(tmp_path, None, now=NOW + timedelta(seconds=2)).submit(command)
+    assert without_backend.status is PageControlStatus.PENDING
+    assert without_backend.result is None
+    recovered = _service(tmp_path, backend, now=NOW + timedelta(seconds=2)).submit(command)
+    assert recovered.status is PageControlStatus.SUCCEEDED
+    assert recovered.result == {"outcome": "task_queued", "task_id": task_id}
+
+
 def test_crash_after_queue_recovers_binding_even_if_completed_artifact_is_damaged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

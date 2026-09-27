@@ -426,8 +426,8 @@ class _ExecutionOutcome:
     error: str | None = None
 
 
-class _RetryableCommittedLocalEffectError(RuntimeError):
-    """A journaled local mutation needs recovery before it can be terminalized."""
+class _RetryableUncertainEffectError(RuntimeError):
+    """A durable effect may have committed; retry its recovery before finalizing."""
 
 
 @dataclass(frozen=True)
@@ -1487,7 +1487,7 @@ class PageControlConsumer:
                 continue
             try:
                 outcome = self._execute_claim(claim)
-            except _RetryableCommittedLocalEffectError:
+            except _RetryableUncertainEffectError:
                 receipts.append(
                     self.outbox.release_claim_for_retry(
                         claim.command.command_id,
@@ -1615,8 +1615,8 @@ class PageControlConsumer:
             try:
                 recovered = self._recover_started_effect(command)
             except Exception as exc:
-                if self._has_committed_local_mutation(command):
-                    raise _RetryableCommittedLocalEffectError(
+                if self._must_recover_before_failure(command, created=created):
+                    raise _RetryableUncertainEffectError(
                         f"{type(exc).__name__}: {exc}"
                     ) from exc
                 effect = self.outbox.finish_effect(
@@ -1660,8 +1660,8 @@ class PageControlConsumer:
             try:
                 recovered = self._recover_started_effect(command)
             except Exception as recovery_exc:
-                if self._has_committed_local_mutation(command):
-                    raise _RetryableCommittedLocalEffectError(
+                if self._must_recover_before_failure(command, created=created):
+                    raise _RetryableUncertainEffectError(
                         f"{type(exc).__name__}: {exc}; recovery failed: "
                         f"{type(recovery_exc).__name__}: {recovery_exc}"
                     ) from recovery_exc
@@ -1758,6 +1758,15 @@ class PageControlConsumer:
             return None
         binding.verify()
         return binding.descriptor
+
+    def _must_recover_before_failure(
+        self, command: PageControlCommandValue, *, created: bool
+    ) -> bool:
+        if isinstance(command, SubmitDataAuditReport):
+            # A started command may have queued a task before its receipt was lost.
+            # A first attempt without a configured backend cannot have done so.
+            return not created or self.data_audit_report_backend is not None
+        return self._has_committed_local_mutation(command)
 
     def _has_committed_local_mutation(self, command: PageControlCommandValue) -> bool:
         if isinstance(command, CreateCanvas):

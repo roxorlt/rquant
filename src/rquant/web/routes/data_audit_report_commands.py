@@ -50,7 +50,7 @@ def _public_receipt(
         command_id=body.command_id,
         status=wire.status,
         message={
-            "pending": "已受理，等待处理",
+            "pending": "状态待确认，请使用原请求重试。",
             "processing": "正在处理",
             "failed": "请求失败，请检查后重新发起。",
             "ambiguous": "状态待确认，请使用原请求重试。",
