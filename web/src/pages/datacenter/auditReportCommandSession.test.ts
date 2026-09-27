@@ -8,8 +8,17 @@ import {
 
 type Command = Schemas["AuditReportCommandRequest"];
 type Receipt = Schemas["AuditReportCommandReceipt"];
+type Market = Schemas["MarketInfo"];
 const TASK = "a".repeat(32);
-const AT = new Date("2026-09-28T07:00:00Z");
+const MARKET: Market = {
+  trade_date: "2026-09-28",
+  phase: "after_close",
+  phase_label: "收盘",
+  is_trading_day: true,
+  previous_trading_day: "2026-09-24",
+  next_trading_day: "2026-09-29",
+};
+const EVIDENCE = { market: MARKET };
 
 beforeEach(() => window.sessionStorage.clear());
 
@@ -32,7 +41,7 @@ it("saves the exact request before POST and marks queued only from a matching ta
   });
   const session = makeSession(post);
 
-  await session.start("2024-09-01", "2025-04-30", AT);
+  await session.start("2024-09-01", "2026-09-28", EVIDENCE);
 
   expect(Object.keys(post.mock.calls[0]?.[0] ?? {}).sort()).toEqual([
     "audit_start",
@@ -54,11 +63,11 @@ it("uses the original request after a timeout, reload, and attempted date change
     return { command_id: body.command_id, status: "queued", task_id: TASK, message: "已排队" };
   });
   const session = makeSession(post);
-  await session.start("2024-09-01", "2025-04-30", AT);
+  await session.start("2024-09-01", "2026-09-28", EVIDENCE);
   expect(session.snapshot().journal?.status).toBe("unknown");
 
   const restored = makeSession(post);
-  await restored.start("2024-10-01", "2025-05-30", AT);
+  await restored.start("2024-10-01", "2026-09-28", EVIDENCE);
   expect(sent).toHaveLength(1);
   expect(restored.snapshot().message).toMatch(/上一次请求/);
   await restored.advance();
@@ -78,7 +87,7 @@ it.each(["pending", "processing", "ambiguous"] as const)(
         : { command_id: body.command_id, status: "queued", task_id: TASK, message: "已排队" };
     });
     const session = makeSession(post);
-    await session.start("2024-09-01", "2025-04-30", AT);
+    await session.start("2024-09-01", "2026-09-28", EVIDENCE);
     expect(session.snapshot().journal?.status).toBe(status);
     await session.advance();
     expect(sent[1]).toEqual(sent[0]);
@@ -95,11 +104,11 @@ it.each([
   const post = vi.fn(async (): Promise<Receipt> => receipt);
   const session = makeSession(post);
 
-  await session.start("2024-09-01", "2025-04-30", AT);
+  await session.start("2024-09-01", "2026-09-28", EVIDENCE);
 
   expect(session.snapshot().journal).toMatchObject({ status: "unknown", taskId: null });
   expect(session.snapshot().message).toMatch(/待确认/);
-  await session.start("2024-10-01", "2025-04-30", AT);
+  await session.start("2024-10-01", "2026-09-28", EVIDENCE);
   expect(post).toHaveBeenCalledTimes(1);
 });
 
@@ -121,7 +130,7 @@ it("does not POST when browser storage cannot prove the request was saved", asyn
   } as unknown as Storage;
   const session = makeSession(post, storage);
 
-  await session.start("2024-09-01", "2025-04-30", AT);
+  await session.start("2024-09-01", "2026-09-28", EVIDENCE);
 
   expect(post).not.toHaveBeenCalled();
   expect(session.snapshot().storageAvailable).toBe(false);
@@ -139,7 +148,7 @@ it("blocks new requests when an existing browser record cannot be checked", asyn
   );
   const session = makeSession(post);
 
-  await session.start("2024-09-01", "2025-04-30", AT);
+  await session.start("2024-09-01", "2026-09-28", EVIDENCE);
 
   expect(post).not.toHaveBeenCalled();
   expect(session.snapshot().storageAvailable).toBe(false);
@@ -154,9 +163,9 @@ it.each([401, 403, 413, 422])(
       return { command_id: body.command_id, status: "queued", task_id: TASK, message: "已排队" };
     });
     const session = makeSession(post);
-    await session.start("2024-09-01", "2025-04-30", AT);
+    await session.start("2024-09-01", "2026-09-28", EVIDENCE);
     expect(session.snapshot().journal?.status).toBe("failed");
-    await session.start("2024-10-01", "2025-04-30", AT);
+    await session.start("2024-10-01", "2026-09-28", EVIDENCE);
     expect(post.mock.calls.map(([body]) => body.command_id)).toEqual([
       "audit-web-1",
       "audit-web-2",
@@ -173,20 +182,91 @@ it("permits a new request after an explicit failed receipt", async () => {
     }),
   );
   const session = makeSession(post);
-  await session.start("2024-09-01", "2025-04-30", AT);
+  await session.start("2024-09-01", "2026-09-28", EVIDENCE);
   expect(session.snapshot().journal?.status).toBe("failed");
-  await session.start("2024-10-01", "2025-04-30", AT);
+  await session.start("2024-10-01", "2026-09-28", EVIDENCE);
   expect(post.mock.calls.map(([body]) => body.command_id)).toEqual(["audit-web-1", "audit-web-2"]);
 });
 
-it("validates real dates, 1–3660 days, and the Shanghai close", () => {
-  const justBefore = new Date("2026-09-28T06:59:00Z");
-  expect(latestClosedAuditDate(justBefore)).toBe("2026-09-27");
-  expect(latestClosedAuditDate(AT)).toBe("2026-09-28");
-  expect(validateAuditReportRange("2026-09-28", "2026-09-28", justBefore)).not.toBeNull();
-  expect(validateAuditReportRange("2026-09-28", "2026-09-28", AT)).toBeNull();
-  expect(validateAuditReportRange("2025-02-30", "2025-04-30", AT)).not.toBeNull();
-  expect(validateAuditReportRange("2025-05-01", "2025-04-30", AT)).not.toBeNull();
-  expect(validateAuditReportRange("2010-01-01", "2025-04-30", AT)).not.toBeNull();
-  expect(validateAuditReportRange("2024-09-01", "2025-04-30", AT)).toBeNull();
+it("derives the last closed SSE day from market phase and the trade calendar", () => {
+  const beforeClose: Market = { ...MARKET, phase: "closing_auction", phase_label: "尾盘" };
+  const weekend: Market = {
+    ...MARKET,
+    trade_date: "2026-09-27",
+    phase: "non_trading_day",
+    phase_label: "休市",
+    is_trading_day: false,
+    next_trading_day: "2026-09-28",
+  };
+  const holiday: Market = { ...weekend, trade_date: "2026-09-25" };
+
+  expect(latestClosedAuditDate(beforeClose)).toBe("2026-09-24");
+  expect(latestClosedAuditDate({ ...MARKET, phase: "continuous" })).toBe("2026-09-24");
+  expect(latestClosedAuditDate(MARKET)).toBe("2026-09-28");
+  expect(latestClosedAuditDate(weekend)).toBe("2026-09-24");
+  expect(latestClosedAuditDate(holiday)).toBe("2026-09-24");
+  expect(latestClosedAuditDate(null)).toBeNull();
+  expect(latestClosedAuditDate({ ...MARKET, is_trading_day: null, phase: "unknown" })).toBeNull();
+  expect(latestClosedAuditDate({ ...MARKET, phase: "non_trading_day" })).toBeNull();
+  expect(latestClosedAuditDate({ ...beforeClose, previous_trading_day: null })).toBeNull();
+});
+
+it("rejects dates beyond the close or without proof they were open SSE days", async () => {
+  const weekend: Market = {
+    ...MARKET,
+    trade_date: "2026-09-27",
+    phase: "non_trading_day",
+    phase_label: "休市",
+    is_trading_day: false,
+  };
+  expect(validateAuditReportRange("2024-09-01", "2026-09-28", { market: weekend })).not.toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-27", { market: weekend })).not.toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-25", EVIDENCE)).not.toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-24", { market: weekend })).toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-24", EVIDENCE)).toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-28", EVIDENCE)).toBeNull();
+
+  const post = vi.fn(
+    async (body: Command): Promise<Receipt> => ({
+      command_id: body.command_id,
+      status: "queued",
+      task_id: TASK,
+      message: "已排队",
+    }),
+  );
+  const session = makeSession(post);
+  await session.start("2024-09-01", "2026-09-25", EVIDENCE);
+  expect(post).not.toHaveBeenCalled();
+  expect(session.snapshot().journal).toBeNull();
+  await session.start("2024-09-01", "2026-09-28", { market: null });
+  expect(post).not.toHaveBeenCalled();
+  expect(session.snapshot().journal).toBeNull();
+  await session.start("2024-09-01", "2026-09-28", undefined);
+  expect(post).not.toHaveBeenCalled();
+  expect(session.snapshot().journal).toBeNull();
+});
+
+it("validates real dates and the 1–3660 day limit without a browser clock", () => {
+  expect(validateAuditReportRange("2025-02-30", "2026-09-28", EVIDENCE)).not.toBeNull();
+  expect(validateAuditReportRange("2026-09-29", "2026-09-28", EVIDENCE)).not.toBeNull();
+  expect(validateAuditReportRange("2010-01-01", "2026-09-28", EVIDENCE)).not.toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-28", EVIDENCE)).toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-28", { market: null })).not.toBeNull();
+  expect(validateAuditReportRange("2024-09-01", "2026-09-28", undefined)).not.toBeNull();
+});
+
+it("accepts a historical open end only from an injected trusted calendar and still enforces close", () => {
+  expect(validateAuditReportRange("2024-09-01", "2025-04-30", EVIDENCE)).not.toBeNull();
+  expect(
+    validateAuditReportRange("2024-09-01", "2025-04-30", {
+      market: MARKET,
+      verifiedOpenDates: ["2025-04-30"],
+    }),
+  ).toBeNull();
+  expect(
+    validateAuditReportRange("2024-09-01", "2026-09-29", {
+      market: MARKET,
+      verifiedOpenDates: ["2026-09-29"],
+    }),
+  ).not.toBeNull();
 });

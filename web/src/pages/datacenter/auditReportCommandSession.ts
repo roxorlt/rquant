@@ -1,9 +1,15 @@
 import { ApiError, type Schemas } from "@/api/client";
-import { formatShanghaiTime, shanghaiDate } from "@/format/time";
 
 export type AuditReportCommand = Schemas["AuditReportCommandRequest"];
 type Receipt = Schemas["AuditReportCommandReceipt"];
+type Market = Schemas["MarketInfo"];
 type CommandStatus = Receipt["status"] | "unknown";
+
+export interface AuditReportDateEvidence {
+  market: Market | null | undefined;
+  /** Include only SSE open dates verified by a Web result from the same data generation. */
+  verifiedOpenDates?: readonly string[];
+}
 
 export interface AuditReportJournal {
   schema: 1;
@@ -32,6 +38,13 @@ const STATUSES = new Set<CommandStatus>([
   "ambiguous",
   "unknown",
 ]);
+const BEFORE_CLOSE = new Set<Market["phase"]>([
+  "pre_open",
+  "call_auction",
+  "continuous",
+  "noon_break",
+  "closing_auction",
+]);
 
 function dateMillis(value: string): number | null {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
@@ -41,21 +54,56 @@ function dateMillis(value: string): number | null {
     : null;
 }
 
-export function latestClosedAuditDate(now: Date): string {
-  const today = shanghaiDate(now).date;
-  if (formatShanghaiTime(now) >= "15:00") return today;
-  const midnight = dateMillis(today);
-  return new Date((midnight ?? 0) - 86_400_000).toISOString().slice(0, 10);
+function validPreviousDay(market: Market): string | null {
+  const previous = market.previous_trading_day;
+  return previous && dateMillis(previous) !== null && previous < market.trade_date
+    ? previous
+    : null;
 }
 
-export function validateAuditReportRange(start: string, end: string, now: Date): string | null {
+/** Only dates positively identified by the trusted market calendar are selectable. */
+function provenClosedAuditDates(market: Market | null | undefined): readonly string[] {
+  if (!market || dateMillis(market.trade_date) === null) return [];
+  const previous = validPreviousDay(market);
+  if (market.is_trading_day === true) {
+    if (market.phase === "after_close")
+      return previous ? [market.trade_date, previous] : [market.trade_date];
+    if (BEFORE_CLOSE.has(market.phase)) return previous ? [previous] : [];
+  }
+  if (market.is_trading_day === false && market.phase === "non_trading_day")
+    return previous ? [previous] : [];
+  return [];
+}
+
+export function latestClosedAuditDate(market: Market | null | undefined): string | null {
+  return provenClosedAuditDates(market)[0] ?? null;
+}
+
+function validateRangeDays(start: string, end: string): string | null {
   const first = dateMillis(start);
   const last = dateMillis(end);
   if (first === null || last === null) return "请选择有效日期。";
   const days = (last - first) / 86_400_000 + 1;
   if (days < 1) return "结束日期不能早于开始日期。";
   if (days > 3660) return "一次最多核对 3660 天。";
-  if (end > latestClosedAuditDate(now)) return "结束日期须在收盘之后。";
+  return null;
+}
+
+export function validateAuditReportRange(
+  start: string,
+  end: string,
+  evidence: AuditReportDateEvidence | null | undefined,
+): string | null {
+  const invalid = validateRangeDays(start, end);
+  if (invalid) return invalid;
+  const latest = latestClosedAuditDate(evidence?.market);
+  if (latest === null) return "交易日历暂不可用，请稍后重试。";
+  if (end > latest) return "结束日期须为已收盘交易日。";
+  if (
+    !provenClosedAuditDates(evidence?.market).includes(end) &&
+    !evidence?.verifiedOpenDates?.includes(end)
+  )
+    return "该日期尚未核实为交易日，请选最近已收盘交易日。";
   return null;
 }
 
@@ -77,11 +125,7 @@ function isJournal(value: unknown): value is AuditReportJournal {
     dateMillis(body.audit_start) !== null &&
     typeof body.observed_through === "string" &&
     dateMillis(body.observed_through) !== null &&
-    validateAuditReportRange(
-      body.audit_start,
-      body.observed_through,
-      new Date(body.requested_at),
-    ) === null &&
+    validateRangeDays(body.audit_start, body.observed_through) === null &&
     STATUSES.has(value.status as CommandStatus) &&
     ((value.status === "queued" &&
       typeof value.taskId === "string" &&
@@ -145,13 +189,17 @@ export class AuditReportCommandSession {
     }
   }
 
-  async start(start: string, end: string, at: Date): Promise<void> {
+  async start(
+    start: string,
+    end: string,
+    evidence: AuditReportDateEvidence | null | undefined,
+  ): Promise<void> {
     if (!this.current.storageAvailable || this.current.busy) return;
     if (this.current.journal && !["queued", "failed"].includes(this.current.journal.status)) {
       this.emit({ message: "请先核对上一次请求。" });
       return;
     }
-    const invalid = validateAuditReportRange(start, end, at);
+    const invalid = validateAuditReportRange(start, end, evidence);
     if (invalid) {
       this.emit({ message: invalid });
       return;
