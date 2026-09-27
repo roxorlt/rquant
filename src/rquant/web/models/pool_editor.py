@@ -56,6 +56,8 @@ class EditableCanvas(BaseModel):
     description: str
     version: str
     pool_refs: list[str]
+    command_id: str
+    record_hash: str
 
 
 class PoolEditorData(BaseModel):
@@ -65,6 +67,7 @@ class PoolEditorData(BaseModel):
     pools: list[EditablePool]
     copy_sources: list[BuiltinPoolCopySource]
     canvases: list[EditableCanvas]
+    canvas_create_available: bool
 
 
 class _EditorCommand(BaseModel):
@@ -101,7 +104,15 @@ class AttachPoolCommand(_EditorCommand):
     expected_pool_version: str = Field(pattern=_SHA256)
 
 
-PoolEditorCommand = Annotated[SavePoolCommand | AttachPoolCommand, Field(discriminator="kind")]
+class CreateCanvasCommand(_EditorCommand):
+    kind: Literal["create_canvas"] = "create_canvas"
+    name: str = Field(min_length=1, max_length=80, pattern=_NAME)
+    description: str = Field(default="", max_length=1_024)
+
+
+PoolEditorCommand = Annotated[
+    SavePoolCommand | AttachPoolCommand | CreateCanvasCommand, Field(discriminator="kind")
+]
 
 
 class PoolEditorReceipt(BaseModel):
@@ -112,3 +123,4 @@ class PoolEditorReceipt(BaseModel):
     message: str
     pool_version: str | None = None
     canvas_name: str | None = None
+    canvas_record_hash: str | None = None

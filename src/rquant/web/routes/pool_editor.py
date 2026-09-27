@@ -1,4 +1,4 @@
-"""Read published editor facts and submit two bounded PageControl commands."""
+"""Read published editor facts and submit bounded PageControl commands."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from rquant.llm.registry import REGISTRY_BY_NAME
 from rquant.web.envelope import Envelope
 from rquant.web.models.pool_editor import (
     AttachPoolCommand,
+    CreateCanvasCommand,
     PoolEditorCommand,
     PoolEditorData,
     PoolEditorReceipt,
@@ -54,6 +55,10 @@ def get_pool_editor(
 
 
 def _authorize(snapshot: PoolEditorSnapshot, body: PoolEditorCommand) -> None:
+    if isinstance(body, CreateCanvasCommand):
+        if snapshot.data.state != "ready" or not snapshot.data.canvas_create_available:
+            raise HTTPException(status_code=409, detail="画布尚不可创建，请刷新后重试。")
+        return
     if snapshot.data.state != "ready":
         raise HTTPException(status_code=409, detail="池子规则尚不可编辑，请刷新后重试。")
     if isinstance(body, AttachPoolCommand):
@@ -77,10 +82,16 @@ def _authorize(snapshot: PoolEditorSnapshot, body: PoolEditorCommand) -> None:
         raise HTTPException(status_code=422, detail="选股字段有误，请检查后重试。")
 
 
-def _failed_message(error: str | None) -> str:
+def _failed_message(error: str | None, body: PoolEditorCommand) -> str:
     text = (error or "").lower()
     if "clock skew" in text:
         return "设备时间可能不准确，请校准后重试。"
+    if isinstance(body, CreateCanvasCommand):
+        if "canvas name is already occupied" in text:
+            return "画布名称已被使用，请换一个名称。"
+        if "canvas current head" in text or "watermark" in text:
+            return "画布状态已变化，请刷新后重试。"
+        return "画布创建失败，请检查后重试。"
     if "version conflict" in text or "definition changed" in text:
         return "规则已变化，请刷新后重试。"
     if "parent pool" in text or "dependency" in text:
@@ -104,6 +115,26 @@ def _receipt(body: PoolEditorCommand, wire: PoolCommandWireReceipt) -> PoolEdito
                 message="池子已保存",
                 pool_version=version,
             )
+        if isinstance(body, CreateCanvasCommand):
+            record_hash = result.get("record_hash")
+            receipt_id = result.get("publication_receipt_id")
+            if (
+                result.get("canvas_name") != body.name
+                or not isinstance(record_hash, str)
+                or _SHA256.fullmatch(record_hash) is None
+                or not isinstance(receipt_id, str)
+                or _SHA256.fullmatch(receipt_id) is None
+            ):
+                raise PoolCommandInvalidReceiptError(
+                    "created canvas publication identity is invalid"
+                )
+            return PoolEditorReceipt(
+                command_id=body.command_id,
+                status="succeeded",
+                message="画布已保存，等待发布",
+                canvas_name=body.name,
+                canvas_record_hash=record_hash,
+            )
         if (
             result.get("canvas_name") != body.canvas_name
             or result.get("pool_name") != body.pool_name
@@ -125,13 +156,13 @@ def _receipt(body: PoolEditorCommand, wire: PoolCommandWireReceipt) -> PoolEdito
         message={
             "pending": "已受理，等待处理",
             "processing": "正在处理",
-            "failed": _failed_message(wire.error),
+            "failed": _failed_message(wire.error, body),
             "ambiguous": "状态待确认，请保留原请求。",
         }[status],
     )
 
 
-@router.post("/commands", response_model=PoolEditorReceipt, summary="保存池子或加入画布")
+@router.post("/commands", response_model=PoolEditorReceipt, summary="保存池子或管理画布")
 async def submit_pool_editor_command(
     request: Request,
     body: PoolEditorCommand,

@@ -13,6 +13,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from rquant import page_control
 from rquant.canvas_publication_receipt import CanvasPublicationReceipt
 from rquant.llm.schemas import RuleCall
 from rquant.notification_state import NotificationStateStore
@@ -976,6 +977,50 @@ def test_signal_source_publishes_canvas_definitions_from_bounded_catalog(tmp_pat
     }
     assert len(str(definition["version_hash"])) == 64
     assert len(str(definition["record_hash"])) == 64
+
+
+def test_signal_source_first_publication_accepts_create_canvas_audit(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    outbox = PageControlOutbox(tmp_path / "create-control.sqlite3")
+    authority = create_canvas_ed25519_test_authority(tmp_path / "create-keys")
+    data_dir = tmp_path / "create-data"
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=data_dir,
+            log_dir=tmp_path / "create-logs",
+            canvas_publication_signer=authority.signer,
+            canvas_publication_keyring=authority.keyring,
+        ),
+    )
+    command = page_control.CreateCanvas(
+        command_id="create-first-publication",
+        requested_at=NOW - timedelta(days=1),
+        name="新画布",
+        description="自选观察",
+    )
+    receipt = service.submit(command)
+    assert receipt.status is PageControlStatus.SUCCEEDED
+
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        canvas_catalog_root=data_dir / "canvases",
+        canvas_receipt_root=data_dir / "canvas-publication-receipts",
+        canvas_publication_keyring=authority.keyring,
+        page_control_outbox=outbox,
+    )(NOW)
+
+    projection = next(
+        item for item in snapshot.projections if item.table_name == "canvas_definition"
+    )
+    assert len(projection.rows) == 1
+    assert projection.rows[0]["name"] == "新画布"
+    assert projection.rows[0]["description"] == "自选观察"
+    assert projection.rows[0]["pool_refs_json"] == "[]"
+    assert projection.rows[0]["command_id"] == command.command_id
+    assert projection.rows[0]["record_hash"] == receipt.result["record_hash"]
 
 
 def test_signal_source_rejects_catalog_and_outbox_tamper_even_when_hashes_recomputed(

@@ -134,6 +134,16 @@ def _attach_body(command_id: str, version: str) -> dict[str, object]:
     }
 
 
+def _create_body(command_id: str, *, name: str = "新画布") -> dict[str, object]:
+    return {
+        "kind": "create_canvas",
+        "command_id": command_id,
+        "requested_at": NOW.isoformat(),
+        "name": name,
+        "description": "日终观察",
+    }
+
+
 def _service(root: Path) -> PageControlService:
     authority = create_canvas_ed25519_test_authority(root / "keys")
     outbox = PageControlOutbox(root / "control.sqlite3")
@@ -172,9 +182,117 @@ def test_editor_reads_registered_user_rules_and_verified_canvas_from_one_generat
         }
     ]
     assert data["canvases"] == [
-        {"name": "观察", "description": "日终观察", "version": "b" * 64, "pool_refs": []}
+        {
+            "name": "观察",
+            "description": "日终观察",
+            "version": "b" * 64,
+            "pool_refs": [],
+            "command_id": "canvas-seed",
+            "record_hash": "e" * 64,
+        }
     ]
+    assert data["canvas_create_available"] is True
     assert response.json()["serving"]["generation_id"] is not None
+
+
+def test_create_canvas_lost_response_keeps_identity_and_waits_for_serving(tmp_path: Path) -> None:
+    service = _service(tmp_path / "control")
+    lost = False
+
+    def transport(body: dict[str, object]) -> dict[str, object]:
+        nonlocal lost
+        receipt = service.submit(parse_page_control_command(body)).model_dump(mode="json")
+        if body["kind"] == "create_canvas" and not lost:
+            lost = True
+            raise TimeoutError("synthetic response loss")
+        return receipt
+
+    app = _app(tmp_path / "serving", canvas_rows=[], transport=transport)
+    body = _create_body("create-new")
+    with TestClient(app) as client:
+        first = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+        pending = client.get("/api/v1/pools/editor").json()["data"]
+        resumed = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+    assert first.status_code == 503
+    assert pending["canvases"] == []
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "succeeded"
+    assert resumed.json()["canvas_name"] == "新画布"
+    assert len(resumed.json()["canvas_record_hash"]) == 64
+    assert "已可用" not in resumed.json()["message"]
+    assert service.outbox.receipt("create-new").status is PageControlStatus.SUCCEEDED
+    record = json.loads((tmp_path / "control" / "data" / "canvases" / "新画布.json").read_text())
+    assert record["pool_refs"] == []
+    assert record["record_hash"] == resumed.json()["canvas_record_hash"]
+
+
+def test_create_canvas_rejects_stale_serving_name_without_overwrite(tmp_path: Path) -> None:
+    service = _service(tmp_path / "control")
+    existing = service.submit(SaveCanvas(command_id="seed", requested_at=NOW, name="观察"))
+    assert existing.status is PageControlStatus.SUCCEEDED
+    path = tmp_path / "control" / "data" / "canvases" / "观察.json"
+    original = path.read_bytes()
+    app = _app(
+        tmp_path / "serving",
+        canvas_rows=[],
+        transport=lambda body: service.submit(parse_page_control_command(body)).model_dump(
+            mode="json"
+        ),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/pools/editor/commands",
+            json=_create_body("create-stale", name="观察"),
+            headers=HEADERS,
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert "已被使用" in response.json()["message"]
+    assert "canvas" not in response.json()["message"]
+    assert path.read_bytes() == original
+
+
+def test_create_canvas_requires_current_canvas_projection(tmp_path: Path) -> None:
+    root = tmp_path / "old"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection(
+                "pool_definition",
+                list(build_pool_definition_rows({}, {}, root_path="/synthetic")),
+            ),
+        ),
+    )
+    app = create_app(
+        WebSettings(serving_root=root),
+        clock=lambda: NOW,
+        background=False,
+        pool_command_transport=lambda _body: pytest.fail("must not submit"),
+    )
+    with TestClient(app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+        denied = client.post(
+            "/api/v1/pools/editor/commands", json=_create_body("create-old"), headers=HEADERS
+        )
+    assert data["canvas_create_available"] is False
+    assert denied.status_code == 409
+    assert "画布" in denied.json()["detail"]
+
+    older_root = tmp_path / "older"
+    build_web_fixture(older_root, "baseline")
+    older = create_app(
+        WebSettings(serving_root=older_root),
+        clock=lambda: NOW,
+        background=False,
+        pool_command_transport=lambda _body: pytest.fail("must not submit"),
+    )
+    with TestClient(older) as client:
+        response = client.post(
+            "/api/v1/pools/editor/commands", json=_create_body("create-older"), headers=HEADERS
+        )
+    assert response.status_code == 409
+    assert "画布" in response.json()["detail"]
 
 
 def test_editor_exposes_bounded_builtin_copy_sources_with_original_semantics(
@@ -287,10 +405,17 @@ def test_editor_hides_noneditable_or_corrupt_rows_and_old_generation_cannot_writ
         data = client.get("/api/v1/pools/editor").json()["data"]
         assert data["pools"] == []
         assert data["canvases"] == []
+        assert data["canvas_create_available"] is False
         denied = client.post(
             "/api/v1/pools/editor/commands", json=_save_body("update"), headers=HEADERS
         )
+        create_denied = client.post(
+            "/api/v1/pools/editor/commands",
+            json=_create_body("create-on-corrupt"),
+            headers=HEADERS,
+        )
     assert denied.status_code == 409
+    assert create_denied.status_code == 409
 
     old_root = tmp_path / "old"
     build_web_fixture(old_root, "baseline")
@@ -476,6 +601,28 @@ def test_successful_attach_receipt_must_match_canvas_and_pool(tmp_path: Path) ->
     assert "其他画布" not in response.text
 
 
+def test_create_canvas_success_requires_verifiable_publication_identity(tmp_path: Path) -> None:
+    app = _app(
+        tmp_path / "serving",
+        transport=lambda body: {
+            "command_id": body["command_id"],
+            "status": "succeeded",
+            "enqueued_at": body["requested_at"],
+            "result": {
+                "path": "/private/internal/canvas.json",
+                "record_hash": "bad",
+                "publication_receipt_id": "b" * 64,
+            },
+        },
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/pools/editor/commands", json=_create_body("create-bad"), headers=HEADERS
+        )
+    assert response.status_code == 502
+    assert "/private/internal" not in response.text
+
+
 def test_fixed_loopback_transport_ignores_proxy_environment_and_never_follows_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -530,6 +677,13 @@ def test_nonloopback_command_target_is_rejected_before_any_transport() -> None:
         ({**HEADERS, "origin": "https://elsewhere.test"}, _save_body("x"), 403),
         (HEADERS, {**_save_body("x"), "base_name": "../bad"}, 422),
         (HEADERS, {**_save_body("x"), "description": "a" * 40_000}, 413),
+        ({"x-rquant-csrf": "1", "origin": "http://testserver"}, _create_body("x"), 401),
+        ({"x-rquant-user": "researcher", "origin": "http://testserver"}, _create_body("x"), 403),
+        ({**HEADERS, "origin": "https://elsewhere.test"}, _create_body("x"), 403),
+        (HEADERS, _create_body("x", name="../bad"), 422),
+        (HEADERS, {**_create_body("x"), "pool_refs": ["user/样本池"]}, 422),
+        (HEADERS, {**_create_body("x"), "description": "a" * 1_025}, 422),
+        (HEADERS, {**_create_body("x"), "description": "a" * 40_000}, 413),
     ],
 )
 def test_write_rejects_unauthorized_or_unbounded_input(
@@ -559,12 +713,15 @@ def test_malformed_success_receipt_cannot_claim_a_saved_pool(tmp_path: Path) -> 
     assert "not-a-version" not in response.text
 
 
-def test_write_rejects_non_json_content_type_before_submission(tmp_path: Path) -> None:
+@pytest.mark.parametrize("body", [_save_body("wrong-type"), _create_body("wrong-type")])
+def test_write_rejects_non_json_content_type_before_submission(
+    tmp_path: Path, body: dict[str, object]
+) -> None:
     app = _app(tmp_path / "serving", transport=lambda _body: pytest.fail("must not submit"))
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/pools/editor/commands",
-            content=json.dumps(_save_body("wrong-type")),
+            content=json.dumps(body),
             headers={**HEADERS, "content-type": "text/plain"},
         )
     assert response.status_code == 415

@@ -1006,6 +1006,49 @@
         "title": "CatalogSummary",
         "type": "object"
       },
+      "CreateCanvasCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "const": "create_canvas",
+            "default": "create_canvas",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "pattern": "^[\\w\\u4e00-\\u9fff-]+$",
+            "title": "Name",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "name"
+        ],
+        "title": "CreateCanvasCommand",
+        "type": "object"
+      },
       "DailyBar": {
         "properties": {
           "close": {
@@ -1374,6 +1417,10 @@
       },
       "EditableCanvas": {
         "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
           "description": {
             "title": "Description",
             "type": "string"
@@ -1389,6 +1436,10 @@
             "title": "Pool Refs",
             "type": "array"
           },
+          "record_hash": {
+            "title": "Record Hash",
+            "type": "string"
+          },
           "version": {
             "title": "Version",
             "type": "string"
@@ -1398,7 +1449,9 @@
           "name",
           "description",
           "version",
-          "pool_refs"
+          "pool_refs",
+          "command_id",
+          "record_hash"
         ],
         "title": "EditableCanvas",
         "type": "object"
@@ -3817,6 +3870,10 @@
       },
       "PoolEditorData": {
         "properties": {
+          "canvas_create_available": {
+            "title": "Canvas Create Available",
+            "type": "boolean"
+          },
           "canvases": {
             "items": {
               "$ref": "#/components/schemas/EditableCanvas"
@@ -3851,7 +3908,8 @@
           "state",
           "pools",
           "copy_sources",
-          "canvases"
+          "canvases",
+          "canvas_create_available"
         ],
         "title": "PoolEditorData",
         "type": "object"
@@ -3868,6 +3926,17 @@
               }
             ],
             "title": "Canvas Name"
+          },
+          "canvas_record_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvas Record Hash"
           },
           "command_id": {
             "title": "Command Id",
@@ -7400,6 +7469,7 @@
                 "discriminator": {
                   "mapping": {
                     "add_pool_to_canvas": "#/components/schemas/AttachPoolCommand",
+                    "create_canvas": "#/components/schemas/CreateCanvasCommand",
                     "save_user_pool_v2": "#/components/schemas/SavePoolCommand"
                   },
                   "propertyName": "kind"
@@ -7410,6 +7480,9 @@
                   },
                   {
                     "$ref": "#/components/schemas/AttachPoolCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CreateCanvasCommand"
                   }
                 ],
                 "title": "Body"
@@ -7440,7 +7513,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "保存池子或加入画布",
+        "summary": "保存池子或管理画布",
         "tags": [
           "pools"
         ]

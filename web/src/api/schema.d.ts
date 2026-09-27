@@ -319,7 +319,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 保存池子或加入画布 */
+        /** 保存池子或管理画布 */
         post: operations["submit_pool_editor_command_api_v1_pools_editor_commands_post"];
         delete?: never;
         options?: never;
@@ -768,6 +768,28 @@ export interface components {
             /** Sources */
             sources: string[];
         };
+        /** CreateCanvasCommand */
+        CreateCanvasCommand: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "create_canvas";
+            /** Name */
+            name: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** DailyBar */
         DailyBar: {
             /** Close */
@@ -897,12 +919,16 @@ export interface components {
         };
         /** EditableCanvas */
         EditableCanvas: {
+            /** Command Id */
+            command_id: string;
             /** Description */
             description: string;
             /** Name */
             name: string;
             /** Pool Refs */
             pool_refs: string[];
+            /** Record Hash */
+            record_hash: string;
             /** Version */
             version: string;
         };
@@ -1668,6 +1694,8 @@ export interface components {
         };
         /** PoolEditorData */
         PoolEditorData: {
+            /** Canvas Create Available */
+            canvas_create_available: boolean;
             /** Canvases */
             canvases: components["schemas"]["EditableCanvas"][];
             /** Copy Sources */
@@ -1684,6 +1712,8 @@ export interface components {
         PoolEditorReceipt: {
             /** Canvas Name */
             canvas_name?: string | null;
+            /** Canvas Record Hash */
+            canvas_record_hash?: string | null;
             /** Command Id */
             command_id: string;
             /** Message */
@@ -3053,7 +3083,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["SavePoolCommand"] | components["schemas"]["AttachPoolCommand"];
+                "application/json": components["schemas"]["SavePoolCommand"] | components["schemas"]["AttachPoolCommand"] | components["schemas"]["CreateCanvasCommand"];
             };
         };
         responses: {
