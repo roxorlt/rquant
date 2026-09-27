@@ -360,6 +360,20 @@ describe("数据中心回补计划", () => {
       availability: "ready",
       event_history: "available",
       task_id: queuedTask,
+      status: "running",
+      created_at: "2026-09-27T07:00:00Z",
+      updated_at: "2026-09-27T07:00:30Z",
+      message: "正在生成",
+      logs: [],
+    };
+    await queryClient.invalidateQueries({ queryKey: ["data", "backfill-plans"] });
+    expect(await screen.findAllByText("本次任务正在生成")).toHaveLength(2);
+    expect(screen.queryByText("本次请求已排队，等待生成")).not.toBeInTheDocument();
+
+    progress = {
+      availability: "ready",
+      event_history: "available",
+      task_id: queuedTask,
       status: "succeeded",
       created_at: "2026-09-27T07:00:00Z",
       updated_at: "2026-09-27T07:01:00Z",
@@ -375,9 +389,14 @@ describe("数据中心回补计划", () => {
         },
       ],
     };
+    await queryClient.invalidateQueries({ queryKey: ["data", "backfill-plans"] });
+    expect(await screen.findByText("本次计划已生成，列表尚未显示")).toBeInTheDocument();
+
     published = true;
     await queryClient.invalidateQueries({ queryKey: ["data", "backfill-plans"] });
     expect(await screen.findByText("2024-09-02")).toBeInTheDocument();
+    expect(screen.getByText("本次计划已生成")).toBeInTheDocument();
+    expect(screen.queryByText("本次计划已生成，列表尚未显示")).not.toBeInTheDocument();
     expect(screen.getByText("计划已生成")).toBeInTheDocument();
     expect(document.querySelector("main")?.textContent).not.toContain("svc-secret");
   });

@@ -203,14 +203,23 @@ const EVENT_LABEL: Record<Schemas["BackfillPlanProgressLog"]["event_type"], stri
   retried: "重新尝试",
 };
 
-function commandLabel(command: BackfillPlanCommandSnapshot, progress: Progress | null | undefined) {
+function commandLabel(
+  command: BackfillPlanCommandSnapshot,
+  progress: Progress | null | undefined,
+  visiblePlans: BackfillPlanItem[],
+) {
   const journal = command.journal;
   if (!journal) return null;
   if (journal.status === "failed") return "本次请求未通过，请调整后重试";
   if (["ambiguous", "unknown"].includes(journal.status)) return "本次提交状态待确认";
   if (journal.status !== "queued") return "本次请求正在处理";
   if (journal.taskId === progress?.task_id && progress?.availability === "ready") {
-    if (progress.status === "succeeded") return "本次计划已生成，正在更新列表";
+    if (progress.status === "running") return "本次任务正在生成";
+    if (progress.status === "succeeded")
+      return progress.plan_hash &&
+        visiblePlans.some((plan) => plan.plan_hash === progress.plan_hash)
+        ? "本次计划已生成"
+        : "本次计划已生成，列表尚未显示";
     if (progress.status === "failed") return "本次计划生成失败";
   }
   return "本次请求已排队，等待生成";
@@ -463,7 +472,7 @@ export function BackfillPlanPanel({
       </Panel>
     );
 
-  const status = commandLabel(command, progress);
+  const status = commandLabel(command, progress, items);
   return (
     <div className="dc-plan-stack">
       {requestOpen ? (
