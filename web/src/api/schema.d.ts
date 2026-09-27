@@ -616,6 +616,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 任务与运行状态 */
+        get: operations["get_overview_api_v1_tasks_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2080,6 +2097,11 @@ export interface components {
             data: components["schemas"]["SurgeSearchData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[TaskOverviewData] */
+        Envelope_TaskOverviewData_: {
+            data: components["schemas"]["TaskOverviewData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** ErrorItem */
         ErrorItem: {
             /** At */
@@ -2979,6 +3001,77 @@ export interface components {
             /** Total */
             total: number | null;
         };
+        /** ResourceGroupItem */
+        ResourceGroupItem: {
+            /** Memory Current Bytes */
+            memory_current_bytes: number | null;
+            /** Memory Peak Bytes */
+            memory_peak_bytes: number | null;
+            /** Name */
+            name: string;
+            /** Slice Unit */
+            slice_unit: string;
+        };
+        /** ResourcesData */
+        ResourcesData: {
+            /** Cpu Note */
+            cpu_note: string;
+            /** Cpu Usage Percent */
+            cpu_usage_percent: number | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Groups */
+            groups: components["schemas"]["ResourceGroupItem"][];
+            /** Host Memory Available Bytes */
+            host_memory_available_bytes: number | null;
+            /** Host Memory Total Bytes */
+            host_memory_total_bytes: number | null;
+            /** Remaining Seconds */
+            remaining_seconds: number | null;
+            /** Rquant Memory Current Bytes */
+            rquant_memory_current_bytes: number | null;
+            /** Rquant Memory Peak Bytes */
+            rquant_memory_peak_bytes: number | null;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+        };
+        /** RuntimeServiceItem */
+        RuntimeServiceItem: {
+            /** Heartbeat At */
+            heartbeat_at: string | null;
+            /** Name */
+            name: string;
+            /** Plane Label */
+            plane_label: string;
+            /** Service Id */
+            service_id: string;
+            status: components["schemas"]["StatusInfo"];
+        };
+        /** RuntimeServicesData */
+        RuntimeServicesData: {
+            /** Items */
+            items: components["schemas"]["RuntimeServiceItem"][];
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+        };
         /**
          * SampleState
          * @enum {string}
@@ -3031,6 +3124,44 @@ export interface components {
             pool_keys: string[];
             /** Refs Truncated */
             refs_truncated: boolean;
+        };
+        /** ScheduledTaskItem */
+        ScheduledTaskItem: {
+            /** Duration Seconds */
+            duration_seconds: number | null;
+            /** Last Trigger At */
+            last_trigger_at: string | null;
+            /** Name */
+            name: string;
+            /** Next At */
+            next_at: string | null;
+            /** Result Label */
+            result_label: string;
+            /** Service Unit */
+            service_unit: string;
+            status: components["schemas"]["StatusInfo"];
+            /** Timer Unit */
+            timer_unit: string;
+        };
+        /** ScheduledTasksData */
+        ScheduledTasksData: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Items */
+            items: components["schemas"]["ScheduledTaskItem"][];
+            /** Remaining Seconds */
+            remaining_seconds: number | null;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
         };
         /** ScreenBlock */
         ScreenBlock: {
@@ -3480,6 +3611,13 @@ export interface components {
             key: string;
             /** Name */
             name: string;
+        };
+        /** TaskOverviewData */
+        TaskOverviewData: {
+            research: components["schemas"]["ResearchJobsData"];
+            resources: components["schemas"]["ResourcesData"];
+            scheduled: components["schemas"]["ScheduledTasksData"];
+            services: components["schemas"]["RuntimeServicesData"];
         };
         /** TdxParseData */
         TdxParseData: {
@@ -4678,6 +4816,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ResearchJobsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_overview_api_v1_tasks_overview_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_TaskOverviewData_"];
                 };
             };
             /** @description Validation Error */

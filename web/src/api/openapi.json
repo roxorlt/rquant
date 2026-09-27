@@ -4350,6 +4350,22 @@
         "title": "Envelope[SurgeSearchData]",
         "type": "object"
       },
+      "Envelope_TaskOverviewData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TaskOverviewData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[TaskOverviewData]",
+        "type": "object"
+      },
       "ErrorItem": {
         "properties": {
           "at": {
@@ -7351,6 +7367,301 @@
         "title": "ResearchJobsData",
         "type": "object"
       },
+      "ResourceGroupItem": {
+        "properties": {
+          "memory_current_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Current Bytes"
+          },
+          "memory_peak_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Peak Bytes"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slice_unit": {
+            "title": "Slice Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "slice_unit",
+          "memory_current_bytes",
+          "memory_peak_bytes"
+        ],
+        "title": "ResourceGroupItem",
+        "type": "object"
+      },
+      "ResourcesData": {
+        "properties": {
+          "cpu_note": {
+            "title": "Cpu Note",
+            "type": "string"
+          },
+          "cpu_usage_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Usage Percent"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/ResourceGroupItem"
+            },
+            "maxItems": 4,
+            "title": "Groups",
+            "type": "array"
+          },
+          "host_memory_available_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Memory Available Bytes"
+          },
+          "host_memory_total_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Memory Total Bytes"
+          },
+          "remaining_seconds": {
+            "anyOf": [
+              {
+                "maximum": 120.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Seconds"
+          },
+          "rquant_memory_current_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rquant Memory Current Bytes"
+          },
+          "rquant_memory_peak_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rquant Memory Peak Bytes"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_label",
+          "source_note",
+          "source_updated_at",
+          "expires_at",
+          "remaining_seconds",
+          "host_memory_total_bytes",
+          "host_memory_available_bytes",
+          "rquant_memory_current_bytes",
+          "rquant_memory_peak_bytes",
+          "groups",
+          "cpu_usage_percent",
+          "cpu_note"
+        ],
+        "title": "ResourcesData",
+        "type": "object"
+      },
+      "RuntimeServiceItem": {
+        "properties": {
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "plane_label": {
+            "title": "Plane Label",
+            "type": "string"
+          },
+          "service_id": {
+            "maxLength": 128,
+            "title": "Service Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusInfo"
+          }
+        },
+        "required": [
+          "name",
+          "plane_label",
+          "status",
+          "heartbeat_at",
+          "service_id"
+        ],
+        "title": "RuntimeServiceItem",
+        "type": "object"
+      },
+      "RuntimeServicesData": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeServiceItem"
+            },
+            "maxItems": 32,
+            "title": "Items",
+            "type": "array"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_label",
+          "source_note",
+          "source_updated_at",
+          "items"
+        ],
+        "title": "RuntimeServicesData",
+        "type": "object"
+      },
       "SampleState": {
         "enum": [
           "available",
@@ -7492,6 +7803,163 @@
           "refs_truncated"
         ],
         "title": "SavedCanvas",
+        "type": "object"
+      },
+      "ScheduledTaskItem": {
+        "properties": {
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "last_trigger_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Trigger At"
+          },
+          "name": {
+            "maxLength": 40,
+            "title": "Name",
+            "type": "string"
+          },
+          "next_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next At"
+          },
+          "result_label": {
+            "title": "Result Label",
+            "type": "string"
+          },
+          "service_unit": {
+            "maxLength": 128,
+            "title": "Service Unit",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StatusInfo"
+          },
+          "timer_unit": {
+            "maxLength": 128,
+            "title": "Timer Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status",
+          "last_trigger_at",
+          "next_at",
+          "duration_seconds",
+          "result_label",
+          "timer_unit",
+          "service_unit"
+        ],
+        "title": "ScheduledTaskItem",
+        "type": "object"
+      },
+      "ScheduledTasksData": {
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ScheduledTaskItem"
+            },
+            "maxItems": 32,
+            "title": "Items",
+            "type": "array"
+          },
+          "remaining_seconds": {
+            "anyOf": [
+              {
+                "maximum": 120.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Seconds"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_label",
+          "source_note",
+          "source_updated_at",
+          "expires_at",
+          "remaining_seconds",
+          "items"
+        ],
+        "title": "ScheduledTasksData",
         "type": "object"
       },
       "ScreenBlock": {
@@ -8893,6 +9361,30 @@
           "name"
         ],
         "title": "TableItem",
+        "type": "object"
+      },
+      "TaskOverviewData": {
+        "properties": {
+          "research": {
+            "$ref": "#/components/schemas/ResearchJobsData"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/ResourcesData"
+          },
+          "scheduled": {
+            "$ref": "#/components/schemas/ScheduledTasksData"
+          },
+          "services": {
+            "$ref": "#/components/schemas/RuntimeServicesData"
+          }
+        },
+        "required": [
+          "scheduled",
+          "services",
+          "resources",
+          "research"
+        ],
+        "title": "TaskOverviewData",
         "type": "object"
       },
       "TdxParseData": {
@@ -10933,6 +11425,68 @@
           }
         },
         "summary": "研究任务队列",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/overview": {
+      "get": {
+        "operationId": "get_overview_api_v1_tasks_overview_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_TaskOverviewData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "任务与运行状态",
         "tags": [
           "tasks"
         ]
