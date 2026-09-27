@@ -1001,6 +1001,7 @@ def build_web_fixture(
     paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
     lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
     audit: bool = False,
+    signal_projections: tuple[ServingProjectionPayload, ...] = (),
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1071,6 +1072,21 @@ def build_web_fixture(
                 )
             lab_page_projections = DuckDBLabPageProjectionSource(research)(built_at).projections
     projections = _projections(scenario, built_at=built_at, generations=generations)
+    if signal_projections:
+        replacements = {
+            item.table_name: ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="signals",
+                owner_generation_id=generations["signals"],
+            )
+            for item in signal_projections
+        }
+        projections = tuple(replacements.get(item.table_name, item) for item in projections)
+        projections += tuple(
+            item
+            for name, item in replacements.items()
+            if name not in {existing.table_name for existing in projections}
+        )
     if lab_page_projections is not None:
         if {item.table_name for item in lab_page_projections} != {
             "data_audit_issue",

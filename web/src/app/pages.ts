@@ -79,8 +79,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/pools",
     title: "池子画布",
     group: "研究",
-    ready: false,
-    summary: "把池子连成画布，看每个池子有哪些股票、从哪天入池。",
+    ready: true,
+    summary: "查看已发布池子、命中步骤和最新成员。",
   },
   {
     id: "factors",
