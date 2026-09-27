@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
+from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.routes import (
     catalog,
@@ -64,6 +65,7 @@ class WebContext:
     screen_gate: threading.BoundedSemaphore
     screen_service: ScreenApplicationService
     pool_commands: PoolCommandGateway
+    ack_lookup: AckLookupGateway
 
 
 def create_app(
@@ -73,6 +75,7 @@ def create_app(
     clock: Callable[[], datetime] = _utc_now,
     background: bool = True,
     pool_command_transport: PoolCommandTransport | None = None,
+    ack_lookup_transport: AckLookupTransport | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -129,12 +132,19 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=pool_command_transport,
         ),
+        ack_lookup=AckLookupGateway(
+            endpoint=settings.page_control_url,
+            transport=ack_lookup_transport,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Response:
-        if request.method == "POST" and request.url.path == "/api/v1/pools/editor/commands":
+        if request.method == "POST" and request.url.path in {
+            "/api/v1/pools/editor/commands",
+            "/api/v1/monitor/ack",
+        }:
             content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
                 return JSONResponse(
@@ -146,10 +156,15 @@ def create_app(
             total = 0
             async for part in request.stream():
                 total += len(part)
-                if total > pool_editor.MAX_REQUEST_BYTES:
+                limit = (
+                    monitor.MAX_ACK_REQUEST_BYTES
+                    if request.url.path == "/api/v1/monitor/ack"
+                    else pool_editor.MAX_REQUEST_BYTES
+                )
+                if total > limit:
                     return JSONResponse(
                         status_code=413,
-                        content={"detail": "条件内容过长，请删减后重试。"},
+                        content={"detail": "请求内容过长，请删减后重试。"},
                         headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
                     )
                 parts.append(part)
@@ -180,6 +195,8 @@ def create_app(
             )
         if request.url.path == "/api/v1/pools/editor/commands":
             return JSONResponse(status_code=422, content={"detail": "编辑内容有误，请检查后重试。"})
+        if request.url.path == "/api/v1/monitor/ack":
+            return JSONResponse(status_code=422, content={"detail": "确认请求有误，请刷新后重试。"})
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])

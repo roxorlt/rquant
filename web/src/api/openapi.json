@@ -1,6 +1,81 @@
 {
   "components": {
     "schemas": {
+      "AckCommandReceipt": {
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "confirmation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmation Id"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "succeeded",
+              "failed",
+              "ambiguous"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "AckCommandReceipt",
+        "type": "object"
+      },
+      "AckCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "alert_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Alert Id",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "alert_id"
+        ],
+        "title": "AckCommandRequest",
+        "type": "object"
+      },
       "ActionCount": {
         "properties": {
           "action": {
@@ -22,6 +97,80 @@
           "count"
         ],
         "title": "ActionCount",
+        "type": "object"
+      },
+      "AlertAcknowledgmentView": {
+        "properties": {
+          "alert_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alert Id"
+          },
+          "confirmation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmation Id"
+          },
+          "confirmed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmed At"
+          },
+          "eligible": {
+            "title": "Eligible",
+            "type": "boolean"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "state": {
+            "enum": [
+              "unavailable",
+              "historical",
+              "unconfirmed",
+              "confirmed"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "eligible",
+          "label"
+        ],
+        "title": "AlertAcknowledgmentView",
         "type": "object"
       },
       "Assignment": {
@@ -2923,6 +3072,9 @@
       },
       "MonitorSignal": {
         "properties": {
+          "acknowledgment": {
+            "$ref": "#/components/schemas/AlertAcknowledgmentView"
+          },
           "action": {
             "title": "Action",
             "type": "string"
@@ -3042,6 +3194,9 @@
       },
       "MonitorSurge": {
         "properties": {
+          "acknowledgment": {
+            "$ref": "#/components/schemas/AlertAcknowledgmentView"
+          },
           "at": {
             "format": "date-time",
             "title": "At",
@@ -3246,6 +3401,9 @@
               }
             ],
             "title": "Total"
+          },
+          "unacknowledged": {
+            "$ref": "#/components/schemas/UnacknowledgedSummary"
           }
         },
         "required": [
@@ -3268,6 +3426,9 @@
       },
       "MonitorTrigger": {
         "properties": {
+          "acknowledgment": {
+            "$ref": "#/components/schemas/AlertAcknowledgmentView"
+          },
           "at": {
             "format": "date-time",
             "title": "At",
@@ -3405,6 +3566,9 @@
           },
           "signals": {
             "$ref": "#/components/schemas/SignalsSummary"
+          },
+          "unacknowledged": {
+            "$ref": "#/components/schemas/UnacknowledgedSummary"
           }
         },
         "required": [
@@ -6710,6 +6874,63 @@
         "title": "TranslationPlan",
         "type": "object"
       },
+      "UnacknowledgedSummary": {
+        "properties": {
+          "count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "count_as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count As Of"
+          },
+          "label": {
+            "default": "确认状态暂不可用",
+            "title": "Label",
+            "type": "string"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "确认信息尚未发布，请稍后查看。",
+            "title": "Note"
+          },
+          "state": {
+            "default": "unavailable",
+            "enum": [
+              "unavailable",
+              "source_incomplete",
+              "ready"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "title": "UnacknowledgedSummary",
+        "type": "object"
+      },
       "UnaryExpr": {
         "additionalProperties": false,
         "properties": {
@@ -7046,6 +7267,47 @@
         "summary": "数据代、数据集水位与市场阶段",
         "tags": [
           "meta"
+        ]
+      }
+    },
+    "/api/v1/monitor/ack": {
+      "post": {
+        "operationId": "acknowledge_alert_api_v1_monitor_ack_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AckCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AckCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "确认一条告警",
+        "tags": [
+          "monitor"
         ]
       }
     },

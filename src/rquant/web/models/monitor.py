@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.web.models.alert_ack import AlertAcknowledgmentView, UnacknowledgedSummary
 from rquant.web.models.overview import DeliveryMode, DeliveryState
 
 SignalSourceState = Literal["unavailable", "not_published", "empty", "ready"]
@@ -45,6 +46,11 @@ class MonitorSignal(BaseModel):
     delivery_label: str
     delivery_note: str | None
     receipts: list[MonitorReceipt]
+    acknowledgment: AlertAcknowledgmentView = Field(
+        default_factory=lambda: AlertAcknowledgmentView(
+            state="unavailable", eligible=False, label="确认状态暂不可用"
+        )
+    )
 
 
 class MonitorTrigger(BaseModel):
@@ -59,6 +65,11 @@ class MonitorTrigger(BaseModel):
     price: float | None
     level_price: float | None
     status_label: str
+    acknowledgment: AlertAcknowledgmentView = Field(
+        default_factory=lambda: AlertAcknowledgmentView(
+            state="unavailable", eligible=False, label="确认状态暂不可用"
+        )
+    )
 
 
 class MonitorSurge(BaseModel):
@@ -73,6 +84,11 @@ class MonitorSurge(BaseModel):
     price: float | None
     pct_chg: float | None
     status_label: str
+    acknowledgment: AlertAcknowledgmentView = Field(
+        default_factory=lambda: AlertAcknowledgmentView(
+            state="unavailable", eligible=False, label="确认状态暂不可用"
+        )
+    )
 
 
 class MonitorNotification(BaseModel):
@@ -109,3 +125,4 @@ class MonitorTimelineData(BaseModel):
     mode_label: str
     mode_note: str | None
     market_note: str | None
+    unacknowledged: UnacknowledgedSummary = Field(default_factory=UnacknowledgedSummary)

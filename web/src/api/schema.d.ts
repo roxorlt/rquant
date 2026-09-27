@@ -106,6 +106,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitor/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认一条告警 */
+        post: operations["acknowledge_alert_api_v1_monitor_ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/monitor/timeline": {
         parameters: {
             query?: never;
@@ -467,6 +484,34 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AckCommandReceipt */
+        AckCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Confirmation Id */
+            confirmation_id?: string | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "succeeded" | "failed" | "ambiguous";
+        };
+        /** AckCommandRequest */
+        AckCommandRequest: {
+            /** Alert Id */
+            alert_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** ActionCount */
         ActionCount: {
             /** Action */
@@ -475,6 +520,26 @@ export interface components {
             count: number;
             /** Label */
             label: string;
+        };
+        /** AlertAcknowledgmentView */
+        AlertAcknowledgmentView: {
+            /** Alert Id */
+            alert_id?: string | null;
+            /** Confirmation Id */
+            confirmation_id?: string | null;
+            /** Confirmed At */
+            confirmed_at?: string | null;
+            /** Eligible */
+            eligible: boolean;
+            /** Label */
+            label: string;
+            /** Note */
+            note?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "unavailable" | "historical" | "unconfirmed" | "confirmed";
         };
         /** Assignment */
         Assignment: {
@@ -1392,6 +1457,7 @@ export interface components {
         };
         /** MonitorSignal */
         MonitorSignal: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
             /** Action */
             action: string;
             /** Action Label */
@@ -1436,6 +1502,7 @@ export interface components {
         };
         /** MonitorSurge */
         MonitorSurge: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
             /**
              * At
              * Format: date-time
@@ -1498,9 +1565,11 @@ export interface components {
             source_state: "unavailable" | "not_published" | "empty" | "ready";
             /** Total */
             total: number | null;
+            unacknowledged?: components["schemas"]["UnacknowledgedSummary"];
         };
         /** MonitorTrigger */
         MonitorTrigger: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
             /**
              * At
              * Format: date-time
@@ -1549,6 +1618,7 @@ export interface components {
             services: components["schemas"]["StateCounts"];
             session: components["schemas"]["SessionInfo"];
             signals: components["schemas"]["SignalsSummary"];
+            unacknowledged?: components["schemas"]["UnacknowledgedSummary"];
         };
         /**
          * PageDataStatus
@@ -2569,6 +2639,29 @@ export interface components {
             /** Window Lookback Bars */
             window_lookback_bars: number;
         };
+        /** UnacknowledgedSummary */
+        UnacknowledgedSummary: {
+            /** Count */
+            count?: number | null;
+            /** Count As Of */
+            count_as_of?: string | null;
+            /**
+             * Label
+             * @default 确认状态暂不可用
+             */
+            label: string;
+            /**
+             * Note
+             * @default 确认信息尚未发布，请稍后查看。
+             */
+            note: string | null;
+            /**
+             * State
+             * @default unavailable
+             * @enum {string}
+             */
+            state: "unavailable" | "source_incomplete" | "ready";
+        };
         /** UnaryExpr */
         UnaryExpr: {
             /**
@@ -2763,6 +2856,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MetaData_"];
+                };
+            };
+        };
+    };
+    acknowledge_alert_api_v1_monitor_ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

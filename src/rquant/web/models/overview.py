@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.web.market import MarketPhase
+from rquant.web.models.alert_ack import UnacknowledgedSummary
 from rquant.web.models.common import StateCounts
 
 StageState = Literal["done", "running", "waiting", "paused", "late"]
@@ -185,3 +186,4 @@ class OverviewData(BaseModel):
     services: StateCounts
     freshness: FreshnessSummary
     attention: list[AttentionItem]
+    unacknowledged: UnacknowledgedSummary = Field(default_factory=UnacknowledgedSummary)

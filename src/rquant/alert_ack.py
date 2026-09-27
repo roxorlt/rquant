@@ -151,7 +151,7 @@ def stable_alert_id(
         verified = parse_signal_envelope(payload)
         if verified.signal_id is None:
             raise ValueError("signal_id identity is missing")
-        fields: list[object] = [["signal_id", verified.signal_id]]
+        return stable_signal_alert_id(verified.signal_id)
     elif source in {"monitor_event", "surge_event"}:
         if not isinstance(event, Mapping):
             raise ValueError("alert event must be a mapping")
@@ -174,6 +174,22 @@ def stable_alert_id(
     else:
         raise ValueError(f"source {source!r} is not confirmable")
     return canonical_sha256({"domain": "rquant-alert/v1", "source": source, "fields": fields})
+
+
+def stable_signal_alert_id(signal_id: str) -> str:
+    """Map a signal ID already verified from a trusted Serving row to alert identity.
+
+    A caller must not use this to treat arbitrary browser input as a verified envelope.
+    """
+    if re.fullmatch(r"[0-9a-f]{64}", signal_id) is None:
+        raise ValueError("invalid published signal_id")
+    return canonical_sha256(
+        {
+            "domain": "rquant-alert/v1",
+            "source": "signal",
+            "fields": [["signal_id", signal_id]],
+        }
+    )
 
 
 def unique_alert_ids(
