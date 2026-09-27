@@ -18,14 +18,14 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-from pydantic import Field, JsonValue, TypeAdapter, field_validator
+from pydantic import Field, JsonValue, TypeAdapter, field_validator, model_validator
 
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
@@ -36,6 +36,7 @@ from rquant.canvas_publication_receipt import (
     CanvasPublicationSigner,
     build_canvas_publication_claims,
 )
+from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.lab_job_protocol import LabCommand
 from rquant.llm.schemas import RuleCall
 from rquant.runtime_contracts import (
@@ -246,6 +247,20 @@ class SubmitLabCommand(PageControlCommand):
     interaction_key: str | None = Field(default=None, min_length=1, max_length=256)
 
 
+class SubmitBackfillPlan(PageControlCommand):
+    kind: Literal["submit_backfill_plan"] = "submit_backfill_plan"
+    actor_id: str = Field(min_length=1, max_length=256)
+    audit_start: date
+    completed_through: date
+
+    @model_validator(mode="after")
+    def validate_range(self) -> SubmitBackfillPlan:
+        days = (self.completed_through - self.audit_start).days + 1
+        if days < 1 or days > MAX_AUDIT_DAYS:
+            raise ValueError(f"backfill plan audit range must contain 1 to {MAX_AUDIT_DAYS} days")
+        return self
+
+
 class ExportLabArtifactZip(PageControlCommand):
     kind: Literal["export_lab_artifact_zip"] = "export_lab_artifact_zip"
     job_id: UUID
@@ -281,6 +296,12 @@ class LabPageControlBackend(Protocol):
     def discard_zip(self, command: DiscardLabArtifactZip) -> JsonValue: ...
 
 
+class BackfillPlanPageControlBackend(Protocol):
+    def submit(self, command: SubmitBackfillPlan) -> JsonValue: ...
+
+    def recover(self, command: SubmitBackfillPlan) -> JsonValue | None: ...
+
+
 PageControlCommandValue = Annotated[
     AckAlert
     | SaveCanvas
@@ -296,6 +317,7 @@ PageControlCommandValue = Annotated[
     | AppendNlQueryLog
     | InitializeLabExports
     | SubmitLabCommand
+    | SubmitBackfillPlan
     | ExportLabArtifactZip
     | DiscardLabArtifactZip,
     Field(discriminator="kind"),
@@ -1385,6 +1407,7 @@ class PageControlConsumer:
         log_dir: Path,
         allowed_lab_export_roots: tuple[Path, ...] = (),
         lab_backend: LabPageControlBackend | None = None,
+        backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -1399,6 +1422,7 @@ class PageControlConsumer:
             Path(os.path.abspath(path)) for path in allowed_lab_export_roots
         )
         self.lab_backend = lab_backend
+        self.backfill_plan_backend = backfill_plan_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -1823,6 +1847,8 @@ class PageControlConsumer:
                 command.command,
                 interaction_key=command.interaction_key,
             )
+        if isinstance(command, SubmitBackfillPlan):
+            return self._backfill_plan_backend().submit(command)
         if isinstance(command, ExportLabArtifactZip):
             return self._lab_backend().export_zip(command.job_id)
         if isinstance(command, DiscardLabArtifactZip):
@@ -1833,6 +1859,11 @@ class PageControlConsumer:
         if self.lab_backend is None:
             raise RuntimeError("Lab page control backend is unavailable")
         return self.lab_backend
+
+    def _backfill_plan_backend(self) -> BackfillPlanPageControlBackend:
+        if self.backfill_plan_backend is None:
+            raise RuntimeError("backfill plan backend is unavailable")
+        return self.backfill_plan_backend
 
     def _local_effect_fence_targets(
         self,
@@ -2042,6 +2073,8 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, SubmitBackfillPlan):
+            return self._backfill_plan_backend().recover(command)
         if isinstance(command, CreateCanvas):
             return self._recover_create_canvas_result(command)
         if isinstance(command, SaveCanvas):
@@ -3674,6 +3707,7 @@ __all__ = [
     "InitializeLabExports",
     "LabArtifactZipResult",
     "LabPageControlBackend",
+    "BackfillPlanPageControlBackend",
     "PageControlCommandValue",
     "PageControlClient",
     "PageControlConsumer",
@@ -3689,4 +3723,5 @@ __all__ = [
     "SaveUserPoolV2",
     "SetCanvasPoolRefs",
     "SubmitLabCommand",
+    "SubmitBackfillPlan",
 ]
