@@ -13,11 +13,13 @@ export function CustomMaParamControl({
   value,
   onChange,
   allowRsi = false,
+  numberUnit,
 }: {
   parameter: ScreenParameter;
   value: ParameterValue;
   onChange: (value: ParameterValue) => void;
   allowRsi?: boolean;
+  numberUnit?: string | null;
 }) {
   const options = parameter.options ?? [];
   const [mode, setMode] = useState<"field" | "ma" | "rsi" | "number">(() => {
@@ -126,17 +128,24 @@ export function CustomMaParamControl({
           </label>
         </div>
       ) : mode === "number" && parameter.input === "operand" ? (
-        <input
-          className="inp num"
-          type="number"
-          inputMode="decimal"
-          step="any"
-          aria-label={`${parameter.label}数值`}
-          value={typeof value === "number" ? value : ""}
-          onChange={(event) =>
-            onChange(event.target.value === "" ? "" : Number(event.target.value))
-          }
-        />
+        <div className="screen-number">
+          <input
+            className="inp num"
+            type="number"
+            inputMode="decimal"
+            step="any"
+            aria-label={`${parameter.label}数值${numberUnit ? `（${numberUnit}）` : ""}`}
+            value={typeof value === "number" ? value : ""}
+            onChange={(event) =>
+              onChange(event.target.value === "" ? "" : Number(event.target.value))
+            }
+          />
+          {numberUnit ? (
+            <span className="screen-unit" aria-hidden="true">
+              {numberUnit}
+            </span>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

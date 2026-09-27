@@ -894,6 +894,7 @@ describe("选股器", () => {
             available: true,
             ranking_metrics: [],
             source: { ...source, identity },
+            source_kind: "replica",
           },
           serving,
         }),
@@ -923,9 +924,127 @@ describe("选股器", () => {
     identity = "b".repeat(64);
     await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
     expect(await screen.findByRole("status")).toHaveTextContent("选股数据已更新，请重新筛选");
-    expect(screen.getByRole("button", { name: "下一页" })).toBeDisabled();
+    expect(screen.queryByText("命中 27 只")).not.toBeInTheDocument();
+    expect(screen.queryByRole("table", { name: "选股结果" })).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
     expect(document.body.textContent).not.toContain(identity);
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("基本面字段按倍数或百分比填写，并绑定目录的数据来源", async () => {
+    const financialOptions = [
+      { value: "PE_TTM[0]", label: "市盈率（倍）" },
+      { value: "ROE[0]", label: "净资产收益率（%）" },
+    ];
+    const financialBlocks: Schemas["ScreenBlock"][] = [
+      blocks[0] as Schemas["ScreenBlock"],
+      {
+        key: "gt",
+        label: "大于",
+        hint: "比较两项数据",
+        category: "compare",
+        category_label: "数值比较",
+        parameters: (["left", "right"] as const).map((key) => ({
+          key,
+          label: key === "left" ? "左侧" : "右侧",
+          input: "operand" as const,
+          initial: key === "left" ? "PE_TTM[0]" : 9,
+          required: true,
+          scale: 1,
+          options: financialOptions,
+          custom_ma: true,
+        })),
+      },
+      {
+        key: "between",
+        label: "落在区间",
+        hint: "指定数据位于上下限之间",
+        category: "compare",
+        category_label: "数值比较",
+        parameters: [
+          {
+            key: "field",
+            label: "比较项",
+            input: "field",
+            initial: "PE_TTM[0]",
+            required: true,
+            scale: 1,
+            options: financialOptions,
+            custom_ma: true,
+          },
+          ...(["low", "high"] as const).map((key) => ({
+            key,
+            label: key === "low" ? "下限" : "上限",
+            input: "number" as const,
+            initial: key === "low" ? 0 : 20,
+            required: true,
+            scale: 1,
+            options: [],
+            custom_ma: false,
+          })),
+        ],
+      },
+    ];
+    const requests: Schemas["ScreenRunRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: financialBlocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        requests.push(body);
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 2,
+            total: 1,
+            unknown_count: 1,
+            steps: [{ label: "大于", count: 1, unknown_count: 1 }],
+            rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 }],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "条件目录" }), "gt");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    expect(screen.getAllByRole("option", { name: "市盈率（倍）" })).toHaveLength(2);
+    expect(screen.getByRole("spinbutton", { name: "右侧数值（倍）" })).toHaveValue(9);
+    await user.selectOptions(screen.getByRole("combobox", { name: "条件目录" }), "between");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "比较项" }), "ROE[0]");
+    expect(screen.getByRole("spinbutton", { name: "下限（%）" })).toHaveAttribute(
+      "inputmode",
+      "decimal",
+    );
+    expect(screen.getByRole("spinbutton", { name: "上限（%）" })).toHaveValue(20);
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toMatchObject({
+      source_identity: source.identity,
+      conditions: [
+        { key: "not_st", args: {} },
+        { key: "gt", args: { left: "PE_TTM[0]", right: 9 } },
+        { key: "between", args: { field: "ROE[0]", low: 0, high: 20 } },
+      ],
+    });
+    expect(await screen.findByText(/未判定 1 只/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(source.identity);
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
   });
 

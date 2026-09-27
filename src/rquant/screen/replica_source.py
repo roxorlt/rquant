@@ -266,6 +266,54 @@ class VerifiedReplicaScreenSource:
             connection.close()
             os.close(descriptor)
 
+    def available_fundamental_fields(
+        self,
+        *,
+        expected_identity: str,
+        dates: Sequence[date],
+    ) -> frozenset[str]:
+        """Offer only fields backed by a valid current head receipt in this replica."""
+        if not dates:
+            return frozenset()
+        if len(dates) > 30 or any(type(day) is not date for day in dates):
+            raise ScreenReplicaBudgetError("fundamental catalog dates exceed the allowed range")
+        connection, descriptor, generation = self._open()
+        try:
+            if generation.identity != expected_identity:
+                raise ScreenReplicaChangedError("screening replica generation changed")
+            placeholders = ",".join("?" for _ in dates)
+            available: set[str] = set()
+            for name in FUNDAMENTAL_COLS_MAP:
+                row = connection.execute(
+                    "SELECT h.ts_code, h.trade_date "
+                    "FROM fundamental_daily_head AS h "
+                    "JOIN fundamental_daily_version AS v "
+                    "ON v.version_id = h.version_id "
+                    "AND v.ts_code = h.ts_code AND v.trade_date = h.trade_date "
+                    f"WHERE h.trade_date IN ({placeholders}) AND v.{name} IS NOT NULL "
+                    "ORDER BY h.trade_date DESC, h.ts_code LIMIT 1",
+                    list(dates),
+                ).fetchone()
+                if row is None:
+                    continue
+                checked = _load_fundamental_wide(
+                    cast("DuckDBStore", _StoreConnection(connection)),
+                    trade_date=row[1].isoformat(),
+                    ts_codes=[row[0]],
+                    sources=FUNDAMENTAL_COLS_MAP,
+                    decision_at=None,
+                )
+                if checked.empty or pd.isna(checked.iloc[0][f"{FUNDAMENTAL_COLS_MAP[name]}[0]"]):
+                    raise ScreenReplicaDataError("fundamental catalog receipt is incomplete")
+                available.add(name)
+            self._finish(descriptor, generation)
+            return frozenset(available)
+        except (duckdb.Error, ScreeningFactError) as error:
+            raise ScreenReplicaDataError("fundamental catalog receipts are unavailable") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
+
     def load(
         self,
         trade_date: date,

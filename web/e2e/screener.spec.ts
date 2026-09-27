@@ -279,7 +279,7 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
   await page.getByRole("button", { name: "刷新选股数据" }).click();
   await expect.poll(() => catalogReads).toBe(2);
   await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
-  await expect(page.getByRole("button", { name: "下一页" })).toBeDisabled();
+  await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect(page.getByText("命中 27 只")).toBeVisible();
@@ -296,6 +296,97 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   expect(await page.locator("main").innerText()).not.toContain(identity);
   await page.screenshot({ path: testInfo.outputPath("screen-source-phone.png") });
+  expect(watcher.problems).toEqual([]);
+});
+
+test("基本面条件在桌面和手机按单位输入，来源更新会清掉旧结果", async ({ page }) => {
+  const watcher = watch(page);
+  let identity = "a".repeat(64);
+  const requests: Schemas["ScreenRunRequest"][] = [];
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    body.data.source_kind = "replica";
+    body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
+    body.data.available = true;
+    const options = [
+      { value: "PE_TTM[0]", label: "市盈率（倍）" },
+      { value: "ROE[0]", label: "净资产收益率（%）" },
+    ];
+    for (const block of body.data.blocks.filter((item) =>
+      ["gt", "lt", "gte", "lte", "between"].includes(item.key),
+    )) {
+      for (const parameter of block.parameters.filter((item) =>
+        ["left", "right", "field"].includes(item.key),
+      )) {
+        parameter.options = [...(parameter.options ?? []), ...options];
+      }
+    }
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/run", async (route) => {
+    const body = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+    requests.push(body);
+    await route.fulfill({
+      status: 200,
+      json: {
+        data: {
+          trade_date: body.trade_date,
+          status: "ready",
+          base_count: 2,
+          total: 1,
+          unknown_count: 1,
+          steps: [{ label: "基本面条件", count: 1, unknown_count: 1 }],
+          rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 }],
+          next_cursor: null,
+          source: { identity, updated_at: "2026-09-24T07:31:00Z" },
+        },
+        serving: {
+          state: "ready",
+          generation_id: "b".repeat(64),
+          built_at: "2026-09-24T07:30:00Z",
+          age_seconds: 60,
+          detail: null,
+        },
+      },
+    });
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("./#/screener");
+  await page.getByRole("combobox", { name: "条件目录" }).selectOption("gt");
+  await page.getByRole("button", { name: "添加条件" }).click();
+  await page.getByRole("combobox", { name: "左侧" }).selectOption("PE_TTM[0]");
+  await page.getByRole("combobox", { name: "右侧" }).selectOption("__number__");
+  const peLimit = page.getByRole("spinbutton", { name: "右侧数值（倍）" });
+  await expect(peLimit).toBeVisible();
+  await peLimit.fill("9");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect(page.getByText("命中 1 只", { exact: false })).toBeVisible();
+  expect(requests[0]?.source_identity).toBe(identity);
+  expect(requests[0]?.conditions[1]).toEqual({ key: "gt", args: { left: "PE_TTM[0]", right: 9 } });
+  await expectNoHorizontalOverflow(page, "fundamental screen desktop");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("combobox", { name: "条件目录" }).selectOption("between");
+  await page.getByRole("button", { name: "添加条件" }).click();
+  await page.getByRole("combobox", { name: "比较项" }).selectOption("ROE[0]");
+  await page.getByRole("spinbutton", { name: "下限（%）" }).fill("8");
+  await page.getByRole("spinbutton", { name: "上限（%）" }).fill("15");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1]?.conditions.at(-1)).toEqual({
+    key: "between",
+    args: { field: "ROE[0]", low: 8, high: 15 },
+  });
+  await expect(page.getByText(/未判定 1 只/)).toBeVisible();
+  await expectNoHorizontalOverflow(page, "fundamental screen phone");
+
+  identity = "c".repeat(64);
+  await page.getByRole("button", { name: "刷新选股数据" }).click();
+  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
+  expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   expect(watcher.problems).toEqual([]);
 });
 
@@ -334,7 +425,7 @@ test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选",
   await page.clock.fastForward(31_000);
   await expect.poll(() => catalogReads).toBe(2);
   await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
-  await expect(page.getByRole("button", { name: "下一页" })).toBeDisabled();
+  await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
   expect(watcher.problems).toEqual([]);
 });

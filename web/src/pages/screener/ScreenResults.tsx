@@ -49,10 +49,12 @@ function ResultBody({
   data,
   running,
   onStock,
+  usesFundamental,
 }: {
   data: ScreenRunData | null;
   running: boolean;
   onStock: (code: string) => void;
+  usesFundamental: boolean;
 }) {
   if (data === null) {
     return running ? (
@@ -68,7 +70,16 @@ function ResultBody({
     return <EmptyState title="所选日期没有选股数据" hint="换一个数据日期后重试。" />;
   }
   if (data.total === 0 && (data.unknown_count ?? 0) > 0) {
-    return <EmptyState title="暂无确定命中" hint="有股票数据不足，换日期核对或调整条件后重试。" />;
+    return (
+      <EmptyState
+        title="暂无确定命中"
+        hint={
+          usesFundamental
+            ? "有股票基本面数据不足，换日期核对或调整条件后重试。"
+            : "有股票数据不足，换日期核对或调整条件后重试。"
+        }
+      />
+    );
   }
   if (data.total === 0) {
     return <EmptyState title="没有命中股票" hint="查看逐条命中，放宽让数量变为 0 的条件。" />;
@@ -94,6 +105,7 @@ export function ScreenResults({
   onStock,
   onPrevious,
   onNext,
+  usesFundamental,
 }: {
   data: ScreenRunData | null;
   stale: boolean;
@@ -104,6 +116,7 @@ export function ScreenResults({
   onStock: (code: string) => void;
   onPrevious: () => void;
   onNext: () => void;
+  usesFundamental: boolean;
 }) {
   return (
     <>
@@ -178,10 +191,17 @@ export function ScreenResults({
         ) : null}
         {data?.status === "ready" && (data.unknown_count ?? 0) > 0 ? (
           <p className="screen-notice">
-            有股票因条件数据缺失或历史不足未判定；结果仅包含已确认命中的股票。
+            {usesFundamental
+              ? "有股票基本面数据不足，结果仅包含已确认命中。"
+              : "有股票因条件数据缺失或历史不足未判定；结果仅包含已确认命中的股票。"}
           </p>
         ) : null}
-        <ResultBody data={data} running={running} onStock={onStock} />
+        <ResultBody
+          data={data}
+          running={running}
+          onStock={onStock}
+          usesFundamental={usesFundamental}
+        />
         {data?.status === "ready" && data.total !== null && data.total > 0 ? (
           <div className="screen-pages">
             <span className="hint">

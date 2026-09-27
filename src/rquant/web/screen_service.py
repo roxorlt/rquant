@@ -24,9 +24,11 @@ from rquant.screen.formula_history_projection import (
     FormulaProjectionUnavailableError,
     VerifiedFormulaHistoryProjection,
 )
+from rquant.screen.loader import FUNDAMENTAL_COLS_MAP
 from rquant.screen.ranking import RankingCondition
 from rquant.screen.replica_source import (
     ScreenReplicaBudgetError,
+    ScreenReplicaChangedError,
     ScreenReplicaDataError,
     ScreenReplicaUnavailableError,
     VerifiedReplicaScreenSource,
@@ -66,6 +68,7 @@ from rquant.web.screen_catalog import (
 from rquant.web.serving import BorrowedGeneration
 
 _REPLICA_RANK_COLUMNS = frozenset({"TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]"})
+_FUNDAMENTAL_COLUMNS = frozenset(f"{name}[0]" for name in FUNDAMENTAL_COLS_MAP.values())
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _PREVIEW_UNKNOWN = {
     "missing_date": "这只股票在所选日期缺少日线，暂无法判断。",
@@ -257,14 +260,30 @@ class ScreenApplicationService:
                 )
             rsi_ready = self._rsi_ready(snapshot.identity, snapshot.dates)
             try:
+                fundamental_fields = self.replica.available_fundamental_fields(
+                    expected_identity=snapshot.identity,
+                    dates=snapshot.dates,
+                )
+            except (
+                ScreenReplicaUnavailableError,
+                ScreenReplicaDataError,
+                ScreenReplicaChangedError,
+            ):
+                fundamental_fields = frozenset()
+            try:
                 current = self.replica.available_dates()
             except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
                 current = None
             if current is None or current.identity != snapshot.identity:
                 rsi_ready = False
+                fundamental_fields = frozenset()
             return ScreenCatalogData(
                 source_kind="replica",
-                blocks=screen_blocks(dynamic_ma=True, dynamic_rsi=rsi_ready),
+                blocks=screen_blocks(
+                    dynamic_ma=True,
+                    dynamic_rsi=rsi_ready,
+                    fundamental_fields=fundamental_fields,
+                ),
                 dates=snapshot.dates,
                 available=bool(snapshot.dates),
                 ranking_metrics=available_ranking_metrics(_REPLICA_RANK_COLUMNS),
@@ -316,17 +335,38 @@ class ScreenApplicationService:
         borrowed: BorrowedGeneration | None,
         serving_unavailable: bool,
     ) -> ScreenRunData:
+        requested_fundamental = {
+            value
+            for condition in body.conditions
+            for value in condition.args.values()
+            if type(value) is str and value in _FUNDAMENTAL_COLUMNS
+        }
+        fundamental_fields: frozenset[str] = frozenset()
+        if requested_fundamental:
+            if self.replica is None:
+                raise ScreenApplicationError(422, "请从条件目录选择数据项或板块。")
+            if body.source_identity is None:
+                raise ScreenApplicationError(422, "请刷新条件目录后重新筛选。")
+            try:
+                snapshot = self.replica.available_dates()
+                fundamental_fields = self.replica.available_fundamental_fields(
+                    expected_identity=body.source_identity,
+                    dates=snapshot.dates,
+                )
+            except ScreenReplicaChangedError as error:
+                raise ScreenApplicationError(409, "选股数据已更新，请重新筛选。") from error
+            except (ScreenReplicaUnavailableError, ScreenReplicaDataError) as error:
+                raise ScreenApplicationError(503, "基本面数据暂不可用，请稍后重试。") from error
         rsi_ready = False
         if self.replica is not None and self.rsi is not None:
             with suppress(ScreenReplicaUnavailableError, ScreenReplicaDataError):
-                rsi_ready = self._rsi_ready(
-                    self.replica.generation_identity(), [body.trade_date]
-                )
+                rsi_ready = self._rsi_ready(self.replica.generation_identity(), [body.trade_date])
         try:
             normalized_args = validate_screen_choices(
                 body.conditions,
                 dynamic_ma=self.replica is not None,
                 dynamic_rsi=rsi_ready,
+                fundamental_fields=fundamental_fields,
             )
         except ValueError as error:
             if "RSI period" in str(error):
@@ -393,7 +433,10 @@ class ScreenApplicationService:
                     compiled.rules,
                     include_columns=rank_columns,
                     rsi_projection=self.rsi if rsi_ready else None,
+                    expected_identity=body.source_identity,
                 )
+            except ScreenReplicaChangedError as error:
+                raise ScreenApplicationError(409, "选股数据已更新，请重新筛选。") from error
             except ScreenReplicaUnavailableError as error:
                 raise ScreenApplicationError(
                     409 if body.cursor else 503,
@@ -424,7 +467,8 @@ class ScreenApplicationService:
                 request.name for request in _collect_aggregates(compiled.rules)
             }
             if any(
-                column not in universe.columns or universe[column].isna().all()
+                column not in universe.columns
+                or (column not in _FUNDAMENTAL_COLUMNS and universe[column].isna().all())
                 for column in required_columns
             ):
                 raise ScreenApplicationError(

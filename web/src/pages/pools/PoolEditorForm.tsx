@@ -3,6 +3,7 @@ import type { PublishedPool } from "@/api/endpoints";
 import type { BuiltinPoolCopySource, EditableCanvas, EditablePool } from "@/api/poolEditor";
 import {
   catalogUsableForGeneration,
+  isFundamentalScreenField,
   type ScreenBlock,
   type ScreenOption,
   useScreenCatalog,
@@ -42,6 +43,7 @@ function validParameter(
   value: ParameterValue,
   parameter: ScreenBlock["parameters"][number],
 ): boolean {
+  if (isFundamentalScreenField(value)) return false;
   if (value === null || value === "") return !parameter.required;
   if (parameter.input === "multi_choice") {
     return (
@@ -73,6 +75,7 @@ function preservedOption(
   parameter: ScreenBlock["parameters"][number],
 ): ScreenOption | null {
   if (
+    isFundamentalScreenField(value) ||
     typeof value !== "string" ||
     value !== original ||
     !["operand", "choice", "field"].includes(parameter.input) ||
@@ -194,7 +197,19 @@ export function PoolEditorForm({
   const [preview, setPreview] = useState(false);
   const previewGeneration = useRef(generationId);
   const previewRef = useRef<HTMLElement>(null);
-  const blocks = catalog.data?.blocks ?? [];
+  const blocks = useMemo(
+    () =>
+      (catalog.data?.blocks ?? []).map((block) => ({
+        ...block,
+        parameters: block.parameters.map((parameter) => ({
+          ...parameter,
+          options: (parameter.options ?? []).filter(
+            (option) => !isFundamentalScreenField(option.value),
+          ),
+        })),
+      })),
+    [catalog.data?.blocks],
+  );
   const blockMap = useMemo(() => new Map(blocks.map((block) => [block.key, block])), [blocks]);
   const parentPool = publishedPools.find((pool) => pool.key === parent);
   const targetCanvas = canvases.find((item) => item.name === canvas);

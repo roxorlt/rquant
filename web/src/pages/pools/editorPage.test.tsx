@@ -184,6 +184,51 @@ function respond(options: { editor?: Schemas["PoolEditorData"]; editorGeneration
   );
 }
 
+it("池子编辑目录不提供尚未接入池子执行的数据项", async () => {
+  respond();
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          ...catalog,
+          blocks: [
+            ...catalog.blocks,
+            {
+              key: "gt",
+              label: "大于",
+              hint: "比较两项数据",
+              category: "compare",
+              category_label: "数值比较",
+              parameters: (["left", "right"] as const).map((key) => ({
+                key,
+                label: key === "left" ? "左侧" : "右侧",
+                input: "operand" as const,
+                initial: "CLOSE[0]",
+                required: true,
+                scale: 1,
+                custom_ma: true,
+                options: [
+                  { value: "CLOSE[0]", label: "收盘价" },
+                  { value: "PE_TTM[0]", label: "市盈率（倍）" },
+                ],
+              })),
+            },
+          ],
+        },
+        serving,
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "添加条件节点" }));
+  const dialog = screen.getByRole("dialog", { name: "添加条件节点" });
+  await user.selectOptions(within(dialog).getByRole("combobox", { name: "条件目录" }), "gt");
+  await user.click(within(dialog).getByRole("button", { name: "添加条件" }));
+  expect(within(dialog).getAllByRole("option", { name: "收盘价" })).toHaveLength(2);
+  expect(within(dialog).queryAllByRole("option", { name: "市盈率（倍）" })).toHaveLength(0);
+});
+
 it("creates a child condition, previews the exact parent and rules, saves, then attaches to selected canvas", async () => {
   respond();
   const commands: Array<Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"]> = [];

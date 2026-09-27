@@ -123,6 +123,19 @@ def _save_body(command_id: str, *, expected_version: str | None = None) -> dict[
     }
 
 
+def test_pool_editor_rejects_unpublished_fundamental_rules(tmp_path: Path) -> None:
+    app = _app(tmp_path / "serving")
+    body = _save_body("fundamental-blocked")
+    body["rule_calls"] = [{"name": "gt", "args": {"left": "PE_TTM[0]", "right": 9}}]
+    with TestClient(app) as client:
+        rejected_rule = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+        body["rule_calls"] = [{"name": "not_st", "args": {}}]
+        body["include_columns"] = ["ROE[0]"]
+        rejected_column = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+    assert rejected_rule.status_code == rejected_column.status_code == 422
+    assert "暂不可用" in rejected_rule.json()["detail"]
+
+
 def _attach_body(command_id: str, version: str) -> dict[str, object]:
     return {
         "kind": "add_pool_to_canvas",

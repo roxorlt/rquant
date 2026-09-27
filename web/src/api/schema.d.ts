@@ -3188,6 +3188,8 @@ export interface components {
              */
             page_size: number;
             ranking?: components["schemas"]["ScreenRankingPlan"] | null;
+            /** Source Identity */
+            source_identity?: string | null;
             /**
              * Trade Date
              * Format: date
