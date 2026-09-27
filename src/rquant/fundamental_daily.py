@@ -70,11 +70,14 @@ class ValuationSource(RuntimeContractModel):
     trade_date: date | None
     candidate_generation_id: Sha256Hex | None
     row_sha256: Sha256Hex | None
+    row_observed_at: AwareUtcDatetime | None
+    first_observed_at: AwareUtcDatetime | None
     source_generation_id: Sha256Hex | None
     source_sequence: int | None
     source_batch_id: Sha256Hex | None
     revision: int | None
     observed_at: AwareUtcDatetime | None
+    valuation_observed: bool | None
 
 
 class FundamentalDailyVersion(RuntimeContractModel):
@@ -213,22 +216,27 @@ def _valuation_source(
             trade_date=None,
             candidate_generation_id=None,
             row_sha256=None,
+            row_observed_at=None,
+            first_observed_at=None,
             source_generation_id=None,
             source_sequence=None,
             source_batch_id=None,
             revision=None,
             observed_at=None,
+            valuation_observed=None,
         )
     batch = conn.execute(
         "SELECT candidate_generation_id, source_generation_id, source_sequence, "
-        "source_batch_id, revision, observed_at FROM daily_basic_valuation_batch "
+        "source_batch_id, revision, observed_at, valuation_observed "
+        "FROM daily_basic_valuation_batch "
         "WHERE trade_date = ? AND observed_at <= ? "
         "ORDER BY observed_at DESC, source_sequence DESC LIMIT 1",
         [previous, decision_at.astimezone(UTC)],
     ).fetchone()
     row = (
         conn.execute(
-            "SELECT row_sha256 FROM daily_basic_valuation_observation "
+            "SELECT row_sha256, observed_at, first_observed_at "
+            "FROM daily_basic_valuation_observation "
             "WHERE candidate_generation_id = ? AND ts_code = ? AND trade_date = ?",
             [batch[0], ts_code, previous],
         ).fetchone()
@@ -239,11 +247,14 @@ def _valuation_source(
         trade_date=previous,
         candidate_generation_id=batch[0] if batch else None,
         row_sha256=row[0] if row else None,
+        row_observed_at=row[1] if row else None,
+        first_observed_at=row[2] if row else None,
         source_generation_id=batch[1] if batch else None,
         source_sequence=batch[2] if batch else None,
         source_batch_id=batch[3] if batch else None,
         revision=batch[4] if batch else None,
         observed_at=batch[5] if batch else None,
+        valuation_observed=batch[6] if batch else None,
     )
 
 
@@ -402,7 +413,8 @@ def _source_progress(
     if prior_valuation.candidate_generation_id is None:
         return
     persisted = conn.execute(
-        "SELECT source_generation_id, source_sequence, source_batch_id, revision, observed_at "
+        "SELECT source_generation_id, source_sequence, source_batch_id, revision, "
+        "trade_date, observed_at, valuation_observed "
         "FROM daily_basic_valuation_batch WHERE candidate_generation_id = ?",
         [prior_valuation.candidate_generation_id],
     ).fetchone()
@@ -411,25 +423,30 @@ def _source_progress(
         prior_valuation.source_sequence,
         prior_valuation.source_batch_id,
         prior_valuation.revision,
+        prior_valuation.trade_date,
         prior_valuation.observed_at,
+        prior_valuation.valuation_observed,
     ):
         raise ValueError("valuation source rollback or changed batch")
     row = conn.execute(
-        "SELECT row_sha256, pe_ttm, pb, dv_ttm FROM daily_basic_valuation_observation "
+        "SELECT row_sha256, observed_at, first_observed_at, pe_ttm, pb, dv_ttm "
+        "FROM daily_basic_valuation_observation "
         "WHERE candidate_generation_id = ? AND ts_code = ? AND trade_date = ?",
         [prior_valuation.candidate_generation_id, old.ts_code, prior_valuation.trade_date],
     ).fetchone()
     if (row is None) != (prior_valuation.row_sha256 is None):
         raise ValueError("valuation source row was removed or changed")
     if row is not None:
+        if row[1] != prior_valuation.row_observed_at or row[2] != prior_valuation.first_observed_at:
+            raise ValueError("valuation source observation times changed")
         try:
             actual_digest = _row_sha256(
                 DailyValuationRow(
                     ts_code=old.ts_code,
                     trade_date=prior_valuation.trade_date,
-                    pe_ttm=row[1],
-                    pb=row[2],
-                    dv_ttm=row[3],
+                    pe_ttm=row[3],
+                    pb=row[4],
+                    dv_ttm=row[5],
                 )
             )
         except ValueError as exc:

@@ -517,6 +517,70 @@ def test_changed_prior_valuation_row_cannot_replace_head(tmp_path: Path) -> None
         )
 
 
+def test_prior_valuation_observed_flag_change_cannot_replace_head(tmp_path: Path) -> None:
+    with _conn() as conn:
+        archive = FinancialArchive(tmp_path / "archive")
+        _finance(conn, archive)
+        _valuation(conn, pb=2)
+        version = _derive(conn)
+        assert version.fields["pb"].value == 2
+        conn.execute(
+            "UPDATE daily_basic_valuation_batch SET valuation_observed = FALSE "
+            "WHERE candidate_generation_id = ?",
+            [version.valuation_source.candidate_generation_id],
+        )
+        with pytest.raises(ValueError, match="valuation source"):
+            _derive(conn)
+        assert (
+            read_fundamental_daily(conn, FundamentalDailyQuery(ts_code=SYMBOL, trade_date=MONDAY))
+            == version
+        )
+
+
+def test_prior_valuation_first_observed_change_cannot_replace_head(tmp_path: Path) -> None:
+    with _conn() as conn:
+        archive = FinancialArchive(tmp_path / "archive")
+        _finance(conn, archive)
+        _valuation(conn, pb=2)
+        version = _derive(conn)
+        assert version.fields["pb"].value == 2
+        conn.execute(
+            "UPDATE daily_basic_valuation_observation SET first_observed_at = ? "
+            "WHERE candidate_generation_id = ? AND ts_code = ?",
+            [
+                datetime(2026, 9, 25, 7, tzinfo=UTC),
+                version.valuation_source.candidate_generation_id,
+                SYMBOL,
+            ],
+        )
+        with pytest.raises(ValueError, match="valuation source"):
+            _derive(conn)
+        assert (
+            read_fundamental_daily(conn, FundamentalDailyQuery(ts_code=SYMBOL, trade_date=MONDAY))
+            == version
+        )
+
+
+def test_prior_valuation_batch_date_change_cannot_switch_to_successor(tmp_path: Path) -> None:
+    with _conn() as conn:
+        archive = FinancialArchive(tmp_path / "archive")
+        _finance(conn, archive)
+        _valuation(conn, pb=2)
+        version = _derive(conn)
+        _valuation(conn, revision=2, observed_at=datetime(2026, 9, 28, 7, tzinfo=UTC), pb=3)
+        conn.execute(
+            "UPDATE daily_basic_valuation_batch SET trade_date = ? "
+            "WHERE candidate_generation_id = ?",
+            [THURSDAY, version.valuation_source.candidate_generation_id],
+        )
+        with pytest.raises(ValueError, match="valuation source"):
+            _derive(conn)
+        assert (
+            read_fundamental_daily(conn, FundamentalDailyQuery(ts_code=SYMBOL, trade_date=MONDAY))
+            == version
+        )
+
+
 def test_version_read_rejects_scalar_or_receipt_drift(tmp_path: Path) -> None:
     with _conn() as conn:
         archive = FinancialArchive(tmp_path / "archive")
