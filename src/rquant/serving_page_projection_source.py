@@ -3132,7 +3132,12 @@ class DuckDBLabPageProjectionSource:
                 label="audit report",
             )
             if found is None:
-                return ()
+                binding.verify()
+                try:
+                    os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    return ()
+                raise PageProjectionSourceIntegrityError("audit report appeared while read")
             raw, identity = found
             report = parse_data_audit_report_bytes(raw, filename=path.name)
             if (
@@ -3140,7 +3145,25 @@ class DuckDBLabPageProjectionSource:
                 or report.source.namespace != "production"
             ):
                 raise ValueError("synthetic test audit report cannot enter production Serving")
-            report_available = datetime.fromtimestamp(identity.st_mtime, tz=UTC)
+            # mtime is caller-settable. Inode ctime and the containing directory's
+            # ctime bound when this content/name could first have been published;
+            # they do not establish collection completion or replica identity.
+            directory_stat = os.fstat(binding.descriptor)
+            if os.name != "posix" or any(
+                not isinstance(value, int) or value <= 0
+                for value in (
+                    identity.st_mtime_ns,
+                    identity.st_ctime_ns,
+                    directory_stat.st_ctime_ns,
+                )
+            ):
+                raise ValueError("audit report publication time cannot be established")
+            available_ns = max(
+                identity.st_mtime_ns,
+                identity.st_ctime_ns,
+                directory_stat.st_ctime_ns,
+            )
+            report_available = datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC)
             if report_available > observed:
                 raise ValueError("audit report is not yet available")
             projections = project_data_audit_report(report, available_at=report_available)

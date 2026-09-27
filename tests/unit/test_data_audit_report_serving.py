@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import duckdb
 import pytest
 
-from rquant.data_audit_report import AuditReportSource, publish_data_audit_report
+from rquant.data_audit_evidence import DailyBarNullFieldSpec
+from rquant.data_audit_report import (
+    AuditReportSource,
+    build_data_audit_report,
+    publish_data_audit_report,
+)
 from rquant.runtime_builder_authority import LabJobsPublisherSettings
 from rquant.serving_page_projection_source import (
     DuckDBLabPageProjectionSource,
@@ -22,6 +28,7 @@ from rquant.serving_read_models import (
     build_serving_read_models,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.storage.schema import DAILY_BAR_DDL, TRADE_CALENDAR_DDL
 from tests.unit.test_data_audit_report import END, START, _database, _report
 
 OBSERVED = datetime(2026, 10, 1, 12, tzinfo=UTC)
@@ -130,6 +137,29 @@ def test_unconfigured_or_missing_report_keeps_all_new_tables_unpublished(tmp_pat
     assert REPORT_TABLES.isdisjoint(item.table_name for item in missing.projections)
 
 
+def test_missing_report_during_directory_replacement_is_not_unpublished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as page_source
+
+    source = _source(tmp_path)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    source = DuckDBLabPageProjectionSource(
+        source.database_path, audit_report_path=reports / "missing.json"
+    )
+    original_read = page_source._read_bound_optional_file
+
+    def rotate_after_missing(*args: object, **kwargs: object) -> None:
+        assert original_read(*args, **kwargs) is None
+        os.replace(reports, tmp_path / "old-reports")
+        reports.mkdir()
+
+    monkeypatch.setattr(page_source, "_read_bound_optional_file", rotate_after_missing)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="rotated"):
+        source(OBSERVED)
+
+
 def test_production_source_rejects_synthetic_report_even_with_matching_label(
     tmp_path: Path,
 ) -> None:
@@ -180,6 +210,50 @@ def test_report_replacement_during_projection_is_rejected(
     monkeypatch.setattr(page_source, "_read_bound_optional_file", replaced_after_read)
     with pytest.raises(PageProjectionSourceIntegrityError, match="rotated|changed"):
         source(OBSERVED)
+
+
+def test_backdated_mtime_cannot_publish_report_into_past_query(tmp_path: Path) -> None:
+    day = date(2026, 9, 14)
+    database = tmp_path / "historical.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(TRADE_CALENDAR_DDL)
+        connection.execute(DAILY_BAR_DDL)
+        connection.execute(
+            "INSERT INTO trade_calendar (exchange, cal_date, is_open, source, updated_at) "
+            "VALUES ('SSE', ?, TRUE, 'synthetic', ?)",
+            (day, datetime(2026, 9, 14, 8, tzinfo=UTC)),
+        )
+        connection.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close, vol) "
+            "VALUES ('600000.SH', ?, 10, 100)",
+            (day,),
+        )
+    with duckdb.connect(str(database), read_only=True) as connection:
+        report = build_data_audit_report(
+            connection,
+            source=AuditReportSource(
+                mode="production_unverified",
+                namespace="production",
+                snapshot_label="historical-fixture",
+            ),
+            audit_start=day,
+            observed_through=day,
+            null_fields=(
+                DailyBarNullFieldSpec(
+                    field_name="close", max_null_numerator=0, max_null_denominator=1
+                ),
+            ),
+        )
+    path = publish_data_audit_report(report, tmp_path / "reports")
+    backdated = datetime(2026, 9, 15, tzinfo=UTC)
+    query = datetime(2026, 9, 20, tzinfo=UTC)
+    os.utime(path, (backdated.timestamp(), backdated.timestamp()))
+    assert path.stat().st_mtime < query.timestamp()
+    assert path.stat().st_ctime > query.timestamp()
+
+    source = _source(tmp_path, report_path=path)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="available|time|past"):
+        source(query)
 
 
 def test_snapshot_contract_cannot_promote_unconfirmed_report_to_healthy(tmp_path: Path) -> None:
