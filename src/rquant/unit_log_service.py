@@ -249,6 +249,8 @@ class UnitLogService:
             or not 1 <= min_interval_seconds <= 60
         ):
             raise ValueError("unit log service configuration is invalid")
+        if web_uid == os.geteuid():
+            raise ValueError("unit log service and Web must use a different UID")
         self.socket_path = Path(socket_path)
         self.web_group_gid = web_group_gid
         self.web_uid = web_uid
@@ -296,6 +298,8 @@ class UnitLogService:
             gate.release()
 
     def serve(self, *, stop: threading.Event, ready: threading.Event | None = None) -> None:
+        if self.web_uid == os.geteuid():
+            raise ValueError("unit log service and Web must use a different UID")
         gate = threading.Lock()
         last_admitted: float | None = None
         worker: threading.Thread | None = None
@@ -355,6 +359,8 @@ class UnitLogClient:
         web_group_gid: int,
         peer_uid: Callable[[socket.socket], int] | None = None,
     ) -> None:
+        if service_uid == os.geteuid():
+            raise ValueError("unit log service and Web must use a different UID")
         self.socket_path = Path(socket_path)
         self.service_uid = service_uid
         self.web_group_gid = web_group_gid
