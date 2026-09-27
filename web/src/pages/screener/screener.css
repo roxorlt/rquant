@@ -114,8 +114,8 @@
   gap: 12px;
 }
 .tdx-preview-date {
-  display: flex;
-  align-items: center;
+  display: block;
+  width: 100%;
   min-height: 32px;
   color: var(--ink-2);
 }

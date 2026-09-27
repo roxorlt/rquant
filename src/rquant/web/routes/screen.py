@@ -20,6 +20,7 @@ from rquant.web.models.screen import (
     TdxParseRequest,
     TdxPreviewData,
     TdxPreviewRequest,
+    TdxPreviewSourceData,
 )
 from rquant.web.screen_service import ScreenApplicationError
 from rquant.web.security import current_user, require_csrf
@@ -67,6 +68,16 @@ def preview_tdx_formula(
             return web.screen_service.preview(body, decision_at=web.clock())
         except ScreenApplicationError as error:
             raise HTTPException(status_code=error.status_code, detail=error.detail) from error
+
+
+@router.get("/tdx/preview/source", response_model=TdxPreviewSourceData, summary="公式预览数据")
+def get_tdx_preview_source(
+    request: Request,
+    _viewer: Annotated[str | None, Depends(current_user)],
+) -> TdxPreviewSourceData:
+    web = request.app.state.web
+    with _screen_slot(web.screen_gate):
+        return web.screen_service.preview_source()
 
 
 @contextmanager

@@ -12,12 +12,17 @@ from pydantic import ValidationError
 from rquant.llm.compile import compile_screen_plan
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
 from rquant.screen.core import _collect_aggregates
+from rquant.screen.formula_history_projection import (
+    FormulaProjectionBudgetError,
+    FormulaProjectionChangedError,
+    FormulaProjectionDateError,
+    FormulaProjectionUnavailableError,
+    VerifiedFormulaHistoryProjection,
+)
 from rquant.screen.ranking import RankingCondition
 from rquant.screen.replica_source import (
     ScreenReplicaBudgetError,
-    ScreenReplicaChangedError,
     ScreenReplicaDataError,
-    ScreenReplicaDateError,
     ScreenReplicaUnavailableError,
     VerifiedReplicaScreenSource,
 )
@@ -45,6 +50,7 @@ from rquant.web.models.screen import (
     ScreenStep,
     TdxPreviewData,
     TdxPreviewRequest,
+    TdxPreviewSourceData,
 )
 from rquant.web.screen_catalog import (
     RANKING_METRIC_LABELS,
@@ -131,15 +137,31 @@ class ScreenApplicationService:
         *,
         cursor_key: bytes,
         replica: VerifiedReplicaScreenSource | None = None,
+        history: VerifiedFormulaHistoryProjection | None = None,
     ) -> None:
         self.cursor_key = cursor_key
         self.replica = replica
+        self.history = history
+
+    def preview_source(self) -> TdxPreviewSourceData:
+        if self.history is None:
+            return TdxPreviewSourceData(available=False, dates=[], source=None)
+        try:
+            catalog = self.history.catalog()
+        except FormulaProjectionUnavailableError:
+            return TdxPreviewSourceData(available=False, dates=[], source=None)
+        return TdxPreviewSourceData(
+            available=bool(catalog.dates), dates=catalog.dates,
+            source=ScreenSourceInfo(
+                identity=catalog.identity, updated_at=catalog.updated_at,
+            ),
+        )
 
     def preview(
         self, body: TdxPreviewRequest, *, decision_at: datetime,
     ) -> TdxPreviewData:
-        if self.replica is None:
-            raise ScreenApplicationError(503, "选股数据暂不可用，请稍后重试。")
+        if self.history is None:
+            raise ScreenApplicationError(503, "公式预览数据暂不可用，请稍后重试。")
         parsed = parse_formula(body.source)
         if parsed.status != "parsed" or parsed.translation is None:
             raise ScreenApplicationError(422, "公式尚未通过检查，请修改后重试。")
@@ -148,20 +170,20 @@ class ScreenApplicationService:
         ):
             raise ScreenApplicationError(422, "这一天的日线尚未收盘，请换日期。")
         try:
-            snapshot = self.replica.formula_history(
+            snapshot = self.history.formula_history(
                 body.trade_date,
                 body.stock_code,
                 expected_identity=body.source_identity,
                 lookback=parsed.translation.window_lookback_bars,
                 full_history=parsed.translation.requires_full_history,
             )
-        except ScreenReplicaChangedError as error:
-            raise ScreenApplicationError(409, "选股数据已更新，请刷新后重试。") from error
-        except ScreenReplicaDateError as error:
+        except FormulaProjectionChangedError as error:
+            raise ScreenApplicationError(409, "公式预览数据已更新，请刷新后重试。") from error
+        except FormulaProjectionDateError as error:
             raise ScreenApplicationError(422, "请选择已开市的交易日。") from error
-        except (ScreenReplicaUnavailableError, ScreenReplicaDataError) as error:
-            raise ScreenApplicationError(503, "选股数据暂不可用，请稍后重试。") from error
-        except ScreenReplicaBudgetError as error:
+        except FormulaProjectionUnavailableError as error:
+            raise ScreenApplicationError(503, "公式预览数据暂不可用，请稍后重试。") from error
+        except FormulaProjectionBudgetError as error:
             raise ScreenApplicationError(
                 422, "这只股票的历史超出单次预览范围，请换股票。",
             ) from error

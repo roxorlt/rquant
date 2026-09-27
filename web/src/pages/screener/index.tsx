@@ -358,15 +358,7 @@ export default function ScreenerPage() {
         </>
       )}
       <StockDrawer tsCode={selectedStock} onClose={() => setSelectedStock(null)} />
-      {formulaOpen ? (
-        <FormulaPreviewDialog
-          onClose={() => setFormulaOpen(false)}
-          onRefresh={() => void catalog.refetch()}
-          tradeDate={tradeDate}
-          source={catalog.data?.source ?? null}
-          sourceKind={catalog.data?.source_kind ?? null}
-        />
-      ) : null}
+      {formulaOpen ? <FormulaPreviewDialog onClose={() => setFormulaOpen(false)} /> : null}
     </>
   );
 }

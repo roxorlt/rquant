@@ -41,6 +41,13 @@ const blocks: Schemas["ScreenBlock"][] = [
 
 function catalog(available = true) {
   server.use(
+    http.get("*/api/v1/screen/tdx/preview/source", () =>
+      HttpResponse.json({
+        available,
+        dates: available ? ["2026-09-24"] : [],
+        source: available ? source : null,
+      }),
+    ),
     http.get("*/api/v1/screen/blocks", () =>
       HttpResponse.json({
         data: {
@@ -77,6 +84,31 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("历史数据未发布时禁用预览，手动刷新后读取独立日期", async () => {
+    catalog();
+    let ready = false;
+    server.use(
+      http.get("*/api/v1/screen/tdx/preview/source", () =>
+        HttpResponse.json({
+          available: ready,
+          dates: ready ? ["2026-09-23"] : [],
+          source: ready ? { ...source, identity: "b".repeat(64) } : null,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "导入公式" }));
+    const dialog = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(dialog).findByRole("status")).toHaveTextContent("预览数据暂不可用");
+    expect(within(dialog).getByRole("button", { name: "预览这只股票" })).toBeDisabled();
+    ready = true;
+    await user.click(within(dialog).getByRole("button", { name: "刷新公式预览数据" }));
+    await waitFor(() =>
+      expect(within(dialog).getByRole("combobox", { name: "数据日期" })).toHaveValue("2026-09-23"),
+    );
+  });
+
   it.each([
     ["no_match", "不符合", null],
     ["unknown", "暂无法判断", "历史日线不完整，暂无法判断。"],
@@ -121,6 +153,13 @@ describe("选股器", () => {
     let identity = source.identity;
     const previews: Schemas["TdxPreviewRequest"][] = [];
     server.use(
+      http.get("*/api/v1/screen/tdx/preview/source", () =>
+        HttpResponse.json({
+          available: true,
+          dates: ["2026-09-24"],
+          source: { ...source, identity },
+        }),
+      ),
       http.get("*/api/v1/screen/blocks", () =>
         HttpResponse.json({
           data: {
@@ -202,9 +241,9 @@ describe("选股器", () => {
     await user.click(within(dialog).getByRole("button", { name: "预览这只股票" }));
     expect(await within(dialog).findByText("符合")).toBeInTheDocument();
     identity = "b".repeat(64);
-    await user.click(within(dialog).getByRole("button", { name: "刷新选股数据" }));
+    await user.click(within(dialog).getByRole("button", { name: "刷新公式预览数据" }));
     expect(await within(dialog).findByRole("status")).toHaveTextContent(
-      "选股数据已更新，请重新预览",
+      "公式预览数据已更新，请重新预览",
     );
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "公式预览" })).toBeNull());

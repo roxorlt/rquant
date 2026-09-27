@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +17,11 @@ from rquant.replica_generation import (
     replica_generation_path,
     write_replica_generation_metadata,
 )
+from rquant.screen.formula_history_projection import (
+    _BARS_SQL,
+    publish_formula_history_projection,
+)
+from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.storage.duckdb import DuckDBStore
 from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
@@ -31,6 +38,10 @@ def _publish(primary: Path, replica: Path) -> None:
         replica_path=replica,
         output_path=replica_generation_path(replica),
         source_before=capture_database_watermark(primary),
+    )
+    publish_formula_history_projection(
+        VerifiedReplicaScreenSource(primary_path=primary, replica_path=replica),
+        primary.parent / "history",
     )
 
 
@@ -66,12 +77,14 @@ def _world(tmp_path: Path) -> tuple[Path, Path]:
 def _client(
     tmp_path: Path, primary: Path | None = None, replica: Path | None = None,
     *, now: datetime = AFTER_CLOSE, serving_root: Path | None = None,
+    history_root: Path | None = None,
 ) -> TestClient:
     return TestClient(create_app(
         WebSettings(
             serving_root=serving_root or tmp_path / "absent",
             screen_primary_path=primary,
             screen_replica_path=replica,
+            screen_history_root=history_root or tmp_path / "history",
         ),
         clock=lambda: now,
         background=False,
@@ -95,10 +108,10 @@ def _preview(
 
 
 def _identity(client: TestClient) -> str:
-    response = client.get("/api/v1/screen/blocks")
+    response = client.get("/api/v1/screen/tdx/preview/source")
     assert response.status_code == 200, response.text
-    assert response.json()["data"]["source_kind"] == "replica"
-    return response.json()["data"]["source"]["identity"]
+    assert response.json()["available"]
+    return response.json()["source"]["identity"]
 
 
 @pytest.mark.parametrize(
@@ -132,6 +145,25 @@ def test_new_listing_with_complete_but_short_history_remains_unknown(tmp_path: P
     primary, replica = _world(tmp_path)
     with _client(tmp_path, primary, replica) as client:
         response = _preview(client, _identity(client), "MA(CLOSE,20)>0")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "unknown"
+    assert response.json()["reason"] == "历史天数不足，暂无法判断。"
+
+
+def test_prelisting_dirty_bar_cannot_complete_fixed_window(tmp_path: Path) -> None:
+    primary, replica = _world(tmp_path)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar "
+            "(ts_code, trade_date, open, high, low, close, vol, amount) "
+            "VALUES ('600001.SH', '2026-04-10', 10, 11, 9, 10, 100, 1000)"
+        )
+    _publish(primary, replica)
+    with _client(tmp_path, primary, replica) as client:
+        response = _preview(
+            client, _identity(client), "MA(CLOSE,2)>0", day="2026-04-13",
+        )
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "unknown"
@@ -183,40 +215,30 @@ def test_missing_date_history_calendar_or_listing_is_unknown(
     assert response.json()["reason"]
 
 
-def test_preview_rejects_stale_source_identity_after_replica_rotation(tmp_path: Path) -> None:
+def test_preview_rejects_stale_source_identity_after_projection_rotation(tmp_path: Path) -> None:
     primary, replica = _world(tmp_path)
     with _client(tmp_path, primary, replica) as client:
         identity = _identity(client)
-        replacement = tmp_path / "replacement.duckdb"
-        shutil.copy2(replica, replacement)
-        replacement.replace(replica)
-        write_replica_generation_metadata(
-            primary_path=primary,
-            replica_path=replica,
-            output_path=replica_generation_path(replica),
-            source_before=capture_database_watermark(primary),
+        publish_formula_history_projection(
+            VerifiedReplicaScreenSource(primary_path=primary, replica_path=replica),
+            tmp_path / "history",
         )
         response = _preview(client, identity, "CLOSE>0")
 
     assert response.status_code == 409
-    assert response.json() == {"detail": "选股数据已更新，请刷新后重试。"}
+    assert response.json() == {"detail": "公式预览数据已更新，请刷新后重试。"}
 
 
-def test_preview_rejects_hardlink_even_with_matching_sidecar(tmp_path: Path) -> None:
+def test_preview_rejects_hardlinked_projection(tmp_path: Path) -> None:
     primary, replica = _world(tmp_path)
-    replica.unlink()
-    os.link(primary, replica)
-    write_replica_generation_metadata(
-        primary_path=primary,
-        replica_path=replica,
-        output_path=replica_generation_path(replica),
-        source_before=capture_database_watermark(primary),
-    )
+    history = tmp_path / "history"
+    file_name = json.loads((history / "current.json").read_text())["file_name"]
+    os.link(history / file_name, history / "alias.sqlite")
     with _client(tmp_path, primary, replica) as client:
         response = _preview(client, "a" * 64, "CLOSE>0")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "选股数据暂不可用，请稍后重试。"}
+    assert response.json() == {"detail": "公式预览数据暂不可用，请稍后重试。"}
 
 
 def test_preview_never_reads_or_stats_primary_file(
@@ -245,6 +267,63 @@ def test_preview_never_reads_or_stats_primary_file(
     assert response.json()["status"] == "match"
 
 
+def test_preview_does_not_reopen_the_screen_replica(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary, replica = _world(tmp_path)
+    with _client(tmp_path, primary, replica) as client:
+        screen_replica = client.app.state.web.screen_service.replica
+        assert screen_replica is not None
+
+        def forbidden_open():
+            raise AssertionError("preview must use its published history source")
+
+        monkeypatch.setattr(screen_replica, "_open", forbidden_open)
+        response = _preview(client, _identity(client), "CLOSE>0")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "match"
+
+
+def test_history_lookup_is_a_bounded_primary_key_search_with_one_million_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE TABLE bars (ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, "
+            "open REAL, high REAL, low REAL, close REAL, vol REAL, amount REAL, "
+            "PRIMARY KEY(ts_code,trade_date)) WITHOUT ROWID"
+        )
+        connection.executemany(
+            "INSERT INTO bars VALUES (?,?,?,?,?,?,?,?)",
+            (
+                (f"{code:06d}.SH", f"2025-{day // 28 + 1:02d}-{day % 28 + 1:02d}",
+                 1.0, 1.0, 1.0, 1.0, 100.0, 100.0)
+                for code in range(600000, 605000)
+                for day in range(200)
+            ),
+        )
+        sql = _BARS_SQL.format(listing="")
+        parameters = ("600001.SH", "2025-08-04", 3)
+        plan = connection.execute("EXPLAIN QUERY PLAN " + sql, parameters).fetchall()
+        steps = 0
+
+        def count_step() -> int:
+            nonlocal steps
+            steps += 1
+            return 0
+
+        connection.set_progress_handler(count_step, 1)
+        rows = connection.execute(sql, parameters).fetchall()
+        connection.set_progress_handler(None, 0)
+        assert len(rows) == 3
+        assert connection.execute("SELECT COUNT(*) FROM bars").fetchone()[0] == 1_000_000
+        assert any("SEARCH bars USING PRIMARY KEY (ts_code=?" in row[3] for row in plan)
+        assert not any("SCAN bars" in row[3] for row in plan)
+        assert steps < 500
+    finally:
+        connection.close()
+
+
 def test_preview_requires_open_calendar_date_and_closed_daily_bar(tmp_path: Path) -> None:
     primary, replica = _world(tmp_path)
     with _client(tmp_path, primary, replica) as client:
@@ -268,7 +347,7 @@ def test_preview_only_queries_selected_stock_history_and_calendar(
     primary, replica = _world(tmp_path)
     with _client(tmp_path, primary, replica) as client:
         identity = _identity(client)
-        source = client.app.state.web.screen_service.replica
+        source = client.app.state.web.screen_service.history
         assert source is not None
         original_open = source._open
         statements: list[str] = []
@@ -284,6 +363,9 @@ def test_preview_only_queries_selected_stock_history_and_calendar(
             def close(self):
                 self.connection.close()
 
+            def set_progress_handler(self, callback, instructions):
+                self.connection.set_progress_handler(callback, instructions)
+
         def observed_open():
             connection, descriptor, generation = original_open()
             return ObservedConnection(connection), descriptor, generation
@@ -292,11 +374,8 @@ def test_preview_only_queries_selected_stock_history_and_calendar(
         response = _preview(client, identity, "MA(CLOSE,2)>0")
 
     assert response.status_code == 200, response.text
-    assert not any("SELECT DISTINCT daily.trade_date" in query for query in statements)
-    assert any(
-        "FROM daily_bar WHERE ts_code = ?" in query and "LIMIT ?" in query
-        for query in statements
-    )
+    assert not any("daily_bar" in query for query in statements)
+    assert any("FROM bars INDEXED BY" in query and "LIMIT ?" in query for query in statements)
 
 
 def test_preview_rejects_invalid_formula_and_bounded_inputs(tmp_path: Path) -> None:
@@ -314,10 +393,22 @@ def test_preview_rejects_invalid_formula_and_bounded_inputs(tmp_path: Path) -> N
     assert "600001.SH' OR 1=1" not in bad_code.text
 
 
+def test_preview_never_falls_back_to_unindexed_replica(tmp_path: Path) -> None:
+    primary, replica = _world(tmp_path)
+    with _client(tmp_path, primary, replica, history_root=tmp_path / "absent-history") as client:
+        catalog = client.get("/api/v1/screen/tdx/preview/source")
+        response = _preview(client, "a" * 64, "CLOSE>0")
+
+    assert catalog.status_code == 200
+    assert catalog.json() == {"available": False, "dates": [], "source": None}
+    assert response.status_code == 503
+    assert response.json() == {"detail": "公式预览数据暂不可用，请稍后重试。"}
+
+
 def test_unconfigured_preview_never_falls_back_to_serving(tmp_path: Path) -> None:
     serving = tmp_path / "serving"
     build_web_fixture(serving, "baseline")
     with _client(tmp_path, serving_root=serving) as client:
         response = _preview(client, "a" * 64, "CLOSE>0")
     assert response.status_code == 503
-    assert response.json() == {"detail": "选股数据暂不可用，请稍后重试。"}
+    assert response.json() == {"detail": "公式预览数据暂不可用，请稍后重试。"}

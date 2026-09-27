@@ -163,3 +163,11 @@ class TdxPreviewData(BaseModel):
     status: Literal["match", "no_match", "unknown"]
     reason: str | None
     source_updated_at: datetime
+
+
+class TdxPreviewSourceData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    available: bool
+    dates: list[date]
+    source: ScreenSourceInfo | None

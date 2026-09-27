@@ -76,4 +76,4 @@ owner 原话：「UI UX 需要按使用人体验极致的角度做精细设计�
 
 - 静态文件由 nginx 在 `/app/` 下直接发送，内容安全策略禁止内联脚本和外部资源：不要在 `index.html` 里写脚本，不要引用 CDN 或 Google Fonts。
 - 编译用相对路径（`base: "./"`）+ hash 路由（`/app/#/panorama`），接口地址也按页面相对计算（`/app/api/v1/...`）。
-- 网页 API 默认只读 Serving 数据代。选股页在显式配置时可读取经 sidecar 核验的只读 DuckDB 副本，副本失效不得回退 Serving；网页进程仍不得访问或检查主库文件。所有写操作将来都经 PageControl，并带 `X-Rquant-Csrf: 1`（`src/rquant/web/security.py`）。
+- 网页 API 默认只读 Serving 数据代。选股条件在显式配置时可读取经 sidecar 核验的只读 DuckDB 副本；单股公式预览只读由该副本离线发布的独立历史投影，缺投影不得回退大表或 Serving。网页进程仍不得访问或检查主库文件。所有写操作将来都经 PageControl，并带 `X-Rquant-Csrf: 1`（`src/rquant/web/security.py`）。

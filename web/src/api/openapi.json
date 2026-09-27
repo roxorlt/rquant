@@ -4770,6 +4770,39 @@
         "title": "TdxPreviewRequest",
         "type": "object"
       },
+      "TdxPreviewSourceData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Dates",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "available",
+          "dates",
+          "source"
+        ],
+        "title": "TdxPreviewSourceData",
+        "type": "object"
+      },
       "TranslationPlan": {
         "additionalProperties": false,
         "properties": {
@@ -5621,6 +5654,27 @@
           }
         },
         "summary": "单股预览通达信公式",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/preview/source": {
+      "get": {
+        "operationId": "get_tdx_preview_source_api_v1_screen_tdx_preview_source_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TdxPreviewSourceData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "公式预览数据",
         "tags": [
           "screen"
         ]

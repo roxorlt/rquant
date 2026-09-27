@@ -3,9 +3,9 @@ import { ApiError } from "@/api/client";
 import {
   fetchTdxParse,
   fetchTdxPreview,
-  type ScreenCatalogData,
   type TdxParseData,
   type TdxPreviewData,
+  useTdxPreviewSource,
 } from "@/api/screen";
 import { Button, RelativeTime, SideDrawer, Tip } from "@/ui";
 
@@ -15,38 +15,33 @@ type Notice = { key: string; message: string };
 
 interface FormulaPreviewDialogProps {
   onClose: () => void;
-  onRefresh: () => void;
-  tradeDate: string | null;
-  source: ScreenCatalogData["source"];
-  sourceKind: ScreenCatalogData["source_kind"] | null;
 }
 
-export function FormulaPreviewDialog({
-  onClose,
-  onRefresh,
-  tradeDate,
-  source,
-  sourceKind,
-}: FormulaPreviewDialogProps) {
+export function FormulaPreviewDialog({ onClose }: FormulaPreviewDialogProps) {
   const [formula, setFormula] = useState("");
   const [stockCode, setStockCode] = useState("");
+  const [selectedDate, setSelectedDate] = useState("");
   const [check, setCheck] = useState<Check | null>(null);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [checking, setChecking] = useState(false);
   const [previewing, setPreviewing] = useState(false);
+  const catalog = useTdxPreviewSource();
+  const dates = catalog.data?.dates ?? [];
+  const tradeDate = dates.includes(selectedDate) ? selectedDate : (dates[0] ?? null);
+  const source = catalog.data?.source ?? null;
   const previewKey = JSON.stringify([formula, stockCode, tradeDate, source?.identity]);
   const checked = check?.source === formula ? check.data : null;
   const currentPreview = preview?.key === previewKey ? preview.data : null;
   const sourceChanged = preview !== null && preview.sourceIdentity !== source?.identity;
-  const sourceReady = sourceKind === "replica" && source !== null && tradeDate !== null;
+  const sourceReady = catalog.data?.available === true && source !== null && tradeDate !== null;
   const stockValid = /^\d{6}\.(?:SH|SZ|BJ)$/.test(stockCode);
   const canPreview = sourceReady && checked?.status === "parsed" && stockValid && !previewing;
 
   let status: string | null = null;
   let tone = "";
   if (sourceChanged) {
-    status = "选股数据已更新，请重新预览。";
+    status = "公式预览数据已更新，请重新预览。";
     tone = "warn";
   } else if (check !== null && check.source !== formula) {
     status = "输入已改，请重新检查并预览。";
@@ -73,7 +68,7 @@ export function FormulaPreviewDialog({
       "公式暂无法预览，请修改后重试。";
     tone = "warn";
   } else if (!sourceReady) {
-    status = "单股预览数据暂不可用，请稍后刷新选股数据。";
+    status = catalog.isLoading ? "正在读取预览数据…" : "公式预览数据暂不可用，请稍后刷新。";
     tone = "warn";
   } else if (checked?.status === "parsed") {
     status = "公式可以预览这只股票。";
@@ -114,8 +109,8 @@ export function FormulaPreviewDialog({
       setPreview({ key: submittedKey, sourceIdentity, data });
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 409) {
-        setNotice({ key: submittedKey, message: "选股数据已更新，请刷新后重新预览。" });
-        onRefresh();
+        setNotice({ key: submittedKey, message: "公式预览数据已更新，请刷新后重新预览。" });
+        void catalog.refetch();
       } else {
         setNotice({
           key: submittedKey,
@@ -132,9 +127,15 @@ export function FormulaPreviewDialog({
       <div className="tdx-preview">
         <div className="tdx-preview-source-info">
           <span>
-            选股数据 {source ? <RelativeTime at={source.updated_at} suffix="更新" /> : "暂不可用"}
+            公式预览数据{" "}
+            {source ? <RelativeTime at={source.updated_at} suffix="更新" /> : "暂不可用"}
           </span>
-          <Button size="sm" variant="ghost" aria-label="刷新选股数据" onClick={onRefresh}>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-label="刷新公式预览数据"
+            onClick={() => void catalog.refetch()}
+          >
             刷新
           </Button>
         </div>
@@ -161,10 +162,22 @@ export function FormulaPreviewDialog({
               autoComplete="off"
             />
           </label>
-          <div className="field">
+          <label className="field">
             <span className="lbl">数据日期</span>
-            <span className="tdx-preview-date num">{tradeDate ?? "暂无日期"}</span>
-          </div>
+            <select
+              className="inp tdx-preview-date num"
+              value={tradeDate ?? ""}
+              onChange={(event) => setSelectedDate(event.target.value)}
+              disabled={dates.length === 0}
+            >
+              {dates.length === 0 ? <option value="">暂无日期</option> : null}
+              {dates.map((day) => (
+                <option key={day} value={day}>
+                  {day}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
         <div className="tdx-preview-actions">
           <Tip content="先检查公式是否支持，再用所选日期预览一只股票。">
@@ -180,7 +193,7 @@ export function FormulaPreviewDialog({
             onClick={() => void previewStock()}
             disabledReason={
               !sourceReady
-                ? "选股数据暂不可用"
+                ? "公式预览数据暂不可用"
                 : checked?.status !== "parsed"
                   ? "先检查公式"
                   : !stockValid
@@ -198,7 +211,7 @@ export function FormulaPreviewDialog({
             {currentPreview?.reason ? <span>{currentPreview.reason}</span> : null}
             {currentPreview ? (
               <small>
-                选股数据 <RelativeTime at={currentPreview.source_updated_at} suffix="更新" />
+                公式预览数据 <RelativeTime at={currentPreview.source_updated_at} suffix="更新" />
               </small>
             ) : null}
           </div>

@@ -6,6 +6,16 @@ import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 test("单股公式预览先检查再判断，来源换代后桌面与手机要求重跑", async ({ page }, testInfo) => {
   const watcher = watch(page);
   let identity = "a".repeat(64);
+  await page.route("**/api/v1/screen/tdx/preview/source", async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        available: true,
+        dates: ["2026-09-24"],
+        source: { identity, updated_at: "2026-09-24T07:31:00Z" },
+      },
+    });
+  });
   await page.route("**/api/v1/screen/blocks", async (route) => {
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
@@ -72,8 +82,8 @@ test("单股公式预览先检查再判断，来源换代后桌面与手机要�
   await expectNoHorizontalOverflow(page, "formula preview phone");
   await page.screenshot({ path: testInfo.outputPath("formula-preview-phone.png") });
   identity = "b".repeat(64);
-  await dialog.getByRole("button", { name: "刷新选股数据" }).click();
-  await expect(dialog.getByRole("status")).toContainText("选股数据已更新，请重新预览");
+  await dialog.getByRole("button", { name: "刷新公式预览数据" }).click();
+  await expect(dialog.getByRole("status")).toContainText("公式预览数据已更新，请重新预览");
   await dialog.getByRole("button", { name: "预览这只股票" }).click();
   await expect(dialog.getByRole("status")).toContainText("符合");
   expect(watcher.problems).toEqual([]);

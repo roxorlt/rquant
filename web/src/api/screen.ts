@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query";
 import { ApiError, apiClient, type Schemas } from "./client";
 import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
@@ -12,6 +13,22 @@ export type TdxParseRequest = Schemas["TdxParseRequest"];
 export type TdxParseData = Schemas["TdxParseData"];
 export type TdxPreviewRequest = Schemas["TdxPreviewRequest"];
 export type TdxPreviewData = Schemas["TdxPreviewData"];
+export type TdxPreviewSourceData = Schemas["TdxPreviewSourceData"];
+
+export function useTdxPreviewSource() {
+  return useQuery({
+    queryKey: ["tdx-preview-source"],
+    queryFn: async (): Promise<TdxPreviewSourceData> => {
+      const { data, response } = await apiClient().GET("/api/v1/screen/tdx/preview/source");
+      if (data === undefined) {
+        throw new ApiError(response.status, "公式预览数据暂时无法加载。");
+      }
+      return data;
+    },
+    staleTime: Infinity,
+    refetchOnMount: "always",
+  });
+}
 
 export function useScreenCatalog(): ServingQueryResult<ScreenCatalogData> {
   return useServingQuery(

@@ -293,6 +293,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/tdx/preview/source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式预览数据 */
+        get: operations["get_tdx_preview_source_api_v1_screen_tdx_preview_source_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stocks/search": {
         parameters: {
             query?: never;
@@ -1815,6 +1832,14 @@ export interface components {
              */
             trade_date: string;
         };
+        /** TdxPreviewSourceData */
+        TdxPreviewSourceData: {
+            /** Available */
+            available: boolean;
+            /** Dates */
+            dates: string[];
+            source: components["schemas"]["ScreenSourceInfo"] | null;
+        };
         /** TranslationPlan */
         TranslationPlan: {
             /** Assignments */
@@ -2352,6 +2377,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_tdx_preview_source_api_v1_screen_tdx_preview_source_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TdxPreviewSourceData"];
                 };
             };
         };
