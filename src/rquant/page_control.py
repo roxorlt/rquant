@@ -261,6 +261,20 @@ class SubmitBackfillPlan(PageControlCommand):
         return self
 
 
+class SubmitDataAuditReport(PageControlCommand):
+    kind: Literal["submit_data_audit_report"] = "submit_data_audit_report"
+    actor_id: str = Field(min_length=1, max_length=256)
+    audit_start: date
+    observed_through: date
+
+    @model_validator(mode="after")
+    def validate_range(self) -> SubmitDataAuditReport:
+        days = (self.observed_through - self.audit_start).days + 1
+        if days < 1 or days > MAX_AUDIT_DAYS:
+            raise ValueError(f"data audit report range must contain 1 to {MAX_AUDIT_DAYS} days")
+        return self
+
+
 class ExportLabArtifactZip(PageControlCommand):
     kind: Literal["export_lab_artifact_zip"] = "export_lab_artifact_zip"
     job_id: UUID
@@ -302,6 +316,12 @@ class BackfillPlanPageControlBackend(Protocol):
     def recover(self, command: SubmitBackfillPlan) -> JsonValue | None: ...
 
 
+class DataAuditReportPageControlBackend(Protocol):
+    def submit(self, command: SubmitDataAuditReport) -> JsonValue: ...
+
+    def recover(self, command: SubmitDataAuditReport) -> JsonValue | None: ...
+
+
 PageControlCommandValue = Annotated[
     AckAlert
     | SaveCanvas
@@ -318,6 +338,7 @@ PageControlCommandValue = Annotated[
     | InitializeLabExports
     | SubmitLabCommand
     | SubmitBackfillPlan
+    | SubmitDataAuditReport
     | ExportLabArtifactZip
     | DiscardLabArtifactZip,
     Field(discriminator="kind"),
@@ -1408,6 +1429,7 @@ class PageControlConsumer:
         allowed_lab_export_roots: tuple[Path, ...] = (),
         lab_backend: LabPageControlBackend | None = None,
         backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
+        data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -1423,6 +1445,7 @@ class PageControlConsumer:
         )
         self.lab_backend = lab_backend
         self.backfill_plan_backend = backfill_plan_backend
+        self.data_audit_report_backend = data_audit_report_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -1849,6 +1872,8 @@ class PageControlConsumer:
             )
         if isinstance(command, SubmitBackfillPlan):
             return self._backfill_plan_backend().submit(command)
+        if isinstance(command, SubmitDataAuditReport):
+            return self._data_audit_report_backend().submit(command)
         if isinstance(command, ExportLabArtifactZip):
             return self._lab_backend().export_zip(command.job_id)
         if isinstance(command, DiscardLabArtifactZip):
@@ -1864,6 +1889,11 @@ class PageControlConsumer:
         if self.backfill_plan_backend is None:
             raise RuntimeError("backfill plan backend is unavailable")
         return self.backfill_plan_backend
+
+    def _data_audit_report_backend(self) -> DataAuditReportPageControlBackend:
+        if self.data_audit_report_backend is None:
+            raise RuntimeError("data audit report backend is unavailable")
+        return self.data_audit_report_backend
 
     def _local_effect_fence_targets(
         self,
@@ -2075,6 +2105,8 @@ class PageControlConsumer:
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
         if isinstance(command, SubmitBackfillPlan):
             return self._backfill_plan_backend().recover(command)
+        if isinstance(command, SubmitDataAuditReport):
+            return self._data_audit_report_backend().recover(command)
         if isinstance(command, CreateCanvas):
             return self._recover_create_canvas_result(command)
         if isinstance(command, SaveCanvas):
@@ -3708,6 +3740,7 @@ __all__ = [
     "LabArtifactZipResult",
     "LabPageControlBackend",
     "BackfillPlanPageControlBackend",
+    "DataAuditReportPageControlBackend",
     "PageControlCommandValue",
     "PageControlClient",
     "PageControlConsumer",
@@ -3724,4 +3757,5 @@ __all__ = [
     "SetCanvasPoolRefs",
     "SubmitLabCommand",
     "SubmitBackfillPlan",
+    "SubmitDataAuditReport",
 ]
