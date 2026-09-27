@@ -16,6 +16,12 @@ from typing import TYPE_CHECKING, cast
 import duckdb
 import pandas as pd
 
+from rquant.financial_data_center import (
+    FinancialSummaryBudgetError,
+    FundamentalSummary,
+    read_fundamental_summary,
+)
+from rquant.fundamental_receipts import FundamentalReceiptError
 from rquant.readside_replica_gate import connect_pinned_readonly
 from rquant.replica_generation import (
     ReplicaFileWatermark,
@@ -92,12 +98,20 @@ class ScreenDatesSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FundamentalSummarySnapshot:
+    summary: FundamentalSummary
+    identity: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _VerifiedGeneration:
     replica: tuple[int, int, int, int, int]
     sidecar: tuple[int, int, int, int, int]
     sidecar_sha256: str
     identity: str
     updated_at: datetime
+    synced_at: datetime
 
 
 @dataclass(slots=True)
@@ -202,6 +216,7 @@ class VerifiedReplicaScreenSource:
             sidecar_sha256=sidecar_hash,
             identity=hashlib.sha256(payload).hexdigest(),
             updated_at=datetime.fromtimestamp(replica_stat.st_mtime_ns / 1e9, tz=UTC),
+            synced_at=datetime.fromtimestamp(sidecar_identity[3] / 1e9, tz=UTC),
         )
 
     def _open(self) -> tuple[duckdb.DuckDBPyConnection, int, _VerifiedGeneration]:
@@ -239,6 +254,25 @@ class VerifiedReplicaScreenSource:
 
     def generation_identity(self) -> str:
         return self._verify().identity
+
+    def fundamental_summary(
+        self, *, now: datetime, expected_identity: str | None = None
+    ) -> FundamentalSummarySnapshot:
+        connection, descriptor, generation = self._open()
+        try:
+            if expected_identity is not None and generation.identity != expected_identity:
+                raise ScreenReplicaChangedError("financial replica generation changed")
+            connection.execute("SET threads=1")
+            summary = read_fundamental_summary(connection, now=now)
+            self._finish(descriptor, generation)
+            return FundamentalSummarySnapshot(summary, generation.identity, generation.synced_at)
+        except FinancialSummaryBudgetError as error:
+            raise ScreenReplicaBudgetError("financial summary exceeds the row budget") from error
+        except (duckdb.Error, FundamentalReceiptError, ValueError) as error:
+            raise ScreenReplicaDataError("financial summary receipts are unavailable") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
 
     def available_dates(self, *, limit: int = 30) -> ScreenDatesSnapshot:
         if not 1 <= limit <= 30:
