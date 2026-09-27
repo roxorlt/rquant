@@ -1173,6 +1173,40 @@ DAILY_BASIC_VALUATION_OBSERVATION_DDLS: tuple[str, ...] = (
     """,
 )
 
+FUNDAMENTAL_DAILY_VERSION_DDLS: tuple[str, ...] = (
+    """
+    CREATE TABLE fundamental_daily_version (
+        version_id VARCHAR PRIMARY KEY,
+        ts_code VARCHAR NOT NULL,
+        trade_date DATE NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        decision_at TIMESTAMPTZ NOT NULL,
+        target_report_period DATE,
+        target_period_reason VARCHAR NOT NULL,
+        financial_source_json VARCHAR NOT NULL,
+        valuation_source_json VARCHAR NOT NULL,
+        fields_json VARCHAR NOT NULL,
+        pe_ttm DOUBLE,
+        pb DOUBLE,
+        dv_ttm DOUBLE,
+        roe DOUBLE,
+        or_yoy DOUBLE,
+        netprofit_yoy DOUBLE,
+        UNIQUE (ts_code, trade_date, revision),
+        UNIQUE (ts_code, trade_date, version_id)
+    );
+    """,
+    """
+    CREATE TABLE fundamental_daily_head (
+        ts_code VARCHAR NOT NULL,
+        trade_date DATE NOT NULL,
+        version_id VARCHAR NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        PRIMARY KEY (ts_code, trade_date)
+    );
+    """,
+)
+
 BASE_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
