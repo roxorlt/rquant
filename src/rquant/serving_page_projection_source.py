@@ -37,6 +37,12 @@ from rquant.backfill_plan_artifact import (
     parse_daily_bar_backfill_plan_bytes,
 )
 from rquant.backfill_plan_core import DailyBarBackfillPlan
+from rquant.backfill_plan_job_projection import (
+    BackfillPlanProgressEvent,
+    BackfillPlanProgressState,
+    read_backfill_plan_job_snapshot,
+    validate_backfill_plan_progress,
+)
 from rquant.backfill_plan_projection import (
     BACKFILL_PLAN_PROJECTION_TABLES,
     MAX_DISCOVERABLE_BACKFILL_PLANS,
@@ -3200,6 +3206,7 @@ class DuckDBLabPageProjectionSource:
         control_root: Path | None = None,
         audit_report_path: Path | None = None,
         backfill_plan_directory: Path | None = None,
+        backfill_plan_job_state_path: Path | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
@@ -3210,6 +3217,12 @@ class DuckDBLabPageProjectionSource:
         if backfill_plan_directory is not None and not backfill_plan_directory.is_absolute():
             raise ValueError("backfill plan directory must be absolute")
         self.backfill_plan_directory = backfill_plan_directory
+        if backfill_plan_job_state_path is not None:
+            if not backfill_plan_job_state_path.is_absolute():
+                raise ValueError("backfill plan job state path must be absolute")
+            if backfill_plan_directory is None:
+                raise ValueError("backfill plan job state requires a plan directory")
+        self.backfill_plan_job_state_path = backfill_plan_job_state_path
 
     def _backfill_plan_projections(
         self, observed_at: datetime
@@ -3220,15 +3233,29 @@ class DuckDBLabPageProjectionSource:
             return ()
         observed = normalize_aware_utc(observed_at)
         try:
+            job_snapshot = read_backfill_plan_job_snapshot(
+                self.backfill_plan_job_state_path, observed_at=observed
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"backfill plan job state invalid: {exc}"
+            ) from exc
+        try:
             binding = _bind_readonly_directory(directory, label="backfill plan directory")
         except FileNotFoundError:
             try:
                 os.stat(directory, follow_symlinks=False)
             except FileNotFoundError:
-                return project_backfill_plans(
-                    (),
-                    available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
-                )
+                try:
+                    return project_backfill_plans(
+                        (),
+                        available_at=max(_EMPTY_PROJECTION_AVAILABLE_AT, job_snapshot.available_at),
+                        job_snapshot=job_snapshot,
+                    )
+                except ValueError as exc:
+                    raise PageProjectionSourceIntegrityError(
+                        f"backfill plan invalid: {exc}"
+                    ) from exc
             raise PageProjectionSourceIntegrityError(
                 "backfill plan directory appeared while read"
             ) from None
@@ -3240,8 +3267,7 @@ class DuckDBLabPageProjectionSource:
             if os.name != "posix" or directory_stat.st_ctime_ns <= 0:
                 raise ValueError("backfill plan directory publication time is unavailable")
             available_ns = max(
-                directory_stat.st_ctime_ns,
-                *(entry.published_ns for entry in entries),
+                (directory_stat.st_ctime_ns, *(entry.published_ns for entry in entries))
             )
             if available_ns > int(observed.timestamp() * 1_000_000_000):
                 raise ValueError("backfill plan is not yet available")
@@ -3255,7 +3281,11 @@ class DuckDBLabPageProjectionSource:
             _verify_bound_backfill_catalogue(binding, entries)
             return project_backfill_plans(
                 indexed,
-                available_at=datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC),
+                available_at=max(
+                    datetime.fromtimestamp(available_ns / 1_000_000_000, tz=UTC),
+                    job_snapshot.available_at,
+                ),
+                job_snapshot=job_snapshot,
             )
         except (OSError, ValueError) as exc:
             raise PageProjectionSourceIntegrityError(f"backfill plan invalid: {exc}") from exc
@@ -4711,29 +4741,52 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         if names >= BACKFILL_PLAN_PROJECTION_TABLES:
             catalog_rows = projections["backfill_plan_catalog"].rows
             progress_rows = projections["backfill_plan_progress"].rows
-            if len(catalog_rows) != 1 or progress_rows != (
-                {"status_key": "current", "availability": "unavailable", "task_id": None},
+            job_rows = projections["backfill_plan_job"].rows
+            if (
+                len(catalog_rows) != 1
+                or progress_rows
+                != ({"status_key": "current", "availability": "unavailable", "task_id": None},)
+                or len(job_rows) != 1
             ):
-                raise ValueError("backfill plan progress must remain unavailable")
+                raise ValueError("backfill plan progress is incomplete")
             catalog = catalog_rows[0]
             index = projections["backfill_plan_index"].rows
             preview = projections["backfill_plan_preview"].rows
             archive = projections["backfill_plan_archive"].rows
+            try:
+                progress = BackfillPlanProgressState.model_validate(dict(job_rows[0]))
+                events = tuple(
+                    BackfillPlanProgressEvent.model_validate(dict(row))
+                    for row in projections["backfill_plan_event"].rows
+                )
+                if (
+                    len(
+                        {projections[name].available_at for name in BACKFILL_PLAN_PROJECTION_TABLES}
+                    )
+                    != 1
+                ):
+                    raise ValueError("backfill plan projection times disagree")
+                validate_backfill_plan_progress(
+                    progress,
+                    events,
+                    available_at=projections["backfill_plan_job"].available_at,
+                    plan_hashes=frozenset(row["plan_hash"] for row in index),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("backfill plan progress is invalid") from exc
             if (
                 catalog["catalog_key"] != "current"
                 or catalog["total_plan_count"] != len(index)
                 or catalog["indexed_plan_count"] != len(index)
                 or catalog["preview_plan_count"] != len(preview)
                 or catalog["has_older_plans"] is not False
-                or catalog["oldest_indexed_hash"]
-                != (index[-1]["plan_hash"] if index else None)
+                or catalog["oldest_indexed_hash"] != (index[-1]["plan_hash"] if index else None)
                 or [row["rank"] for row in index] != list(range(len(index)))
                 or len(preview) != min(MAX_PREVIEW_BACKFILL_PLANS, len(index))
                 or {row["plan_hash"] for row in preview}
                 != {row["plan_hash"] for row in index[: len(preview)]}
                 or len(archive) != len(index)
-                or {row["plan_hash"] for row in archive}
-                != {row["plan_hash"] for row in index}
+                or {row["plan_hash"] for row in archive} != {row["plan_hash"] for row in index}
             ):
                 raise ValueError("backfill plan catalog rows disagree")
             if any(
@@ -4753,12 +4806,10 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     if (
                         detail.audit_start.isoformat() != summary["audit_start"]
                         or detail.completed_through.isoformat() != summary["completed_through"]
-                        or detail.cutoff_observed_at.isoformat()
-                        != summary["cutoff_observed_at"]
+                        or detail.cutoff_observed_at.isoformat() != summary["cutoff_observed_at"]
                         or detail.published_at.isoformat() != summary["published_at"]
                         or len(detail.missing_dates) != summary["missing_day_count"]
-                        or str(detail.estimate.estimated_seconds)
-                        != summary["estimated_seconds"]
+                        or str(detail.estimate.estimated_seconds) != summary["estimated_seconds"]
                         or detail.source.mode != summary["source_mode"]
                         or detail.source.snapshot_label != summary["snapshot_label"]
                     ):
