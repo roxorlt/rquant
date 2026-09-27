@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ApiError } from "@/api/client";
-import { type ResearchJobItem, type ResearchJobsData, useResearchJobs } from "@/api/endpoints";
+import { type ResearchJobItem, type ResearchJobsData, useTaskOverview } from "@/api/endpoints";
 import { formatCount, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime, formatShanghaiTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
@@ -16,6 +16,7 @@ import {
   StatusBadge,
   Tip,
 } from "@/ui";
+import { OverviewSections } from "./OverviewSections";
 import "./tasks.css";
 
 function metrics(data: ResearchJobsData): Kpi[] {
@@ -140,10 +141,62 @@ function emptyHint(state: ResearchJobsData["source_state"]): string {
 export default function TasksPage() {
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [, setClockPulse] = useState(0);
   const pageIndex = cursors.length - 1;
-  const result = useResearchJobs(cursors[pageIndex] ?? null, refreshKey);
-  const data = result.data;
+  const result = useTaskOverview(cursors[pageIndex] ?? null, refreshKey);
+  const snapshot = result.data;
+  const data = snapshot?.overview;
   const changed = result.error instanceof ApiError && result.error.status === 409;
+  const now = performance.now();
+  const scheduledDeadline = snapshot?.scheduledDeadline ?? null;
+  const resourcesDeadline = snapshot?.resourcesDeadline ?? null;
+  const scheduledFresh =
+    data?.scheduled.source_state === "ready" &&
+    scheduledDeadline !== null &&
+    scheduledDeadline > now;
+  const resourcesFresh =
+    data?.resources.source_state === "ready" &&
+    resourcesDeadline !== null &&
+    resourcesDeadline > now;
+
+  useEffect(() => {
+    if (!changed || pageIndex === 0) return;
+    setCursors([null]);
+    setRefreshKey((value) => value + 1);
+  }, [changed, pageIndex]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const schedule = () => {
+      const current = performance.now();
+      const next = [snapshot?.scheduledDeadline, snapshot?.resourcesDeadline]
+        .filter(
+          (deadline): deadline is number =>
+            deadline !== null && deadline !== undefined && deadline > current,
+        )
+        .sort((left, right) => left - right)[0];
+      if (next === undefined) return;
+      timer = window.setTimeout(
+        () => {
+          setClockPulse((value) => value + 1);
+          schedule();
+        },
+        Math.ceil(next - current),
+      );
+    };
+    schedule();
+    return () => window.clearTimeout(timer);
+  }, [snapshot?.scheduledDeadline, snapshot?.resourcesDeadline]);
+
+  useEffect(() => {
+    const wake = () => setClockPulse((value) => value + 1);
+    window.addEventListener("focus", wake);
+    document.addEventListener("visibilitychange", wake);
+    return () => {
+      window.removeEventListener("focus", wake);
+      document.removeEventListener("visibilitychange", wake);
+    };
+  }, []);
 
   function refresh() {
     setCursors([null]);
@@ -155,51 +208,61 @@ export default function TasksPage() {
       <PageHeader
         eyebrow="运维"
         title="任务与调度"
-        note="查看研究任务的进度与预计结束时间"
+        note="定时任务、运行服务、资源和研究队列"
         actions={
           <Button size="sm" variant="ghost" onClick={refresh} disabled={result.isFetching}>
             刷新
           </Button>
         }
       />
-      {result.isLoading ? (
-        <PageSkeleton label="研究任务加载中" />
+      {result.isLoading || (changed && pageIndex > 0) ? (
+        <PageSkeleton label="任务总览加载中" />
       ) : result.error ? (
-        <Panel title="研究任务">
+        <Panel title="任务总览">
           <EmptyState
-            title={changed ? "数据已更新，请从第一页重新查看。" : "研究任务暂时无法加载"}
+            title={changed ? "数据已更新，请重新查看。" : "任务总览暂时无法加载"}
             hint={
-              <Button size="sm" onClick={changed ? refresh : result.refetch}>
-                {changed ? "返回最新" : "重试"}
+              <Button size="sm" onClick={result.refetch}>
+                重试
               </Button>
             }
           />
         </Panel>
       ) : data ? (
         <div className="tasks-content">
-          {data.counts ? <KpiStrip items={metrics(data)} label="任务状态概况" compact /> : null}
+          <OverviewSections
+            data={data}
+            scheduledFresh={scheduledFresh}
+            resourcesFresh={resourcesFresh}
+          />
+          {data.research.counts ? (
+            <KpiStrip items={metrics(data.research)} label="任务状态概况" compact />
+          ) : null}
           <Panel
             title="研究任务"
             sub={
-              data.source_updated_at ? (
+              data.research.source_updated_at ? (
                 <span>
-                  数据 <RelativeTime at={data.source_updated_at} />
+                  数据 <RelativeTime at={data.research.source_updated_at} />
                   更新
                 </span>
               ) : undefined
             }
           >
-            {data.source_note ? (
+            {data.research.source_note ? (
               <p className="tasks-notice" role="status">
-                {data.source_note}
+                {data.research.source_note}
               </p>
             ) : null}
-            {data.source_state !== "ready" ? (
-              <EmptyState title={data.source_label} hint={emptyHint(data.source_state)} />
+            {data.research.source_state !== "ready" ? (
+              <EmptyState
+                title={data.research.source_label}
+                hint={emptyHint(data.research.source_state)}
+              />
             ) : (
               <>
                 <DataTable
-                  rows={data.items}
+                  rows={data.research.items}
                   columns={COLUMNS}
                   rowKey={(row) => row.job_id}
                   label="研究任务队列"
@@ -216,10 +279,12 @@ export default function TasksPage() {
                   </Button>
                   <Button
                     size="sm"
-                    disabled={data.next_cursor === null || result.isFetching}
+                    disabled={data.research.next_cursor === null || result.isFetching}
                     onClick={() =>
                       setCursors((current) =>
-                        data.next_cursor ? [...current, data.next_cursor] : current,
+                        data.research.next_cursor
+                          ? [...current, data.research.next_cursor]
+                          : current,
                       )
                     }
                   >
