@@ -899,6 +899,53 @@ export interface components {
             /** Unassessed Reasons */
             unassessed_reasons: components["schemas"]["AuditReportUnassessedReason"][];
         };
+        /** AuditReportTaskEvent */
+        AuditReportTaskEvent: {
+            /**
+             * Event Type
+             * @enum {string}
+             */
+            event_type: "queued" | "started" | "resumed" | "source_check" | "succeeded" | "failed";
+            /** Label */
+            label: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+        };
+        /** AuditReportTaskProgress */
+        AuditReportTaskProgress: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "ready";
+            /** Events */
+            events?: components["schemas"]["AuditReportTaskEvent"][];
+            /** Latest Attempts */
+            latest_attempts?: number | null;
+            /** Latest Created At */
+            latest_created_at?: string | null;
+            /** Latest Hint */
+            latest_hint?: string | null;
+            /** Latest Status */
+            latest_status?: ("queued" | "running" | "succeeded" | "failed") | null;
+            /** Latest Status Label */
+            latest_status_label?: string | null;
+            /** Latest Task Id */
+            latest_task_id?: string | null;
+            /** Latest Updated At */
+            latest_updated_at?: string | null;
+            /** Successful Created At */
+            successful_created_at?: string | null;
+            /** Successful Report Hash */
+            successful_report_hash?: string | null;
+            /** Successful Task Id */
+            successful_task_id?: string | null;
+            /** Successful Updated At */
+            successful_updated_at?: string | null;
+        };
         /** AuditReportUnassessedReason */
         AuditReportUnassessedReason: {
             /** Days */
@@ -1595,6 +1642,7 @@ export interface components {
             /** Months */
             months: components["schemas"]["AuditReportMonth"][];
             overview: components["schemas"]["AuditReportOverview"] | null;
+            progress?: components["schemas"]["AuditReportTaskProgress"];
             /** Rules */
             rules: components["schemas"]["AuditReportRule"][];
             /**

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel
 
-from rquant.data_audit_contracts import REPORT_PROJECTION_TABLES
+from rquant.data_audit_contracts import REPORT_JOB_PROJECTION_TABLES, REPORT_PROJECTION_TABLES
+from rquant.data_audit_report_job_projection import (
+    DataAuditReportJobProgress,
+    validate_data_audit_report_job_progress,
+)
+from rquant.data_audit_report_jobs import DataAuditReportJobEvent
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
 from rquant.web.envelope import Envelope
 from rquant.web.models.data_audit_report import (
@@ -18,6 +24,8 @@ from rquant.web.models.data_audit_report import (
     AuditReportMonth,
     AuditReportOverview,
     AuditReportRule,
+    AuditReportTaskEvent,
+    AuditReportTaskProgress,
     AuditReportUnassessedReason,
     DataAuditReportData,
     IssueRuleId,
@@ -31,6 +39,7 @@ from rquant.web.serving import BorrowedGeneration, serving_meta
 
 router = APIRouter(prefix="/data")
 _TABLES = tuple(sorted(REPORT_PROJECTION_TABLES))
+_JOB_TABLES = tuple(sorted(REPORT_JOB_PROJECTION_TABLES))
 _CHANGED = "审计报告已更新，请重新查看。"
 _UNREADABLE = "审计报告暂时无法读取，请稍后重试。"
 _RULE_NAMES = {
@@ -69,25 +78,49 @@ _ISSUE_TO_RULE = {
     "daily_bar.zero_volume_unsuspended": "daily_bar.zero_volume",
     "daily_bar.field_null_ratio": "daily_bar.field_null_ratio",
 }
-_RowT = TypeVar("_RowT", ReportOverviewRow, ReportMonthRow, ReportRuleRow, ReportIssueRow)
+_STATUS_LABELS = {
+    "queued": "等待审计",
+    "running": "正在审计",
+    "succeeded": "审计完成",
+    "failed": "审计未完成",
+}
+_EVENT_LABELS = {
+    "queued": "已提交",
+    "started": "开始检查",
+    "resumed": "继续检查",
+    "source_check": "核对数据来源",
+    "succeeded": "检查完成",
+    "failed": "检查未完成",
+}
+_ERROR_HINTS = {
+    "replica_changed": "数据副本已更新，请重新发起审计。",
+    "invalid_evidence": "数据凭据未通过校验，请检查后重试。",
+    "artifact_invalid": "报告保存未完成，请稍后重试。",
+    "internal_error": "审计未完成，请稍后重试。",
+}
+_RowT = TypeVar("_RowT", bound=BaseModel)
 
 
-def _source_state(
+def _projection_state(
     borrowed: BorrowedGeneration | None,
-) -> Literal["ready", "not_published", "unavailable"]:
+    tables: tuple[str, ...],
+    *,
+    absent_state: Literal["not_published", "unavailable"],
+) -> tuple[Literal["ready", "not_published", "unavailable"], datetime | None]:
     if borrowed is None:
-        return "unavailable"
+        return "unavailable", None
     marks = borrowed.cursor.execute(
         "SELECT table_name, available, row_count, owner_dataset_id, "
         "owner_generation_id, available_at FROM projection_status "
-        "WHERE table_name IN (?, ?, ?, ?) ORDER BY table_name LIMIT 5",
-        _TABLES,
+        f"WHERE table_name IN ({', '.join('?' for _ in tables)}) ORDER BY table_name "
+        "LIMIT ?",
+        (*tables, len(tables) + 1),
     ).fetchall()
     if not marks:
-        if any(borrowed.manifest.row_counts.get(name, 0) for name in _TABLES):
+        if any(borrowed.manifest.row_counts.get(name, 0) for name in tables):
             raise ValueError("report table is missing from projection status")
-        return "not_published"
-    if len(marks) != len(_TABLES) or tuple(row[0] for row in marks) != _TABLES:
+        return absent_state, None
+    if len(marks) != len(tables) or tuple(row[0] for row in marks) != tables:
         raise ValueError("report projection status is incomplete")
     if any(
         type(available) is not bool or type(count) is not int for _, available, count, *_ in marks
@@ -95,10 +128,15 @@ def _source_state(
         raise ValueError("report projection status has invalid types")
     if not any(row[1] for row in marks):
         if any(
-            count or borrowed.manifest.row_counts.get(str(name), 0) for name, _, count, *_ in marks
+            count
+            or borrowed.manifest.row_counts.get(str(name), 0)
+            or owner != "lab_jobs"
+            or generation is not None
+            or at is not None
+            for name, _, count, owner, generation, at in marks
         ):
-            raise ValueError("unpublished report has rows")
-        return "not_published"
+            raise ValueError("unpublished report projection status is invalid")
+        return absent_state, None
     watermark = next(
         (item for item in borrowed.manifest.watermarks if item.dataset_id == "lab_jobs"), None
     )
@@ -117,7 +155,13 @@ def _source_state(
         for name, available, count, owner, generation, at in marks
     ):
         raise ValueError("report projection status disagrees with the generation")
-    return "ready"
+    return "ready", available_at
+
+
+def _source_state(
+    borrowed: BorrowedGeneration | None,
+) -> tuple[Literal["ready", "not_published", "unavailable"], datetime | None]:
+    return _projection_state(borrowed, _TABLES, absent_state="not_published")
 
 
 def _rows(
@@ -283,6 +327,7 @@ def _read_report(borrowed: BorrowedGeneration) -> DataAuditReportData:
         raise ValueError("report issue counts exceed rule totals")
     return DataAuditReportData(
         source_state="ready",
+        progress=AuditReportTaskProgress(availability="unavailable"),
         overview=AuditReportOverview.model_validate(
             {
                 **overview.model_dump(),
@@ -335,14 +380,84 @@ def _read_report(borrowed: BorrowedGeneration) -> DataAuditReportData:
     )
 
 
+def _read_progress(
+    borrowed: BorrowedGeneration,
+    *,
+    report_hash: str | None,
+    report_available_at: datetime | None,
+) -> AuditReportTaskProgress:
+    state, available_at = _projection_state(borrowed, _JOB_TABLES, absent_state="unavailable")
+    if state != "ready":
+        return AuditReportTaskProgress(availability="unavailable")
+    assert available_at is not None
+    if report_available_at is not None and report_available_at != available_at:
+        raise ValueError("report and task availability differ")
+    counts = borrowed.manifest.row_counts
+    progress_rows = _rows(
+        borrowed, "audit_report_job", DataAuditReportJobProgress, counts["audit_report_job"]
+    )
+    if len(progress_rows) != 1:
+        raise ValueError("audit task progress is not singular")
+    events = _rows(
+        borrowed,
+        "audit_report_job_event",
+        DataAuditReportJobEvent,
+        counts["audit_report_job_event"],
+    )
+    progress = progress_rows[0]
+    validate_data_audit_report_job_progress(
+        progress, tuple(events), available_at=available_at, report_hash=report_hash
+    )
+    return AuditReportTaskProgress(
+        availability=progress.availability,
+        latest_task_id=progress.latest_task_id,
+        latest_status=progress.latest_status,
+        latest_status_label=None
+        if progress.latest_status is None
+        else _STATUS_LABELS[progress.latest_status],
+        latest_attempts=progress.latest_attempts,
+        latest_created_at=progress.latest_created_at,
+        latest_updated_at=progress.latest_updated_at,
+        latest_hint=None
+        if progress.latest_error_code is None
+        else _ERROR_HINTS[progress.latest_error_code],
+        successful_task_id=progress.successful_task_id,
+        successful_report_hash=progress.successful_report_hash,
+        successful_created_at=progress.successful_created_at,
+        successful_updated_at=progress.successful_updated_at,
+        events=[
+            AuditReportTaskEvent(
+                event_type=event.event_type,
+                occurred_at=event.occurred_at,
+                label=_EVENT_LABELS[event.event_type],
+            )
+            for event in events
+        ],
+    )
+
+
 def _snapshot(borrowed: BorrowedGeneration | None) -> DataAuditReportData:
     try:
-        state = _source_state(borrowed)
+        state, report_available_at = _source_state(borrowed)
         if state != "ready" or borrowed is None:
-            return DataAuditReportData(
-                source_state=state, overview=None, months=[], rules=[], issues=[]
+            data = DataAuditReportData(
+                source_state=state,
+                overview=None,
+                months=[],
+                rules=[],
+                issues=[],
+                progress=AuditReportTaskProgress(availability="unavailable"),
             )
-        return _read_report(borrowed)
+        else:
+            data = _read_report(borrowed)
+        if borrowed is None:
+            return data
+        progress = _read_progress(
+            borrowed,
+            report_hash=None if data.overview is None else data.overview.report_hash,
+            report_available_at=report_available_at,
+        )
+        return data.model_copy(update={"progress": progress})
     except Exception as error:
         raise HTTPException(status_code=503, detail=_UNREADABLE) from error
 
