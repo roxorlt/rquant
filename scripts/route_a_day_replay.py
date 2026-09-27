@@ -494,9 +494,13 @@ def extract_replica(
     would be reading its own future. `minute_bar` in the extract keeps the prior
     `minute_sessions` sessions (the notifier's page projection requires the table); the
     trade date's own minutes go to a separate parquet the minute replay serves bar by bar.
+    `monitor_event` keeps only history from before the trade date, so the notifier's
+    projection has its canonical table without seeing events from the replayed day.
     """
 
     import duckdb
+
+    from rquant.storage.schema import MONITOR_EVENT_DDL
 
     prior = tuple(day for day in calendar.open_dates if day < trade_date)
     daily_from = prior[-daily_sessions] if len(prior) >= daily_sessions else prior[0]
@@ -507,6 +511,7 @@ def extract_replica(
         target.unlink()
     audit.before(replica)
     counts: dict[str, int] = {}
+    empty_tables_created: list[str] = []
     connection = duckdb.connect(str(target))
     try:
         #: gentle on a host whose own services keep running beside the replay
@@ -543,7 +548,25 @@ def extract_replica(
                 connection.execute(f"CREATE TABLE {table} AS {query}", parameters)
             else:
                 connection.execute(_EMPTY_TABLES[table])
+                empty_tables_created.append(table)
             counts[table] = int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+        connection.execute(MONITOR_EVENT_DDL)
+        if "monitor_event" in present:
+            connection.execute(
+                "INSERT INTO monitor_event "
+                "(trade_date, ts_code, level, trigger_price, level_price, trigger_time, "
+                "trigger_type, pool, body_upper, body_lower) "
+                "SELECT trade_date, ts_code, level, trigger_price, level_price, trigger_time, "
+                "trigger_type, pool, body_upper, body_lower "
+                "FROM source_replica.monitor_event "
+                "WHERE trade_date < ? AND trigger_time < ?",
+                [trade_date, datetime.combine(trade_date, clock_time.min)],
+            )
+        else:
+            empty_tables_created.append("monitor_event")
+        counts["monitor_event"] = int(
+            connection.execute("SELECT count(*) FROM monitor_event").fetchone()[0]
+        )
         if "minute_bar" in present:
             day_minutes = connection.execute(
                 "SELECT ts_code, trade_time, freq, open, high, low, close, vol, amount, source "
@@ -597,6 +620,7 @@ def extract_replica(
     return {
         "path": str(target),
         "tables_on_host": sorted(present),
+        "empty_tables_created": empty_tables_created,
         "rows": counts,
         "daily_bar_from": daily_from,
         "daily_bar_latest_on_host": latest_daily,
