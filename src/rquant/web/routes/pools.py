@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
 from typing import Annotated, Any
 
@@ -13,9 +14,11 @@ from fastapi import APIRouter, Depends, Request, Response
 from rquant.web import readers
 from rquant.web.envelope import Envelope
 from rquant.web.labels import PRESET_LABELS
+from rquant.web.market import shanghai_trade_date
 from rquant.web.models.pools import (
     PoolDefinitionView,
     PoolMember,
+    PoolResultView,
     PoolsData,
     PoolStep,
     PublishedPool,
@@ -33,6 +36,16 @@ _MAX_POOLS = 64
 _MAX_MEMBERS = 100
 _MAX_STEPS = 32
 _MAX_RULE_ROWS = 512
+_MAX_RECEIPTS = 512
+
+
+@dataclass(frozen=True)
+class _RunReceipt:
+    trade_date: date
+    definition_version: str
+    hit_count: int
+    lineage_complete: bool
+    current_definition: bool
 
 
 def _available(tables: dict[str, readers.TableState], name: str) -> bool:
@@ -79,12 +92,12 @@ def _canvases(cursor: Any, tables: dict[str, readers.TableState]) -> tuple[list[
 
 def _rule_definitions(
     cursor: Any, tables: dict[str, readers.TableState]
-) -> dict[str, PoolDefinitionView]:
+) -> tuple[dict[str, PoolDefinitionView], dict[str, str | None]]:
     if not _available(tables, "pool_definition"):
-        return {}
+        return {}, {}
     rows = cursor.execute(
         "SELECT pool_name, display_name, description, source_kind, state, reason, "
-        "depends_on, delay_mode, delay_days, rules_json FROM pool_definition "
+        "version, depends_on, delay_mode, delay_days, rules_json FROM pool_definition "
         "ORDER BY pool_name LIMIT ?",
         (_MAX_RULE_ROWS,),
     ).fetchall()
@@ -95,12 +108,106 @@ def _rule_definitions(
         "source_kind",
         "state",
         "reason",
+        "version",
         "depends_on",
         "delay_mode",
         "delay_days",
         "rules_json",
     )
-    return {str(row[0]): pool_definition_view(dict(zip(fields, row, strict=True))) for row in rows}
+    return (
+        {str(row[0]): pool_definition_view(dict(zip(fields, row, strict=True))) for row in rows},
+        {str(row[0]): str(row[6]) if row[6] is not None else None for row in rows},
+    )
+
+
+def _run_receipts(cursor: Any, tables: dict[str, readers.TableState]) -> dict[str, _RunReceipt]:
+    if not _available(tables, "screen_run_receipt"):
+        return {}
+    rows = cursor.execute(
+        "SELECT trade_date, preset_name, definition_version, hit_count, "
+        "lineage_complete, current_definition FROM screen_run_receipt "
+        "ORDER BY preset_name LIMIT ?",
+        (_MAX_RECEIPTS,),
+    ).fetchall()
+    return {
+        str(name): _RunReceipt(
+            trade_date=trade_date,
+            definition_version=str(version),
+            hit_count=int(count),
+            lineage_complete=bool(lineage_complete),
+            current_definition=bool(current_definition),
+        )
+        for trade_date, name, version, count, lineage_complete, current_definition in rows
+    }
+
+
+def _result_view(
+    *,
+    receipt: _RunReceipt | None,
+    definition: PoolDefinitionView | None,
+    definition_version: str | None,
+    latest: date | None,
+    latest_pool_result_date: date | None,
+    today: date,
+    member_state: str,
+    member_count: int,
+    has_result_record: bool,
+    results_available: bool,
+) -> PoolResultView:
+    if not results_available:
+        return PoolResultView(
+            state="unavailable", status_label="结果暂不可用", trade_date=None, hit_count=None
+        )
+    if receipt is None:
+        state = "unverified" if has_result_record else "not_run"
+        return PoolResultView(
+            state=state,
+            status_label="结果版本待确认" if has_result_record else "尚无选股结果",
+            trade_date=None,
+            hit_count=None,
+        )
+    unverified = PoolResultView(
+        state="unverified",
+        status_label="结果版本待确认",
+        trade_date=receipt.trade_date if receipt.trade_date == latest_pool_result_date else None,
+        hit_count=None,
+    )
+    if (
+        latest is None
+        or receipt.trade_date > latest
+        or (latest_pool_result_date is not None and receipt.trade_date < latest_pool_result_date)
+        or not receipt.lineage_complete
+    ):
+        return unverified
+    if member_state == "current" and receipt.trade_date != latest:
+        return unverified
+    if receipt.trade_date == latest and receipt.hit_count != member_count:
+        return unverified
+    if definition is None or definition.state != "available" or definition_version is None:
+        return unverified
+    if receipt.definition_version != definition_version:
+        return PoolResultView(
+            state="rules_changed",
+            status_label="规则已更新，等待下次选股",
+            trade_date=receipt.trade_date,
+            hit_count=receipt.hit_count,
+        )
+    if not receipt.current_definition:
+        return unverified
+    current = receipt.trade_date == latest
+    return PoolResultView(
+        state="current_rules" if current else "older_rules",
+        status_label="结果已按当前规则更新" if current else "上次结果与当前规则一致",
+        trade_date=receipt.trade_date,
+        hit_count=receipt.hit_count,
+        zero_hit_label=(
+            "今天没有符合条件的股票"
+            if receipt.hit_count == 0 and current and receipt.trade_date == today
+            else "该交易日没有符合条件的股票"
+            if receipt.hit_count == 0 and current
+            else None
+        ),
+    )
 
 
 def _selected_keys(ordered: list[str], canvases: list[SavedCanvas], known: set[str]) -> list[str]:
@@ -119,7 +226,7 @@ def _selected_keys(ordered: list[str], canvases: list[SavedCanvas], known: set[s
     return [key for key in ordered if key in selected]
 
 
-def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
+def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsData:
     if borrowed is None:
         return PoolsData(
             state="unavailable",
@@ -136,7 +243,8 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
     definitions_available = _available(tables, "canvas_definition")
     canvases, canvases_truncated = _canvases(cursor, tables)
     rules_available = _available(tables, "pool_definition")
-    rule_definitions = _rule_definitions(cursor, tables)
+    rule_definitions, rule_versions = _rule_definitions(cursor, tables)
+    receipts = _run_receipts(cursor, tables)
     results_available = all(
         _available(tables, name) for name in ("canvas_latest_trade_date", "canvas_hit")
     )
@@ -197,7 +305,7 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
                     )
                 )
 
-    known = set(bounds) | set(counts) | set(step_counts)
+    known = set(bounds) | set(counts) | set(step_counts) | set(receipts)
     referenced = {key for canvas in canvases for key in canvas.pool_keys}
     ordered = sorted(
         known | referenced | set(rule_definitions),
@@ -226,6 +334,21 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
                     count=pool_steps[0].count,
                 )
             ]
+        receipt = receipts.get(key)
+        latest_pool_result_date = bounds.get(key)
+        if receipt is not None:
+            latest_pool_result_date = max(
+                latest_pool_result_date or receipt.trade_date, receipt.trade_date
+            )
+        verified_zero = (
+            receipt is not None
+            and receipt.lineage_complete
+            and receipt.trade_date == latest
+            and receipt.hit_count == 0
+            and counts[key] == 0
+        )
+        if verified_zero:
+            pool_steps = []
         if not results_available:
             state = "unavailable"
             trade_date = None
@@ -238,14 +361,18 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
             state = "unpublished" if _available(tables, "screen_bounds") else "unavailable"
             trade_date = None
             member_count = None
+        elif verified_zero:
+            state = "current"
+            trade_date = latest
+            member_count = 0
         elif (
-            bounds.get(key) is not None
-            and bounds[key] < latest
+            latest_pool_result_date is not None
+            and latest_pool_result_date < latest
             and counts[key] == 0
             and step_counts[key] == 0
         ):
             state = "older"
-            trade_date = bounds[key]
+            trade_date = latest_pool_result_date
             member_count = None
         elif counts[key] > 0 or (pool_steps and pool_steps[-1].count == 0):
             state = "current"
@@ -270,6 +397,18 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
                 members=hits[key] if state == "current" else [],
                 members_truncated=counts[key] > _MAX_MEMBERS,
                 definition=rule_definitions.get(key),
+                result=_result_view(
+                    receipt=receipt,
+                    definition=rule_definitions.get(key),
+                    definition_version=rule_versions.get(key),
+                    latest=latest,
+                    latest_pool_result_date=latest_pool_result_date,
+                    today=today,
+                    member_state=state,
+                    member_count=counts[key],
+                    has_result_record=key in bounds or counts[key] > 0 or step_counts[key] > 0,
+                    results_available=results_available,
+                ),
             )
         )
     return PoolsData(
@@ -305,7 +444,7 @@ def get_pools(
             stale_after=web.settings.stale_after,
             failure=web.tracker.failure,
         )
-        data = build_pools(borrowed)
+        data = build_pools(borrowed, today=shanghai_trade_date(now))
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     return Envelope[PoolsData](data=data, serving=meta)

@@ -7,6 +7,8 @@ import { layoutFlow } from "./flowLayout";
 export interface FlowGraphNode {
   id: string;
   label: string;
+  width?: number;
+  height?: number;
 }
 
 export interface FlowGraphEdge {
@@ -47,6 +49,7 @@ export function FlowGraph({ nodes, edges, label, onSelect }: FlowGraphProps) {
       id: node.id,
       position: positions.get(node.id) ?? { x: 0, y: 0 },
       data: { label: node.label },
+      style: { width: node.width, height: node.height },
     }));
   }, [nodes, edges, narrow]);
   const flowEdges = useMemo<Edge[]>(

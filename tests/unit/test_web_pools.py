@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
+import duckdb
 from fastapi.testclient import TestClient
 
 from rquant.pool_definition_projection import build_pool_definition_rows
@@ -14,6 +17,7 @@ from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.app import create_app
 from rquant.web.pool_rule_view import _FIELDS
 from rquant.web.screen_catalog import screen_blocks
+from rquant.web.serving import BorrowedGeneration
 from rquant.web.settings import WebSettings
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
@@ -82,6 +86,274 @@ def _get(root: Path) -> dict:
         response = client.get("/api/v1/pools")
     assert response.status_code == 200
     return response.json()
+
+
+def _receipt_row(
+    name: str,
+    *,
+    day: str = "2026-09-23",
+    version: str = "v" * 64,
+    count: int = 1,
+    lineage_complete: bool = True,
+    current_definition: bool = True,
+) -> tuple[object, ...]:
+    return (
+        day,
+        name,
+        version,
+        "r" * 64,
+        None,
+        None,
+        count,
+        "m" * 64,
+        lineage_complete,
+        current_definition,
+        "2026-09-24T07:00:00Z",
+    )
+
+
+def _receipt_response(
+    tmp_path: Path,
+    *,
+    definitions: list[dict],
+    hits: list[tuple[str, str]],
+    receipts: list[tuple[object, ...]] | None,
+    bounds: dict[str, str] | None = None,
+    latest: str = "2026-09-23",
+) -> dict:
+    """Exercise the HTTP route over one synthetic borrowed generation.
+
+    The publisher's receipt table contract is integrated separately; this cursor has
+    its projected columns and status so the Web branch can test the consumer now.
+    """
+    root = tmp_path / "serving"
+    manifest = build_web_fixture(root, "baseline")
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE TABLE projection_status (table_name VARCHAR, available BOOLEAN, "
+            "row_count INTEGER, available_at TIMESTAMPTZ)"
+        )
+        connection.execute(
+            "CREATE TABLE pool_definition (pool_name VARCHAR, display_name VARCHAR, "
+            "description VARCHAR, source_kind VARCHAR, state VARCHAR, reason VARCHAR, "
+            "version VARCHAR, depends_on VARCHAR, delay_mode VARCHAR, delay_days INTEGER, "
+            "rules_json VARCHAR)"
+        )
+        if definitions:
+            connection.executemany(
+                "INSERT INTO pool_definition VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    tuple(
+                        row[key]
+                        for key in (
+                            "pool_name",
+                            "display_name",
+                            "description",
+                            "source_kind",
+                            "state",
+                            "reason",
+                            "version",
+                            "depends_on",
+                            "delay_mode",
+                            "delay_days",
+                            "rules_json",
+                        )
+                    )
+                    for row in definitions
+                ],
+            )
+        connection.execute(
+            "CREATE TABLE canvas_latest_trade_date (snapshot_key VARCHAR, trade_date DATE)"
+        )
+        connection.execute("INSERT INTO canvas_latest_trade_date VALUES ('current', ?)", [latest])
+        connection.execute(
+            "CREATE TABLE canvas_hit (trade_date DATE, preset_name VARCHAR, "
+            "ts_code VARCHAR, row_json VARCHAR)"
+        )
+        if hits:
+            connection.executemany(
+                "INSERT INTO canvas_hit VALUES (?, ?, ?, '{}')",
+                [(latest, name, code) for name, code in hits],
+            )
+        connection.execute("CREATE TABLE screen_bounds (preset_name VARCHAR, max_date DATE)")
+        if bounds:
+            connection.executemany("INSERT INTO screen_bounds VALUES (?, ?)", list(bounds.items()))
+        names = ["pool_definition", "canvas_latest_trade_date", "canvas_hit", "screen_bounds"]
+        if receipts is not None:
+            connection.execute(
+                "CREATE TABLE screen_run_receipt (trade_date DATE, preset_name VARCHAR, "
+                "definition_version VARCHAR, result_version VARCHAR, parent_trade_date DATE, "
+                "parent_result_version VARCHAR, hit_count INTEGER, member_digest VARCHAR, "
+                "lineage_complete BOOLEAN, current_definition BOOLEAN, completed_at TIMESTAMPTZ)"
+            )
+            if receipts:
+                connection.executemany(
+                    "INSERT INTO screen_run_receipt VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    receipts,
+                )
+            names.append("screen_run_receipt")
+        connection.executemany(
+            "INSERT INTO projection_status VALUES (?, true, 1, ?)",
+            [(name, FIXTURE_BUILT_AT) for name in names],
+        )
+        app = create_app(
+            WebSettings(serving_root=root, stale_after_seconds=600),
+            clock=lambda: FIXTURE_BUILT_AT + timedelta(seconds=30),
+            background=False,
+        )
+        borrow_count = 0
+
+        @contextmanager
+        def borrow() -> Iterator[BorrowedGeneration]:
+            nonlocal borrow_count
+            borrow_count += 1
+            cursor = connection.cursor()
+            try:
+                yield BorrowedGeneration(manifest, None, cursor, None)
+            finally:
+                cursor.close()
+
+        with TestClient(app) as client:
+            app.state.web.tracker.borrow = borrow
+            response = client.get("/api/v1/pools")
+        assert response.status_code == 200
+        assert borrow_count == 1
+        assert response.headers["x-rquant-generation"] == manifest.generation_id
+        return response.json()
+    finally:
+        connection.close()
+
+
+def test_verified_receipt_confirms_current_rules_and_zero_hit_day(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/命中池"), _rule_row("user/零命中池")],
+        hits=[("user/命中池", "600001.SH")],
+        receipts=[
+            _receipt_row("user/命中池"),
+            _receipt_row("user/零命中池", count=0),
+        ],
+        bounds={"user/命中池": "2026-09-23", "user/零命中池": "2026-09-22"},
+    )["data"]
+    pools = {pool["key"]: pool for pool in data["pools"]}
+    current = pools["user/命中池"]
+    assert current["result"] == {
+        "state": "current_rules",
+        "status_label": "结果已按当前规则更新",
+        "trade_date": "2026-09-23",
+        "hit_count": 1,
+        "zero_hit_label": None,
+    }
+    assert current["definition"]["status_label"] == "已发布"
+    assert [member["code"] for member in current["members"]] == ["600001.SH"]
+    zero = pools["user/零命中池"]
+    assert zero["result"] == {
+        "state": "current_rules",
+        "status_label": "结果已按当前规则更新",
+        "trade_date": "2026-09-23",
+        "hit_count": 0,
+        "zero_hit_label": "该交易日没有符合条件的股票",
+    }
+    assert (zero["state"], zero["trade_date"], zero["member_count"]) == ("current", "2026-09-23", 0)
+    assert zero["members"] == [] and zero["steps"] == []
+
+
+def test_zero_hit_copy_says_today_only_on_the_same_calendar_day(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/当日池")],
+        hits=[],
+        receipts=[_receipt_row("user/当日池", day="2026-09-24", count=0)],
+        latest="2026-09-24",
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/当日池")
+    assert pool["result"]["zero_hit_label"] == "今天没有符合条件的股票"
+
+
+def test_receipt_versions_lineage_and_missing_definition_never_claim_current_rules(
+    tmp_path: Path,
+) -> None:
+    names = ["改规则", "父谱系", "父规则变化", "缺定义", "人数不符", "无回执"]
+    definitions = [_rule_row(f"user/{name}") for name in names if name != "缺定义"]
+    data = _receipt_response(
+        tmp_path,
+        definitions=definitions,
+        hits=[(f"user/{name}", f"60000{index}.SH") for index, name in enumerate(names)],
+        receipts=[
+            _receipt_row("user/改规则", version="o" * 64),
+            _receipt_row("user/父谱系", lineage_complete=False),
+            _receipt_row("user/父规则变化", current_definition=False),
+            _receipt_row("user/缺定义"),
+            _receipt_row("user/人数不符", count=2),
+        ],
+    )["data"]
+    pools = {pool["key"]: pool for pool in data["pools"]}
+    assert pools["user/改规则"]["result"]["status_label"] == "规则已更新，等待下次选股"
+    assert pools["user/改规则"]["result"]["state"] == "rules_changed"
+    for name in ("父谱系", "父规则变化", "缺定义", "人数不符", "无回执"):
+        assert pools[f"user/{name}"]["result"]["state"] == "unverified"
+        assert pools[f"user/{name}"]["result"]["status_label"] == "结果版本待确认"
+    assert all(pool["members"] for pool in pools.values())
+
+
+def test_other_pool_today_does_not_relabel_this_pools_older_receipt(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/今日池"), _rule_row("user/前日池")],
+        hits=[("user/今日池", "600001.SH")],
+        receipts=[
+            _receipt_row("user/今日池"),
+            _receipt_row("user/前日池", day="2026-09-22", count=2),
+        ],
+        bounds={"user/今日池": "2026-09-23", "user/前日池": "2026-09-22"},
+    )["data"]
+    pools = {pool["key"]: pool for pool in data["pools"]}
+    assert pools["user/前日池"]["state"] == "older"
+    assert pools["user/前日池"]["members"] == []
+    assert pools["user/前日池"]["result"] == {
+        "state": "older_rules",
+        "status_label": "上次结果与当前规则一致",
+        "trade_date": "2026-09-22",
+        "hit_count": 2,
+        "zero_hit_label": None,
+    }
+    assert pools["user/今日池"]["result"]["state"] == "current_rules"
+
+
+def test_newer_pool_result_without_receipt_does_not_confirm_an_older_run(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/今日池"), _rule_row("user/未确认池")],
+        hits=[("user/今日池", "600001.SH")],
+        receipts=[
+            _receipt_row("user/今日池", day="2026-09-24"),
+            _receipt_row("user/未确认池", day="2026-09-22", count=2),
+        ],
+        bounds={"user/今日池": "2026-09-24", "user/未确认池": "2026-09-23"},
+        latest="2026-09-24",
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/未确认池")
+    assert pool["state"] == "older"
+    assert pool["trade_date"] == "2026-09-23"
+    assert pool["result"]["state"] == "unverified"
+    assert pool["result"]["status_label"] == "结果版本待确认"
+    assert pool["result"]["trade_date"] is None
+    assert pool["result"]["hit_count"] is None
+
+
+def test_legacy_members_stay_visible_without_a_receipt(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/旧池")],
+        hits=[("user/旧池", "600001.SH")],
+        receipts=None,
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/旧池")
+    assert pool["state"] == "current"
+    assert [item["code"] for item in pool["members"]] == ["600001.SH"]
+    assert pool["result"]["state"] == "unverified"
+    assert pool["result"]["status_label"] == "结果版本待确认"
 
 
 def test_pools_map_saved_refs_latest_hits_steps_and_older_pools(tmp_path: Path) -> None:

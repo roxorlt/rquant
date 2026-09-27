@@ -4,7 +4,7 @@ import { useMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { FlowGraph, type FlowGraphEdge, type FlowGraphNode } from "@/charts/FlowGraph";
 import { formatCount, formatPrice } from "@/format/number";
-import { formatTradeDate } from "@/format/time";
+import { formatTradeDate, weekdayOf } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { ChangeText, EmptyState, PageHeader, PageSkeleton, Panel, Tip } from "@/ui";
 import "./pools.css";
@@ -146,34 +146,47 @@ function ResultsDetail({
   pool: PublishedPool;
   onSelectStock: (code: string) => void;
 }) {
+  const resultDate = pool.result.trade_date ?? pool.trade_date;
   return (
     <>
-      <Panel
-        title="上次选股结果"
-        sub={pool.trade_date ? formatTradeDate(pool.trade_date) : "—"}
-        label="上次选股结果"
-      >
+      <Panel title="上次选股结果" sub={pool.result.status_label} label="上次选股结果">
+        <p className="pools-result-date">
+          选股日期 · {resultDate ? `${resultDate} ${weekdayOf(resultDate)}` : "—"}
+        </p>
         {pool.state === "current" ? (
           <>
+            {pool.result.zero_hit_label ? (
+              <p className="pools-zero" role="status">
+                {pool.result.zero_hit_label}
+              </p>
+            ) : null}
             <div className="pools-count">
               <span>成员</span>
               <strong className="num">{formatCount(pool.member_count)} 只</strong>
             </div>
-            <div className="pools-steps">
-              <h3>上次命中步骤</h3>
-              {pool.steps.length ? (
-                pool.steps.map((step) => (
+            {pool.steps.length ? (
+              <div className="pools-steps">
+                <h3>上次命中步骤</h3>
+                {pool.steps.map((step) => (
                   <div className="pools-step" key={step.step_index}>
                     <span>{step.label}</span>
                     <strong className="num">{formatCount(step.count)} 只</strong>
                   </div>
-                ))
-              ) : (
-                <span className="hint">暂无已发布的命中步骤</span>
-              )}
-              {pool.steps_truncated ? <p className="pools-note">仅显示前一部分命中步骤。</p> : null}
-            </div>
+                ))}
+                {pool.steps_truncated ? (
+                  <p className="pools-note">仅显示前一部分命中步骤。</p>
+                ) : null}
+              </div>
+            ) : null}
           </>
+        ) : pool.result.state === "older_rules" ? (
+          <div className="pools-older-result">
+            <div className="pools-count">
+              <span>上次命中</span>
+              <strong className="num">{formatCount(pool.result.hit_count)} 只</strong>
+            </div>
+            <p className="pools-note">最近交易日未运行，暂不显示旧日成员。</p>
+          </div>
         ) : (
           <EmptyState
             title={poolStatus(pool)}
@@ -187,7 +200,7 @@ function ResultsDetail({
           />
         )}
       </Panel>
-      {pool.state === "current" ? (
+      {pool.state === "current" && pool.members.length > 0 ? (
         <Panel
           title="成员"
           sub={
@@ -245,11 +258,13 @@ export default function PoolsPage() {
       ? [
           {
             id: `condition:${pool.key}`,
-            label: `${pool.name} · ${pool.definition.rules.length} 条条件`,
+            label: `${pool.name}\n规则已发布 · ${pool.definition.rules.length} 条条件`,
+            width: 190,
+            height: 82,
           },
         ]
       : []),
-    { id: pool.key, label: pool.name },
+    { id: pool.key, label: `${pool.name}\n${pool.result.status_label}`, width: 190, height: 82 },
   ]);
   const graphEdges: FlowGraphEdge[] = graphPools.flatMap((pool) => {
     if (pool.definition?.state !== "available") return [];
@@ -269,7 +284,7 @@ export default function PoolsPage() {
         title="池子画布"
         note={
           !changing && data?.latest_trade_date
-            ? `上次选股 · ${formatTradeDate(data.latest_trade_date)}`
+            ? `最近选股记录 · ${formatTradeDate(data.latest_trade_date)}`
             : undefined
         }
       />
@@ -311,7 +326,6 @@ export default function PoolsPage() {
           {!data.definitions_available ? (
             <p className="pools-note">保存的画布暂不可用，显示已发布池子。</p>
           ) : null}
-          <p className="pools-note">上次结果与当前规则的对应关系尚未确认。</p>
           {data.canvases_truncated || data.pools_truncated || canvas?.refs_truncated ? (
             <p className="pools-note" role="status">
               内容较多，仅显示前一部分池子或画布。
@@ -342,17 +356,19 @@ export default function PoolsPage() {
                   <span className="pools-info">连线说明</span>
                 </Tip>
                 <fieldset className="pools-list" aria-label="池子列表">
-                  {shown.map((pool) => (
+                  {shown.map((pool, index) => (
                     <div className="pools-list-entry" key={pool.key}>
                       <button
                         type="button"
                         className="pools-list-item"
                         aria-label={`查看 ${pool.name}成员`}
+                        aria-describedby={`pool-result-${index}`}
                         aria-pressed={selected?.key === pool.key && selectedKind === "pool"}
                         onClick={() => setSelectionId(pool.key)}
                       >
                         <span>{pool.name}</span>
-                        <small>上次结果 · {poolStatus(pool)}</small>
+                        <small id={`pool-result-${index}`}>{pool.result.status_label}</small>
+                        <small>{poolStatus(pool)}</small>
                       </button>
                       {pool.definition?.state === "available" ? (
                         <button

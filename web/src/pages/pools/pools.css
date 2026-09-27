@@ -59,7 +59,7 @@
 }
 .pools-list-item {
   width: 100%;
-  min-height: 60px;
+  min-height: 76px;
   display: grid;
   align-content: center;
   gap: 3px;
@@ -79,6 +79,7 @@
 .pools-list-item small {
   font-size: 11px;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 .pools-list-entry {
   min-width: 0;
@@ -121,6 +122,16 @@
   border: 1px dashed var(--accent);
   border-radius: 10px;
   font-weight: 600;
+}
+.pools-page .react-flow__node-default {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+  font-size: 12px;
+  padding: 8px;
 }
 .pools-page .react-flow__edge-path {
   stroke: var(--accent);
@@ -220,6 +231,19 @@
   gap: 12px;
   padding: 4px 0 16px;
   color: var(--muted);
+  font-size: 13px;
+}
+.pools-result-date {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pools-zero {
+  margin: 0 0 10px;
+  padding: 9px 11px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink-2);
   font-size: 13px;
 }
 .pools-count strong {
