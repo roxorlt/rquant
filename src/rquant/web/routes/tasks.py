@@ -15,12 +15,20 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import ServingQueryError
+from rquant.web.calendar import calendar_day
 from rquant.web.envelope import Envelope
+from rquant.web.market import shanghai_trade_date
 from rquant.web.models.common import StatusInfo
-from rquant.web.models.tasks import JobCounts, ResearchJobItem, ResearchJobsData
+from rquant.web.models.tasks import JobCounts, ResearchJobItem, ResearchJobsData, TaskOverviewData
 from rquant.web.security import current_user
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.status import UserState
+from rquant.web.task_overview import (
+    ops_sections,
+    service_section,
+    unavailable_ops,
+    unavailable_services,
+)
 
 router = APIRouter(prefix="/tasks")
 
@@ -65,7 +73,7 @@ _STATUS_INFO = {
 class _Cursor(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    kind: Literal["research_jobs_v1"]
+    kind: Literal["research_jobs_v1", "task_overview_v1"]
     generation_id: str = Field(min_length=1, max_length=128)
     last_at: AwareUtcDatetime
     last_id: UUID
@@ -131,7 +139,7 @@ def _eta_label(status: str, intent: str) -> str:
     return "暂无法预计"
 
 
-def _item(row: tuple[Any, ...]) -> ResearchJobItem:
+def _item(row: tuple[Any, ...], *, name_limit: int | None = None) -> ResearchJobItem:
     (
         job_id,
         name,
@@ -155,9 +163,10 @@ def _item(row: tuple[Any, ...]) -> ResearchJobItem:
         and raw_intent == "none"
         and (raw_status, eta_status) in {("queued", "queued"), ("running", "running")}
     )
+    display_name = str(name).strip() or "未命名研究任务"
     return ResearchJobItem(
         job_id=str(UUID(str(job_id))),
-        strategy_name=str(name).strip() or "未命名研究任务",
+        strategy_name=display_name if name_limit is None else display_name[:name_limit],
         job_type_label=_TYPE_LABELS.get(str(job_type), "研究任务"),
         resource_label=_RESOURCE_LABELS.get(str(resource), "未分类"),
         status=_status(raw_status, raw_intent),
@@ -203,6 +212,7 @@ def _page(
     page_size: int,
     after: _Cursor | None,
     key: bytes,
+    cursor_kind: Literal["research_jobs_v1", "task_overview_v1"] = "research_jobs_v1",
 ) -> ResearchJobsData:
     try:
         count_values = borrowed.cursor.execute(_COUNTS_SQL).fetchone()
@@ -222,13 +232,16 @@ def _page(
                 (after.last_at, after.last_at, str(after.last_id), page_size + 1),
             ).fetchall()
         selected = rows[:page_size]
-        items = [_item(row) for row in selected]
+        items = [
+            _item(row, name_limit=80 if cursor_kind == "task_overview_v1" else None)
+            for row in selected
+        ]
     except (ServingQueryError, ValueError, TypeError, ValidationError) as error:
         raise HTTPException(status_code=503, detail=_UNREADABLE) from error
     next_cursor = (
         _encode_cursor(
             _Cursor(
-                kind="research_jobs_v1",
+                kind=cursor_kind,
                 generation_id=borrowed.manifest.generation_id,
                 last_at=items[-1].updated_at,
                 last_id=UUID(items[-1].job_id),
@@ -277,7 +290,9 @@ def get_jobs(
             response.headers["X-Rquant-Generation"] = meta.generation_id
         decoded = _decode_cursor(cursor, web.cursor_key) if cursor is not None else None
         if decoded is not None and (
-            decoded.generation_id != meta.generation_id or decoded.page_size != page_size
+            decoded.kind != "research_jobs_v1"
+            or decoded.generation_id != meta.generation_id
+            or decoded.page_size != page_size
         ):
             raise HTTPException(status_code=409, detail=_CHANGED)
         if borrowed is None or meta.state == "unavailable":
@@ -295,3 +310,61 @@ def get_jobs(
                     borrowed, mark=mark, page_size=page_size, after=decoded, key=web.cursor_key
                 )
     return Envelope[ResearchJobsData](data=data, serving=meta)
+
+
+@router.get("/overview", response_model=Envelope[TaskOverviewData], summary="任务与运行状态")
+def get_overview(
+    request: Request,
+    response: Response,
+    _viewer: Annotated[str | None, Depends(current_user)],
+    page_size: Annotated[int, Query(ge=1, le=50)] = 20,
+    cursor: Annotated[str | None, Query(max_length=512)] = None,
+) -> Envelope[TaskOverviewData]:
+    web = request.app.state.web
+    now = web.clock()
+    with web.tracker.borrow() as borrowed:
+        meta = serving_meta(
+            borrowed, now=now, stale_after=web.settings.stale_after, failure=web.tracker.failure
+        )
+        if meta.generation_id is not None:
+            response.headers["X-Rquant-Generation"] = meta.generation_id
+        decoded = _decode_cursor(cursor, web.cursor_key) if cursor is not None else None
+        if decoded is not None and (
+            decoded.kind != "task_overview_v1"
+            or decoded.generation_id != meta.generation_id
+            or decoded.page_size != page_size
+        ):
+            raise HTTPException(status_code=409, detail=_CHANGED)
+        if borrowed is None or meta.state == "unavailable":
+            if decoded is not None:
+                raise HTTPException(status_code=409, detail=_CHANGED)
+            scheduled, resources = unavailable_ops()
+            services = unavailable_services()
+            research = _empty("unavailable", page_size)
+        else:
+            day = calendar_day(borrowed.cursor, shanghai_trade_date(now))
+            scheduled, resources = ops_sections(borrowed, now=now, day=day)
+            services = service_section(borrowed, now=now, day=day)
+            mark = _watermark(borrowed)
+            if mark is None or mark.status is FreshnessStatus.UNAVAILABLE:
+                if decoded is not None:
+                    raise HTTPException(status_code=409, detail=_CHANGED)
+                research = _empty("not_published", page_size)
+            else:
+                research = _page(
+                    borrowed,
+                    mark=mark,
+                    page_size=page_size,
+                    after=decoded,
+                    key=web.cursor_key,
+                    cursor_kind="task_overview_v1",
+                )
+    return Envelope[TaskOverviewData](
+        data=TaskOverviewData(
+            scheduled=scheduled,
+            services=services,
+            resources=resources,
+            research=research,
+        ),
+        serving=meta,
+    )
