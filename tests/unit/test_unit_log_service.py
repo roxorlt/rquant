@@ -6,13 +6,16 @@ import stat
 import struct
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pytest
 
+from rquant import unit_log_service
 from rquant.strict_json import canonical_json_bytes, strict_json_loads
 from rquant.unit_log_reader import (
     JournalCursorError,
@@ -27,6 +30,7 @@ SHORT_TMP = "/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
 SINCE = datetime(2026, 9, 28, 4, 0, tzinfo=UTC)
 UNIT = "rquant-daily.service"
 TOKEN = "Bearer secret-key=123456"
+WEB_UID = os.geteuid() + 1
 
 
 class FakeReader:
@@ -93,6 +97,19 @@ def _call(path: Path, **overrides: object) -> dict[str, object]:
     return _wire(path, canonical_json_bytes(_request(**overrides)))
 
 
+def _web_client(
+    path: Path, *, peer_uid: Callable[[socket.socket], int] | None = None
+) -> UnitLogClient:
+    service_uid = os.geteuid()
+    with patch.object(unit_log_service.os, "geteuid", return_value=WEB_UID):
+        return UnitLogClient(
+            socket_path=path,
+            service_uid=service_uid,
+            web_group_gid=os.getegid(),
+            peer_uid=peer_uid,
+        )
+
+
 class RunningService:
     def __init__(
         self,
@@ -109,9 +126,9 @@ class RunningService:
         self.service = UnitLogService(
             socket_path=path,
             web_group_gid=os.getegid(),
-            web_uid=os.geteuid(),
+            web_uid=WEB_UID,
             reader=reader,
-            peer_uid=(lambda _connection: peer_uid) if peer_uid is not None else None,
+            peer_uid=(lambda _connection: peer_uid if peer_uid is not None else WEB_UID),
             min_interval_seconds=min_interval,
             monotonic=clock if clock is not None else count(100).__next__,
         )
@@ -148,11 +165,7 @@ def test_valid_request_round_trip_uses_private_socket_and_fixed_fields() -> None
             assert set(result) == {"status", "page"}
             assert result["status"] == "ok"
             assert result["page"] == reader.result.model_dump(mode="json")
-            client = UnitLogClient(
-                socket_path=path,
-                service_uid=os.geteuid(),
-                web_group_gid=os.getegid(),
-            )
+            client = _web_client(path)
             assert client.read(unit=UNIT, since=SINCE, page_size=20) == reader.result
             assert (
                 reader.calls
@@ -170,7 +183,7 @@ def test_service_refuses_unsafe_directory_before_binding(directory_mode: int) ->
         service = UnitLogService(
             socket_path=path,
             web_group_gid=os.getegid(),
-            web_uid=os.geteuid(),
+            web_uid=WEB_UID,
             reader=FakeReader(),
         )
         with pytest.raises(ValueError, match="0710"):
@@ -185,7 +198,7 @@ def test_service_refuses_preexisting_socket_path_without_unlinking() -> None:
         service = UnitLogService(
             socket_path=path,
             web_group_gid=os.getegid(),
-            web_uid=os.geteuid(),
+            web_uid=WEB_UID,
             reader=FakeReader(),
         )
         with pytest.raises(ValueError, match="already exists"):
@@ -198,17 +211,48 @@ def test_service_cannot_disable_fixed_rate_limit() -> None:
         UnitLogService(
             socket_path=Path("/private/tmp/logs.sock"),
             web_group_gid=os.getegid(),
-            web_uid=os.geteuid(),
+            web_uid=WEB_UID,
             reader=FakeReader(),
             min_interval_seconds=0,
         )
+
+
+def test_same_uid_service_and_client_configuration_fail_closed() -> None:
+    with pytest.raises(ValueError, match="different UID"):
+        UnitLogService(
+            socket_path=Path("/private/tmp/logs.sock"),
+            web_group_gid=os.getegid(),
+            web_uid=os.geteuid(),
+            reader=FakeReader(),
+        )
+    with pytest.raises(ValueError, match="different UID"):
+        UnitLogClient(
+            socket_path=Path("/private/tmp/logs.sock"),
+            service_uid=os.geteuid(),
+            web_group_gid=os.getegid(),
+        )
+
+
+def test_service_rechecks_uid_separation_at_startup() -> None:
+    web_uid = WEB_UID
+    service = UnitLogService(
+        socket_path=Path("/private/tmp/logs.sock"),
+        web_group_gid=os.getegid(),
+        web_uid=web_uid,
+        reader=FakeReader(),
+    )
+    with (
+        patch.object(unit_log_service.os, "geteuid", return_value=web_uid),
+        pytest.raises(ValueError, match="different UID"),
+    ):
+        service.serve(stop=threading.Event())
 
 
 def test_wrong_peer_uid_is_rejected_before_parsing_or_reading() -> None:
     with TemporaryDirectory(prefix="rql-", dir=SHORT_TMP) as directory:
         path = _private_path(Path(directory))
         reader = FakeReader()
-        with RunningService(path, reader, peer_uid=os.geteuid() + 1):
+        with RunningService(path, reader, peer_uid=WEB_UID + 1):
             response = _wire(path, canonical_json_bytes(_request(authorization=TOKEN)))
         assert response == {
             "status": "error",
@@ -217,6 +261,34 @@ def test_wrong_peer_uid_is_rejected_before_parsing_or_reading() -> None:
         }
         assert not reader.calls
         assert TOKEN not in str(response)
+
+
+def test_real_local_peer_uid_cannot_impersonate_distinct_web_uid() -> None:
+    with TemporaryDirectory(prefix="rql-", dir=SHORT_TMP) as directory:
+        path = _private_path(Path(directory))
+        reader = FakeReader()
+        service = UnitLogService(
+            socket_path=path,
+            web_group_gid=os.getegid(),
+            web_uid=WEB_UID,
+            reader=reader,
+        )
+        stop = threading.Event()
+        ready = threading.Event()
+        thread = threading.Thread(target=service.serve, kwargs={"stop": stop, "ready": ready})
+        thread.start()
+        try:
+            assert ready.wait(2)
+            assert _call(path) == {
+                "status": "error",
+                "code": "forbidden",
+                "message": "无权查看运行日志",
+            }
+            assert not reader.calls
+        finally:
+            stop.set()
+            thread.join(2)
+        assert not thread.is_alive()
 
 
 @pytest.mark.parametrize(
@@ -368,11 +440,7 @@ def test_fixed_rate_rejects_early_request_then_recovers() -> None:
 def test_client_rejects_untrusted_path_and_server_error() -> None:
     with TemporaryDirectory(prefix="rql-", dir=SHORT_TMP) as directory:
         path = _private_path(Path(directory))
-        client = UnitLogClient(
-            socket_path=path,
-            service_uid=os.geteuid(),
-            web_group_gid=os.getegid(),
-        )
+        client = _web_client(path)
         reader = FakeReader()
         with RunningService(path, reader):
             reader.error = JournalCursorError()
@@ -389,12 +457,7 @@ def test_client_rejects_wrong_server_peer_uid_before_sending_request() -> None:
     with TemporaryDirectory(prefix="rql-", dir=SHORT_TMP) as directory:
         path = _private_path(Path(directory))
         reader = FakeReader()
-        client = UnitLogClient(
-            socket_path=path,
-            service_uid=os.geteuid(),
-            web_group_gid=os.getegid(),
-            peer_uid=lambda _connection: os.geteuid() + 1,
-        )
+        client = _web_client(path, peer_uid=lambda _connection: WEB_UID)
         with (
             RunningService(path, reader),
             pytest.raises(UnitLogServiceError, match="运行日志暂不可用"),
