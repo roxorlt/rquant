@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import tempfile
+from collections.abc import Callable
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -43,6 +44,20 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 class _Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+
+class AuditReplicaFileIdentity(_Contract):
+    """O(1) file evidence, not a verified production data generation."""
+
+    device: int = Field(ge=0, strict=True)
+    inode: int = Field(ge=0, strict=True)
+    size: int = Field(gt=0, strict=True)
+    mtime_ns: int = Field(gt=0, strict=True)
+    ctime_ns: int = Field(gt=0, strict=True)
+
+
+class DataAuditReplicaChangedError(ValueError):
+    """The submitted read-only source cannot be used for this report."""
 
 
 class AuditReportSource(_Contract):
@@ -578,6 +593,16 @@ def _file_identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def _replica_identity(observed: os.stat_result) -> AuditReplicaFileIdentity:
+    return AuditReplicaFileIdentity(
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        size=observed.st_size,
+        mtime_ns=observed.st_mtime_ns,
+        ctime_ns=observed.st_ctime_ns,
+    )
+
+
 def _require_explicit_path(path: Path) -> None:
     if (
         not path.is_absolute()
@@ -592,15 +617,31 @@ def _require_fixed_replica(primary_path: Path, replica_path: Path, opened: os.st
         primary = primary_path.stat(follow_symlinks=False)
         current = replica_path.stat(follow_symlinks=False)
     except OSError as exc:
-        raise ValueError("read-only replica path changed during audit") from exc
+        raise DataAuditReplicaChangedError("read-only replica path changed during audit") from exc
     if not stat.S_ISREG(primary.st_mode) or not stat.S_ISREG(current.st_mode):
-        raise ValueError("primary and read-only replica must be regular files")
+        raise DataAuditReplicaChangedError("primary and read-only replica must be regular files")
     if (primary.st_dev, primary.st_ino) == (opened.st_dev, opened.st_ino):
-        raise ValueError("read-only replica aliases the primary")
+        raise DataAuditReplicaChangedError("read-only replica aliases the primary")
     if _file_identity(current) != _file_identity(opened):
-        raise ValueError("read-only replica changed during audit")
+        raise DataAuditReplicaChangedError("read-only replica changed during audit")
     if os.path.lexists(f"{replica_path}.wal"):
-        raise ValueError("read-only replica has an unsealed DuckDB WAL")
+        raise DataAuditReplicaChangedError("read-only replica has an unsealed DuckDB WAL")
+
+
+def capture_data_audit_replica_identity(
+    primary_path: Path, replica_path: Path
+) -> AuditReplicaFileIdentity:
+    """Bind an explicit sealed replica without scanning bytes or connecting to DuckDB."""
+    primary_path, replica_path = Path(primary_path), Path(replica_path)
+    _require_explicit_path(primary_path)
+    _require_explicit_path(replica_path)
+    descriptor = os.open(replica_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size <= 0:
+            raise DataAuditReplicaChangedError("read-only replica must be a nonempty regular file")
+        _require_fixed_replica(primary_path, replica_path, opened)
+        return _replica_identity(opened)
 
 
 def _file_sha256(handle: BinaryIO) -> str:
@@ -619,6 +660,9 @@ def create_and_publish_data_audit_report(
     observed_through: date,
     null_fields: tuple[DailyBarNullFieldSpec, ...],
     directory: Path,
+    expected_file_identity: AuditReplicaFileIdentity | None = None,
+    expected_file_sha256: str | None = None,
+    on_replica_sha256: Callable[[str], None] | None = None,
 ) -> Path:
     """Seal one trusted local replica read into an unverified production report.
 
@@ -632,14 +676,45 @@ def create_and_publish_data_audit_report(
     )
     for path in (primary_path, replica_path, directory):
         _require_explicit_path(path)
+    if expected_file_identity is not None:
+        expected_file_identity = AuditReplicaFileIdentity.model_validate(expected_file_identity)
+    if expected_file_sha256 is not None and (
+        len(expected_file_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_file_sha256)
+    ):
+        raise ValueError("expected replica SHA256 is invalid")
     if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
         raise ValueError("audit report directory must be a real directory")
     descriptor = os.open(replica_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode) or opened.st_size <= 0:
-            raise ValueError("read-only replica must be a nonempty regular file")
+            raise DataAuditReplicaChangedError("read-only replica must be a nonempty regular file")
         _require_fixed_replica(primary_path, replica_path, opened)
+        if expected_file_identity is not None:
+            actual = _replica_identity(opened)
+            if expected_file_sha256 is None:
+                if actual != expected_file_identity:
+                    raise DataAuditReplicaChangedError("submitted replica file identity changed")
+            elif (
+                actual.device,
+                actual.inode,
+                actual.size,
+                actual.mtime_ns,
+            ) != (
+                expected_file_identity.device,
+                expected_file_identity.inode,
+                expected_file_identity.size,
+                expected_file_identity.mtime_ns,
+            ):
+                raise DataAuditReplicaChangedError("submitted replica file identity changed")
+
+        digest = _file_sha256(handle)
+        _require_fixed_replica(primary_path, replica_path, opened)
+        if expected_file_sha256 is not None and digest != expected_file_sha256:
+            raise DataAuditReplicaChangedError("submitted replica SHA256 changed")
+        if on_replica_sha256 is not None:
+            on_replica_sha256(digest)
 
         directory.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".audit-source-", dir=directory.parent) as private:
@@ -657,9 +732,7 @@ def create_and_publish_data_audit_report(
                 or pinned_source.st_size != opened.st_size
                 or pinned_source.st_mtime_ns != opened.st_mtime_ns
             ):
-                raise ValueError("read-only replica changed before pinning")
-            _require_fixed_replica(primary_path, replica_path, pinned_source)
-            digest = _file_sha256(handle)
+                raise DataAuditReplicaChangedError("read-only replica changed before pinning")
             _require_fixed_replica(primary_path, replica_path, pinned_source)
             with duckdb.connect(str(pinned), read_only=True) as connection:
                 _require_fixed_replica(primary_path, replica_path, pinned_source)
@@ -676,6 +749,6 @@ def create_and_publish_data_audit_report(
                 )
                 _require_fixed_replica(primary_path, replica_path, pinned_source)
             if _file_sha256(handle) != digest:
-                raise ValueError("read-only replica digest changed during audit")
+                raise DataAuditReplicaChangedError("read-only replica digest changed during audit")
             _require_fixed_replica(primary_path, replica_path, pinned_source)
     return publish_data_audit_report(report, directory)
