@@ -5,7 +5,10 @@ export type PoolEditorData = Schemas["PoolEditorData"];
 export type EditablePool = Schemas["EditablePool"];
 export type EditableCanvas = Schemas["EditableCanvas"];
 export type BuiltinPoolCopySource = Schemas["BuiltinPoolCopySource"];
-export type EditorCommand = Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"];
+export type EditorCommand =
+  | Schemas["SavePoolCommand"]
+  | Schemas["AttachPoolCommand"]
+  | Schemas["CreateCanvasCommand"];
 export type EditorReceipt = Schemas["PoolEditorReceipt"];
 
 export function usePoolEditor(): ServingQueryResult<PoolEditorData> {

@@ -13,6 +13,9 @@ import { formatCount, formatPrice } from "@/format/number";
 import { formatTradeDate, weekdayOf } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, ChangeText, EmptyState, PageHeader, PageSkeleton, Panel, Tip } from "@/ui";
+import { CanvasCreateForm, canvasCreateLabel } from "./CanvasCreateForm";
+import { CanvasCreateSession } from "./canvasCreateSession";
+import { canvasPublicationStage } from "./canvasPublication";
 import { publicationStage } from "./editorPublication";
 import { PoolEditorSession } from "./editorSession";
 import { PoolEditorForm } from "./PoolEditorForm";
@@ -337,6 +340,23 @@ export default function PoolsPage() {
     editorSession.snapshot,
     editorSession.snapshot,
   );
+  const [canvasCreateSession] = useState(
+    () =>
+      new CanvasCreateSession(
+        browserStorage(),
+        submitPoolEditorCommand,
+        () =>
+          `web-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (item) => item.toString(16).padStart(2, "0")).join("")}`,
+        () => new Date().toISOString(),
+      ),
+  );
+  const canvasCreateSnapshot = useSyncExternalStore(
+    canvasCreateSession.subscribe,
+    canvasCreateSession.snapshot,
+    canvasCreateSession.snapshot,
+  );
+  const canvasAutoRetry = useRef({ commandId: "", attempts: 0 });
+  const [canvasDrawerOpen, setCanvasDrawerOpen] = useState(false);
   const autoRetry = useRef({ commandId: "", attempts: 0 });
   const [editorMode, setEditorMode] = useState<
     | { kind: "create"; parentKey: string | null }
@@ -379,6 +399,22 @@ export default function PoolsPage() {
     visibleGeneration,
     newest,
   );
+  const canvasStage = canvasPublicationStage(
+    canvasCreateSnapshot.journal,
+    editorQuery.data,
+    data,
+    editorQuery.serving?.generation_id,
+    visibleGeneration,
+    newest,
+  );
+  const canCreateCanvas =
+    editorReady && editorQuery.data?.canvas_create_available === true && !!meta.data?.data.viewer;
+  const canvasCreateBlockedReason = !meta.data
+    ? "正在加载用户信息。"
+    : !meta.data.data.viewer
+      ? "请先登录，才能新建画布。"
+      : "画布资料正在更新，暂时无法创建。";
+  const canvasStatus = canvasCreateLabel(canvasCreateSnapshot, canvasStage === "available");
   const savedKey =
     editorSnapshot.journal?.saveStatus === "succeeded"
       ? `user/${editorSnapshot.journal.save.base_name}`
@@ -400,6 +436,20 @@ export default function PoolsPage() {
     }, 1800);
     return () => window.clearTimeout(timer);
   }, [editorReady, editorSession, editorSnapshot]);
+
+  useEffect(() => {
+    const journal = canvasCreateSnapshot.journal;
+    if (!canCreateCanvas || !journal || canvasCreateSnapshot.busy) return;
+    if (!["pending", "processing", "unknown"].includes(journal.status)) return;
+    if (canvasAutoRetry.current.commandId !== journal.body.command_id)
+      canvasAutoRetry.current = { commandId: journal.body.command_id, attempts: 0 };
+    if (canvasAutoRetry.current.attempts >= 3) return;
+    const timer = window.setTimeout(() => {
+      canvasAutoRetry.current.attempts += 1;
+      void canvasCreateSession.advance();
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [canCreateCanvas, canvasCreateSession, canvasCreateSnapshot]);
 
   const canvas =
     canvasName === ""
@@ -505,6 +555,51 @@ export default function PoolsPage() {
             : undefined
         }
       />
+      {!canvasDrawerOpen && canvasCreateSnapshot.journal && canvasStatus ? (
+        <div className="pools-editor-evidence" role="status" aria-label="画布创建状态">
+          <span>
+            {canvasCreateSnapshot.journal.body.name} · {canvasStatus}
+          </span>
+          {canvasStage === "available" ? (
+            <Button
+              size="sm"
+              onClick={() => {
+                setCanvasName(canvasCreateSnapshot.journal?.body.name ?? null);
+                setSelectionId(null);
+              }}
+            >
+              打开画布
+            </Button>
+          ) : ["pending", "processing", "unknown", "ambiguous"].includes(
+              canvasCreateSnapshot.journal.status,
+            ) ? (
+            <Button
+              size="sm"
+              disabledReason={
+                !canCreateCanvas
+                  ? canvasCreateBlockedReason
+                  : canvasCreateSnapshot.busy
+                    ? "正在核对，请稍候。"
+                    : undefined
+              }
+              onClick={() => void canvasCreateSession.advance()}
+            >
+              继续核对
+            </Button>
+          ) : canvasCreateSnapshot.journal.status === "succeeded" ? (
+            <Button
+              size="sm"
+              onClick={() => {
+                void meta.refetch();
+                editorQuery.refetch();
+                query.refetch();
+              }}
+            >
+              检查发布
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {!editorDrawerOpen && editorSnapshot.journal?.saveStatus === "succeeded" ? (
         <div className="pools-editor-evidence" role="status">
           <span>池子已保存</span>
@@ -616,7 +711,7 @@ export default function PoolsPage() {
         <PageSkeleton />
       ) : query.error || changing ? (
         <EmptyState title="池子数据正在更新" hint="稍后刷新页面再查看。" />
-      ) : data?.pools.length ? (
+      ) : data && (data.state === "ready" || data.pools.length > 0 || editorReady) ? (
         <div className="pools-page">
           <div className="pools-toolbar">
             {data.canvases.length > 0 ? (
@@ -647,11 +742,26 @@ export default function PoolsPage() {
               </Tip>
             ) : null}
             <Button
+              className="pools-create-canvas-button"
+              size="sm"
+              disabledReason={canCreateCanvas ? undefined : canvasCreateBlockedReason}
+              onClick={() => {
+                if (canvasStage === "available") canvasCreateSession.clearTerminal();
+                setCanvasDrawerOpen(true);
+              }}
+            >
+              新建画布
+            </Button>
+            <Button
               className="pools-add-button"
               variant="primary"
               size="sm"
               disabledReason={
-                editorReady && data.pools.length ? undefined : `${editorNotice}，暂时无法添加条件。`
+                !data.pools.length
+                  ? "还没有可作为来源的池子，先发布一只池子。"
+                  : editorReady
+                    ? undefined
+                    : `${editorNotice}，暂时无法添加条件。`
               }
               onClick={() =>
                 setEditorMode({
@@ -677,7 +787,23 @@ export default function PoolsPage() {
             </p>
           ) : null}
           {canvas && shown.length === 0 ? (
-            <EmptyState title="这张画布暂无可查看的池子" hint="池子发布后会显示。" />
+            <EmptyState
+              title="这张画布还是空的"
+              hint={
+                data.pools.length
+                  ? "添加条件节点后，池子会显示在这里。"
+                  : "先发布一只池子，再来添加条件节点。"
+              }
+            />
+          ) : !canvas && data.pools.length === 0 ? (
+            <EmptyState
+              title={data.state === "unavailable" ? "池子结果暂不可用" : "还没有已发布的池子"}
+              hint={
+                data.state === "unavailable"
+                  ? "结果或规则发布后会在这里显示。"
+                  : "规则或选股结果发布后会在这里显示。"
+              }
+            />
           ) : (
             <div className="pools-layout">
               <Panel title="池子分布" sub="选择条件或池子" label="池子分布">
@@ -834,6 +960,27 @@ export default function PoolsPage() {
         entryMark={entryMark}
         onClose={() => setStockSelection(null)}
       />
+      {canvasDrawerOpen ? (
+        <CanvasCreateForm
+          session={canvasCreateSession}
+          snapshot={canvasCreateSnapshot}
+          available={canvasStage === "available"}
+          canCreate={canCreateCanvas}
+          unavailableReason={canvasCreateBlockedReason}
+          existingNames={editorQuery.data?.canvases.map((item) => item.name) ?? []}
+          onClose={() => setCanvasDrawerOpen(false)}
+          onOpen={() => {
+            setCanvasName(canvasCreateSnapshot.journal?.body.name ?? null);
+            setSelectionId(null);
+            setCanvasDrawerOpen(false);
+          }}
+          onRefresh={() => {
+            void meta.refetch();
+            editorQuery.refetch();
+            query.refetch();
+          }}
+        />
+      ) : null}
       {editorDrawerOpen && activeMode ? (
         <PoolEditorForm
           key={
