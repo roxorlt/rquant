@@ -456,7 +456,8 @@ def write_projection_replica(path: Path) -> None:
 
     `scripts/sync-readonly-replica.sh` leaves a WAL-free 0644 copy of the main database,
     which is why the readers' mode rule allows 0644 (#249). `DuckDBSignalPageProjectionSource`
-    refuses a projection database without both `screen_result` and `minute_bar`, so a
+    refuses a projection database without `screen_result`, `minute_bar` and
+    `monitor_event`, so a
     replica carrying only `daily_bar` -- which is all the read-side file's world needs --
     takes this role DEGRADED on every iteration. The mtime is the instant the timer last
     replaced it, before anything in this file reads it, because every reader on this path
@@ -464,6 +465,8 @@ def write_projection_replica(path: Path) -> None:
     """
 
     import duckdb
+
+    from rquant.storage.schema import MONITOR_EVENT_DDL
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -484,6 +487,7 @@ def write_projection_replica(path: Path) -> None:
             );
             """
         )
+        connection.execute(MONITOR_EVENT_DDL)
         connection.executemany(
             "INSERT INTO daily_bar VALUES (?, ?, ?)",
             [(SIGNAL_CODE, day, 1_000.0) for day in OPEN_DATES[:-1]],
