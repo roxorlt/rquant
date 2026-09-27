@@ -16,6 +16,7 @@ from rquant.screen.dynamic_ma import (
     dynamic_ma_day_count,
     requested_dynamic_ma,
 )
+from rquant.screen.dynamic_rsi import requested_dynamic_rsi
 from rquant.screen.rules import AggregateRequest
 
 if TYPE_CHECKING:
@@ -33,10 +34,18 @@ PRICE_COLS_MAP = {
 }
 
 IND_COLS_MAP = {
-    "ma5": "MA5", "ma10": "MA10", "ma20": "MA20", "ma60": "MA60",
-    "rsi6": "RSI6", "rsi14": "RSI14",
-    "macd": "MACD", "macd_signal": "MACD_SIGNAL", "macd_hist": "MACD_HIST",
-    "kdj_k": "KDJ_K", "kdj_d": "KDJ_D", "kdj_j": "KDJ_J",
+    "ma5": "MA5",
+    "ma10": "MA10",
+    "ma20": "MA20",
+    "ma60": "MA60",
+    "rsi6": "RSI6",
+    "rsi14": "RSI14",
+    "macd": "MACD",
+    "macd_signal": "MACD_SIGNAL",
+    "macd_hist": "MACD_HIST",
+    "kdj_k": "KDJ_K",
+    "kdj_d": "KDJ_D",
+    "kdj_j": "KDJ_J",
 }
 
 STATE_COLS_MAP = {
@@ -107,9 +116,7 @@ def _parse_trade_date(trade_date: str) -> date:
     return date.fromisoformat(trade_date[:10])
 
 
-def _resolve_decision_at(
-    trade_date: str, decision_at: datetime | None
-) -> datetime:
+def _resolve_decision_at(trade_date: str, decision_at: datetime | None) -> datetime:
     daily_screen_at = datetime.combine(
         _parse_trade_date(trade_date),
         DAILY_SCREEN_TIME,
@@ -180,9 +187,7 @@ def _calendar_window(
     return dates, complete
 
 
-def _resolve_trading_dates(
-    store: DuckDBStore, trade_date: str, lookback: int
-) -> list[str]:
+def _resolve_trading_dates(store: DuckDBStore, trade_date: str, lookback: int) -> list[str]:
     """返回 [T 日, T-1 日, ..., T-lookback 日] 的字符串日期列表。"""
     anchor = _parse_trade_date(trade_date)
     anchor_row = store._conn.execute(
@@ -280,13 +285,9 @@ def _compute_aggregate(
     """根据 AggregateRequest 生成 DuckDB SQL，返回 (ts_code, <agg_col>) DataFrame。"""
     allowed_columns = _AGGREGATE_SOURCE_COLUMNS.get(req.source_table)
     if allowed_columns is None or req.source_col not in allowed_columns:
-        raise ValueError(
-            f"Unsupported aggregate source: {req.source_table}.{req.source_col}"
-        )
+        raise ValueError(f"Unsupported aggregate source: {req.source_table}.{req.source_col}")
 
-    window_dates, calendar_complete = _calendar_window(
-        store, t0_date, req.window
-    )
+    window_dates, calendar_complete = _calendar_window(store, t0_date, req.window)
     if req.exclude_offset is not None:
         if 0 <= req.exclude_offset < len(window_dates):
             exclude_date = window_dates[req.exclude_offset]
@@ -308,15 +309,9 @@ def _compute_aggregate(
         "AND COUNT(*) FILTER (WHERE fact_known) = ?"
     )
     if req.agg_func == "max":
-        agg_expr = (
-            f"CASE WHEN {complete_predicate} "
-            "THEN MAX(source_value) ELSE NULL END"
-        )
+        agg_expr = f"CASE WHEN {complete_predicate} THEN MAX(source_value) ELSE NULL END"
     elif req.agg_func == "sum":
-        agg_expr = (
-            f"CASE WHEN {complete_predicate} "
-            "THEN SUM(source_value) ELSE NULL END"
-        )
+        agg_expr = f"CASE WHEN {complete_predicate} THEN SUM(source_value) ELSE NULL END"
     elif req.agg_func == "any":
         agg_expr = """
         CASE
@@ -422,20 +417,29 @@ def _selected_sources(
     selected: dict[str, dict[str, set[int]]] = {}
     wide_columns = set(_BASE_DISPLAY_COLUMNS)
     dynamic_ma = requested_dynamic_ma(required_columns)
+    dynamic_rsi = {
+        column
+        for column, (period, _) in requested_dynamic_rsi(frozenset(required_columns)).items()
+        if period not in (6, 14)
+    }
     for column in required_columns:
         if not isinstance(column, str):
             raise ValueError("unsupported screen dependency")
         if column in _ATTRIBUTE_COLUMNS:
             continue
         match = _WIDE_COLUMN.fullmatch(column)
-        if match is None or (match.group(1) not in _WIDE_SOURCES and column not in dynamic_ma):
+        if match is None or (
+            match.group(1) not in _WIDE_SOURCES
+            and column not in dynamic_ma
+            and column not in dynamic_rsi
+        ):
             raise ValueError(f"unsupported screen dependency: {column}")
         offset = int(match.group(2))
         if offset > lookback:
             raise ValueError(f"screen dependency offset exceeds lookback: {column}")
         wide_columns.add(column)
     for column in sorted(wide_columns):
-        if column in dynamic_ma:
+        if column in dynamic_ma or column in dynamic_rsi:
             continue
         match = _WIDE_COLUMN.fullmatch(column)
         assert match is not None
@@ -471,7 +475,8 @@ def _load_selected_wide(
             state_columns_sql = ", ".join(f"state.{source}" for source in sources)
             value_sql = ", ".join(
                 f"CASE WHEN status_visible THEN {source} ELSE NULL END AS {source}"
-                if source in PIT_STATE_COLS else source
+                if source in PIT_STATE_COLS
+                else source
                 for source in sources
             )
             sql = f"""
@@ -499,7 +504,7 @@ def _load_selected_wide(
         else:
             sql = f"""
                 SELECT ts_code, strftime(trade_date, '%Y-%m-%d') AS trade_date_str,
-                       {', '.join(sources)}
+                       {", ".join(sources)}
                 FROM {table}
                 WHERE ts_code IN ({code_slots})
                   AND trade_date IN ({date_slots})
@@ -528,10 +533,8 @@ def _load_universe_selective(
     dynamic_ma = requested_dynamic_ma(required_columns)
     resolved_decision_at = _resolve_decision_at(trade_date, decision_at)
     needed_days = dynamic_ma_day_count(dynamic_ma)
-    all_dates = _resolve_trading_dates(
-        store, trade_date, max(lookback + 1, needed_days) - 1
-    )
-    dates = all_dates[:lookback + 1]
+    all_dates = _resolve_trading_dates(store, trade_date, max(lookback + 1, needed_days) - 1)
+    dates = all_dates[: lookback + 1]
     t0_date = dates[0]
     universe = store._conn.execute(
         """
@@ -595,9 +598,12 @@ def _load_universe_selective(
     for request in aggregate_requests or []:
         aggregates = [
             _compute_aggregate(
-                store, request, t0_date,
-                ts_codes[start:start + _AGGREGATE_STOCK_BATCH],
-                resolved_decision_at, sparse_source=True,
+                store,
+                request,
+                t0_date,
+                ts_codes[start : start + _AGGREGATE_STOCK_BATCH],
+                resolved_decision_at,
+                sparse_source=True,
             )
             for start in range(0, len(ts_codes), _AGGREGATE_STOCK_BATCH)
         ]
@@ -641,8 +647,12 @@ def load_universe(
     try:
         if required_columns is not None:
             return _load_universe_selective(
-                trade_date, lookback, store, aggregate_requests,
-                decision_at, required_columns,
+                trade_date,
+                lookback,
+                store,
+                aggregate_requests,
+                decision_at,
+                required_columns,
             )
         resolved_decision_at = _resolve_decision_at(trade_date, decision_at)
         dates = _resolve_trading_dates(store, trade_date, lookback)

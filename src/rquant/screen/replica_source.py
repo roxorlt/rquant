@@ -29,6 +29,12 @@ from rquant.screen.dynamic_ma import (
     dynamic_ma_day_count,
     requested_dynamic_ma,
 )
+from rquant.screen.dynamic_rsi import (
+    DynamicRsiProjectionBudgetError,
+    DynamicRsiProjectionUnavailableError,
+    VerifiedDynamicRsiProjection,
+    requested_dynamic_rsi,
+)
 from rquant.screen.loader import (
     ScreeningCalendarError,
     ScreeningFactError,
@@ -148,11 +154,13 @@ class VerifiedReplicaScreenSource:
     def __init__(self, *, primary_path: Path, replica_path: Path) -> None:
         self.primary_path = Path(primary_path)
         self.replica_path = Path(replica_path)
-        if any(
-            not path.is_absolute()
-            or path != Path(os.path.abspath(path))
-            for path in (self.primary_path, self.replica_path)
-        ) or self.replica_path.parent.resolve(strict=False) != self.replica_path.parent:
+        if (
+            any(
+                not path.is_absolute() or path != Path(os.path.abspath(path))
+                for path in (self.primary_path, self.replica_path)
+            )
+            or self.replica_path.parent.resolve(strict=False) != self.replica_path.parent
+        ):
             raise ValueError("screen database paths must be absolute and canonical")
         if self.primary_path == self.replica_path:
             raise ValueError("screen replica must differ from the primary database")
@@ -227,6 +235,9 @@ class VerifiedReplicaScreenSource:
         if _identity(os.fstat(descriptor)) != before.replica or self._verify() != before:
             raise ScreenReplicaUnavailableError("screening replica changed during the request")
 
+    def generation_identity(self) -> str:
+        return self._verify().identity
+
     def available_dates(self, *, limit: int = 30) -> ScreenDatesSnapshot:
         if not 1 <= limit <= 30:
             raise ScreenReplicaBudgetError("screen date limit exceeds the allowed range")
@@ -260,6 +271,7 @@ class VerifiedReplicaScreenSource:
         *,
         decision_at: datetime | None = None,
         include_columns: Sequence[str] | None = None,
+        rsi_projection: VerifiedDynamicRsiProjection | None = None,
     ) -> ScreenUniverseSnapshot:
         if type(trade_date) is not date:
             raise ValueError("screen trade date must be a date")
@@ -268,6 +280,11 @@ class VerifiedReplicaScreenSource:
         rule_columns = required_rule_columns(rules)
         requested_columns = rule_columns | frozenset(include_columns or ())
         dynamic_ma = requested_dynamic_ma(requested_columns)
+        dynamic_rsi = {
+            column: parts
+            for column, parts in requested_dynamic_rsi(frozenset(requested_columns)).items()
+            if parts[0] not in (6, 14)
+        }
         dynamic_days = dynamic_ma_day_count(dynamic_ma)
         _, wide_columns = _selected_sources(requested_columns, MAX_LOOKBACK)
         required_offset = max(
@@ -314,6 +331,17 @@ class VerifiedReplicaScreenSource:
                 decision_at=decision_at,
                 required_columns=requested_columns,
             )
+            if dynamic_rsi:
+                if rsi_projection is None:
+                    raise ScreenReplicaDataError("screening RSI projection is unavailable")
+                values = rsi_projection.values(
+                    generation.identity,
+                    trade_date,
+                    frame["ts_code"].tolist(),
+                    dynamic_rsi,
+                ).set_index("ts_code")
+                for column in dynamic_rsi:
+                    frame[column] = frame["ts_code"].map(values[column])
             frame.insert(0, "trade_date", trade_date)
             self._finish(descriptor, generation)
             return ScreenUniverseSnapshot(
@@ -327,6 +355,10 @@ class VerifiedReplicaScreenSource:
             raise ScreenReplicaDataError("screening facts are ambiguous") from error
         except DynamicMaFactError as error:
             raise ScreenReplicaDataError("screening MA facts are incomplete") from error
+        except DynamicRsiProjectionBudgetError as error:
+            raise ScreenReplicaBudgetError("screening RSI request exceeds budget") from error
+        except DynamicRsiProjectionUnavailableError as error:
+            raise ScreenReplicaDataError("screening RSI projection is unavailable") from error
         except duckdb.Error as error:
             raise ScreenReplicaDataError("screening facts are unavailable") from error
         finally:
