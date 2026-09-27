@@ -10,6 +10,12 @@
 .pools-add-button {
   margin-left: auto;
 }
+.pools-create-canvas-button {
+  margin-left: auto;
+}
+.pools-create-canvas-button + .pools-add-button {
+  margin-left: 0;
+}
 .pools-detail-actions {
   display: flex;
   justify-content: flex-end;
@@ -542,10 +548,22 @@
     width: 100%;
     margin-left: 0;
   }
+  .pools-create-canvas-button {
+    width: 100%;
+    margin-left: 0;
+  }
   .pools-canvas-picker,
   .pools-canvas-picker select {
     width: 100%;
     max-width: 100%;
+  }
+  .pools-canvas-picker > span {
+    flex: none;
+    white-space: nowrap;
+  }
+  .pools-canvas-picker select {
+    flex: 1;
+    min-width: 0;
   }
   .pools-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
