@@ -14,7 +14,10 @@
     "moduleDetection": "force",
     "skipLibCheck": true,
     "noEmit": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
   },
   "include": ["vite.config.ts", "vitest.config.ts", "e2e/**/*.ts"]
 }

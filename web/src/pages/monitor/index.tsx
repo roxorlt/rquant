@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ApiError } from "@/api/client";
 import { type MonitorTimelineItem, useMonitorTimeline } from "@/api/endpoints";
+import { useCurrentGeneration } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
@@ -18,6 +19,7 @@ import {
   StatusBadge,
   Tip,
 } from "@/ui";
+import { AlertAcknowledgment, unacknowledgedKpi } from "../shared/AlertAcknowledgment";
 import { StockCell } from "../shared/StockCell";
 import "./monitor.css";
 
@@ -89,6 +91,7 @@ function TimelineEntry({
           ) : (
             <Pill kind={row.kind === "monitor" ? "acc" : "idle"}>{row.status_label}</Pill>
           )}
+          <AlertAcknowledgment acknowledgment={row.acknowledgment} />
         </div>
         {row.kind === "signal" ? (
           <>
@@ -142,7 +145,10 @@ export default function MonitorPage() {
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const pageIndex = cursors.length - 1;
   const result = useMonitorTimeline(cursors[pageIndex] ?? null, refreshKey);
-  const data = result.data;
+  const currentGeneration = useCurrentGeneration();
+  const oldGeneration =
+    currentGeneration !== undefined && result.serving?.generation_id !== currentGeneration;
+  const data = oldGeneration || result.error ? undefined : result.data;
   const changed = result.error instanceof ApiError && result.error.status === 409;
 
   function refresh() {
@@ -159,6 +165,7 @@ export default function MonitorPage() {
           unit: data.total === null ? undefined : "条",
           sub: data.source_state === "ready" && data.next_cursor ? "可向前翻看历史" : undefined,
         },
+        unacknowledgedKpi(data.unacknowledged),
         {
           key: "mode",
           label: "新信号通知",
@@ -187,7 +194,7 @@ export default function MonitorPage() {
           </Button>
         }
       />
-      {result.isLoading ? (
+      {result.isLoading || (oldGeneration && !result.error) ? (
         <PageSkeleton label="告警时间线加载中" />
       ) : result.error ? (
         <Panel title="告警时间线">

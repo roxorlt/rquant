@@ -101,6 +101,10 @@
 }
 
 @media (max-width: 640px) {
+  .monitor-content .kpis.compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .monitor-event {
     grid-template-columns: 1fr;
     gap: 3px;
