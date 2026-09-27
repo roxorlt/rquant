@@ -162,18 +162,15 @@ def _summarize_series(results: tuple[CorrelationResult, ...]) -> ICSeriesSummary
         )
 
     raw_sum = fsum(values)
-    raw_scale = max(abs(value) for value in values)
-    normalized_values = [value / raw_scale for value in values] if raw_scale else [0.0] * count
-    scaled_sum = raw_sum / raw_scale if raw_scale else 0.0
-    normalized_mean = scaled_sum / count
     raw_mean = raw_sum / count
-    centered = [value - normalized_mean for value in normalized_values]
-    scale = max(abs(value) for value in centered)
-    if scale == 0.0:
+    reference = values[0]
+    offsets = [value - reference for value in values]
+    offset_scale = max(abs(value) for value in offsets)
+    if offset_scale == 0.0:
         return ICSeriesSummary(
             status="zero_variance",
             **common,
-            mean=raw_mean,
+            mean=reference,
             sample_std=0.0,
             ir=None,
             positive_rate=positive_rate,
@@ -184,13 +181,22 @@ def _summarize_series(results: tuple[CorrelationResult, ...]) -> ICSeriesSummary
             excess_kurtosis=None,
         )
 
+    scaled_offsets = [value / offset_scale for value in offsets]
+    scaled_offset_mean = fsum(offsets) / offset_scale / count
+    centered = [value - scaled_offset_mean for value in scaled_offsets]
+    scale = max(abs(value) for value in centered)
     normalized = [value / scale for value in centered]
     normalized_sum_of_squares = fsum(value * value for value in normalized)
     scaled_sample_std = scale * sqrt(normalized_sum_of_squares / (count - 1))
-    raw_sample_std = raw_scale * scaled_sample_std
+    raw_sample_std = offset_scale * scaled_sample_std
     population_std = sqrt(normalized_sum_of_squares / count)
     standardized = [value / population_std for value in normalized]
-    ratio = scaled_sum / scaled_sample_std
+    # Divide by the factor below one first so a subnormal sum is not lost prematurely.
+    ratio = (
+        (raw_sum / offset_scale) / scaled_sample_std
+        if offset_scale <= 1.0
+        else (raw_sum / scaled_sample_std) / offset_scale
+    )
     ir_candidate = ratio / count
     t_candidate = ratio / sqrt(count)
     ir = None if raw_sum != 0.0 and ir_candidate == 0.0 else ir_candidate

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from math import atan, fsum, pi, sqrt
+from math import atan, fsum, nextafter, pi, sqrt
 from statistics import stdev
 
 import pytest
@@ -320,6 +320,35 @@ def test_constant_valid_days_report_zero_variance_without_inventing_ratios() -> 
         getattr(result, name) is None
         for name in ("ir", "t_value", "p_value", "skewness", "excess_kurtosis")
     )
+
+
+def test_three_identical_decimal_ic_values_have_exactly_zero_variance() -> None:
+    from rquant.factor.summary import summarize_factor_ic
+
+    result = summarize_factor_ic(
+        FactorEvaluation(days=tuple(_day(index, _correlation("ok", 0.1)) for index in range(3)))
+    ).normal_ic
+
+    assert result.status == "zero_variance"
+    assert result.mean == 0.1
+    assert result.sample_std == 0.0
+    assert result.ir is result.t_value is result.p_value is None
+    assert result.skewness is result.excess_kurtosis is None
+
+
+def test_adjacent_floats_near_one_keep_sample_variance_and_population_moments() -> None:
+    from rquant.factor.summary import summarize_factor_ic
+
+    lower = nextafter(1.0, 0.0)
+    result = summarize_factor_ic(
+        FactorEvaluation(
+            days=(_day(0, _correlation("ok", 1.0)), _day(1, _correlation("ok", lower)))
+        )
+    ).normal_ic
+
+    assert result.sample_std == pytest.approx((1.0 - lower) / sqrt(2), rel=1e-12, abs=0)
+    assert result.skewness == pytest.approx(0.0, abs=1e-12)
+    assert result.excess_kurtosis == pytest.approx(-2.0)
 
 
 @pytest.mark.parametrize(
