@@ -144,7 +144,22 @@ function PlanDetail({ plan }: { plan: BackfillPlanDetail }) {
         </div>
         <div>
           <dt>预计耗时</dt>
-          <dd className="num">预计 {estimatedTime(plan.estimated_seconds)}</dd>
+          <dd className="num">
+            <Tip
+              content={
+                <span>
+                  按日线 {formatCount(operations.daily)}、每日指标{" "}
+                  {formatCount(operations.daily_basic)}、复权因子{" "}
+                  {formatCount(operations.adj_factor)}、名称变更窗口{" "}
+                  {formatCount(operations.namechange_windows)}、特殊股票状态最多{" "}
+                  {formatCount(operations.stock_st_upper_bound)} 项估算，共{" "}
+                  {formatCount(operations.total)} 次逻辑操作。实际请求次数与配额扣额待确认。
+                </span>
+              }
+            >
+              <span className="dc-plan-estimate">预计 {estimatedTime(plan.estimated_seconds)}</span>
+            </Tip>
+          </dd>
         </div>
       </dl>
       <div className="dc-plan-checks">
@@ -161,22 +176,6 @@ function PlanDetail({ plan }: { plan: BackfillPlanDetail }) {
           <span>仅核对整日空洞</span>
         </Tip>
       </p>
-      <div className="dc-plan-cost">
-        <Tip
-          content={
-            <span>
-              日线 {formatCount(operations.daily)}、每日指标 {formatCount(operations.daily_basic)}、
-              复权因子 {formatCount(operations.adj_factor)}、名称变更资料{" "}
-              {formatCount(operations.namechange_context_batches)}、 特殊股票状态最多{" "}
-              {formatCount(operations.stock_st_upper_bound)} 次。
-              逻辑操作不等于实际请求次数或配额扣额。
-            </span>
-          }
-        >
-          <span className="num">{formatCount(operations.total)} 次逻辑操作</span>
-        </Tip>
-        <span className="dc-plan-muted">估算，非实际调用记录</span>
-      </div>
       <section className="dc-plan-section" aria-label="缺失交易日">
         <div className="dc-plan-section-head">
           <h3>缺失交易日</h3>

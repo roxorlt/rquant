@@ -57,8 +57,7 @@
 }
 .dc-plan-item-range,
 .dc-plan-item-foot,
-.dc-plan-kicker,
-.dc-plan-muted {
+.dc-plan-kicker {
   color: var(--muted);
   font-size: 11px;
 }
@@ -100,7 +99,7 @@
   margin-bottom: 3px;
 }
 .dc-plan-tech,
-.dc-plan-cost .num,
+.dc-plan-estimate,
 .dc-plan-scope span {
   border-bottom: 1px dotted var(--faint);
   cursor: help;
@@ -121,7 +120,6 @@
 .dc-plan-facts dt,
 .dc-plan-checks,
 .dc-plan-scope,
-.dc-plan-cost,
 .dc-plan-month-head {
   font-size: 12px;
 }
@@ -150,13 +148,6 @@
 }
 .dc-plan-scope {
   margin-top: 10px;
-}
-.dc-plan-cost {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-  margin-top: 14px;
 }
 .dc-plan-section {
   min-width: 0;

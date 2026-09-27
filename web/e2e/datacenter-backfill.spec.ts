@@ -41,7 +41,7 @@ const detail: Schemas["BackfillPlanDetail"] = {
       namechange_windows: 2,
       stock_st_upper_bound: 3,
       trade_cal: 0,
-      total: 13,
+      total: 14,
     },
     assumptions: {
       adapter_seconds_per_operation: "1",
@@ -142,10 +142,11 @@ test.describe("390px touch backfill plan", () => {
     await installPlans(page);
     await page.goto("./#/datacenter");
     await page.getByRole("button", { name: "回补计划" }).tap();
-    const estimate = page.getByText("13 次逻辑操作");
+    const estimate = page.getByText("预计 46 分钟");
     await expect(estimate).toBeVisible();
     await estimate.locator("..").tap();
-    await expect(page.getByRole("tooltip")).toContainText("逻辑操作不等于实际请求次数");
+    await expect(page.getByRole("tooltip")).toContainText("名称变更窗口 2");
+    await expect(page.getByRole("tooltip")).toContainText("共 14 次逻辑操作");
     await expectNoHorizontalOverflow(page, "touch backfill plan");
   });
 });

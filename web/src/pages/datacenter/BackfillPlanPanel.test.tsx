@@ -69,7 +69,7 @@ function detail(planHash: string, rank: number): PlanDetail {
         namechange_windows: 2,
         stock_st_upper_bound: 3,
         trade_cal: 0,
-        total: 13,
+        total: 14,
       },
       assumptions: {
         adapter_seconds_per_operation: "1",
@@ -177,7 +177,8 @@ describe("数据中心回补计划", () => {
     expect(within(main as HTMLElement).getByText("2024-09-03")).toBeInTheDocument();
     expect(within(main as HTMLElement).getByText("2024-10-08")).toBeInTheDocument();
     expect(within(main as HTMLElement).getByText("预计 46 分钟")).toBeInTheDocument();
-    expect(within(main as HTMLElement).getByText("13 次逻辑操作")).toBeInTheDocument();
+    expect(main?.textContent).not.toContain("逻辑操作");
+    expect(main?.textContent).not.toContain("非实际调用记录");
     expect(within(main as HTMLElement).getByText("配额待确认")).toBeInTheDocument();
     expect(within(main as HTMLElement).getByText("暂无进度信息")).toBeInTheDocument();
     expect(within(main as HTMLElement).queryByText("未运行")).not.toBeInTheDocument();
@@ -187,6 +188,11 @@ describe("数据中心回补计划", () => {
     expect(main?.textContent).not.toContain(firstHash);
     expect(main?.textContent).not.toContain("replica-private-label");
     expect(findJargon(main?.textContent ?? "")).toEqual([]);
+
+    await user.hover(within(main as HTMLElement).getByText("预计 46 分钟"));
+    const estimate = await screen.findByRole("tooltip");
+    expect(estimate).toHaveTextContent("名称变更窗口 2");
+    expect(estimate).toHaveTextContent("共 14 次逻辑操作");
 
     await user.click(screen.getByRole("button", { name: "下一页" }));
     expect(await screen.findByRole("button", { name: /第 3 份计划/ })).toBeInTheDocument();
