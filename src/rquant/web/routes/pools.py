@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -37,15 +38,36 @@ _MAX_MEMBERS = 100
 _MAX_STEPS = 32
 _MAX_RULE_ROWS = 512
 _MAX_RECEIPTS = 512
+_MAX_MEMBERSHIP_ROWS = 4_608
 
 
 @dataclass(frozen=True)
 class _RunReceipt:
     trade_date: date
     definition_version: str
+    result_version: str | None
     hit_count: int
     lineage_complete: bool
     current_definition: bool
+
+
+@dataclass(frozen=True)
+class _MembershipRow:
+    trade_date: date | None
+    result_version: str | None
+    row_kind: str
+    code: str
+    status: str
+    entry_trade_date: date | None
+    entry_close: float | None
+    entry_result_version: str | None
+    unknown_reason: str | None
+
+
+@dataclass(frozen=True)
+class _EntryEvidence:
+    trade_date: date | None = None
+    close: float | None = None
 
 
 def _available(tables: dict[str, readers.TableState], name: str) -> bool:
@@ -124,21 +146,136 @@ def _run_receipts(cursor: Any, tables: dict[str, readers.TableState]) -> dict[st
     if not _available(tables, "screen_run_receipt"):
         return {}
     rows = cursor.execute(
-        "SELECT trade_date, preset_name, definition_version, hit_count, "
+        "SELECT trade_date, preset_name, definition_version, result_version, hit_count, "
         "lineage_complete, current_definition FROM screen_run_receipt "
         "ORDER BY preset_name LIMIT ?",
         (_MAX_RECEIPTS,),
     ).fetchall()
-    return {
-        str(name): _RunReceipt(
-            trade_date=trade_date,
+    receipts: dict[str, _RunReceipt] = {}
+    for day, name, version, result_version, count, lineage, current in rows:
+        receipts[str(name)] = _RunReceipt(
+            trade_date=day,
             definition_version=str(version),
+            result_version=None if result_version is None else str(result_version),
             hit_count=int(count),
-            lineage_complete=bool(lineage_complete),
-            current_definition=bool(current_definition),
+            lineage_complete=bool(lineage),
+            current_definition=bool(current),
         )
-        for trade_date, name, version, count, lineage_complete, current_definition in rows
-    }
+    return receipts
+
+
+def _membership_rows(
+    cursor: Any, tables: dict[str, readers.TableState]
+) -> dict[str, list[_MembershipRow]]:
+    if not _available(tables, "pool_membership"):
+        return {}
+    rows = cursor.execute(
+        "SELECT pool_name, trade_date, result_version, row_kind, ts_code, status, "
+        "entry_trade_date, entry_close, entry_result_version, unknown_reason "
+        "FROM pool_membership ORDER BY pool_name, row_kind, ts_code LIMIT ?",
+        (_MAX_MEMBERSHIP_ROWS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_MEMBERSHIP_ROWS:
+        return {}
+    by_pool: dict[str, list[_MembershipRow]] = defaultdict(list)
+    for (
+        name,
+        trade_date,
+        result_version,
+        row_kind,
+        code,
+        status,
+        entry_trade_date,
+        entry_close,
+        entry_result_version,
+        unknown_reason,
+    ) in rows:
+        by_pool[str(name)].append(
+            _MembershipRow(
+                trade_date=trade_date,
+                result_version=None if result_version is None else str(result_version),
+                row_kind=str(row_kind),
+                code=str(code),
+                status=str(status),
+                entry_trade_date=entry_trade_date,
+                entry_close=readers._number(entry_close),
+                entry_result_version=(
+                    None if entry_result_version is None else str(entry_result_version)
+                ),
+                unknown_reason=None if unknown_reason is None else str(unknown_reason),
+            )
+        )
+    return by_pool
+
+
+def _entry_evidence(row: _MembershipRow, *, result_date: date) -> _EntryEvidence:
+    if (
+        row.entry_trade_date is None
+        or row.entry_trade_date > result_date
+        or row.entry_result_version is None
+        or re.fullmatch(r"[0-9a-f]{64}", row.entry_result_version) is None
+    ):
+        return _EntryEvidence()
+    if row.unknown_reason == "entry_price_missing" and row.entry_close is None:
+        return _EntryEvidence(trade_date=row.entry_trade_date)
+    if (
+        row.unknown_reason is not None
+        or row.entry_close is None
+        or not math.isfinite(row.entry_close)
+        or row.entry_close <= 0
+    ):
+        return _EntryEvidence()
+    return _EntryEvidence(trade_date=row.entry_trade_date, close=row.entry_close)
+
+
+def _member_entries(
+    *,
+    rows: list[_MembershipRow] | None,
+    receipt: _RunReceipt | None,
+    result: PoolResultView,
+    latest: date | None,
+    member_codes: set[str],
+    member_count: int,
+) -> dict[str, _EntryEvidence]:
+    if (
+        rows is None
+        or receipt is None
+        or receipt.result_version is None
+        or result.state != "current_rules"
+        or latest is None
+        or receipt.trade_date != latest
+        or len(member_codes) != member_count
+        or len(rows) != member_count + 1
+    ):
+        return {}
+    status_rows = [row for row in rows if row.row_kind == "status"]
+    if len(status_rows) != 1:
+        return {}
+    status = status_rows[0]
+    if (
+        status.trade_date != receipt.trade_date
+        or status.result_version != receipt.result_version
+        or status.code != ""
+        or status.status != "verified"
+        or status.entry_trade_date is not None
+        or status.entry_close is not None
+        or status.entry_result_version is not None
+        or status.unknown_reason is not None
+    ):
+        return {}
+    members = [row for row in rows if row.row_kind == "member"]
+    if (
+        len(members) != member_count
+        or {row.code for row in members} != member_codes
+        or any(
+            row.trade_date != receipt.trade_date
+            or row.result_version != receipt.result_version
+            or row.status != "verified"
+            for row in members
+        )
+    ):
+        return {}
+    return {row.code: _entry_evidence(row, result_date=receipt.trade_date) for row in members}
 
 
 def _result_view(
@@ -245,6 +382,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
     rules_available = _available(tables, "pool_definition")
     rule_definitions, rule_versions = _rule_definitions(cursor, tables)
     receipts = _run_receipts(cursor, tables)
+    memberships = _membership_rows(cursor, tables)
     results_available = all(
         _available(tables, name) for name in ("canvas_latest_trade_date", "canvas_hit")
     )
@@ -259,6 +397,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             ).fetchall()
         }
     hits: dict[str, list[PoolMember]] = defaultdict(list)
+    hit_codes: dict[str, set[str]] = defaultdict(set)
     counts: dict[str, int] = defaultdict(int)
     if latest is not None:
         for key, code, row_json in cursor.execute(
@@ -268,6 +407,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
         ).fetchall():
             pool_key = str(key)
             counts[pool_key] += 1
+            hit_codes[pool_key].add(str(code))
             if len(hits[pool_key]) >= _MAX_MEMBERS:
                 continue
             try:
@@ -283,6 +423,8 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                     name=name if isinstance(name, str) and name else None,
                     close=readers._number(payload.get("close")),
                     pct_chg=readers._number(payload.get("pct_chg")),
+                    entry_trade_date=None,
+                    entry_close=None,
                 )
             )
 
@@ -382,6 +524,37 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             state = "no_data"
             trade_date = latest if step_counts[key] else bounds.get(key)
             member_count = None
+        result_view = _result_view(
+            receipt=receipt,
+            definition=rule_definitions.get(key),
+            definition_version=rule_versions.get(key),
+            latest=latest,
+            latest_pool_result_date=latest_pool_result_date,
+            today=today,
+            member_state=state,
+            member_count=counts[key],
+            has_result_record=key in bounds or counts[key] > 0 or step_counts[key] > 0,
+            results_available=results_available,
+        )
+        entries = _member_entries(
+            rows=memberships.get(key),
+            receipt=receipt,
+            result=result_view,
+            latest=latest,
+            member_codes=hit_codes[key],
+            member_count=counts[key],
+        )
+        visible_members = [
+            member.model_copy(
+                update={
+                    "entry_trade_date": entries[member.code].trade_date,
+                    "entry_close": entries[member.code].close,
+                }
+            )
+            if member.code in entries
+            else member
+            for member in hits[key]
+        ]
         pools.append(
             PublishedPool(
                 key=key,
@@ -394,21 +567,10 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                 member_count=member_count,
                 steps=pool_steps if state == "current" else [],
                 steps_truncated=state == "current" and step_counts[key] > _MAX_STEPS,
-                members=hits[key] if state == "current" else [],
+                members=visible_members if state == "current" else [],
                 members_truncated=counts[key] > _MAX_MEMBERS,
                 definition=rule_definitions.get(key),
-                result=_result_view(
-                    receipt=receipt,
-                    definition=rule_definitions.get(key),
-                    definition_version=rule_versions.get(key),
-                    latest=latest,
-                    latest_pool_result_date=latest_pool_result_date,
-                    today=today,
-                    member_state=state,
-                    member_count=counts[key],
-                    has_result_record=key in bounds or counts[key] > 0 or step_counts[key] > 0,
-                    results_available=results_available,
-                ),
+                result=result_view,
             )
         )
     return PoolsData(

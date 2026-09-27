@@ -22,6 +22,30 @@ const MEMBER_COLUMNS: DataColumn<PoolMember>[] = [
     sortable: true,
   },
   {
+    id: "entry_date",
+    header: "入池日",
+    value: (row) => row.entry_trade_date,
+    cell: (row) => (
+      <span className="pool-entry-cell">
+        <time className="num" dateTime={row.entry_trade_date ?? undefined}>
+          {row.entry_trade_date ?? "—"}
+        </time>
+        <span className="pool-entry-phone">
+          入池收盘价 <span className="num">{formatPrice(row.entry_close)}</span>
+        </span>
+      </span>
+    ),
+    sortable: true,
+  },
+  {
+    id: "entry_close",
+    header: "入池日收盘价",
+    value: (row) => row.entry_close,
+    cell: (row) => <span className="num">{formatPrice(row.entry_close)}</span>,
+    numeric: true,
+    secondary: true,
+  },
+  {
     id: "close",
     header: "收盘价",
     value: (row) => row.close,
@@ -144,7 +168,7 @@ function ResultsDetail({
   onSelectStock,
 }: {
   pool: PublishedPool;
-  onSelectStock: (code: string) => void;
+  onSelectStock: (member: PoolMember, poolKey: string) => void;
 }) {
   const resultDate = pool.result.trade_date ?? pool.trade_date;
   return (
@@ -206,6 +230,11 @@ function ResultsDetail({
           sub={
             pool.members_truncated ? `仅显示前 ${formatCount(pool.members.length)} 只` : undefined
           }
+          actions={
+            <Tip content="入池价取入池日收盘价；暂无可靠记录时显示—。">
+              <span className="pools-info">入池价说明</span>
+            </Tip>
+          }
           label="池子成员"
           flush
         >
@@ -214,7 +243,7 @@ function ResultsDetail({
             columns={MEMBER_COLUMNS}
             rowKey={(row) => row.code}
             label="池子成员"
-            onSelect={(row) => onSelectStock(row.code)}
+            onSelect={(row) => onSelectStock(row, pool.key)}
             emptyText="本次没有成员"
           />
         </Panel>
@@ -228,7 +257,11 @@ export default function PoolsPage() {
   const meta = useMeta();
   const [canvasName, setCanvasName] = useState<string | null>(null);
   const [selectionId, setSelectionId] = useState<string | null>(null);
-  const [stockCode, setStockCode] = useState<string | null>(null);
+  const [stockSelection, setStockSelection] = useState<{
+    code: string;
+    poolKey: string;
+    generationId: string | null;
+  } | null>(null);
   const data = query.data;
   const newest = meta.data?.serving.generation_id;
   const visibleGeneration = query.serving?.generation_id;
@@ -248,6 +281,19 @@ export default function PoolsPage() {
   const selected = shown.find((pool) => pool.key === selectedKey) ?? shown[0];
   const selectedKind =
     selectionId?.startsWith("condition:") && selected?.key === selectedKey ? "condition" : "pool";
+  const stockPool = data?.pools.find((pool) => pool.key === stockSelection?.poolKey);
+  const stockMember = stockPool?.members.find((member) => member.code === stockSelection?.code);
+  const entryMark =
+    !changing &&
+    stockSelection?.generationId &&
+    stockSelection.generationId === visibleGeneration &&
+    stockPool?.result.state === "current_rules" &&
+    stockMember?.entry_trade_date
+      ? { date: stockMember.entry_trade_date, generationId: stockSelection.generationId }
+      : null;
+  const selectStock = (member: PoolMember, poolKey: string) => {
+    setStockSelection({ code: member.code, poolKey, generationId: visibleGeneration ?? null });
+  };
   const graphPools = shown.filter(
     (pool) =>
       pool.definition?.state === "available" ||
@@ -400,11 +446,11 @@ export default function PoolsPage() {
                         truncated={data.pools_truncated}
                         rulesAvailable={data.rules_available}
                       />
-                      <ResultsDetail pool={selected} onSelectStock={setStockCode} />
+                      <ResultsDetail pool={selected} onSelectStock={selectStock} />
                     </>
                   ) : (
                     <>
-                      <ResultsDetail pool={selected} onSelectStock={setStockCode} />
+                      <ResultsDetail pool={selected} onSelectStock={selectStock} />
                       <RulesDetail
                         pool={selected}
                         shown={shown}
@@ -426,7 +472,11 @@ export default function PoolsPage() {
       ) : (
         <EmptyState title="还没有已发布的池子" hint="规则或选股结果发布后会在这里显示。" />
       )}
-      <StockDrawer tsCode={stockCode} onClose={() => setStockCode(null)} />
+      <StockDrawer
+        tsCode={stockSelection?.code ?? null}
+        entryMark={entryMark}
+        onClose={() => setStockSelection(null)}
+      />
     </>
   );
 }

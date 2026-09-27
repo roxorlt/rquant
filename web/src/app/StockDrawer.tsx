@@ -4,7 +4,15 @@ import { PriceChart } from "@/charts/PriceChart";
 import { formatPrice } from "@/format/number";
 import { Button, EmptyState, Pill, SideDrawer, SkeletonRows } from "@/ui";
 
-export function StockDrawer({ tsCode, onClose }: { tsCode: string | null; onClose: () => void }) {
+export function StockDrawer({
+  tsCode,
+  onClose,
+  entryMark,
+}: {
+  tsCode: string | null;
+  onClose: () => void;
+  entryMark?: { date: string; generationId: string } | null;
+}) {
   const summary = useStockSummary(tsCode);
   const daily = useDaily(tsCode);
   const name = summary.data?.name ?? tsCode ?? "个股";
@@ -24,6 +32,17 @@ export function StockDrawer({ tsCode, onClose }: { tsCode: string | null; onClos
       })),
     [daily.data],
   );
+  const markedDay =
+    !daily.isLoading &&
+    !daily.error &&
+    tsCode !== null &&
+    entryMark !== null &&
+    entryMark !== undefined &&
+    daily.data?.ts_code === tsCode &&
+    entryMark.generationId === daily.serving?.generation_id &&
+    daily.data?.bars.some((bar) => bar.date === entryMark.date && !bar.provisional)
+      ? entryMark.date
+      : null;
 
   return (
     <SideDrawer
@@ -72,7 +91,10 @@ export function StockDrawer({ tsCode, onClose }: { tsCode: string | null; onClos
           </div>
         )}
         <section aria-label="日 K 走势">
-          <h3 className="stock-chart-title">日 K</h3>
+          <div className="stock-chart-heading">
+            <h3 className="stock-chart-title">日 K</h3>
+            {markedDay ? <span className="stock-entry-mark">入池 · {markedDay}</span> : null}
+          </div>
           {daily.isLoading ? (
             <SkeletonRows rows={6} />
           ) : daily.error ? (
@@ -83,7 +105,12 @@ export function StockDrawer({ tsCode, onClose }: { tsCode: string | null; onClos
               </Button>
             </div>
           ) : bars.length ? (
-            <PriceChart mode="daily" bars={bars} label={`${name} 日 K`} />
+            <PriceChart
+              mode="daily"
+              bars={bars}
+              marks={markedDay ? [{ time: markedDay, label: "入池" }] : []}
+              label={`${name} 日 K`}
+            />
           ) : (
             <EmptyState title="暂无日 K 数据" hint="目前仅覆盖候选股票" />
           )}

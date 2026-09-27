@@ -248,8 +248,19 @@
   gap: 6px;
 }
 .stock-chart-title {
-  margin: 0 0 8px;
+  margin: 0;
   font-size: 14px;
+}
+.stock-chart-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-bottom: 8px;
+}
+.stock-entry-mark {
+  color: var(--accent-t);
+  font-size: 12px;
 }
 .icon-btn {
   display: inline-grid;

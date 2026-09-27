@@ -7,6 +7,16 @@ import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
 
+vi.mock("@/charts/PriceChart", () => ({
+  PriceChart: ({
+    label,
+    marks,
+  }: {
+    label: string;
+    marks?: readonly { time: string; label: string }[];
+  }) => <div role="img" aria-label={label} data-marks={JSON.stringify(marks ?? [])} />,
+}));
+
 const serving = metaEnvelope().serving;
 const base: Schemas["PoolsData"] = {
   state: "ready",
@@ -31,7 +41,16 @@ const base: Schemas["PoolsData"] = {
       member_count: 121,
       steps: [{ step_index: 0, label: "最终命中", count: 121 }],
       steps_truncated: false,
-      members: [{ code: "600001.SH", name: "样本01", close: 11, pct_chg: 1.2 }],
+      members: [
+        {
+          code: "600001.SH",
+          name: "样本01",
+          close: 11,
+          pct_chg: 1.2,
+          entry_trade_date: null,
+          entry_close: null,
+        },
+      ],
       members_truncated: true,
       result: {
         state: "unverified",
@@ -120,6 +139,93 @@ it("selects a published pool by keyboard and opens a member's stock drawer", asy
   expect(findJargon(container.textContent ?? "")).toEqual([]);
   await user.click(screen.getByRole("row", { name: /样本01/ }));
   expect(await screen.findByRole("dialog")).toHaveTextContent("样本01");
+});
+
+it.each([
+  {
+    name: "same generation with the entry day",
+    generation: serving.generation_id,
+    day: "2026-09-22",
+    marked: true,
+  },
+  {
+    name: "another generation",
+    generation: "another-generation",
+    day: "2026-09-22",
+    marked: false,
+  },
+  {
+    name: "daily bars without the entry day",
+    generation: serving.generation_id,
+    day: "2026-09-23",
+    marked: false,
+  },
+])("shows an entry marker only for $name", async ({ generation, day, marked }) => {
+  const first = base.pools[0];
+  const member = first?.members[0];
+  if (!first || !member) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    pools: [
+      {
+        ...first,
+        member_count: 1,
+        members: [{ ...member, entry_trade_date: "2026-09-22", entry_close: null }],
+        result: {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: 1,
+        },
+      },
+    ],
+  });
+  server.use(
+    http.get("*/api/v1/stocks/600001.SH/summary", () =>
+      HttpResponse.json({
+        data: { ts_code: "600001.SH", name: "样本01", price: 11, as_of: null, pools: [] },
+        serving,
+      }),
+    ),
+    http.get("*/api/v1/panorama/stocks/600001.SH/daily", () =>
+      HttpResponse.json({
+        data: {
+          ts_code: "600001.SH",
+          name: "样本01",
+          bars: [
+            {
+              date: day,
+              open: 10,
+              high: 11,
+              low: 9.8,
+              close: 10.5,
+              volume: 1000,
+              ma5: null,
+              ma10: null,
+              ma20: null,
+              provisional: false,
+            },
+          ],
+        },
+        serving: { ...serving, generation_id: generation },
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  const table = await screen.findByRole("table", { name: "池子成员" });
+  expect(within(table).getByRole("columnheader", { name: "入池日" })).toBeInTheDocument();
+  expect(within(table).getByRole("columnheader", { name: "入池日收盘价" })).toBeInTheDocument();
+  expect(within(table).getByRole("row", { name: /样本01/ })).toHaveTextContent("09-22");
+  await user.click(within(table).getByRole("row", { name: /样本01/ }));
+  const drawer = await screen.findByRole("dialog");
+  const chart = await within(drawer).findByRole("img", { name: "样本01 日 K" });
+  expect(chart).toHaveAttribute(
+    "data-marks",
+    JSON.stringify(marked ? [{ time: "2026-09-22", label: "入池" }] : []),
+  );
+  expect(within(drawer).queryByText("入池 · 2026-09-22") !== null).toBe(marked);
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
 });
 
 it("shows independent published-rule and verified-result states in graph, list, and detail", async () => {

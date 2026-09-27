@@ -108,6 +108,27 @@ describe("price chart", () => {
     cleanup();
   });
 
+  it("places an entry marker on its daily candle without adding a price line", () => {
+    const cleanup = withTokens();
+    const { unmount } = render(
+      <ThemeProvider>
+        <PriceChart
+          mode="daily"
+          bars={[{ time: "2026-09-22", open: 10, high: 11, low: 9.8, close: 10.5 }]}
+          marks={[{ time: "2026-09-22", label: "入池" }]}
+          label="日 K"
+        />
+      </ThemeProvider>,
+    );
+    expect(chart.markers.setMarkers).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ time: "2026-09-22", text: "入池", position: "belowBar" }),
+      ]),
+    );
+    unmount();
+    cleanup();
+  });
+
   it("colours volume by the bar's direction", () => {
     const cleanup = withTokens();
     const colors = chartColors();

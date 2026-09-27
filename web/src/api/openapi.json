@@ -3560,6 +3560,29 @@
             "title": "Code",
             "type": "string"
           },
+          "entry_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Close"
+          },
+          "entry_trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Trade Date"
+          },
           "name": {
             "anyOf": [
               {
@@ -3587,7 +3610,9 @@
           "code",
           "name",
           "close",
-          "pct_chg"
+          "pct_chg",
+          "entry_trade_date",
+          "entry_close"
         ],
         "title": "PoolMember",
         "type": "object"

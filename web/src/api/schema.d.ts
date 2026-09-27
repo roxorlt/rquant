@@ -1544,6 +1544,10 @@ export interface components {
             close: number | null;
             /** Code */
             code: string;
+            /** Entry Close */
+            entry_close: number | null;
+            /** Entry Trade Date */
+            entry_trade_date: string | null;
             /** Name */
             name: string | null;
             /** Pct Chg */

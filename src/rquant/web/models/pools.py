@@ -15,6 +15,8 @@ class PoolMember(BaseModel):
     name: str | None
     close: float | None
     pct_chg: float | None
+    entry_trade_date: date | None
+    entry_close: float | None
 
 
 class PoolStep(BaseModel):

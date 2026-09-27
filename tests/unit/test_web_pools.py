@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import duckdb
+import pytest
 from fastapi.testclient import TestClient
 
 from rquant.pool_definition_projection import build_pool_definition_rows
@@ -112,12 +113,49 @@ def _receipt_row(
     )
 
 
+def _membership_status(
+    name: str,
+    *,
+    day: str = "2026-09-23",
+    version: str = "r" * 64,
+    status: str = "verified",
+) -> tuple[object, ...]:
+    return (name, day, version, "status", "", status, None, None, None, None)
+
+
+def _membership_member(
+    name: str,
+    code: str,
+    *,
+    day: str = "2026-09-23",
+    version: str = "r" * 64,
+    status: str = "verified",
+    entry_day: str | None = "2026-09-22",
+    entry_close: float | None = 10.25,
+    entry_version: str | None = "e" * 64,
+    reason: str | None = None,
+) -> tuple[object, ...]:
+    return (
+        name,
+        day,
+        version,
+        "member",
+        code,
+        status,
+        entry_day,
+        entry_close,
+        entry_version,
+        reason,
+    )
+
+
 def _receipt_response(
     tmp_path: Path,
     *,
     definitions: list[dict],
     hits: list[tuple[str, str]],
     receipts: list[tuple[object, ...]] | None,
+    memberships: list[tuple[object, ...]] | None = None,
     bounds: dict[str, str] | None = None,
     latest: str = "2026-09-23",
 ) -> dict:
@@ -193,6 +231,19 @@ def _receipt_response(
                     receipts,
                 )
             names.append("screen_run_receipt")
+        if memberships is not None:
+            connection.execute(
+                "CREATE TABLE pool_membership (pool_name VARCHAR, trade_date DATE, "
+                "result_version VARCHAR, row_kind VARCHAR, ts_code VARCHAR, status VARCHAR, "
+                "entry_trade_date DATE, entry_close DOUBLE, entry_result_version VARCHAR, "
+                "unknown_reason VARCHAR)"
+            )
+            if memberships:
+                connection.executemany(
+                    "INSERT INTO pool_membership VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    memberships,
+                )
+            names.append("pool_membership")
         connection.executemany(
             "INSERT INTO projection_status VALUES (?, true, 1, ?)",
             [(name, FIXTURE_BUILT_AT) for name in names],
@@ -354,6 +405,110 @@ def test_legacy_members_stay_visible_without_a_receipt(tmp_path: Path) -> None:
     assert [item["code"] for item in pool["members"]] == ["600001.SH"]
     assert pool["result"]["state"] == "unverified"
     assert pool["result"]["status_label"] == "结果版本待确认"
+
+
+def test_membership_entry_uses_only_matching_current_result_and_member_set(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/可证池")],
+        hits=[("user/可证池", "600001.SH"), ("user/可证池", "600002.SH")],
+        receipts=[_receipt_row("user/可证池", count=2)],
+        memberships=[
+            _membership_status("user/可证池"),
+            _membership_member("user/可证池", "600001.SH"),
+            _membership_member(
+                "user/可证池",
+                "600002.SH",
+                entry_close=None,
+                reason="entry_price_missing",
+            ),
+        ],
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/可证池")
+    assert pool["result"]["state"] == "current_rules"
+    members = {member["code"]: member for member in pool["members"]}
+    assert members["600001.SH"]["entry_trade_date"] == "2026-09-22"
+    assert members["600001.SH"]["entry_close"] == 10.25
+    assert members["600002.SH"]["entry_trade_date"] == "2026-09-22"
+    assert members["600002.SH"]["entry_close"] is None
+
+
+@pytest.mark.parametrize(
+    "memberships",
+    [
+        None,
+        [
+            _membership_status("user/可证池", version="other"),
+            _membership_member("user/可证池", "600001.SH"),
+        ],
+        [
+            _membership_status("user/可证池", day="2026-09-22"),
+            _membership_member("user/可证池", "600001.SH"),
+        ],
+        [_membership_status("user/可证池"), _membership_member("user/错池", "600001.SH")],
+        [_membership_member("user/可证池", "600001.SH")],
+        [_membership_status("user/可证池"), _membership_member("user/可证池", "600002.SH")],
+        [
+            _membership_status("user/可证池"),
+            _membership_member("user/可证池", "600001.SH", version="other"),
+        ],
+        [
+            _membership_status("user/可证池", status="calendar_incomplete"),
+            _membership_member("user/可证池", "600001.SH"),
+        ],
+    ],
+)
+def test_membership_missing_or_wrong_identity_never_adds_an_entry(
+    tmp_path: Path, memberships: list[tuple[object, ...]] | None
+) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/可证池")],
+        hits=[("user/可证池", "600001.SH")],
+        receipts=[_receipt_row("user/可证池")],
+        memberships=memberships,
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/可证池")
+    assert pool["result"]["state"] == "current_rules"
+    assert pool["members"][0]["entry_trade_date"] is None
+    assert pool["members"][0]["entry_close"] is None
+
+
+def test_membership_unknown_reason_and_invalid_price_never_become_evidence(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/可证池")],
+        hits=[("user/可证池", "600001.SH"), ("user/可证池", "600002.SH")],
+        receipts=[_receipt_row("user/可证池", count=2)],
+        memberships=[
+            _membership_status("user/可证池"),
+            _membership_member(
+                "user/可证池", "600001.SH", entry_close=None, reason="unknown_new_reason"
+            ),
+            _membership_member("user/可证池", "600002.SH", entry_close=float("nan")),
+        ],
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/可证池")
+    for member in pool["members"]:
+        assert member["entry_trade_date"] is None
+        assert member["entry_close"] is None
+
+
+def test_membership_entry_does_not_attach_to_an_unverified_result(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/旧规则池")],
+        hits=[("user/旧规则池", "600001.SH")],
+        receipts=[_receipt_row("user/旧规则池", version="o" * 64)],
+        memberships=[
+            _membership_status("user/旧规则池"),
+            _membership_member("user/旧规则池", "600001.SH"),
+        ],
+    )["data"]
+    pool = next(pool for pool in data["pools"] if pool["key"] == "user/旧规则池")
+    assert pool["result"]["state"] == "rules_changed"
+    assert pool["members"][0]["entry_trade_date"] is None
+    assert pool["members"][0]["entry_close"] is None
 
 
 def test_pools_map_saved_refs_latest_hits_steps_and_older_pools(tmp_path: Path) -> None:
