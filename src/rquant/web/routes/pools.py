@@ -58,6 +58,20 @@ def _canvases(cursor: Any, tables: dict[str, readers.TableState]) -> tuple[list[
     ], len(rows) > _MAX_CANVASES
 
 
+def _selected_keys(ordered: list[str], canvases: list[SavedCanvas], known: set[str]) -> list[str]:
+    selected: set[str] = set()
+    for canvas in canvases:
+        if not canvas.pool_keys:
+            continue
+        first_published = next((key for key in canvas.pool_keys if key in known), None)
+        selected.add(first_published or canvas.pool_keys[0])
+    for key in ordered:
+        if len(selected) >= _MAX_POOLS:
+            break
+        selected.add(key)
+    return [key for key in ordered if key in selected]
+
+
 def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
     if borrowed is None:
         return PoolsData(
@@ -143,8 +157,20 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
     ordered = sorted(
         known | referenced, key=lambda key: (key not in referenced, key not in counts, key)
     )
+    selected_keys = _selected_keys(ordered, canvases, known)
+    unknown_names = {
+        key: f"选股池 {index}"
+        for index, key in enumerate(
+            sorted(
+                key
+                for key in known | referenced
+                if key not in PRESET_LABELS and not key.startswith("user/")
+            ),
+            start=1,
+        )
+    }
     pools: list[PublishedPool] = []
-    for key in ordered[:_MAX_POOLS]:
+    for key in selected_keys:
         pool_steps = steps[key]
         if len(pool_steps) == 1 and pool_steps[0].label.lower() in {"final", "最终命中"}:
             pool_steps = [
@@ -155,7 +181,7 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
                 )
             ]
         if key not in known:
-            state = "missing" if _available(tables, "screen_bounds") else "unavailable"
+            state = "unpublished" if _available(tables, "screen_bounds") else "unavailable"
             trade_date = None
             member_count = None
         elif (
@@ -178,7 +204,8 @@ def build_pools(borrowed: BorrowedGeneration | None) -> PoolsData:
         pools.append(
             PublishedPool(
                 key=key,
-                name=PRESET_LABELS.get(key, "选股池"),
+                name=PRESET_LABELS.get(key)
+                or (key.removeprefix("user/") if key.startswith("user/") else unknown_names[key]),
                 state=state,
                 trade_date=trade_date,
                 member_count=member_count,

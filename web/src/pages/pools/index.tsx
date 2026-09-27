@@ -40,7 +40,7 @@ const MEMBER_COLUMNS: DataColumn<PoolMember>[] = [
 ];
 
 function poolStatus(pool: PublishedPool): string {
-  if (pool.state === "missing") return "引用的池子已失效";
+  if (pool.state === "unpublished") return "尚无已发布结果";
   if (pool.state === "older") return "不是最新交易日的结果";
   if (pool.state === "unavailable") return "池子结果暂不可用";
   if (pool.state === "no_data") return "这只池子暂无可确认的最新结果";
@@ -67,7 +67,9 @@ export default function PoolsPage() {
     ? canvas.pool_keys.flatMap((key) => data?.pools.find((pool) => pool.key === key) ?? [])
     : (data?.pools ?? []);
   const selected = shown.find((pool) => pool.key === poolKey) ?? shown[0];
-  const graphPools = shown.filter((pool) => pool.state !== "missing");
+  const graphPools = shown.filter(
+    (pool) => pool.state !== "unpublished" && pool.state !== "unavailable",
+  );
 
   return (
     <>
@@ -140,7 +142,7 @@ export default function PoolsPage() {
                     onSelect={setPoolKey}
                   />
                 ) : (
-                  <EmptyState title="没有可显示的池子节点" />
+                  <EmptyState title="暂无已发布的池子节点" />
                 )}
                 <Tip content="当前只发布画布名称和池子引用，没有规则或依赖关系；节点之间暂无线条。">
                   <span className="pools-info">关于连线</span>
@@ -180,8 +182,8 @@ export default function PoolsPage() {
                           hint={
                             selected.state === "older"
                               ? "最近交易日没有这只池子的成员，不能沿用旧日人数。"
-                              : selected.state === "missing"
-                                ? "保存画布中的引用找不到对应的已发布池子。"
+                              : selected.state === "unpublished"
+                                ? "画布保存了这条引用，但尚无结果可确认池子是否存在。"
                                 : "这只池子的最新成员尚未发布。"
                           }
                         />

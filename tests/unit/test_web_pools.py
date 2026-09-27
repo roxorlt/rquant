@@ -22,6 +22,22 @@ def _projection(name: str, rows: list[dict]) -> ServingProjectionPayload:
     )
 
 
+def _canvas_row(name: str, pool_refs: list[str]) -> dict:
+    return {
+        "name": name,
+        "description": "日终观察",
+        "pool_refs_json": json.dumps(pool_refs),
+        "created_at": "2026-09-24T07:00:00Z",
+        "updated_at": "2026-09-24T07:00:00Z",
+        "source": "user",
+        "command_id": f"cmd-{name}",
+        "command_hash": "a" * 64,
+        "source_identity_hash": "b" * 64,
+        "record_hash": "c" * 64,
+        "version_hash": "d" * 64,
+    }
+
+
 def _get(root: Path) -> dict:
     app = create_app(
         WebSettings(serving_root=root, stale_after_seconds=600),
@@ -115,7 +131,8 @@ def test_pools_map_saved_refs_latest_hits_steps_and_older_pools(tmp_path: Path) 
     ]
     assert pools["old-pool"]["state"] == "older"
     assert pools["old-pool"]["member_count"] is None
-    assert pools["deleted-pool"]["state"] == "missing"
+    assert pools["deleted-pool"]["state"] == "unpublished"
+    assert pools["deleted-pool"]["member_count"] is None
     assert all("999" not in str(pool) and "cmd-secret" not in str(pool) for pool in data["pools"])
 
 
@@ -278,3 +295,90 @@ def test_single_named_diagnostic_keeps_its_published_label(tmp_path: Path) -> No
     )
     pool = next(item for item in _get(root)["data"]["pools"] if item["key"] == "n-shape-pool1")
     assert pool["steps"] == [{"step_index": 1, "label": "均线过滤", "count": 3}]
+
+
+def test_user_pool_names_and_unknown_keys_remain_distinguishable(tmp_path: Path) -> None:
+    root = tmp_path / "names"
+    keys = ["user/突破新高", "user/回踩均线", "unknown-alpha", "unknown-beta"]
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("canvas_definition", [_canvas_row("观察画布", keys)]),
+            _projection(
+                "screen_bounds",
+                [
+                    {
+                        "preset_name": key,
+                        "min_date": "2026-09-23",
+                        "max_date": "2026-09-23",
+                        "candidate_count": 1,
+                    }
+                    for key in keys
+                ],
+            ),
+        ),
+    )
+    pools = {pool["key"]: pool for pool in _get(root)["data"]["pools"]}
+    assert pools["user/突破新高"]["name"] == "突破新高"
+    assert pools["user/回踩均线"]["name"] == "回踩均线"
+    unknown_names = [pools[key]["name"] for key in keys[2:]]
+    assert len(set(unknown_names)) == 2
+    assert all(name.startswith("选股池 ") and name not in keys for name in unknown_names)
+
+
+def test_canvas_reference_without_first_published_result_is_unverified(tmp_path: Path) -> None:
+    root = tmp_path / "unpublished"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection("canvas_definition", [_canvas_row("新画布", ["user/初选池"])]),
+            _projection("screen_bounds", []),
+            _projection("canvas_hit", []),
+            _projection("canvas_diagnostic", []),
+        ),
+    )
+    pool = next(pool for pool in _get(root)["data"]["pools"] if pool["key"] == "user/初选池")
+    assert pool["name"] == "初选池"
+    assert pool["state"] == "unpublished"
+    assert pool["trade_date"] is None
+    assert pool["member_count"] is None
+
+
+def test_later_canvas_keeps_a_published_pool_at_global_limit(tmp_path: Path) -> None:
+    root = tmp_path / "many-canvases"
+    first_keys = [f"pool-{index:02d}" for index in range(64)]
+    later_key = "pool-64"
+    build_web_fixture(
+        root,
+        "baseline",
+        signal_projections=(
+            _projection(
+                "canvas_definition",
+                [
+                    _canvas_row("第一画布", first_keys),
+                    _canvas_row("第二画布", [later_key]),
+                ],
+            ),
+            _projection(
+                "canvas_hit",
+                [
+                    {
+                        "trade_date": "2026-09-23",
+                        "preset_name": key,
+                        "ts_code": "600001.SH",
+                        "row_json": "{}",
+                    }
+                    for key in [*first_keys, later_key]
+                ],
+            ),
+        ),
+    )
+    data = _get(root)["data"]
+    pools = {pool["key"]: pool for pool in data["pools"]}
+    assert data["pools_truncated"] is True
+    assert len(data["pools"]) == 64
+    assert later_key in pools
+    assert pools[later_key]["state"] == "current"
+    assert pools[later_key]["member_count"] == 1

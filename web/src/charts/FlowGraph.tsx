@@ -46,7 +46,19 @@ export function FlowGraph({ nodes, edges, label, onSelect }: FlowGraphProps) {
   );
   return (
     // biome-ignore lint/a11y/useSemanticElements: the graph container is not a form fieldset.
-    <div className="flow-graph" role="group" aria-label={label}>
+    <div
+      className="flow-graph"
+      role="group"
+      aria-label={label}
+      onKeyDown={(event) => {
+        if (!onSelect || (event.key !== "Enter" && event.key !== " ")) return;
+        if (!(event.target instanceof Element)) return;
+        const node = event.target.closest<HTMLElement>(".react-flow__node[data-id]");
+        if (!node?.dataset.id) return;
+        event.preventDefault();
+        onSelect(node.dataset.id);
+      }}
+    >
       <ReactFlow
         nodes={flowNodes}
         edges={flowEdges}

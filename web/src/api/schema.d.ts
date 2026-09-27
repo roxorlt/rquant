@@ -1583,7 +1583,7 @@ export interface components {
              * State
              * @enum {string}
              */
-            state: "current" | "older" | "no_data" | "missing" | "unavailable";
+            state: "current" | "older" | "no_data" | "unpublished" | "unavailable";
             /** Steps */
             steps: components["schemas"]["PoolStep"][];
             /** Steps Truncated */

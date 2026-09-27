@@ -30,7 +30,7 @@ class PublishedPool(BaseModel):
 
     key: str
     name: str
-    state: Literal["current", "older", "no_data", "missing", "unavailable"]
+    state: Literal["current", "older", "no_data", "unpublished", "unavailable"]
     trade_date: date | None
     member_count: int | None
     steps: list[PoolStep]

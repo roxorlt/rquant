@@ -36,7 +36,7 @@ const base: Schemas["PoolsData"] = {
     {
       key: "deleted-pool",
       name: "选股池",
-      state: "missing",
+      state: "unpublished",
       trade_date: null,
       member_count: null,
       steps: [],
@@ -82,10 +82,10 @@ it("selects a published pool by keyboard and opens a member's stock drawer", asy
   expect(await screen.findByRole("dialog")).toHaveTextContent("样本01");
 });
 
-it("explains missing references, older results, and empty data", async () => {
+it("does not call unpublished references invalid or reuse older counts", async () => {
   const current = base.pools[0];
-  const missing = base.pools[1];
-  if (!current || !missing) throw new Error("pool fixture is incomplete");
+  const unpublished = base.pools[1];
+  if (!current || !unpublished) throw new Error("pool fixture is incomplete");
   respond({
     ...base,
     pools: [
@@ -97,14 +97,43 @@ it("explains missing references, older results, and empty data", async () => {
         members: [],
         steps: [],
       },
-      missing,
+      unpublished,
     ],
   });
   const user = userEvent.setup();
   renderApp("/pools");
   expect((await screen.findAllByText(/不是最新交易日/)).length).toBeGreaterThan(0);
   await user.click(screen.getByRole("button", { name: /选股池/ }));
-  expect(screen.getAllByText(/引用的池子已失效/).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/尚无已发布结果/).length).toBeGreaterThan(0);
+  expect(screen.queryByText(/已失效/)).not.toBeInTheDocument();
+});
+
+it("selects a graph node's details with Enter and Space", async () => {
+  const first = base.pools[0];
+  const canvas = base.canvases[0];
+  if (!first || !canvas) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    canvases: [{ ...canvas, pool_keys: ["n-shape-pool1", "n-shape-pool2"] }],
+    pools: [first, { ...first, key: "n-shape-pool2", name: "N 字二池", member_count: 2 }],
+  });
+  const user = userEvent.setup();
+  renderApp("/pools");
+  const graph = await screen.findByRole("group", { name: "已发布池子；关系尚未发布" });
+  const secondNode = graph.querySelector<HTMLElement>('[data-id="n-shape-pool2"]');
+  const firstNode = graph.querySelector<HTMLElement>('[data-id="n-shape-pool1"]');
+  expect(secondNode).toBeTruthy();
+  expect(firstNode).toBeTruthy();
+  act(() => secondNode?.focus());
+  await user.keyboard("{Enter}");
+  expect(
+    within(screen.getByRole("region", { name: "池子详情" })).getByText("2 只"),
+  ).toBeInTheDocument();
+  act(() => firstNode?.focus());
+  await user.keyboard("{Space}");
+  expect(
+    within(screen.getByRole("region", { name: "池子详情" })).getAllByText("121 只").length,
+  ).toBeGreaterThan(0);
 });
 
 it("shows a truthful unavailable state without stale members", async () => {

@@ -22,6 +22,15 @@ for (const viewport of [
       await pool.press("Enter");
       await expect(pool).toHaveAttribute("aria-pressed", "true");
       await expect(page.getByRole("region", { name: "池子详情" })).toContainText("3 只");
+      const graph = page.getByRole("group", { name: "已发布池子；关系尚未发布" });
+      const secondNode = graph.locator('.react-flow__node[data-id="n-shape-pool2"]');
+      await secondNode.focus();
+      await secondNode.press("Enter");
+      await expect(page.getByRole("region", { name: "池子详情" })).toContainText("2 只");
+      const firstNode = graph.locator('.react-flow__node[data-id="n-shape-pool1"]');
+      await firstNode.focus();
+      await firstNode.press("Space");
+      await expect(page.getByRole("region", { name: "池子详情" })).toContainText("3 只");
       await page.screenshot({
         path: join(tmpdir(), `rquant-pools-${viewport.name}.png`),
         fullPage: true,
