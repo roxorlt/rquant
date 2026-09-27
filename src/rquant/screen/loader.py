@@ -11,6 +11,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from rquant.screen.dynamic_ma import (
+    derive_requested_ma,
+    dynamic_ma_day_count,
+    requested_dynamic_ma,
+)
 from rquant.screen.rules import AggregateRequest
 
 if TYPE_CHECKING:
@@ -92,6 +97,10 @@ _AGGREGATE_STOCK_BATCH = 64
 
 class ScreeningCalendarError(RuntimeError):
     """Authoritative trade-calendar coverage cannot support the screen."""
+
+
+class ScreeningFactError(ValueError):
+    """Selected screening facts have ambiguous stock/date identity."""
 
 
 def _parse_trade_date(trade_date: str) -> date:
@@ -241,6 +250,8 @@ def _wide_from_long(
     long_df["offset"] = long_df["trade_date_str"].map(date_to_offset)
     long_df = long_df.dropna(subset=["offset"])
     long_df["offset"] = long_df["offset"].astype(int)
+    if long_df.duplicated(subset=["ts_code", "offset"]).any():
+        raise ScreeningFactError("duplicate selected screening facts")
 
     frames: list[pd.DataFrame] = []
     for src, dst in rename_map.items():
@@ -410,19 +421,22 @@ def _selected_sources(
 ) -> tuple[dict[str, dict[str, set[int]]], frozenset[str]]:
     selected: dict[str, dict[str, set[int]]] = {}
     wide_columns = set(_BASE_DISPLAY_COLUMNS)
+    dynamic_ma = requested_dynamic_ma(required_columns)
     for column in required_columns:
         if not isinstance(column, str):
             raise ValueError("unsupported screen dependency")
         if column in _ATTRIBUTE_COLUMNS:
             continue
         match = _WIDE_COLUMN.fullmatch(column)
-        if match is None or match.group(1) not in _WIDE_SOURCES:
+        if match is None or (match.group(1) not in _WIDE_SOURCES and column not in dynamic_ma):
             raise ValueError(f"unsupported screen dependency: {column}")
         offset = int(match.group(2))
         if offset > lookback:
             raise ValueError(f"screen dependency offset exceeds lookback: {column}")
         wide_columns.add(column)
     for column in sorted(wide_columns):
+        if column in dynamic_ma:
+            continue
         match = _WIDE_COLUMN.fullmatch(column)
         assert match is not None
         table, source = _WIDE_SOURCES[match.group(1)]
@@ -511,8 +525,13 @@ def _load_universe_selective(
     required_columns: Collection[str],
 ) -> pd.DataFrame:
     selected, wide_columns = _selected_sources(required_columns, lookback)
+    dynamic_ma = requested_dynamic_ma(required_columns)
     resolved_decision_at = _resolve_decision_at(trade_date, decision_at)
-    dates = _resolve_trading_dates(store, trade_date, lookback)
+    needed_days = dynamic_ma_day_count(dynamic_ma)
+    all_dates = _resolve_trading_dates(
+        store, trade_date, max(lookback + 1, needed_days) - 1
+    )
+    dates = all_dates[:lookback + 1]
     t0_date = dates[0]
     universe = store._conn.execute(
         """
@@ -538,6 +557,8 @@ def _load_universe_selective(
     ).fetchdf()
     if universe.empty:
         return pd.DataFrame()
+    if universe["ts_code"].duplicated().any():
+        raise ScreeningFactError("duplicate screen universe facts")
 
     ts_codes = universe["ts_code"].tolist()
     code_slots = ",".join("?" for _ in ts_codes)
@@ -547,7 +568,7 @@ def _load_universe_selective(
         [*ts_codes, t0_date],
     ).fetchdf()
     if state_t0["ts_code"].duplicated().any():
-        raise ValueError("duplicate screen state facts")
+        raise ScreeningFactError("duplicate screen state facts")
     out = universe.merge(state_t0, on="ts_code", how="left")
     for table, fields in selected.items():
         for wide in _load_selected_wide(
@@ -555,6 +576,15 @@ def _load_universe_selective(
         ):
             if not wide.empty:
                 out = out.merge(wide, on="ts_code", how="left")
+
+    if dynamic_ma:
+        dynamic = derive_requested_ma(
+            store._conn,
+            dates=all_dates[:needed_days],
+            ts_codes=ts_codes,
+            columns=dynamic_ma,
+        )
+        out = out.merge(dynamic, on="ts_code", how="left", validate="one_to_one")
 
     missing_columns = [column for column in sorted(wide_columns) if column not in out.columns]
     if missing_columns:

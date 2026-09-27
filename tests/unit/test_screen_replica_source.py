@@ -407,6 +407,32 @@ def test_open_trade_date_without_daily_rows_is_data_unavailable_not_zero_hits(
     assert "daily_bar" not in str(failed.value)
 
 
+@pytest.mark.parametrize("offset", [0, 1])
+def test_duplicate_selected_daily_bar_is_data_error(
+    tmp_path: Path, offset: int,
+) -> None:
+    primary, replica, dates = _world(tmp_path)
+    with DuckDBStore(primary) as store:
+        store._conn.execute("CREATE TABLE daily_bar_copy AS SELECT * FROM daily_bar")
+        store._conn.execute(
+            "INSERT INTO daily_bar_copy SELECT * FROM daily_bar "
+            "WHERE ts_code = '600001.SH' AND trade_date = ?",
+            [dates[offset]],
+        )
+        store._conn.execute("DROP TABLE daily_bar")
+        store._conn.execute("ALTER TABLE daily_bar_copy RENAME TO daily_bar")
+    shutil.copy2(primary, replica)
+    write_replica_generation_metadata(
+        primary_path=primary,
+        replica_path=replica,
+        output_path=replica_generation_path(replica),
+        source_before=capture_database_watermark(primary),
+    )
+
+    with pytest.raises(_source_module().ScreenReplicaDataError):
+        _reader(primary, replica).load(dates[0], [gt(f"CLOSE[{offset}]", 1)])
+
+
 def test_condition_and_universe_budgets_prevent_unbounded_load(tmp_path: Path) -> None:
     primary, replica, dates = _world(tmp_path)
     module = _source_module()
