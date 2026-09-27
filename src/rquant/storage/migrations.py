@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.storage.schema import (
     BASE_DDL,
+    DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
     DATA_AUDIT_RUN_DDL,
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
@@ -177,6 +178,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=13,
         name="financial PIT observations",
         statements=FINANCIAL_PIT_OBSERVATION_DDLS,
+    ),
+    Migration(
+        version=14,
+        name="daily basic valuation PIT observations",
+        statements=DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
     ),
 )
 

@@ -34,7 +34,11 @@ SOURCE_NAMES = {
 # registry: its Eastmoney source only provides the current day, and a missing day
 # cannot be backfilled from that source.
 CATALOG_CONTRACTS: tuple[DatasetContract, ...] = (
-    *(contract for contract in DATASET_CONTRACTS if contract.dataset_id != "financial_observation"),
+    *(
+        contract
+        for contract in DATASET_CONTRACTS
+        if contract.dataset_id not in {"financial_observation", "daily_basic_valuation_observation"}
+    ),
     DatasetContract(
         dataset_id="limit_up_pool_daily",
         table_name="limit_up_pool_daily",
@@ -106,7 +110,7 @@ def build_catalog(
     """Strictly join human copy to contracts and physical types, with no inferred columns."""
     datasets: list[CatalogDataset] = []
     for contract in contracts:
-        if contract.dataset_id == "financial_observation":
+        if contract.dataset_id in {"financial_observation", "daily_basic_valuation_observation"}:
             continue
         copy = descriptions.get(contract.dataset_id)
         if (

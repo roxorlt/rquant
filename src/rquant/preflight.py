@@ -375,7 +375,9 @@ PRODUCTION_FRESHNESS_DATASET_IDS = (
     "stock_suspend_coverage",
 )
 RESEARCH_FRESHNESS_DATASET_IDS = tuple(
-    dataset_id for dataset_id in CONTRACTS_BY_ID if dataset_id != "financial_observation"
+    dataset_id
+    for dataset_id in CONTRACTS_BY_ID
+    if dataset_id not in {"financial_observation", "daily_basic_valuation_observation"}
 )
 READONLY_REPLICA_MAX_SOURCE_LAG = timedelta(minutes=12)
 FreshnessProfile = Literal["production", "research"]

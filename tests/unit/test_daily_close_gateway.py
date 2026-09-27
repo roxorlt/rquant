@@ -12,12 +12,15 @@ from threading import Event
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 
 import rquant.daily_close_gateway as daily_close_gateway_module
 import rquant.runtime_builder_daily as runtime_builder_daily
 from rquant.daily_close_gateway import (
     DAILY_CLOSE_SOURCE_INTERFACES,
+    DailyBasicFact,
     DailyCloseDataset,
+    DailyCloseFacts,
     DailyCloseFetchResult,
     DailyCloseGateway,
     DailyCloseGatewayConfig,
@@ -27,6 +30,7 @@ from rquant.daily_close_gateway import (
 )
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
+from rquant.runtime_contracts import canonical_sha256
 from rquant.source_quota_store import SourceQuotaAttemptOutcome, SourceQuotaStore
 from rquant.source_quota_transport import QuotaBoundTransportObserver
 
@@ -124,6 +128,41 @@ def _gateway(
         quota_store=quota_store,
         transport_observer=transport_observer,
     )
+
+
+def test_legacy_daily_basic_payload_keeps_its_original_content_identity() -> None:
+    old_snapshot = _snapshot()
+    facts = DailyCloseFacts.model_validate(old_snapshot)
+    assert facts.identity_sha256 == canonical_sha256(old_snapshot)
+    assert facts.daily_basic[0].valuation_observed is False
+
+    request = DailyCloseSourceRequest(source="tushare.daily_close", trade_date=TRADE_DATE)
+    payload = DailyCloseRawPayload(
+        schema_version=1,
+        source_request=request,
+        source_request_id=request.identity_sha256,
+        observed_at=OBSERVED_AT,
+        available_at=AVAILABLE_AT,
+        revision=1,
+        content_sha256=facts.identity_sha256,
+        quality_status=BatchQualityStatus.PUBLISHED,
+        facts=facts,
+    )
+    raw_json = payload.model_dump(mode="json")
+    old_row = raw_json["facts"]["daily_basic"][0]
+    for field_name in ("pe_ttm", "pb", "dv_ttm", "valuation_observed"):
+        old_row.pop(field_name)
+    restored = DailyCloseGateway.decode_payload(
+        json.dumps(raw_json, sort_keys=True).encode("utf-8")
+    )
+    assert restored.facts.identity_sha256 == facts.identity_sha256
+
+
+def test_observed_valuation_requires_all_three_source_fields() -> None:
+    basic = _snapshot()["daily_basic"][0]
+    assert isinstance(basic, dict)
+    with pytest.raises(ValidationError, match="include all source fields"):
+        DailyBasicFact.model_validate({**basic, "pb": 1.25, "valuation_observed": True})
 
 
 def test_transport_restart_aggregates_a_killed_second_call_as_unknown(
@@ -478,6 +517,9 @@ def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot = _snapshot()
+    basic_row = snapshot["daily_basic"][0]
+    assert isinstance(basic_row, dict)
+    basic_row.update(pe_ttm=None, pb=1.25, dv_ttm=2.5)
 
     class FakeAdapter:
         def __init__(self, *, token: str, backup_token: str) -> None:
@@ -520,6 +562,8 @@ def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
     assert isinstance(result, DailyCloseFetchResult)
     assert result.actual_call_count == 7
     assert result.interface_calls == DAILY_CLOSE_SOURCE_INTERFACES
+    observed_basic = result.payload["daily_basic"][0]
+    assert observed_basic == {**basic_row, "valuation_observed": True}
 
 
 def _records(gateway: DailyCloseGateway):

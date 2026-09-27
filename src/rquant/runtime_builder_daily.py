@@ -176,9 +176,14 @@ def _tushare_daily_close_fetcher(
                 "volume_ratio",
                 "total_mv",
                 "circ_mv",
+                "pe_ttm",
+                "pb",
+                "dv_ttm",
             ),
             label="daily_basic",
         )
+        for row in basic:
+            row["valuation_observed"] = True
         factors = _rows(
             call("adj_factor_by_date", lambda: adapter.adj_factor_by_date(trade_date)),
             fields=("ts_code", "trade_date", "adj_factor"),

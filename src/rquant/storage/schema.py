@@ -1142,6 +1142,37 @@ FINANCIAL_PIT_OBSERVATION_DDLS: tuple[str, ...] = (
     """,
 )
 
+DAILY_BASIC_VALUATION_OBSERVATION_DDLS: tuple[str, ...] = (
+    """
+    CREATE TABLE daily_basic_valuation_batch (
+        candidate_generation_id VARCHAR PRIMARY KEY,
+        source_generation_id VARCHAR NOT NULL,
+        source_sequence BIGINT NOT NULL CHECK (source_sequence >= 0),
+        source_batch_id VARCHAR NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        trade_date DATE NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        valuation_observed BOOLEAN NOT NULL,
+        UNIQUE (source_generation_id, source_sequence)
+    );
+    """,
+    """
+    CREATE TABLE daily_basic_valuation_observation (
+        candidate_generation_id VARCHAR NOT NULL,
+        ts_code VARCHAR NOT NULL,
+        trade_date DATE NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        first_observed_at TIMESTAMPTZ NOT NULL,
+        row_sha256 VARCHAR NOT NULL,
+        pe_ttm DOUBLE,
+        pb DOUBLE,
+        dv_ttm DOUBLE,
+        PRIMARY KEY (candidate_generation_id, ts_code, trade_date),
+        CHECK (first_observed_at <= observed_at)
+    );
+    """,
+)
+
 BASE_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
@@ -1188,6 +1219,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     SCREEN_RUN_RECEIPT_DDL,
     *SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
     *FINANCIAL_PIT_OBSERVATION_DDLS,
+    *DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

@@ -58,6 +58,7 @@ EXPECTED_DATASET_IDS = (
     "moneyflow_ind_dc",
     "moneyflow_cnt_ths",
     "moneyflow_mkt_dc",
+    "daily_basic_valuation_observation",
     "financial_observation",
 )
 
@@ -490,7 +491,7 @@ def test_opted_in_backfill_contracts_map_to_the_same_physical_table() -> None:
         for contract in DATASET_CONTRACTS
         if contract.backfill_dataset_id is not None
     }
-    assert opted_in == set(EXPECTED_DATASET_IDS[8:-1])
+    assert opted_in == set(EXPECTED_DATASET_IDS[8:-2])
     assert opted_in < set(DATASETS)
 
     for contract in DATASET_CONTRACTS:
@@ -627,7 +628,7 @@ def test_unknown_visibility_fails_closed() -> None:
     )
 
 
-@pytest.mark.parametrize("dataset_id", EXPECTED_DATASET_IDS[:-1])
+@pytest.mark.parametrize("dataset_id", EXPECTED_DATASET_IDS[:-2])
 def test_visibility_api_requires_timezone_aware_as_of_time(dataset_id: str) -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         is_visible(
