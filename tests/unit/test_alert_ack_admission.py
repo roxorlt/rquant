@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,6 +175,48 @@ def test_admission_uses_verified_generation_and_durable_retry(tmp_path: Path) ->
         admission.admit(command.model_copy(update={"actor_id": "another-user"}))
     with pytest.raises(ValueError, match="verified Serving eligibility"):
         service.submit(command.model_copy(update={"command_id": "legacy-tcp"}))
+
+
+def test_persisted_pending_command_resumes_after_restart_via_private_socket(
+    tmp_path: Path,
+) -> None:
+    root, service, command = _setup(tmp_path)
+    pending = service.outbox.enqueue_verified_ack(command)
+    assert pending.status is PageControlStatus.PENDING
+    assert service.lookup_ack_command(command) == pending
+    assert service.outbox.acknowledgment(command.alert_id) is None
+
+    build_web_fixture(root, "baseline", sequence=1, signal_projections=_alert_projections())
+    restarted = build_page_control_service(
+        outbox_path=service.outbox.path,
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+        allowed_lab_export_roots=(tmp_path / "exports",),
+        load_default_lab_backend=False,
+        clock=lambda: NOW,
+    )
+    assert restarted.lookup_ack_command(command) == pending
+    assert restarted.outbox.acknowledgment(command.alert_id) is None
+    admission = AckAdmission(restarted, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        server = build_ack_admission_server(admission, socket_path=socket_path)
+        assert server is not None
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            receipt = AckAdmissionClient(socket_path).submit(command)
+            assert receipt.status is PageControlStatus.SUCCEEDED
+            assert receipt.result["confirmation_id"] == command.command_id
+            assert AckAdmissionClient(socket_path).submit(command) == receipt
+            assert restarted.lookup_ack_command(command) == receipt
+            assert restarted.outbox.acknowledgment(command.alert_id).confirmation_id == (
+                command.command_id
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
 
 
 def test_web_and_admission_share_the_same_generation_reader(tmp_path: Path) -> None:
@@ -385,6 +428,175 @@ def test_socket_refuses_broad_or_symlinked_directory(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="mode 0700"):
             build_ack_admission_server(admission, socket_path=alias / "ack.sock")
         assert not (target / "ack.sock").exists()
+
+
+def test_stale_owned_socket_is_recovered_without_blocking_tcp_lookup(tmp_path: Path) -> None:
+    root, service, command = _setup(tmp_path)
+    admission = AckAdmission(service, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        crashed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        crashed.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        crashed.close()
+        assert socket_path.is_socket()
+
+        server = build_ack_admission_server(admission, socket_path=socket_path)
+        assert server is not None
+        tcp = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(service))
+        worker = threading.Thread(target=tcp.serve_forever, daemon=True)
+        worker.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", tcp.server_port, timeout=2)
+            connection.request(
+                "POST",
+                "/v1/commands/lookup",
+                body=json.dumps(command.model_dump(mode="json")),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read()) == {"found": False}
+            connection.close()
+        finally:
+            tcp.shutdown()
+            tcp.server_close()
+            worker.join(timeout=2)
+            server.server_close()
+        assert not socket_path.exists()
+
+
+def test_active_socket_is_not_replaced(tmp_path: Path) -> None:
+    root, service, _command = _setup(tmp_path)
+    admission = AckAdmission(service, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        active = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        active.bind(str(socket_path))
+        active.listen(1)
+        os.chmod(socket_path, 0o600)
+        original = socket_path.stat()
+        try:
+            with pytest.raises(ValueError, match="already exists|active"):
+                build_ack_admission_server(admission, socket_path=socket_path)
+            assert socket_path.stat().st_ino == original.st_ino
+            active.settimeout(1)
+            accepted, _address = active.accept()
+            accepted.close()
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(1)
+                probe.connect(str(socket_path))
+            finally:
+                probe.close()
+        finally:
+            active.close()
+            socket_path.unlink()
+
+
+def test_full_listen_backlog_is_not_mistaken_for_stale_socket(tmp_path: Path) -> None:
+    root, service, _command = _setup(tmp_path)
+    admission = AckAdmission(service, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        active = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        active.bind(str(socket_path))
+        active.listen(1)
+        os.chmod(socket_path, 0o600)
+        queued = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        queued.connect(str(socket_path))
+        original = socket_path.stat()
+        try:
+            with pytest.raises(ValueError, match="active"):
+                build_ack_admission_server(admission, socket_path=socket_path)
+            assert socket_path.stat().st_ino == original.st_ino
+        finally:
+            queued.close()
+            active.close()
+            socket_path.unlink()
+
+
+def test_stale_socket_is_retained_when_liveness_check_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, service, _command = _setup(tmp_path)
+    admission = AckAdmission(service, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        crashed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        crashed.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        crashed.close()
+        original = socket_path.stat()
+        original_is_file = Path.is_file
+
+        def no_lsof(path: Path) -> bool:
+            if str(path) in {"/usr/sbin/lsof", "/usr/bin/lsof"}:
+                return False
+            return original_is_file(path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "is_file", no_lsof)
+            with pytest.raises(ValueError, match="liveness cannot be verified"):
+                build_ack_admission_server(admission, socket_path=socket_path)
+        assert socket_path.stat().st_ino == original.st_ino
+
+
+def test_foreign_owned_socket_path_is_not_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, service, _command = _setup(tmp_path)
+    admission = AckAdmission(service, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        foreign = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        foreign.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        foreign.close()
+        original = socket_path.lstat()
+        original_lstat = Path.lstat
+
+        def lstat_with_foreign_owner(path: Path):
+            observed = original_lstat(path)
+            if path != socket_path:
+                return observed
+            return SimpleNamespace(
+                st_mode=observed.st_mode,
+                st_uid=os.geteuid() + 1,
+                st_dev=observed.st_dev,
+                st_ino=observed.st_ino,
+            )
+
+        monkeypatch.setattr(Path, "lstat", lstat_with_foreign_owner)
+        try:
+            with pytest.raises(ValueError, match="owner|owned|foreign"):
+                build_ack_admission_server(admission, socket_path=socket_path)
+            assert socket_path.stat().st_ino == original.st_ino
+        finally:
+            socket_path.unlink()
+
+
+def test_socket_bind_failure_does_not_unlink_replaced_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, service, _command = _setup(tmp_path)
+    admission = AckAdmission(service, root, clock=lambda: NOW)
+    with TemporaryDirectory(prefix="rqa-", dir=SHORT_TMP) as directory:
+        socket_path = Path(directory) / "ack.sock"
+        original_chmod = os.chmod
+
+        def replace_after_bind(path: os.PathLike[str] | str, mode: int, **kwargs: object) -> None:
+            if Path(path) == socket_path:
+                socket_path.unlink()
+                socket_path.write_text("replacement")
+                raise OSError("simulated replacement after bind")
+            original_chmod(path, mode, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "chmod", replace_after_bind)
+            with pytest.raises(OSError, match="simulated replacement"):
+                build_ack_admission_server(admission, socket_path=socket_path)
+        assert socket_path.read_text() == "replacement"
 
 
 def test_private_socket_client_returns_durable_receipt(tmp_path: Path) -> None:

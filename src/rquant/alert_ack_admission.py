@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import os
@@ -9,6 +10,7 @@ import socket
 import socketserver
 import stat
 import struct
+import subprocess
 import sys
 from collections.abc import Callable
 from ctypes import CDLL, byref, c_uint, get_errno
@@ -52,7 +54,7 @@ class AckAdmission:
     def admit(self, command: AckAlert) -> PageControlReceipt:
         original = self.service.lookup_ack_command(command)
         if original is not None:
-            return original
+            return self.service.submit(command)
         reader = self.reader_factory(self.serving_root)
         with reader.acquire_generation() as lease:
             if lease.pointer is None or lease.manifest.generation_id != command.generation_id:
@@ -141,18 +143,26 @@ class AckAdmissionServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         self.admission = admission
         self.trusted_uid = trusted_uid
         self.peer_uid = peer_uid
+        self._socket_identity: tuple[int, int] | None = None
         super().__init__(str(socket_path), _handler_for_admission())
         try:
-            os.chmod(socket_path, 0o600, follow_symlinks=False)
             info = socket_path.lstat()
             if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
                 raise ValueError("ack admission socket is unsafe")
+            self._socket_identity = (info.st_dev, info.st_ino)
+            os.chmod(socket_path, 0o600, follow_symlinks=False)
+            info = socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or (info.st_dev, info.st_ino) != self._socket_identity
+            ):
+                raise ValueError("ack admission socket is unsafe")
             if stat.S_IMODE(info.st_mode) != 0o600:
                 raise ValueError("ack admission socket permissions are unsafe")
-            self._socket_identity = (info.st_dev, info.st_ino)
         except Exception:
             super().server_close()
-            socket_path.unlink(missing_ok=True)
+            _unlink_matching_socket(socket_path, self._socket_identity)
             raise
 
     def verify_request(self, request: socket.socket, client_address: object) -> bool:
@@ -163,12 +173,83 @@ class AckAdmissionServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
 
     def server_close(self) -> None:
         super().server_close()
-        try:
-            info = self.socket_path.lstat()
-        except FileNotFoundError:
-            return
-        if (info.st_dev, info.st_ino) == self._socket_identity and stat.S_ISSOCK(info.st_mode):
-            self.socket_path.unlink()
+        _unlink_matching_socket(self.socket_path, self._socket_identity)
+
+
+def _socket_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISSOCK(info.st_mode):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _unlink_matching_socket(path: Path, identity: tuple[int, int] | None) -> None:
+    if identity is not None and _socket_identity(path) == identity:
+        path.unlink()
+
+
+def _remove_stale_owned_socket(path: Path) -> None:
+    try:
+        original = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISSOCK(original.st_mode)
+        or original.st_uid != os.geteuid()
+        or stat.S_IMODE(original.st_mode) != 0o600
+    ):
+        raise ValueError("ack admission socket path has an unsafe or foreign owner")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            result = probe.connect_ex(str(path))
+    except OSError as exc:
+        raise ValueError("ack admission socket liveness cannot be verified") from exc
+    if result == 0:
+        raise ValueError("ack admission socket is active")
+    if result != errno.ECONNREFUSED:
+        raise ValueError("ack admission socket liveness cannot be verified")
+    # A full Unix listen backlog may also refuse connections on macOS. Verify that
+    # no process still holds this pathname before treating refusal as stale.
+    _assert_no_socket_holder(path)
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISSOCK(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+    ):
+        raise ValueError("ack admission socket changed during stale check")
+    path.unlink()
+
+
+def _assert_no_socket_holder(path: Path) -> None:
+    lsof = next(
+        (
+            candidate
+            for candidate in ("/usr/sbin/lsof", "/usr/bin/lsof")
+            if Path(candidate).is_file()
+        ),
+        None,
+    )
+    if lsof is None:
+        raise ValueError("ack admission socket liveness cannot be verified")
+    try:
+        result = subprocess.run(
+            (lsof, "-nP", str(path)), capture_output=True, text=True, timeout=2, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("ack admission socket liveness cannot be verified") from exc
+    if result.returncode == 0:
+        raise ValueError("ack admission socket is active")
+    if result.returncode != 1 or result.stdout or result.stderr:
+        raise ValueError("ack admission socket liveness cannot be verified")
 
 
 def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
@@ -237,8 +318,7 @@ def build_ack_admission_server(
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise ValueError("ack admission directory must be owned and mode 0700")
-    if path.exists() or path.is_symlink():
-        raise ValueError("ack admission socket path already exists")
+    _remove_stale_owned_socket(path)
     uid = os.geteuid() if trusted_uid is None else trusted_uid
     if uid != os.geteuid():
         raise ValueError("ack admission trusted UID must be the service UID")
