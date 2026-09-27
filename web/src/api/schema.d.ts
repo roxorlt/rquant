@@ -633,6 +633,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/jobs/{job_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研究任务进展 */
+        get: operations["get_job_events_api_v1_tasks_jobs__job_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/overview": {
         parameters: {
             query?: never;
@@ -3078,6 +3095,38 @@ export interface components {
             /** Total */
             total: number | null;
         };
+        /** ResearchTaskEvent */
+        ResearchTaskEvent: {
+            /** Event Id */
+            event_id: number;
+            /** Label */
+            label: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /** Status Label */
+            status_label: string;
+        };
+        /** ResearchTaskEventsData */
+        ResearchTaskEventsData: {
+            /** Events */
+            events: components["schemas"]["ResearchTaskEvent"][];
+            /** Generation Id */
+            generation_id: string | null;
+            /** Note */
+            note: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "empty" | "truncated" | "not_published" | "not_included" | "unavailable";
+            /** Truncated */
+            truncated: boolean;
+            /** Updated At */
+            updated_at: string | null;
+        };
         /** ResourceGroupItem */
         ResourceGroupItem: {
             /** Memory Current Bytes */
@@ -3691,6 +3740,11 @@ export interface components {
         };
         /** TaskOverviewData */
         TaskOverviewData: {
+            /**
+             * Can View Research Logs
+             * @default false
+             */
+            can_view_research_logs: boolean;
             research: components["schemas"]["ResearchJobsData"];
             resources: components["schemas"]["ResourcesData"];
             scheduled: components["schemas"]["ScheduledTasksData"];
@@ -4924,6 +4978,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ResearchJobsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_job_events_api_v1_tasks_jobs__job_id__events_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchTaskEventsData"];
                 };
             };
             /** @description Validation Error */

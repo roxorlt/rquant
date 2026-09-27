@@ -7559,6 +7559,107 @@
         "title": "ResearchJobsData",
         "type": "object"
       },
+      "ResearchTaskEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "event_id": {
+            "minimum": 1.0,
+            "title": "Event Id",
+            "type": "integer"
+          },
+          "label": {
+            "maxLength": 24,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "status_label": {
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "occurred_at",
+          "label",
+          "status_label"
+        ],
+        "title": "ResearchTaskEvent",
+        "type": "object"
+      },
+      "ResearchTaskEventsData": {
+        "additionalProperties": false,
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ResearchTaskEvent"
+            },
+            "maxItems": 500,
+            "title": "Events",
+            "type": "array"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "note": {
+            "title": "Note",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "empty",
+              "truncated",
+              "not_published",
+              "not_included",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "state",
+          "note",
+          "generation_id",
+          "updated_at",
+          "events",
+          "truncated"
+        ],
+        "title": "ResearchTaskEventsData",
+        "type": "object"
+      },
       "ResourceGroupItem": {
         "properties": {
           "memory_current_bytes": {
@@ -9557,6 +9658,11 @@
       },
       "TaskOverviewData": {
         "properties": {
+          "can_view_research_logs": {
+            "default": false,
+            "title": "Can View Research Logs",
+            "type": "boolean"
+          },
           "research": {
             "$ref": "#/components/schemas/ResearchJobsData"
           },
@@ -11667,6 +11773,65 @@
           }
         },
         "summary": "研究任务队列",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/jobs/{job_id}/events": {
+      "get": {
+        "operationId": "get_job_events_api_v1_tasks_jobs__job_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResearchTaskEventsData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "研究任务进展",
         "tags": [
           "tasks"
         ]

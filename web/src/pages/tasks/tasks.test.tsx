@@ -32,6 +32,7 @@ function overviewEnvelope(
   return {
     serving: tasksEnvelope().serving,
     data: {
+      can_view_research_logs: false,
       scheduled: {
         source_state: "ready",
         source_label: "定时任务",

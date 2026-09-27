@@ -53,6 +53,7 @@ const JOBS_ENVELOPE: components["schemas"]["Envelope_ResearchJobsData_"] = {
 const OVERVIEW_ENVELOPE: components["schemas"]["Envelope_TaskOverviewData_"] = {
   serving: JOBS_ENVELOPE.serving,
   data: {
+    can_view_research_logs: false,
     scheduled: {
       source_state: "ready",
       source_label: "定时任务",
