@@ -353,6 +353,60 @@
         "title": "AuditAttempt",
         "type": "object"
       },
+      "AuditReportCalendarData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "earliest_selectable_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Earliest Selectable Date"
+          },
+          "latest_closed_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Closed Date"
+          },
+          "open_dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "maxItems": 3660,
+            "title": "Open Dates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "availability",
+          "latest_closed_date",
+          "earliest_selectable_date",
+          "open_dates"
+        ],
+        "title": "AuditReportCalendarData",
+        "type": "object"
+      },
       "AuditReportCommandReceipt": {
         "additionalProperties": false,
         "properties": {
@@ -3396,6 +3450,22 @@
           "args"
         ],
         "title": "EditorRuleCall",
+        "type": "object"
+      },
+      "Envelope_AuditReportCalendarData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AuditReportCalendarData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[AuditReportCalendarData]",
         "type": "object"
       },
       "Envelope_BackfillPlanDetailData_": {
@@ -8785,6 +8855,57 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/data/audit-report/calendar": {
+      "get": {
+        "operationId": "get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_AuditReportCalendarData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "审计日期可选交易日",
+        "tags": [
+          "data-audit"
+        ]
+      }
+    },
     "/api/v1/data/audit-report/commands": {
       "post": {
         "operationId": "submit_data_audit_report_command_api_v1_data_audit_report_commands_post",

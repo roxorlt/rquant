@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/v1/data/audit-report/calendar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 审计日期可选交易日 */
+        get: operations["get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/audit-report/commands": {
         parameters: {
             query?: never;
@@ -686,6 +703,20 @@ export interface components {
              * @enum {string}
              */
             status: "running" | "completed" | "failed";
+        };
+        /** AuditReportCalendarData */
+        AuditReportCalendarData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable";
+            /** Earliest Selectable Date */
+            earliest_selectable_date: string | null;
+            /** Latest Closed Date */
+            latest_closed_date: string | null;
+            /** Open Dates */
+            open_dates: string[];
         };
         /** AuditReportCommandReceipt */
         AuditReportCommandReceipt: {
@@ -1742,6 +1773,11 @@ export interface components {
             };
             /** Name */
             name: string;
+        };
+        /** Envelope[AuditReportCalendarData] */
+        Envelope_AuditReportCalendarData_: {
+            data: components["schemas"]["AuditReportCalendarData"];
+            serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[BackfillPlanDetailData] */
         Envelope_BackfillPlanDetailData_: {
@@ -3439,6 +3475,37 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AuditReportCalendarData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     submit_data_audit_report_command_api_v1_data_audit_report_commands_post: {
         parameters: {
             query?: never;
