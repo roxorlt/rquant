@@ -17,6 +17,7 @@ from rquant.storage.schema import (
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
+    FINANCIAL_PIT_OBSERVATION_DDLS,
     LIMIT_UP_POOL_WRITE_GUARD_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
@@ -171,6 +172,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=12,
         name="screen run price proof",
         statements=SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
+    ),
+    Migration(
+        version=13,
+        name="financial PIT observations",
+        statements=FINANCIAL_PIT_OBSERVATION_DDLS,
     ),
 )
 

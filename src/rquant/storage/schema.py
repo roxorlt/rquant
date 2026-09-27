@@ -1096,6 +1096,52 @@ DATA_METADATA_TABLE_DDLS: tuple[str, ...] = (
     DATA_QUALITY_ISSUE_DDL,
 )
 
+FINANCIAL_PIT_OBSERVATION_DDLS: tuple[str, ...] = (
+    """
+    CREATE TABLE financial_import_batch (
+        archive_id VARCHAR NOT NULL,
+        request_id VARCHAR NOT NULL,
+        query_json VARCHAR NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        status VARCHAR NOT NULL CHECK (status IN ('observed', 'empty', 'possibly_truncated')),
+        row_count INTEGER NOT NULL CHECK (row_count >= 0),
+        relative_path VARCHAR NOT NULL,
+        file_sha256 VARCHAR NOT NULL,
+        byte_count INTEGER NOT NULL CHECK (byte_count > 0),
+        PRIMARY KEY (archive_id, request_id),
+        UNIQUE (archive_id, observed_at)
+    );
+    """,
+    """
+    CREATE TABLE financial_observation (
+        archive_id VARCHAR NOT NULL,
+        request_id VARCHAR NOT NULL,
+        row_index INTEGER NOT NULL CHECK (row_index >= 0),
+        source_api VARCHAR NOT NULL,
+        ts_code VARCHAR NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        report_period DATE,
+        report_type VARCHAR,
+        ann_date DATE,
+        f_ann_date DATE,
+        raw_json VARCHAR NOT NULL,
+        row_sha256 VARCHAR NOT NULL,
+        pit_usable BOOLEAN NOT NULL,
+        conflicted BOOLEAN NOT NULL,
+        PRIMARY KEY (archive_id, request_id, row_index)
+    );
+    """,
+    """
+    CREATE TABLE financial_import_cursor (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        archive_id VARCHAR NOT NULL,
+        last_observed_at TIMESTAMPTZ,
+        anchor_generation BIGINT NOT NULL CHECK (anchor_generation >= 0),
+        anchor_record_sha256 VARCHAR NOT NULL
+    );
+    """,
+)
+
 BASE_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,
@@ -1141,6 +1187,7 @@ VERSIONED_COMPATIBILITY_DDL = [
     DATASET_SNAPSHOT_BINDING_DDL,
     SCREEN_RUN_RECEIPT_DDL,
     *SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
+    *FINANCIAL_PIT_OBSERVATION_DDLS,
 ]
 
 # Compatibility export for callers outside rQuant; schema initialization uses

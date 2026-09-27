@@ -33,6 +33,7 @@ class FinancialFact(_PITModel):
     first_observed_at: datetime | None
     value: Decimal | None
     update_flag: str | None = None
+    block_reason: str | None = None
 
     @property
     def logical_key(self) -> tuple[str, str, str, date, str]:
@@ -176,26 +177,38 @@ def select_financial_fact(
         return _unknown("mixed_logical_keys")
 
     eligible: list[tuple[datetime, str, FinancialFact, datetime]] = []
+    latest_blocker: tuple[datetime, str] | None = None
+    unavailable_reason = "no_visible_version"
     for fact in facts:
         observed_utc = _aware_utc(fact.first_observed_at)
         if observed_utc is None:
             return _unknown("missing_observation_time")
         if as_of_utc <= observed_utc:
             continue
-        if fact.ann_date is None:
-            return _unknown("missing_announcement_date")
-        if fact.value is None:
-            return _unknown("missing_value")
+        block_reason = (
+            fact.block_reason
+            or ("missing_announcement_date" if fact.ann_date is None else None)
+            or ("missing_value" if fact.value is None else None)
+        )
+        if block_reason is not None:
+            if latest_blocker is None or observed_utc >= latest_blocker[0]:
+                latest_blocker = (observed_utc, block_reason)
+            continue
+        assert fact.ann_date is not None
         publication_date = max(fact.ann_date, fact.f_ann_date or fact.ann_date)
+        if publication_date > as_of_local.date():
+            continue
         if not calendar.coverage_start <= publication_date <= calendar.coverage_end:
-            return _unknown("outside_calendar")
+            unavailable_reason = "outside_calendar"
+            continue
         next_open_at = _next_open_at(
             publication_date=publication_date,
             calendar=calendar,
             calendar_days=calendar_days,
         )
         if next_open_at is None:
-            return _unknown("no_next_open_day")
+            unavailable_reason = "no_next_open_day"
+            continue
         if as_of_local < next_open_at:
             continue
         digest = _content_sha256(
@@ -206,8 +219,10 @@ def select_financial_fact(
         eligible.append((observed_utc, digest, fact, next_open_at))
 
     if not eligible:
-        return _unknown("no_visible_version")
+        return _unknown(latest_blocker[1] if latest_blocker is not None else unavailable_reason)
     latest_observation = max(item[0] for item in eligible)
+    if latest_blocker is not None and latest_blocker[0] >= latest_observation:
+        return _unknown(latest_blocker[1])
     latest = [item for item in eligible if item[0] == latest_observation]
     if len({item[1] for item in latest}) != 1:
         return _unknown("conflicting_versions")
