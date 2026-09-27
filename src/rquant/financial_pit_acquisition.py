@@ -771,7 +771,19 @@ class FinancialArchive:
             row = state.connection.execute(
                 "SELECT * FROM batch_manifest WHERE request_id = ?", (str(request_id),)
             ).fetchone()
-            return None if row is None else self._receipt_from_row(row)
+            if row is not None:
+                return self._receipt_from_row(row)
+            batches_fd = _open_child_directory(state.root_fd, "batches")
+            try:
+                try:
+                    os.stat(f"{request_id}.json", dir_fd=batches_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+                except OSError as exc:
+                    raise ValueError("uncommitted batch target cannot be inspected") from exc
+            finally:
+                os.close(batches_fd)
+            raise ValueError("uncommitted batch target already exists; request is pending")
 
     def receipt(self, request_id: UUID) -> FinancialReceipt:
         with self._state() as state:

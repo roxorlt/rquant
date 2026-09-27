@@ -449,6 +449,48 @@ def test_interruption_after_file_publish_leaves_only_an_uncommitted_orphan(
         _acquire(root, query, pd.DataFrame([_row()]))
 
 
+def test_orphan_retry_is_pending_before_supplier_or_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "archive"
+    archive = FinancialArchive(root)
+    query = _query()
+    publish = archive._publish_file
+
+    def interrupt(root_fd: int, request_id: UUID, data: bytes) -> None:
+        publish(root_fd, request_id, data)
+        raise RuntimeError("snapshot was not published")
+
+    monkeypatch.setattr(archive, "_publish_file", interrupt)
+    with pytest.raises(RuntimeError, match="snapshot was not published"):
+        acquire_financial_batches(
+            FakeTushare(pd.DataFrame([_row()])),
+            archive,
+            (query,),
+            run_day=date(2026, 9, 28),
+            clock=_clock(datetime(2026, 9, 28, 12, tzinfo=UTC)),
+        )
+
+    retry_client = FakeTushare(PermissionError("supplier must not be called"))
+    ticks: list[int] = []
+
+    def retry_clock() -> datetime:
+        ticks.append(1)
+        return datetime(2026, 9, 28, 13, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="pending"):
+        acquire_financial_batches(
+            retry_client,
+            FinancialArchive(root),
+            (query,),
+            run_day=date(2026, 9, 28),
+            clock=retry_clock,
+        )
+    assert retry_client.calls == []
+    assert ticks == []
+    assert FinancialArchive(root).list_committed() == ()
+
+
 def test_target_symlink_conflict_does_not_write_outside_archive(tmp_path: Path) -> None:
     root = tmp_path / "archive"
     archive = FinancialArchive(root)
