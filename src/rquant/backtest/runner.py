@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from rquant.backtest.contracts import (
     BacktestDayInput,
     BacktestDayResult,
+    BacktestDecision,
     BacktestInstrument,
     BacktestOrder,
     BacktestRequest,
@@ -86,11 +87,51 @@ def _can_submit(
     instruments: dict[str, BacktestInstrument],
 ) -> SkippedTarget | None:
     instrument = instruments.get(ts_code)
-    if instrument is None or instrument.open_price is None:
+    if instrument is None or instrument.decision_price is None:
+        return SkippedTarget(ts_code=ts_code, side=side.value, reason="missing_decision_price")
+    if instrument.open_price is None:
         return SkippedTarget(ts_code=ts_code, side=side.value, reason="missing_open_price")
     if instrument.conditions is None:
         return SkippedTarget(ts_code=ts_code, side=side.value, reason="unverified_conditions")
     return None
+
+
+def _decision(
+    request: BacktestRequest,
+    day: BacktestDayInput,
+    instrument: BacktestInstrument,
+    *,
+    side: PaperSide,
+    quantity: int,
+    entry_signal_id: str | None = None,
+) -> BacktestDecision:
+    assert instrument.decision_price is not None
+    return BacktestDecision(
+        decided_at=_local_at(day.trade_date, 9, 25),
+        producer_commit=request.producer_commit,
+        strategy_config_id=canonical_sha256(
+            {
+                "weight_rule": request.weight_rule,
+                "rebalance_rule": request.rebalance_rule,
+                "initial_cash": request.initial_cash,
+                "cost_spec_id": request.execution_cost_spec.cost_spec_id,
+                "calendar_source_identity": request.calendar.source_identity,
+            }
+        ),
+        ranking_source_identity=day.ranking.source_identity,
+        reference_price_snapshot_id=canonical_sha256(
+            {
+                "source_identity": instrument.decision_price_source_identity,
+                "ts_code": instrument.ts_code,
+                "decision_price": instrument.decision_price,
+                "decision_price_observed_at": instrument.decision_price_observed_at,
+            }
+        ),
+        ts_code=instrument.ts_code,
+        side=side.value,
+        quantity=quantity,
+        entry_signal_id=entry_signal_id,
+    )
 
 
 def _order(
@@ -99,24 +140,14 @@ def _order(
     day: BacktestDayInput,
     instrument: BacktestInstrument,
     *,
-    side: PaperSide,
-    quantity: int,
+    decision: BacktestDecision,
     next_trade_date: date,
-    ordinal: int,
-    entry_signal_id: str | None = None,
     entry_remaining: int | None = None,
 ) -> BacktestOrder:
-    execution_at = _local_at(day.trade_date, 9, 31)
-    signal_id = canonical_sha256(
-        {
-            "request_id": request.request_id,
-            "trade_date": day.trade_date,
-            "ts_code": instrument.ts_code,
-            "side": side,
-            "entry_signal_id": entry_signal_id,
-            "ordinal": ordinal,
-        }
-    )
+    execution_at = _local_at(day.trade_date, 9, 30)
+    side = PaperSide(decision.side)
+    entry_signal_id = decision.entry_signal_id
+    quantity = decision.quantity
     authority = None
     if side is PaperSide.SELL:
         assert entry_signal_id is not None
@@ -130,7 +161,7 @@ def _order(
             else Decimal(quantity + 50) / Decimal(entry_remaining)
         )
         authority = broker.sell_quantity_authority(
-            exit_signal_id=signal_id,
+            exit_signal_id=decision.decision_id,
             entry_signal_id=entry_signal_id,
             ts_code=instrument.ts_code,
             action=action,
@@ -141,7 +172,7 @@ def _order(
         if authority.requested_quantity != quantity:
             raise RuntimeError("broker sell authority disagrees with planned quantity")
     intent = PaperOrderIntent(
-        signal_id=signal_id,
+        signal_id=decision.decision_id,
         entry_signal_id=entry_signal_id,
         sell_quantity_authority=authority,
         account_id=broker.account_id,
@@ -149,10 +180,10 @@ def _order(
         side=side,
         order_type=PaperOrderType.MARKET,
         quantity=quantity,
-        event_time=_local_at(day.trade_date, 9, 25),
-        available_at=_local_at(day.trade_date, 9, 25),
+        event_time=execution_at,
+        available_at=execution_at,
         earliest_execution_at=execution_at,
-        expires_at=_local_at(day.trade_date, 9, 32),
+        expires_at=_local_at(day.trade_date, 9, 31),
         price_snapshot_id=canonical_sha256(
             {
                 "source_identity": instrument.price_source_identity,
@@ -176,7 +207,7 @@ def _order(
     receipt = broker.execution(execution_id)
     if receipt is None or receipt.order != order:
         raise RuntimeError("broker did not persist the expected execution receipt")
-    return BacktestOrder(intent=intent, receipt=receipt)
+    return BacktestOrder(decision=decision, intent=intent, receipt=receipt)
 
 
 def _replay_day(
@@ -187,7 +218,7 @@ def _replay_day(
     next_trade_date: date,
     previous_nav: Decimal,
     entries: list[_Entry],
-) -> tuple[tuple[BacktestOrder, ...], tuple[SkippedTarget, ...]]:
+) -> tuple[tuple[BacktestDecision, ...], tuple[BacktestOrder, ...], tuple[SkippedTarget, ...]]:
     instruments = {item.ts_code: item for item in day.instruments}
     target_quantities: dict[str, int] = {}
     protected: set[str] = set()
@@ -200,57 +231,75 @@ def _replay_day(
             if target.status != "selected" or target.target_amount == 0:
                 continue
             instrument = instruments.get(target.ts_code)
-            if instrument is None or instrument.open_price is None:
+            if instrument is None or instrument.decision_price is None:
                 protected.add(target.ts_code)
                 skipped.append(
-                    SkippedTarget(ts_code=target.ts_code, side="BUY", reason="missing_open_price")
+                    SkippedTarget(
+                        ts_code=target.ts_code, side="BUY", reason="missing_decision_price"
+                    )
                 )
                 continue
-            quantity = int(target.target_amount / instrument.open_price) // 100 * 100
+            quantity = int(target.target_amount / instrument.decision_price) // 100 * 100
             if quantity == 0:
                 skipped.append(
                     SkippedTarget(ts_code=target.ts_code, side="BUY", reason="below_lot")
                 )
             target_quantities[target.ts_code] = quantity
 
+    decisions: list[BacktestDecision] = []
     orders: list[BacktestOrder] = []
     for ts_code, held_quantity in sorted(_quantity_by_code(entries).items()):
         if ts_code in protected:
             continue
-        excess = held_quantity - target_quantities.get(ts_code, 0)
-        if excess <= 0:
+        planned_excess = held_quantity - target_quantities.get(ts_code, 0)
+        if planned_excess <= 0:
             continue
-        skip = _can_submit(ts_code, PaperSide.SELL, instruments)
-        if skip is not None:
-            skipped.append(skip)
+        instrument = instruments.get(ts_code)
+        if instrument is None or instrument.decision_price is None:
+            skipped.append(
+                SkippedTarget(ts_code=ts_code, side="SELL", reason="missing_decision_price")
+            )
             continue
-        instrument = instruments[ts_code]
         for entry in entries:
-            if entry.ts_code != ts_code or entry.remaining == 0 or excess == 0:
+            if entry.ts_code != ts_code or entry.remaining == 0 or planned_excess == 0:
                 continue
-            quantity = min(excess, entry.remaining)
-            order = _order(
-                broker,
+            quantity = min(planned_excess, entry.remaining)
+            planned_excess -= quantity
+            decision = _decision(
                 request,
                 day,
                 instrument,
                 side=PaperSide.SELL,
                 quantity=quantity,
-                next_trade_date=next_trade_date,
-                ordinal=len(orders),
                 entry_signal_id=entry.signal_id,
+            )
+            decisions.append(decision)
+            skip = _can_submit(ts_code, PaperSide.SELL, instruments)
+            if skip is not None:
+                if skip not in skipped:
+                    skipped.append(skip)
+                continue
+            order = _order(
+                broker,
+                request,
+                day,
+                instrument,
+                decision=decision,
+                next_trade_date=next_trade_date,
                 entry_remaining=entry.remaining,
             )
             orders.append(order)
             fill = order.receipt.fill
             if fill is not None:
                 entry.remaining -= fill.quantity
-                excess -= fill.quantity
 
     for ts_code, target_quantity in sorted(target_quantities.items()):
         deficit = target_quantity - _quantity_by_code(entries).get(ts_code, 0)
         if deficit <= 0:
             continue
+        instrument = instruments[ts_code]
+        decision = _decision(request, day, instrument, side=PaperSide.BUY, quantity=deficit)
+        decisions.append(decision)
         skip = _can_submit(ts_code, PaperSide.BUY, instruments)
         if skip is not None:
             skipped.append(skip)
@@ -259,11 +308,9 @@ def _replay_day(
             broker,
             request,
             day,
-            instruments[ts_code],
-            side=PaperSide.BUY,
-            quantity=deficit,
+            instrument,
+            decision=decision,
             next_trade_date=next_trade_date,
-            ordinal=len(orders),
         )
         orders.append(order)
         fill = order.receipt.fill
@@ -271,17 +318,34 @@ def _replay_day(
             entries.append(
                 _Entry(ts_code=ts_code, signal_id=order.intent.signal_id, remaining=fill.quantity)
             )
-    return tuple(orders), tuple(skipped)
+    return tuple(decisions), tuple(orders), tuple(skipped)
 
 
 def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> BacktestResult:
-    """Replay one typed daily input in a new private ledger, then discard it."""
+    """Replay at the observed daily open in a disposable private broker ledger.
+
+    This models a same-instant opening fill. The broker persists the order at
+    09:30, so this is not evidence of a live pre-open exchange submission.
+    """
 
     request = BacktestRequest.model_validate(request)
     root = Path(research_root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("research_root must be an existing real directory")
-    account_id = f"backtest-{request.request_id[:20]}"
+    account_id = (
+        "backtest-"
+        + canonical_sha256(
+            {
+                "producer_commit": request.producer_commit,
+                "calendar_source_identity": request.calendar.source_identity,
+                "cost_spec_id": request.execution_cost_spec.cost_spec_id,
+                "weight_rule": request.weight_rule,
+                "rebalance_rule": request.rebalance_rule,
+                "initial_cash": request.initial_cash,
+                "first_trade_date": request.days[0].trade_date,
+            }
+        )[:20]
+    )
     entries: list[_Entry] = []
     results: list[BacktestDayResult] = []
     previous_nav = request.initial_cash
@@ -297,7 +361,7 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
             rebalanced = _should_rebalance(index, request.days, request.rebalance_rule)
             if rebalanced:
                 calendar_index = request.calendar.dates.index(day.trade_date)
-                orders, skipped = _replay_day(
+                decisions, orders, skipped = _replay_day(
                     broker,
                     request,
                     day,
@@ -306,7 +370,7 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
                     entries=entries,
                 )
             else:
-                orders, skipped = (), ()
+                decisions, orders, skipped = (), (), ()
             fees = sum(
                 (
                     order.receipt.fill.total_fees
@@ -322,6 +386,7 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
                     BacktestDayResult(
                         trade_date=day.trade_date,
                         rebalanced=rebalanced,
+                        decisions=decisions,
                         orders=orders,
                         skipped=skipped,
                         fees=fees,
@@ -354,6 +419,7 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
                 BacktestDayResult(
                     trade_date=day.trade_date,
                     rebalanced=rebalanced,
+                    decisions=decisions,
                     orders=orders,
                     skipped=skipped,
                     fees=fees,

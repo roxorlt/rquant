@@ -3,6 +3,7 @@
 from rquant.backtest.contracts import (
     BacktestDayInput,
     BacktestDayResult,
+    BacktestDecision,
     BacktestInstrument,
     BacktestOrder,
     BacktestRequest,
@@ -18,6 +19,7 @@ from rquant.backtest.runner import run_portfolio_backtest
 __all__ = [
     "BacktestDayInput",
     "BacktestDayResult",
+    "BacktestDecision",
     "BacktestInstrument",
     "BacktestOrder",
     "BacktestRequest",

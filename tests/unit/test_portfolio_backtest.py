@@ -79,6 +79,9 @@ def _day(
                 ts_code=code,
                 instrument_context=paper_instrument_context(code),
                 classification_observed_at=_at(previous_trade_date, 15),
+                decision_price=Decimal("10"),
+                decision_price_observed_at=_at(previous_trade_date, 15),
+                decision_price_source_identity="8" * 64,
                 open_price=Decimal("10"),
                 open_observed_at=_at(trade_date, 9, 30),
                 close_price=None if code == missing_close else Decimal("10"),
@@ -162,6 +165,8 @@ def test_ten_day_three_stock_manual_cash_and_nav_replay(tmp_path: Path) -> None:
     result = run_portfolio_backtest(request, research_root=tmp_path)
 
     assert result.schema_version == 1
+    assert result.execution_convention == "SIMULATED_DAILY_OPEN"
+    assert result.execution_assumption == "按当日开盘价模拟撮合，不代表真实预挂单或保证成交"
     assert result.producer_commit == request.producer_commit
     assert result.input_generation_id == request.input_generation_id
     assert result.calendar_source_identity == request.calendar.source_identity
@@ -183,6 +188,7 @@ def test_ten_day_three_stock_manual_cash_and_nav_replay(tmp_path: Path) -> None:
     assert result.days[4].orders[1].receipt.order.status is PaperOrderStatus.REJECTED
     assert result.days[4].orders[1].receipt.order.reject_reason is PaperRejectReason.LIMIT_LOCKED
     assert result.days[0].account.holdings[0].available_quantity == 0
+    assert result.days[0].orders[0].receipt.fill.executed_at == _at(_TRADE_DATES[0], 9, 30)
     assert result.days[1].account.holdings[0].available_quantity == 100
     assert result.days[9].account.holdings == ()
     assert [sum(day.fees for day in result.days)] == [Decimal("44")]
@@ -208,6 +214,35 @@ def test_repeated_run_is_content_identical_despite_private_ephemeral_ledger(tmp_
     assert first == second
     assert first.content_hash == second.content_hash
     assert not tuple(tmp_path.iterdir())
+
+
+def test_preopen_intent_does_not_depend_on_later_open_or_close_price(tmp_path: Path) -> None:
+    original = _request((_CODES[0],))
+    changed = original.model_dump(mode="python")
+    quote = changed["days"][0]["instruments"][0]
+    quote["open_price"] = Decimal("11")
+    quote["close_price"] = Decimal("12")
+    quote["price_source_identity"] = "9" * 64
+    revised = BacktestRequest.model_validate(changed)
+
+    first = run_portfolio_backtest(original, research_root=tmp_path)
+    second = run_portfolio_backtest(revised, research_root=tmp_path)
+    first_order = first.days[0].orders[0]
+    second_order = second.days[0].orders[0]
+
+    assert first_order.decision == second_order.decision
+    assert first_order.decision.quantity == 100
+    assert first_order.decision.decided_at == _at(_TRADE_DATES[0], 9, 25)
+    assert first_order.intent.signal_id == second_order.intent.signal_id
+    assert first_order.intent.signal_id == first_order.decision.decision_id
+    assert first_order.intent.event_time == _at(_TRADE_DATES[0], 9, 30)
+    assert first_order.intent.available_at == _at(_TRADE_DATES[0], 9, 30)
+    assert first_order.intent.price_snapshot_id != second_order.intent.price_snapshot_id
+    assert first_order.receipt.fill.price_snapshot_id == first_order.intent.price_snapshot_id
+    assert first_order.intent.price_snapshot_id != first_order.decision.reference_price_snapshot_id
+    assert first_order.receipt.persisted_at == _at(_TRADE_DATES[0], 9, 30)
+    assert first_order.receipt.fill.executed_at == _at(_TRADE_DATES[0], 9, 30)
+    assert first_order.receipt.fill.price != second_order.receipt.fill.price
 
 
 def test_future_ranking_and_missing_calendar_day_are_rejected() -> None:
@@ -268,13 +303,13 @@ def test_partial_rebalance_uses_broker_sell_authority_and_fifo_cash(tmp_path: Pa
     assert result.days[0].account.holdings[0].quantity == 400
     sell = result.days[1].orders[0]
     assert sell.intent.side.value == "SELL"
-    assert sell.intent.quantity == 200
+    assert sell.intent.quantity == 100
     assert sell.intent.sell_quantity_authority.action == "REDUCE"
-    assert sell.receipt.fill.quantity == 200
-    assert sell.receipt.fill.total_fees == Decimal("8")
-    assert result.days[1].account.holdings[0].quantity == 200
-    assert result.days[1].account.cash == Decimal("6987")
-    assert result.days[1].account.nav == Decimal("9987")
+    assert sell.receipt.fill.quantity == 100
+    assert sell.receipt.fill.total_fees == Decimal("6.50")
+    assert result.days[1].account.holdings[0].quantity == 300
+    assert result.days[1].account.cash == Decimal("5488.50")
+    assert result.days[1].account.nav == Decimal("9988.50")
 
 
 @pytest.mark.parametrize(
@@ -330,6 +365,7 @@ def test_sub_lot_and_missing_open_do_not_invent_fills(tmp_path: Path) -> None:
         BacktestRequest.model_validate(missing), research_root=tmp_path
     )
     assert no_open.days[0].orders == ()
+    assert no_open.days[0].decisions[0].quantity == 100
     assert no_open.days[0].skipped[0].reason == "missing_open_price"
 
 
@@ -353,8 +389,8 @@ def test_each_backtest_execution_matches_direct_paper_broker(tmp_path: Path) -> 
             direct_order = broker.submit_intent(
                 replay_order.intent,
                 execution_id=replay_order.receipt.execution_id,
-                decision_time=_at(day.trade_date, 9, 31),
-                persisted_at=_at(day.trade_date, 9, 31),
+                decision_time=_at(day.trade_date, 9, 30),
+                persisted_at=_at(day.trade_date, 9, 30),
                 trade_date=day.trade_date,
                 quote=BrokerExecutionContext(
                     executable_price=quote.open_price,
@@ -396,7 +432,7 @@ def test_same_day_sell_is_blocked_by_shared_broker_t_plus_one(tmp_path: Path) ->
     broker.submit_intent(
         buy.intent,
         execution_id=buy.receipt.execution_id,
-        decision_time=_at(_TRADE_DATES[0], 9, 31),
+        decision_time=_at(_TRADE_DATES[0], 9, 30),
         trade_date=_TRADE_DATES[0],
         quote=BrokerExecutionContext(
             executable_price=Decimal("10"),
@@ -404,7 +440,7 @@ def test_same_day_sell_is_blocked_by_shared_broker_t_plus_one(tmp_path: Path) ->
             acquisition_available_date=_TRADE_DATES[1],
         ),
     )
-    sell_at = _at(_TRADE_DATES[0], 9, 31).replace(second=30)
+    sell_at = _at(_TRADE_DATES[0], 9, 30).replace(second=30)
     authority = broker.sell_quantity_authority(
         exit_signal_id="1" * 64,
         entry_signal_id=buy.intent.signal_id,
@@ -426,7 +462,7 @@ def test_same_day_sell_is_blocked_by_shared_broker_t_plus_one(tmp_path: Path) ->
         event_time=_at(_TRADE_DATES[0], 9, 25),
         available_at=_at(_TRADE_DATES[0], 9, 25),
         earliest_execution_at=sell_at,
-        expires_at=_at(_TRADE_DATES[0], 9, 32),
+        expires_at=_at(_TRADE_DATES[0], 9, 31),
         price_snapshot_id=buy.intent.price_snapshot_id,
         producer_commit=request.producer_commit,
     )
@@ -453,6 +489,20 @@ def test_pit_requires_authoritative_source_and_visible_classification() -> None:
 
     data = _request((_CODES[0],)).model_dump(mode="python")
     data["days"][0]["instruments"][0]["conditions"]["observed_at"] = _at(_TRADE_DATES[0], 9, 29)
+    with pytest.raises(ValidationError, match="condition.*open"):
+        BacktestRequest.model_validate(data)
+
+    data = _request((_CODES[0],)).model_dump(mode="python")
+    data["days"][0]["instruments"][0]["open_observed_at"] = _at(_TRADE_DATES[0], 9, 30).replace(
+        second=30
+    )
+    with pytest.raises(ValidationError, match="open price"):
+        BacktestRequest.model_validate(data)
+
+    data = _request((_CODES[0],)).model_dump(mode="python")
+    data["days"][0]["instruments"][0]["conditions"]["observed_at"] = _at(
+        _TRADE_DATES[0], 9, 30
+    ).replace(second=30)
     with pytest.raises(ValidationError, match="condition.*open"):
         BacktestRequest.model_validate(data)
 

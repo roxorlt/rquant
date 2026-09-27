@@ -79,6 +79,9 @@ class BacktestInstrument(RuntimeContractModel):
     ts_code: str = Field(min_length=1)
     instrument_context: InstrumentContext
     classification_observed_at: AwareUtcDatetime
+    decision_price: PositivePrice | None
+    decision_price_observed_at: AwareUtcDatetime | None
+    decision_price_source_identity: Sha256
     price_source_identity: Sha256
     open_price: PositivePrice | None
     open_observed_at: AwareUtcDatetime | None
@@ -88,6 +91,8 @@ class BacktestInstrument(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_evidence(self) -> Self:
+        if (self.decision_price is None) != (self.decision_price_observed_at is None):
+            raise ValueError("decision price and observation time must appear together")
         if (self.open_price is None) != (self.open_observed_at is None):
             raise ValueError("open price and observation time must appear together")
         if (self.close_price is None) != (self.close_observed_at is None):
@@ -120,6 +125,7 @@ class BacktestDayInput(RuntimeContractModel):
 
 class BacktestRequest(RuntimeContractModel):
     schema_version: Literal[1] = 1
+    execution_convention: Literal["SIMULATED_DAILY_OPEN"] = "SIMULATED_DAILY_OPEN"
     producer_commit: CommitSha
     input_generation_id: Sha256
     calendar: SSECalendar
@@ -150,7 +156,7 @@ class BacktestRequest(RuntimeContractModel):
         for index, day in enumerate(self.days, start=first):
             previous_date = self.calendar.dates[index - 1]
             cutoff = _local_at(day.trade_date, 9, 25)
-            execution = _local_at(day.trade_date, 9, 31)
+            execution = _local_at(day.trade_date, 9, 30)
             valuation = _local_at(day.trade_date, 15, 1)
             if day.ranking.source_trade_date != previous_date:
                 raise ValueError("ranking source date must be previous SSE trading day")
@@ -159,17 +165,17 @@ class BacktestRequest(RuntimeContractModel):
             for quote in day.instruments:
                 if quote.classification_observed_at >= cutoff:
                     raise ValueError("instrument classification is not visible at decision cutoff")
-                if quote.open_observed_at is not None and not (
-                    _local_at(day.trade_date, 9, 30) <= quote.open_observed_at <= execution
+                if quote.decision_price_observed_at is not None and not (
+                    _local_at(previous_date, 15, 0) <= quote.decision_price_observed_at < cutoff
                 ):
-                    raise ValueError("open price must be observed by execution time")
+                    raise ValueError("decision price must be visible before the 09:25 cutoff")
+                if quote.open_observed_at is not None and quote.open_observed_at != execution:
+                    raise ValueError("open price evidence must match the opening execution")
                 if quote.close_observed_at is not None and not (
                     _local_at(day.trade_date, 15, 0) <= quote.close_observed_at <= valuation
                 ):
                     raise ValueError("close price must be observed by valuation time")
-                if quote.conditions is not None and not (
-                    _local_at(day.trade_date, 9, 30) <= quote.conditions.observed_at <= execution
-                ):
+                if quote.conditions is not None and quote.conditions.observed_at != execution:
                     raise ValueError("trade condition evidence must cover the open")
         return self
 
@@ -181,17 +187,60 @@ class BacktestRequest(RuntimeContractModel):
 class SkippedTarget(RuntimeContractModel):
     ts_code: str = Field(min_length=1)
     side: Literal["BUY", "SELL"]
-    reason: Literal["unverified_conditions", "missing_open_price", "below_lot"]
+    reason: Literal[
+        "unverified_conditions", "missing_decision_price", "missing_open_price", "below_lot"
+    ]
+
+
+class BacktestDecision(RuntimeContractModel):
+    """A 09:25 target order fixed without using the current day's opening print."""
+
+    decision_id: Sha256 | None = None
+    decided_at: AwareUtcDatetime
+    producer_commit: CommitSha
+    strategy_config_id: Sha256
+    ranking_source_identity: Sha256
+    reference_price_snapshot_id: Sha256
+    ts_code: str = Field(min_length=1)
+    side: Literal["BUY", "SELL"]
+    quantity: int = Field(gt=0, multiple_of=100)
+    entry_signal_id: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> Self:
+        if (self.side == "SELL") != (self.entry_signal_id is not None):
+            raise ValueError("SELL decision requires a BUY entry signal")
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"decision_id"}))
+        if self.decision_id is None:
+            object.__setattr__(self, "decision_id", expected)
+        elif self.decision_id != expected:
+            raise ValueError("pre-open decision id does not match its content")
+        return self
 
 
 class BacktestOrder(RuntimeContractModel):
+    decision: BacktestDecision
     intent: PaperOrderIntent
     receipt: PaperExecutionReceipt
+
+    @model_validator(mode="after")
+    def validate_order_binding(self) -> Self:
+        if (
+            self.intent.signal_id != self.decision.decision_id
+            or self.intent.ts_code != self.decision.ts_code
+            or self.intent.side.value != self.decision.side
+            or self.intent.quantity != self.decision.quantity
+            or self.intent.entry_signal_id != self.decision.entry_signal_id
+            or self.receipt.intent_id != self.intent.intent_id
+        ):
+            raise ValueError("broker order does not bind the pre-open decision")
+        return self
 
 
 class BacktestDayResult(RuntimeContractModel):
     trade_date: date
     rebalanced: bool
+    decisions: tuple[BacktestDecision, ...]
     orders: tuple[BacktestOrder, ...]
     skipped: tuple[SkippedTarget, ...]
     fees: NonNegativeMoney
@@ -203,6 +252,11 @@ class BacktestDayResult(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_account(self) -> Self:
+        decision_ids = {item.decision_id for item in self.decisions}
+        if len(decision_ids) != len(self.decisions) or any(
+            item.decision.decision_id not in decision_ids for item in self.orders
+        ):
+            raise ValueError("executed orders must bind distinct daily decisions")
         if (self.account is None) != (self.incomplete_reason is not None):
             raise ValueError("incomplete day must have no account valuation")
         if self.account is None and self.market_value is not None:
@@ -226,6 +280,10 @@ class BacktestDayResult(RuntimeContractModel):
 
 class BacktestResult(RuntimeContractModel):
     schema_version: Literal[1] = 1
+    execution_convention: Literal["SIMULATED_DAILY_OPEN"] = "SIMULATED_DAILY_OPEN"
+    execution_assumption: Literal["按当日开盘价模拟撮合，不代表真实预挂单或保证成交"] = (
+        "按当日开盘价模拟撮合，不代表真实预挂单或保证成交"
+    )
     request_id: Sha256
     producer_commit: CommitSha
     input_generation_id: Sha256
