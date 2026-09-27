@@ -27,6 +27,14 @@ export const tasksHandler = (envelope = tasksEnvelope()) =>
 export const paperHandler = (envelope = paperEnvelope()) =>
   http.get("*/api/v1/paper/accounts", () => HttpResponse.json(envelope));
 
+export const poolEditorHandler = () =>
+  http.get("*/api/v1/pools/editor", () =>
+    HttpResponse.json({
+      data: { state: "unavailable", pools: [], copy_sources: [], canvases: [] },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
@@ -35,4 +43,5 @@ export const server = setupServer(
   monitorHandler(),
   tasksHandler(),
   paperHandler(),
+  poolEditorHandler(),
 );
