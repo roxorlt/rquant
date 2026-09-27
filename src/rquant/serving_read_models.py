@@ -733,6 +733,23 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=2 * 1024 * 1024,
             event_date_columns=("trade_date", "entry_trade_date"),
         ),
+        "pool_member_return": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("trade_date", "date"),
+                ("result_version", "string"),
+                ("ts_code", "string"),
+                ("entry_trade_date", "date"),
+                ("entry_result_version", "string"),
+                ("gain_pct", "float"),
+                ("entry_line_price", "float"),
+            ),
+            ("pool_name", "ts_code"),
+            max_rows=4_096,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date", "entry_trade_date"),
+        ),
         "nl_screen_universe": _contract(
             "reference_slow_authority",
             (
