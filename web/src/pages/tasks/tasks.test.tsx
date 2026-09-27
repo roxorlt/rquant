@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
 import { deadlineFromRemaining, pinnedTaskDeadline } from "@/api/endpoints";
-import { tasksEnvelope } from "@/test/fixtures";
+import { metaEnvelope, tasksEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
@@ -98,6 +98,27 @@ function overviewEnvelope(
 
 function overviewHandler(envelope = overviewEnvelope()) {
   return http.get("*/api/v1/tasks/overview", () => HttpResponse.json(envelope));
+}
+
+function eventsData(
+  overrides: Partial<Schemas["ResearchTaskEventsData"]> = {},
+): Schemas["ResearchTaskEventsData"] {
+  return {
+    state: "ready",
+    note: "任务进展",
+    generation_id: tasksEnvelope().serving.generation_id,
+    updated_at: "2026-09-24T07:31:00Z",
+    truncated: false,
+    events: [
+      {
+        event_id: 1,
+        label: "任务已开始",
+        status_label: "运行中",
+        occurred_at: "2026-09-24T07:30:00Z",
+      },
+    ],
+    ...overrides,
+  };
 }
 
 describe("任务与运行状态总览", () => {
@@ -296,5 +317,217 @@ describe("任务与运行状态总览", () => {
     expect(await screen.findByText("任务总览暂时无法加载")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
     expect(screen.queryByRole("table", { name: "研究任务队列" })).toBeNull();
+  });
+});
+
+describe("研究任务进展", () => {
+  beforeEach(() => server.use(overviewHandler()));
+
+  it("hides entry when overview denies it", async () => {
+    const requests: string[] = [];
+    server.use(
+      http.get("*/api/v1/tasks/jobs/:jobId/events", ({ request }) => {
+        requests.push(request.url);
+        return HttpResponse.json(eventsData());
+      }),
+    );
+    renderApp("/tasks");
+    await screen.findByRole("table", { name: "研究任务队列" });
+    expect(screen.queryByRole("button", { name: /进展/ })).toBeNull();
+    expect(requests).toEqual([]);
+  });
+
+  it("hides entry when the source has no published jobs", async () => {
+    server.use(
+      overviewHandler(
+        overviewEnvelope({
+          can_view_research_logs: true,
+          research: { ...tasksEnvelope().data, items: [], next_cursor: null },
+        }),
+      ),
+    );
+    renderApp("/tasks");
+    await screen.findByRole("table", { name: "研究任务队列" });
+    expect(screen.queryByRole("button", { name: /进展/ })).toBeNull();
+  });
+
+  it("pins the request to overview data, renders plain Chinese events, and restores focus on Escape", async () => {
+    const requests: URL[] = [];
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", ({ request }) => {
+        requests.push(new URL(request.url));
+        return HttpResponse.json(eventsData());
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    const trigger = await screen.findByRole("button", { name: "查看动量参数搜索的进展" });
+    await user.click(trigger);
+    const dialog = await screen.findByRole("dialog", { name: /任务进展/ });
+    expect(within(dialog).getByText("任务已开始")).toBeInTheDocument();
+    expect(within(dialog).getByText("2026-09-24 15:30:00")).toBeInTheDocument();
+    expect(within(dialog).getByText("运行中")).toBeInTheDocument();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.pathname).toContain("/00000000-0000-0000-0000-000000000001/events");
+    expect(requests[0]?.searchParams.get("generation_id")).toBe(
+      tasksEnvelope().serving.generation_id,
+    );
+    expect(dialog).not.toHaveTextContent("00000000-0000-0000-0000-000000000001");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("clears an open drawer when the overview generation changes", async () => {
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () => HttpResponse.json(eventsData())),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+    queryClient.setQueryData(
+      ["meta"],
+      metaEnvelope({
+        generationId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("任务已开始")).toBeNull());
+    expect(await screen.findByText("数据已更新，请重新打开任务进展。")).toBeInTheDocument();
+  });
+
+  it("closes and hides progress when the refreshed overview revokes access", async () => {
+    let permitted = true;
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(overviewEnvelope({ can_view_research_logs: permitted })),
+      ),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () => HttpResponse.json(eventsData())),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+    permitted = false;
+    await queryClient.invalidateQueries({ queryKey: ["tasks", "overview"] });
+    await waitFor(() => expect(screen.queryByText("任务已开始")).toBeNull());
+    expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
+    expect(screen.getByText("当前无法查看任务进展。")).toBeInTheDocument();
+  });
+
+  it("closes the stale drawer on 409 and never renders an older response", async () => {
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () =>
+        HttpResponse.json({ detail: "stale-internal-id" }, { status: 409 }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("数据已更新，请重新打开任务进展。")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /任务进展/ })).toBeNull();
+    expect(document.body).not.toHaveTextContent("stale-internal-id");
+  });
+
+  it("closes a 200 response that names another data generation", async () => {
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () =>
+        HttpResponse.json(eventsData({ generation_id: "other", events: [] })),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("数据已更新，请重新打开任务进展。")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: /任务进展/ })).toBeNull();
+  });
+
+  it.each([
+    ["not_published", "任务进展尚未发布。"],
+    ["not_included", "当前数据未包含该任务。"],
+    ["unavailable", "任务进展暂时无法读取，请稍后重试。"],
+  ] as const)("explains %s without inventing records", async (state, note) => {
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () =>
+        HttpResponse.json(eventsData({ state, note, events: [] })),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    const dialog = await screen.findByRole("dialog", { name: /任务进展/ });
+    expect(within(dialog).getByText(note)).toBeInTheDocument();
+    expect(within(dialog).queryByRole("list", { name: "最近进展" })).toBeNull();
+  });
+
+  it("shows empty and truncated source states and bounds rendering to 500 rows", async () => {
+    const user = userEvent.setup();
+    let response = eventsData({ state: "empty", note: "还没有进展记录。", events: [] });
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () => HttpResponse.json(response)),
+    );
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("还没有进展记录。")).toBeInTheDocument();
+    response = eventsData({
+      state: "truncated",
+      note: "仅显示最近记录。",
+      truncated: true,
+      events: Array.from({ length: 501 }, (_, index) => ({
+        event_id: index + 1,
+        label: `任务进展 ${index + 1}`,
+        status_label: "运行中",
+        occurred_at: "2026-09-24T07:30:00Z",
+      })),
+    });
+    await user.click(screen.getByRole("button", { name: "刷新进展" }));
+    expect(await screen.findByText("仅显示最近记录。")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("list", { name: "最近进展" })).getAllByRole("listitem"),
+    ).toHaveLength(500);
+    expect(screen.queryByText("任务进展 501")).toBeNull();
+  });
+
+  it.each([401, 403, 503])(
+    "shows a safe %i error without displaying server detail",
+    async (status) => {
+      server.use(
+        overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+        http.get("*/api/v1/tasks/jobs/:jobId/events", () =>
+          HttpResponse.json({ detail: "secret-internal-error" }, { status }),
+        ),
+      );
+      const user = userEvent.setup();
+      renderApp("/tasks");
+      await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+      expect(await screen.findByRole("dialog", { name: /任务进展/ })).toBeInTheDocument();
+      expect(await screen.findByRole("alert")).toBeInTheDocument();
+      expect(document.body).not.toHaveTextContent("secret-internal-error");
+    },
+  );
+
+  it("retries an unavailable request without replaying server details", async () => {
+    let unavailable = true;
+    server.use(
+      overviewHandler(overviewEnvelope({ can_view_research_logs: true })),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () =>
+        unavailable
+          ? HttpResponse.json({ detail: "private-error" }, { status: 503 })
+          : HttpResponse.json(eventsData()),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("进展暂时不可用，请稍后重试。")).toBeInTheDocument();
+    unavailable = false;
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("private-error");
   });
 });
