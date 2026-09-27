@@ -27,6 +27,7 @@ from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer
 from rquant.page_control import (
     DEFAULT_PAGE_CONTROL_SERVICE_ID,
+    AckAlert,
     LabPageControlBackend,
     PageControlConsumer,
     PageControlOutbox,
@@ -206,7 +207,7 @@ def build_page_control_service_with_dependencies(
 def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
     class PageControlHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
-            if self.path != "/v1/commands":
+            if self.path not in {"/v1/commands", "/v1/commands/lookup"}:
                 self.send_error(404)
                 return
             try:
@@ -215,13 +216,35 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
                     raise ValueError("request body must be between 1 byte and 1 MiB")
                 payload = json.loads(self.rfile.read(content_length))
                 command = parse_page_control_command(payload)
-                response = service.submit(command).model_dump(mode="json")
             except Exception as exc:
                 self._write_json(
                     400,
                     {"error": f"{type(exc).__name__}: {exc}"},
                 )
                 return
+            if self.path == "/v1/commands/lookup":
+                if not isinstance(command, AckAlert):
+                    self._write_json(400, {"error": "lookup requires ack_alert"})
+                    return
+                try:
+                    receipt = service.lookup_ack_command(command)
+                except ValueError:
+                    self._write_json(409, {"error": "command conflict"})
+                    return
+                except Exception:
+                    self._write_json(503, {"error": "lookup unavailable"})
+                    return
+                response = (
+                    {"found": False}
+                    if receipt is None
+                    else {"found": True, "receipt": receipt.model_dump(mode="json")}
+                )
+            else:
+                try:
+                    response = service.submit(command).model_dump(mode="json")
+                except Exception as exc:
+                    self._write_json(400, {"error": f"{type(exc).__name__}: {exc}"})
+                    return
             self._write_json(200, response)
 
         def log_message(self, format: str, *args: object) -> None:

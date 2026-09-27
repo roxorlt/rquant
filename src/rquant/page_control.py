@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from pydantic import Field, JsonValue, TypeAdapter, field_validator
@@ -73,6 +74,13 @@ class PageControlCommand(RuntimeContractModel):
     kind: str
     command_id: str = Field(min_length=1, max_length=128)
     requested_at: AwareUtcDatetime
+
+
+class AckAlert(PageControlCommand):
+    kind: Literal["ack_alert"] = "ack_alert"
+    generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    actor_id: str = Field(min_length=1, max_length=256)
 
 
 class SaveCanvas(PageControlCommand):
@@ -274,7 +282,8 @@ class LabPageControlBackend(Protocol):
 
 
 PageControlCommandValue = Annotated[
-    SaveCanvas
+    AckAlert
+    | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
     | SetCanvasPoolRefs
@@ -332,6 +341,14 @@ class PageControlReceipt(RuntimeContractModel):
     completed_at: AwareUtcDatetime | None = None
     result: JsonValue | None = None
     error: str | None = None
+
+
+class AlertAcknowledgment(RuntimeContractModel):
+    alert_id: str
+    confirmation_id: str
+    actor_id: str
+    confirmed_at: AwareUtcDatetime
+    generation_id: str
 
 
 class PageControlCommandAudit(RuntimeContractModel):
@@ -597,6 +614,17 @@ class PageControlOutbox:
                     protocol_version INTEGER NOT NULL,
                     activated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS page_control_alert_activation (
+                    marker_name TEXT PRIMARY KEY CHECK(marker_name = 'alert_ack'),
+                    activated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS page_control_alert_ack (
+                    alert_id TEXT PRIMARY KEY,
+                    confirmation_id TEXT NOT NULL UNIQUE,
+                    actor_id TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    generation_id TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(connection, "processing_owner", "TEXT")
@@ -701,10 +729,22 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, AckAlert):
+            raise ValueError("ack_alert requires verified Serving eligibility")
+        return self._enqueue(command)
+
+    def enqueue_verified_ack(self, command: AckAlert) -> PageControlReceipt:
+        """Internal admission point for a future verified Serving event lookup."""
+        if self.alert_ack_activated_at() is None:
+            raise ValueError("alert acknowledgment is not activated")
+        return self._enqueue(command)
+
+    def _enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT * FROM page_control_command WHERE command_id = ?",
                 (command.command_id,),
@@ -732,6 +772,169 @@ class PageControlOutbox:
         receipt = self.receipt(command.command_id)
         assert receipt is not None
         return receipt
+
+    def activate_alert_ack(self, activated_at: datetime) -> datetime:
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT activated_at FROM page_control_alert_activation "
+                "WHERE marker_name = 'alert_ack'"
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO page_control_alert_activation(marker_name, activated_at) "
+                    "VALUES ('alert_ack', ?)",
+                    (frozen,),
+                )
+            elif existing["activated_at"] != frozen:
+                raise ValueError("alert acknowledgment was already activated at another time")
+        return datetime.fromisoformat(frozen)
+
+    def alert_ack_activated_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT activated_at FROM page_control_alert_activation "
+                "WHERE marker_name = 'alert_ack'"
+            ).fetchone()
+        return None if row is None else datetime.fromisoformat(row["activated_at"])
+
+    def lookup_ack_command(self, command: AckAlert) -> PageControlReceipt | None:
+        """Read-only exact retry lookup, safe across Serving generation changes."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["command_kind"] != command.kind or row["command_hash"] != _command_hash(command):
+            raise ValueError("command_id already exists with different payload")
+        stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        if not isinstance(stored, AckAlert) or _command_hash(stored) != row["command_hash"]:
+            raise ValueError("stored acknowledgment command conflicts with its hash")
+        return self._receipt(row)
+
+    def acknowledgment(self, alert_id: str) -> AlertAcknowledgment | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_alert_ack WHERE alert_id = ?",
+                (alert_id,),
+            ).fetchone()
+        return None if row is None else self._acknowledgment(row)
+
+    def complete_ack(self, claim: PageControlClaim) -> PageControlReceipt:
+        """Commit first confirmation, effect, and terminal receipt in one SQLite transaction."""
+        command = claim.command
+        if not isinstance(command, AckAlert):
+            raise TypeError("complete_ack requires an ack_alert claim")
+        command_hash = _command_hash(command)
+        confirmed_at = datetime.now(UTC).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["command_kind"] != command.kind
+                or row["command_hash"] != command_hash
+            ):
+                raise ValueError("acknowledgment command content changed")
+            if (
+                row["status"] != PageControlStatus.PROCESSING.value
+                or row["processing_owner"] != claim.owner_id
+                or row["claim_token"] != claim.claim_token
+            ):
+                raise RuntimeError("stale acknowledgment claim cannot complete")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM page_control_alert_activation WHERE marker_name = 'alert_ack'"
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("alert acknowledgment is not activated")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO page_control_alert_ack(
+                    alert_id, confirmation_id, actor_id, confirmed_at, generation_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    command.alert_id,
+                    command.command_id,
+                    command.actor_id,
+                    confirmed_at,
+                    command.generation_id,
+                ),
+            )
+            acknowledgment = connection.execute(
+                "SELECT * FROM page_control_alert_ack WHERE alert_id = ?",
+                (command.alert_id,),
+            ).fetchone()
+            assert acknowledgment is not None
+            result: JsonValue = {
+                "alert_id": command.alert_id,
+                "confirmation_id": acknowledgment["confirmation_id"],
+                "confirmed_by": acknowledgment["actor_id"],
+                "confirmed_at": acknowledgment["confirmed_at"],
+            }
+            result_json = json.dumps(result, ensure_ascii=True)
+            connection.execute(
+                """
+                INSERT INTO page_control_effect(
+                    command_id, command_hash, effect_kind, status,
+                    owner_id, claim_token, started_at, completed_at, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command_hash,
+                    command.kind,
+                    PageControlEffectStatus.SUCCEEDED.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                    confirmed_at,
+                    confirmed_at,
+                    result_json,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE page_control_command
+                SET status = ?, completed_at = ?, result_json = ?, error = NULL,
+                    processing_owner = NULL, lease_expires_at = NULL, claim_token = NULL
+                WHERE command_id = ? AND status = ? AND processing_owner = ? AND claim_token = ?
+                """,
+                (
+                    PageControlStatus.SUCCEEDED.value,
+                    confirmed_at,
+                    result_json,
+                    command.command_id,
+                    PageControlStatus.PROCESSING.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("acknowledgment claim changed during completion")
+            completed = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            assert completed is not None
+        return self._receipt(completed)
+
+    @staticmethod
+    def _acknowledgment(row: sqlite3.Row) -> AlertAcknowledgment:
+        return AlertAcknowledgment(
+            alert_id=row["alert_id"],
+            confirmation_id=row["confirmation_id"],
+            actor_id=row["actor_id"],
+            confirmed_at=datetime.fromisoformat(row["confirmed_at"]),
+            generation_id=row["generation_id"],
+        )
 
     def claim(
         self,
@@ -1220,6 +1423,10 @@ class PageControlConsumer:
             lease_seconds=self.lease_seconds,
             now=self.clock(),
         ):
+            if isinstance(claim.command, AckAlert):
+                self._assert_command_time(claim.command)
+                receipts.append(self.outbox.complete_ack(claim))
+                continue
             try:
                 outcome = self._execute_claim(claim)
             except _RetryableCommittedLocalEffectError:
@@ -2763,7 +2970,12 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
-        receipt = self.outbox.enqueue(command)
+        if isinstance(command, AckAlert):
+            receipt = self.lookup_ack_command(command)
+            if receipt is None:
+                raise ValueError("ack_alert requires verified Serving eligibility")
+        else:
+            receipt = self.outbox.enqueue(command)
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
@@ -2777,6 +2989,9 @@ class PageControlService:
                 return observed
             receipt = observed
         raise RuntimeError("page control command did not reach a terminal state")
+
+    def lookup_ack_command(self, command: AckAlert) -> PageControlReceipt | None:
+        return self.outbox.lookup_ack_command(command)
 
 
 PageControlTransport = Callable[[dict[str, object]], dict[str, object]]
@@ -2794,6 +3009,7 @@ class PageControlClient:
         *,
         endpoint: str | None = None,
         transport: PageControlTransport | None = None,
+        lookup_transport: PageControlTransport | None = None,
         timeout_seconds: float = 1.0,
     ) -> None:
         self.endpoint = endpoint or os.environ.get(
@@ -2801,6 +3017,7 @@ class PageControlClient:
             "http://127.0.0.1:8767/v1/commands",
         )
         self.transport = transport or self._post
+        self.lookup_transport = lookup_transport or self._post_lookup
         self.timeout_seconds = timeout_seconds
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
@@ -2812,9 +3029,56 @@ class PageControlClient:
             ) from exc
         return PageControlReceipt.model_validate(response)
 
+    def lookup_ack_command(self, command: AckAlert) -> PageControlReceipt | None:
+        try:
+            response = self.lookup_transport(command.model_dump(mode="json"))
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise PageControlUnavailableError(
+                f"page control lookup unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        if response == {"found": False}:
+            return None
+        if (
+            isinstance(response, dict)
+            and response.get("found") is True
+            and set(response)
+            == {
+                "found",
+                "receipt",
+            }
+        ):
+            receipt = PageControlReceipt.model_validate(response["receipt"])
+            if receipt.command_id != command.command_id:
+                raise ValueError("invalid page control lookup response command_id")
+            return receipt
+        raise ValueError("invalid page control lookup response")
+
     def _post(self, payload: dict[str, object]) -> dict[str, object]:
+        return self._post_to(self.endpoint, payload)
+
+    def _post_lookup(self, payload: dict[str, object]) -> dict[str, object]:
+        endpoint = urlsplit(self.endpoint)
+        if (
+            endpoint.scheme != "http"
+            or endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or endpoint.path != "/v1/commands"
+            or endpoint.query
+            or endpoint.fragment
+            or endpoint.username is not None
+            or endpoint.password is not None
+        ):
+            raise ValueError("PageControl lookup requires the fixed loopback endpoint")
+        lookup_url = urlunsplit((endpoint.scheme, endpoint.netloc, "/v1/commands/lookup", "", ""))
+        try:
+            return self._post_to(lookup_url, payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                raise ValueError("command conflict") from exc
+            raise
+
+    def _post_to(self, endpoint: str, payload: dict[str, object]) -> dict[str, object]:
         request = urllib.request.Request(
-            self.endpoint,
+            endpoint,
             data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -3376,7 +3640,9 @@ def parse_page_control_command(payload: object) -> PageControlCommandValue:
 
 
 __all__ = [
+    "AckAlert",
     "AddPoolToCanvas",
+    "AlertAcknowledgment",
     "AppendNlQueryLog",
     "CreateCanvas",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
