@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import http.client
+import json
+import os
 import socket
+import threading
 from datetime import UTC, datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pytest
 
+import rquant.alert_ack_admission as alert_ack_admission
 import rquant.page_control_service as page_control_service
 import rquant.runtime_deployment_profile as deployment_profile_module
 from rquant.canvas_publication_receipt import CanvasPublicationReceipt
-from rquant.page_control import PageControlStatus, SaveCanvas
+from rquant.page_control import AckAlert, PageControlStatus, SaveCanvas
 from rquant.page_control_service import build_page_control_service
 from rquant.runtime_deployment_profile import (
     LINUX_PRODUCTION_RUNTIME_ROOT,
@@ -20,7 +27,10 @@ from rquant.runtime_deployment_profile import (
 )
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
-from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
+from tests.canvas_ed25519_support import (
+    OpenSslCanvasSigningClient,
+    create_canvas_ed25519_test_authority,
+)
 
 NOW = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
 COMMIT = "a" * 40
@@ -322,3 +332,177 @@ def test_page_control_service_factory_accepts_canvas_authority_and_restarts_once
     )
     assert publication.claims.consumer_service_id == "page-control-service-test"
     assert publication.claims.consumer_instance_id == "page-control-service-instance"
+
+
+@pytest.mark.parametrize(
+    "socket_failure",
+    ("stale_without_lsof", "stale_lsof_timeout", "active", "foreign_owner"),
+)
+def test_optional_ack_socket_refusal_preserves_tcp_page_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_failure: str
+) -> None:
+    authority = create_canvas_ed25519_test_authority(tmp_path / "keys")
+    public_key = (tmp_path / "keys" / "canvas-test-v1.public.pem").read_text()
+    runtime_root = tmp_path / "runtime"
+    _install_page_control_profile(
+        runtime_root,
+        PageControlRuntimeProfile.model_validate(
+            {
+                "endpoint": "http://127.0.0.1:8767/v1/commands",
+                "outbox_path": runtime_root / "control" / "page-control.sqlite3",
+                "data_dir": runtime_root / "serving" / "page-control",
+                "log_dir": runtime_root / "control" / "page-control-logs",
+                "page_projection_canvas_catalog_root": (
+                    runtime_root / "serving" / "page-control" / "canvases"
+                ),
+                "canvas_publication": {
+                    "active_key_id": authority.keyring.active_key_id,
+                    "active_public_key_pem": public_key,
+                    "signer_command": ("/test/signer",),
+                    "consumer_service_id": "page-control.test.v1",
+                    "consumer_instance_id": "page-control-test",
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        page_control_service.SecureCanvasPublicationSigningClient,
+        "sign",
+        lambda _client, *, namespace, payload: OpenSslCanvasSigningClient(
+            tmp_path / "keys" / "canvas-test-v1.private.pem"
+        ).sign(namespace=namespace, payload=payload),
+    )
+    socket_directory = TemporaryDirectory(
+        prefix="rqa-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    )
+    private = Path(socket_directory.name)
+    socket_path = private / "ack.sock"
+    existing = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    existing.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    original = socket_path.lstat()
+    if socket_failure == "active":
+        existing.listen(1)
+    else:
+        existing.close()
+    if socket_failure == "foreign_owner":
+        original_lstat = Path.lstat
+
+        def foreign_lstat(path: Path):
+            info = original_lstat(path)
+            if path != socket_path:
+                return info
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_uid=os.geteuid() + 1,
+                st_dev=info.st_dev,
+                st_ino=info.st_ino,
+            )
+
+        monkeypatch.setattr(Path, "lstat", foreign_lstat)
+    if socket_failure == "stale_without_lsof":
+        original_is_file = Path.is_file
+
+        def missing_lsof(path: Path) -> bool:
+            if str(path) in {"/usr/sbin/lsof", "/usr/bin/lsof"}:
+                return False
+            return original_is_file(path)
+
+        monkeypatch.setattr(Path, "is_file", missing_lsof)
+    if socket_failure == "stale_lsof_timeout":
+
+        def timed_out(_path: Path) -> None:
+            raise ValueError("ack admission socket liveness cannot be verified: lsof timeout")
+
+        monkeypatch.setattr(alert_ack_admission, "_assert_no_socket_holder", timed_out)
+
+    ready = threading.Event()
+    servers: list[ThreadingHTTPServer] = []
+
+    class ObservedHTTPServer(ThreadingHTTPServer):
+        def __init__(self, _address: tuple[str, int], handler: type) -> None:
+            super().__init__(("127.0.0.1", 0), handler)
+            servers.append(self)
+
+        def serve_forever(self, poll_interval: float = 0.5) -> None:
+            ready.set()
+            super().serve_forever(poll_interval)
+
+    monkeypatch.setattr(
+        page_control_service, "_server_class_for_host", lambda _host: ObservedHTTPServer
+    )
+    errors: list[Exception] = []
+
+    def run_service() -> None:
+        try:
+            page_control_service.main(
+                runtime_root=runtime_root,
+                expected_commit=COMMIT,
+                ack_socket_path=socket_path,
+                ack_serving_root=tmp_path / "serving",
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_service, daemon=True)
+    worker.start()
+    try:
+        assert ready.wait(timeout=3), f"old TCP service did not start: {errors!r}"
+        assert socket_path.stat().st_ino == original.st_ino
+        command = AckAlert(
+            command_id="lookup-after-ack-socket-failure",
+            requested_at=NOW,
+            generation_id="a" * 64,
+            alert_id="b" * 64,
+            actor_id="researcher",
+        )
+        connection = http.client.HTTPConnection("127.0.0.1", servers[0].server_port, timeout=2)
+        connection.request(
+            "POST",
+            "/v1/commands/lookup",
+            body=command.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read()) == {"found": False}
+        connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", servers[0].server_port, timeout=2)
+        connection.request(
+            "POST",
+            "/v1/commands",
+            body=command.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 400
+        response.read()
+        connection.close()
+
+        save_canvas = SaveCanvas(
+            command_id="save-after-ack-socket-failure",
+            requested_at=NOW,
+            name="ack-socket-unavailable",
+        )
+        connection = http.client.HTTPConnection("127.0.0.1", servers[0].server_port, timeout=2)
+        connection.request(
+            "POST",
+            "/v1/commands",
+            body=save_canvas.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["status"] == PageControlStatus.SUCCEEDED.value
+        connection.close()
+    finally:
+        if ready.is_set():
+            servers[0].shutdown()
+        worker.join(timeout=3)
+        if socket_failure == "active":
+            existing.close()
+        socket_path.unlink(missing_ok=True)
+        socket_directory.cleanup()
+    assert not worker.is_alive()
+    assert errors == []

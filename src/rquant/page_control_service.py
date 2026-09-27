@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from loguru import logger
+
 from rquant.canvas_publication_receipt import (
     CANVAS_PUBLICATION_PROBE_NAMESPACE,
     CanvasPublicationKeyring,
@@ -408,12 +410,15 @@ def _serve(
         raise ValueError("ack socket and Serving root must be configured together")
     ack_server = None
     if ack_socket_path is not None and ack_serving_root is not None:
-        from rquant.alert_ack_admission import AckAdmission, build_ack_admission_server
+        try:
+            from rquant.alert_ack_admission import AckAdmission, build_ack_admission_server
 
-        ack_server = build_ack_admission_server(
-            AckAdmission(service, ack_serving_root),
-            socket_path=ack_socket_path,
-        )
+            ack_server = build_ack_admission_server(
+                AckAdmission(service, ack_serving_root),
+                socket_path=ack_socket_path,
+            )
+        except Exception:
+            logger.exception("AckAlert admission listener disabled during startup")
     server_class = _server_class_for_host(host)
     try:
         server = server_class((host, port), handler_for(service))
