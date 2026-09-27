@@ -96,6 +96,7 @@ from rquant.serving_read_models import (
     screen_nl_projection,
 )
 from rquant.storage.duckdb import DuckDBStore
+from rquant.storage.schema import MONITOR_EVENT_DDL
 from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 
 
@@ -812,6 +813,7 @@ def _signal_projections() -> tuple[ServingProjectionPayload, ...]:
 def _signal_page_source_database(path: Path) -> None:
     connection = duckdb.connect(str(path))
     try:
+        connection.execute(MONITOR_EVENT_DDL)
         connection.execute(
             """
             CREATE TABLE screen_result (
