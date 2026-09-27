@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Annotated, Literal, Protocol
 
+from loguru import logger
 from pydantic import (
     Field,
     StrictInt,
@@ -19,6 +20,7 @@ from pydantic import (
 
 from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
+from rquant.ops_status import OpsSnapshot
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
@@ -50,11 +52,12 @@ PAPER_ACCOUNTS_DATASET_ID = "paper_accounts"
 RUNTIME_HEALTH_DATASET_ID = "runtime_health"
 LAB_JOBS_DATASET_ID = "lab_jobs"
 PROMOTIONS_DATASET_ID = "promotions"
+OPS_STATUS_DATASET_ID = "ops_status"
 REFERENCE_SLOW_AUTHORITY_DATASET_ID = "reference_slow_authority"
 REFERENCE_SLOW_DATASET_ID = "reference_slow"
 REFERENCE_SLOW_CONTRACT_DATASET_ID = "reference_slow_contract"
 
-#: Not a second copy of the six: the owner datasets are named once, by
+#: Not a second copy of the seven: the owner datasets are named once, by
 #: `runtime_builder_serving._SOURCE_PAYLOAD_KINDS`, and both guards read that one list.
 SOURCE_DATASET_IDS: frozenset[str] = SERVING_SOURCE_DATASET_IDS
 
@@ -228,6 +231,28 @@ class PromotionsPayload(RuntimeContractModel):
     projections: tuple[ServingProjectionPayload, ...] = ()
 
 
+class OpsStatusPayload(RuntimeContractModel):
+    payload_kind: Literal["ops_status"] = "ops_status"
+    snapshot: OpsSnapshot | None = None
+    projections: tuple[ServingProjectionPayload, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_projection_set(self) -> OpsStatusPayload:
+        expected = {"ops_host_status", "ops_unit_status", "ops_resource_status"}
+        observed = {projection.table_name for projection in self.projections}
+        if self.snapshot is None:
+            if observed:
+                raise ValueError("ops projections require a source snapshot")
+        elif observed != expected or len(self.projections) != len(expected):
+            raise ValueError("ops snapshot requires its exact serving projections")
+        else:
+            from rquant.ops_status_serving import ops_status_projections
+
+            if self.projections != ops_status_projections(self.snapshot):
+                raise ValueError("ops projections must match sample evidence")
+        return self
+
+
 class ReferenceSlowPayload(ServingReferenceSlowEvidence):
     payload_kind: Literal["reference_slow"] = "reference_slow"
     projections: tuple[ServingProjectionPayload, ...] = ()
@@ -239,6 +264,7 @@ SourcePayload = Annotated[
     | RuntimeHealthPayload
     | LabJobsPayload
     | PromotionsPayload
+    | OpsStatusPayload
     | ReferenceSlowPayload,
     Field(discriminator="payload_kind"),
 ]
@@ -299,6 +325,7 @@ PaperAccountsReader = SourceReader
 RuntimeHealthReader = SourceReader
 LabJobsReader = SourceReader
 PromotionsReader = SourceReader
+OpsStatusReader = SourceReader
 ReferenceSlowReader = SourceReader
 
 
@@ -318,12 +345,20 @@ def _payload_is_empty(payload: SourcePayload) -> bool:
         return not payload.lab_jobs and not payload.projections
     if isinstance(payload, PromotionsPayload):
         return not payload.promotions and not payload.projections
+    if isinstance(payload, OpsStatusPayload):
+        return payload.snapshot is None and not payload.projections
     return False
 
 
 def _error_text(error: BaseException) -> str:
     detail = str(error).strip()
     return type(error).__name__ if not detail else f"{type(error).__name__}: {detail}"
+
+
+def _missing_ops_status(_as_of: AwareUtcDatetime) -> SourceReadResult:
+    from rquant.runtime_serving_authority import ServingSourceAuthorityUnavailableError
+
+    raise ServingSourceAuthorityUnavailableError("ops status collector is not installed")
 
 
 class ServingSnapshotAssembler:
@@ -338,8 +373,13 @@ class ServingSnapshotAssembler:
         lab_jobs_reader: LabJobsReader,
         promotions_reader: PromotionsReader,
         reference_slow_reader: ReferenceSlowReader,
+        ops_status_reader: OpsStatusReader | None = None,
+        expected_ops_manifest_digest: GenerationId | None = None,
         optional_datasets: frozenset[str] = DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ) -> None:
+        selected_ops_reader = (
+            _missing_ops_status if ops_status_reader is None else ops_status_reader
+        )
         readers = (
             signal_reader,
             paper_accounts_reader,
@@ -347,6 +387,7 @@ class ServingSnapshotAssembler:
             lab_jobs_reader,
             promotions_reader,
             reference_slow_reader,
+            selected_ops_reader,
         )
         if any(not callable(reader) for reader in readers):
             raise TypeError("all serving source readers must be callable")
@@ -370,8 +411,11 @@ class ServingSnapshotAssembler:
         self.runtime_health_reader = runtime_health_reader
         self.lab_jobs_reader = lab_jobs_reader
         self.promotions_reader = promotions_reader
+        self.ops_status_reader = selected_ops_reader
+        self.expected_ops_manifest_digest = expected_ops_manifest_digest
         self.reference_slow_reader = reference_slow_reader
         self.optional_datasets = optional_datasets
+        self._last_ops_security_reason: str | None = None
 
     def assemble(self, as_of: AwareUtcDatetime) -> ServingRuntimeSnapshot:
         observed_at = normalize_aware_utc(as_of)
@@ -389,6 +433,7 @@ class ServingSnapshotAssembler:
             ),
             (LAB_JOBS_DATASET_ID, self.lab_jobs_reader, LabJobsPayload),
             (PROMOTIONS_DATASET_ID, self.promotions_reader, PromotionsPayload),
+            (OPS_STATUS_DATASET_ID, self.ops_status_reader, OpsStatusPayload),
             (
                 REFERENCE_SLOW_AUTHORITY_DATASET_ID,
                 self.reference_slow_reader,
@@ -424,12 +469,14 @@ class ServingSnapshotAssembler:
         runtime_payload = by_dataset[RUNTIME_HEALTH_DATASET_ID].payload
         lab_payload = by_dataset[LAB_JOBS_DATASET_ID].payload
         promotion_payload = by_dataset[PROMOTIONS_DATASET_ID].payload
+        ops_payload = by_dataset[OPS_STATUS_DATASET_ID].payload
         reference_payload = by_dataset[REFERENCE_SLOW_AUTHORITY_DATASET_ID].payload
         assert isinstance(signal_payload, SignalDeliveryReadPayload)
         assert isinstance(paper_payload, PaperAccountsPayload)
         assert isinstance(runtime_payload, RuntimeHealthPayload)
         assert isinstance(lab_payload, LabJobsPayload)
         assert isinstance(promotion_payload, PromotionsPayload)
+        assert isinstance(ops_payload, OpsStatusPayload)
         assert isinstance(reference_payload, ReferenceSlowPayload)
         if reference_payload.available_at > observed_at:
             raise ValueError("reference slow evidence contains future availability")
@@ -559,18 +606,61 @@ class ServingSnapshotAssembler:
     ) -> SourceReadResult:
         try:
             result = reader(as_of)
+            if dataset_id == OPS_STATUS_DATASET_ID:
+                from rquant.runtime_serving_authority import (
+                    ServingSourceAuthorityIntegrityError,
+                    ServingSourceAuthorityUnavailableError,
+                )
+
+                if not isinstance(result, SourceReadResult) or not isinstance(
+                    result.payload, OpsStatusPayload
+                ):
+                    raise ServingSourceAuthorityIntegrityError("ops source payload is invalid")
+                if result.status is not FreshnessStatus.UNAVAILABLE:
+                    sample = result.payload.snapshot
+                    if sample is None or sample.sampled_at != result.event_time:
+                        raise ServingSourceAuthorityIntegrityError("ops sample identity is invalid")
+                    if (
+                        self.expected_ops_manifest_digest is None
+                        or sample.manifest_digest != self.expected_ops_manifest_digest
+                    ):
+                        raise ServingSourceAuthorityIntegrityError(
+                            "ops sample manifest digest does not match the serving manifest"
+                        )
+                    if sample.sampled_at > as_of:
+                        raise ServingSourceAuthorityIntegrityError("ops sample is in the future")
+                    if (as_of - sample.sampled_at).total_seconds() >= 120:
+                        raise ServingSourceAuthorityUnavailableError(
+                            "ops sample is at least 120 seconds old"
+                        )
+                    self._last_ops_security_reason = None
         except Exception as error:
             # The authority reader imports this module for SourceReadResult, so keep the
             # classified exception import local to the failure path.
-            from rquant.runtime_serving_authority import ServingSourceAuthorityUnavailableError
+            from rquant.runtime_serving_authority import (
+                ServingSourceAuthorityIntegrityError,
+                ServingSourceAuthorityUnavailableError,
+            )
 
+            classified = isinstance(error, ServingSourceAuthorityUnavailableError) or (
+                dataset_id == OPS_STATUS_DATASET_ID
+                and isinstance(error, ServingSourceAuthorityIntegrityError)
+            )
             if (
                 dataset_id not in self.optional_datasets
                 or payload_type is ReferenceSlowPayload
-                or not isinstance(error, ServingSourceAuthorityUnavailableError)
+                or not classified
             ):
                 raise RuntimeError(f"{dataset_id} reader failed: {_error_text(error)}") from error
             reason = _error_text(error)
+            if (
+                dataset_id == OPS_STATUS_DATASET_ID
+                and reason != self._last_ops_security_reason
+            ):
+                self._last_ops_security_reason = reason
+                logger.bind(
+                    ops_status_security_event={"dataset_id": dataset_id, "reason": reason}
+                ).warning("ops_status_source_unavailable")
             return SourceReadResult(
                 dataset_id=dataset_id,
                 #: Named by the refusal and nothing else. `as_of` used to be part of this
@@ -606,6 +696,7 @@ class ServingSnapshotAssembler:
 __all__ = [
     "DEFAULT_OPTIONAL_SOURCE_DATASETS",
     "LAB_JOBS_DATASET_ID",
+    "OPS_STATUS_DATASET_ID",
     "PAPER_ACCOUNTS_DATASET_ID",
     "PROMOTIONS_DATASET_ID",
     "RUNTIME_HEALTH_DATASET_ID",
