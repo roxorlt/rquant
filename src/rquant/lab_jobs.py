@@ -170,6 +170,10 @@ class InvalidStoredJobError(RuntimeError):
     """Stored spec content or denormalized query columns were tampered with."""
 
 
+class LabPublishedEventIntegrityError(InvalidStoredJobError):
+    """A bounded task-event window cannot match its published job snapshot."""
+
+
 class LabIntegrityDegradedError(RuntimeError):
     """A bounded or full ledger audit failed, so a daemon must fail closed."""
 
@@ -1705,6 +1709,29 @@ class LabJobPage(LabRecordModel):
     total_count: int | None = Field(default=None, ge=0)
     has_more: bool
     next_cursor: str | None
+
+
+class LabPublishedEvent(LabRecordModel):
+    """Only event fields that can cross the Lab-to-Serving read boundary."""
+
+    event_id: int = Field(ge=1)
+    job_id: UUID
+    event_type: str = Field(max_length=64)
+    prior_status: JobStatus | None
+    new_status: JobStatus
+    job_version: int = Field(ge=0)
+    created_at: datetime
+
+
+class LabPublishedJobEventWindow(LabRecordModel):
+    job_id: UUID
+    events: tuple[LabPublishedEvent, ...]
+    truncated: bool
+
+
+class LabPublishedJobsEventSnapshot(LabRecordModel):
+    page: LabJobPage
+    windows: tuple[LabPublishedJobEventWindow, ...]
 
 
 class LabGraphIntegrityTableCounts(LabRecordModel):
@@ -6215,37 +6242,16 @@ class LabJobReader:
             page_parameters.extend((cursor_time, cursor_time, str(decoded_cursor.job_id)))
         if len(page_parameters) + 1 > LAB_JOB_LIST_QUERY_PARAMETER_MAX:
             raise ValueError("job list query exceeds the SQL parameter budget")
-        page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
         try:
             with self._read_snapshot(label="job list") as connection:
-                total_row = (
-                    connection.execute(
-                        "SELECT total_count FROM lab_job_list_summary WHERE singleton = 1"
-                    ).fetchone()
-                    if not clauses
-                    else None
+                return self._list_jobs_in_snapshot(
+                    connection,
+                    limit=limit,
+                    clauses=page_clauses,
+                    parameters=page_parameters,
+                    include_total=not clauses,
+                    filters=selected_filters,
                 )
-                page_cte = (
-                    "page_jobs AS MATERIALIZED ("
-                    f"SELECT j.* FROM lab_job AS j{page_where} "
-                    "ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?"
-                    ")"
-                )
-                stats_sql = self._summary_stats_sql(
-                    leading_ctes=page_cte,
-                    shard_job_scope="page_jobs",
-                )
-                rows = connection.execute(
-                    f"{stats_sql} "
-                    f"SELECT {self._summary_columns_sql()} FROM page_jobs AS j "
-                    "LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id "
-                    "ORDER BY j.created_at DESC, j.job_id DESC",
-                    (*page_parameters, limit + 1),
-                ).fetchall()
-                for row in rows[:limit]:
-                    page_job = self._job_from_row(row)
-                    if page_job.result_state is LabResultState.SEALED:
-                        self._validate_complete_result_graph(connection, page_job)
         except sqlite3.OperationalError as exc:
             if (
                 selected_filters.keyword is not None
@@ -6255,6 +6261,46 @@ class LabJobReader:
                     "invalid stored lab job encountered while filtering strategy names"
                 ) from exc
             raise
+
+    def _list_jobs_in_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        limit: int,
+        clauses: list[str],
+        parameters: list[object],
+        include_total: bool,
+        filters: LabJobListFilters,
+    ) -> LabJobPage:
+        page_where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        total_row = (
+            connection.execute(
+                "SELECT total_count FROM lab_job_list_summary WHERE singleton = 1"
+            ).fetchone()
+            if include_total
+            else None
+        )
+        page_cte = (
+            "page_jobs AS MATERIALIZED ("
+            f"SELECT j.* FROM lab_job AS j{page_where} "
+            "ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?"
+            ")"
+        )
+        stats_sql = self._summary_stats_sql(
+            leading_ctes=page_cte,
+            shard_job_scope="page_jobs",
+        )
+        rows = connection.execute(
+            f"{stats_sql} "
+            f"SELECT {self._summary_columns_sql()} FROM page_jobs AS j "
+            "LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id "
+            "ORDER BY j.created_at DESC, j.job_id DESC",
+            (*parameters, limit + 1),
+        ).fetchall()
+        for row in rows[:limit]:
+            page_job = self._job_from_row(row)
+            if page_job.result_state is LabResultState.SEALED:
+                self._validate_complete_result_graph(connection, page_job)
         total_count = (
             _strict_sqlite_int(total_row["total_count"], field="total_count", minimum=0)
             if total_row is not None
@@ -6267,7 +6313,7 @@ class LabJobReader:
             self._encode_job_list_cursor(
                 created_at=items[-1].created_at,
                 job_id=items[-1].job_id,
-                filters=selected_filters,
+                filters=filters,
             )
             if has_more and items
             else None
@@ -6277,6 +6323,125 @@ class LabJobReader:
             total_count=total_count,
             has_more=has_more,
             next_cursor=next_cursor,
+        )
+
+    def list_published_jobs_with_events(
+        self,
+        *,
+        limit: int = LAB_JOB_LIST_LIMIT_MAX,
+        max_events_per_job: int = 500,
+        max_total_events: int = 4_096,
+    ) -> LabPublishedJobsEventSnapshot:
+        """Read the published job set and its bounded event windows in one SQLite view."""
+
+        if not 1 <= limit <= LAB_JOB_LIST_LIMIT_MAX:
+            raise ValueError(f"limit must be between 1 and {LAB_JOB_LIST_LIMIT_MAX}")
+        if not 1 <= max_events_per_job <= 500:
+            raise ValueError("max_events_per_job must be between 1 and 500")
+        if not 1 <= max_total_events <= 4_096:
+            raise ValueError("max_total_events must be between 1 and 4096")
+        with self._read_snapshot(label="published lab job events") as connection:
+            page = self._list_jobs_in_snapshot(
+                connection,
+                limit=limit,
+                clauses=[],
+                parameters=[],
+                include_total=True,
+                filters=LabJobListFilters(),
+            )
+            if not page.items:
+                return LabPublishedJobsEventSnapshot(page=page, windows=())
+            per_job_limit = min(max_events_per_job, max_total_events // len(page.items))
+            if per_job_limit < 1:
+                raise ValueError("total event budget cannot cover every published job")
+            windows = tuple(
+                self._published_event_window(
+                    connection,
+                    summary=summary,
+                    limit=per_job_limit,
+                )
+                for summary in page.items
+            )
+            return LabPublishedJobsEventSnapshot(page=page, windows=windows)
+
+    @staticmethod
+    def _published_event_window(
+        connection: sqlite3.Connection,
+        *,
+        summary: LabJobSummary,
+        limit: int,
+    ) -> LabPublishedJobEventWindow:
+        rows = connection.execute(
+            "SELECT event_id, job_id, "
+            "CASE WHEN length(event_type) <= 64 THEN event_type ELSE '' END AS event_type, "
+            "prior_status, new_status, job_version, created_at "
+            "FROM lab_event WHERE job_id = ? ORDER BY event_id DESC LIMIT ?",
+            (str(summary.job_id), limit + 1),
+        ).fetchall()
+        if not rows and (
+            summary.version != 0
+            or summary.status is not JobStatus.QUEUED
+            or summary.updated_at != summary.created_at
+        ):
+            raise LabPublishedEventIntegrityError("published event missing for advanced job")
+        parsed: list[LabPublishedEvent] = []
+        prior_id: int | None = None
+        expected_version = summary.version
+        expected_status: JobStatus | None = summary.status
+        expected_time = summary.updated_at
+        for row in rows:
+            try:
+                event = LabPublishedEvent(
+                    event_id=_strict_sqlite_int(
+                        row["event_id"], field="published event ID", minimum=1
+                    ),
+                    job_id=_canonical_uuid_text(row["job_id"], field="published event job ID"),
+                    event_type=str(row["event_type"]),
+                    prior_status=(
+                        JobStatus(str(row["prior_status"]))
+                        if row["prior_status"] is not None
+                        else None
+                    ),
+                    new_status=JobStatus(str(row["new_status"])),
+                    job_version=_strict_sqlite_int(
+                        row["job_version"], field="published event version", minimum=0
+                    ),
+                    created_at=_load_time(str(row["created_at"])),
+                )
+            except (InvalidStoredJobError, ValueError, TypeError):
+                raise LabPublishedEventIntegrityError(
+                    "published event contains invalid safe fields"
+                ) from None
+            if prior_id is None and event.created_at != summary.updated_at:
+                raise LabPublishedEventIntegrityError(
+                    "published event time conflicts with job update"
+                )
+            if (
+                event.job_id != summary.job_id
+                or (prior_id is not None and event.event_id >= prior_id)
+                or event.job_version != expected_version
+                or event.new_status != expected_status
+                or not summary.created_at <= event.created_at <= expected_time
+            ):
+                raise LabPublishedEventIntegrityError(
+                    "published event conflicts with job version or status"
+                )
+            prior_id = event.event_id
+            expected_version -= 1
+            expected_status = event.prior_status
+            expected_time = event.created_at
+            parsed.append(event)
+        truncated = len(parsed) > limit
+        if parsed and not truncated and (
+            expected_version != -1
+            or expected_status is not None
+            or parsed[-1].created_at != summary.created_at
+        ):
+            raise LabPublishedEventIntegrityError("published event history is incomplete")
+        return LabPublishedJobEventWindow(
+            job_id=summary.job_id,
+            events=tuple(parsed[:limit]),
+            truncated=truncated,
         )
 
     def list_finalization_candidates(

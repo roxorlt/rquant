@@ -76,6 +76,33 @@ _DUCKDB_PROJECTION_TYPES: Mapping[ProjectionColumnKind, DuckDBColumnType] = Mapp
     }
 )
 
+LAB_EVENT_LABEL_BY_TYPE: Mapping[str, str] = MappingProxyType(
+    {
+        "job_submitted": "任务已创建",
+        "job_started": "任务已开始",
+        "job_transitioned": "状态已更新",
+        "job_checkpointed": "任务已暂停",
+        "job_resumed": "任务已继续",
+        "job_cancelled": "任务已取消",
+        "job_cancel_confirmed": "任务已取消",
+        "job_failed": "任务未完成",
+        "job_plan_failed": "任务未完成",
+        "job_deadline_exceeded": "任务未完成",
+        "job_failed_legacy_result_contract": "任务未完成",
+        "job_result_ready": "结果待确认",
+        "job_result_ready_recovered": "结果待确认",
+        "job_result_sealed": "任务已完成",
+        "control_intent_changed": "操作请求已记录",
+        "job_retry_rejected": "重试未执行",
+        "job_retried": "任务已重试",
+        "lease_recovered": "状态已恢复",
+    }
+)
+UNKNOWN_LAB_EVENT_LABEL = "状态已更新"
+LAB_EVENT_ALLOWED_LABELS: frozenset[str] = frozenset(
+    (*LAB_EVENT_LABEL_BY_TYPE.values(), UNKNOWN_LAB_EVENT_LABEL)
+)
+
 
 @dataclass(frozen=True)
 class ServingProjectionContract:
@@ -136,6 +163,34 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        "lab_job_event_window": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("job_version", "int"),
+                ("state", "string"),
+                ("retained_count", "int"),
+                ("truncated", "bool"),
+            ),
+            ("job_id",),
+            max_rows=100,
+            max_bytes=32 * 1024,
+        ),
+        "lab_job_event": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("event_id", "int"),
+                ("job_version", "int"),
+                ("occurred_at", "timestamp"),
+                ("new_status", "string"),
+                ("label", "string"),
+            ),
+            ("job_id", "event_id"),
+            max_rows=4_096,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("occurred_at",),
+        ),
         "ops_host_status": _contract(
             "ops_status",
             (
