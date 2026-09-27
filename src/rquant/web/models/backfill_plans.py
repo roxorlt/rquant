@@ -33,11 +33,27 @@ class BackfillPlanItem(_PlanModel):
     executable: Literal[False]
 
 
+class BackfillPlanProgressLog(_PlanModel):
+    event_id: int = Field(gt=0)
+    event_type: Literal[
+        "queued", "started", "resumed", "source_check", "succeeded", "failed", "retried"
+    ]
+    attempts: int = Field(ge=0)
+    occurred_at: datetime
+    message: str = Field(max_length=64)
+
+
 class BackfillPlanProgress(_PlanModel):
-    availability: Literal["unavailable"]
-    task_id: None
-    message: Literal["任务进度尚未提供"] = "任务进度尚未提供"
-    logs: list[str] = Field(default_factory=list, max_length=100)
+    availability: Literal["unavailable", "empty", "ready"]
+    event_history: Literal["available", "unavailable"] = "unavailable"
+    task_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    status: Literal["queued", "running", "succeeded", "failed"] | None = None
+    attempts: int | None = Field(default=None, ge=0)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    plan_hash: PlanHash | None = None
+    message: str = Field(max_length=64)
+    logs: list[BackfillPlanProgressLog] = Field(default_factory=list, max_length=20)
 
 
 class BackfillPlanCatalogRow(_PlanModel):

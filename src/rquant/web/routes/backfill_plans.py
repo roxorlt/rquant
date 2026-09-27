@@ -5,7 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Annotated, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
+from pydantic import BaseModel
 
+from rquant.backfill_plan_job_projection import (
+    BackfillPlanProgressEvent,
+    BackfillPlanProgressState,
+    validate_backfill_plan_progress,
+)
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
 from rquant.web.envelope import Envelope
 from rquant.web.models.backfill_plans import (
@@ -14,6 +20,7 @@ from rquant.web.models.backfill_plans import (
     BackfillPlanDetailData,
     BackfillPlanItem,
     BackfillPlanProgress,
+    BackfillPlanProgressLog,
     BackfillPlanProgressRow,
     BackfillPlansData,
     PlanSourceState,
@@ -28,12 +35,26 @@ router = APIRouter(prefix="/data")
 _TABLES = tuple(
     sorted(name for name in PAGE_PROJECTION_CONTRACTS if name.startswith("backfill_plan_"))
 )
+_JOB_TABLES = frozenset({"backfill_plan_job", "backfill_plan_event"})
+_LEGACY_TABLES = tuple(name for name in _TABLES if name not in _JOB_TABLES)
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CHANGED = "回补计划已更新，请从列表重新查看。"
 _UNREADABLE = "回补计划暂时无法读取，请稍后重试。"
-_CatalogOrProgress = TypeVar(
-    "_CatalogOrProgress", BackfillPlanCatalogRow, BackfillPlanProgressRow
-)
+_RowModel = TypeVar("_RowModel", bound=BaseModel)
+_EVENT_MESSAGES = {
+    "queued": "已加入队列",
+    "started": "开始生成计划",
+    "resumed": "继续生成计划",
+    "source_check": "正在核对来源",
+    "succeeded": "计划已生成",
+    "retried": "已重新加入队列",
+}
+_FAILURE_MESSAGES = {
+    "snapshot_changed": "来源已更新，请重新生成",
+    "invalid_evidence": "来源无法核对，请检查数据",
+    "artifact_invalid": "生成的计划无法验证",
+    "internal_error": "生成失败，请稍后重试",
+}
 
 
 def _source_state(borrowed: BorrowedGeneration | None) -> PlanSourceState:
@@ -50,14 +71,29 @@ def _source_state(borrowed: BorrowedGeneration | None) -> PlanSourceState:
         if any(borrowed.manifest.row_counts.get(name, 0) for name in _TABLES):
             raise ValueError("plan tables are missing from projection status")
         return "not_published"
-    if len(marks) != len(_TABLES) or tuple(item[0] for item in marks) != _TABLES:
+    names = tuple(item[0] for item in marks)
+    if names not in (_TABLES, _LEGACY_TABLES):
         raise ValueError("plan projection status is incomplete")
     if any(
-        type(available) is not bool or type(count) is not int
-        for _, available, count, *_ in marks
+        type(available) is not bool or type(count) is not int for _, available, count, *_ in marks
     ):
         raise ValueError("plan projection status types are invalid")
-    if not any(item[1] for item in marks):
+    job_marks = tuple(item for item in marks if item[0] in _JOB_TABLES)
+    if job_marks and (
+        len(job_marks) != len(_JOB_TABLES)
+        or not (
+            all(item[1] for item in job_marks)
+            or all(
+                not item[1] and item[2] == 0 and borrowed.manifest.row_counts.get(item[0], 0) == 0
+                for item in job_marks
+            )
+        )
+    ):
+        raise ValueError("job projections are only partly published")
+    if not job_marks and any(borrowed.manifest.row_counts.get(name, 0) for name in _JOB_TABLES):
+        raise ValueError("job rows are present without projection status")
+    active_marks = tuple(item for item in marks if item[0] not in _JOB_TABLES or item[1])
+    if not any(item[1] for item in active_marks):
         if any(count or borrowed.manifest.row_counts.get(name, 0) for name, _, count, *_ in marks):
             raise ValueError("unpublished plans have rows")
         return "not_published"
@@ -75,23 +111,96 @@ def _source_state(borrowed: BorrowedGeneration | None) -> PlanSourceState:
         or at is None
         or at > borrowed.manifest.built_at
         or count != borrowed.manifest.row_counts.get(name)
-        for name, available, count, owner, generation, at in marks
+        for name, available, count, owner, generation, at in active_marks
     ):
         raise ValueError("plan projection status disagrees with the generation")
     return "ready"
 
 
-def _one_row(
-    borrowed: BorrowedGeneration, table: str, model: type[_CatalogOrProgress]
-) -> _CatalogOrProgress:
+def _one_row(borrowed: BorrowedGeneration, table: str, model: type[_RowModel]) -> _RowModel:
     contract = PAGE_PROJECTION_CONTRACTS[table]
     columns = contract.column_names
-    rows = borrowed.cursor.execute(
-        f"SELECT {', '.join(columns)} FROM {table} LIMIT 2"
-    ).fetchall()
+    rows = borrowed.cursor.execute(f"SELECT {', '.join(columns)} FROM {table} LIMIT 2").fetchall()
     if len(rows) != 1 or borrowed.manifest.row_counts.get(table) != 1:
         raise ValueError("plan singleton row count differs from manifest")
     return model.model_validate(dict(zip(columns, rows[0], strict=True)))
+
+
+def _event_message(event: BackfillPlanProgressEvent) -> str:
+    if event.event_type == "failed":
+        if event.error_code is None:
+            raise ValueError("failed event has no safe error code")
+        return _FAILURE_MESSAGES[event.error_code]
+    return _EVENT_MESSAGES[event.event_type]
+
+
+def _job_progress(borrowed: BorrowedGeneration) -> BackfillPlanProgress:
+    row = _one_row(borrowed, "backfill_plan_job", BackfillPlanProgressState)
+    expected_events = borrowed.manifest.row_counts["backfill_plan_event"]
+    if expected_events > 20:
+        raise ValueError("backfill plan event count exceeds its bound")
+    columns = PAGE_PROJECTION_CONTRACTS["backfill_plan_event"].column_names
+    raw_events = borrowed.cursor.execute(
+        f"SELECT {', '.join(columns)} FROM backfill_plan_event ORDER BY event_id LIMIT 21"
+    ).fetchall()
+    if len(raw_events) != expected_events:
+        raise ValueError("backfill plan event rows differ from manifest")
+    events = tuple(
+        BackfillPlanProgressEvent.model_validate(dict(zip(columns, raw, strict=True)))
+        for raw in raw_events
+    )
+    available_at_row = borrowed.cursor.execute(
+        "SELECT available_at FROM projection_status WHERE table_name = 'backfill_plan_job'"
+    ).fetchone()
+    if available_at_row is None:
+        raise ValueError("backfill plan job has no projection status")
+    plan_hashes = frozenset(
+        {row.plan_hash}
+        if row.plan_hash is not None and _index_row(borrowed, row.plan_hash) is not None
+        else ()
+    )
+    validate_backfill_plan_progress(
+        row, events, available_at=available_at_row[0], plan_hashes=plan_hashes
+    )
+    if row.availability == "unavailable":
+        message = "任务进度尚未提供"
+    elif row.availability == "empty":
+        message = "还没有生成任务"
+    elif row.status == "failed":
+        if row.error_code is None:
+            raise ValueError("failed job has no safe error code")
+        message = _FAILURE_MESSAGES[row.error_code]
+    elif row.status == "running" and events and events[-1].event_type == "source_check":
+        message = "正在核对来源"
+    elif row.status == "running":
+        message = "正在生成计划"
+    elif row.status == "queued":
+        message = "已加入队列"
+    elif row.status == "succeeded":
+        message = "计划已生成"
+    else:
+        raise ValueError("backfill plan job status is invalid")
+    return BackfillPlanProgress(
+        availability=row.availability,
+        event_history=row.event_history,
+        task_id=row.task_id,
+        status=row.status,
+        attempts=row.attempts,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        plan_hash=row.plan_hash,
+        message=message,
+        logs=[
+            BackfillPlanProgressLog(
+                event_id=event.event_id,
+                event_type=event.event_type,
+                attempts=event.attempts,
+                occurred_at=event.occurred_at,
+                message=_event_message(event),
+            )
+            for event in events
+        ],
+    )
 
 
 def _catalog_progress(
@@ -114,10 +223,15 @@ def _catalog_progress(
         borrowed.manifest.row_counts["backfill_plan_archive"] != indexed
     ):
         raise ValueError("plan archive is incomplete")
+    job_mark = borrowed.cursor.execute(
+        "SELECT available FROM projection_status WHERE table_name = 'backfill_plan_job'"
+    ).fetchone()
+    if job_mark is not None and job_mark[0]:
+        return catalog, _job_progress(borrowed)
     return catalog, BackfillPlanProgress(
         availability=progress_row.availability,
         task_id=progress_row.task_id,
-        logs=[],
+        message="任务进度尚未提供",
     )
 
 
@@ -135,16 +249,13 @@ def _empty(state: Literal["not_published", "unavailable"], page_size: int) -> Ba
 def _index_row(borrowed: BorrowedGeneration, plan_hash: str) -> BackfillPlanItem | None:
     columns = PAGE_PROJECTION_CONTRACTS["backfill_plan_index"].column_names
     rows = borrowed.cursor.execute(
-        f"SELECT {', '.join(columns)} FROM backfill_plan_index "
-        "WHERE plan_hash = ? LIMIT 2",
+        f"SELECT {', '.join(columns)} FROM backfill_plan_index WHERE plan_hash = ? LIMIT 2",
         (plan_hash,),
     ).fetchall()
     if len(rows) > 1:
         raise ValueError("plan hash is duplicated")
     return (
-        BackfillPlanItem.model_validate(dict(zip(columns, rows[0], strict=True)))
-        if rows
-        else None
+        BackfillPlanItem.model_validate(dict(zip(columns, rows[0], strict=True))) if rows else None
     )
 
 
