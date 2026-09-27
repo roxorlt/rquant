@@ -54,3 +54,85 @@ class ResearchJobsData(BaseModel):
     page_size: int = Field(ge=1, le=50)
     items: list[ResearchJobItem]
     next_cursor: str | None
+
+
+OverviewSourceState = Literal["ready", "unavailable"]
+
+
+class ScheduledTaskItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(max_length=40)
+    status: StatusInfo
+    last_trigger_at: AwareUtcDatetime | None
+    next_at: AwareUtcDatetime | None
+    duration_seconds: float | None = Field(ge=0, allow_inf_nan=False)
+    result_label: str
+    timer_unit: str = Field(max_length=128)
+    service_unit: str = Field(max_length=128)
+
+
+class ScheduledTasksData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_state: OverviewSourceState
+    source_label: str
+    source_note: str | None
+    source_updated_at: AwareUtcDatetime | None
+    expires_at: AwareUtcDatetime | None
+    items: list[ScheduledTaskItem] = Field(max_length=32)
+
+
+class RuntimeServiceItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    plane_label: str
+    status: StatusInfo
+    heartbeat_at: AwareUtcDatetime | None
+    service_id: str = Field(max_length=128)
+
+
+class RuntimeServicesData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_state: OverviewSourceState
+    source_label: str
+    source_note: str | None
+    source_updated_at: AwareUtcDatetime | None
+    items: list[RuntimeServiceItem] = Field(max_length=32)
+
+
+class ResourceGroupItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    slice_unit: str
+    memory_current_bytes: int | None = Field(ge=0)
+    memory_peak_bytes: int | None = Field(ge=0)
+
+
+class ResourcesData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_state: OverviewSourceState
+    source_label: str
+    source_note: str | None
+    source_updated_at: AwareUtcDatetime | None
+    expires_at: AwareUtcDatetime | None
+    host_memory_total_bytes: int | None = Field(ge=0)
+    host_memory_available_bytes: int | None = Field(ge=0)
+    rquant_memory_current_bytes: int | None = Field(ge=0)
+    rquant_memory_peak_bytes: int | None = Field(ge=0)
+    groups: list[ResourceGroupItem] = Field(max_length=4)
+    cpu_usage_percent: float | None = Field(ge=0, le=100, allow_inf_nan=False)
+    cpu_note: str
+
+
+class TaskOverviewData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    scheduled: ScheduledTasksData
+    services: RuntimeServicesData
+    resources: ResourcesData
+    research: ResearchJobsData
