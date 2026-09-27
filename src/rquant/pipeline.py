@@ -34,6 +34,10 @@ class DailyPoolPipelineResult(RuntimeContractModel):
     errors: tuple[str, ...] = ()
 
 
+class ParentMarketDataGapError(LookupError):
+    """A trusted parent trading day has no daily market rows."""
+
+
 def _get_prev_trading_date(store: DuckDBStore, trade_date: str, n: int = 1) -> str | None:
     """trade_date 前第 n 个交易日（n=1 = 前一天）。"""
     row = store._conn.execute(
@@ -49,6 +53,25 @@ def _get_prev_trading_date(store: DuckDBStore, trade_date: str, n: int = 1) -> s
         [trade_date, n - 1],
     ).fetchone()
     return row[0] if row else None
+
+
+def _get_exact_delayed_trading_date(
+    store: DuckDBStore, trade_date: str, delay_days: int
+) -> str:
+    anchor = date.fromisoformat(trade_date)
+    if not store.is_trading_day("SSE", anchor):
+        raise ValueError(f"v2 screen date is not an open trading day: {trade_date}")
+    for _ in range(delay_days):
+        anchor = store.previous_trading_day(anchor)
+    available = store._conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM daily_bar WHERE trade_date = ?)",
+        [anchor],
+    ).fetchone()[0]
+    if not available:
+        raise ParentMarketDataGapError(
+            f"daily_bar missing for exact parent trading day {anchor.isoformat()}"
+        )
+    return anchor.isoformat()
 
 
 def _to_screen_result_df(
@@ -236,13 +259,18 @@ def run_daily_screen_stage(
                 ts_whitelist = []
                 parent_dates = []
                 # v2 延后只取 T-N；旧 offset_days 保持 T-1..T-N 回看窗口。
-                offsets = (
-                    (preset.delay_days,)
-                    if preset.delay_days is not None
-                    else range(1, preset.offset_days + 1)
-                )
-                for offset in offsets:
-                    parent_date = _get_prev_trading_date(store, trade_date, offset)
+                if preset.delay_days is not None:
+                    candidate_dates = (
+                        _get_exact_delayed_trading_date(
+                            store, trade_date, preset.delay_days
+                        ),
+                    )
+                else:
+                    candidate_dates = tuple(
+                        _get_prev_trading_date(store, trade_date, offset)
+                        for offset in range(1, preset.offset_days + 1)
+                    )
+                for parent_date in candidate_dates:
                     if parent_date is None:
                         continue
                     parent_df = store.query_screen_result(parent_date, preset.depends_on)
@@ -260,6 +288,12 @@ def run_daily_screen_stage(
                         f"{name}: 父预设 {preset.depends_on} "
                         f"在 {lookback} 无命中，跳过"
                     )
+                    if preset.delay_days is not None:
+                        store.replace_screen_result(
+                            trade_date,
+                            name,
+                            _to_screen_result_df(pd.DataFrame(), trade_date, name),
+                        )
                     summary[name] = 0
                     continue
                 logger.info(f"{name}: 从 {parent_dates} 合并 {len(ts_whitelist)} 只白名单")
@@ -278,7 +312,10 @@ def run_daily_screen_stage(
                     removed = sr_df.loc[hit_mask, "ts_code"].tolist()
                     sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
                     logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
-            store.upsert_screen_result(sr_df)
+            if preset.delay_days is not None:
+                store.replace_screen_result(trade_date, name, sr_df)
+            else:
+                store.upsert_screen_result(sr_df)
             summary[name] = len(sr_df)
             logger.info(f"  {name}: {len(sr_df)} 命中")
         except Exception as exc:
