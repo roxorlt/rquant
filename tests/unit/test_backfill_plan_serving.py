@@ -319,6 +319,12 @@ def test_legacy_job_store_without_event_table_keeps_status_without_invented_logs
     task = store.submit(_request(_snapshot(tmp_path)))
     with sqlite3.connect(state_path) as connection:
         connection.execute("DROP TABLE backfill_plan_job_event")
+        if any(
+            row[1] == "event_history_complete"
+            for row in connection.execute("PRAGMA table_info(backfill_plan_job)")
+        ):
+            connection.execute("ALTER TABLE backfill_plan_job DROP COLUMN event_history_complete")
+    BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
     source = _source(tmp_path, directory, state_path)
 
     queued = _rows(source)
@@ -339,6 +345,12 @@ def test_legacy_success_without_events_still_requires_same_generation_plan(
     assert completed is not None and completed.plan_hash is not None
     with sqlite3.connect(state_path) as connection:
         connection.execute("DROP TABLE backfill_plan_job_event")
+        if any(
+            row[1] == "event_history_complete"
+            for row in connection.execute("PRAGMA table_info(backfill_plan_job)")
+        ):
+            connection.execute("ALTER TABLE backfill_plan_job DROP COLUMN event_history_complete")
+    BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
     source = _source(tmp_path, directory, state_path)
 
     served = _rows(source)
@@ -348,6 +360,44 @@ def test_legacy_success_without_events_still_requires_same_generation_plan(
     (directory / f"daily-bar-backfill-plan-v1-{completed.plan_hash}.json").unlink()
     with pytest.raises(PageProjectionSourceIntegrityError, match="succeeded|plan"):
         source(OBSERVED)
+
+
+def test_new_task_missing_its_events_refuses_generation(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    task = store.submit(_request(_snapshot(tmp_path)))
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DELETE FROM backfill_plan_job_event WHERE task_id=?", (task.task_id,))
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="latest event"):
+        _source(tmp_path, directory, state_path)(OBSERVED)
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DROP TABLE backfill_plan_job_event")
+    with pytest.raises(ValueError, match="event history|event table"):
+        BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+
+
+def test_read_only_job_reader_does_not_create_missing_wal_sidecar(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    store.submit(_request(_snapshot(tmp_path)))
+    writer = sqlite3.connect(state_path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("UPDATE backfill_plan_job SET updated_at=updated_at")
+    writer.commit()
+    wal = Path(f"{state_path}-wal")
+    shm = Path(f"{state_path}-shm")
+    assert wal.is_file() and shm.is_file()
+    shm.unlink()
+    try:
+        with pytest.raises(PageProjectionSourceIntegrityError, match="shared memory|sidecar"):
+            _source(tmp_path, directory, state_path)(OBSERVED)
+        assert not shm.exists()
+    finally:
+        writer.close()
 
 
 def test_in_progress_lab_temp_file_does_not_hide_published_plans(tmp_path: Path) -> None:

@@ -255,9 +255,7 @@ def test_changed_snapshot_fails_without_publishing_and_retry_keeps_identity(
     store = _store(tmp_path, clock)
     request = _request(snapshot)
     queued = store.submit(request)
-    replacement = _database(
-        tmp_path / "other.duckdb", START, END, [("600000.SH", START)]
-    )
+    replacement = _database(tmp_path / "other.duckdb", START, END, [("600000.SH", START)])
     os.replace(replacement, snapshot)
 
     failed = BackfillPlanJobWorker(store).run_one()
@@ -531,6 +529,7 @@ def test_legacy_job_database_gains_events_without_changing_old_job(tmp_path: Pat
     queued = store.submit(_request(snapshot))
     with store._connect() as connection:
         connection.execute("DROP TABLE backfill_plan_job_event")
+        connection.execute("ALTER TABLE backfill_plan_job DROP COLUMN event_history_complete")
 
     reopened = _store(tmp_path, clock)
 

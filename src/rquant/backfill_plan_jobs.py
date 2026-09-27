@@ -38,9 +38,7 @@ _JobStatus = Literal["queued", "running", "succeeded", "failed"]
 _EventType = Literal[
     "queued", "started", "resumed", "source_check", "succeeded", "failed", "retried"
 ]
-_ErrorCode = Literal[
-    "snapshot_changed", "invalid_evidence", "artifact_invalid", "internal_error"
-]
+_ErrorCode = Literal["snapshot_changed", "invalid_evidence", "artifact_invalid", "internal_error"]
 
 
 class _JobModel(BaseModel):
@@ -186,8 +184,17 @@ class BackfillPlanJobStore:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                """
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                event_table_existed = (
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='backfill_plan_job_event'"
+                    ).fetchone()
+                    is not None
+                )
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS backfill_plan_job (
                     task_id TEXT PRIMARY KEY,
                     idempotency_key TEXT NOT NULL UNIQUE,
@@ -201,12 +208,31 @@ class BackfillPlanJobStore:
                     snapshot_sha256 TEXT,
                     error_code TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    event_history_complete INTEGER NOT NULL DEFAULT 1
+                        CHECK(event_history_complete IN (0,1))
                 )
                 """
-            )
-            connection.execute(
-                """
+                )
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(backfill_plan_job)")
+                }
+                if "event_history_complete" not in columns:
+                    connection.execute(
+                        "ALTER TABLE backfill_plan_job ADD COLUMN "
+                        "event_history_complete INTEGER NOT NULL DEFAULT 1 "
+                        "CHECK(event_history_complete IN (0,1))"
+                    )
+                    if not event_table_existed:
+                        connection.execute("UPDATE backfill_plan_job SET event_history_complete=0")
+                elif (
+                    not event_table_existed
+                    and connection.execute("SELECT 1 FROM backfill_plan_job LIMIT 1").fetchone()
+                    is not None
+                ):
+                    raise ValueError("backfill plan event history table vanished")
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS backfill_plan_job_event (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT NOT NULL,
@@ -221,13 +247,17 @@ class BackfillPlanJobStore:
                     CHECK((event_type = 'failed') = (error_code IS NOT NULL))
                 )
                 """
-            )
-            connection.execute(
-                """
+                )
+                connection.execute(
+                    """
                 CREATE INDEX IF NOT EXISTS backfill_plan_job_event_task_order
                 ON backfill_plan_job_event(task_id, event_id)
                 """
-            )
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.state_path, timeout=5, isolation_level=None)
@@ -374,9 +404,7 @@ class BackfillPlanJobStore:
         request, task_id = admission
         return request, self.status(task_id)
 
-    def admission_by_key(
-        self, idempotency_key: str
-    ) -> tuple[BackfillPlanJobRequest, str] | None:
+    def admission_by_key(self, idempotency_key: str) -> tuple[BackfillPlanJobRequest, str] | None:
         """Read the durable task binding without treating plan generation as admission."""
         if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", idempotency_key) is None:
             raise ValueError("invalid backfill plan idempotency key")
@@ -433,9 +461,11 @@ class BackfillPlanJobStore:
     def _verify_artifact(
         self, plan_hash: str, request: BackfillPlanJobRequest, snapshot_sha256: str | None
     ) -> None:
-        if _SHA256.fullmatch(plan_hash) is None or snapshot_sha256 is None or _SHA256.fullmatch(
-            snapshot_sha256
-        ) is None:
+        if (
+            _SHA256.fullmatch(plan_hash) is None
+            or snapshot_sha256 is None
+            or _SHA256.fullmatch(snapshot_sha256) is None
+        ):
             raise BackfillPlanArtifactUnavailableError("stored plan identity is invalid")
         path = self.plan_directory / f"{_PLAN_PREFIX}{plan_hash}.json"
         try:
@@ -651,9 +681,7 @@ class BackfillPlanJobWorker:
                 snapshot_path=request.snapshot_path,
                 expected_file_sha256=claim.snapshot_sha256,
                 expected_file_identity=current_identity,
-                on_source_sha256=lambda digest: self.store._record_snapshot_sha256(
-                    claim, digest
-                ),
+                on_source_sha256=lambda digest: self.store._record_snapshot_sha256(claim, digest),
                 snapshot_label=request.snapshot_label,
                 evidence_code_revision=request.evidence_code_revision,
                 audit_start=request.audit_start,

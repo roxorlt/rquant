@@ -172,6 +172,25 @@ def _file_identity(value: os.stat_result) -> tuple[int, int]:
     return value.st_dev, value.st_ino
 
 
+def _require_existing_wal_sidecars(state_path: Path) -> None:
+    wal_path = Path(f"{state_path}-wal")
+    shm_path = Path(f"{state_path}-shm")
+
+    def regular_or_missing(path: Path) -> bool:
+        try:
+            found = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(found.st_mode):
+            raise ValueError("backfill plan job SQLite sidecar is not a regular file")
+        return True
+
+    wal_exists = regular_or_missing(wal_path)
+    shm_exists = regular_or_missing(shm_path)
+    if wal_exists and not shm_exists:
+        raise ValueError("backfill plan job WAL shared memory sidecar is missing")
+
+
 def read_backfill_plan_job_snapshot(
     state_path: Path | None, *, observed_at: datetime
 ) -> BackfillPlanJobSnapshot:
@@ -192,26 +211,31 @@ def read_backfill_plan_job_snapshot(
         return unavailable
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
         raise ValueError("backfill plan job state must be a regular non-symlink file")
+    _require_existing_wal_sidecars(state_path)
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(f"{state_path.as_uri()}?mode=ro", uri=True, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         connection.execute("BEGIN")
-        event_history = (
-            "available"
-            if connection.execute(
+        event_table_available = (
+            connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backfill_plan_job_event'"
             ).fetchone()
-            else "unavailable"
+            is not None
         )
+        job_columns = {row[1] for row in connection.execute("PRAGMA table_info(backfill_plan_job)")}
+        has_history_marker = "event_history_complete" in job_columns
+        if has_history_marker and not event_table_available:
+            raise ValueError("backfill plan event history table vanished")
         if connection.execute(
             "SELECT 1 FROM backfill_plan_job LIMIT 1 OFFSET ?", (_MAX_STORED_JOBS,)
         ).fetchone():
             raise ValueError("backfill plan job store exceeds its bound")
         row = connection.execute(
-            """
+            f"""
             SELECT task_id, status, attempts, created_at, updated_at, plan_hash, error_code
+                   {", event_history_complete" if has_history_marker else ""}
             FROM backfill_plan_job ORDER BY created_at DESC, rowid DESC LIMIT 1
             """
         ).fetchone()
@@ -219,12 +243,20 @@ def read_backfill_plan_job_snapshot(
             available_at = datetime.fromtimestamp(before.st_ctime_ns / 1_000_000_000, tz=UTC)
             snapshot = BackfillPlanJobSnapshot(
                 progress=BackfillPlanProgressState(
-                    availability="empty", event_history=event_history
+                    availability="empty",
+                    event_history="available" if event_table_available else "unavailable",
                 ),
                 events=(),
                 available_at=available_at,
             )
         else:
+            if has_history_marker:
+                complete = row["event_history_complete"]
+                if type(complete) is not int or complete not in (0, 1):
+                    raise ValueError("backfill plan event history marker is invalid")
+                event_history = "available" if complete == 1 else "unavailable"
+            else:
+                event_history = "available" if event_table_available else "unavailable"
             progress = BackfillPlanProgressState(
                 availability="ready",
                 event_history=event_history,
