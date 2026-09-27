@@ -84,6 +84,13 @@ class WebSettings(BaseModel):
         parse_bind(value)
         return value
 
+    @field_validator("page_control_url")
+    @classmethod
+    def validate_page_control_url(cls, value: str) -> str:
+        if value != DEFAULT_PAGE_CONTROL_URL:
+            raise ValueError("page control URL must be the fixed IPv4 loopback endpoint")
+        return value
+
     @property
     def bind_host(self) -> str:
         return parse_bind(self.bind)[0]

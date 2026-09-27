@@ -73,6 +73,57 @@
         "title": "Assignment",
         "type": "object"
       },
+      "AttachPoolCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "canvas_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "pattern": "^[\\w\\u4e00-\\u9fff-]+$",
+            "title": "Canvas Name",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_pool_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Pool Version",
+            "type": "string"
+          },
+          "kind": {
+            "const": "add_pool_to_canvas",
+            "default": "add_pool_to_canvas",
+            "title": "Kind",
+            "type": "string"
+          },
+          "pool_name": {
+            "maxLength": 85,
+            "minLength": 6,
+            "pattern": "^user/[\\w\\u4e00-\\u9fff-]+$",
+            "title": "Pool Name",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "canvas_name",
+          "pool_name",
+          "expected_pool_version"
+        ],
+        "title": "AttachPoolCommand",
+        "type": "object"
+      },
       "AttentionItem": {
         "properties": {
           "action": {
@@ -1233,6 +1284,122 @@
         "title": "DeliveriesSummary",
         "type": "object"
       },
+      "EditableCanvas": {
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "pool_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pool Refs",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "version",
+          "pool_refs"
+        ],
+        "title": "EditableCanvas",
+        "type": "object"
+      },
+      "EditablePool": {
+        "properties": {
+          "delay_days": {
+            "title": "Delay Days",
+            "type": "integer"
+          },
+          "depends_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depends On"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "include_columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Include Columns",
+            "type": "array"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "rule_calls": {
+            "items": {
+              "$ref": "#/components/schemas/EditorRuleCall"
+            },
+            "title": "Rule Calls",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "display_name",
+          "description",
+          "version",
+          "depends_on",
+          "delay_days",
+          "rule_calls",
+          "include_columns"
+        ],
+        "title": "EditablePool",
+        "type": "object"
+      },
+      "EditorRuleCall": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Args",
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "args"
+        ],
+        "title": "EditorRuleCall",
+        "type": "object"
+      },
       "Envelope_BoardsData_": {
         "properties": {
           "data": {
@@ -1439,6 +1606,22 @@
           "serving"
         ],
         "title": "Envelope[PaperAccountsData]",
+        "type": "object"
+      },
+      "Envelope_PoolEditorData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PoolEditorData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PoolEditorData]",
         "type": "object"
       },
       "Envelope_PoolsData_": {
@@ -2091,6 +2274,7 @@
         "title": "JobCounts",
         "type": "object"
       },
+      "JsonValue": {},
       "LocalExpr": {
         "additionalProperties": false,
         "properties": {
@@ -3543,6 +3727,91 @@
         "title": "PoolDefinitionView",
         "type": "object"
       },
+      "PoolEditorData": {
+        "properties": {
+          "canvases": {
+            "items": {
+              "$ref": "#/components/schemas/EditableCanvas"
+            },
+            "title": "Canvases",
+            "type": "array"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/EditablePool"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "pools",
+          "canvases"
+        ],
+        "title": "PoolEditorData",
+        "type": "object"
+      },
+      "PoolEditorReceipt": {
+        "properties": {
+          "canvas_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvas Name"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "pool_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pool Version"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "succeeded",
+              "failed",
+              "ambiguous"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "PoolEditorReceipt",
+        "type": "object"
+      },
       "PoolMember": {
         "properties": {
           "close": {
@@ -4459,6 +4728,105 @@
           "next_cursor"
         ],
         "title": "ResearchJobsData",
+        "type": "object"
+      },
+      "SavePoolCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "base_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "pattern": "^[\\w\\u4e00-\\u9fff-]+$",
+            "title": "Base Name",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "delay_days": {
+            "default": 0,
+            "maximum": 252.0,
+            "minimum": 0.0,
+            "title": "Delay Days",
+            "type": "integer"
+          },
+          "depends_on": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depends On"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Description",
+            "type": "string"
+          },
+          "display_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "include_columns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Include Columns",
+            "type": "array"
+          },
+          "kind": {
+            "const": "save_user_pool_v2",
+            "default": "save_user_pool_v2",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rule_calls": {
+            "items": {
+              "$ref": "#/components/schemas/EditorRuleCall"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Rule Calls",
+            "type": "array"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "base_name",
+          "display_name",
+          "rule_calls"
+        ],
+        "title": "SavePoolCommand",
         "type": "object"
       },
       "SavedCanvas": {
@@ -6900,6 +7268,83 @@
           }
         },
         "summary": "已发布池子画布",
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/editor": {
+      "get": {
+        "operationId": "get_pool_editor_api_v1_pools_editor_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PoolEditorData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "可编辑池子与画布",
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/editor/commands": {
+      "post": {
+        "operationId": "submit_pool_editor_command_api_v1_pools_editor_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "add_pool_to_canvas": "#/components/schemas/AttachPoolCommand",
+                    "save_user_pool_v2": "#/components/schemas/SavePoolCommand"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SavePoolCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AttachPoolCommand"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PoolEditorReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存池子或加入画布",
         "tags": [
           "pools"
         ]

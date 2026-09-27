@@ -293,6 +293,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/pools/editor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可编辑池子与画布 */
+        get: operations["get_pool_editor_api_v1_pools_editor_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/editor/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存池子或加入画布 */
+        post: operations["submit_pool_editor_command_api_v1_pools_editor_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/blocks": {
         parameters: {
             query?: never;
@@ -448,6 +482,27 @@ export interface components {
             name: string;
             /** Value */
             value: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+        };
+        /** AttachPoolCommand */
+        AttachPoolCommand: {
+            /** Canvas Name */
+            canvas_name: string;
+            /** Command Id */
+            command_id: string;
+            /** Expected Pool Version */
+            expected_pool_version: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "add_pool_to_canvas";
+            /** Pool Name */
+            pool_name: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** AttentionItem */
         AttentionItem: {
@@ -812,6 +867,45 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** EditableCanvas */
+        EditableCanvas: {
+            /** Description */
+            description: string;
+            /** Name */
+            name: string;
+            /** Pool Refs */
+            pool_refs: string[];
+            /** Version */
+            version: string;
+        };
+        /** EditablePool */
+        EditablePool: {
+            /** Delay Days */
+            delay_days: number;
+            /** Depends On */
+            depends_on: string | null;
+            /** Description */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Include Columns */
+            include_columns: string[];
+            /** Key */
+            key: string;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+            /** Version */
+            version: string;
+        };
+        /** EditorRuleCall */
+        EditorRuleCall: {
+            /** Args */
+            args: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Name */
+            name: string;
+        };
         /** Envelope[BoardsData] */
         Envelope_BoardsData_: {
             data: components["schemas"]["BoardsData"];
@@ -875,6 +969,11 @@ export interface components {
         /** Envelope[PaperAccountsData] */
         Envelope_PaperAccountsData_: {
             data: components["schemas"]["PaperAccountsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PoolEditorData] */
+        Envelope_PoolEditorData_: {
+            data: components["schemas"]["PoolEditorData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[PoolsData] */
@@ -1077,6 +1176,7 @@ export interface components {
             /** Succeeded */
             succeeded: number;
         };
+        JsonValue: unknown;
         /** LocalExpr */
         LocalExpr: {
             /**
@@ -1538,6 +1638,34 @@ export interface components {
             /** Status Label */
             status_label: string;
         };
+        /** PoolEditorData */
+        PoolEditorData: {
+            /** Canvases */
+            canvases: components["schemas"]["EditableCanvas"][];
+            /** Pools */
+            pools: components["schemas"]["EditablePool"][];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "unavailable";
+        };
+        /** PoolEditorReceipt */
+        PoolEditorReceipt: {
+            /** Canvas Name */
+            canvas_name?: string | null;
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /** Pool Version */
+            pool_version?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "succeeded" | "failed" | "ambiguous";
+        };
         /** PoolMember */
         PoolMember: {
             /** Close */
@@ -1780,6 +1908,43 @@ export interface components {
             source_updated_at: string | null;
             /** Total */
             total: number | null;
+        };
+        /** SavePoolCommand */
+        SavePoolCommand: {
+            /** Base Name */
+            base_name: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Delay Days
+             * @default 0
+             */
+            delay_days: number;
+            /** Depends On */
+            depends_on?: string | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Expected Version */
+            expected_version?: string | null;
+            /** Include Columns */
+            include_columns?: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_user_pool_v2";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
         };
         /** SavedCanvas */
         SavedCanvas: {
@@ -2825,6 +2990,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_PoolsData_"];
+                };
+            };
+        };
+    };
+    get_pool_editor_api_v1_pools_editor_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PoolEditorData_"];
+                };
+            };
+        };
+    };
+    submit_pool_editor_command_api_v1_pools_editor_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SavePoolCommand"] | components["schemas"]["AttachPoolCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PoolEditorReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
