@@ -23,6 +23,12 @@ from rquant.replica_generation import (
     replica_generation_path,
 )
 from rquant.screen.core import _collect_aggregates, _infer_lookback
+from rquant.screen.dynamic_ma import (
+    MAX_DYNAMIC_MA_FACTS,
+    DynamicMaFactError,
+    dynamic_ma_day_count,
+    requested_dynamic_ma,
+)
 from rquant.screen.loader import ScreeningCalendarError, _selected_sources, load_universe
 from rquant.screen.rules import Rule, required_rule_columns
 
@@ -256,6 +262,8 @@ class VerifiedReplicaScreenSource:
             raise ScreenReplicaBudgetError("screen has too many conditions")
         rule_columns = required_rule_columns(rules)
         requested_columns = rule_columns | frozenset(include_columns or ())
+        dynamic_ma = requested_dynamic_ma(requested_columns)
+        dynamic_days = dynamic_ma_day_count(dynamic_ma)
         _, wide_columns = _selected_sources(requested_columns, MAX_LOOKBACK)
         required_offset = max(
             (int(column.split("[")[1][:-1]) for column in wide_columns),
@@ -286,6 +294,8 @@ class VerifiedReplicaScreenSource:
                 raise ScreenReplicaBudgetError(
                     "screen needs too many historical columns; narrow conditions or ranking"
                 )
+            if dynamic_days and row_count * dynamic_days > MAX_DYNAMIC_MA_FACTS:
+                raise ScreenReplicaBudgetError("dynamic MA history exceeds the allowed budget")
             if (
                 row_count > MAX_STOCKS
                 or row_count * sum(req.window for req in aggregates) > MAX_AGGREGATE_FACTS
@@ -308,6 +318,8 @@ class VerifiedReplicaScreenSource:
             )
         except ScreeningCalendarError as error:
             raise ScreenReplicaDataError("screening calendar is incomplete") from error
+        except DynamicMaFactError as error:
+            raise ScreenReplicaDataError("screening MA facts are incomplete") from error
         except duckdb.Error as error:
             raise ScreenReplicaDataError("screening facts are unavailable") from error
         finally:
