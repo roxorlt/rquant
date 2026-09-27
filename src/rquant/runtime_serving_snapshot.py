@@ -20,6 +20,7 @@ from pydantic import (
 
 from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
+from rquant.lab_jobs import JobStatus
 from rquant.ops_status import OpsSnapshot
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
@@ -38,6 +39,7 @@ from rquant.runtime_service_control import RuntimeServiceHealth
 from rquant.serving_alert_projection import build_alert_read_projections
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_read_models import (
+    LAB_EVENT_ALLOWED_LABELS,
     ServingLabJobRecord,
     ServingProjectionInput,
     ServingProjectionPayload,
@@ -223,6 +225,74 @@ class LabJobsPayload(RuntimeContractModel):
     payload_kind: Literal["lab_jobs"] = "lab_jobs"
     lab_jobs: tuple[ServingLabJobRecord, ...] = ()
     projections: tuple[ServingProjectionPayload, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_event_windows(self) -> LabJobsPayload:
+        event_tables = {
+            projection.table_name: projection
+            for projection in self.projections
+            if projection.table_name in {"lab_job_event_window", "lab_job_event"}
+        }
+        if not event_tables:
+            return self  # Older Lab authority generations have no event publication.
+        if len(event_tables) != 2 or sum(
+            item.table_name in event_tables for item in self.projections
+        ) != 2:
+            raise ValueError("lab event projections require one complete table pair")
+        windows = event_tables["lab_job_event_window"]
+        events = event_tables["lab_job_event"]
+        if windows.available_at != events.available_at:
+            raise ValueError("lab event projections have different snapshot times")
+        jobs = {str(item.summary.job_id): item.summary for item in self.lab_jobs}
+        if len(jobs) != len(self.lab_jobs):
+            raise ValueError("lab event jobs contain duplicate identities")
+        window_rows = {str(row["job_id"]): row for row in windows.rows}
+        if set(window_rows) != set(jobs):
+            raise ValueError("lab event windows do not match published jobs")
+        event_rows: dict[str, list[Mapping[str, object]]] = {job_id: [] for job_id in jobs}
+        for row in events.rows:
+            job_id = row["job_id"]
+            if job_id not in event_rows:
+                raise ValueError("lab event refers to a job outside this publication")
+            if row["label"] not in LAB_EVENT_ALLOWED_LABELS:
+                raise ValueError("lab event label is not registered")
+            if row["new_status"] not in {status.value for status in JobStatus}:
+                raise ValueError("lab event status is invalid")
+            if type(row["event_id"]) is not int or row["event_id"] < 1:
+                raise ValueError("lab event ID is invalid")
+            if type(row["job_version"]) is not int or row["job_version"] < 0:
+                raise ValueError("lab event version is invalid")
+            event_rows[job_id].append(row)
+        for job_id, window in window_rows.items():
+            summary = jobs[job_id]
+            entries = event_rows[job_id]
+            count = window["retained_count"]
+            truncated = window["truncated"]
+            if (
+                type(count) is not int
+                or not 0 <= count <= 500
+                or type(truncated) is not bool
+                or count != len(entries)
+                or window["job_version"] != summary.version
+                or window["state"]
+                != ("truncated" if truncated else "available" if count else "empty")
+                or (truncated and count == 0)
+            ):
+                raise ValueError("lab event window conflicts with published job")
+            ordered = sorted(entries, key=lambda item: item["event_id"], reverse=True)
+            if ordered and (
+                ordered[0]["job_version"] != summary.version
+                or ordered[0]["new_status"] != summary.status.value
+            ):
+                raise ValueError("lab event latest state conflicts with published job")
+            if any(
+                older["job_version"] != newer["job_version"] - 1
+                for newer, older in zip(ordered, ordered[1:], strict=False)
+            ):
+                raise ValueError("lab event versions are not consecutive")
+            if ordered and not truncated and ordered[-1]["job_version"] != 0:
+                raise ValueError("lab event complete window has a missing first version")
+        return self
 
 
 class PromotionsPayload(RuntimeContractModel):
