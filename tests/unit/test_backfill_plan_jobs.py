@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -397,3 +398,181 @@ def test_worker_does_not_use_network_or_dotenv(
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     assert BackfillPlanJobWorker(store).run_one().status == "succeeded"
+
+
+def test_events_are_durable_and_describe_verified_success(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    request = _request(snapshot).model_copy(update={"snapshot_label": "private-source-label"})
+    queued = store.submit(request)
+
+    finished = BackfillPlanJobWorker(store).run_one()
+
+    assert finished is not None and finished.status == "succeeded"
+    events = _store(tmp_path, clock).list_events(queued.task_id)
+    assert [event.event_type for event in events] == [
+        "queued",
+        "started",
+        "source_check",
+        "succeeded",
+    ]
+    assert [event.attempts for event in events] == [0, 1, 1, 1]
+    assert all(event.task_id == queued.task_id for event in events)
+    assert all(event.occurred_at == clock.now for event in events)
+    assert "private-source-label" not in "".join(event.model_dump_json() for event in events)
+    assert str(snapshot) not in "".join(event.model_dump_json() for event in events)
+
+
+def test_duplicate_submit_does_not_write_a_second_queued_event(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    request = _request(snapshot)
+    queued = store.submit(request)
+
+    assert store.submit(request) == queued
+    assert [event.event_type for event in store.list_events(queued.task_id)] == ["queued"]
+
+
+def test_expired_claim_records_recovery_attempt_without_heartbeat_noise(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(snapshot))
+    first = store._claim()
+    assert first is not None
+    for _ in range(3):
+        clock.advance(5)
+        assert store._renew(first)
+    assert [event.event_type for event in store.list_events(queued.task_id)] == [
+        "queued",
+        "started",
+    ]
+
+    clock.advance(31)
+    resumed = _store(tmp_path, clock)._claim()
+
+    assert resumed is not None and resumed.task_id == queued.task_id
+    assert store.status(queued.task_id).attempts == 2
+    assert [(event.event_type, event.attempts) for event in store.list_events(queued.task_id)] == [
+        ("queued", 0),
+        ("started", 1),
+        ("resumed", 2),
+    ]
+
+
+def test_failure_and_explicit_retry_only_expose_bounded_error_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import backfill_plan_jobs as jobs
+
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(snapshot))
+    secret = "SECRET-ACCESS-TOKEN-in-raw-error"
+
+    def fail(**kwargs: object) -> Path:
+        raise OSError(f"private path /private/credentials and {secret}")
+
+    monkeypatch.setattr(jobs, "create_and_publish_daily_bar_backfill_plan", fail)
+    failed = BackfillPlanJobWorker(store).run_one()
+    assert failed is not None and failed.error_code == "snapshot_changed"
+    assert store.retry_failed(queued.task_id).status == "queued"
+
+    events = store.list_events(queued.task_id)
+    assert [event.event_type for event in events] == [
+        "queued",
+        "started",
+        "failed",
+        "retried",
+    ]
+    assert events[-2].error_code == "snapshot_changed"
+    assert all(event.error_code is None for event in events if event.event_type != "failed")
+    with store._connect() as connection:
+        persisted = connection.execute(
+            "SELECT * FROM backfill_plan_job_event WHERE task_id = ?", (queued.task_id,)
+        ).fetchall()
+    persisted_text = repr([tuple(row) for row in persisted])
+    assert secret not in persisted_text
+    assert "credentials" not in persisted_text
+
+
+def test_event_history_is_bounded_and_read_in_time_order(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(snapshot))
+    for _ in range(25):
+        claim = store._claim()
+        assert claim is not None
+        store._finish_failure(claim, "internal_error")
+        store.retry_failed(queued.task_id)
+    with store._connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM backfill_plan_job_event WHERE task_id = ?", (queued.task_id,)
+        ).fetchone()[0]
+
+    assert count <= 64
+    recent = store.list_events(queued.task_id)
+    assert len(recent) == 20
+    assert [event.event_id for event in recent] == sorted(event.event_id for event in recent)
+    assert recent[-1].event_type == "retried"
+    assert len(store.list_events(queued.task_id, limit=64)) == count
+    with pytest.raises(ValueError, match="limit"):
+        store.list_events(queued.task_id, limit=65)
+
+
+def test_legacy_job_database_gains_events_without_changing_old_job(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(snapshot))
+    with store._connect() as connection:
+        connection.execute("DROP TABLE backfill_plan_job_event")
+
+    reopened = _store(tmp_path, clock)
+
+    assert reopened.status(queued.task_id) == queued
+    assert reopened.list_events(queued.task_id) == ()
+    result = BackfillPlanJobWorker(reopened).run_one()
+    assert result is not None and result.status == "succeeded"
+    assert [event.event_type for event in reopened.list_events(queued.task_id)] == [
+        "started",
+        "source_check",
+        "succeeded",
+    ]
+
+
+def test_event_insert_failure_rolls_back_claim_state(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(snapshot))
+    with store._connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER block_started_event BEFORE INSERT ON backfill_plan_job_event
+            WHEN NEW.event_type = 'started'
+            BEGIN SELECT RAISE(ABORT, 'blocked'); END
+            """
+        )
+
+    with pytest.raises(sqlite3.DatabaseError, match="blocked"):
+        store._claim()
+    assert store.status(queued.task_id) == queued
+    assert [event.event_type for event in store.list_events(queued.task_id)] == ["queued"]
+
+
+def test_event_reader_rechecks_success_artifact(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    clock = _Clock()
+    store = _store(tmp_path, clock)
+    queued = store.submit(_request(snapshot))
+    finished = BackfillPlanJobWorker(store).run_one()
+    assert finished is not None and finished.plan_hash is not None
+    (tmp_path / "plans" / f"daily-bar-backfill-plan-v1-{finished.plan_hash}.json").unlink()
+
+    with pytest.raises(BackfillPlanArtifactUnavailableError):
+        store.list_events(queued.task_id)
