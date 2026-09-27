@@ -70,6 +70,7 @@ _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
         "pool_definition",
         "screen_run_receipt",
         "pool_membership",
+        "pool_member_return",
     }
 )
 _NOTIFICATION_PROJECTION_TABLES = (

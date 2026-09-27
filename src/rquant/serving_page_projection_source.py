@@ -66,6 +66,7 @@ from rquant.page_control import (
     read_canvas_current_head,
 )
 from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
+from rquant.pool_member_return import calculate_adjusted_pool_return
 from rquant.pool_membership import PoolDayEvidence, PoolMemberClose, compute_pool_membership
 from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
 from rquant.readside_replica_gate import (
@@ -1506,6 +1507,17 @@ class _MembershipSource:
     source_limited: bool
     days: tuple[PoolDayEvidence, ...]
     candidate_keys: frozenset[tuple[date, str]]
+    return_facts: tuple[_MemberReturnFact, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberReturnFact:
+    pool_name: str
+    trade_date: date
+    ts_code: str
+    close: float | None
+    volume: float | None
+    factor: float | None
 
 
 def _membership_calendar(
@@ -1559,6 +1571,7 @@ def _read_membership_source(
             source_limited=False,
             days=(),
             candidate_keys=frozenset(),
+            return_facts=(),
         )
     if receipts.membership_daily is None:
         return _MembershipSource(
@@ -1569,12 +1582,13 @@ def _read_membership_source(
             source_limited=True,
             days=(),
             candidate_keys=receipts.membership_candidate_keys,
+            return_facts=(),
         )
     tables = {
         str(row[0])
         for row in connection.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' "
-            "AND table_name IN ('trade_calendar', 'daily_bar')"
+            "AND table_name IN ('trade_calendar', 'daily_bar', 'adj_factor')"
         ).fetchall()
     }
     daily_columns = (
@@ -1583,6 +1597,12 @@ def _read_membership_source(
         else set()
     )
     daily_has_close = {"trade_date", "ts_code", "close"} <= daily_columns
+    factor_columns = (
+        {str(row[1]) for row in connection.execute("PRAGMA table_info('adj_factor')").fetchall()}
+        if "adj_factor" in tables
+        else set()
+    )
+    has_factor = {"trade_date", "ts_code", "adj_factor"} <= factor_columns
     start = min(
         (day for day, _pool in receipts.membership_candidate_keys if day <= target_date),
         default=target_date,
@@ -1593,19 +1613,29 @@ def _read_membership_source(
         else ((), False)
     )
     days: list[PoolDayEvidence] = []
+    return_facts: list[_MemberReturnFact] = []
     member_total = 0
     for receipt in receipts.membership_daily:
-        daily_close_select = (
-            "db.close AS daily_close FROM screen_result AS sr "
-            "LEFT JOIN daily_bar AS db ON db.trade_date = sr.trade_date "
-            "AND db.ts_code = sr.ts_code"
+        daily_values = (
+            "db.close AS daily_close, "
+            + ("db.vol" if "vol" in daily_columns else "NULL::DOUBLE")
+            + " AS daily_volume"
             if daily_has_close
-            else "NULL::DOUBLE AS daily_close FROM screen_result AS sr"
+            else "NULL::DOUBLE AS daily_close, NULL::DOUBLE AS daily_volume"
+        )
+        daily_join = (
+            "LEFT JOIN daily_bar AS db ON db.trade_date = sr.trade_date "
+            "AND db.ts_code = sr.ts_code "
+            if daily_has_close
+            else ""
         )
         member_rows = connection.execute(
-            "SELECT sr.ts_code, sr.close, " + daily_close_select + " "
-            "WHERE sr.trade_date = ? AND sr.preset_name = ? AND sr.created_at <= ? "
-            "ORDER BY sr.ts_code LIMIT ?",
+            "SELECT sr.ts_code, sr.close, "
+            + daily_values
+            + " FROM screen_result AS sr "
+            + daily_join
+            + "WHERE sr.trade_date = ? AND sr.preset_name = ? AND sr.created_at <= ? "
+            + "ORDER BY sr.ts_code LIMIT ?",
             (
                 receipt.trade_date,
                 receipt.preset_name,
@@ -1623,26 +1653,55 @@ def _read_membership_source(
                 source_limited=True,
                 days=(),
                 candidate_keys=receipts.membership_candidate_keys,
+                return_facts=(),
             )
         prices_match_receipt = receipt.result_version in receipts.price_digest_verified
-        members = tuple(
-            PoolMemberClose(
-                ts_code=str(code),
-                close=(
-                    close
-                    if prices_match_receipt
-                    and close is not None
-                    and daily_close is not None
-                    and math.isfinite(close)
-                    and close > 0
-                    and close == daily_close
-                    else None
-                ),
+        factors: dict[str, float] = {}
+        if has_factor and prices_match_receipt and member_rows:
+            try:
+                factor_rows = connection.execute(
+                    "SELECT af.ts_code, af.adj_factor FROM adj_factor AS af "
+                    "JOIN screen_result AS sr ON sr.trade_date = af.trade_date "
+                    "AND sr.ts_code = af.ts_code "
+                    "WHERE sr.trade_date = ? AND sr.preset_name = ? "
+                    "AND sr.created_at <= ? ORDER BY af.ts_code LIMIT ?",
+                    (
+                        receipt.trade_date,
+                        receipt.preset_name,
+                        cutoff,
+                        len(member_rows) + 1,
+                    ),
+                ).fetchall()
+            except duckdb.Error:
+                factor_rows = []
+            factor_codes = [str(code) for code, _factor in factor_rows]
+            if len(factor_rows) <= len(member_rows) and len(set(factor_codes)) == len(factor_rows):
+                factors = {str(code): factor for code, factor in factor_rows}
+        members: list[PoolMemberClose] = []
+        for code, close, daily_close, daily_volume in member_rows:
+            trusted_close = (
+                close
+                if prices_match_receipt
+                and close is not None
+                and daily_close is not None
+                and math.isfinite(close)
+                and close > 0
+                and close == daily_close
+                else None
             )
-            for code, close, daily_close in member_rows
-        )
+            members.append(PoolMemberClose(ts_code=str(code), close=trusted_close))
+            return_facts.append(
+                _MemberReturnFact(
+                    pool_name=receipt.preset_name,
+                    trade_date=receipt.trade_date,
+                    ts_code=str(code),
+                    close=trusted_close,
+                    volume=daily_volume,
+                    factor=factors.get(str(code)),
+                )
+            )
         days.append(
-            PoolDayEvidence(trade_date=receipt.trade_date, receipt=receipt, members=members)
+            PoolDayEvidence(trade_date=receipt.trade_date, receipt=receipt, members=tuple(members))
         )
     return _MembershipSource(
         target_date=target_date,
@@ -1652,6 +1711,7 @@ def _read_membership_source(
         source_limited=False,
         days=tuple(days),
         candidate_keys=receipts.membership_candidate_keys,
+        return_facts=tuple(return_facts),
     )
 
 
@@ -1775,6 +1835,104 @@ def _membership_projection(
         )
         return ServingProjectionPayload(
             table_name="pool_membership", available_at=available_at, rows=limited
+        )
+
+
+def _return_projection(
+    source: _MembershipSource,
+    *,
+    membership: ServingProjectionPayload,
+    receipts: _VerifiedRunReceipts | None,
+    observed: datetime,
+) -> ServingProjectionPayload | None:
+    if receipts is None:
+        return None
+    facts = {(fact.pool_name, fact.trade_date, fact.ts_code): fact for fact in source.return_facts}
+    if len(facts) != len(source.return_facts):
+        facts = {}
+    current_receipts = {receipt.preset_name: receipt for receipt in receipts.latest}
+    history_receipts = {
+        (receipt.preset_name, receipt.trade_date): receipt
+        for receipt in receipts.membership_daily or ()
+    }
+    current_status = {
+        str(row["pool_name"]): row
+        for row in membership.rows
+        if row["row_kind"] == "status" and row["status"] == "verified"
+    }
+    rows: list[dict[str, object]] = []
+    for member in membership.rows:
+        if member["row_kind"] != "member" or member["status"] != "verified":
+            continue
+        pool_name = str(member["pool_name"])
+        status = current_status.get(pool_name)
+        current = current_receipts.get(pool_name)
+        entry_day_raw = member["entry_trade_date"]
+        entry_version = member["entry_result_version"]
+        entry_close = member["entry_close"]
+        if (
+            status is None
+            or current is None
+            or entry_day_raw is None
+            or entry_version is None
+            or entry_close is None
+            or status["trade_date"] != current.trade_date.isoformat()
+            or status["result_version"] != current.result_version
+            or member["trade_date"] != status["trade_date"]
+            or member["result_version"] != current.result_version
+            or current.contract != "screen-run-receipt/v2"
+            or current.result_version not in receipts.price_digest_verified
+        ):
+            continue
+        market_close = datetime.combine(current.trade_date, time(15), tzinfo=_SHANGHAI).astimezone(
+            UTC
+        )
+        if observed < market_close or current.completed_at < market_close:
+            continue
+        entry_day = date.fromisoformat(str(entry_day_raw))
+        entry = history_receipts.get((pool_name, entry_day))
+        if (
+            entry is None
+            or entry.result_version != entry_version
+            or entry.contract != "screen-run-receipt/v2"
+            or entry.result_version not in receipts.price_digest_verified
+        ):
+            continue
+        code = str(member["ts_code"])
+        entry_fact = facts.get((pool_name, entry_day, code))
+        current_fact = facts.get((pool_name, current.trade_date, code))
+        if entry_fact is None or current_fact is None or entry_fact.close != entry_close:
+            continue
+        adjusted = calculate_adjusted_pool_return(
+            entry_close=entry_close,
+            current_close=current_fact.close,
+            entry_factor=entry_fact.factor,
+            current_factor=current_fact.factor,
+            current_volume=current_fact.volume,
+        )
+        if adjusted is None:
+            continue
+        rows.append(
+            {
+                "pool_name": pool_name,
+                "trade_date": current.trade_date.isoformat(),
+                "result_version": current.result_version,
+                "ts_code": code,
+                "entry_trade_date": entry_day.isoformat(),
+                "entry_result_version": entry.result_version,
+                "gain_pct": adjusted.gain_pct,
+                "entry_line_price": adjusted.entry_line_price,
+            }
+        )
+    try:
+        return ServingProjectionPayload(
+            table_name="pool_member_return", available_at=membership.available_at, rows=tuple(rows)
+        )
+    except ValueError as error:
+        if "byte budget" not in str(error) and "row budget" not in str(error):
+            raise
+        return ServingProjectionPayload(
+            table_name="pool_member_return", available_at=membership.available_at, rows=()
         )
 
 
@@ -1974,6 +2132,12 @@ class DuckDBSignalPageProjectionSource:
                 else _EMPTY_PROJECTION_AVAILABLE_AT,
             ),
         )
+        pool_member_return = _return_projection(
+            database.membership,
+            membership=pool_membership,
+            receipts=database.run_receipts,
+            observed=observed,
+        )
         pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
             self.surge_live_root,
             observed=observed,
@@ -2006,6 +2170,7 @@ class DuckDBSignalPageProjectionSource:
             pool_definition=pool_definition,
             screen_run_receipt=run_receipt_projection,
             pool_membership=pool_membership,
+            pool_member_return=pool_member_return,
             pulse_history=pulse_history,
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
@@ -3088,6 +3253,7 @@ class SignalPageProjectionProducer:
                     "pool_definition",
                     "screen_run_receipt",
                     "pool_membership",
+                    "pool_member_return",
                 }
             )
             try:
@@ -4022,6 +4188,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "pool_definition",
             "screen_run_receipt",
             "pool_membership",
+            "pool_member_return",
             "pulse_history",
             "pulse_alert",
             "surge_runtime_config",
@@ -4054,6 +4221,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         pool_definition: ServingProjectionPayload | None = None,
         screen_run_receipt: ServingProjectionPayload | None = None,
         pool_membership: ServingProjectionPayload | None = None,
+        pool_member_return: ServingProjectionPayload | None = None,
         pulse_history: PulseHistoryProjectionSource | None = None,
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
@@ -4117,6 +4285,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             ("pool_definition", pool_definition),
             ("screen_run_receipt", screen_run_receipt),
             ("pool_membership", pool_membership),
+            ("pool_member_return", pool_member_return),
             ("monitor_event", monitor_event),
             ("surge_event", surge_event),
             ("legacy_notification", legacy_notification),
