@@ -19,6 +19,7 @@ from rquant.storage.schema import (
     DATA_REPAIR_AUDIT_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
     FINANCIAL_PIT_OBSERVATION_DDLS,
+    FUNDAMENTAL_DAILY_VERSION_DDLS,
     LIMIT_UP_POOL_WRITE_GUARD_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
@@ -183,6 +184,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=14,
         name="daily basic valuation PIT observations",
         statements=DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
+    ),
+    Migration(
+        version=15,
+        name="immutable fundamental daily derivations",
+        statements=FUNDAMENTAL_DAILY_VERSION_DDLS,
     ),
 )
 
