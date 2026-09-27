@@ -2,22 +2,50 @@
 
 from __future__ import annotations
 
-from datetime import date
+from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
+from types import MappingProxyType
 
 import duckdb
 import pytest
 
+import rquant.serving_read_models as read_models
+from rquant.notification_state import (
+    NotificationProjectionAuthoritySnapshot,
+    NotificationProjectionSourceReceipt,
+    NotificationStateStore,
+)
 from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest
+from rquant.serving_page_projection_source import (
+    DuckDBSignalPageProjectionSource,
+    SignalPageProjectionProducer,
+)
+from rquant.serving_read_models import ServingProjectionPayload
 from rquant.storage.schema import SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS
 from tests.unit.test_pool_membership_publication import _POOL, _projection, _three_day_history
 from tests.unit.test_pool_result_publication import (
+    NOW,
     OLD_DAY,
     TODAY,
     _database,
     _insert_receipt,
     _seal_database_before_cutoff,
     _trading_evidence,
+)
+
+_LEGACY_RECEIPT_PROJECTION_COLUMNS = (
+    "trade_date",
+    "preset_name",
+    "definition_version",
+    "result_version",
+    "parent_trade_date",
+    "parent_result_version",
+    "hit_count",
+    "member_digest",
+    "lineage_complete",
+    "current_definition",
+    "completed_at",
 )
 
 
@@ -77,6 +105,95 @@ def _entry(path: Path) -> dict[str, object]:
     return next(row for row in rows if row["row_kind"] == "member")
 
 
+def test_new_producer_reads_nonempty_legacy_receipt_authority_before_publishing_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "rquant_ro.duckdb"
+    _database(path)
+    _trading_evidence(path)
+    _insert_receipt(path, day=OLD_DAY, members=("600000.SH",))
+    source = DuckDBSignalPageProjectionSource(path)
+    seed_store = NotificationStateStore(tmp_path / "seed.sqlite3")
+    SignalPageProjectionProducer(source=source, store=seed_store).publish(NOW)
+    seeded = seed_store.serving_snapshot(observed_at=NOW, history_limit=1)
+    receipt_projection = next(
+        item for item in seeded.payload.projections if item.table_name == "screen_run_receipt"
+    )
+    assert len(receipt_projection.rows) == 1
+    assert receipt_projection.rows[0]["hit_count"] == 1
+
+    contracts = dict(read_models.PAGE_PROJECTION_CONTRACTS)
+    contracts["screen_run_receipt"] = replace(
+        contracts["screen_run_receipt"],
+        columns=tuple(
+            column
+            for column in contracts["screen_run_receipt"].columns
+            if column[0] in _LEGACY_RECEIPT_PROJECTION_COLUMNS
+        ),
+    )
+    assert tuple(name for name, _kind in contracts["screen_run_receipt"].columns) == (
+        _LEGACY_RECEIPT_PROJECTION_COLUMNS
+    )
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    with monkeypatch.context() as legacy:
+        legacy.setattr(read_models, "PAGE_PROJECTION_CONTRACTS", MappingProxyType(contracts))
+        old_receipt = ServingProjectionPayload(
+            table_name="screen_run_receipt",
+            available_at=receipt_projection.available_at,
+            rows=tuple(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key in _LEGACY_RECEIPT_PROJECTION_COLUMNS
+                }
+                for row in receipt_projection.rows
+            ),
+        )
+        old_projections = tuple(
+            old_receipt if item.table_name == "screen_run_receipt" else item
+            for item in seeded.payload.projections
+        )
+        old_source = NotificationProjectionSourceReceipt.create(
+            dataset_id="legacy-signal",
+            generation_id="1" * 64,
+            sequence=1,
+            event_time=NOW,
+            published_at=NOW,
+            projections=old_projections,
+        )
+        old_authority = NotificationProjectionAuthoritySnapshot.create_from_sources(
+            observed_at=NOW,
+            sources=(old_source,),
+        )
+        assert store.publish_projection_authority(old_authority).written
+        persisted = store.serving_snapshot(observed_at=NOW, history_limit=1)
+        old_row = next(
+            item.rows[0]
+            for item in persisted.payload.projections
+            if item.table_name == "screen_run_receipt"
+        )
+        assert old_row["hit_count"] == 1
+        assert set(old_row) == set(_LEGACY_RECEIPT_PROJECTION_COLUMNS)
+
+    _insert_receipt(path, day=TODAY)
+    _upgrade(path)
+    sealed = _seal_v2(path, TODAY)
+    _seal_database_before_cutoff(path)
+    publication = SignalPageProjectionProducer(source=source, store=store).publish(
+        NOW + timedelta(seconds=1)
+    )
+
+    assert publication.written
+    current = store.serving_snapshot(observed_at=NOW + timedelta(seconds=1), history_limit=1)
+    row = next(
+        item.rows[0]
+        for item in current.payload.projections
+        if item.table_name == "screen_run_receipt"
+    )
+    assert row["result_version"] == sealed.result_version
+    assert row["hit_count"] == 0
+
+
 def test_v2_zero_hit_is_a_verified_success(tmp_path: Path) -> None:
     path = tmp_path / "rquant_ro.duckdb"
     _database(path)
@@ -90,8 +207,6 @@ def test_v2_zero_hit_is_a_verified_success(tmp_path: Path) -> None:
 
     receipt = projections["screen_run_receipt"].rows[0]
     assert receipt["result_version"] == sealed.result_version
-    assert receipt["contract"] == "screen-run-receipt/v2"
-    assert receipt["price_digest_verified"] is True
     assert receipt["hit_count"] == 0
     status = next(row for row in projections["pool_membership"].rows if row["pool_name"] == _POOL)
     assert status["status"] == "verified"
@@ -128,7 +243,9 @@ def test_migrated_v1_receipts_do_not_inherit_a_price_proof(tmp_path: Path) -> No
     assert entry["unknown_reason"] == "entry_price_missing"
 
 
-def test_latest_v2_price_rewrite_keeps_member_receipt_without_price_proof(tmp_path: Path) -> None:
+def test_latest_v2_price_rewrite_keeps_member_receipt_and_historical_entry(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "rquant_ro.duckdb"
     _three_day_history(path)
     _upgrade(path)
@@ -156,7 +273,6 @@ def test_latest_v2_price_rewrite_keeps_member_receipt_without_price_proof(tmp_pa
     )
 
     assert receipt["result_version"] == latest.result_version
-    assert receipt["price_digest_verified"] is False
     assert member["entry_trade_date"] == OLD_DAY.isoformat()
     assert member["entry_close"] == 10.6
 

@@ -700,8 +700,6 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
                 ("preset_name", "string"),
                 ("definition_version", "string"),
                 ("result_version", "string"),
-                ("contract", "string"),
-                ("price_digest_verified", "bool"),
                 ("parent_trade_date", "date"),
                 ("parent_result_version", "string"),
                 ("hit_count", "int"),

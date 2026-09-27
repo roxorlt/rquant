@@ -136,8 +136,6 @@ def test_zero_hit_receipt_advances_canvas_day_without_old_hits_or_fake_step(
     assert projections["canvas_diagnostic"].rows == ()
     row = projections["screen_run_receipt"].rows[0]
     assert row["preset_name"] == "n-shape-pool1"
-    assert row["contract"] == "screen-run-receipt/v1"
-    assert row["price_digest_verified"] is False
     assert row["hit_count"] == 0
     assert row["result_version"] == receipt.result_version
     builtin = next(
@@ -445,8 +443,6 @@ def test_receipt_source_and_contract_reject_row_overflow(tmp_path: Path) -> None
         "preset_name": "n-shape-pool1",
         "definition_version": seed.definition_version,
         "result_version": seed.result_version,
-        "contract": seed.contract,
-        "price_digest_verified": False,
         "parent_trade_date": None,
         "parent_result_version": None,
         "hit_count": 0,

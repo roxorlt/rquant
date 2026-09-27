@@ -1477,8 +1477,6 @@ def _receipt_projection(
             "preset_name": item.preset_name,
             "definition_version": item.definition_version,
             "result_version": item.result_version,
-            "contract": item.contract,
-            "price_digest_verified": item.result_version in receipts.price_digest_verified,
             "parent_trade_date": (
                 None if item.parent_trade_date is None else item.parent_trade_date.isoformat()
             ),

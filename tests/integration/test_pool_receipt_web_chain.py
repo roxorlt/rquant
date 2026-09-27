@@ -130,7 +130,7 @@ def test_v2_zero_hit_replaces_v1_member_generation_at_web_api(tmp_path: Path) ->
 
     with ServingReader(serving_root).acquire_generation() as lease:
         serving_receipt = lease.connection.execute(
-            "SELECT contract, result_version, price_digest_verified "
+            "SELECT result_version, hit_count "
             "FROM screen_run_receipt WHERE preset_name = 'n-shape-pool1'"
         ).fetchone()
         serving_membership = lease.connection.execute(
@@ -153,9 +153,8 @@ def test_v2_zero_hit_replaces_v1_member_generation_at_web_api(tmp_path: Path) ->
     assert new_pool["members"] == []
     assert new_pool["result"]["state"] == "current_rules"
     assert new_pool["result"]["hit_count"] == 0
-    assert published["screen_run_receipt"].rows[0]["contract"] == "screen-run-receipt/v2"
     assert published["screen_run_receipt"].rows[0]["result_version"] == sealed.result_version
-    assert serving_receipt == ("screen-run-receipt/v2", sealed.result_version, True)
+    assert serving_receipt == (sealed.result_version, 0)
     assert serving_membership == ("verified", sealed.result_version)
     membership = next(
         row for row in published["pool_membership"].rows if row["pool_name"] == "n-shape-pool1"
