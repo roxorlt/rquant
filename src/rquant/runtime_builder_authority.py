@@ -100,6 +100,7 @@ class LabJobsPublisherSettings(RuntimeContractModel):
     research_metadata_path: Path | None = None
     audit_report_path: Path | None = None
     backfill_plan_directory: Path | None = None
+    backfill_plan_job_state_path: Path | None = None
     authority_root: Path
     max_jobs: StrictInt = Field(default=100, gt=0, le=100)
     eta_completed_limit: StrictInt = Field(default=256, ge=3, le=256)
@@ -109,6 +110,7 @@ class LabJobsPublisherSettings(RuntimeContractModel):
         "research_metadata_path",
         "audit_report_path",
         "backfill_plan_directory",
+        "backfill_plan_job_state_path",
         "authority_root",
     )
     @classmethod
@@ -125,6 +127,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
             raise ValueError("audit_report_path requires research_metadata_path")
         if self.backfill_plan_directory is not None and self.research_metadata_path is None:
             raise ValueError("backfill_plan_directory requires research_metadata_path")
+        if self.backfill_plan_job_state_path is not None and self.backfill_plan_directory is None:
+            raise ValueError("backfill_plan_job_state_path requires backfill_plan_directory")
         return self
 
 
@@ -342,6 +346,7 @@ def lab_jobs_publisher_builder(
                     settings.research_metadata_path,
                     audit_report_path=settings.audit_report_path,
                     backfill_plan_directory=settings.backfill_plan_directory,
+                    backfill_plan_job_state_path=settings.backfill_plan_job_state_path,
                 )
 
                 def page_projection_reader(

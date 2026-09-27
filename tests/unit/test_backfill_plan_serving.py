@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from rquant.backfill_plan_artifact import load_daily_bar_backfill_plan
+from rquant.backfill_plan_jobs import BackfillPlanJobStore, BackfillPlanJobWorker
 from rquant.runtime_builder_authority import LabJobsPublisherSettings
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_page_projection_source import (
@@ -28,6 +30,7 @@ from rquant.serving_read_models import (
 from rquant.storage.duckdb import DuckDBStore
 from tests.unit.test_backfill_plan_artifact import _publish, _snapshot
 from tests.unit.test_backfill_plan_core import _rehash
+from tests.unit.test_backfill_plan_jobs import _Clock, _request
 from tests.unit.test_data_audit_report_serving import _production_report_file
 
 OBSERVED = datetime(2026, 10, 1, 12, tzinfo=UTC)
@@ -37,14 +40,24 @@ TABLES = {
     "backfill_plan_preview",
     "backfill_plan_archive",
     "backfill_plan_progress",
+    "backfill_plan_job",
+    "backfill_plan_event",
 }
 
 
-def _source(tmp_path: Path, directory: Path | None = None) -> DuckDBLabPageProjectionSource:
+def _source(
+    tmp_path: Path,
+    directory: Path | None = None,
+    job_state: Path | None = None,
+) -> DuckDBLabPageProjectionSource:
     database = tmp_path / "research_ro.duckdb"
     with DuckDBStore(database):
         pass
-    return DuckDBLabPageProjectionSource(database, backfill_plan_directory=directory)
+    return DuckDBLabPageProjectionSource(
+        database,
+        backfill_plan_directory=directory,
+        backfill_plan_job_state_path=job_state,
+    )
 
 
 def _rows(source: DuckDBLabPageProjectionSource) -> dict[str, tuple[object, ...]]:
@@ -97,6 +110,7 @@ def test_multiple_plans_publish_complete_preview_and_separate_unknown_progress(
     assert rows["backfill_plan_progress"] == (
         {"status_key": "current", "availability": "unavailable", "task_id": None},
     )
+    assert rows["backfill_plan_job"][0]["availability"] == "unavailable"
     assert all(row["source_mode"] == "production_unverified" for row in index)
     assert all(row["identity_verified"] is False for row in index)
     assert all(row["collection_complete_verified"] is False for row in index)
@@ -127,7 +141,213 @@ def test_absent_configuration_and_empty_directory_are_distinct(tmp_path: Path) -
     assert configured["backfill_plan_preview"] == ()
     assert configured["backfill_plan_archive"] == ()
     assert configured["backfill_plan_catalog"][0]["total_plan_count"] == 0
-    assert configured["backfill_plan_progress"][0]["availability"] == "unavailable"
+    assert configured["backfill_plan_job"][0]["availability"] == "unavailable"
+
+
+def test_missing_job_file_is_unavailable_without_creating_it(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    directory.mkdir()
+    state_path = tmp_path / "job-state.sqlite"
+
+    rows = _rows(_source(tmp_path, directory, state_path))
+
+    assert rows["backfill_plan_job"][0]["availability"] == "unavailable"
+    assert rows["backfill_plan_event"] == ()
+    assert not state_path.exists()
+
+
+def test_existing_empty_job_store_and_queued_job_have_distinct_progress(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "plans"
+    directory.mkdir()
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    source = _source(tmp_path, directory, state_path)
+
+    empty = _rows(source)
+    assert empty["backfill_plan_job"][0]["availability"] == "empty"
+    assert empty["backfill_plan_event"] == ()
+
+    task = store.submit(_request(_snapshot(tmp_path)))
+    queued = _rows(source)
+    progress = queued["backfill_plan_job"][0]
+    assert progress["availability"] == "ready"
+    assert progress["status"] == "queued"
+    assert progress["task_id"] == task.task_id
+    assert progress["attempts"] == 0
+    assert progress["plan_hash"] is None
+    assert queued["backfill_plan_event"] == (
+        {
+            "event_id": 1,
+            "task_id": task.task_id,
+            "event_type": "queued",
+            "attempts": 0,
+            "occurred_at": task.created_at.isoformat().replace("+00:00", "Z"),
+            "error_code": None,
+        },
+    )
+
+
+def test_succeeded_task_requires_its_plan_in_same_generation(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    store.submit(_request(_snapshot(tmp_path)))
+    completed = BackfillPlanJobWorker(store).run_one()
+    assert completed is not None and completed.plan_hash is not None
+    source = _source(tmp_path, directory, state_path)
+
+    projected = _rows(source)
+    progress = projected["backfill_plan_job"][0]
+    assert progress["status"] == "succeeded"
+    assert progress["plan_hash"] == completed.plan_hash
+    assert progress["task_id"] == completed.task_id
+    assert projected["backfill_plan_event"][-1]["event_type"] == "succeeded"
+    assert completed.plan_hash in {row["plan_hash"] for row in projected["backfill_plan_archive"]}
+
+    plan = directory / f"daily-bar-backfill-plan-v1-{completed.plan_hash}.json"
+    plan.unlink()
+    with pytest.raises(PageProjectionSourceIntegrityError, match="succeeded|same-generation|plan"):
+        source(OBSERVED)
+
+
+def test_job_status_and_events_use_one_live_sqlite_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import backfill_plan_job_projection as job_projection
+
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    task = store.submit(_request(_snapshot(tmp_path)))
+    source = _source(tmp_path, directory, state_path)
+    real_connect = sqlite3.connect
+    committed: list[bool] = []
+
+    def connect_with_transition(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+
+        def on_read(statement: str) -> None:
+            if "FROM backfill_plan_job_event" not in statement or committed:
+                return
+            changed_at = "2026-02-06T02:01:00+00:00"
+            with real_connect(state_path) as writer:
+                writer.execute(
+                    "UPDATE backfill_plan_job SET status='running', attempts=1, "
+                    "updated_at=? WHERE task_id=?",
+                    (changed_at, task.task_id),
+                )
+                writer.execute(
+                    "INSERT INTO backfill_plan_job_event "
+                    "(task_id,event_type,attempts,occurred_at) VALUES (?,?,?,?)",
+                    (task.task_id, "started", 1, changed_at),
+                )
+            committed.append(True)
+
+        connection.set_trace_callback(on_read)
+        return connection
+
+    monkeypatch.setattr(job_projection.sqlite3, "connect", connect_with_transition)
+    during = _rows(source)
+    assert committed == [True]
+    assert during["backfill_plan_job"][0]["status"] == "queued"
+    assert [item["event_type"] for item in during["backfill_plan_event"]] == ["queued"]
+    monkeypatch.setattr(job_projection.sqlite3, "connect", real_connect)
+
+    after = _rows(source)
+    assert after["backfill_plan_job"][0]["status"] == "running"
+    assert [item["event_type"] for item in after["backfill_plan_event"]] == [
+        "queued",
+        "started",
+    ]
+
+
+def test_tampered_or_future_task_state_refuses_generation(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    task = store.submit(_request(_snapshot(tmp_path)))
+    source = _source(tmp_path, directory, state_path)
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "UPDATE backfill_plan_job SET status='running', attempts=1 WHERE task_id=?",
+            (task.task_id,),
+        )
+    with pytest.raises(PageProjectionSourceIntegrityError, match="progress"):
+        source(OBSERVED)
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "UPDATE backfill_plan_job SET status='queued', attempts=0, "
+            "updated_at='2026-10-02T00:00:00+00:00' WHERE task_id=?",
+            (task.task_id,),
+        )
+    with pytest.raises(PageProjectionSourceIntegrityError, match="newer than observation"):
+        source(OBSERVED)
+
+
+def test_unsupported_job_schema_and_excess_events_refuse_generation(tmp_path: Path) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    directory.mkdir()
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("CREATE TABLE old_job(id TEXT)")
+    source = _source(tmp_path, directory, state_path)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="job state invalid"):
+        source(OBSERVED)
+
+    state_path.unlink()
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    task = store.submit(_request(_snapshot(tmp_path)))
+    with sqlite3.connect(state_path) as connection:
+        connection.executemany(
+            "INSERT INTO backfill_plan_job_event "
+            "(task_id,event_type,attempts,occurred_at) VALUES (?,?,?,?)",
+            [(task.task_id, "queued", 0, task.created_at.isoformat())] * 64,
+        )
+    with pytest.raises(PageProjectionSourceIntegrityError, match="stored bound"):
+        source(OBSERVED)
+
+
+def test_legacy_job_store_without_event_table_keeps_status_without_invented_logs(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    task = store.submit(_request(_snapshot(tmp_path)))
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DROP TABLE backfill_plan_job_event")
+    source = _source(tmp_path, directory, state_path)
+
+    queued = _rows(source)
+    assert queued["backfill_plan_job"][0]["task_id"] == task.task_id
+    assert queued["backfill_plan_job"][0]["status"] == "queued"
+    assert queued["backfill_plan_job"][0]["event_history"] == "unavailable"
+    assert queued["backfill_plan_event"] == ()
+
+
+def test_legacy_success_without_events_still_requires_same_generation_plan(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "plans"
+    state_path = tmp_path / "job-state.sqlite"
+    store = BackfillPlanJobStore(state_path=state_path, plan_directory=directory, clock=_Clock())
+    store.submit(_request(_snapshot(tmp_path)))
+    completed = BackfillPlanJobWorker(store).run_one()
+    assert completed is not None and completed.plan_hash is not None
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DROP TABLE backfill_plan_job_event")
+    source = _source(tmp_path, directory, state_path)
+
+    served = _rows(source)
+    assert served["backfill_plan_job"][0]["status"] == "succeeded"
+    assert served["backfill_plan_job"][0]["event_history"] == "unavailable"
+    assert served["backfill_plan_event"] == ()
+    (directory / f"daily-bar-backfill-plan-v1-{completed.plan_hash}.json").unlink()
+    with pytest.raises(PageProjectionSourceIntegrityError, match="succeeded|plan"):
+        source(OBSERVED)
 
 
 def test_in_progress_lab_temp_file_does_not_hide_published_plans(tmp_path: Path) -> None:
@@ -246,7 +466,8 @@ def test_snapshot_contract_cannot_promote_plan_or_invent_progress(tmp_path: Path
     directory = tmp_path / "plans"
     _publish(_snapshot(tmp_path), directory)
     projections = tuple(
-        item for item in _source(tmp_path, directory)(OBSERVED).projections
+        item
+        for item in _source(tmp_path, directory)(OBSERVED).projections
         if item.table_name in TABLES
     )
     by_name = {item.table_name: item for item in projections}
@@ -260,38 +481,44 @@ def test_snapshot_contract_cannot_promote_plan_or_invent_progress(tmp_path: Path
         LabPageProjectionSnapshot.create(
             available_at=OBSERVED,
             backfill_plan_projections=tuple(
-                promoted if item.table_name == index.table_name else item
-                for item in projections
+                promoted if item.table_name == index.table_name else item for item in projections
             ),
         )
-    progress = by_name["backfill_plan_progress"]
+    progress = by_name["backfill_plan_job"]
     invented = ServingProjectionPayload(
         table_name=progress.table_name,
         available_at=progress.available_at,
-        rows=({"status_key": "current", "availability": "running", "task_id": "x"},),
+        rows=(
+            {
+                **dict(progress.rows[0]),
+                "availability": "ready",
+                "event_history": "available",
+                "task_id": "a" * 32,
+                "status": "queued",
+                "attempts": 0,
+                "created_at": progress.available_at.isoformat(),
+                "updated_at": progress.available_at.isoformat(),
+            },
+        ),
     )
-    with pytest.raises(ValueError, match="progress|unavailable"):
+    with pytest.raises(ValueError, match="progress"):
         LabPageProjectionSnapshot.create(
             available_at=OBSERVED,
             backfill_plan_projections=tuple(
-                invented if item.table_name == progress.table_name else item
-                for item in projections
+                invented if item.table_name == progress.table_name else item for item in projections
             ),
         )
     archive = by_name["backfill_plan_archive"]
     damaged = ServingProjectionPayload(
         table_name=archive.table_name,
         available_at=archive.available_at,
-        rows=(
-            {**dict(archive.rows[0]), "detail_sha256": "0" * 64},
-        ),
+        rows=({**dict(archive.rows[0]), "detail_sha256": "0" * 64},),
     )
     with pytest.raises(ValueError, match="archive|hash|detail"):
         LabPageProjectionSnapshot.create(
             available_at=OBSERVED,
             backfill_plan_projections=tuple(
-                damaged if item.table_name == archive.table_name else item
-                for item in projections
+                damaged if item.table_name == archive.table_name else item for item in projections
             ),
         )
 
@@ -446,9 +673,7 @@ def test_more_than_preview_window_has_every_plan_in_same_generation(tmp_path: Pa
     assert {row["plan_hash"] for row in first["backfill_plan_archive"]} == {
         row["plan_hash"] for row in first["backfill_plan_index"]
     }
-    assert oldest.content_sha256 in {
-        row["plan_hash"] for row in first["backfill_plan_archive"]
-    }
+    assert oldest.content_sha256 in {row["plan_hash"] for row in first["backfill_plan_archive"]}
 
 
 def test_directory_capacity_is_explicit_and_not_silently_truncated(

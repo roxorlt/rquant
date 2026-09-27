@@ -20,6 +20,7 @@ from rquant.backfill_plan_core import (
     BackfillPlanSource,
     DailyBarBackfillPlan,
 )
+from rquant.backfill_plan_job_projection import BackfillPlanJobSnapshot
 from rquant.data_audit_evidence import MAX_AUDIT_DAYS
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
 from rquant.serving_read_models import ServingProjectionPayload
@@ -31,6 +32,8 @@ BACKFILL_PLAN_PROJECTION_TABLES = frozenset(
         "backfill_plan_preview",
         "backfill_plan_archive",
         "backfill_plan_progress",
+        "backfill_plan_job",
+        "backfill_plan_event",
     }
 )
 MAX_PREVIEW_BACKFILL_PLANS = 8
@@ -74,9 +77,7 @@ def backfill_plan_preview_row(plan: DailyBarBackfillPlan) -> dict[str, object]:
     return {
         "plan_hash": plan.content_sha256,
         "missing_dates_json": _compact_json([day.isoformat() for day in plan.missing_dates]),
-        "monthly_json": _compact_json(
-            [month.model_dump(mode="json") for month in plan.monthly]
-        ),
+        "monthly_json": _compact_json([month.model_dump(mode="json") for month in plan.monthly]),
         "estimate_json": _compact_json(plan.estimate.model_dump(mode="json")),
         "source_json": _compact_json(plan.source.model_dump(mode="json")),
         "gap_count": len(plan.gaps),
@@ -104,9 +105,12 @@ class BackfillPlanServingDetail(RuntimeContractModel):
     def validate_detail(self) -> BackfillPlanServingDetail:
         if self.audit_start > self.completed_through or self.published_at < self.cutoff_observed_at:
             raise ValueError("backfill plan detail dates disagree")
-        if any(
-            day < self.audit_start or day > self.completed_through for day in self.missing_dates
-        ) or tuple(sorted(set(self.missing_dates))) != self.missing_dates:
+        if (
+            any(
+                day < self.audit_start or day > self.completed_through for day in self.missing_dates
+            )
+            or tuple(sorted(set(self.missing_dates))) != self.missing_dates
+        ):
             raise ValueError("backfill plan detail missing dates are invalid")
         if sum(month.missing_open_days for month in self.monthly) != len(self.missing_dates):
             raise ValueError("backfill plan detail month totals disagree")
@@ -249,6 +253,7 @@ def project_backfill_plans(
     plans: Sequence[tuple[DailyBarBackfillPlan, datetime]],
     *,
     available_at: datetime,
+    job_snapshot: BackfillPlanJobSnapshot | None = None,
 ) -> tuple[ServingProjectionPayload, ...]:
     """Seal every catalogued plan in one generation or refuse that generation."""
     if len(plans) > MAX_DISCOVERABLE_BACKFILL_PLANS:
@@ -257,6 +262,9 @@ def project_backfill_plans(
     archive = tuple(_archive_row(plan, published) for plan, published in plans)
     if len(_compact_json(archive).encode("utf-8")) > MAX_BACKFILL_ARCHIVE_BYTES:
         raise ValueError("backfill plan same-generation archive exceeds its bound")
+    if job_snapshot is not None:
+        job_snapshot.validate(plan_hashes=frozenset(plan.content_sha256 for plan, _ in plans))
+    progress = job_snapshot.progress if job_snapshot is not None else None
     rows = {
         "backfill_plan_catalog": (
             {
@@ -272,12 +280,31 @@ def project_backfill_plans(
             backfill_plan_index_row(plan, rank=rank, published_at=published)
             for rank, (plan, published) in enumerate(plans)
         ),
-        "backfill_plan_preview": tuple(
-            backfill_plan_preview_row(plan) for plan, _ in preview
-        ),
+        "backfill_plan_preview": tuple(backfill_plan_preview_row(plan) for plan, _ in preview),
         "backfill_plan_archive": archive,
+        "backfill_plan_job": (
+            progress.model_dump(mode="json")
+            if progress is not None
+            else {
+                "status_key": "current",
+                "availability": "unavailable",
+                "event_history": "unavailable",
+                "task_id": None,
+                "status": None,
+                "attempts": None,
+                "created_at": None,
+                "updated_at": None,
+                "plan_hash": None,
+                "error_code": None,
+            },
+        ),
         "backfill_plan_progress": (
             {"status_key": "current", "availability": "unavailable", "task_id": None},
+        ),
+        "backfill_plan_event": (
+            tuple(event.model_dump(mode="json") for event in job_snapshot.events)
+            if job_snapshot is not None
+            else ()
         ),
     }
     return tuple(
