@@ -618,6 +618,223 @@ describe("选股器", () => {
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
   });
 
+  it("就绪副本可填写 RSI 周期和偏移，并在比较项使用自定义 RSI", async () => {
+    const dynamicBlocks: Schemas["ScreenBlock"][] = [
+      blocks[0] as Schemas["ScreenBlock"],
+      {
+        key: "rsi_oversold",
+        label: "RSI 超卖",
+        hint: "RSI 低于指定值",
+        category: "indicator",
+        category_label: "指标",
+        parameters: [
+          {
+            key: "period",
+            label: "RSI 周期（日）",
+            input: "integer",
+            initial: 14,
+            required: false,
+            minimum: 2,
+            maximum: 60,
+            scale: 1,
+            hint: "可填 2–60 个交易日",
+            custom_ma: false,
+          },
+          {
+            key: "threshold",
+            label: "RSI 门槛",
+            input: "number",
+            initial: 30,
+            required: true,
+            minimum: 0,
+            maximum: 100,
+            scale: 1,
+            custom_ma: false,
+          },
+          {
+            key: "offset",
+            label: "相对日期",
+            input: "integer",
+            initial: 0,
+            required: false,
+            minimum: 0,
+            maximum: 30,
+            scale: 1,
+            custom_ma: false,
+          },
+        ],
+      },
+      {
+        key: "gt",
+        label: "大于",
+        hint: "比较两项数据",
+        category: "compare",
+        category_label: "数值比较",
+        parameters: (["left", "right"] as const).map((key) => ({
+          key,
+          label: key === "left" ? "左侧" : "右侧",
+          input: "operand" as const,
+          initial: key === "left" ? "CLOSE[0]" : "MA5[0]",
+          required: true,
+          scale: 1,
+          options: [{ value: "CLOSE[0]", label: "收盘价" }],
+          custom_ma: true,
+        })),
+      },
+    ];
+    const requests: Schemas["ScreenRunRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: dynamicBlocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        requests.push(body);
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 3,
+            total: 1,
+            steps: [],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.selectOptions(
+      await screen.findByRole("combobox", { name: "条件目录" }),
+      "rsi_oversold",
+    );
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    const period = screen.getByRole("spinbutton", { name: "RSI 周期（日）" });
+    expect(period).toHaveAttribute("min", "2");
+    expect(period).toHaveAttribute("max", "60");
+    await user.clear(period);
+    await user.type(period, "7");
+    const offset = screen.getByRole("spinbutton", { name: "相对日期" });
+    await user.clear(offset);
+    await user.type(offset, "30");
+    await user.selectOptions(screen.getByRole("combobox", { name: "条件目录" }), "gt");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "左侧" }), "__custom_rsi__");
+    const leftPeriod = screen.getByRole("spinbutton", { name: "左侧RSI 周期（日）" });
+    await user.clear(leftPeriod);
+    await user.type(leftPeriod, "7");
+    await user.clear(screen.getByRole("spinbutton", { name: "左侧相对日期" }));
+    await user.type(screen.getByRole("spinbutton", { name: "左侧相对日期" }), "30");
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]?.conditions.slice(1)).toEqual([
+      { key: "rsi_oversold", args: { period: 7, threshold: 30, offset: 30 } },
+      { key: "gt", args: { left: "RSI7[30]", right: "MA5[0]" } },
+    ]);
+  });
+
+  it("自定义 RSI 不可用后将旧周期恢复为目录选项", async () => {
+    let ready = true;
+    const base = {
+      key: "period",
+      label: "指标周期",
+      initial: "14",
+      required: false,
+      scale: 1,
+      custom_ma: false,
+    };
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: [
+              blocks[0],
+              {
+                key: "rsi_oversold",
+                label: "RSI 超卖",
+                hint: "RSI 低于指定值",
+                category: "indicator",
+                category_label: "指标",
+                parameters: [
+                  ready
+                    ? {
+                        ...base,
+                        label: "RSI 周期（日）",
+                        input: "integer",
+                        initial: 14,
+                        minimum: 2,
+                        maximum: 60,
+                      }
+                    : {
+                        ...base,
+                        input: "choice",
+                        options: [
+                          { value: "6", label: "6 日 RSI" },
+                          { value: "14", label: "14 日 RSI" },
+                        ],
+                      },
+                  {
+                    key: "threshold",
+                    label: "RSI 门槛",
+                    input: "number",
+                    initial: 30,
+                    required: true,
+                    scale: 1,
+                    custom_ma: false,
+                  },
+                  {
+                    key: "offset",
+                    label: "相对日期",
+                    input: "integer",
+                    initial: 0,
+                    required: false,
+                    minimum: 0,
+                    maximum: 30,
+                    scale: 1,
+                    custom_ma: false,
+                  },
+                ],
+              },
+            ],
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.selectOptions(
+      await screen.findByRole("combobox", { name: "条件目录" }),
+      "rsi_oversold",
+    );
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    const period = screen.getByRole("spinbutton", { name: "RSI 周期（日）" });
+    await user.clear(period);
+    await user.type(period, "7");
+    ready = false;
+    await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
+    expect(await screen.findByText("自定义 RSI 暂不可用")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "指标周期" })).toHaveValue("14");
+  });
+
   it("条件修改后标明旧结果；无数据或不支持的条件不显示伪结果", async () => {
     catalog();
     let unsupported = false;

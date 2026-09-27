@@ -61,6 +61,13 @@ export default function ScreenerPage() {
   const blocks = catalog.data?.blocks ?? [];
   const dates = catalog.data?.dates ?? [];
   const rankMetrics = catalog.data?.ranking_metrics ?? [];
+  const customRsiReady = blocks.some(
+    (block) =>
+      (block.key === "rsi_oversold" || block.key === "rsi_overbought") &&
+      block.parameters.some(
+        (parameter) => parameter.key === "period" && parameter.input === "integer",
+      ),
+  );
 
   useEffect(() => {
     if (initialized || blocks.length === 0) return;
@@ -77,6 +84,35 @@ export default function ScreenerPage() {
       setTradeDate(dates[0] ?? null);
     }
   }, [dates, initialized, tradeDate]);
+
+  useEffect(() => {
+    if (!initialized || customRsiReady || blocks.length === 0) return;
+    setDraft((current) => {
+      let changed = false;
+      const next = current.map((condition) => {
+        const block = blocks.find((item) => item.key === condition.key);
+        if (!block) return condition;
+        let args = condition.args;
+        for (const parameter of block.parameters) {
+          const value = args[parameter.key];
+          const listed = parameter.options?.some((option) => option.value === String(value));
+          const unavailablePeriod =
+            (condition.key === "rsi_oversold" || condition.key === "rsi_overbought") &&
+            parameter.key === "period" &&
+            parameter.input === "choice" &&
+            !listed;
+          const unavailableField =
+            parameter.custom_ma && typeof value === "string" && value.startsWith("RSI") && !listed;
+          if (unavailablePeriod || unavailableField) {
+            args = { ...args, [parameter.key]: parameter.initial };
+            changed = true;
+          }
+        }
+        return args === condition.args ? condition : { ...condition, args };
+      });
+      return changed ? next : current;
+    });
+  }, [blocks, customRsiReady, initialized]);
 
   const byKey = new Map(blocks.map((block) => [block.key, block]));
   const rankWeights = rankDraft.map((row) =>
@@ -219,6 +255,9 @@ export default function ScreenerPage() {
     <>
       <PageHeader eyebrow="研究" title="选股器" />
       <div className="screen-source">
+        {catalog.data?.source_kind === "replica" ? (
+          <span>{customRsiReady ? "RSI 可填 2–60 日" : "自定义 RSI 暂不可用"}</span>
+        ) : null}
         {catalog.data?.source ? (
           <span>
             选股数据 <RelativeTime at={catalog.data.source.updated_at} suffix="更新" />
@@ -295,6 +334,7 @@ export default function ScreenerPage() {
                               parameter={parameter}
                               value={condition.args[parameter.key] ?? null}
                               onChange={(value) => updateArg(condition.id, parameter.key, value)}
+                              allowRsi={customRsiReady}
                             />
                           ) : (
                             <ParamControl

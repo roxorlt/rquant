@@ -81,6 +81,7 @@ _RSI_PERIOD_OPTIONS = (("6", "6 日 RSI"), ("14", "14 日 RSI"))
 _MA_PERIOD_TEXT = re.compile(r"[1-9][0-9]*\Z")
 _MA_NAME_TEXT = re.compile(r"MA([1-9][0-9]*)\Z")
 _MA_FIELD_TEXT = re.compile(r"MA([1-9][0-9]{0,2})\[(0|[1-9][0-9]?)\]\Z")
+_RSI_FIELD_TEXT = re.compile(r"RSI([1-9][0-9]?)\[(0|[1-9][0-9]?)\]\Z")
 _DYNAMIC_MA_RULES = frozenset({"above_ma", "cross_above", "cross_below"})
 _COMPARE_RULES = frozenset({"gt", "lt", "gte", "lte"})
 RANKING_METRIC_LABELS = {
@@ -97,6 +98,8 @@ def available_ranking_metrics(columns: Collection[str]) -> list[ScreenOption]:
         for key, label in RANKING_METRIC_LABELS.items()
         if key in columns
     ]
+
+
 _INITIALS: dict[str, dict[str, Any]] = {
     "circ_mv_lt": {"threshold_yi": 100},
     "board_in": {"boards": ["main"]},
@@ -119,13 +122,17 @@ def _options(rows: tuple[tuple[str, str], ...]) -> list[ScreenOption]:
     return [ScreenOption(value=key, label=label) for key, label in rows]
 
 
-def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter:
+def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool, dynamic_rsi: bool) -> ScreenParameter:
     field = spec.args_model.model_fields[key]
     prop = spec.args_model.model_json_schema()["properties"][key]
     options: list[ScreenOption] = []
     scale = 1
     hint: str | None = None
     custom_ma = dynamic_ma and (
+        (spec.name in _COMPARE_RULES and key in {"left", "right"})
+        or (spec.name == "between" and key == "field")
+    )
+    custom_rsi = dynamic_rsi and (
         (spec.name in _COMPARE_RULES and key in {"left", "right"})
         or (spec.name == "between" and key == "field")
     )
@@ -143,19 +150,25 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
             )
     elif key == "field":
         label, kind, options = "比较项", "field", _options(_FIELDS)
-        if custom_ma:
-            hint = "也可自定义均线：周期 2–250 日，相对日期 0–30 日"
+        if custom_rsi:
+            hint = "可自定义均线或 RSI；相对日期 0–30 日"
+        elif custom_ma:
+            hint = "可自定义均线；相对日期 0–30 日"
     elif key in {"left", "right"}:
         label, kind, options = ("左侧" if key == "left" else "右侧"), "operand", _options(_FIELDS)
         hint = (
-            "可选数据项、固定数字或自定义均线；均线周期 2–250 日，相对日期 0–30 日"
-            if custom_ma else "可选数据项，也可输入固定数字"
+            "可选数据项、固定数字或自定义均线与 RSI；相对日期 0–30 日"
+            if custom_rsi
+            else "可选数据项、固定数字或自定义均线；相对日期 0–30 日"
+            if custom_ma
+            else "可选数据项，也可输入固定数字"
         )
     elif key == "offset":
         label, kind = "相对日期", "integer"
         hint = (
             "0 为所选交易日，最多往前 30 个交易日"
-            if dynamic_ma and spec.name in _DYNAMIC_MA_RULES
+            if (dynamic_ma and spec.name in _DYNAMIC_MA_RULES)
+            or (dynamic_rsi and spec.name in {"rsi_oversold", "rsi_overbought"})
             else "0 为所选交易日，1 为前一交易日"
         )
     elif key == "threshold_yi":
@@ -177,6 +190,9 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
         if dynamic_ma and spec.name == "above_ma":
             label, kind = "均线周期（日）", "integer"
             hint = "可填 2–250 个交易日"
+        elif dynamic_rsi and spec.name in {"rsi_oversold", "rsi_overbought"}:
+            label, kind = "RSI 周期（日）", "integer"
+            hint = "可填 2–60 个交易日"
         else:
             label, kind, options = (
                 "指标周期",
@@ -196,12 +212,21 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
         initial = field.default
     if dynamic_ma and key in {"fast", "slow"}:
         initial = int(initial[2:])
-    if key == "period" and initial is not None and not (dynamic_ma and spec.name == "above_ma"):
+    if (
+        key == "period"
+        and initial is not None
+        and not (
+            (dynamic_ma and spec.name == "above_ma")
+            or (dynamic_rsi and spec.name in {"rsi_oversold", "rsi_overbought"})
+        )
+    ):
         initial = str(initial)
     minimum = prop.get("minimum", prop.get("exclusiveMinimum"))
     maximum = prop.get("maximum", prop.get("exclusiveMaximum"))
     if dynamic_ma and (key in {"fast", "slow"} or (spec.name == "above_ma" and key == "period")):
         minimum, maximum = 2, 250
+    if dynamic_rsi and spec.name in {"rsi_oversold", "rsi_overbought"} and key == "period":
+        minimum, maximum = 2, 60
     return ScreenParameter(
         key=key,
         label=label,
@@ -217,7 +242,7 @@ def _parameter(spec: RuleSpec, key: str, *, dynamic_ma: bool) -> ScreenParameter
     )
 
 
-def screen_blocks(*, dynamic_ma: bool = False) -> list[ScreenBlock]:
+def screen_blocks(*, dynamic_ma: bool = False, dynamic_rsi: bool = False) -> list[ScreenBlock]:
     if set(_RULE_COPY) != {spec.name for spec in REGISTRY}:
         raise ValueError("screen rule catalog labels are out of sync with registry")
     return [
@@ -228,7 +253,7 @@ def screen_blocks(*, dynamic_ma: bool = False) -> list[ScreenBlock]:
             category=spec.category,
             category_label=_CATEGORIES[spec.category],
             parameters=[
-                _parameter(spec, name, dynamic_ma=dynamic_ma)
+                _parameter(spec, name, dynamic_ma=dynamic_ma, dynamic_rsi=dynamic_rsi)
                 for name in spec.args_model.model_fields
             ],
         )
@@ -257,12 +282,28 @@ def _valid_custom_ma_field(value: object) -> bool:
     return match is not None and 2 <= int(match.group(1)) <= 250 and int(match.group(2)) <= 30
 
 
+def _valid_custom_rsi_field(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    match = _RSI_FIELD_TEXT.fullmatch(value)
+    return match is not None and 2 <= int(match.group(1)) <= 60 and int(match.group(2)) <= 30
+
+
 def validate_screen_choices(
-    conditions: Sequence[ScreenCondition], *, dynamic_ma: bool = False,
+    conditions: Sequence[ScreenCondition],
+    *,
+    dynamic_ma: bool = False,
+    dynamic_rsi: bool = False,
 ) -> list[dict[str, Any]]:
     """Accept only offered choices and normalize replica MA periods for the registry."""
 
-    blocks = {block.key: block for block in screen_blocks(dynamic_ma=dynamic_ma)}
+    blocks = {
+        block.key: block
+        for block in screen_blocks(
+            dynamic_ma=dynamic_ma,
+            dynamic_rsi=dynamic_rsi,
+        )
+    }
     normalized: list[dict[str, Any]] = []
     for condition in conditions:
         args = dict(condition.args)
@@ -281,6 +322,14 @@ def validate_screen_choices(
                 if condition.key == "above_ma" and parameter.key == "period":
                     args[parameter.key] = _dynamic_period(value, named=False)
                     continue
+            if (
+                dynamic_rsi
+                and condition.key in {"rsi_oversold", "rsi_overbought"}
+                and parameter.key == "period"
+            ):
+                if type(value) is not int or not 2 <= value <= 60:
+                    raise ValueError("screen RSI period is not available")
+                continue
             choices = {option.value for option in parameter.options}
             if parameter.input in {"choice", "field"}:
                 valid = (
@@ -290,10 +339,14 @@ def validate_screen_choices(
                 )
                 if parameter.custom_ma:
                     valid = valid or _valid_custom_ma_field(value)
+                if dynamic_rsi and condition.key in _COMPARE_RULES | {"between"}:
+                    valid = valid or _valid_custom_rsi_field(value)
             elif parameter.input == "operand":
                 valid = type(value) in {int, float} or (type(value) is str and value in choices)
                 if parameter.custom_ma:
                     valid = valid or _valid_custom_ma_field(value)
+                if dynamic_rsi and condition.key in _COMPARE_RULES:
+                    valid = valid or _valid_custom_rsi_field(value)
             elif parameter.input == "multi_choice":
                 valid = type(value) is list and all(
                     type(item) is str and item in choices for item in value
@@ -303,7 +356,9 @@ def validate_screen_choices(
             if not valid:
                 if parameter.key == "period":
                     raise ValueError("screen indicator period is not yet available")
-                if parameter.custom_ma:
-                    raise ValueError("screen custom MA field is not available")
+                if parameter.custom_ma or (
+                    dynamic_rsi and condition.key in _COMPARE_RULES | {"between"}
+                ):
+                    raise ValueError("screen custom indicator field is not available")
                 raise ValueError("screen form choice is not listed in the catalog")
     return normalized

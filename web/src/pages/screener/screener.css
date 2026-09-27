@@ -3,6 +3,7 @@
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
+  flex-wrap: wrap;
   min-height: 28px;
   margin: -4px 0 12px;
   color: var(--muted);

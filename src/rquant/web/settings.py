@@ -24,6 +24,7 @@ STALE_AFTER_ENV_VAR = "RQUANT_WEB_STALE_AFTER_SECONDS"
 SCREEN_PRIMARY_ENV_VAR = "RQUANT_WEB_SCREEN_PRIMARY_PATH"
 SCREEN_REPLICA_ENV_VAR = "RQUANT_WEB_SCREEN_REPLICA_PATH"
 SCREEN_HISTORY_ENV_VAR = "RQUANT_WEB_SCREEN_HISTORY_ROOT"
+SCREEN_RSI_ENV_VAR = "RQUANT_WEB_SCREEN_RSI_ROOT"
 CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
@@ -74,6 +75,7 @@ class WebSettings(BaseModel):
     screen_primary_path: Path | None = None
     screen_replica_path: Path | None = None
     screen_history_root: Path | None = None
+    screen_rsi_root: Path | None = None
     catalog_samples_file: Path | None = None
     ack_admission_socket_path: Path | None = None
     ingress_socket_path: Path | None = None
@@ -152,6 +154,9 @@ class WebSettings(BaseModel):
         history = source.get(SCREEN_HISTORY_ENV_VAR, "").strip()
         if history:
             values["screen_history_root"] = Path(history)
+        rsi = source.get(SCREEN_RSI_ENV_VAR, "").strip()
+        if rsi:
+            values["screen_rsi_root"] = Path(rsi)
         samples = source.get(CATALOG_SAMPLES_ENV_VAR, "").strip()
         if samples:
             values["catalog_samples_file"] = Path(samples)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
@@ -12,6 +13,10 @@ from pydantic import ValidationError
 from rquant.llm.compile import compile_screen_plan
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
 from rquant.screen.core import _collect_aggregates
+from rquant.screen.dynamic_rsi import (
+    DynamicRsiProjectionUnavailableError,
+    VerifiedDynamicRsiProjection,
+)
 from rquant.screen.formula_history_projection import (
     FormulaProjectionBudgetError,
     FormulaProjectionChangedError,
@@ -110,18 +115,20 @@ def _known_rule(rule: Rule, dependencies: tuple[str, ...]) -> Rule:
 
 
 def _replica_rule_state(
-    universe: pd.DataFrame, rules: list[Rule],
+    universe: pd.DataFrame,
+    rules: list[Rule],
 ) -> tuple[list[Rule], list[int]]:
     confirmed = pd.Series(True, index=universe.index, dtype="boolean")
     possible = confirmed.copy()
     safe_rules: list[Rule] = []
     unknown_counts: list[int] = []
     for rule in rules:
-        dependencies = tuple(sorted(
-            required_rule_columns([rule]) | {
-                request.name for request in _collect_aggregates([rule])
-            }
-        ))
+        dependencies = tuple(
+            sorted(
+                required_rule_columns([rule])
+                | {request.name for request in _collect_aggregates([rule])}
+            )
+        )
         present = universe.loc[:, dependencies].notna().all(axis=1)
         passed = rule(universe).astype("boolean").fillna(False) & present
         confirmed &= passed
@@ -138,10 +145,21 @@ class ScreenApplicationService:
         cursor_key: bytes,
         replica: VerifiedReplicaScreenSource | None = None,
         history: VerifiedFormulaHistoryProjection | None = None,
+        rsi: VerifiedDynamicRsiProjection | None = None,
     ) -> None:
         self.cursor_key = cursor_key
         self.replica = replica
         self.history = history
+        self.rsi = rsi
+
+    def _rsi_ready(self, source_identity: str, dates: list[date]) -> bool:
+        if self.rsi is None:
+            return False
+        try:
+            projected_dates = self.rsi.catalog(source_identity).dates
+            return bool(dates) and set(dates).issubset(projected_dates)
+        except DynamicRsiProjectionUnavailableError:
+            return False
 
     def preview_source(self) -> TdxPreviewSourceData:
         if self.history is None:
@@ -151,14 +169,19 @@ class ScreenApplicationService:
         except FormulaProjectionUnavailableError:
             return TdxPreviewSourceData(available=False, dates=[], source=None)
         return TdxPreviewSourceData(
-            available=bool(catalog.dates), dates=catalog.dates,
+            available=bool(catalog.dates),
+            dates=catalog.dates,
             source=ScreenSourceInfo(
-                identity=catalog.identity, updated_at=catalog.updated_at,
+                identity=catalog.identity,
+                updated_at=catalog.updated_at,
             ),
         )
 
     def preview(
-        self, body: TdxPreviewRequest, *, decision_at: datetime,
+        self,
+        body: TdxPreviewRequest,
+        *,
+        decision_at: datetime,
     ) -> TdxPreviewData:
         if self.history is None:
             raise ScreenApplicationError(503, "公式预览数据暂不可用，请稍后重试。")
@@ -166,7 +189,9 @@ class ScreenApplicationService:
         if parsed.status != "parsed" or parsed.translation is None:
             raise ScreenApplicationError(422, "公式尚未通过检查，请修改后重试。")
         if decision_at.astimezone(_SHANGHAI) < datetime.combine(
-            body.trade_date, time(17), _SHANGHAI,
+            body.trade_date,
+            time(17),
+            _SHANGHAI,
         ):
             raise ScreenApplicationError(422, "这一天的日线尚未收盘，请换日期。")
         try:
@@ -185,22 +210,26 @@ class ScreenApplicationService:
             raise ScreenApplicationError(503, "公式预览数据暂不可用，请稍后重试。") from error
         except FormulaProjectionBudgetError as error:
             raise ScreenApplicationError(
-                422, "这只股票的历史超出单次预览范围，请换股票。",
+                422,
+                "这只股票的历史超出单次预览范围，请换股票。",
             ) from error
 
         status = "unknown"
         reason = _PREVIEW_UNKNOWN[snapshot.unknown_reason] if snapshot.unknown_reason else None
         if snapshot.stock is not None:
             try:
-                evaluated = evaluate_formula(FormulaEvaluationInput(
-                    formula=body.source,
-                    decision_date=body.trade_date,
-                    decision_at=decision_at,
-                    stocks=(snapshot.stock,),
-                ))
+                evaluated = evaluate_formula(
+                    FormulaEvaluationInput(
+                        formula=body.source,
+                        decision_date=body.trade_date,
+                        decision_at=decision_at,
+                        stocks=(snapshot.stock,),
+                    )
+                )
             except EvaluationRejectedError as error:
                 raise ScreenApplicationError(
-                    422, "公式或历史超出单次预览范围，请缩短后重试。",
+                    422,
+                    "公式或历史超出单次预览范围，请缩短后重试。",
                 ) from error
             decision = evaluated.decisions[0]
             status = decision.status
@@ -219,17 +248,29 @@ class ScreenApplicationService:
                 snapshot = self.replica.available_dates()
             except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
                 return ScreenCatalogData(
-                    source_kind="replica", blocks=screen_blocks(), dates=[], available=False,
-                    ranking_metrics=[], source=None,
+                    source_kind="replica",
+                    blocks=screen_blocks(),
+                    dates=[],
+                    available=False,
+                    ranking_metrics=[],
+                    source=None,
                 )
+            rsi_ready = self._rsi_ready(snapshot.identity, snapshot.dates)
+            try:
+                current = self.replica.available_dates()
+            except (ScreenReplicaUnavailableError, ScreenReplicaDataError):
+                current = None
+            if current is None or current.identity != snapshot.identity:
+                rsi_ready = False
             return ScreenCatalogData(
                 source_kind="replica",
-                blocks=screen_blocks(dynamic_ma=True),
+                blocks=screen_blocks(dynamic_ma=True, dynamic_rsi=rsi_ready),
                 dates=snapshot.dates,
                 available=bool(snapshot.dates),
                 ranking_metrics=available_ranking_metrics(_REPLICA_RANK_COLUMNS),
                 source=ScreenSourceInfo(
-                    identity=snapshot.identity, updated_at=snapshot.updated_at,
+                    identity=snapshot.identity,
+                    updated_at=snapshot.updated_at,
                 ),
             )
 
@@ -275,25 +316,34 @@ class ScreenApplicationService:
         borrowed: BorrowedGeneration | None,
         serving_unavailable: bool,
     ) -> ScreenRunData:
+        rsi_ready = False
+        if self.replica is not None and self.rsi is not None:
+            with suppress(ScreenReplicaUnavailableError, ScreenReplicaDataError):
+                rsi_ready = self._rsi_ready(
+                    self.replica.generation_identity(), [body.trade_date]
+                )
         try:
             normalized_args = validate_screen_choices(
-                body.conditions, dynamic_ma=self.replica is not None,
+                body.conditions,
+                dynamic_ma=self.replica is not None,
+                dynamic_rsi=rsi_ready,
             )
         except ValueError as error:
-            if "indicator period" in str(error):
+            if "RSI period" in str(error):
+                detail = "RSI 周期请填 2 到 60 日。"
+            elif "indicator period" in str(error):
                 detail = (
                     "均线周期请填 2 到 250 日；RSI 请从目录选择。"
                     if self.replica is not None
                     else "当前仅支持已列出的均线和 RSI 周期，请调整条件。"
                 )
-            elif "custom MA field" in str(error):
-                detail = "请从目录选择数据项；均线周期填 2 到 250 日，相对日期填 0 到 30 日。"
+            elif "custom indicator field" in str(error):
+                detail = "所选指标暂不可用，请调整周期或刷新数据。"
             else:
                 detail = "请从条件目录选择数据项或板块。"
             raise ScreenApplicationError(422, detail) from error
         if body.ranking is not None and any(
-            condition.metric not in RANKING_METRIC_LABELS
-            for condition in body.ranking.conditions
+            condition.metric not in RANKING_METRIC_LABELS for condition in body.ranking.conditions
         ):
             raise ScreenApplicationError(422, "请从排名指标目录选择。")
 
@@ -301,10 +351,17 @@ class ScreenApplicationService:
         try:
             plan = ScreenPlan(
                 trade_date=body.trade_date.isoformat(),
-                stages=[Stage(label="条件", rules=[
-                    RuleCall(name=condition.key, args=args)
-                    for condition, args in zip(body.conditions, normalized_args, strict=True)
-                ])],
+                stages=[
+                    Stage(
+                        label="条件",
+                        rules=[
+                            RuleCall(name=condition.key, args=args)
+                            for condition, args in zip(
+                                body.conditions, normalized_args, strict=True
+                            )
+                        ],
+                    )
+                ],
             )
             compiled = compile_screen_plan(plan)
             rule_labels = [labels[condition.key] for condition in body.conditions]
@@ -327,33 +384,39 @@ class ScreenApplicationService:
             if unsupported_metric is not None:
                 label = RANKING_METRIC_LABELS[unsupported_metric]
                 raise ScreenApplicationError(
-                    422, f"当前数据还没有「{label}」，请换一个排名指标。",
+                    422,
+                    f"当前数据还没有「{label}」，请换一个排名指标。",
                 )
             try:
                 snapshot = self.replica.load(
                     body.trade_date,
                     compiled.rules,
                     include_columns=rank_columns,
+                    rsi_projection=self.rsi if rsi_ready else None,
                 )
             except ScreenReplicaUnavailableError as error:
                 raise ScreenApplicationError(
                     409 if body.cursor else 503,
                     "选股数据已更新，请重新筛选。"
-                    if body.cursor else "选股数据暂不可用，请稍后重试。",
+                    if body.cursor
+                    else "选股数据暂不可用，请稍后重试。",
                 ) from error
             except ScreenReplicaDataError as error:
                 raise ScreenApplicationError(
                     409 if body.cursor else 503,
                     "选股数据已更新，请重新筛选。"
-                    if body.cursor else "所选日期的数据不完整，请换日期或稍后重试。",
+                    if body.cursor
+                    else "所选日期的数据不完整，请换日期或稍后重试。",
                 ) from error
             except ScreenReplicaBudgetError as error:
                 raise ScreenApplicationError(
-                    422, "条件组合超出单次筛选范围，请减少条件或回看天数。",
+                    422,
+                    "条件组合超出单次筛选范围，请减少条件或回看天数。",
                 ) from error
             except ValueError as error:
                 raise ScreenApplicationError(
-                    422, "当前数据还不支持这个条件，请换一条或稍后重试。",
+                    422,
+                    "当前数据还不支持这个条件，请换一条或稍后重试。",
                 ) from error
             universe = snapshot.frame
             # An entirely unknown input would read as zero hits for a valid rule.
@@ -365,11 +428,13 @@ class ScreenApplicationService:
                 for column in required_columns
             ):
                 raise ScreenApplicationError(
-                    503, "所选日期的数据不完整，请换日期或稍后重试。",
+                    503,
+                    "所选日期的数据不完整，请换日期或稍后重试。",
                 )
             page_rules, unknown_counts = _replica_rule_state(universe, compiled.rules)
             source = ScreenSourceInfo(
-                identity=snapshot.identity, updated_at=snapshot.updated_at,
+                identity=snapshot.identity,
+                updated_at=snapshot.updated_at,
             )
         else:
             if borrowed is None or serving_unavailable:
@@ -402,7 +467,8 @@ class ScreenApplicationService:
         if missing_metrics:
             label = RANKING_METRIC_LABELS[missing_metrics[0]]
             raise ScreenApplicationError(
-                422, f"当前数据还没有「{label}」，请换一个排名指标。",
+                422,
+                f"当前数据还没有「{label}」，请换一个排名指标。",
             )
         if self.replica is not None and any(
             universe[metric].isna().all() for metric in rank_columns
@@ -425,11 +491,14 @@ class ScreenApplicationService:
             else:
                 page = paginate_ranked_nl_screen_projection(
                     universe,
-                    ranking=[RankingCondition(
-                        column=condition.metric,
-                        ascending=condition.ascending,
-                        weight=condition.weight,
-                    ) for condition in ranking.conditions],
+                    ranking=[
+                        RankingCondition(
+                            column=condition.metric,
+                            ascending=condition.ascending,
+                            weight=condition.weight,
+                        )
+                        for condition in ranking.conditions
+                    ],
                     top_n=ranking.top_n,
                     **page_args,
                 )
@@ -440,13 +509,15 @@ class ScreenApplicationService:
             ) from error
         except NlScreenProjectionFeatureError as error:
             raise ScreenApplicationError(
-                422, "当前数据还不支持这个条件，请换一条或稍后重试。",
+                422,
+                "当前数据还不支持这个条件，请换一条或稍后重试。",
             ) from error
         except ValueError as error:
             raise ScreenApplicationError(
                 422,
                 "当前数据还不支持这个条件，请换一条或稍后重试。"
-                if ranking is None else "当前数据还不支持这项排名，请换一个指标。",
+                if ranking is None
+                else "当前数据还不支持这项排名，请换一个指标。",
             ) from error
 
         rows = [

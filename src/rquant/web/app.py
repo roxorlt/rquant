@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
+from rquant.screen.dynamic_rsi import VerifiedDynamicRsiProjection
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
@@ -145,6 +146,11 @@ def create_app(
         if settings.screen_history_root is not None
         else None
     )
+    screen_rsi = (
+        VerifiedDynamicRsiProjection(settings.screen_rsi_root)
+        if settings.screen_rsi_root is not None and screen_replica is not None
+        else None
+    )
     configured_ack_admission = None
     if settings.ack_admission_socket_path is not None:
         from rquant.alert_ack_admission import AckAdmissionClient
@@ -164,6 +170,7 @@ def create_app(
             cursor_key=cursor_key,
             replica=screen_replica,
             history=screen_history,
+            rsi=screen_rsi,
         ),
         pool_commands=PoolCommandGateway(
             endpoint=settings.page_control_url,

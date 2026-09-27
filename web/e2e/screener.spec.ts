@@ -118,6 +118,68 @@ test("中文条件筛选、翻页和个股详情在桌面与手机宽度可用",
   expect(watcher.problems).toEqual([]);
 });
 
+test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async ({ page }) => {
+  const watcher = watch(page);
+  const requests: Schemas["ScreenRunRequest"][] = [];
+  let fulfilled = 0;
+  const source = { identity: "a".repeat(64), updated_at: "2026-09-24T07:31:00Z" };
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    body.data.source_kind = "replica";
+    body.data.source = source;
+    const rsi = body.data.blocks.find((block) => block.key === "rsi_oversold");
+    const period = rsi?.parameters.find((parameter) => parameter.key === "period");
+    if (!period) throw new Error("RSI period missing from fixture");
+    period.label = "RSI 周期（日）";
+    period.input = "integer";
+    period.initial = 14;
+    period.minimum = 2;
+    period.maximum = 60;
+    period.options = [];
+    period.hint = "可填 2–60 个交易日";
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/run", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+    requests.push(request);
+    const response = await route.fetch({
+      postData: JSON.stringify({ ...request, conditions: [{ key: "not_st", args: {} }] }),
+    });
+    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
+    body.data.source = source;
+    await route.fulfill({ response, json: body });
+    fulfilled += 1;
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("./#/screener");
+  await page.getByRole("combobox", { name: "条件目录" }).selectOption("rsi_oversold");
+  await page.getByRole("button", { name: "添加条件" }).click();
+  const period = page.getByRole("spinbutton", { name: "RSI 周期（日）" });
+  await expect(period).toHaveAttribute("max", "60");
+  await period.fill("7");
+  await page.getByRole("spinbutton", { name: "相对日期" }).fill("30");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect.poll(() => requests.length).toBe(1);
+  expect(requests[0]?.conditions[1]).toEqual({
+    key: "rsi_oversold",
+    args: { period: 7, threshold: 30, offset: 30 },
+  });
+  await expectNoHorizontalOverflow(page, "custom RSI desktop");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(period).toBeVisible();
+  await period.fill("14");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect.poll(() => requests.length).toBe(2);
+  await expect.poll(() => fulfilled).toBe(2);
+  expect(requests[1]?.conditions[1]?.args?.period).toBe(14);
+  await expectNoHorizontalOverflow(page, "custom RSI phone");
+  expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+  expect(watcher.problems).toEqual([]);
+});
+
 test("排名条件可编辑、折算并按分数稳定翻页，手机上可修改前 N", async ({ page }) => {
   const watcher = watch(page);
   await page.setViewportSize({ width: 1440, height: 900 });

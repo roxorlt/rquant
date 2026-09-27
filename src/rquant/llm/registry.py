@@ -138,8 +138,9 @@ class AboveMaArgs(BaseModel):
 class RsiArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     period: int = Field(14, ge=2, le=60)
-    threshold: float = Field(..., ge=0, le=100,
-                             description="超卖一般 ≤30，超买一般 ≥70")
+    threshold: float = Field(
+        ..., ge=0, le=100, allow_inf_nan=False, description="超卖一般 ≤30，超买一般 ≥70"
+    )
     offset: int = Field(0, ge=0, le=30)
 
 
@@ -273,7 +274,10 @@ REGISTRY: list[RuleSpec] = [
         name="gt",
         description="left > right；操作数可以是字段名（'CLOSE[0]'）或数字常数",
         args_model=CompareArgs,
-        examples=["今最高 > 昨收（left='HIGH[0]', right='CLOSE[1]'）", "PCT_CHG > 5（left='PCT_CHG[0]', right=5）"],
+        examples=[
+            "今最高 > 昨收（left='HIGH[0]', right='CLOSE[1]'）",
+            "PCT_CHG > 5（left='PCT_CHG[0]', right=5）",
+        ],
         category="compare",
         fn=gt,
     ),
