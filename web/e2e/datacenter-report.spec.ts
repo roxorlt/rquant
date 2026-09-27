@@ -154,6 +154,13 @@ for (const width of [1440, 390]) {
     await expect(panel.getByRole("table", { name: "日线质量问题" })).toContainText(
       "未停牌但零成交量",
     );
+    if (width === 1440) {
+      const rule = panel
+        .getByRole("table", { name: "质量规则" })
+        .getByRole("row", { name: /零成交量/ });
+      await rule.locator("td").nth(1).locator(".tip-anchor").focus();
+      await expect(page.getByRole("tooltip")).toContainText("已评估日期：2026-07-01 至 2026-09-30");
+    }
     await expectNoHorizontalOverflow(page, "daily-bar report");
     if (width === 390) {
       const localOverflow = await page.evaluate(() =>
@@ -204,5 +211,32 @@ test.describe("390px touch report", () => {
     await expect(mobileProgress).toBeVisible();
     await mobileProgress.tap();
     await expect(page.getByRole("tooltip")).toContainText("已评估日期：2026-07-01 至 2026-09-30");
+  });
+
+  test("external keyboard opens rule details with Enter and Space", async ({ page }) => {
+    const metaResponse = await page.request.get("./api/v1/meta");
+    expect(metaResponse.ok()).toBe(true);
+    const meta: Schemas["Envelope_MetaData_"] = await metaResponse.json();
+    await page.route("**/api/v1/meta*", async (route) => {
+      await route.fulfill({ json: meta });
+    });
+    await page.route("**/api/v1/data/report*", async (route) => {
+      await route.fulfill({ json: { data: report, serving: meta.serving } });
+    });
+    await page.goto("./#/datacenter");
+    await page.getByRole("button", { name: /股票日线/ }).click();
+
+    const rules = page.getByRole("table", { name: "质量规则" });
+    const assessed = rules.getByRole("row", { name: /零成交量/ }).getByText("已评估 64 / 66 天");
+    await assessed.locator("..").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("tooltip")).toContainText("已评估日期：2026-07-01 至 2026-09-30");
+
+    const unassessed = rules
+      .getByRole("row", { name: /收盘价上下限/ })
+      .getByText("已评估 0 / 66 天");
+    await unassessed.locator("..").focus();
+    await page.keyboard.press("Space");
+    await expect(page.getByRole("tooltip").filter({ hasText: "尚无已评估日期" })).toBeVisible();
   });
 });

@@ -128,10 +128,12 @@ const RULE_COLUMNS: DataColumn<AuditReportRule>[] = [
         {row.name}
         {row.field_label ? <small>{row.field_label}</small> : null}
         <span className="dc-report-mobile-progress">
-          <Tip content={assessmentDetail(row)}>
-            <small className="dc-report-progress">
-              已评估 {formatCount(row.assessed_days)} / {formatCount(row.expected_days)} 天
-            </small>
+          <Tip content={assessmentDetail(row)} interactive>
+            <button type="button" className="dc-report-mobile-trigger">
+              <small className="dc-report-progress">
+                已评估 {formatCount(row.assessed_days)} / {formatCount(row.expected_days)} 天
+              </small>
+            </button>
           </Tip>
         </span>
       </span>

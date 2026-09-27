@@ -259,8 +259,17 @@
 .dc-report-mobile-code {
   display: none;
 }
-.dc-report-mobile-progress .tip-anchor {
+.dc-report-mobile-trigger {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
   min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
 }
 .dc-report-progress {
   white-space: nowrap;
