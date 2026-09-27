@@ -126,6 +126,7 @@ for (const viewport of [
       const watcher = watch(page);
       let entryCode: string | null = null;
       let dailyGeneration: string | null = null;
+      let factorChanged = false;
       await page.route("**/api/v1/pools", async (route) => {
         const upstream = await route.fetch();
         const body = (await upstream.json()) as Schemas["Envelope_PoolsData_"];
@@ -134,7 +135,12 @@ for (const viewport of [
         if (!pool || !member) throw new Error("synthetic pool member is missing");
         entryCode = member.code;
         member.entry_trade_date = "2026-09-22";
-        member.entry_close = null;
+        member.entry_close = 10.25;
+        member.gain_pct = 12.5;
+        member.gain_through_date = "2026-09-23";
+        member.entry_line_price = factorChanged ? null : 10.25;
+        pool.gain_verified_count = 1;
+        pool.gain_sample_avg_pct = 12.5;
         pool.result = {
           state: "current_rules",
           status_label: "结果已按当前规则更新",
@@ -153,7 +159,19 @@ for (const viewport of [
             open: 10,
             high: 11,
             low: 9.8,
-            close: 10.5,
+            close: 10.25,
+            volume: 1000,
+            ma5: null,
+            ma10: null,
+            ma20: null,
+            provisional: false,
+          },
+          {
+            date: "2026-09-23",
+            open: 10.5,
+            high: 11.5,
+            low: 10.2,
+            close: 11.3,
             volume: 1000,
             ma5: null,
             ma10: null,
@@ -167,9 +185,13 @@ for (const viewport of [
       await page.goto("./#/pools");
       const table = page.getByRole("table", { name: "池子成员" });
       await expect(table.getByRole("columnheader", { name: "入池日", exact: true })).toBeVisible();
+      await expect(table.getByRole("columnheader", { name: "入池后复权涨幅" })).toBeVisible();
       const row = table.locator("tbody tr").first();
       await expect(row).toContainText("2026-09-22");
-      await expect(row).toContainText("—");
+      await expect(row).toContainText("12.50%");
+      await expect(page.getByRole("region", { name: "上次选股结果" })).toContainText(
+        "已核验样本平均",
+      );
       await row.focus();
       await row.press("Enter");
       const drawer = page.getByRole("dialog");
@@ -180,6 +202,13 @@ for (const viewport of [
         path: join(tmpdir(), `rquant-pool-entry-${viewport.name}.png`),
       });
       await expectNoHorizontalOverflow(page, "pool entry");
+      factorChanged = true;
+      await page.reload();
+      const changedRow = page.getByRole("table", { name: "池子成员" }).locator("tbody tr").first();
+      await changedRow.focus();
+      await changedRow.press("Enter");
+      await expect(page.getByRole("dialog").getByText("价格口径不同")).toBeVisible();
+      await expectNoHorizontalOverflow(page, "changed factor");
       dailyGeneration = "another-generation";
       await page.reload();
       const nextRow = page.getByRole("table", { name: "池子成员" }).locator("tbody tr").first();

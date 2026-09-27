@@ -86,6 +86,30 @@
   gap: 2px;
   white-space: nowrap;
 }
+.pool-gain-cell {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  white-space: nowrap;
+}
+.pool-gain-cell time {
+  color: var(--muted);
+  font-size: 10px;
+}
+.pools-return-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 12px;
+  align-items: baseline;
+  padding: 8px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pools-return-summary strong {
+  text-align: right;
+  color: var(--ink);
+  font-weight: 600;
+}
 .pool-entry-phone {
   display: none;
   color: var(--muted);
@@ -292,6 +316,17 @@
   }
 }
 @media (max-width: 390px) {
+  .pools-page .tbl {
+    font-size: 11px;
+  }
+  .pools-page .tbl th,
+  .pools-page .tbl td {
+    padding-left: 5px;
+    padding-right: 5px;
+  }
+  .pool-entry-cell time {
+    font-size: 11px;
+  }
   .pools-toolbar {
     align-items: flex-start;
     flex-direction: column;

@@ -46,6 +46,21 @@ const MEMBER_COLUMNS: DataColumn<PoolMember>[] = [
     secondary: true,
   },
   {
+    id: "gain",
+    header: "入池后复权涨幅",
+    value: (row) => row.gain_pct,
+    cell: (row) => (
+      <span className="pool-gain-cell">
+        <ChangeText value={row.gain_pct} />
+        {row.gain_through_date ? (
+          <time dateTime={row.gain_through_date}>截至 {row.gain_through_date.slice(5)}</time>
+        ) : null}
+      </span>
+    ),
+    numeric: true,
+    sortable: true,
+  },
+  {
     id: "close",
     header: "收盘价",
     value: (row) => row.close,
@@ -188,6 +203,22 @@ function ResultsDetail({
               <span>成员</span>
               <strong className="num">{formatCount(pool.member_count)} 只</strong>
             </div>
+            {pool.member_count ? (
+              <div className="pools-return-summary">
+                <span>涨幅已核验</span>
+                <strong className="num">
+                  {formatCount(pool.gain_verified_count)}/{formatCount(pool.member_count)} 只
+                </strong>
+                {pool.gain_sample_avg_pct !== null ? (
+                  <>
+                    <span>已核验样本平均</span>
+                    <strong>
+                      <ChangeText value={pool.gain_sample_avg_pct} />
+                    </strong>
+                  </>
+                ) : null}
+              </div>
+            ) : null}
             {pool.steps.length ? (
               <div className="pools-steps">
                 <h3>上次命中步骤</h3>
@@ -231,7 +262,7 @@ function ResultsDetail({
             pool.members_truncated ? `仅显示前 ${formatCount(pool.members.length)} 只` : undefined
           }
           actions={
-            <Tip content="入池价取入池日收盘价；暂无可靠记录时显示—。">
+            <Tip content="入池价取入池日收盘价；涨幅使用复权价格，按已核验样本统计。暂无可靠记录时显示—。">
               <span className="pools-info">入池价说明</span>
             </Tip>
           }
@@ -289,7 +320,12 @@ export default function PoolsPage() {
     stockSelection.generationId === visibleGeneration &&
     stockPool?.result.state === "current_rules" &&
     stockMember?.entry_trade_date
-      ? { date: stockMember.entry_trade_date, generationId: stockSelection.generationId }
+      ? {
+          date: stockMember.entry_trade_date,
+          generationId: stockSelection.generationId,
+          linePrice: stockMember.entry_line_price,
+          factorChanged: stockMember.gain_pct !== null && stockMember.entry_line_price === null,
+        }
       : null;
   const selectStock = (member: PoolMember, poolKey: string) => {
     setStockSelection({ code: member.code, poolKey, generationId: visibleGeneration ?? null });

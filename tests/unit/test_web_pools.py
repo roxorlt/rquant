@@ -156,6 +156,7 @@ def _receipt_response(
     hits: list[tuple[str, str]],
     receipts: list[tuple[object, ...]] | None,
     memberships: list[tuple[object, ...]] | None = None,
+    returns: list[tuple[object, ...]] | None = None,
     bounds: dict[str, str] | None = None,
     latest: str = "2026-09-23",
 ) -> dict:
@@ -244,6 +245,17 @@ def _receipt_response(
                     memberships,
                 )
             names.append("pool_membership")
+        if returns is not None:
+            connection.execute(
+                "CREATE TABLE pool_member_return (pool_name VARCHAR, trade_date DATE, "
+                "result_version VARCHAR, ts_code VARCHAR, entry_trade_date DATE, "
+                "entry_result_version VARCHAR, gain_pct DOUBLE, entry_line_price DOUBLE)"
+            )
+            if returns:
+                connection.executemany(
+                    "INSERT INTO pool_member_return VALUES (?, ?, ?, ?, ?, ?, ?, ?)", returns
+                )
+            names.append("pool_member_return")
         connection.executemany(
             "INSERT INTO projection_status VALUES (?, true, 1, ?)",
             [(name, FIXTURE_BUILT_AT) for name in names],

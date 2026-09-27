@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useDaily, useStockSummary } from "@/api/endpoints";
 import { PriceChart } from "@/charts/PriceChart";
 import { formatPrice } from "@/format/number";
-import { Button, EmptyState, Pill, SideDrawer, SkeletonRows } from "@/ui";
+import { Button, EmptyState, Pill, SideDrawer, SkeletonRows, Tip } from "@/ui";
 
 export function StockDrawer({
   tsCode,
@@ -11,7 +11,12 @@ export function StockDrawer({
 }: {
   tsCode: string | null;
   onClose: () => void;
-  entryMark?: { date: string; generationId: string } | null;
+  entryMark?: {
+    date: string;
+    generationId: string;
+    linePrice?: number | null;
+    factorChanged?: boolean;
+  } | null;
 }) {
   const summary = useStockSummary(tsCode);
   const daily = useDaily(tsCode);
@@ -43,6 +48,15 @@ export function StockDrawer({
     daily.data?.bars.some((bar) => bar.date === entryMark.date && !bar.provisional)
       ? entryMark.date
       : null;
+  const entryLine =
+    markedDay &&
+    entryMark?.linePrice != null &&
+    Number.isFinite(entryMark.linePrice) &&
+    entryMark.linePrice > 0 &&
+    daily.data?.bars.find((bar) => bar.date === markedDay)?.close === entryMark.linePrice &&
+    daily.data?.bars.at(-1)?.provisional === false
+      ? { price: entryMark.linePrice, label: "入池日收盘价" }
+      : undefined;
 
   return (
     <SideDrawer
@@ -94,6 +108,11 @@ export function StockDrawer({
           <div className="stock-chart-heading">
             <h3 className="stock-chart-title">日 K</h3>
             {markedDay ? <span className="stock-entry-mark">入池 · {markedDay}</span> : null}
+            {markedDay && entryMark?.factorChanged ? (
+              <Tip content="收益按复权价格计算；日 K 显示原始价，不能画入池价横线。">
+                <span className="stock-entry-mark">价格口径不同</span>
+              </Tip>
+            ) : null}
           </div>
           {daily.isLoading ? (
             <SkeletonRows rows={6} />
@@ -109,6 +128,7 @@ export function StockDrawer({
               mode="daily"
               bars={bars}
               marks={markedDay ? [{ time: markedDay, label: "入池" }] : []}
+              referenceLine={entryLine}
               label={`${name} 日 K`}
             />
           ) : (
