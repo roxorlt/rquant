@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import duckdb
 import pandas as pd
 import pytest
 
@@ -27,6 +28,7 @@ from rquant.presets import ScreenPreset, load_user_presets
 from rquant.runtime_contracts import canonical_sha256
 from rquant.screen.rules import not_st
 from rquant.storage.duckdb import DuckDBStore
+from rquant.trade_calendar import TradeCalendarDay
 
 NOW = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
 
@@ -71,6 +73,19 @@ def _command(
 
 def _pool_path(tmp_path: Path, base_name: str = "breakout") -> Path:
     return tmp_path / "data" / "user_presets" / f"{base_name}.json"
+
+
+def _seed_calendar(store: DuckDBStore, start: date, end: date) -> None:
+    store.upsert_trade_calendar(
+        [
+            TradeCalendarDay(
+                exchange="SSE",
+                cal_date=start + timedelta(days=offset),
+                is_open=(start + timedelta(days=offset)).weekday() < 5,
+            )
+            for offset in range((end - start).days + 1)
+        ]
+    )
 
 
 def test_v2_command_is_parsed_and_create_update_require_exact_file_version(
@@ -259,7 +274,7 @@ def test_v2_can_update_legacy_pool_and_legacy_commands_still_load(tmp_path: Path
     assert update.status is PageControlStatus.SUCCEEDED
     upgraded = load_user_presets(_pool_path(tmp_path).parent)["user/breakout"]
     assert upgraded.offset_days == 0
-    assert upgraded.delay_days is None
+    assert upgraded.delay_days == 0
 
     nl = SaveNlPreset(
         command_id="legacy-nl",
@@ -425,6 +440,7 @@ def test_daily_screen_uses_exact_prior_trading_day_and_reloads_saved_definition(
     assert child.status is PageControlStatus.SUCCEEDED
     data_dir = tmp_path / "data" / "user_presets"
     with DuckDBStore(tmp_path / "pipeline.duckdb") as store:
+        _seed_calendar(store, date(2026, 7, 30), date(2026, 8, 4))
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
             "('X', '2026-07-30', 1,1,1,1,1,0,0,0,0),"
@@ -463,6 +479,171 @@ def test_daily_screen_uses_exact_prior_trading_day_and_reloads_saved_definition(
     assert observed == [("2026-08-04", ["TWO"])]
 
 
+def test_v2_same_day_rerun_to_zero_atomically_replaces_old_members(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    assert service.submit(_command("save-pool")).status is PageControlStatus.SUCCEEDED
+    frame = pd.DataFrame(
+        {
+            "ts_code": ["600000.SH"],
+            "name": ["浦发银行"],
+            "CLOSE[0]": [10.0],
+            "PCT_CHG[0]": [1.0],
+        }
+    )
+    empty = frame.iloc[0:0].copy()
+    with DuckDBStore(tmp_path / "rerun.duckdb") as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('600000.SH', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
+        )
+        store.upsert_screen_result(
+            pd.DataFrame(
+                {
+                    "trade_date": ["2026-08-04"],
+                    "preset_name": ["unrelated"],
+                    "ts_code": ["KEEP"],
+                    "name": ["其他池"],
+                    "close": [1.0],
+                    "pct_chg": [0.0],
+                    "extra": [None],
+                }
+            )
+        )
+        with patch("rquant.pipeline.screen", side_effect=(frame, empty)):
+            first = run_daily_screen_stage(
+                "2026-08-04",
+                preset_names=["user/breakout"],
+                store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+            store._conn.execute("BEGIN")
+            second = run_daily_screen_stage(
+                "2026-08-04",
+                preset_names=["user/breakout"],
+                store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+            store._conn.execute("COMMIT")
+        assert first.preset_hits == {"user/breakout": 1}
+        assert second.preset_hits == {"user/breakout": 0}
+        assert store.query_screen_result("2026-08-04", "user/breakout").empty
+        assert len(store.query_screen_result("2026-08-04", "unrelated")) == 1
+
+
+def test_v2_atomic_replace_failure_preserves_previous_snapshot(tmp_path: Path) -> None:
+    with DuckDBStore(tmp_path / "atomic.duckdb") as store:
+        old = pd.DataFrame(
+            {
+                "trade_date": ["2026-08-04"],
+                "preset_name": ["user/breakout"],
+                "ts_code": ["OLD"],
+                "name": ["旧成员"],
+                "close": [1.0],
+                "pct_chg": [0.0],
+                "extra": [None],
+            }
+        )
+        store.replace_screen_result("2026-08-04", "user/breakout", old)
+        invalid = pd.concat(
+            [old.assign(ts_code="NEW"), old.assign(ts_code="NEW")], ignore_index=True
+        )
+        with pytest.raises(duckdb.ConstraintException, match="duplicate key"):
+            store.replace_screen_result("2026-08-04", "user/breakout", invalid)
+        assert store.query_screen_result("2026-08-04", "user/breakout")["ts_code"].tolist() == [
+            "OLD"
+        ]
+
+
+def test_v2_without_trusted_calendar_fails_instead_of_using_daily_bar(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    assert service.submit(
+        _command("save-child", base_name="child", depends_on="n-shape-pool1", delay_days=1)
+    ).status is PageControlStatus.SUCCEEDED
+    with DuckDBStore(tmp_path / "no-calendar.duckdb") as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('X', '2026-08-03', 1,1,1,1,1,0,0,0,0),"
+            "('X', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
+        )
+        with patch("rquant.pipeline.screen") as screened:
+            result = run_daily_screen_stage(
+                "2026-08-04",
+                preset_names=["user/child"],
+                store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+        screened.assert_not_called()
+    assert result.preset_hits == {"user/child": -1}
+    assert result.errors == ("screen:user/child:TradeCalendarGapError",)
+
+
+def test_v2_missing_exact_parent_day_market_data_fails_without_falling_back(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    assert service.submit(
+        _command("save-child", base_name="child", depends_on="n-shape-pool1", delay_days=1)
+    ).status is PageControlStatus.SUCCEEDED
+    with DuckDBStore(tmp_path / "missing-parent-day.duckdb") as store:
+        _seed_calendar(store, date(2026, 7, 31), date(2026, 8, 4))
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('X', '2026-07-31', 1,1,1,1,1,0,0,0,0),"
+            "('X', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
+        )
+        store.upsert_screen_result(
+            pd.DataFrame(
+                {
+                    "trade_date": ["2026-07-31"],
+                    "preset_name": ["n-shape-pool1"],
+                    "ts_code": ["TOO_OLD"],
+                    "name": ["old"],
+                    "close": [1.0],
+                    "pct_chg": [0.0],
+                    "extra": [None],
+                }
+            )
+        )
+        with patch("rquant.pipeline.screen") as screened:
+            result = run_daily_screen_stage(
+                "2026-08-04",
+                preset_names=["user/child"],
+                store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+        screened.assert_not_called()
+    assert result.preset_hits == {"user/child": -1}
+    assert result.errors == ("screen:user/child:ParentMarketDataGapError",)
+
+
+def test_v2_exact_parent_day_with_market_data_and_zero_hits_is_empty_not_error(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    assert service.submit(
+        _command("save-child", base_name="child", depends_on="n-shape-pool1", delay_days=1)
+    ).status is PageControlStatus.SUCCEEDED
+    with DuckDBStore(tmp_path / "zero-parent.duckdb") as store:
+        _seed_calendar(store, date(2026, 8, 3), date(2026, 8, 4))
+        store._conn.execute(
+            "INSERT INTO daily_bar VALUES "
+            "('X', '2026-08-03', 1,1,1,1,1,0,0,0,0),"
+            "('X', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
+        )
+        with patch("rquant.pipeline.screen") as screened:
+            result = run_daily_screen_stage(
+                "2026-08-04",
+                preset_names=["user/child"],
+                store=store,
+                preset_directory=tmp_path / "data" / "user_presets",
+            )
+        screened.assert_not_called()
+    assert result.preset_hits == {"user/child": 0}
+    assert result.errors == ()
+
+
 def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_result(
     tmp_path: Path,
 ) -> None:
@@ -475,6 +656,7 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
         _command("save-c", base_name="c", depends_on="user/b", delay_days=1)
     ).status is PageControlStatus.SUCCEEDED
     with DuckDBStore(tmp_path / "chain.duckdb") as store:
+        _seed_calendar(store, date(2026, 7, 31), date(2026, 8, 4))
         store._conn.execute(
             "INSERT INTO daily_bar VALUES "
             "('X', '2026-07-31', 1,1,1,1,1,0,0,0,0),"

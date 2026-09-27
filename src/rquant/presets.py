@@ -58,8 +58,6 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
                     raise ValueError("delay_days must be 0 without a parent pool")
                 if depends_on is not None and not 1 <= delay_days <= 252:
                     raise ValueError("delay_days must be 1..252 with a parent pool")
-                if depends_on is None:
-                    delay_days = None
             else:
                 offset_days = data.get("offset_days", 0)
                 if type(offset_days) is not int or offset_days < 0:
