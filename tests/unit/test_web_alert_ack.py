@@ -197,6 +197,43 @@ def test_complete_projection_with_matching_source_rows_is_usable(tmp_path: Path)
     assert all(item["acknowledgment"]["eligible"] is True for item in timeline["items"])
 
 
+def test_complete_window_digest_ignores_later_alert_projection_event(tmp_path: Path) -> None:
+    cutoff = FIXTURE_BUILT_AT - timedelta(minutes=1)
+    late_alert_id = "e" * 64
+    projections = []
+    for projection in _complete_alert_projections():
+        rows = [dict(row) for row in projection.rows]
+        if projection.table_name == "alert_source_coverage":
+            for row in rows:
+                row["window_end"] = cutoff.isoformat()
+                row["count_as_of"] = cutoff.isoformat()
+        elif projection.table_name == "alert_overview":
+            rows[0]["count_as_of"] = cutoff.isoformat()
+        elif projection.table_name == "alert_event":
+            rows.append(
+                {
+                    "source": "signal",
+                    "alert_id": late_alert_id,
+                    "occurred_at": (FIXTURE_BUILT_AT - timedelta(seconds=30)).isoformat(),
+                    "confirmation_id": None,
+                    "confirmed_at": None,
+                    "eligible": False,
+                }
+            )
+        projections.append(_projection(projection.table_name, rows))
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline", signal_projections=tuple(projections))
+
+    with TestClient(_app(root)) as client:
+        timeline = client.get("/api/v1/monitor/timeline").json()["data"]
+        overview = client.get("/api/v1/overview").json()["data"]
+
+    assert timeline["unacknowledged"] == overview["unacknowledged"]
+    assert timeline["unacknowledged"]["state"] == "ready"
+    assert timeline["unacknowledged"]["count"] == 4
+    assert timeline["total"] == 4
+
+
 def test_complete_projection_rejects_wrong_source_generation(tmp_path: Path) -> None:
     root = tmp_path / "serving"
     build_web_fixture(

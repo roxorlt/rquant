@@ -8,13 +8,14 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import Field, field_serializer, field_validator, model_validator
 
+from rquant.alert_ack import alert_event_at, alert_window_start
 from rquant.delivery_contracts import (
     DeliveryChannel,
     DeliveryTarget,
@@ -32,14 +33,18 @@ from rquant.signal_bus import (
     SignalBusRoutedRecord,
     SignalBusSourceDescriptor,
     SignalBusStore,
+    SignalBusWatermarkError,
     SignalRouteReceipt,
+    _require_consistent_high_watermark,
     parse_stored_signal,
     require_legacy_signal_write,
 )
 from rquant.signal_contracts import SignalEnvelopeFamily
+from rquant.signal_observed_prefix import SignalObservedPrefixReceipt, signal_window_digest
 
 if TYPE_CHECKING:
     from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
+    from rquant.serving_read_models import ServingSignalRecord
 
 from rquant.serving_read_models import ServingProjectionPayload
 
@@ -79,6 +84,8 @@ _NOTIFICATION_PROJECTION_TABLES = (
     _REQUIRED_NOTIFICATION_PROJECTION_TABLES | _OPTIONAL_NOTIFICATION_PROJECTION_TABLES
 )
 _MAX_SERVING_DELIVERIES = 10_000
+_MAX_SIGNAL_COVERAGE_PREFIX = 10_000
+_SIGNAL_OBSERVATION_INTERVAL = timedelta(minutes=1)
 
 
 class NotificationReplicationError(RuntimeError):
@@ -424,6 +431,7 @@ class NotificationServingSnapshot:
     payload: SignalDeliveryReadPayload
     projection_generation_id: str | None = None
     projection_source_receipts: Mapping[str, str] = dataclass_field(default_factory=dict)
+    signal_observed_prefix: SignalObservedPrefixReceipt | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -485,6 +493,15 @@ class NotificationStateStore(SignalBusStore):
                         REFERENCES signal_envelope(signal_id),
                     receipt_hash TEXT NOT NULL,
                     receipt_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_source_observation (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    source_id TEXT NOT NULL,
+                    source_generation_id TEXT NOT NULL,
+                    first_global_sequence INTEGER NOT NULL,
+                    source_high_watermark INTEGER NOT NULL,
+                    inspected_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS notification_state_revision (
@@ -563,6 +580,7 @@ class NotificationStateStore(SignalBusStore):
                 "delivery_attempt",
                 "delivery_unknown",
                 "notification_projection_authority",
+                "notification_source_observation",
             ):
                 for operation in ("INSERT", "UPDATE", "DELETE"):
                     trigger = f"notification_revision_{table}_{operation.lower()}"
@@ -773,8 +791,14 @@ class NotificationStateStore(SignalBusStore):
         records: tuple[SignalBusRoutedRecord, ...],
         *,
         observed_at: datetime,
+        source_inspected_at: datetime | None = None,
     ) -> NotificationReplicationSummary:
         observed = normalize_aware_utc(observed_at)
+        inspected = (
+            None if source_inspected_at is None else normalize_aware_utc(source_inspected_at)
+        )
+        if inspected is not None and inspected > observed:
+            raise ValueError("source inspection cannot follow replication observation")
         source = SignalBusSourceDescriptor.model_validate(source)
         records = tuple(SignalBusRoutedRecord.model_validate(record) for record in records)
         for record in records:
@@ -899,6 +923,43 @@ class NotificationStateStore(SignalBusStore):
                         timestamp,
                     ),
                 )
+            if inspected is not None:
+                previous_observation = connection.execute(
+                    "SELECT * FROM notification_source_observation WHERE singleton = 1"
+                ).fetchone()
+                if (
+                    previous_observation is None
+                    or previous_observation["source_id"] != self.replication_source_id
+                    or previous_observation["source_generation_id"] != source.generation_id
+                    or previous_observation["first_global_sequence"] != source.first_global_sequence
+                    or previous_observation["source_high_watermark"] != source.high_watermark
+                    or inspected
+                    - normalize_aware_utc(
+                        datetime.fromisoformat(str(previous_observation["inspected_at"]))
+                    )
+                    >= _SIGNAL_OBSERVATION_INTERVAL
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO notification_source_observation(
+                            singleton, source_id, source_generation_id,
+                            first_global_sequence, source_high_watermark, inspected_at
+                        ) VALUES (1, ?, ?, ?, ?, ?)
+                        ON CONFLICT(singleton) DO UPDATE SET
+                            source_id = excluded.source_id,
+                            source_generation_id = excluded.source_generation_id,
+                            first_global_sequence = excluded.first_global_sequence,
+                            source_high_watermark = excluded.source_high_watermark,
+                            inspected_at = excluded.inspected_at
+                        """,
+                        (
+                            self.replication_source_id,
+                            source.generation_id,
+                            source.first_global_sequence,
+                            source.high_watermark,
+                            inspected.isoformat(timespec="microseconds"),
+                        ),
+                    )
             self._before_commit(connection)
 
         return NotificationReplicationSummary(
@@ -907,6 +968,132 @@ class NotificationStateStore(SignalBusStore):
             started_after_sequence=started_after,
             ended_at_sequence=ended_at,
             replicated_count=replicated_count,
+        )
+
+    def _observed_signal_prefix_from_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        observed_at: datetime,
+        selected: tuple[ServingSignalRecord, ...],
+        truncated: bool,
+    ) -> SignalObservedPrefixReceipt | None:
+        """Verify the observed spool prefix inside the serving read transaction."""
+        if truncated:
+            return None
+        observation = connection.execute(
+            "SELECT * FROM notification_source_observation WHERE singleton = 1"
+        ).fetchone()
+        cursor_row = connection.execute(
+            "SELECT * FROM notification_replication_source WHERE singleton = 1"
+        ).fetchone()
+        if observation is None or cursor_row is None:
+            return None
+        cursor = self._cursor_from_row(cursor_row)
+        inspected_at = normalize_aware_utc(datetime.fromisoformat(str(observation["inspected_at"])))
+        high = int(observation["source_high_watermark"])
+        if (
+            inspected_at > observed_at
+            or cursor.updated_at is None
+            or cursor.updated_at > observed_at
+            or cursor.source_id != self.replication_source_id
+            or observation["source_id"] != cursor.source_id
+            or observation["source_generation_id"] != cursor.source_generation_id
+            or observation["first_global_sequence"] != cursor.first_global_sequence
+            or observation["first_global_sequence"] != 1
+            or high != cursor.observed_high_watermark
+            or high != cursor.last_global_sequence
+            or high > _MAX_SIGNAL_COVERAGE_PREFIX
+        ):
+            return None
+        try:
+            local_high = _require_consistent_high_watermark(connection)
+        except SignalBusWatermarkError:
+            return None
+        if local_high != high:
+            return None
+        rows = connection.execute(
+            """
+            SELECT signal.global_sequence, signal.signal_id, signal.payload_hash,
+                   signal.payload_json, signal.received_at,
+                   receipt.signal_id AS receipt_signal_id, receipt.receipt_hash,
+                   receipt.receipt_json
+            FROM signal_envelope AS signal
+            LEFT JOIN notification_source_route_receipt AS receipt
+              ON receipt.global_sequence = signal.global_sequence
+            WHERE signal.global_sequence <= ?
+            ORDER BY signal.global_sequence
+            LIMIT ?
+            """,
+            (high, _MAX_SIGNAL_COVERAGE_PREFIX + 1),
+        ).fetchall()
+        if len(rows) != high:
+            return None
+        from rquant.serving_read_models import ServingSignalRecord
+
+        first = alert_window_start(
+            count_as_of=inspected_at,
+            activated_at=datetime(1970, 1, 1, tzinfo=UTC),
+        )
+        window_records: list[ServingSignalRecord] = []
+        prefix_rows: list[tuple[int, str, str, str]] = []
+        for expected, row in enumerate(rows, start=1):
+            if (
+                row["global_sequence"] != expected
+                or row["receipt_signal_id"] != row["signal_id"]
+                or not isinstance(row["receipt_hash"], str)
+                or not isinstance(row["receipt_json"], str)
+            ):
+                return None
+            signal = parse_stored_signal(
+                signal_id=str(row["signal_id"]),
+                payload_hash=str(row["payload_hash"]),
+                payload_json=str(row["payload_json"]),
+                payload_size=len(str(row["payload_json"]).encode("utf-8")),
+            )
+            route_bytes = str(row["receipt_json"]).encode("utf-8")
+            if hashlib.sha256(route_bytes).hexdigest() != row["receipt_hash"]:
+                return None
+            route = SignalRouteReceipt.model_validate_json(route_bytes)
+            if route.signal_id != signal.signal_id:
+                return None
+            event_at = alert_event_at("signal", signal)
+            received_at = normalize_aware_utc(datetime.fromisoformat(str(row["received_at"])))
+            if event_at <= inspected_at and (
+                signal.available_at > inspected_at
+                or received_at > inspected_at
+                or route.routed_at > inspected_at
+            ):
+                return None
+            if first <= event_at <= inspected_at:
+                window_records.append(ServingSignalRecord(global_sequence=expected, signal=signal))
+            prefix_rows.append(
+                (expected, str(row["signal_id"]), str(row["payload_hash"]), row["receipt_hash"])
+            )
+        selected_window = tuple(
+            record
+            for record in selected
+            if first <= alert_event_at("signal", record.signal) <= inspected_at
+        )
+        digest = signal_window_digest(window_records)
+        if (
+            len(selected_window) != len(window_records)
+            or signal_window_digest(selected_window) != digest
+        ):
+            return None
+        return SignalObservedPrefixReceipt(
+            source_generation_id=str(observation["source_generation_id"]),
+            first_global_sequence=1,
+            source_high_watermark=high,
+            source_inspected_at=inspected_at,
+            window_start=first,
+            window_end=inspected_at,
+            window_row_count=len(window_records),
+            window_rows_sha256=digest,
+            prefix_row_count=len(prefix_rows),
+            prefix_rows_sha256=canonical_sha256(
+                {"contract": "signal-source-prefix/v1", "rows": prefix_rows}
+            ),
         )
 
     def serving_snapshot(
@@ -1096,6 +1283,13 @@ class NotificationStateStore(SignalBusStore):
                         "notification serving deliveries exceed the bounded projection limit"
                     )
                 deliveries = tuple(self._outbox_from_row(row) for row in delivery_rows)
+            omitted = visible_signal_count - len(selected)
+            observed_prefix = self._observed_signal_prefix_from_transaction(
+                connection,
+                observed_at=observed,
+                selected=signal_records,
+                truncated=omitted > 0,
+            )
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -1116,7 +1310,6 @@ class NotificationStateStore(SignalBusStore):
             deliveries=coherent.deliveries,
             projections=(() if projection_snapshot is None else projection_snapshot.projections),
         )
-        omitted = visible_signal_count - len(selected)
         return NotificationServingSnapshot(
             observed_at=observed,
             sequence=int(revision_row["revision"]),
@@ -1131,6 +1324,7 @@ class NotificationStateStore(SignalBusStore):
             projection_source_receipts=(
                 {} if projection_snapshot is None else projection_snapshot.source_receipts
             ),
+            signal_observed_prefix=observed_prefix,
         )
 
     def apply_recipient_alias_migrations(

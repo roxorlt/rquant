@@ -297,6 +297,25 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=2 * 1024 * 1024,
             event_time_columns=("confirmed_at",),
         ),
+        "signal_observed_prefix": _contract(
+            "signals",
+            (
+                ("source_generation_id", "string"),
+                ("first_global_sequence", "int"),
+                ("source_high_watermark", "int"),
+                ("source_inspected_at", "timestamp"),
+                ("window_start", "timestamp"),
+                ("window_end", "timestamp"),
+                ("window_row_count", "int"),
+                ("window_rows_sha256", "string"),
+                ("prefix_row_count", "int"),
+                ("prefix_rows_sha256", "string"),
+            ),
+            ("source_generation_id",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("source_inspected_at", "window_start", "window_end"),
+        ),
         "alert_event": _contract(
             "signals",
             (

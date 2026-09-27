@@ -17,6 +17,7 @@ from rquant.serving_read_models import (
     ServingProjectionPayload,
     ServingReadModelInput,
 )
+from rquant.signal_observed_prefix import SignalObservedPrefixReceipt, signal_window_digest
 
 _SOURCES: tuple[AlertSource, ...] = ("signal", "monitor_event", "surge_event")
 _MAX_ALERT_EVENTS = 20_000
@@ -203,27 +204,58 @@ def _source_events(
     return tuple(sorted(selected, key=lambda row: str(row["alert_id"]))), "coverage_unverified"
 
 
+def _observed_signal_prefix(
+    source: ServingReadModelInput,
+    projections: Mapping[str, ServingProjectionInput],
+    signal_generation_id: str | None,
+) -> SignalObservedPrefixReceipt | None:
+    projection = projections.get("signal_observed_prefix")
+    if (
+        signal_generation_id is None
+        or projection is None
+        or projection.owner_dataset_id != "signals"
+        or projection.owner_generation_id != signal_generation_id
+        or len(projection.rows) != 1
+    ):
+        return None
+    try:
+        receipt = SignalObservedPrefixReceipt.model_validate(projection.rows[0])
+        if receipt.window_end > source.observed_at:
+            return None
+        selected = tuple(
+            record
+            for record in source.signals
+            if receipt.window_start <= alert_event_at("signal", record.signal) <= receipt.window_end
+        )
+        if (
+            len(selected) != receipt.window_row_count
+            or signal_window_digest(selected) != receipt.window_rows_sha256
+        ):
+            return None
+        return receipt
+    except (TypeError, ValueError):
+        return None
+
+
 def build_alert_read_projections(
     source: ServingReadModelInput,
     *,
     signal_generation_id: str | None = None,
 ) -> tuple[ServingProjectionPayload, ...]:
-    """Create observed alerts and honest unknown coverage from one fixed source input.
-
-    None of the three legacy source producers publishes a positive 30-day window proof.
-    Their observed rows are useful timeline evidence, never proof of a complete count.
-    """
+    """Create observed alerts; each source becomes complete only with its own proof."""
     by_name = {item.table_name: item for item in source.projections}
     ack = _ack_snapshot_from_input(by_name)
+    observed_prefix = _observed_signal_prefix(source, by_name, signal_generation_id)
+    coverage_cutoff = source.observed_at if observed_prefix is None else observed_prefix.window_end
     first_at = alert_window_start(
-        count_as_of=source.observed_at,
+        count_as_of=coverage_cutoff,
         activated_at=datetime(1970, 1, 1, tzinfo=UTC),
     )
     window_start = (
         None
         if ack is None
         else alert_window_start(
-            count_as_of=source.observed_at, activated_at=ack.activated_at
+            count_as_of=coverage_cutoff, activated_at=ack.activated_at
         ).isoformat()
     )
     acknowledgments = {} if ack is None else {row.alert_id: row for row in ack.rows}
@@ -257,6 +289,18 @@ def build_alert_read_projections(
         ):
             rows, reason = (), "event_bound_exceeded"
         events.extend(rows)
+        signal_prefix_available = (
+            event_source == "signal"
+            and observed_prefix is not None
+            and reason == "coverage_unverified"
+        )
+        coverage_first = first_at if window_start is None else datetime.fromisoformat(window_start)
+        coverage_end = observed_prefix.window_end if signal_prefix_available else source.observed_at
+        coverage_rows = tuple(
+            row
+            for row in rows
+            if coverage_first <= datetime.fromisoformat(str(row["occurred_at"])) <= coverage_end
+        )
         generation_id = (
             signal_generation_id
             if event_source == "signal"
@@ -268,15 +312,27 @@ def build_alert_read_projections(
             {
                 "source": event_source,
                 "state": "unavailable",
-                "reason": reason,
-                "window_start": window_start,
-                "window_end": None,
+                "reason": "upstream_unverified" if signal_prefix_available else reason,
+                "window_start": (
+                    first_at.isoformat()
+                    if signal_prefix_available and window_start is None
+                    else window_start
+                ),
+                "window_end": observed_prefix.window_end.isoformat()
+                if signal_prefix_available
+                else None,
                 "count_as_of": None,
                 "source_generation_id": generation_id,
-                "high_watermark": None,
-                "row_count": len(rows),
+                "high_watermark": (
+                    str(observed_prefix.source_high_watermark) if signal_prefix_available else None
+                ),
+                "row_count": len(coverage_rows),
                 "row_digest": canonical_sha256(
-                    {"contract": "alert-observed-rows/v1", "source": event_source, "rows": rows}
+                    {
+                        "contract": "alert-observed-rows/v1",
+                        "source": event_source,
+                        "rows": coverage_rows,
+                    }
                 ),
             }
         )

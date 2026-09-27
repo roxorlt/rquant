@@ -434,7 +434,11 @@ def _ready_summary(
                 "eligible": event.eligible,
             }
             for event in sorted(
-                (item for item in events.values() if item.source == source),
+                (
+                    item
+                    for item in events.values()
+                    if item.source == source and first <= item.occurred_at <= cutoff
+                ),
                 key=lambda item: item.alert_id,
             )
         )
