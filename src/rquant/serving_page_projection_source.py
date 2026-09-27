@@ -63,7 +63,7 @@ from rquant.canvas_publication_receipt import (
     canvas_publication_receipt_id,
     canvas_source_identity_hash,
 )
-from rquant.data_audit_contracts import REPORT_PROJECTION_TABLES
+from rquant.data_audit_contracts import REPORT_JOB_PROJECTION_TABLES, REPORT_PROJECTION_TABLES
 from rquant.data_audit_projection import (
     MAX_AUDIT_ISSUES as _MAX_AUDIT_ISSUES,
 )
@@ -72,6 +72,14 @@ from rquant.data_audit_projection import (
     DataAuditStatusProjectionRow,
 )
 from rquant.data_audit_report import MAX_REPORT_BYTES, parse_data_audit_report_bytes
+from rquant.data_audit_report_job_projection import (
+    DataAuditReportJobProgress,
+    DataAuditReportSuccessfulTask,
+    project_data_audit_report_job,
+    read_data_audit_report_job_snapshot,
+    validate_data_audit_report_job_progress,
+)
+from rquant.data_audit_report_jobs import DataAuditReportJobEvent
 from rquant.data_audit_report_projection import project_data_audit_report
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
@@ -3205,6 +3213,8 @@ class DuckDBLabPageProjectionSource:
         *,
         control_root: Path | None = None,
         audit_report_path: Path | None = None,
+        audit_report_job_state_path: Path | None = None,
+        audit_report_job_directory: Path | None = None,
         backfill_plan_directory: Path | None = None,
         backfill_plan_job_state_path: Path | None = None,
     ) -> None:
@@ -3213,7 +3223,20 @@ class DuckDBLabPageProjectionSource:
         self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
         if audit_report_path is not None and not audit_report_path.is_absolute():
             raise ValueError("audit report path must be absolute")
+        if (audit_report_job_state_path is None) != (audit_report_job_directory is None):
+            raise ValueError("audit report job state and directory require paired paths")
+        if audit_report_path is not None and audit_report_job_state_path is not None:
+            raise ValueError(
+                "audit report job and explicit file modes are exclusive, not ambiguous"
+            )
+        if audit_report_job_state_path is not None and (
+            not audit_report_job_state_path.is_absolute()
+            or not audit_report_job_directory.is_absolute()
+        ):
+            raise ValueError("audit report job paths must be absolute")
         self.audit_report_path = audit_report_path
+        self.audit_report_job_state_path = audit_report_job_state_path
+        self.audit_report_job_directory = audit_report_job_directory
         if backfill_plan_directory is not None and not backfill_plan_directory.is_absolute():
             raise ValueError("backfill plan directory must be absolute")
         self.backfill_plan_directory = backfill_plan_directory
@@ -3292,13 +3315,26 @@ class DuckDBLabPageProjectionSource:
         finally:
             binding.close()
 
-    def _report_projections(self, observed: datetime) -> tuple[ServingProjectionPayload, ...]:
+    def _report_projections(
+        self, observed: datetime, *, success: DataAuditReportSuccessfulTask | None = None
+    ) -> tuple[ServingProjectionPayload, ...]:
         path = self.audit_report_path
+        if self.audit_report_job_state_path is not None:
+            if success is None:
+                return ()
+            assert self.audit_report_job_directory is not None
+            path = self.audit_report_job_directory / (
+                f"data-audit-v1-{success.receipt.report_hash}.json"
+            )
         if path is None:
             return ()
         try:
             binding = _bind_readonly_directory(path.parent, label="audit report directory")
         except FileNotFoundError:
+            if success is not None:
+                raise PageProjectionSourceIntegrityError(
+                    "audit report directory is missing"
+                ) from None
             return ()
         try:
             found = _read_bound_optional_file(
@@ -3312,6 +3348,10 @@ class DuckDBLabPageProjectionSource:
                 try:
                     os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
                 except FileNotFoundError:
+                    if success is not None:
+                        raise PageProjectionSourceIntegrityError(
+                            "successful audit report is missing"
+                        ) from None
                     return ()
                 raise PageProjectionSourceIntegrityError("audit report appeared while read")
             raw, identity = found
@@ -3321,6 +3361,16 @@ class DuckDBLabPageProjectionSource:
                 or report.source.namespace != "production"
             ):
                 raise ValueError("synthetic test audit report cannot enter production Serving")
+            if success is not None and (
+                report.content_hash != success.receipt.report_hash
+                or report.source.snapshot_label != f"sha256:{success.replica_sha256}"
+                or report.audit_start != success.request.audit_start
+                or report.observed_through != success.request.observed_through
+                or report.null_fields
+                != tuple(sorted(success.request.null_fields, key=lambda field: field.field_name))
+                or report.collection_status != "collection_unconfirmed"
+            ):
+                raise ValueError("audit report differs from successful task")
             # mtime is caller-settable. Inode ctime and the containing directory's
             # ctime bound when this content/name could first have been published;
             # they do not establish collection completion or replica identity.
@@ -3352,6 +3402,30 @@ class DuckDBLabPageProjectionSource:
             raise PageProjectionSourceIntegrityError(f"audit report invalid: {exc}") from exc
         finally:
             binding.close()
+
+    def _audit_report_bundle(
+        self, observed: datetime
+    ) -> tuple[tuple[ServingProjectionPayload, ...], tuple[ServingProjectionPayload, ...]]:
+        if self.audit_report_job_state_path is None:
+            return self._report_projections(observed), ()
+        try:
+            job_snapshot = read_data_audit_report_job_snapshot(
+                self.audit_report_job_state_path, observed_at=observed
+            )
+            report = self._report_projections(observed, success=job_snapshot.successful)
+            available = max((job_snapshot.available_at, *(item.available_at for item in report)))
+            report = tuple(
+                ServingProjectionPayload(
+                    table_name=item.table_name, available_at=available, rows=item.rows
+                )
+                for item in report
+            )
+            job = project_data_audit_report_job(job_snapshot, available_at=available)
+            return report, job
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"audit report job state invalid: {exc}"
+            ) from exc
 
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
@@ -3464,12 +3538,14 @@ class DuckDBLabPageProjectionSource:
                 ),
             )
         )
+        audit_report, audit_job = self._audit_report_bundle(observed)
         return LabPageProjectionSnapshot.create(
             available_at=available_at,
             rows=tuple(rows),
             audit_status=audit_status,
             audit_issues=audit_issues,
-            audit_report_projections=self._report_projections(observed),
+            audit_report_projections=audit_report,
+            audit_job_projections=audit_job,
             backfill_plan_projections=self._backfill_plan_projections(observed),
         )
 
@@ -4691,14 +4767,15 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
     def validate_snapshot(self) -> Self:
         names = {item.table_name for item in self.projections}
         required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
+        optional_groups = (
+            REPORT_PROJECTION_TABLES,
+            REPORT_JOB_PROJECTION_TABLES,
+            BACKFILL_PLAN_PROJECTION_TABLES,
+        )
         if (
-            names
-            not in (
-                required,
-                required | REPORT_PROJECTION_TABLES,
-                required | BACKFILL_PLAN_PROJECTION_TABLES,
-                required | REPORT_PROJECTION_TABLES | BACKFILL_PLAN_PROJECTION_TABLES,
-            )
+            not required.issubset(names)
+            or any(names & group not in (set(), group) for group in optional_groups)
+            or names - required - set().union(*optional_groups)
             or len(names) != len(self.projections)
             or tuple(item.table_name for item in self.projections) != tuple(sorted(names))
         ):
@@ -4710,6 +4787,37 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             raise ValueError("lab audit projection row count differs")
         if any(item["audit_run_id"] != status[0]["successful_audit_id"] for item in issues):
             raise ValueError("lab audit projection mixes audit runs")
+        if names >= REPORT_JOB_PROJECTION_TABLES:
+            job_rows = projections["audit_report_job"].rows
+            if len(job_rows) != 1 or (
+                projections["audit_report_job"].available_at
+                != projections["audit_report_job_event"].available_at
+            ):
+                raise ValueError("audit report task projection is incomplete")
+            try:
+                progress = DataAuditReportJobProgress.model_validate(dict(job_rows[0]))
+                events = tuple(
+                    DataAuditReportJobEvent.model_validate(dict(row))
+                    for row in projections["audit_report_job_event"].rows
+                )
+                report_hash = (
+                    projections["audit_report_overview"].rows[0]["report_hash"]
+                    if names >= REPORT_PROJECTION_TABLES
+                    else None
+                )
+                validate_data_audit_report_job_progress(
+                    progress,
+                    events,
+                    available_at=projections["audit_report_job"].available_at,
+                    report_hash=report_hash,
+                )
+                if names >= REPORT_PROJECTION_TABLES and any(
+                    projections[name].available_at != projections["audit_report_job"].available_at
+                    for name in REPORT_PROJECTION_TABLES
+                ):
+                    raise ValueError("audit report and task projection times disagree")
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError("audit report task projection is invalid") from exc
         if names >= REPORT_PROJECTION_TABLES:
             overview = projections["audit_report_overview"].rows
             if len(overview) != 1:
@@ -4840,6 +4948,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         audit_status: DataAuditStatusProjectionRow | None = None,
         audit_issues: tuple[DataAuditIssueProjectionRow, ...] = (),
         audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
+        audit_job_projections: tuple[ServingProjectionPayload, ...] = (),
         backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
@@ -4869,6 +4978,11 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         ):
             raise ValueError("audit report projections must be complete")
         if (
+            audit_job_projections
+            and {item.table_name for item in audit_job_projections} != REPORT_JOB_PROJECTION_TABLES
+        ):
+            raise ValueError("audit report task projections must be complete")
+        if (
             backfill_plan_projections
             and {item.table_name for item in backfill_plan_projections}
             != BACKFILL_PLAN_PROJECTION_TABLES
@@ -4876,7 +4990,12 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             raise ValueError("backfill plan projections must be complete")
         projections = tuple(
             sorted(
-                (*projections, *audit_report_projections, *backfill_plan_projections),
+                (
+                    *projections,
+                    *audit_report_projections,
+                    *audit_job_projections,
+                    *backfill_plan_projections,
+                ),
                 key=lambda item: item.table_name,
             )
         )

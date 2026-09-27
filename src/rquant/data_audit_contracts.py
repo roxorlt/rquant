@@ -12,3 +12,5 @@ REPORT_PROJECTION_TABLES = frozenset(
         "audit_report_issue",
     }
 )
+
+REPORT_JOB_PROJECTION_TABLES = frozenset({"audit_report_job", "audit_report_job_event"})
