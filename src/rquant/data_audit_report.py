@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, BinaryIO, Literal, Self
 
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -520,9 +521,12 @@ def parse_data_audit_report_bytes(data: bytes, *, filename: str) -> DataAuditRep
 
 def load_data_audit_report(path: Path) -> DataAuditReport:
     """Reject oversized, noncanonical, renamed, symlinked, or corrupt artifacts."""
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as handle:
-        size = os.fstat(handle.fileno()).st_size
+        observed = os.fstat(handle.fileno())
+        if not stat.S_ISREG(observed.st_mode):
+            raise ValueError("audit report must be a regular file")
+        size = observed.st_size
         if size <= 0 or size > MAX_REPORT_BYTES:
             raise ValueError("audit report exceeds byte limit or is empty")
         data = handle.read(MAX_REPORT_BYTES + 1)
@@ -562,3 +566,116 @@ def publish_data_audit_report(report: DataAuditReport, directory: Path) -> Path:
         return destination
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _file_identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+def _require_explicit_path(path: Path) -> None:
+    if (
+        not path.is_absolute()
+        or path != Path(os.path.abspath(path))
+        or path.parent.resolve(strict=False) != path.parent
+    ):
+        raise ValueError("audit paths must be absolute and canonical")
+
+
+def _require_fixed_replica(primary_path: Path, replica_path: Path, opened: os.stat_result) -> None:
+    try:
+        primary = primary_path.stat(follow_symlinks=False)
+        current = replica_path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("read-only replica path changed during audit") from exc
+    if not stat.S_ISREG(primary.st_mode) or not stat.S_ISREG(current.st_mode):
+        raise ValueError("primary and read-only replica must be regular files")
+    if (primary.st_dev, primary.st_ino) == (opened.st_dev, opened.st_ino):
+        raise ValueError("read-only replica aliases the primary")
+    if _file_identity(current) != _file_identity(opened):
+        raise ValueError("read-only replica changed during audit")
+    if os.path.lexists(f"{replica_path}.wal"):
+        raise ValueError("read-only replica has an unsealed DuckDB WAL")
+
+
+def _file_sha256(handle: BinaryIO) -> str:
+    handle.seek(0)
+    digest = hashlib.sha256()
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def create_and_publish_data_audit_report(
+    *,
+    primary_path: Path,
+    replica_path: Path,
+    audit_start: date,
+    observed_through: date,
+    null_fields: tuple[DailyBarNullFieldSpec, ...],
+    directory: Path,
+) -> Path:
+    """Seal one trusted local replica read into an unverified production report.
+
+    The file digest binds the observed bytes, not a production generation or
+    collection-completion authority. The caller selects paths and dates outside Web.
+    """
+    primary_path, replica_path, directory = (
+        Path(primary_path),
+        Path(replica_path),
+        Path(directory),
+    )
+    for path in (primary_path, replica_path, directory):
+        _require_explicit_path(path)
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError("audit report directory must be a real directory")
+    descriptor = os.open(replica_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size <= 0:
+            raise ValueError("read-only replica must be a nonempty regular file")
+        _require_fixed_replica(primary_path, replica_path, opened)
+
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".audit-source-", dir=directory.parent) as private:
+            pinned = Path(private) / "replica.duckdb"
+            try:
+                os.link(replica_path, pinned, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("cannot pin read-only replica inode") from exc
+            pinned_source = os.fstat(handle.fileno())
+            pinned_stat = pinned.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(pinned_stat.st_mode)
+                or (pinned_stat.st_dev, pinned_stat.st_ino) != (opened.st_dev, opened.st_ino)
+                or _file_identity(pinned_stat) != _file_identity(pinned_source)
+                or pinned_source.st_size != opened.st_size
+                or pinned_source.st_mtime_ns != opened.st_mtime_ns
+            ):
+                raise ValueError("read-only replica changed before pinning")
+            _require_fixed_replica(primary_path, replica_path, pinned_source)
+            digest = _file_sha256(handle)
+            _require_fixed_replica(primary_path, replica_path, pinned_source)
+            with duckdb.connect(str(pinned), read_only=True) as connection:
+                _require_fixed_replica(primary_path, replica_path, pinned_source)
+                report = build_data_audit_report(
+                    connection,
+                    source=AuditReportSource(
+                        mode="production_unverified",
+                        namespace="production",
+                        snapshot_label=f"sha256:{digest}",
+                    ),
+                    audit_start=audit_start,
+                    observed_through=observed_through,
+                    null_fields=null_fields,
+                )
+                _require_fixed_replica(primary_path, replica_path, pinned_source)
+            if _file_sha256(handle) != digest:
+                raise ValueError("read-only replica digest changed during audit")
+            _require_fixed_replica(primary_path, replica_path, pinned_source)
+    return publish_data_audit_report(report, directory)
