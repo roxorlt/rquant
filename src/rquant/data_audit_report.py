@@ -521,9 +521,12 @@ def parse_data_audit_report_bytes(data: bytes, *, filename: str) -> DataAuditRep
 
 def load_data_audit_report(path: Path) -> DataAuditReport:
     """Reject oversized, noncanonical, renamed, symlinked, or corrupt artifacts."""
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as handle:
-        size = os.fstat(handle.fileno()).st_size
+        observed = os.fstat(handle.fileno())
+        if not stat.S_ISREG(observed.st_mode):
+            raise ValueError("audit report must be a regular file")
+        size = observed.st_size
         if size <= 0 or size > MAX_REPORT_BYTES:
             raise ValueError("audit report exceeds byte limit or is empty")
         data = handle.read(MAX_REPORT_BYTES + 1)
@@ -631,7 +634,7 @@ def create_and_publish_data_audit_report(
         _require_explicit_path(path)
     if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
         raise ValueError("audit report directory must be a real directory")
-    descriptor = os.open(replica_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(replica_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode) or opened.st_size <= 0:

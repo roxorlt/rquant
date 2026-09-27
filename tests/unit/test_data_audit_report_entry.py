@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -156,3 +158,71 @@ def test_entry_rejects_in_place_mutation_despite_restored_mtime(
         _publish(primary, replica, directory)
 
     assert not directory.exists() or not list(directory.iterdir())
+
+
+def _run_fifo_probe(script: str, *paths: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", script, *(str(path) for path in paths)],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+            "RQUANT_DISABLE_DOTENV": "1",
+            "TUSHARE_TOKEN_MAIN": "0" * 40,
+        },
+    )
+
+
+def test_entry_refuses_fifo_source_without_blocking_or_replacing_old_report(tmp_path: Path) -> None:
+    primary, replica = _sources(tmp_path)
+    directory = tmp_path / "reports"
+    previous = _publish(primary, replica, directory)
+    previous_bytes = previous.read_bytes()
+    replica.unlink()
+    os.mkfifo(replica)
+    script = """
+from datetime import date
+from pathlib import Path
+import sys
+from rquant.data_audit_evidence import DailyBarNullFieldSpec
+from rquant.data_audit_report import create_and_publish_data_audit_report
+try:
+    create_and_publish_data_audit_report(
+        primary_path=Path(sys.argv[1]), replica_path=Path(sys.argv[2]),
+        audit_start=date(2026, 9, 25), observed_through=date(2026, 9, 29),
+        null_fields=(DailyBarNullFieldSpec(
+            field_name='close', max_null_numerator=0, max_null_denominator=1,
+        ),), directory=Path(sys.argv[3]),
+    )
+except (OSError, ValueError):
+    sys.exit(0)
+sys.exit(1)
+"""
+
+    result = _run_fifo_probe(script, primary, replica, directory)
+
+    assert result.returncode == 0, result.stderr
+    assert previous.read_bytes() == previous_bytes
+    assert sorted(directory.iterdir()) == [previous]
+
+
+def test_report_loader_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / f"data-audit-v1-{'0' * 64}.json"
+    os.mkfifo(fifo)
+    script = """
+from pathlib import Path
+import sys
+from rquant.data_audit_report import load_data_audit_report
+try:
+    load_data_audit_report(Path(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(0)
+sys.exit(1)
+"""
+
+    result = _run_fifo_probe(script, fifo)
+
+    assert result.returncode == 0, result.stderr
