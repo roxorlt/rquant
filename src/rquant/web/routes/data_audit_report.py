@@ -240,6 +240,13 @@ def _read_report(borrowed: BorrowedGeneration) -> DataAuditReportData:
     ):
         raise ValueError("report rule day range is invalid")
     reasons = {key: _reasons(rule) for key, rule in zip(rule_keys, rules, strict=True)}
+    if any(
+        rule.checked_days != overview.covered_open_days
+        or next((item.days for item in reasons[key] if item.reason == "no_daily_bar"), 0)
+        != overview.missing_open_days
+        for key, rule in zip(rule_keys, rules, strict=True)
+    ):
+        raise ValueError("report rule dates disagree with daily-bar coverage")
     if (
         sum(item.unassessed_days for item in rules) != overview.unassessed_rule_days
         or sum(item.issue_count for item in rules) != overview.quality_issue_count

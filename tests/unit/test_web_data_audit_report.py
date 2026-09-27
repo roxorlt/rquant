@@ -222,6 +222,53 @@ def test_partial_report_projection_fails_closed(tmp_path: Path) -> None:
     assert "hash" not in response.text
 
 
+def test_missing_daily_bar_cannot_be_recast_as_fully_checked_and_healthy(tmp_path: Path) -> None:
+    projections: list[ServingProjectionPayload] = []
+    for item in _report_projections(tmp_path):
+        rows = item.rows
+        if item.table_name == "audit_report_overview":
+            rows = (
+                {
+                    **dict(rows[0]),
+                    "quality_conclusion": "no_issues_observed",
+                    "quality_issue_count": 0,
+                    "indexed_issue_count": 0,
+                    "omitted_issue_count": 0,
+                    "unassessed_rule_days": 0,
+                },
+            )
+        elif item.table_name == "audit_report_rule":
+            rows = tuple(
+                {
+                    **dict(row),
+                    "checked_days": 3,
+                    "assessed_days": 3,
+                    "unassessed_days": 0,
+                    "first_assessed_date": "2026-09-22",
+                    "last_assessed_date": "2026-09-24",
+                    "assessment_complete": True,
+                    "unassessed_reasons_json": "{}",
+                    "issue_count": 0,
+                }
+                for row in rows
+            )
+        elif item.table_name == "audit_report_issue":
+            rows = ()
+        projections.append(
+            ServingProjectionPayload(
+                table_name=item.table_name, available_at=item.available_at, rows=rows
+            )
+        )
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline", audit_report_projections=tuple(projections))
+
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/data/report")
+
+    assert response.status_code == 503
+    assert "hash" not in response.text
+
+
 @pytest.mark.parametrize(
     ("table", "change"),
     [
@@ -233,6 +280,14 @@ def test_partial_report_projection_fails_closed(tmp_path: Path) -> None:
         ("audit_report_month", {"report_hash": "f" * 64}),
         ("audit_report_month", {"covered_open_days": 3}),
         ("audit_report_rule", {"unassessed_reasons_json": "{}"}),
+        (
+            "audit_report_rule",
+            {
+                "unassessed_reasons_json": (
+                    '{"close_missing":1,"limits_unavailable":1,"no_observations":1}'
+                )
+            },
+        ),
         ("audit_report_rule", {"first_assessed_date": "2026-09-22"}),
         ("audit_report_issue", {"issue_index": 3}),
     ],
