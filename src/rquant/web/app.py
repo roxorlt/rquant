@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from rquant.screen.dynamic_rsi import VerifiedDynamicRsiProjection
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
+from rquant.unit_log_service import UnitLogClient
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
 from rquant.web.backfill_plan_command_gateway import (
     BackfillPlanCommandGateway,
@@ -55,6 +56,7 @@ from rquant.web.routes import (
     pool_editor,
     pools,
     screen,
+    service_logs,
     stocks,
     tasks,
 )
@@ -92,6 +94,8 @@ class WebContext:
     pool_commands: PoolCommandGateway
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
+    unit_log_client: UnitLogClient | None
+    unit_log_gate: threading.BoundedSemaphore
     backfill_plan_commands: BackfillPlanCommandGateway
     audit_report_commands: AuditReportCommandGateway
 
@@ -105,6 +109,7 @@ def create_app(
     pool_command_transport: PoolCommandTransport | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
+    unit_log_client: UnitLogClient | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
     audit_report_command_transport: AuditReportCommandTransport | None = None,
 ) -> FastAPI:
@@ -162,6 +167,19 @@ def create_app(
             if ack_admission_client is not None
             else AckAdmissionClient(settings.ack_admission_socket_path)
         )
+    configured_unit_log = None
+    if settings.unit_log_socket_path is not None:
+        assert settings.unit_log_service_uid is not None
+        assert settings.unit_log_web_group_gid is not None
+        configured_unit_log = (
+            unit_log_client
+            if unit_log_client is not None
+            else UnitLogClient(
+                socket_path=settings.unit_log_socket_path,
+                service_uid=settings.unit_log_service_uid,
+                web_group_gid=settings.unit_log_web_group_gid,
+            )
+        )
     app.state.web = WebContext(
         settings=settings,
         tracker=generation_tracker,
@@ -183,6 +201,8 @@ def create_app(
             transport=ack_lookup_transport,
         ),
         ack_admission=configured_ack_admission,
+        unit_log_client=configured_unit_log,
+        unit_log_gate=threading.BoundedSemaphore(1),
         backfill_plan_commands=BackfillPlanCommandGateway(
             endpoint=settings.page_control_url,
             transport=backfill_plan_command_transport,
@@ -257,6 +277,7 @@ def create_app(
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])
+    app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"])
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
