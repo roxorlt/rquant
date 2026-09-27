@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PublishedPool } from "@/api/endpoints";
 import type { BuiltinPoolCopySource, EditableCanvas, EditablePool } from "@/api/poolEditor";
-import { type ScreenBlock, useScreenCatalog } from "@/api/screen";
+import { type ScreenBlock, type ScreenOption, useScreenCatalog } from "@/api/screen";
 import { Button, ParamControl, type ParameterValue, SideDrawer, Tip } from "@/ui";
 import type { EditorSessionSnapshot, PoolEditorSession, SaveInput } from "./editorSession";
 
@@ -23,7 +23,12 @@ function initialRules(pool: Pick<EditablePool, "rule_calls"> | null): RuleDraft[
 
 function initialArgs(block: ScreenBlock): Record<string, ParameterValue> {
   return Object.fromEntries(
-    block.parameters.map((parameter) => [parameter.key, parameter.initial]),
+    block.parameters.map((parameter) => [
+      parameter.key,
+      parameter.key === "period" && parameter.input === "choice"
+        ? Number(parameter.initial)
+        : parameter.initial,
+    ]),
   );
 }
 
@@ -41,8 +46,9 @@ function validParameter(
   }
   if (parameter.input === "choice" || parameter.input === "field") {
     return (
-      typeof value === "string" &&
-      parameter.options?.some((option) => option.value === value) === true
+      (typeof value === "string" ||
+        (parameter.key === "period" && typeof value === "number" && Number.isInteger(value))) &&
+      parameter.options?.some((option) => option.value === String(value)) === true
     );
   }
   if (parameter.input === "operand" && typeof value === "string") {
@@ -55,9 +61,35 @@ function validParameter(
   return true;
 }
 
+function preservedOption(
+  value: ParameterValue,
+  original: ParameterValue | undefined,
+  parameter: ScreenBlock["parameters"][number],
+): ScreenOption | null {
+  if (
+    typeof value !== "string" ||
+    value !== original ||
+    !["operand", "choice", "field"].includes(parameter.input) ||
+    parameter.options?.some((option) => option.value === value)
+  )
+    return null;
+  const match = /^([A-Z_][A-Z0-9_]*)\[(\d+)\]$/.exec(value);
+  const label = match
+    ? parameter.options?.find((option) => option.value === `${match[1]}[0]`)?.label
+    : null;
+  const offset = match ? Number(match[2]) : 0;
+  return {
+    value,
+    label: label
+      ? `${offset === 1 ? "前一交易日" : `前 ${offset} 个交易日`}${label}`
+      : "原有数据项",
+  };
+}
+
 function parameterText(
   value: ParameterValue,
   parameter: ScreenBlock["parameters"][number],
+  extraOption: ScreenOption | null = null,
 ): string {
   if (value === null || value === "") return "未设置";
   if (Array.isArray(value)) {
@@ -68,7 +100,15 @@ function parameterText(
       .join("、");
   }
   if (typeof value === "string")
-    return parameter.options?.find((option) => option.value === value)?.label ?? "未识别选项";
+    return (
+      parameter.options?.find((option) => option.value === value)?.label ??
+      extraOption?.label ??
+      "未识别选项"
+    );
+  if (parameter.key === "period" && parameter.input === "choice")
+    return (
+      parameter.options?.find((option) => option.value === String(value))?.label ?? `${value} 日`
+    );
   return String(value * (parameter.scale || 1));
 }
 
@@ -93,6 +133,8 @@ export function PoolEditorForm({
   canvases,
   currentCanvas,
   generationId,
+  verifiedVersion,
+  attachmentVersion,
   session,
   snapshot,
   onClose,
@@ -102,6 +144,8 @@ export function PoolEditorForm({
   canvases: EditableCanvas[];
   currentCanvas: string | null;
   generationId: string | null;
+  verifiedVersion: string | null;
+  attachmentVersion: string | null;
   session: PoolEditorSession;
   snapshot: EditorSessionSnapshot;
   onClose: () => void;
@@ -129,7 +173,12 @@ export function PoolEditorForm({
   );
   const [chosenBlock, setChosenBlock] = useState("");
   const [rules, setRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
+  const [originalRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
   const [preview, setPreview] = useState(false);
+  const previewGeneration = useRef(generationId);
+  const [acknowledgedVersion, setAcknowledgedVersion] = useState(
+    editing?.version ?? copying?.version ?? null,
+  );
   const previewRef = useRef<HTMLElement>(null);
   const blocks = catalog.data?.blocks ?? [];
   const blockMap = useMemo(() => new Map(blocks.map((block) => [block.key, block])), [blocks]);
@@ -158,8 +207,9 @@ export function PoolEditorForm({
         rule_calls: previous.save.rule_calls,
         canvas: previous.canvasName,
       });
-  const versionCurrent =
-    !sameTarget || previous.saveStatus !== "succeeded" || editing?.version === previous.saveVersion;
+  const versionNeedsReview =
+    (editing !== null || copying !== null) &&
+    (verifiedVersion === null || verifiedVersion !== acknowledgedVersion);
   const nameValid =
     /^[\w\u4e00-\u9fff-]{1,80}$/u.test(baseName) &&
     name.trim().length >= 1 &&
@@ -169,9 +219,14 @@ export function PoolEditorForm({
     rules.length <= 32 &&
     rules.every((rule) => {
       const block = blockMap.get(rule.key);
-      return block?.parameters.every((parameter) =>
-        validParameter(rule.args[parameter.key] ?? null, parameter),
-      );
+      const original = originalRules.find((item) => item.id === rule.id && item.key === rule.key);
+      return block?.parameters.every((parameter) => {
+        const value = rule.args[parameter.key] ?? null;
+        return (
+          validParameter(value, parameter) ||
+          preservedOption(value, original?.args[parameter.key], parameter) !== null
+        );
+      });
     });
   const canSubmit =
     !!generationId &&
@@ -188,7 +243,13 @@ export function PoolEditorForm({
     rulesValid &&
     snapshot.storageAvailable &&
     !snapshot.busy &&
-    versionCurrent &&
+    !versionNeedsReview &&
+    !(
+      sameTarget &&
+      previous?.saveConflict &&
+      editing !== null &&
+      verifiedVersion === previous.save.expected_version
+    ) &&
     !(sameTarget && previous?.saveStatus === "succeeded" && unchanged) &&
     !(
       snapshot.journal &&
@@ -224,7 +285,7 @@ export function PoolEditorForm({
       delay_days: parent ? delay : 0,
       rule_calls: rules.map((rule) => ({ name: rule.key, args: rule.args })),
       include_columns: editing?.include_columns ?? copying?.include_columns ?? [],
-      expected_version: editing?.version ?? null,
+      expected_version: editing ? acknowledgedVersion : null,
     };
     await session.startSave(input, attachTo);
   };
@@ -235,6 +296,13 @@ export function PoolEditorForm({
       previewRef.current.scrollIntoView({ block: "start" });
     }
   }, [preview]);
+
+  useEffect(() => {
+    if (previewGeneration.current !== generationId) {
+      previewGeneration.current = generationId;
+      setPreview(false);
+    }
+  }, [generationId]);
 
   return (
     <SideDrawer
@@ -253,9 +321,25 @@ export function PoolEditorForm({
               <strong>{statusLabel}</strong>
               {snapshot.message ? <p>{snapshot.message}</p> : null}
               {snapshot.journal?.attachStatus === "failed" ? (
-                <Button size="sm" onClick={() => void session.retryAttachment()}>
-                  重试加入画布
-                </Button>
+                <>
+                  <Button
+                    size="sm"
+                    disabledReason={
+                      !generationId ||
+                      !attachmentVersion ||
+                      (snapshot.journal.attachConflict &&
+                        attachmentVersion === snapshot.journal.attach?.expected_pool_version)
+                        ? "等待最新规则发布后重试，或结束本次挂接。"
+                        : undefined
+                    }
+                    onClick={() => void session.retryAttachment(attachmentVersion ?? undefined)}
+                  >
+                    按最新规则加入画布
+                  </Button>
+                  <Button size="sm" onClick={() => session.discardFailedAttachment()}>
+                    结束本次挂接
+                  </Button>
+                </>
               ) : null}
               {snapshot.journal &&
               (["pending", "processing", "ambiguous", "unknown"].includes(
@@ -265,9 +349,17 @@ export function PoolEditorForm({
                   ["pending", "processing", "ambiguous", "unknown"].includes(
                     snapshot.journal.attachStatus,
                   ))) ? (
-                <Button size="sm" disabled={snapshot.busy} onClick={() => void session.advance()}>
-                  继续核对
-                </Button>
+                <>
+                  <Button size="sm" disabled={snapshot.busy} onClick={() => void session.advance()}>
+                    {snapshot.journal.attachStatus !== "idle" ? "继续核对画布" : "继续核对保存"}
+                  </Button>
+                  {snapshot.journal.saveStatus === "succeeded" &&
+                  ["ambiguous", "unknown"].includes(snapshot.journal.attachStatus) ? (
+                    <Button size="sm" onClick={() => session.deferAttachment()}>
+                      留待核对，继续编辑
+                    </Button>
+                  ) : null}
+                </>
               ) : null}
             </div>
           ) : null}
@@ -296,6 +388,26 @@ export function PoolEditorForm({
       }
     >
       <div className="pool-editor">
+        {!generationId ? (
+          <p className="pool-editor-error" role="status">
+            数据正在更新，草稿已保留。请稍后重新预览。
+          </p>
+        ) : null}
+        {versionNeedsReview ? (
+          <div className="pool-editor-review" role="status">
+            <p>规则版本已变化。请核对草稿后按最新版本继续。</p>
+            <Button
+              size="sm"
+              disabledReason={!generationId || !verifiedVersion ? "等待最新规则可用。" : undefined}
+              onClick={() => {
+                setAcknowledgedVersion(verifiedVersion);
+                setPreview(false);
+              }}
+            >
+              按最新版本继续
+            </Button>
+          </div>
+        ) : null}
         <p className="pool-editor-lead">
           {editing
             ? "调整这只自建池的筛选条件。"
@@ -399,6 +511,9 @@ export function PoolEditorForm({
           ) : null}
           {rules.map((rule, index) => {
             const block = blockMap.get(rule.key);
+            const original = originalRules.find(
+              (item) => item.id === rule.id && item.key === rule.key,
+            );
             return (
               <div className="pool-editor-rule" key={rule.id}>
                 <div className="pool-editor-rule-head">
@@ -429,11 +544,25 @@ export function PoolEditorForm({
                         key={parameter.key}
                         parameter={parameter}
                         value={rule.args[parameter.key] ?? null}
+                        extraOption={preservedOption(
+                          rule.args[parameter.key] ?? null,
+                          original?.args[parameter.key],
+                          parameter,
+                        )}
                         onChange={(value) => {
                           setRules((current) =>
                             current.map((item) =>
                               item.id === rule.id
-                                ? { ...item, args: { ...item.args, [parameter.key]: value } }
+                                ? {
+                                    ...item,
+                                    args: {
+                                      ...item.args,
+                                      [parameter.key]:
+                                        parameter.key === "period" && typeof value === "string"
+                                          ? Number(value)
+                                          : value,
+                                    },
+                                  }
                                 : item,
                             ),
                           );
@@ -498,6 +627,9 @@ export function PoolEditorForm({
               <ol>
                 {rules.map((rule) => {
                   const block = blockMap.get(rule.key);
+                  const original = originalRules.find(
+                    (item) => item.id === rule.id && item.key === rule.key,
+                  );
                   return (
                     <li key={rule.id}>
                       <b>{block?.label}</b>
@@ -506,7 +638,7 @@ export function PoolEditorForm({
                           {block.parameters
                             .map(
                               (parameter) =>
-                                `${parameter.label} ${parameterText(rule.args[parameter.key] ?? null, parameter)}`,
+                                `${parameter.label} ${parameterText(rule.args[parameter.key] ?? null, parameter, preservedOption(rule.args[parameter.key] ?? null, original?.args[parameter.key], parameter))}`,
                             )
                             .join(" · ")}
                         </span>

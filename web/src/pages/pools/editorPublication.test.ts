@@ -102,6 +102,22 @@ it("requires one generation, target version, canvas membership, and current-rule
   expect(publicationStage(journal, editor, pools, GENERATION, GENERATION, GENERATION)).toBe(
     "result",
   );
+  const newerVersion = "e".repeat(64);
+  if (!journal.attach) throw new Error("test fixture missing attachment");
+  expect(
+    publicationStage(
+      {
+        ...journal,
+        attach: { ...journal.attach, expected_pool_version: newerVersion },
+        attachStatus: "succeeded",
+      },
+      { ...editor, pools: [{ ...editorPool, version: newerVersion }] },
+      pools,
+      GENERATION,
+      GENERATION,
+      GENERATION,
+    ),
+  ).toBe("result");
   expect(publicationStage(journal, editor, pools, GENERATION, "b".repeat(64), GENERATION)).toBe(
     "attached",
   );

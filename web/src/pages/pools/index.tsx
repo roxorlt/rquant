@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { type PoolMember, type PublishedPool, usePools } from "@/api/endpoints";
-import { submitPoolEditorCommand, usePoolEditor } from "@/api/poolEditor";
+import {
+  type BuiltinPoolCopySource,
+  type EditablePool,
+  submitPoolEditorCommand,
+  usePoolEditor,
+} from "@/api/poolEditor";
 import { useMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { FlowGraph, type FlowGraphEdge, type FlowGraphNode } from "@/charts/FlowGraph";
@@ -335,8 +340,8 @@ export default function PoolsPage() {
   const autoRetry = useRef({ commandId: "", attempts: 0 });
   const [editorMode, setEditorMode] = useState<
     | { kind: "create"; parentKey: string | null }
-    | { kind: "edit"; key: string }
-    | { kind: "copy"; key: string }
+    | { kind: "edit"; pool: EditablePool }
+    | { kind: "copy"; source: BuiltinPoolCopySource }
     | null
   >(null);
   const [canvasName, setCanvasName] = useState<string | null>(null);
@@ -413,26 +418,26 @@ export default function PoolsPage() {
   const selectedCopySource = editorQuery.data?.copy_sources.find(
     (item) => item.key === selected?.key,
   );
-  const activeEditable =
-    editorMode?.kind === "edit"
-      ? editorQuery.data?.pools.find((item) => item.key === editorMode.key)
+  const activeMode = editorMode;
+  const editorDrawerOpen = activeMode !== null;
+  const activePoolKey =
+    activeMode?.kind === "edit"
+      ? activeMode.pool.key
+      : activeMode?.kind === "copy"
+        ? activeMode.source.key
+        : null;
+  const verifiedVersion =
+    editorReady && activePoolKey
+      ? activeMode?.kind === "edit"
+        ? (editorQuery.data?.pools.find((item) => item.key === activePoolKey)?.version ?? null)
+        : (editorQuery.data?.copy_sources.find(
+            (item) => item.key === activePoolKey && item.copyable,
+          )?.version ?? null)
       : null;
-  const activeCopySource =
-    editorMode?.kind === "copy"
-      ? editorQuery.data?.copy_sources.find(
-          (item) =>
-            item.key === editorMode.key && item.copyable && item.delay_mode !== "legacy_window",
-        )
+  const attachmentVersion =
+    editorReady && savedKey
+      ? (editorQuery.data?.pools.find((item) => item.key === savedKey)?.version ?? null)
       : null;
-  const activeMode =
-    editorMode?.kind === "create"
-      ? editorMode
-      : activeEditable
-        ? { kind: "edit" as const, pool: activeEditable }
-        : activeCopySource
-          ? { kind: "copy" as const, source: activeCopySource }
-          : null;
-  const editorDrawerOpen = activeMode !== null && editorReady;
   const stockPool = data?.pools.find((pool) => pool.key === stockSelection?.poolKey);
   const stockMember = stockPool?.members.find((member) => member.code === stockSelection?.code);
   const entryMark =
@@ -500,6 +505,108 @@ export default function PoolsPage() {
             : undefined
         }
       />
+      {!editorDrawerOpen && editorSnapshot.journal?.saveStatus === "succeeded" ? (
+        <div className="pools-editor-evidence" role="status">
+          <span>池子已保存</span>
+          {editorSnapshot.journal.canvasName ? (
+            <span>
+              {editorSnapshot.journal.attachStatus === "succeeded"
+                ? "已加入当前画布"
+                : "尚未加入当前画布"}
+            </span>
+          ) : null}
+          <span>{stage === "published" || stage === "result" ? "规则已发布" : "等待规则发布"}</span>
+          <span>{stage === "result" ? "结果已按当前规则更新" : "等待新规则选股"}</span>
+          {editorSnapshot.journal.attachStatus === "failed" ? (
+            <>
+              <Button
+                size="sm"
+                disabledReason={
+                  !editorReady ||
+                  !editorQuery.data?.pools.some(
+                    (item) =>
+                      item.key === savedKey &&
+                      (!editorSnapshot.journal?.attachConflict ||
+                        item.version !== editorSnapshot.journal.attach?.expected_pool_version),
+                  )
+                    ? "等待最新规则发布后重试，或结束本次挂接。"
+                    : undefined
+                }
+                onClick={() =>
+                  void editorSession.retryAttachment(
+                    editorQuery.data?.pools.find((item) => item.key === savedKey)?.version,
+                  )
+                }
+              >
+                按最新规则加入画布
+              </Button>
+              <Button size="sm" onClick={() => editorSession.discardFailedAttachment()}>
+                结束本次挂接
+              </Button>
+            </>
+          ) : null}
+          {["pending", "processing", "ambiguous", "unknown"].includes(
+            editorSnapshot.journal.attachStatus,
+          ) ? (
+            <Button
+              size="sm"
+              disabled={editorSnapshot.busy}
+              onClick={() => void editorSession.advance()}
+            >
+              继续核对画布
+            </Button>
+          ) : null}
+          {["ambiguous", "unknown"].includes(editorSnapshot.journal.attachStatus) ? (
+            <Button
+              size="sm"
+              disabled={editorSnapshot.busy}
+              onClick={() => editorSession.deferAttachment()}
+            >
+              留待核对，继续编辑
+            </Button>
+          ) : null}
+        </div>
+      ) : !editorDrawerOpen &&
+        editorSnapshot.journal &&
+        ["ambiguous", "unknown"].includes(editorSnapshot.journal.saveStatus) ? (
+        <div className="pools-editor-evidence" role="status">
+          <span>保存状态待确认</span>
+          <Button size="sm" onClick={() => void editorSession.advance()}>
+            继续核对
+          </Button>
+        </div>
+      ) : null}
+      {editorSnapshot.deferred.map((item) =>
+        item.attach ? (
+          <div className="pools-editor-evidence" role="status" key={item.attach.command_id}>
+            <span>
+              {item.save.display_name} ·{" "}
+              {item.attachStatus === "succeeded"
+                ? "已加入画布"
+                : item.attachStatus === "failed"
+                  ? "画布挂接失败"
+                  : "画布状态待确认"}
+            </span>
+            {["pending", "processing", "ambiguous", "unknown"].includes(item.attachStatus) ? (
+              <Button
+                size="sm"
+                disabled={editorSnapshot.busy}
+                onClick={() => void editorSession.advanceDeferred(item.attach?.command_id ?? "")}
+              >
+                继续核对这次挂接
+              </Button>
+            ) : null}
+            {["failed", "succeeded"].includes(item.attachStatus) ? (
+              <Button
+                size="sm"
+                onClick={() => editorSession.dismissDeferred(item.attach?.command_id ?? "")}
+              >
+                关闭记录
+              </Button>
+            ) : null}
+          </div>
+        ) : null,
+      )}
       {query.isLoading ? (
         <PageSkeleton />
       ) : query.error || changing ? (
@@ -555,36 +662,6 @@ export default function PoolsPage() {
             <p className="pools-note" role="status">
               {editorNotice}
             </p>
-          ) : null}
-          {!editorDrawerOpen && editorSnapshot.journal?.saveStatus === "succeeded" ? (
-            <div className="pools-editor-evidence" role="status">
-              <span>池子已保存</span>
-              {editorSnapshot.journal.canvasName ? (
-                <span>
-                  {editorSnapshot.journal.attachStatus === "succeeded"
-                    ? "已加入当前画布"
-                    : "尚未加入当前画布"}
-                </span>
-              ) : null}
-              <span>
-                {stage === "published" || stage === "result" ? "规则已发布" : "等待规则发布"}
-              </span>
-              <span>{stage === "result" ? "结果已按当前规则更新" : "等待新规则选股"}</span>
-              {editorSnapshot.journal.attachStatus === "failed" ? (
-                <Button size="sm" onClick={() => void editorSession.retryAttachment()}>
-                  重试加入画布
-                </Button>
-              ) : null}
-            </div>
-          ) : !editorDrawerOpen &&
-            editorSnapshot.journal &&
-            ["ambiguous", "unknown"].includes(editorSnapshot.journal.saveStatus) ? (
-            <div className="pools-editor-evidence" role="status">
-              <span>保存状态待确认</span>
-              <Button size="sm" onClick={() => void editorSession.advance()}>
-                继续核对
-              </Button>
-            </div>
           ) : null}
           {!data.definitions_available ? (
             <p className="pools-note">保存的画布暂不可用，显示已发布池子。</p>
@@ -673,7 +750,10 @@ export default function PoolsPage() {
                                 ? undefined
                                 : "这只池子的可编辑规则暂不可用。"
                             }
-                            onClick={() => setEditorMode({ kind: "edit", key: selected.key })}
+                            onClick={() =>
+                              selectedEditable &&
+                              setEditorMode({ kind: "edit", pool: selectedEditable })
+                            }
                           >
                             编辑规则
                           </Button>
@@ -688,7 +768,10 @@ export default function PoolsPage() {
                                 : (selectedCopySource?.copy_block_reason ??
                                   "这只内置池的复制资料暂不可用。")
                             }
-                            onClick={() => setEditorMode({ kind: "copy", key: selected.key })}
+                            onClick={() =>
+                              selectedCopySource &&
+                              setEditorMode({ kind: "copy", source: selectedCopySource })
+                            }
                           >
                             复制为自建池
                           </Button>
@@ -759,7 +842,9 @@ export default function PoolsPage() {
           publishedPools={data?.pools ?? []}
           canvases={editorQuery.data?.canvases ?? []}
           currentCanvas={canvas?.name ?? null}
-          generationId={visibleGeneration ?? null}
+          generationId={editorReady ? (visibleGeneration ?? null) : null}
+          verifiedVersion={verifiedVersion}
+          attachmentVersion={attachmentVersion}
           session={editorSession}
           snapshot={editorSnapshot}
           onClose={() => setEditorMode(null)}

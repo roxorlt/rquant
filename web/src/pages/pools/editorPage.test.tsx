@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
@@ -294,6 +294,196 @@ const copySource: Schemas["BuiltinPoolCopySource"] = {
   copy_block_reason: null,
 };
 
+const option = (value: string, label: string): Schemas["ScreenOption"] => ({ value, label });
+const parameter = (
+  key: string,
+  label: string,
+  input: Schemas["ScreenParameter"]["input"],
+  options: Schemas["ScreenOption"][] = [],
+): Schemas["ScreenParameter"] => ({
+  key,
+  label,
+  input,
+  initial: options[0]?.value ?? 0,
+  required: true,
+  minimum: null,
+  maximum: null,
+  scale: 1,
+  options,
+  hint: "",
+});
+const block = (
+  key: string,
+  label: string,
+  parameters: Schemas["ScreenParameter"][] = [],
+): Schemas["ScreenBlock"] => ({
+  key,
+  label,
+  hint: "",
+  category: "filter",
+  category_label: "条件",
+  parameters,
+});
+const builtinOneRules: Schemas["BuiltinPoolCopySource"]["rule_calls"] = [
+  { name: "not_st", args: {} },
+  { name: "not_bj", args: {} },
+  { name: "first_limit_up", args: { offset: 1 } },
+  { name: "not_limit_up", args: { offset: 0 } },
+  { name: "not_yiziban", args: { offset: 1 } },
+  { name: "gt", args: { left: "HIGH[0]", right: "CLOSE[1]" } },
+  { name: "circ_mv_lt", args: { threshold_yi: 150 } },
+  { name: "has_lower_shadow", args: { min_ratio: 0.5, min_amplitude: 0.02, offset: 0 } },
+  { name: "no_consec_ups_in_window", args: { threshold: 3, window: 8 } },
+  { name: "no_limit_down_in_window", args: { window: 30 } },
+  { name: "has_prior_limit_up", args: { window: 120, exclude_offset: 1 } },
+];
+const numberParam = (key: string, label: string) => parameter(key, label, "number");
+const intParam = (key: string, label: string) => parameter(key, label, "integer");
+const builtinOneCatalog: Schemas["ScreenBlock"][] = [
+  block("not_st", "排除 ST"),
+  block("not_bj", "排除北交所"),
+  block("first_limit_up", "首板", [intParam("offset", "相对日期")]),
+  block("not_limit_up", "未涨停", [intParam("offset", "相对日期")]),
+  block("not_yiziban", "非一字板", [intParam("offset", "相对日期")]),
+  block("gt", "大于", [
+    parameter("left", "左侧", "operand", [option("HIGH[0]", "最高价")]),
+    parameter("right", "右侧", "operand", [option("CLOSE[0]", "收盘价")]),
+  ]),
+  block("circ_mv_lt", "流通市值低于", [numberParam("threshold_yi", "市值上限")]),
+  block("has_lower_shadow", "明显下影线", [
+    numberParam("min_ratio", "下影线倍数"),
+    numberParam("min_amplitude", "最小振幅"),
+    intParam("offset", "相对日期"),
+  ]),
+  block("no_consec_ups_in_window", "近期无高连板", [
+    numberParam("threshold", "连板下限"),
+    intParam("window", "回看交易日"),
+  ]),
+  block("no_limit_down_in_window", "近期无跌停", [intParam("window", "回看交易日")]),
+  block("has_prior_limit_up", "近期曾涨停", [
+    intParam("window", "回看交易日"),
+    intParam("exclude_offset", "排除前几日"),
+  ]),
+];
+
+it("copies every verified builtin-one rule, including the prior close operand", async () => {
+  respond({
+    editor: { ...editor, copy_sources: [{ ...copySource, rule_calls: builtinOneRules }] },
+  });
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: { ...catalog, blocks: builtinOneCatalog },
+        serving,
+      }),
+    ),
+  );
+  const commands: Schemas["SavePoolCommand"][] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Schemas["SavePoolCommand"];
+      commands.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 N 形态一池条件" }));
+  await user.click(screen.getByRole("button", { name: "复制为自建池" }));
+  const dialog = screen.getByRole("dialog", { name: "复制为自建池" });
+  expect(within(dialog).getByRole("combobox", { name: "右侧" })).toHaveValue("CLOSE[1]");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent(
+    "前一交易日收盘价",
+  );
+  await user.click(within(dialog).getByRole("button", { name: "保存并加入画布" }));
+  expect(commands[0]?.rule_calls).toEqual(builtinOneRules);
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("edits existing numeric moving-average and RSI periods without changing their types", async () => {
+  const original = editor.pools[0];
+  if (!original) throw new Error("missing custom pool");
+  respond({
+    editor: {
+      ...editor,
+      pools: [
+        {
+          ...original,
+          rule_calls: [
+            { name: "above_ma", args: { period: 20, offset: 0 } },
+            { name: "rsi_oversold", args: { period: 14, threshold: 30, offset: 0 } },
+          ],
+        },
+      ],
+    },
+  });
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          ...catalog,
+          blocks: [
+            block("above_ma", "收盘价高于均线", [
+              parameter("period", "指标周期", "choice", [
+                option("5", "5 日均线"),
+                option("20", "20 日均线"),
+              ]),
+              intParam("offset", "相对日期"),
+            ]),
+            block("rsi_oversold", "RSI 超卖", [
+              parameter("period", "指标周期", "choice", [
+                option("6", "6 日 RSI"),
+                option("14", "14 日 RSI"),
+              ]),
+              numberParam("threshold", "RSI 门槛"),
+              intParam("offset", "相对日期"),
+            ]),
+          ],
+        },
+        serving,
+      }),
+    ),
+  );
+  const commands: Schemas["SavePoolCommand"][] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Schemas["SavePoolCommand"];
+      commands.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  expect(
+    within(dialog)
+      .getAllByRole("combobox", { name: "指标周期" })
+      .map((item) => (item as HTMLSelectElement).value),
+  ).toEqual(["20", "14"]);
+  const firstPeriod = within(dialog).getAllByRole("combobox", { name: "指标周期" })[0];
+  if (!firstPeriod) throw new Error("missing period control");
+  await user.selectOptions(firstPeriod, "5");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  expect(commands[0]?.rule_calls).toEqual([
+    { name: "above_ma", args: { period: 5, offset: 0 } },
+    { name: "rsi_oversold", args: { period: 14, threshold: 30, offset: 0 } },
+  ]);
+});
+
 it("copies verified builtin rules as a new custom pool without guessing its delay", async () => {
   respond({ editor: { ...editor, copy_sources: [copySource] } });
   const commands: Array<Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"]> = [];
@@ -420,4 +610,260 @@ it("blocks editing when the editor's Serving generation differs", async () => {
   renderApp("/pools");
   expect(await screen.findByRole("button", { name: "添加条件节点" })).toBeDisabled();
   expect(screen.getByText("池子数据正在更新")).toBeInTheDocument();
+});
+
+it("shows an attachment resume action after reload and keeps its original request", async () => {
+  respond();
+  const attach = {
+    kind: "add_pool_to_canvas" as const,
+    command_id: "attach-original",
+    requested_at: "2026-09-27T07:00:00.000Z",
+    canvas_name: "观察画布",
+    pool_name: "user/放量确认",
+    expected_pool_version: NEXT_VERSION,
+  };
+  window.sessionStorage.setItem(
+    POOL_EDITOR_JOURNAL_KEY,
+    JSON.stringify({
+      schema: 1,
+      save: {
+        kind: "save_user_pool_v2",
+        command_id: "save-original",
+        requested_at: "2026-09-27T07:00:00.000Z",
+        base_name: "放量确认",
+        display_name: "放量确认",
+        description: "",
+        depends_on: "n-shape-pool1",
+        delay_days: 1,
+        rule_calls: [{ name: "not_st", args: {} }],
+        include_columns: [],
+        expected_version: null,
+      },
+      canvasName: "观察画布",
+      saveVersion: NEXT_VERSION,
+      saveStatus: "succeeded",
+      attach,
+      attachStatus: "ambiguous",
+    }),
+  );
+  const seen: unknown[] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = await request.json();
+      seen.push(body);
+      return HttpResponse.json({
+        command_id: attach.command_id,
+        status: seen.length === 1 ? "unknown" : "succeeded",
+        message: "待确认",
+        pool_version: NEXT_VERSION,
+        canvas_name: "观察画布",
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  const first = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "继续核对画布" }));
+  await waitFor(() => expect(seen).toEqual([attach]));
+  first.unmount();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "继续核对画布" }));
+  await waitFor(() => expect(seen).toEqual([attach, attach]));
+  expect(await screen.findByText("已加入当前画布")).toBeInTheDocument();
+});
+
+it("retains a draft through a data-generation change and requires a fresh preview", async () => {
+  respond();
+  const user = userEvent.setup();
+  const { queryClient } = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "添加条件节点" }));
+  const dialog = screen.getByRole("dialog", { name: "添加条件节点" });
+  await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "待保留草稿");
+  await user.selectOptions(
+    within(dialog).getByRole("combobox", { name: "条件目录" }),
+    "volume_ratio_gte",
+  );
+  await user.click(within(dialog).getByRole("button", { name: "添加条件" }));
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent("待保留草稿");
+  const nextGeneration = "f".repeat(64);
+  server.use(
+    http.get("*/api/v1/meta", () =>
+      HttpResponse.json(metaEnvelope({ generationId: nextGeneration })),
+    ),
+  );
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["meta"] });
+  });
+  await waitFor(() =>
+    expect(document.querySelector(".gen-tag")).toHaveAttribute(
+      "data-generation",
+      nextGeneration.slice(0, 12),
+    ),
+  );
+  expect(screen.getByRole("dialog", { name: "添加条件节点" })).toBeInTheDocument();
+  expect(within(dialog).getByRole("textbox", { name: "池子名称" })).toHaveValue("待保留草稿");
+  expect(within(dialog).getByRole("button", { name: "保存并加入画布" })).toBeDisabled();
+  server.use(
+    http.get("*/api/v1/pools", () =>
+      HttpResponse.json({
+        data: published,
+        serving: { ...serving, generation_id: nextGeneration },
+      }),
+    ),
+    http.get("*/api/v1/pools/editor", () =>
+      HttpResponse.json({ data: editor, serving: { ...serving, generation_id: nextGeneration } }),
+    ),
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({ data: catalog, serving: { ...serving, generation_id: nextGeneration } }),
+    ),
+  );
+  await act(async () => {
+    await queryClient.invalidateQueries();
+  });
+  await waitFor(() =>
+    expect(within(dialog).getByRole("button", { name: "预览变更" })).toBeEnabled(),
+  );
+  expect(within(dialog).getByRole("textbox", { name: "池子名称" })).toHaveValue("待保留草稿");
+  expect(within(dialog).getByRole("button", { name: "保存并加入画布" })).toBeDisabled();
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("button", { name: "保存并加入画布" })).toBeEnabled();
+});
+
+it("recovers a conflicted attachment only with a newer verified pool version", async () => {
+  let currentVersion = VERSION;
+  respond();
+  server.use(
+    http.get("*/api/v1/pools/editor", () =>
+      HttpResponse.json({
+        data: {
+          ...editor,
+          pools: editor.pools.map((pool) => ({ ...pool, version: currentVersion })),
+        },
+        serving,
+      }),
+    ),
+  );
+  window.sessionStorage.setItem(
+    POOL_EDITOR_JOURNAL_KEY,
+    JSON.stringify({
+      schema: 1,
+      save: {
+        kind: "save_user_pool_v2",
+        command_id: "save-old",
+        requested_at: "2026-09-27T07:00:00Z",
+        base_name: "自建观察",
+        display_name: "自建观察",
+        description: "",
+        depends_on: "n-shape-pool1",
+        delay_days: 1,
+        rule_calls: [{ name: "not_st", args: {} }],
+        include_columns: [],
+        expected_version: null,
+      },
+      canvasName: "观察画布",
+      saveVersion: VERSION,
+      saveStatus: "succeeded",
+      attach: {
+        kind: "add_pool_to_canvas",
+        command_id: "attach-old",
+        requested_at: "2026-09-27T07:00:01Z",
+        canvas_name: "观察画布",
+        pool_name: "user/自建观察",
+        expected_pool_version: VERSION,
+      },
+      attachStatus: "failed",
+      attachConflict: true,
+    }),
+  );
+  const seen: Schemas["AttachPoolCommand"][] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Schemas["AttachPoolCommand"];
+      seen.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "已加入",
+        pool_version: body.expected_pool_version,
+        canvas_name: body.canvas_name,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  const { queryClient } = renderApp("/pools");
+  const retry = await screen.findByRole("button", { name: "按最新规则加入画布" });
+  expect(retry).toBeDisabled();
+  currentVersion = NEXT_VERSION;
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["pools", "editor"] });
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "按最新规则加入画布" })).toBeEnabled(),
+  );
+  await user.click(screen.getByRole("button", { name: "按最新规则加入画布" }));
+  expect(seen).toHaveLength(1);
+  expect(seen[0]?.expected_pool_version).toBe(NEXT_VERSION);
+  expect(seen[0]?.command_id).not.toBe("attach-old");
+  expect(await screen.findByText("已加入当前画布")).toBeInTheDocument();
+});
+
+it("keeps a failed edit draft and rebases only after the user checks a newer version", async () => {
+  let currentVersion = VERSION;
+  respond();
+  server.use(
+    http.get("*/api/v1/pools/editor", () =>
+      HttpResponse.json({
+        data: {
+          ...editor,
+          pools: editor.pools.map((pool) => ({ ...pool, version: currentVersion })),
+        },
+        serving,
+      }),
+    ),
+  );
+  const commands: Schemas["SavePoolCommand"][] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Schemas["SavePoolCommand"];
+      commands.push(body);
+      return commands.length === 1
+        ? HttpResponse.json({ detail: "规则已更新" }, { status: 409 })
+        : HttpResponse.json({
+            command_id: body.command_id,
+            status: "succeeded",
+            message: "已保存",
+            pool_version: "d".repeat(64),
+          });
+    }),
+  );
+  const user = userEvent.setup();
+  const { queryClient } = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.clear(within(dialog).getByRole("spinbutton", { name: "放量倍数" }));
+  await user.type(within(dialog).getByRole("spinbutton", { name: "放量倍数" }), "4");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeEnabled();
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  expect(commands).toHaveLength(1);
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(4);
+  expect(
+    JSON.parse(window.sessionStorage.getItem(POOL_EDITOR_JOURNAL_KEY) ?? "{}").saveStatus,
+  ).toBe("failed");
+  expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeDisabled();
+  currentVersion = NEXT_VERSION;
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["pools", "editor"] });
+  });
+  const rebase = await within(dialog).findByRole("button", { name: "按最新版本继续" });
+  await waitFor(() => expect(rebase).toBeEnabled());
+  await user.click(rebase);
+  expect(within(dialog).queryByRole("button", { name: "按最新版本继续" })).not.toBeInTheDocument();
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(4);
+  expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeDisabled();
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeEnabled();
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  expect(commands[1]?.expected_version).toBe(NEXT_VERSION);
 });

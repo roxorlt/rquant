@@ -15,12 +15,15 @@ export interface EditorJournal {
   canvasName: string | null;
   saveVersion: string | null;
   saveStatus: CommandStatus;
+  saveConflict?: boolean;
   attach: AttachCommand | null;
   attachStatus: AttachStatus;
+  attachConflict?: boolean;
 }
 
 export interface EditorSessionSnapshot {
   journal: EditorJournal | null;
+  deferred: EditorJournal[];
   busy: boolean;
   storageAvailable: boolean;
   message: string | null;
@@ -28,6 +31,7 @@ export interface EditorSessionSnapshot {
 }
 
 export const POOL_EDITOR_JOURNAL_KEY = "rquant.pool-editor-command.v1";
+export const POOL_EDITOR_DEFERRED_KEY = "rquant.pool-editor-deferred.v1";
 const VERSION = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9._-]{1,128}$/;
 const SAVE_STATUSES = new Set<CommandStatus>([
@@ -60,7 +64,9 @@ function isJournal(value: unknown): value is EditorJournal {
     (value.saveVersion !== null &&
       (typeof value.saveVersion !== "string" || !VERSION.test(value.saveVersion))) ||
     !SAVE_STATUSES.has(value.saveStatus as CommandStatus) ||
-    !ATTACH_STATUSES.has(value.attachStatus as AttachStatus)
+    (value.saveConflict !== undefined && typeof value.saveConflict !== "boolean") ||
+    !ATTACH_STATUSES.has(value.attachStatus as AttachStatus) ||
+    (value.attachConflict !== undefined && typeof value.attachConflict !== "boolean")
   )
     return false;
   if (value.attach === null) return value.attachStatus === "idle";
@@ -73,7 +79,8 @@ function isJournal(value: unknown): value is EditorJournal {
     typeof attach.requested_at === "string" &&
     attach.canvas_name === value.canvasName &&
     attach.pool_name === `user/${save.base_name}` &&
-    attach.expected_pool_version === value.saveVersion &&
+    typeof attach.expected_pool_version === "string" &&
+    VERSION.test(attach.expected_pool_version) &&
     value.saveStatus === "succeeded"
   );
 }
@@ -90,6 +97,7 @@ export class PoolEditorSession {
     private readonly now: () => string,
   ) {
     let journal: EditorJournal | null = null;
+    let deferred: EditorJournal[] = [];
     let storageAvailable = true;
     let message: string | null = null;
     try {
@@ -99,11 +107,18 @@ export class PoolEditorSession {
         if (isJournal(parsed)) journal = parsed;
         else throw new Error("invalid journal");
       }
+      const archived = storage.getItem(POOL_EDITOR_DEFERRED_KEY);
+      if (archived !== null) {
+        const parsed: unknown = JSON.parse(archived);
+        if (!Array.isArray(parsed) || parsed.length > 20 || !parsed.every(isJournal))
+          throw new Error("invalid deferred requests");
+        deferred = parsed.filter((item) => item.attach?.command_id !== journal?.attach?.command_id);
+      }
     } catch {
       storageAvailable = false;
       message = "浏览器存储不可用，上次请求无法核对。";
     }
-    this.current = { journal, busy: false, storageAvailable, message, revision: 0 };
+    this.current = { journal, deferred, busy: false, storageAvailable, message, revision: 0 };
   }
 
   snapshot = (): EditorSessionSnapshot => this.current;
@@ -136,6 +151,21 @@ export class PoolEditorSession {
     }
   }
 
+  private persistDeferred(deferred: EditorJournal[]): boolean {
+    if (!this.current.storageAvailable) return false;
+    try {
+      const serialized = JSON.stringify(deferred);
+      this.storage.setItem(POOL_EDITOR_DEFERRED_KEY, serialized);
+      if (this.storage.getItem(POOL_EDITOR_DEFERRED_KEY) !== serialized)
+        throw new Error("not saved");
+      this.emit({ deferred, message: null });
+      return true;
+    } catch {
+      this.emit({ storageAvailable: false, message: "浏览器存储不可用，无法安全核对。" });
+      return false;
+    }
+  }
+
   private attachBody(save: SaveCommand, canvasName: string, version: string): AttachCommand {
     return {
       kind: "add_pool_to_canvas",
@@ -149,6 +179,16 @@ export class PoolEditorSession {
 
   async startSave(input: SaveInput, canvasName: string | null): Promise<void> {
     if (!this.current.storageAvailable || this.current.busy) return;
+    if (
+      this.current.deferred.some(
+        (item) =>
+          item.save.base_name === input.base_name &&
+          ["pending", "processing", "ambiguous", "unknown"].includes(item.attachStatus),
+      )
+    ) {
+      this.emit({ message: "这只池子的画布请求待确认，请先继续核对。" });
+      return;
+    }
     const previous = this.current.journal;
     if (previous && !["failed", "succeeded"].includes(previous.saveStatus)) {
       this.emit({ message: "请先确认上一次保存请求。" });
@@ -174,6 +214,7 @@ export class PoolEditorSession {
         canvasName,
         saveVersion: null,
         saveStatus: "pending",
+        saveConflict: false,
         attach: null,
         attachStatus: "idle",
       };
@@ -183,7 +224,7 @@ export class PoolEditorSession {
     }
   }
 
-  async retryAttachment(): Promise<void> {
+  async retryAttachment(verifiedVersion?: string): Promise<void> {
     const journal = this.current.journal;
     if (
       this.current.busy ||
@@ -194,12 +235,118 @@ export class PoolEditorSession {
       journal.attachStatus !== "failed"
     )
       return;
+    const version = verifiedVersion ?? journal.saveVersion;
+    if (
+      !VERSION.test(version) ||
+      (journal.attachConflict && version === journal.attach?.expected_pool_version)
+    ) {
+      this.emit({ message: "请先核对已发布的新规则版本，或结束本次挂接。" });
+      return;
+    }
     try {
-      const attach = this.attachBody(journal.save, journal.canvasName, journal.saveVersion);
-      if (this.persist({ ...journal, attach, attachStatus: "pending" })) await this.advance();
+      const attach = this.attachBody(journal.save, journal.canvasName, version);
+      if (this.persist({ ...journal, attach, attachStatus: "pending", attachConflict: false }))
+        await this.advance();
     } catch {
       this.emit({ message: "暂时无法生成画布请求，请重试。" });
     }
+  }
+
+  discardFailedAttachment(): void {
+    const journal = this.current.journal;
+    if (
+      !journal ||
+      this.current.busy ||
+      journal.saveStatus !== "succeeded" ||
+      journal.attachStatus !== "failed"
+    )
+      return;
+    this.persist({
+      ...journal,
+      canvasName: null,
+      attach: null,
+      attachStatus: "idle",
+      attachConflict: false,
+    });
+  }
+
+  deferAttachment(): void {
+    const journal = this.current.journal;
+    if (
+      !journal ||
+      this.current.busy ||
+      !this.current.storageAvailable ||
+      journal.saveStatus !== "succeeded" ||
+      !["ambiguous", "unknown"].includes(journal.attachStatus) ||
+      !journal.attach ||
+      this.current.deferred.length >= 20
+    )
+      return;
+    if (!this.persistDeferred([...this.current.deferred, journal])) return;
+    try {
+      this.storage.removeItem(POOL_EDITOR_JOURNAL_KEY);
+      this.emit({ journal: null, message: "画布请求已留待核对，可继续编辑其他池子。" });
+    } catch {
+      this.emit({ storageAvailable: false, message: "浏览器存储不可用，无法安全暂存请求。" });
+    }
+  }
+
+  async advanceDeferred(commandId: string): Promise<void> {
+    const journal = this.current.deferred.find((item) => item.attach?.command_id === commandId);
+    const body = journal?.attach;
+    if (
+      !journal ||
+      !body ||
+      this.current.busy ||
+      !this.current.storageAvailable ||
+      !["pending", "processing", "ambiguous", "unknown"].includes(journal.attachStatus)
+    )
+      return;
+    this.emit({ busy: true });
+    try {
+      const receipt = await this.post(body);
+      if (receipt.command_id !== body.command_id) throw new Error("receipt identity mismatch");
+      if (
+        receipt.status === "succeeded" &&
+        (receipt.pool_version !== body.expected_pool_version ||
+          receipt.canvas_name !== body.canvas_name)
+      )
+        throw new Error("attachment identity mismatch");
+      this.persistDeferred(
+        this.current.deferred.map((item) =>
+          item.attach?.command_id === commandId ? { ...item, attachStatus: receipt.status } : item,
+        ),
+      );
+      if (["failed", "ambiguous"].includes(receipt.status)) this.emit({ message: receipt.message });
+    } catch (error) {
+      const invalid = error instanceof ApiError && (error.status === 409 || error.status === 422);
+      this.persistDeferred(
+        this.current.deferred.map((item) =>
+          item.attach?.command_id === commandId
+            ? {
+                ...item,
+                attachStatus: invalid ? "failed" : "unknown",
+                attachConflict: error instanceof ApiError && error.status === 409,
+              }
+            : item,
+        ),
+      );
+      this.emit({
+        message:
+          invalid && error instanceof ApiError ? error.message : "状态待确认，请用原请求继续核对。",
+      });
+    } finally {
+      this.emit({ busy: false });
+    }
+  }
+
+  dismissDeferred(commandId: string): void {
+    if (this.current.busy) return;
+    const journal = this.current.deferred.find((item) => item.attach?.command_id === commandId);
+    if (journal?.attachStatus !== "failed" && journal?.attachStatus !== "succeeded") return;
+    this.persistDeferred(
+      this.current.deferred.filter((item) => item.attach?.command_id !== commandId),
+    );
   }
 
   async advance(): Promise<void> {
@@ -237,7 +384,7 @@ export class PoolEditorSession {
           ) {
             throw new Error("attachment identity mismatch");
           }
-          this.persist({ ...journal, attachStatus: "succeeded" });
+          this.persist({ ...journal, attachStatus: "succeeded", attachConflict: false });
         }
       } else if (savePhase) {
         this.persist({ ...journal, saveStatus: receipt.status });
@@ -246,7 +393,7 @@ export class PoolEditorSession {
             receipt.status === "failed" || receipt.status === "ambiguous" ? receipt.message : null,
         });
       } else {
-        this.persist({ ...journal, attachStatus: receipt.status });
+        this.persist({ ...journal, attachStatus: receipt.status, attachConflict: false });
         this.emit({
           message:
             receipt.status === "failed" || receipt.status === "ambiguous" ? receipt.message : null,
@@ -255,8 +402,16 @@ export class PoolEditorSession {
     } catch (error) {
       const invalid = error instanceof ApiError && (error.status === 409 || error.status === 422);
       const next = savePhase
-        ? { ...journal, saveStatus: invalid ? ("failed" as const) : ("unknown" as const) }
-        : { ...journal, attachStatus: invalid ? ("failed" as const) : ("unknown" as const) };
+        ? {
+            ...journal,
+            saveStatus: invalid ? ("failed" as const) : ("unknown" as const),
+            saveConflict: error instanceof ApiError && error.status === 409,
+          }
+        : {
+            ...journal,
+            attachStatus: invalid ? ("failed" as const) : ("unknown" as const),
+            attachConflict: error instanceof ApiError && error.status === 409,
+          };
       this.persist(next);
       this.emit({
         message:

@@ -1,4 +1,4 @@
-import type { ScreenParameter } from "@/api/screen";
+import type { ScreenOption, ScreenParameter } from "@/api/screen";
 import { Tip } from "./Tip";
 
 export type ParameterValue = string | number | string[] | null;
@@ -6,13 +6,17 @@ export type ParameterValue = string | number | string[] | null;
 export function ParamControl({
   parameter,
   value,
+  extraOption,
   onChange,
 }: {
   parameter: ScreenParameter;
   value: ParameterValue;
+  extraOption?: ScreenOption | null;
   onChange: (value: ParameterValue) => void;
 }) {
-  const options = parameter.options ?? [];
+  const options = extraOption
+    ? [...(parameter.options ?? []), extraOption]
+    : (parameter.options ?? []);
   const label = (
     <span className="lbl">
       {parameter.label}

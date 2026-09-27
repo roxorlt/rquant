@@ -27,10 +27,14 @@ export function publicationStage(
     return accepted;
 
   const key = `user/${journal.save.base_name}`;
+  const targetVersion =
+    journal.attachStatus === "succeeded"
+      ? (journal.attach?.expected_pool_version ?? journal.saveVersion)
+      : journal.saveVersion;
   const publishedEditorPool = editor.pools.find((pool) => pool.key === key);
   const publishedPool = pools.pools.find((pool) => pool.key === key);
   if (
-    publishedEditorPool?.version !== journal.saveVersion ||
+    publishedEditorPool?.version !== targetVersion ||
     publishedPool?.definition?.state !== "available"
   )
     return accepted;
