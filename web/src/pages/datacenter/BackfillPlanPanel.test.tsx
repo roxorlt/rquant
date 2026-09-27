@@ -1,11 +1,13 @@
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { vi } from "vitest";
 import type { Schemas } from "@/api/client";
+import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
-import { server } from "@/test/server";
+import { metaHandler, server } from "@/test/server";
+import { BACKFILL_PLAN_JOURNAL_KEY } from "./backfillPlanCommandSession";
 
 vi.mock("@/charts/EChart", () => ({
   EChart: ({ label }: { label: string }) => <div role="img" aria-label={label} />,
@@ -19,6 +21,7 @@ type PlanDetailData = Schemas["BackfillPlanDetailData"];
 const firstHash = "a".repeat(64);
 const secondHash = "b".repeat(64);
 const olderHash = "c".repeat(64);
+const queuedTask = "e".repeat(32);
 const serving = {
   generation_id: "generation-a",
   built_at: "2026-09-27T06:00:00Z",
@@ -171,6 +174,15 @@ async function openPlans() {
 }
 
 describe("数据中心回补计划", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    server.use(
+      http.get("*/api/v1/data/catalog", () =>
+        HttpResponse.json({ data: { version: 1, datasets: [] }, serving }),
+      ),
+    );
+  });
+
   it("pages within one data generation and shows every missing day without an execution affordance", async () => {
     const requests = planHandlers();
     const user = await openPlans();
@@ -183,10 +195,11 @@ describe("数据中心回补计划", () => {
     expect(main?.textContent).not.toContain("逻辑操作");
     expect(main?.textContent).not.toContain("非实际调用记录");
     expect(within(main as HTMLElement).getByText("配额待确认")).toBeInTheDocument();
-    expect(within(main as HTMLElement).getByText("暂无进度信息")).toBeInTheDocument();
+    expect(within(main as HTMLElement).getByText("任务进度暂不可用")).toBeInTheDocument();
     expect(within(main as HTMLElement).queryByText("未运行")).not.toBeInTheDocument();
+    expect(within(main as HTMLElement).getByRole("button", { name: "生成回补计划" })).toBeEnabled();
     expect(
-      within(main as HTMLElement).queryByRole("button", { name: /生成|执行/ }),
+      within(main as HTMLElement).queryByRole("button", { name: "执行回补" }),
     ).not.toBeInTheDocument();
     expect(main?.textContent).not.toContain(firstHash);
     expect(main?.textContent).not.toContain("replica-private-label");
@@ -275,5 +288,309 @@ describe("数据中心回补计划", () => {
     );
     await user.click(screen.getByRole("button", { name: "刷新计划" }));
     expect(await screen.findByText("暂时读不到回补计划")).toBeInTheDocument();
+  });
+
+  it("queues a read-only request, keeps lagging progress honest, then reads the published result", async () => {
+    let progress: Schemas["BackfillPlanProgress"] = {
+      availability: "empty",
+      event_history: "available",
+      message: "还没有任务",
+      logs: [],
+    };
+    let published = false;
+    let sent: Schemas["BackfillPlanCommandRequest"] | null = null;
+    server.use(
+      http.get("*/api/v1/data/backfill-plans", () =>
+        HttpResponse.json({
+          data: {
+            source_state: published ? "ready" : "empty",
+            total: published ? 1 : 0,
+            page_size: 20,
+            items: published ? [item(firstHash, 0)] : [],
+            next_cursor: null,
+            progress,
+          } satisfies PlanList,
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/data/backfill-plans/:hash", () =>
+        HttpResponse.json({
+          data: {
+            source_state: "ready",
+            plan: detail(firstHash, 0),
+            progress,
+          } satisfies PlanDetailData,
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/data/backfill-plans/commands", async ({ request }) => {
+        sent = (await request.json()) as Schemas["BackfillPlanCommandRequest"];
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        expect(
+          JSON.parse(window.sessionStorage.getItem(BACKFILL_PLAN_JOURNAL_KEY) ?? "{}").body,
+        ).toEqual(sent);
+        return HttpResponse.json({
+          command_id: sent.command_id,
+          status: "queued",
+          task_id: queuedTask,
+          message: "已排队",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/datacenter");
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成回补计划" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "生成回补计划" }));
+    expect(await screen.findByText("还没有回补计划")).toBeInTheDocument();
+    expect(screen.getByText("还没有生成任务")).toBeInTheDocument();
+    const form = screen.getByRole("region", { name: "生成回补计划" });
+    expect(within(form).getByLabelText("开始日期")).toHaveValue("2024-09-01");
+    expect(within(form).getByLabelText("结束日期")).toHaveValue("2025-04-30");
+    await user.click(within(form).getByRole("button", { name: "核对并生成" }));
+    const dialog = screen.getByRole("dialog", { name: "生成回补计划" });
+    expect(dialog).toHaveTextContent("只读核对");
+    expect(dialog).toHaveTextContent("耗时");
+    await user.click(within(dialog).getByRole("button", { name: "确认排队" }));
+    await waitFor(() => expect(sent).not.toBeNull());
+    expect(await screen.findByText("本次请求已排队，等待生成")).toBeInTheDocument();
+    expect(screen.queryByText("计划已生成")).not.toBeInTheDocument();
+    expect(findJargon(document.querySelector("main")?.textContent ?? "")).toEqual([]);
+
+    progress = {
+      availability: "ready",
+      event_history: "available",
+      task_id: queuedTask,
+      status: "succeeded",
+      created_at: "2026-09-27T07:00:00Z",
+      updated_at: "2026-09-27T07:01:00Z",
+      plan_hash: firstHash,
+      message: "计划已生成",
+      logs: [
+        {
+          event_id: 1,
+          event_type: "succeeded",
+          attempts: 1,
+          occurred_at: "2026-09-27T07:01:00Z",
+          message: "svc-secret",
+        },
+      ],
+    };
+    published = true;
+    await queryClient.invalidateQueries({ queryKey: ["data", "backfill-plans"] });
+    expect(await screen.findByText("2024-09-02")).toBeInTheDocument();
+    expect(screen.getByText("计划已生成")).toBeInTheDocument();
+    expect(document.querySelector("main")?.textContent).not.toContain("svc-secret");
+  });
+
+  it("keeps a recovered uncertain request and latest unrelated task separate", async () => {
+    const saved: Schemas["BackfillPlanCommandRequest"] = {
+      command_id: "web-recover",
+      requested_at: "2026-09-27T07:00:00.000Z",
+      audit_start: "2024-09-01",
+      completed_through: "2025-04-30",
+    };
+    window.sessionStorage.setItem(
+      BACKFILL_PLAN_JOURNAL_KEY,
+      JSON.stringify({ schema: 1, body: saved, status: "unknown", taskId: null }),
+    );
+    planHandlers();
+    server.use(
+      http.get("*/api/v1/data/backfill-plans", () =>
+        HttpResponse.json({
+          data: {
+            source_state: "empty",
+            total: 0,
+            page_size: 20,
+            items: [],
+            next_cursor: null,
+            progress: {
+              availability: "ready",
+              event_history: "available",
+              task_id: "f".repeat(32),
+              status: "running",
+              message: "正在生成",
+              logs: [
+                {
+                  event_id: 2,
+                  event_type: "started",
+                  attempts: 1,
+                  occurred_at: "2026-09-27T07:00:00Z",
+                  message: "svc-secret",
+                },
+              ],
+            },
+          } satisfies PlanList,
+          serving,
+        }),
+      ),
+    );
+    let retried: Schemas["BackfillPlanCommandRequest"] | null = null;
+    server.use(
+      http.post("*/api/v1/data/backfill-plans/commands", async ({ request }) => {
+        retried = (await request.json()) as Schemas["BackfillPlanCommandRequest"];
+        return HttpResponse.json({
+          command_id: saved.command_id,
+          status: "queued",
+          task_id: queuedTask,
+          message: "已排队",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/datacenter");
+    expect(await screen.findByText("本次提交状态待确认")).toBeInTheDocument();
+    expect(await screen.findByText("最新任务正在生成")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "继续核对" }));
+    await waitFor(() => expect(retried).toEqual(saved));
+    expect(await screen.findByText("本次请求已排队，等待生成")).toBeInTheDocument();
+    expect(screen.getByText("最新任务正在生成")).toBeInTheDocument();
+    expect(findJargon(document.querySelector("main")?.textContent ?? "")).toEqual([]);
+  });
+
+  it("disables submission before login and rejects invalid dates before confirmation", async () => {
+    planHandlers();
+    server.use(metaHandler(metaEnvelope({ viewer: null })));
+    const user = userEvent.setup();
+    const first = renderApp("/datacenter");
+    const disabled = await screen.findByRole("button", { name: "生成回补计划" });
+    await waitFor(() =>
+      expect(disabled).toHaveAttribute("aria-description", "请先登录，才能生成回补计划。"),
+    );
+    expect(disabled).toBeDisabled();
+    first.unmount();
+
+    server.use(metaHandler());
+    renderApp("/datacenter");
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成回补计划" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "生成回补计划" }));
+    const form = screen.getByRole("region", { name: "生成回补计划" });
+    fireEvent.change(within(form).getByLabelText("开始日期"), { target: { value: "2010-01-01" } });
+    expect(within(form).getByText("一次最多核对 3660 天。")).toBeInTheDocument();
+    expect(within(form).getByRole("button", { name: "核对并生成" })).toBeDisabled();
+    fireEvent.change(within(form).getByLabelText("开始日期"), { target: { value: "2024-09-01" } });
+    fireEvent.change(within(form).getByLabelText("结束日期"), { target: { value: "2026-09-28" } });
+    expect(within(form).getByText("结束日期须在收盘之后。")).toBeInTheDocument();
+  });
+
+  it("keeps an uncertain HTTP result on the original request until the operator retries", async () => {
+    planHandlers();
+    const sent: Schemas["BackfillPlanCommandRequest"][] = [];
+    server.use(
+      http.post("*/api/v1/data/backfill-plans/commands", async ({ request }) => {
+        const body = (await request.json()) as Schemas["BackfillPlanCommandRequest"];
+        sent.push(body);
+        return sent.length === 1
+          ? HttpResponse.json({ detail: "状态待确认" }, { status: 503 })
+          : HttpResponse.json({
+              command_id: body.command_id,
+              status: "queued",
+              task_id: queuedTask,
+              message: "已排队",
+            });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/datacenter");
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成回补计划" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "生成回补计划" }));
+    await user.click(
+      within(screen.getByRole("region", { name: "生成回补计划" })).getByRole("button", {
+        name: "核对并生成",
+      }),
+    );
+    await user.click(
+      within(screen.getByRole("dialog", { name: "生成回补计划" })).getByRole("button", {
+        name: "确认排队",
+      }),
+    );
+    expect(await screen.findByText("本次提交状态待确认")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "生成回补计划" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "继续核对" }));
+    await waitFor(() => expect(sent).toHaveLength(2));
+    expect(sent[1]).toEqual(sent[0]);
+    expect(screen.getByText("本次请求已排队，等待生成")).toBeInTheDocument();
+  });
+
+  it("shows a definitive submission failure without claiming a queued task", async () => {
+    planHandlers();
+    server.use(
+      http.post("*/api/v1/data/backfill-plans/commands", async ({ request }) => {
+        const body = (await request.json()) as Schemas["BackfillPlanCommandRequest"];
+        return HttpResponse.json({
+          command_id: body.command_id,
+          status: "failed",
+          message: "未通过检查",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/datacenter");
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成回补计划" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "生成回补计划" }));
+    await user.click(
+      within(screen.getByRole("region", { name: "生成回补计划" })).getByRole("button", {
+        name: "核对并生成",
+      }),
+    );
+    await user.click(
+      within(screen.getByRole("dialog", { name: "生成回补计划" })).getByRole("button", {
+        name: "确认排队",
+      }),
+    );
+    expect(await screen.findByText("本次请求未通过，请调整后重试")).toBeInTheDocument();
+    expect(screen.queryByText("本次请求已排队，等待生成")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "生成回补计划" })).toBeEnabled());
+  });
+
+  it("blocks new submission when a saved request cannot be safely read", async () => {
+    window.sessionStorage.setItem(BACKFILL_PLAN_JOURNAL_KEY, "{corrupted");
+    planHandlers();
+    const user = userEvent.setup();
+    renderApp("/datacenter");
+    const button = await screen.findByRole("button", { name: "生成回补计划" });
+    await waitFor(() =>
+      expect(button).toHaveAttribute("aria-description", "浏览器存储不可用，无法安全提交。"),
+    );
+    expect(button).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: /^回补计划$/ }));
+    expect(await screen.findByText("浏览器存储不可用，上次请求无法核对。")).toBeInTheDocument();
+  });
+
+  it("shows a failed task and at most 20 safe recent events, without raw server messages", async () => {
+    const progress: Schemas["BackfillPlanProgress"] = {
+      availability: "ready",
+      event_history: "available",
+      task_id: "f".repeat(32),
+      status: "failed",
+      message: "svc-internal failure",
+      logs: Array.from({ length: 25 }, (_, index) => ({
+        event_id: index + 1,
+        event_type: "failed",
+        attempts: 1,
+        occurred_at: "2026-09-27T07:00:00Z",
+        message: "svc-internal failure",
+      })),
+    };
+    server.use(
+      http.get("*/api/v1/data/backfill-plans", () =>
+        HttpResponse.json({
+          data: {
+            source_state: "empty",
+            total: 0,
+            page_size: 20,
+            items: [],
+            next_cursor: null,
+            progress,
+          } satisfies PlanList,
+          serving,
+        }),
+      ),
+    );
+    await openPlans();
+    const region = await screen.findByRole("region", { name: "任务进度" });
+    expect(within(region).getByText("最新任务生成失败")).toBeInTheDocument();
+    expect(within(region).getAllByRole("listitem")).toHaveLength(20);
+    expect(region.textContent).not.toContain("svc-internal");
+    expect(findJargon(document.querySelector("main")?.textContent ?? "")).toEqual([]);
   });
 });
