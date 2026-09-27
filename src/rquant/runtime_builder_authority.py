@@ -99,6 +99,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
     lab_jobs_path: Path
     research_metadata_path: Path | None = None
     audit_report_path: Path | None = None
+    audit_report_job_state_path: Path | None = None
+    audit_report_job_directory: Path | None = None
     backfill_plan_directory: Path | None = None
     backfill_plan_job_state_path: Path | None = None
     authority_root: Path
@@ -109,6 +111,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
         "lab_jobs_path",
         "research_metadata_path",
         "audit_report_path",
+        "audit_report_job_state_path",
+        "audit_report_job_directory",
         "backfill_plan_directory",
         "backfill_plan_job_state_path",
         "authority_root",
@@ -125,6 +129,12 @@ class LabJobsPublisherSettings(RuntimeContractModel):
     def require_page_reader(self) -> LabJobsPublisherSettings:
         if self.audit_report_path is not None and self.research_metadata_path is None:
             raise ValueError("audit_report_path requires research_metadata_path")
+        if (self.audit_report_job_state_path is None) != (self.audit_report_job_directory is None):
+            raise ValueError("audit report job paths require paired settings")
+        if self.audit_report_job_state_path is not None and self.research_metadata_path is None:
+            raise ValueError("audit report job paths require research_metadata_path")
+        if self.audit_report_job_state_path is not None and self.audit_report_path is not None:
+            raise ValueError("audit report job and explicit report settings are ambiguous")
         if self.backfill_plan_directory is not None and self.research_metadata_path is None:
             raise ValueError("backfill_plan_directory requires research_metadata_path")
         if self.backfill_plan_job_state_path is not None and self.backfill_plan_directory is None:
@@ -345,6 +355,8 @@ def lab_jobs_publisher_builder(
                 page_source = DuckDBLabPageProjectionSource(
                     settings.research_metadata_path,
                     audit_report_path=settings.audit_report_path,
+                    audit_report_job_state_path=settings.audit_report_job_state_path,
+                    audit_report_job_directory=settings.audit_report_job_directory,
                     backfill_plan_directory=settings.backfill_plan_directory,
                     backfill_plan_job_state_path=settings.backfill_plan_job_state_path,
                 )
