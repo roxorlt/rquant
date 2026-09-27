@@ -106,6 +106,45 @@ def test_replaced_snapshot_during_evidence_read_is_rejected(
     assert not directory.exists() or not list(directory.iterdir())
 
 
+def test_rename_and_restore_during_duckdb_open_cannot_splice_other_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import backfill_plan_artifact as artifact
+    from rquant.backfill_plan_artifact import load_daily_bar_backfill_plan
+
+    input_directory = tmp_path / "input"
+    input_directory.mkdir()
+    snapshot = _database(input_directory / "replica.duckdb", START, END, [])
+    replacement = _database(tmp_path / "other.duckdb", START, END, [("600000.SH", START)])
+    expected = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    original_connect = artifact.duckdb.connect
+
+    def swap_around_connect(
+        path: str, *args: object, **kwargs: object
+    ) -> duckdb.DuckDBPyConnection:
+        parked = tmp_path / "parked-input"
+        os.replace(input_directory, parked)
+        input_directory.mkdir()
+        os.replace(replacement, snapshot)
+        try:
+            return original_connect(path, *args, **kwargs)
+        finally:
+            os.replace(snapshot, replacement)
+            input_directory.rmdir()
+            os.replace(parked, input_directory)
+
+    monkeypatch.setattr(artifact.duckdb, "connect", swap_around_connect)
+
+    try:
+        published = _publish(snapshot, tmp_path / "plans", expected_file_sha256=expected)
+    except ValueError:
+        return  # A safe refusal is also acceptable when the directory changes.
+
+    plan = load_daily_bar_backfill_plan(published)
+    assert START in plan.missing_dates
+    assert plan.source.claimed_file_sha256 == expected
+
+
 def test_repeated_content_publish_is_idempotent_and_corrupt_target_refuses_reuse(
     tmp_path: Path,
 ) -> None:
@@ -140,15 +179,43 @@ def test_interrupted_publish_keeps_prior_artifact(
     previous = _publish(snapshot, directory)
     before = previous.read_bytes()
 
-    def fail_link(_source: str, _target: str) -> None:
-        raise OSError("simulated interruption before publication")
+    def fail_link(source: str, target: str, **kwargs: object) -> None:
+        if target.endswith(".json"):
+            raise OSError("simulated interruption before publication")
+        original_link(source, target, **kwargs)
 
+    original_link = artifact.os.link
     monkeypatch.setattr(artifact.os, "link", fail_link)
     with pytest.raises(OSError, match="simulated interruption"):
         _publish(snapshot, directory, evidence_code_revision="revision-2")
 
     assert previous.read_bytes() == before
     assert sorted(item.name for item in directory.iterdir()) == [previous.name]
+
+
+def test_renamed_output_directory_after_link_cannot_report_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import backfill_plan_artifact as artifact
+
+    snapshot = _snapshot(tmp_path)
+    directory = tmp_path / "plans"
+    moved = tmp_path / "moved-plans"
+    original_link = artifact.os.link
+
+    def link_then_move(source: str, target: str, **kwargs: object) -> None:
+        original_link(source, target, **kwargs)
+        if target.endswith(".json"):
+            os.replace(directory, moved)
+            directory.mkdir()
+
+    monkeypatch.setattr(artifact.os, "link", link_then_move)
+
+    with pytest.raises(ValueError, match="directory|changed|identity"):
+        _publish(snapshot, directory)
+
+    assert not list(directory.iterdir())
+    assert len(list(moved.glob("daily-bar-backfill-plan-v1-*.json"))) == 1
 
 
 def test_symlinked_snapshot_is_not_accepted(tmp_path: Path) -> None:
