@@ -74,7 +74,25 @@ def audit_daily_bar_coverage_from_connection(
     audit_start: date,
     completed_through: date,
 ) -> DailyBarCoverageReport:
-    """Measure date presence through a caller-verified completed SSE session.
+    """Summarize the same fixed read-only evidence used by backfill planning."""
+    return audit_daily_bar_coverage(
+        read_daily_bar_coverage_evidence_from_connection(
+            connection,
+            snapshot_id=snapshot_id,
+            audit_start=audit_start,
+            completed_through=completed_through,
+        )
+    )
+
+
+def read_daily_bar_coverage_evidence_from_connection(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    snapshot_id: str,
+    audit_start: date,
+    completed_through: date,
+) -> DailyBarCoverageRequest:
+    """Read bounded daily evidence through a caller-verified completed SSE session.
 
     The caller owns the already fixed replica connection, its generation ID, and
     completion cutoff. This function does not open a database or infer today's date.
@@ -149,7 +167,7 @@ def audit_daily_bar_coverage_from_connection(
             days=tuple(DailyBarCount(day=row[0], row_count=row[1]) for row in count_rows),
         ),
     )
-    return audit_daily_bar_coverage(request)
+    return request
 
 
 def _complete_suspension_snapshot(
