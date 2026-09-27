@@ -31,6 +31,7 @@ from rquant.lab_page_control import build_lab_page_control_writer
 from rquant.page_control import (
     DEFAULT_PAGE_CONTROL_SERVICE_ID,
     AckAlert,
+    BackfillPlanPageControlBackend,
     LabPageControlBackend,
     PageControlConsumer,
     PageControlOutbox,
@@ -126,6 +127,7 @@ def build_page_control_service(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -140,6 +142,7 @@ def build_page_control_service(
         log_dir=log_dir,
         allowed_lab_export_roots=allowed_lab_export_roots,
         lab_backend=lab_backend,
+        backfill_plan_backend=backfill_plan_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -157,6 +160,7 @@ def build_page_control_service_with_dependencies(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -197,6 +201,7 @@ def build_page_control_service_with_dependencies(
                 if lab_backend is not None or not load_default_lab_backend
                 else _build_lab_backend()
             ),
+            backfill_plan_backend=backfill_plan_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,
