@@ -19,7 +19,7 @@ CC 可点击原型是最终页面与交互目标，不是只做相似外观的�
 3. **页面只引用自己的封装**：`@/ui`、`@/table/DataTable`、`@/charts/*`、`@/api/*`、`@/format/*`。页面、外框和报告不直接引用 antd、echarts、
    lightweight-charts、TanStack、React Flow、dagre、openapi-fetch（`biome.json` 的 `noRestrictedImports` 会报错）。
 4. **TypeScript 严格模式**（含 `noUncheckedIndexedAccess`），不写 `any`；依赖在 `pnpm-lock.yaml` 里精确锁定，升级单独开 PR。
-5. **库版本比训练资料新**（React 19.3、React Router 8、Vite 8、antd 6、ECharts 6、lightweight-charts 5、TanStack Table 8.21、Vitest 5）：写代码前先用 context7 查当前文档。
+5. **按锁定版本核对 API**（React 19.3、React Router 8、Vite 8、antd 6、ECharts 6、lightweight-charts 5、TanStack Table 8.21、Vitest 5）：遇到不熟悉的 API，先查本地已安装包的类型和随包文档；需要外部资料且当前任务允许联网时，再查官方文档。工具不可用不阻断实现。
 6. **禁用目录名**：`lib/`、`build/`、`env/`、`var/`、`parts/`、`data/`、`logs/`、`tmp/`、`temp/`、`secrets/`、`downloads/`，以及 `web/dist` 以外任何 `dist/`。
    根 `.gitignore` 会悄悄忽略它们；`pnpm -C web verify:dist` 发现被忽略的文件会失败。数据中心页因此叫 `pages/datacenter/`。
 7. **设计变量只有一份**：`src/styles/tokens.css`（原型 `:root` 变量）；图表（`src/charts/tokens.ts`）和 antd（`src/ui/theme.ts`）运行时读取它。
