@@ -52,6 +52,11 @@ from rquant.data_audit_projection import (
     DataAuditIssueProjectionRow,
     DataAuditStatusProjectionRow,
 )
+from rquant.data_audit_report import MAX_REPORT_BYTES, parse_data_audit_report_bytes
+from rquant.data_audit_report_projection import (
+    REPORT_PROJECTION_TABLES,
+    project_data_audit_report,
+)
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
     NotificationProjectionPublication,
@@ -3097,10 +3102,57 @@ class DuckDBSignalPageProjectionSource:
 class DuckDBLabPageProjectionSource:
     """Project formal research gate metadata from one stable research replica."""
 
-    def __init__(self, database_path: Path, *, control_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        control_root: Path | None = None,
+        audit_report_path: Path | None = None,
+    ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
         self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
+        if audit_report_path is not None and not audit_report_path.is_absolute():
+            raise ValueError("audit report path must be absolute")
+        self.audit_report_path = audit_report_path
+
+    def _report_projections(self, observed: datetime) -> tuple[ServingProjectionPayload, ...]:
+        path = self.audit_report_path
+        if path is None:
+            return ()
+        try:
+            binding = _bind_readonly_directory(path.parent, label="audit report directory")
+        except FileNotFoundError:
+            return ()
+        try:
+            found = _read_bound_optional_file(
+                binding,
+                path.name,
+                max_bytes=MAX_REPORT_BYTES,
+                label="audit report",
+            )
+            if found is None:
+                return ()
+            raw, identity = found
+            report = parse_data_audit_report_bytes(raw, filename=path.name)
+            if (
+                report.source.mode != "production_unverified"
+                or report.source.namespace != "production"
+            ):
+                raise ValueError("synthetic test audit report cannot enter production Serving")
+            report_available = datetime.fromtimestamp(identity.st_mtime, tz=UTC)
+            if report_available > observed:
+                raise ValueError("audit report is not yet available")
+            projections = project_data_audit_report(report, available_at=report_available)
+            binding.verify()
+            named = os.stat(path.name, dir_fd=binding.descriptor, follow_symlinks=False)
+            if _copy_identity(named) != _copy_identity(identity):
+                raise PageProjectionSourceIntegrityError("audit report rotated while read")
+            return projections
+        except (OSError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(f"audit report invalid: {exc}") from exc
+        finally:
+            binding.close()
 
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
@@ -3218,6 +3270,7 @@ class DuckDBLabPageProjectionSource:
             rows=tuple(rows),
             audit_status=audit_status,
             audit_issues=audit_issues,
+            audit_report_projections=self._report_projections(observed),
         )
 
     @staticmethod
@@ -4436,18 +4489,49 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
-        if tuple(item.table_name for item in self.projections) != (
-            "data_audit_issue",
-            "data_audit_status",
-            "research_gate_metadata",
+        names = {item.table_name for item in self.projections}
+        required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
+        if (
+            names not in (required, required | REPORT_PROJECTION_TABLES)
+            or len(names) != len(self.projections)
+            or tuple(item.table_name for item in self.projections) != tuple(sorted(names))
         ):
             raise ValueError("lab page projection snapshot is incomplete")
-        status = self.projections[1].rows
-        issues = self.projections[0].rows
+        projections = {item.table_name: item for item in self.projections}
+        status = projections["data_audit_status"].rows
+        issues = projections["data_audit_issue"].rows
         if len(status) != 1 or len(issues) != status[0]["finding_count"]:
             raise ValueError("lab audit projection row count differs")
         if any(item["audit_run_id"] != status[0]["successful_audit_id"] for item in issues):
             raise ValueError("lab audit projection mixes audit runs")
+        if names >= REPORT_PROJECTION_TABLES:
+            overview = projections["audit_report_overview"].rows
+            if len(overview) != 1:
+                raise ValueError("audit report overview row is missing")
+            summary = overview[0]
+            if (
+                summary["current"] is not False
+                or summary["collection_status"] != "collection_unconfirmed"
+                or summary["collection_completed_through"] is not None
+                or summary["coverage_conclusion"] != "unconfirmed"
+                or summary["source_mode"] != "production_unverified"
+                or summary["source_namespace"] != "production"
+            ):
+                raise ValueError("audit report source and completion remain unconfirmed")
+            report_hash = summary["report_hash"]
+            for name in REPORT_PROJECTION_TABLES - {"audit_report_overview"}:
+                if any(row["report_hash"] != report_hash for row in projections[name].rows):
+                    raise ValueError("audit report projection mixes reports")
+            if (
+                len(projections["audit_report_month"].rows) != summary["monthly_count"]
+                or len(projections["audit_report_rule"].rows) != summary["rule_count"]
+                or len(projections["audit_report_issue"].rows) != summary["indexed_issue_count"]
+                or summary["quality_issue_count"]
+                != summary["indexed_issue_count"] + summary["omitted_issue_count"]
+                or sum(row["issue_count"] for row in projections["audit_report_rule"].rows)
+                != summary["quality_issue_count"]
+            ):
+                raise ValueError("audit report projection row counts disagree")
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("lab page projection snapshot hash mismatch")
@@ -4461,6 +4545,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         rows: tuple[ResearchGateProjectionRow, ...] = (),
         audit_status: DataAuditStatusProjectionRow | None = None,
         audit_issues: tuple[DataAuditIssueProjectionRow, ...] = (),
+        audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         status = audit_status or DataAuditStatusProjectionRow(
@@ -4483,7 +4568,18 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                 rows=tuple(_research_gate_row(row) for row in rows),
             ),
         )
-        identity = {"available_at": available, "projections": projections}
+        if (
+            audit_report_projections
+            and {item.table_name for item in audit_report_projections} != REPORT_PROJECTION_TABLES
+        ):
+            raise ValueError("audit report projections must be complete")
+        projections = tuple(
+            sorted((*projections, *audit_report_projections), key=lambda item: item.table_name)
+        )
+        identity = {
+            "available_at": max(item.available_at for item in projections),
+            "projections": projections,
+        }
         return cls(**identity, content_sha256=canonical_sha256(identity))
 
 

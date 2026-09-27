@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, StrictInt, field_validator
+from pydantic import Field, StrictInt, field_validator, model_validator
 
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
@@ -98,11 +98,14 @@ class RuntimeHealthPublisherSettings(RuntimeContractModel):
 class LabJobsPublisherSettings(RuntimeContractModel):
     lab_jobs_path: Path
     research_metadata_path: Path | None = None
+    audit_report_path: Path | None = None
     authority_root: Path
     max_jobs: StrictInt = Field(default=100, gt=0, le=100)
     eta_completed_limit: StrictInt = Field(default=256, ge=3, le=256)
 
-    @field_validator("lab_jobs_path", "research_metadata_path", "authority_root")
+    @field_validator(
+        "lab_jobs_path", "research_metadata_path", "audit_report_path", "authority_root"
+    )
     @classmethod
     def require_absolute_path(cls, value: Path | None) -> Path | None:
         if value is None:
@@ -110,6 +113,12 @@ class LabJobsPublisherSettings(RuntimeContractModel):
         if not value.is_absolute():
             raise ValueError("lab jobs authority paths must be absolute")
         return value
+
+    @model_validator(mode="after")
+    def require_report_reader(self) -> LabJobsPublisherSettings:
+        if self.audit_report_path is not None and self.research_metadata_path is None:
+            raise ValueError("audit_report_path requires research_metadata_path")
+        return self
 
 
 class PromotionsPublisherSettings(RuntimeContractModel):
@@ -273,9 +282,7 @@ def runtime_health_publisher_builder(
                 input_sequence=source.sequence,
                 output_sequence=source.sequence,
                 processed_count=len(settings.sources),
-                source_generations={
-                    RUNTIME_HEALTH_DATASET_ID: publication.pointer.generation_id
-                },
+                source_generations={RUNTIME_HEALTH_DATASET_ID: publication.pointer.generation_id},
                 generation_published=publication.written,
             )
 
@@ -324,7 +331,10 @@ def lab_jobs_publisher_builder(
             if settings.research_metadata_path is not None:
                 from rquant.serving_page_projection_source import DuckDBLabPageProjectionSource
 
-                page_source = DuckDBLabPageProjectionSource(settings.research_metadata_path)
+                page_source = DuckDBLabPageProjectionSource(
+                    settings.research_metadata_path,
+                    audit_report_path=settings.audit_report_path,
+                )
 
                 def page_projection_reader(
                     observed_at: datetime,
