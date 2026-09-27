@@ -38,7 +38,11 @@ from rquant.runtime_serving_snapshot import (
     SourceReadResult,
 )
 from rquant.serving_contracts import FreshnessStatus
-from rquant.serving_read_models import ServingProjectionPayload, ServingSignalRecord
+from rquant.serving_read_models import (
+    ServingProjectionPayload,
+    ServingSignalRecord,
+    build_serving_read_models,
+)
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
 NOW = datetime(2026, 7, 31, 2, 31, tzinfo=UTC)
@@ -165,6 +169,23 @@ def _assembler(
         ),
         optional_datasets=optional_datasets,
     )
+
+
+def test_alert_projection_serializes_from_the_same_fixed_serving_input() -> None:
+    signal_result = _result(
+        SIGNALS_DATASET_ID,
+        SignalDeliveryPayload(signals=(_signal_record(1, "600000.SH"),)),
+        generation_character="1",
+    )
+    snapshot = _assembler(signal_result=signal_result).assemble(NOW)
+    projections = {item.table_name: item for item in snapshot.read_model.projections}
+    tables = build_serving_read_models(snapshot.read_model)
+
+    assert projections["alert_event"].owner_generation_id == signal_result.generation_id
+    assert len(tables["alert_event"]) == 1
+    assert tables["alert_event"].iloc[0]["source"] == "signal"
+    assert tables["alert_overview"]["unacknowledged_count"].isna().all()
+    assert set(tables["alert_source_coverage"]["state"]) == {"unavailable"}
 
 
 def test_assembles_all_owner_readers_into_one_coherent_snapshot() -> None:
@@ -323,8 +344,14 @@ def test_page_projection_is_bound_to_the_verified_owner_generation() -> None:
 
     snapshot = assembler.assemble(NOW)
 
-    assert len(snapshot.read_model.projections) == 1
-    projection = snapshot.read_model.projections[0]
+    projections = {item.table_name: item for item in snapshot.read_model.projections}
+    assert set(projections) == {
+        "alert_event",
+        "alert_source_coverage",
+        "alert_overview",
+        "stock_basic",
+    }
+    projection = projections["stock_basic"]
     assert projection.table_name == "stock_basic"
     assert projection.owner_dataset_id == REFERENCE_SLOW_AUTHORITY_DATASET_ID
     assert projection.owner_generation_id == "7" * 64

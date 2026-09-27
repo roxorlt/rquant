@@ -59,6 +59,7 @@ from rquant.notification_state import (
     NotificationStateStore,
 )
 from rquant.page_control import (
+    AlertAcknowledgment,
     CanvasCurrentHead,
     PageControlOutbox,
     PageControlStatus,
@@ -88,6 +89,10 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.runtime_read_interrupt import READ_INTERRUPTS, interruptible_read
+from rquant.serving_alert_projection import (
+    AlertAckAuthoritySnapshot,
+    build_ack_source_projections,
+)
 from rquant.serving_read_models import ProjectionScalar, ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strict_json import StrictJsonError, strict_json_loads
@@ -136,6 +141,7 @@ _MAX_PULSE_FILE_BYTES = 256 * 1024
 _MAX_ALERT_FILE_BYTES = 512 * 1024
 _MAX_RUNTIME_CONFIG_BYTES = 16 * 1024
 _MAX_EVENT_ROWS = 10_000
+_MAX_ALERT_ACK_ROWS = 10_000
 _MAX_SURGE_EVENT_BYTES = 8 * 1024 * 1024
 _MAX_LEGACY_NOTIFICATION_BYTES = 8 * 1024 * 1024
 _EVENT_WINDOW_DAYS = 30
@@ -989,6 +995,100 @@ class _ReadonlyPageControlAuditReader:
             raise PageProjectionSourceIntegrityError(
                 "PageControl audit contains an in-flight mutating command"
             )
+
+    def alert_ack_snapshot(self) -> AlertAckAuthoritySnapshot | None:
+        """Read activation and every acknowledgment in the pinned SQLite transaction."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("PageControl alert read requires an active audit snapshot")
+        with self._read_connection() as connection:
+            present = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('page_control_alert_activation', 'page_control_alert_ack')"
+                ).fetchall()
+            }
+            if not present:
+                return None
+            if present != {"page_control_alert_activation", "page_control_alert_ack"}:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl alert authority tables are incomplete"
+                )
+            expected = {
+                "page_control_alert_activation": {
+                    "marker_name": ("TEXT", 0, None, 1),
+                    "activated_at": ("TEXT", 1, None, 0),
+                },
+                "page_control_alert_ack": {
+                    "alert_id": ("TEXT", 0, None, 1),
+                    "confirmation_id": ("TEXT", 1, None, 0),
+                    "actor_id": ("TEXT", 1, None, 0),
+                    "confirmed_at": ("TEXT", 1, None, 0),
+                    "generation_id": ("TEXT", 1, None, 0),
+                },
+            }
+            for table_name, columns in expected.items():
+                observed = {
+                    str(row[1]): (
+                        str(row[2]).upper(),
+                        int(row[3]),
+                        None if row[4] is None else str(row[4]),
+                        int(row[5]),
+                    )
+                    for row in connection.execute(f"PRAGMA table_info({table_name})")
+                }
+                if observed != columns:
+                    raise PageProjectionSourceIntegrityError(
+                        "PageControl alert authority schema is invalid"
+                    )
+            unique_confirmation = False
+            for index in connection.execute("PRAGMA index_list(page_control_alert_ack)"):
+                if int(index[2]) != 1:
+                    continue
+                index_name = str(index[1]).replace('"', '""')
+                index_columns = tuple(
+                    str(column[2])
+                    for column in connection.execute(f'PRAGMA index_info("{index_name}")')
+                )
+                if index_columns == ("confirmation_id",):
+                    unique_confirmation = True
+                    break
+            if not unique_confirmation:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl alert confirmation uniqueness is missing"
+                )
+            activation_rows = connection.execute(
+                "SELECT marker_name, activated_at FROM page_control_alert_activation LIMIT 2"
+            ).fetchall()
+            rows = connection.execute(
+                "SELECT alert_id, confirmation_id, actor_id, confirmed_at, generation_id "
+                "FROM page_control_alert_ack ORDER BY alert_id LIMIT ?",
+                (_MAX_ALERT_ACK_ROWS + 1,),
+            ).fetchall()
+        if len(activation_rows) > 1 or len(rows) > _MAX_ALERT_ACK_ROWS:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert authority exceeds its bounded snapshot"
+            )
+        if not activation_rows:
+            if rows:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl alert rows exist without activation"
+                )
+            return None
+        if activation_rows[0]["marker_name"] != "alert_ack":
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert activation marker is invalid"
+            )
+        try:
+            acknowledgments = tuple(AlertAcknowledgment.model_validate(dict(row)) for row in rows)
+            return AlertAckAuthoritySnapshot.create(
+                activated_at=datetime.fromisoformat(activation_rows[0]["activated_at"]),
+                rows=acknowledgments,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert authority snapshot is invalid"
+            ) from exc
 
     def audit(self, command_id: str) -> _ReadonlyPageControlAudit | None:
         with self._read_connection() as connection:
@@ -2153,6 +2253,12 @@ class DuckDBSignalPageProjectionSource:
         legacy_notification, legacy_notification_status = self.legacy_notification_projections(
             observed
         )
+        alert_ack_projections = build_ack_source_projections(
+            None
+            if self.page_control_outbox is None
+            else self.page_control_outbox.alert_ack_snapshot(),
+            observed_at=observed,
+        )
         if canvas_definitions:
             available = max(
                 available,
@@ -2181,6 +2287,8 @@ class DuckDBSignalPageProjectionSource:
             surge_event=surge_event,
             legacy_notification=legacy_notification,
             legacy_notification_status=legacy_notification_status,
+            alert_ack_state=alert_ack_projections[0],
+            alert_ack=(alert_ack_projections[1] if len(alert_ack_projections) > 1 else None),
         )
 
     def legacy_notification_projections(
@@ -3257,6 +3365,8 @@ class SignalPageProjectionProducer:
                     "screen_run_receipt",
                     "pool_membership",
                     "pool_member_return",
+                    "alert_ack_state",
+                    "alert_ack",
                 }
             )
             try:
@@ -3272,6 +3382,7 @@ class SignalPageProjectionProducer:
             page_projections += tuple(
                 item for item in (legacy_notification, legacy_status) if item is not None
             )
+            page_projections += build_ack_source_projections(None, observed_at=observed)
             page_available_at = max(item.available_at for item in page_projections)
             page_generation_id = canonical_sha256(
                 {"source": "signal-page-projections-partial", "projections": page_projections}
@@ -4197,6 +4308,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "surge_runtime_config",
             "monitor_event",
             "surge_event",
+            "alert_ack_state",
+            "alert_ack",
             "legacy_notification",
             "legacy_notification_status",
         }
@@ -4230,6 +4343,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
         monitor_event: ServingProjectionPayload | None = None,
         surge_event: ServingProjectionPayload | None = None,
+        alert_ack_state: ServingProjectionPayload | None = None,
+        alert_ack: ServingProjectionPayload | None = None,
         legacy_notification: ServingProjectionPayload | None = None,
         legacy_notification_status: ServingProjectionPayload | None = None,
     ) -> SignalPageProjectionSnapshot:
@@ -4291,6 +4406,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             ("pool_member_return", pool_member_return),
             ("monitor_event", monitor_event),
             ("surge_event", surge_event),
+            ("alert_ack_state", alert_ack_state),
+            ("alert_ack", alert_ack),
             ("legacy_notification", legacy_notification),
             ("legacy_notification_status", legacy_notification_status),
         ):
