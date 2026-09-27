@@ -29,7 +29,12 @@ from rquant.screen.dynamic_ma import (
     dynamic_ma_day_count,
     requested_dynamic_ma,
 )
-from rquant.screen.loader import ScreeningCalendarError, _selected_sources, load_universe
+from rquant.screen.loader import (
+    ScreeningCalendarError,
+    ScreeningFactError,
+    _selected_sources,
+    load_universe,
+)
 from rquant.screen.rules import Rule, required_rule_columns
 
 if TYPE_CHECKING:
@@ -318,6 +323,8 @@ class VerifiedReplicaScreenSource:
             )
         except ScreeningCalendarError as error:
             raise ScreenReplicaDataError("screening calendar is incomplete") from error
+        except ScreeningFactError as error:
+            raise ScreenReplicaDataError("screening facts are ambiguous") from error
         except DynamicMaFactError as error:
             raise ScreenReplicaDataError("screening MA facts are incomplete") from error
         except duckdb.Error as error:

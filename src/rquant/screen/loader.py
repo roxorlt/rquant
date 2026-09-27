@@ -99,6 +99,10 @@ class ScreeningCalendarError(RuntimeError):
     """Authoritative trade-calendar coverage cannot support the screen."""
 
 
+class ScreeningFactError(ValueError):
+    """Selected screening facts have ambiguous stock/date identity."""
+
+
 def _parse_trade_date(trade_date: str) -> date:
     return date.fromisoformat(trade_date[:10])
 
@@ -246,6 +250,8 @@ def _wide_from_long(
     long_df["offset"] = long_df["trade_date_str"].map(date_to_offset)
     long_df = long_df.dropna(subset=["offset"])
     long_df["offset"] = long_df["offset"].astype(int)
+    if long_df.duplicated(subset=["ts_code", "offset"]).any():
+        raise ScreeningFactError("duplicate selected screening facts")
 
     frames: list[pd.DataFrame] = []
     for src, dst in rename_map.items():
@@ -551,6 +557,8 @@ def _load_universe_selective(
     ).fetchdf()
     if universe.empty:
         return pd.DataFrame()
+    if universe["ts_code"].duplicated().any():
+        raise ScreeningFactError("duplicate screen universe facts")
 
     ts_codes = universe["ts_code"].tolist()
     code_slots = ",".join("?" for _ in ts_codes)
@@ -560,7 +568,7 @@ def _load_universe_selective(
         [*ts_codes, t0_date],
     ).fetchdf()
     if state_t0["ts_code"].duplicated().any():
-        raise ValueError("duplicate screen state facts")
+        raise ScreeningFactError("duplicate screen state facts")
     out = universe.merge(state_t0, on="ts_code", how="left")
     for table, fields in selected.items():
         for wide in _load_selected_wide(
