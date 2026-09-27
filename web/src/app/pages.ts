@@ -119,7 +119,7 @@ export const PAGES: readonly PageDef[] = [
     path: "/paper",
     title: "模拟盘",
     group: "跟踪与告警",
-    ready: false,
+    ready: true,
     summary: "模拟账户的净值、持仓和当天委托。",
   },
   {

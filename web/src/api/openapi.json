@@ -1181,6 +1181,22 @@
         "title": "Envelope[OverviewData]",
         "type": "object"
       },
+      "Envelope_PaperAccountsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperAccountsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperAccountsData]",
+        "type": "object"
+      },
       "Envelope_PulseData_": {
         "properties": {
           "data": {
@@ -2841,6 +2857,192 @@
           "unpublished"
         ],
         "title": "PageDataStatus",
+        "type": "object"
+      },
+      "PaperAccountItem": {
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "as_of": {
+            "format": "date-time",
+            "title": "As Of",
+            "type": "string"
+          },
+          "cash": {
+            "minimum": 0.0,
+            "title": "Cash",
+            "type": "number"
+          },
+          "holdings": {
+            "items": {
+              "$ref": "#/components/schemas/PaperHoldingItem"
+            },
+            "title": "Holdings",
+            "type": "array"
+          },
+          "market_value": {
+            "minimum": 0.0,
+            "title": "Market Value",
+            "type": "number"
+          },
+          "nav": {
+            "minimum": 0.0,
+            "title": "Nav",
+            "type": "number"
+          },
+          "unrealized_pnl": {
+            "title": "Unrealized Pnl",
+            "type": "number"
+          }
+        },
+        "required": [
+          "account_id",
+          "as_of",
+          "nav",
+          "cash",
+          "market_value",
+          "unrealized_pnl",
+          "holdings"
+        ],
+        "title": "PaperAccountItem",
+        "type": "object"
+      },
+      "PaperAccountsData": {
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/PaperAccountItem"
+            },
+            "title": "Accounts",
+            "type": "array"
+          },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "empty",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          },
+          "valuation_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valuation Note"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_updated_at",
+          "source_note",
+          "valuation_note",
+          "accounts"
+        ],
+        "title": "PaperAccountsData",
+        "type": "object"
+      },
+      "PaperHoldingItem": {
+        "properties": {
+          "available_quantity": {
+            "minimum": 0.0,
+            "title": "Available Quantity",
+            "type": "integer"
+          },
+          "average_cost": {
+            "minimum": 0.0,
+            "title": "Average Cost",
+            "type": "number"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "market_price": {
+            "minimum": 0.0,
+            "title": "Market Price",
+            "type": "number"
+          },
+          "market_value": {
+            "minimum": 0.0,
+            "title": "Market Value",
+            "type": "number"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "quantity": {
+            "minimum": 0.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "unrealized_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unrealized Pct"
+          },
+          "unrealized_pnl": {
+            "title": "Unrealized Pnl",
+            "type": "number"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "quantity",
+          "available_quantity",
+          "average_cost",
+          "market_price",
+          "market_value",
+          "unrealized_pnl",
+          "unrealized_pct"
+        ],
+        "title": "PaperHoldingItem",
         "type": "object"
       },
       "PaperSummary": {
@@ -5779,6 +5981,27 @@
         "summary": "爆量记录（跨日搜索）",
         "tags": [
           "panorama"
+        ]
+      }
+    },
+    "/api/v1/paper/accounts": {
+      "get": {
+        "operationId": "get_accounts_api_v1_paper_accounts_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperAccountsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "模拟账户与持仓",
+        "tags": [
+          "paper"
         ]
       }
     },

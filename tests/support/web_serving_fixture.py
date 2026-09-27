@@ -18,7 +18,8 @@ Scenarios:
   ``minute_coverage``, the latest daily screen (``canvas_hit``,
   ``canvas_latest_trade_date``, ``screen_bounds``), ``trade_calendar`` and
   ``stock_basic``; every watermark fresh.
-* ``panorama``: ``baseline`` plus every table the market panorama reads.
+* ``panorama``: ``baseline`` plus every table the market panorama reads and a second,
+  cash-only paper account for account-switching browser tests.
 * ``degraded``: ``baseline`` with degraded / unavailable watermarks and two page
   projections left unpublished.
 
@@ -357,6 +358,19 @@ def _paper_account(as_of: datetime) -> PaperAccountSnapshot:
         realized_pnl=Decimal("0"),
         unrealized_pnl=unrealized,
         nav=cash + value,
+    )
+
+
+def _cash_only_account(as_of: datetime) -> PaperAccountSnapshot:
+    return PaperAccountSnapshot(
+        account_id="cash-only",
+        as_of_time=as_of,
+        cash=Decimal("5000.00"),
+        available_cash=Decimal("5000.00"),
+        frozen_cash=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        nav=Decimal("5000.00"),
     )
 
 
@@ -980,6 +994,7 @@ def build_web_fixture(
     sequence: int = 0,
     event_projections: tuple[ServingProjectionPayload, ...] | None = None,
     lab_jobs: tuple[ServingLabJobRecord, ...] = (),
+    paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1003,12 +1018,15 @@ def build_web_fixture(
             for item in event_projections
         }
         projections = tuple(replacements.get(item.table_name, item) for item in projections)
+    default_paper_accounts = (_paper_account(built_at - timedelta(seconds=30)),)
+    if scenario == "panorama":
+        default_paper_accounts += (_cash_only_account(built_at - timedelta(minutes=1)),)
     source = ServingReadModelInput(
         observed_at=built_at,
         signals=signals,
         routes=routes,
         deliveries=deliveries,
-        paper_accounts=(_paper_account(built_at - timedelta(seconds=30)),),
+        paper_accounts=default_paper_accounts if paper_accounts is None else paper_accounts,
         runtime_services=_runtime_services(built_at - timedelta(seconds=5)),
         lab_jobs=lab_jobs,
         projections=projections,

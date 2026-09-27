@@ -197,6 +197,64 @@ export function tasksEnvelope(
   };
 }
 
+export function paperEnvelope(
+  overrides: Partial<Schemas["PaperAccountsData"]> = {},
+): Schemas["Envelope_PaperAccountsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: {
+      source_state: "ready",
+      source_updated_at: "2026-09-24T07:30:20Z",
+      source_note: null,
+      valuation_note: "持仓按最近成交价估值，不是实时价",
+      accounts: [
+        {
+          account_id: "shadow-main",
+          as_of: "2026-09-24T07:30:30Z",
+          nav: 100042,
+          cash: 97620,
+          market_value: 2422,
+          unrealized_pnl: 42,
+          holdings: [
+            {
+              code: "600005.SH",
+              name: "样本05",
+              quantity: 100,
+              available_quantity: 100,
+              average_cost: 15,
+              market_price: 15.42,
+              market_value: 1542,
+              unrealized_pnl: 42,
+              unrealized_pct: 2.8,
+            },
+            {
+              code: "600001.SH",
+              name: "样本01",
+              quantity: 100,
+              available_quantity: 0,
+              average_cost: 8.8,
+              market_price: 8.8,
+              market_value: 880,
+              unrealized_pnl: 0,
+              unrealized_pct: 0,
+            },
+          ],
+        },
+        {
+          account_id: "cash-only",
+          as_of: "2026-09-24T07:29:30Z",
+          nav: 5000,
+          cash: 5000,
+          market_value: 0,
+          unrealized_pnl: 0,
+          holdings: [],
+        },
+      ],
+      ...overrides,
+    },
+  };
+}
+
 /** A synthetic /api/v1/overview envelope shaped like the 2026-09-24 replay. */
 export function overviewEnvelope(
   overrides: Partial<OverviewEnvelope["data"]> = {},

@@ -17,6 +17,9 @@ export type MonitorTimelineData = Schemas["MonitorTimelineData"];
 export type MonitorTimelineItem = MonitorTimelineData["items"][number];
 export type ResearchJobsData = Schemas["ResearchJobsData"];
 export type ResearchJobItem = Schemas["ResearchJobItem"];
+export type PaperAccountsData = Schemas["PaperAccountsData"];
+export type PaperAccountItem = Schemas["PaperAccountItem"];
+export type PaperHoldingItem = Schemas["PaperHoldingItem"];
 export type StockSearchData = Schemas["StockSearchData"];
 export type StockSearchRow = Schemas["StockSearchRow"];
 export type StockSummaryData = Schemas["StockSummaryData"];
@@ -70,6 +73,13 @@ export function useResearchJobs(
     const { data, response } = await apiClient().GET("/api/v1/tasks/jobs", {
       params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
     });
+    return unwrap(data, response);
+  });
+}
+
+export function usePaperAccounts(): ServingQueryResult<PaperAccountsData> {
+  return useServingQuery(["paper", "accounts"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/paper/accounts");
     return unwrap(data, response);
   });
 }
