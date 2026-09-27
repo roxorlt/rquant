@@ -381,6 +381,7 @@ class DailyScreenStage(_DailyDownstreamStage):
                     canonical.trade_date.isoformat(),
                     preset_names=preset_names,
                     store=store,
+                    transaction_open=True,
                 )
                 self._assert_boundary(store, canonical, fence, ledger_input_identity)
                 store._conn.execute("COMMIT")

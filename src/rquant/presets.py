@@ -9,6 +9,7 @@ from loguru import logger as _logger
 
 from rquant.builtin_presets import BUILTIN_PRESET_SCREENS, ScreenPreset
 from rquant.config import settings as _settings
+from rquant.runtime_contracts import canonical_sha256
 
 
 def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
@@ -90,6 +91,7 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
                 offset_days=offset_days,
                 delay_days=delay_days,
                 display_name=display_name,
+                definition_version=canonical_sha256(data),
             )
         except Exception as e:
             _logger.warning(f"加载 user preset 失败 {path.name}: {e}")

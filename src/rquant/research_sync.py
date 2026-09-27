@@ -72,6 +72,7 @@ from rquant.trade_calendar import TradeCalendarConflictError
 REPLACE_TABLES: tuple[str, ...] = (
     "stock_basic",
     "screen_result",
+    "screen_run_receipt",
     "pool2_watch",
     "risk_blacklist",
 )
@@ -1179,6 +1180,25 @@ def _sync_table(
         [table],
     ).fetchone()[0]
     if not src_exists:
+        if table == "screen_run_receipt" and mode == "replace":
+            started = False
+            try:
+                if manage_transaction:
+                    conn.execute("BEGIN")
+                    started = True
+                conn.execute("DELETE FROM screen_run_receipt")
+                if started:
+                    conn.execute("COMMIT")
+                    started = False
+            except Exception as exc:
+                if started:
+                    conn.execute("ROLLBACK")
+                return TableSyncResult(table=table, mode="error", detail=str(exc)[:200])
+            return TableSyncResult(
+                table=table,
+                mode="skipped",
+                detail="legacy source has no screen_run_receipt; local proofs cleared",
+            )
         if mode == "replace":
             return TableSyncResult(
                 table=table,
@@ -1195,6 +1215,18 @@ def _sync_table(
         )
 
     cols, pk_cols = _common_columns(conn, table, alias)
+    if table == "screen_run_receipt":
+        required = {
+            "trade_date", "preset_name", "definition_version", "parent_trade_date",
+            "parent_result_version", "hit_count", "member_digest", "lineage_complete",
+            "completed_at", "result_version",
+        }
+        if not required <= set(cols):
+            return TableSyncResult(
+                table=table,
+                mode="error",
+                detail=f"screen_run_receipt missing columns: {sorted(required - set(cols))}",
+            )
     if not cols:
         return TableSyncResult(table=table, mode="skipped", detail="无共同列")
     if mode in ("merge", "restore") and any(pk not in cols for pk in pk_cols):

@@ -339,7 +339,7 @@ def test_v10_creates_dataset_snapshot_binding_only_through_migration() -> None:
         DATASET_SNAPSHOT_BINDING_DDL,
     )
 
-    assert [migration.version for migration in MIGRATIONS] == list(range(1, 11))
+    assert [migration.version for migration in MIGRATIONS[:10]] == list(range(1, 11))
     assert MIGRATIONS[9].statements == (DATASET_SNAPSHOT_BINDING_DDL,)
     assert DATASET_SNAPSHOT_BINDING_DDL in ALL_DDL
 
@@ -379,6 +379,33 @@ def test_v10_creates_dataset_snapshot_binding_only_through_migration() -> None:
         "WHERE table_name = 'dataset_snapshot_binding' "
         "AND constraint_type = 'FOREIGN KEY'"
     ).fetchall() == []
+    conn.close()
+
+
+def test_v11_creates_screen_run_receipt_only_through_migration() -> None:
+    from rquant.storage.schema import ALL_DDL, SCREEN_RUN_RECEIPT_DDL
+
+    assert [migration.version for migration in MIGRATIONS] == list(range(1, 12))
+    assert MIGRATIONS[10].statements == (SCREEN_RUN_RECEIPT_DDL,)
+    assert SCREEN_RUN_RECEIPT_DDL in ALL_DDL
+
+    conn = duckdb.connect(":memory:")
+    initialize_schema(conn, migrations=MIGRATIONS[:10])
+    assert conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'screen_run_receipt'"
+    ).fetchone() == (0,)
+    initialize_schema(conn)
+    columns = conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'screen_run_receipt' ORDER BY ordinal_position"
+    ).fetchall()
+    assert [item[0] for item in columns] == [
+        "trade_date", "preset_name", "definition_version", "parent_trade_date",
+        "parent_result_version", "hit_count", "member_digest", "lineage_complete",
+        "completed_at", "result_version",
+    ]
+    assert [row[0] for row in _migration_rows(conn)] == list(range(1, 12))
     conn.close()
 
 

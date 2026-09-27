@@ -4,22 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from rquant.llm.schemas import RuleCall
-from rquant.screen.rules import (
-    Rule,
-    circ_mv_lt,
-    first_limit_up,
-    gt,
-    has_lower_shadow,
-    has_prior_limit_up,
-    lt,
-    no_consec_ups_in_window,
-    no_limit_down_in_window,
-    not_bj,
-    not_limit_up,
-    not_st,
-    not_yiziban,
-)
+from rquant.llm.compile import compile_screen_plan
+from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
+from rquant.runtime_contracts import canonical_sha256
+from rquant.screen.rules import Rule
 
 
 @dataclass
@@ -36,6 +24,20 @@ class ScreenPreset:
     display_name: str | None = None
     delay_days: int | None = None
     ui_description: str | None = None
+    definition_version: str | None = None
+
+
+def builtin_definition_version(preset: ScreenPreset) -> str:
+    """The code-owned definition identity shared with read-only publication."""
+    identity = {
+        "name": preset.name,
+        "description": preset.description,
+        "depends_on": preset.depends_on,
+        "offset_days": preset.offset_days,
+        "rules": [item.model_dump(mode="json") for item in preset.rule_calls],
+        "include_columns": preset.include_columns,
+    }
+    return canonical_sha256({"contract": "builtin-pool/v1", **identity})
 
 
 BUILTIN_PRESET_SCREENS: dict[str, ScreenPreset] = {
@@ -44,20 +46,7 @@ BUILTIN_PRESET_SCREENS: dict[str, ScreenPreset] = {
         display_name="N 形态一池",
         ui_description="昨首板、安全过滤与下影线",
         description="N形态-Pool1：昨首板+安全过滤+下影线",
-        rules=[
-            not_st(),
-            not_bj(),
-            first_limit_up(offset=1),
-            not_limit_up(offset=0),
-            not_yiziban(offset=1),
-            gt("HIGH[0]", "CLOSE[1]"),
-            circ_mv_lt(150),
-            has_lower_shadow(0.5, 0.02, 0),
-            no_consec_ups_in_window(3, 8),
-            no_limit_down_in_window(30),
-            has_prior_limit_up(120, 1),
-        ],
-        # 跟 rules 一一对应；canvas C.4 fork-to-user 用
+        rules=[],
         rule_calls=[
             RuleCall(name="not_st", args={}),
             RuleCall(name="not_bj", args={}),
@@ -88,11 +77,7 @@ BUILTIN_PRESET_SCREENS: dict[str, ScreenPreset] = {
         description="N形态-Pool2：Pool1子集T+1实体收缩+下影线",
         depends_on="n-shape-pool1",
         offset_days=2,
-        rules=[
-            lt("BODY_UPPER[0]", "BODY_UPPER[1]"),
-            lt("BODY_LOWER[0]", "BODY_LOWER[1]"),
-            has_lower_shadow(0.5, 0.02, 0),
-        ],
+        rules=[],
         rule_calls=[
             RuleCall(name="lt", args={"left": "BODY_UPPER[0]", "right": "BODY_UPPER[1]"}),
             RuleCall(name="lt", args={"left": "BODY_LOWER[0]", "right": "BODY_LOWER[1]"}),
@@ -109,3 +94,13 @@ BUILTIN_PRESET_SCREENS: dict[str, ScreenPreset] = {
         ],
     ),
 }
+
+# Execute the same registered rule calls whose metadata is published as the definition.
+for _preset in BUILTIN_PRESET_SCREENS.values():
+    _preset.rules = compile_screen_plan(
+        ScreenPlan(
+            trade_date="1900-01-01",
+            stages=[Stage(label="builtin", rules=_preset.rule_calls)],
+            include_columns=_preset.include_columns,
+        )
+    ).rules
