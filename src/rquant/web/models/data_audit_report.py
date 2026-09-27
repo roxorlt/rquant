@@ -7,8 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from rquant.data_audit_evidence import MAX_AUDIT_DAYS
-from rquant.data_audit_report import MAX_REPORT_ISSUES
+from rquant.data_audit_contracts import MAX_AUDIT_DAYS, MAX_INDEXED_ISSUES, MAX_REPORT_ISSUES
 
 ReportHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 RuleId = Literal["daily_bar.close_limit", "daily_bar.zero_volume", "daily_bar.field_null_ratio"]
@@ -56,7 +55,7 @@ class ReportOverviewRow(_ReportModel):
     monthly_count: int = Field(ge=1, le=122)
     rule_count: int = Field(ge=3, le=11)
     quality_issue_count: int = Field(ge=0, le=MAX_REPORT_ISSUES)
-    indexed_issue_count: int = Field(ge=0, le=256)
+    indexed_issue_count: int = Field(ge=0, le=MAX_INDEXED_ISSUES)
     omitted_issue_count: int = Field(ge=0, le=MAX_REPORT_ISSUES)
     unassessed_rule_days: int = Field(ge=0, le=MAX_AUDIT_DAYS * 11)
 
@@ -76,7 +75,7 @@ class ReportOverviewRow(_ReportModel):
             raise ValueError("report gap counts disagree")
         if self.quality_issue_count != self.indexed_issue_count + self.omitted_issue_count:
             raise ValueError("report issue counts disagree")
-        if self.indexed_issue_count != min(self.quality_issue_count, 256):
+        if self.indexed_issue_count != min(self.quality_issue_count, MAX_INDEXED_ISSUES):
             raise ValueError("report issue index is incomplete")
         return self
 
@@ -129,7 +128,7 @@ class ReportRuleRow(_ReportModel):
 
 class ReportIssueRow(_ReportModel):
     report_hash: ReportHash
-    issue_index: int = Field(ge=0, le=255)
+    issue_index: int = Field(ge=0, le=MAX_INDEXED_ISSUES - 1)
     trade_date: date
     rule_id: IssueRuleId
     ts_code: str | None = Field(default=None, max_length=32)
@@ -178,7 +177,7 @@ class AuditReportRule(_ReportModel):
 
 
 class AuditReportIssue(_ReportModel):
-    number: int = Field(ge=1, le=256)
+    number: int = Field(ge=1, le=MAX_INDEXED_ISSUES)
     trade_date: date
     rule_id: IssueRuleId
     name: str

@@ -14,6 +14,7 @@ from typing import Annotated, Literal, Self
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from rquant.data_audit_contracts import MAX_REPORT_ISSUES
 from rquant.data_audit_coverage import (
     ClosedDayRows,
     DailyBarCoverageReport,
@@ -28,7 +29,6 @@ from rquant.data_audit_evidence import (
 )
 from rquant.data_audit_quality import DailyBarQualityIssue
 
-MAX_REPORT_ISSUES = 10_000
 MAX_REPORT_BYTES = 8_000_000
 _MAX_NULL_FIELDS = 9
 _REPORT_VERSION = 1

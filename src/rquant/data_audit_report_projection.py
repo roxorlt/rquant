@@ -6,18 +6,9 @@ import json
 from collections import Counter
 from datetime import datetime
 
+from rquant.data_audit_contracts import MAX_INDEXED_ISSUES
 from rquant.data_audit_report import DataAuditReport
 from rquant.serving_read_models import ServingProjectionPayload
-
-REPORT_PROJECTION_TABLES = frozenset(
-    {
-        "audit_report_overview",
-        "audit_report_month",
-        "audit_report_rule",
-        "audit_report_issue",
-    }
-)
-MAX_INDEXED_ISSUES = 256
 
 
 def project_data_audit_report(

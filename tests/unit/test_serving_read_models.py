@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+import subprocess
+import sys
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from rquant.data_audit_contracts import MAX_INDEXED_ISSUES
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxRecord, OutboxStatus
 from rquant.paper_contracts import PaperAccountSnapshot, PaperHolding
 from rquant.runtime_service_control import (
@@ -382,6 +387,33 @@ def test_page_isolation_projections_are_typed_bounded_and_owned() -> None:
         assert contract.max_rows == max_rows
         assert contract.max_bytes <= 6 * 1024 * 1024
         assert table_name in SERVING_TABLE_SPECS
+
+
+def test_audit_report_issue_row_budget_follows_shared_limit() -> None:
+    assert PAGE_PROJECTION_CONTRACTS["audit_report_issue"].max_rows == MAX_INDEXED_ISSUES
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import rquant.data_audit_contracts as limits; "
+            "limits.MAX_INDEXED_ISSUES = 257; "
+            "from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS; "
+            "print(PAGE_PROJECTION_CONTRACTS['audit_report_issue'].max_rows)",
+        ),
+        cwd=root,
+        env={
+            "PATH": os.environ.get("PATH", os.defpath),
+            "LANG": "C",
+            "PYTHONPATH": str(root / "src"),
+            "RQUANT_DISABLE_DOTENV": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "257"
 
 
 def test_nl_projection_allows_bounded_feature_columns_but_rejects_oversized_cells() -> None:
