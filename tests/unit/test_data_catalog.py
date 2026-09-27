@@ -84,8 +84,11 @@ def test_all_real_contracts_are_described_and_snapshot_matches(tmp_path: Path) -
         initialize_schema(connection)
         schemas = schema_from_connection(connection)
     result = build_catalog(CATALOG_CONTRACTS, schemas, DATASETS, FIELDS)
-    assert len(result.datasets) == len(DATASET_CONTRACTS)
+    assert len(result.datasets) == len(DATASET_CONTRACTS) - 1
     assert "financial_observation" not in {item.dataset_id for item in result.datasets}
+    assert "daily_basic_valuation_observation" not in {
+        item.dataset_id for item in result.datasets
+    }
     assert "limit_up_pool_daily" not in CONTRACTS_BY_ID
     assert all(item.name and item.purpose and item.fields for item in result.datasets)
     assert all(

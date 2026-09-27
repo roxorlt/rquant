@@ -124,6 +124,21 @@ class DailyBasicFact(RuntimeContractModel):
     volume_ratio: NonnegativeFloat
     total_mv: NonnegativeFloat
     circ_mv: NonnegativeFloat
+    pe_ttm: FiniteFloat | None = None
+    pb: FiniteFloat | None = None
+    dv_ttm: FiniteFloat | None = None
+    valuation_observed: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_valuation_evidence(self) -> DailyBasicFact:
+        valuation_fields = {"pe_ttm", "pb", "dv_ttm"}
+        if self.valuation_observed and not valuation_fields <= self.model_fields_set:
+            raise ValueError("observed daily valuation must include all source fields")
+        if not self.valuation_observed and any(
+            getattr(self, field_name) is not None for field_name in valuation_fields
+        ):
+            raise ValueError("daily valuation values require source observation evidence")
+        return self
 
 
 class AdjFactorFact(RuntimeContractModel):
@@ -175,7 +190,13 @@ class DailyCloseFacts(RuntimeContractModel):
 
     @property
     def identity_sha256(self) -> str:
-        return canonical_sha256(self.model_dump(mode="python"))
+        facts = self.model_dump(mode="python")
+        # Historical sealed batches predate valuation fields; their signed content stays stable.
+        for row in facts["daily_basic"]:
+            if not row["valuation_observed"]:
+                for field_name in ("pe_ttm", "pb", "dv_ttm", "valuation_observed"):
+                    row.pop(field_name)
+        return canonical_sha256(facts)
 
 
 class DailyCloseSourceRequest(RuntimeContractModel):

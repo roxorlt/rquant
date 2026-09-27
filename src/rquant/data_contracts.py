@@ -30,6 +30,7 @@ class VisibilityRule(StrEnum):
     AUCTION_0925 = "auction_0925"
     PANEL_CLOSE_NEXT_SESSION = "panel_close_next_session"
     FINANCIAL_PIT = "financial_pit"
+    DAILY_VALUATION_PIT = "daily_valuation_pit"
     UNKNOWN = "unknown"
 
 
@@ -140,6 +141,9 @@ class DatasetContract(ContractModel):
         elif self.visibility is VisibilityRule.FINANCIAL_PIT:
             if self.event_date_column is not None or self.event_time_column is not None:
                 raise ValueError("FINANCIAL_PIT requires the dedicated fact selector")
+        elif self.visibility is VisibilityRule.DAILY_VALUATION_PIT:
+            if self.event_date_column is None or self.ingested_at_column is None:
+                raise ValueError("DAILY_VALUATION_PIT requires date and observation time")
         else:
             if self.event_date_column is not None or self.event_time_column is not None:
                 raise ValueError("UNKNOWN visibility is reserved for undated current snapshots")
@@ -212,6 +216,8 @@ def is_visible(
 
     if contract.visibility is VisibilityRule.FINANCIAL_PIT:
         raise ValueError("financial PIT requires query_financial_pit")
+    if contract.visibility is VisibilityRule.DAILY_VALUATION_PIT:
+        raise ValueError("daily valuation PIT requires query_daily_valuation_pit")
 
     local_as_of = _require_aware_as_of(as_of_time)
 
@@ -649,6 +655,23 @@ DATASET_CONTRACTS: tuple[DatasetContract, ...] = (
         earliest_date=None,
         allowed_missing_reasons=(),
         backfill_dataset_id="moneyflow_mkt_dc",
+    ),
+    DatasetContract(
+        dataset_id="daily_basic_valuation_observation",
+        table_name="daily_basic_valuation_observation",
+        sources=("tushare",),
+        physical_primary_key=("candidate_generation_id", "ts_code", "trade_date"),
+        logical_key=("ts_code", "trade_date"),
+        event_date_column="trade_date",
+        ingested_at_column="first_observed_at",
+        price_basis=PriceBasis.NOT_APPLICABLE,
+        visibility=VisibilityRule.DAILY_VALUATION_PIT,
+        freshness=FreshnessRule(
+            watermark_column="observed_at",
+            event_driven=True,
+            required_on_open_day=False,
+        ),
+        historized=True,
     ),
     DatasetContract(
         dataset_id="financial_observation",

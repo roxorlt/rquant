@@ -405,9 +405,9 @@ class TushareAdapter:
         return df
 
     def daily_basic_by_date(self, trade_date: date) -> pd.DataFrame:
-        """按交易日拉全市场每日基本面指标（历史回补用，字段对齐 daily_basic 表）。"""
+        """按交易日拉全市场每日指标，含旧表字段和 PIT 估值观察字段。"""
         ds = trade_date.strftime("%Y%m%d")
-        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
+        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv,pe_ttm,pb,dv_ttm"
         logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
 
         df = self._call_with_backoff(

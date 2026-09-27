@@ -30,6 +30,11 @@ from rquant.daily_pipeline_ledger import (
     DailyStageReceipt,
     StageResult,
 )
+from rquant.daily_valuation_pit import (
+    DailyValuationBatch,
+    DailyValuationRow,
+    _record_daily_valuation_batch_in_transaction,
+)
 from rquant.ingest import (
     DailyIngestMaterialization,
     apply_daily_materialization_in_transaction,
@@ -411,6 +416,38 @@ class DailyCanonicalPublisher:
                 target_indicators=target_indicators,
                 replace_trade_date=True,
                 include_market_sentiment=False,
+            )
+            observed_flags = {row.valuation_observed for row in candidate.facts.daily_basic}
+            if len(observed_flags) > 1:
+                raise DailyCanonicalPublishError("daily valuation observation coverage is mixed")
+            valuation_observed = observed_flags == {True}
+            _record_daily_valuation_batch_in_transaction(
+                writer._conn,
+                DailyValuationBatch(
+                    candidate_generation_id=candidate.generation_id,
+                    source_generation_id=candidate.manifest.source_generation_id,
+                    source_sequence=candidate.manifest.source_sequence,
+                    source_batch_id=candidate.manifest.source_batch_id,
+                    revision=candidate.manifest.revision,
+                    trade_date=candidate.manifest.trade_date,
+                    # Source completion is sampled after fetch; caller observed_at can be backdated.
+                    observed_at=candidate.manifest.available_at,
+                    valuation_observed=valuation_observed,
+                    rows=(
+                        tuple(
+                            DailyValuationRow(
+                                ts_code=row.ts_code,
+                                trade_date=row.trade_date,
+                                pe_ttm=row.pe_ttm,
+                                pb=row.pb,
+                                dv_ttm=row.dv_ttm,
+                            )
+                            for row in candidate.facts.daily_basic
+                        )
+                        if valuation_observed
+                        else ()
+                    ),
+                ),
             )
             self._assert_boundary(
                 candidate,
