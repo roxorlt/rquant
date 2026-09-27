@@ -103,8 +103,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/backtest",
     title: "回测",
     group: "策略与验证",
-    ready: false,
-    summary: "看策略在历史上的净值、回撤、每月收益和每笔交易。",
+    ready: true,
+    summary: "查看已发布的分钟回放、配置统计和逐笔交易。",
   },
   {
     id: "experiments",
