@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/v1/data/audit-report/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 生成日线数据审计报告 */
+        post: operations["submit_data_audit_report_command_api_v1_data_audit_report_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/backfill-plans": {
         parameters: {
             query?: never;
@@ -669,6 +686,40 @@ export interface components {
              * @enum {string}
              */
             status: "running" | "completed" | "failed";
+        };
+        /** AuditReportCommandReceipt */
+        AuditReportCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "pending" | "processing" | "failed" | "ambiguous";
+            /** Task Id */
+            task_id?: string | null;
+        };
+        /** AuditReportCommandRequest */
+        AuditReportCommandRequest: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Observed Through
+             * Format: date
+             */
+            observed_through: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** AuditReportIssue */
         AuditReportIssue: {
@@ -3340,6 +3391,39 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    submit_data_audit_report_command_api_v1_data_audit_report_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuditReportCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditReportCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_backfill_plans_api_v1_data_backfill_plans_get: {
         parameters: {
             query?: {

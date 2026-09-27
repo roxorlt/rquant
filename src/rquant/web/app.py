@@ -30,6 +30,10 @@ from rquant.web.backfill_plan_command_gateway import (
     BackfillPlanCommandGateway,
     BackfillPlanCommandTransport,
 )
+from rquant.web.data_audit_report_command_gateway import (
+    AuditReportCommandGateway,
+    AuditReportCommandTransport,
+)
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.routes import (
     backfill_plan_commands,
@@ -37,6 +41,7 @@ from rquant.web.routes import (
     catalog,
     data_audit,
     data_audit_report,
+    data_audit_report_commands,
     health,
     meta,
     monitor,
@@ -64,6 +69,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/pools/editor/commands": pool_editor.MAX_REQUEST_BYTES,
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
+    "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
 }
 
 
@@ -83,6 +89,7 @@ class WebContext:
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
     backfill_plan_commands: BackfillPlanCommandGateway
+    audit_report_commands: AuditReportCommandGateway
 
 
 def create_app(
@@ -95,6 +102,7 @@ def create_app(
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
+    audit_report_command_transport: AuditReportCommandTransport | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -169,6 +177,10 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=backfill_plan_command_transport,
         ),
+        audit_report_commands=AuditReportCommandGateway(
+            endpoint=settings.page_control_url,
+            transport=audit_report_command_transport,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -224,6 +236,8 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": "确认请求有误，请刷新后重试。"})
         if request.url.path == "/api/v1/data/backfill-plans/commands":
             return JSONResponse(status_code=422, content={"detail": "计划日期有误，请检查后重试。"})
+        if request.url.path == "/api/v1/data/audit-report/commands":
+            return JSONResponse(status_code=422, content={"detail": "审计日期有误，请检查后重试。"})
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
@@ -240,6 +254,7 @@ def create_app(
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(data_audit_report.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(data_audit_report_commands.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(backfill_plans.router, prefix="/api/v1", tags=["data-audit"])
     app.include_router(backfill_plan_commands.router, prefix="/api/v1", tags=["data-audit"])
     return app
