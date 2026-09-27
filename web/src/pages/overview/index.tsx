@@ -6,6 +6,7 @@ import {
   type SignalItem,
   useOverview,
 } from "@/api/endpoints";
+import { useCurrentGeneration } from "@/api/useMeta";
 import { toneClass, toneOf } from "@/format/color";
 import { EMPTY, formatCount, formatNumber, formatPrice, formatSignedNumber } from "@/format/number";
 import { formatShanghaiTime, formatTradeDate } from "@/format/time";
@@ -26,9 +27,11 @@ import {
   StatusBadge,
   Tip,
 } from "@/ui";
+import { unacknowledgedKpi } from "../shared/AlertAcknowledgment";
 import { StockCell } from "../shared/StockCell";
 import { Attention } from "./Attention";
 import { Pipeline } from "./Pipeline";
+import "./overview.css";
 
 const ACTION_KIND: Record<string, PillKind> = {
   b_intent: "acc",
@@ -98,6 +101,7 @@ function kpis(data: OverviewData): Kpi[] {
         ? signals.by_action.map((item) => `${item.label} ${item.count}`).join(" · ")
         : "还没有信号",
     },
+    unacknowledgedKpi(data.unacknowledged),
     {
       key: "deliveries",
       label: "推送",
@@ -390,16 +394,19 @@ function Holdings({ data }: { data: OverviewData }) {
 }
 
 export default function OverviewPage() {
-  const { data, isLoading, isFetching, error, refetch } = useOverview();
+  const { data, serving, isLoading, isFetching, error, refetch } = useOverview();
+  const currentGeneration = useCurrentGeneration();
+  const oldGeneration =
+    currentGeneration !== undefined && serving?.generation_id !== currentGeneration;
   const refresh = (
     <Button size="sm" variant="ghost" onClick={refetch} disabled={isFetching}>
       {isFetching ? "刷新中" : "刷新"}
     </Button>
   );
-  if (isLoading) {
+  if (isLoading || (oldGeneration && !error)) {
     return <PageSkeleton label="总览加载中" />;
   }
-  if (data === undefined) {
+  if (error || data === undefined) {
     return (
       <>
         <PageHeader eyebrow="概览" title="总览" actions={refresh} />
@@ -416,7 +423,9 @@ export default function OverviewPage() {
     <>
       <PageHeader eyebrow="概览" title="总览" note={sessionNote(data)} actions={refresh} />
       {data.pipeline.length ? <Pipeline stages={data.pipeline} /> : null}
-      <KpiStrip label="今日关键数字" items={kpis(data)} />
+      <div className="overview-kpis">
+        <KpiStrip label="今日关键数字" items={kpis(data)} />
+      </div>
       <div className="g2">
         <Panel title="最新信号" sub={`${formatCount(data.signals.total)} 条`} flush>
           <DataTable

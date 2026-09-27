@@ -15,6 +15,12 @@ export async function fetchMeta(): Promise<MetaEnvelope> {
   return data;
 }
 
+/** Observe the shell's meta response without starting another request. */
+export function useCurrentGeneration(): string | null | undefined {
+  const query = useQuery({ queryKey: META_QUERY_KEY, queryFn: fetchMeta, enabled: false });
+  return query.data?.data.generation?.generation_id;
+}
+
 /**
  * Polls /api/v1/meta every 15 s. A Serving generation change invalidates
  * Serving-backed queries; the independent screen replica stays on manual refresh.
