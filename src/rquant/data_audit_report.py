@@ -510,6 +510,14 @@ def _decode_report(data: bytes) -> DataAuditReport:
     return report
 
 
+def parse_data_audit_report_bytes(data: bytes, *, filename: str) -> DataAuditReport:
+    """Validate the whole immutable artifact, including its content-addressed name."""
+    report = _decode_report(data)
+    if filename != f"data-audit-v{report.schema_version}-{report.content_hash}.json":
+        raise ValueError("audit report filename disagrees with content hash")
+    return report
+
+
 def load_data_audit_report(path: Path) -> DataAuditReport:
     """Reject oversized, noncanonical, renamed, symlinked, or corrupt artifacts."""
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -520,10 +528,7 @@ def load_data_audit_report(path: Path) -> DataAuditReport:
         data = handle.read(MAX_REPORT_BYTES + 1)
         if os.fstat(handle.fileno()).st_size != size or len(data) != size:
             raise ValueError("audit report changed during read")
-    report = _decode_report(data)
-    if path.name != f"data-audit-v{report.schema_version}-{report.content_hash}.json":
-        raise ValueError("audit report filename disagrees with content hash")
-    return report
+    return parse_data_audit_report_bytes(data, filename=path.name)
 
 
 def publish_data_audit_report(report: DataAuditReport, directory: Path) -> Path:
