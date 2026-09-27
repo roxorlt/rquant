@@ -1000,6 +1000,14 @@ class _ReadonlyPageControlAuditReader:
         """Read activation and every acknowledgment in the pinned SQLite transaction."""
         if self._snapshot_connection is None:
             raise RuntimeError("PageControl alert read requires an active audit snapshot")
+        try:
+            return self._read_alert_ack_snapshot()
+        except sqlite3.Error as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl alert authority cannot be read"
+            ) from exc
+
+    def _read_alert_ack_snapshot(self) -> AlertAckAuthoritySnapshot | None:
         with self._read_connection() as connection:
             present = {
                 str(row[0])

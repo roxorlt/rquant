@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -307,8 +309,9 @@ def test_signal_page_source_carries_optional_ack_snapshot_in_one_generation(tmp_
     assert activated["alert_ack"].rows == ()
 
 
+@pytest.mark.parametrize("failure", ("page_source", "ack_sqlite"))
 def test_page_source_failure_revokes_previous_confirmation_projection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     database = tmp_path / "replica.duckdb"
     _signal_projection_database(database)
@@ -333,10 +336,32 @@ def test_page_source_failure_revokes_previous_confirmation_projection(
     )
     assert initial["alert_ack"].rows[0]["confirmation_id"] == command.command_id
 
-    def fail_read(_observed: datetime) -> None:
-        raise PageProjectionSourceIntegrityError("source unavailable")
+    if failure == "page_source":
 
-    monkeypatch.setattr(source, "_build_snapshot", fail_read)
+        def fail_read(_observed: datetime) -> None:
+            raise PageProjectionSourceIntegrityError("source unavailable")
+
+        monkeypatch.setattr(source, "_build_snapshot", fail_read)
+    else:
+        assert source.page_control_outbox is not None
+        reader = source.page_control_outbox
+        original_read = reader._read_connection
+
+        class FailAckRows:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self.connection = connection
+
+            def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+                if "FROM page_control_alert_ack ORDER BY alert_id" in sql:
+                    raise sqlite3.OperationalError("simulated confirmation read failure")
+                return self.connection.execute(sql, parameters)
+
+        @contextmanager
+        def fail_ack_query() -> Iterator[FailAckRows]:
+            with original_read() as connection:
+                yield FailAckRows(connection)
+
+        monkeypatch.setattr(reader, "_read_connection", fail_ack_query)
     later = observed + timedelta(seconds=3)
     producer.publish(later)
     fallback = _by_name(
