@@ -5,14 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 from pydantic import ValidationError
 
-from rquant.alert_ack import AlertSource, alert_window_start
+from rquant.alert_ack import (
+    AlertSource,
+    alert_event_at,
+    alert_window_start,
+    stable_alert_id,
+    stable_signal_alert_id,
+)
 from rquant.page_control import AlertAcknowledgment
 from rquant.runtime_contracts import canonical_sha256
 from rquant.serving_alert_projection import AlertAckAuthoritySnapshot
+from rquant.serving_contracts import FreshnessStatus
 from rquant.web import readers
 from rquant.web.envelope import ServingMeta, ServingState
 from rquant.web.models.alert_ack import AlertAcknowledgmentView, UnacknowledgedSummary
@@ -22,6 +30,7 @@ _SOURCES: frozenset[str] = frozenset({"signal", "monitor_event", "surge_event"})
 _SHA = frozenset("0123456789abcdef")
 _MAX_EVENTS = 20_000
 _MAX_ACKS = 10_000
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 _UNAVAILABLE = UnacknowledgedSummary(
     state="unavailable",
     count=None,
@@ -142,8 +151,10 @@ def _present(states: dict[str, readers.TableState], name: str) -> bool:
     return state is not None and state.available
 
 
-def _read_rows(cursor: Any, query: str, limit: int) -> list[tuple[Any, ...]]:
-    rows = cursor.execute(query, (limit + 1,)).fetchall()
+def _read_rows(
+    cursor: Any, query: str, limit: int, *, params: tuple[object, ...] = ()
+) -> list[tuple[Any, ...]]:
+    rows = cursor.execute(query, (*params, limit + 1)).fetchall()
     if len(rows) > limit:
         raise ValueError("alert projection exceeds bound")
     return rows
@@ -237,6 +248,112 @@ def _read_coverage(cursor: Any) -> dict[AlertSource, _Coverage]:
     return result
 
 
+def _source_identifiers(
+    cursor: Any, source: AlertSource, *, first: datetime, cutoff: datetime
+) -> dict[str, datetime]:
+    if source == "signal":
+        rows = _read_rows(
+            cursor,
+            "SELECT signal_id, event_time FROM signals "
+            "WHERE event_time BETWEEN ? AND ? OR event_time IS NULL LIMIT ?",
+            _MAX_EVENTS,
+            params=(first, cutoff),
+        )
+    else:
+        columns = (
+            "trade_date, trigger_time, ts_code, level, trigger_price, level_price, "
+            "trigger_type, pool"
+            if source == "monitor_event"
+            else "trade_date, confirmed_at, ts_code, name, theme, price, pct_chg, "
+            "cum_amount, rel_cum, room_to_limit_pct, status"
+        )
+        names = (
+            (
+                "trade_date",
+                "trigger_time",
+                "ts_code",
+                "level",
+                "trigger_price",
+                "level_price",
+                "trigger_type",
+                "pool",
+            )
+            if source == "monitor_event"
+            else (
+                "trade_date",
+                "confirmed_at",
+                "ts_code",
+                "name",
+                "theme",
+                "price",
+                "pct_chg",
+                "cum_amount",
+                "rel_cum",
+                "room_to_limit_pct",
+                "status",
+            )
+        )
+        where = "trade_date BETWEEN ? AND ? OR trade_date IS NULL"
+        params: tuple[object, ...] = (
+            first.astimezone(_SHANGHAI).date(),
+            cutoff.astimezone(_SHANGHAI).date(),
+        )
+        if source == "monitor_event":
+            where += " OR trigger_time BETWEEN ? AND ?"
+            params += (first, cutoff)
+        rows = _read_rows(
+            cursor,
+            f"SELECT {columns} FROM {source} WHERE {where} LIMIT ?",
+            _MAX_EVENTS,
+            params=params,
+        )
+    result: dict[str, datetime] = {}
+    for raw in rows:
+        if source == "signal":
+            signal_id, occurred = raw
+            if not isinstance(signal_id, str):
+                raise ValueError("published signal identity is invalid")
+            alert_id = stable_signal_alert_id(signal_id)
+            at = _utc(occurred)
+        else:
+            facts = dict(zip(names, raw, strict=True))
+            alert_id = stable_alert_id(source, facts)
+            at = alert_event_at(source, facts)
+        if at is None:
+            raise ValueError("published source time is missing")
+        if not first <= at <= cutoff:
+            continue
+        if alert_id in result:
+            raise ValueError("duplicate published source identity")
+        result[alert_id] = at
+    return result
+
+
+def _same_source_generation(
+    borrowed: BorrowedGeneration,
+    coverage: dict[AlertSource, _Coverage],
+) -> bool:
+    generation = borrowed.manifest.source_generations.get("signals")
+    watermark = next(
+        (item for item in borrowed.manifest.watermarks if item.dataset_id == "signals"), None
+    )
+    if not generation or watermark is None or watermark.status is not FreshnessStatus.FRESH:
+        return False
+    if any(proof.source_generation_id != generation for proof in coverage.values()):
+        return False
+    owners = borrowed.cursor.execute(
+        "SELECT table_name, available, owner_dataset_id, owner_generation_id "
+        "FROM projection_status WHERE table_name IN ('monitor_event', 'surge_event')"
+    ).fetchall()
+    return {str(row[0]) for row in owners} == {"monitor_event", "surge_event"} and all(
+        name in {"monitor_event", "surge_event"}
+        and bool(available)
+        and dataset == "signals"
+        and owner_generation == generation
+        for name, available, dataset, owner_generation in owners
+    )
+
+
 def _ready_summary(
     *,
     overview: tuple[Any, ...],
@@ -246,6 +363,7 @@ def _ready_summary(
     meta: ServingMeta,
     now: datetime,
     stale_after: timedelta,
+    borrowed: BorrowedGeneration,
 ) -> UnacknowledgedSummary | None:
     state, count, cutoff, activated = overview
     cutoff = _utc(cutoff)
@@ -263,6 +381,20 @@ def _ready_summary(
     ):
         return None
     first = alert_window_start(count_as_of=cutoff, activated_at=snapshot.activated_at)
+    if not _same_source_generation(borrowed, coverage):
+        return None
+    try:
+        for source in _SOURCES:
+            raw = _source_identifiers(borrowed.cursor, source, first=first, cutoff=cutoff)
+            projected = {
+                event.alert_id: event.occurred_at
+                for event in events.values()
+                if event.source == source and first <= event.occurred_at <= cutoff
+            }
+            if raw != projected:
+                return None
+    except (duckdb.Error, TypeError, ValueError):
+        return None
     for source in _SOURCES:
         proof = coverage[source]
         source_rows = tuple(
@@ -366,6 +498,7 @@ def read_alert_ack(
             meta=meta,
             now=now,
             stale_after=stale_after,
+            borrowed=borrowed,
         )
         return AlertReadModel(ready or _INCOMPLETE, snapshot.activated_at, events, ack_by_id)
     except (duckdb.Error, TypeError, ValueError, ValidationError):
