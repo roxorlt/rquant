@@ -508,16 +508,27 @@ def _signal_source_result(
 ) -> SourceReadResult:
     from rquant.runtime_serving_snapshot import SignalDeliveryPayload, SourceReadResult
     from rquant.serving_contracts import FreshnessStatus
+    from rquant.serving_read_models import ServingProjectionPayload
 
     status = FreshnessStatus.DEGRADED if snapshot.truncated else FreshnessStatus.FRESH
     reason = (
         f"history_limit_truncated:{snapshot.omitted_signal_count}" if snapshot.truncated else None
     )
+    projections = snapshot.payload.projections
+    if snapshot.signal_coverage_receipt is not None:
+        receipt = snapshot.signal_coverage_receipt
+        projections += (
+            ServingProjectionPayload(
+                table_name="signal_coverage_receipt",
+                available_at=receipt.source_inspected_at,
+                rows=(receipt.model_dump(mode="json"),),
+            ),
+        )
     writer_payload = SignalDeliveryPayload(
         signals=snapshot.payload.signals,
         routes=snapshot.payload.routes,
         deliveries=snapshot.payload.deliveries,
-        projections=snapshot.payload.projections,
+        projections=projections,
     )
     provisional = SourceReadResult(
         dataset_id=_SIGNALS_DATASET_ID,
@@ -1148,6 +1159,8 @@ def notifier_builder(
             projection_published: bool | None = None
             if page_projection_producer is not None:
                 page_projection_producer.source.begin_replica_iteration()
+            # The clock is a lower bound for the verified spool read, never a later claim.
+            source_inspected_at = clock()
             descriptor = source.source_descriptor()
             cursor = store.replication_cursor()
             if settings.paused:
@@ -1198,6 +1211,7 @@ def notifier_builder(
                 descriptor,
                 visible_records,
                 observed_at=observed_at,
+                source_inspected_at=source_inspected_at,
             )
             loaded_providers = resolved_provider_loader()
             if settings.suppress_delivery:

@@ -10,6 +10,7 @@ from typing import Self
 from pydantic import Field, StrictInt, model_validator
 
 from rquant.alert_ack import AlertSource, alert_event_at, alert_window_start, stable_alert_id
+from rquant.alert_signal_coverage import SignalSourceCoverageReceipt, signal_window_digest
 from rquant.page_control import AlertAcknowledgment
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.serving_read_models import (
@@ -203,27 +204,62 @@ def _source_events(
     return tuple(sorted(selected, key=lambda row: str(row["alert_id"]))), "coverage_unverified"
 
 
+def _verified_signal_receipt(
+    source: ServingReadModelInput,
+    projections: Mapping[str, ServingProjectionInput],
+    signal_generation_id: str | None,
+) -> SignalSourceCoverageReceipt | None:
+    projection = projections.get("signal_coverage_receipt")
+    if (
+        signal_generation_id is None
+        or projection is None
+        or projection.owner_dataset_id != "signals"
+        or projection.owner_generation_id != signal_generation_id
+        or len(projection.rows) != 1
+    ):
+        return None
+    try:
+        receipt = SignalSourceCoverageReceipt.model_validate(projection.rows[0])
+        if receipt.window_end > source.observed_at:
+            return None
+        selected = tuple(
+            record
+            for record in source.signals
+            if receipt.window_start <= alert_event_at("signal", record.signal) <= receipt.window_end
+        )
+        if (
+            len(selected) != receipt.window_row_count
+            or signal_window_digest(selected) != receipt.window_rows_sha256
+        ):
+            return None
+        return receipt
+    except (TypeError, ValueError):
+        return None
+
+
 def build_alert_read_projections(
     source: ServingReadModelInput,
     *,
     signal_generation_id: str | None = None,
 ) -> tuple[ServingProjectionPayload, ...]:
-    """Create observed alerts and honest unknown coverage from one fixed source input.
-
-    None of the three legacy source producers publishes a positive 30-day window proof.
-    Their observed rows are useful timeline evidence, never proof of a complete count.
-    """
+    """Create observed alerts; each source becomes complete only with its own proof."""
     by_name = {item.table_name: item for item in source.projections}
     ack = _ack_snapshot_from_input(by_name)
+    signal_receipt = _verified_signal_receipt(source, by_name, signal_generation_id)
+    coverage_cutoff = source.observed_at if signal_receipt is None else signal_receipt.window_end
     first_at = alert_window_start(
-        count_as_of=source.observed_at,
+        count_as_of=coverage_cutoff,
+        activated_at=datetime(1970, 1, 1, tzinfo=UTC),
+    )
+    full_window_start = alert_window_start(
+        count_as_of=coverage_cutoff,
         activated_at=datetime(1970, 1, 1, tzinfo=UTC),
     )
     window_start = (
         None
         if ack is None
         else alert_window_start(
-            count_as_of=source.observed_at, activated_at=ack.activated_at
+            count_as_of=coverage_cutoff, activated_at=ack.activated_at
         ).isoformat()
     )
     acknowledgments = {} if ack is None else {row.alert_id: row for row in ack.rows}
@@ -257,6 +293,16 @@ def build_alert_read_projections(
         ):
             rows, reason = (), "event_bound_exceeded"
         events.extend(rows)
+        signal_complete = (
+            event_source == "signal"
+            and signal_receipt is not None
+            and reason == "coverage_unverified"
+            and (ack is None or ack.activated_at <= signal_receipt.window_end)
+            and (
+                full_window_start if window_start is None else datetime.fromisoformat(window_start)
+            )
+            >= signal_receipt.window_start
+        )
         generation_id = (
             signal_generation_id
             if event_source == "signal"
@@ -267,13 +313,19 @@ def build_alert_read_projections(
         coverage.append(
             {
                 "source": event_source,
-                "state": "unavailable",
-                "reason": reason,
-                "window_start": window_start,
-                "window_end": None,
-                "count_as_of": None,
+                "state": "complete" if signal_complete else "unavailable",
+                "reason": "verified" if signal_complete else reason,
+                "window_start": (
+                    full_window_start.isoformat()
+                    if signal_complete and window_start is None
+                    else window_start
+                ),
+                "window_end": signal_receipt.window_end.isoformat() if signal_complete else None,
+                "count_as_of": signal_receipt.window_end.isoformat() if signal_complete else None,
                 "source_generation_id": generation_id,
-                "high_watermark": None,
+                "high_watermark": (
+                    str(signal_receipt.source_high_watermark) if signal_complete else None
+                ),
                 "row_count": len(rows),
                 "row_digest": canonical_sha256(
                     {"contract": "alert-observed-rows/v1", "source": event_source, "rows": rows}
