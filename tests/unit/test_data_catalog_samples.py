@@ -7,8 +7,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from rquant.data_catalog.models import CatalogDocument
-from rquant.data_catalog.sample_policy import SAMPLE_FIELDS
+from rquant.data_catalog.models import CatalogDocument, CatalogField
+from rquant.data_catalog.sample_policy import SAMPLE_FIELDS, public_sample_value
 from rquant.data_catalog.samples import build_samples
 
 CATALOG = Path(__file__).resolve().parents[2] / "src/rquant/data_catalog/catalog-v1.json"
@@ -33,7 +33,12 @@ def _source(path: Path) -> None:
                 (
                     "000001.SZ",
                     f"2026-09-{day:02d}",
-                    "/private/secrets/source_file" if day == 25 else "平安银行",
+                    {
+                        25: "/private/secrets/source_file",
+                        23: "SOURCE",
+                        22: "SVCINTERNAL",
+                        21: "A" * 40,
+                    }.get(day, "平安银行"),
                     False,
                     "notifier.admin.shadow.v1",
                     "/private/secrets/price.json",
@@ -68,6 +73,19 @@ def test_each_catalog_dataset_has_an_explicit_small_business_whitelist() -> None
         assert len(selected) == len(set(selected))
         assert set(selected) <= {field.key for field in item.fields}
         assert not set(selected) & forbidden
+    for key in ("name", "con_name", "board_name", "industry"):
+        field = CatalogField(
+            key=key,
+            name="名称",
+            description="业务名称",
+            data_type="VARCHAR",
+            unit=None,
+            is_primary_key=False,
+        )
+        for internal in ("SOURCE", "SVCINTERNAL", "A" * 40):
+            assert public_sample_value(field, internal) is None
+        assert public_sample_value(field, "平安银行") == "平安银行"
+        assert public_sample_value(field, "*ST中南") == "*ST中南"
 
 
 def test_builder_writes_only_safe_columns_and_latest_twenty_rows(tmp_path: Path) -> None:
@@ -85,6 +103,7 @@ def test_builder_writes_only_safe_columns_and_latest_twenty_rows(tmp_path: Path)
     ]
     assert status["rows"][0]["name"] is None
     assert status["rows"][1]["name"] == "平安银行"
+    assert [status["rows"][index]["name"] for index in (2, 3, 4)] == [None, None, None]
     assert payload["datasets"]["stock_suspend_coverage"]["rows"][0]["row_count"] == 3
     assert payload["datasets"]["daily_bar"] == {"state": "missing", "rows": []}
     serialized = output.read_text(encoding="utf-8")
@@ -97,6 +116,9 @@ def test_builder_writes_only_safe_columns_and_latest_twenty_rows(tmp_path: Path)
         "a" * 64,
         "svc-internal",
         "degraded:internal",
+        "SOURCE",
+        "SVCINTERNAL",
+        "A" * 40,
     ):
         assert secret not in serialized
 

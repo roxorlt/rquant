@@ -6,6 +6,8 @@ import {
   useCatalog,
   useCatalogDataset,
 } from "@/api/endpoints";
+import { formatNumber, formatPrice } from "@/format/number";
+import { formatShanghaiDateTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
   Button,
@@ -56,11 +58,14 @@ function sampleText(field: CatalogField, value: SampleRow[string] | undefined): 
   if (value === null || value === undefined) return "—";
   if (typeof value === "boolean") return value ? "是" : "否";
   if (typeof value === "number") {
-    if (field.unit === "%" || field.key === "close" || field.key === "price") {
-      return value.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    }
+    if (field.unit === "%") return `${formatNumber(value, 2)}%`;
+    if (field.key === "close" || field.key === "price") return formatPrice(value);
     return value.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
   }
+  if (field.data_type.toUpperCase().startsWith("TIMESTAMP WITH TIME ZONE")) {
+    return formatShanghaiDateTime(value);
+  }
+  if (field.data_type.toUpperCase().startsWith("TIMESTAMP")) return value.replace("T", " ");
   return value;
 }
 

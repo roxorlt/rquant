@@ -90,8 +90,8 @@ def public_sample_value(field: CatalogField, value: object) -> SampleValue:
         if field.key in NAME_FIELDS:
             if not NAME_RE.fullmatch(cleaned):
                 return None
-            has_hanzi = any("\u3400" <= char <= "\u9fff" for char in cleaned)
-            return cleaned if has_hanzi or (cleaned.isascii() and cleaned.isupper()) else None
+            # These A-share names need a Hanzi character; ASCII-only text can be an internal code.
+            return cleaned if any("\u3400" <= char <= "\u9fff" for char in cleaned) else None
         raise ValueError(f"unapproved sample text field: {field.key}")
     if kind == "DATE":
         if isinstance(value, datetime):
@@ -130,6 +130,9 @@ def public_sample_value(field: CatalogField, value: object) -> SampleValue:
     if kind in {"DOUBLE", "FLOAT"}:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("sample number has wrong type")
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ValueError("sample number is out of range") from exc
         return number if math.isfinite(number) else None
     raise ValueError(f"unapproved sample type: {field.data_type}")

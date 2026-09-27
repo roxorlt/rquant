@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
 from rquant.data_catalog.samples import build_samples
 from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
-from tests.unit.test_data_catalog_samples import _source
+from tests.unit.test_data_catalog_samples import _source, _table
 
 
 def test_list_and_detail_work_without_a_serving_generation(tmp_path: Path) -> None:
@@ -107,7 +108,8 @@ def test_detail_rejects_unapproved_sample_values_and_keeps_dictionary(tmp_path: 
         assert "/private/secrets/price.json" not in good.text
         assert "notifier.admin.shadow.v1" not in good.text
 
-        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        good_artifact = artifact.read_text(encoding="utf-8")
+        payload = json.loads(good_artifact)
         payload["datasets"]["stock_status_daily"]["rows"][0]["source_file"] = "/private/secret"
         artifact.write_text(json.dumps(payload), encoding="utf-8")
         bad = client.get("/api/v1/data/catalog/stock_status_daily")
@@ -116,6 +118,39 @@ def test_detail_rejects_unapproved_sample_values_and_keeps_dictionary(tmp_path: 
         assert bad.json()["data"]["sample"]["rows"] == []
         assert "/private/secret" not in bad.text
         assert bad.json()["data"]["fields"] == good.json()["data"]["fields"]
+
+        for internal in ("SOURCE", "SVCINTERNAL", "A" * 40):
+            payload = json.loads(good_artifact)
+            payload["datasets"]["stock_status_daily"]["rows"][0]["name"] = internal
+            artifact.write_text(json.dumps(payload), encoding="utf-8")
+            rejected = client.get("/api/v1/data/catalog/stock_status_daily")
+            assert rejected.status_code == 200
+            assert rejected.json()["data"]["sample"] == {"state": "error", "rows": []}
+            assert internal not in rejected.text
+
+
+def test_huge_double_in_bad_artifact_keeps_catalog_detail_readable(tmp_path: Path) -> None:
+    source = tmp_path / "snapshot.duckdb"
+    artifact = tmp_path / "samples.json"
+    _source(source)
+    with duckdb.connect(str(source)) as connection:
+        _table(connection, "daily_bar")
+        connection.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close, pct_chg, vol) "
+            "VALUES ('000001.SZ', DATE '2026-09-25', 10.5, 3.14, 1000)"
+        )
+    payload = build_samples(source, artifact)
+    payload["datasets"]["daily_bar"]["rows"][0]["close"] = 10**309
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+    app = create_app(
+        WebSettings(serving_root=tmp_path / "missing", catalog_samples_file=artifact),
+        background=False,
+    )
+    with TestClient(app) as client:
+        response = client.get("/api/v1/data/catalog/daily_bar")
+    assert response.status_code == 200
+    assert response.json()["data"]["sample"] == {"state": "error", "rows": []}
+    assert response.json()["data"]["fields"]
 
 
 def test_stale_and_unconfigured_samples_have_distinct_empty_states(tmp_path: Path) -> None:

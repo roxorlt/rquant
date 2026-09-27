@@ -60,12 +60,32 @@ for (const viewport of [
       };
       await route.fulfill({ response: upstream, json: response });
     });
+    await page.route("**/api/v1/data/catalog/stock_suspend_coverage", async (route) => {
+      const upstream = await route.fetch();
+      const response = await upstream.json();
+      response.data.sample_fields = response.data.fields.filter((field: { key: string }) =>
+        ["trade_date", "row_count", "queried_at"].includes(field.key),
+      );
+      response.data.sample_available = true;
+      response.data.sample = {
+        state: "available",
+        rows: [
+          {
+            trade_date: "2026-09-25",
+            row_count: 1234,
+            queried_at: "2026-09-25T02:00:00+00:00",
+            source: "SVCINTERNAL",
+          },
+        ],
+      };
+      await route.fulfill({ response: upstream, json: response });
+    });
     await page.goto("./#/datacenter");
     await page.getByRole("button", { name: /股票日线/ }).click();
     const sample = page.getByRole("table", { name: "样例数据" });
     await expect(sample).toBeVisible();
     await expect(sample).toContainText("000001.SZ");
-    await expect(sample).toContainText("3.14");
+    await expect(sample).toContainText("3.14%");
     const body = await page.locator("main").innerText();
     for (const secret of [
       "source_file",
@@ -77,6 +97,15 @@ for (const viewport of [
       expect(body).not.toContain(secret);
     }
     await expectNoHorizontalOverflow(page, "sample table");
+    if (viewport.name === "phone") {
+      await page.getByRole("button", { name: "返回目录" }).click();
+    }
+    await page.getByRole("button", { name: /停复牌采集记录/ }).click();
+    const coverageSample = page.getByRole("table", { name: "样例数据" });
+    await expect(coverageSample).toContainText("1,234");
+    await expect(coverageSample).toContainText("2026-09-25 10:00:00");
+    expect(await page.locator("main").innerText()).not.toContain("SVCINTERNAL");
+    await expectNoHorizontalOverflow(page, "Shanghai sample time");
     if (viewport.name === "phone") {
       await page.getByRole("button", { name: "返回目录" }).click();
       await expect(page.getByRole("list", { name: "数据集" })).toBeVisible();

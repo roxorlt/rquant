@@ -257,7 +257,7 @@ describe("数据中心目录", () => {
     renderApp("/datacenter");
     const table = await screen.findByRole("table", { name: "样例数据" });
     expect(within(table).getByText("000001.SZ")).toBeInTheDocument();
-    expect(within(table).getByText("3.14")).toBeInTheDocument();
+    expect(within(table).getByText("3.14%")).toBeInTheDocument();
     expect(within(table).queryAllByText("a".repeat(64))).toHaveLength(0);
     const body = document.querySelector("main")?.textContent ?? "";
     for (const secret of [
@@ -270,6 +270,58 @@ describe("数据中心目录", () => {
       expect(body).not.toContain(secret);
     }
     expect(findJargon(body)).toEqual([]);
+  });
+
+  it("shows timezone-aware sample timestamps in Shanghai time", async () => {
+    const queriedAt = {
+      key: "queried_at",
+      name: "查询时间",
+      description: "完成查询的时间",
+      data_type: "TIMESTAMP WITH TIME ZONE",
+      unit: null,
+      is_primary_key: false,
+    };
+    const coverage: CatalogDataset = {
+      ...daily,
+      dataset_id: "stock_suspend_coverage",
+      name: "停复牌采集记录",
+      fields: [queriedAt],
+      sample_fields: [queriedAt],
+      sample_available: true,
+      sample: { state: "available", rows: [{ queried_at: "2026-09-25T02:00:00+00:00" }] },
+    };
+    catalogHandlers({
+      version: 1,
+      datasets: [
+        {
+          dataset_id: coverage.dataset_id,
+          name: coverage.name,
+          purpose: coverage.purpose,
+          category: coverage.category,
+          sources: coverage.sources,
+          schema_available: true,
+        },
+      ],
+    });
+    server.use(
+      http.get("*/api/v1/data/catalog/stock_suspend_coverage", () =>
+        HttpResponse.json({
+          data: coverage,
+          serving: {
+            generation_id: null,
+            built_at: null,
+            age_seconds: null,
+            state: "ready",
+            message: null,
+            detail: "static",
+          },
+        }),
+      ),
+    );
+    renderApp("/datacenter");
+    const table = await screen.findByRole("table", { name: "样例数据" });
+    expect(within(table).getByText("2026-09-25 10:00:00")).toBeInTheDocument();
+    expect(within(table).queryByText("2026-09-25T02:00:00+00:00")).not.toBeInTheDocument();
   });
 
   it.each([
