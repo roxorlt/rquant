@@ -6,6 +6,7 @@ import hashlib
 import hmac
 from base64 import b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
+from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -15,11 +16,20 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import ServingQueryError
+from rquant.serving_read_models import LAB_EVENT_ALLOWED_LABELS
 from rquant.web.calendar import calendar_day
 from rquant.web.envelope import Envelope
 from rquant.web.market import shanghai_trade_date
 from rquant.web.models.common import StatusInfo
-from rquant.web.models.tasks import JobCounts, ResearchJobItem, ResearchJobsData, TaskOverviewData
+from rquant.web.models.tasks import (
+    JobCounts,
+    ResearchJobItem,
+    ResearchJobsData,
+    ResearchTaskEvent,
+    ResearchTaskEventsData,
+    ResearchTaskEventsState,
+    TaskOverviewData,
+)
 from rquant.web.security import current_user
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.status import UserState
@@ -53,6 +63,16 @@ _PAGE_AFTER = (
 )
 _CHANGED = "任务数据已更新，请从第一页重新查看。"
 _UNREADABLE = "研究任务数据暂时无法读取，请稍后重试。"
+_EVENT_CHANGED = "任务进展已更新，请重新打开查看。"
+_EVENT_NOTES: dict[ResearchTaskEventsState, str] = {
+    "ready": "任务进展",
+    "empty": "还没有进展记录。",
+    "truncated": "仅显示最近记录。",
+    "not_published": "任务进展尚未发布。",
+    "not_included": "当前数据未包含该任务。",
+    "unavailable": "任务进展暂时无法读取，请稍后重试。",
+}
+_EVENT_TABLES = ("lab_job_event", "lab_job_event_window")
 
 _TYPE_LABELS = {
     "strategy_replay": "策略回放",
@@ -187,6 +207,163 @@ def _watermark(borrowed: BorrowedGeneration) -> ServingDatasetWatermark | None:
     )
 
 
+def _can_view_research_logs(viewer: str | None, request: Request) -> bool:
+    settings = request.app.state.web.settings
+    return (
+        settings.ingress_socket_path is not None
+        and viewer is not None
+        and viewer in settings.log_admin_users
+    )
+
+
+def _events_data(
+    state: ResearchTaskEventsState,
+    *,
+    generation_id: str | None,
+    updated_at: datetime | None = None,
+    events: list[ResearchTaskEvent] | None = None,
+) -> ResearchTaskEventsData:
+    selected = events if events is not None else []
+    note = (
+        "当前没有可展示的最近记录。"
+        if state == "truncated" and not selected
+        else _EVENT_NOTES[state]
+    )
+    return ResearchTaskEventsData(
+        state=state,
+        note=note,
+        generation_id=generation_id,
+        updated_at=updated_at,
+        events=selected,
+        truncated=state == "truncated",
+    )
+
+
+def _published_event_time(borrowed: BorrowedGeneration) -> datetime | None:
+    rows = borrowed.cursor.execute(
+        "SELECT table_name, available, row_count, owner_dataset_id, "
+        "owner_generation_id, available_at FROM projection_status "
+        "WHERE table_name IN (?, ?) ORDER BY table_name LIMIT 3",
+        _EVENT_TABLES,
+    ).fetchall()
+    if not rows and all(borrowed.manifest.row_counts.get(name, 0) == 0 for name in _EVENT_TABLES):
+        return None
+    if len(rows) != 2 or tuple(row[0] for row in rows) != _EVENT_TABLES:
+        raise ValueError("research event projection status is incomplete")
+    mark = _watermark(borrowed)
+    if all(not row[1] for row in rows):
+        if any(
+            row[2] != 0
+            or row[3] != "lab_jobs"
+            or row[4] is not None
+            or row[5] is not None
+            or borrowed.manifest.row_counts.get(str(row[0]), 0) != 0
+            for row in rows
+        ):
+            raise ValueError("unpublished research event projection is inconsistent")
+        return None
+    if mark is None or mark.status is FreshnessStatus.UNAVAILABLE:
+        raise ValueError("research event owner is unavailable")
+    at = rows[0][5]
+    if (
+        any(
+            type(available) is not bool
+            or not available
+            or type(count) is not int
+            or count != borrowed.manifest.row_counts.get(str(name))
+            or owner != "lab_jobs"
+            or owner_generation != mark.generation_id
+            or available_at != at
+            for name, available, count, owner, owner_generation, available_at in rows
+        )
+        or not isinstance(at, datetime)
+        or at.tzinfo is None
+        or at > borrowed.manifest.built_at
+    ):
+        raise ValueError("research event projection is not from this source generation")
+    return at
+
+
+def _read_events(borrowed: BorrowedGeneration, job_id: str) -> ResearchTaskEventsData:
+    generation = borrowed.manifest.generation_id
+    at = _published_event_time(borrowed)
+    if at is None:
+        return _events_data("not_published", generation_id=generation)
+    jobs = borrowed.cursor.execute(
+        "SELECT status FROM lab_jobs WHERE job_id = ? LIMIT 2", (job_id,)
+    ).fetchall()
+    if not jobs:
+        return _events_data("not_included", generation_id=generation, updated_at=at)
+    if len(jobs) != 1 or jobs[0][0] not in _STATUS_INFO:
+        raise ValueError("published research job is invalid")
+    windows = borrowed.cursor.execute(
+        "SELECT job_version, state, retained_count, truncated "
+        "FROM lab_job_event_window WHERE job_id = ? LIMIT 2",
+        (job_id,),
+    ).fetchall()
+    if len(windows) != 1:
+        raise ValueError("published research event window is missing")
+    version, state, retained, truncated = windows[0]
+    if (
+        type(version) is not int
+        or version < 0
+        or type(retained) is not int
+        or not 0 <= retained <= 500
+        or type(truncated) is not bool
+        or (state, truncated)
+        not in {
+            ("empty", False),
+            ("available", False),
+            ("truncated", True),
+        }
+        or (state == "empty" and retained != 0)
+        or (state == "available" and retained == 0)
+    ):
+        raise ValueError("published research event window is invalid")
+    rows = borrowed.cursor.execute(
+        "SELECT event_id, job_version, occurred_at, new_status, label "
+        "FROM lab_job_event WHERE job_id = ? ORDER BY event_id DESC LIMIT 501",
+        (job_id,),
+    ).fetchall()
+    if len(rows) != retained:
+        raise ValueError("published research event count differs from its window")
+    events: list[ResearchTaskEvent] = []
+    previous_id: int | None = None
+    previous_version: int | None = None
+    previous_time: datetime | None = None
+    for event_id, event_version, occurred_at, new_status, label in rows:
+        if (
+            type(event_id) is not int
+            or event_id < 1
+            or (previous_id is not None and event_id >= previous_id)
+            or type(event_version) is not int
+            or not 0 <= event_version <= version
+            or (previous_version is not None and event_version > previous_version)
+            or not isinstance(occurred_at, datetime)
+            or occurred_at.tzinfo is None
+            or occurred_at > at
+            or (previous_time is not None and occurred_at > previous_time)
+            or new_status not in _STATUS_INFO
+            or label not in LAB_EVENT_ALLOWED_LABELS
+        ):
+            raise ValueError("published research event is invalid")
+        events.append(
+            ResearchTaskEvent(
+                event_id=event_id,
+                occurred_at=occurred_at,
+                label=label,
+                status_label=_STATUS_INFO[new_status][1],
+            )
+        )
+        previous_id, previous_version, previous_time = event_id, event_version, occurred_at
+    if rows and (rows[0][1] != version or rows[0][3] != jobs[0][0]):
+        raise ValueError("latest research event differs from the published job")
+    result_state: ResearchTaskEventsState = (
+        "truncated" if truncated else "empty" if not events else "ready"
+    )
+    return _events_data(result_state, generation_id=generation, updated_at=at, events=events)
+
+
 def _empty(
     source_state: Literal["unavailable", "not_published"], page_size: int
 ) -> ResearchJobsData:
@@ -312,11 +489,53 @@ def get_jobs(
     return Envelope[ResearchJobsData](data=data, serving=meta)
 
 
+@router.get(
+    "/jobs/{job_id}/events",
+    response_model=ResearchTaskEventsData,
+    summary="研究任务进展",
+)
+def get_job_events(
+    job_id: str,
+    request: Request,
+    response: Response,
+    viewer: Annotated[str | None, Depends(current_user)],
+    generation_id: Annotated[str | None, Query(max_length=128)] = None,
+) -> ResearchTaskEventsData:
+    web = request.app.state.web
+    if web.settings.ingress_socket_path is None or not web.settings.log_admin_users:
+        raise HTTPException(status_code=503, detail="任务进展尚未开放。")
+    if viewer is None:
+        raise HTTPException(status_code=401, detail="请先登录。")
+    if viewer not in web.settings.log_admin_users:
+        raise HTTPException(status_code=403, detail="当前账号不能查看任务进展。")
+    try:
+        canonical_job_id = str(UUID(job_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="任务标识无效。") from None
+    if canonical_job_id != job_id:
+        raise HTTPException(status_code=404, detail="任务标识无效。")
+    with web.tracker.borrow() as borrowed:
+        if borrowed is None:
+            if generation_id is not None:
+                raise HTTPException(status_code=409, detail=_EVENT_CHANGED)
+            return _events_data("unavailable", generation_id=None)
+        current = borrowed.manifest.generation_id
+        if generation_id is not None and generation_id != current:
+            raise HTTPException(status_code=409, detail=_EVENT_CHANGED)
+        response.headers["X-Rquant-Generation"] = current
+        if borrowed.manifest.built_at > web.clock():
+            return _events_data("unavailable", generation_id=current)
+        try:
+            return _read_events(borrowed, canonical_job_id)
+        except (ServingQueryError, ValueError, TypeError, ValidationError):
+            return _events_data("unavailable", generation_id=current)
+
+
 @router.get("/overview", response_model=Envelope[TaskOverviewData], summary="任务与运行状态")
 def get_overview(
     request: Request,
     response: Response,
-    _viewer: Annotated[str | None, Depends(current_user)],
+    viewer: Annotated[str | None, Depends(current_user)],
     page_size: Annotated[int, Query(ge=1, le=50)] = 20,
     cursor: Annotated[str | None, Query(max_length=512)] = None,
 ) -> Envelope[TaskOverviewData]:
@@ -365,6 +584,7 @@ def get_overview(
             services=services,
             resources=resources,
             research=research,
+            can_view_research_logs=_can_view_research_logs(viewer, request),
         ),
         serving=meta,
     )

@@ -56,6 +56,31 @@ class ResearchJobsData(BaseModel):
     next_cursor: str | None
 
 
+ResearchTaskEventsState = Literal[
+    "ready", "empty", "truncated", "not_published", "not_included", "unavailable"
+]
+
+
+class ResearchTaskEvent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event_id: int = Field(ge=1)
+    occurred_at: AwareUtcDatetime
+    label: str = Field(min_length=1, max_length=24)
+    status_label: str = Field(min_length=1, max_length=16)
+
+
+class ResearchTaskEventsData(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    state: ResearchTaskEventsState
+    note: str
+    generation_id: str | None
+    updated_at: AwareUtcDatetime | None
+    events: list[ResearchTaskEvent] = Field(max_length=500)
+    truncated: bool
+
+
 OverviewSourceState = Literal["ready", "unavailable"]
 
 
@@ -155,3 +180,4 @@ class TaskOverviewData(BaseModel):
     services: RuntimeServicesData
     resources: ResourcesData
     research: ResearchJobsData
+    can_view_research_logs: bool = False

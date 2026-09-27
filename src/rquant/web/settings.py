@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
@@ -28,6 +29,8 @@ SCREEN_RSI_ENV_VAR = "RQUANT_WEB_SCREEN_RSI_ROOT"
 CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
+LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
+_ADMIN_USER_PATTERN = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
 DEFAULT_BIND = "127.0.0.1:8768"
 DEFAULT_PAGE_CONTROL_URL = "http://127.0.0.1:8767/v1/commands"
@@ -79,6 +82,7 @@ class WebSettings(BaseModel):
     catalog_samples_file: Path | None = None
     ack_admission_socket_path: Path | None = None
     ingress_socket_path: Path | None = None
+    log_admin_users: frozenset[str] = frozenset()
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
@@ -118,6 +122,13 @@ class WebSettings(BaseModel):
     def validate_ingress_socket_path(cls, value: Path | None) -> Path | None:
         if value is not None and not value.is_absolute():
             raise ValueError("private Web ingress socket path must be absolute")
+        return value
+
+    @field_validator("log_admin_users")
+    @classmethod
+    def validate_log_admin_users(cls, value: frozenset[str]) -> frozenset[str]:
+        if len(value) > 16 or any(_ADMIN_USER_PATTERN.fullmatch(user) is None for user in value):
+            raise ValueError("log admins must be a bounded list of exact user names")
         return value
 
     @property
@@ -168,4 +179,10 @@ class WebSettings(BaseModel):
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():
                 raise ValueError("private Web ingress cannot also configure a TCP bind")
             values["ingress_socket_path"] = Path(ingress_socket)
+        admins = source.get(LOG_ADMIN_USERS_ENV_VAR, "").strip()
+        if admins:
+            names = tuple(user.strip() for user in admins.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("log admins must be distinct nonempty user names")
+            values["log_admin_users"] = frozenset(names)
         return cls.model_validate(values)
