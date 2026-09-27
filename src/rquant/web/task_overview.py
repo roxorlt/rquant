@@ -226,6 +226,10 @@ def _timer_status(item: OpsUnitEvidence, phase: MarketPhase, now: datetime) -> S
         return Status(UserState.IDLE, "未运行", "这项任务已按计划停用")
     if item.timer_load_state != "loaded":
         return Status(UserState.CRIT, "异常", "定时任务没有正确安装")
+    if item.service_load_state != "loaded":
+        return Status(UserState.CRIT, "异常", "对应服务没有正确安装")
+    if item.timer_active_state == "failed":
+        return Status(UserState.CRIT, "异常", "定时任务当前运行异常")
     if item.timer_unit_file_state not in {"enabled", "enabled-runtime", "static"}:
         return Status(UserState.WARN, "注意", "定时任务未启用")
     if item.service_active_state == "failed" or item.service_result not in {None, "success"}:
@@ -302,7 +306,13 @@ def ops_sections(
             for item in sample.units
         ],
     )
-    parent = sample.resources[0]
+    display_resources = tuple(
+        item
+        if item.load_state == "loaded" and item.active_state == "active"
+        else item.model_copy(update={"memory_current_bytes": None, "memory_peak_bytes": None})
+        for item in sample.resources
+    )
+    parent = display_resources[0]
     resources = ResourcesData(
         source_state="ready",
         source_label="资源使用",
@@ -321,7 +331,7 @@ def ops_sections(
                 memory_current_bytes=item.memory_current_bytes,
                 memory_peak_bytes=item.memory_peak_bytes,
             )
-            for name, item in zip(_GROUP_NAMES, sample.resources[1:], strict=True)
+            for name, item in zip(_GROUP_NAMES, display_resources[1:], strict=True)
         ],
         cpu_usage_percent=None,
         cpu_note="暂无可信 CPU 数据",
