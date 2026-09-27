@@ -14,8 +14,10 @@ import duckdb
 import pytest
 
 from rquant.canvas_publication_receipt import CanvasPublicationReceipt
+from rquant.llm.schemas import RuleCall
 from rquant.notification_state import NotificationStateStore
 from rquant.page_control import (
+    AddPoolToCanvas,
     DeleteCanvas,
     PageControlConsumer,
     PageControlOutbox,
@@ -23,6 +25,7 @@ from rquant.page_control import (
     PageControlService,
     PageControlStatus,
     SaveCanvas,
+    SaveUserPoolV2,
 )
 from rquant.research_gate import ResearchGateFailure
 from rquant.runtime_contracts import canonical_sha256
@@ -1600,6 +1603,71 @@ def test_signal_source_canvas_definition_update_and_delete_create_new_snapshots(
     assert first != second
     definitions = {item.table_name: item for item in deleted.projections}["canvas_definition"]
     assert definitions.rows == ()
+
+
+def test_signal_source_publishes_a_verified_page_control_canvas_attachment(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    outbox = PageControlOutbox(tmp_path / "page-control.sqlite3")
+    data_dir = tmp_path / "page-data"
+    authority = create_canvas_ed25519_test_authority(tmp_path / "page-keys")
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=data_dir,
+            log_dir=tmp_path / "page-logs",
+            canvas_publication_signer=authority.signer,
+            canvas_publication_keyring=authority.keyring,
+        ),
+    )
+    assert (
+        service.submit(
+            SaveCanvas(
+                command_id="canvas-seed",
+                requested_at=NOW - timedelta(days=1),
+                name="breakout",
+                pool_refs=("n-shape-pool1",),
+            )
+        ).status
+        is PageControlStatus.SUCCEEDED
+    )
+    saved = service.submit(
+        SaveUserPoolV2(
+            command_id="pool-save",
+            requested_at=NOW - timedelta(hours=2),
+            base_name="first",
+            display_name="First",
+            rule_calls=(RuleCall(name="not_st", args={}),),
+        )
+    )
+    assert saved.status is PageControlStatus.SUCCEEDED
+    assert isinstance(saved.result, dict)
+    attached = service.submit(
+        AddPoolToCanvas(
+            command_id="pool-attach",
+            requested_at=NOW - timedelta(hours=1),
+            canvas_name="breakout",
+            pool_name="user/first",
+            expected_pool_version=saved.result["version"],
+        )
+    )
+    assert attached.status is PageControlStatus.SUCCEEDED
+
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        canvas_catalog_root=data_dir / "canvases",
+        canvas_receipt_root=data_dir / "canvas-publication-receipts",
+        canvas_publication_keyring=authority.keyring,
+        page_control_outbox=outbox,
+    )(NOW)
+    definition = next(
+        item for item in snapshot.projections if item.table_name == "canvas_definition"
+    )
+    assert len(definition.rows) == 1
+    assert json.loads(definition.rows[0]["pool_refs_json"]) == ["n-shape-pool1", "user/first"]
 
 
 @pytest.mark.parametrize("after_delete", [False, True])

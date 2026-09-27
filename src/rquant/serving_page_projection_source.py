@@ -1020,7 +1020,7 @@ class _ReadonlyPageControlAuditReader:
                 FROM page_control_command AS c
                 LEFT JOIN page_control_effect AS e USING (command_id)
                 WHERE c.status = ?
-                  AND c.command_kind IN (?, ?, ?, ?, ?)
+                  AND c.command_kind IN (?, ?, ?, ?, ?, ?)
                 ORDER BY c.rowid
                 """,
                 (
@@ -1028,6 +1028,7 @@ class _ReadonlyPageControlAuditReader:
                     "save_canvas",
                     "delete_canvas",
                     "set_canvas_pool_refs",
+                    "add_pool_to_canvas",
                     "save_user_pool",
                     "fork_builtin_pool",
                 ),

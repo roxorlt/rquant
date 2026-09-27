@@ -23,7 +23,8 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_POOLS = 512
 _MAX_CANVASES = 512
 _MAX_RULES = 32
-_MAX_REFS = 64
+_MAX_COLUMNS = 64
+_MAX_CANVAS_REFS = 256
 _MAX_JSON_BYTES = 64 * 1024
 
 
@@ -87,7 +88,7 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
     ):
         return None
     raw_rules = _json_list(rules_json, limit=_MAX_RULES)
-    raw_columns = _json_list(columns_json, limit=_MAX_REFS)
+    raw_columns = _json_list(columns_json, limit=_MAX_COLUMNS)
     if raw_rules is None or raw_columns is None:
         return None
     rules: list[EditorRuleCall] = []
@@ -117,7 +118,7 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
 
 def _canvas(row: tuple[object, ...]) -> EditableCanvas | None:
     name, description, refs_json, version = row
-    refs = _json_list(refs_json, limit=_MAX_REFS)
+    refs = _json_list(refs_json, limit=_MAX_CANVAS_REFS)
     if (
         not isinstance(name, str)
         or not 1 <= len(name) <= 80

@@ -171,6 +171,18 @@ def test_editor_reads_registered_user_rules_and_verified_canvas_from_one_generat
     assert response.json()["serving"]["generation_id"] is not None
 
 
+@pytest.mark.parametrize("count", [65, 256])
+def test_editor_keeps_canvas_visible_through_authoritative_ref_limit(
+    tmp_path: Path, count: int
+) -> None:
+    refs = [f"user/pool-{index:03d}" for index in range(count)]
+    app = _app(tmp_path / "serving", canvas_rows=[_canvas_row(refs)])
+    with TestClient(app) as client:
+        response = client.get("/api/v1/pools/editor")
+    assert response.status_code == 200
+    assert response.json()["data"]["canvases"][0]["pool_refs"] == refs
+
+
 def test_editor_hides_noneditable_or_corrupt_rows_and_old_generation_cannot_write(
     tmp_path: Path,
 ) -> None:
