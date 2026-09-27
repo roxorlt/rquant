@@ -6,12 +6,15 @@ from __future__ import annotations
 import re
 from collections.abc import Collection
 from datetime import date, datetime, time
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from rquant.screen.rules import AggregateRequest
-from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 PRICE_COLS_MAP = {
     "open": "OPEN",
@@ -600,7 +603,10 @@ def load_universe(
     Research callers must enforce those dataset contracts before calling.
     """
     owns_store = store is None
-    store = store or DuckDBStore()
+    if not store:
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore()
 
     try:
         if required_columns is not None:

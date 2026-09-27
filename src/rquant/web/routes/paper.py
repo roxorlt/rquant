@@ -6,12 +6,12 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import ValidationError
 
 from rquant.paper_contracts import PaperAccountSnapshot, PaperHolding
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
+from rquant.serving_publisher import ServingQueryError
 from rquant.web import readers
 from rquant.web.envelope import Envelope
 from rquant.web.models.paper import PaperAccountItem, PaperAccountsData, PaperHoldingItem
@@ -95,7 +95,7 @@ def _read(borrowed: BorrowedGeneration, mark: ServingDatasetWatermark) -> PaperA
             names = readers.stock_names(
                 borrowed.cursor, readers.table_states(borrowed.cursor), codes
             )
-        except duckdb.Error:
+        except ServingQueryError:
             names = {}
 
         accounts: list[PaperAccountItem] = []
@@ -149,7 +149,14 @@ def _read(borrowed: BorrowedGeneration, mark: ServingDatasetWatermark) -> PaperA
                     holdings=items,
                 )
             )
-    except (duckdb.Error, ValidationError, ValueError, TypeError, KeyError, OverflowError) as error:
+    except (
+        ServingQueryError,
+        ValidationError,
+        ValueError,
+        TypeError,
+        KeyError,
+        OverflowError,
+    ) as error:
         raise HTTPException(status_code=503, detail=_UNREADABLE) from error
 
     note = (

@@ -9,12 +9,12 @@ from binascii import Error as Base64Error
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
+from rquant.serving_publisher import ServingQueryError
 from rquant.web.envelope import Envelope
 from rquant.web.models.common import StatusInfo
 from rquant.web.models.tasks import JobCounts, ResearchJobItem, ResearchJobsData
@@ -223,7 +223,7 @@ def _page(
             ).fetchall()
         selected = rows[:page_size]
         items = [_item(row) for row in selected]
-    except (duckdb.Error, ValueError, TypeError, ValidationError) as error:
+    except (ServingQueryError, ValueError, TypeError, ValidationError) as error:
         raise HTTPException(status_code=503, detail=_UNREADABLE) from error
     next_cursor = (
         _encode_cursor(

@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import duckdb
 import pandas as pd
@@ -25,7 +25,9 @@ from rquant.replica_generation import (
 from rquant.screen.core import _collect_aggregates, _infer_lookback
 from rquant.screen.loader import ScreeningCalendarError, _selected_sources, load_universe
 from rquant.screen.rules import Rule, required_rule_columns
-from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 MAX_CONDITIONS = 26
 MAX_STOCKS = 8_000
@@ -292,7 +294,7 @@ class VerifiedReplicaScreenSource:
             frame = load_universe(
                 trade_date.isoformat(),
                 lookback=lookback,
-                store=cast(DuckDBStore, _StoreConnection(connection)),
+                store=cast("DuckDBStore", _StoreConnection(connection)),
                 aggregate_requests=aggregates,
                 decision_at=decision_at,
                 required_columns=requested_columns,
