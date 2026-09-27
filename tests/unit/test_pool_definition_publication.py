@@ -78,9 +78,7 @@ def _rows(root: Path) -> dict[str, dict[str, object]]:
 
     reader = _ReadonlyPageControlAuditReader(root / "control.sqlite3")
     with reader.snapshot():
-        projection = _pool_definition_projection(
-            root / "data" / "user_presets", reader, observed=NOW
-        )
+        projection = _pool_definition_projection(root / "data" / "user_presets", reader)
     return {str(row["pool_name"]): dict(row) for row in projection.rows}
 
 
@@ -351,7 +349,7 @@ def test_pool_projection_joins_same_signal_generation(tmp_path: Path) -> None:
     projection = {item.table_name: item for item in snapshot.projections}["pool_definition"]
     row = next(item for item in projection.rows if item["pool_name"] == "user/breakout")
     assert row["state"] == "available"
-    assert projection.available_at == snapshot.available_at
+    assert projection.available_at == datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def test_unchanged_pool_projection_does_not_publish_new_generation(tmp_path: Path) -> None:
@@ -378,6 +376,45 @@ def test_unchanged_pool_projection_does_not_publish_new_generation(tmp_path: Pat
     changed = producer.publish(NOW + timedelta(seconds=4))
     assert changed.written is True
     assert changed.generation_id != first.generation_id
+
+
+def test_valid_client_clock_skew_keeps_new_pool_definition_published(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    first_save = service.submit(_v2("save-first"))
+    assert first_save.status is PageControlStatus.SUCCEEDED
+    assert isinstance(first_save.result, dict)
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(
+            database,
+            user_presets_root=tmp_path / "data" / "user_presets",
+            page_control_outbox=tmp_path / "control.sqlite3",
+        ),
+        store=store,
+    )
+    first_generation = producer.publish(NOW)
+
+    future_save = service.submit(
+        _v2(
+            "save-future",
+            requested_at=NOW + timedelta(minutes=2),
+            expected_version=first_save.result["version"],
+            display_name="新版本",
+        )
+    )
+    assert future_save.status is PageControlStatus.SUCCEEDED
+    assert isinstance(future_save.result, dict)
+
+    new_generation = producer.publish(NOW + timedelta(seconds=2))
+    assert new_generation.written is True
+    assert new_generation.generation_id != first_generation.generation_id
+    latest = store.serving_snapshot(observed_at=NOW + timedelta(seconds=2), history_limit=1)
+    projection = {item.table_name: item for item in latest.payload.projections}["pool_definition"]
+    row = next(item for item in projection.rows if item["pool_name"] == "user/breakout")
+    assert row["state"] == "available"
+    assert row["version"] == future_save.result["version"]
 
 
 def test_old_signal_generation_without_optional_pool_projection_still_valid(

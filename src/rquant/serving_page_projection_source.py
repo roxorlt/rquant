@@ -295,8 +295,6 @@ def _read_bound_optional_file(
 def _pool_definition_projection(
     root: Path,
     audit: _ReadonlyPageControlAuditReader,
-    *,
-    observed: datetime,
 ) -> ServingProjectionPayload:
     """Read every managed pool through pinned paths in one PageControl audit snapshot."""
     root = Path(os.path.abspath(root))
@@ -348,20 +346,11 @@ def _pool_definition_projection(
         finally:
             binding.close()
     rows = build_pool_definition_rows(files, mutations, root_path=str(root))
-    # Successful, hash-checked commands supply a stable source timestamp. File and
-    # builtin changes are represented by the rows' content hash, not by the poll time.
-    available_at = max(
-        (
-            normalize_aware_utc(datetime.fromisoformat(str(item.payload["requested_at"])))
-            for item in mutations.values()
-        ),
-        default=_EMPTY_PROJECTION_AVAILABLE_AT,
-    )
-    if available_at > normalize_aware_utc(observed):
-        raise PageProjectionSourceIntegrityError("user pool audit is newer than observation")
+    # A client request time is not a server publication time. Verified command and
+    # file versions live in the rows, whose content hash changes only with facts.
     return ServingProjectionPayload(
         table_name="pool_definition",
-        available_at=available_at,
+        available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
         rows=rows,
     )
 
@@ -1341,7 +1330,6 @@ class DuckDBSignalPageProjectionSource:
             else _pool_definition_projection(
                 self.user_presets_root,
                 self.page_control_outbox,
-                observed=observed,
             )
         )
         pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
