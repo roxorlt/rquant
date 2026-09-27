@@ -303,6 +303,7 @@ for (const width of [1440, 390]) {
     await page.getByRole("button", { name: /股票日线/ }).click();
     const panel = page.getByRole("region", { name: "日线质量报告" });
     await expect(panel.getByLabel("结束日期")).toHaveValue("2026-09-23");
+    await expect(panel.getByText("还没有审计任务，选择日期后运行。")).toBeVisible();
     const run = panel.getByRole("button", { name: "运行数据审计" });
     await expect(run).toBeEnabled();
     await run.focus();

@@ -37,22 +37,20 @@ function taskTone(status: Progress["latest_status"]): "waiting" | "ok" | "crit" 
 function currentRequestLabel(
   command: AuditReportCommandSnapshot,
   progress: Progress | null,
-  report: Overview | null,
+  ownPublished: boolean,
 ): string | null {
   const journal = command.journal;
   if (!journal) return null;
   if (journal.status === "failed") return "本次请求未通过";
   if (["ambiguous", "unknown", "pending", "processing"].includes(journal.status))
     return "本次提交状态待确认";
+  if (ownPublished) return "本次报告已发布";
   if (journal.taskId !== progress?.latest_task_id) return "本次请求已排队";
   if (progress.latest_status === "queued") return "本次任务等待运行";
   if (progress.latest_status === "running") return "本次任务正在核对";
   if (progress.latest_status === "failed") return "本次审计未完成";
   if (progress.latest_status === "succeeded") {
-    return progress.successful_task_id === journal.taskId &&
-      progress.successful_report_hash === report?.report_hash
-      ? "本次报告已发布"
-      : "本次任务已结束，等待报告发布";
+    return "本次任务已结束，等待报告发布";
   }
   return "本次请求已排队";
 }
@@ -65,6 +63,8 @@ export function AuditReportRun({
   viewer,
   overview,
   progress,
+  ownPublished,
+  readBlock,
   commandSession,
   command,
   onRefresh,
@@ -75,6 +75,8 @@ export function AuditReportRun({
   viewer: string | null | undefined;
   overview: Overview | null;
   progress: Progress | null;
+  ownPublished: boolean;
+  readBlock: string | null;
   commandSession: AuditReportCommandSession;
   command: AuditReportCommandSnapshot;
   onRefresh: () => void;
@@ -104,11 +106,13 @@ export function AuditReportRun({
     command.journal.taskId === recent?.latest_task_id;
   const currentTaskActive =
     command.journal?.status === "queued" &&
+    !ownPublished &&
     (!sameTask || !["succeeded", "failed"].includes(recent?.latest_status ?? ""));
   const requestUncertain =
     command.journal !== null && !["queued", "failed"].includes(command.journal.status);
   const disabledReason =
-    viewer === undefined
+    readBlock ??
+    (viewer === undefined
       ? "正在确认登录状态。"
       : viewer === null
         ? "请先登录，才能运行审计。"
@@ -120,8 +124,8 @@ export function AuditReportRun({
               ? "当前审计尚未结束。"
               : !calendarReady || !evidence
                 ? "交易日历暂不可用，请刷新后重试。"
-                : (invalid ?? undefined);
-  const requestLabel = currentRequestLabel(command, recent, overview);
+                : (invalid ?? undefined));
+  const requestLabel = currentRequestLabel(command, recent, ownPublished);
   const events = recent?.events?.slice(0, 20) ?? [];
 
   return (
@@ -167,7 +171,11 @@ export function AuditReportRun({
             运行数据审计
           </Button>
         </div>
-        {invalid && calendarReady ? (
+        {readBlock ? (
+          <p className="dc-report-run-note" role="status">
+            {readBlock}
+          </p>
+        ) : invalid && calendarReady ? (
           <p className="dc-report-run-note" role="status">
             {invalid}
           </p>
@@ -265,7 +273,7 @@ export function AuditReportRun({
           </>
         ) : (
           <p className="dc-report-progress-hint">
-            {recent?.availability === "empty"
+            {progress?.availability === "empty"
               ? "还没有审计任务，选择日期后运行。"
               : "近期任务暂不可查看，稍后刷新进度。"}
           </p>

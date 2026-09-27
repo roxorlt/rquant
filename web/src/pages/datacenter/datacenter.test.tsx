@@ -613,6 +613,137 @@ describe("运行日线审计", () => {
     expect(within(panel).getByRole("heading", { name: "本次报告" })).toBeInTheDocument();
   });
 
+  it("keeps a published result tied to its request after a newer task fails", async () => {
+    const taskId = "a".repeat(32);
+    localStorage.setItem(
+      AUDIT_REPORT_JOURNAL_KEY,
+      JSON.stringify({
+        schema: 1,
+        body: {
+          command_id: "web-original",
+          requested_at: "2026-09-24T07:00:00Z",
+          audit_start: "2024-09-02",
+          observed_through: "2026-09-23",
+        },
+        status: "queued",
+        taskId,
+      }),
+    );
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      ...report,
+      progress: {
+        availability: "ready",
+        latest_task_id: "b".repeat(32),
+        latest_status: "failed",
+        successful_task_id: taskId,
+        successful_report_hash: report.overview?.report_hash ?? null,
+        successful_updated_at: "2026-09-24T07:05:00Z",
+        events: [
+          { event_type: "failed", label: "检查未完成", occurred_at: "2026-09-24T07:07:00Z" },
+        ],
+      },
+    });
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("本次报告已发布")).toBeInTheDocument();
+    expect(within(panel).getByRole("heading", { name: "本次报告" })).toBeInTheDocument();
+    expect(within(panel).getByText("最近任务未完成")).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeEnabled();
+  });
+
+  it("shows a real empty task state while the report is unpublished", async () => {
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      source_state: "not_published",
+      overview: null,
+      months: [],
+      rules: [],
+      issues: [],
+      progress: { availability: "empty", events: [] },
+    });
+    renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("还没有审计任务，选择日期后运行。")).toBeInTheDocument();
+    expect(within(panel).queryByText(/近期任务暂不可查看/)).not.toBeInTheDocument();
+  });
+
+  it("blocks stale meta data after a failed refresh", async () => {
+    catalogHandlers();
+    calendarHandler();
+    reportHandler();
+    const { queryClient } = renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    await waitFor(() =>
+      expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeEnabled(),
+    );
+    server.use(
+      http.get("*/api/v1/meta", () =>
+        HttpResponse.json({ detail: "unavailable" }, { status: 503 }),
+      ),
+    );
+    await queryClient.invalidateQueries({ queryKey: ["meta"] });
+    await waitFor(() => expect(queryClient.getQueryState(["meta"])?.error).toBeTruthy());
+    expect(queryClient.getQueryState(["meta"])?.data).toBeDefined();
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeDisabled();
+    expect(within(panel).queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+
+  it("withdraws a cached success and blocks submission after report refresh conflicts", async () => {
+    const taskId = "a".repeat(32);
+    localStorage.setItem(
+      AUDIT_REPORT_JOURNAL_KEY,
+      JSON.stringify({
+        schema: 1,
+        body: {
+          command_id: "web-original",
+          requested_at: "2026-09-24T07:00:00Z",
+          audit_start: "2024-09-02",
+          observed_through: "2026-09-23",
+        },
+        status: "queued",
+        taskId,
+      }),
+    );
+    catalogHandlers();
+    calendarHandler();
+    reportHandler({
+      ...report,
+      progress: {
+        availability: "ready",
+        latest_task_id: taskId,
+        latest_status: "succeeded",
+        successful_task_id: taskId,
+        successful_report_hash: report.overview?.report_hash ?? null,
+        events: [],
+      },
+    });
+    const { queryClient } = renderApp("/datacenter");
+    const panel = await screen.findByRole("region", { name: "日线质量报告" });
+    expect(await within(panel).findByText("本次报告已发布")).toBeInTheDocument();
+    server.use(
+      http.get("*/api/v1/data/report", () =>
+        HttpResponse.json({ detail: "changed" }, { status: 409 }),
+      ),
+    );
+    await queryClient.invalidateQueries({ queryKey: ["data", "audit", "report"] });
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState(["data", "audit", "report", metaEnvelope().serving.generation_id])
+          ?.error,
+      ).toBeTruthy(),
+    );
+    expect(
+      queryClient.getQueryState(["data", "audit", "report", metaEnvelope().serving.generation_id])
+        ?.data,
+    ).toBeDefined();
+    expect(within(panel).getByRole("button", { name: "运行数据审计" })).toBeDisabled();
+    expect(within(panel).queryByText("本次报告已发布")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
+  });
+
   it("keeps an unknown original request for manual retry and retains the previous report after failure", async () => {
     const user = userEvent.setup();
     const original = {

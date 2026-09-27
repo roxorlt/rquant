@@ -393,11 +393,21 @@ export function DailyReportPanel() {
     commandSession.snapshot,
     commandSession.snapshot,
   );
+  const readBlock = meta.error
+    ? "暂时无法确认当前数据，请刷新后重试。"
+    : report.error
+      ? "审计进度暂不可读取，请刷新后重试。"
+      : report.isLoading
+        ? "正在读取近期任务。"
+        : null;
   const sameReport =
+    !meta.error &&
+    !report.error &&
     expectedGeneration !== null &&
     expectedGeneration !== undefined &&
     report.serving?.generation_id === expectedGeneration;
   const sameCalendar =
+    readBlock === null &&
     expectedGeneration !== null &&
     expectedGeneration !== undefined &&
     meta.data?.data.generation?.generation_id === expectedGeneration &&
@@ -406,14 +416,16 @@ export function DailyReportPanel() {
   const progress = sameReport ? (report.data?.progress ?? null) : null;
   const overview =
     sameReport && report.data?.source_state === "ready" ? report.data.overview : null;
-  const ownPublished =
+  const ownPublished = Boolean(
     command.journal?.taskId &&
-    progress?.successful_task_id === command.journal.taskId &&
-    progress.successful_report_hash === overview?.report_hash;
-  const ownFailed =
+      progress?.successful_task_id === command.journal.taskId &&
+      progress.successful_report_hash === overview?.report_hash,
+  );
+  const ownFailed = Boolean(
     command.journal?.taskId &&
-    progress?.latest_task_id === command.journal.taskId &&
-    progress.latest_status === "failed";
+      progress?.latest_task_id === command.journal.taskId &&
+      progress.latest_status === "failed",
+  );
 
   useEffect(() => {
     if (
@@ -464,6 +476,8 @@ export function DailyReportPanel() {
         viewer={meta.data?.data.viewer}
         overview={overview}
         progress={progress}
+        ownPublished={ownPublished}
+        readBlock={readBlock}
         commandSession={commandSession}
         command={command}
         onRefresh={() => {
