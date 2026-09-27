@@ -10,10 +10,12 @@ export interface AckJournalEntry {
   status: Status;
   confirmationId: string | null;
   failureKind: "stale_generation" | null;
+  receiptObserved: boolean;
 }
 
-interface StoredAckJournal extends AckJournalEntry {
+interface StoredAckJournal extends Omit<AckJournalEntry, "receiptObserved"> {
   schema: 2;
+  receiptObserved?: boolean;
 }
 
 export interface AckCommandSnapshot {
@@ -58,6 +60,7 @@ function validEntry(value: unknown, alertId: string, commandId: string): value i
     REQUESTED_AT.test(body.requested_at) &&
     Number.isFinite(Date.parse(body.requested_at)) &&
     STATUSES.has(value.status as Status) &&
+    (value.receiptObserved === undefined || typeof value.receiptObserved === "boolean") &&
     (value.failureKind === null ||
       (value.status === "failed" && value.failureKind === "stale_generation")) &&
     (value.status === "succeeded"
@@ -153,7 +156,8 @@ export class AlertAckCommandSession {
       const parsed: unknown = JSON.parse(saved);
       if (!validEntry(parsed, alertId, commandId))
         throw new Error("invalid acknowledgment journal");
-      records[key] = parsed;
+      // Entries written before receipt tracking cannot prove that no durable reply was seen.
+      records[key] = { ...parsed, receiptObserved: parsed.receiptObserved ?? true };
     }
     return records;
   }
@@ -192,12 +196,18 @@ export class AlertAckCommandSession {
     const key = this.key(entry.body);
     try {
       const prior = this.storage.getItem(key);
+      let receiptObserved = entry.receiptObserved;
       if (prior !== null) {
         const parsed: unknown = JSON.parse(prior);
         if (!validEntry(parsed, entry.body.alert_id, entry.body.command_id))
           throw new Error("invalid existing request");
         if (JSON.stringify(parsed.body) !== JSON.stringify(entry.body))
           throw new Error("command identity collision");
+        receiptObserved ||= parsed.receiptObserved ?? true;
+        if (entry.failureKind === "stale_generation" && receiptObserved) {
+          this.refreshFromStorage(true);
+          return false;
+        }
         if (
           (parsed.status === "succeeded" ||
             (parsed.status === "failed" && parsed.failureKind === "stale_generation")) &&
@@ -207,10 +217,11 @@ export class AlertAckCommandSession {
           return false;
         }
       }
-      const serialized = JSON.stringify({ schema: 2, ...entry } satisfies StoredAckJournal);
+      const savedEntry = { ...entry, receiptObserved };
+      const serialized = JSON.stringify({ schema: 2, ...savedEntry } satisfies StoredAckJournal);
       this.storage.setItem(key, serialized);
       if (this.storage.getItem(key) !== serialized) throw new Error("request not stored");
-      this.records = { ...this.records, [key]: entry };
+      this.records = { ...this.records, [key]: savedEntry };
       this.emit({ entries: this.visibleEntries(), message: null });
       return true;
     } catch {
@@ -247,14 +258,22 @@ export class AlertAckCommandSession {
         !Number.isFinite(Date.parse(body.requested_at))
       )
         throw new Error("invalid command identity");
-      if (this.persist({ body, status: "pending", confirmationId: null, failureKind: null }))
-        await this.advance(alertId, body.command_id);
+      if (
+        this.persist({
+          body,
+          status: "pending",
+          confirmationId: null,
+          failureKind: null,
+          receiptObserved: false,
+        })
+      )
+        await this.advance(alertId);
     } catch {
       this.emit({ message: "暂时无法创建确认请求，请重试。" });
     }
   }
 
-  async advance(alertId: string, firstCommandId?: string): Promise<void> {
+  async advance(alertId: string): Promise<void> {
     if (
       !this.current.storageAvailable ||
       this.current.busyAlerts.includes(alertId) ||
@@ -290,6 +309,7 @@ export class AlertAckCommandSession {
               ...entry,
               status: "succeeded",
               confirmationId: receipt.confirmation_id,
+              receiptObserved: true,
             });
           } else if (["pending", "processing", "ambiguous", "failed"].includes(receipt.status)) {
             if (receipt.confirmation_id != null)
@@ -299,32 +319,34 @@ export class AlertAckCommandSession {
               status: receipt.status,
               confirmationId: null,
               failureKind: null,
+              receiptObserved: true,
             });
           } else {
             throw new Error("unrecognized receipt status");
           }
         } catch (error) {
-          const firstRejected =
+          const noEffect =
             error instanceof AckNoEffectError &&
-            firstCommandId === entry.body.command_id &&
-            entry.status === "pending";
+            this.refreshFromStorage() &&
+            this.records[this.key(entry.body)]?.receiptObserved === false;
           const saved = this.persist({
             ...entry,
-            status: firstRejected ? "failed" : "unknown",
+            status: noEffect ? "failed" : "unknown",
             confirmationId: null,
-            failureKind: firstRejected ? "stale_generation" : null,
+            failureKind: noEffect ? "stale_generation" : null,
           });
           if (!saved && this.current.entries[alertId]?.failureKind === "stale_generation") continue;
           this.emit({
-            message: firstRejected
-              ? "数据已更新，请刷新后重新确认。"
-              : error instanceof ApiError && error.status === 401
-                ? "请先登录，再继续核对本次请求。"
-                : error instanceof ApiError && error.status === 403
-                  ? "当前账号无权确认，请继续核对本次请求。"
-                  : error instanceof ApiError && error.status === 409
-                    ? "告警状态已变化，请刷新并核对本次请求。"
-                    : "确认状态待核对，请继续核对本次请求。",
+            message:
+              saved && noEffect
+                ? "数据已更新，请刷新后重新确认。"
+                : error instanceof ApiError && error.status === 401
+                  ? "请先登录，再继续核对本次请求。"
+                  : error instanceof ApiError && error.status === 403
+                    ? "当前账号无权确认，请继续核对本次请求。"
+                    : error instanceof ApiError && error.status === 409
+                      ? "告警状态已变化，请刷新并核对本次请求。"
+                      : "确认状态待核对，请继续核对本次请求。",
           });
         }
       }

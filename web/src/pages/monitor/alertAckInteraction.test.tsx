@@ -306,6 +306,57 @@ it("ends a directly rejected old-version request and starts a new command only o
   expect(posts[1]?.command_id).not.toBe(posts[0]?.command_id);
 });
 
+it("recovers a lost old-version request after a proved no-effect retry on the refreshed version", async () => {
+  const posts: Schemas["AckCommandRequest"][] = [];
+  server.use(
+    monitorHandler(eligibleEnvelope()),
+    http.post("*/api/v1/monitor/ack", async ({ request }) => {
+      const body = (await request.json()) as Schemas["AckCommandRequest"];
+      posts.push(body);
+      if (posts.length === 1) return new HttpResponse(null, { status: 503 });
+      if (posts.length === 2)
+        return HttpResponse.json(
+          { detail: "数据已更新，请刷新告警时间线。", code: "stale_generation_no_effect" },
+          { status: 409 },
+        );
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        confirmation_id: "first-confirmation",
+        message: "已受理，正在同步",
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  const view = renderApp("/monitor");
+  const timeline = await screen.findByRole("list", { name: "告警时间线" });
+  await user.click(
+    within(timeline.firstElementChild as HTMLElement).getByRole("button", { name: "确认" }),
+  );
+  await screen.findByText("状态待核对");
+
+  const generation = "c".repeat(64);
+  const original = eligibleEnvelope();
+  server.use(
+    metaHandler(metaEnvelope({ generationId: generation })),
+    monitorHandler({
+      ...original,
+      serving: { ...original.serving, generation_id: generation },
+    }),
+  );
+  await Promise.all([
+    view.queryClient.invalidateQueries({ queryKey: ["meta"] }),
+    view.queryClient.invalidateQueries({ queryKey: ["monitor"] }),
+  ]);
+  await user.click(screen.getByRole("button", { name: "继续核对" }));
+  await screen.findByText("数据已更新，请刷新后重新确认。");
+  expect(posts[1]).toEqual(posts[0]);
+  await user.click(screen.getByRole("button", { name: "重新确认" }));
+  await screen.findByText("已受理，正在同步");
+  expect(posts[2]?.generation_id).toBe(generation);
+  expect(posts[2]?.command_id).not.toBe(posts[0]?.command_id);
+});
+
 it("does not resume the previous login's saved request after the browser identity changes", async () => {
   server.use(metaHandler(metaEnvelope({ viewer: "alice" })));
   const view = renderApp("/overview");

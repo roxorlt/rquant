@@ -166,7 +166,7 @@ it("rejects a malformed saved journal instead of overwriting an uncertain comman
   expect(post).not.toHaveBeenCalled();
 });
 
-it("turns only a proved no-effect first request into a terminal stale command", async () => {
+it("ends a proved no-effect request with no observed receipt", async () => {
   const post = vi.fn(async () => {
     throw new AckNoEffectError();
   });
@@ -181,6 +181,121 @@ it("turns only a proved no-effect first request into a terminal stale command", 
     status: "failed",
     failureKind: "stale_generation",
   });
+});
+
+it("treats an older saved request without receipt evidence as uncertain", async () => {
+  const body: Command = {
+    command_id: "web-1",
+    requested_at: "2026-09-28T07:00:00.000Z",
+    generation_id: GENERATION,
+    alert_id: ALERT,
+  };
+  window.localStorage.setItem(
+    `${ACK_JOURNAL_KEY}:tester:${ALERT}:${body.command_id}`,
+    JSON.stringify({
+      schema: 2,
+      body,
+      status: "unknown",
+      confirmationId: null,
+      failureKind: null,
+    }),
+  );
+  const post = vi.fn(async () => {
+    throw new AckNoEffectError();
+  });
+  const current = session(post);
+  await current.advance(ALERT);
+  expect(current.snapshot().entries[ALERT]).toMatchObject({
+    status: "unknown",
+    failureKind: null,
+  });
+  await current.start("c".repeat(64), ALERT);
+  expect(post).toHaveBeenCalledTimes(1);
+});
+
+it("ends a lost original request only after a later retry proves no effect", async () => {
+  const nextGeneration = "c".repeat(64);
+  const sent: Command[] = [];
+  const post = vi.fn(async (body: Command): Promise<Receipt> => {
+    sent.push(body);
+    if (sent.length === 1) throw new ApiError(503, "连接断开");
+    if (sent.length === 2) throw new AckNoEffectError();
+    return {
+      command_id: body.command_id,
+      status: "succeeded",
+      confirmation_id: CONFIRMATION,
+      message: "已受理，正在同步",
+    };
+  });
+  await session(post).start(GENERATION, ALERT);
+  const reopened = session(post);
+  await reopened.advance(ALERT);
+  expect(sent[1]).toEqual(sent[0]);
+  expect(reopened.snapshot().entries[ALERT]).toMatchObject({
+    status: "failed",
+    failureKind: "stale_generation",
+  });
+  await reopened.start(nextGeneration, ALERT);
+  expect(sent).toHaveLength(3);
+  expect(sent[2]?.generation_id).toBe(nextGeneration);
+  expect(sent[2]?.command_id).not.toBe(sent[0]?.command_id);
+});
+
+it.each(["pending", "processing"] as const)(
+  "retains an original request after a durable %s receipt despite later no-effect reply",
+  async (status) => {
+    const sent: Command[] = [];
+    const post = vi.fn(async (body: Command): Promise<Receipt> => {
+      sent.push(body);
+      if (sent.length === 1) return { command_id: body.command_id, status, message: "稍后核对" };
+      if (sent.length === 2) throw new ApiError(503, "连接断开");
+      throw new AckNoEffectError();
+    });
+    const current = session(post);
+    await current.start(GENERATION, ALERT);
+    await current.advance(ALERT);
+    const reopened = session(post);
+    await reopened.advance(ALERT);
+    expect(sent[1]).toEqual(sent[0]);
+    expect(sent[2]).toEqual(sent[0]);
+    expect(reopened.snapshot().entries[ALERT]).toMatchObject({
+      status: "unknown",
+      failureKind: null,
+    });
+    await reopened.start("c".repeat(64), ALERT);
+    expect(sent).toHaveLength(3);
+  },
+);
+
+it("keeps another tab's observed receipt when a stale request returns no effect", async () => {
+  let rejectStale!: () => void;
+  const firstPost = vi.fn(
+    (_body: Command) =>
+      new Promise<Receipt>((_resolve, reject) => {
+        rejectStale = () => reject(new AckNoEffectError());
+      }),
+  );
+  const otherPost = vi.fn(
+    async (body: Command): Promise<Receipt> => ({
+      command_id: body.command_id,
+      status: "pending",
+      message: "等待处理",
+    }),
+  );
+  const first = session(firstPost);
+  const firstRequest = first.start(GENERATION, ALERT);
+  const otherTab = session(otherPost);
+  await otherTab.advance(ALERT);
+  expect(otherPost.mock.calls[0]?.[0]).toEqual(firstPost.mock.calls[0]?.[0]);
+  rejectStale();
+  await firstRequest;
+  const reopened = session(otherPost);
+  expect(reopened.snapshot().entries[ALERT]).toMatchObject({
+    status: "unknown",
+    failureKind: null,
+  });
+  await reopened.start("c".repeat(64), ALERT);
+  expect(otherPost).toHaveBeenCalledTimes(1);
 });
 
 it("does not turn a later 409 into failure after an uncertain first effect", async () => {

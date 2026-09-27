@@ -333,3 +333,70 @@ test("旧数据的确认持续被拒后，刷新到新数据才生成新请求",
   expect(watcher.problems).toHaveLength(2);
   expect(watcher.problems.every((problem) => problem.includes("409"))).toBe(true);
 });
+
+test("失联后旧请求在新数据上证实未受理，才允许重新确认", async ({ page }) => {
+  const watcher = watch(page);
+  const first = monitorEnvelope();
+  const oldGeneration = first.serving.generation_id;
+  if (!oldGeneration) throw new Error("synthetic data version is missing");
+  const newGeneration = "c".repeat(64);
+  const alertId = "a".repeat(64);
+  const active = monitorEnvelope({
+    unacknowledged: { ...READY, count: 1 },
+    items: first.data.items.map((item, index) => ({
+      ...item,
+      acknowledgment:
+        index === 0
+          ? { state: "unconfirmed" as const, eligible: true, alert_id: alertId, label: "待确认" }
+          : { state: "historical" as const, eligible: false, label: "历史告警" },
+    })),
+  });
+  let generation = oldGeneration;
+  const requests: Schemas["AckCommandRequest"][] = [];
+  await page.route("**/api/v1/meta", (route) =>
+    route.fulfill({ json: metaEnvelope({ generationId: generation }) }),
+  );
+  await page.route(/\/api\/v1\/monitor\/timeline(?:\?|$)/, (route) =>
+    route.fulfill({
+      json: { ...active, serving: { ...active.serving, generation_id: generation } },
+    }),
+  );
+  await page.route("**/api/v1/monitor/ack", async (route) => {
+    const body = route.request().postDataJSON() as Schemas["AckCommandRequest"];
+    requests.push(body);
+    await route.fulfill(
+      requests.length === 1
+        ? { status: 503 }
+        : requests.length === 2
+          ? {
+              status: 409,
+              json: {
+                detail: "数据已更新，请刷新告警时间线。",
+                code: "stale_generation_no_effect",
+              },
+            }
+          : {
+              json: {
+                command_id: body.command_id,
+                status: "succeeded",
+                confirmation_id: "first-confirmation",
+                message: "已受理，正在同步",
+              },
+            },
+    );
+  });
+  await page.goto("./#/monitor");
+  const row = page.getByRole("list", { name: "告警时间线" }).locator(":scope > li").first();
+  await row.getByRole("button", { name: "确认" }).click();
+  await expect(row).toContainText("状态待核对");
+  generation = newGeneration;
+  await page.reload();
+  await expect(row).toContainText("数据已更新");
+  expect(requests[1]).toEqual(requests[0]);
+  await row.getByRole("button", { name: "重新确认" }).click();
+  await expect(row).toContainText("已受理，正在同步");
+  expect(requests).toHaveLength(3);
+  expect(requests[2]?.generation_id).toBe(newGeneration);
+  expect(requests[2]?.command_id).not.toBe(requests[0]?.command_id);
+  expect(watcher.problems.every((problem) => /503|409/.test(problem))).toBe(true);
+});
