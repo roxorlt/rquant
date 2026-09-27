@@ -1,6 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
+import type { Schemas } from "../src/api/client.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
@@ -28,7 +29,9 @@ for (const viewport of [
       await expect(detail.getByRole("list", { name: "已发布条件" }).locator("li")).toHaveCount(3);
       await expect(detail).toContainText("使用父池前 2 个交易日内的成员");
       await expect(detail).toContainText("上次选股结果");
-      await expect(page.getByText("上次结果与当前规则的对应关系尚未确认。")).toBeVisible();
+      await expect(detail.getByRole("region", { name: "上次选股结果" })).toContainText(
+        "结果版本待确认",
+      );
       const pool = list.getByRole("button", { name: "查看 N 形态一池成员" });
       await pool.focus();
       await pool.press("Enter");
@@ -65,6 +68,54 @@ for (const viewport of [
       await member.press("Enter");
       await expect(page.getByRole("dialog")).toBeVisible();
       await expectNoHorizontalOverflow(page, "published pools");
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      expect(watcher.problems).toEqual([]);
+    });
+
+    test("shows verified zero hits and a changed rule version with keyboard", async ({ page }) => {
+      const watcher = watch(page);
+      await page.route("**/api/v1/pools", async (route) => {
+        const upstream = await route.fetch();
+        const body = (await upstream.json()) as Schemas["Envelope_PoolsData_"];
+        const first = body.data.pools.find((pool) => pool.key === "n-shape-pool1");
+        const second = body.data.pools.find((pool) => pool.key === "n-shape-pool2");
+        if (!first || !second) throw new Error("synthetic pools are missing");
+        first.member_count = 0;
+        first.members = [];
+        first.steps = [];
+        first.members_truncated = false;
+        first.result = {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: 0,
+          zero_hit_label: "该交易日没有符合条件的股票",
+        };
+        second.result = {
+          state: "rules_changed",
+          status_label: "规则已更新，等待下次选股",
+          trade_date: "2026-09-23",
+          hit_count: second.member_count,
+        };
+        await route.fulfill({ response: upstream, body: JSON.stringify(body) });
+      });
+      await page.goto("./#/pools");
+      const list = page.getByRole("group", { name: "池子列表" });
+      const first = list.getByRole("button", { name: "查看 N 形态一池成员" });
+      await first.focus();
+      await first.press("Enter");
+      const result = page.getByRole("region", { name: "上次选股结果" });
+      await expect(result).toContainText("结果已按当前规则更新");
+      await expect(result).toContainText("该交易日没有符合条件的股票");
+      await expect(result).toContainText("0 只");
+      await expect(result.locator(".pools-step")).toHaveCount(0);
+      await expect(page.getByRole("table", { name: "池子成员" })).toHaveCount(0);
+      const second = list.getByRole("button", { name: "查看 N 形态二池成员" });
+      await second.focus();
+      await second.press("Space");
+      await expect(result).toContainText("规则已更新，等待下次选股");
+      await expect(page.getByRole("region", { name: "规则详情" })).toContainText("已发布");
+      await expectNoHorizontalOverflow(page, "pool receipts");
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
       expect(watcher.problems).toEqual([]);
     });

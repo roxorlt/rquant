@@ -3592,6 +3592,68 @@
         "title": "PoolMember",
         "type": "object"
       },
+      "PoolResultView": {
+        "properties": {
+          "hit_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hit Count"
+          },
+          "state": {
+            "enum": [
+              "current_rules",
+              "older_rules",
+              "rules_changed",
+              "unverified",
+              "not_run",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          },
+          "zero_hit_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Zero Hit Label"
+          }
+        },
+        "required": [
+          "state",
+          "status_label",
+          "trade_date",
+          "hit_count"
+        ],
+        "title": "PoolResultView",
+        "type": "object"
+      },
       "PoolRuleItem": {
         "properties": {
           "label": {
@@ -3818,6 +3880,9 @@
             "title": "Name",
             "type": "string"
           },
+          "result": {
+            "$ref": "#/components/schemas/PoolResultView"
+          },
           "state": {
             "enum": [
               "current",
@@ -3862,7 +3927,8 @@
           "steps",
           "steps_truncated",
           "members",
-          "members_truncated"
+          "members_truncated",
+          "result"
         ],
         "title": "PublishedPool",
         "type": "object"

@@ -33,6 +33,12 @@ const base: Schemas["PoolsData"] = {
       steps_truncated: false,
       members: [{ code: "600001.SH", name: "样本01", close: 11, pct_chg: 1.2 }],
       members_truncated: true,
+      result: {
+        state: "unverified",
+        status_label: "结果版本待确认",
+        trade_date: null,
+        hit_count: null,
+      },
     },
     {
       key: "deleted-pool",
@@ -44,6 +50,12 @@ const base: Schemas["PoolsData"] = {
       steps_truncated: false,
       members: [],
       members_truncated: false,
+      result: {
+        state: "not_run",
+        status_label: "尚无选股结果",
+        trade_date: null,
+        hit_count: null,
+      },
     },
   ],
   pools_truncated: false,
@@ -110,6 +122,124 @@ it("selects a published pool by keyboard and opens a member's stock drawer", asy
   expect(await screen.findByRole("dialog")).toHaveTextContent("样本01");
 });
 
+it("shows independent published-rule and verified-result states in graph, list, and detail", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    rules_available: true,
+    pools: [
+      {
+        ...first,
+        definition: firstRule,
+        result: {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: 121,
+        },
+      },
+    ],
+  });
+  const { container } = renderApp("/pools");
+  const list = await screen.findByRole("group", { name: "池子列表" });
+  expect(within(list).getByRole("button", { name: "查看 N 字一池成员" })).toHaveTextContent(
+    "结果已按当前规则更新",
+  );
+  const graph = screen.getByRole("group", { name: "已发布规则与池子" });
+  expect(graph.querySelector('[data-id="n-shape-pool1"]')).toHaveTextContent(
+    "结果已按当前规则更新",
+  );
+  expect(graph.querySelector('[data-id="condition:n-shape-pool1"]')).toHaveTextContent(
+    "规则已发布",
+  );
+  const detail = screen.getByRole("region", { name: "池子详情" });
+  expect(within(detail).getByRole("region", { name: "规则详情" })).toHaveTextContent("已发布");
+  expect(within(detail).getByRole("region", { name: "上次选股结果" })).toHaveTextContent(
+    "结果已按当前规则更新",
+  );
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("shows trusted zero hits without a fabricated step or old member", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    rules_available: true,
+    pools: [
+      {
+        ...first,
+        definition: firstRule,
+        member_count: 0,
+        members: [],
+        steps: [],
+        result: {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: 0,
+          zero_hit_label: "该交易日没有符合条件的股票",
+        },
+      },
+    ],
+  });
+  renderApp("/pools");
+  const detail = await screen.findByRole("region", { name: "上次选股结果" });
+  expect(detail).toHaveTextContent("该交易日没有符合条件的股票");
+  expect(detail).toHaveTextContent("0 只");
+  expect(detail).not.toHaveTextContent("命中步骤");
+  expect(screen.queryByText("样本01")).not.toBeInTheDocument();
+});
+
+it("keeps old members visible after a rule change and dates another pool's earlier run", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    rules_available: true,
+    canvases: [],
+    pools: [
+      {
+        ...first,
+        definition: firstRule,
+        result: {
+          state: "rules_changed",
+          status_label: "规则已更新，等待下次选股",
+          trade_date: "2026-09-23",
+          hit_count: 121,
+        },
+      },
+      {
+        ...first,
+        key: "user/旧日池",
+        name: "旧日池",
+        state: "older",
+        trade_date: "2026-09-22",
+        member_count: null,
+        members: [],
+        definition: { ...firstRule, name: "旧日池" },
+        result: {
+          state: "older_rules",
+          status_label: "上次结果与当前规则一致",
+          trade_date: "2026-09-22",
+          hit_count: 2,
+        },
+      },
+    ],
+  });
+  const user = userEvent.setup();
+  renderApp("/pools");
+  const detail = await screen.findByRole("region", { name: "池子详情" });
+  expect(detail).toHaveTextContent("规则已更新，等待下次选股");
+  expect(detail).toHaveTextContent("样本01");
+  await user.click(screen.getByRole("button", { name: /查看 旧日池成员/ }));
+  expect(detail).toHaveTextContent("上次结果与当前规则一致");
+  expect(detail).toHaveTextContent("2026");
+  expect(detail).toHaveTextContent("最近交易日未运行");
+  expect(detail).not.toHaveTextContent("样本01");
+});
+
 it("does not call unpublished references invalid or reuse older counts", async () => {
   const current = base.pools[0];
   const unpublished = base.pools[1];
@@ -172,10 +302,25 @@ it("shows a truthful unavailable state without stale members", async () => {
 });
 
 it("does not show cached pool members from a different generation", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
   server.use(
     http.get("*/api/v1/pools", () =>
       HttpResponse.json({
-        data: base,
+        data: {
+          ...base,
+          pools: [
+            {
+              ...first,
+              result: {
+                state: "current_rules",
+                status_label: "结果已按当前规则更新",
+                trade_date: "2026-09-23",
+                hit_count: 121,
+              },
+            },
+          ],
+        },
         serving: { ...serving, generation_id: "another-generation" },
       }),
     ),
@@ -183,6 +328,7 @@ it("does not show cached pool members from a different generation", async () => 
   renderApp("/pools");
   expect(await screen.findByText("池子数据正在更新")).toBeInTheDocument();
   expect(screen.queryByText("样本01")).not.toBeInTheDocument();
+  expect(screen.queryByText("结果已按当前规则更新")).not.toBeInTheDocument();
 });
 
 it("explains when no pools have been published", async () => {

@@ -53,6 +53,18 @@ class PoolDefinitionView(BaseModel):
     rules: list[PoolRuleItem]
 
 
+class PoolResultView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal[
+        "current_rules", "older_rules", "rules_changed", "unverified", "not_run", "unavailable"
+    ]
+    status_label: str
+    trade_date: date | None
+    hit_count: int | None
+    zero_hit_label: str | None = None
+
+
 class PublishedPool(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -66,6 +78,7 @@ class PublishedPool(BaseModel):
     members: list[PoolMember]
     members_truncated: bool
     definition: PoolDefinitionView | None = None
+    result: PoolResultView
 
 
 class SavedCanvas(BaseModel):

@@ -1549,6 +1549,22 @@ export interface components {
             /** Pct Chg */
             pct_chg: number | null;
         };
+        /** PoolResultView */
+        PoolResultView: {
+            /** Hit Count */
+            hit_count: number | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "current_rules" | "older_rules" | "rules_changed" | "unverified" | "not_run" | "unavailable";
+            /** Status Label */
+            status_label: string;
+            /** Trade Date */
+            trade_date: string | null;
+            /** Zero Hit Label */
+            zero_hit_label?: string | null;
+        };
         /** PoolRuleItem */
         PoolRuleItem: {
             /** Label */
@@ -1623,6 +1639,7 @@ export interface components {
             members_truncated: boolean;
             /** Name */
             name: string;
+            result: components["schemas"]["PoolResultView"];
             /**
              * State
              * @enum {string}
