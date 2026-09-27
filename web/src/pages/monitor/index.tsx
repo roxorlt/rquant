@@ -232,10 +232,17 @@ function AckAction({
     );
   }
   if (entry?.status === "failed") {
+    const stale = entry.failureKind === "stale_generation";
     return (
       <span className="monitor-ack">
-        <StatusBadge state="warn" label="确认未完成" reason="上次请求已结束，告警仍需确认。" />
-        {eligible ? (
+        <StatusBadge
+          state="warn"
+          label={stale ? "数据已更新" : "确认未完成"}
+          reason={
+            stale ? "旧数据上的请求未受理，刷新后可重新确认。" : "上次请求已结束，告警仍需确认。"
+          }
+        />
+        {eligible && (!stale || generationId !== entry.body.generation_id) ? (
           <Button
             size="sm"
             onClick={() => {
@@ -280,14 +287,18 @@ export default function MonitorPage() {
   const pageIndex = cursors.length - 1;
   const result = useMonitorTimeline(cursors[pageIndex] ?? null, refreshKey);
   const meta = useCurrentMeta();
+  useEffect(() => {
+    void meta.refetch();
+  }, [meta.refetch]);
   const currentGeneration = meta.data?.data.generation?.generation_id;
-  const viewer = meta.data?.data.viewer ?? null;
+  const viewer =
+    meta.isFetchedAfterMount && !meta.isError ? (meta.data?.data.viewer ?? null) : null;
   const commandSession = useMemo(
     () =>
       new AlertAckCommandSession(
         (() => {
           try {
-            return window.sessionStorage;
+            return window.localStorage;
           } catch {
             return null;
           }
@@ -313,6 +324,7 @@ export default function MonitorPage() {
   const data = oldGeneration || result.error ? undefined : result.data;
   const changed = result.error instanceof ApiError && result.error.status === 409;
   const pageFresh =
+    meta.isFetchedAfterMount &&
     !meta.isError &&
     meta.data?.serving.state === "ready" &&
     result.serving?.state === "ready" &&

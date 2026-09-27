@@ -6,6 +6,7 @@ import { metaEnvelope, monitorEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { metaHandler, monitorHandler, server } from "@/test/server";
+import { AlertAckCommandSession } from "./alertAckCommandSession";
 
 const IDS = ["1".repeat(64), "2".repeat(64), "3".repeat(64)];
 const READY: Schemas["UnacknowledgedSummary"] = {
@@ -30,7 +31,10 @@ function eligibleEnvelope(summary = READY) {
   });
 }
 
-beforeEach(() => window.sessionStorage.clear());
+beforeEach(() => {
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+});
 
 it("offers exactly three eligible trigger actions, never a notification action", async () => {
   const envelope = eligibleEnvelope();
@@ -220,7 +224,6 @@ it("retries the original request after an uncertain response and reload", async 
 
 it.each([
   [403, "当前账号无权确认"],
-  [409, "告警状态已变化"],
   [503, "确认状态待核对"],
 ] as const)("keeps the original request after HTTP %s", async (status, message) => {
   const sent: Schemas["AckCommandRequest"][] = [];
@@ -247,4 +250,89 @@ it.each([
   await user.click(screen.getByRole("button", { name: "继续核对" }));
   await screen.findByText("已受理，正在同步");
   expect(sent[1]).toEqual(sent[0]);
+});
+
+it("ends a directly rejected old-version request and starts a new command only on the refreshed version", async () => {
+  const posts: Schemas["AckCommandRequest"][] = [];
+  server.use(
+    monitorHandler(eligibleEnvelope()),
+    http.post("*/api/v1/monitor/ack", async ({ request }) => {
+      const body = (await request.json()) as Schemas["AckCommandRequest"];
+      posts.push(body);
+      return body.generation_id === monitorEnvelope().serving.generation_id
+        ? HttpResponse.json({ detail: "数据已更新，请刷新告警时间线。" }, { status: 409 })
+        : HttpResponse.json({
+            command_id: body.command_id,
+            status: "succeeded",
+            confirmation_id: "first-confirmation",
+            message: "已受理，正在同步",
+          });
+    }),
+  );
+  const user = userEvent.setup();
+  const view = renderApp("/monitor");
+  const timeline = await screen.findByRole("list", { name: "告警时间线" });
+  await user.click(
+    within(timeline.firstElementChild as HTMLElement).getByRole("button", { name: "确认" }),
+  );
+  await screen.findByText("数据已更新，请刷新后重新确认。");
+  expect(
+    within(timeline.firstElementChild as HTMLElement).queryByRole("button", { name: "继续核对" }),
+  ).toBeNull();
+  expect(
+    within(timeline.firstElementChild as HTMLElement).queryByRole("button", { name: "重新确认" }),
+  ).toBeNull();
+
+  const generation = "c".repeat(64);
+  const original = eligibleEnvelope();
+  server.use(
+    metaHandler(metaEnvelope({ generationId: generation })),
+    monitorHandler({
+      ...original,
+      serving: { ...original.serving, generation_id: generation },
+    }),
+  );
+  await view.queryClient.invalidateQueries({ queryKey: ["meta"] });
+  const retry = await screen.findByRole("button", { name: "重新确认" });
+  await user.click(retry);
+  await screen.findByText("已受理，正在同步");
+  expect(posts).toHaveLength(2);
+  expect(posts[1]?.generation_id).toBe(generation);
+  expect(posts[1]?.alert_id).toBe(posts[0]?.alert_id);
+  expect(posts[1]?.command_id).not.toBe(posts[0]?.command_id);
+});
+
+it("does not resume the previous login's saved request after the browser identity changes", async () => {
+  server.use(metaHandler(metaEnvelope({ viewer: "alice" })));
+  const view = renderApp("/overview");
+  await screen.findByRole("table", { name: "最新信号" });
+  const saved = new AlertAckCommandSession(
+    window.localStorage,
+    "alice",
+    async (body) => ({ command_id: body.command_id, status: "pending", message: "等待处理" }),
+    () => "alice-command",
+    () => "2026-09-28T07:00:00.000Z",
+  );
+  await saved.start(monitorEnvelope().serving.generation_id as string, IDS[0] as string);
+
+  const posts = vi.fn(async ({ request }: { request: Request }) => {
+    const body = (await request.json()) as Schemas["AckCommandRequest"];
+    return HttpResponse.json({
+      command_id: body.command_id,
+      status: "pending",
+      message: "等待处理",
+    });
+  });
+  server.use(
+    metaHandler(metaEnvelope({ viewer: "bob" })),
+    monitorHandler(eligibleEnvelope()),
+    http.post("*/api/v1/monitor/ack", posts),
+  );
+  await view.router.navigate("/monitor");
+  await screen.findByRole("list", { name: "告警时间线" });
+  await waitFor(() =>
+    expect(screen.queryByText("请先登录，才能确认告警。")).not.toBeInTheDocument(),
+  );
+  expect(posts).not.toHaveBeenCalled();
+  expect(screen.getAllByRole("button", { name: /^确认$/ })).toHaveLength(3);
 });

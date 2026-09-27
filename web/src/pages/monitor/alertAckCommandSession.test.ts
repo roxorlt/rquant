@@ -6,28 +6,34 @@ type Receipt = Schemas["AckCommandReceipt"];
 const ALERT = "a".repeat(64);
 const GENERATION = "b".repeat(64);
 const CONFIRMATION = "confirmed-first";
+let idSequence = 0;
 
-beforeEach(() => window.sessionStorage.clear());
+beforeEach(() => {
+  idSequence = 0;
+  window.localStorage.clear();
+  window.sessionStorage.clear();
+});
 
 function session(
   post: (body: Command) => Promise<Receipt>,
   viewer = "tester",
-  storage = window.sessionStorage,
+  storage = window.localStorage,
 ) {
-  let number = 0;
   return new AlertAckCommandSession(
     storage,
     viewer,
     post,
-    () => `web-${++number}`,
+    () => `web-${++idSequence}`,
     () => "2026-09-28T07:00:00.000Z",
   );
 }
 
 it("saves the four-field original request before POST and records only a verified success", async () => {
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
-    const saved = JSON.parse(window.sessionStorage.getItem(`${ACK_JOURNAL_KEY}:tester`) ?? "{}");
-    expect(saved.entries[ALERT].body).toEqual(body);
+    const saved = JSON.parse(
+      window.localStorage.getItem(`${ACK_JOURNAL_KEY}:tester:${ALERT}:${body.command_id}`) ?? "{}",
+    );
+    expect(saved.body).toEqual(body);
     return {
       command_id: body.command_id,
       status: "succeeded",
@@ -51,7 +57,7 @@ it("saves the four-field original request before POST and records only a verifie
   expect(post).toHaveBeenCalledTimes(1);
 });
 
-it("retries a lost response after reload with exactly the stored request", async () => {
+it("retries a lost response after the tab closes and reopens with exactly the stored request", async () => {
   const seen: Command[] = [];
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
     seen.push(body);
@@ -66,6 +72,7 @@ it("retries a lost response after reload with exactly the stored request", async
   const first = session(post);
   await first.start(GENERATION, ALERT);
   expect(first.snapshot().entries[ALERT]?.status).toBe("unknown");
+  window.sessionStorage.clear();
   const restored = session(post);
   await restored.resumePending();
   expect(seen).toHaveLength(2);
@@ -150,12 +157,78 @@ it("does not POST without durable storage and keeps each viewer's requests separ
 });
 
 it("rejects a malformed saved journal instead of overwriting an uncertain command", async () => {
-  window.sessionStorage.setItem(`${ACK_JOURNAL_KEY}:tester`, "{broken");
+  window.localStorage.setItem(`${ACK_JOURNAL_KEY}:tester:${ALERT}:web-1`, "{broken");
   const post = vi.fn();
   const current = session(post);
   await current.start(GENERATION, ALERT);
   expect(current.snapshot().storageAvailable).toBe(false);
   expect(post).not.toHaveBeenCalled();
+});
+
+it("turns only a direct first-request 409 into a terminal stale command", async () => {
+  const post = vi.fn(async () => {
+    throw new ApiError(409, "数据已更新");
+  });
+  const current = session(post);
+  await current.start(GENERATION, ALERT);
+  expect(current.snapshot().entries[ALERT]).toMatchObject({
+    status: "failed",
+    failureKind: "stale_generation",
+  });
+  const reopened = session(post);
+  expect(reopened.snapshot().entries[ALERT]).toMatchObject({
+    status: "failed",
+    failureKind: "stale_generation",
+  });
+});
+
+it("does not turn a later 409 into failure after an uncertain first effect", async () => {
+  let attempts = 0;
+  const post = vi.fn(async (_body: Command) => {
+    attempts += 1;
+    throw new ApiError(attempts === 1 ? 503 : 409, "状态不明");
+  });
+  const current = session(post);
+  await current.start(GENERATION, ALERT);
+  await current.advance(ALERT);
+  expect(current.snapshot().entries[ALERT]?.status).toBe("unknown");
+  expect(post.mock.calls[1]?.[0]).toEqual(post.mock.calls[0]?.[0]);
+});
+
+it("keeps different tabs' commands in independent records and adopts an existing alert request", async () => {
+  const post = vi.fn(
+    async (body: Command): Promise<Receipt> => ({
+      command_id: body.command_id,
+      status: "pending",
+      message: "等待处理",
+    }),
+  );
+  const firstTab = session(post);
+  const secondTab = session(post);
+  const unsubscribe = secondTab.subscribe(vi.fn());
+  await firstTab.start(GENERATION, ALERT);
+  window.dispatchEvent(
+    new StorageEvent("storage", {
+      key: `${ACK_JOURNAL_KEY}:tester:${ALERT}:web-1`,
+      storageArea: window.localStorage,
+    }),
+  );
+  expect(secondTab.snapshot().message).toContain("另一标签页");
+  await secondTab.start(GENERATION, ALERT);
+  expect(post).toHaveBeenCalledTimes(1);
+  expect(secondTab.snapshot().entries[ALERT]?.body).toEqual(
+    firstTab.snapshot().entries[ALERT]?.body,
+  );
+
+  const otherAlert = "c".repeat(64);
+  await secondTab.start(GENERATION, otherAlert);
+  const reopened = session(post);
+  expect(reopened.snapshot().entries[ALERT]).toBeDefined();
+  expect(reopened.snapshot().entries[otherAlert]).toBeDefined();
+  expect(
+    Object.keys(window.localStorage).filter((key) => key.startsWith(`${ACK_JOURNAL_KEY}:tester:`)),
+  ).toHaveLength(2);
+  unsubscribe();
 });
 
 it("only a durable failed receipt permits a fresh command", async () => {
