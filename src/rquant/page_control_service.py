@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -285,19 +286,28 @@ def main(
     *,
     runtime_root: Path | None = None,
     expected_commit: str | None = None,
+    ack_socket_path: Path | None = None,
+    ack_serving_root: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
 
     if argv is not None:
         arguments = build_parser().parse_args(list(argv))
         expected_commit = expected_commit or arguments.expected_commit
-    return _serve(runtime_root=runtime_root, expected_commit=expected_commit)
+    return _serve(
+        runtime_root=runtime_root,
+        expected_commit=expected_commit,
+        ack_socket_path=ack_socket_path,
+        ack_serving_root=ack_serving_root,
+    )
 
 
 def _serve(
     *,
     runtime_root: Path | None = None,
     expected_commit: str | None = None,
+    ack_socket_path: Path | None = None,
+    ack_serving_root: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
         LINUX_PRODUCTION_RUNTIME_ROOT,
@@ -394,9 +404,38 @@ def _serve(
         ),
         canvas_publication_keyring=keyring,
     )
+    if (ack_socket_path is None) != (ack_serving_root is None):
+        raise ValueError("ack socket and Serving root must be configured together")
+    ack_server = None
+    if ack_socket_path is not None and ack_serving_root is not None:
+        from rquant.alert_ack_admission import AckAdmission, build_ack_admission_server
+
+        ack_server = build_ack_admission_server(
+            AckAdmission(service, ack_serving_root),
+            socket_path=ack_socket_path,
+        )
     server_class = _server_class_for_host(host)
-    server = server_class((host, port), handler_for(service))
-    server.serve_forever()
+    try:
+        server = server_class((host, port), handler_for(service))
+    except Exception:
+        if ack_server is not None:
+            ack_server.server_close()
+        raise
+    ack_thread = None
+    ack_started = False
+    try:
+        if ack_server is not None:
+            ack_thread = threading.Thread(target=ack_server.serve_forever, daemon=True)
+            ack_thread.start()
+            ack_started = True
+        server.serve_forever()
+    finally:
+        server.server_close()
+        if ack_server is not None:
+            if ack_started and ack_thread is not None:
+                ack_server.shutdown()
+                ack_thread.join()
+            ack_server.server_close()
 
 
 if __name__ == "__main__":
