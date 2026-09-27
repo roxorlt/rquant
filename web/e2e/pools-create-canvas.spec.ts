@@ -34,9 +34,10 @@ for (const viewport of [
         const upstream = await route.fetch();
         const body = (await upstream.json()) as Schemas["Envelope_PoolsData_"];
         body.serving.generation_id = published ? "canvas-published" : "canvas-old";
-        body.data.state = "no_data";
-        body.data.latest_trade_date = null;
-        body.data.pools = [];
+        expect(body.data.pools.map((pool) => pool.key)).toEqual(
+          expect.arrayContaining(["n-shape-pool1", "n-shape-pool2"]),
+        );
+        body.data.state = "ready";
         body.data.definitions_available = true;
         body.data.canvases = published
           ? [{ name: "晨盘观察", description: "观察候选池", pool_keys: [], refs_truncated: false }]

@@ -15,6 +15,19 @@ export type TdxPreviewRequest = Schemas["TdxPreviewRequest"];
 export type TdxPreviewData = Schemas["TdxPreviewData"];
 export type TdxPreviewSourceData = Schemas["TdxPreviewSourceData"];
 
+/** Replica catalogs have their own source lifetime; Serving catalogs follow the page generation. */
+export function catalogUsableForGeneration(
+  catalog: ScreenCatalogData | undefined,
+  catalogGeneration: string | null | undefined,
+  pageGeneration: string | null | undefined,
+): boolean {
+  return (
+    !!catalog &&
+    pageGeneration != null &&
+    (catalog.source_kind === "replica" || catalogGeneration === pageGeneration)
+  );
+}
+
 export function useTdxPreviewSource() {
   return useQuery({
     queryKey: ["tdx-preview-source"],

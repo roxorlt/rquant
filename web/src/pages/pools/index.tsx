@@ -608,11 +608,11 @@ export default function PoolsPage() {
             <span>
               {editorSnapshot.journal.attachStatus === "succeeded"
                 ? stage === "published" || stage === "result"
-                  ? "已加入当前画布"
+                  ? `已加入「${editorSnapshot.journal.canvasName}」`
                   : "加入请求已完成，等待画布更新"
                 : editorSnapshot.journal.attachStatus === "failed"
                   ? "画布挂接失败"
-                  : "尚未加入当前画布"}
+                  : `尚未加入「${editorSnapshot.journal.canvasName}」`}
             </span>
           ) : null}
           <span>{stage === "published" || stage === "result" ? "规则已发布" : "等待规则发布"}</span>
@@ -695,7 +695,7 @@ export default function PoolsPage() {
                       newest,
                     ),
                   )
-                  ? "已加入画布"
+                  ? `已加入「${item.canvasName}」`
                   : "加入请求已完成，等待画布更新"
                 : item.attachStatus === "failed"
                   ? "画布挂接失败"
@@ -770,7 +770,7 @@ export default function PoolsPage() {
             >
               新建画布
             </Button>
-            {data.pools.length === 0 ? (
+            {shown.length === 0 ? (
               <FirstPoolAction
                 canvas={canvas}
                 editor={editorQuery.data}
@@ -779,7 +779,6 @@ export default function PoolsPage() {
                 generationId={visibleGeneration}
                 viewer={meta.data?.data.viewer}
                 definitionsAvailable={data.definitions_available}
-                poolsTruncated={data.pools_truncated}
                 storageAvailable={editorSnapshot.storageAvailable}
                 onCreate={() => setEditorMode({ kind: "create", parentKey: null })}
               />
@@ -814,14 +813,7 @@ export default function PoolsPage() {
             </p>
           ) : null}
           {canvas && shown.length === 0 ? (
-            <EmptyState
-              title="这张画布还是空的"
-              hint={
-                data.pools.length
-                  ? "添加条件节点后，池子会显示在这里。"
-                  : "创建首只池子后，这里会显示条件和结果。"
-              }
-            />
+            <EmptyState title="这张画布还是空的" hint="创建首只池子后，这里会显示条件和结果。" />
           ) : !canvas && data.pools.length === 0 ? (
             <EmptyState
               title={data.state === "unavailable" ? "池子结果暂不可用" : "还没有已发布的池子"}

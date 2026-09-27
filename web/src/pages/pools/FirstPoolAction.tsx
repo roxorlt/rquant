@@ -1,5 +1,5 @@
 import type { Schemas } from "@/api/client";
-import { useScreenCatalog } from "@/api/screen";
+import { catalogUsableForGeneration, useScreenCatalog } from "@/api/screen";
 import { Button } from "@/ui";
 
 export function FirstPoolAction({
@@ -10,7 +10,6 @@ export function FirstPoolAction({
   generationId,
   viewer,
   definitionsAvailable,
-  poolsTruncated,
   storageAvailable,
   onCreate,
 }: {
@@ -21,24 +20,18 @@ export function FirstPoolAction({
   generationId: string | null | undefined;
   viewer: string | null | undefined;
   definitionsAvailable: boolean;
-  poolsTruncated: boolean;
   storageAvailable: boolean;
   onCreate: () => void;
 }) {
   const catalog = useScreenCatalog();
   const editableCanvas = editor?.canvases.find((item) => item.name === canvas?.name);
   const canvasReady =
-    !!canvas &&
-    definitionsAvailable &&
-    !poolsTruncated &&
-    !canvas.refs_truncated &&
-    canvas.pool_keys.length === 0;
+    !!canvas && definitionsAvailable && !canvas.refs_truncated && canvas.pool_keys.length === 0;
   const editableCanvasReady = !!editableCanvas && editableCanvas.pool_refs.length === 0;
   const catalogReady =
     !catalog.error &&
     !!catalog.data?.blocks.length &&
-    generationId != null &&
-    catalog.serving?.generation_id === generationId;
+    catalogUsableForGeneration(catalog.data, catalog.serving?.generation_id, generationId);
   const disabledReason = !canvasReady
     ? "请先打开已发布的空画布。"
     : !editorReady

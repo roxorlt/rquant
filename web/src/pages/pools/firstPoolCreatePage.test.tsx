@@ -27,6 +27,20 @@ const BLOCKS: Schemas["ScreenCatalogData"] = {
   ranking_metrics: [],
   source: null,
 };
+const BUILTIN_POOL: Schemas["PublishedPool"] = {
+  key: "n-shape-pool1",
+  name: "N 形态一池",
+  state: "unpublished",
+  trade_date: null,
+  member_count: null,
+  gain_verified_count: 0,
+  gain_sample_avg_pct: null,
+  steps: [],
+  steps_truncated: false,
+  members: [],
+  members_truncated: false,
+  result: { state: "not_run", status_label: "尚无选股结果", trade_date: null, hit_count: null },
+};
 
 beforeEach(() => window.sessionStorage.clear());
 
@@ -36,19 +50,23 @@ function respondFirstPool(
     catalog?: Schemas["ScreenCatalogData"] | null;
     editorState?: "ready" | "unavailable";
     editorCanvasAvailable?: boolean;
+    builtinPools?: boolean;
+    generation?: () => string;
+    catalogGeneration?: string;
   } = {},
 ) {
   const isPublished = options.published ?? (() => false);
-  const serving = () => metaEnvelope({ generationId: isPublished() ? "g2" : "g1" }).serving;
+  const generation = () => options.generation?.() ?? (isPublished() ? "g2" : "g1");
+  const serving = () => metaEnvelope({ generationId: generation() }).serving;
   const key = "user/首只观察";
   server.use(
     http.get("*/api/v1/meta", () =>
-      HttpResponse.json(metaEnvelope({ generationId: isPublished() ? "g2" : "g1" })),
+      HttpResponse.json(metaEnvelope({ generationId: generation() })),
     ),
     http.get("*/api/v1/pools", () =>
       HttpResponse.json({
         data: {
-          state: isPublished() ? "ready" : "no_data",
+          state: isPublished() || options.builtinPools ? "ready" : "no_data",
           latest_trade_date: null,
           definitions_available: true,
           rules_available: true,
@@ -62,40 +80,45 @@ function respondFirstPool(
           ],
           canvases_truncated: false,
           pools_truncated: false,
-          pools: isPublished()
-            ? [
-                {
-                  key,
-                  name: "首只观察",
-                  state: "unpublished",
-                  trade_date: null,
-                  member_count: null,
-                  gain_verified_count: 0,
-                  gain_sample_avg_pct: null,
-                  steps: [],
-                  steps_truncated: false,
-                  members: [],
-                  members_truncated: false,
-                  definition: {
+          pools: [
+            ...(options.builtinPools
+              ? [BUILTIN_POOL, { ...BUILTIN_POOL, key: "n-shape-pool2", name: "N 形态二池" }]
+              : []),
+            ...(isPublished()
+              ? [
+                  {
+                    key,
                     name: "首只观察",
-                    state: "available",
-                    status_label: "已发布",
-                    reason_label: null,
-                    source_label: "自建规则",
-                    description: "",
-                    depends_on: null,
-                    delay_label: null,
-                    rules: [{ label: "排除 ST", parameters: [] }],
-                  },
-                  result: {
-                    state: "not_run",
-                    status_label: "尚无选股结果",
+                    state: "unpublished",
                     trade_date: null,
-                    hit_count: null,
-                  },
-                },
-              ]
-            : [],
+                    member_count: null,
+                    gain_verified_count: 0,
+                    gain_sample_avg_pct: null,
+                    steps: [],
+                    steps_truncated: false,
+                    members: [],
+                    members_truncated: false,
+                    definition: {
+                      name: "首只观察",
+                      state: "available",
+                      status_label: "已发布",
+                      reason_label: null,
+                      source_label: "自建规则",
+                      description: "",
+                      depends_on: null,
+                      delay_label: null,
+                      rules: [{ label: "排除 ST", parameters: [] }],
+                    },
+                    result: {
+                      state: "not_run",
+                      status_label: "尚无选股结果",
+                      trade_date: null,
+                      hit_count: null,
+                    },
+                  } satisfies Schemas["PublishedPool"],
+                ]
+              : []),
+          ],
         } satisfies Schemas["PoolsData"],
         serving: serving(),
       }),
@@ -140,7 +163,11 @@ function respondFirstPool(
     http.get("*/api/v1/screen/blocks", () =>
       options.catalog === null
         ? HttpResponse.json({ detail: "目录不可用" }, { status: 503 })
-        : HttpResponse.json({ data: options.catalog ?? BLOCKS, serving: serving() }),
+        : HttpResponse.json({
+            data: options.catalog ?? BLOCKS,
+            serving: metaEnvelope({ generationId: options.catalogGeneration ?? generation() })
+              .serving,
+          }),
     ),
   );
 }
@@ -219,8 +246,80 @@ it("creates the first independent pool on a published empty canvas and waits for
   await act(async () => {
     await queryClient.invalidateQueries();
   });
-  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("已加入当前画布"));
+  await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(`已加入「${CANVAS}」`));
   expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("creates an independent first node while builtin pools exist outside the selected empty canvas", async () => {
+  respondFirstPool({ builtinPools: true });
+  const commands: Array<Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"]> = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as
+        | Schemas["SavePoolCommand"]
+        | Schemas["AttachPoolCommand"];
+      commands.push(body);
+      return HttpResponse.json(
+        body.kind === "save_user_pool_v2"
+          ? {
+              command_id: body.command_id,
+              status: "succeeded",
+              message: "池子已保存",
+              pool_version: VERSION,
+            }
+          : {
+              command_id: body.command_id,
+              status: "succeeded",
+              message: "加入请求已完成",
+              pool_version: VERSION,
+              canvas_name: CANVAS,
+            },
+      );
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await screen.findByRole("button", { name: "创建首只池子" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "创建首只池子" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "创建首只池子" }));
+  const dialog = screen.getByRole("dialog", { name: "创建首只池子" });
+  expect(within(dialog).getByRole("combobox", { name: "筛选来源" })).toHaveValue("");
+  await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "首只观察");
+  await user.selectOptions(within(dialog).getByRole("combobox", { name: "条件目录" }), "not_st");
+  await user.click(within(dialog).getByRole("button", { name: "添加条件" }));
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("region", { name: "变更预览" })).toHaveTextContent("独立筛选");
+  await user.click(within(dialog).getByRole("button", { name: "保存并加入画布" }));
+  await waitFor(() => expect(commands).toHaveLength(2));
+  expect(commands[0]).toMatchObject({ depends_on: null, delay_days: 0 });
+  expect(commands[1]).toMatchObject({ kind: "add_pool_to_canvas", canvas_name: CANVAS });
+});
+
+it("keeps an independent replica condition catalog usable across a Serving change without reload", async () => {
+  let generation = "g1";
+  respondFirstPool({
+    generation: () => generation,
+    catalog: { ...BLOCKS, source_kind: "replica" },
+    catalogGeneration: "g1",
+  });
+  const user = userEvent.setup();
+  const { queryClient } = renderApp("/pools");
+  await screen.findByRole("button", { name: "创建首只池子" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "创建首只池子" })).toBeEnabled());
+  generation = "g2";
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["meta"] });
+  });
+  await waitFor(() =>
+    expect(document.querySelector(".gen-tag")).toHaveAttribute("data-generation", "g2"),
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "创建首只池子" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "创建首只池子" }));
+  const dialog = screen.getByRole("dialog", { name: "创建首只池子" });
+  await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "首只观察");
+  await user.selectOptions(within(dialog).getByRole("combobox", { name: "条件目录" }), "not_st");
+  await user.click(within(dialog).getByRole("button", { name: "添加条件" }));
+  expect(within(dialog).getByRole("button", { name: "预览变更" })).toBeEnabled();
 });
 
 it.each([
