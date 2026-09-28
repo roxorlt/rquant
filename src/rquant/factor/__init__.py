@@ -17,6 +17,13 @@ from rquant.factor.expression import (
     ParsedFactorExpression,
     parse_factor_expression,
 )
+from rquant.factor.portfolio import (
+    FactorPortfolioDay,
+    FactorPortfolioDiagnostics,
+    PortfolioGroupingDay,
+    PortfolioGroupPoint,
+    evaluate_factor_portfolios,
+)
 from rquant.factor.summary import FactorICSummary, ICSeriesSummary, summarize_factor_ic
 from rquant.factor.time_series import (
     DecisionTime,
@@ -38,6 +45,8 @@ __all__ = [
     "FactorEvaluation",
     "FactorEvaluationInput",
     "FactorSample",
+    "FactorPortfolioDay",
+    "FactorPortfolioDiagnostics",
     "FactorTimeSeriesError",
     "FactorTimeSeriesInput",
     "FactorTimeSeriesResult",
@@ -52,8 +61,11 @@ __all__ = [
     "GroupingResult",
     "ICSeriesSummary",
     "ParsedFactorExpression",
+    "PortfolioGroupPoint",
+    "PortfolioGroupingDay",
     "build_factor_definition",
     "evaluate_factor",
+    "evaluate_factor_portfolios",
     "evaluate_factor_time_series",
     "parse_factor_expression",
     "summarize_factor_ic",

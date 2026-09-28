@@ -195,9 +195,32 @@ def _correlation_result(left: list[float], right: list[float]) -> CorrelationRes
     )
 
 
-def _grouping_result(sorted_samples: list[FactorSample], group_count: int) -> GroupingResult:
+def _partition_groups(
+    sorted_samples: list[FactorSample], group_count: int
+) -> tuple[tuple[FactorSample, ...], ...] | None:
     count = len(sorted_samples)
     if count < group_count:
+        return None
+    base_size, extra = divmod(count, group_count)
+    groups: list[tuple[FactorSample, ...]] = []
+    offset = 0
+    for group_number in range(1, group_count + 1):
+        size = base_size + (1 if group_number <= extra else 0)
+        members = tuple(sorted_samples[offset : offset + size])
+        groups.append(members)
+        offset += size
+    return tuple(groups)
+
+
+def _sorted_samples(samples: list[FactorSample], direction: FactorDirection) -> list[FactorSample]:
+    sign = 1 if direction == "higher_is_better" else -1
+    return sorted(samples, key=lambda sample: (sign * sample.factor_value, sample.stock_code))
+
+
+def _grouping_result(sorted_samples: list[FactorSample], group_count: int) -> GroupingResult:
+    partition = _partition_groups(sorted_samples, group_count)
+    count = len(sorted_samples)
+    if partition is None:
         return GroupingResult(
             group_count=group_count,
             status="insufficient_samples",
@@ -205,20 +228,15 @@ def _grouping_result(sorted_samples: list[FactorSample], group_count: int) -> Gr
             effective_sample_count=count,
             groups=(),
         )
-    base_size, extra = divmod(count, group_count)
     groups: list[GroupReturn] = []
-    offset = 0
-    for group_number in range(1, group_count + 1):
-        size = base_size + (1 if group_number <= extra else 0)
-        members = sorted_samples[offset : offset + size]
+    for group_number, members in enumerate(partition, 1):
         groups.append(
             GroupReturn(
                 group_number=group_number,
-                member_count=size,
+                member_count=len(members),
                 mean_forward_return=_mean([sample.forward_return for sample in members]),
             )
         )
-        offset += size
     return GroupingResult(
         group_count=group_count,
         status="ok",
@@ -240,10 +258,7 @@ def evaluate_factor(data: FactorEvaluationInput) -> FactorEvaluation:
         samples = by_date[decision_date]
         factors = [sign * sample.factor_value for sample in samples]
         returns = [sample.forward_return for sample in samples]
-        sorted_samples = sorted(
-            samples,
-            key=lambda sample: (sign * sample.factor_value, sample.stock_code),
-        )
+        sorted_samples = _sorted_samples(samples, data.direction)
         count = len(samples)
         days.append(
             DailyFactorResult(
