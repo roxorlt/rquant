@@ -92,9 +92,11 @@ def run_formula_market(
         raise FormulaMarketRunBudgetError("captured market exceeds formula run capacity")
 
     projection = VerifiedFormulaHistoryProjection(projection_root)
-    catalog = projection.catalog_snapshot(
+    catalog = projection.listing_snapshot_for_codes(
         trade_date,
+        tuple(entry.ts_code for entry in universe.entries),
         expected_identity=expected_projection_identity,
+        check_deadline=check_deadline,
     )
     check_deadline()
     if catalog.updated_at.tzinfo is None or catalog.updated_at.utcoffset() is None:

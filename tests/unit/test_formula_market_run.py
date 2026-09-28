@@ -12,10 +12,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import rquant.screen.formula_history_projection as projection_module
 import rquant.screen.formula_market_run as runner
 from rquant.screen.formula_history_projection import (
     FormulaProjectionChangedError,
     FormulaProjectionDateError,
+    FormulaProjectionUnavailableError,
     VerifiedFormulaHistoryProjection,
 )
 from rquant.screen.formula_market_universe import (
@@ -98,6 +100,7 @@ def _history(
     name: str = "a" * 32,
     updated_at: datetime | None = None,
     open_day: bool = True,
+    listing_primary_key: bool = True,
 ) -> tuple[Path, str]:
     listings = (
         listings
@@ -128,7 +131,10 @@ def _history(
             "is_open INTEGER NOT NULL, PRIMARY KEY(exchange,cal_date)) WITHOUT ROWID"
         )
         connection.execute(
-            "CREATE TABLE listing (ts_code TEXT PRIMARY KEY, list_date TEXT) WITHOUT ROWID"
+            "CREATE TABLE listing (ts_code TEXT "
+            + ("PRIMARY KEY, " if listing_primary_key else "NOT NULL, ")
+            + "list_date TEXT)"
+            + (" WITHOUT ROWID" if listing_primary_key else "")
         )
         connection.executemany(
             "INSERT INTO calendar VALUES ('SSE', ?, ?)",
@@ -235,6 +241,79 @@ def test_missing_projection_code_and_listing_conflict_are_unknown(tmp_path: Path
     assert result.market_total == sum(
         (result.match_count, result.no_match_count, result.unknown_count)
     )
+
+
+def test_old_catalog_above_capacity_does_not_block_captured_market(tmp_path: Path) -> None:
+    market = _market(tmp_path)
+    old_rows = [(f"8{index:05d}.BJ", "2000-01-01") for index in range(10_001)]
+    history = _history(tmp_path, listings=[
+        (item.ts_code, item.list_date.isoformat()) for item in ENTRIES
+    ] + old_rows)
+
+    result = _run(market, history)
+
+    assert result.market_total == len(ENTRIES)
+    assert (result.match_count, result.no_match_count, result.unknown_count) == (2, 1, 1)
+
+
+def test_market_listing_lookup_crosses_batches_without_losing_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(projection_module, "_MARKET_LISTING_BATCH_SIZE", 2)
+    result = _run(_market(tmp_path), _history(tmp_path))
+    assert (result.match_count, result.no_match_count, result.unknown_count) == (2, 1, 1)
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "invalid_date"])
+def test_corrupt_requested_market_listing_rejects_whole_run(
+    tmp_path: Path, fault: str,
+) -> None:
+    listings = [(item.ts_code, item.list_date.isoformat()) for item in ENTRIES]
+    if fault == "duplicate":
+        listings.append(listings[0])
+    else:
+        listings[0] = (listings[0][0], "2026-13-40")
+    history = _history(
+        tmp_path, listings=listings, listing_primary_key=fault != "duplicate"
+    )
+
+    with pytest.raises(FormulaProjectionUnavailableError):
+        _run(_market(tmp_path), history)
+
+
+def test_unrequested_corrupt_old_listing_does_not_affect_market_run(tmp_path: Path) -> None:
+    history = _history(tmp_path, listings=[
+        (item.ts_code, item.list_date.isoformat()) for item in ENTRIES
+    ] + [("888888.BJ", "bad-date")])
+
+    result = _run(_market(tmp_path), history)
+
+    assert result.market_total == len(ENTRIES)
+
+
+def test_projection_switch_during_market_listing_lookup_discards_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    market = _market(tmp_path)
+    history = _history(tmp_path)
+    original = VerifiedFormulaHistoryProjection._finish
+    switched = False
+
+    def switch_before_finish(
+        self: VerifiedFormulaHistoryProjection,
+        descriptor: int,
+        generation: projection_module._PinnedGeneration,
+    ) -> None:
+        nonlocal switched
+        if not switched:
+            switched = True
+            _history(tmp_path, name="b" * 32)
+        original(self, descriptor, generation)
+
+    monkeypatch.setattr(VerifiedFormulaHistoryProjection, "_finish", switch_before_finish)
+    with pytest.raises(FormulaProjectionChangedError):
+        _run(market, history)
 
 
 @pytest.mark.parametrize("fault", ["market_date", "closed_projection_day"])
