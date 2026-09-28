@@ -29,6 +29,7 @@ from rquant.runtime_contracts import canonical_sha256
 from rquant.screen.rules import not_st
 from rquant.storage.duckdb import DuckDBStore
 from rquant.trade_calendar import TradeCalendarDay
+from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 
 NOW = datetime(2026, 8, 3, 1, 30, tzinfo=UTC)
 
@@ -73,6 +74,222 @@ def _command(
 
 def _pool_path(tmp_path: Path, base_name: str = "breakout") -> Path:
     return tmp_path / "data" / "user_presets" / f"{base_name}.json"
+
+
+def _v3_payload(command_id: str, **updates: object) -> dict[str, object]:
+    return {
+        **_command(command_id).model_dump(mode="json"),
+        "kind": "save_user_pool_v3",
+        "ranking": {
+            "conditions": [
+                {"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 60},
+                {"metric": "TURNOVER_RATE[0]", "ascending": False, "weight": 40},
+            ],
+            "top_n": 2,
+        },
+        **updates,
+    }
+
+
+def test_v3_command_saves_ranked_definition_without_changing_v2_contract(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    assert page_control._command_hash(_command("legacy-v2")) == (
+        "aafc4f8946a625a8bf3da6ba1c78421b5c6761eae84a9387e1a90c9c4215eac0"
+    )
+    command = parse_page_control_command(_v3_payload("ranked-create"))
+    assert isinstance(command, page_control.SaveUserPoolV3)
+    result = service.submit(command)
+    assert result.status is PageControlStatus.SUCCEEDED
+    assert isinstance(result.result, dict)
+    path = _pool_path(tmp_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 3
+    assert raw["source"] == "page_control_v3"
+    assert raw["ranking"] == _v3_payload("ranked-create")["ranking"]
+    assert result.result["version"] == canonical_sha256(raw)
+    loaded = load_user_presets(path.parent)["user/breakout"]
+    assert loaded.ranking is not None
+    assert loaded.ranking.top_n == 2
+    assert loaded.definition_version == result.result["version"]
+    assert service.submit(command).result == result.result
+
+    prior_bytes = path.read_bytes()
+    erasing_v2 = service.submit(
+        _command("cannot-erase-ranking", expected_version=result.result["version"])
+    )
+    assert erasing_v2.status is PageControlStatus.FAILED
+    assert path.read_bytes() == prior_bytes
+
+
+def test_v3_recovers_original_command_after_atomic_write_without_second_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = page_control.PageControlConsumer._atomic_json
+    writes = 0
+
+    def crash_after_write(path: Path, payload: object, *, command_id: str) -> None:
+        nonlocal writes
+        writes += 1
+        original(path, payload, command_id=command_id)
+        if writes == 1:
+            raise KeyboardInterrupt("after atomic replace")
+
+    monkeypatch.setattr(
+        page_control.PageControlConsumer, "_atomic_json", staticmethod(crash_after_write)
+    )
+    command = parse_page_control_command(_v3_payload("recover-v3"))
+    with pytest.raises(KeyboardInterrupt):
+        _service(tmp_path).submit(command)
+    written = _pool_path(tmp_path).read_bytes()
+    recovered = _service(tmp_path, now=NOW + timedelta(seconds=2)).submit(command)
+    assert recovered.status is PageControlStatus.SUCCEEDED
+    assert isinstance(recovered.result, dict)
+    assert recovered.result["version"] == canonical_sha256(json.loads(written))
+    assert _pool_path(tmp_path).read_bytes() == written
+    assert writes == 1
+
+
+def test_v3_accepts_existing_daily_pct_change_ranking_metric(tmp_path: Path) -> None:
+    payload = _v3_payload(
+        "daily-change-ranking",
+        ranking={
+            "conditions": [{"metric": "PCT_CHG[0]", "ascending": False, "weight": 100}],
+            "top_n": 10,
+        },
+    )
+    command = parse_page_control_command(payload)
+    saved = _service(tmp_path).submit(command)
+    assert saved.status is PageControlStatus.SUCCEEDED
+    assert json.loads(_pool_path(tmp_path).read_text())["ranking"] == payload["ranking"]
+
+
+def test_v3_unranked_pool_saves_null_and_daily_run_keeps_all_filtered_members(
+    tmp_path: Path,
+) -> None:
+    command = parse_page_control_command(_v3_payload("unranked", ranking=None))
+    saved = _service(tmp_path).submit(command)
+    assert saved.status is PageControlStatus.SUCCEEDED
+    path = _pool_path(tmp_path)
+    assert json.loads(path.read_text(encoding="utf-8"))["ranking"] is None
+    assert load_user_presets(path.parent)["user/breakout"].ranking is None
+
+    frame = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000002.SZ"],
+            "name": ["甲", "乙"],
+            "CLOSE[0]": [10.0, 20.0],
+            "PCT_CHG[0]": [1.0, 2.0],
+        }
+    )
+    with DuckDBStore(tmp_path / "unranked.duckdb") as store:
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) "
+            "VALUES ('000001.SZ', '2026-08-04', 10)"
+        )
+        with patch("rquant.pipeline.screen", return_value=frame):
+            result = run_daily_screen_stage(
+                "2026-08-04",
+                preset_names=["user/breakout"],
+                store=store,
+                preset_directory=path.parent,
+            )
+        members = store.query_screen_result("2026-08-04", "user/breakout")
+        receipt = store.query_screen_run_receipt("2026-08-04", "user/breakout")
+    assert result.preset_hits == {"user/breakout": 2}
+    assert members["ts_code"].tolist() == ["000001.SZ", "000002.SZ"]
+    assert receipt is not None and receipt.hit_count == 2
+
+
+@pytest.mark.parametrize(
+    "rule_call",
+    [
+        RuleCall(name="gt", args={"left": "PE_TTM[0]", "right": 10}),
+        RuleCall(name="rsi_oversold", args={"period": 30, "threshold": 30}),
+        RuleCall(name="cross_above", args={"fast": "MA37", "slow": "MA20"}),
+    ],
+)
+def test_v3_unranked_rejects_conditions_daily_writer_cannot_reproduce(
+    tmp_path: Path, rule_call: RuleCall
+) -> None:
+    candidate = parse_page_control_command(
+        _v3_payload("unranked-unsupported", ranking=None, rule_calls=[rule_call.model_dump()])
+    )
+    result = _service(tmp_path).submit(candidate)
+    assert result.status is PageControlStatus.FAILED
+    assert "not reproducible" in (result.error or "")
+    assert not _pool_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "rule_calls",
+    [
+        (RuleCall(name="gt", args={"left": "PE_TTM[0]", "right": 10}),),
+        (RuleCall(name="rsi_oversold", args={"period": 30, "threshold": 30}),),
+        (RuleCall(name="cross_above", args={"fast": "MA37", "slow": "MA20"}),),
+    ],
+)
+def test_v3_rejects_conditions_daily_writer_cannot_reproduce(
+    tmp_path: Path, rule_calls: tuple[RuleCall, ...]
+) -> None:
+    service = _service(tmp_path)
+    candidate = parse_page_control_command(
+        _v3_payload("unsupported-rule", rule_calls=[rule.model_dump() for rule in rule_calls])
+    )
+    result = service.submit(candidate)
+    assert result.status is PageControlStatus.FAILED
+    assert "not reproducible" in (result.error or "")
+    assert not _pool_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("unranked", [False, True])
+def test_v3_pool_can_attach_to_canvas_only_at_its_exact_version(
+    tmp_path: Path, unranked: bool
+) -> None:
+    authority = create_canvas_ed25519_test_authority(tmp_path / "keys")
+    outbox = PageControlOutbox(tmp_path / "control.sqlite3")
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=tmp_path / "data",
+            log_dir=tmp_path / "logs",
+            clock=lambda: NOW,
+            canvas_publication_signer=authority.signer,
+            canvas_publication_keyring=authority.keyring,
+        ),
+    )
+    payload = (
+        _v3_payload("ranked-for-canvas", ranking=None)
+        if unranked else _v3_payload("ranked-for-canvas")
+    )
+    saved = service.submit(parse_page_control_command(payload))
+    assert saved.status is PageControlStatus.SUCCEEDED
+    assert isinstance(saved.result, dict)
+    assert service.submit(
+        page_control.SaveCanvas(command_id="canvas", requested_at=NOW, name="观察")
+    ).status is PageControlStatus.SUCCEEDED
+    stale = service.submit(
+        page_control.AddPoolToCanvas(
+            command_id="attach-stale",
+            requested_at=NOW,
+            canvas_name="观察",
+            pool_name="user/breakout",
+            expected_pool_version="a" * 64,
+        )
+    )
+    assert stale.status is PageControlStatus.FAILED
+    attached = service.submit(
+        page_control.AddPoolToCanvas(
+            command_id="attach-ranked",
+            requested_at=NOW,
+            canvas_name="观察",
+            pool_name="user/breakout",
+            expected_pool_version=saved.result["version"],
+        )
+    )
+    assert attached.status is PageControlStatus.SUCCEEDED
+    canvas = json.loads((tmp_path / "data" / "canvases" / "观察.json").read_text())
+    assert canvas["pool_refs"] == ["user/breakout"]
 
 
 def _seed_calendar(store: DuckDBStore, start: date, end: date) -> None:

@@ -17,6 +17,12 @@ from rquant.presets import PRESET_SCREENS, ScreenPreset, load_user_presets
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.screen.core import screen
+from rquant.screen.ranking import (
+    RETURN_20D_COLUMN,
+    RankingCondition,
+    load_twenty_day_adjusted_returns,
+    rank_screen_results,
+)
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -380,15 +386,56 @@ def run_daily_screen_stage(
                 dates = [parent_trade_date.isoformat()] if parent_trade_date else parent_dates
                 logger.info(f"{name}: 从 {dates} 合并 {len(ts_whitelist)} 只白名单")
 
+            screen_columns = list(preset.include_columns)
+            if preset.ranking is not None:
+                screen_columns.extend(
+                    condition.metric
+                    for condition in preset.ranking.conditions
+                    if condition.metric != RETURN_20D_COLUMN
+                    and condition.metric not in screen_columns
+                )
             result_df = screen(
                 trade_date=trade_date,
                 rules=preset.rules,
-                include_columns=preset.include_columns or None,
+                include_columns=screen_columns or None,
                 store=store,
                 ts_code_whitelist=ts_whitelist,
             )
+            if preset.ranking is not None:
+                if blacklist and not result_df.empty:
+                    hit_mask = result_df["ts_code"].isin(blacklist.keys())
+                    if hit_mask.any():
+                        removed = result_df.loc[hit_mask, "ts_code"].tolist()
+                        result_df = result_df.loc[~hit_mask].reset_index(drop=True)
+                        logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
+                if RETURN_20D_COLUMN in {
+                    condition.metric for condition in preset.ranking.conditions
+                }:
+                    returns = load_twenty_day_adjusted_returns(
+                        store._conn,
+                        date.fromisoformat(trade_date),
+                        result_df["ts_code"].tolist(),
+                    )
+                    result_df = result_df.merge(
+                        returns, on="ts_code", how="left", validate="one_to_one"
+                    )
+                ranked = rank_screen_results(
+                    result_df,
+                    [
+                        RankingCondition(item.metric, item.ascending, item.weight)
+                        for item in preset.ranking.conditions
+                    ],
+                    top_n=preset.ranking.top_n,
+                )
+                visible_columns = [
+                    column
+                    for column in ranked.columns
+                    if column in {"ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"}
+                    or column in preset.include_columns
+                ]
+                result_df = ranked[visible_columns]
             sr_df = _to_screen_result_df(result_df, trade_date, name)
-            if blacklist and not sr_df.empty:
+            if preset.ranking is None and blacklist and not sr_df.empty:
                 hit_mask = sr_df["ts_code"].isin(blacklist.keys())
                 if hit_mask.any():
                     removed = sr_df.loc[hit_mask, "ts_code"].tolist()

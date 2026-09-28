@@ -353,7 +353,7 @@ def test_replica_catalog_offers_bounded_ma_periods_and_custom_compare_fields(
     with _client(tmp_path / "absent", primary, replica) as client:
         catalog = client.get("/api/v1/screen/blocks").json()["data"]
         legacy_period = _run(client, conditions=[{"key": "above_ma", "args": {"period": "20"}}])
-        missing_metric = _run(client, ranking={
+        incomplete_return = _run(client, ranking={
             "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
             "top_n": 10,
         })
@@ -388,9 +388,10 @@ def test_replica_catalog_offers_bounded_ma_periods_and_custom_compare_fields(
     assert "MA7[0]" not in {item["value"] for item in next(
         p for p in blocks["gt"]["parameters"] if p["key"] == "left"
     )["options"]}
-    assert "RETURN_20D_PCT[0]" not in {item["value"] for item in catalog["ranking_metrics"]}
+    assert "RETURN_20D_PCT[0]" in {item["value"] for item in catalog["ranking_metrics"]}
     assert legacy_period.status_code == 200, legacy_period.text
-    assert missing_metric.status_code == 422
+    assert incomplete_return.status_code == 503
+    assert incomplete_return.json()["detail"] == "当前排名数据不完整，请换一个指标或稍后重试。"
 
 
 @pytest.mark.parametrize("condition", [
@@ -636,6 +637,67 @@ def test_replica_ranking_keeps_order_across_pages(tmp_path: Path) -> None:
     assert [row["ts_code"] for row in second.json()["data"]["rows"]] == ["600001.SH"]
     assert [row["rank_position"] for row in first.json()["data"]["rows"]] == [1, 2]
     assert second.json()["data"]["rows"][0]["rank_position"] == 3
+
+
+def test_replica_twenty_day_adjusted_return_ranks_across_pages(
+    tmp_path: Path,
+) -> None:
+    primary, replica, latest = _replica_world(tmp_path, days=21)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, CASE "
+            "WHEN ts_code = '600001.SH' AND trade_date = ? THEN 2 "
+            "WHEN ts_code = '600002.SH' AND trade_date = ? THEN 2 "
+            "ELSE 1 END FROM daily_bar",
+            [latest - timedelta(days=20), latest],
+        )
+    _publish(primary, replica)
+    ranking = {
+        "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
+        "top_n": 3,
+    }
+    with _client(tmp_path / "absent", primary, replica) as client:
+        catalog = client.get("/api/v1/screen/blocks").json()["data"]
+        first = _run(client, ranking=ranking)
+        second = _run(client, ranking=ranking, cursor=first.json()["data"]["next_cursor"])
+
+    assert "RETURN_20D_PCT[0]" in {item["value"] for item in catalog["ranking_metrics"]}
+    assert first.status_code == second.status_code == 200
+    identity = catalog["source"]["identity"]
+    assert first.json()["data"]["source"]["identity"] == identity
+    assert second.json()["data"]["source"]["identity"] == identity
+    assert [row["ts_code"] for row in first.json()["data"]["rows"]] == [
+        "600002.SH", "600003.SH",
+    ]
+    assert [row["ts_code"] for row in second.json()["data"]["rows"]] == ["600001.SH"]
+    assert [row["rank_position"] for row in first.json()["data"]["rows"]] == [1, 2]
+    assert second.json()["data"]["rows"][0]["rank_position"] == 3
+
+
+def test_replica_twenty_day_return_with_missing_stock_history_stays_rankable(
+    tmp_path: Path,
+) -> None:
+    primary, replica, latest = _replica_world(tmp_path, days=21)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar "
+            "WHERE ts_code != '600001.SH' OR trade_date != ?",
+            [latest - timedelta(days=5)],
+        )
+    _publish(primary, replica)
+    with _client(tmp_path / "absent", primary, replica) as client:
+        response = _run(client, ranking={
+            "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
+            "top_n": 3,
+        }, page_size=3)
+
+    assert response.status_code == 200, response.text
+    assert [row["ts_code"] for row in response.json()["data"]["rows"]] == [
+        "600002.SH", "600003.SH", "600001.SH",
+    ]
+    assert response.json()["data"]["rows"][-1]["ranking_score"] == 0
 
 
 def test_replica_calendar_gap_reports_incomplete_data(tmp_path: Path) -> None:

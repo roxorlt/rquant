@@ -2821,6 +2821,16 @@
             "title": "Key",
             "type": "string"
           },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PoolRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "rule_calls": {
             "items": {
               "$ref": "#/components/schemas/EditorRuleCall"
@@ -3837,12 +3847,31 @@
             "title": "Key",
             "type": "string"
           },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PoolRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "rule_calls": {
             "items": {
               "$ref": "#/components/schemas/EditorRuleCall"
             },
             "title": "Rule Calls",
             "type": "array"
+          },
+          "save_kind": {
+            "default": "save_user_pool_v2",
+            "enum": [
+              "save_user_pool_v2",
+              "save_user_pool_v3"
+            ],
+            "title": "Save Kind",
+            "type": "string"
           },
           "version": {
             "title": "Version",
@@ -7698,6 +7727,16 @@
             "title": "Name",
             "type": "string"
           },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PoolRankingView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "reason_label": {
             "anyOf": [
               {
@@ -8059,6 +8098,108 @@
           "instruction"
         ],
         "title": "PoolNlPreviewRequest",
+        "type": "object"
+      },
+      "PoolRankingCondition": {
+        "additionalProperties": false,
+        "properties": {
+          "ascending": {
+            "title": "Ascending",
+            "type": "boolean"
+          },
+          "metric": {
+            "enum": [
+              "RETURN_20D_PCT[0]",
+              "TURNOVER_RATE[0]",
+              "CIRC_MV[0]",
+              "PCT_CHG[0]"
+            ],
+            "title": "Metric",
+            "type": "string"
+          },
+          "weight": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "metric",
+          "ascending",
+          "weight"
+        ],
+        "title": "PoolRankingCondition",
+        "type": "object"
+      },
+      "PoolRankingItem": {
+        "properties": {
+          "direction_label": {
+            "title": "Direction Label",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "label",
+          "direction_label",
+          "weight"
+        ],
+        "title": "PoolRankingItem",
+        "type": "object"
+      },
+      "PoolRankingPlan": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/PoolRankingCondition"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "top_n": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top N",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conditions",
+          "top_n"
+        ],
+        "title": "PoolRankingPlan",
+        "type": "object"
+      },
+      "PoolRankingView": {
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/PoolRankingItem"
+            },
+            "title": "Conditions",
+            "type": "array"
+          },
+          "top_n": {
+            "title": "Top N",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "conditions",
+          "top_n"
+        ],
+        "title": "PoolRankingView",
         "type": "object"
       },
       "PoolResultView": {
@@ -9417,6 +9558,114 @@
           "rule_calls"
         ],
         "title": "SavePoolCommand",
+        "type": "object"
+      },
+      "SaveRankedPoolCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "base_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "pattern": "^[\\w\\u4e00-\\u9fff-]+$",
+            "title": "Base Name",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "delay_days": {
+            "default": 0,
+            "maximum": 252.0,
+            "minimum": 0.0,
+            "title": "Delay Days",
+            "type": "integer"
+          },
+          "depends_on": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depends On"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Description",
+            "type": "string"
+          },
+          "display_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "include_columns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 26,
+            "title": "Include Columns",
+            "type": "array"
+          },
+          "kind": {
+            "const": "save_user_pool_v3",
+            "default": "save_user_pool_v3",
+            "title": "Kind",
+            "type": "string"
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PoolRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rule_calls": {
+            "items": {
+              "$ref": "#/components/schemas/EditorRuleCall"
+            },
+            "maxItems": 26,
+            "title": "Rule Calls",
+            "type": "array"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "base_name",
+          "display_name",
+          "ranking"
+        ],
+        "title": "SaveRankedPoolCommand",
         "type": "object"
       },
       "SavedCanvas": {
@@ -12845,13 +13094,17 @@
                   "mapping": {
                     "add_pool_to_canvas": "#/components/schemas/AttachPoolCommand",
                     "create_canvas": "#/components/schemas/CreateCanvasCommand",
-                    "save_user_pool_v2": "#/components/schemas/SavePoolCommand"
+                    "save_user_pool_v2": "#/components/schemas/SavePoolCommand",
+                    "save_user_pool_v3": "#/components/schemas/SaveRankedPoolCommand"
                   },
                   "propertyName": "kind"
                 },
                 "oneOf": [
                   {
                     "$ref": "#/components/schemas/SavePoolCommand"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SaveRankedPoolCommand"
                   },
                   {
                     "$ref": "#/components/schemas/AttachPoolCommand"

@@ -1828,6 +1828,7 @@ export interface components {
             include_columns: string[];
             /** Key */
             key: string;
+            ranking?: components["schemas"]["PoolRankingPlan"] | null;
             /** Rule Calls */
             rule_calls: components["schemas"]["EditorRuleCall"][];
             /** Version */
@@ -2159,8 +2160,15 @@ export interface components {
             include_columns: string[];
             /** Key */
             key: string;
+            ranking?: components["schemas"]["PoolRankingPlan"] | null;
             /** Rule Calls */
             rule_calls: components["schemas"]["EditorRuleCall"][];
+            /**
+             * Save Kind
+             * @default save_user_pool_v2
+             * @enum {string}
+             */
+            save_kind: "save_user_pool_v2" | "save_user_pool_v3";
             /** Version */
             version: string;
         };
@@ -3408,6 +3416,7 @@ export interface components {
             description: string | null;
             /** Name */
             name: string;
+            ranking?: components["schemas"]["PoolRankingView"] | null;
             /** Reason Label */
             reason_label: string | null;
             /** Rules */
@@ -3507,6 +3516,41 @@ export interface components {
             instruction: string;
             /** Pool Key */
             pool_key: string;
+        };
+        /** PoolRankingCondition */
+        PoolRankingCondition: {
+            /** Ascending */
+            ascending: boolean;
+            /**
+             * Metric
+             * @enum {string}
+             */
+            metric: "RETURN_20D_PCT[0]" | "TURNOVER_RATE[0]" | "CIRC_MV[0]" | "PCT_CHG[0]";
+            /** Weight */
+            weight: number;
+        };
+        /** PoolRankingItem */
+        PoolRankingItem: {
+            /** Direction Label */
+            direction_label: string;
+            /** Label */
+            label: string;
+            /** Weight */
+            weight: number;
+        };
+        /** PoolRankingPlan */
+        PoolRankingPlan: {
+            /** Conditions */
+            conditions: components["schemas"]["PoolRankingCondition"][];
+            /** Top N */
+            top_n: number;
+        };
+        /** PoolRankingView */
+        PoolRankingView: {
+            /** Conditions */
+            conditions: components["schemas"]["PoolRankingItem"][];
+            /** Top N */
+            top_n: number;
         };
         /** PoolResultView */
         PoolResultView: {
@@ -3886,6 +3930,44 @@ export interface components {
             requested_at: string;
             /** Rule Calls */
             rule_calls: components["schemas"]["EditorRuleCall"][];
+        };
+        /** SaveRankedPoolCommand */
+        SaveRankedPoolCommand: {
+            /** Base Name */
+            base_name: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Delay Days
+             * @default 0
+             */
+            delay_days: number;
+            /** Depends On */
+            depends_on?: string | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Expected Version */
+            expected_version?: string | null;
+            /** Include Columns */
+            include_columns?: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_user_pool_v3";
+            ranking: components["schemas"]["PoolRankingPlan"] | null;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Rule Calls */
+            rule_calls?: components["schemas"]["EditorRuleCall"][];
         };
         /** SavedCanvas */
         SavedCanvas: {
@@ -5420,7 +5502,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["SavePoolCommand"] | components["schemas"]["AttachPoolCommand"] | components["schemas"]["CreateCanvasCommand"];
+                "application/json": components["schemas"]["SavePoolCommand"] | components["schemas"]["SaveRankedPoolCommand"] | components["schemas"]["AttachPoolCommand"] | components["schemas"]["CreateCanvasCommand"];
             };
         };
         responses: {

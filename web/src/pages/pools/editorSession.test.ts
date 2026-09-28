@@ -1,7 +1,10 @@
 import { ApiError, type Schemas } from "@/api/client";
 import { POOL_EDITOR_JOURNAL_KEY, PoolEditorSession } from "./editorSession";
 
-type Command = Schemas["SavePoolCommand"] | Schemas["AttachPoolCommand"];
+type Command =
+  | Schemas["SavePoolCommand"]
+  | Schemas["SaveRankedPoolCommand"]
+  | Schemas["AttachPoolCommand"];
 type Receipt = Schemas["PoolEditorReceipt"];
 
 const VERSION = "b".repeat(64);
@@ -35,9 +38,9 @@ it("persists each complete immutable body before POST and never repeats a succee
   const seen: Command[] = [];
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
     const persisted = JSON.parse(window.sessionStorage.getItem(POOL_EDITOR_JOURNAL_KEY) ?? "{}");
-    expect(body).toEqual(body.kind === "save_user_pool_v2" ? persisted.save : persisted.attach);
+    expect(body).toEqual(body.kind === "add_pool_to_canvas" ? persisted.attach : persisted.save);
     seen.push(body);
-    return body.kind === "save_user_pool_v2"
+    return body.kind !== "add_pool_to_canvas"
       ? {
           command_id: body.command_id,
           status: "succeeded",
@@ -58,6 +61,33 @@ it("persists each complete immutable body before POST and never repeats a succee
   expect(seen[1]).toMatchObject({ expected_pool_version: VERSION, pool_name: "user/放量确认" });
   expect(session.snapshot().journal?.saveVersion).toBe(VERSION);
   expect(session.snapshot().journal?.attachStatus).toBe("succeeded");
+});
+
+it("persists a ranked save as the new command and restores its exact body after a lost reply", async () => {
+  const seen: Command[] = [];
+  const post = vi.fn(async (body: Command): Promise<Receipt> => {
+    seen.push(body);
+    if (seen.length === 1) throw new ApiError(503, "连接暂不可用");
+    return {
+      command_id: body.command_id,
+      status: "succeeded",
+      message: "池子已保存",
+      pool_version: VERSION,
+    };
+  });
+  const rankedInput = {
+    ...saveInput,
+    ranking: {
+      conditions: [{ metric: "CIRC_MV[0]", ascending: true, weight: 100 }],
+      top_n: 20,
+    },
+  };
+  await makeSession(post).startSave(rankedInput, null);
+  const restored = makeSession(post);
+  await restored.advance();
+  expect(seen[0]).toMatchObject({ kind: "save_user_pool_v3", ranking: rankedInput.ranking });
+  expect(seen[1]).toEqual(seen[0]);
+  expect(restored.snapshot().journal?.saveVersion).toBe(VERSION);
 });
 
 it("keeps the exact save body after a 503, pending receipt, and reload", async () => {
@@ -115,7 +145,7 @@ it("keeps ambiguous save identity and retries only attachment with a new ID afte
   let attachAttempts = 0;
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
     seen.push(body);
-    if (body.kind === "save_user_pool_v2") {
+    if (body.kind !== "add_pool_to_canvas") {
       return {
         command_id: body.command_id,
         status: "succeeded",
@@ -170,7 +200,7 @@ it("keeps an unresolved attachment resumable after reload and frees other saves 
   const seen: Command[] = [];
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
     seen.push(body);
-    if (body.kind === "save_user_pool_v2")
+    if (body.kind !== "add_pool_to_canvas")
       return {
         command_id: body.command_id,
         status: "succeeded",
@@ -207,7 +237,7 @@ it("never substitutes a newer rule version for the saved attachment after confli
   const seen: Command[] = [];
   const post = vi.fn(async (body: Command): Promise<Receipt> => {
     seen.push(body);
-    if (body.kind === "save_user_pool_v2")
+    if (body.kind !== "add_pool_to_canvas")
       return {
         command_id: body.command_id,
         status: "succeeded",
@@ -233,7 +263,7 @@ it("never substitutes a newer rule version for the saved attachment after confli
   expect(session.snapshot().journal?.attachStatus).toBe("failed");
 
   const failed = makeSession(async (body) =>
-    body.kind === "save_user_pool_v2"
+    body.kind !== "add_pool_to_canvas"
       ? {
           command_id: body.command_id,
           status: "succeeded",

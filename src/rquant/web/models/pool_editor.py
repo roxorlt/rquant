@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from rquant.runtime_contracts import AwareUtcDatetime
+from rquant.screen.pool_ranking import PoolRankingPlan
 
 _NAME = r"^[\w\u4e00-\u9fff-]+$"
 _USER_POOL = r"^user/[\w\u4e00-\u9fff-]+$"
@@ -31,6 +32,8 @@ class EditablePool(BaseModel):
     delay_days: int
     rule_calls: list[EditorRuleCall]
     include_columns: list[str]
+    ranking: PoolRankingPlan | None = None
+    save_kind: Literal["save_user_pool_v2", "save_user_pool_v3"] = "save_user_pool_v2"
 
 
 class BuiltinPoolCopySource(BaseModel):
@@ -45,6 +48,7 @@ class BuiltinPoolCopySource(BaseModel):
     delay_days: int
     rule_calls: list[EditorRuleCall]
     include_columns: list[str]
+    ranking: PoolRankingPlan | None = None
     copyable: bool
     copy_block_reason: str | None
 
@@ -133,6 +137,27 @@ class SavePoolCommand(_EditorCommand):
         return self
 
 
+class SaveRankedPoolCommand(_EditorCommand):
+    kind: Literal["save_user_pool_v3"] = "save_user_pool_v3"
+    base_name: str = Field(min_length=1, max_length=80, pattern=_NAME)
+    display_name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=1_024)
+    rule_calls: list[EditorRuleCall] = Field(default_factory=list, max_length=26)
+    include_columns: list[str] = Field(default_factory=list, max_length=26)
+    depends_on: str | None = Field(default=None, max_length=100)
+    delay_days: int = Field(default=0, ge=0, le=252)
+    expected_version: str | None = Field(default=None, pattern=_SHA256)
+    ranking: PoolRankingPlan | None
+
+    @model_validator(mode="after")
+    def validate_parent_delay(self) -> SaveRankedPoolCommand:
+        if (self.depends_on is None and self.delay_days != 0) or (
+            self.depends_on is not None and self.delay_days == 0
+        ):
+            raise ValueError("parent pool and exact delay must agree")
+        return self
+
+
 class AttachPoolCommand(_EditorCommand):
     kind: Literal["add_pool_to_canvas"] = "add_pool_to_canvas"
     canvas_name: str = Field(min_length=1, max_length=80, pattern=_NAME)
@@ -147,7 +172,8 @@ class CreateCanvasCommand(_EditorCommand):
 
 
 PoolEditorCommand = Annotated[
-    SavePoolCommand | AttachPoolCommand | CreateCanvasCommand, Field(discriminator="kind")
+    SavePoolCommand | SaveRankedPoolCommand | AttachPoolCommand | CreateCanvasCommand,
+    Field(discriminator="kind"),
 ]
 
 

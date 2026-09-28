@@ -85,7 +85,7 @@ function editableValue(value: unknown): ParameterValue | undefined {
   return undefined;
 }
 
-function describeConditions(
+export function describeConditions(
   conditions: ScreenNlPreviewData["conditions"],
   blocks: ScreenBlock[],
 ): { conditions: EditableScreenCondition[]; descriptions: ConditionDescription[] } | null {

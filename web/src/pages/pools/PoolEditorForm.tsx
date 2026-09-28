@@ -6,6 +6,7 @@ import type {
   EditablePool,
   PoolNlPreview,
 } from "@/api/poolEditor";
+import { isPoolRankingMetric, type PoolRankingMetric } from "@/api/poolEditor";
 import {
   catalogUsableForGeneration,
   isFundamentalScreenField,
@@ -19,6 +20,7 @@ import type { EditorSessionSnapshot, PoolEditorSession, SaveInput } from "./edit
 import { PoolSentenceEdit } from "./PoolSentenceEdit";
 
 type RuleDraft = { id: number; key: string; args: Record<string, ParameterValue> };
+type RankDraft = { id: number; metric: PoolRankingMetric; ascending: boolean; weight: string };
 type Mode =
   | { kind: "create"; parentKey: string | null }
   | { kind: "edit"; pool: EditablePool }
@@ -244,6 +246,16 @@ export function PoolEditorForm({
   );
   const [chosenBlock, setChosenBlock] = useState("");
   const [rules, setRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
+  const [rankRows, setRankRows] = useState<RankDraft[]>(
+    () =>
+      (editing?.ranking ?? copying?.ranking)?.conditions.map((row, index) => ({
+        id: index + 1,
+        metric: row.metric,
+        ascending: row.ascending,
+        weight: String(row.weight),
+      })) ?? [],
+  );
+  const [topN, setTopN] = useState(String((editing?.ranking ?? copying?.ranking)?.top_n ?? 20));
   const [originalRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
   const [ruleRevision, setRuleRevision] = useState(0);
   const [metadataRevision, setMetadataRevision] = useState(0);
@@ -264,6 +276,40 @@ export function PoolEditorForm({
     [catalog.data?.blocks],
   );
   const blockMap = useMemo(() => new Map(blocks.map((block) => [block.key, block])), [blocks]);
+  const rankMetrics = (catalog.data?.ranking_metrics ?? []).filter(
+    (item): item is ScreenOption & { value: PoolRankingMetric } => isPoolRankingMetric(item.value),
+  );
+  const metricLabels = new Map(rankMetrics.map((item) => [item.value, item.label]));
+  const weights = rankRows.map((row) =>
+    row.weight.trim() === "" ? Number.NaN : Number(row.weight),
+  );
+  const rankingError =
+    rankRows.length === 0
+      ? null
+      : rankRows.length > 4
+        ? "最多添加 4 项排名。"
+        : rankRows.some((row) => !metricLabels.has(row.metric))
+          ? "原有排名指标暂不可用，请稍后刷新。"
+          : new Set(rankRows.map((row) => row.metric)).size !== rankRows.length
+            ? "同一排名指标只能添加一次。"
+            : weights.some((weight) => !Number.isFinite(weight) || weight < 0 || weight > 100)
+              ? "权重请填 0 到 100。"
+              : weights.reduce((sum, weight) => sum + weight, 0) <= 0
+                ? "至少一项权重大于 0。"
+                : !Number.isInteger(Number(topN)) || Number(topN) < 1 || Number(topN) > 100
+                  ? "前 N 只请填 1 到 100。"
+                  : null;
+  const ranking =
+    rankRows.length > 0 && rankingError === null
+      ? {
+          conditions: rankRows.map((row) => ({
+            metric: row.metric,
+            ascending: row.ascending,
+            weight: Number(row.weight),
+          })),
+          top_n: Number(topN),
+        }
+      : null;
   const rulesChanged =
     JSON.stringify(rules.map((rule) => ({ name: rule.key, args: rule.args }))) !==
     JSON.stringify(originalRules.map((rule) => ({ name: rule.key, args: rule.args })));
@@ -282,6 +328,7 @@ export function PoolEditorForm({
       depends_on: parent || null,
       delay_days: parent ? delay : 0,
       rule_calls: rules.map((rule) => ({ name: rule.key, args: rule.args })),
+      ranking,
       canvas: attachTo,
     }) ===
       JSON.stringify({
@@ -290,6 +337,7 @@ export function PoolEditorForm({
         depends_on: previous.save.depends_on,
         delay_days: previous.save.delay_days,
         rule_calls: previous.save.rule_calls,
+        ranking: previous.save.kind === "save_user_pool_v3" ? previous.save.ranking : null,
         canvas: previous.canvasName,
       });
   const versionNeedsReview =
@@ -303,9 +351,10 @@ export function PoolEditorForm({
     /^[\w\u4e00-\u9fff-]{1,80}$/u.test(baseName) &&
     name.trim().length >= 1 &&
     name.trim().length <= 80;
+  const ruleLimit = rankRows.length > 0 || editing?.save_kind === "save_user_pool_v3" ? 26 : 32;
   const rulesValid =
     rules.length > 0 &&
-    rules.length <= 32 &&
+    rules.length <= ruleLimit &&
     rules.every((rule) => {
       const block = blockMap.get(rule.key);
       const original = originalRules.find((item) => item.id === rule.id && item.key === rule.key);
@@ -332,6 +381,7 @@ export function PoolEditorForm({
         copying !== null ||
         (firstPoolMode && targetCanvas?.pool_refs.length === 0 && attachTo !== null)) &&
     rulesValid &&
+    rankingError === null &&
     snapshot.storageAvailable &&
     !snapshot.busy &&
     !versionNeedsReview &&
@@ -349,7 +399,7 @@ export function PoolEditorForm({
 
   const addRule = () => {
     const block = blockMap.get(chosenBlock);
-    if (!block) return;
+    if (!block || rules.length >= ruleLimit) return;
     setRules((current) => [
       ...current,
       {
@@ -372,7 +422,7 @@ export function PoolEditorForm({
   };
   const submit = async () => {
     if (!canSubmit || !preview) return;
-    const input: SaveInput = {
+    const common = {
       base_name: baseName,
       display_name: name.trim(),
       description: description.trim(),
@@ -382,6 +432,10 @@ export function PoolEditorForm({
       include_columns: editing?.include_columns ?? copying?.include_columns ?? [],
       expected_version: editing?.version ?? null,
     };
+    const input: SaveInput =
+      ranking !== null || editing?.save_kind === "save_user_pool_v3"
+        ? { ...common, ranking }
+        : common;
     await session.startSave(input, attachTo);
   };
   const statusLabel = requestLabel(snapshot, publicationStage);
@@ -645,7 +699,9 @@ export function PoolEditorForm({
         <section className="pool-editor-section" aria-label="筛选条件">
           <div className="pool-editor-section-head">
             <h3>筛选条件</h3>
-            <span className="num">{rules.length}/32</span>
+            <span className="num">
+              {rules.length}/{ruleLimit}
+            </span>
           </div>
           {catalog.isLoading ? (
             <p className="pools-note">正在加载条件目录…</p>
@@ -653,6 +709,11 @@ export function PoolEditorForm({
             <p className="pools-note">条件目录暂不可用，请稍后重试。</p>
           ) : rules.length === 0 ? (
             <p className="pools-note">还没有条件。请从目录添加。</p>
+          ) : null}
+          {rules.length > ruleLimit ? (
+            <p className="pool-editor-error" role="alert">
+              最多保留 {ruleLimit} 条条件，请移除多余条件。
+            </p>
           ) : null}
           {rules.map((rule, index) => {
             const block = blockMap.get(rule.key);
@@ -740,8 +801,8 @@ export function PoolEditorForm({
               disabledReason={
                 !chosenBlock
                   ? "先从条件目录选择一条。"
-                  : rules.length >= 32
-                    ? "最多添加 32 条条件。"
+                  : rules.length >= ruleLimit
+                    ? `最多添加 ${ruleLimit} 条条件。`
                     : undefined
               }
               onClick={addRule}
@@ -749,6 +810,173 @@ export function PoolEditorForm({
               添加条件
             </Button>
           </div>
+        </section>
+        <section className="pool-editor-section" aria-label="排名规则">
+          <div className="pool-editor-section-head">
+            <h3>排名规则</h3>
+            <Button
+              size="sm"
+              disabledReason={
+                rankRows.length >= 4
+                  ? "最多添加 4 项排名。"
+                  : !rankMetrics.some(
+                        (metric) => !rankRows.some((row) => row.metric === metric.value),
+                      )
+                    ? "暂无更多可用指标。"
+                    : undefined
+              }
+              onClick={() => {
+                const metric = rankMetrics.find(
+                  (item) => !rankRows.some((row) => row.metric === item.value),
+                );
+                if (!metric) return;
+                setRankRows((current) => [
+                  ...current,
+                  {
+                    id: Math.max(0, ...current.map((row) => row.id)) + 1,
+                    metric: metric.value,
+                    ascending: metric.value === "CIRC_MV[0]",
+                    weight: current.length === 0 ? "100" : "0",
+                  },
+                ]);
+                markMetadataEdit();
+              }}
+            >
+              添加排名
+            </Button>
+          </div>
+          {rankRows.length === 0 ? (
+            <p className="pools-note">未设置排名，保留所有符合条件的股票。</p>
+          ) : (
+            <div className="pool-editor-ranking">
+              {rankRows.map((row, index) => (
+                <div className="pool-editor-rank-row" key={row.id}>
+                  <span className="pool-editor-rule-index num">
+                    {String(index + 1).padStart(2, "0")}
+                  </span>
+                  <label className="field pool-editor-rank-metric">
+                    <span className="lbl">指标</span>
+                    <select
+                      className="inp"
+                      aria-label={`第 ${index + 1} 项排名指标`}
+                      value={row.metric}
+                      onChange={(event) => {
+                        const metric = event.target.value;
+                        if (!isPoolRankingMetric(metric)) return;
+                        setRankRows((current) =>
+                          current.map((item) =>
+                            item.id === row.id
+                              ? {
+                                  ...item,
+                                  metric,
+                                  ascending: metric === "CIRC_MV[0]",
+                                }
+                              : item,
+                          ),
+                        );
+                        markMetadataEdit();
+                      }}
+                    >
+                      {!metricLabels.has(row.metric) ? (
+                        <option value={row.metric}>原有指标暂不可用</option>
+                      ) : null}
+                      {rankMetrics.map((metric) => (
+                        <option
+                          key={metric.value}
+                          value={metric.value}
+                          disabled={
+                            metric.value !== row.metric &&
+                            rankRows.some((item) => item.metric === metric.value)
+                          }
+                        >
+                          {metric.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field pool-editor-rank-direction">
+                    <span className="lbl">优先方向</span>
+                    <select
+                      className="inp"
+                      aria-label={`第 ${index + 1} 项排名方向`}
+                      value={row.ascending ? "asc" : "desc"}
+                      onChange={(event) => {
+                        setRankRows((current) =>
+                          current.map((item) =>
+                            item.id === row.id
+                              ? { ...item, ascending: event.target.value === "asc" }
+                              : item,
+                          ),
+                        );
+                        markMetadataEdit();
+                      }}
+                    >
+                      <option value="desc">数值高优先</option>
+                      <option value="asc">数值低优先</option>
+                    </select>
+                  </label>
+                  <label className="field pool-editor-rank-weight">
+                    <span className="lbl">权重</span>
+                    <input
+                      className="inp num"
+                      type="number"
+                      min={0}
+                      max={100}
+                      step="0.1"
+                      inputMode="decimal"
+                      aria-label={`第 ${index + 1} 项排名权重`}
+                      value={row.weight}
+                      onChange={(event) => {
+                        setRankRows((current) =>
+                          current.map((item) =>
+                            item.id === row.id ? { ...item, weight: event.target.value } : item,
+                          ),
+                        );
+                        markMetadataEdit();
+                      }}
+                    />
+                  </label>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabledReason={
+                      rankRows.length === 1 && (editing?.ranking ?? copying?.ranking)
+                        ? "这只池子需要保留排名。"
+                        : undefined
+                    }
+                    aria-label={`删除第 ${index + 1} 项排名`}
+                    onClick={() => {
+                      setRankRows((current) => current.filter((item) => item.id !== row.id));
+                      markMetadataEdit();
+                    }}
+                  >
+                    删除
+                  </Button>
+                </div>
+              ))}
+              <label className="field pool-editor-rank-top">
+                <span className="lbl">取前 N 只</span>
+                <input
+                  className="inp num"
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  inputMode="numeric"
+                  value={topN}
+                  onChange={(event) => {
+                    setTopN(event.target.value);
+                    markMetadataEdit();
+                  }}
+                />
+              </label>
+            </div>
+          )}
+          {rankingError ? (
+            <p className="pool-editor-error" role="alert">
+              {rankingError}
+            </p>
+          ) : null}
         </section>
         <section ref={previewRef} className="pool-editor-section" aria-label="变更预览">
           <div className="pool-editor-section-head">
@@ -769,6 +997,17 @@ export function PoolEditorForm({
                 {parent ? `从 ${parentPool?.name} 筛选 · 延后 ${delay} 个交易日` : "独立筛选"}
               </span>
               <span>{attachTo ? `保存后加入「${canvas}」` : "只保存池子规则"}</span>
+              {ranking ? (
+                <div className="pool-editor-rank-preview">
+                  <strong>排名后取前 {ranking.top_n.toLocaleString("zh-CN")} 只</strong>
+                  {ranking.conditions.map((row) => (
+                    <span key={row.metric}>
+                      {metricLabels.get(row.metric)} · {row.ascending ? "低值优先" : "高值优先"} ·
+                      权重 {row.weight.toLocaleString("zh-CN")}%
+                    </span>
+                  ))}
+                </div>
+              ) : null}
               <ol>
                 {rules.map((rule) => {
                   const block = blockMap.get(rule.key);

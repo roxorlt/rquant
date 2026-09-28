@@ -129,10 +129,13 @@ def _rule_definitions(
 ) -> tuple[dict[str, PoolDefinitionView], dict[str, str | None]]:
     if not _available(tables, "pool_definition"):
         return {}, {}
+    cursor.execute("SELECT * FROM pool_definition LIMIT 0")
+    has_ranking = any(column[0] == "ranking_json" for column in cursor.description)
+    ranking_column = "ranking_json" if has_ranking else "NULL AS ranking_json"
     rows = cursor.execute(
         "SELECT pool_name, display_name, description, source_kind, state, reason, "
-        "version, depends_on, delay_mode, delay_days, rules_json FROM pool_definition "
-        "ORDER BY pool_name LIMIT ?",
+        "version, depends_on, delay_mode, delay_days, rules_json, "
+        f"{ranking_column} FROM pool_definition ORDER BY pool_name LIMIT ?",
         (_MAX_RULE_ROWS,),
     ).fetchall()
     fields = (
@@ -147,6 +150,7 @@ def _rule_definitions(
         "delay_mode",
         "delay_days",
         "rules_json",
+        "ranking_json",
     )
     return (
         {str(row[0]): pool_definition_view(dict(zip(fields, row, strict=True))) for row in rows},

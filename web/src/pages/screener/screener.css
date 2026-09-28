@@ -772,6 +772,84 @@
   padding: 15px;
   text-align: center;
 }
+.screen-save-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 14px 0 0;
+}
+.screen-save-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+.screen-save-drawer {
+  display: grid;
+  gap: 18px;
+  min-width: 0;
+}
+.screen-save-drawer .field,
+.screen-save-drawer .inp {
+  width: 100%;
+  min-width: 0;
+}
+.screen-save-preview,
+.screen-save-state {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--sunken);
+}
+.screen-save-preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.screen-save-preview-head span,
+.screen-save-preview p,
+.screen-save-state p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.screen-save-preview ol {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding-left: 22px;
+  font-size: 12px;
+}
+.screen-save-preview li span,
+.screen-save-rank span {
+  display: block;
+  color: var(--ink-2);
+}
+.screen-save-rank,
+.screen-save-publication {
+  display: grid;
+  gap: 5px;
+  padding-top: 10px;
+  border-top: 1px solid var(--rule);
+  font-size: 12px;
+}
+.screen-save-rank strong {
+  font-size: 13px;
+}
+.screen-save-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.screen-save-error {
+  margin: 0;
+  color: var(--crit);
+  font-size: 12px;
+}
 @media (max-width: 760px) {
   .screen-nl-compose {
     grid-template-columns: minmax(0, 1fr);
@@ -854,6 +932,12 @@
   }
   .screen-rank-top {
     width: 100%;
+  }
+  .screen-save-bar .btn {
+    flex: 1 1 100%;
+  }
+  .screen-save-footer .btn {
+    flex: 1;
   }
   .screen-funnel li {
     grid-template-columns: minmax(80px, 140px) minmax(30px, 1fr) minmax(70px, auto);

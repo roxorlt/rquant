@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from rquant.screen import ranking
 from rquant.screen.ranking import RankingCondition, rank_screen_results
+from rquant.storage.duckdb import DuckDBStore
 
 
 def test_ranking_uses_weighted_valid_percentiles_and_returns_top_n() -> None:
@@ -188,3 +192,80 @@ def test_empty_screen_result_preserves_columns_and_adds_score() -> None:
 
     assert result.empty
     assert result.columns.tolist() == ["ts_code", "metric", "ranking_score"]
+
+
+def test_nonempty_candidates_with_no_trusted_positive_weight_metric_fail() -> None:
+    frame = pd.DataFrame(
+        {"ts_code": ["000002.SZ", "000001.SZ"], "missing": [np.nan, np.nan], "ignored": [1, 2]}
+    )
+    with pytest.raises(ValueError, match="trusted ranking"):
+        rank_screen_results(
+            frame,
+            [RankingCondition("missing", False, 100), RankingCondition("ignored", False, 0)],
+            top_n=1,
+        )
+
+
+def test_twenty_day_adjusted_return_requires_all_21_open_session_facts(tmp_path) -> None:
+    sessions = [date(2026, 8, 1) + timedelta(days=offset) for offset in range(21)]
+    with DuckDBStore(tmp_path / "returns.duckdb") as store:
+        for index, session in enumerate(sessions):
+            store._conn.execute(
+                "INSERT INTO trade_calendar (exchange, cal_date, is_open, source, updated_at) "
+                "VALUES ('SSE', ?, TRUE, 'fixture', '2026-08-22 00:00:00+00')",
+                [session],
+            )
+            for code, close, factor in (
+                ("000001.SZ", 20.0 if index == 20 else 10.0, 1.0),
+                ("000002.SZ", 10.0, 2.0 if index == 20 else 1.0),
+                ("000003.SZ", 10.0, 1.0),
+            ):
+                if code == "000003.SZ" and index == 8:
+                    continue
+                store._conn.execute(
+                    "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, ?)",
+                    [code, session, close],
+                )
+                store._conn.execute(
+                    "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) VALUES (?, ?, ?)",
+                    [code, session, factor],
+                )
+        result = ranking.load_twenty_day_adjusted_returns(
+            store._conn, sessions[-1], ["000002.SZ", "000003.SZ", "000001.SZ", "000004.SZ"]
+        )
+        early = ranking.load_twenty_day_adjusted_returns(
+            store._conn, sessions[-2], ["000001.SZ"]
+        )
+    assert result.columns.tolist() == ["ts_code", "RETURN_20D_PCT[0]"]
+    assert result["ts_code"].tolist() == ["000002.SZ", "000003.SZ", "000001.SZ", "000004.SZ"]
+    assert result["RETURN_20D_PCT[0]"].iloc[[0, 2]].tolist() == pytest.approx([100, 100])
+    assert result["RETURN_20D_PCT[0]"].iloc[[1, 3]].isna().all()
+    assert early["RETURN_20D_PCT[0]"].isna().all()
+
+
+def test_twenty_day_return_rejects_missing_calendar_coverage(tmp_path) -> None:
+    sessions = [date(2026, 8, 1) + timedelta(days=offset) for offset in range(22)]
+    missing_calendar_day = sessions[8]
+    with DuckDBStore(tmp_path / "calendar-gap.duckdb") as store:
+        for session in sessions:
+            if session == missing_calendar_day:
+                continue
+            store._conn.execute(
+                "INSERT INTO trade_calendar (exchange, cal_date, is_open, source, updated_at) "
+                "VALUES ('SSE', ?, TRUE, 'fixture', '2026-08-23 00:00:00+00')",
+                [session],
+            )
+            store._conn.execute(
+                "INSERT INTO daily_bar (ts_code, trade_date, close) "
+                "VALUES ('000001.SZ', ?, 10)",
+                [session],
+            )
+            store._conn.execute(
+                "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+                "VALUES ('000001.SZ', ?, 1)",
+                [session],
+            )
+        result = ranking.load_twenty_day_adjusted_returns(
+            store._conn, sessions[-1], ["000001.SZ"]
+        )
+    assert result["RETURN_20D_PCT[0]"].isna().all()

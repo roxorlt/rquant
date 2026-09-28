@@ -1316,7 +1316,7 @@ class _ReadonlyPageControlAuditReader:
                 FROM page_control_command AS c
                 LEFT JOIN page_control_effect AS e USING (command_id)
                 WHERE c.status = ?
-                  AND c.command_kind IN (?, ?, ?, ?, ?)
+                  AND c.command_kind IN (?, ?, ?, ?, ?, ?)
                 ORDER BY c.rowid DESC
                 LIMIT ?
                 """,
@@ -1327,6 +1327,7 @@ class _ReadonlyPageControlAuditReader:
                     PageControlStatus.SUCCEEDED.value,
                     "save_user_pool",
                     "save_user_pool_v2",
+                    "save_user_pool_v3",
                     "save_nl_preset",
                     "fork_builtin_pool",
                     "delete_user_pool",

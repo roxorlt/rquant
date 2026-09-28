@@ -1270,6 +1270,7 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
                 ("delay_days", "int"),
                 ("rules_json", "string"),
                 ("include_columns_json", "string"),
+                ("ranking_json", "string"),
                 ("can_edit", "bool"),
             ),
             ("pool_name",),

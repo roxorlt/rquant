@@ -73,6 +73,7 @@ def _rule_row(
         "delay_days": delay_days,
         "rules_json": json.dumps(rules if rules is not None else [], ensure_ascii=False),
         "include_columns_json": "[]",
+        "ranking_json": None,
         "can_edit": state == "available",
     }
 
@@ -320,6 +321,20 @@ def test_verified_receipt_confirms_current_rules_and_zero_hit_day(tmp_path: Path
     }
     assert (zero["state"], zero["trade_date"], zero["member_count"]) == ("current", "2026-09-23", 0)
     assert zero["members"] == [] and zero["steps"] == []
+
+
+def test_old_serving_pool_definition_without_ranking_column_remains_readable(
+    tmp_path: Path,
+) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/旧池")],
+        hits=[],
+        receipts=None,
+    )["data"]
+    pool = next(item for item in data["pools"] if item["key"] == "user/旧池")
+    assert pool["definition"]["state"] == "available"
+    assert pool["definition"]["ranking"] is None
 
 
 def test_zero_hit_copy_says_today_only_on_the_same_calendar_day(tmp_path: Path) -> None:
@@ -930,6 +945,58 @@ def test_published_rules_include_real_conditions_and_keep_results_separate(tmp_p
     assert size_rule["parameters"][0] == {"label": "市值上限", "value": "150 亿元"}
     assert "private-command" not in json.dumps(data, ensure_ascii=False)
     assert "command_hash" not in json.dumps(data, ensure_ascii=False)
+
+
+def test_ranked_pool_rule_detail_displays_plan_without_claiming_scores(tmp_path: Path) -> None:
+    row = _rule_row("user/排名观察")
+    row["ranking_json"] = json.dumps(
+        {
+            "conditions": [
+                {"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 50},
+                {"metric": "CIRC_MV[0]", "ascending": True, "weight": 30},
+                {"metric": "PCT_CHG[0]", "ascending": False, "weight": 20},
+            ],
+            "top_n": 20,
+        }
+    )
+    root = tmp_path / "ranked-rules"
+    build_web_fixture(root, "baseline", signal_projections=(_projection("pool_definition", [row]),))
+
+    pool = next(item for item in _get(root)["data"]["pools"] if item["key"] == "user/排名观察")
+    assert pool["state"] == "unpublished"
+    assert pool["definition"]["ranking"] == {
+        "conditions": [
+            {"label": "20 日涨幅", "direction_label": "越高越好", "weight": 50.0},
+            {"label": "流通市值", "direction_label": "越低越好", "weight": 30.0},
+            {"label": "今日涨跌幅", "direction_label": "越高越好", "weight": 20.0},
+        ],
+        "top_n": 20,
+    }
+    assert "ranking_score" not in json.dumps(pool)
+
+
+def test_corrupt_published_ranking_does_not_look_available(tmp_path: Path) -> None:
+    row = _rule_row("user/排名损坏")
+    row["ranking_json"] = json.dumps(
+        {"conditions": [{"metric": "OTHER", "ascending": False, "weight": 100}], "top_n": 20}
+    )
+    root = tmp_path / "corrupt-ranking"
+    build_web_fixture(root, "baseline", signal_projections=(_projection("pool_definition", [row]),))
+
+    pool = next(item for item in _get(root)["data"]["pools"] if item["key"] == "user/排名损坏")
+    assert pool["definition"]["state"] == "unavailable"
+    assert pool["definition"]["reason_label"] == "排名设置损坏"
+
+
+def test_unranked_v3_definition_is_available_without_ranking_summary(tmp_path: Path) -> None:
+    row = _rule_row("user/无排名新池")
+    row["ranking_json"] = "null"
+    root = tmp_path / "unranked-v3"
+    build_web_fixture(root, "baseline", signal_projections=(_projection("pool_definition", [row]),))
+
+    pool = next(item for item in _get(root)["data"]["pools"] if item["key"] == "user/无排名新池")
+    assert pool["definition"]["state"] == "available"
+    assert pool["definition"]["ranking"] is None
 
 
 def test_rule_source_and_result_source_are_independent(tmp_path: Path) -> None:

@@ -305,6 +305,58 @@
 .pool-editor-add .btn {
   flex: none;
 }
+.pool-editor-ranking {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.pool-editor-rank-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1.5fr) minmax(0, 1fr) 78px auto;
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--sunken);
+}
+.pool-editor-rank-row .field,
+.pool-editor-rank-row .inp {
+  min-width: 0;
+  width: 100%;
+}
+.pool-editor-rank-row > .pool-editor-rule-index {
+  align-self: center;
+}
+.pool-editor-rank-top {
+  width: min(180px, 100%);
+}
+.pool-editor-rank-preview {
+  display: grid;
+  gap: 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--rule);
+}
+.pools-ranking-summary {
+  display: grid;
+  gap: 7px;
+  padding: 11px 13px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--sunken);
+  font-size: 12px;
+}
+.pools-ranking-summary strong {
+  font-size: 13px;
+}
+.pools-ranking-summary ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink-2);
+}
 .pool-editor-preview {
   display: grid;
   gap: 7px;
@@ -377,6 +429,25 @@
   }
   .pool-editor-fields .field {
     grid-column: 1 / -1;
+  }
+  .pool-editor-rank-row {
+    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .pool-editor-rank-metric {
+    grid-column: 2 / -1;
+  }
+  .pool-editor-rank-direction {
+    grid-column: 2;
+  }
+  .pool-editor-rank-weight {
+    grid-column: 3;
+  }
+  .pool-editor-rank-row > .btn {
+    grid-column: 2 / -1;
+    justify-self: end;
+  }
+  .pool-editor-rank-top {
+    width: 100%;
   }
   .pool-editor-footer-actions .btn {
     flex: 1;

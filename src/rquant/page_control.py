@@ -44,6 +44,7 @@ from rquant.runtime_contracts import (
     RuntimeContractModel,
     canonical_sha256,
 )
+from rquant.screen.pool_ranking import PoolRankingPlan
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
@@ -179,6 +180,24 @@ class SaveUserPoolV2(PageControlCommand):
     depends_on: str | None = None
     delay_days: int = 0
     expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("base_name")
+    @classmethod
+    def validate_base_name(cls, value: str) -> str:
+        return _validated_name(value, label="user pool name")
+
+
+class SaveUserPoolV3(PageControlCommand):
+    kind: Literal["save_user_pool_v3"] = "save_user_pool_v3"
+    base_name: str
+    display_name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+    rule_calls: tuple[RuleCall, ...] = Field(default=(), max_length=26)
+    include_columns: tuple[str, ...] = Field(default=(), max_length=26)
+    depends_on: str | None = None
+    delay_days: int = 0
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    ranking: PoolRankingPlan | None
 
     @field_validator("base_name")
     @classmethod
@@ -364,6 +383,7 @@ PageControlCommandValue = Annotated[
     | AddPoolToCanvas
     | SaveUserPool
     | SaveUserPoolV2
+    | SaveUserPoolV3
     | SaveFormulaPoolV1
     | DeleteUserPool
     | ForkBuiltinPool
@@ -1829,8 +1849,10 @@ class PageControlConsumer:
                 and not record.pool_refs
                 and record.source == "page_control"
             )
-        if isinstance(command, SaveUserPoolV2):
+        if isinstance(command, (SaveUserPoolV2, SaveUserPoolV3)):
             try:
+                if isinstance(command, SaveUserPoolV3):
+                    return self._recover_user_pool_v3_result(command) is not None
                 return self._recover_user_pool_v2_result(command) is not None
             except Exception:
                 return False
@@ -1898,6 +1920,8 @@ class PageControlConsumer:
             return result
         if isinstance(command, SaveUserPoolV2):
             return self._save_user_pool_v2(command)
+        if isinstance(command, SaveUserPoolV3):
+            return self._save_user_pool_v3(command)
         if isinstance(command, SaveFormulaPoolV1):
             return self._formula_pool_backend().submit(command)
         if isinstance(command, DeleteUserPool):
@@ -1992,7 +2016,7 @@ class PageControlConsumer:
             if command.canvas_name is not None and command.canvas_name != "__default__":
                 targets.extend(self._canvas_publication_fence_targets(command.canvas_name))
             return tuple(targets)
-        if isinstance(command, SaveUserPoolV2):
+        if isinstance(command, (SaveUserPoolV2, SaveUserPoolV3)):
             return (
                 _LocalEffectFenceTarget(
                     role="user_pool_directory",
@@ -2208,6 +2232,8 @@ class PageControlConsumer:
             return result
         if isinstance(command, SaveUserPoolV2):
             return self._recover_user_pool_v2_result(command)
+        if isinstance(command, SaveUserPoolV3):
+            return self._recover_user_pool_v3_result(command)
         if isinstance(command, SaveNlPreset):
             save = SaveUserPool(
                 command_id=command.command_id,
@@ -2384,8 +2410,10 @@ class PageControlConsumer:
         identity = command if identity_command is None else identity_command
         self._assert_no_formula_pool_name(command.base_name)
         path = self._user_pool_path(command.base_name)
-        if self._managed_json_exists(path) and self._read_json(path).get("schema_version") == 2:
-            raise ValueError("v2 pool definition requires save_user_pool_v2")
+        if self._managed_json_exists(path) and self._read_json(path).get(
+            "schema_version"
+        ) in (2, 3):
+            raise ValueError("versioned pool definition requires matching save command")
         payload = {
             "name": command.base_name,
             "description": command.description,
@@ -2407,6 +2435,8 @@ class PageControlConsumer:
 
         path = self._user_pool_path(command.base_name)
         current = self._read_json(path) if self._managed_json_exists(path) else None
+        if current is not None and current.get("schema_version") == 3:
+            raise ValueError("ranked pool definition requires save_user_pool_v3")
         current_version = None if current is None else canonical_sha256(current)
         if command.expected_version != current_version:
             raise ValueError("pool version conflict: definition changed since it was read")
@@ -2457,6 +2487,89 @@ class PageControlConsumer:
         }
         self._atomic_json(path, payload, command_id=command.command_id)
         return {"path": str(path), "version": canonical_sha256(payload)}
+
+    def _save_user_pool_v3(self, command: SaveUserPoolV3) -> JsonValue:
+        self._assert_no_formula_pool_name(command.base_name)
+        from rquant.llm.dispatch import build_rules
+        from rquant.llm.schemas import ScreenPlan, Stage
+        from rquant.presets import BUILTIN_PRESET_SCREENS, load_user_presets
+        from rquant.screen.dynamic_ma import requested_dynamic_ma
+        from rquant.screen.dynamic_rsi import requested_dynamic_rsi
+        from rquant.screen.loader import FUNDAMENTAL_COLS_MAP, _selected_sources
+        from rquant.screen.rules import required_rule_columns
+
+        path = self._user_pool_path(command.base_name)
+        current = self._read_json(path) if self._managed_json_exists(path) else None
+        current_version = None if current is None else canonical_sha256(current)
+        if command.expected_version != current_version:
+            raise ValueError("pool version conflict: definition changed since it was read")
+        if not command.display_name.strip():
+            raise ValueError("pool display name is required")
+        if command.depends_on is None:
+            if command.delay_days != 0:
+                raise ValueError("delay_days must be 0 without a parent pool")
+        elif not 1 <= command.delay_days <= 252:
+            raise ValueError("delay_days must be 1..252 with a parent pool")
+
+        rules = build_rules(
+            ScreenPlan(
+                trade_date="1900-01-01",
+                stages=[Stage(label="saved", rules=list(command.rule_calls))],
+                include_columns=list(command.include_columns),
+            )
+        )
+        columns = required_rule_columns(rules) | frozenset(command.include_columns)
+        try:
+            _selected_sources(columns, 500)
+            fundamentals = set(FUNDAMENTAL_COLS_MAP.values())
+            unsupported = any(column.split("[", 1)[0] in fundamentals for column in columns)
+            dynamic_rsi = any(
+                period not in (6, 14)
+                for period, _offset in requested_dynamic_rsi(columns).values()
+            )
+            dynamic_ma = bool(requested_dynamic_ma(columns))
+        except ValueError as error:
+            raise ValueError("pool conditions are not reproducible by the daily writer") from error
+        if unsupported or dynamic_rsi or dynamic_ma:
+            raise ValueError("pool conditions are not reproducible by the daily writer")
+
+        candidate_name = f"user/{command.base_name}"
+        if command.depends_on == candidate_name:
+            raise ValueError("pool cannot depend on itself")
+        available = dict(BUILTIN_PRESET_SCREENS)
+        available.update(load_user_presets(path.parent))
+        parent_name = command.depends_on
+        visited = {candidate_name}
+        while parent_name is not None:
+            if parent_name in visited:
+                raise ValueError("pool dependency cycle")
+            visited.add(parent_name)
+            parent = available.get(parent_name)
+            if parent is None:
+                raise ValueError(f"parent pool does not exist or is invalid: {parent_name}")
+            parent_name = parent.depends_on
+
+        payload = self._user_pool_v3_payload(command)
+        self._atomic_json(path, payload, command_id=command.command_id)
+        return {"path": str(path), "version": canonical_sha256(payload)}
+
+    @staticmethod
+    def _user_pool_v3_payload(command: SaveUserPoolV3) -> dict[str, JsonValue]:
+        return {
+            "schema_version": 3,
+            "name": command.base_name,
+            "display_name": command.display_name.strip(),
+            "description": command.description,
+            "rules": [rule.model_dump(mode="json") for rule in command.rule_calls],
+            "include_columns": list(command.include_columns),
+            "depends_on": command.depends_on,
+            "delay_days": command.delay_days,
+            "ranking": None if command.ranking is None else command.ranking.model_dump(mode="json"),
+            "updated_at": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
+            "source": "page_control_v3",
+            "command_id": command.command_id,
+            "command_hash": _command_hash(command),
+        }
 
     def _fork_builtin(self, command: ForkBuiltinPool) -> JsonValue:
         save = self._fork_builtin_save_command(command)
@@ -2535,13 +2648,19 @@ class PageControlConsumer:
         if not self._managed_json_exists(path):
             raise ValueError("pool definition is unavailable")
         current = self._read_json(path)
+        versioned_source = (
+            (current.get("schema_version"), current.get("source"))
+            in {(2, "page_control_v2"), (3, "page_control_v3")}
+            and (current.get("schema_version") != 3 or "ranking" in current)
+        )
         if (
-            current.get("schema_version") != 2
+            not versioned_source
             or current.get("name") != base_name
-            or current.get("source") != "page_control_v2"
             or canonical_sha256(current) != command.expected_pool_version
         ):
             raise ValueError("pool version conflict: definition changed since save")
+        if current["schema_version"] == 3 and current.get("ranking") is not None:
+            PoolRankingPlan.model_validate(current.get("ranking"))
         result = self._add_pool_to_canvas(
             command.canvas_name,
             command.pool_name,
@@ -2610,6 +2729,15 @@ class PageControlConsumer:
         if raw.get("command_id") != command.command_id:
             return None
         if raw.get("command_hash") != _command_hash(command):
+            return None
+        return {"path": str(path), "version": canonical_sha256(raw)}
+
+    def _recover_user_pool_v3_result(self, command: SaveUserPoolV3) -> JsonValue | None:
+        path = self._user_pool_path(command.base_name)
+        if not self._managed_json_exists(path):
+            return None
+        raw = self._read_json(path)
+        if raw != self._user_pool_v3_payload(command):
             return None
         return {"path": str(path), "version": canonical_sha256(raw)}
 
@@ -3840,6 +3968,7 @@ __all__ = [
     "SaveNlPreset",
     "SaveUserPool",
     "SaveUserPoolV2",
+    "SaveUserPoolV3",
     "SetCanvasPoolRefs",
     "SubmitLabCommand",
     "SubmitBackfillPlan",

@@ -123,6 +123,59 @@ def test_verified_replica_reads_only_rule_base_and_requested_ranking_columns(
     assert pd.isna(result.frame.loc[0, "CIRC_MV[0]"])
 
 
+def test_verified_replica_adds_selected_day_adjusted_twenty_day_return(
+    tmp_path: Path,
+) -> None:
+    primary, replica, dates = _world(tmp_path, days=22)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, CASE "
+            "WHEN trade_date = ? THEN 5 "
+            "WHEN trade_date = ? THEN 2 ELSE 1 END "
+            "FROM daily_bar",
+            [dates[0], dates[1]],
+        )
+    shutil.copy2(primary, replica)
+    write_replica_generation_metadata(
+        primary_path=primary,
+        replica_path=replica,
+        output_path=replica_generation_path(replica),
+        source_before=capture_database_watermark(primary),
+    )
+
+    reader = _reader(primary, replica)
+    selected = reader.load(dates[1], [], include_columns=["RETURN_20D_PCT[0]"])
+    latest = reader.load(dates[0], [], include_columns=["RETURN_20D_PCT[0]"])
+    assert selected.frame.loc[0, "RETURN_20D_PCT[0]"] == pytest.approx(100.0)
+    assert latest.frame.loc[0, "RETURN_20D_PCT[0]"] == pytest.approx(450.0)
+    assert selected.identity == latest.identity
+
+
+def test_verified_replica_keeps_incomplete_adjusted_return_unknown(
+    tmp_path: Path,
+) -> None:
+    primary, replica, dates = _world(tmp_path, days=21)
+    with DuckDBStore(primary) as store:
+        store._conn.execute(
+            "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) "
+            "SELECT ts_code, trade_date, 1 FROM daily_bar WHERE trade_date != ?",
+            [dates[5]],
+        )
+    shutil.copy2(primary, replica)
+    write_replica_generation_metadata(
+        primary_path=primary,
+        replica_path=replica,
+        output_path=replica_generation_path(replica),
+        source_before=capture_database_watermark(primary),
+    )
+
+    result = _reader(primary, replica).load(
+        dates[0], [], include_columns=["RETURN_20D_PCT[0]"]
+    )
+    assert pd.isna(result.frame.loc[0, "RETURN_20D_PCT[0]"])
+
+
 def test_verified_replica_rejects_unregistered_dependency(tmp_path: Path) -> None:
     primary, replica, dates = _world(tmp_path)
     with pytest.raises(ValueError, match="metadata"):

@@ -44,6 +44,21 @@ class PoolRuleItem(BaseModel):
     parameters: list[PoolRuleParameter]
 
 
+class PoolRankingItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    direction_label: str
+    weight: float
+
+
+class PoolRankingView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    conditions: list[PoolRankingItem]
+    top_n: int
+
+
 class PoolDefinitionView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -56,6 +71,7 @@ class PoolDefinitionView(BaseModel):
     depends_on: str | None
     delay_label: str | None
     rules: list[PoolRuleItem]
+    ranking: PoolRankingView | None = None
 
 
 class PoolResultView(BaseModel):

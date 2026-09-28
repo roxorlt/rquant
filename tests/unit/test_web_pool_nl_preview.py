@@ -82,6 +82,7 @@ def _app(
         "delay_days": 2,
         "rules_json": json.dumps([{"name": "not_st", "args": {}}]),
         "include_columns_json": json.dumps(include_columns or ["CLOSE[0]"]),
+        "ranking_json": None,
         "can_edit": True,
     }
     projections = (

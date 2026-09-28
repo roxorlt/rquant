@@ -1,17 +1,20 @@
 import { ApiError, type Schemas } from "@/api/client";
 
 export type SaveCommand = Schemas["SavePoolCommand"];
+export type RankedSaveCommand = Schemas["SaveRankedPoolCommand"];
 export type AttachCommand = Schemas["AttachPoolCommand"];
-export type EditorCommand = SaveCommand | AttachCommand;
+export type EditorCommand = SaveCommand | RankedSaveCommand | AttachCommand;
 export type EditorReceipt = Schemas["PoolEditorReceipt"];
-export type SaveInput = Omit<SaveCommand, "kind" | "command_id" | "requested_at">;
+export type SaveInput =
+  | Omit<SaveCommand, "kind" | "command_id" | "requested_at">
+  | Omit<RankedSaveCommand, "kind" | "command_id" | "requested_at">;
 
 type CommandStatus = "pending" | "processing" | "succeeded" | "failed" | "ambiguous" | "unknown";
 type AttachStatus = CommandStatus | "idle";
 
 export interface EditorJournal {
   schema: 1;
-  save: SaveCommand;
+  save: SaveCommand | RankedSaveCommand;
   canvasName: string | null;
   saveVersion: string | null;
   saveStatus: CommandStatus;
@@ -52,7 +55,7 @@ function isJournal(value: unknown): value is EditorJournal {
   if (!isRecord(value) || value.schema !== 1 || !isRecord(value.save)) return false;
   const save = value.save;
   if (
-    save.kind !== "save_user_pool_v2" ||
+    (save.kind !== "save_user_pool_v2" && save.kind !== "save_user_pool_v3") ||
     typeof save.command_id !== "string" ||
     !ID.test(save.command_id) ||
     typeof save.requested_at !== "string" ||
@@ -69,6 +72,26 @@ function isJournal(value: unknown): value is EditorJournal {
     (value.attachConflict !== undefined && typeof value.attachConflict !== "boolean")
   )
     return false;
+  if (save.kind === "save_user_pool_v3" && save.ranking !== null) {
+    if (!isRecord(save.ranking) || !Array.isArray(save.ranking.conditions)) return false;
+    if (
+      !Number.isInteger(save.ranking.top_n) ||
+      typeof save.ranking.top_n !== "number" ||
+      save.ranking.top_n < 1 ||
+      save.ranking.top_n > 100 ||
+      save.ranking.conditions.length < 1 ||
+      save.ranking.conditions.length > 4 ||
+      !save.ranking.conditions.every(
+        (item: unknown) =>
+          isRecord(item) &&
+          typeof item.metric === "string" &&
+          typeof item.ascending === "boolean" &&
+          typeof item.weight === "number" &&
+          Number.isFinite(item.weight),
+      )
+    )
+      return false;
+  }
   if (value.attach === null) return value.attachStatus === "idle";
   if (!isRecord(value.attach)) return false;
   const attach = value.attach;
@@ -174,7 +197,11 @@ export class PoolEditorSession {
     }
   }
 
-  private attachBody(save: SaveCommand, canvasName: string, version: string): AttachCommand {
+  private attachBody(
+    save: SaveCommand | RankedSaveCommand,
+    canvasName: string,
+    version: string,
+  ): AttachCommand {
     return {
       kind: "add_pool_to_canvas",
       command_id: this.nextId(),
@@ -214,12 +241,11 @@ export class PoolEditorSession {
       return;
     }
     try {
-      const save: SaveCommand = {
-        ...input,
-        kind: "save_user_pool_v2",
-        command_id: this.nextId(),
-        requested_at: this.now(),
-      };
+      const identity = { command_id: this.nextId(), requested_at: this.now() };
+      const save: SaveCommand | RankedSaveCommand =
+        "ranking" in input
+          ? { ...input, ...identity, kind: "save_user_pool_v3" }
+          : { ...input, ...identity, kind: "save_user_pool_v2" };
       const journal: EditorJournal = {
         schema: 1,
         save,

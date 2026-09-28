@@ -784,6 +784,38 @@ it("draws published dependencies through condition nodes and opens rules by keyb
   expect(findJargon(container.textContent ?? "")).toEqual([]);
 });
 
+it("在已发布规则中展示中文排名摘要，不展示指标代码或未核验分数", async () => {
+  const first = base.pools[0];
+  if (!first) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    rules_available: true,
+    pools: [
+      {
+        ...first,
+        name: "排名观察",
+        definition: {
+          ...firstRule,
+          ranking: {
+            conditions: [
+              { label: "流通市值", direction_label: "低值优先", weight: 70 },
+              { label: "今日涨跌幅", direction_label: "高值优先", weight: 30 },
+            ],
+            top_n: 20,
+          },
+        },
+      },
+    ],
+  });
+  renderApp("/pools");
+  const detail = await screen.findByRole("region", { name: "规则详情" });
+  expect(detail).toHaveTextContent("排名后取前 20 只");
+  expect(detail).toHaveTextContent("流通市值 · 低值优先 · 70%");
+  expect(detail).toHaveTextContent("今日涨跌幅 · 高值优先 · 30%");
+  expect(detail.textContent).not.toContain("CIRC_MV");
+  expect(detail.textContent).not.toContain("排名分");
+});
+
 it("keeps published rules visible when the member source is unavailable", async () => {
   const first = base.pools[0];
   if (!first) throw new Error("pool fixture is incomplete");

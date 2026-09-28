@@ -24,6 +24,7 @@ import { CustomMaParamControl } from "./CustomMaParamControl";
 import { FormulaPreviewDialog } from "./FormulaPreviewDialog";
 import { type RankingDraft, RankingEditor } from "./RankingEditor";
 import { type EditableScreenCondition, ScreenNaturalLanguage } from "./ScreenNaturalLanguage";
+import { ScreenPoolSave } from "./ScreenPoolSave";
 import { ScreenResults } from "./ScreenResults";
 import "./screener.css";
 
@@ -229,6 +230,29 @@ export default function ScreenerPage() {
     draft.length > 0 &&
     catalog.data?.source?.identity != null &&
     rankingError === null;
+  const saveCandidate =
+    result?.status === "ready" &&
+    !stale &&
+    !running &&
+    rankingError === null &&
+    applied !== null &&
+    appliedKey === snapshotKey &&
+    applied.source_identity !== null &&
+    result.source?.identity === applied.source_identity &&
+    result.trade_date === applied.trade_date
+      ? applied
+      : null;
+  const saveBlockedReason =
+    result?.status !== "ready"
+      ? null
+      : running
+        ? "筛选完成后再保存。"
+        : forcedStaleReason === "source" ||
+            result.source?.identity !== catalog.data?.source?.identity
+          ? "选股数据已更新，请重新运行筛选。"
+          : saveCandidate === null
+            ? "条件已改，请重新运行筛选。"
+            : null;
 
   function markManualConditionEdit() {
     draftEpoch.current += 1;
@@ -576,6 +600,12 @@ export default function ScreenerPage() {
             onPrevious={() => runPage(pageIndex - 1, cursors[pageIndex - 1] ?? null)}
             onNext={() => runPage(pageIndex + 1, result?.next_cursor ?? null)}
             usesFundamental={applied !== null && usesFundamental(applied.conditions)}
+          />
+          <ScreenPoolSave
+            candidate={saveCandidate}
+            blockedReason={saveBlockedReason}
+            blocks={blocks}
+            rankingMetrics={rankMetrics}
           />
         </>
       )}

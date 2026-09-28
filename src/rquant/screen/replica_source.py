@@ -49,6 +49,7 @@ from rquant.screen.loader import (
     _selected_sources,
     load_universe,
 )
+from rquant.screen.ranking import RETURN_20D_COLUMN, load_twenty_day_adjusted_returns
 from rquant.screen.rules import Rule, required_rule_columns
 
 if TYPE_CHECKING:
@@ -364,18 +365,24 @@ class VerifiedReplicaScreenSource:
             raise ScreenReplicaBudgetError("screen has too many conditions")
         rule_columns = required_rule_columns(rules)
         requested_columns = rule_columns | frozenset(include_columns or ())
-        dynamic_ma = requested_dynamic_ma(requested_columns)
+        adjusted_return_requested = RETURN_20D_COLUMN in (include_columns or ())
+        load_columns = (
+            requested_columns - {RETURN_20D_COLUMN}
+            if adjusted_return_requested and RETURN_20D_COLUMN not in rule_columns
+            else requested_columns
+        )
+        dynamic_ma = requested_dynamic_ma(load_columns)
         dynamic_rsi = {
             column: parts
-            for column, parts in requested_dynamic_rsi(frozenset(requested_columns)).items()
+            for column, parts in requested_dynamic_rsi(frozenset(load_columns)).items()
             if parts[0] not in (6, 14)
         }
         dynamic_days = dynamic_ma_day_count(dynamic_ma)
-        selected_sources, wide_columns = _selected_sources(requested_columns, MAX_LOOKBACK)
+        selected_sources, wide_columns = _selected_sources(load_columns, MAX_LOOKBACK)
         fundamental_fields = selected_sources.get("fundamental_daily_version", {})
         if fundamental_fields and expected_identity is None:
             raise ScreenReplicaChangedError("fundamental screening requires a bound replica")
-        ordinary_columns = requested_columns - {
+        ordinary_columns = load_columns - {
             f"{FUNDAMENTAL_COLS_MAP[name]}[0]" for name in fundamental_fields
         }
         required_offset = max(
@@ -444,6 +451,13 @@ class VerifiedReplicaScreenSource:
                 ).set_index("ts_code")
                 for column in dynamic_rsi:
                     frame[column] = frame["ts_code"].map(values[column])
+            if adjusted_return_requested:
+                adjusted_returns = load_twenty_day_adjusted_returns(
+                    connection, trade_date, frame["ts_code"].tolist()
+                )
+                frame = frame.merge(
+                    adjusted_returns, on="ts_code", how="left", validate="one_to_one"
+                )
             frame.insert(0, "trade_date", trade_date)
             self._finish(descriptor, generation)
             return ScreenUniverseSnapshot(

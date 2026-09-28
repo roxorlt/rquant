@@ -7,9 +7,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from pydantic import ValidationError
+
 from rquant.builtin_presets import BUILTIN_PRESET_SCREENS, builtin_definition_version
 from rquant.llm.registry import REGISTRY_BY_NAME
 from rquant.runtime_contracts import canonical_sha256
+from rquant.screen.pool_ranking import PoolRankingPlan
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,7 @@ def _empty_row(
         "delay_days": 0,
         "rules_json": None,
         "include_columns_json": None,
+        "ranking_json": None,
         "can_edit": False,
     }
 
@@ -70,6 +74,7 @@ def _builtins() -> dict[str, dict[str, object]]:
             "delay_days": preset.offset_days,
             "rules_json": _json(rules),
             "include_columns_json": _json(preset.include_columns),
+            "ranking_json": None,
             "can_edit": False,
         }
     return rows
@@ -78,9 +83,9 @@ def _builtins() -> dict[str, dict[str, object]]:
 def _expected_fields(mutation: PoolMutation) -> dict[str, object] | None:
     payload = mutation.payload
     kind = mutation.command_kind
-    if kind == "save_user_pool_v2":
-        return {
-            "schema_version": 2,
+    if kind in {"save_user_pool_v2", "save_user_pool_v3"}:
+        expected = {
+            "schema_version": 3 if kind == "save_user_pool_v3" else 2,
             "name": payload["base_name"],
             "display_name": str(payload["display_name"]).strip(),
             "description": payload["description"],
@@ -88,8 +93,11 @@ def _expected_fields(mutation: PoolMutation) -> dict[str, object] | None:
             "include_columns": payload["include_columns"],
             "depends_on": payload["depends_on"],
             "delay_days": payload["delay_days"],
-            "source": "page_control_v2",
+            "source": "page_control_v3" if kind == "save_user_pool_v3" else "page_control_v2",
         }
+        if kind == "save_user_pool_v3":
+            expected["ranking"] = payload["ranking"]
+        return expected
     if kind == "save_user_pool":
         return {
             "name": payload["base_name"],
@@ -177,7 +185,8 @@ def _user_row(
         return _empty_row(pool_name, state="unavailable", reason="name_mismatch", mutation=mutation)
     version = canonical_sha256(raw)
     if mutation.result.get("path") != file_path or (
-        mutation.command_kind == "save_user_pool_v2" and mutation.result.get("version") != version
+        mutation.command_kind in {"save_user_pool_v2", "save_user_pool_v3"}
+        and mutation.result.get("version") != version
     ):
         return _empty_row(
             pool_name, state="unavailable", reason="version_mismatch", mutation=mutation
@@ -189,7 +198,15 @@ def _user_row(
         return _empty_row(
             pool_name, state="unavailable", reason="dependency_invalid", mutation=mutation
         )
-    if mutation.command_kind == "save_user_pool_v2":
+    ranking: PoolRankingPlan | None = None
+    if mutation.command_kind == "save_user_pool_v3" and raw.get("ranking") is not None:
+        try:
+            ranking = PoolRankingPlan.model_validate(raw["ranking"])
+        except (TypeError, ValueError, ValidationError):
+            return _empty_row(
+                pool_name, state="unavailable", reason="ranking_invalid", mutation=mutation
+            )
+    if mutation.command_kind in {"save_user_pool_v2", "save_user_pool_v3"}:
         delay_mode = "exact" if dependent else "none"
         delay_days = raw.get("delay_days")
     else:
@@ -221,6 +238,11 @@ def _user_row(
         "delay_days": delay_days,
         "rules_json": _json(raw["rules"]),
         "include_columns_json": _json(raw.get("include_columns", [])),
+        "ranking_json": (
+            _json(None if ranking is None else ranking.model_dump(mode="json"))
+            if mutation.command_kind == "save_user_pool_v3"
+            else None
+        ),
         "can_edit": True,
     }
 

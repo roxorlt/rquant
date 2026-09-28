@@ -10,6 +10,7 @@ from loguru import logger as _logger
 from rquant.builtin_presets import BUILTIN_PRESET_SCREENS, ScreenPreset
 from rquant.config import settings as _settings
 from rquant.runtime_contracts import canonical_sha256
+from rquant.screen.pool_ranking import PoolRankingPlan
 
 
 def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
@@ -71,6 +72,19 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
             display_name = data.get("display_name", base_name)
             if not isinstance(display_name, str) or not display_name.strip():
                 raise ValueError("display_name must be nonempty")
+            schema_version = data.get("schema_version")
+            if schema_version == 3:
+                if data.get("source") != "page_control_v3" or "ranking" not in data:
+                    raise ValueError("ranked pool definition is incomplete")
+                ranking = (
+                    None
+                    if data["ranking"] is None
+                    else PoolRankingPlan.model_validate(data["ranking"])
+                )
+            elif schema_version in (None, 2) and "ranking" not in data:
+                ranking = None
+            else:
+                raise ValueError("unsupported pool definition version")
 
             # 把 rules（flat list）包成单 stage，复用 dispatch.build_rules 校验
             rule_calls = [RuleCall(name=r["name"], args=r.get("args", {})) for r in data["rules"]]
@@ -92,6 +106,7 @@ def load_user_presets(directory: _Path) -> dict[str, ScreenPreset]:
                 delay_days=delay_days,
                 display_name=display_name,
                 definition_version=canonical_sha256(data),
+                ranking=ranking,
             )
         except Exception as e:
             _logger.warning(f"加载 user preset 失败 {path.name}: {e}")

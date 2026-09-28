@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from rquant.llm.compile import compile_screen_plan
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
 from rquant.runtime_contracts import canonical_sha256
+from rquant.screen.pool_ranking import PoolRankingPlan
 from rquant.screen.rules import Rule
 
 
@@ -25,6 +26,7 @@ class ScreenPreset:
     delay_days: int | None = None
     ui_description: str | None = None
     definition_version: str | None = None
+    ranking: PoolRankingPlan | None = None
 
 
 def builtin_definition_version(preset: ScreenPreset) -> str:

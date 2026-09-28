@@ -25,7 +25,7 @@ from rquant.screen.formula_history_projection import (
     VerifiedFormulaHistoryProjection,
 )
 from rquant.screen.loader import FUNDAMENTAL_COLS_MAP
-from rquant.screen.ranking import RankingCondition
+from rquant.screen.ranking import RETURN_20D_COLUMN, RankingCondition
 from rquant.screen.replica_source import (
     ScreenReplicaBudgetError,
     ScreenReplicaChangedError,
@@ -67,7 +67,9 @@ from rquant.web.screen_catalog import (
 )
 from rquant.web.serving import BorrowedGeneration
 
-_REPLICA_RANK_COLUMNS = frozenset({"TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]"})
+_REPLICA_RANK_COLUMNS = frozenset({
+    "TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]", RETURN_20D_COLUMN
+})
 _FUNDAMENTAL_COLUMNS = frozenset(f"{name}[0]" for name in FUNDAMENTAL_COLS_MAP.values())
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _PREVIEW_UNKNOWN = {

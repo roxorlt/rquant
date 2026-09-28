@@ -6,6 +6,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import duckdb
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -21,7 +22,11 @@ from rquant.page_control import (
 from rquant.pool_definition_projection import build_pool_definition_rows
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.app import create_app
+from rquant.web.models.pool_editor import SavePoolCommand, SaveRankedPoolCommand
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandUnavailableError
+from rquant.web.pool_editor_read import read_pool_editor
+from rquant.web.routes.pool_editor import _failed_message
+from rquant.web.serving import BorrowedGeneration
 from rquant.web.settings import WebSettings
 from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
@@ -74,6 +79,7 @@ def _user_row(*, version: str = "a" * 64, can_edit: bool = True) -> dict[str, ob
         "delay_days": 2,
         "rules_json": json.dumps([{"name": "not_st", "args": {}}]),
         "include_columns_json": json.dumps(["CLOSE[0]"]),
+        "ranking_json": None,
         "can_edit": can_edit,
     }
 
@@ -120,6 +126,20 @@ def _save_body(command_id: str, *, expected_version: str | None = None) -> dict[
         "depends_on": None,
         "delay_days": 0,
         "expected_version": expected_version,
+    }
+
+
+def _ranked_save_body(command_id: str, *, expected_version: str | None = None) -> dict[str, object]:
+    return {
+        **_save_body(command_id, expected_version=expected_version),
+        "kind": "save_user_pool_v3",
+        "ranking": {
+            "conditions": [
+                {"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 60},
+                {"metric": "TURNOVER_RATE[0]", "ascending": False, "weight": 40},
+            ],
+            "top_n": 20,
+        },
     }
 
 
@@ -192,6 +212,8 @@ def test_editor_reads_registered_user_rules_and_verified_canvas_from_one_generat
             "delay_days": 2,
             "rule_calls": [{"name": "not_st", "args": {}}],
             "include_columns": ["CLOSE[0]"],
+            "ranking": None,
+            "save_kind": "save_user_pool_v2",
         }
     ]
     assert data["canvases"] == [
@@ -206,6 +228,232 @@ def test_editor_reads_registered_user_rules_and_verified_canvas_from_one_generat
     ]
     assert data["canvas_create_available"] is True
     assert response.json()["serving"]["generation_id"] is not None
+
+
+def test_ranked_pool_readback_keeps_plan_and_rejects_v2_overwrite(tmp_path: Path) -> None:
+    row = _user_row()
+    ranking = _ranked_save_body("ranked-read")["ranking"]
+    row["ranking_json"] = json.dumps(ranking)
+    submitted: list[dict[str, object]] = []
+
+    def transport(body: dict[str, object]) -> dict[str, object]:
+        submitted.append(body)
+        return {
+            "command_id": body["command_id"],
+            "status": "succeeded",
+            "enqueued_at": body["requested_at"],
+            "result": {"version": "b" * 64},
+        }
+
+    app = _app(
+        tmp_path / "serving",
+        user_rows=[row],
+        transport=transport,
+    )
+    with TestClient(app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+        refused = client.post(
+            "/api/v1/pools/editor/commands",
+            json=_save_body("erase-ranking", expected_version="a" * 64),
+            headers=HEADERS,
+        )
+    assert data["pools"][0]["ranking"] == ranking
+    assert data["pools"][0]["save_kind"] == "save_user_pool_v3"
+    assert refused.status_code == 409
+    assert "排名" in refused.json()["detail"]
+    assert submitted == []
+
+
+def test_unranked_v3_readback_keeps_v3_edit_command_and_explicit_null(tmp_path: Path) -> None:
+    row = _user_row()
+    row["ranking_json"] = "null"
+    submitted: list[dict[str, object]] = []
+
+    def transport(body: dict[str, object]) -> dict[str, object]:
+        submitted.append(body)
+        return {
+            "command_id": body["command_id"],
+            "status": "succeeded",
+            "enqueued_at": body["requested_at"],
+            "result": {"version": "b" * 64},
+        }
+
+    app = _app(tmp_path / "serving", user_rows=[row], transport=transport)
+    with TestClient(app) as client:
+        pool = client.get("/api/v1/pools/editor").json()["data"]["pools"][0]
+        legacy_update = client.post(
+            "/api/v1/pools/editor/commands",
+            json=_save_body("legacy-update", expected_version="a" * 64),
+            headers=HEADERS,
+        )
+        v3_update = client.post(
+            "/api/v1/pools/editor/commands",
+            json={**_ranked_save_body("v3-update", expected_version="a" * 64), "ranking": None},
+            headers=HEADERS,
+        )
+    assert pool["ranking"] is None
+    assert pool["save_kind"] == "save_user_pool_v3"
+    assert legacy_update.status_code == 409
+    assert v3_update.status_code == 200
+    assert len(submitted) == 1
+    assert submitted[0]["kind"] == "save_user_pool_v3"
+    assert "ranking" in submitted[0] and submitted[0]["ranking"] is None
+
+
+def test_v3_save_requires_explicit_ranking_field_even_when_empty(tmp_path: Path) -> None:
+    body = _ranked_save_body("missing-ranking")
+    body.pop("ranking")
+    app = _app(tmp_path / "serving", transport=lambda _body: pytest.fail("must not submit"))
+    with TestClient(app) as client:
+        response = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+    assert response.status_code == 422
+
+
+def test_old_serving_pool_definition_without_ranking_column_remains_editable() -> None:
+    row = _user_row()
+    columns = (
+        "pool_name",
+        "display_name",
+        "description",
+        "source_kind",
+        "state",
+        "version",
+        "depends_on",
+        "delay_mode",
+        "delay_days",
+        "rules_json",
+        "include_columns_json",
+        "can_edit",
+    )
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE TABLE projection_status (table_name VARCHAR, available BOOLEAN, "
+            "row_count INTEGER, available_at TIMESTAMPTZ)"
+        )
+        connection.execute(
+            "INSERT INTO projection_status VALUES ('pool_definition', true, 1, NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE pool_definition (pool_name VARCHAR, display_name VARCHAR, "
+            "description VARCHAR, source_kind VARCHAR, state VARCHAR, version VARCHAR, "
+            "depends_on VARCHAR, delay_mode VARCHAR, delay_days INTEGER, rules_json VARCHAR, "
+            "include_columns_json VARCHAR, can_edit BOOLEAN)"
+        )
+        connection.execute(
+            "INSERT INTO pool_definition VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(row[name] for name in columns),
+        )
+        snapshot = read_pool_editor(BorrowedGeneration(None, None, connection.cursor(), None))
+    finally:
+        connection.close()
+    assert snapshot.data.state == "ready"
+    assert len(snapshot.data.pools) == 1
+    assert snapshot.data.pools[0].ranking is None
+
+
+def test_invalid_published_ranking_is_not_editable(tmp_path: Path) -> None:
+    bad = _user_row()
+    bad["ranking_json"] = json.dumps(
+        {"conditions": [{"metric": "OTHER", "ascending": False, "weight": 100}], "top_n": 10}
+    )
+    app = _app(
+        tmp_path / "serving",
+        user_rows=[bad],
+        transport=lambda _body: pytest.fail("invalid pool must not be edited"),
+    )
+    with TestClient(app) as client:
+        data = client.get("/api/v1/pools/editor").json()["data"]
+        refused = client.post(
+            "/api/v1/pools/editor/commands",
+            json=_ranked_save_body("bad-ranking", expected_version="a" * 64),
+            headers=HEADERS,
+        )
+    assert data["pools"] == []
+    assert refused.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "ranking",
+    [
+        {"conditions": [], "top_n": 10},
+        {"conditions": [{"metric": "OTHER", "ascending": False, "weight": 100}], "top_n": 10},
+        {
+            "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
+            "top_n": 0,
+        },
+        {
+            "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": -1}],
+            "top_n": 10,
+        },
+        {
+            "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 0}],
+            "top_n": 10,
+        },
+        {
+            "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": "false", "weight": 100}],
+            "top_n": 10,
+        },
+    ],
+)
+def test_ranked_save_rejects_invalid_plan_before_submission(
+    tmp_path: Path, ranking: object
+) -> None:
+    body = _ranked_save_body("invalid-ranking")
+    body["ranking"] = ranking
+    app = _app(tmp_path / "serving", transport=lambda _body: pytest.fail("must not submit"))
+    with TestClient(app) as client:
+        response = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+    assert response.status_code == 422
+
+
+def test_ranked_save_uses_same_auth_csrf_and_typed_receipt(tmp_path: Path) -> None:
+    submitted: list[dict[str, object]] = []
+
+    def transport(body: dict[str, object]) -> dict[str, object]:
+        submitted.append(body)
+        return {
+            "command_id": body["command_id"],
+            "status": "succeeded",
+            "enqueued_at": body["requested_at"],
+            "result": {"version": "b" * 64},
+        }
+
+    app = _app(tmp_path / "serving", transport=transport)
+    body = _ranked_save_body("ranked-create")
+    with TestClient(app) as client:
+        unauthenticated = client.post(
+            "/api/v1/pools/editor/commands",
+            json=body,
+            headers={key: value for key, value in HEADERS.items() if key != "x-rquant-user"},
+        )
+        no_csrf = client.post(
+            "/api/v1/pools/editor/commands",
+            json=body,
+            headers={"x-rquant-user": "researcher"},
+        )
+        accepted = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
+    assert unauthenticated.status_code == 401
+    assert no_csrf.status_code == 403
+    assert accepted.status_code == 200
+    assert accepted.json()["pool_version"] == "b" * 64
+    assert accepted.json()["message"] == "池子已保存"
+    assert len(submitted) == 1
+    assert submitted[0]["kind"] == "save_user_pool_v3"
+    assert submitted[0]["ranking"] == body["ranking"]
+
+
+def test_v3_name_conflict_guides_new_pool_to_rename_but_edit_to_refresh() -> None:
+    error = "ValueError: pool version conflict: definition changed since it was read"
+    new_pool = SaveRankedPoolCommand.model_validate(_ranked_save_body("new-pool"))
+    editing = SaveRankedPoolCommand.model_validate(
+        _ranked_save_body("edit-pool", expected_version="a" * 64)
+    )
+    legacy_new = SavePoolCommand.model_validate(_save_body("legacy-new"))
+
+    assert _failed_message(error, new_pool) == "池子名称已被使用，请换一个名称。"
+    assert _failed_message(error, editing) == "规则已变化，请刷新后重试。"
+    assert _failed_message(error, legacy_new) == "规则已变化，请刷新后重试。"
 
 
 def test_create_canvas_lost_response_keeps_identity_and_waits_for_serving(tmp_path: Path) -> None:
@@ -326,6 +574,7 @@ def test_editor_exposes_bounded_builtin_copy_sources_with_original_semantics(
     assert first["delay_days"] == 0
     assert first["copyable"] is True
     assert first["copy_block_reason"] is None
+    assert first["ranking"] is None
     assert {"name": "circ_mv_lt", "args": {"threshold_yi": 150}} in first["rule_calls"]
     assert "CIRC_MV[0]" in first["include_columns"]
 

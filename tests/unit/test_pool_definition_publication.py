@@ -24,8 +24,11 @@ from rquant.page_control import (
     SaveNlPreset,
     SaveUserPool,
     SaveUserPoolV2,
+    SaveUserPoolV3,
 )
+from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
 from rquant.runtime_builder_signal import NotifierSettings
+from rquant.runtime_contracts import canonical_sha256
 from rquant.runtime_deployment_bundle import _validate_manifest_authority
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
@@ -114,8 +117,118 @@ def test_verified_v2_is_exact_and_has_matching_command_version(tmp_path: Path) -
     assert row["delay_mode"] == "exact"
     assert row["delay_days"] == 2
     assert row["can_edit"] is True
+    assert row["ranking_json"] is None
     assert json.loads(str(row["rules_json"]))[0]["name"] == "not_st"
     assert _rows(tmp_path)["n-shape-pool2"]["delay_mode"] == "legacy_window"
+
+
+def test_ranked_definition_requires_exact_audited_ranking_and_publishes_it() -> None:
+    ranking = {
+        "conditions": [
+            {"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 60.0},
+            {"metric": "TURNOVER_RATE[0]", "ascending": False, "weight": 40.0},
+        ],
+        "top_n": 20,
+    }
+    payload: dict[str, object] = {
+        "kind": "save_user_pool_v3",
+        "command_id": "ranked-save",
+        "requested_at": NOW.isoformat(),
+        "base_name": "breakout",
+        "display_name": "突破观察",
+        "description": "日终筛选",
+        "rule_calls": [{"name": "not_st", "args": {}}],
+        "include_columns": ["CLOSE[0]"],
+        "depends_on": None,
+        "delay_days": 0,
+        "expected_version": None,
+        "ranking": ranking,
+    }
+    raw: dict[str, object] = {
+        "schema_version": 3,
+        "name": "breakout",
+        "display_name": "突破观察",
+        "description": "日终筛选",
+        "rules": payload["rule_calls"],
+        "include_columns": payload["include_columns"],
+        "depends_on": None,
+        "delay_days": 0,
+        "ranking": ranking,
+        "source": "page_control_v3",
+        "updated_at": NOW.isoformat(timespec="seconds"),
+        "command_id": "ranked-save",
+        "command_hash": "a" * 64,
+    }
+    mutation = PoolMutation(
+        command_id="ranked-save",
+        command_kind="save_user_pool_v3",
+        command_hash="a" * 64,
+        payload=payload,
+        result={"path": "/synthetic/breakout.json", "version": canonical_sha256(raw)},
+    )
+
+    def published(
+        document: dict[str, object], evidence: PoolMutation = mutation
+    ) -> dict[str, object]:
+        return next(
+            row
+            for row in build_pool_definition_rows(
+                {"breakout": document}, {"breakout": evidence}, root_path="/synthetic"
+            )
+            if row["pool_name"] == "user/breakout"
+        )
+
+    verified = published(raw)
+    assert verified["state"] == "available"
+    assert verified["can_edit"] is True
+    assert json.loads(str(verified["ranking_json"])) == ranking
+
+    altered = json.loads(json.dumps(raw))
+    altered["ranking"]["top_n"] = 21
+    rejected = published(altered)
+    assert rejected["state"] == "unavailable"
+    assert rejected["can_edit"] is False
+    assert rejected["ranking_json"] is None
+
+    missing = {key: value for key, value in raw.items() if key != "ranking"}
+    assert published(missing)["state"] == "unavailable"
+
+    unranked_raw = {**raw, "ranking": None}
+    unranked_evidence = PoolMutation(
+        command_id=mutation.command_id,
+        command_kind=mutation.command_kind,
+        command_hash=mutation.command_hash,
+        payload={**payload, "ranking": None},
+        result={
+            "path": "/synthetic/breakout.json",
+            "version": canonical_sha256(unranked_raw),
+        },
+    )
+    unranked = published(unranked_raw, unranked_evidence)
+    assert unranked["state"] == "available"
+    assert unranked["can_edit"] is True
+    assert unranked["ranking_json"] == "null"
+
+
+def test_v3_page_control_audit_reaches_the_readonly_projection(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    ranked = SaveUserPoolV3.model_validate(
+        {
+            **_v2("save-ranked", depends_on=None, delay_days=0).model_dump(mode="json"),
+            "kind": "save_user_pool_v3",
+            "ranking": {
+                "conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
+                "top_n": 10,
+            },
+        }
+    )
+    receipt = service.submit(ranked)
+    assert receipt.status is PageControlStatus.SUCCEEDED
+
+    row = _rows(tmp_path)["user/breakout"]
+    assert row["state"] == "available"
+    assert row["can_edit"] is True
+    assert json.loads(str(row["ranking_json"]))["top_n"] == 10
 
 
 def test_direct_legacy_file_has_no_verified_editable_rules(tmp_path: Path) -> None:

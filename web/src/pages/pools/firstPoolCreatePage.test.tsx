@@ -137,6 +137,7 @@ function respondFirstPool(
                   display_name: "首只观察",
                   description: "",
                   version: VERSION,
+                  save_kind: "save_user_pool_v2",
                   depends_on: null,
                   delay_days: 0,
                   rule_calls: [{ name: "not_st", args: {} }],

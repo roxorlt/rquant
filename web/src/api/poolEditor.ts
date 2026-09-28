@@ -7,12 +7,26 @@ export type EditableCanvas = Schemas["EditableCanvas"];
 export type BuiltinPoolCopySource = Schemas["BuiltinPoolCopySource"];
 export type EditorCommand =
   | Schemas["SavePoolCommand"]
+  | Schemas["SaveRankedPoolCommand"]
   | Schemas["AttachPoolCommand"]
   | Schemas["CreateCanvasCommand"];
 export type EditorReceipt = Schemas["PoolEditorReceipt"];
 export type PoolNlPreviewRequest = Schemas["PoolNlPreviewRequest"];
 export type PoolNlPreview = Schemas["PoolNlPreview"];
 export type PoolRuleChange = Schemas["PoolRuleChange"];
+export type PoolRankingPlan = Schemas["PoolRankingPlan"];
+export type PoolRankingMetric = PoolRankingPlan["conditions"][number]["metric"];
+
+const POOL_RANKING_METRICS = new Set<PoolRankingMetric>([
+  "RETURN_20D_PCT[0]",
+  "TURNOVER_RATE[0]",
+  "CIRC_MV[0]",
+  "PCT_CHG[0]",
+]);
+
+export function isPoolRankingMetric(value: string): value is PoolRankingMetric {
+  return POOL_RANKING_METRICS.has(value as PoolRankingMetric);
+}
 
 export function usePoolEditor(): ServingQueryResult<PoolEditorData> {
   return useServingQuery(["pools", "editor"], async () => {

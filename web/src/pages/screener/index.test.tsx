@@ -1714,4 +1714,409 @@ describe("选股器", () => {
     await user.click(screen.getByRole("button", { name: "删除第 2 项排名" }));
     expect(screen.getByText(/权重合计 60%/)).toBeInTheDocument();
   });
+
+  it("只从最新未过期的成功筛选保存定义，并在条件改变后要求重跑", async () => {
+    catalog();
+    server.use(
+      http.get("*/api/v1/pools", () =>
+        HttpResponse.json({
+          data: {
+            state: "ready",
+            latest_trade_date: null,
+            definitions_available: true,
+            rules_available: true,
+            canvases: [],
+            canvases_truncated: false,
+            pools: [],
+            pools_truncated: false,
+          },
+          serving,
+        }),
+      ),
+    );
+    const commands: Record<string, unknown>[] = [];
+    server.use(
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+      http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        const body = (await request.json()) as Record<string, unknown>;
+        commands.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          status: "succeeded",
+          message: "池子已保存",
+          pool_version: "b".repeat(64),
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
+    const open = screen.getByRole("button", { name: "保存为池子" });
+    expect(open).toBeEnabled();
+    await user.click(open);
+    const dialog = screen.getByRole("dialog", { name: "保存为池子" });
+    await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "首次观察");
+    await user.click(within(dialog).getByRole("button", { name: "保存池子" }));
+    await waitFor(() => expect(commands).toHaveLength(1));
+    expect(commands[0]).toMatchObject({
+      kind: "save_user_pool_v3",
+      base_name: "首次观察",
+      ranking: null,
+      rule_calls: [{ name: "not_st", args: {} }],
+      depends_on: null,
+      delay_days: 0,
+    });
+    expect(within(dialog).getByText("保存请求已完成")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "返回选股" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "条件目录" }), "circ_mv_lt");
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    expect(screen.getByRole("button", { name: "保存为池子" })).toBeDisabled();
+    expect(screen.getByText("条件已改，请重新运行。旧结果仅供参考。")).toBeInTheDocument();
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("有排名时保存完整排名定义与前 N，只能提交最新运行快照", async () => {
+    catalog();
+    server.use(
+      http.get("*/api/v1/pools", () =>
+        HttpResponse.json({
+          data: {
+            state: "ready",
+            latest_trade_date: null,
+            definitions_available: true,
+            rules_available: true,
+            canvases: [],
+            canvases_truncated: false,
+            pools: [],
+            pools_truncated: false,
+          },
+          serving,
+        }),
+      ),
+    );
+    const commands: Record<string, unknown>[] = [];
+    server.use(
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            ranked_count: 20,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+      http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        commands.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          status: "succeeded",
+          message: "池子已保存",
+          pool_version: "b".repeat(64),
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await screen.findByRole("button", { name: "添加排名" });
+    await user.click(screen.getByRole("button", { name: "添加排名" }));
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("按排名分展示前 20 只")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "保存为池子" }));
+    const dialog = screen.getByRole("dialog", { name: "保存为池子" });
+    await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "排序观察");
+    await user.click(within(dialog).getByRole("button", { name: "保存池子" }));
+    await waitFor(() => expect(commands).toHaveLength(1));
+    expect(commands[0]).toMatchObject({
+      kind: "save_user_pool_v3",
+      ranking: {
+        conditions: [{ metric: "CIRC_MV[0]", ascending: true, weight: 100 }],
+        top_n: 20,
+      },
+    });
+  });
+
+  it("保存失联后刷新页面，使用同一请求继续核对", async () => {
+    catalog();
+    const commands: Record<string, unknown>[] = [];
+    server.use(
+      http.get("*/api/v1/pools", () =>
+        HttpResponse.json({
+          data: {
+            state: "ready",
+            latest_trade_date: null,
+            definitions_available: true,
+            rules_available: true,
+            canvases: [],
+            canvases_truncated: false,
+            pools: [],
+            pools_truncated: false,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        commands.push(body);
+        return commands.length === 1
+          ? HttpResponse.json({ detail: "连接断开" }, { status: 503 })
+          : HttpResponse.json({
+              command_id: body.command_id,
+              status: "succeeded",
+              message: "池子已保存",
+              pool_version: "b".repeat(64),
+            });
+      }),
+    );
+    const user = userEvent.setup();
+    const app = renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    await screen.findByText("命中 27 只");
+    await user.click(screen.getByRole("button", { name: "保存为池子" }));
+    const dialog = screen.getByRole("dialog", { name: "保存为池子" });
+    await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "续查观察");
+    await user.click(within(dialog).getByRole("button", { name: "保存池子" }));
+    expect(await within(dialog).findByText("保存状态待确认")).toBeInTheDocument();
+    app.unmount();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "查看保存进度" }));
+    await user.click(
+      within(screen.getByRole("dialog", { name: "保存为池子" })).getByRole("button", {
+        name: "继续核对",
+      }),
+    );
+    await waitFor(() => expect(commands).toHaveLength(2));
+    expect(commands[1]).toEqual(commands[0]);
+    expect(screen.getByText("保存请求已完成", { exact: true })).toBeInTheDocument();
+  });
+
+  it("同代读回后分别提示规则发布与下次选股结果", async () => {
+    catalog();
+    const version = "b".repeat(64);
+    let editorGeneration: string | null = "c".repeat(64);
+    let resultState = "not_run";
+    server.use(
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+        const body = (await request.json()) as { command_id: string };
+        return HttpResponse.json({
+          command_id: body.command_id,
+          status: "succeeded",
+          message: "池子已保存",
+          pool_version: version,
+        });
+      }),
+      http.get("*/api/v1/pools/editor", () =>
+        HttpResponse.json({
+          data: {
+            state: "ready",
+            canvas_create_available: true,
+            nl_preview_available: false,
+            canvases: [],
+            copy_sources: [],
+            pools: [
+              {
+                key: "user/发布观察",
+                display_name: "发布观察",
+                description: "",
+                version,
+                save_kind: "save_user_pool_v3",
+                depends_on: null,
+                delay_days: 0,
+                rule_calls: [{ name: "not_st", args: {} }],
+                include_columns: [],
+                ranking: null,
+              },
+            ],
+          },
+          serving: { ...serving, generation_id: editorGeneration },
+        }),
+      ),
+      http.get("*/api/v1/pools", () =>
+        HttpResponse.json({
+          data: {
+            state: "ready",
+            latest_trade_date: "2026-09-24",
+            definitions_available: true,
+            rules_available: true,
+            canvases: [],
+            canvases_truncated: false,
+            pools_truncated: false,
+            pools: [
+              {
+                key: "user/发布观察",
+                name: "发布观察",
+                state: "unpublished",
+                trade_date: null,
+                member_count: null,
+                gain_verified_count: 0,
+                gain_sample_avg_pct: null,
+                steps: [],
+                steps_truncated: false,
+                members: [],
+                members_truncated: false,
+                definition: {
+                  name: "发布观察",
+                  state: "available",
+                  status_label: "已发布",
+                  reason_label: null,
+                  source_label: "自建规则",
+                  description: "",
+                  depends_on: null,
+                  delay_label: null,
+                  rules: [{ label: "排除 ST", parameters: [] }],
+                  ranking: null,
+                },
+                result: {
+                  state: resultState,
+                  status_label: "等待选股",
+                  trade_date: null,
+                  hit_count: null,
+                },
+              },
+            ],
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    await screen.findByText("命中 27 只");
+    await user.click(screen.getByRole("button", { name: "保存为池子" }));
+    const dialog = screen.getByRole("dialog", { name: "保存为池子" });
+    await user.type(within(dialog).getByRole("textbox", { name: "池子名称" }), "发布观察");
+    await user.click(within(dialog).getByRole("button", { name: "保存池子" }));
+    expect(await within(dialog).findByText("等待规则发布")).toBeInTheDocument();
+    editorGeneration = serving.generation_id;
+    await user.click(within(dialog).getByRole("button", { name: "检查更新" }));
+    expect(await within(dialog).findByText("规则已发布")).toBeInTheDocument();
+    expect(within(dialog).getByText("等待下次选股结果")).toBeInTheDocument();
+    resultState = "current_rules";
+    await user.click(within(dialog).getByRole("button", { name: "检查更新" }));
+    expect(await within(dialog).findByText("结果已按新规则更新")).toBeInTheDocument();
+  });
+
+  it("自定义指标虽能预览，也不允许保存成无法每日重算的池子", async () => {
+    catalog();
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: [
+              ...blocks,
+              {
+                key: "rsi_oversold",
+                label: "RSI 超卖",
+                hint: "RSI 低于指定值",
+                category: "indicator",
+                category_label: "指标",
+                parameters: [
+                  {
+                    key: "period",
+                    label: "周期",
+                    input: "integer",
+                    initial: 7,
+                    required: true,
+                    minimum: 2,
+                    maximum: 60,
+                    scale: 1,
+                    custom_ma: false,
+                  },
+                ],
+              },
+            ],
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+            nl_generate_available: false,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 4,
+            steps: [],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.selectOptions(
+      await screen.findByRole("combobox", { name: "条件目录" }),
+      "rsi_oversold",
+    );
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await screen.findByText("命中 4 只");
+    expect(screen.getByRole("button", { name: "保存为池子" })).toBeDisabled();
+    expect(screen.getByText("自定义 RSI 暂不能保存为每日池子。")).toBeInTheDocument();
+  });
 });

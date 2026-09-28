@@ -153,6 +153,7 @@ const editor: Schemas["PoolEditorData"] = {
       display_name: "自建观察",
       description: "",
       version: VERSION,
+      save_kind: "save_user_pool_v2",
       depends_on: "n-shape-pool1",
       delay_days: 1,
       rule_calls: [{ name: "volume_ratio_gte", args: { n: 2, window: 5 } }],
@@ -399,6 +400,241 @@ it("edits only the verified custom version and does not offer direct builtin edi
   await user.click(within(dialog).getByRole("button", { name: "返回画布" }));
   await user.click(screen.getByRole("button", { name: "查看 N 形态一池条件" }));
   expect(screen.getByRole("button", { name: "复制为自建池" })).toBeDisabled();
+});
+
+it("编辑带排名池子的说明时保留排名，并以带排名的命令保存", async () => {
+  const ranking: Schemas["PoolRankingPlan"] = {
+    conditions: [
+      { metric: "CIRC_MV[0]", ascending: true, weight: 70 },
+      { metric: "PCT_CHG[0]", ascending: false, weight: 30 },
+    ],
+    top_n: 20,
+  };
+  const rankedEditor = {
+    ...editor,
+    pools: editor.pools.map((pool) => ({
+      ...pool,
+      save_kind: "save_user_pool_v3" as const,
+      ranking,
+    })),
+  };
+  respond({ editor: rankedEditor });
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          ...catalog,
+          ranking_metrics: [
+            { value: "CIRC_MV[0]", label: "流通市值" },
+            { value: "PCT_CHG[0]", label: "今日涨跌幅" },
+          ],
+        },
+        serving,
+      }),
+    ),
+  );
+  const commands: Record<string, unknown>[] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      commands.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "池子已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  expect(within(dialog).getByRole("region", { name: "排名规则" })).toHaveTextContent("流通市值");
+  expect(within(dialog).getByRole("region", { name: "排名规则" })).toHaveTextContent("今日涨跌幅");
+  await user.type(within(dialog).getByRole("textbox", { name: /简短说明/ }), "每天复查");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  await waitFor(() => expect(commands).toHaveLength(1));
+  expect(commands[0]).toMatchObject({
+    kind: "save_user_pool_v3",
+    expected_version: VERSION,
+    description: "每天复查",
+    ranking,
+  });
+  expect(findJargon(dialog.textContent ?? "")).toEqual([]);
+});
+
+it("编辑已有排名的权重和前 N 后保存新排名", async () => {
+  const ranking: Schemas["PoolRankingPlan"] = {
+    conditions: [
+      { metric: "CIRC_MV[0]", ascending: true, weight: 70 },
+      { metric: "PCT_CHG[0]", ascending: false, weight: 30 },
+    ],
+    top_n: 20,
+  };
+  respond({
+    editor: {
+      ...editor,
+      pools: editor.pools.map((pool) => ({ ...pool, save_kind: "save_user_pool_v3", ranking })),
+    },
+  });
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          ...catalog,
+          ranking_metrics: [
+            { value: "CIRC_MV[0]", label: "流通市值" },
+            { value: "PCT_CHG[0]", label: "今日涨跌幅" },
+          ],
+        },
+        serving,
+      }),
+    ),
+  );
+  const commands: Record<string, unknown>[] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      commands.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "池子已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.clear(within(dialog).getByRole("spinbutton", { name: "第 1 项排名权重" }));
+  await user.type(within(dialog).getByRole("spinbutton", { name: "第 1 项排名权重" }), "60");
+  await user.clear(within(dialog).getByRole("spinbutton", { name: "第 2 项排名权重" }));
+  await user.type(within(dialog).getByRole("spinbutton", { name: "第 2 项排名权重" }), "40");
+  await user.clear(within(dialog).getByRole("spinbutton", { name: "取前 N 只" }));
+  await user.type(within(dialog).getByRole("spinbutton", { name: "取前 N 只" }), "10");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  await waitFor(() => expect(commands).toHaveLength(1));
+  expect(commands[0]).toMatchObject({
+    kind: "save_user_pool_v3",
+    ranking: {
+      conditions: [
+        { metric: "CIRC_MV[0]", ascending: true, weight: 60 },
+        { metric: "PCT_CHG[0]", ascending: false, weight: 40 },
+      ],
+      top_n: 10,
+    },
+  });
+});
+
+it("编辑原有无排名的新定义时仍保留新定义命令类型", async () => {
+  respond({
+    editor: {
+      ...editor,
+      pools: editor.pools.map((pool) => ({
+        ...pool,
+        save_kind: "save_user_pool_v3",
+        ranking: null,
+      })),
+    },
+  });
+  const commands: Record<string, unknown>[] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      commands.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "池子已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.type(within(dialog).getByRole("textbox", { name: /简短说明/ }), "保留定义");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  await waitFor(() => expect(commands).toHaveLength(1));
+  expect(commands[0]).toMatchObject({
+    kind: "save_user_pool_v3",
+    ranking: null,
+    expected_version: VERSION,
+  });
+});
+
+it("无排名新定义到第 26 条时阻止添加第 27 条", async () => {
+  respond({
+    editor: {
+      ...editor,
+      pools: editor.pools.map((pool) => ({
+        ...pool,
+        save_kind: "save_user_pool_v3",
+        ranking: null,
+        rule_calls: Array.from({ length: 26 }, () => ({ name: "not_st", args: {} })),
+      })),
+    },
+  });
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  const conditions = within(dialog).getByRole("region", { name: "筛选条件" });
+  expect(conditions).toHaveTextContent("26/26");
+  await user.selectOptions(
+    within(conditions).getByRole("combobox", { name: "条件目录" }),
+    "not_st",
+  );
+  expect(within(conditions).getByRole("button", { name: "添加条件" })).toBeDisabled();
+  expect(within(conditions).getByRole("button", { name: "添加条件" })).toHaveAttribute(
+    "aria-description",
+    "最多添加 26 条条件。",
+  );
+});
+
+it("旧定义超过 26 条时加排名会要求先移除多余条件", async () => {
+  respond({
+    editor: {
+      ...editor,
+      pools: editor.pools.map((pool) => ({
+        ...pool,
+        rule_calls: Array.from({ length: 27 }, () => ({ name: "not_st", args: {} })),
+      })),
+    },
+  });
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          ...catalog,
+          ranking_metrics: [{ value: "CIRC_MV[0]", label: "流通市值" }],
+        },
+        serving,
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  const conditions = within(dialog).getByRole("region", { name: "筛选条件" });
+  expect(conditions).toHaveTextContent("27/32");
+  await user.click(within(dialog).getByRole("button", { name: "添加排名" }));
+  expect(conditions).toHaveTextContent("27/26");
+  expect(within(conditions).getByRole("alert")).toHaveTextContent("最多保留 26 条条件");
+  expect(within(dialog).getByRole("button", { name: "预览变更" })).toBeDisabled();
 });
 
 it("previews a sentence edit without changing the draft, then applies, corrects, and saves it", async () => {

@@ -22,6 +22,7 @@ from rquant.web.models.pool_editor import (
     PoolNlPreview,
     PoolNlPreviewRequest,
     SavePoolCommand,
+    SaveRankedPoolCommand,
 )
 from rquant.web.nl_parser import NlClarificationNeededError, NlParserUnavailableError
 from rquant.web.pool_editor_gateway import (
@@ -195,6 +196,13 @@ def _authorize(snapshot: PoolEditorSnapshot, body: PoolEditorCommand) -> None:
         raise HTTPException(status_code=409, detail="这份池子规则尚不可编辑，请刷新后重试。")
     if body.base_name in snapshot.builtin_names and key not in snapshot.present_user_names:
         raise HTTPException(status_code=409, detail="内置池需先复制为自建池。")
+    current = next((pool for pool in snapshot.data.pools if pool.key == key), None)
+    if (
+        isinstance(body, SavePoolCommand)
+        and current is not None
+        and current.save_kind == "save_user_pool_v3"
+    ):
+        raise HTTPException(status_code=409, detail="这份池子有排名设置，请保留排名后保存。")
     for rule in body.rule_calls:
         if any(
             type(value) is str and value in _UNPUBLISHED_POOL_COLUMNS
@@ -224,10 +232,20 @@ def _failed_message(error: str | None, body: PoolEditorCommand) -> str:
         if "canvas current head" in text or "watermark" in text:
             return "画布状态已变化，请刷新后重试。"
         return "画布创建失败，请检查后重试。"
+    if (
+        isinstance(body, SaveRankedPoolCommand)
+        and body.expected_version is None
+        and "pool version conflict" in text
+    ):
+        return "池子名称已被使用，请换一个名称。"
     if "version conflict" in text or "definition changed" in text:
         return "规则已变化，请刷新后重试。"
     if "parent pool" in text or "dependency" in text:
         return "父池已变化，请检查后重试。"
+    if "not reproducible" in text:
+        return "部分条件暂不能按相同口径每日重算，请调整条件后重试。"
+    if "ranking" in text:
+        return "排名设置有误，请检查后重试。"
     return "保存失败，请检查条件后重试。"
 
 
@@ -237,7 +255,7 @@ def _receipt(body: PoolEditorCommand, wire: PoolCommandWireReceipt) -> PoolEdito
         result = wire.result
         if not isinstance(result, dict):
             raise PoolCommandInvalidReceiptError("succeeded command has no result")
-        if isinstance(body, SavePoolCommand):
+        if isinstance(body, (SavePoolCommand, SaveRankedPoolCommand)):
             version = result.get("version")
             if not isinstance(version, str) or _SHA256.fullmatch(version) is None:
                 raise PoolCommandInvalidReceiptError("saved pool version is invalid")

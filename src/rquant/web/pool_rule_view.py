@@ -9,7 +9,14 @@ from functools import lru_cache
 from typing import Any
 
 from rquant.llm.registry import REGISTRY_BY_NAME
-from rquant.web.models.pools import PoolDefinitionView, PoolRuleItem, PoolRuleParameter
+from rquant.screen.pool_ranking import PoolRankingPlan
+from rquant.web.models.pools import (
+    PoolDefinitionView,
+    PoolRankingItem,
+    PoolRankingView,
+    PoolRuleItem,
+    PoolRuleParameter,
+)
 from rquant.web.models.screen import ScreenBlock, ScreenParameter
 from rquant.web.screen_catalog import screen_blocks
 
@@ -25,6 +32,7 @@ _REASONS = {
     "name_mismatch": "规则名称与文件不一致",
     "version_mismatch": "规则文件与发布版本不一致",
     "rules_invalid": "规则内容无效",
+    "ranking_invalid": "排名设置无效",
     "dependency_invalid": "父池设置无效",
     "delay_invalid": "父池时段设置无效",
     "parent_missing": "父池不存在",
@@ -62,6 +70,12 @@ _FIELDS = {
     "IS_FIRST_LIMIT_UP": "首板状态",
     "IS_YIZIBAN": "一字板状态",
     "CONSECUTIVE_LIMIT_UPS": "连板数",
+}
+_RANKING_LABELS = {
+    "RETURN_20D_PCT[0]": "20 日涨幅",
+    "TURNOVER_RATE[0]": "换手率",
+    "CIRC_MV[0]": "流通市值",
+    "PCT_CHG[0]": "今日涨跌幅",
 }
 _FIELD_PATTERN = re.compile(r"([A-Z][A-Z0-9_]*)(?:\[(0|[1-9][0-9]*)\])?\Z")
 
@@ -163,6 +177,25 @@ def _rules(raw: object) -> list[PoolRuleItem]:
     return result
 
 
+def _ranking(raw: object) -> PoolRankingView | None:
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 4_096:
+        raise ValueError("ranking is unavailable")
+    if raw == "null":
+        return None
+    plan = PoolRankingPlan.model_validate(json.loads(raw))
+    return PoolRankingView(
+        conditions=[
+            PoolRankingItem(
+                label=_RANKING_LABELS[condition.metric],
+                direction_label="越低越好" if condition.ascending else "越高越好",
+                weight=condition.weight,
+            )
+            for condition in plan.conditions
+        ],
+        top_n=plan.top_n,
+    )
+
+
 def _unavailable(
     name: str, source_label: str, reason: str, *, state: str = "unavailable"
 ) -> PoolDefinitionView:
@@ -217,6 +250,11 @@ def pool_definition_view(row: dict[str, Any]) -> PoolDefinitionView:
         rendered = _rules(raw_rules)
     except (TypeError, ValueError):
         return _unavailable(name, source_label, "规则内容无法识别")
+    ranking_json = row.get("ranking_json")
+    try:
+        ranking = None if ranking_json is None else _ranking(ranking_json)
+    except (TypeError, ValueError, KeyError):
+        return _unavailable(name, source_label, "排名设置损坏")
 
     depends_on = row.get("depends_on")
     delay_mode = row.get("delay_mode")
@@ -248,4 +286,5 @@ def pool_definition_view(row: dict[str, Any]) -> PoolDefinitionView:
         depends_on=depends_on,
         delay_label=delay_label,
         rules=rendered,
+        ranking=ranking,
     )

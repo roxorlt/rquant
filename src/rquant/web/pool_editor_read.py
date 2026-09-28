@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from rquant.llm.registry import REGISTRY_BY_NAME
+from rquant.screen.pool_ranking import PoolRankingPlan
 from rquant.web import readers
 from rquant.web.models.pool_editor import (
     BuiltinPoolCopySource,
@@ -79,6 +80,15 @@ def _columns(value: object) -> list[str] | None:
     return columns
 
 
+def _ranking(value: object) -> PoolRankingPlan | None:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_JSON_BYTES:
+        return None
+    try:
+        return PoolRankingPlan.model_validate(json.loads(value))
+    except (TypeError, ValueError, ValidationError):
+        return None
+
+
 def _pool(row: tuple[object, ...]) -> EditablePool | None:
     (
         key,
@@ -92,6 +102,7 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
         delay_days,
         rules_json,
         columns_json,
+        ranking_json,
         can_edit,
     ) = row
     if (
@@ -121,6 +132,17 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
     columns = _columns(columns_json)
     if rules is None or columns is None:
         return None
+    if ranking_json is None:
+        ranking = None
+        save_kind = "save_user_pool_v2"
+    elif ranking_json == "null":
+        ranking = None
+        save_kind = "save_user_pool_v3"
+    else:
+        ranking = _ranking(ranking_json)
+        if ranking is None:
+            return None
+        save_kind = "save_user_pool_v3"
     return EditablePool(
         key=key,
         display_name=display_name,
@@ -130,6 +152,8 @@ def _pool(row: tuple[object, ...]) -> EditablePool | None:
         delay_days=delay_days,
         rule_calls=rules,
         include_columns=columns,
+        ranking=ranking,
+        save_kind=save_kind,
     )
 
 
@@ -146,6 +170,7 @@ def _copy_source(row: tuple[object, ...]) -> BuiltinPoolCopySource | None:
         delay_days,
         rules_json,
         columns_json,
+        ranking_json,
         can_edit,
     ) = row
     if (
@@ -162,6 +187,7 @@ def _copy_source(row: tuple[object, ...]) -> BuiltinPoolCopySource | None:
         or len(description) > 1_024
         or type(delay_days) is not int
         or not 0 <= delay_days <= 10_000
+        or ranking_json is not None
     ):
         return None
     if depends_on is None:
@@ -246,10 +272,13 @@ def read_pool_editor(borrowed: BorrowedGeneration | None) -> PoolEditorSnapshot:
     definition = tables.get("pool_definition")
     if definition is None or not definition.available:
         return unavailable
+    cursor.execute("SELECT * FROM pool_definition LIMIT 0")
+    has_ranking = any(column[0] == "ranking_json" for column in cursor.description)
+    ranking_column = "ranking_json" if has_ranking else "NULL AS ranking_json"
     pool_rows = cursor.execute(
         "SELECT pool_name, display_name, description, source_kind, state, version, "
-        "depends_on, delay_mode, delay_days, rules_json, include_columns_json, can_edit "
-        "FROM pool_definition ORDER BY pool_name LIMIT ?",
+        "depends_on, delay_mode, delay_days, rules_json, include_columns_json, "
+        f"{ranking_column}, can_edit FROM pool_definition ORDER BY pool_name LIMIT ?",
         (_MAX_POOLS + 1,),
     ).fetchall()
     if len(pool_rows) > _MAX_POOLS:

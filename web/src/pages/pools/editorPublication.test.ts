@@ -43,6 +43,7 @@ const editor: Schemas["PoolEditorData"] = {
       display_name: "放量确认",
       description: "",
       version: VERSION,
+      save_kind: "save_user_pool_v2",
       depends_on: "n-shape-pool1",
       delay_days: 1,
       rule_calls: [],

@@ -202,6 +202,18 @@ function RulesDetail({
           ) : (
             <p className="pools-note">这只池子没有附加筛选条件。</p>
           )}
+          {definition.ranking ? (
+            <div className="pools-ranking-summary">
+              <strong>排名后取前 {formatCount(definition.ranking.top_n)} 只</strong>
+              <ul>
+                {definition.ranking.conditions.map((item) => (
+                  <li key={item.label}>
+                    {item.label} · {item.direction_label} · {formatCount(item.weight)}%
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
         </div>
       )}
     </Panel>
